@@ -2,528 +2,947 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Model server calls with deadline and fallback',
+  title: 'Model server calls: a deadline, one retry, and the right model',
   concept: 'grpc',
   file: 'client',
-  focus: ['api', 'model', 'fallback'],
+  focus: ['api', 'model'],
   task: `## Task
 
-**Starting point.** The starter implements \`embed(text, model_version)\`, the one call the write
-path makes: it calls the primary model server and, when that call fails for any reason, calls the
-fallback model and returns whatever vector comes back under the primary's namespace. While the
-model server is up every input gets a vector. It compiles and hides 5 flaws.
+**Starting point.** The starter's \`embed(text, model_version)\` calls \`Embedder.Embed\`
+(\`embedder.proto\`, served as a stand-in at \`MODEL_SERVER\`) and returns the reply's \`values\`. On
+any \`RpcError\` it sleeps \`BACKOFF_S\` and tries again, up to \`MAX_ATTEMPTS = 5\`, then raises
+\`EmbedError("unavailable")\`. It serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** A bad deployment that becomes a hot loop against a service that
-is already down, and a fallback whose 384-dimension vectors land where 1024-dimension ones are
-expected, so retrieval ranks garbage before anyone notices.
+**Failure mode the checks target.** A model server that hangs and holds every request with it, an
+outage turned into five times the load, a malformed input retried as if the server were at fault,
+and a replica still on \`embed-v1\` whose vectors are returned as \`embed-v2\` ones.
 
-Requirements:
-
-- Each attempt carries a **2-second deadline** (\`DEADLINE_S = 2.0\`).
-- At most **2 attempts** and only \`UNAVAILABLE\` is retryable. A malformed input, \`INVALID_ARGUMENT\`,
-  is returned to the caller immediately: retrying it wastes the budget and still fails.
-- When the attempts run out, the input is embedded by the **fallback model**; because the fallback has
-  a different dimension, its vectors go to a **different cache namespace** (\`{version}+fallback\`).
-- The returned vector's dimension is checked against the namespace it would be cached under: a
-  wrong-dimension fallback must raise instead of being returned as a primary vector.`,
+- Every attempt carries a **2-second deadline** (\`DEADLINE_S\`).
+- At most **2 attempts** (\`MAX_ATTEMPTS = 2\`), with a backoff between them, and only
+  \`UNAVAILABLE\` earns the second one. Every other status raises \`EmbedError\` with the status name
+  in lower case (\`deadline_exceeded\`, \`invalid_argument\`).
+- The reply names the model that answered. A \`model_version\` other than the one asked for, or a
+  vector whose length is not \`DIMENSIONS[model_version]\`, raises \`EmbedError("model_mismatch")\`.`,
   sequence: {
-    participants: ['Embedding API', 'Model server', 'Fallback model'],
+    participants: ['Embedding API', 'Model server'],
     messages: [
-      {from: 'Embedding API', to: 'Model server', label: 'Embed(text) · deadline 2 s', kind: 'sync'},
-      {from: 'Model server', to: 'Embedding API', label: 'UNAVAILABLE / INVALID_ARGUMENT', kind: 'reply'},
-      {from: 'Embedding API', to: 'Embedding API', label: 'retry only UNAVAILABLE · attempt ≤ 2', kind: 'sync'},
-      {from: 'Embedding API', to: 'Fallback model', label: 'Embed(text) · namespace {version}+fallback', kind: 'sync'},
-      {from: 'Fallback model', to: 'Embedding API', label: '384-dimension vector', kind: 'reply'},
+      {from: 'Embedding API', to: 'Model server', label: 'Embed(model_version, text) · deadline 2 s', kind: 'sync'},
+      {from: 'Model server', to: 'Embedding API', label: 'UNAVAILABLE → backoff, attempt 2 of 2', kind: 'reply'},
+      {
+        from: 'Model server',
+        to: 'Embedding API',
+        label: 'INVALID_ARGUMENT / DEADLINE_EXCEEDED → EmbedError',
+        kind: 'reply',
+      },
+      {from: 'Model server', to: 'Embedding API', label: '{model_version, values}', kind: 'reply'},
       {
         from: 'Embedding API',
         to: 'Embedding API',
-        label: 'dimension guard: refuse under the primary version',
+        label: 'version and DIMENSIONS match, or model_mismatch',
         kind: 'sync',
       },
     ],
   },
-  hints: [
-    'During a model server outage, CPU on the API pods pins at 100% and nothing returns; after the outage, some lookups for the primary model return vectors of the wrong length.',
-    'The loop has no attempt limit and treats every error alike, so INVALID_ARGUMENT retries too. The fallback reply goes out under the primary namespace with no shape check.',
-    "Add `MAX_ATTEMPTS = 2`, retry only `UNAVAILABLE`, return `cache_namespace(version, used_fallback)` with the vector, and raise when `len(vector)` differs from that namespace's dimension.",
-  ],
   checks: [
+    {
+      id: 'healthy',
+      title: 'Returns the model server’s vector',
+      detail: 'One `Embed` call per input on a healthy model server, and its `values` are the vector.',
+      match: {
+        python: {all: [/stub\.Embed\(/]},
+        typescript: {all: [/stub\.Embed\(/]},
+        go: {all: [/stub\.Embed\(/]},
+        scala: {all: [/\.embed\(\s*EmbedRequest\(/]},
+        cpp: {all: [/stub->Embed\(/]},
+      },
+    },
     {
       id: 'deadline',
       title: 'Every attempt carries a 2-second deadline',
-      detail:
-        'The call is created with a 2-second deadline (`DEADLINE_S`, `deadline: Date.now() + …`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`). Without it one stuck model server pins the worker.',
+      detail: 'The call is made with a deadline (`timeout=DEADLINE_S`), so a hung model server is cut at 2 s.',
       match: {
-        python: {all: [/DEADLINE_S\s*=\s*2\b/, /timeout=DEADLINE_S/]},
-        typescript: {all: [/DEADLINE_MS\s*=\s*2000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
-        go: {all: [/deadlineMS\s*=\s*2000/, /context\.WithTimeout/]},
-        scala: {all: [/DeadlineMs\s*=\s*2000/, /withDeadlineAfter/]},
-        cpp: {all: [/kDeadlineMs\s*=\s*2000/, /set_deadline\(/]},
+        python: {all: [/timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
+        go: {all: [/context\.WithTimeout\(/]},
+        scala: {all: [/\.withDeadlineAfter\(/]},
+        cpp: {all: [/\.set_deadline\(/]},
       },
     },
     {
-      id: 'bounded-attempts',
-      title: 'At most two attempts, only UNAVAILABLE retried',
-      detail:
-        'Attempts are bounded (`MAX_ATTEMPTS = 2`) and only `UNAVAILABLE` is retryable; `INVALID_ARGUMENT` is returned immediately. The starter retries every error forever.',
+      id: 'bounded-retry',
+      title: 'Two attempts at most',
+      detail: '`MAX_ATTEMPTS = 2`: a model server that stays `UNAVAILABLE` gets two calls, then `EmbedError`.',
       match: {
-        python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /RETRYABLE/, /UNAVAILABLE/]},
-        typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /RETRYABLE/, /UNAVAILABLE/]},
-        go: {all: [/maxAttempts\s*=\s*2\b/, /retryable/, /Unavailable/]},
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /Retryable/, /UNAVAILABLE/]},
-        cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /kRetryable/, /UNAVAILABLE/]},
+        python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/]},
+        typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/]},
+        go: {all: [/maxAttempts\s*=\s*2\b/]},
+        scala: {all: [/MaxAttempts\s*=\s*2\b/]},
+        cpp: {all: [/kMaxAttempts\s*=\s*2\b/]},
       },
     },
     {
-      id: 'namespace',
-      title: 'Switches the cache namespace for the fallback',
+      id: 'unavailable-only',
+      title: 'Only UNAVAILABLE is retried',
       detail:
-        "The cache namespace is a function of the model version and whether the fallback was used, so the fallback's vectors never land under the primary version. The starter caches both under one namespace.",
+        'The retry is conditioned on the status `UNAVAILABLE`; `INVALID_ARGUMENT` and the rest raise after one call.',
       match: {
-        python: {all: [/def cache_namespace\(/, /used_fallback/]},
-        typescript: {all: [/function cacheNamespace\(/, /usedFallback/]},
-        go: {all: [/func cacheNamespace\(/, /usedFallback/]},
-        scala: {all: [/def cacheNamespace\(/, /usedFallback/]},
-        cpp: {all: [/cache_namespace\(/, /used_fallback/]},
+        python: {all: [/StatusCode\.UNAVAILABLE/]},
+        typescript: {all: [/grpc\.status\.UNAVAILABLE/]},
+        go: {all: [/codes\.Unavailable/]},
+        scala: {all: [/Status\.Code\.UNAVAILABLE/]},
+        cpp: {all: [/StatusCode::UNAVAILABLE/]},
       },
     },
     {
-      id: 'dimension-guard',
-      title: 'Refuses a wrong-dimension vector',
+      id: 'model-check',
+      title: 'Refuses a vector from another model',
       detail:
-        "The vector length is compared with the dimension of the namespace it would be cached under. The starter returns the fallback's 384-dimension vector as if it were a primary 1024-dimension one.",
+        'The reply’s `model_version` is compared with the one asked for and its length with `DIMENSIONS`; a mismatch raises `EmbedError("model_mismatch")`.',
       match: {
-        python: {all: [/PRIMARY_DIMENSION\s*=\s*1024/, /len\(vector\)\s*!=\s*expected/]},
-        typescript: {all: [/PRIMARY_DIMENSION\s*=\s*1024/, /vector\.length\s*!==\s*expected/]},
-        go: {all: [/primaryDimension\s*=\s*1024/, /len\(vector\)\s*!=\s*expected/]},
-        scala: {all: [/PrimaryDimension\s*=\s*1024/, /vector\.length\s*!=\s*expected/]},
-        cpp: {all: [/kPrimaryDimension\s*=\s*1024/, /vector\.size\(\)\s*!=\s*expected/]},
-      },
-    },
-    {
-      id: 'fallback',
-      title: 'Fails over to the fallback model',
-      detail:
-        "When the primary's attempts are exhausted the input is embedded by the fallback model instead of failing the batch. The starter has no fallback path with its own namespace.",
-      match: {
-        python: {all: [/FALLBACK_MODEL/, /fallback_stub\.Embed\(/]},
-        typescript: {all: [/FALLBACK_MODEL/, /fallbackClient\.Embed\(/]},
-        go: {all: [/fallbackModel/, /fallbackClient\.Embed\(/]},
-        scala: {all: [/FallbackModel/, /fallbackStub/, /\.embed\(/]},
-        cpp: {all: [/kFallbackModel/, /fallback_stub->Embed\(/]},
+        python: {all: [/reply\.model_version\s*!=|!=\s*reply\.model_version/, /DIMENSIONS/, /model_mismatch/]},
+        typescript: {all: [/reply\.model_version\s*!==|!==\s*reply\.model_version/, /DIMENSIONS\[/, /model_mismatch/]},
+        go: {
+          all: [/GetModelVersion\(\)\s*!=|!=\s*reply\.GetModelVersion\(\)/, /config\.Dimensions\[/, /model_mismatch/],
+        },
+        scala: {all: [/reply\.modelVersion\s*!=|!=\s*reply\.modelVersion/, /Config\.Dimensions/, /model_mismatch/]},
+        cpp: {all: [/reply\.model_version\(\)\s*!=|!=\s*reply\.model_version\(\)/, /kDimensions/, /model_mismatch/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""The model server call: primary first, fallback model when the primary fails."""
+      starter: `import time
+
 import grpc
 
-TIMEOUT_S = 2.0
+import embedder_pb2
+import embedder_pb2_grpc
+from embedding.config import MODEL_SERVER, EmbedError
+
+MAX_ATTEMPTS = 5
+BACKOFF_S = 0.2
+
+channel = grpc.insecure_channel(MODEL_SERVER)
+stub = embedder_pb2_grpc.EmbedderStub(channel)
 
 
-def embed(text: str, model_version: str) -> dict:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    while True:
+def embed(text: str, model_version: str) -> list[float]:
+    """The model server's vector of text under model_version; EmbedError when there is no usable one."""
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    for _attempt in range(MAX_ATTEMPTS):
         try:
-            reply = primary_stub.Embed(Request(text=text, model_version=model_version), timeout=TIMEOUT_S)
-            return {"vector": list(reply.vector)}
-        except Exception:
-            reply = fallback_stub.Embed(Request(text=text), timeout=TIMEOUT_S)
-            return {"vector": list(reply.vector)}
+            reply = stub.Embed(embedder_pb2.EmbedRequest(model_version=model_version, text=text))
+        except grpc.RpcError:
+            time.sleep(BACKOFF_S)
+            continue
+        return list(reply.values)
+    raise EmbedError("unavailable")
 `,
-      solution: `"""The model server call — bounded retries, a dimension guard and a fallback namespace."""
+      solution: `import time
+
 import grpc
+
+import embedder_pb2
+import embedder_pb2_grpc
+from embedding.config import DIMENSIONS, MODEL_SERVER, EmbedError
 
 DEADLINE_S = 2.0
 MAX_ATTEMPTS = 2
-PRIMARY_DIMENSION = 1024
-FALLBACK_DIMENSION = 384
-FALLBACK_MODEL = "text-embedding-fallback"
-RETRYABLE = {grpc.StatusCode.UNAVAILABLE}
+BACKOFF_S = 0.2
+
+channel = grpc.insecure_channel(MODEL_SERVER)
+stub = embedder_pb2_grpc.EmbedderStub(channel)
 
 
-class DimensionMismatch(RuntimeError):
-    """A vector whose shape does not match the namespace it would be cached under."""
-
-
-def cache_namespace(model_version: str, used_fallback: bool) -> str:
-    """The fallback's vectors live in their own namespace, never mixed into the primary's."""
-    return f"{model_version}+fallback" if used_fallback else model_version
-
-
-def _checked(vector: list[float], expected: int) -> list[float]:
-    if len(vector) != expected:
-        raise DimensionMismatch(f"expected {expected} dimensions, got {len(vector)}")
-    return vector
-
-
-def embed(text: str, model_version: str) -> dict:
-    """Embed one input; the fallback keeps its own cache namespace."""
-    for _ in range(MAX_ATTEMPTS):
+def embed(text: str, model_version: str) -> list[float]:
+    """The model server's vector of text under model_version; EmbedError when there is no usable one."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            reply = primary_stub.Embed(Request(text=text, model_version=model_version), timeout=DEADLINE_S)
-            vector = _checked(list(reply.vector), PRIMARY_DIMENSION)
-            return {"namespace": cache_namespace(model_version, False), "vector": vector}
-        except grpc.RpcError as exc:
-            if exc.code() not in RETRYABLE:
-                raise
-    reply = fallback_stub.Embed(Request(text=text, model_version=FALLBACK_MODEL), timeout=DEADLINE_S)
-    vector = _checked(list(reply.vector), FALLBACK_DIMENSION)
-    return {"namespace": cache_namespace(FALLBACK_MODEL, True), "vector": vector}
+            reply = stub.Embed(embedder_pb2.EmbedRequest(model_version=model_version, text=text), timeout=DEADLINE_S)
+        except grpc.RpcError as err:
+            if err.code() == grpc.StatusCode.UNAVAILABLE and attempt < MAX_ATTEMPTS:
+                time.sleep(BACKOFF_S * attempt)
+                continue
+            raise EmbedError(err.code().name.lower()) from err
+        if reply.model_version != model_version or len(reply.values) != DIMENSIONS.get(model_version):
+            raise EmbedError("model_mismatch")  # a replica on another model: its vector lives in another space
+        return list(reply.values)
+    raise EmbedError("unavailable")
 `,
     },
     typescript: {
-      starter: `/** The model server call: primary first, fallback model when the primary fails. */
+      starter: `import {setTimeout as sleep} from 'node:timers/promises';
+
 import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-const TIMEOUT_MS = 2_000;
+import {EmbedError, MODEL_SERVER} from 'embedding/config';
 
-declare const primaryStub: {
-  Embed(request: unknown, options: {deadline: number}): Promise<{vector: number[]}>;
+export const MAX_ATTEMPTS = 5;
+export const BACKOFF_MS = 200;
+
+interface EmbedReply {
+  model_version: string;
+  values: number[];
+}
+interface EmbedderClient {
+  Embed(request: {model_version: string; text: string}, options?: {deadline: number}): Promise<EmbedReply>;
+}
+
+const {embedding} = grpc.loadPackageDefinition(protoLoader.loadSync('embedder.proto')) as unknown as {
+  embedding: {Embedder: new (target: string, credentials: grpc.ChannelCredentials) => EmbedderClient};
 };
-declare const fallbackStub: {
-  Embed(request: unknown, options: {deadline: number}): Promise<{vector: number[]}>;
-};
+const stub = new embedding.Embedder(MODEL_SERVER, grpc.credentials.createInsecure());
 
-export async function embed(text: string, modelVersion: string): Promise<{vector: number[]}> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  for (;;) {
+/** The model server's vector of text under modelVersion; EmbedError when there is no usable one. */
+export async function embed(text: string, modelVersion: string): Promise<number[]> {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     try {
-      const reply = await primaryStub.Embed({text, model_version: modelVersion}, {deadline: Date.now() + TIMEOUT_MS});
-      return {vector: reply.vector};
+      const reply = await stub.Embed({model_version: modelVersion, text});
+      return reply.values;
     } catch {
-      const reply = await fallbackStub.Embed({text}, {deadline: Date.now() + TIMEOUT_MS});
-      return {vector: reply.vector};
+      await sleep(BACKOFF_MS);
     }
   }
+  throw new EmbedError('unavailable');
 }
 `,
-      solution: `/** The model server call — bounded retries, a dimension guard and a fallback namespace. */
+      solution: `import {setTimeout as sleep} from 'node:timers/promises';
+
 import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-const DEADLINE_MS = 2000;
-const MAX_ATTEMPTS = 2;
-const PRIMARY_DIMENSION = 1024;
-const FALLBACK_DIMENSION = 384;
-const FALLBACK_MODEL = 'text-embedding-fallback';
-const RETRYABLE: Record<number, true> = {[grpc.status.UNAVAILABLE]: true};
+import {DIMENSIONS, EmbedError, MODEL_SERVER} from 'embedding/config';
 
-declare const primaryStub: {Embed(request: unknown, options: {deadline: number}): Promise<{vector: number[]}>};
-declare const fallbackClient: {Embed(request: unknown, options: {deadline: number}): Promise<{vector: number[]}>;
+export const DEADLINE_MS = 2_000;
+export const MAX_ATTEMPTS = 2;
+export const BACKOFF_MS = 200;
 
-/** The fallback's vectors live in their own namespace, never mixed into the primary's. */
-function cacheNamespace(modelVersion: string, usedFallback: boolean): string {
-  return usedFallback ? \`\${modelVersion}+fallback\` : modelVersion;
+interface EmbedReply {
+  model_version: string;
+  values: number[];
+}
+interface EmbedderClient {
+  Embed(request: {model_version: string; text: string}, options?: {deadline: number}): Promise<EmbedReply>;
 }
 
-function checked(vector: number[], expected: number): number[] {
-  if (vector.length !== expected) {
-    throw new Error(\`expected \${expected} dimensions, got \${vector.length}\`);
-  }
-  return vector;
-}
+const {embedding} = grpc.loadPackageDefinition(protoLoader.loadSync('embedder.proto')) as unknown as {
+  embedding: {Embedder: new (target: string, credentials: grpc.ChannelCredentials) => EmbedderClient};
+};
+const stub = new embedding.Embedder(MODEL_SERVER, grpc.credentials.createInsecure());
 
-export async function embed(text: string, modelVersion: string): Promise<{namespace: string; vector: number[]}> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+/** The model server's vector of text under modelVersion; EmbedError when there is no usable one. */
+export async function embed(text: string, modelVersion: string): Promise<number[]> {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    let reply: EmbedReply;
     try {
-      const reply = await primaryStub.Embed({text, model_version: modelVersion}, {deadline: Date.now() + DEADLINE_MS});
-      return {namespace: cacheNamespace(modelVersion, false), vector: checked(reply.vector, PRIMARY_DIMENSION)};
-    } catch (error) {
-      lastError = error;
-      const code = (error as grpc.ServiceError).code;
-      if (RETRYABLE[code] !== true) throw error;
+      reply = await stub.Embed({model_version: modelVersion, text}, {deadline: Date.now() + DEADLINE_MS});
+    } catch (err) {
+      const {code} = err as grpc.ServiceError;
+      if (code === grpc.status.UNAVAILABLE && attempt < MAX_ATTEMPTS) {
+        await sleep(BACKOFF_MS * attempt);
+        continue;
+      }
+      const name = Object.keys(grpc.status).find(k => grpc.status[k as keyof typeof grpc.status] === code);
+      throw new EmbedError((name ?? \`status_\${code}\`).toLowerCase());
     }
+    if (reply.model_version !== modelVersion || reply.values.length !== DIMENSIONS[modelVersion]) {
+      throw new EmbedError('model_mismatch'); // a replica on another model: its vector lives in another space
+    }
+    return reply.values;
   }
-  void lastError;
-  const reply = await fallbackClient.Embed({text, model_version: FALLBACK_MODEL}, {deadline: Date.now() + DEADLINE_MS});
-  return {namespace: cacheNamespace(FALLBACK_MODEL, true), vector: checked(reply.vector, FALLBACK_DIMENSION)};
+  throw new EmbedError('unavailable');
 }
 `,
     },
     go: {
-      starter: `// The model server call: primary first, fallback model when the primary fails.
-package main
+      starter: `package main
 
 import (
 	"context"
 	"time"
-)
 
-const timeoutMS = 2000
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
-type modelClient interface {
-	Embed(ctx context.Context, text string) ([]float32, error)
-}
-
-// embed calls the primary model server and falls back when it fails.
-func embed(ctx context.Context, primary modelClient, fallback modelClient, text, modelVersion string) ([]float32, error) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	for {
-		callCtx, cancel := context.WithTimeout(ctx, timeoutMS*time.Millisecond)
-		vector, err := primary.Embed(callCtx, text)
-		cancel()
-		if err == nil {
-			return vector, nil
-		}
-		callCtx, cancel = context.WithTimeout(ctx, timeoutMS*time.Millisecond)
-		vector, err = fallback.Embed(callCtx, text)
-		cancel()
-		if err == nil {
-			return vector, nil
-		}
-	}
-}
-`,
-      solution: `// The model server call — bounded retries, a dimension guard and a fallback namespace.
-package main
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"time"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"embedding/config" // config.ModelServer, EmbedError — provided
+	pb "embedding/gen/embedder"
 )
 
 const (
-	deadlineMS        = 2000
-	maxAttempts       = 2
-	primaryDimension  = 1024
-	fallbackDimension = 384
-	fallbackModel     = "text-embedding-fallback"
+	maxAttempts = 5
+	backoff     = 200 * time.Millisecond
 )
 
-var retryable = map[codes.Code]bool{codes.Unavailable: true}
+var conn, _ = grpc.NewClient(config.ModelServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var stub = pb.NewEmbedderClient(conn)
 
-type modelClient interface {
-	Embed(ctx context.Context, text, modelVersion string) ([]float32, error)
-}
-
-// cacheNamespace is the fallback's own namespace: its vectors are never mixed into the primary's.
-func cacheNamespace(modelVersion string, usedFallback bool) string {
-	if usedFallback {
-		return modelVersion + "+fallback"
+// embed is the model server's vector of text under modelVersion; a *config.EmbedError when there is no usable one.
+func embed(ctx context.Context, text, modelVersion string) ([]float32, error) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		reply, err := stub.Embed(ctx, &pb.EmbedRequest{ModelVersion: modelVersion, Text: text})
+		if err != nil {
+			time.Sleep(backoff)
+			continue
+		}
+		return reply.GetValues(), nil
 	}
-	return modelVersion
+	return nil, &config.EmbedError{Reason: "unavailable"}
 }
+`,
+      solution: `package main
 
-func checked(vector []float32, expected int) ([]float32, error) {
-	if len(vector) != expected {
-		return nil, fmt.Errorf("expected %d dimensions, got %d", expected, len(vector))
+import (
+	"context"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	"embedding/config" // config.ModelServer, Dimensions, EmbedError — provided
+	pb "embedding/gen/embedder"
+)
+
+const (
+	deadline    = 2 * time.Second
+	maxAttempts = 2
+	backoff     = 200 * time.Millisecond
+)
+
+var conn, _ = grpc.NewClient(config.ModelServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var stub = pb.NewEmbedderClient(conn)
+
+// reasonOf names a status the way every language of the service does: unavailable, deadline_exceeded, invalid_argument.
+func reasonOf(code codes.Code) string {
+	switch code {
+	case codes.DeadlineExceeded:
+		return "deadline_exceeded"
+	case codes.InvalidArgument:
+		return "invalid_argument"
+	default:
+		return strings.ToLower(code.String())
 	}
-	return vector, nil
 }
 
-// embed calls the model server under a deadline and falls over to the fallback model.
-func embed(
-	ctx context.Context,
-	primary, fallbackClient modelClient,
-	text, modelVersion string,
-) (string, []float32, error) {
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, deadlineMS*time.Millisecond)
-		vector, err := primary.Embed(callCtx, text, modelVersion)
+// embed is the model server's vector of text under modelVersion; a *config.EmbedError when there is no usable one.
+func embed(ctx context.Context, text, modelVersion string) ([]float32, error) {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, deadline)
+		reply, err := stub.Embed(callCtx, &pb.EmbedRequest{ModelVersion: modelVersion, Text: text})
 		cancel()
-		if err == nil {
-			checkedVector, checkErr := checked(vector, primaryDimension)
-			if checkErr != nil {
-				return "", nil, checkErr
+		if err != nil {
+			code := status.Code(err)
+			if code == codes.Unavailable && attempt < maxAttempts {
+				time.Sleep(backoff * time.Duration(attempt))
+				continue
 			}
-			return cacheNamespace(modelVersion, false), checkedVector, nil
+			return nil, &config.EmbedError{Reason: reasonOf(code)}
 		}
-		lastErr = err
-		if !retryable[status.Code(err)] {
-			return "", nil, err
+		if reply.GetModelVersion() != modelVersion || len(reply.GetValues()) != config.Dimensions[modelVersion] {
+			// A replica on another model: its vector lives in another space.
+			return nil, &config.EmbedError{Reason: "model_mismatch"}
 		}
+		return reply.GetValues(), nil
 	}
-	callCtx, cancel := context.WithTimeout(ctx, deadlineMS*time.Millisecond)
-	defer cancel()
-	vector, err := fallbackClient.Embed(callCtx, text, fallbackModel)
-	if err != nil {
-		return "", nil, errors.Join(lastErr, err)
-	}
-	checkedVector, checkErr := checked(vector, fallbackDimension)
-	if checkErr != nil {
-		return "", nil, checkErr
-	}
-	return cacheNamespace(fallbackModel, true), checkedVector, nil
+	return nil, &config.EmbedError{Reason: "unavailable"}
 }
 `,
     },
     scala: {
-      starter: `// The model server call: primary first, fallback model when the primary fails.
-import scala.concurrent.Future
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-import io.grpc.StatusRuntimeException
+import embedding.{Config, EmbedError}
+import embedding.embedder.{EmbedRequest, EmbedderGrpc}
 
 object ModelClient {
-  val TimeoutMs = 2000
+  val MaxAttempts = 5
+  val BackoffMs = 200L
 
-  def embed(text: String, modelVersion: String): Future[Vector[Float]] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    def loop(): Future[Vector[Float]] =
-      primaryStub.embed(Request(text, modelVersion)).recoverWith { case _: StatusRuntimeException =>
-        fallbackStub.embed(Request(text)).recoverWith { case _: StatusRuntimeException => loop() }
+  private val channel = ManagedChannelBuilder.forTarget(Config.ModelServer).usePlaintext().build()
+  private val stub = EmbedderGrpc.blockingStub(channel)
+
+  /** The model server's vector of text under modelVersion; EmbedError when there is no usable one. */
+  def embed(text: String, modelVersion: String): Seq[Float] = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    var attempt = 1
+    while (attempt <= MaxAttempts) {
+      try {
+        return stub.embed(EmbedRequest(modelVersion = modelVersion, text = text)).values
+      } catch {
+        case _: StatusRuntimeException =>
+          Thread.sleep(BackoffMs)
+          attempt += 1
       }
-    loop()
+    }
+    throw EmbedError("unavailable")
   }
 }
 `,
-      solution: `// The model server call — bounded retries, a dimension guard and a fallback namespace.
-import java.util.concurrent.TimeUnit
+      solution: `import java.util.concurrent.TimeUnit
 
-import io.grpc.{Status, StatusRuntimeException}
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+
+import embedding.{Config, EmbedError}
+import embedding.embedder.{EmbedRequest, EmbedderGrpc}
 
 object ModelClient {
-  val DeadlineMs = 2000
+  val DeadlineMs = 2000L
   val MaxAttempts = 2
-  val PrimaryDimension = 1024
-  val FallbackDimension = 384
-  val FallbackModel = "text-embedding-fallback"
-  val Retryable = Set(Status.Code.UNAVAILABLE)
+  val BackoffMs = 200L
 
-  final case class Result(namespace: String, vector: Vector[Float])
+  private val channel = ManagedChannelBuilder.forTarget(Config.ModelServer).usePlaintext().build()
+  private val stub = EmbedderGrpc.blockingStub(channel)
 
-  class DimensionMismatch(message: String) extends RuntimeException(message)
-
-  /** The fallback's vectors live in their own namespace, never mixed into the primary's. */
-  def cacheNamespace(modelVersion: String, usedFallback: Boolean): String =
-    if (usedFallback) s"$modelVersion+fallback" else modelVersion
-
-  def checked(vector: Vector[Float], expected: Int): Vector[Float] = {
-    if (vector.length != expected) throw new DimensionMismatch(s"expected $expected dimensions")
-    vector
-  }
-
-  /** Calls the model server under a deadline and falls over to the fallback model. */
-  def embed(text: String, modelVersion: String): Result = {
-    var attempt = 0
-    var lastError: StatusRuntimeException = null
-    while (attempt < MaxAttempts) {
+  /** The model server's vector of text under modelVersion; EmbedError when there is no usable one. */
+  def embed(text: String, modelVersion: String): Seq[Float] = {
+    var attempt = 1
+    while (attempt <= MaxAttempts) {
       try {
-        val reply = primaryStub
-          .withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS)
-          .embed(Request(text, modelVersion))
-        return Result(cacheNamespace(modelVersion, false), checked(reply.vector, PrimaryDimension))
+        val reply = stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).embed(EmbedRequest(modelVersion = modelVersion, text = text))
+        // A replica on another model: its vector lives in another space.
+        if (reply.modelVersion != modelVersion || !Config.Dimensions.get(modelVersion).contains(reply.values.size))
+          throw EmbedError("model_mismatch")
+        return reply.values
       } catch {
-        case exc: StatusRuntimeException =>
-          lastError = exc
-          if (!Retryable.contains(exc.getStatus.getCode)) throw exc
+        case e: StatusRuntimeException =>
+          val code = e.getStatus.getCode
+          if (code == Status.Code.UNAVAILABLE && attempt < MaxAttempts) {
+            Thread.sleep(BackoffMs * attempt)
+            attempt += 1
+          } else throw EmbedError(code.name.toLowerCase)
       }
-      attempt += 1
     }
-    val reply = fallbackStub
-      .withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS)
-      .embed(Request(text, FallbackModel))
-    if (reply == null && lastError != null) throw lastError
-    Result(cacheNamespace(FallbackModel, true), checked(reply.vector, FallbackDimension))
+    throw EmbedError("unavailable")
   }
 }
 `,
     },
     cpp: {
-      starter: `// The model server call: primary first, fallback model when the primary fails.
-#include <grpcpp/grpcpp.h>
+      starter: `#include <grpcpp/grpcpp.h>
 
 #include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
-constexpr int kTimeoutMs = 2000;
+#include "embedder.grpc.pb.h"
+#include "embedding/config.h"  // config::kModelServer, EmbedError — provided
 
-std::vector<float> embed(
-    Model::Stub* primary,
-    Model::Stub* fallbackStub,
-    const std::string& text,
-    const std::string& modelVersion) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  while (true) {
+constexpr int kMaxAttempts = 5;
+constexpr std::chrono::milliseconds kBackoff{200};
+
+auto channel = grpc::CreateChannel(config::kModelServer, grpc::InsecureChannelCredentials());
+auto stub = embedding::Embedder::NewStub(channel);
+
+// The model server's vector of text under model_version; config::EmbedError when there is no usable one.
+std::vector<float> embed(const std::string& text, const std::string& model_version) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
     grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kTimeoutMs));
-    EmbedRequest request;
+    embedding::EmbedRequest request;
+    request.set_model_version(model_version);
     request.set_text(text);
-    request.set_model_version(modelVersion);
-    EmbedReply reply;
-    if (primary->Embed(&ctx, request, &reply).ok()) return {};
-    grpc::ClientContext fallbackCtx;
-    fallbackCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kTimeoutMs));
-    if (fallbackStub->Embed(&fallbackCtx, request, &reply).ok()) return {};
+    embedding::EmbedReply reply;
+    if (!stub->Embed(&ctx, request, &reply).ok()) {
+      std::this_thread::sleep_for(kBackoff);
+      continue;
+    }
+    return {reply.values().begin(), reply.values().end()};
   }
+  throw config::EmbedError("unavailable");
 }
 `,
-      solution: `// The model server call — bounded retries, a dimension guard and a fallback namespace.
-#include <grpcpp/grpcpp.h>
+      solution: `#include <grpcpp/grpcpp.h>
 
 #include <chrono>
-#include <set>
-#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
-constexpr int kDeadlineMs = 2000;
+#include "embedder.grpc.pb.h"
+#include "embedding/config.h"  // config::kModelServer, kDimensions, EmbedError — provided
+
+constexpr std::chrono::seconds kDeadline{2};
 constexpr int kMaxAttempts = 2;
-constexpr int kPrimaryDimension = 1024;
-constexpr int kFallbackDimension = 384;
-constexpr char kFallbackModel[] = "text-embedding-fallback";
-const std::set<grpc::StatusCode> kRetryable{grpc::StatusCode::UNAVAILABLE};
+constexpr std::chrono::milliseconds kBackoff{200};
 
-struct Embedding {
-  std::string namespace_;
-  std::vector<float> vector;
-};
+auto channel = grpc::CreateChannel(config::kModelServer, grpc::InsecureChannelCredentials());
+auto stub = embedding::Embedder::NewStub(channel);
 
-/** The fallback's vectors live in their own namespace, never mixed into the primary's. */
-std::string cache_namespace(const std::string& model_version, bool used_fallback) {
-  return used_fallback ? model_version + "+fallback" : model_version;
-}
-
-std::vector<float> checked(const std::vector<float>& vector, int expected) {
-  if (vector.size() != expected) throw std::runtime_error("wrong embedding dimension");
-  return vector;
-}
-
-/** Calls the model server under a deadline and falls over to the fallback model. */
-Embedding embed(Model::Stub* primary, Model::Stub* fallback_stub, const std::string& text, const std::string& modelVersion) {
-  grpc::Status lastStatus;
-  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
-    grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kDeadlineMs));
-    EmbedRequest request;
-    request.set_text(text);
-    request.set_model_version(modelVersion);
-    EmbedReply reply;
-    const auto status = primary->Embed(&ctx, request, &reply);
-    if (status.ok()) {
-      return {cache_namespace(modelVersion, false), checked({reply.vector().begin(), reply.vector().end()}, kPrimaryDimension)};
-    }
-    lastStatus = status;
-    if (kRetryable.count(status.error_code()) == 0) throw std::runtime_error(status.error_message());
+// A status named the way every language of the service names it: unavailable, deadline_exceeded, invalid_argument.
+std::string reasonOf(grpc::StatusCode code) {
+  switch (code) {
+    case grpc::StatusCode::UNAVAILABLE: return "unavailable";
+    case grpc::StatusCode::DEADLINE_EXCEEDED: return "deadline_exceeded";
+    case grpc::StatusCode::INVALID_ARGUMENT: return "invalid_argument";
+    default: return "status_" + std::to_string(static_cast<int>(code));
   }
-  grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kDeadlineMs));
-  EmbedRequest request;
-  request.set_text(text);
-  request.set_model_version(kFallbackModel);
-  EmbedReply reply;
-  if (!fallback_stub->Embed(&ctx, request, &reply).ok()) throw std::runtime_error(lastStatus.error_message());
-  return {cache_namespace(kFallbackModel, true), checked({reply.vector().begin(), reply.vector().end()}, kFallbackDimension)};
+}
+
+// The model server's vector of text under model_version; config::EmbedError when there is no usable one.
+std::vector<float> embed(const std::string& text, const std::string& model_version) {
+  for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    embedding::EmbedRequest request;
+    request.set_model_version(model_version);
+    request.set_text(text);
+    embedding::EmbedReply reply;
+    const grpc::Status status = stub->Embed(&ctx, request, &reply);
+    if (!status.ok()) {
+      if (status.error_code() == grpc::StatusCode::UNAVAILABLE && attempt < kMaxAttempts) {
+        std::this_thread::sleep_for(kBackoff * attempt);
+        continue;
+      }
+      throw config::EmbedError(reasonOf(status.error_code()));
+    }
+    const auto expected = config::kDimensions.find(model_version);
+    if (reply.model_version() != model_version || expected == config::kDimensions.end() || reply.values_size() != expected->second)
+      throw config::EmbedError("model_mismatch");  // a replica on another model: its vector lives in another space
+    return {reply.values().begin(), reply.values().end()};
+  }
+  throw config::EmbedError("unavailable");
 }
 `,
     },
   },
-  debrief: `A deadline bounds one attempt, the attempt cap bounds the call, and the retryable set decides which
-failures are worth a second attempt at all: \`UNAVAILABLE\` is the transport saying try again, while
-\`INVALID_ARGUMENT\` is the model saying this input will fail every time. The fallback keeps the
-write path alive during an outage, but only under its own namespace, because a 384-dimension vector
-cached where 1024 is expected poisons every later lookup. The dimension guard turns that silent
-corruption into an exception at the only place that knows both shapes.
+  harness: {
+    python: `import grpc
 
-This step retries immediately. A production client backs off with jitter, opens a circuit after
-repeated \`UNAVAILABLE\` so the fallback is reached without paying two deadlines first, and labels
-each vector with the model that produced it.`,
+import embedder_pb2
+import embedder_pb2_grpc
+from embedding import model
+from embedding.config import MODEL_SERVER, MODEL_VERSION, PREVIOUS_VERSION
+
+TEXT = "Rotate keys every 90 days."
+
+
+class ModelServer(embedder_pb2_grpc.EmbedderServicer):
+    """The stand-in model server: answers from embedding.model; answer_as plays a replica on another model."""
+
+    def __init__(self):
+        self.answer_as = None
+        self.truncate = None
+
+    def Embed(self, request, context):
+        version = self.answer_as or request.model_version
+        values = model.vector_for(version, request.text)
+        if self.truncate is not None:
+            values = values[: self.truncate]
+        return embedder_pb2.EmbedReply(model_version=version, values=values)
+
+
+def _world(ctx):
+    server = ModelServer()
+    ctx.grpc.serve(embedder_pb2_grpc.add_EmbedderServicer_to_server, server, MODEL_SERVER)
+    return ctx.load("client"), server
+
+
+def _calls(ctx):
+    return ctx.grpc.calls_to("Embed")
+
+
+def _attempt(fn):
+    """What fn returned, and the EmbedError it raised (None when it returned)."""
+    try:
+        return fn(), None
+    except Exception as e:  # noqa: BLE001
+        if type(e).__name__ != "EmbedError":
+            raise AssertionError(f"embed raised {type(e).__name__}: {e}; a call that yields no vector raises EmbedError(reason)") from e
+        return None, e
+
+
+def check_healthy(ctx):
+    m, _ = _world(ctx)
+    got = m.embed(TEXT, MODEL_VERSION)
+    assert got == model.vector_for(MODEL_VERSION, TEXT), f"embed must return the reply's values, got {got}"
+    assert len(_calls(ctx)) == 1, f"a healthy model server is called once per input, saw {len(_calls(ctx))} Embed calls"
+
+
+def check_deadline(ctx):
+    m, _ = _world(ctx)
+    m.embed(TEXT, MODEL_VERSION)
+    timeout = _calls(ctx)[0].timeout
+    assert timeout is not None, "the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs"
+    assert 1.5 <= timeout <= 2.5, f"the deadline must be DEADLINE_S = 2 s, got {timeout} s"
+    ctx.grpc.set_latency("Embed", 5.0, MODEL_SERVER)
+    started = ctx.clock.offset
+    value, err = _attempt(lambda: m.embed("Revoke a leaked key at once.", MODEL_VERSION))
+    waited = ctx.clock.offset - started
+    assert err is not None, f"a model server that takes 5 s answered after {waited:.1f} s and embed returned {value}: the deadline must cut the call at 2 s and raise EmbedError"
+    assert waited <= 2.6, f"embed waited {waited:.1f} s on a hung model server: the deadline must cut it at about 2 s"
+    assert len(_calls(ctx)) == 2, f"a call cut by its deadline is not retried: saw {len(_calls(ctx)) - 1} calls for it"
+
+
+def check_bounded_retry(ctx):
+    m, _ = _world(ctx)
+    ctx.grpc.fail("Embed", grpc.StatusCode.UNAVAILABLE, "replica restarting", times=1, target=MODEL_SERVER)
+    got = m.embed(TEXT, MODEL_VERSION)
+    assert got == model.vector_for(MODEL_VERSION, TEXT) and len(_calls(ctx)) == 2, f"one UNAVAILABLE earns one retry: expected 2 calls and the vector, saw {len(_calls(ctx))} calls and {got}"
+    assert ctx.clock.sleeps >= 1, "a retry waits a backoff before the second attempt"
+    ctx.grpc.fail("Embed", grpc.StatusCode.UNAVAILABLE, "model server down", times=5, target=MODEL_SERVER)
+    value, err = _attempt(lambda: m.embed("Audit key use weekly.", MODEL_VERSION))
+    calls = len(_calls(ctx)) - 2
+    assert calls == 2, f"a model server that stays UNAVAILABLE gets MAX_ATTEMPTS = 2 calls, then EmbedError: saw {calls} calls, each one more load on a server that is already down"
+    assert err is not None, f"after its attempts embed must raise EmbedError, it returned {value}"
+
+
+def check_unavailable_only(ctx):
+    m, _ = _world(ctx)
+    ctx.grpc.fail("Embed", grpc.StatusCode.INVALID_ARGUMENT, "input is empty", times=5, target=MODEL_SERVER)
+    value, err = _attempt(lambda: m.embed("", MODEL_VERSION))
+    assert len(_calls(ctx)) == 1, f"INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed {len(_calls(ctx))} times"
+    assert err is not None, f"an INVALID_ARGUMENT must raise EmbedError, embed returned {value}"
+    assert err.reason == "invalid_argument", f"the EmbedError must name the status (invalid_argument), got {err.reason!r}"
+
+
+def check_model_check(ctx):
+    m, server = _world(ctx)
+    server.answer_as = PREVIOUS_VERSION
+    value, err = _attempt(lambda: m.embed(TEXT, MODEL_VERSION))
+    assert err is not None, f"a replica still on {PREVIOUS_VERSION} answered an {MODEL_VERSION} request and embed returned its vector {value}: it would be cached and ranked as an {MODEL_VERSION} vector"
+    assert err.reason == "model_mismatch", f"the EmbedError must be model_mismatch, got {err.reason!r}"
+    server.answer_as, server.truncate = None, 4
+    value, err = _attempt(lambda: m.embed(TEXT, MODEL_VERSION))
+    assert err is not None and err.reason == "model_mismatch", f"a reply that says {MODEL_VERSION} but carries 4 values must raise EmbedError('model_mismatch'), embed returned {value}"
+    server.truncate = None
+    assert m.embed(TEXT, MODEL_VERSION) == model.vector_for(MODEL_VERSION, TEXT), "a matching reply is returned"
+`,
+    typescript: `const TEXT = 'Rotate keys every 90 days.';
+
+/** The stand-in model server at MODEL_SERVER (answerAs plays a replica on another model) and the learner's module. */
+function world(ctx) {
+  const {embedding} = ctx.proto('embedder.proto');
+  const config = ctx.load('/support/embedding/config.ts');
+  const model = ctx.load('/support/embedding/model.ts');
+  const server = {answerAs: null as string | null, truncate: null as number | null};
+  ctx.grpc.serve(embedding.Embedder.service, {
+    Embed(call, callback) {
+      const version = server.answerAs ?? call.request.model_version;
+      let values = model.vectorFor(version, call.request.text);
+      if (server.truncate !== null) values = values.slice(0, server.truncate);
+      callback(null, {model_version: version, values});
+    },
+  }, config.MODEL_SERVER);
+  return {m: ctx.load('client'), server, config, model};
+}
+
+const calls = ctx => ctx.grpc.callsTo('Embed');
+
+/** What the promise resolved to, and the EmbedError it rejected with (null when it resolved). */
+async function attempt(promise: Promise<number[]>) {
+  try {
+    return {value: await promise, err: null};
+  } catch (e) {
+    assert((e as Error)?.name === 'EmbedError', \`embed rejected with \${e}; a call that yields no vector rejects with EmbedError(reason)\`);
+    return {value: null, err: e as {reason: string}};
+  }
+}
+
+export async function check_healthy(ctx) {
+  const {m, config, model} = world(ctx);
+  const got = await m.embed(TEXT, config.MODEL_VERSION);
+  assert.deepEqual(got, model.vectorFor(config.MODEL_VERSION, TEXT), \`embed must resolve to the reply's values, got \${JSON.stringify(got)}\`);
+  assert.equal(calls(ctx).length, 1, \`a healthy model server is called once per input, saw \${calls(ctx).length} Embed calls\`);
+}
+
+export async function check_deadline(ctx) {
+  const {m, config} = world(ctx);
+  await m.embed(TEXT, config.MODEL_VERSION);
+  const timeout = calls(ctx)[0].timeout;
+  assert(timeout !== null, 'the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs');
+  assert(1.5 <= timeout && timeout <= 2.5, \`the deadline must be DEADLINE_MS = 2000 ms, got \${timeout} s\`);
+  ctx.grpc.setLatency('Embed', 5.0, config.MODEL_SERVER);
+  const started = ctx.clock.now();
+  const {value, err} = await attempt(m.embed('Revoke a leaked key at once.', config.MODEL_VERSION));
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert(err !== null, \`a model server that takes 5 s answered after \${waited.toFixed(1)} s and embed resolved to \${JSON.stringify(value)}: the deadline must cut the call at 2 s and reject with EmbedError\`);
+  assert(waited <= 2.6, \`embed waited \${waited.toFixed(1)} s on a hung model server: the deadline must cut it at about 2 s\`);
+  assert.equal(calls(ctx).length, 2, \`a call cut by its deadline is not retried: saw \${calls(ctx).length - 1} calls for it\`);
+}
+
+export async function check_bounded_retry(ctx) {
+  const {m, config, model} = world(ctx);
+  ctx.grpc.fail('Embed', ctx.grpc.status.UNAVAILABLE, 'replica restarting', 1, config.MODEL_SERVER);
+  const got = await m.embed(TEXT, config.MODEL_VERSION);
+  assert(JSON.stringify(got) === JSON.stringify(model.vectorFor(config.MODEL_VERSION, TEXT)) && calls(ctx).length === 2, \`one UNAVAILABLE earns one retry: expected 2 calls and the vector, saw \${calls(ctx).length} calls and \${JSON.stringify(got)}\`);
+  assert(ctx.clock.sleeps >= 1, 'a retry waits a backoff before the second attempt');
+  ctx.grpc.fail('Embed', ctx.grpc.status.UNAVAILABLE, 'model server down', 5, config.MODEL_SERVER);
+  const {value, err} = await attempt(m.embed('Audit key use weekly.', config.MODEL_VERSION));
+  const n = calls(ctx).length - 2;
+  assert.equal(n, 2, \`a model server that stays UNAVAILABLE gets MAX_ATTEMPTS = 2 calls, then EmbedError: saw \${n} calls, each one more load on a server that is already down\`);
+  assert(err !== null, \`after its attempts embed must reject with EmbedError, it resolved to \${JSON.stringify(value)}\`);
+}
+
+export async function check_unavailable_only(ctx) {
+  const {m, config} = world(ctx);
+  ctx.grpc.fail('Embed', ctx.grpc.status.INVALID_ARGUMENT, 'input is empty', 5, config.MODEL_SERVER);
+  const {value, err} = await attempt(m.embed('', config.MODEL_VERSION));
+  assert.equal(calls(ctx).length, 1, \`INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed \${calls(ctx).length} times\`);
+  assert(err !== null, \`an INVALID_ARGUMENT must reject with EmbedError, embed resolved to \${JSON.stringify(value)}\`);
+  assert.equal(err.reason, 'invalid_argument', \`the EmbedError must name the status (invalid_argument), got \${err.reason}\`);
+}
+
+export async function check_model_check(ctx) {
+  const {m, server, config, model} = world(ctx);
+  server.answerAs = config.PREVIOUS_VERSION;
+  let r = await attempt(m.embed(TEXT, config.MODEL_VERSION));
+  assert(r.err !== null, \`a replica still on embed-v1 answered an embed-v2 request and embed resolved to its vector \${JSON.stringify(r.value)}: it would be cached and ranked as an embed-v2 vector\`);
+  assert.equal(r.err.reason, 'model_mismatch', \`the EmbedError must be model_mismatch, got \${r.err.reason}\`);
+  server.answerAs = null;
+  server.truncate = 4;
+  r = await attempt(m.embed(TEXT, config.MODEL_VERSION));
+  assert(r.err !== null && r.err.reason === 'model_mismatch', \`a reply that says embed-v2 but carries 4 values must reject with EmbedError('model_mismatch'), embed resolved to \${JSON.stringify(r.value)}\`);
+  server.truncate = null;
+  assert.deepEqual(await m.embed(TEXT, config.MODEL_VERSION), model.vectorFor(config.MODEL_VERSION, TEXT), 'a matching reply is returned');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	"embedding/config"
+	pb "embedding/gen/embedder"
+	"embedding/model"
+
+	"leetbuild/harness"
+)
+
+const clientText = "Rotate keys every 90 days."
+
+// clientPeer is the stand-in model server: answers from embedding/model; answerAs plays a replica on another model.
+type clientPeer struct {
+	pb.UnimplementedEmbedderServer
+	answerAs string
+	truncate int
+}
+
+func (p *clientPeer) Embed(_ context.Context, req *pb.EmbedRequest) (*pb.EmbedReply, error) {
+	version := req.GetModelVersion()
+	if p.answerAs != "" {
+		version = p.answerAs
+	}
+	values := model.VectorFor(version, req.GetText())
+	if p.truncate > 0 && p.truncate < len(values) {
+		values = values[:p.truncate]
+	}
+	return &pb.EmbedReply{ModelVersion: version, Values: values}, nil
+}
+
+func clientWorld(ctx *harness.Ctx) *clientPeer {
+	peer := &clientPeer{}
+	pb.RegisterEmbedderServer(ctx.GRPC.Server(config.ModelServer), peer)
+	return peer
+}
+
+// clientAttempt is what embed returned and the *config.EmbedError it failed with (nil when it returned a vector).
+func clientAttempt(ctx *harness.Ctx, text string) ([]float32, *config.EmbedError) {
+	got, err := embed(context.Background(), text, config.ModelVersion)
+	if err == nil {
+		return got, nil
+	}
+	var embedErr *config.EmbedError
+	ctx.Assert(errors.As(err, &embedErr), "embed failed with %v; a call that yields no vector returns a *config.EmbedError", err)
+	return got, embedErr
+}
+
+func CheckHealthy(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	got, err := clientAttempt(ctx, clientText)
+	ctx.Assert(err == nil, "a healthy model server answered and embed failed: %v", err)
+	ctx.Equal(got, model.VectorFor(config.ModelVersion, clientText), "embed must return the reply's values")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Embed", "")), 1, "a healthy model server is called once per input; Embed calls")
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	clientAttempt(ctx, clientText)
+	calls := ctx.GRPC.CallsTo("Embed", "")
+	ctx.Assert(len(calls) == 1 && calls[0].HasDeadline(), "the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs")
+	ctx.Assert(1500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 2500*time.Millisecond, "the deadline must be 2 s, got %v", calls[0].Timeout)
+	ctx.GRPC.SetLatency("Embed", 5.0, config.ModelServer)
+	started := ctx.Clock.Now()
+	got, err := clientAttempt(ctx, "Revoke a leaked key at once.")
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(err != nil, "a model server that takes 5 s answered after %.1f s and embed returned %v: the deadline must cut the call at 2 s and return an EmbedError", waited, got)
+	ctx.Assert(waited <= 2.6, "embed waited %.1f s on a hung model server: the deadline must cut it at about 2 s", waited)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Embed", "")), 2, "a call cut by its deadline is not retried; Embed calls so far")
+}
+
+func CheckBoundedRetry(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	ctx.GRPC.Fail("Embed", codes.Unavailable, "replica restarting", 1, config.ModelServer)
+	got, err := clientAttempt(ctx, clientText)
+	ctx.Assert(err == nil && len(ctx.GRPC.CallsTo("Embed", "")) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and the vector, saw %d calls and %v (%v)", len(ctx.GRPC.CallsTo("Embed", "")), got, err)
+	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the second attempt")
+	ctx.GRPC.Fail("Embed", codes.Unavailable, "model server down", 5, config.ModelServer)
+	got, err = clientAttempt(ctx, "Audit key use weekly.")
+	n := len(ctx.GRPC.CallsTo("Embed", "")) - 2
+	ctx.Assert(n == 2, "a model server that stays UNAVAILABLE gets maxAttempts = 2 calls, then an EmbedError: saw %d calls, each one more load on a server that is already down", n)
+	ctx.Assert(err != nil, "after its attempts embed must return an EmbedError, it returned %v", got)
+}
+
+func CheckUnavailableOnly(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	ctx.GRPC.Fail("Embed", codes.InvalidArgument, "input is empty", 5, config.ModelServer)
+	got, err := clientAttempt(ctx, "")
+	n := len(ctx.GRPC.CallsTo("Embed", ""))
+	ctx.Assert(n == 1, "INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed %d times", n)
+	ctx.Assert(err != nil, "an INVALID_ARGUMENT must return an EmbedError, embed returned %v", got)
+	ctx.Equal(err.Reason, "invalid_argument", "the EmbedError must name the status")
+}
+
+func CheckModelCheck(ctx *harness.Ctx) {
+	peer := clientWorld(ctx)
+	peer.answerAs = config.PreviousVersion
+	got, err := clientAttempt(ctx, clientText)
+	ctx.Assert(err != nil, "a replica still on embed-v1 answered an embed-v2 request and embed returned its vector %v: it would be cached and ranked as an embed-v2 vector", got)
+	ctx.Equal(err.Reason, "model_mismatch", "the EmbedError's reason")
+	peer.answerAs, peer.truncate = "", 4
+	got, err = clientAttempt(ctx, clientText)
+	ctx.Assert(err != nil && err.Reason == "model_mismatch", "a reply that says embed-v2 but carries 4 values must return EmbedError{model_mismatch}, embed returned %v", got)
+	peer.truncate = 0
+	got, err = clientAttempt(ctx, clientText)
+	ctx.Assert(err == nil, "a matching reply is returned, embed failed: %v", err)
+	ctx.Equal(got, model.VectorFor(config.ModelVersion, clientText), "a matching reply is returned")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <exception>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "embedder.grpc.pb.h"
+#include "embedding/config.h"
+#include "embedding/model.h"
+
+namespace {
+
+const std::string kText = "Rotate keys every 90 days.";
+
+// The stand-in model server: answers from embedding/model.h; answer_as plays a replica on another model.
+class ModelPeer final : public embedding::Embedder::Service {
+ public:
+  std::string answer_as;
+  int truncate = 0;
+
+  grpc::Status Embed(grpc::ServerContext*, const embedding::EmbedRequest* req, embedding::EmbedReply* reply) override {
+    const std::string version = answer_as.empty() ? req->model_version() : answer_as;
+    std::vector<float> values = model::vectorFor(version, req->text());
+    if (truncate > 0 && truncate < static_cast<int>(values.size())) values.resize(truncate);
+    reply->set_model_version(version);
+    for (float v : values) reply->add_values(v);
+    return grpc::Status::OK;
+  }
+};
+
+ModelPeer& clientWorld(harness::Ctx& ctx) {
+  static ModelPeer* peer = nullptr;
+  delete peer;
+  peer = new ModelPeer;
+  ctx.GRPC.Server(config::kModelServer)->RegisterService(peer);
+  return *peer;
+}
+
+// What embed returned, and the EmbedError's reason when it threw one.
+struct Attempt {
+  std::vector<float> value;
+  std::optional<std::string> reason;
+};
+
+Attempt clientAttempt(harness::Ctx& ctx, const std::string& text) {
+  try {
+    return {embed(text, config::kModelVersion), std::nullopt};
+  } catch (const config::EmbedError& e) {
+    return {{}, e.reason};
+  } catch (const std::exception& e) {
+    ctx.Fatalf("embed threw %s; a call that yields no vector throws config::EmbedError(reason)", e.what());
+  }
+  return {};
+}
+
+size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Embed").size(); }
+
+}  // namespace
+
+void CheckHealthy(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  const Attempt a = clientAttempt(ctx, kText);
+  ctx.Assert(!a.reason, "a healthy model server answered and embed threw %s", a.reason.value_or(""));
+  ctx.Equal(a.value, model::vectorFor(config::kModelVersion, kText), "embed must return the reply's values");
+  ctx.Equal(calls(ctx), 1, "a healthy model server is called once per input; Embed calls");
+}
+
+void CheckDeadline(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  clientAttempt(ctx, kText);
+  const auto first = ctx.GRPC.CallsTo("Embed");
+  ctx.Assert(first.size() == 1 && first[0].HasDeadline(), "the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs");
+  ctx.Assert(1.5 <= first[0].TimeoutSeconds() && first[0].TimeoutSeconds() <= 2.5, "the deadline must be 2 s, got %vs", first[0].TimeoutSeconds());
+  ctx.GRPC.SetLatency("Embed", 5.0, config::kModelServer);
+  const int64_t started = ctx.Clock.Now();
+  const Attempt a = clientAttempt(ctx, "Revoke a leaked key at once.");
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Assert(a.reason.has_value(), "a model server that takes 5 s answered after %.1f s and embed returned %v: the deadline must cut the call at 2 s and throw EmbedError", waited, a.value);
+  ctx.Assert(waited <= 2.6, "embed waited %.1f s on a hung model server: the deadline must cut it at about 2 s", waited);
+  ctx.Equal(calls(ctx), 2, "a call cut by its deadline is not retried; Embed calls so far");
+}
+
+void CheckBoundedRetry(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  ctx.GRPC.Fail("Embed", grpc::StatusCode::UNAVAILABLE, "replica restarting", 1, config::kModelServer);
+  Attempt a = clientAttempt(ctx, kText);
+  ctx.Assert(!a.reason && calls(ctx) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and the vector, saw %d calls (%s)", calls(ctx), a.reason.value_or("a vector"));
+  ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the second attempt");
+  ctx.GRPC.Fail("Embed", grpc::StatusCode::UNAVAILABLE, "model server down", 5, config::kModelServer);
+  a = clientAttempt(ctx, "Audit key use weekly.");
+  const size_t n = calls(ctx) - 2;
+  ctx.Assert(n == 2, "a model server that stays UNAVAILABLE gets kMaxAttempts = 2 calls, then EmbedError: saw %d calls, each one more load on a server that is already down", n);
+  ctx.Assert(a.reason.has_value(), "after its attempts embed must throw EmbedError, it returned %v", a.value);
+}
+
+void CheckUnavailableOnly(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  ctx.GRPC.Fail("Embed", grpc::StatusCode::INVALID_ARGUMENT, "input is empty", 5, config::kModelServer);
+  const Attempt a = clientAttempt(ctx, "");
+  ctx.Assert(calls(ctx) == 1, "INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed %d times", calls(ctx));
+  ctx.Assert(a.reason.has_value(), "an INVALID_ARGUMENT must throw EmbedError, embed returned %v", a.value);
+  ctx.Equal(a.reason.value_or(""), "invalid_argument", "the EmbedError must name the status");
+}
+
+void CheckModelCheck(harness::Ctx& ctx) {
+  ModelPeer& peer = clientWorld(ctx);
+  peer.answer_as = config::kPreviousVersion;
+  Attempt a = clientAttempt(ctx, kText);
+  ctx.Assert(a.reason.has_value(), "a replica still on embed-v1 answered an embed-v2 request and embed returned its vector %v: it would be cached and ranked as an embed-v2 vector", a.value);
+  ctx.Equal(a.reason.value_or(""), "model_mismatch", "the EmbedError's reason");
+  peer.answer_as = "";
+  peer.truncate = 4;
+  a = clientAttempt(ctx, kText);
+  ctx.Assert(a.reason.value_or("") == "model_mismatch", "a reply that says embed-v2 but carries 4 values must throw EmbedError(model_mismatch), embed returned %v", a.value);
+  peer.truncate = 0;
+  a = clientAttempt(ctx, kText);
+  ctx.Assert(!a.reason, "a matching reply is returned, embed threw %s", a.reason.value_or(""));
+  ctx.Equal(a.value, model::vectorFor(config::kModelVersion, kText), "a matching reply is returned");
+}
+`,
+  },
+  hints: [
+    'When the model server stalls, requests pile up until the API runs out of workers; during an outage it sees five times the traffic; and after a rollout some vectors come back with four values.',
+    'The call has no deadline, so it waits as long as the server does. The loop retries every `RpcError` five times, a bad input included. Nothing compares the reply’s `model_version` or length with what was asked.',
+    'Pass `timeout=DEADLINE_S`; retry only when `err.code() == grpc.StatusCode.UNAVAILABLE` and `attempt < MAX_ATTEMPTS` (2), else raise `EmbedError(code.name.lower())`; raise `EmbedError("model_mismatch")` when the version or `DIMENSIONS` length differs.',
+  ],
+  debrief: `The shape comes from sorting what the model server can say. \`UNAVAILABLE\` is the server’s problem and may clear in a moment, so it earns one more try after a pause; \`INVALID_ARGUMENT\` is the input’s problem and a retry only repeats it; a deadline turns a hang into an error the caller can act on. The version check is the one a cache cannot do later: once a vector from the wrong model is stored under \`embed-v2\`, nothing about its bytes marks it as wrong, and retrieval quietly ranks it against vectors from another space. Production clients add a circuit breaker per replica, hedged requests on a slow tail, and batching of inputs into one call.`,
 };

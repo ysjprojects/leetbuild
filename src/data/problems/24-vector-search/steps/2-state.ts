@@ -2,345 +2,196 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis result cache with tenant-safe keys',
+  title: 'A Redis result cache keyed by tenant, version, digest and k',
   concept: 'redis',
   file: 'state',
-  focus: ['search', 'cache', 'index'],
+  focus: ['search', 'cache', 'corpus'],
   task: `## Task
 
-**Starting point.** The starter puts a Redis cache in front of the index: it digests
-\`str(query)\` with SHA-256, builds the key \`search:{digest}:{k}\`, serves a hit straight from the
-cache, and on a miss deletes the key, searches as the body's tenant and writes the payload back
-with no expiry. It compiles, serves the demo and hides five flaws.
+**Starting point.** The starter is the result cache in front of the corpus: \`cached_search(tenant,
+query, k)\` reads \`search:{query_digest(query)}\`, answers a hit as \`{hits, k, index_version,
+cached: true}\`, and on a miss resolves the active version, searches with \`corpus.nearest\` and writes
+the result back with \`SET\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A key without the tenant is a cross-tenant read: the query hash
-is identical for two tenants who embed similar text, so the cache serves one tenant's private hits
-to another. A key without the index version serves results from a snapshot the tenant no longer
-sees. Manual deletion has no bound on staleness (the TTL is the bound), and float formatting as a
-key makes the cache miss forever.
+**Failure mode the checks target.** globex runs the query acme ran a minute ago and receives acme's
+documents; after the reindex to idx-43 the service keeps answering from idx-42; a search for 3
+results after a search for 2 answers 2; and an entry written last week still answers.
 
-- The key is \`search:{tenant}:{index_version}:{query_digest}:{k}\`, built from the authenticated
-  tenant, the active index version, a stable digest of the query vector and the cap that was
-  actually searched.
-- The digest must be stable across processes: pack the vector's IEEE-754 bytes (or quantize them)
-  and hash that. \`str(vector)\` (or any float formatting) is not a key; the same floats print
-  differently in another runtime and the hit rate silently drops to zero.
-- Entries **expire**: write with a **60-second TTL** in the same \`SET\` (\`ex=TTL_S\`, \`EX\`,
-  \`setex\`, \`std::chrono::seconds\`). No \`DEL\` anywhere.
-- The read path keys by the authenticated \`X-Tenant-Id\` tenant only; a contradicting body tenant
-  is **403**.`,
+- The key is \`search:{tenant}:{version}:{digest}:{k}\`, with \`digest = query_digest(query)\`
+  (\`search.fingerprint\`, provided).
+- The active version is resolved **before** the lookup, because the key names it.
+- Every entry is written with a TTL of \`CACHE_TTL_S\` (60 seconds) in the same \`SET\`.`,
   sequence: {
-    participants: ['Search API', 'Result cache', 'Index shards'],
+    participants: ['searchd', 'Corpus', 'Result cache'],
     messages: [
-      {from: 'Search API', to: 'Search API', label: 'key = search:{tenant}:{version}:{digest}:{k}', kind: 'sync'},
-      {from: 'Search API', to: 'Result cache', label: 'GET key', kind: 'sync'},
-      {from: 'Result cache', to: 'Search API', label: 'hit → 200 (no shard is touched)', kind: 'reply'},
-      {from: 'Search API', to: 'Index shards', label: 'Search(...) only on a miss', kind: 'sync'},
-      {from: 'Index shards', to: 'Search API', label: 'hits', kind: 'reply'},
-      {from: 'Search API', to: 'Result cache', label: 'SET key payload EX 60', kind: 'async'},
+      {from: 'searchd', to: 'Corpus', label: 'active_index() → idx-42', kind: 'sync'},
+      {from: 'searchd', to: 'Result cache', label: 'GET search:acme:idx-42:{digest}:10', kind: 'sync'},
+      {from: 'Result cache', to: 'searchd', label: 'hit → {hits, cached: true}', kind: 'reply'},
+      {from: 'searchd', to: 'Corpus', label: 'miss → nearest(acme, idx-42, query, 10)', kind: 'sync'},
+      {from: 'searchd', to: 'Result cache', label: 'SET search:acme:idx-42:{digest}:10 … EX 60', kind: 'sync'},
     ],
   },
-  hints: [
-    "Tenant B runs the query tenant A ran a minute ago and gets A's hits back. The same query from a second worker misses every time, and entries written an hour ago still answer.",
-    'The key is built from `query_digest(body.query)` and `k` alone, the digest hashes `str(query)`, the tenant comes from the body, and the miss path does `delete` then `set` with no `ex`.',
-    'Add `cache_key(tenant, version, digest, k)`, digest `struct.pack` bytes of the floats, take the tenant from `X-Tenant-Id` (403 on mismatch), drop the `delete`, and `set(..., ex=TTL_S)` with `TTL_S = 60`.',
-  ],
   checks: [
     {
-      id: 'cache-key',
-      title: 'Key carries tenant, version, digest and k',
+      id: 'tenant-key',
+      title: 'The key carries the tenant',
       detail:
-        'The key is `search:{tenant}:{version}:{digest}:{k}`. The starter builds it from the digest and `k` alone, so a hit one tenant wrote is served to the next tenant that runs the same query.',
+        "The key starts `search:{tenant}:`, so one tenant's entry is never another's hit. The starter keys by the digest alone, and the first tenant to run a query fills the entry every tenant reads.",
       match: {
-        python: {all: [/def cache_key\(/, /\{tenant\}/, /\{version\}/, /\{digest\}/, /\{k\}/]},
-        typescript: {all: [/function cacheKey\(/, /\$\{tenant\}/, /\$\{version\}/, /\$\{digest\}/, /\$\{k\}/]},
-        go: {all: [/func cacheKey\(/, /search:%s:%s:%s:%d/, /tenant, version, digest/]},
-        scala: {all: [/def cacheKey\(/, /search:\$tenant:\$version:\$digest:\$k/]},
-        cpp: {all: [/cacheKey\(/, /"search:"\s*\+\s*tenant/, /std::to_string\(k\)/]},
+        python: {all: [/search:\{tenant\}:|["']search["']\s*,\s*tenant\b/]},
+        typescript: {all: [/search:\$\{tenant\}:/]},
+        go: {all: [/"search:%s:%s:%s:%d"|"search:"\s*\+\s*tenant\b/]},
+        scala: {all: [/search:\$tenant:|search:\$\{tenant\}:/]},
+        cpp: {all: [/"search:"\s*\+\s*tenant\b/]},
       },
     },
     {
-      id: 'query-digest',
-      title: 'Digest is stable across processes',
+      id: 'version-key',
+      title: 'The key carries the active version, resolved first',
       detail:
-        'The query is fingerprinted over its bytes (`struct.pack`, `writeFloatBE`, `math.Float64bits` + `sha256`, `ByteBuffer.putDouble`, an FNV-1a walk), not by formatting the floats. A formatted-float key never hits in another runtime.',
+        'The active version is resolved before the lookup and is part of the key, so a reindex is a miss. The starter reads the version only on a miss, so entries written for idx-42 keep answering after idx-43 goes live.',
       match: {
-        python: {all: [/sha256/, /struct\.pack/, /query_digest/]},
-        typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /Buffer\.alloc/, /queryDigest/]},
-        go: {all: [/sha256\.Sum256/, /Float64bits/, /queryDigest/]},
-        scala: {all: [/MessageDigest\.getInstance\("SHA-256"\)/, /putDouble/, /queryDigest/]},
-        cpp: {all: [/kFnvOffsetBasis/, /queryDigest/]},
+        python: {all: [/\{version\}:/], order: [/corpus\.active_index\(/, /\br\.get\(/]},
+        typescript: {all: [/\$\{version\}:/], order: [/activeIndex\(/, /redis\.get\(/]},
+        go: {all: [/"search:%s:%s:%s:%d"|\+\s*version\s*\+/], order: [/corpus\.ActiveIndex\(/, /rdb\.Get\(/]},
+        scala: {all: [/\$version:|\$\{version\}:/], order: [/Corpus\.activeIndex\(/, /jedis\.get\(/]},
+        cpp: {all: [/\+\s*version\s*\+/], order: [/corpus::activeIndex\(/, /redis\.get\(/]},
+      },
+    },
+    {
+      id: 'k-key',
+      title: 'The key carries k',
+      detail:
+        'The key ends with `:{k}`, so a search for 3 never answers from the entry a search for 2 wrote. The starter answers both from one entry.',
+      match: {
+        python: {all: [/:\{k\}["']/]},
+        typescript: {all: [/:\$\{k\}`/]},
+        go: {all: [/%s:%d"|\+\s*strconv\.Itoa\(k\)/]},
+        scala: {all: [/:\$k"|:\$\{k\}"/]},
+        cpp: {all: [/\+\s*std::to_string\(k\)/]},
       },
     },
     {
       id: 'ttl',
-      title: 'Entries expire with a 60-second TTL',
+      title: 'Entries expire after 60 seconds',
       detail:
-        'Writes carry a 60-second expiry — `ex=TTL_S`, `SET ... EX TTL_S`, `setex(key, TtlSeconds, …)`, `std::chrono::seconds(kCacheTtlSeconds)`. The starter writes without an expiry and deletes by hand, so staleness is unbounded.',
+        'Every entry is written with the TTL in the same command (`ex=CACHE_TTL_S`, `EX`, `setex`, a duration); the TTL bounds how long an answer can outlive a document change inside one version. The starter writes with no expiry.',
       match: {
-        python: {all: [/TTL_S\s*=\s*60/, /ex\s*=\s*TTL_S/]},
-        typescript: {all: [/TTL_S\s*=\s*60/, /['"]EX['"],\s*TTL_S/]},
-        go: {all: [/cacheTTL\s*=\s*60\s*\*\s*time\.Second/, /cache\.Set\(.*cacheTTL\)/]},
-        scala: {all: [/TtlSeconds\s*=\s*60/, /setex\(/]},
-        cpp: {all: [/kCacheTtlSeconds\s*=\s*60/, /std::chrono::seconds\(kCacheTtlSeconds\)/]},
-      },
-    },
-    {
-      id: 'no-manual-invalidation',
-      title: 'Expires, never invalidates by hand',
-      detail:
-        'No `DEL`/`delete`/`.del(` call anywhere: the 60-second TTL is the only invalidation. The starter deletes the key before writing, which opens a window where every tenant misses and leaves entries with no staleness bound.',
-      match: {
-        python: {none: [/\.del\(/, /\bDEL\b/, /\.delete\(/]},
-        typescript: {none: [/\.del\(/, /\bDEL\b/, /\.delete\(/]},
-        go: {none: [/\.Del\(/, /\bDEL\b/, /\.Delete\(/]},
-        scala: {none: [/\.del\(/, /\bDEL\b/, /\.delete\(/]},
-        cpp: {none: [/\.del\(/, /\bDEL\b/, /\.delete\(/]},
-      },
-    },
-    {
-      id: 'tenant-isolation',
-      title: 'Reads and writes are scoped by the authenticated tenant',
-      detail:
-        'The tenant that builds the key is the authenticated `X-Tenant-Id` one; a body tenant that contradicts it is **403**. The starter passes the body tenant straight into the search and the key, so tenant isolation is only as good as the caller.',
-      match: {
-        python: {all: [/X-Tenant-Id/, /cache_key\(tenant,/, /status_code\s*=\s*403/]},
-        typescript: {all: [/x-tenant-id/, /cacheKey\(tenant,/, /code\(\s*403\s*\)/]},
-        go: {all: [/X-Tenant-Id/, /cacheKey\(tenant,/, /StatusForbidden/]},
-        scala: {all: [/X-Tenant-Id/, /cacheKey\(tenant,/, /StatusCodes\.Forbidden/]},
-        cpp: {all: [/X-Tenant-Id/, /cacheKey\(tenant,/, /\b403\b/]},
+        python: {all: [/\bex\s*=\s*CACHE_TTL_S|\.setex\(/]},
+        typescript: {all: [/['"]EX['"]\s*,\s*CACHE_TTL_S|\.setex\(/]},
+        go: {all: [/rdb\.Set\([^\n]*cacheTTL\)|\.SetEx\(/]},
+        scala: {all: [/\.setex\(|SetParams\(\)\.ex\(/]},
+        cpp: {all: [/std::chrono::seconds\(kCacheTtlSeconds\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import hashlib
-import json
-import logging
+      starter: `import json
 
 import redis
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("search")
-cache = redis.Redis(host="redis", port=6379, decode_responses=True)
+from search import corpus  # active_index, nearest
+from search.fingerprint import query_digest
 
-ACTIVE_INDEX_VERSION = "idx-42"
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+CACHE_TTL_S = 60
 
 
-class SearchRequest(BaseModel):
-    query: list[float]
-    k: int = 10
-    tenant: str
-
-
-class Index:
-    def search(self, tenant: str, query: list[float], k: int, version: str) -> list[dict]:
-        raise NotImplementedError
-
-
-index = Index()
-
-
-def query_digest(query: list[float]) -> str:
-    return hashlib.sha256(str(query).encode("utf-8")).hexdigest()[:32]
-
-
-@app.post("/v1/search")
-def search(body: SearchRequest) -> JSONResponse:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    tenant = body.tenant
-    key = f"search:{query_digest(body.query)}:{body.k}"
-    cached = cache.get(key)
-    if cached is not None:
-        return JSONResponse(json.loads(cached), status_code=200)
-    cache.delete(key)
-    hits = index.search(tenant, body.query, body.k, ACTIVE_INDEX_VERSION)
-    payload = {"hits": hits, "k": body.k, "index_version": ACTIVE_INDEX_VERSION}
-    cache.set(key, json.dumps(payload))
-    return JSONResponse(payload, status_code=200)
+def cached_search(tenant: str, query: list[float], k: int) -> dict:
+    """The tenant's k nearest documents to query through the result cache: {hits, k, index_version, cached}."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    key = f"search:{query_digest(query)}"
+    raw = r.get(key)
+    if raw is not None:
+        return {**json.loads(raw), "cached": True}
+    version = corpus.active_index()["version"]
+    result = {"hits": corpus.nearest(tenant, version, query, k), "k": k, "index_version": version}
+    r.set(key, json.dumps(result))
+    return {**result, "cached": False}
 `,
-      solution: `import hashlib
-import json
-import logging
-import struct
+      solution: `import json
 
 import redis
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("search")
-cache = redis.Redis(host="redis", port=6379, decode_responses=True)
+from search import corpus  # active_index, nearest
+from search.fingerprint import query_digest
 
-TTL_S = 60
-MAX_K = 100
-INDEX_DIMENSIONS = 768
-ACTIVE_INDEX_VERSION = "idx-42"
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+CACHE_TTL_S = 60
 
 
-class SearchRequest(BaseModel):
-    query: list[float]
-    k: int = 10
-    tenant: str | None = None
-    index_version: str | None = None
-
-
-class Index:
-    def search(self, tenant: str, query: list[float], k: int, version: str) -> list[dict]:
-        raise NotImplementedError
-
-
-index = Index()
-
-
-def query_digest(query: list[float]) -> str:
-    """A fingerprint of one query: the same bytes hash the same in every process."""
-    packed = b"".join(struct.pack(">f", value) for value in query)
-    return hashlib.sha256(packed).hexdigest()[:32]
-
-
-def cache_key(tenant: str, version: str, digest: str, k: int) -> str:
-    """Tenant and index version are part of the key: a shared key is a cross-tenant leak."""
-    return f"search:{tenant}:{version}:{digest}:{k}"
-
-
-@app.post("/v1/search")
-def search(
-    body: SearchRequest,
-    tenant_header: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant_header is None or tenant_header == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if body.tenant is not None and body.tenant != tenant_header:
-        raise HTTPException(status_code=403, detail="body tenant does not match the authenticated tenant")
-    if body.index_version is not None and body.index_version != ACTIVE_INDEX_VERSION:
-        raise HTTPException(status_code=409, detail={"error": "index version is not active"})
-    if len(body.query) != INDEX_DIMENSIONS:
-        raise HTTPException(status_code=400, detail={"error": "query vector has the wrong dimension"})
-    if not 1 <= body.k <= MAX_K:
-        raise HTTPException(status_code=400, detail={"error": "k must be between 1 and 100"})
-
-    tenant = tenant_header
-    version = ACTIVE_INDEX_VERSION
-    key = cache_key(tenant, version, query_digest(body.query), body.k)
-    cached = cache.get(key)
-    if cached is not None:
-        logger.info("search cache=hit tenant=%s k=%d version=%s", tenant, body.k, version)
-        return JSONResponse(json.loads(cached), status_code=200)
-
-    logger.info("search cache=miss tenant=%s k=%d version=%s", tenant, body.k, version)
-    hits = index.search(tenant, body.query, body.k, version)
-    payload = {"hits": hits, "k": body.k, "index_version": version}
-    cache.set(key, json.dumps(payload), ex=TTL_S)
-    return JSONResponse(payload, status_code=200)
+def cached_search(tenant: str, query: list[float], k: int) -> dict:
+    """The tenant's k nearest documents to query through the result cache: {hits, k, index_version, cached}."""
+    # Every input that changes the answer is in the key; the version is resolved first because the key names it.
+    version = corpus.active_index()["version"]
+    key = f"search:{tenant}:{version}:{query_digest(query)}:{k}"
+    raw = r.get(key)
+    if raw is not None:
+        return {**json.loads(raw), "cached": True}
+    result = {"hits": corpus.nearest(tenant, version, query, k), "k": k, "index_version": version}
+    r.set(key, json.dumps(result), ex=CACHE_TTL_S)
+    return {**result, "cached": False}
 `,
     },
     typescript: {
-      starter: `/** POST /v1/search. */
-import {createHash} from 'node:crypto';
+      starter: `import Redis from 'ioredis';
 
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+import {type Hit, activeIndex, nearest} from 'search/corpus';
+import {queryDigest} from 'search/fingerprint';
 
-import {index} from './index_store';
+const redis = new Redis({host: 'redis', port: 6379});
 
-export const app = Fastify();
-const cache = new Redis('redis://redis:6379');
+export const CACHE_TTL_S = 60;
 
-const ACTIVE_INDEX_VERSION = 'idx-42';
-
-interface SearchBody {
-  query: number[];
-  k?: number;
-  tenant: string;
+export interface Result {
+  hits: Hit[];
+  k: number;
+  index_version: string;
+  cached: boolean;
 }
 
-function queryDigest(query: number[]): string {
-  return createHash('sha256').update(JSON.stringify(query)).digest('hex').slice(0, 32);
+/** The tenant's k nearest documents to query through the result cache. */
+export async function cachedSearch(tenant: string, query: number[], k: number): Promise<Result> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const key = \`search:\${queryDigest(query)}\`;
+  const raw = await redis.get(key);
+  if (raw !== null) return {...(JSON.parse(raw) as Result), cached: true};
+  const version = (await activeIndex()).version;
+  const result = {hits: await nearest(tenant, version, query, k), k, index_version: version};
+  await redis.set(key, JSON.stringify(result));
+  return {...result, cached: false};
 }
-
-app.post('/v1/search', async (request, reply) => {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const body = request.body as SearchBody;
-  const k = body.k ?? 10;
-  const key = \`search:\${queryDigest(body.query)}:\${k}\`;
-  const cached = await cache.get(key);
-  if (cached !== null) return reply.code(200).send(JSON.parse(cached));
-  await cache.del(key);
-  const hits = await index.search(body.tenant, body.query, k, ACTIVE_INDEX_VERSION);
-  const payload = {hits, k, index_version: ACTIVE_INDEX_VERSION};
-  await cache.set(key, JSON.stringify(payload));
-  return reply.code(200).send(payload);
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/search: a cache entry belongs to one tenant and one index version. */
-import {createHash} from 'node:crypto';
+      solution: `import Redis from 'ioredis';
 
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+import {type Hit, activeIndex, nearest} from 'search/corpus';
+import {queryDigest} from 'search/fingerprint';
 
-import {index} from './index_store';
+const redis = new Redis({host: 'redis', port: 6379});
 
-export const app = Fastify();
-const cache = new Redis('redis://redis:6379');
+export const CACHE_TTL_S = 60;
 
-const TTL_S = 60;
-const MAX_K = 100;
-const INDEX_DIMENSIONS = 768;
-const ACTIVE_INDEX_VERSION = 'idx-42';
-
-interface SearchBody {
-  query?: number[];
-  k?: number;
-  tenant?: string;
-  index_version?: string;
+export interface Result {
+  hits: Hit[];
+  k: number;
+  index_version: string;
+  cached: boolean;
 }
 
-function queryDigest(query: number[]): string {
-  const packed = Buffer.alloc(query.length * 4);
-  query.forEach((value, position) => packed.writeFloatBE(value, position * 4));
-  return createHash('sha256').update(packed).digest('hex').slice(0, 32);
+/** The tenant's k nearest documents to query through the result cache. */
+export async function cachedSearch(tenant: string, query: number[], k: number): Promise<Result> {
+  // Every input that changes the answer is in the key; the version is resolved first because the key names it.
+  const version = (await activeIndex()).version;
+  const key = \`search:\${tenant}:\${version}:\${queryDigest(query)}:\${k}\`;
+  const raw = await redis.get(key);
+  if (raw !== null) return {...(JSON.parse(raw) as Result), cached: true};
+  const result = {hits: await nearest(tenant, version, query, k), k, index_version: version};
+  await redis.set(key, JSON.stringify(result), 'EX', CACHE_TTL_S);
+  return {...result, cached: false};
 }
-
-function cacheKey(tenant: string, version: string, digest: string, k: number): string {
-  return \`search:\${tenant}:\${version}:\${digest}:\${k}\`;
-}
-
-app.post('/v1/search', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-
-  const body = (request.body ?? {}) as SearchBody;
-  if (body.tenant !== undefined && body.tenant !== tenant)
-    return reply.code(403).send({error: 'body tenant does not match the authenticated tenant'});
-  if (body.index_version !== undefined && body.index_version !== ACTIVE_INDEX_VERSION)
-    return reply.code(409).send({error: 'index version is not active'});
-  const vector = body.query;
-  if (!Array.isArray(vector) || vector.length !== INDEX_DIMENSIONS)
-    return reply.code(400).send({error: 'query vector has the wrong dimension'});
-  const k = body.k ?? 10;
-  if (!Number.isInteger(k) || k < 1 || k > MAX_K) return reply.code(400).send({error: 'k must be between 1 and 100'});
-
-  const key = cacheKey(tenant, ACTIVE_INDEX_VERSION, queryDigest(vector), k);
-  const cached = await cache.get(key);
-  if (cached !== null) {
-    request.log.info({tenant, k, cache: 'hit'}, 'served from cache');
-    return reply.code(200).send(JSON.parse(cached));
-  }
-
-  const hits = await index.search(tenant, vector, k, ACTIVE_INDEX_VERSION);
-  const payload = {hits, k, index_version: ACTIVE_INDEX_VERSION};
-  await cache.set(key, JSON.stringify(payload), 'EX', TTL_S);
-  return reply.code(200).send(payload);
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -348,534 +199,562 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
+	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"search/corpus"      // corpus.ActiveIndex, Nearest
+	"search/fingerprint" // fingerprint.QueryDigest
 )
 
-const activeIndexVersion = "idx-42"
+const cacheTTL = 60 * time.Second
 
-type SearchRequest struct {
-	Query  []float64 \`json:"query"\`
-	K      int       \`json:"k"\`
-	Tenant string    \`json:"tenant"\`
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+// Result is a search answer as the cache stores it; Cached says whether this one came from the cache.
+type Result struct {
+	Hits         []corpus.Hit \`json:"hits"\`
+	K            int          \`json:"k"\`
+	IndexVersion string       \`json:"index_version"\`
+	Cached       bool         \`json:"-"\`
 }
 
-type Hit struct {
-	ID    string  \`json:"id"\`
-	Score float64 \`json:"score"\`
-}
-
-type Index struct{}
-
-func (i *Index) Search(ctx context.Context, tenant string, query []float64, k int, version string) ([]Hit, error) {
-	return nil, nil
-}
-
-var (
-	index = &Index{}
-	cache = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-)
-
-func queryDigest(query []float64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%v", query)))
-	return hex.EncodeToString(sum[:])[:32]
-}
-
-func search(rw http.ResponseWriter, r *http.Request) {
-	var body SearchRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(rw, "invalid json", http.StatusBadRequest)
-		return
+// cachedSearch is the tenant's k nearest documents to query through the result cache.
+func cachedSearch(ctx context.Context, tenant string, query []float64, k int) (Result, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	key := "search:" + fingerprint.QueryDigest(query)
+	raw, err := rdb.Get(ctx, key).Result()
+	if err == nil {
+		var cached Result
+		if json.Unmarshal([]byte(raw), &cached) == nil {
+			cached.Cached = true
+			return cached, nil
+		}
+	} else if err != redis.Nil {
+		return Result{}, err
 	}
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	k := body.K
-	if k == 0 {
-		k = 10
+	version := corpus.ActiveIndex(ctx).Version
+	result := Result{Hits: corpus.Nearest(ctx, tenant, version, query, k), K: k, IndexVersion: version}
+	encoded, _ := json.Marshal(result)
+	if err := rdb.Set(ctx, key, encoded, 0).Err(); err != nil {
+		return Result{}, err
 	}
-	key := fmt.Sprintf("search:%s:%d", queryDigest(body.Query), k)
-	if cached, err := cache.Get(r.Context(), key).Result(); err == nil {
-		rw.Header().Set("Content-Type", "application/json")
-		rw.Write([]byte(cached))
-		return
-	}
-	cache.Del(r.Context(), key)
-	hits, err := index.Search(r.Context(), body.Tenant, body.Query, k, activeIndexVersion)
-	if err != nil {
-		http.Error(rw, "index unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	payload, _ := json.Marshal(map[string]any{"hits": hits, "k": k, "index_version": activeIndexVersion})
-	cache.Set(r.Context(), key, payload, 0)
-	log.Printf("search cache=miss tenant=%s k=%d version=%s", body.Tenant, k, activeIndexVersion)
-	rw.Header().Set("Content-Type", "application/json")
-	rw.Write(payload)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/search", search)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	return result, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
-	"math"
-	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"search/corpus"      // corpus.ActiveIndex, Nearest
+	"search/fingerprint" // fingerprint.QueryDigest
 )
 
-const (
-	maxK               = 100
-	indexDimensions    = 768
-	activeIndexVersion = "idx-42"
-	cacheTTL           = 60 * time.Second
-)
+const cacheTTL = 60 * time.Second
 
-type SearchRequest struct {
-	Query        []float64 \`json:"query"\`
-	K            int       \`json:"k"\`
-	Tenant       string    \`json:"tenant,omitempty"\`
-	IndexVersion string    \`json:"index_version,omitempty"\`
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+// Result is a search answer as the cache stores it; Cached says whether this one came from the cache.
+type Result struct {
+	Hits         []corpus.Hit \`json:"hits"\`
+	K            int          \`json:"k"\`
+	IndexVersion string       \`json:"index_version"\`
+	Cached       bool         \`json:"-"\`
 }
 
-type Hit struct {
-	ID    string  \`json:"id"\`
-	Score float64 \`json:"score"\`
-}
-
-type Index struct{}
-
-func (i *Index) Search(ctx context.Context, tenant string, query []float64, k int, version string) ([]Hit, error) {
-	return nil, nil
-}
-
-var (
-	index = &Index{}
-	cache = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-)
-
-func queryDigest(query []float64) string {
-	buffer := make([]byte, len(query)*8)
-	for position, value := range query {
-		binary.BigEndian.PutUint64(buffer[position*8:], math.Float64bits(value))
+// cachedSearch is the tenant's k nearest documents to query through the result cache.
+func cachedSearch(ctx context.Context, tenant string, query []float64, k int) (Result, error) {
+	// Every input that changes the answer is in the key; the version is resolved first because the key names it.
+	version := corpus.ActiveIndex(ctx).Version
+	key := fmt.Sprintf("search:%s:%s:%s:%d", tenant, version, fingerprint.QueryDigest(query), k)
+	raw, err := rdb.Get(ctx, key).Result()
+	if err == nil {
+		var cached Result
+		if json.Unmarshal([]byte(raw), &cached) == nil {
+			cached.Cached = true
+			return cached, nil
+		}
+	} else if err != redis.Nil {
+		return Result{}, err
 	}
-	sum := sha256.Sum256(buffer)
-	return hex.EncodeToString(sum[:])[:32]
-}
-
-func cacheKey(tenant, version, digest string, k int) string {
-	return fmt.Sprintf("search:%s:%s:%s:%d", tenant, version, digest, k)
-}
-
-func search(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		http.Error(rw, "missing X-Tenant-Id", http.StatusUnauthorized)
-		return
+	result := Result{Hits: corpus.Nearest(ctx, tenant, version, query, k), K: k, IndexVersion: version}
+	encoded, _ := json.Marshal(result)
+	if err := rdb.Set(ctx, key, encoded, cacheTTL).Err(); err != nil {
+		return Result{}, err
 	}
-	var body SearchRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(rw, "invalid json", http.StatusBadRequest)
-		return
-	}
-	if body.Tenant != "" && body.Tenant != tenant {
-		http.Error(rw, "body tenant does not match the authenticated tenant", http.StatusForbidden)
-		return
-	}
-	if body.IndexVersion != "" && body.IndexVersion != activeIndexVersion {
-		http.Error(rw, "index version is not active", http.StatusConflict)
-		return
-	}
-	if len(body.Query) != indexDimensions {
-		http.Error(rw, "query vector has the wrong dimension", http.StatusBadRequest)
-		return
-	}
-	k := body.K
-	if k == 0 {
-		k = 10
-	}
-	if k < 1 || k > maxK {
-		http.Error(rw, "k must be between 1 and 100", http.StatusBadRequest)
-		return
-	}
-
-	key := cacheKey(tenant, activeIndexVersion, queryDigest(body.Query), k)
-	if cached, err := cache.Get(r.Context(), key).Result(); err == nil {
-		log.Printf("search cache=hit tenant=%s k=%d version=%s", tenant, k, activeIndexVersion)
-		rw.Header().Set("Content-Type", "application/json")
-		rw.Write([]byte(cached))
-		return
-	}
-
-	hits, err := index.Search(r.Context(), tenant, body.Query, k, activeIndexVersion)
-	if err != nil {
-		http.Error(rw, "index unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	payload, _ := json.Marshal(map[string]any{"hits": hits, "k": k, "index_version": activeIndexVersion})
-	cache.Set(r.Context(), key, payload, cacheTTL)
-	log.Printf("search cache=miss tenant=%s k=%d version=%s", tenant, k, activeIndexVersion)
-	rw.Header().Set("Content-Type", "application/json")
-	rw.Write(payload)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/search", search)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	return result, nil
 }
 `,
     },
     scala: {
-      starter: `import java.nio.charset.StandardCharsets
+      starter: `import redis.clients.jedis.JedisPooled
+import spray.json._
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import search.{Corpus, Fingerprint} // Corpus.activeIndex, nearest; Fingerprint.queryDigest
 
-final case class SearchRequest(query: List[Double], k: Int, tenant: String)
+object State {
+  val CacheTtlSeconds = 60L
 
-trait Index {
-  def search(tenant: String, query: List[Double], k: Int, version: String): List[String]
-}
+  val jedis = new JedisPooled("redis", 6379)
 
-object Index {
-  def open(): Index = new Index {
-    def search(tenant: String, query: List[Double], k: Int, version: String): List[String] = Nil
-  }
-}
+  /** A search answer as the cache stores it; cached says whether this one came from the cache. */
+  final case class Result(hits: Vector[Corpus.Hit], k: Int, indexVersion: String, cached: Boolean)
 
-object SearchApi {
-  implicit val system: ActorSystem = ActorSystem("vector-search")
-  implicit val searchFormat: RootJsonFormat[SearchRequest] = jsonFormat3(SearchRequest)
+  private def encode(result: Result): String = JsObject(
+    "hits" -> JsArray(result.hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score)))),
+    "k" -> JsNumber(result.k),
+    "index_version" -> JsString(result.indexVersion),
+  ).compactPrint
 
-  val ActiveIndexVersion = "idx-42"
-  val index: Index = Index.open()
-  val cache = new Jedis("redis", 6379)
-
-  def queryDigest(query: List[Double]): String = query.mkString(",").getBytes(StandardCharsets.UTF_8).hashCode.toString
-
-  val route: Route =
-    path("v1" / "search") {
-      post {
-        entity(as[SearchRequest]) { body =>
-          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-          val k = math.max(1, math.min(body.k, 100))
-          val key = s"search:\${queryDigest(body.query)}:$k"
-          val cached = cache.get(key)
-          if (cached != null) {
-            complete(StatusCodes.OK, cached)
-          } else {
-            cache.del(key)
-            val hits = index.search(body.tenant, body.query, k, ActiveIndexVersion)
-            val payload = s"""{"k":$k,"index_version":"$ActiveIndexVersion","hits":\${hits.size}}"""
-            cache.set(key, payload)
-            complete(StatusCodes.OK, payload)
-          }
+  private def decode(raw: String): Result = {
+    val fields = raw.parseJson.asJsObject.fields
+    val hits = fields("hits") match {
+      case JsArray(items) =>
+        items.map { item =>
+          val hit = item.asJsObject.fields
+          Corpus.Hit(hit("id").asInstanceOf[JsString].value, hit("score").asInstanceOf[JsNumber].value.toDouble)
         }
-      }
+      case _ => Vector.empty
     }
+    Result(hits, fields("k").asInstanceOf[JsNumber].value.toInt, fields("index_version").asInstanceOf[JsString].value, cached = true)
+  }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** The tenant's k nearest documents to query through the result cache. */
+  def cachedSearch(tenant: String, query: Seq[Double], k: Int): Result = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val key = s"search:\${Fingerprint.queryDigest(query)}"
+    Option(jedis.get(key)) match {
+      case Some(raw) => decode(raw)
+      case None =>
+        val version = Corpus.activeIndex().version
+        val result = Result(Corpus.nearest(tenant, version, query, k), k, version, cached = false)
+        jedis.set(key, encode(result))
+        result
+    }
   }
 }
 `,
-      solution: `import java.nio.ByteBuffer
-import java.security.MessageDigest
+      solution: `import redis.clients.jedis.JedisPooled
+import spray.json._
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import search.{Corpus, Fingerprint} // Corpus.activeIndex, nearest; Fingerprint.queryDigest
 
-final case class SearchRequest(query: List[Double], k: Int, tenant: Option[String], index_version: Option[String])
+object State {
+  val CacheTtlSeconds = 60L
 
-trait Index {
-  def search(tenant: String, query: List[Double], k: Int, version: String): List[String]
-}
+  val jedis = new JedisPooled("redis", 6379)
 
-object Index {
-  def open(): Index = new Index {
-    def search(tenant: String, query: List[Double], k: Int, version: String): List[String] = Nil
-  }
-}
+  /** A search answer as the cache stores it; cached says whether this one came from the cache. */
+  final case class Result(hits: Vector[Corpus.Hit], k: Int, indexVersion: String, cached: Boolean)
 
-object SearchApi {
-  implicit val system: ActorSystem = ActorSystem("vector-search")
-  implicit val searchFormat: RootJsonFormat[SearchRequest] = jsonFormat4(SearchRequest)
+  private def encode(result: Result): String = JsObject(
+    "hits" -> JsArray(result.hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score)))),
+    "k" -> JsNumber(result.k),
+    "index_version" -> JsString(result.indexVersion),
+  ).compactPrint
 
-  val TtlSeconds = 60
-  val MaxK = 100
-  val IndexDimensions = 768
-  val ActiveIndexVersion = "idx-42"
-
-  val index: Index = Index.open()
-  val cache = new Jedis("redis", 6379)
-
-  def queryDigest(query: List[Double]): String = {
-    val digest = MessageDigest.getInstance("SHA-256")
-    val buffer = ByteBuffer.allocate(query.length * 8)
-    query.foreach(value => buffer.putDouble(value))
-    digest.digest(buffer.array()).take(16).map("%02x".format(_)).mkString
-  }
-
-  def cacheKey(tenant: String, version: String, digest: String, k: Int): String =
-    s"search:$tenant:$version:$digest:$k"
-
-  val route: Route =
-    path("v1" / "search") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[SearchRequest]) { body =>
-            tenantOpt.filter(_.nonEmpty) match {
-              case None =>
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              case Some(tenant) if body.tenant.exists(_ != tenant) =>
-                complete(StatusCodes.Forbidden, """{"error":"body tenant does not match the authenticated tenant"}""")
-              case Some(_) if body.index_version.exists(_ != ActiveIndexVersion) =>
-                complete(StatusCodes.Conflict, """{"error":"index version is not active"}""")
-              case Some(_) if body.query.length != IndexDimensions =>
-                complete(StatusCodes.BadRequest, """{"error":"query vector has the wrong dimension"}""")
-              case Some(_) if body.k < 1 || body.k > MaxK =>
-                complete(StatusCodes.BadRequest, """{"error":"k must be between 1 and 100"}""")
-              case Some(tenant) =>
-                val key = cacheKey(tenant, ActiveIndexVersion, queryDigest(body.query), body.k)
-                val cached = cache.get(key)
-                if (cached != null) {
-                  system.log.info(s"search cache=hit tenant=$tenant k=\${body.k}")
-                  complete(StatusCodes.OK, cached)
-                } else {
-                  val hits = index.search(tenant, body.query, body.k, ActiveIndexVersion)
-                  val payload = s"""{"k":\${body.k},"index_version":"$ActiveIndexVersion","hits":\${hits.size}}"""
-                  cache.setex(key, TtlSeconds, payload)
-                  system.log.info(s"search cache=miss tenant=$tenant k=\${body.k}")
-                  complete(StatusCodes.OK, payload)
-                }
-            }
-          }
+  private def decode(raw: String): Result = {
+    val fields = raw.parseJson.asJsObject.fields
+    val hits = fields("hits") match {
+      case JsArray(items) =>
+        items.map { item =>
+          val hit = item.asJsObject.fields
+          Corpus.Hit(hit("id").asInstanceOf[JsString].value, hit("score").asInstanceOf[JsNumber].value.toDouble)
         }
-      }
+      case _ => Vector.empty
     }
+    Result(hits, fields("k").asInstanceOf[JsNumber].value.toInt, fields("index_version").asInstanceOf[JsString].value, cached = true)
+  }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** The tenant's k nearest documents to query through the result cache. */
+  def cachedSearch(tenant: String, query: Seq[Double], k: Int): Result = {
+    // Every input that changes the answer is in the key; the version is resolved first because the key names it.
+    val version = Corpus.activeIndex().version
+    val key = s"search:$tenant:$version:\${Fingerprint.queryDigest(query)}:$k"
+    Option(jedis.get(key)) match {
+      case Some(raw) => decode(raw)
+      case None =>
+        val result = Result(Corpus.nearest(tenant, version, query, k), k, version, cached = false)
+        jedis.setex(key, CacheTtlSeconds, encode(result))
+        result
+    }
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
-
-#include <iomanip>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <vector>
-
-using json = nlohmann::json;
-
-const std::string kActiveIndexVersion = "idx-42";
-
-auto cache = sw::redis::Redis("redis://redis:6379");
-
-struct Index {
-  json search(const std::string& tenant, const std::vector<double>& query, int k, const std::string& version);
-};
-
-Index index;
-
-std::string queryDigest(const std::vector<double>& query) {
-  std::ostringstream out;
-  out << std::setprecision(17);
-  for (double value : query) {
-    out << value << ',';
-  }
-  return out.str();
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/search", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    const auto tenant = body.value("tenant", std::string());
-    const auto query = body.value("query", std::vector<double>());
-    const int k = body.value("k", 10);
-    const std::string key = "search:" + queryDigest(query) + ":" + std::to_string(k);
-    const auto cached = cache.get(key);
-    if (cached) {
-      res.status = 200;
-      res.set_content(*cached, "application/json");
-      return;
-    }
-    cache.del(key);
-    const json hits = index.search(tenant, query, k, kActiveIndexVersion);
-    const std::string payload = json{{"hits", hits}, {"k", k}, {"index_version", kActiveIndexVersion}}.dump();
-    cache.set(key, payload);
-    res.status = 200;
-    res.set_content(payload, "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
+      starter: `#include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <cstdint>
-#include <cstring>
-#include <iomanip>
-#include <iostream>
-#include <sstream>
 #include <string>
 #include <vector>
 
+#include "search/corpus.h"       // corpus::activeIndex, nearest
+#include "search/fingerprint.h"  // fingerprint::queryDigest
+
 using json = nlohmann::json;
 
-constexpr int kMaxK = 100;
-constexpr std::size_t kIndexDimensions = 768;
-const std::string kActiveIndexVersion = "idx-42";
-constexpr int kCacheTtlSeconds = 60;
-constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
-constexpr uint64_t kFnvPrime = 1099511628211ULL;
+constexpr long kCacheTtlSeconds = 60;
 
-auto cache = sw::redis::Redis("redis://redis:6379");
+sw::redis::Redis redis("tcp://redis:6379");
 
-struct Index {
-  json search(const std::string& tenant, const std::vector<double>& query, int k, const std::string& version);
-};
-
-Index index;
-
-std::string queryDigest(const std::vector<double>& query) {
-  uint64_t digest = kFnvOffsetBasis;
-  for (double value : query) {
-    uint64_t bits;
-    std::memcpy(&bits, &value, sizeof(bits));
-    for (int shift = 0; shift < 64; shift += 8) {
-      digest ^= (bits >> shift) & 0xFFULL;
-      digest *= kFnvPrime;
-    }
+// The tenant's k nearest documents to query through the result cache: {hits, k, index_version, cached}.
+json cachedSearch(const std::string& tenant, const std::vector<double>& query, long k) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string key = "search:" + fingerprint::queryDigest(query);
+  if (const auto raw = redis.get(key)) {
+    json cached = json::parse(*raw);
+    cached["cached"] = true;
+    return cached;
   }
-  std::ostringstream out;
-  out << std::hex << std::setfill('0') << std::setw(16) << digest;
-  return out.str();
+  const std::string version = corpus::activeIndex().version;
+  json result = {{"hits", corpus::nearest(tenant, version, query, k)}, {"k", k}, {"index_version", version}};
+  redis.set(key, result.dump());
+  result["cached"] = false;
+  return result;
 }
+`,
+      solution: `#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
-std::string cacheKey(const std::string& tenant, const std::string& version, const std::string& digest, int k) {
-  return "search:" + tenant + ":" + version + ":" + digest + ":" + std::to_string(k);
-}
+#include <chrono>
+#include <string>
+#include <vector>
 
-int main() {
-  httplib::Server svr;
+#include "search/corpus.h"       // corpus::activeIndex, nearest
+#include "search/fingerprint.h"  // fingerprint::queryDigest
 
-  svr.Post("/v1/search", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto bodyTenant = body.value("tenant", std::string());
-    if (!bodyTenant.empty() && bodyTenant != tenant) {
-      res.status = 403;
-      res.set_content(R"({"error":"body tenant does not match the authenticated tenant"})", "application/json");
-      return;
-    }
-    const auto requestedVersion = body.value("index_version", std::string());
-    if (!requestedVersion.empty() && requestedVersion != kActiveIndexVersion) {
-      res.status = 409;
-      res.set_content(R"({"error":"index version is not active"})", "application/json");
-      return;
-    }
-    const auto query = body.value("query", std::vector<double>());
-    if (query.size() != kIndexDimensions) {
-      res.status = 400;
-      res.set_content(R"({"error":"query vector has the wrong dimension"})", "application/json");
-      return;
-    }
-    const int k = body.value("k", 10);
-    if (k < 1 || k > kMaxK) {
-      res.status = 400;
-      res.set_content(R"({"error":"k must be between 1 and 100"})", "application/json");
-      return;
-    }
+using json = nlohmann::json;
 
-    const std::string key = cacheKey(tenant, kActiveIndexVersion, queryDigest(query), k);
-    const auto cached = cache.get(key);
-    if (cached) {
-      std::clog << "search cache=hit tenant=" << tenant << " k=" << k << "\\n";
-      res.status = 200;
-      res.set_content(*cached, "application/json");
-      return;
-    }
+constexpr long kCacheTtlSeconds = 60;
 
-    const json hits = index.search(tenant, query, k, kActiveIndexVersion);
-    const std::string payload =
-        json{{"hits", hits}, {"k", k}, {"index_version", kActiveIndexVersion}}.dump();
-    cache.set(key, payload, std::chrono::seconds(kCacheTtlSeconds));
-    std::clog << "search cache=miss tenant=" << tenant << " k=" << k << "\\n";
-    res.status = 200;
-    res.set_content(payload, "application/json");
-  });
+sw::redis::Redis redis("tcp://redis:6379");
 
-  svr.listen("0.0.0.0", 8443);
+// The tenant's k nearest documents to query through the result cache: {hits, k, index_version, cached}.
+json cachedSearch(const std::string& tenant, const std::vector<double>& query, long k) {
+  // Every input that changes the answer is in the key; the version is resolved first because the key names it.
+  const std::string version = corpus::activeIndex().version;
+  const std::string key = "search:" + tenant + ":" + version + ":" + fingerprint::queryDigest(query) + ":" + std::to_string(k);
+  if (const auto raw = redis.get(key)) {
+    json cached = json::parse(*raw);
+    cached["cached"] = true;
+    return cached;
+  }
+  json result = {{"hits", corpus::nearest(tenant, version, query, k)}, {"k", k}, {"index_version", version}};
+  redis.set(key, result.dump(), std::chrono::seconds(kCacheTtlSeconds));
+  result["cached"] = false;
+  return result;
 }
 `,
     },
   },
-  debrief: `The cache key is the security boundary of a tenant-scoped service, which is why the fix
-is a four-part key rather than a longer hash: tenant and index version are the isolation half, digest
-and \`k\` are what make the entry this query. Two tenants embedding different private corpora can
-produce the very same vector, so a tenant-less key is not a cache miss waiting to happen, it is a
-cross-tenant read waiting to happen. The digest hashes bytes rather than formatted floats so every
-worker computes the same key, and expiry replaces deletion because a TTL bounds staleness while a
-\`DEL\` only opens a window where everyone misses. Production caches add a per-tenant hit-rate
-metric so a missing key component shows up as a traffic spike rather than a support ticket, and a
-key-version prefix so a bad cache can be drained without flushing everyone's entries.
+  harness: {
+    python: `from search import corpus
+from search.fingerprint import query_digest
+
+QUERY = [1.0, 0.0, 0.0, 0.0]
+DIGEST = query_digest(QUERY)
+
+
+def _state(ctx):
+    """acme and globex in the active idx-42; acme's b1 in idx-43, built but not live."""
+    corpus.activate("idx-42", 4)
+    corpus.put_document("acme", "idx-42", "a1", [0.9, 0.1, 0.0, 0.0])
+    corpus.put_document("acme", "idx-42", "a2", [0.5, 0.5, 0.0, 0.0])
+    corpus.put_document("acme", "idx-42", "a3", [0.1, 0.9, 0.0, 0.0])
+    corpus.put_document("globex", "idx-42", "g1", [1.0, 0.0, 0.0, 0.0])
+    corpus.put_document("acme", "idx-43", "b1", [1.0, 0.0, 0.0, 0.0])
+    return ctx.load("state")
+
+
+def _ids(result):
+    return [h["id"] for h in result["hits"]]
+
+
+def check_tenant_key(ctx):
+    m = _state(ctx)
+    first = m.cached_search("acme", QUERY, 2)
+    assert _ids(first) == ["a1", "a2"] and first["cached"] is False, f"acme's first search must miss and answer a1, a2, got {first}"
+    again = m.cached_search("acme", QUERY, 2)
+    assert again["cached"] is True and _ids(again) == ["a1", "a2"], f"the same search repeated must be served from the cache, got {again}"
+    globex = m.cached_search("globex", QUERY, 2)
+    assert "a1" not in _ids(globex), f"globex ran the query acme ran and received acme's documents {globex}: the key must carry the tenant"
+    assert _ids(globex) == ["g1"] and globex["cached"] is False, f"globex's search must miss and answer g1, got {globex}"
+    key = f"search:globex:idx-42:{DIGEST}:2"
+    assert ctx.redis.exists(key), f"globex's entry must be {key}; Redis holds {sorted(ctx.redis.keys('search:*'))}"
+
+
+def check_version_key(ctx):
+    m = _state(ctx)
+    before = m.cached_search("acme", QUERY, 2)
+    assert before["index_version"] == "idx-42", f"the first search must answer from idx-42, got {before}"
+    corpus.activate("idx-43", 4)
+    after = m.cached_search("acme", QUERY, 2)
+    assert after["index_version"] == "idx-43" and _ids(after) == ["b1"], f"after the switch to idx-43 the search answered {after}: an entry written for idx-42 was served. Resolve the active version before the lookup and put it in the key"
+    key = f"search:acme:idx-43:{DIGEST}:2"
+    assert ctx.redis.exists(key), f"the idx-43 entry must be {key}; Redis holds {sorted(ctx.redis.keys('search:*'))}"
+
+
+def check_k_key(ctx):
+    m = _state(ctx)
+    two = m.cached_search("acme", QUERY, 2)
+    assert _ids(two) == ["a1", "a2"], f"a search for 2 answered {two}"
+    three = m.cached_search("acme", QUERY, 3)
+    assert three["k"] == 3 and _ids(three) == ["a1", "a2", "a3"], f"a search for 3 after a search for 2 answered {three}: the entry for k 2 was served. The key must carry k"
+
+
+def check_ttl(ctx):
+    m = _state(ctx)
+    m.cached_search("acme", QUERY, 2)
+    keys = ctx.redis.keys("search:*")
+    assert len(keys) == 1, f"one search must write one entry, Redis holds {sorted(keys)}"
+    ttl = ctx.redis.ttl(keys[0])
+    assert 0 < ttl <= 60, f"{keys[0]} has TTL {ttl}: write every entry with CACHE_TTL_S (60 s) in the same SET, or it answers until someone deletes it"
+    corpus.put_document("acme", "idx-42", "a0", [1.0, 0.0, 0.0, 0.0])
+    ctx.clock.advance(61)
+    later = m.cached_search("acme", QUERY, 2)
+    assert later["cached"] is False and _ids(later) == ["a0", "a1"], f"61 seconds later, after a0 was added, the search answered {later}: the entry must have expired"
 `,
+    typescript: `const QUERY = [1, 0, 0, 0];
+
+/** acme and globex in the active idx-42; acme's b1 in idx-43, built but not live. */
+async function state(ctx) {
+  const corpus = ctx.load('/support/search/corpus.ts');
+  const {queryDigest} = ctx.load('/support/search/fingerprint.ts');
+  await corpus.activate('idx-42', 4);
+  await corpus.putDocument('acme', 'idx-42', 'a1', [0.9, 0.1, 0, 0]);
+  await corpus.putDocument('acme', 'idx-42', 'a2', [0.5, 0.5, 0, 0]);
+  await corpus.putDocument('acme', 'idx-42', 'a3', [0.1, 0.9, 0, 0]);
+  await corpus.putDocument('globex', 'idx-42', 'g1', [1, 0, 0, 0]);
+  await corpus.putDocument('acme', 'idx-43', 'b1', [1, 0, 0, 0]);
+  return {m: ctx.load('state'), corpus, digest: queryDigest(QUERY)};
+}
+
+const ids = result => result.hits.map(h => h.id).join(',');
+
+export async function check_tenant_key(ctx) {
+  const {m, digest} = await state(ctx);
+  const first = await m.cachedSearch('acme', QUERY, 2);
+  assert(ids(first) === 'a1,a2' && first.cached === false, \`acme's first search must miss and answer a1, a2, got \${JSON.stringify(first)}\`);
+  const again = await m.cachedSearch('acme', QUERY, 2);
+  assert(again.cached === true && ids(again) === 'a1,a2', \`the same search repeated must be served from the cache, got \${JSON.stringify(again)}\`);
+  const globex = await m.cachedSearch('globex', QUERY, 2);
+  assert(!ids(globex).includes('a1'), \`globex ran the query acme ran and received acme's documents \${JSON.stringify(globex)}: the key must carry the tenant\`);
+  assert(ids(globex) === 'g1' && globex.cached === false, \`globex's search must miss and answer g1, got \${JSON.stringify(globex)}\`);
+  const key = \`search:globex:idx-42:\${digest}:2\`;
+  assert.equal(ctx.redis.exists(key), 1, \`globex's entry must be \${key}; Redis holds \${JSON.stringify(ctx.redis.keys('search:*'))}\`);
+}
+
+export async function check_version_key(ctx) {
+  const {m, corpus, digest} = await state(ctx);
+  const before = await m.cachedSearch('acme', QUERY, 2);
+  assert.equal(before.index_version, 'idx-42', \`the first search must answer from idx-42, got \${JSON.stringify(before)}\`);
+  await corpus.activate('idx-43', 4);
+  const after = await m.cachedSearch('acme', QUERY, 2);
+  assert(after.index_version === 'idx-43' && ids(after) === 'b1', \`after the switch to idx-43 the search answered \${JSON.stringify(after)}: an entry written for idx-42 was served. Resolve the active version before the lookup and put it in the key\`);
+  const key = \`search:acme:idx-43:\${digest}:2\`;
+  assert.equal(ctx.redis.exists(key), 1, \`the idx-43 entry must be \${key}; Redis holds \${JSON.stringify(ctx.redis.keys('search:*'))}\`);
+}
+
+export async function check_k_key(ctx) {
+  const {m} = await state(ctx);
+  const two = await m.cachedSearch('acme', QUERY, 2);
+  assert.equal(ids(two), 'a1,a2', \`a search for 2 answered \${JSON.stringify(two)}\`);
+  const three = await m.cachedSearch('acme', QUERY, 3);
+  assert(three.k === 3 && ids(three) === 'a1,a2,a3', \`a search for 3 after a search for 2 answered \${JSON.stringify(three)}: the entry for k 2 was served. The key must carry k\`);
+}
+
+export async function check_ttl(ctx) {
+  const {m, corpus} = await state(ctx);
+  await m.cachedSearch('acme', QUERY, 2);
+  const keys = ctx.redis.keys('search:*');
+  assert.equal(keys.length, 1, \`one search must write one entry, Redis holds \${JSON.stringify(keys)}\`);
+  const ttl = ctx.redis.ttl(keys[0]);
+  assert(ttl > 0 && ttl <= 60, \`\${keys[0]} has TTL \${ttl}: write every entry with CACHE_TTL_S (60 s) in the same SET, or it answers until someone deletes it\`);
+  await corpus.putDocument('acme', 'idx-42', 'a0', [1, 0, 0, 0]);
+  ctx.clock.advance(61);
+  const later = await m.cachedSearch('acme', QUERY, 2);
+  assert(later.cached === false && ids(later) === 'a0,a1', \`61 seconds later, after a0 was added, the search answered \${JSON.stringify(later)}: the entry must have expired\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"search/corpus"
+	"search/fingerprint"
+
+	"leetbuild/harness"
+)
+
+var (
+	stateBg     = context.Background()
+	stateQuery  = []float64{1, 0, 0, 0}
+	stateDigest = fingerprint.QueryDigest(stateQuery)
+)
+
+// seedState puts acme and globex in the active idx-42 and acme's b1 in idx-43, built but not live.
+func seedState() {
+	corpus.Activate(stateBg, "idx-42", 4)
+	corpus.PutDocument(stateBg, "acme", "idx-42", "a1", []float64{0.9, 0.1, 0, 0})
+	corpus.PutDocument(stateBg, "acme", "idx-42", "a2", []float64{0.5, 0.5, 0, 0})
+	corpus.PutDocument(stateBg, "acme", "idx-42", "a3", []float64{0.1, 0.9, 0, 0})
+	corpus.PutDocument(stateBg, "globex", "idx-42", "g1", []float64{1, 0, 0, 0})
+	corpus.PutDocument(stateBg, "acme", "idx-43", "b1", []float64{1, 0, 0, 0})
+}
+
+func mustSearch(ctx *harness.Ctx, tenant string, k int) Result {
+	result, err := cachedSearch(stateBg, tenant, stateQuery, k)
+	ctx.NoError(err, "cachedSearch(%s, …, %d) failed", tenant, k)
+	return result
+}
+
+func resultIDs(result Result) string {
+	ids := []string{}
+	for _, h := range result.Hits {
+		ids = append(ids, h.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
+func CheckTenantKey(ctx *harness.Ctx) {
+	seedState()
+	first := mustSearch(ctx, "acme", 2)
+	ctx.Assert(resultIDs(first) == "a1,a2" && !first.Cached, "acme's first search must miss and answer a1, a2, got %+v", first)
+	again := mustSearch(ctx, "acme", 2)
+	ctx.Assert(again.Cached && resultIDs(again) == "a1,a2", "the same search repeated must be served from the cache, got %+v", again)
+	globex := mustSearch(ctx, "globex", 2)
+	ctx.Assert(!strings.Contains(resultIDs(globex), "a1"), "globex ran the query acme ran and received acme's documents %+v: the key must carry the tenant", globex)
+	ctx.Assert(resultIDs(globex) == "g1" && !globex.Cached, "globex's search must miss and answer g1, got %+v", globex)
+	key := fmt.Sprintf("search:globex:idx-42:%s:2", stateDigest)
+	ctx.Equal(ctx.Redis.Exists(key), int64(1), "globex's entry must be %s; Redis holds %q; exists", key, ctx.Redis.Keys("search:*"))
+}
+
+func CheckVersionKey(ctx *harness.Ctx) {
+	seedState()
+	before := mustSearch(ctx, "acme", 2)
+	ctx.Equal(before.IndexVersion, "idx-42", "the first search's index version")
+	corpus.Activate(stateBg, "idx-43", 4)
+	after := mustSearch(ctx, "acme", 2)
+	ctx.Assert(after.IndexVersion == "idx-43" && resultIDs(after) == "b1", "after the switch to idx-43 the search answered %+v: an entry written for idx-42 was served. Resolve the active version before the lookup and put it in the key", after)
+	key := fmt.Sprintf("search:acme:idx-43:%s:2", stateDigest)
+	ctx.Equal(ctx.Redis.Exists(key), int64(1), "the idx-43 entry must be %s; Redis holds %q; exists", key, ctx.Redis.Keys("search:*"))
+}
+
+func CheckKKey(ctx *harness.Ctx) {
+	seedState()
+	two := mustSearch(ctx, "acme", 2)
+	ctx.Equal(resultIDs(two), "a1,a2", "a search for 2")
+	three := mustSearch(ctx, "acme", 3)
+	ctx.Assert(three.K == 3 && resultIDs(three) == "a1,a2,a3", "a search for 3 after a search for 2 answered %+v: the entry for k 2 was served. The key must carry k", three)
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	seedState()
+	mustSearch(ctx, "acme", 2)
+	keys := ctx.Redis.Keys("search:*")
+	ctx.Equal(len(keys), 1, "one search must write one entry; Redis holds %q; entries", keys)
+	ttl := ctx.Redis.TTL(keys[0])
+	ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: write every entry with the 60 s TTL in the same SET, or it answers until someone deletes it", keys[0], ttl)
+	corpus.PutDocument(stateBg, "acme", "idx-42", "a0", []float64{1, 0, 0, 0})
+	ctx.Clock.Advance(61)
+	later := mustSearch(ctx, "acme", 2)
+	ctx.Assert(!later.Cached && resultIDs(later) == "a0,a1", "61 seconds later, after a0 was added, the search answered %+v: the entry must have expired", later)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::vector<double> kQuery = {1, 0, 0, 0};
+
+// acme and globex in the active idx-42; acme's b1 in idx-43, built but not live.
+void seedState() {
+  corpus::activate("idx-42", 4);
+  corpus::putDocument("acme", "idx-42", "a1", {0.9, 0.1, 0, 0});
+  corpus::putDocument("acme", "idx-42", "a2", {0.5, 0.5, 0, 0});
+  corpus::putDocument("acme", "idx-42", "a3", {0.1, 0.9, 0, 0});
+  corpus::putDocument("globex", "idx-42", "g1", {1, 0, 0, 0});
+  corpus::putDocument("acme", "idx-43", "b1", {1, 0, 0, 0});
+}
+
+std::string ids(const nlohmann::json& result) {
+  std::string out;
+  for (const auto& h : result.value("hits", nlohmann::json::array())) out += (out.empty() ? "" : ",") + h.value("id", std::string());
+  return out;
+}
+
+bool cached(const nlohmann::json& result) { return result.value("cached", false); }
+
+}  // namespace
+
+void CheckTenantKey(harness::Ctx& ctx) {
+  seedState();
+  const auto first = cachedSearch("acme", kQuery, 2);
+  ctx.Assert(ids(first) == "a1,a2" && !cached(first), "acme's first search must miss and answer a1, a2, got %s", first.dump());
+  const auto again = cachedSearch("acme", kQuery, 2);
+  ctx.Assert(cached(again) && ids(again) == "a1,a2", "the same search repeated must be served from the cache, got %s", again.dump());
+  const auto globex = cachedSearch("globex", kQuery, 2);
+  ctx.Assert(ids(globex).find("a1") == std::string::npos, "globex ran the query acme ran and received acme's documents %s: the key must carry the tenant", globex.dump());
+  ctx.Assert(ids(globex) == "g1" && !cached(globex), "globex's search must miss and answer g1, got %s", globex.dump());
+  const std::string key = "search:globex:idx-42:" + fingerprint::queryDigest(kQuery) + ":2";
+  ctx.Equal(ctx.Redis.Exists(key), 1, "globex's entry must be %s; Redis holds %q; exists", key, ctx.Redis.Keys("search:*"));
+}
+
+void CheckVersionKey(harness::Ctx& ctx) {
+  seedState();
+  const auto before = cachedSearch("acme", kQuery, 2);
+  ctx.Equal(before.value("index_version", std::string()), "idx-42", "the first search's index version");
+  corpus::activate("idx-43", 4);
+  const auto after = cachedSearch("acme", kQuery, 2);
+  ctx.Assert(after.value("index_version", std::string()) == "idx-43" && ids(after) == "b1",
+             "after the switch to idx-43 the search answered %s: an entry written for idx-42 was served. Resolve the active version before the lookup and put it in the key", after.dump());
+  const std::string key = "search:acme:idx-43:" + fingerprint::queryDigest(kQuery) + ":2";
+  ctx.Equal(ctx.Redis.Exists(key), 1, "the idx-43 entry must be %s; Redis holds %q; exists", key, ctx.Redis.Keys("search:*"));
+}
+
+void CheckKKey(harness::Ctx& ctx) {
+  seedState();
+  const auto two = cachedSearch("acme", kQuery, 2);
+  ctx.Equal(ids(two), "a1,a2", "a search for 2");
+  const auto three = cachedSearch("acme", kQuery, 3);
+  ctx.Assert(three.value("k", 0L) == 3 && ids(three) == "a1,a2,a3", "a search for 3 after a search for 2 answered %s: the entry for k 2 was served. The key must carry k", three.dump());
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  seedState();
+  cachedSearch("acme", kQuery, 2);
+  const auto keys = ctx.Redis.Keys("search:*");
+  ctx.Equal(keys.size(), 1, "one search must write one entry; Redis holds %q; entries", keys);
+  const long long ttl = ctx.Redis.TTL(keys[0]);
+  ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: write every entry with the 60 s TTL in the same SET, or it answers until someone deletes it", keys[0], ttl);
+  corpus::putDocument("acme", "idx-42", "a0", {1, 0, 0, 0});
+  ctx.Clock.Advance(61);
+  const auto later = cachedSearch("acme", kQuery, 2);
+  ctx.Assert(!cached(later) && ids(later) == "a0,a1", "61 seconds later, after a0 was added, the search answered %s: the entry must have expired", later.dump());
+}
+`,
+  },
+  hints: [
+    "globex runs the query acme ran a minute ago and gets acme's documents; after the switch to idx-43 searches still answer idx-42; asking for 3 after asking for 2 returns 2; old entries never go away.",
+    'The key is `search:{digest}` alone, so every tenant, version and k share one entry, and the active version is read only on a miss. A `SET` without an expiry keeps the entry until something deletes it.',
+    'Resolve `active_index()` first, key by `search:{tenant}:{version}:{query_digest(query)}:{k}`, and write with `ex=CACHE_TTL_S` (`EX`, `setex`, a duration) in the same `SET`.',
+  ],
+  debrief: `A cache key claims that every request mapping to it deserves the same answer, so it must carry every input that changes the answer: the tenant for isolation, the index version for correctness across a reindex, the digest and k for the query itself. Resolving the version before the lookup is what turns a reindex into a miss instead of a stale hit. The TTL covers what no key can express: a document added or deleted inside the same version. Production caches add a memory budget per tenant, coalesce concurrent misses on one hot key so the shards see one query, and skip caching answers a degraded shard set produced.`,
 };

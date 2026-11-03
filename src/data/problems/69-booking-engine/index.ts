@@ -61,6 +61,12 @@ One service, **bookd**, on one \`booking\` support package every step imports: \
 5. \`GET /v1/resources/{id}/availability\`: free slots over at most 90 days, from the live map with
    confirmed bookings and live holds excluded, in a zone the response names.
 
+## The debugging habit
+
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
+
 ## Left out on purpose
 
 Payment processing, recurring bookings, resource catalogues and pricing, staff scheduling,

@@ -5,360 +5,265 @@ export const stateStep: Step = {
   title: 'Redis feature cache with a single-flight refresh',
   concept: 'redis',
   file: 'state',
-  focus: ['recsvc', 'redis', 'features'],
+  focus: ['api', 'redis', 'features'],
   task: `## Task
 
-**Starting point.** The starter implements \`load_features(tenant, user)\`, the call the ranking path
-makes before it scores a request: it reads the cached vector, returns it on a hit, and on a miss
-asks the feature service and writes the result back. It serves the demo and hides five flaws.
+**Starting point.** The starter is \`load_features(tenant, user_id)\`, the feature read the ranking
+client (step 3) makes before every call to the model: it GETs \`features:{user_id}\`, answers a hit as
+\`{values, stale: false}\`, and on a miss calls \`FeatureService.UserFeatures\` over gRPC and SETs the
+vector back. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Rankings served from another tenant's data, a vector that
-outlives catalog changes, a herd of feature-service calls at every expiry, empty rankings while the
-feature service restarts, and a key wedged after one failed refresh.
+**Failure mode the checks target.** Two tenants' users with the same id share one vector; a cached
+vector never expires; a cold user requested twice at once costs two feature-service calls, so every
+expiry of a busy user's vector becomes a herd; and while the feature service restarts, ranking gets
+no features at all.
 
-- Key the vector **per \`(tenant, user)\`** as \`features:{tenant}:{user}\`; a user id is only unique
-  inside a tenant.
-- Write the fresh copy with a **TTL of 300 s** (\`TTL_S = 300\`, as \`ex=\`/\`EX\`/\`Expire\`/\`setex\`).
-- A miss is refreshed by **exactly one caller**: take
-  \`SET lock:features:{tenant}:{user} 1 NX EX LOCK_TTL_S\` (5 s) first. Others sleep 50 ms and
-  re-read \`features:{tenant}:{user}\` until it appears or the lock TTL passes.
-- On every successful refresh write a **stale copy** at \`features:stale:{tenant}:{user}\`
-  (\`STALE_TTL_S = 86_400\`); when the refresh fails, return it with \`stale=True\`.
-- Release the lock in a \`finally\`/\`defer\`/scope guard, on the failure path too, and let a
-  follower that outlives the lock TTL take over the refresh.`,
+- Key the vector by tenant and user, \`features:{tenant}:{user_id}\`, written with \`EX 300\`
+  (\`FEATURES_TTL_S\`).
+- Refresh a miss only under \`SET lock:features:{tenant}:{user_id} 1 NX EX 5\` (\`LOCK_TTL_S\`). A
+  caller that finds the lock taken does not call the feature service: it answers the stale copy, or
+  nothing (\`None\`, \`null\`, \`nil\`). Release the lock in \`finally\` (\`defer\`, a scope guard), on
+  the failure path too.
+- Every refresh also writes \`features:stale:{tenant}:{user_id}\` with \`EX 86400\` (\`STALE_TTL_S\`);
+  when the feature service fails, answer that copy as \`{values, stale: true}\`.`,
   sequence: {
-    participants: ['Ranking path', 'Concurrent request', 'Redis', 'Feature service'],
+    participants: ['Ranking client', 'Concurrent request', 'Redis', 'Feature service'],
     messages: [
-      {from: 'Ranking path', to: 'Redis', label: 'GET features:acme:u-42 → (nil)', kind: 'sync'},
-      {from: 'Concurrent request', to: 'Redis', label: 'GET features:acme:u-42 → (nil)', kind: 'sync'},
-      {from: 'Ranking path', to: 'Redis', label: 'SET lock:features:acme:u-42 1 NX EX 5 → OK', kind: 'sync'},
+      {from: 'Ranking client', to: 'Redis', label: 'GET features:t1:u-1 → (nil)', kind: 'sync'},
+      {from: 'Ranking client', to: 'Redis', label: 'SET lock:features:t1:u-1 1 NX EX 5 → OK', kind: 'sync'},
+      {from: 'Concurrent request', to: 'Redis', label: 'SET lock:features:t1:u-1 NX → (nil)', kind: 'sync'},
+      {from: 'Redis', to: 'Concurrent request', label: 'stale copy, or nothing: no second refresh', kind: 'reply'},
+      {from: 'Ranking client', to: 'Feature service', label: 'UserFeatures(t1, u-1)', kind: 'sync'},
+      {from: 'Feature service', to: 'Ranking client', label: 'vector · or UNAVAILABLE → stale copy', kind: 'reply'},
       {
-        from: 'Concurrent request',
+        from: 'Ranking client',
         to: 'Redis',
-        label: 'SET lock:features:acme:u-42 1 NX → (nil): it waits instead of refreshing',
-        kind: 'sync',
-      },
-      {from: 'Ranking path', to: 'Feature service', label: 'Get(acme, u-42)', kind: 'sync'},
-      {from: 'Concurrent request', to: 'Redis', label: 'GET features:acme:u-42 every 50 ms', kind: 'sync'},
-      {from: 'Feature service', to: 'Ranking path', label: 'vector', kind: 'reply'},
-      {
-        from: 'Ranking path',
-        to: 'Redis',
-        label: 'SET features:acme:u-42 EX 300 · SET features:stale:acme:u-42 EX 86400 · DEL lock',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Concurrent request', label: 'vector (one refresh served both)', kind: 'reply'},
-      {from: 'Feature service', to: 'Ranking path', label: 'unavailable on a later refresh', kind: 'reply'},
-      {
-        from: 'Ranking path',
-        to: 'Redis',
-        label: 'GET features:stale:acme:u-42 → previous vector, stale=True',
+        label: 'SET features:t1:u-1 EX 300 · SET features:stale:t1:u-1 EX 86400 · DEL lock',
         kind: 'sync',
       },
     ],
   },
   checks: [
     {
-      id: 'ttl',
-      title: 'Caches the vector with a 300 s TTL',
+      id: 'tenant-key',
+      title: 'Keys the vector by tenant and user',
       detail:
-        'The fresh copy is written with `TTL_S = 300` (`ex=`/`EX`/`Expire`/`setex`), so a catalog change reaches the ranking within five minutes. The starter writes the vector with no expiry at all, so the first value a user ever gets is the one they keep.',
+        'The cache key is `features:{tenant}:{user_id}`: a user id is unique only inside its tenant, and the starter keys by the user id alone, so two tenants share one vector.',
       match: {
-        python: {all: [/\bTTL_S = 300/, /r\.set\(key, blob, ex=TTL_S\)/]},
-        typescript: {all: [/\bTTL_S = 300/, /r\.set\(key, blob, 'EX', TTL_S\)/]},
-        go: {all: [/ttlS\s*=\s*300/, /rdb\.Set\(ctx, key, blob, ttlS\*time\.Second\)/]},
-        scala: {all: [/\bTtlS = 300L/, /jedis\.setex\(key, TtlS, blob\)/]},
-        cpp: {all: [/\bkTtlS = 300/, /redis\.set\(key, blob, std::chrono::seconds\{kTtlS\}\)/]},
+        python: {all: [/f"features:\{tenant\}:\{user_id\}"/], none: [/f"features:\{user_id\}"/]},
+        typescript: {all: [/`features:\$\{tenant\}:\$\{userId\}`/], none: [/`features:\$\{userId\}`/]},
+        go: {all: [/"features:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*userID/], none: [/"features:"\s*\+\s*userID/]},
+        scala: {all: [/s"features:\$tenant:\$userId"/], none: [/s"features:\$userId"/]},
+        cpp: {all: [/"features:"\s*\+\s*tenant\s*\+\s*":"\s*\+\s*user_id/], none: [/"features:"\s*\+\s*user_id/]},
       },
     },
     {
-      id: 'tenant-key',
-      title: 'Keys the cache by (tenant, user)',
+      id: 'ttl',
+      title: 'Caches the vector for 300 seconds',
       detail:
-        'The key is `features:{tenant}:{user}`: both ids are part of it. The starter keys by the user id alone, so two tenants that share a user id collide — the first writer wins and the second tenant is ranked from the first tenant’s vector.',
+        'The vector is written with `FEATURES_TTL_S` = 300 as its expiry, so a user whose behaviour changed is re-read within five minutes; the starter writes it with no expiry.',
       match: {
-        python: {all: [/features:\{tenant\}:\{user\}/], none: [/features:\{user\}/]},
-        typescript: {all: [/features:\$\{tenant\}:\$\{user\}/], none: [/features:\$\{user\}/]},
-        go: {all: [/"features:" \+ tenant \+ ":" \+ user/], none: [/"features:" \+ user/]},
-        scala: {all: [/s"features:\$tenant:\$user"/], none: [/s"features:\$user"/]},
-        cpp: {all: [/"features:" \+ tenant \+ ":" \+ user/], none: [/"features:" \+ user/]},
+        python: {all: [/FEATURES_TTL_S\s*=\s*300\b/, /ex=FEATURES_TTL_S/]},
+        typescript: {all: [/FEATURES_TTL_S\s*=\s*300\b/, /'EX',\s*FEATURES_TTL_S/]},
+        go: {all: [/featuresTTL\s*=\s*300\s*\*\s*time\.Second/, /\.Set\([^\n]*featuresTTL\)/]},
+        scala: {all: [/FeaturesTtlSeconds\s*=\s*300L?\b/, /\.ex\(\s*FeaturesTtlSeconds\s*\)/]},
+        cpp: {all: [/kFeaturesTtl\{300\}/, /\.set\([^\n]*kFeaturesTtl\)/]},
       },
     },
     {
       id: 'single-flight',
-      title: 'Refreshes once per miss under concurrency',
+      title: 'One refresh per miss, under a lock released on every path',
       detail:
-        'The caller that wins `SET lock:features:{tenant}:{user} 1 NX EX LOCK_TTL_S` calls the feature service; every concurrent miss sleeps, re-reads the fresh key and waits for the value the winner publishes instead of calling the service too. The starter has no lock, so a cold key with N concurrent requests makes N identical calls.',
+        'A miss takes `lock:features:{tenant}:{user_id}` with `NX` and a 5-second expiry before it calls the feature service; a caller that finds it taken answers the stale copy instead of calling too; the lock is released in `finally`/`defer`/a scope guard.',
       match: {
         python: {
-          all: [/nx=True/, /ex=LOCK_TTL_S/, /time\.sleep\(POLL_S\)/],
-          order: [/nx=True/, /features\.get\(/],
+          all: [/lock:features:/, /nx=True/, /finally:/, /\.delete\(\s*lock/],
+          order: [/nx=True/, /\.UserFeatures\(/],
         },
         typescript: {
-          all: [/'NX'/, /'EX', LOCK_TTL_S/, /deadline/],
-          order: [/'NX'/, /featureService\.get\(/],
+          all: [/lock:features:/, /'NX'/, /finally\s*\{/, /\.del\(\s*lock/],
+          order: [/'NX'/, /\.UserFeatures\(/],
         },
         go: {
-          all: [/SetNX\(ctx, lock, "1", lockTtlS\)/, /time\.Sleep\(pollS\)/, /deadline/],
-          order: [/SetNX\(/, /features\.Get\(/],
+          all: [/lock:features:/, /\.SetNX\(/, /defer rdb\.Del\(/],
+          order: [/\.SetNX\(/, /\.UserFeatures\(/],
         },
         scala: {
-          all: [/SetParams\.setParams\(\)\.nx\(\)\.ex\(LockTtlS\)/, /Thread\.sleep\(PollMillis\)/, /deadline/],
-          order: [/\.nx\(\)/, /fetchFeatures\(/],
+          all: [/lock:features:/, /\.nx\(\)/, /finally/, /\.del\(\s*lock/],
+          order: [/\.nx\(\)/, /\.userFeatures\(/],
         },
         cpp: {
-          all: [/UpdateType::NOT_EXIST/, /sleep_for\(kPoll\)/, /deadline/],
-          order: [/UpdateType::NOT_EXIST/, /fetchFeatures\(/],
+          all: [/lock:features:/, /UpdateType::NOT_EXIST/, /~\w+\(\)\s*\{[^}]*\.del\(/],
+          order: [/UpdateType::NOT_EXIST/, /->UserFeatures\(/],
         },
       },
     },
     {
       id: 'stale-fallback',
-      title: 'Serves the stale copy when the refresh fails',
+      title: 'Answers the stale copy when the feature service fails',
       detail:
-        'A longer-lived stale copy `features:stale:{tenant}:{user}` (`STALE_TTL_S = 86_400`) is written on every successful refresh, and when the refresh fails the previous features are returned marked `stale=True` instead of empty ones. The starter has no stale copy at all and degrades to an empty vector.',
+        'Every refresh writes `features:stale:{tenant}:{user_id}` for a day; a failed `UserFeatures` call answers that copy marked `stale`, where the starter lets the error through and ranking gets no features.',
       match: {
-        python: {all: [/STALE_TTL_S/, /features:stale:\{tenant\}:\{user\}/, /"stale": True/]},
-        typescript: {all: [/STALE_TTL_S/, /features:stale:/, /stale: true/]},
-        go: {all: [/features:stale:/, /staleTtlS\*time\.Second/, /Stale: true/]},
-        scala: {all: [/features:stale:/, /setex\(staleKey\(tenant, user\), StaleTtlS, blob\)/, /stale = true/]},
-        cpp: {all: [/features:stale:/, /std::chrono::seconds\{kStaleTtlS\}/, /stale = true/]},
-      },
-    },
-    {
-      id: 'lock-release',
-      title: 'Releases the lock on every path',
-      detail:
-        'The lock is released after the refresh — a `finally`/`defer`/scope guard, so the failure path releases it too, with `EX` as the crash net — and a follower that outlives the lock TTL takes over the refresh. A lock left behind wedges the key at its first failed refresh.',
-      match: {
-        python: {all: [/finally:/, /r\.delete\(lock\)/]},
-        typescript: {all: [/finally/, /r\.del\(lock\)/]},
-        go: {
-          all: [/defer rdb\.Del\(ctx, lock\)/],
-          order: [/SetNX\(ctx, lock/, /rdb\.Del\(ctx, lock\)/],
+        python: {all: [/features:stale:/, /ex=STALE_TTL_S/, /except grpc\.RpcError/, /"stale":\s*True/]},
+        typescript: {all: [/features:stale:/, /'EX',\s*STALE_TTL_S/, /catch/, /stale:\s*true/]},
+        go: {all: [/features:stale:/, /staleTTL\)/, /Stale:\s*true/]},
+        scala: {
+          all: [/features:stale:/, /\.ex\(\s*StaleTtlSeconds\s*\)/, /StatusRuntimeException/, /stale\s*=\s*true/],
         },
-        scala: {all: [/finally/, /jedis\.del\(lock\)/]},
-        cpp: {all: [/~Release\(\)/, /redis\.del\(lock\)/]},
+        cpp: {all: [/features:stale:/, /kStaleTtl\)/, /\.ok\(\)/, /\btrue\}/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""load_features: the ranking path's read of the per-(tenant, user) feature vector."""
-import json
+      starter: `import json
 
+import grpc
 import redis
 
+import ranking_pb2
+import ranking_pb2_grpc
+
+FEATURES_DEADLINE_S = 0.3
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
+features = ranking_pb2_grpc.FeatureServiceStub(grpc.insecure_channel("features:9000"))
 
 
-class FeatureService:
-    def get(self, tenant: str, user: str) -> dict[str, float]:
-        """The feature service's vector for one (tenant, user)."""
-        raise NotImplementedError
-
-
-features = FeatureService()
-
-
-def load_features(tenant: str, user: str) -> dict:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    key = f"features:{user}"
+def load_features(tenant: str, user_id: str) -> dict | None:
+    """The user's feature vector for ranking, {values, stale}, or None when there is none to give."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    key = f"features:{user_id}"
     cached = r.get(key)
     if cached is not None:
-        return {"features": json.loads(cached), "stale": False}
-    try:
-        vector = features.get(tenant, user)
-    except Exception:
-        return {"features": {}, "stale": False}
-    r.set(key, json.dumps(vector))
-    return {"features": vector, "stale": False}
+        return {"values": json.loads(cached), "stale": False}
+    vector = features.UserFeatures(ranking_pb2.FeaturesRequest(tenant=tenant, user_id=user_id), timeout=FEATURES_DEADLINE_S)
+    values = list(vector.values)
+    r.set(key, json.dumps(values))
+    return {"values": values, "stale": False}
 `,
-      solution: `"""load_features: one refresh per miss, with the stale copy served when that refresh fails."""
-import json
-import time
-from typing import Any
+      solution: `import json
 
+import grpc
 import redis
-from fastapi import HTTPException
 
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
+import ranking_pb2
+import ranking_pb2_grpc
 
-TTL_S = 300
+FEATURES_DEADLINE_S = 0.3
+FEATURES_TTL_S = 300
 STALE_TTL_S = 86_400
 LOCK_TTL_S = 5
-POLL_S = 0.05
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+features = ranking_pb2_grpc.FeatureServiceStub(grpc.insecure_channel("features:9000"))
 
 
-class FeatureService:
-    def get(self, tenant: str, user: str) -> dict[str, float]:
-        """The feature service's vector for one (tenant, user)."""
-        raise NotImplementedError
+def stale_copy(tenant: str, user_id: str) -> dict | None:
+    """The vector the last good refresh kept, marked stale, or None."""
+    raw = r.get(f"features:stale:{tenant}:{user_id}")
+    return {"values": json.loads(raw), "stale": True} if raw is not None else None
 
 
-features = FeatureService()
-
-
-def features_key(tenant: str, user: str) -> str:
-    """The fresh copy the ranking path reads: one key per (tenant, user)."""
-    return f"features:{tenant}:{user}"
-
-
-def stale_key(tenant: str, user: str) -> str:
-    """The last known good copy: written with a longer TTL so a failed refresh can still serve it."""
-    return f"features:stale:{tenant}:{user}"
-
-
-def lock_key(tenant: str, user: str) -> str:
-    """The single-flight lock: one refresher per miss."""
-    return f"lock:features:{tenant}:{user}"
-
-
-def serve_stale(tenant: str, user: str) -> dict[str, Any]:
-    """The previous features, marked degraded; 503 when this key was never refreshed."""
-    cached = r.get(stale_key(tenant, user))
-    if cached is None:
-        raise HTTPException(status_code=503, detail="features unavailable")
-    return {"features": json.loads(cached), "stale": True}
-
-
-def load_features(tenant: str, user: str) -> dict[str, Any]:
-    """One refresh per miss; concurrent callers wait on the value the leader publishes."""
-    key = features_key(tenant, user)
+def load_features(tenant: str, user_id: str) -> dict | None:
+    """The user's feature vector for ranking, {values, stale}, or None when there is none to give."""
+    key = f"features:{tenant}:{user_id}"
     cached = r.get(key)
     if cached is not None:
-        return {"features": json.loads(cached), "stale": False}
-
-    lock = lock_key(tenant, user)
+        return {"values": json.loads(cached), "stale": False}
+    lock = f"lock:features:{tenant}:{user_id}"
     if not r.set(lock, "1", nx=True, ex=LOCK_TTL_S):
-        # Someone else is refreshing: wait for their value instead of calling the service too.
-        deadline = time.monotonic() + LOCK_TTL_S
-        while time.monotonic() < deadline:
-            time.sleep(POLL_S)
-            cached = r.get(key)
-            if cached is not None:
-                return {"features": json.loads(cached), "stale": False}
-        if not r.set(lock, "1", nx=True, ex=LOCK_TTL_S):
-            return serve_stale(tenant, user)  # the leader died: waiters take the fallback
-
+        return stale_copy(tenant, user_id)  # another request is refreshing: one miss, one call
     try:
-        vector = features.get(tenant, user)
-        blob = json.dumps(vector)
-        r.set(key, blob, ex=TTL_S)
-        r.set(stale_key(tenant, user), blob, ex=STALE_TTL_S)
-        return {"features": vector, "stale": False}
-    except Exception:
-        return serve_stale(tenant, user)
+        try:
+            vector = features.UserFeatures(ranking_pb2.FeaturesRequest(tenant=tenant, user_id=user_id), timeout=FEATURES_DEADLINE_S)
+        except grpc.RpcError:
+            return stale_copy(tenant, user_id)
+        values = list(vector.values)
+        r.set(key, json.dumps(values), ex=FEATURES_TTL_S)
+        r.set(f"features:stale:{tenant}:{user_id}", json.dumps(values), ex=STALE_TTL_S)
+        return {"values": values, "stale": False}
     finally:
-        r.delete(lock)
+        r.delete(lock)  # on the failure path too, or nobody refreshes this user for LOCK_TTL_S
 `,
     },
     typescript: {
-      starter: `/** loadFeatures: the ranking path's read of the per-(tenant, user) feature vector. */
-import {Redis} from 'ioredis';
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
 
-const r = new Redis('redis://redis:6379');
+import type {Features} from 'recs/types';
 
-interface Features {
-  [name: string]: number;
-}
+export const FEATURES_DEADLINE_MS = 300;
 
-/** The feature service's vector for one (tenant, user). */
-const featureService = {
-  async get(tenant: string, user: string): Promise<Features> {
-    throw new Error('feature service not implemented');
-  },
+const redis = new Redis({host: 'redis', port: 6379});
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('ranking.proto')) as unknown as {
+  recsys: {FeatureService: grpc.ServiceClientConstructor};
+};
+const features = new pkg.recsys.FeatureService('features:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  UserFeatures(request: {tenant: string; user_id: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{values: number[]}>;
 };
 
-export async function loadFeatures(tenant: string, user: string): Promise<{features: Features; stale: boolean}> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const key = \`features:\${user}\`;
-  const cached = await r.get(key);
-  if (cached !== null) return {features: JSON.parse(cached) as Features, stale: false};
-  try {
-    const vector = await featureService.get(tenant, user);
-    await r.set(key, JSON.stringify(vector));
-    return {features: vector, stale: false};
-  } catch {
-    return {features: {}, stale: false};
-  }
+/** The user's feature vector for ranking, or null when there is none to give. */
+export async function loadFeatures(tenant: string, userId: string): Promise<Features | null> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const key = \`features:\${userId}\`;
+  const cached = await redis.get(key);
+  if (cached !== null) return {values: JSON.parse(cached) as number[], stale: false};
+  const vector = await features.UserFeatures({tenant, user_id: userId}, new grpc.Metadata(), {deadline: Date.now() + FEATURES_DEADLINE_MS});
+  const values = [...vector.values];
+  await redis.set(key, JSON.stringify(values));
+  return {values, stale: false};
 }
 `,
-      solution: `/** loadFeatures: one refresh per miss, with the stale copy served when that refresh fails. */
-import {setTimeout as sleep} from 'node:timers/promises';
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
 
-import {Redis} from 'ioredis';
+import type {Features} from 'recs/types';
 
-const r = new Redis('redis://redis:6379');
+export const FEATURES_DEADLINE_MS = 300;
+export const FEATURES_TTL_S = 300;
+export const STALE_TTL_S = 86_400;
+export const LOCK_TTL_S = 5;
 
-const TTL_S = 300;
-const STALE_TTL_S = 86_400;
-const LOCK_TTL_S = 5;
-const POLL_MS = 50;
+const redis = new Redis({host: 'redis', port: 6379});
 
-interface Features {
-  [name: string]: number;
-}
-
-interface FeatureResult {
-  features: Features;
-  stale: boolean;
-}
-
-/** The feature service's vector for one (tenant, user). */
-const featureService = {
-  async get(tenant: string, user: string): Promise<Features> {
-    throw new Error('feature service not implemented');
-  },
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('ranking.proto')) as unknown as {
+  recsys: {FeatureService: grpc.ServiceClientConstructor};
+};
+const features = new pkg.recsys.FeatureService('features:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  UserFeatures(request: {tenant: string; user_id: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{values: number[]}>;
 };
 
-function freshKey(tenant: string, user: string): string {
-  return \`features:\${tenant}:\${user}\`;
+/** The vector the last good refresh kept, marked stale, or null. */
+async function staleCopy(tenant: string, userId: string): Promise<Features | null> {
+  const raw = await redis.get(\`features:stale:\${tenant}:\${userId}\`);
+  return raw === null ? null : {values: JSON.parse(raw) as number[], stale: true};
 }
 
-function staleKey(tenant: string, user: string): string {
-  return \`features:stale:\${tenant}:\${user}\`;
-}
-
-function lockKey(tenant: string, user: string): string {
-  return \`lock:features:\${tenant}:\${user}\`;
-}
-
-/** The previous features, marked degraded; throws when this key was never refreshed. */
-async function serveStale(tenant: string, user: string): Promise<FeatureResult> {
-  const cached = await r.get(staleKey(tenant, user));
-  if (cached === null) throw new Error('features unavailable');
-  return {features: JSON.parse(cached) as Features, stale: true};
-}
-
-/** One refresh per miss; concurrent callers wait on the value the leader publishes. */
-export async function loadFeatures(tenant: string, user: string): Promise<FeatureResult> {
-  const key = freshKey(tenant, user);
-  const cached = await r.get(key);
-  if (cached !== null) return {features: JSON.parse(cached) as Features, stale: false};
-
-  const lock = lockKey(tenant, user);
-  const won = (await r.set(lock, '1', 'EX', LOCK_TTL_S, 'NX')) === 'OK';
-  if (!won) {
-    // Someone else is refreshing: wait for their value instead of calling the service too.
-    const deadline = Date.now() + LOCK_TTL_S * 1000;
-    while (Date.now() < deadline) {
-      await sleep(POLL_MS);
-      const seen = await r.get(key);
-      if (seen !== null) return {features: JSON.parse(seen) as Features, stale: false};
-    }
-    if ((await r.set(lock, '1', 'EX', LOCK_TTL_S, 'NX')) !== 'OK') return serveStale(tenant, user);
-  }
+/** The user's feature vector for ranking, or null when there is none to give. */
+export async function loadFeatures(tenant: string, userId: string): Promise<Features | null> {
+  const key = \`features:\${tenant}:\${userId}\`;
+  const cached = await redis.get(key);
+  if (cached !== null) return {values: JSON.parse(cached) as number[], stale: false};
+  const lock = \`lock:features:\${tenant}:\${userId}\`;
+  // Another request is refreshing: one miss, one call.
+  if ((await redis.set(lock, '1', 'EX', LOCK_TTL_S, 'NX')) === null) return staleCopy(tenant, userId);
   try {
-    const vector = await featureService.get(tenant, user);
-    const blob = JSON.stringify(vector);
-    await r.set(key, blob, 'EX', TTL_S);
-    await r.set(staleKey(tenant, user), blob, 'EX', STALE_TTL_S);
-    return {features: vector, stale: false};
-  } catch {
-    return serveStale(tenant, user);
+    let vector: {values: number[]};
+    try {
+      vector = await features.UserFeatures({tenant, user_id: userId}, new grpc.Metadata(), {deadline: Date.now() + FEATURES_DEADLINE_MS});
+    } catch {
+      return await staleCopy(tenant, userId);
+    }
+    const values = [...vector.values];
+    await redis.set(key, JSON.stringify(values), 'EX', FEATURES_TTL_S);
+    await redis.set(\`features:stale:\${tenant}:\${userId}\`, JSON.stringify(values), 'EX', STALE_TTL_S);
+    return {values, stale: false};
   } finally {
-    await r.del(lock);
+    await redis.del(lock); // on the failure path too, or nobody refreshes this user for LOCK_TTL_S
   }
 }
 `,
@@ -369,45 +274,42 @@ export async function loadFeatures(tenant: string, user: string): Promise<Featur
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"time"
 
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "recs/gen/ranking"
+	"recs/types"
 )
 
-var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+const featuresDeadline = 300 * time.Millisecond
 
-// FeatureVector is the feature service's per-(tenant, user) vector.
-type FeatureVector map[string]float64
+var (
+	rdb             = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	featuresConn, _ = grpc.NewClient("features:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	featureService  = pb.NewFeatureServiceClient(featuresConn)
+)
 
-type featureService struct{}
-
-func (featureService) Get(ctx context.Context, tenant, user string) (FeatureVector, error) {
-	return nil, errors.New("feature service not implemented")
-}
-
-var features = featureService{}
-
-// loadFeatures: the ranking path's read of the per-(tenant, user) feature vector.
-func loadFeatures(ctx context.Context, tenant, user string) (FeatureVector, bool, error) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	key := "features:" + user
-	if blob, err := rdb.Get(ctx, key).Bytes(); err == nil {
-		var vector FeatureVector
-		if err := json.Unmarshal(blob, &vector); err != nil {
-			return nil, false, err
-		}
-		return vector, false, nil
+// loadFeatures is the user's feature vector for ranking, or nil when there is none to give.
+func loadFeatures(ctx context.Context, tenant, userID string) *types.Features {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	key := "features:" + userID
+	if cached, err := rdb.Get(ctx, key).Result(); err == nil {
+		var values []float64
+		json.Unmarshal([]byte(cached), &values)
+		return &types.Features{Values: values}
 	}
-	vector, err := features.Get(ctx, tenant, user)
+	callCtx, cancel := context.WithTimeout(ctx, featuresDeadline)
+	defer cancel()
+	vector, err := featureService.UserFeatures(callCtx, &pb.FeaturesRequest{Tenant: tenant, UserId: userID})
 	if err != nil {
-		return FeatureVector{}, false, nil
+		return nil
 	}
-	blob, err := json.Marshal(vector)
-	if err != nil {
-		return nil, false, err
-	}
-	rdb.Set(ctx, key, blob, 0)
-	return vector, false, nil
+	raw, _ := json.Marshal(vector.GetValues())
+	rdb.Set(ctx, key, raw, 0)
+	return &types.Features{Values: vector.GetValues()}
 }
 `,
       solution: `package main
@@ -415,385 +317,653 @@ func loadFeatures(ctx context.Context, tenant, user string) (FeatureVector, bool
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "recs/gen/ranking"
+	"recs/types"
 )
 
 const (
-	ttlS      = 300
-	staleTtlS = 86_400
-	lockTtlS  = 5 * time.Second
-	pollS     = 50 * time.Millisecond
+	featuresDeadline = 300 * time.Millisecond
+	featuresTTL      = 300 * time.Second
+	staleTTL         = 24 * time.Hour
+	lockTTL          = 5 * time.Second
 )
 
-var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+var (
+	rdb             = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	featuresConn, _ = grpc.NewClient("features:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	featureService  = pb.NewFeatureServiceClient(featuresConn)
+)
 
-// FeatureVector is the feature service's per-(tenant, user) vector.
-type FeatureVector map[string]float64
-
-// FeatureResult is what the ranking path reads: the vector and whether it is the degraded copy.
-type FeatureResult struct {
-	Vector FeatureVector
-	Stale  bool
-}
-
-type featureService struct{}
-
-func (featureService) Get(ctx context.Context, tenant, user string) (FeatureVector, error) {
-	return nil, errors.New("feature service not implemented")
-}
-
-var features = featureService{}
-
-func freshKey(tenant, user string) string {
-	return "features:" + tenant + ":" + user
-}
-
-func staleKey(tenant, user string) string {
-	return "features:stale:" + tenant + ":" + user
-}
-
-func lockKey(tenant, user string) string {
-	return "lock:features:" + tenant + ":" + user
-}
-
-// serveStale: the previous features, marked degraded; an error when this key was never refreshed.
-func serveStale(ctx context.Context, tenant, user string) (FeatureResult, error) {
-	blob, err := rdb.Get(ctx, staleKey(tenant, user)).Bytes()
+// staleCopy is the vector the last good refresh kept, marked stale, or nil.
+func staleCopy(ctx context.Context, tenant, userID string) *types.Features {
+	raw, err := rdb.Get(ctx, "features:stale:"+tenant+":"+userID).Result()
 	if err != nil {
-		return FeatureResult{}, errors.New("features unavailable")
+		return nil
 	}
-	var vector FeatureVector
-	if err := json.Unmarshal(blob, &vector); err != nil {
-		return FeatureResult{}, err
-	}
-	return FeatureResult{Vector: vector, Stale: true}, nil
+	var values []float64
+	json.Unmarshal([]byte(raw), &values)
+	return &types.Features{Values: values, Stale: true}
 }
 
-// loadFeatures: one refresh per miss; concurrent callers wait on the value the leader publishes.
-func loadFeatures(ctx context.Context, tenant, user string) (FeatureResult, error) {
-	key := freshKey(tenant, user)
-	if blob, err := rdb.Get(ctx, key).Bytes(); err == nil {
-		var vector FeatureVector
-		if err := json.Unmarshal(blob, &vector); err != nil {
-			return FeatureResult{}, err
-		}
-		return FeatureResult{Vector: vector, Stale: false}, nil
+// loadFeatures is the user's feature vector for ranking, or nil when there is none to give.
+func loadFeatures(ctx context.Context, tenant, userID string) *types.Features {
+	key := "features:" + tenant + ":" + userID
+	if cached, err := rdb.Get(ctx, key).Result(); err == nil {
+		var values []float64
+		json.Unmarshal([]byte(cached), &values)
+		return &types.Features{Values: values}
 	}
-
-	lock := lockKey(tenant, user)
-	won, err := rdb.SetNX(ctx, lock, "1", lockTtlS).Result()
+	lock := "lock:features:" + tenant + ":" + userID
+	if taken, _ := rdb.SetNX(ctx, lock, "1", lockTTL).Result(); !taken {
+		return staleCopy(ctx, tenant, userID) // another request is refreshing: one miss, one call
+	}
+	defer rdb.Del(ctx, lock) // on the failure path too, or nobody refreshes this user for lockTTL
+	callCtx, cancel := context.WithTimeout(ctx, featuresDeadline)
+	defer cancel()
+	vector, err := featureService.UserFeatures(callCtx, &pb.FeaturesRequest{Tenant: tenant, UserId: userID})
 	if err != nil {
-		return FeatureResult{}, err
+		return staleCopy(ctx, tenant, userID)
 	}
-	if !won {
-		// Someone else is refreshing: wait for their value instead of calling the service too.
-		deadline := time.Now().Add(lockTtlS)
-		for time.Now().Before(deadline) {
-			time.Sleep(pollS)
-			if blob, err := rdb.Get(ctx, key).Bytes(); err == nil {
-				var vector FeatureVector
-				if err := json.Unmarshal(blob, &vector); err != nil {
-					return FeatureResult{}, err
-				}
-				return FeatureResult{Vector: vector, Stale: false}, nil
-			}
-		}
-		if won, err = rdb.SetNX(ctx, lock, "1", lockTtlS).Result(); err != nil {
-			return FeatureResult{}, err
-		}
-		if !won {
-			// The leader died holding the lock: take the refresh over, or serve the stale copy.
-			return serveStale(ctx, tenant, user)
-		}
-	}
-	// The deferred release covers the failure path too: one failed refresh cannot wedge the key.
-	defer rdb.Del(ctx, lock)
-	vector, err := features.Get(ctx, tenant, user)
-	if err != nil {
-		return serveStale(ctx, tenant, user)
-	}
-	blob, err := json.Marshal(vector)
-	if err != nil {
-		return FeatureResult{}, err
-	}
-	rdb.Set(ctx, key, blob, ttlS*time.Second)
-	rdb.Set(ctx, staleKey(tenant, user), blob, staleTtlS*time.Second)
-	return FeatureResult{Vector: vector, Stale: false}, nil
+	raw, _ := json.Marshal(vector.GetValues())
+	rdb.Set(ctx, key, raw, featuresTTL)
+	rdb.Set(ctx, "features:stale:"+tenant+":"+userID, raw, staleTTL)
+	return &types.Features{Values: vector.GetValues()}
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
+      starter: `import java.util.concurrent.TimeUnit
+
+import io.grpc.ManagedChannelBuilder
+import redis.clients.jedis.JedisPooled
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
-final case class FeatureResult(features: Map[String, Double], stale: Boolean)
+import recs.Features
+import recsys.ranking.{FeatureServiceGrpc, FeaturesRequest}
 
-object FeatureCache {
-  val jedis = new Jedis("redis", 6379)
+object State {
+  val FeaturesDeadlineMs = 300L
 
-  /** The feature service's vector for one (tenant, user). */
-  def fetchFeatures(tenant: String, user: String): Map[String, Double] = ???
+  private val jedis = new JedisPooled("redis", 6379)
+  private val featureService = FeatureServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("features", 9000).usePlaintext().build())
 
-  def encode(vector: Map[String, Double]): String =
-    JsObject(vector.map { case (name, value) => name -> JsNumber(value) }).compactPrint
-
-  def decode(blob: String): Map[String, Double] =
-    blob.parseJson.asJsObject.fields.map { case (name, value) => name -> value.convertTo[Double] }
-
-  /** The ranking path's read of the per-(tenant, user) feature vector. */
-  def loadFeatures(tenant: String, user: String): FeatureResult = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val key = s"features:$user"
+  /** The user's feature vector for ranking, or None when there is none to give. */
+  def loadFeatures(tenant: String, userId: String): Option[Features] = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val key = s"features:$userId"
     Option(jedis.get(key)) match {
-      case Some(blob) => FeatureResult(decode(blob), stale = false)
+      case Some(cached) => Some(Features(cached.parseJson.convertTo[Vector[Double]], stale = false))
       case None =>
-        val vector =
-          try fetchFeatures(tenant, user)
-          catch { case _: Exception => Map.empty[String, Double] }
-        jedis.set(key, encode(vector))
-        FeatureResult(vector, stale = false)
+        val vector = featureService.withDeadlineAfter(FeaturesDeadlineMs, TimeUnit.MILLISECONDS).userFeatures(FeaturesRequest(tenant, userId))
+        jedis.set(key, vector.values.toVector.toJson.compactPrint)
+        Some(Features(vector.values, stale = false))
     }
   }
 }
 `,
-      solution: `import redis.clients.jedis.Jedis
+      solution: `import java.util.concurrent.TimeUnit
+
+import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+import redis.clients.jedis.JedisPooled
 import redis.clients.jedis.params.SetParams
-import spray.json.DefaultJsonProtocol._
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
-final case class FeatureResult(features: Map[String, Double], stale: Boolean)
+import recs.Features
+import recsys.ranking.{FeatureServiceGrpc, FeaturesRequest}
 
-object FeatureCache {
-  val TtlS = 300L
-  val StaleTtlS = 86400L
-  val LockTtlS = 5L
-  val PollMillis = 50L
+object State {
+  val FeaturesDeadlineMs = 300L
+  val FeaturesTtlSeconds = 300L
+  val StaleTtlSeconds = 86400L
+  val LockTtlSeconds = 5L
 
-  val jedis = new Jedis("redis", 6379)
+  private val jedis = new JedisPooled("redis", 6379)
+  private val featureService = FeatureServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("features", 9000).usePlaintext().build())
 
-  /** The feature service's vector for one (tenant, user). */
-  def fetchFeatures(tenant: String, user: String): Map[String, Double] = ???
+  /** The vector the last good refresh kept, marked stale, if any. */
+  def staleCopy(tenant: String, userId: String): Option[Features] =
+    Option(jedis.get(s"features:stale:$tenant:$userId")).map(raw => Features(raw.parseJson.convertTo[Vector[Double]], stale = true))
 
-  def freshKey(tenant: String, user: String): String = s"features:$tenant:$user"
-
-  def staleKey(tenant: String, user: String): String = s"features:stale:$tenant:$user"
-
-  def lockKey(tenant: String, user: String): String = s"lock:features:$tenant:$user"
-
-  def encode(vector: Map[String, Double]): String =
-    JsObject(vector.map { case (name, value) => name -> JsNumber(value) }).compactPrint
-
-  def decode(blob: String): Map[String, Double] =
-    blob.parseJson.asJsObject.fields.map { case (name, value) => name -> value.convertTo[Double] }
-
-  /** The previous features, marked degraded; throws when this key was never refreshed. */
-  def serveStale(tenant: String, user: String): FeatureResult =
-    Option(jedis.get(staleKey(tenant, user))) match {
-      case Some(blob) => FeatureResult(decode(blob), stale = true)
-      case None => throw new RuntimeException("features unavailable")
-    }
-
-  /** One refresh per miss; concurrent callers wait on the value the leader publishes. */
-  def loadFeatures(tenant: String, user: String): FeatureResult = {
-    val key = freshKey(tenant, user)
+  /** The user's feature vector for ranking, or None when there is none to give. */
+  def loadFeatures(tenant: String, userId: String): Option[Features] = {
+    val key = s"features:$tenant:$userId"
     Option(jedis.get(key)) match {
-      case Some(blob) => FeatureResult(decode(blob), stale = false)
-      case None => refresh(tenant, user, key)
+      case Some(cached) => Some(Features(cached.parseJson.convertTo[Vector[Double]], stale = false))
+      case None =>
+        val lock = s"lock:features:$tenant:$userId"
+        // Another request is refreshing: one miss, one call.
+        if (jedis.set(lock, "1", SetParams.setParams().nx().ex(LockTtlSeconds)) == null) staleCopy(tenant, userId)
+        else
+          try {
+            val vector = featureService.withDeadlineAfter(FeaturesDeadlineMs, TimeUnit.MILLISECONDS).userFeatures(FeaturesRequest(tenant, userId))
+            val raw = vector.values.toVector.toJson.compactPrint
+            jedis.set(key, raw, SetParams.setParams().ex(FeaturesTtlSeconds))
+            jedis.set(s"features:stale:$tenant:$userId", raw, SetParams.setParams().ex(StaleTtlSeconds))
+            Some(Features(vector.values, stale = false))
+          } catch {
+            case _: StatusRuntimeException => staleCopy(tenant, userId)
+          } finally {
+            jedis.del(lock) // on the failure path too, or nobody refreshes this user for LockTtlSeconds
+          }
     }
   }
-
-  /** Tries to become the single refresher; a follower waits, then takes over when the lock lapses. */
-  private def refresh(tenant: String, user: String, key: String): FeatureResult = {
-    val lock = lockKey(tenant, user)
-    val params = SetParams.setParams().nx().ex(LockTtlS)
-    if (jedis.set(lock, "1", params) != null) {
-      refreshUnderLock(tenant, user, lock, key)
-    } else {
-      val deadline = System.nanoTime() + LockTtlS * 1000000000L
-      var seen: Option[String] = None
-      while (seen.isEmpty && System.nanoTime() < deadline) {
-        Thread.sleep(PollMillis)
-        seen = Option(jedis.get(key))
-      }
-      seen match {
-        case Some(blob) => FeatureResult(decode(blob), stale = false)
-        case None =>
-          if (jedis.set(lock, "1", params) != null) refreshUnderLock(tenant, user, lock, key)
-          else serveStale(tenant, user)
-      }
-    }
-  }
-
-  /** The call the lock holder makes: fetch, publish the fresh and stale copies, then release. */
-  private def refreshUnderLock(tenant: String, user: String, lock: String, key: String): FeatureResult =
-    try {
-      val vector = fetchFeatures(tenant, user)
-      val blob = encode(vector)
-      jedis.setex(key, TtlS, blob)
-      jedis.setex(staleKey(tenant, user), StaleTtlS, blob)
-      FeatureResult(vector, stale = false)
-    } catch {
-      case _: Exception => serveStale(tenant, user)
-    } finally {
-      jedis.del(lock)
-    }
 }
 `,
     },
     cpp: {
-      starter: `#include <sw/redis++/redis++.h>
-
+      starter: `#include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
-
-#include <stdexcept>
-#include <string>
-
-using json = nlohmann::json;
-
-sw::redis::Redis redis("tcp://redis:6379");
-
-struct FeatureResult {
-  json features;
-  bool stale = false;
-};
-
-/** The feature service's vector for one (tenant, user). */
-json fetchFeatures(const std::string& tenant, const std::string& user) {
-  throw std::runtime_error("feature service not implemented");
-}
-
-// loadFeatures: the ranking path's read of the per-(tenant, user) feature vector.
-FeatureResult loadFeatures(const std::string& tenant, const std::string& user) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const auto key = "features:" + user;
-  if (const auto cached = redis.get(key)) {
-    FeatureResult fresh;
-    fresh.features = json::parse(*cached);
-    fresh.stale = false;
-    return fresh;
-  }
-  json vector = json::object();
-  try {
-    vector = fetchFeatures(tenant, user);
-  } catch (const std::exception&) {
-    return FeatureResult{json::object(), false};
-  }
-  redis.set(key, vector.dump());
-  FeatureResult fresh;
-  fresh.features = vector;
-  fresh.stale = false;
-  return fresh;
-}
-`,
-      solution: `#include <sw/redis++/redis++.h>
-
-#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <stdexcept>
+#include <optional>
 #include <string>
-#include <thread>
+#include <vector>
+
+#include "ranking.grpc.pb.h"
+#include "recs/types.h"
 
 using json = nlohmann::json;
 
-constexpr long long kTtlS = 300;
-constexpr long long kStaleTtlS = 86400;
-constexpr long long kLockTtlS = 5;
-constexpr auto kPoll = std::chrono::milliseconds{50};
+constexpr std::chrono::milliseconds kFeaturesDeadline{300};
 
 sw::redis::Redis redis("tcp://redis:6379");
+auto featureService = recsys::FeatureService::NewStub(grpc::CreateChannel("features:9000", grpc::InsecureChannelCredentials()));
 
-struct FeatureResult {
-  json features;
-  bool stale = false;
+// The user's feature vector for ranking, or nothing when there is none to give.
+std::optional<recs::Features> loadFeatures(const std::string& tenant, const std::string& user_id) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string key = "features:" + user_id;
+  if (const auto cached = redis.get(key)) return recs::Features{json::parse(*cached).get<std::vector<double>>(), false};
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + kFeaturesDeadline);
+  recsys::FeaturesRequest request;
+  request.set_tenant(tenant);
+  request.set_user_id(user_id);
+  recsys::FeatureVector vector;
+  if (!featureService->UserFeatures(&ctx, request, &vector).ok()) return std::nullopt;
+  const std::vector<double> values(vector.values().begin(), vector.values().end());
+  redis.set(key, json(values).dump());
+  return recs::Features{values, false};
+}
+`,
+      solution: `#include <grpcpp/grpcpp.h>
+#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
+
+#include <chrono>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "ranking.grpc.pb.h"
+#include "recs/types.h"
+
+using json = nlohmann::json;
+
+constexpr std::chrono::milliseconds kFeaturesDeadline{300};
+constexpr std::chrono::seconds kFeaturesTtl{300};
+constexpr std::chrono::seconds kStaleTtl{86400};
+constexpr std::chrono::seconds kLockTtl{5};
+
+sw::redis::Redis redis("tcp://redis:6379");
+auto featureService = recsys::FeatureService::NewStub(grpc::CreateChannel("features:9000", grpc::InsecureChannelCredentials()));
+
+// Releases the refresh lock when the refresh ends, on the failure path too.
+struct LockRelease {
+  std::string key;
+  ~LockRelease() { redis.del(key); }
 };
 
-/** The feature service's vector for one (tenant, user). */
-json fetchFeatures(const std::string& tenant, const std::string& user) {
-  throw std::runtime_error("feature service not implemented");
+// The vector the last good refresh kept, marked stale, or nothing.
+std::optional<recs::Features> staleCopy(const std::string& tenant, const std::string& user_id) {
+  const auto raw = redis.get("features:stale:" + tenant + ":" + user_id);
+  if (!raw) return std::nullopt;
+  return recs::Features{json::parse(*raw).get<std::vector<double>>(), true};
 }
 
-std::string freshKey(const std::string& tenant, const std::string& user) {
-  return "features:" + tenant + ":" + user;
-}
-
-std::string staleKey(const std::string& tenant, const std::string& user) {
-  return "features:stale:" + tenant + ":" + user;
-}
-
-std::string lockKey(const std::string& tenant, const std::string& user) {
-  return "lock:features:" + tenant + ":" + user;
-}
-
-FeatureResult makeFresh(const json& vector) {
-  FeatureResult result;
-  result.features = vector;
-  result.stale = false;
-  return result;
-}
-
-/** The previous features, marked degraded; throws when this key was never refreshed. */
-FeatureResult serveStale(const std::string& tenant, const std::string& user) {
-  const auto blob = redis.get(staleKey(tenant, user));
-  if (!blob) throw std::runtime_error("features unavailable");
-  FeatureResult result;
-  result.features = json::parse(*blob);
-  result.stale = true;
-  return result;
-}
-
-/** One refresh per miss; concurrent callers wait on the value the leader publishes. */
-FeatureResult loadFeatures(const std::string& tenant, const std::string& user) {
-  const auto key = freshKey(tenant, user);
-  if (const auto cached = redis.get(key)) return makeFresh(json::parse(*cached));
-
-  const auto lock = lockKey(tenant, user);
-  bool won = redis.set(lock, "1", std::chrono::seconds{kLockTtlS}, sw::redis::UpdateType::NOT_EXIST);
-  if (!won) {
-    // Someone else is refreshing: wait for their value instead of calling the service too.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{kLockTtlS};
-    while (std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(kPoll);
-      if (const auto seen = redis.get(key)) return makeFresh(json::parse(*seen));
-    }
-    won = redis.set(lock, "1", std::chrono::seconds{kLockTtlS}, sw::redis::UpdateType::NOT_EXIST);
-    if (!won) return serveStale(tenant, user);
+// The user's feature vector for ranking, or nothing when there is none to give.
+std::optional<recs::Features> loadFeatures(const std::string& tenant, const std::string& user_id) {
+  const std::string key = "features:" + tenant + ":" + user_id;
+  if (const auto cached = redis.get(key)) return recs::Features{json::parse(*cached).get<std::vector<double>>(), false};
+  const std::string lock = "lock:features:" + tenant + ":" + user_id;
+  if (!redis.set(lock, "1", kLockTtl, sw::redis::UpdateType::NOT_EXIST)) {
+    return staleCopy(tenant, user_id);  // another request is refreshing: one miss, one call
   }
-  // The scope guard releases the lock on every path, the failure path included.
-  struct Release {
-    const std::string& lock;
-    ~Release() { redis.del(lock); }
-  } release{lock};
-  try {
-    const auto vector = fetchFeatures(tenant, user);
-    const auto blob = vector.dump();
-    redis.set(key, blob, std::chrono::seconds{kTtlS});
-    redis.set(staleKey(tenant, user), blob, std::chrono::seconds{kStaleTtlS});
-    return makeFresh(vector);
-  } catch (const std::exception&) {
-    return serveStale(tenant, user);
-  }
+  const LockRelease release{lock};
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + kFeaturesDeadline);
+  recsys::FeaturesRequest request;
+  request.set_tenant(tenant);
+  request.set_user_id(user_id);
+  recsys::FeatureVector vector;
+  if (!featureService->UserFeatures(&ctx, request, &vector).ok()) return staleCopy(tenant, user_id);
+  const std::vector<double> values(vector.values().begin(), vector.values().end());
+  redis.set(key, json(values).dump(), kFeaturesTtl);
+  redis.set("features:stale:" + tenant + ":" + user_id, json(values).dump(), kStaleTtl);
+  return recs::Features{values, false};
 }
 `,
     },
   },
-  hints: [
-    'Operators see a feature-service graph with a spike of identical calls every five minutes, a tenant complaining that a user was ranked from data it does not own, and empty lists during a feature-service restart.',
-    'The key omits the tenant, the write has no expiry, every concurrent miss calls the service because nothing elects a refresher, and a failed refresh has no older copy to fall back to.',
-    'Key by `features:{tenant}:{user}`, `set` with `ex=TTL_S`, `SET lock NX EX LOCK_TTL_S` then poll on loss, write `features:stale:` with `STALE_TTL_S` on success and return it with `stale=True` on failure, delete the lock in `finally`.',
-  ],
-  debrief: `Cache-aside plus two additions that matter under load and under failure. The lock is a
-per-key mutex: \`NX\` elects one refresher, \`EX\` makes a crashed one harmless, and waiters read the
-value the winner publishes, so N concurrent misses become one feature-service call per TTL. The
-fresh key expires after 300 s so catalog changes become visible, but an old vector beats none, so a
-longer-lived copy is served marked degraded. The tenant belongs in the key because a user id is only
-unique inside a tenant.
+  harness: {
+    python: `import grpc
 
-Production caches add in-process single-flight, jittered TTLs so entries written together do not
-expire together, a lock token so a slow refresher cannot delete a successor's lock, and background
-revalidation so nobody waits.`,
+import ranking_pb2
+import ranking_pb2_grpc
+
+T1 = [0.25, 0.375]  # every user of tenant t1
+T2 = [0.75, 0.875]  # every user of tenant t2
+
+
+class FeatureService(ranking_pb2_grpc.FeatureServiceServicer):
+    def UserFeatures(self, request, context):
+        base = 0.25 if request.tenant == "t1" else 0.75
+        return ranking_pb2.FeatureVector(values=[base, base + 0.125])
+
+
+def _state(ctx):
+    ctx.grpc.serve(ranking_pb2_grpc.add_FeatureServiceServicer_to_server, FeatureService())
+    return ctx.load("state")
+
+
+def _calls(ctx):
+    return len(ctx.grpc.calls_to("UserFeatures"))
+
+
+def _cached_keys(ctx):
+    return sorted(k for k in ctx.redis.keys("features:*") if not k.startswith("features:stale:"))
+
+
+def check_tenant_key(ctx):
+    m = _state(ctx)
+    first = m.load_features("t1", "u-1")
+    assert first == {"values": T1, "stale": False}, f"load_features('t1', 'u-1') gave {first}, expected {{'values': {T1}, 'stale': False}}"
+    other = m.load_features("t2", "u-1")
+    assert other is not None and other["values"] == T2, f"user u-1 of tenant t2 got {other}: tenant t1's vector, cached under a key without the tenant. Key the cache by (tenant, user)"
+    assert _calls(ctx) == 2, f"two users of two tenants made {_calls(ctx)} feature-service calls, expected 2"
+    assert _cached_keys(ctx) == ["features:t1:u-1", "features:t2:u-1"], f"the cache holds {_cached_keys(ctx)}, expected features:{{tenant}}:{{user_id}}"
+    again = m.load_features("t1", "u-1")
+    assert again == first and _calls(ctx) == 2, f"a second read of t1/u-1 must be a cache hit, got {again} after {_calls(ctx)} calls"
+
+
+def check_ttl(ctx):
+    m = _state(ctx)
+    m.load_features("t1", "u-1")
+    keys = _cached_keys(ctx)
+    assert keys, "load_features cached nothing under features:*"
+    ttl = ctx.redis.ttl(keys[0])
+    assert 0 < ttl <= 300, f"{keys[0]} has TTL {ttl}: a vector cached without an expiry is served long after the user's behaviour changed. Write it with EX 300"
+    ctx.clock.advance(301)
+    m.load_features("t1", "u-1")
+    assert _calls(ctx) == 2, f"301 s after the refresh the vector was served from the cache ({_calls(ctx)} feature-service call): it must have expired and been refreshed"
+
+
+def check_single_flight(ctx):
+    m = _state(ctx)
+    # A second request for the same cold user lands right after this one took the refresh lock.
+    rival = ctx.redis_after("lock:features:t1:u-1", lambda: m.load_features("t1", "u-1"))
+    first = m.load_features("t1", "u-1")
+    assert rival.fired, "nothing took lock:features:t1:u-1: every request that misses calls the feature service. Take SET lock:features:{tenant}:{user_id} 1 NX EX 5 before refreshing"
+    if rival.error is not None:
+        raise rival.error
+    assert _calls(ctx) == 1, f"two requests for one cold user made {_calls(ctx)} feature-service calls: the one that finds the lock taken must not refresh too"
+    assert rival.result is None, f"the request that found the lock taken answered {rival.result}: with no stale copy yet it has nothing to give"
+    assert first == {"values": T1, "stale": False}, f"the request holding the lock answered {first}"
+    assert ctx.redis.exists("lock:features:t1:u-1") == 0, "the lock outlived the refresh: release it once the vector is written"
+    # A refresh that fails releases the lock, so the next request refreshes instead of waiting out its TTL.
+    ctx.grpc.fail("UserFeatures", grpc.StatusCode.UNAVAILABLE, "restarting")
+    try:
+        m.load_features("t1", "u-2")
+    except grpc.RpcError:
+        pass
+    assert ctx.redis.exists("lock:features:t1:u-2") == 0, "a refresh that failed left lock:features:t1:u-2 behind: for 5 s nobody may refresh u-2. Release the lock in finally"
+    got = m.load_features("t1", "u-2")
+    assert got == {"values": T1, "stale": False}, f"once the feature service answered again, u-2 got {got}"
+
+
+def check_stale_fallback(ctx):
+    m = _state(ctx)
+    m.load_features("t1", "u-1")
+    stale_ttl = ctx.redis.ttl("features:stale:t1:u-1")
+    assert stale_ttl != -2, "the refresh kept no copy at features:stale:t1:u-1: when the feature service is down there is nothing to fall back to"
+    assert stale_ttl > 300, f"features:stale:t1:u-1 has TTL {stale_ttl}: the stale copy must outlive the cached vector (EX 86400)"
+    ctx.clock.advance(301)  # the cached vector expired
+    ctx.grpc.fail("UserFeatures", grpc.StatusCode.UNAVAILABLE, "restarting")
+    try:
+        got = m.load_features("t1", "u-1")
+    except Exception as exc:
+        raise AssertionError(f"with the feature service down load_features raised {type(exc).__name__}: {exc}. Answer the stale copy instead")
+    assert got == {"values": T1, "stale": True}, f"with the feature service down load_features answered {got}, expected the stale copy {{'values': {T1}, 'stale': True}}"
+`,
+    typescript: `const T1 = [0.25, 0.375]; // every user of tenant t1
+const T2 = [0.75, 0.875]; // every user of tenant t2
+
+function state(ctx) {
+  const pkg = ctx.proto('ranking.proto');
+  ctx.grpc.serve(pkg.recsys.FeatureService.service, {
+    UserFeatures(call, callback) {
+      const base = call.request.tenant === 't1' ? 0.25 : 0.75;
+      callback(null, {values: [base, base + 0.125]});
+    },
+  });
+  return ctx.load('state');
+}
+
+const calls = (ctx): number => ctx.grpc.callsTo('UserFeatures').length;
+const cachedKeys = (ctx): string[] => (ctx.redis.keys('features:*') as string[]).filter(k => !k.startsWith('features:stale:')).sort();
+const show = (value): string => JSON.stringify(value);
+
+export async function check_tenant_key(ctx) {
+  const m = state(ctx);
+  const first = await m.loadFeatures('t1', 'u-1');
+  assert.deepStrictEqual(first, {values: T1, stale: false}, \`loadFeatures('t1', 'u-1') gave \${show(first)}\`);
+  const other = await m.loadFeatures('t2', 'u-1');
+  assert(other !== null && show(other.values) === show(T2), \`user u-1 of tenant t2 got \${show(other)}: tenant t1's vector, cached under a key without the tenant. Key the cache by (tenant, user)\`);
+  assert.equal(calls(ctx), 2, \`two users of two tenants made \${calls(ctx)} feature-service calls, expected 2\`);
+  assert.deepStrictEqual(cachedKeys(ctx), ['features:t1:u-1', 'features:t2:u-1'], \`the cache holds \${show(cachedKeys(ctx))}, expected features:{tenant}:{user_id}\`);
+  const again = await m.loadFeatures('t1', 'u-1');
+  assert(show(again) === show(first) && calls(ctx) === 2, \`a second read of t1/u-1 must be a cache hit, got \${show(again)} after \${calls(ctx)} calls\`);
+}
+
+export async function check_ttl(ctx) {
+  const m = state(ctx);
+  await m.loadFeatures('t1', 'u-1');
+  const keys = cachedKeys(ctx);
+  assert(keys.length > 0, 'loadFeatures cached nothing under features:*');
+  const ttl = Number(ctx.redis.ttl(keys[0]));
+  assert(ttl > 0 && ttl <= 300, \`\${keys[0]} has TTL \${ttl}: a vector cached without an expiry is served long after the user's behaviour changed. Write it with EX 300\`);
+  ctx.clock.advance(301);
+  await m.loadFeatures('t1', 'u-1');
+  assert.equal(calls(ctx), 2, \`301 s after the refresh the vector was served from the cache (\${calls(ctx)} feature-service call): it must have expired and been refreshed\`);
+}
+
+export async function check_single_flight(ctx) {
+  const m = state(ctx);
+  // A second request for the same cold user lands right after this one took the refresh lock.
+  const rival = ctx.redisAfter('lock:features:t1:u-1', () => m.loadFeatures('t1', 'u-1'));
+  const first = await m.loadFeatures('t1', 'u-1');
+  assert(rival.fired, 'nothing took lock:features:t1:u-1: every request that misses calls the feature service. Take SET lock:features:{tenant}:{user_id} 1 NX EX 5 before refreshing');
+  if (rival.error !== undefined) throw rival.error;
+  const rivalResult = await rival.result;
+  assert.equal(calls(ctx), 1, \`two requests for one cold user made \${calls(ctx)} feature-service calls: the one that finds the lock taken must not refresh too\`);
+  assert.equal(rivalResult, null, \`the request that found the lock taken answered \${show(rivalResult)}: with no stale copy yet it has nothing to give\`);
+  assert.deepStrictEqual(first, {values: T1, stale: false}, \`the request holding the lock answered \${show(first)}\`);
+  assert.equal(ctx.redis.exists('lock:features:t1:u-1'), 0, 'the lock outlived the refresh: release it once the vector is written');
+  // A refresh that fails releases the lock, so the next request refreshes instead of waiting out its TTL.
+  ctx.grpc.fail('UserFeatures', ctx.grpc.status.UNAVAILABLE, 'restarting');
+  await m.loadFeatures('t1', 'u-2').catch(() => null);
+  assert.equal(ctx.redis.exists('lock:features:t1:u-2'), 0, 'a refresh that failed left lock:features:t1:u-2 behind: for 5 s nobody may refresh u-2. Release the lock in finally');
+  const got = await m.loadFeatures('t1', 'u-2');
+  assert.deepStrictEqual(got, {values: T1, stale: false}, \`once the feature service answered again, u-2 got \${show(got)}\`);
+}
+
+export async function check_stale_fallback(ctx) {
+  const m = state(ctx);
+  await m.loadFeatures('t1', 'u-1');
+  const staleTtl = Number(ctx.redis.ttl('features:stale:t1:u-1'));
+  assert(staleTtl !== -2, 'the refresh kept no copy at features:stale:t1:u-1: when the feature service is down there is nothing to fall back to');
+  assert(staleTtl > 300, \`features:stale:t1:u-1 has TTL \${staleTtl}: the stale copy must outlive the cached vector (EX 86400)\`);
+  ctx.clock.advance(301); // the cached vector expired
+  ctx.grpc.fail('UserFeatures', ctx.grpc.status.UNAVAILABLE, 'restarting');
+  let got;
+  try {
+    got = await m.loadFeatures('t1', 'u-1');
+  } catch (e) {
+    assert.fail(\`with the feature service down loadFeatures threw \${(e as Error).message}. Answer the stale copy instead\`);
+  }
+  assert.deepStrictEqual(got, {values: T1, stale: true}, \`with the feature service down loadFeatures answered \${show(got)}, expected the stale copy\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"google.golang.org/grpc/codes"
+
+	pb "recs/gen/ranking"
+	"recs/types"
+
+	"leetbuild/harness"
+)
+
+var (
+	stateBg = context.Background()
+	t1      = []float64{0.25, 0.375} // every user of tenant t1
+	t2      = []float64{0.75, 0.875} // every user of tenant t2
+)
+
+type featurePeer struct {
+	pb.UnimplementedFeatureServiceServer
+}
+
+func (featurePeer) UserFeatures(_ context.Context, req *pb.FeaturesRequest) (*pb.FeatureVector, error) {
+	base := 0.75
+	if req.GetTenant() == "t1" {
+		base = 0.25
+	}
+	return &pb.FeatureVector{Values: []float64{base, base + 0.125}}, nil
+}
+
+func serveFeatures(ctx *harness.Ctx) {
+	pb.RegisterFeatureServiceServer(ctx.GRPC.Server(""), featurePeer{})
+}
+
+func featureCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("UserFeatures", "")) }
+
+func cachedKeys(ctx *harness.Ctx) []string {
+	out := []string{}
+	for _, k := range ctx.Redis.Keys("features:*") {
+		if !strings.HasPrefix(k, "features:stale:") {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+func show(f *types.Features) string {
+	if f == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("{values %v, stale %t}", f.Values, f.Stale)
+}
+
+func sameValues(f *types.Features, values []float64, stale bool) bool {
+	return f != nil && fmt.Sprint(f.Values) == fmt.Sprint(values) && f.Stale == stale
+}
+
+func CheckTenantKey(ctx *harness.Ctx) {
+	serveFeatures(ctx)
+	first := loadFeatures(stateBg, "t1", "u-1")
+	ctx.Assert(sameValues(first, t1, false), "loadFeatures(t1, u-1) gave %s, expected {values %v, stale false}", show(first), t1)
+	other := loadFeatures(stateBg, "t2", "u-1")
+	ctx.Assert(other != nil && fmt.Sprint(other.Values) == fmt.Sprint(t2), "user u-1 of tenant t2 got %s: tenant t1's vector, cached under a key without the tenant. Key the cache by (tenant, user)", show(other))
+	ctx.Equal(featureCalls(ctx), 2, "two users of two tenants must make two feature-service calls; the calls")
+	ctx.Equal(cachedKeys(ctx), []string{"features:t1:u-1", "features:t2:u-1"}, "the cache must hold features:{tenant}:{user_id}; it holds")
+	again := loadFeatures(stateBg, "t1", "u-1")
+	ctx.Assert(sameValues(again, t1, false) && featureCalls(ctx) == 2, "a second read of t1/u-1 must be a cache hit, got %s after %d calls", show(again), featureCalls(ctx))
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	serveFeatures(ctx)
+	loadFeatures(stateBg, "t1", "u-1")
+	keys := cachedKeys(ctx)
+	ctx.Assert(len(keys) > 0, "loadFeatures cached nothing under features:*")
+	ttl := ctx.Redis.TTL(keys[0])
+	ctx.Assert(ttl > 0 && ttl <= 300, "%s has TTL %d: a vector cached without an expiry is served long after the user's behaviour changed. Write it with EX 300", keys[0], ttl)
+	ctx.Clock.Advance(301)
+	loadFeatures(stateBg, "t1", "u-1")
+	ctx.Equal(featureCalls(ctx), 2, "301 s after the refresh the vector must have expired and been refreshed; the feature-service calls")
+}
+
+func CheckSingleFlight(ctx *harness.Ctx) {
+	serveFeatures(ctx)
+	// A second request for the same cold user lands right after this one took the refresh lock.
+	rival := ctx.Redis.After("lock:features:t1:u-1", func() any { return loadFeatures(stateBg, "t1", "u-1") })
+	first := loadFeatures(stateBg, "t1", "u-1")
+	ctx.Assert(rival.Fired, "nothing took lock:features:t1:u-1: every request that misses calls the feature service. Take SET lock:features:{tenant}:{user_id} 1 NX EX 5 before refreshing")
+	ctx.Assert(rival.Err == nil, "the concurrent request failed: %v", rival.Err)
+	ctx.Equal(featureCalls(ctx), 1, "two requests for one cold user: the one that finds the lock taken must not refresh too; the feature-service calls")
+	rivalFeatures, _ := rival.Result.(*types.Features)
+	ctx.Assert(rivalFeatures == nil, "the request that found the lock taken answered %s: with no stale copy yet it has nothing to give", show(rivalFeatures))
+	ctx.Assert(sameValues(first, t1, false), "the request holding the lock answered %s", show(first))
+	ctx.Equal(ctx.Redis.Exists("lock:features:t1:u-1"), int64(0), "the lock outlived the refresh: release it once the vector is written; the lock keys")
+	// A refresh that fails releases the lock, so the next request refreshes instead of waiting out its TTL.
+	ctx.GRPC.Fail("UserFeatures", codes.Unavailable, "restarting", 1, "")
+	loadFeatures(stateBg, "t1", "u-2")
+	ctx.Equal(ctx.Redis.Exists("lock:features:t1:u-2"), int64(0), "a refresh that failed left lock:features:t1:u-2 behind: for 5 s nobody may refresh u-2. Release the lock with defer; the lock keys")
+	got := loadFeatures(stateBg, "t1", "u-2")
+	ctx.Assert(sameValues(got, t1, false), "once the feature service answered again, u-2 got %s", show(got))
+}
+
+func CheckStaleFallback(ctx *harness.Ctx) {
+	serveFeatures(ctx)
+	loadFeatures(stateBg, "t1", "u-1")
+	staleTTL := ctx.Redis.TTL("features:stale:t1:u-1")
+	ctx.Assert(staleTTL != -2, "the refresh kept no copy at features:stale:t1:u-1: when the feature service is down there is nothing to fall back to")
+	ctx.Assert(staleTTL > 300, "features:stale:t1:u-1 has TTL %d: the stale copy must outlive the cached vector (EX 86400)", staleTTL)
+	ctx.Clock.Advance(301) // the cached vector expired
+	ctx.GRPC.Fail("UserFeatures", codes.Unavailable, "restarting", 1, "")
+	got := loadFeatures(stateBg, "t1", "u-1")
+	ctx.Assert(sameValues(got, t1, true), "with the feature service down loadFeatures answered %s, expected the stale copy {values %v, stale true}", show(got), t1)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::vector<double> kT1{0.25, 0.375};  // every user of tenant t1
+const std::vector<double> kT2{0.75, 0.875};  // every user of tenant t2
+
+class FeaturePeer final : public recsys::FeatureService::Service {
+ public:
+  grpc::Status UserFeatures(grpc::ServerContext*, const recsys::FeaturesRequest* req, recsys::FeatureVector* out) override {
+    const double base = req->tenant() == "t1" ? 0.25 : 0.75;
+    out->add_values(base);
+    out->add_values(base + 0.125);
+    return grpc::Status::OK;
+  }
+};
+
+void serveFeatures(harness::Ctx& ctx) {
+  static FeaturePeer* peer = nullptr;
+  delete peer;
+  peer = new FeaturePeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+}
+
+size_t featureCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("UserFeatures").size(); }
+
+std::vector<std::string> cachedKeys(harness::Ctx& ctx) {
+  std::vector<std::string> out;
+  for (const auto& k : ctx.Redis.Keys("features:*")) {
+    if (k.rfind("features:stale:", 0) != 0) out.push_back(k);
+  }
+  return out;
+}
+
+std::string show(const std::optional<recs::Features>& f) {
+  if (!f) return "nothing";
+  std::ostringstream out;
+  out << "{values [";
+  for (size_t i = 0; i < f->values.size(); i++) out << (i ? " " : "") << f->values[i];
+  out << "], stale " << (f->stale ? "true" : "false") << "}";
+  return out.str();
+}
+
+bool same(const std::optional<recs::Features>& f, const std::vector<double>& values, bool stale) {
+  return f && f->values == values && f->stale == stale;
+}
+
+}  // namespace
+
+void CheckTenantKey(harness::Ctx& ctx) {
+  serveFeatures(ctx);
+  const auto first = loadFeatures("t1", "u-1");
+  ctx.Assert(same(first, kT1, false), "loadFeatures(t1, u-1) gave %s, expected {values [0.25 0.375], stale false}", show(first));
+  const auto other = loadFeatures("t2", "u-1");
+  ctx.Assert(other && other->values == kT2, "user u-1 of tenant t2 got %s: tenant t1's vector, cached under a key without the tenant. Key the cache by (tenant, user)", show(other));
+  ctx.Equal(featureCalls(ctx), 2, "two users of two tenants must make two feature-service calls; the calls");
+  ctx.Equal(cachedKeys(ctx), {"features:t1:u-1", "features:t2:u-1"}, "the cache must hold features:{tenant}:{user_id}; it holds");
+  const auto again = loadFeatures("t1", "u-1");
+  ctx.Assert(same(again, kT1, false) && featureCalls(ctx) == 2, "a second read of t1/u-1 must be a cache hit, got %s after %d calls", show(again), featureCalls(ctx));
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  serveFeatures(ctx);
+  loadFeatures("t1", "u-1");
+  const auto keys = cachedKeys(ctx);
+  ctx.Assert(!keys.empty(), "loadFeatures cached nothing under features:*");
+  const long long ttl = ctx.Redis.TTL(keys[0]);
+  ctx.Assert(ttl > 0 && ttl <= 300, "%s has TTL %d: a vector cached without an expiry is served long after the user's behaviour changed. Write it with EX 300", keys[0], ttl);
+  ctx.Clock.Advance(301);
+  loadFeatures("t1", "u-1");
+  ctx.Equal(featureCalls(ctx), 2, "301 s after the refresh the vector must have expired and been refreshed; the feature-service calls");
+}
+
+void CheckSingleFlight(harness::Ctx& ctx) {
+  serveFeatures(ctx);
+  // A second request for the same cold user lands right after this one took the refresh lock.
+  auto fired = std::make_shared<bool>(false);
+  auto seen = std::make_shared<std::optional<recs::Features>>();
+  auto err = std::make_shared<std::string>();
+  ctx.Redis.After("lock:features:t1:u-1", [fired, seen, err] {
+    *fired = true;
+    try {
+      *seen = loadFeatures("t1", "u-1");
+    } catch (const std::exception& e) {
+      *err = e.what();
+    }
+  });
+  const auto first = loadFeatures("t1", "u-1");
+  ctx.Assert(*fired, "nothing took lock:features:t1:u-1: every request that misses calls the feature service. Take SET lock:features:{tenant}:{user_id} 1 NX EX 5 before refreshing");
+  ctx.Assert(err->empty(), "the concurrent request failed: %s", *err);
+  ctx.Equal(featureCalls(ctx), 1, "two requests for one cold user: the one that finds the lock taken must not refresh too; the feature-service calls");
+  ctx.Assert(!seen->has_value(), "the request that found the lock taken answered %s: with no stale copy yet it has nothing to give", show(*seen));
+  ctx.Assert(same(first, kT1, false), "the request holding the lock answered %s", show(first));
+  ctx.Equal(ctx.Redis.Exists("lock:features:t1:u-1"), 0, "the lock outlived the refresh: release it once the vector is written; the lock keys");
+  // A refresh that fails releases the lock, so the next request refreshes instead of waiting out its TTL.
+  ctx.GRPC.Fail("UserFeatures", grpc::StatusCode::UNAVAILABLE, "restarting");
+  loadFeatures("t1", "u-2");
+  ctx.Equal(ctx.Redis.Exists("lock:features:t1:u-2"), 0, "a refresh that failed left lock:features:t1:u-2 behind: for 5 s nobody may refresh u-2. Release the lock in a scope guard; the lock keys");
+  const auto got = loadFeatures("t1", "u-2");
+  ctx.Assert(same(got, kT1, false), "once the feature service answered again, u-2 got %s", show(got));
+}
+
+void CheckStaleFallback(harness::Ctx& ctx) {
+  serveFeatures(ctx);
+  loadFeatures("t1", "u-1");
+  const long long staleTtl = ctx.Redis.TTL("features:stale:t1:u-1");
+  ctx.Assert(staleTtl != -2, "the refresh kept no copy at features:stale:t1:u-1: when the feature service is down there is nothing to fall back to");
+  ctx.Assert(staleTtl > 300, "features:stale:t1:u-1 has TTL %d: the stale copy must outlive the cached vector (EX 86400)", staleTtl);
+  ctx.Clock.Advance(301);  // the cached vector expired
+  ctx.GRPC.Fail("UserFeatures", grpc::StatusCode::UNAVAILABLE, "restarting");
+  const auto got = loadFeatures("t1", "u-1");
+  ctx.Assert(same(got, kT1, true), "with the feature service down loadFeatures answered %s, expected the stale copy {values [0.25 0.375], stale true}", show(got));
+}
+`,
+  },
+  hints: [
+    "Ask for user u-1 of tenant t2 right after u-1 of tenant t1: the second tenant gets the first one's vector. Restart the feature service and every ranking runs without features.",
+    'The key carries only the user id and the SET has no expiry. A miss goes straight to the feature service with nothing stopping a second request doing the same, and its error has nowhere to fall back to.',
+    'Key `features:{tenant}:{user_id}` with `EX 300`; before calling, `SET lock:… 1 NX EX 5` and answer the stale copy when it fails; write `features:stale:…` with `EX 86400`; catch the RPC error into that copy; delete the lock in `finally`.',
+  ],
+  debrief: `The cache key is the tenant boundary, which is why the tenant goes into it rather than into a check after the read. The lock is the whole single-flight mechanism: \`NX\` makes one request the refresher, the expiry bounds how long a crashed refresher can block the user, and releasing it on every path keeps a failed refresh from blocking for that long. The stale copy is what makes the failure mode ranking with old features rather than with none, and the flag lets the impression say so. Production feature stores refresh ahead of expiry so a busy key never goes cold, add jitter to TTLs so a bulk write does not expire all at once, and let a waiting request poll briefly before giving up.`,
 };

@@ -64,6 +64,12 @@ package holding the constants and the key scheme every step shares:
    counters, \`free\` clamped at zero, and a reconcile that recomputes \`allocated\` from the open
    placements.
 
+## The debugging habit
+
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
+
 ## Left out on purpose
 
 Autoscaling, preemption and fair share between teams, rack affinity, driver installation,

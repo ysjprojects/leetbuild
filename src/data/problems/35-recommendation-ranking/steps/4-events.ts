@@ -2,63 +2,46 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Impression events keyed by user, with identifiers only',
+  title: 'Impression events keyed by user, with positions and an outbox',
   concept: 'kafka',
   file: 'events',
-  focus: ['recsvc', 'kafka', 'consumer'],
+  focus: ['api', 'kafka', 'analytics'],
   task: `## Task
 
-**Starting point.** The starter implements \`publish_impression(tenant, user_id, items,
-model_version, fallback)\`: it builds one event per response from \`items\` (at most 30, each with
-\`id\`, \`score\` and zero-based \`position\`), produces it to \`recsys.impression\` through an idempotent
-producer, and the Impression consumer folds each event into per-item counters. It serves the demo
-and hides four flaws.
+**Starting point.** The starter is \`publish_impression(tenant, user_id, surface, ranked)\`, the record
+offline evaluation reads for every served list (\`ranked\` is the \`rank\` result): it builds
+\`{tenant, user_id, surface, model_version, items}\` from the ranked items, produces it to
+\`recsys.impression\` keyed by surface, and writes an outbox row (\`store.outbox_insert\`) when
+\`produce\` raises. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A replay that cannot reconstruct the order one user saw, a
-retained topic that becomes an unowned feature store, an exposure row that cannot say which slot an
-item sat in or whether the list was degraded, and a rejected impression nobody re-captures.
+**Failure mode the checks target.** Every impression of a surface lands on one partition; the event
+says what scored the list but not where each item sat or whether the list was the fallback; a lost
+acknowledgement writes the impression twice and a failover loses one only the leader had; and a
+broker that rejects the record, or never answers, loses the impression, because only a local enqueue
+error reaches the outbox.
 
-- Produce keyed by the **user id** (\`key=user_id\`, \`key: userId\`, \`Key: []byte(userID)\`).
-- The payload carries \`candidate_ids\` in rank order, their \`positions\`, the \`model_version\` and
-  \`fallback\`; no \`features\`/\`vector\`/\`embedding\` array and no PII (\`email\`, \`name\`).
-- The producer stays **idempotent with \`acks=all\`** so a retried produce cannot duplicate.
-- When the broker rejects the produce, write the event to the **outbox** (\`outbox.put(...)\`)
-  instead of dropping it.
-- The consumer folds the event (\`HINCRBY impressions:{tenant}:{candidate_id} shown\`) and **only
-  then** commits the offset.`,
+- Key the record by the **user id**.
+- The payload is \`{tenant, user_id, surface, model_version, fallback, items: [{id, position}]}\`:
+  positions zero-based in served order, no scores.
+- The producer is idempotent with \`acks=all\` (kafkajs \`idempotent: true\` with \`acks: -1\`; the Go
+  code uses confluent-kafka-go, whose producer supports \`enable.idempotence\`).
+- Wait for the delivery report at most \`ACK_TIMEOUT_S\` = 2 s; a failed delivery or no report writes
+  the outbox row and returns false.`,
   sequence: {
-    participants: ['Recommendation API', 'recsys.impression', 'Impression consumer', 'Redis'],
+    participants: ['Recommendation API', 'recsys.impression', 'Outbox', 'Offline evaluation'],
     messages: [
       {
         from: 'Recommendation API',
         to: 'recsys.impression',
-        label: 'produce · key = user_id · acks = all',
+        label: 'produce · key = user_id · acks = all · idempotent',
         kind: 'sync',
       },
-      {from: 'recsys.impression', to: 'Recommendation API', label: 'ack / broker rejection', kind: 'reply'},
-      {
-        from: 'Recommendation API',
-        to: 'Recommendation API',
-        label: 'outbox.put(tenant, user_id, event) when rejected',
-        kind: 'sync',
-      },
+      {from: 'recsys.impression', to: 'Recommendation API', label: 'delivery report within 2 s', kind: 'reply'},
+      {from: 'Recommendation API', to: 'Outbox', label: 'failed or no report → RPUSH outbox', kind: 'sync'},
       {
         from: 'recsys.impression',
-        to: 'Impression consumer',
-        label: 'consume · group impression-counters',
-        kind: 'async',
-      },
-      {
-        from: 'Impression consumer',
-        to: 'Redis',
-        label: 'HINCRBY impressions:{tenant}:{candidate_id} shown',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Impression consumer', label: 'counter value', kind: 'reply'},
-      {
-        from: 'Impression consumer',
-        to: 'recsys.impression',
-        label: 'commit offset after folding',
+        to: 'Offline evaluation',
+        label: '{items [{id, position}], model_version, fallback}',
         kind: 'async',
       },
     ],
@@ -66,918 +49,856 @@ item sat in or whether the list was degraded, and a rejected impression nobody r
   checks: [
     {
       id: 'user-key',
-      title: 'Keyed by the user id, so one user’s exposure stream stays ordered',
+      title: 'Keyed by user id',
       detail:
-        'The message key is the user id — `key=user_id`, `key: userId`, `Key: []byte(userID)` — so all impressions of one user land on one partition in order. The starter keys by the first item id, so a user’s exposure stream is scattered across partitions and the order the counters are reconciled against is gone.',
+        "The record key is the user id (`key=user_id`, `key: userId`, `[]byte(userID)`, `ProducerRecord(topic, userId, …)`), so one user's impressions stay in order on one partition and the traffic spreads; the starter keys by surface.",
       match: {
-        python: {all: [/recsys\.impression/, /key=user_id/]},
-        typescript: {all: [/recsys\.impression/, /key:\s*userId/]},
-        go: {all: [/recsys\.impression/, /Key:\s*\[\]byte\(userID\)/]},
-        scala: {all: [/recsys\.impression/, /new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*userId\s*,/]},
-        cpp: {all: [/recsys\.impression/, /userId\.c_str\(\),\s*userId\.size\(\)/]},
+        python: {all: [/key=user_id/], none: [/key=surface/]},
+        typescript: {all: [/key:\s*userId\b/], none: [/key:\s*surface\b/]},
+        go: {all: [/Key:\s*\[\]byte\(userID\)/], none: [/Key:\s*\[\]byte\(surface\)/]},
+        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*userId/], none: [/Topic,\s*surface/]},
+        cpp: {all: [/user_id\.c_str\(\),\s*user_id\.size\(\)/], none: [/surface\.c_str\(\)/]},
       },
     },
     {
-      id: 'no-features',
-      title: 'Carries identifiers only — no feature values, no PII',
+      id: 'impression-payload',
+      title: 'Carries positions, the version and the fallback flag',
       detail:
-        'The payload never carries a raw feature vector (`features` / `vector` / `embedding`) and never user PII (`email`, `name`). The starter copies the item features into the event so the training pipeline can skip a join — and the topic is retained and replicated for days, so that copy outlives the request.',
-      match: {
-        python: {
-          all: [/recsys\.impression/],
-          none: [/features|Features/, /embedding|Embedding/, /["']vector["']/, /email|Email/, /full_name|FullName/],
-        },
-        typescript: {
-          all: [/recsys\.impression/],
-          none: [/features|Features/, /embedding|Embedding/, /\bvector\b/, /email|Email/, /full_name|FullName/],
-        },
-        go: {
-          all: [/recsys\.impression/],
-          none: [/features|Features/, /embedding|Embedding/, /"vector"/, /email|Email/, /full_name|FullName/],
-        },
-        scala: {
-          all: [/recsys\.impression/],
-          none: [/features|Features/, /embedding|Embedding/, /"vector"/, /email|Email/, /full_name|FullName/],
-        },
-        cpp: {
-          all: [/recsys\.impression/],
-          none: [/features|Features/, /embedding|Embedding/, /"vector"/, /email|Email/, /full_name|FullName/],
-        },
-      },
-    },
-    {
-      id: 'payload-ids',
-      title: 'Payload carries the shown ids, their positions, model_version and fallback',
-      detail:
-        'The event carries `candidate_ids`, the `positions` they were rendered at, the `model_version` that ranked them and the `fallback` flag for a degraded ranking. The starter ships ids and a feature blob and no positions or flag, so an impression can be neither attributed to a slot nor told apart from a real model result.',
+        'Each item is `{id, position}` with its zero-based position in the served list, and the event carries `model_version` and `fallback`; the starter copies the scored items and drops the flag, so a click cannot be credited to a slot or a degraded list told apart.',
       match: {
         python: {
-          all: [
-            /["']candidate_ids["']\s*:/,
-            /["']positions["']\s*:/,
-            /["']model_version["']\s*:/,
-            /["']fallback["']\s*:/,
-          ],
+          all: [/"position":\s*position/, /"fallback":\s*ranked\["fallback"\]/],
+          none: [/"items":\s*ranked\["items"\]/],
         },
-        typescript: {all: [/candidate_ids\s*:/, /positions\s*:/, /model_version\s*:/, /fallback\s*:/]},
-        go: {all: [/json:"candidate_ids"/, /json:"positions"/, /json:"model_version"/, /json:"fallback"/]},
-        scala: {all: [/\bcandidate_ids\b/, /\bpositions\b/, /\bmodel_version\b/, /\bfallback\b/]},
-        cpp: {all: [/["']candidate_ids["']/, /["']positions["']/, /["']model_version["']/, /["']fallback["']/]},
+        typescript: {all: [/position\b/, /fallback:\s*ranked\.fallback/], none: [/items:\s*ranked\.items\s*[,}]/]},
+        go: {all: [/"position":\s*position/, /"fallback":\s*ranked\.Fallback/], none: [/"items":\s*ranked\.Items/]},
+        scala: {all: [/"position"\s*->/, /"fallback"\s*->\s*JsBoolean\(ranked\.fallback\)/], none: [/"score"\s*->/]},
+        cpp: {all: [/\{"position",\s*position\}/, /\{"fallback",\s*ranked\.fallback\}/], none: [/\{"score",/]},
       },
     },
     {
-      id: 'producer-acks',
+      id: 'acks-idempotent',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` — `enable.idempotence` plus `acks`, KafkaJS’s `idempotent: true` with an explicit `acks`, or the Go writer’s `RequireAll` with the hash balancer — so a retried produce cannot publish the same impression twice.',
+        'The producer has idempotence on and `acks=all`, so a retry after a lost acknowledgement writes the impression once and a leader failover cannot lose one; the starter acknowledges on the leader alone.',
       match: {
-        python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
+        python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
-        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /Balancer:\s*&kafka\.Hash\{\}/]},
-        scala: {all: [/enable\.idempotence/, /"acks"/]},
-        cpp: {all: [/enable\.idempotence/, /set\("acks",\s*"all"/]},
+        go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
+        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
+        cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
     {
-      id: 'outbox',
-      title: 'A rejected produce is kept in the outbox, not dropped',
+      id: 'outbox-on-failure',
+      title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'When the broker rejects the produce the event is written as an outbox row (`outbox.put(...)` / `outbox.Put(...)`) inside the failure branch, for a relay to republish. The starter acks the produce and drops the rejection, so an impression that was served is lost without a trace.',
+        'The outcome comes from the delivery report (`on_delivery`, an awaited `send`, the delivery channel, `dr_cb`, the send future), waited for at most 2 s; a failure or no report writes the outbox row. The starter catches only the local enqueue error, which a broker rejection never raises.',
       match: {
-        python: {all: [/outbox\.put\(/, /except\s+KafkaException/]},
-        typescript: {all: [/outbox\.put\(/, /catch\s*\(/]},
-        go: {all: [/outbox\.Put\(/, /err != nil/]},
-        scala: {all: [/outbox\.put\(/, /catch\s*\{/]},
-        cpp: {all: [/outbox\.put\(/, /ERR_NO_ERROR/]},
+        python: {
+          all: [/store\.outbox_insert\(/, /on_delivery\s*=/, /producer\.flush\(/],
+          none: [/except KafkaException/],
+        },
+        typescript: {all: [/await producer\.send\(/, /outboxInsert\(/], none: [/void producer\.send\(/]},
+        go: {
+          all: [/TopicPartition\.Error/, /store\.OutboxInsert\(/, /time\.After\(/],
+          none: [/Produce\([^\n]*,\s*nil\)/],
+        },
+        scala: {all: [/\.get\(\s*AckTimeoutMs/, /Store\.outboxInsert\(/], none: [/case _: KafkaException/]},
+        cpp: {all: [/dr_cb/, /store::outboxInsert\(/, /->flush\(/], none: [/->poll\(0\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `# publish_impression: report what a ranked response showed, once per response.
-import json
-import uuid
+      starter: `import json
 
-import redis
-from confluent_kafka import Consumer, Producer
+from confluent_kafka import KafkaException, Producer
+
+from recs import store  # outbox_insert(topic, key, payload)
 
 TOPIC = "recsys.impression"
 
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
-    }
-)
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 
 
-class RankedItem:
-    """One item of the ranked response, with the slot it was rendered at."""
-
-    def __init__(self, id: str, score: float, position: int, features: list[float]) -> None:
-        self.id = id
-        self.score = score
-        self.position = position
-        self.features = features
-
-
-class OutboxStore:
-    def put(self, tenant: str, user_id: str, event: dict) -> None:
-        """One row per undelivered impression; the relay republishes it to the topic."""
-        raise NotImplementedError
-
-
-outbox = OutboxStore()
-
-
-def publish_impression(
-    tenant: str, user_id: str, items: list[RankedItem], model_version: str, fallback: bool
-) -> None:
+def publish_impression(tenant: str, user_id: str, surface: str, ranked: dict) -> bool:
+    """Record what the user was shown; True once the broker has the impression."""
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    event = {
-        "id": str(uuid.uuid4()),
+    payload = {
         "tenant": tenant,
         "user_id": user_id,
-        "candidate_ids": [item.id for item in items],
-        "features": [item.features for item in items],
-        "model_version": model_version,
+        "surface": surface,
+        "model_version": ranked["model_version"],
+        "items": ranked["items"],
     }
-    producer.produce(TOPIC, key=items[0].id, value=json.dumps(event))
-    producer.flush(2.0)
-
-
-def consume() -> None:
-    consumer = Consumer(
-        {"bootstrap.servers": "kafka:9092", "group.id": "impression-counters", "enable.auto.commit": False}
-    )
-    consumer.subscribe([TOPIC])
-    while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
-            continue
-        event = json.loads(msg.value())
-        for candidate_id in event["candidate_ids"]:
-            r.hincrby(f"impressions:{event['tenant']}:{candidate_id}", "shown", 1)
-        consumer.commit(msg)
+    try:
+        producer.produce(TOPIC, key=surface, value=json.dumps(payload))
+        producer.poll(0)
+    except KafkaException:
+        store.outbox_insert(TOPIC, surface, payload)
+        return False
+    return True
 `,
-      solution: `# publish_impression: report what a ranked response showed, once per response.
-import json
-import uuid
+      solution: `import json
 
-import redis
-from confluent_kafka import Consumer, KafkaException, Producer
+from confluent_kafka import Producer
+
+from recs import store  # outbox_insert(topic, key, payload)
 
 TOPIC = "recsys.impression"
+ACK_TIMEOUT_S = 2
 
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
-    }
-)
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
+producer = Producer({
+    "bootstrap.servers": "kafka:9092",
+    "acks": "all",  # every in-sync replica has the impression before the broker answers
+    "enable.idempotence": True,  # a send retried after a lost acknowledgement lands once
+})
 
 
-class RankedItem:
-    """One item of the ranked response, with the slot it was rendered at."""
-
-    def __init__(self, id: str, score: float, position: int) -> None:
-        self.id = id
-        self.score = score
-        self.position = position
-
-
-class OutboxStore:
-    def put(self, tenant: str, user_id: str, event: dict) -> None:
-        """One row per undelivered impression; the relay republishes it to the topic."""
-        raise NotImplementedError
-
-
-outbox = OutboxStore()
-
-
-def publish_impression(
-    tenant: str, user_id: str, items: list[RankedItem], model_version: str, fallback: bool
-) -> None:
-    event = {
-        "id": str(uuid.uuid4()),
+def impression_payload(tenant: str, user_id: str, surface: str, ranked: dict) -> dict:
+    """What the user saw: each item at its slot, the version that ordered them, and whether that was the fallback."""
+    return {
         "tenant": tenant,
         "user_id": user_id,
-        "candidate_ids": [item.id for item in items],
-        "positions": [item.position for item in items],
-        "model_version": model_version,
-        "fallback": fallback,
+        "surface": surface,
+        "model_version": ranked["model_version"],
+        "fallback": ranked["fallback"],
+        "items": [{"id": item["id"], "position": position} for position, item in enumerate(ranked["items"])],
     }
-    payload = json.dumps(event)
-    try:
-        producer.produce(TOPIC, key=user_id, value=payload)
-        producer.flush(2.0)
-    except KafkaException:
-        outbox.put(tenant, user_id, event)
 
 
-def consume() -> None:
-    consumer = Consumer(
-        {"bootstrap.servers": "kafka:9092", "group.id": "impression-counters", "enable.auto.commit": False}
-    )
-    consumer.subscribe([TOPIC])
-    while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
-            continue
-        event = json.loads(msg.value())
-        for candidate_id in event["candidate_ids"]:
-            r.hincrby(f"impressions:{event['tenant']}:{candidate_id}", "shown", 1)
-        consumer.commit(msg)
+def publish_impression(tenant: str, user_id: str, surface: str, ranked: dict) -> bool:
+    """Record what the user was shown; True once the broker has the impression."""
+    payload = impression_payload(tenant, user_id, surface, ranked)
+    outcome = {}
+
+    def on_delivery(err, msg):
+        outcome["error"] = err
+
+    producer.produce(TOPIC, key=user_id, value=json.dumps(payload), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or outcome.get("error") is not None:
+        # The broker did not take it: the relay produces the row later, so the impression is late, not lost.
+        store.outbox_insert(TOPIC, user_id, payload)
+        return False
+    return True
 `,
     },
     typescript: {
-      starter: `/** publish_impression: report what a ranked response showed, once per response. */
-import {randomUUID} from 'node:crypto';
+      starter: `import {Kafka} from 'kafkajs';
 
-import {Redis} from 'ioredis';
-import {Kafka} from 'kafkajs';
+import {outboxInsert} from 'recs/store';
+import type {Ranked} from 'recs/types';
 
-const TOPIC = 'recsys.impression';
+export const TOPIC = 'recsys.impression';
 
-const kafka = new Kafka({clientId: 'recommendations', brokers: ['kafka:9092']});
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+const kafka = new Kafka({clientId: 'recsvc', brokers: ['kafka:9092']});
+const producer = kafka.producer();
 void producer.connect();
-const r = new Redis('redis://redis:6379');
 
-export interface RankedItem {
-  id: string;
-  score: number;
-  position: number;
-  features: number[];
-}
-
-export interface ImpressionEvent {
-  id: string;
-  tenant: string;
-  user_id: string;
-  candidate_ids: string[];
-  model_version: string;
-}
-
-/** One row per undelivered impression; the relay republishes it to the topic. */
-export class OutboxStore {
-  async put(tenant: string, userId: string, event: ImpressionEvent): Promise<void> {
-    throw new Error('not implemented');
-  }
-}
-
-export const outbox = new OutboxStore();
-
-export async function publishImpression(
-  tenant: string,
-  userId: string,
-  items: RankedItem[],
-  modelVersion: string,
-  fallback: boolean,
-): Promise<void> {
+/** Record what the user was shown; true once the broker has the impression. */
+export async function publishImpression(tenant: string, userId: string, surface: string, ranked: Ranked): Promise<boolean> {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const event = {
-    id: randomUUID(),
-    tenant,
-    user_id: userId,
-    candidate_ids: items.map(item => item.id),
-    features: items.map(item => item.features),
-    model_version: modelVersion,
-  };
-  await producer.send({
-    topic: TOPIC,
-    acks: -1,
-    messages: [{key: items[0].id, value: JSON.stringify(event)}],
-  });
-}
-
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'impression-counters'});
-  await consumer.connect();
-  await consumer.subscribe({topic: TOPIC});
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {tenant: string; candidate_ids: string[]};
-      for (const candidateId of event.candidate_ids) {
-        await r.hincrby(\`impressions:\${event.tenant}:\${candidateId}\`, 'shown', 1);
-      }
-      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-    },
-  });
+  const payload = {tenant, user_id: userId, surface, model_version: ranked.model_version, items: ranked.items};
+  try {
+    void producer.send({topic: TOPIC, messages: [{key: surface, value: JSON.stringify(payload)}], acks: 1});
+  } catch {
+    await outboxInsert(TOPIC, surface, payload);
+    return false;
+  }
+  return true;
 }
 `,
-      solution: `/** publish_impression: report what a ranked response showed, once per response. */
-import {randomUUID} from 'node:crypto';
+      solution: `import {Kafka} from 'kafkajs';
 
-import {Redis} from 'ioredis';
-import {Kafka} from 'kafkajs';
+import {outboxInsert} from 'recs/store';
+import type {Ranked} from 'recs/types';
 
-const TOPIC = 'recsys.impression';
+export const TOPIC = 'recsys.impression';
+export const ACK_TIMEOUT_MS = 2000;
 
-const kafka = new Kafka({clientId: 'recommendations', brokers: ['kafka:9092']});
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+const kafka = new Kafka({clientId: 'recsvc', brokers: ['kafka:9092']});
+// Idempotent: a send retried after a lost acknowledgement lands once (and needs acks: -1).
+const producer = kafka.producer({idempotent: true});
 void producer.connect();
-const r = new Redis('redis://redis:6379');
 
-export interface RankedItem {
-  id: string;
-  score: number;
-  position: number;
-}
-
-export interface ImpressionEvent {
-  id: string;
-  tenant: string;
-  user_id: string;
-  candidate_ids: string[];
-  positions: number[];
-  model_version: string;
-  fallback: boolean;
-}
-
-/** One row per undelivered impression; the relay republishes it to the topic. */
-export class OutboxStore {
-  async put(tenant: string, userId: string, event: ImpressionEvent): Promise<void> {
-    throw new Error('not implemented');
-  }
-}
-
-export const outbox = new OutboxStore();
-
-export async function publishImpression(
-  tenant: string,
-  userId: string,
-  items: RankedItem[],
-  modelVersion: string,
-  fallback: boolean,
-): Promise<void> {
-  const event: ImpressionEvent = {
-    id: randomUUID(),
+/** What the user saw: each item at its slot, the version that ordered them, and whether that was the fallback. */
+export function impressionPayload(tenant: string, userId: string, surface: string, ranked: Ranked) {
+  return {
     tenant,
     user_id: userId,
-    candidate_ids: items.map(item => item.id),
-    positions: items.map(item => item.position),
-    model_version: modelVersion,
-    fallback: fallback,
+    surface,
+    model_version: ranked.model_version,
+    fallback: ranked.fallback,
+    items: ranked.items.map(({id}, position) => ({id, position})),
   };
-  try {
-    await producer.send({
-      topic: TOPIC,
-      acks: -1,
-      messages: [{key: userId, value: JSON.stringify(event)}],
-    });
-  } catch (error) {
-    await outbox.put(tenant, userId, event);
-  }
 }
 
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'impression-counters'});
-  await consumer.connect();
-  await consumer.subscribe({topic: TOPIC});
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {tenant: string; candidate_ids: string[]};
-      for (const candidateId of event.candidate_ids) {
-        await r.hincrby(\`impressions:\${event.tenant}:\${candidateId}\`, 'shown', 1);
-      }
-      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-    },
-  });
+/** Record what the user was shown; true once the broker has the impression. */
+export async function publishImpression(tenant: string, userId: string, surface: string, ranked: Ranked): Promise<boolean> {
+  const payload = impressionPayload(tenant, userId, surface, ranked);
+  try {
+    // acks: -1 (all): every in-sync replica has the impression before the broker answers.
+    await producer.send({topic: TOPIC, messages: [{key: userId, value: JSON.stringify(payload)}], acks: -1, timeout: ACK_TIMEOUT_MS});
+    return true;
+  } catch {
+    // The broker did not take it: the relay produces the row later, so the impression is late, not lost.
+    await outboxInsert(TOPIC, userId, payload);
+    return false;
+  }
 }
 `,
     },
     go: {
-      starter: `// publish_impression: report what a ranked response showed, once per response.
-package main
+      starter: `package main
 
 import (
 	"context"
 	"encoding/json"
-	"log"
 
-	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"recs/store" // store.OutboxInsert(ctx, topic, key, payload)
+	"recs/types"
 )
 
 const topic = "recsys.impression"
 
-var impressionWriter = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        topic,
-	Balancer:     &kafka.Hash{},
-	RequiredAcks: kafka.RequireAll,
+var producer = newProducer()
+
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
-var rdb *redis.Client
-
-type RankedItem struct {
-	ID       string    \`json:"id"\`
-	Score    float64   \`json:"score"\`
-	Position int       \`json:"position"\`
-	Features []float64 \`json:"features"\`
-}
-
-// ImpressionEvent is the payload of one impression.
-type ImpressionEvent struct {
-	ID           string      \`json:"id"\`
-	Tenant       string      \`json:"tenant"\`
-	UserID       string      \`json:"user_id"\`
-	CandidateIDs []string    \`json:"candidate_ids"\`
-	Features     [][]float64 \`json:"features"\`
-	ModelVersion string      \`json:"model_version"\`
-}
-
-// OutboxStore keeps one row per undelivered impression; the relay republishes it to the topic.
-type OutboxStore struct{}
-
-func (s *OutboxStore) Put(ctx context.Context, tenant, userID string, payload []byte) error {
-	return nil
-}
-
-var outbox = &OutboxStore{}
-
-func publishImpression(ctx context.Context, tenant, userID string, items []RankedItem, modelVersion string, fallback bool) {
+// publishImpression records what the user was shown; true once the broker has the impression.
+func publishImpression(ctx context.Context, tenant, userID, surface string, ranked types.Ranked) (bool, error) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	candidateIDs := make([]string, 0, len(items))
-	features := make([][]float64, 0, len(items))
-	for _, item := range items {
-		candidateIDs = append(candidateIDs, item.ID)
-		features = append(features, item.Features)
+	payload := map[string]any{
+		"tenant":        tenant,
+		"user_id":       userID,
+		"surface":       surface,
+		"model_version": ranked.ModelVersion,
+		"items":         ranked.Items,
 	}
-	event := ImpressionEvent{
-		ID:           uuid.NewString(),
-		Tenant:       tenant,
-		UserID:       userID,
-		CandidateIDs: candidateIDs,
-		Features:     features,
-		ModelVersion: modelVersion,
+	value, _ := json.Marshal(payload)
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(surface), Value: value}
+	if err := producer.Produce(msg, nil); err != nil {
+		return false, store.OutboxInsert(ctx, topic, surface, payload)
 	}
-	payload, _ := json.Marshal(event)
-	log.Printf("impression tenant=%s user=%s items=%d", tenant, userID, len(candidateIDs))
-	_ = impressionWriter.WriteMessages(ctx, kafka.Message{Key: []byte(items[0].ID), Value: payload})
-}
-
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   topic,
-		GroupID: "impression-counters",
-	})
-	for {
-		msg, err := reader.FetchMessage(ctx)
-		if err != nil {
-			continue
-		}
-		var event ImpressionEvent
-		_ = json.Unmarshal(msg.Value, &event)
-		for _, candidateID := range event.CandidateIDs {
-			rdb.HIncrBy(ctx, "impressions:"+event.Tenant+":"+candidateID, "shown", 1)
-		}
-		_ = reader.CommitMessages(ctx, msg)
-	}
+	return true, nil
 }
 `,
-      solution: `// publish_impression: report what a ranked response showed, once per response.
-package main
+      solution: `package main
 
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"time"
 
-	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"recs/store" // store.OutboxInsert(ctx, topic, key, payload)
+	"recs/types"
 )
 
-const topic = "recsys.impression"
+const (
+	topic      = "recsys.impression"
+	ackTimeout = 2 * time.Second
+)
 
-var impressionWriter = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        topic,
-	Balancer:     &kafka.Hash{},
-	RequiredAcks: kafka.RequireAll,
-}
+var producer = newProducer()
 
-var rdb *redis.Client
-
-type RankedItem struct {
-	ID       string  \`json:"id"\`
-	Score    float64 \`json:"score"\`
-	Position int     \`json:"position"\`
-}
-
-// ImpressionEvent is the payload of one impression: identifiers only.
-type ImpressionEvent struct {
-	ID           string   \`json:"id"\`
-	Tenant       string   \`json:"tenant"\`
-	UserID       string   \`json:"user_id"\`
-	CandidateIDs []string \`json:"candidate_ids"\`
-	Positions    []int    \`json:"positions"\`
-	ModelVersion string   \`json:"model_version"\`
-	Fallback     bool     \`json:"fallback"\`
-}
-
-// OutboxStore keeps one row per undelivered impression; the relay republishes it to the topic.
-type OutboxStore struct{}
-
-func (s *OutboxStore) Put(ctx context.Context, tenant, userID string, payload []byte) error {
-	return nil
-}
-
-var outbox = &OutboxStore{}
-
-func publishImpression(ctx context.Context, tenant, userID string, items []RankedItem, modelVersion string, fallback bool) {
-	candidateIDs := make([]string, 0, len(items))
-	positions := make([]int, 0, len(items))
-	for _, item := range items {
-		candidateIDs = append(candidateIDs, item.ID)
-		positions = append(positions, item.Position)
-	}
-	event := ImpressionEvent{
-		ID:           uuid.NewString(),
-		Tenant:       tenant,
-		UserID:       userID,
-		CandidateIDs: candidateIDs,
-		Positions:    positions,
-		ModelVersion: modelVersion,
-		Fallback:     fallback,
-	}
-	payload, _ := json.Marshal(event)
-	if err := impressionWriter.WriteMessages(ctx, kafka.Message{Key: []byte(userID), Value: payload}); err != nil {
-		_ = outbox.Put(ctx, tenant, userID, payload)
-	}
-	log.Printf("impression tenant=%s user=%s items=%d", tenant, userID, len(candidateIDs))
-}
-
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   topic,
-		GroupID: "impression-counters",
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the impression before the broker answers
+		"enable.idempotence": true,  // a send retried after a lost acknowledgement lands once
 	})
-	for {
-		msg, err := reader.FetchMessage(ctx)
-		if err != nil {
-			continue
-		}
-		var event ImpressionEvent
-		_ = json.Unmarshal(msg.Value, &event)
-		for _, candidateID := range event.CandidateIDs {
-			rdb.HIncrBy(ctx, "impressions:"+event.Tenant+":"+candidateID, "shown", 1)
-		}
-		_ = reader.CommitMessages(ctx, msg)
+	if err != nil {
+		panic(err)
 	}
+	return p
+}
+
+// impressionPayload is what the user saw: each item at its slot, the version that ordered them, and whether that was the fallback.
+func impressionPayload(tenant, userID, surface string, ranked types.Ranked) map[string]any {
+	items := make([]map[string]any, 0, len(ranked.Items))
+	for position, item := range ranked.Items {
+		items = append(items, map[string]any{"id": item.ID, "position": position})
+	}
+	return map[string]any{
+		"tenant":        tenant,
+		"user_id":       userID,
+		"surface":       surface,
+		"model_version": ranked.ModelVersion,
+		"fallback":      ranked.Fallback,
+		"items":         items,
+	}
+}
+
+// publishImpression records what the user was shown; true once the broker has the impression.
+func publishImpression(ctx context.Context, tenant, userID, surface string, ranked types.Ranked) (bool, error) {
+	payload := impressionPayload(tenant, userID, surface, ranked)
+	value, _ := json.Marshal(payload)
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(userID), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded // no delivery report within the window
+		}
+	}
+	if err != nil {
+		// The broker did not take it: the relay produces the row later, so the impression is late, not lost.
+		return false, store.OutboxInsert(ctx, topic, userID, payload)
+	}
+	return true, nil
 }
 `,
     },
     scala: {
-      starter: `// publish_impression: report what a ranked response showed, once per response.
-import java.util.Properties
+      starter: `import java.util.Properties
 
-import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.KafkaException
 import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
 import spray.json._
 
-final case class RankedItem(id: String, score: Double, position: Int, features: List[Double])
+import recs.{Ranked, Store}
 
-final case class ImpressionEvent(
-    id: String,
-    tenant: String,
-    user_id: String,
-    candidate_ids: List[String],
-    features: List[List[Double]],
-    model_version: String
-)
-
-object Impressions {
-  implicit val impressionFormat: RootJsonFormat[ImpressionEvent] = jsonFormat6(ImpressionEvent)
-
+object Events {
   val Topic = "recsys.impression"
 
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new Jedis("redis", 6379)
-
-  /** One row per undelivered impression; the relay republishes it to the topic. */
-  object OutboxStore {
-    def put(tenant: String, userId: String, payload: String): Unit = ()
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  val outbox = OutboxStore
-
-  def publishImpression(
-      tenant: String,
-      userId: String,
-      items: List[RankedItem],
-      modelVersion: String,
-      fallback: Boolean
-  ): Unit = {
+  /** Record what the user was shown; true once the broker has the impression. */
+  def publishImpression(tenant: String, userId: String, surface: String, ranked: Ranked): Boolean = {
     // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val event = ImpressionEvent(
-      id = java.util.UUID.randomUUID().toString,
-      tenant = tenant,
-      user_id = userId,
-      candidate_ids = items.map(_.id),
-      features = items.map(_.features),
-      model_version = modelVersion
+    val items = JsArray(ranked.items.map(item => JsObject("id" -> JsString(item.id), "score" -> JsNumber(item.score))).toVector)
+    val payload = JsObject(
+      "tenant" -> JsString(tenant),
+      "user_id" -> JsString(userId),
+      "surface" -> JsString(surface),
+      "model_version" -> JsString(ranked.modelVersion),
+      "items" -> items
     )
-    producer.send(new ProducerRecord[String, String](Topic, items.head.id, event.toJson.compactPrint))
-    producer.flush()
-  }
-
-  def consume(): Unit = {
-    val consumer = new KafkaConsumer[String, String](props)
-    consumer.subscribe(java.util.List.of(Topic))
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(500))
-      records.forEach { record =>
-        val event = record.value.parseJson.convertTo[ImpressionEvent]
-        val tenant = event.tenant
-        event.candidate_ids.foreach { candidateId =>
-          jedis.hincrBy(s"impressions:$tenant:$candidateId", "shown", 1)
-        }
-        consumer.commitSync()
-      }
+    try {
+      producer.send(new ProducerRecord[String, String](Topic, surface, payload.compactPrint))
+      true
+    } catch {
+      case _: KafkaException =>
+        Store.outboxInsert(Topic, surface, payload)
+        false
     }
   }
 }
 `,
-      solution: `// publish_impression: report what a ranked response showed, once per response.
-import java.util.Properties
+      solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
 
-import org.apache.kafka.clients.consumer.KafkaConsumer
+import scala.util.Try
+
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.serialization.StringSerializer
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
 import spray.json._
 
-final case class RankedItem(id: String, score: Double, position: Int)
+import recs.{Ranked, Store}
 
-final case class ImpressionEvent(
-    id: String,
-    tenant: String,
-    user_id: String,
-    candidate_ids: List[String],
-    positions: List[Int],
-    model_version: String,
-    fallback: Boolean
-)
-
-object Impressions {
-  implicit val impressionFormat: RootJsonFormat[ImpressionEvent] = jsonFormat7(ImpressionEvent)
-
+object Events {
   val Topic = "recsys.impression"
+  val AckTimeoutMs = 2000L
 
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
-  private val jedis = new Jedis("redis", 6379)
-
-  /** One row per undelivered impression; the relay republishes it to the topic. */
-  object OutboxStore {
-    def put(tenant: String, userId: String, payload: String): Unit = ()
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "all") // every in-sync replica has the impression before the broker answers
+    props.put("enable.idempotence", "true") // a send retried after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  val outbox = OutboxStore
-
-  def publishImpression(
-      tenant: String,
-      userId: String,
-      items: List[RankedItem],
-      modelVersion: String,
-      fallback: Boolean
-  ): Unit = {
-    val event = ImpressionEvent(
-      id = java.util.UUID.randomUUID().toString,
-      tenant = tenant,
-      user_id = userId,
-      candidate_ids = items.map(_.id),
-      positions = items.map(_.position),
-      model_version = modelVersion,
-      fallback = fallback
+  /** What the user saw: each item at its slot, the version that ordered them, and whether that was the fallback. */
+  def impressionPayload(tenant: String, userId: String, surface: String, ranked: Ranked): JsObject = {
+    val items = ranked.items.zipWithIndex.map { case (item, position) => JsObject("id" -> JsString(item.id), "position" -> JsNumber(position)) }
+    JsObject(
+      "tenant" -> JsString(tenant),
+      "user_id" -> JsString(userId),
+      "surface" -> JsString(surface),
+      "model_version" -> JsString(ranked.modelVersion),
+      "fallback" -> JsBoolean(ranked.fallback),
+      "items" -> JsArray(items.toVector)
     )
-    val payload = event.toJson.compactPrint
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, userId, payload))
-      producer.flush()
-    } catch {
-      case _: Exception => outbox.put(tenant, userId, payload)
-    }
   }
 
-  def consume(): Unit = {
-    val consumer = new KafkaConsumer[String, String](props)
-    consumer.subscribe(java.util.List.of(Topic))
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(500))
-      records.forEach { record =>
-        val event = record.value.parseJson.convertTo[ImpressionEvent]
-        val tenant = event.tenant
-        event.candidate_ids.foreach { candidateId =>
-          jedis.hincrBy(s"impressions:$tenant:$candidateId", "shown", 1)
-        }
-        consumer.commitSync()
-      }
+  /** Record what the user was shown; true once the broker has the impression. */
+  def publishImpression(tenant: String, userId: String, surface: String, ranked: Ranked): Boolean = {
+    val payload = impressionPayload(tenant, userId, surface, ranked)
+    val record = new ProducerRecord[String, String](Topic, userId, payload.compactPrint)
+    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
+    if (acked.isFailure) {
+      // The broker did not take it: the relay produces the row later, so the impression is late, not lost.
+      Store.outboxInsert(Topic, userId, payload)
     }
+    acked.isSuccess
   }
 }
 `,
     },
     cpp: {
-      starter: `// publish_impression: report what a ranked response showed, once per response.
-#include <librdkafka/rdkafkacpp.h>
+      starter: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
 
-#include <iostream>
 #include <memory>
 #include <string>
-#include <vector>
+
+#include "recs/store.h"  // store::outboxInsert(topic, key, payload)
+#include "recs/types.h"
 
 using json = nlohmann::json;
 
 const std::string kTopic = "recsys.impression";
-constexpr int kAckTimeoutMs = 2000;
-
-struct RankedItem {
-  std::string id;
-  double score = 0.0;
-  int position = 0;
-  std::vector<float> features;
-};
-
-// One row per undelivered impression; the relay republishes it to the topic.
-struct OutboxStore {
-  void put(const std::string& tenant, const std::string& userId, const std::string& payload);
-};
-OutboxStore outbox;
-
-std::string newId();
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
   auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("acks", "all", err);
-  conf->set("enable.idempotence", "true", err);
+  conf->set("acks", "1", err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
 auto producer = makeProducer();
 
-void publishImpression(const std::string& tenant, const std::string& userId, const std::vector<RankedItem>& items,
-                       const std::string& modelVersion, bool fallback) {
+// Record what the user was shown; true once the broker has the impression.
+bool publishImpression(const std::string& tenant, const std::string& user_id, const std::string& surface, const recs::Ranked& ranked) {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  json candidateIds = json::array();
-  json features = json::array();
-  for (const auto& item : items) {
-    candidateIds.push_back(item.id);
-    features.push_back(item.features);
+  json items = json::array();
+  for (const auto& item : ranked.items) items.push_back(json{{"id", item.id}, {"score", item.score}});
+  const json payload{{"tenant", tenant}, {"user_id", user_id}, {"surface", surface}, {"model_version", ranked.model_version}, {"items", items}};
+  const std::string value = payload.dump();
+  const RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                                                   value.size(), surface.c_str(), surface.size(), 0, nullptr);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    store::outboxInsert(kTopic, surface, payload);
+    return false;
   }
-  const json event = {
-      {"id", newId()},
-      {"tenant", tenant},
-      {"user_id", userId},
-      {"candidate_ids", candidateIds},
-      {"features", features},
-      {"model_version", modelVersion},
-  };
-  const auto payload = event.dump();
-  const auto& key = items.front().id;
-  const auto error = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                                       const_cast<char*>(payload.data()), payload.size(), key.c_str(), key.size(),
-                                       0, nullptr);
-  (void)error;
-  producer->flush(kAckTimeoutMs);
-  std::cerr << "impression tenant=" << tenant << " user=" << userId << " items=" << candidateIds.size() << "\\n";
-}
-
-void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
-  while (true) {
-    auto message = consumer->consume(500);
-    if (message->err() != RdKafka::ERR_NO_ERROR) {
-      delete message;
-      continue;
-    }
-    const auto event = json::parse(static_cast<RdKafka::Message*>(message)->payload(), nullptr, false);
-    const auto tenant = event.value("tenant", std::string());
-    for (const auto& candidateId : event.value("candidate_ids", json::array())) {
-      redis.hincrby("impressions:" + tenant + ":" + candidateId.get<std::string>(), "shown", 1);
-    }
-    consumer->commitSync(message);
-    delete message;
-  }
+  producer->poll(0);
+  return true;
 }
 `,
-      solution: `// publish_impression: report what a ranked response showed, once per response.
-#include <librdkafka/rdkafkacpp.h>
+      solution: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
 
-#include <iostream>
 #include <memory>
 #include <string>
-#include <vector>
+
+#include "recs/store.h"  // store::outboxInsert(topic, key, payload)
+#include "recs/types.h"
 
 using json = nlohmann::json;
 
 const std::string kTopic = "recsys.impression";
 constexpr int kAckTimeoutMs = 2000;
 
-struct RankedItem {
-  std::string id;
-  double score = 0.0;
-  int position = 0;
+// The delivery report of the record in flight: publishImpression produces one record and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
 };
 
-// One row per undelivered impression; the relay republishes it to the topic.
-struct OutboxStore {
-  void put(const std::string& tenant, const std::string& userId, const std::string& payload);
-};
-OutboxStore outbox;
-
-std::string newId();
+DeliveryReport delivery;
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
   auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("acks", "all", err);
-  conf->set("enable.idempotence", "true", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the impression before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a send retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
 auto producer = makeProducer();
 
-void publishImpression(const std::string& tenant, const std::string& userId, const std::vector<RankedItem>& items,
-                       const std::string& modelVersion, bool fallback) {
-  json candidateIds = json::array();
-  json positions = json::array();
-  for (const auto& item : items) {
-    candidateIds.push_back(item.id);
-    positions.push_back(item.position);
+// What the user saw: each item at its slot, the version that ordered them, and whether that was the fallback.
+json impressionPayload(const std::string& tenant, const std::string& user_id, const std::string& surface, const recs::Ranked& ranked) {
+  json items = json::array();
+  for (size_t position = 0; position < ranked.items.size(); position++) {
+    items.push_back(json{{"id", ranked.items[position].id}, {"position", position}});
   }
-  const json event = {
-      {"id", newId()},
-      {"tenant", tenant},
-      {"user_id", userId},
-      {"candidate_ids", candidateIds},
-      {"positions", positions},
-      {"model_version", modelVersion},
-      {"fallback", fallback},
-  };
-  const std::string payload = event.dump();
-  const RdKafka::ErrorCode error = producer->produce(
-      kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()),
-      payload.size(), userId.c_str(), userId.size(), 0, nullptr);
-  if (error != RdKafka::ERR_NO_ERROR) outbox.put(tenant, userId, payload);
-  producer->flush(kAckTimeoutMs);
-  std::cerr << "impression tenant=" << tenant << " user=" << userId << " items=" << candidateIds.size() << "\\n";
+  return json{{"tenant", tenant},   {"user_id", user_id},           {"surface", surface},
+              {"model_version", ranked.model_version}, {"fallback", ranked.fallback}, {"items", items}};
 }
 
-void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
-  while (true) {
-    auto message = consumer->consume(500);
-    if (message->err() != RdKafka::ERR_NO_ERROR) {
-      delete message;
-      continue;
-    }
-    const auto event = json::parse(static_cast<RdKafka::Message*>(message)->payload(), nullptr, false);
-    const auto tenant = event.value("tenant", std::string());
-    for (const auto& candidateId : event.value("candidate_ids", json::array())) {
-      redis.hincrby("impressions:" + tenant + ":" + candidateId.get<std::string>(), "shown", 1);
-    }
-    consumer->commitSync(message);
-    delete message;
+// Record what the user was shown; true once the broker has the impression.
+bool publishImpression(const std::string& tenant, const std::string& user_id, const std::string& surface, const recs::Ranked& ranked) {
+  const json payload = impressionPayload(tenant, user_id, surface, ranked);
+  const std::string value = payload.dump();
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                                             value.size(), user_id.c_str(), user_id.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
   }
+  if (err != RdKafka::ERR_NO_ERROR) {
+    // The broker did not take it: the relay produces the row later, so the impression is late, not lost.
+    store::outboxInsert(kTopic, user_id, payload);
+    return false;
+  }
+  return true;
 }
 `,
     },
   },
-  hints: [
-    "A data engineer replaying one user's exposure stream gets items out of order, finds float arrays in a topic retained for days, cannot tell slot 1 from slot 30, and sees counters that under-report during a broker incident.",
-    "The record key is the first item id, so a user's events spread across partitions; the payload copies each item's feature values and omits positions and the fallback flag; the produce failure is logged and the event is discarded.",
-    'Produce with `key=user_id`; build the payload from `candidate_ids`, `positions`, `model_version` and `fallback` only; wrap the produce in `except KafkaException` (or the language equivalent) and call `outbox.put(event)` there.',
-  ],
-  debrief: `A publish path that looks fire-and-forget decides what the training pipeline can prove later. Keying by user makes one person's exposure stream ordered and replayable; keying by item looks natural and silently reorders a user's shows. The payload is a join key, not a transport for features: raw vectors in a topic retained for days become a retention problem. An idempotent producer with \`acks=all\` stops the client's own retry from duplicating an event, but only an outbox protects the impression the broker refused. Folding counters before the commit means a crash replays the event instead of losing it.
+  harness: {
+    python: `import json
 
-Production pipelines put a schema registry in front of the topic, dedupe on an event id so replays are idempotent, and set a retention policy per topic.`,
+TOPIC = "recsys.impression"
+RANKED = {
+    "items": [{"id": "c-2", "score": 0.74}, {"id": "c-4", "score": 0.47}, {"id": "c-1", "score": 0.37}],
+    "model_version": "ranker-v7",
+    "fallback": False,
+}
+DEGRADED = {"items": [{"id": "c-3", "score": 40.0}, {"id": "c-1", "score": 25.0}], "model_version": "popularity-v1", "fallback": True}
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.lrange("outbox", 0, -1)]
+
+
+def check_user_key(ctx):
+    m = ctx.load("events")
+    m.publish_impression("t1", "u-1", "home", RANKED)
+    m.publish_impression("t1", "u-2", "home", RANKED)
+    m.publish_impression("t1", "u-1", "home", RANKED)
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three publish_impression calls produced {len(records)} records on {TOPIC} (topics: {sorted(ctx.kafka.topics)})"
+    keys = [r.key for r in records]
+    assert keys == [b"u-1", b"u-2", b"u-1"], f"the impressions are keyed {keys}, expected the user ids u-1, u-2, u-1: keyed by surface, every home impression lands on one partition"
+    assert records[0].partition == records[2].partition, "both impressions of u-1 must land on one partition, or a consumer reads the user's history out of order"
+
+
+def check_impression_payload(ctx):
+    m = ctx.load("events")
+    m.publish_impression("t1", "u-1", "home", DEGRADED)
+    values = ctx.kafka.values(TOPIC)
+    assert len(values) == 1, f"one publish_impression produced {len(values)} records"
+    event = json.loads(values[0])
+    assert event.get("tenant") == "t1" and event.get("user_id") == "u-1" and event.get("surface") == "home", f"the impression is {event}, expected tenant, user_id and surface"
+    items = event.get("items")
+    assert items == [{"id": "c-3", "position": 0}, {"id": "c-1", "position": 1}], f"the impression's items are {items}: each must be {{id, position}}, the zero-based slot the user saw it in, with no score"
+    assert event.get("model_version") == "popularity-v1" and event.get("fallback") is True, f"the impression says model_version {event.get('model_version')!r}, fallback {event.get('fallback')!r}: offline evaluation must be able to leave the popularity order out of the model's numbers"
+
+
+def check_acks_idempotent(ctx):
+    m = ctx.load("events")
+    ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
+    m.publish_impression("t1", "u-1", "home", RANKED)
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"after one lost acknowledgement the topic holds {len(ctx.kafka.records(TOPIC))} records: the producer's retry wrote the impression twice. Enable idempotence"
+    m.publish_impression("t1", "u-2", "home", RANKED)
+    ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
+    assert len(ctx.kafka.records(TOPIC)) == 2, "a leader failover lost an impression only the leader had acknowledged: acks=all waits for every in-sync replica"
+
+
+def check_outbox_on_failure(ctx):
+    m = ctx.load("events")
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_impression("t1", "u-1", "home", RANKED)
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the impression is lost and the list never reaches offline evaluation"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "u-1" and rows[0].get("payload", {}).get("user_id") == "u-1", f"the outbox row is {rows[0]}, expected the topic, the key u-1 and the payload"
+    assert ok is False, f"publish_impression returned {ok!r} after a failed delivery, expected False"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    ok = m.publish_impression("t1", "u-2", "home", RANKED)
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"publish_impression waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("payload", {}).get("user_id") == "u-2", f"no delivery report within the window and the outbox holds {rows}"
+    assert ok is False, f"publish_impression returned {ok!r} without a delivery report, expected False"
+`,
+    typescript: `const TOPIC = 'recsys.impression';
+const RANKED = {
+  items: [
+    {id: 'c-2', score: 0.74},
+    {id: 'c-4', score: 0.47},
+    {id: 'c-1', score: 0.37},
+  ],
+  model_version: 'ranker-v7',
+  fallback: false,
+};
+const DEGRADED = {
+  items: [
+    {id: 'c-3', score: 40},
+    {id: 'c-1', score: 25},
+  ],
+  model_version: 'popularity-v1',
+  fallback: true,
+};
+
+const outboxRows = ctx => (ctx.redis.lrange('outbox', 0, -1) as string[]).map(row => JSON.parse(row));
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+export async function check_user_key(ctx) {
+  const m = ctx.load('events');
+  await m.publishImpression('t1', 'u-1', 'home', RANKED);
+  await m.publishImpression('t1', 'u-2', 'home', RANKED);
+  await m.publishImpression('t1', 'u-1', 'home', RANKED);
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three publishImpression calls produced \${records.length} records on \${TOPIC}\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['u-1', 'u-2', 'u-1'], \`the impressions are keyed \${JSON.stringify(keys)}, expected the user ids u-1, u-2, u-1: keyed by surface, every home impression lands on one partition\`);
+  assert.equal(records[0].partition, records[2].partition, "both impressions of u-1 must land on one partition, or a consumer reads the user's history out of order");
+}
+
+export async function check_impression_payload(ctx) {
+  const m = ctx.load('events');
+  await m.publishImpression('t1', 'u-1', 'home', DEGRADED);
+  await settle();
+  const values = ctx.kafka.values(TOPIC);
+  assert.equal(values.length, 1, \`one publishImpression produced \${values.length} records\`);
+  const event = JSON.parse(values[0]);
+  assert(event.tenant === 't1' && event.user_id === 'u-1' && event.surface === 'home', \`the impression is \${values[0]}, expected tenant, user_id and surface\`);
+  assert.deepStrictEqual(event.items, [{id: 'c-3', position: 0}, {id: 'c-1', position: 1}], \`the impression's items are \${JSON.stringify(event.items)}: each must be {id, position}, the zero-based slot the user saw it in, with no score\`);
+  assert(event.model_version === 'popularity-v1' && event.fallback === true, \`the impression says model_version \${JSON.stringify(event.model_version)}, fallback \${JSON.stringify(event.fallback)}: offline evaluation must be able to leave the popularity order out of the model's numbers\`);
+}
+
+export async function check_acks_idempotent(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
+  await m.publishImpression('t1', 'u-1', 'home', RANKED);
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`after one lost acknowledgement the topic holds \${ctx.kafka.records(TOPIC).length} records: the producer's retry wrote the impression twice. Enable idempotence\`);
+  await m.publishImpression('t1', 'u-2', 'home', RANKED);
+  await settle();
+  ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, 'a leader failover lost an impression only the leader had acknowledged: acks: -1 (all) waits for every in-sync replica');
+}
+
+export async function check_outbox_on_failure(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.failNext(TOPIC, 1);
+  let ok = await m.publishImpression('t1', 'u-1', 'home', RANKED);
+  await settle();
+  let rows = outboxRows(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the impression is lost and the list never reaches offline evaluation\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'u-1' && rows[0].payload?.user_id === 'u-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key u-1 and the payload\`);
+  assert.equal(ok, false, \`publishImpression resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  ok = await m.publishImpression('t1', 'u-2', 'home', RANKED);
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`publishImpression waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  rows = outboxRows(ctx);
+  assert(rows.length === 2 && rows[1].payload?.user_id === 'u-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert.equal(ok, false, \`publishImpression resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+
+	"recs/types"
+
+	"leetbuild/harness"
+)
+
+const eventsTopic = "recsys.impression"
+
+var (
+	eventsBg = context.Background()
+	ranked   = types.Ranked{Items: []types.Item{{ID: "c-2", Score: 0.74}, {ID: "c-4", Score: 0.47}, {ID: "c-1", Score: 0.37}}, ModelVersion: "ranker-v7"}
+	degraded = types.Ranked{Items: []types.Item{{ID: "c-3", Score: 40}, {ID: "c-1", Score: 25}}, ModelVersion: "popularity-v1", Fallback: true}
+)
+
+func publish(ctx *harness.Ctx, userID string, r types.Ranked) bool {
+	ok, err := publishImpression(eventsBg, "t1", userID, "home", r)
+	ctx.NoError(err, "publishImpression")
+	return ok
+}
+
+type outboxRow struct {
+	Topic   string         \`json:"topic"\`
+	Key     string         \`json:"key"\`
+	Payload map[string]any \`json:"payload"\`
+}
+
+func outboxRows(ctx *harness.Ctx) []outboxRow {
+	var rows []outboxRow
+	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
+		var row outboxRow
+		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func CheckUserKey(ctx *harness.Ctx) {
+	publish(ctx, "u-1", ranked)
+	publish(ctx, "u-2", ranked)
+	publish(ctx, "u-1", ranked)
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three publishImpression calls must produce three records on recsys.impression; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"u-1", "u-2", "u-1"}, "the impressions must be keyed by the user ids (keyed by surface, every home impression lands on one partition)")
+	ctx.Equal(records[0].Partition, records[2].Partition, "both impressions of u-1 must land on one partition, or a consumer reads the user's history out of order; the partitions")
+}
+
+func CheckImpressionPayload(ctx *harness.Ctx) {
+	publish(ctx, "u-1", degraded)
+	ctx.Settle()
+	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 1, "one publishImpression must produce one record; the records")
+	var event map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the impression must be JSON")
+	ctx.Assert(event["tenant"] == "t1" && event["user_id"] == "u-1" && event["surface"] == "home", "the impression is %s, expected tenant, user_id and surface", values[0])
+	want := []any{map[string]any{"id": "c-3", "position": float64(0)}, map[string]any{"id": "c-1", "position": float64(1)}}
+	ctx.Equal(event["items"], want, "each item must be {id, position}, the zero-based slot the user saw it in, with no score; the impression's items")
+	ctx.Assert(event["model_version"] == "popularity-v1" && event["fallback"] == true, "the impression says model_version %v, fallback %v: offline evaluation must be able to leave the popularity order out of the model's numbers", event["model_version"], event["fallback"])
+}
+
+func CheckAcksIdempotent(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	publish(ctx, "u-1", ranked)
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the impression twice (enable.idempotence); the records")
+	publish(ctx, "u-2", ranked)
+	ctx.Settle()
+	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose an impression (acks=all waits for every in-sync replica); the records")
+}
+
+func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok := publish(ctx, "u-1", ranked)
+	ctx.Settle()
+	rows := outboxRows(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the impression is lost and the list never reaches offline evaluation; the rows")
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "u-1" && rows[0].Payload["user_id"] == "u-1", "the outbox row is %v, expected the topic, the key u-1 and the payload", rows[0])
+	ctx.Equal(ok, false, "publishImpression's result after a failed delivery")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	ok = publish(ctx, "u-2", ranked)
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "publishImpression waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	rows = outboxRows(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Payload["user_id"] == "u-2", "no delivery report within the window and the outbox holds %v", rows)
+	ctx.Equal(ok, false, "publishImpression's result without a delivery report")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kEventsTopic = "recsys.impression";
+const recs::Ranked kRanked{{{"c-2", 0.74}, {"c-4", 0.47}, {"c-1", 0.37}}, "ranker-v7", false};
+const recs::Ranked kDegraded{{{"c-3", 40}, {"c-1", 25}}, "popularity-v1", true};
+
+std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> rows;
+  for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
+    const auto row = nlohmann::json::parse(text, nullptr, false);
+    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", text);
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+std::string field(const nlohmann::json& j, const std::string& name) {
+  return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckUserKey(harness::Ctx& ctx) {
+  publishImpression("t1", "u-1", "home", kRanked);
+  publishImpression("t1", "u-2", "home", kRanked);
+  publishImpression("t1", "u-1", "home", kRanked);
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 3, "three publishImpression calls must produce three records on recsys.impression; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"u-1", "u-2", "u-1"}, "the impressions must be keyed by the user ids (keyed by surface, every home impression lands on one partition)");
+  ctx.Equal(records[0].Partition, records[2].Partition, "both impressions of u-1 must land on one partition, or a consumer reads the user's history out of order; the partitions");
+}
+
+void CheckImpressionPayload(harness::Ctx& ctx) {
+  publishImpression("t1", "u-1", "home", kDegraded);
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(values.size(), 1, "one publishImpression must produce one record; the records");
+  const auto event = nlohmann::json::parse(values[0], nullptr, false);
+  ctx.Assert(field(event, "tenant") == "t1" && field(event, "user_id") == "u-1" && field(event, "surface") == "home", "the impression is %s, expected tenant, user_id and surface", values[0]);
+  const nlohmann::json want = nlohmann::json::array({{{"id", "c-3"}, {"position", 0}}, {{"id", "c-1"}, {"position", 1}}});
+  const nlohmann::json items = event.is_object() && event.contains("items") ? event["items"] : nlohmann::json();
+  ctx.Assert(items == want, "the impression's items are %s: each must be {id, position}, the zero-based slot the user saw it in, with no score", items.dump());
+  const bool fallback = event.is_object() && event.contains("fallback") && event["fallback"] == true;
+  ctx.Assert(field(event, "model_version") == "popularity-v1" && fallback, "the impression is %s: offline evaluation needs model_version popularity-v1 and fallback true to leave the popularity order out of the model's numbers", values[0]);
+}
+
+void CheckAcksIdempotent(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishImpression("t1", "u-1", "home", kRanked);
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the impression twice (enable.idempotence); the records");
+  publishImpression("t1", "u-2", "home", kRanked);
+  ctx.Settle();
+  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an impression (acks=all waits for every in-sync replica); the records");
+}
+
+void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  bool ok = publishImpression("t1", "u-1", "home", kRanked);
+  ctx.Settle();
+  auto rows = outboxRows(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the impression is lost and the list never reaches offline evaluation; the rows");
+  ctx.Assert(field(rows[0], "topic") == kEventsTopic && field(rows[0], "key") == "u-1" && rows[0].contains("payload") && field(rows[0]["payload"], "user_id") == "u-1",
+             "the outbox row is %s, expected the topic, the key u-1 and the payload", rows[0].dump());
+  ctx.Equal(ok, false, "publishImpression's result after a failed delivery");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const int64_t before = ctx.Clock.Now();
+  ok = publishImpression("t1", "u-2", "home", kRanked);
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "publishImpression waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  rows = outboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && field(rows[1]["payload"], "user_id") == "u-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Equal(ok, false, "publishImpression's result without a delivery report");
+}
+`,
+  },
+  hints: [
+    'Watch the partitions while two users load the home page: every impression lands on one of them. Then fail one delivery: the call returns true and the impression is gone.',
+    'The key is the surface, the payload copies the scored items and drops the flag, the producer acknowledges on the leader alone, and the try/except only sees an error raised before the record leaves the client.',
+    'Key by `user_id`; build `items` as `{id, position}` with `fallback`; set `enable.idempotence` and `acks=all`; pass `on_delivery`, `flush(ACK_TIMEOUT_S)`, and on an error or a record still in flight call `store.outbox_insert` and return False.',
+  ],
+  debrief: `An impression is evidence for an experiment, so its shape follows what the analysis needs: the slot each item sat in, because position explains clicks as much as relevance does, and the fallback flag, because a list the model did not produce must not count for it. Keying by user spreads load and keeps one user's history in order for the jobs that join impressions to clicks. Only the delivery report says whether the broker took the record, which is why the outbox hangs off the report and not off \`produce\`. Production pipelines add an impression id the click event carries, sample logging on high-traffic surfaces, and run the outbox relay with its own retries and alerting on its lag.`,
 };

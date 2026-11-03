@@ -2,163 +2,119 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/search: the query contract',
+  title: 'POST /v1/search: the server decides tenant, width, k and version',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'search', 'index'],
+  focus: ['client', 'search', 'corpus'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/search\` with body
-\`{"query": [0.1, …], "k": 10, "tenant": "acme", "index_version": "idx-42"}\`, clamps \`k\` into
-1..100, searches the index as the tenant and version the body names, and returns \`hits\`, \`k\`
-and \`index_version\`. It compiles, serves the demo and hides four flaws.
+**Starting point.** The starter serves \`POST /v1/search\` with body \`{query, k, tenant?,
+index_version?}\` on the corpus (\`search.corpus\`, provided): it takes the tenant from the body when
+one is given (the \`X-Tenant-Id\` header otherwise), searches the version the body names (the active
+one otherwise), clamps \`k\` into 1 to 100 and answers \`{hits, k, index_version}\` from
+\`corpus.nearest\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A body \`tenant\` lets any caller read any tenant's corpus by
-naming it; an unbounded \`k\` asks the index for everything; a caller-named \`index_version\` reads a
-retired or future snapshot; and only the dimension check stops a wrong-width query at the edge.
+**Failure mode the checks target.** Any caller reads another tenant's corpus by naming it in the
+body; a client that asks for 500 results gets 100 and believes it saw everything; a 3-number query
+is scored against 4-dimension vectors and still ranks; and a caller searches a retired index version.
 
-- The tenant is the authenticated \`X-Tenant-Id\` header and is **required** (**401** when absent).
-  A \`tenant\` field in the body is not trusted: when it contradicts the header the request is
-  **403**. The header is the only tenant the search runs as.
-- The query vector must have exactly the active index's dimension (**768**); a mismatch is **400**
-  and the error names the active index version it was compared against.
-- \`k\` is an integer from **1** to **100**; anything above the cap is **400**, not clamped, and the
-  response echoes the \`k\` that was actually searched.
-- The index version is resolved **server-side** to the active one. A body \`index_version\` that is
-  not the active version is **409** with the active version in the error.
-- The response carries \`hits\`, \`k\` and the \`index_version\` the search actually ran against.`,
+- The tenant is the \`X-Tenant-Id\` header: absent is **401**, a body \`tenant\` that differs is **403**.
+- The query has exactly the active index's \`dims\` numbers, else **400** naming the active version.
+- \`k\` is an integer from 1 to \`MAX_K\` (100); anything else is **400**, not clamped.
+- The search runs in the active version; a body \`index_version\` that is not it is **409** naming the
+  active one.`,
   sequence: {
-    participants: ['Client', 'Search API', 'Index versions'],
+    participants: ['Client', 'searchd', 'Corpus'],
     messages: [
-      {from: 'Client', to: 'Search API', label: 'POST /v1/search · X-Tenant-Id · {query, k}', kind: 'sync'},
-      {from: 'Search API', to: 'Search API', label: 'authenticate · drop body tenant', kind: 'sync'},
-      {from: 'Search API', to: 'Index versions', label: 'activeVersion() · dimensions()', kind: 'sync'},
-      {from: 'Index versions', to: 'Search API', label: 'idx-42 · 768', kind: 'reply'},
-      {from: 'Search API', to: 'Search API', label: 'reject k > 100 · wrong dimension', kind: 'sync'},
-      {from: 'Search API', to: 'Client', label: '200 {hits, k, index_version} / 403 / 409', kind: 'reply'},
+      {from: 'Client', to: 'searchd', label: 'POST /v1/search · X-Tenant-Id · {query, k}', kind: 'sync'},
+      {from: 'searchd', to: 'searchd', label: 'tenant = header · 401 / 403 on a body tenant', kind: 'sync'},
+      {from: 'searchd', to: 'Corpus', label: 'active_index()', kind: 'sync'},
+      {from: 'Corpus', to: 'searchd', label: 'idx-42 · dims 4', kind: 'reply'},
+      {from: 'searchd', to: 'searchd', label: '409 other version · 400 width · 400 k outside 1..100', kind: 'sync'},
+      {from: 'searchd', to: 'Corpus', label: 'nearest(tenant, idx-42, query, k)', kind: 'sync'},
+      {from: 'searchd', to: 'Client', label: '200 {hits, k, index_version}', kind: 'reply'},
     ],
   },
-  hints: [
-    "A request with a forged body `tenant` returns another tenant's documents, `k: 500` comes back 200 with `k: 100`, and a 512-wide vector reaches the shards.",
-    'The handler reads tenant and version from the body and clamps `k` with `min`; nothing reads `X-Tenant-Id`, compares `len(query)` to the index dimension, or checks the version.',
-    'Read `X-Tenant-Id` (401 absent, 403 on body mismatch), reject `len(query) != INDEX_DIMENSIONS` with 400, reject `k > MAX_K` with 400, and 409 any body `index_version` that is not `ACTIVE_INDEX_VERSION`.',
-  ],
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/search',
-      detail: 'Register the search route on `POST /v1/search`.',
+      title: 'Answers POST /v1/search from the tenant namespace',
+      detail:
+        'Register `POST /v1/search`; a search under `X-Tenant-Id` answers `{hits, k, index_version}` from `nearest` in the active version.',
       match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/search["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/search['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/search"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"search"\s*\)/, /\bpost\s*\{/]},
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/search"/]},
+        python: {all: [/@app\.post\(\s*["']\/v1\/search["']/, /corpus\.nearest\(/]},
+        typescript: {all: [/app\.post\(\s*['"]\/v1\/search['"]/, /nearest\(/]},
+        go: {all: [/HandleFunc\(\s*"POST \/v1\/search"/, /corpus\.Nearest\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"search"\s*\)/, /\bpost\b/, /Corpus\.nearest\(/]},
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/search"/, /corpus::nearest\(/]},
       },
     },
     {
-      id: 'tenant-filter',
-      title: 'Scopes the search to the authenticated tenant',
+      id: 'tenant-header',
+      title: 'The tenant is the authenticated header',
       detail:
-        'The tenant comes from `X-Tenant-Id` (**401** when missing) and a contradicting `tenant` in the body is **403**. The starter reads the tenant from the body, so any caller can search any corpus.',
+        'The tenant is `X-Tenant-Id` (**401** when absent); a body `tenant` that differs is **403**. The starter prefers the body, so a caller reads any corpus by naming it.',
       match: {
-        python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/, /status_code\s*=\s*403/, /body\.tenant/]},
-        typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/, /body\.tenant/]},
-        go: {all: [/X-Tenant-Id/, /StatusUnauthorized/, /StatusForbidden/, /body\.Tenant/]},
-        scala: {all: [/X-Tenant-Id/, /StatusCodes\.Unauthorized/, /StatusCodes\.Forbidden/, /body\.tenant/]},
-        cpp: {all: [/X-Tenant-Id/, /\b401\b/, /\b403\b/, /body\.value\(\s*"tenant"/]},
+        python: {all: [/x-tenant-id/i, /\b401\b/, /\b403\b/], none: [/body\.tenant\s+or\b/]},
+        typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/], none: [/body\.tenant\s*\?\?/]},
+        go: {
+          all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/],
+          none: [/tenant\s*:=\s*body\.Tenant\b/],
+        },
+        scala: {all: [/X-Tenant-Id/i, /Unauthorized/, /Forbidden/], none: [/\.orElse\(header\)/]},
+        cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /\b403\b/], none: [/tenant\s*=\s*body\.value\(\s*"tenant"/]},
       },
     },
     {
       id: 'k-cap',
-      title: 'Rejects k above the cap instead of clamping it',
+      title: 'Rejects k outside 1 to 100 instead of clamping it',
       detail:
-        '`k` must be an integer in 1..100 and anything above the cap is **400**. The starter clamps `k` down to the cap and answers 200, so the caller never learns its request was rewritten.',
+        '`k` must be an integer from 1 to `MAX_K` (100); anything else is **400**. The starter clamps it and answers 200, so the caller never learns its request was rewritten.',
       match: {
-        python: {all: [/MAX_K\s*=\s*100/, /1\s*<=\s*body\.k\s*<=\s*MAX_K/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_K\s*=\s*100/, /k\s*>\s*MAX_K/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxK\s*=\s*100/, /k\s*>\s*maxK/, /StatusBadRequest/]},
-        scala: {all: [/MaxK\s*=\s*100/, /k\s*>\s*MaxK/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kMaxK\s*=\s*100/, /k\s*>\s*kMaxK/, /\b400\b/]},
+        python: {all: [/MAX_K/, /\b400\b/], none: [/min\(\s*body\.k/]},
+        typescript: {all: [/MAX_K/, /code\(\s*400\s*\)/], none: [/Math\.min\(/]},
+        go: {all: [/maxK/, /StatusBadRequest|\b400\b/], none: [/\bk\s*=\s*maxK\b/]},
+        scala: {all: [/MaxK/, /BadRequest/], none: [/math\.min\(/]},
+        cpp: {all: [/kMaxK/, /\b400\b/], none: [/std::(clamp|min)\(/]},
       },
     },
     {
       id: 'dimension',
-      title: 'Checks the query against the active dimension',
+      title: 'Checks the query width against the active index',
       detail:
-        'The vector length is compared against the active index dimension (**768**) and a mismatch is **400** with the active version in the error. The starter never compares the vector, so a wrong-width query reaches the shards.',
+        "The query's length is compared with the active index's `dims` and a mismatch is **400** naming the active version. `nearest` scores over the shorter of two vectors, so the starter ranks a wrong-width query.",
       match: {
-        python: {all: [/INDEX_DIMENSIONS/, /len\(body\.query\)\s*!=\s*INDEX_DIMENSIONS/, /active_version/]},
-        typescript: {all: [/INDEX_DIMENSIONS/, /vector\.length\s*!==\s*INDEX_DIMENSIONS/, /active_version/]},
-        go: {all: [/indexDimensions/, /len\(body\.Query\)\s*!=\s*indexDimensions/, /active_version/]},
-        scala: {all: [/IndexDimensions/, /\.length\s*!=\s*IndexDimensions/, /active_version/]},
-        cpp: {all: [/kIndexDimensions/, /\.size\(\)\s*!=\s*kIndexDimensions/, /active_version/]},
+        python: {all: [/["']dims["']/, /len\(\s*body\.query\s*\)/]},
+        typescript: {all: [/\.dims\b/, /query\.length/]},
+        go: {all: [/\.Dims\b/, /len\(\s*body\.Query\s*\)/]},
+        scala: {all: [/\.dims\b/, /query\.(length|size)\b/]},
+        cpp: {all: [/\.dims\b/, /query\.size\(\)/]},
       },
     },
     {
       id: 'active-version',
-      title: 'Resolves the index version server-side',
+      title: 'Searches the active version only',
       detail:
-        'The searched version is the active one and a body `index_version` that disagrees is **409** naming the active version. The starter searches whatever version the body names.',
+        'The search runs in `active_index()` and a body `index_version` that is not the active one is **409** naming it. The starter searches whatever version the body names.',
       match: {
-        python: {all: [/ACTIVE_INDEX_VERSION/, /status_code\s*=\s*409/, /body\.index_version/]},
-        typescript: {all: [/ACTIVE_INDEX_VERSION/, /code\(\s*409\s*\)/, /body\.index_version/]},
-        go: {all: [/activeIndexVersion/, /StatusConflict/, /body\.IndexVersion/]},
-        scala: {all: [/ActiveIndexVersion/, /StatusCodes\.Conflict/, /body\.index_version/]},
-        cpp: {all: [/kActiveIndexVersion/, /\b409\b/, /index_version/]},
+        python: {all: [/\b409\b/], none: [/body\.index_version\s+or\b/]},
+        typescript: {all: [/code\(\s*409\s*\)/], none: [/body\.index_version\s*\?\?/]},
+        go: {all: [/StatusConflict|\b409\b/], none: [/version\s*:=\s*body\.IndexVersion\b/]},
+        scala: {all: [/Conflict/], none: [/getOrElse\(active\.version\)/]},
+        cpp: {all: [/\b409\b/], none: [/body\.value\(\s*"index_version",\s*active\.version\s*\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("search")
-
-ACTIVE_INDEX_VERSION = "idx-42"
-
-
-class SearchRequest(BaseModel):
-    query: list[float]
-    k: int = 10
-    tenant: str
-    index_version: str = ACTIVE_INDEX_VERSION
-
-
-class Index:
-    def search(self, tenant: str, query: list[float], k: int, version: str) -> list[dict]:
-        """Nearest neighbors for one tenant, from one index version."""
-        raise NotImplementedError
-
-
-index = Index()
-
-
-@app.post("/v1/search")
-def search(body: SearchRequest) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    k = max(1, min(body.k, 100))
-    hits = index.search(body.tenant, body.query, k, body.index_version)
-    logger.info("search tenant=%s k=%d version=%s", body.tenant, k, body.index_version)
-    return JSONResponse({"hits": hits, "k": k, "index_version": body.index_version}, status_code=200)
-`,
-      solution: `import logging
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from search import corpus  # active_index, nearest, document, document_by_id
 
 app = FastAPI()
-logger = logging.getLogger("search")
 
 MAX_K = 100
-INDEX_DIMENSIONS = 768
-ACTIVE_INDEX_VERSION = "idx-42"
 
 
 class SearchRequest(BaseModel):
@@ -168,423 +124,339 @@ class SearchRequest(BaseModel):
     index_version: str | None = None
 
 
-class Index:
-    def search(self, tenant: str, query: list[float], k: int, version: str) -> list[dict]:
-        """Nearest neighbors for one tenant, from one index version."""
-        raise NotImplementedError
+@app.post("/v1/search")
+def search(body: SearchRequest, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = body.tenant or request.headers.get("x-tenant-id", "")
+    active = corpus.active_index()
+    version = body.index_version or active["version"]
+    k = max(1, min(body.k, MAX_K))
+    hits = corpus.nearest(tenant, version, body.query, k)
+    return {"hits": hits, "k": k, "index_version": version}
+`,
+      solution: `from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+
+from search import corpus  # active_index, nearest, document, document_by_id
+
+app = FastAPI()
+
+MAX_K = 100
 
 
-index = Index()
-
-
-def authenticate(header_tenant: str | None, body_tenant: str | None) -> str:
-    """The header is the tenant; a body field may only agree with it."""
-    if header_tenant is None or header_tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if body_tenant is not None and body_tenant != header_tenant:
-        raise HTTPException(status_code=403, detail="body tenant does not match the authenticated tenant")
-    return header_tenant
-
-
-def resolve_version(requested: str | None) -> str:
-    """The only searchable version is the active one; a caller may only confirm it."""
-    if requested is not None and requested != ACTIVE_INDEX_VERSION:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "index version is not active", "active_version": ACTIVE_INDEX_VERSION},
-        )
-    return ACTIVE_INDEX_VERSION
-
-
-def validate(body: SearchRequest) -> None:
-    if len(body.query) != INDEX_DIMENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "query vector has the wrong dimension",
-                "expected": INDEX_DIMENSIONS,
-                "active_version": ACTIVE_INDEX_VERSION,
-            },
-        )
-    if not 1 <= body.k <= MAX_K:
-        raise HTTPException(status_code=400, detail="k must be an integer between 1 and 100")
+class SearchRequest(BaseModel):
+    query: list[float]
+    k: int = 10
+    tenant: str | None = None
+    index_version: str | None = None
 
 
 @app.post("/v1/search")
-def search(
-    body: SearchRequest,
-    tenant_header: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    tenant = authenticate(tenant_header, body.tenant)
-    version = resolve_version(body.index_version)
-    validate(body)
-    hits = index.search(tenant, body.query, body.k, version)
-    logger.info("search tenant=%s k=%d version=%s", tenant, body.k, version)
-    return JSONResponse({"hits": hits, "k": body.k, "index_version": version}, status_code=200)
+def search(body: SearchRequest, request: Request) -> dict:
+    # The tenant is who authenticated; a body field may only agree with it.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    if body.tenant is not None and body.tenant != tenant:
+        raise HTTPException(status_code=403, detail="the body names another tenant")
+    active = corpus.active_index()
+    if body.index_version is not None and body.index_version != active["version"]:
+        raise HTTPException(status_code=409, detail={"error": "index version is not active", "index_version": active["version"]})
+    if len(body.query) != active["dims"]:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"query has {len(body.query)} dimensions, the index has {active['dims']}", "index_version": active["version"]},
+        )
+    if not 1 <= body.k <= MAX_K:
+        raise HTTPException(status_code=400, detail=f"k must be an integer from 1 to {MAX_K}")
+    hits = corpus.nearest(tenant, active["version"], body.query, body.k)
+    return {"hits": hits, "k": body.k, "index_version": active["version"]}
 `,
     },
     typescript: {
-      starter: `/** POST /v1/search. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-import {index} from './index_store';
-
-export const app = Fastify();
-
-interface SearchBody {
-  query: number[];
-  k?: number;
-  tenant: string;
-  index_version?: string;
-}
-
-app.post('/v1/search', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const body = request.body as SearchBody;
-  const version = body.index_version ?? 'idx-42';
-  const k = Math.min(Math.max(body.k ?? 10, 1), 100);
-  const hits = await index.search(body.tenant, body.query, k, version);
-  request.log.info({tenant: body.tenant, k, version}, 'searched');
-  return reply.code(200).send({hits, k, index_version: version});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** POST /v1/search: the tenant, the cap and the index version are the server's to decide. */
-import Fastify from 'fastify';
-
-import {index} from './index_store';
+import {activeIndex, nearest} from 'search/corpus';
 
 export const app = Fastify();
 
 const MAX_K = 100;
-const INDEX_DIMENSIONS = 768;
-const ACTIVE_INDEX_VERSION = 'idx-42';
 
 interface SearchBody {
-  query?: number[];
+  query: number[];
+  k?: number;
+  tenant?: string;
+  index_version?: string;
+}
+
+app.post('/v1/search', async request => {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const body = request.body as SearchBody;
+  const tenant = body.tenant ?? String(request.headers['x-tenant-id'] ?? '');
+  const active = await activeIndex();
+  const version = body.index_version ?? active.version;
+  const k = Math.max(1, Math.min(body.k ?? 10, MAX_K));
+  const hits = await nearest(tenant, version, body.query, k);
+  return {hits, k, index_version: version};
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {activeIndex, nearest} from 'search/corpus';
+
+export const app = Fastify();
+
+const MAX_K = 100;
+
+interface SearchBody {
+  query: number[];
   k?: number;
   tenant?: string;
   index_version?: string;
 }
 
 app.post('/v1/search', async (request, reply) => {
+  const body = request.body as SearchBody;
+  // The tenant is who authenticated; a body field may only agree with it.
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-
-  const body = (request.body ?? {}) as SearchBody;
-  if (body.tenant !== undefined && body.tenant !== tenant)
-    return reply.code(403).send({error: 'body tenant does not match the authenticated tenant'});
-  if (body.index_version !== undefined && body.index_version !== ACTIVE_INDEX_VERSION)
-    return reply
-      .code(409)
-      .send({error: 'index version is not active', active_version: ACTIVE_INDEX_VERSION});
-
-  const vector = body.query;
-  if (!Array.isArray(vector) || vector.length !== INDEX_DIMENSIONS)
-    return reply.code(400).send({
-      error: 'query vector has the wrong dimension',
-      expected: INDEX_DIMENSIONS,
-      active_version: ACTIVE_INDEX_VERSION,
-    });
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  if (body.tenant !== undefined && body.tenant !== tenant) return reply.code(403).send({error: 'the body names another tenant'});
+  const active = await activeIndex();
+  if (body.index_version !== undefined && body.index_version !== active.version) {
+    return reply.code(409).send({error: 'index version is not active', index_version: active.version});
+  }
+  if (body.query.length !== active.dims) {
+    return reply.code(400).send({error: \`query has \${body.query.length} dimensions, the index has \${active.dims}\`, index_version: active.version});
+  }
   const k = body.k ?? 10;
-  if (!Number.isInteger(k) || k < 1 || k > MAX_K) return reply.code(400).send({error: 'k must be between 1 and 100'});
-
-  const hits = await index.search(tenant, vector, k, ACTIVE_INDEX_VERSION);
-  request.log.info({tenant, k, version: ACTIVE_INDEX_VERSION}, 'searched');
-  return reply.code(200).send({hits, k, index_version: ACTIVE_INDEX_VERSION});
+  if (!Number.isInteger(k) || k < 1 || k > MAX_K) return reply.code(400).send({error: \`k must be an integer from 1 to \${MAX_K}\`});
+  const hits = await nearest(tenant, active.version, body.query, k);
+  return {hits, k, index_version: active.version};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"search/corpus" // corpus.ActiveIndex, Nearest, Document, DocumentByID
 )
 
-const activeIndexVersion = "idx-42"
+const maxK = 100
 
-type SearchRequest struct {
+type searchRequest struct {
 	Query        []float64 \`json:"query"\`
-	K            int       \`json:"k"\`
-	Tenant       string    \`json:"tenant,omitempty"\`
-	IndexVersion string    \`json:"index_version,omitempty"\`
+	K            *int      \`json:"k"\`
+	Tenant       string    \`json:"tenant"\`
+	IndexVersion string    \`json:"index_version"\`
 }
 
-type Hit struct {
-	ID    string  \`json:"id"\`
-	Score float64 \`json:"score"\`
+type searchResponse struct {
+	Hits         []corpus.Hit \`json:"hits"\`
+	K            int          \`json:"k"\`
+	IndexVersion string       \`json:"index_version"\`
 }
 
-type Index struct{}
-
-func (i *Index) Search(ctx context.Context, tenant string, query []float64, k int, version string) ([]Hit, error) {
-	return nil, nil
-}
-
-var index = &Index{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func search(rw http.ResponseWriter, r *http.Request) {
-	var body SearchRequest
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	var body searchRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "the body must be JSON"})
 		return
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	tenant := body.Tenant
+	if tenant == "" {
+		tenant = r.Header.Get("X-Tenant-Id")
+	}
+	active := corpus.ActiveIndex(r.Context())
 	version := body.IndexVersion
 	if version == "" {
-		version = activeIndexVersion
+		version = active.Version
 	}
-	k := body.K
+	k := 10
+	if body.K != nil {
+		k = *body.K
+	}
+	if k > maxK {
+		k = maxK
+	}
 	if k < 1 {
-		k = 10
+		k = 1
 	}
-	if k > 100 {
-		k = 100
-	}
-	hits, err := index.Search(r.Context(), body.Tenant, body.Query, k, version)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "index unavailable"})
-		return
-	}
-	log.Printf("search tenant=%s k=%d version=%s", body.Tenant, k, version)
-	writeJSON(rw, http.StatusOK, map[string]any{"hits": hits, "k": k, "index_version": version})
+	hits := corpus.Nearest(r.Context(), tenant, version, body.Query, k)
+	writeJSON(rw, http.StatusOK, searchResponse{Hits: hits, K: k, IndexVersion: version})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/search", search)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
+
+	"search/corpus" // corpus.ActiveIndex, Nearest, Document, DocumentByID
 )
 
-const (
-	maxK               = 100
-	indexDimensions    = 768
-	activeIndexVersion = "idx-42"
-)
+const maxK = 100
 
-type SearchRequest struct {
+type searchRequest struct {
 	Query        []float64 \`json:"query"\`
-	K            int       \`json:"k"\`
-	Tenant       string    \`json:"tenant,omitempty"\`
-	IndexVersion string    \`json:"index_version,omitempty"\`
+	K            *int      \`json:"k"\`
+	Tenant       string    \`json:"tenant"\`
+	IndexVersion string    \`json:"index_version"\`
 }
 
-type Hit struct {
-	ID    string  \`json:"id"\`
-	Score float64 \`json:"score"\`
+type searchResponse struct {
+	Hits         []corpus.Hit \`json:"hits"\`
+	K            int          \`json:"k"\`
+	IndexVersion string       \`json:"index_version"\`
 }
 
-type Index struct{}
-
-func (i *Index) Search(ctx context.Context, tenant string, query []float64, k int, version string) ([]Hit, error) {
-	return nil, nil
-}
-
-var index = &Index{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func resolveVersion(requested string) (string, bool) {
-	if requested != "" && requested != activeIndexVersion {
-		return activeIndexVersion, false
-	}
-	return activeIndexVersion, true
+	json.NewEncoder(rw).Encode(v)
 }
 
 func search(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	var body searchRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "the body must be JSON"})
 		return
 	}
-	var body SearchRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	// The tenant is who authenticated; a body field may only agree with it.
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
 	if body.Tenant != "" && body.Tenant != tenant {
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "body tenant does not match the authenticated tenant"})
+		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "the body names another tenant"})
 		return
 	}
-	version, ok := resolveVersion(body.IndexVersion)
-	if !ok {
-		writeJSON(rw, http.StatusConflict, map[string]any{"error": "index version is not active", "active_version": version})
+	active := corpus.ActiveIndex(r.Context())
+	if body.IndexVersion != "" && body.IndexVersion != active.Version {
+		writeJSON(rw, http.StatusConflict, map[string]string{"error": "index version is not active", "index_version": active.Version})
 		return
 	}
-	if len(body.Query) != indexDimensions {
-		writeJSON(rw, http.StatusBadRequest, map[string]any{
-			"error":          "query vector has the wrong dimension",
-			"expected":       indexDimensions,
-			"active_version": version,
-		})
+	if len(body.Query) != active.Dims {
+		msg := fmt.Sprintf("query has %d dimensions, the index has %d", len(body.Query), active.Dims)
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": msg, "index_version": active.Version})
 		return
 	}
-	k := body.K
-	if k == 0 {
-		k = 10
+	k := 10
+	if body.K != nil {
+		k = *body.K
 	}
 	if k < 1 || k > maxK {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "k must be between 1 and 100"})
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("k must be an integer from 1 to %d", maxK)})
 		return
 	}
-	hits, err := index.Search(r.Context(), tenant, body.Query, k, version)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "index unavailable"})
-		return
-	}
-	log.Printf("search tenant=%s k=%d version=%s", tenant, k, version)
-	writeJSON(rw, http.StatusOK, map[string]any{"hits": hits, "k": k, "index_version": version})
+	hits := corpus.Nearest(r.Context(), tenant, active.Version, body.Query, k)
+	writeJSON(rw, http.StatusOK, searchResponse{Hits: hits, K: k, IndexVersion: active.Version})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/search", search)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class SearchRequest(query: List[Double], k: Int, tenant: String, index_version: Option[String])
-final case class Hit(id: String, score: Double)
+import search.Corpus // Corpus.activeIndex, nearest, document, documentById
 
-trait Index {
-  def search(tenant: String, query: List[Double], k: Int, version: String): List[Hit]
-}
+object Api {
+  val MaxK = 100
 
-object Index {
-  def open(): Index = new Index {
-    def search(tenant: String, query: List[Double], k: Int, version: String): List[Hit] = Nil
-  }
-}
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-object SearchApi {
-  implicit val system: ActorSystem = ActorSystem("vector-search")
-  implicit val searchFormat: RootJsonFormat[SearchRequest] = jsonFormat4(SearchRequest)
+  private def hitsJson(hits: Seq[Corpus.Hit]): JsArray =
+    JsArray(hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score))).toVector)
 
-  val ActiveIndexVersion = "idx-42"
-  val index: Index = Index.open()
-
-  val route: Route =
-    path("v1" / "search") {
-      post {
-        entity(as[SearchRequest]) { body =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val version = body.index_version.getOrElse(ActiveIndexVersion)
-          val k = math.max(1, math.min(body.k, 100))
-          val hits = index.search(body.tenant, body.query, k, version)
-          system.log.info(s"search tenant=\${body.tenant} k=$k version=$version")
-          complete(StatusCodes.OK, s"""{"k":$k,"index_version":"$version","hits":\${hits.size}}""")
+  val route: Route = path("v1" / "search") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { header =>
+        entity(as[String]) { raw =>
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+          val body = raw.parseJson.asJsObject.fields
+          val query = body.get("query").collect { case JsArray(xs) => xs.collect { case JsNumber(n) => n.toDouble } }.getOrElse(Vector.empty)
+          val tenant = body.get("tenant").collect { case JsString(s) => s }.orElse(header).getOrElse("")
+          val active = Corpus.activeIndex()
+          val version = body.get("index_version").collect { case JsString(s) => s }.getOrElse(active.version)
+          val k = math.max(1, math.min(body.get("k").collect { case JsNumber(n) => n.toInt }.getOrElse(10), MaxK))
+          val hits = Corpus.nearest(tenant, version, query, k)
+          complete(json(StatusCodes.OK, JsObject("hits" -> hitsJson(hits), "k" -> JsNumber(k), "index_version" -> JsString(version))))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class SearchRequest(query: List[Double], k: Int, tenant: Option[String], index_version: Option[String])
-final case class Hit(id: String, score: Double)
-final case class SearchResponse(k: Int, index_version: String, hits: List[Hit])
+import search.Corpus // Corpus.activeIndex, nearest, document, documentById
 
-trait Index {
-  def search(tenant: String, query: List[Double], k: Int, version: String): List[Hit]
-}
-
-object Index {
-  def open(): Index = new Index {
-    def search(tenant: String, query: List[Double], k: Int, version: String): List[Hit] = Nil
-  }
-}
-
-object SearchApi {
-  implicit val system: ActorSystem = ActorSystem("vector-search")
-  implicit val searchFormat: RootJsonFormat[SearchRequest] = jsonFormat4(SearchRequest)
-  implicit val hitFormat: RootJsonFormat[Hit] = jsonFormat2(Hit)
-  implicit val responseFormat: RootJsonFormat[SearchResponse] = jsonFormat3(SearchResponse)
-
+object Api {
   val MaxK = 100
-  val IndexDimensions = 768
-  val ActiveIndexVersion = "idx-42"
 
-  val index: Index = Index.open()
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "search") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[SearchRequest]) { body =>
-            tenantOpt.filter(_.nonEmpty) match {
-              case None =>
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              case Some(tenant) if body.tenant.exists(_ != tenant) =>
-                complete(StatusCodes.Forbidden, """{"error":"body tenant does not match the authenticated tenant"}""")
-              case Some(_) if body.index_version.exists(_ != ActiveIndexVersion) =>
-                complete(
-                  StatusCodes.Conflict,
-                  s"""{"error":"index version is not active","active_version":"$ActiveIndexVersion"}""")
-              case Some(_) if body.query.length != IndexDimensions =>
-                complete(
-                  StatusCodes.BadRequest,
-                  s"""{"error":"query vector has the wrong dimension","expected":$IndexDimensions,"active_version":"$ActiveIndexVersion"}""")
-              case Some(_) if body.k < 1 || body.k > MaxK =>
-                complete(StatusCodes.BadRequest, """{"error":"k must be between 1 and 100"}""")
-              case Some(tenant) =>
-                val hits = index.search(tenant, body.query, body.k, ActiveIndexVersion)
-                system.log.info(s"search tenant=$tenant k=\${body.k} version=$ActiveIndexVersion")
-                complete(StatusCodes.OK, SearchResponse(body.k, ActiveIndexVersion, hits))
-            }
+  private def error(status: StatusCode, message: String, fields: (String, JsValue)*): HttpResponse =
+    json(status, JsObject(("error" -> JsString(message)) +: fields: _*))
+
+  private def hitsJson(hits: Seq[Corpus.Hit]): JsArray =
+    JsArray(hits.map(h => JsObject("id" -> JsString(h.id), "score" -> JsNumber(h.score))).toVector)
+
+  val route: Route = path("v1" / "search") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { header =>
+        entity(as[String]) { raw =>
+          val body = raw.parseJson.asJsObject.fields
+          val query = body.get("query").collect { case JsArray(xs) => xs.collect { case JsNumber(n) => n.toDouble } }.getOrElse(Vector.empty)
+          val bodyTenant = body.get("tenant").collect { case JsString(s) => s }
+          val requested = body.get("index_version").collect { case JsString(s) => s }
+          val k = body.get("k").collect { case JsNumber(n) if n.isValidInt => n.toInt }.getOrElse(10)
+          // The tenant is who authenticated; a body field may only agree with it.
+          header.filter(_.nonEmpty) match {
+            case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
+            case Some(tenant) if bodyTenant.exists(_ != tenant) => complete(error(StatusCodes.Forbidden, "the body names another tenant"))
+            case Some(tenant) =>
+              val active = Corpus.activeIndex()
+              if (requested.exists(_ != active.version))
+                complete(error(StatusCodes.Conflict, "index version is not active", "index_version" -> JsString(active.version)))
+              else if (query.length != active.dims)
+                complete(error(StatusCodes.BadRequest, s"query has \${query.length} dimensions, the index has \${active.dims}", "index_version" -> JsString(active.version)))
+              else if (k < 1 || k > MaxK) complete(error(StatusCodes.BadRequest, s"k must be an integer from 1 to $MaxK"))
+              else {
+                val hits = Corpus.nearest(tenant, active.version, query, k)
+                complete(json(StatusCodes.OK, JsObject("hits" -> hitsJson(hits), "k" -> JsNumber(k), "index_version" -> JsString(active.version))))
+              }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -594,126 +466,453 @@ object SearchApi {
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <iostream>
 #include <string>
+#include <vector>
+
+#include "search/corpus.h"  // corpus::activeIndex, nearest, document, documentById
 
 using json = nlohmann::json;
 
-const std::string kActiveIndexVersion = "idx-42";
+constexpr long kMaxK = 100;
 
-struct Index {
-  json search(const std::string& tenant, const std::vector<double>& query, int k, const std::string& version);
-};
-
-Index index;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/search", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto tenant = body.value("tenant", std::string());
-    const auto version = body.value("index_version", kActiveIndexVersion);
-    const auto query = body.value("query", std::vector<double>());
-    const int k = std::clamp(body.value("k", 10), 1, 100);
-    const json hits = index.search(tenant, query, k, version);
-    std::clog << "search tenant=" << tenant << " k=" << k << " version=" << version << "\\n";
-    res.status = 200;
-    res.set_content(json{{"hits", hits}, {"k", k}, {"index_version", version}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+void search(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const json body = json::parse(req.body, nullptr, false);
+  if (body.is_discarded() || !body.contains("query")) {
+    reply(res, 400, {{"error", "the body must be JSON with a query"}});
+    return;
+  }
+  const std::vector<double> query = body["query"].get<std::vector<double>>();
+  std::string tenant = body.value("tenant", "");
+  if (tenant.empty()) tenant = req.get_header_value("X-Tenant-Id");
+  const corpus::Index active = corpus::activeIndex();
+  const std::string version = body.value("index_version", active.version);
+  const long k = std::clamp(body.value("k", 10L), 1L, kMaxK);
+  reply(res, 200, {{"hits", corpus::nearest(tenant, version, query, k)}, {"k", k}, {"index_version", version}});
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/search", search); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <string>
+#include <vector>
+
+#include "search/corpus.h"  // corpus::activeIndex, nearest, document, documentById
 
 using json = nlohmann::json;
 
-constexpr int kMaxK = 100;
-constexpr std::size_t kIndexDimensions = 768;
-const std::string kActiveIndexVersion = "idx-42";
+constexpr long kMaxK = 100;
 
-struct Index {
-  json search(const std::string& tenant, const std::vector<double>& query, int k, const std::string& version);
-};
-
-Index index;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/search", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto bodyTenant = body.value("tenant", std::string());
-    if (!bodyTenant.empty() && bodyTenant != tenant) {
-      res.status = 403;
-      res.set_content(R"({"error":"body tenant does not match the authenticated tenant"})", "application/json");
-      return;
-    }
-    const auto requestedVersion = body.value("index_version", std::string());
-    if (!requestedVersion.empty() && requestedVersion != kActiveIndexVersion) {
-      res.status = 409;
-      res.set_content(
-          json{{"error", "index version is not active"}, {"active_version", kActiveIndexVersion}}.dump(),
-          "application/json");
-      return;
-    }
-    const auto query = body.value("query", std::vector<double>());
-    if (query.size() != kIndexDimensions) {
-      res.status = 400;
-      res.set_content(json{{"error", "query vector has the wrong dimension"},
-                           {"expected", kIndexDimensions},
-                           {"active_version", kActiveIndexVersion}}
-                          .dump(),
-                      "application/json");
-      return;
-    }
-    const int k = body.value("k", 10);
-    if (k < 1 || k > kMaxK) {
-      res.status = 400;
-      res.set_content(R"({"error":"k must be between 1 and 100"})", "application/json");
-      return;
-    }
-    const json hits = index.search(tenant, query, k, kActiveIndexVersion);
-    std::clog << "search tenant=" << tenant << " k=" << k << " version=" << kActiveIndexVersion << "\\n";
-    res.status = 200;
-    res.set_content(json{{"hits", hits}, {"k", k}, {"index_version", kActiveIndexVersion}}.dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+void search(const httplib::Request& req, httplib::Response& res) {
+  const json body = json::parse(req.body, nullptr, false);
+  if (body.is_discarded() || !body.contains("query")) {
+    reply(res, 400, {{"error", "the body must be JSON with a query"}});
+    return;
+  }
+  const std::vector<double> query = body["query"].get<std::vector<double>>();
+  // The tenant is who authenticated; a body field may only agree with it.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    reply(res, 401, {{"error", "X-Tenant-Id is required"}});
+    return;
+  }
+  if (body.contains("tenant") && body["tenant"] != tenant) {
+    reply(res, 403, {{"error", "the body names another tenant"}});
+    return;
+  }
+  const corpus::Index active = corpus::activeIndex();
+  if (body.contains("index_version") && body["index_version"] != active.version) {
+    reply(res, 409, {{"error", "index version is not active"}, {"index_version", active.version}});
+    return;
+  }
+  if (static_cast<long>(query.size()) != active.dims) {
+    const std::string msg = "query has " + std::to_string(query.size()) + " dimensions, the index has " + std::to_string(active.dims);
+    reply(res, 400, {{"error", msg}, {"index_version", active.version}});
+    return;
+  }
+  const long k = body.value("k", 10L);
+  if (k < 1 || k > kMaxK) {
+    reply(res, 400, {{"error", "k must be an integer from 1 to " + std::to_string(kMaxK)}});
+    return;
+  }
+  reply(res, 200, {{"hits", corpus::nearest(tenant, active.version, query, k)}, {"k", k}, {"index_version", active.version}});
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/search", search); }
 `,
     },
   },
-  debrief: `The fix has the shape of guard clauses in trust order: the header tenant first, because
-every later decision runs as that tenant; then the version, read once from the registry so the
-dimension check, the search and the response all agree on one string; then the width and \`k\`.
-Rejecting \`k > 100\` instead of clamping keeps the response consistent with what was searched, and a
-body \`tenant\` that contradicts the header is a 403 rather than a silent override. Production
-search services go further: the index registry carries per-tenant dimensions and caps an operator
-can lower, and a handshake endpoint returns \`active_version\` and \`dimensions\` so clients can
-validate a query before sending it.
+  harness: {
+    python: `from search import corpus
+
+QUERY = [1.0, 0.0, 0.0, 0.0]
+ACME = {"X-Tenant-Id": "acme"}
+
+
+def _api(ctx):
+    """acme's namespace in the active idx-42 (4 dimensions), globex's g1 beside it, and acme's old-1 in the retired idx-41."""
+    corpus.activate("idx-42", 4)
+    corpus.put_document("acme", "idx-42", "a1", [0.9, 0.1, 0.0, 0.0])
+    corpus.put_document("acme", "idx-42", "a2", [0.5, 0.5, 0.0, 0.0])
+    corpus.put_document("acme", "idx-42", "a3", [0.1, 0.9, 0.0, 0.0])
+    corpus.put_document("globex", "idx-42", "g1", [1.0, 0.0, 0.0, 0.0])
+    corpus.put_document("acme", "idx-41", "old-1", [1.0, 0.0, 0.0, 0.0])
+    return ctx.client(ctx.load("api").app)
+
+
+def _ids(r):
+    try:
+        return [h["id"] for h in r.json().get("hits", [])]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/search", json={"query": QUERY, "k": 2}, headers=ACME)
+    assert r.status_code == 200, f"POST /v1/search answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert _ids(r) == ["a1", "a2"], f"acme's two nearest documents to {QUERY} are a1 and a2; the search answered {body}"
+    assert body.get("k") == 2 and body.get("index_version") == "idx-42", f"the response must carry k 2 and the active version idx-42, got {body}"
+
+
+async def check_tenant_header(ctx):
+    async with _api(ctx) as c:
+        anonymous = await c.post("/v1/search", json={"query": QUERY, "k": 2, "tenant": "globex"})
+        forged = await c.post("/v1/search", json={"query": QUERY, "k": 2, "tenant": "globex"}, headers=ACME)
+        agreeing = await c.post("/v1/search", json={"query": QUERY, "k": 2, "tenant": "acme"}, headers=ACME)
+    assert "g1" not in forged.text, f"a caller authenticated as acme read globex's document g1 by naming globex in the body: {forged.status_code} {forged.text}"
+    assert "g1" not in anonymous.text, f"a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: {anonymous.status_code} {anonymous.text}"
+    assert anonymous.status_code == 401, f"a search without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert forged.status_code == 403, f"a body tenant globex under X-Tenant-Id acme answered {forged.status_code}, expected 403"
+    assert agreeing.status_code == 200 and _ids(agreeing) == ["a1", "a2"], f"a body tenant that agrees with the header is allowed: got {agreeing.status_code} {agreeing.text}"
+
+
+async def check_k_cap(ctx):
+    async with _api(ctx) as c:
+        big = await c.post("/v1/search", json={"query": QUERY, "k": 500}, headers=ACME)
+        zero = await c.post("/v1/search", json={"query": QUERY, "k": 0}, headers=ACME)
+        cap = await c.post("/v1/search", json={"query": QUERY, "k": 100}, headers=ACME)
+    assert big.status_code == 400, f"k 500 answered {big.status_code} {big.text}: a request above the cap of 100 must be rejected with 400, not clamped"
+    assert zero.status_code == 400, f"k 0 answered {zero.status_code} {zero.text}, expected 400"
+    assert cap.status_code == 200 and cap.json().get("k") == 100 and len(_ids(cap)) == 3, f"k 100 is allowed and answers acme's three documents, got {cap.status_code} {cap.text}"
+
+
+async def check_dimension(ctx):
+    async with _api(ctx) as c:
+        narrow = await c.post("/v1/search", json={"query": [1.0, 0.0, 0.0], "k": 2}, headers=ACME)
+        wide = await c.post("/v1/search", json={"query": [1.0, 0.0, 0.0, 0.0, 0.0], "k": 2}, headers=ACME)
+    assert narrow.status_code == 400, f"a 3-number query against the 4-dimension index answered {narrow.status_code} {narrow.text}: it was scored against vectors of another width. Reject it with 400"
+    assert "idx-42" in narrow.text, f"the 400 must name the active index version it compared against (idx-42), got {narrow.text}"
+    assert wide.status_code == 400, f"a 5-number query against the 4-dimension index answered {wide.status_code} {wide.text}, expected 400"
+
+
+async def check_active_version(ctx):
+    async with _api(ctx) as c:
+        retired = await c.post("/v1/search", json={"query": QUERY, "k": 2, "index_version": "idx-41"}, headers=ACME)
+        current = await c.post("/v1/search", json={"query": QUERY, "k": 2, "index_version": "idx-42"}, headers=ACME)
+    assert "old-1" not in retired.text, f"a caller searched the retired version idx-41 by naming it in the body: {retired.status_code} {retired.text}"
+    assert retired.status_code == 409 and "idx-42" in retired.text, f"a body index_version idx-41 must be 409 naming the active idx-42, got {retired.status_code} {retired.text}"
+    assert current.status_code == 200 and _ids(current) == ["a1", "a2"], f"a body index_version equal to the active one is allowed, got {current.status_code} {current.text}"
 `,
+    typescript: `const QUERY = [1, 0, 0, 0];
+const ACME = {'X-Tenant-Id': 'acme'};
+
+/** acme's namespace in the active idx-42 (4 dimensions), globex's g1 beside it, and acme's old-1 in the retired idx-41. */
+async function api(ctx) {
+  const corpus = ctx.load('/support/search/corpus.ts');
+  await corpus.activate('idx-42', 4);
+  await corpus.putDocument('acme', 'idx-42', 'a1', [0.9, 0.1, 0, 0]);
+  await corpus.putDocument('acme', 'idx-42', 'a2', [0.5, 0.5, 0, 0]);
+  await corpus.putDocument('acme', 'idx-42', 'a3', [0.1, 0.9, 0, 0]);
+  await corpus.putDocument('globex', 'idx-42', 'g1', [1, 0, 0, 0]);
+  await corpus.putDocument('acme', 'idx-41', 'old-1', [1, 0, 0, 0]);
+  return ctx.client(ctx.load('api').app);
+}
+
+function ids(r): string[] {
+  try {
+    return (r.json().hits ?? []).map(h => h.id);
+  } catch {
+    return [];
+  }
+}
+
+const search = (c, body, headers = ACME) => c.post('/v1/search', {json: body, headers});
+
+export async function check_route(ctx) {
+  const c = await api(ctx);
+  const r = await search(c, {query: QUERY, k: 2});
+  assert.equal(r.status, 200, \`POST /v1/search answered \${r.status}: \${r.text}\`);
+  assert.deepStrictEqual(ids(r), ['a1', 'a2'], \`acme's two nearest documents to [1, 0, 0, 0] are a1 and a2; the search answered \${r.text}\`);
+  const body = r.json();
+  assert(body.k === 2 && body.index_version === 'idx-42', \`the response must carry k 2 and the active version idx-42, got \${r.text}\`);
+}
+
+export async function check_tenant_header(ctx) {
+  const c = await api(ctx);
+  const anonymous = await search(c, {query: QUERY, k: 2, tenant: 'globex'}, {});
+  const forged = await search(c, {query: QUERY, k: 2, tenant: 'globex'});
+  const agreeing = await search(c, {query: QUERY, k: 2, tenant: 'acme'});
+  assert(!forged.text.includes('g1'), \`a caller authenticated as acme read globex's document g1 by naming globex in the body: \${forged.status} \${forged.text}\`);
+  assert(!anonymous.text.includes('g1'), \`a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: \${anonymous.status} \${anonymous.text}\`);
+  assert.equal(anonymous.status, 401, \`a search without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(forged.status, 403, \`a body tenant globex under X-Tenant-Id acme answered \${forged.status}, expected 403\`);
+  assert(agreeing.status === 200 && ids(agreeing).join() === 'a1,a2', \`a body tenant that agrees with the header is allowed: got \${agreeing.status} \${agreeing.text}\`);
+}
+
+export async function check_k_cap(ctx) {
+  const c = await api(ctx);
+  const big = await search(c, {query: QUERY, k: 500});
+  const zero = await search(c, {query: QUERY, k: 0});
+  const cap = await search(c, {query: QUERY, k: 100});
+  assert.equal(big.status, 400, \`k 500 answered \${big.status} \${big.text}: a request above the cap of 100 must be rejected with 400, not clamped\`);
+  assert.equal(zero.status, 400, \`k 0 answered \${zero.status} \${zero.text}, expected 400\`);
+  assert(cap.status === 200 && cap.json().k === 100 && ids(cap).length === 3, \`k 100 is allowed and answers acme's three documents, got \${cap.status} \${cap.text}\`);
+}
+
+export async function check_dimension(ctx) {
+  const c = await api(ctx);
+  const narrow = await search(c, {query: [1, 0, 0], k: 2});
+  const wide = await search(c, {query: [1, 0, 0, 0, 0], k: 2});
+  assert.equal(narrow.status, 400, \`a 3-number query against the 4-dimension index answered \${narrow.status} \${narrow.text}: it was scored against vectors of another width. Reject it with 400\`);
+  assert(narrow.text.includes('idx-42'), \`the 400 must name the active index version it compared against (idx-42), got \${narrow.text}\`);
+  assert.equal(wide.status, 400, \`a 5-number query against the 4-dimension index answered \${wide.status} \${wide.text}, expected 400\`);
+}
+
+export async function check_active_version(ctx) {
+  const c = await api(ctx);
+  const retired = await search(c, {query: QUERY, k: 2, index_version: 'idx-41'});
+  const current = await search(c, {query: QUERY, k: 2, index_version: 'idx-42'});
+  assert(!retired.text.includes('old-1'), \`a caller searched the retired version idx-41 by naming it in the body: \${retired.status} \${retired.text}\`);
+  assert(retired.status === 409 && retired.text.includes('idx-42'), \`a body index_version idx-41 must be 409 naming the active idx-42, got \${retired.status} \${retired.text}\`);
+  assert(current.status === 200 && ids(current).join() === 'a1,a2', \`a body index_version equal to the active one is allowed, got \${current.status} \${current.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+
+	"search/corpus"
+
+	"leetbuild/harness"
+)
+
+var apiQuery = []float64{1, 0, 0, 0}
+
+// api seeds acme's namespace in the active idx-42 (4 dimensions), globex's g1 beside it, and
+// acme's old-1 in the retired idx-41.
+func api(ctx *harness.Ctx) *harness.HTTP {
+	bg := context.Background()
+	corpus.Activate(bg, "idx-42", 4)
+	corpus.PutDocument(bg, "acme", "idx-42", "a1", []float64{0.9, 0.1, 0, 0})
+	corpus.PutDocument(bg, "acme", "idx-42", "a2", []float64{0.5, 0.5, 0, 0})
+	corpus.PutDocument(bg, "acme", "idx-42", "a3", []float64{0.1, 0.9, 0, 0})
+	corpus.PutDocument(bg, "globex", "idx-42", "g1", []float64{1, 0, 0, 0})
+	corpus.PutDocument(bg, "acme", "idx-41", "old-1", []float64{1, 0, 0, 0})
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+type apiAnswer struct {
+	Hits []struct {
+		ID string \`json:"id"\`
+	} \`json:"hits"\`
+	K            int    \`json:"k"\`
+	IndexVersion string \`json:"index_version"\`
+}
+
+func answerOf(r *harness.Response) apiAnswer {
+	var a apiAnswer
+	json.Unmarshal(r.Body, &a)
+	return a
+}
+
+func idsOf(r *harness.Response) []string {
+	out := []string{}
+	for _, h := range answerOf(r).Hits {
+		out = append(out, h.ID)
+	}
+	return out
+}
+
+func searchAs(c *harness.HTTP, body map[string]any, tenant string) *harness.Response {
+	if tenant == "" {
+		return c.Post("/v1/search", body)
+	}
+	return c.Post("/v1/search", body, "X-Tenant-Id", tenant)
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := searchAs(c, map[string]any{"query": apiQuery, "k": 2}, "acme")
+	ctx.Equal(r.Status, 200, "POST /v1/search (%s)", r.Text())
+	ctx.Equal(idsOf(r), []string{"a1", "a2"}, "acme's two nearest documents to [1 0 0 0] are a1 and a2 (%s)", r.Text())
+	a := answerOf(r)
+	ctx.Assert(a.K == 2 && a.IndexVersion == "idx-42", "the response must carry k 2 and the active version idx-42, got %s", r.Text())
+}
+
+func CheckTenantHeader(ctx *harness.Ctx) {
+	c := api(ctx)
+	anonymous := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "tenant": "globex"}, "")
+	forged := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "tenant": "globex"}, "acme")
+	agreeing := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "tenant": "acme"}, "acme")
+	ctx.Assert(!strings.Contains(forged.Text(), "g1"), "a caller authenticated as acme read globex's document g1 by naming globex in the body: %d %s", forged.Status, forged.Text())
+	ctx.Assert(!strings.Contains(anonymous.Text(), "g1"), "a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: %d %s", anonymous.Status, anonymous.Text())
+	ctx.Equal(anonymous.Status, 401, "a search without X-Tenant-Id")
+	ctx.Equal(forged.Status, 403, "a body tenant globex under X-Tenant-Id acme")
+	ctx.Assert(agreeing.Status == 200 && strings.Join(idsOf(agreeing), ",") == "a1,a2", "a body tenant that agrees with the header is allowed: got %d %s", agreeing.Status, agreeing.Text())
+}
+
+func CheckKCap(ctx *harness.Ctx) {
+	c := api(ctx)
+	big := searchAs(c, map[string]any{"query": apiQuery, "k": 500}, "acme")
+	zero := searchAs(c, map[string]any{"query": apiQuery, "k": 0}, "acme")
+	limit := searchAs(c, map[string]any{"query": apiQuery, "k": 100}, "acme")
+	ctx.Equal(big.Status, 400, "k 500 answered %s: a request above the cap of 100 must be rejected with 400, not clamped; the status", big.Text())
+	ctx.Equal(zero.Status, 400, "k 0 (%s)", zero.Text())
+	ctx.Assert(limit.Status == 200 && answerOf(limit).K == 100 && len(idsOf(limit)) == 3, "k 100 is allowed and answers acme's three documents, got %d %s", limit.Status, limit.Text())
+}
+
+func CheckDimension(ctx *harness.Ctx) {
+	c := api(ctx)
+	narrow := searchAs(c, map[string]any{"query": []float64{1, 0, 0}, "k": 2}, "acme")
+	wide := searchAs(c, map[string]any{"query": []float64{1, 0, 0, 0, 0}, "k": 2}, "acme")
+	ctx.Equal(narrow.Status, 400, "a 3-number query against the 4-dimension index answered %s: it was scored against vectors of another width. Reject it with 400; the status", narrow.Text())
+	ctx.Assert(strings.Contains(narrow.Text(), "idx-42"), "the 400 must name the active index version it compared against (idx-42), got %s", narrow.Text())
+	ctx.Equal(wide.Status, 400, "a 5-number query against the 4-dimension index (%s)", wide.Text())
+}
+
+func CheckActiveVersion(ctx *harness.Ctx) {
+	c := api(ctx)
+	retired := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "index_version": "idx-41"}, "acme")
+	current := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "index_version": "idx-42"}, "acme")
+	ctx.Assert(!strings.Contains(retired.Text(), "old-1"), "a caller searched the retired version idx-41 by naming it in the body: %d %s", retired.Status, retired.Text())
+	ctx.Assert(retired.Status == 409 && strings.Contains(retired.Text(), "idx-42"), "a body index_version idx-41 must be 409 naming the active idx-42, got %d %s", retired.Status, retired.Text())
+	ctx.Assert(current.Status == 200 && strings.Join(idsOf(current), ",") == "a1,a2", "a body index_version equal to the active one is allowed, got %d %s", current.Status, current.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kQuery = "[1.0, 0.0, 0.0, 0.0]";
+
+// acme's namespace in the active idx-42 (4 dimensions), globex's g1 beside it, and acme's old-1 in
+// the retired idx-41.
+harness::HTTP api(harness::Ctx& ctx) {
+  corpus::activate("idx-42", 4);
+  corpus::putDocument("acme", "idx-42", "a1", {0.9, 0.1, 0, 0});
+  corpus::putDocument("acme", "idx-42", "a2", {0.5, 0.5, 0, 0});
+  corpus::putDocument("acme", "idx-42", "a3", {0.1, 0.9, 0, 0});
+  corpus::putDocument("globex", "idx-42", "g1", {1, 0, 0, 0});
+  corpus::putDocument("acme", "idx-41", "old-1", {1, 0, 0, 0});
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+nlohmann::json parsed(const harness::Response& r) {
+  const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
+  return j.is_discarded() ? nlohmann::json::object() : j;
+}
+
+std::string ids(const harness::Response& r) {
+  const auto j = parsed(r);
+  std::string out;
+  if (j.is_object() && j.contains("hits") && j["hits"].is_array()) {
+    for (const auto& h : j["hits"]) out += (out.empty() ? "" : ",") + h.value("id", std::string());
+  }
+  return out;
+}
+
+bool has(const harness::Response& r, const std::string& needle) { return r.Text().find(needle) != std::string::npos; }
+
+harness::Response searchAs(harness::HTTP& c, const std::string& body, const std::string& tenant) {
+  if (tenant.empty()) return c.Post("/v1/search", body, "Content-Type", "application/json");
+  return c.Post("/v1/search", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
+  ctx.Equal(r.Status, 200, "POST /v1/search (%s)", r.Text());
+  ctx.Equal(ids(r), "a1,a2", "acme's two nearest documents to [1, 0, 0, 0] are a1 and a2 (%s)", r.Text());
+  const auto body = parsed(r);
+  ctx.Assert(body.value("k", 0L) == 2 && body.value("index_version", std::string()) == "idx-42", "the response must carry k 2 and the active version idx-42, got %s", r.Text());
+}
+
+void CheckTenantHeader(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto anonymous = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "globex"})", "");
+  const auto forged = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "globex"})", "acme");
+  const auto agreeing = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "acme"})", "acme");
+  ctx.Assert(!has(forged, "g1"), "a caller authenticated as acme read globex's document g1 by naming globex in the body: %d %s", forged.Status, forged.Text());
+  ctx.Assert(!has(anonymous, "g1"), "a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: %d %s", anonymous.Status, anonymous.Text());
+  ctx.Equal(anonymous.Status, 401, "a search without X-Tenant-Id");
+  ctx.Equal(forged.Status, 403, "a body tenant globex under X-Tenant-Id acme");
+  ctx.Assert(agreeing.Status == 200 && ids(agreeing) == "a1,a2", "a body tenant that agrees with the header is allowed: got %d %s", agreeing.Status, agreeing.Text());
+}
+
+void CheckKCap(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto big = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 500})", "acme");
+  const auto zero = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 0})", "acme");
+  const auto limit = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 100})", "acme");
+  ctx.Equal(big.Status, 400, "k 500 answered %s: a request above the cap of 100 must be rejected with 400, not clamped; the status", big.Text());
+  ctx.Equal(zero.Status, 400, "k 0 (%s)", zero.Text());
+  ctx.Assert(limit.Status == 200 && parsed(limit).value("k", 0L) == 100 && ids(limit) == "a1,a2,a3", "k 100 is allowed and answers acme's three documents, got %d %s", limit.Status, limit.Text());
+}
+
+void CheckDimension(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto narrow = searchAs(c, R"({"query": [1.0, 0.0, 0.0], "k": 2})", "acme");
+  const auto wide = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
+  ctx.Equal(narrow.Status, 400, "a 3-number query against the 4-dimension index answered %s: it was scored against vectors of another width. Reject it with 400; the status", narrow.Text());
+  ctx.Assert(has(narrow, "idx-42"), "the 400 must name the active index version it compared against (idx-42), got %s", narrow.Text());
+  ctx.Equal(wide.Status, 400, "a 5-number query against the 4-dimension index (%s)", wide.Text());
+}
+
+void CheckActiveVersion(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto retired = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-41"})", "acme");
+  const auto current = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-42"})", "acme");
+  ctx.Assert(!has(retired, "old-1"), "a caller searched the retired version idx-41 by naming it in the body: %d %s", retired.Status, retired.Text());
+  ctx.Assert(retired.Status == 409 && has(retired, "idx-42"), "a body index_version idx-41 must be 409 naming the active idx-42, got %d %s", retired.Status, retired.Text());
+  ctx.Assert(current.Status == 200 && ids(current) == "a1,a2", "a body index_version equal to the active one is allowed, got %d %s", current.Status, current.Text());
+}
+`,
+  },
+  hints: [
+    'Send `tenant: "globex"` in the body under acme\'s header and globex\'s documents come back; `k: 500` answers 200 with `k: 100`; a three-number query against the four-dimension index still ranks.',
+    "The handler prefers the body's `tenant` and `index_version` to what the server knows, clamps `k` with `min` and `max`, and hands the query to `nearest`, which scores over the shorter of two vectors without checking widths.",
+    'Read `X-Tenant-Id` (401 when empty, 403 when the body tenant differs), 409 a body `index_version` other than the active one, 400 when `len(query)` differs from `dims`, 400 for `k` outside 1 to `MAX_K`; search the active version.',
+  ],
+  debrief: `Each fix moves a decision from the caller to the server: the tenant comes from authentication, the version from the index catalog, the width from the index itself. Rejecting instead of clamping matters because a clamped request still answers 200, so a client paging through 500 results stops at 100 believing it saw everything. The width check belongs at the edge because a dot product over mismatched vectors still produces numbers, and numbers look like a ranking. Production services take the tenant from a signed token rather than a bare header, reject non-finite elements, and let a client pin an older index only through a named alias the operator controls.`,
 };

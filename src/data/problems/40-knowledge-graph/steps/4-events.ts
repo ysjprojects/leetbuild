@@ -2,527 +2,868 @@ import type {Step} from '@/lib/types';
 
 export const graphEventsStep: Step = {
   id: 'events',
-  title: 'Graph events keyed by entity for replay',
+  title: 'graph.changed events keyed by entity, after the commit',
   concept: 'kafka',
   file: 'events',
   focus: ['api', 'db', 'kafka', 'consumer', 'outbox'],
   task: `## Task
 
-**Starting point.** The starter is the graph event path: \`publish_change\` builds a payload with
-the tenant, entity id and new label, produces it to \`graph.changed\` keyed by operation type,
-flushes, and then commits the graph transaction; \`consume\` parses an event, applies the merge and
-commits the offset. It compiles, the demo replays cleanly, and it hides five flaws.
+**Starting point.** The starter is \`rename_entity(tenant, entity_id, new_name)\`, the write that
+tells the graph consumers an entity changed: it produces
+\`{"type": "entity.renamed", "tenant", "entity_id", "new_name"}\` to \`graph.changed\` with no key,
+falls back to \`store.insert_outbox\` when \`produce\` raises, then commits with \`store.rename\`. It
+serves the demo and hides four flaws.
 
-**Failure mode the checks target.** \`edge_added\` and \`entity_merged\` for one entity land on
-different partitions, so a consumer can apply the merge before the edge that caused it. A crash
-between produce and commit leaves a permanent event for an edge that was never written. A broker
-rejection drops the event. After a rebalance the consumer re-applies every merge in the retained
-window, and the payload carries too little for a replayer to tell a repeat from a new transition.
+**Failure mode the checks target.** Two renames of one entity land on two partitions and a consumer
+applies them in the wrong order; a consumer cannot tell what changed or whether it already applied
+an event; a rename whose commit fails is announced anyway; and a delivery the broker rejected is
+lost.
 
-- Publish edge and merge events to \`graph.changed\` keyed by entity id (\`key = entity id\`), so one
-  entity's history stays on one partition.
-- The payload carries \`old_label\`, \`new_label\` and \`policy_version\`.
-- Publish after the graph transaction commits: the commit happens before \`produce\`/\`send\`.
-- When the broker rejects the produce, write an outbox row (\`outbox.put\` into \`OUTBOX_TABLE\`) so
-  the event survives the outage and can be replayed.
-- The consumer is idempotent on replay: it checks \`already_applied(entity_id, policy_version)\`
-  first, applies the merge, and only then commits the offset.`,
+- The record key is the **entity id**: Kafka orders per partition.
+- The payload adds \`old_name\` and the entity's \`version\` after the rename, both from
+  \`store.rename\`, which returns \`entity_id\`, \`old_name\`, \`new_name\` and \`version\`.
+- **Commit first**: \`store.rename\` before the produce; when it fails, nothing is produced.
+- Wait for the **delivery report**, at most 2 s (\`ACK_TIMEOUT_S\`). A failed delivery, or none in
+  time, inserts an outbox row (topic, key, payload) and returns \`False\`.`,
   sequence: {
-    participants: ['graph-api', 'Graph store', 'graph.changed', 'Graph consumer'],
+    participants: ['graph-api', 'Graph store', 'graph.changed', 'Outbox'],
     messages: [
-      {from: 'graph-api', to: 'Graph store', label: 'apply edge · commit', kind: 'sync'},
-      {
-        from: 'graph-api',
-        to: 'graph.changed',
-        label: 'produce key = entity id · old/new label · policy version',
-        kind: 'async',
-      },
-      {from: 'graph-api', to: 'Graph store', label: 'outbox row on broker rejection', kind: 'async'},
-      {from: 'graph.changed', to: 'Graph consumer', label: 'consume (ordered per entity)', kind: 'async'},
-      {from: 'Graph consumer', to: 'Graph store', label: 'already_applied(entity, version)?', kind: 'sync'},
-      {from: 'Graph consumer', to: 'Graph store', label: 'applyMerge(event)', kind: 'sync'},
-      {from: 'Graph consumer', to: 'graph.changed', label: 'commit offset after the merge', kind: 'async'},
+      {from: 'graph-api', to: 'Graph store', label: 'rename(e-1, "Ada Lovelace") → old_name, version', kind: 'sync'},
+      {from: 'graph-api', to: 'graph.changed', label: 'produce key = e-1 · old_name, new_name, version', kind: 'sync'},
+      {from: 'graph.changed', to: 'graph-api', label: 'delivery report within 2 s → True', kind: 'reply'},
+      {from: 'graph.changed', to: 'graph-api', label: 'delivery failed / no report', kind: 'reply'},
+      {from: 'graph-api', to: 'Outbox', label: 'insert_outbox(topic, e-1, payload) → False', kind: 'async'},
     ],
   },
   checks: [
     {
-      id: 'topic-key',
-      title: 'Publishes graph.changed keyed by entity id',
+      id: 'entity-key',
+      title: 'Keys graph.changed by the entity id',
       detail:
-        'Events go to `graph.changed` with the key set to the entity id, so one entity stays on one partition. The starter keys by operation type.',
+        'Renames of e-1, e-2, e-1 carry those keys and the two e-1 records share a partition. The starter produces without a key, so one entity spreads over every partition.',
       match: {
-        python: {all: [/TOPIC\s*=\s*"graph\.changed"/, /key=entity_id/]},
-        typescript: {all: [/TOPIC\s*=\s*'graph\.changed'/, /key:\s*entityId/]},
-        go: {all: [/topic\s*=\s*"graph\.changed"/, /Key:\s*\[\]byte\(entityID\)/]},
-        scala: {all: [/Topic\s*=\s*"graph\.changed"/, /ProducerRecord\[String, String\]\(Topic, entityId/]},
-        cpp: {all: [/kTopic\s*=\s*"graph\.changed"/, /RD_KAFKA_V_KEY\(entityId\.data\(\)/]},
+        python: {all: [/producer\.produce\([^\n]*key\s*=\s*entity_id/]},
+        typescript: {all: [/key:\s*entityId/]},
+        go: {all: [/Key:\s*\[\]byte\(\s*entityID\s*\)/]},
+        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*entityId\s*,/]},
+        cpp: {all: [/entity_id\.c_str\(\)\s*,\s*entity_id\.(size|length)\(\)/]},
       },
     },
     {
       id: 'payload-fields',
-      title: 'Carries old label, new label and the policy version',
+      title: 'Carries the old name and the version',
       detail:
-        'The event body has `old_label`, `new_label` and `policy_version` so a replay can reconstruct the transition and dedupe. The starter sends only the new value.',
+        'The value names `old_name` and the entity `version` after the rename, so a consumer sees the transition and drops a replay it already applied. The starter sends the new name only.',
       match: {
-        python: {all: [/old_label/, /new_label/, /policy_version/]},
-        typescript: {all: [/oldLabel/, /newLabel/, /policyVersion/]},
-        go: {all: [/OldLabel/, /NewLabel/, /PolicyVersion/]},
-        scala: {all: [/oldLabel/, /newLabel/, /policyVersion/]},
-        cpp: {all: [/old_label/, /new_label/, /policy_version/]},
+        python: {all: [/["']old_name["']\s*:/, /["']version["']\s*:/]},
+        typescript: {all: [/old_name:/, /version:/]},
+        go: {all: [/"old_name"/, /"version"/]},
+        scala: {all: [/"old_name"/, /"version"/]},
+        cpp: {all: [/"old_name"/, /"version"/]},
       },
     },
     {
       id: 'after-commit',
-      title: 'Publishes only after the graph transaction commits',
+      title: 'Commits the rename before producing its event',
       detail:
-        'The graph commit happens before the produce, so a consumer never sees an event whose edge is not durable. The starter produces first and commits afterwards.',
+        'When the rename reaches the store the topic is still empty, and a rename whose commit fails produces nothing. The starter produces first.',
       match: {
-        python: {order: [/\bcommit\(/, /producer\.produce\(/]},
-        typescript: {order: [/commit\(/, /producer\.send\(/]},
-        go: {order: [/\.Commit\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/\.commit\(/, /producer\.send\(/]},
-        cpp: {order: [/commit\(/, /producev\(/]},
+        python: {order: [/store\.rename\(/, /producer\.produce\(/]},
+        typescript: {order: [/await rename\(/, /producer\.send\(/]},
+        go: {order: [/store\.Rename\(/, /producer\.Produce\(/]},
+        scala: {order: [/Store\.rename\(/, /producer\.send\(/]},
+        cpp: {order: [/store::rename\(/, /producer->produce\(/]},
       },
     },
     {
       id: 'outbox',
-      title: 'Writes an outbox row when the broker rejects the produce',
+      title: 'Falls back to the outbox on a failed or missing delivery report',
       detail:
-        'A rejected produce is recorded via `outbox.put` into `OUTBOX_TABLE` so it can be replayed. The starter has no outbox.',
-      match: {
-        python: {all: [/outbox\.put\(/, /OUTBOX_TABLE/]},
-        typescript: {all: [/outbox\.put\(/, /OUTBOX_TABLE/]},
-        go: {all: [/outbox\.Put\(/, /outboxTable/]},
-        scala: {all: [/outbox\.put\(/, /OutboxTable/]},
-        cpp: {all: [/outbox\.put\(/, /kOutboxTable/]},
-      },
-    },
-    {
-      id: 'consumer-idempotent',
-      title: 'Consumer applies idempotently, then commits the offset',
-      detail:
-        'The consumer checks `already_applied` first, applies the merge, and commits the offset only after. The starter applies then commits with no mark, so a replay double-applies.',
+        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false. The starter only catches the error `produce` raises while enqueueing.',
       match: {
         python: {
-          all: [/def consume\(/, /already_applied\(/],
-          order: [/already_applied\(/, /merge_entities\(/, /consumer\.commit\(/],
+          all: [/on_delivery\s*=|callback\s*=/, /producer\.flush\(/, /store\.insert_outbox\(/],
+          none: [/except KafkaException/],
         },
-        typescript: {
-          all: [/async function consume\(/, /isApplied\(/],
-          order: [/isApplied\(/, /applyMerge\(/, /commitOffsets\(/],
+        typescript: {all: [/await producer\.send\(/, /insertOutbox\(/, /catch/], none: [/void producer\.send\(/]},
+        go: {
+          all: [/store\.InsertOutbox\(/, /TopicPartition\.Error/, /time\.After\(|Flush\(/],
+          none: [/Produce\(\s*msg\s*,\s*nil\s*\)/],
         },
-        go: {all: [/func consume\(/, /isApplied\(/], order: [/isApplied\(/, /applyMerge\(/, /CommitOffsets\(/]},
-        scala: {all: [/def consume\(/, /isApplied\(/], order: [/isApplied\(/, /applyMerge\(/, /commitSync\(/]},
-        cpp: {all: [/consume\(/, /isApplied\(/], order: [/isApplied\(/, /applyMerge\(/, /commitSync\(/]},
+        scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/], none: [/case _: KafkaException/]},
+        cpp: {all: [/store::insertOutbox\(/, /->flush\(/, /dr_cb/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
-import logging
 
-from confluent_kafka import Producer
+from confluent_kafka import KafkaException, Producer
 
-logger = logging.getLogger("graph")
+from graph import store  # rename, insert_outbox
 
 TOPIC = "graph.changed"
 
-
-def publish_change(producer: Producer, graph, tenant: str, entity_id: str, op_type: str, edge: dict) -> None:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    payload = {"tenant": tenant, "entity_id": entity_id, "new_label": edge["new_label"]}
-    producer.produce(TOPIC, key=op_type, value=json.dumps(payload))
-    producer.flush()
-    graph.commit()
+producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
-def consume(consumer, message) -> None:
-    # TODO: the consumer's share of the five flaws lives here.
-    event = json.loads(message.value())
-    merge_entities(event["tenant"], event["entity_id"], event)
-    consumer.commit()
+def rename_entity(tenant: str, entity_id: str, new_name: str) -> bool:
+    """Commit the rename and tell the graph consumers; True when the event is on its way."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    payload = {"type": "entity.renamed", "tenant": tenant, "entity_id": entity_id, "new_name": new_name}
+    try:
+        producer.produce(TOPIC, value=json.dumps(payload))
+        producer.poll(0)
+    except KafkaException:
+        store.insert_outbox(TOPIC, entity_id, payload)
+        return False
+    store.rename(entity_id, new_name)
+    return True
 `,
       solution: `import json
-import logging
 
 from confluent_kafka import Producer
 
-logger = logging.getLogger("graph")
+from graph import store  # rename, insert_outbox
 
 TOPIC = "graph.changed"
-OUTBOX_TABLE = "graph_outbox"
+ACK_TIMEOUT_S = 2
+
+producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
-def publish_change(producer: Producer, graph, tenant: str, entity_id: str, edge: dict) -> None:
-    """Commit the graph change first, then publish an event keyed by entity."""
-    graph.commit()  # durable before anyone can consume the event
+def rename_entity(tenant: str, entity_id: str, new_name: str) -> bool:
+    """Commit the rename, then tell the graph consumers; True once the broker acknowledged the event."""
+    # The rename is durable before its event exists; a failed commit raises before anything is produced.
+    renamed = store.rename(entity_id, new_name)
     payload = {
+        "type": "entity.renamed",
         "tenant": tenant,
         "entity_id": entity_id,
-        "edge_id": edge["id"],
-        "old_label": edge["old_label"],
-        "new_label": edge["new_label"],
-        "policy_version": edge["policy_version"],
+        "old_name": renamed["old_name"],
+        "new_name": renamed["new_name"],
+        "version": renamed["version"],
     }
-    try:
-        producer.produce(TOPIC, key=entity_id, value=json.dumps(payload))
-        producer.flush()
-    except Exception as exc:  # the broker rejected the produce
-        outbox.put(OUTBOX_TABLE, payload, reason=str(exc))
-        logger.warning("outbox tenant=%s entity=%s", tenant, entity_id)
+    outcome = {}
 
+    def on_delivery(err, msg):
+        outcome["error"] = err
 
-def consume(consumer, message) -> None:
-    """Apply the merge idempotently, and commit the offset only once it is durable."""
-    event = json.loads(message.value())
-    if already_applied(event["entity_id"], event["policy_version"]):
-        consumer.commit()  # already folded in; nothing to do but move on
-        return
-    merge_entities(event["tenant"], event["entity_id"], event)
-    consumer.commit()
+    producer.produce(TOPIC, key=entity_id, value=json.dumps(payload), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or outcome.get("error") is not None:
+        # The broker did not take it: the relay produces the row later, so a consumer is late, not wrong.
+        store.insert_outbox(TOPIC, entity_id, payload)
+        return False
+    return True
 `,
     },
     typescript: {
-      starter: `/** graph.changed: flawed code that publishes before the commit. */
-import {Kafka, type Consumer, type EachMessagePayload} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
 
-import {graph} from './graph';
+import {insertOutbox, rename} from 'graph/store';
 
-const kafka = new Kafka({clientId: 'knowledge-graph', brokers: ['127.0.0.1:9092']});
-const producer = kafka.producer({idempotent: true});
+export const TOPIC = 'graph.changed';
 
-const TOPIC = 'graph.changed';
+const kafka = new Kafka({clientId: 'graph-api', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect();
 
-interface EdgeChange {
-  id: string;
-  newLabel: string;
-}
-
-export async function publishChange(tenant: string, entityId: string, opType: string, edge: EdgeChange): Promise<void> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const payload = {tenant, entity_id: entityId, new_label: edge.newLabel};
-  await producer.send({topic: TOPIC, messages: [{key: opType, value: JSON.stringify(payload)}]});
-  await graph.commit();
-}
-
-export async function consume(consumer: Consumer, payload: EachMessagePayload): Promise<void> {
-  // TODO: the consumer's share of the five flaws lives here.
-  const event = JSON.parse(payload.message.value?.toString() ?? '{}') as {tenant: string; entity_id: string};
-  await applyMerge(event);
-  await consumer.commitOffsets([{topic: payload.topic, partition: payload.partition, offset: payload.message.offset}]);
+/** Commit the rename and tell the graph consumers; true when the event is on its way. */
+export async function renameEntity(tenant: string, entityId: string, newName: string): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const payload = {type: 'entity.renamed', tenant, entity_id: entityId, new_name: newName};
+  try {
+    void producer.send({topic: TOPIC, messages: [{value: JSON.stringify(payload)}]});
+  } catch {
+    await insertOutbox(TOPIC, entityId, payload);
+    return false;
+  }
+  await rename(entityId, newName);
+  return true;
 }
 `,
-      solution: `/** graph.changed: entity-keyed, publish-after-commit, idempotent replay. */
-import {Kafka, type Consumer, type EachMessagePayload} from 'kafkajs';
+      solution: `import {Kafka} from 'kafkajs';
 
-import {graph} from './graph';
+import {insertOutbox, rename} from 'graph/store';
 
-const kafka = new Kafka({clientId: 'knowledge-graph', brokers: ['127.0.0.1:9092']});
-const producer = kafka.producer({idempotent: true, acks: -1});
+export const TOPIC = 'graph.changed';
+export const ACK_TIMEOUT_MS = 2000;
 
-const TOPIC = 'graph.changed';
-const OUTBOX_TABLE = 'graph_outbox';
+const kafka = new Kafka({clientId: 'graph-api', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect();
 
-interface EdgeChange {
-  id: string;
-  oldLabel: string;
-  newLabel: string;
-  policyVersion: number;
-}
-
-interface ChangeEvent {
-  tenant: string;
-  entity_id: string;
-  edge_id: string;
-  old_label: string;
-  new_label: string;
-  policy_version: number;
-}
-
-export async function publishChange(tenant: string, entityId: string, edge: EdgeChange): Promise<void> {
-  await graph.commit(); // durable before anyone can consume the event
-  const payload: ChangeEvent = {
+/** Commit the rename, then tell the graph consumers; true once the broker acknowledged the event. */
+export async function renameEntity(tenant: string, entityId: string, newName: string): Promise<boolean> {
+  // The rename is durable before its event exists; a failed commit throws before anything is produced.
+  const renamed = await rename(entityId, newName);
+  const payload = {
+    type: 'entity.renamed',
     tenant,
     entity_id: entityId,
-    edge_id: edge.id,
-    old_label: edge.oldLabel,
-    new_label: edge.newLabel,
-    policy_version: edge.policyVersion,
+    old_name: renamed.old_name,
+    new_name: renamed.new_name,
+    version: renamed.version,
   };
   try {
-    await producer.send({topic: TOPIC, messages: [{key: entityId, value: JSON.stringify(payload)}]});
-  } catch (error) {
-    await outbox.put(OUTBOX_TABLE, payload, String(error));
+    await producer.send({topic: TOPIC, messages: [{key: entityId, value: JSON.stringify(payload)}], timeout: ACK_TIMEOUT_MS});
+    return true;
+  } catch {
+    // The broker did not take it: the relay produces the row later, so a consumer is late, not wrong.
+    await insertOutbox(TOPIC, entityId, payload);
+    return false;
   }
-}
-
-export async function consume(consumer: Consumer, payload: EachMessagePayload): Promise<void> {
-  const event = JSON.parse(payload.message.value?.toString() ?? '{}') as ChangeEvent;
-  const offset = {topic: payload.topic, partition: payload.partition, offset: payload.message.offset};
-  if (await isApplied(event.entity_id, event.policy_version)) {
-    await consumer.commitOffsets([offset]); // already folded in; nothing to do but move on
-    return;
-  }
-  await applyMerge(event);
-  await consumer.commitOffsets([offset]);
 }
 `,
     },
     go: {
-      starter: `package events
+      starter: `package main
 
 import (
 	"context"
 	"encoding/json"
-	"log"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"graph/store" // store.Rename, store.InsertOutbox
 )
 
 const topic = "graph.changed"
 
-type EdgeChange struct {
-	ID       string
-	NewLabel string
-}
+var producer = newProducer()
 
-func publishChange(ctx context.Context, writer *kafka.Writer, graph Graph, tenant, entityID, opType string, edge EdgeChange) error {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	payload, _ := json.Marshal(map[string]string{"tenant": tenant, "entity_id": entityID, "new_label": edge.NewLabel})
-	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(opType), Value: payload}); err != nil {
-		return err
-	}
-	return graph.Commit(ctx)
-}
-
-func consume(ctx context.Context, reader *kafka.Reader, consumer Consumer) error {
-	// TODO: the consumer's share of the five flaws lives here.
-	message, err := reader.ReadMessage(ctx)
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092"})
 	if err != nil {
-		return err
+		panic(err)
 	}
-	var event ChangeEvent
-	if err := json.Unmarshal(message.Value, &event); err != nil {
-		return err
+	return p
+}
+
+// renameEntity commits the rename and tells the graph consumers; true when the event is on its way.
+func renameEntity(ctx context.Context, tenant, entityID, newName string) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	payload := map[string]any{"type": "entity.renamed", "tenant": tenant, "entity_id": entityID, "new_name": newName}
+	value, _ := json.Marshal(payload)
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Value: value}
+	if err := producer.Produce(msg, nil); err != nil {
+		store.InsertOutbox(ctx, topic, entityID, payload)
+		return false, nil
 	}
-	if err := applyMerge(ctx, event); err != nil {
-		return err
+	if _, err := store.Rename(ctx, entityID, newName); err != nil {
+		return false, err
 	}
-	return consumer.CommitOffsets(ctx, message)
+	return true, nil
 }
 `,
-      solution: `package events
+      solution: `package main
 
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"graph/store" // store.Rename, store.InsertOutbox
 )
 
-const topic = "graph.changed"
-const outboxTable = "graph_outbox"
+const (
+	topic      = "graph.changed"
+	ackTimeout = 2 * time.Second
+)
 
-type EdgeChange struct {
-	ID            string
-	OldLabel      string
-	NewLabel      string
-	PolicyVersion int64
-}
+var producer = newProducer()
 
-type ChangeEvent struct {
-	Tenant        string \`json:"tenant"\`
-	EntityID      string \`json:"entity_id"\`
-	EdgeID        string \`json:"edge_id"\`
-	OldLabel      string \`json:"old_label"\`
-	NewLabel      string \`json:"new_label"\`
-	PolicyVersion int64  \`json:"policy_version"\`
-}
-
-func publishChange(ctx context.Context, writer *kafka.Writer, graph Graph, outbox Outbox, tenant, entityID string, edge EdgeChange) error {
-	if err := graph.Commit(ctx); err != nil { // durable before anyone can consume the event
-		return err
-	}
-	event := ChangeEvent{
-		Tenant:        tenant,
-		EntityID:      entityID,
-		EdgeID:        edge.ID,
-		OldLabel:      edge.OldLabel,
-		NewLabel:      edge.NewLabel,
-		PolicyVersion: edge.PolicyVersion,
-	}
-	payload, _ := json.Marshal(event)
-	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(entityID), Value: payload}); err != nil {
-		if outboxErr := outbox.Put(ctx, outboxTable, payload); outboxErr != nil {
-			return outboxErr
-		}
-		log.Printf("produce rejected, parked in outbox tenant=%s entity=%s", tenant, entityID)
-	}
-	return nil
-}
-
-func consume(ctx context.Context, reader *kafka.Reader, consumer Consumer) error {
-	message, err := reader.ReadMessage(ctx)
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092"})
 	if err != nil {
-		return err
+		panic(err)
 	}
-	var event ChangeEvent
-	if err := json.Unmarshal(message.Value, &event); err != nil {
-		return err
+	return p
+}
+
+// renameEntity commits the rename, then tells the graph consumers; true once the broker acknowledged the event.
+func renameEntity(ctx context.Context, tenant, entityID, newName string) (bool, error) {
+	// The rename is durable before its event exists; a failed commit returns before anything is produced.
+	renamed, err := store.Rename(ctx, entityID, newName)
+	if err != nil {
+		return false, err
 	}
-	if isApplied(ctx, event.EntityID, event.PolicyVersion) {
-		return consumer.CommitOffsets(ctx, message) // already folded in; nothing to do but move on
+	payload := map[string]any{
+		"type":      "entity.renamed",
+		"tenant":    tenant,
+		"entity_id": entityID,
+		"old_name":  renamed.OldName,
+		"new_name":  renamed.NewName,
+		"version":   renamed.Version,
 	}
-	if err := applyMerge(ctx, event); err != nil {
-		return err
+	value, _ := json.Marshal(payload)
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(entityID), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err = producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded // no delivery report within the window
+		}
 	}
-	return consumer.CommitOffsets(ctx, message)
+	if err != nil {
+		// The broker did not take it: the relay produces the row later, so a consumer is late, not wrong.
+		store.InsertOutbox(ctx, topic, entityID, payload)
+		return false, nil
+	}
+	return true, nil
 }
 `,
     },
     scala: {
-      starter: `import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+      starter: `import java.util.Properties
 
-object GraphEvents {
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.KafkaException
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
+
+import graph.Store // Store.rename, Store.insertOutbox
+
+object Events {
   val Topic = "graph.changed"
 
-  final case class EdgeChange(id: String, newLabel: String)
-
-  def publishChange(producer: KafkaProducer[String, String], graph: Graph, tenant: String, entityId: String,
-      opType: String, edge: EdgeChange): Unit = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = s"""{"tenant":"$tenant","entity_id":"$entityId","new_label":"\${edge.newLabel}"}"""
-    producer.send(new ProducerRecord[String, String](Topic, opType, payload))
-    producer.flush()
-    graph.commit()
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  def consume(consumer: KafkaConsumer[String, String], record: ConsumerRecord[String, String]): Unit = {
-    // TODO: the consumer's share of the five flaws lives here.
-    val event = parse(record.value())
-    applyMerge(event)
-    consumer.commitSync()
+  /** Commit the rename and tell the graph consumers; true when the event is on its way. */
+  def renameEntity(tenant: String, entityId: String, newName: String): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val payload =
+      JsObject("type" -> JsString("entity.renamed"), "tenant" -> JsString(tenant), "entity_id" -> JsString(entityId), "new_name" -> JsString(newName))
+    try producer.send(new ProducerRecord[String, String](Topic, payload.compactPrint))
+    catch {
+      case _: KafkaException =>
+        Store.insertOutbox(Topic, entityId, payload)
+        return false
+    }
+    Store.rename(entityId, newName)
+    true
   }
 }
 `,
-      solution: `import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+      solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
 
-object GraphEvents {
+import scala.util.Try
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
+
+import graph.Store // Store.rename, Store.insertOutbox
+
+object Events {
   val Topic = "graph.changed"
-  val OutboxTable = "graph_outbox"
+  val AckTimeoutMs = 2000L
 
-  final case class EdgeChange(id: String, oldLabel: String, newLabel: String, policyVersion: Long)
-
-  def publishChange(producer: KafkaProducer[String, String], graph: Graph, outbox: Outbox, tenant: String,
-      entityId: String, edge: EdgeChange): Unit = {
-    graph.commit() // durable before anyone can consume the event
-    val payload = s"""{"tenant":"$tenant","entity_id":"$entityId","edge_id":"\${edge.id}",""" +
-      s""""old_label":"\${edge.oldLabel}","new_label":"\${edge.newLabel}","policy_version":\${edge.policyVersion}}"""
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, entityId, payload))
-      producer.flush()
-    } catch {
-      case _: Throwable => outbox.put(OutboxTable, payload)
-    }
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  def consume(consumer: KafkaConsumer[String, String], record: ConsumerRecord[String, String]): Unit = {
-    val event = parse(record.value())
-    if (isApplied(event.entity_id, event.policy_version)) {
-      consumer.commitSync() // already folded in; nothing to do but move on
-      return
-    }
-    applyMerge(event)
-    consumer.commitSync()
+  /** Commit the rename, then tell the graph consumers; true once the broker acknowledged the event. */
+  def renameEntity(tenant: String, entityId: String, newName: String): Boolean = {
+    // The rename is durable before its event exists; a failed commit throws before anything is produced.
+    val renamed = Store.rename(entityId, newName)
+    val payload = JsObject(
+      "type" -> JsString("entity.renamed"),
+      "tenant" -> JsString(tenant),
+      "entity_id" -> JsString(entityId),
+      "old_name" -> JsString(renamed.oldName),
+      "new_name" -> JsString(renamed.newName),
+      "version" -> JsNumber(renamed.version))
+    val record = new ProducerRecord[String, String](Topic, entityId, payload.compactPrint)
+    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
+    // The broker did not take it: the relay produces the row later, so a consumer is late, not wrong.
+    if (acked.isFailure) Store.insertOutbox(Topic, entityId, payload)
+    acked.isSuccess
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <librdkafka/rdkafka.h>
+      starter: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <string>
+
+#include "graph/store.h"  // store::rename, store::insertOutbox
 
 using json = nlohmann::json;
 
 const std::string kTopic = "graph.changed";
 
-struct EdgeChange {
-  std::string id;
-  std::string newLabel;
-};
-
-void publishChange(rd_kafka_t* producer, Graph& graph, const std::string& tenant, const std::string& entityId,
-                   const std::string& opType, const EdgeChange& edge) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const json payload = {{"tenant", tenant}, {"entity_id", entityId}, {"new_label", edge.newLabel}};
-  const std::string value = payload.dump();
-  rd_kafka_producev(producer, RD_KAFKA_V_TOPIC(kTopic.c_str()), RD_KAFKA_V_MSGSIZE(value.size()),
-                    RD_KAFKA_V_KEY(opType.data(), opType.size()),
-                    RD_KAFKA_V_VALUE(const_cast<char*>(value.data()), value.size()), RD_KAFKA_V_END);
-  graph.commit();
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-void consume(rd_kafka_t* consumer, const std::string& value) {
-  // TODO: the consumer's share of the five flaws lives here.
-  const json event = json::parse(value);
-  applyMerge(event);
-  commitSync(consumer);
+auto producer = makeProducer();
+
+// Commit the rename and tell the graph consumers; true when the event is on its way.
+bool renameEntity(const std::string& tenant, const std::string& entity_id, const std::string& new_name) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const json payload = {{"type", "entity.renamed"}, {"tenant", tenant}, {"entity_id", entity_id}, {"new_name", new_name}};
+  const std::string value = payload.dump();
+  const RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
+                                                   const_cast<char*>(value.data()), value.size(), nullptr, 0, 0, nullptr);
+  producer->poll(0);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    store::insertOutbox(kTopic, entity_id, payload);
+    return false;
+  }
+  store::rename(entity_id, new_name);
+  return true;
 }
 `,
-      solution: `#include <librdkafka/rdkafka.h>
+      solution: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <string>
+
+#include "graph/store.h"  // store::rename, store::insertOutbox
 
 using json = nlohmann::json;
 
 const std::string kTopic = "graph.changed";
-const std::string kOutboxTable = "graph_outbox";
+constexpr int kAckTimeoutMs = 2000;
 
-struct EdgeChange {
-  std::string id;
-  std::string oldLabel;
-  std::string newLabel;
-  long long policyVersion;
+// The delivery report of the record in flight: renameEntity produces one record and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
 };
 
-void publishChange(rd_kafka_t* producer, Graph& graph, Outbox& outbox, const std::string& tenant,
-                   const std::string& entityId, const EdgeChange& edge) {
-  graph.commit(); // durable before anyone can consume the event
-  const json payload = {{"tenant", tenant},
-                        {"entity_id", entityId},
-                        {"edge_id", edge.id},
-                        {"old_label", edge.oldLabel},
-                        {"new_label", edge.newLabel},
-                        {"policy_version", edge.policyVersion}};
-  const std::string value = payload.dump();
-  const rd_kafka_resp_err_t err =
-      rd_kafka_producev(producer, RD_KAFKA_V_TOPIC(kTopic.c_str()), RD_KAFKA_V_MSGSIZE(value.size()),
-                        RD_KAFKA_V_KEY(entityId.data(), entityId.size()),
-                        RD_KAFKA_V_VALUE(const_cast<char*>(value.data()), value.size()), RD_KAFKA_V_END);
-  if (err != RD_KAFKA_RESP_ERR_NO_ERROR) outbox.put(kOutboxTable, payload);
+DeliveryReport delivery;
+
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("dr_cb", &delivery, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-void consume(rd_kafka_t* consumer, const std::string& value) {
-  const json event = json::parse(value);
-  if (isApplied(event.value("entity_id", std::string()), event.value("policy_version", 0LL))) {
-    commitSync(consumer); // already folded in; nothing to do but move on
-    return;
+auto producer = makeProducer();
+
+// Commit the rename, then tell the graph consumers; true once the broker acknowledged the event.
+bool renameEntity(const std::string& tenant, const std::string& entity_id, const std::string& new_name) {
+  // The rename is durable before its event exists; a failed commit throws before anything is produced.
+  const store::Renamed renamed = store::rename(entity_id, new_name);
+  const json payload = {{"type", "entity.renamed"}, {"tenant", tenant}, {"entity_id", entity_id},
+                        {"old_name", renamed.old_name}, {"new_name", renamed.new_name}, {"version", renamed.version}};
+  const std::string value = payload.dump();
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                                             value.size(), entity_id.c_str(), entity_id.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
   }
-  applyMerge(event);
-  commitSync(consumer);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    // The broker did not take it: the relay produces the row later, so a consumer is late, not wrong.
+    store::insertOutbox(kTopic, entity_id, payload);
+    return false;
+  }
+  return true;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+from graph import store
+
+TOPIC = "graph.changed"
+
+
+def _entities(*names):
+    return [store.create_entity("t1", "person", name, [])["id"] for name in names]
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.lrange("outbox", 0, -1)]
+
+
+def check_entity_key(ctx):
+    m = ctx.load("events")
+    ada, grace = _entities("Ada", "Grace")
+    m.rename_entity("t1", ada, "Ada Lovelace")
+    m.rename_entity("t1", grace, "Grace Hopper")
+    m.rename_entity("t1", ada, "Augusta Ada King")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three renames produced {len(records)} records on graph.changed (topics: {sorted(ctx.kafka.topics)})"
+    keys = [r.key for r in records]
+    expected = [ada.encode(), grace.encode(), ada.encode()]
+    assert keys == expected, f"the records are keyed {keys}, expected the entity ids {expected}: without the entity as key one entity's renames spread over partitions"
+    assert records[0].partition == records[2].partition, f"both renames of {ada} must land on one partition, or a consumer applies them out of order"
+
+
+def check_payload_fields(ctx):
+    m = ctx.load("events")
+    (ada,) = _entities("Ada")
+    m.rename_entity("t1", ada, "Ada Lovelace")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one rename produced {len(records)} records"
+    value = json.loads(records[0].value)
+    assert value.get("entity_id") == ada and value.get("tenant") == "t1" and value.get("new_name") == "Ada Lovelace", f"the payload is {value}, expected entity_id, tenant and new_name"
+    assert value.get("old_name") == "Ada", f"the payload's old_name is {value.get('old_name')!r}, expected 'Ada': a consumer that missed an event cannot tell what changed"
+    assert value.get("version") == 2, f"the payload's version is {value.get('version')!r}, expected 2 (the entity's version after the rename): without it a replayed event looks like a new one"
+
+
+def check_after_commit(ctx):
+    m = ctx.load("events")
+    (ada,) = _entities("Ada")
+    probe = ctx.redis_after(f"entity:{ada}", lambda: len(ctx.kafka.records(TOPIC)))
+    m.rename_entity("t1", ada, "Ada Lovelace")
+    assert probe.fired, f"rename_entity never committed the rename (nothing touched entity:{ada})"
+    assert probe.result == 0, f"when the rename reached the store the topic already held {probe.result} record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce"
+    assert len(ctx.kafka.records(TOPIC)) == 1, "the event must still be produced after the commit"
+    try:
+        m.rename_entity("t1", "e-404", "Nobody")
+    except Exception:
+        pass
+    assert len(ctx.kafka.records(TOPIC)) == 1, "a rename whose commit failed (there is no e-404) still produced an event: consumers hear of a change that never happened"
+
+
+def check_outbox(ctx):
+    m = ctx.load("events")
+    ada, grace = _entities("Ada", "Grace")
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.rename_entity("t1", ada, "Ada Lovelace")
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: the rename is committed and no consumer will ever hear of it"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == ada and rows[0].get("payload", {}).get("new_name") == "Ada Lovelace", f"the outbox row is {rows[0]}, expected the topic, the key {ada} and the payload"
+    assert ok is False, f"rename_entity returned {ok!r} after a failed delivery, expected False"
+    assert store.get_entity(ada)["name"] == "Ada Lovelace", "the rename must stay committed when only the produce failed"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    ok = m.rename_entity("t1", grace, "Grace Hopper")
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"rename_entity waited {waited:.0f} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("key") == grace, f"no delivery report within the window and the outbox holds {rows}"
+    assert ok is False, f"rename_entity returned {ok!r} without a delivery report, expected False"
+`,
+    typescript: `const TOPIC = 'graph.changed';
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+async function world(ctx, ...names: string[]) {
+  const store = ctx.load('/support/graph/store.ts');
+  const ids: string[] = [];
+  for (const name of names) ids.push((await store.createEntity('t1', 'person', name, [])).id);
+  return {m: ctx.load('events'), store, ids};
+}
+
+const outboxRows = ctx => (ctx.redis.lrange('outbox', 0, -1) as string[]).map(row => JSON.parse(row));
+
+export async function check_entity_key(ctx) {
+  const {m, ids} = await world(ctx, 'Ada', 'Grace');
+  const [ada, grace] = ids;
+  await m.renameEntity('t1', ada, 'Ada Lovelace');
+  await m.renameEntity('t1', grace, 'Grace Hopper');
+  await m.renameEntity('t1', ada, 'Augusta Ada King');
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three renames produced \${records.length} records on graph.changed\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, [ada, grace, ada], \`the records are keyed \${JSON.stringify(keys)}, expected the entity ids: without the entity as key one entity's renames spread over partitions\`);
+  assert.equal(records[0].partition, records[2].partition, \`both renames of \${ada} must land on one partition, or a consumer applies them out of order\`);
+}
+
+export async function check_payload_fields(ctx) {
+  const {m, ids} = await world(ctx, 'Ada');
+  const [ada] = ids;
+  await m.renameEntity('t1', ada, 'Ada Lovelace');
+  await settle();
+  const values = ctx.kafka.values(TOPIC);
+  assert.equal(values.length, 1, \`one rename produced \${values.length} records\`);
+  const value = JSON.parse(values[0]);
+  assert(value.entity_id === ada && value.tenant === 't1' && value.new_name === 'Ada Lovelace', \`the payload is \${values[0]}, expected entity_id, tenant and new_name\`);
+  assert.equal(value.old_name, 'Ada', \`the payload's old_name is \${JSON.stringify(value.old_name)}, expected "Ada": a consumer that missed an event cannot tell what changed\`);
+  assert.equal(value.version, 2, \`the payload's version is \${JSON.stringify(value.version)}, expected 2 (the entity's version after the rename): without it a replayed event looks like a new one\`);
+}
+
+export async function check_after_commit(ctx) {
+  const {m, ids} = await world(ctx, 'Ada');
+  const [ada] = ids;
+  const probe = ctx.redisAfter(\`entity:\${ada}\`, () => ctx.kafka.records(TOPIC).length);
+  await m.renameEntity('t1', ada, 'Ada Lovelace');
+  await settle();
+  assert(probe.fired, \`renameEntity never committed the rename (nothing touched entity:\${ada})\`);
+  assert.equal(probe.result, 0, \`when the rename reached the store the topic already held \${probe.result} record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the event must still be produced after the commit');
+  try {
+    await m.renameEntity('t1', 'e-404', 'Nobody');
+  } catch {
+    // the commit failed, as it should for an unknown entity
+  }
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'a rename whose commit failed (there is no e-404) still produced an event: consumers hear of a change that never happened');
+}
+
+export async function check_outbox(ctx) {
+  const {m, store, ids} = await world(ctx, 'Ada', 'Grace');
+  const [ada, grace] = ids;
+  ctx.kafka.failNext(TOPIC, 1);
+  let ok = await m.renameEntity('t1', ada, 'Ada Lovelace');
+  await settle();
+  let rows = outboxRows(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: the rename is committed and no consumer will ever hear of it\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === ada && rows[0].payload?.new_name === 'Ada Lovelace', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key \${ada} and the payload\`);
+  assert.equal(ok, false, \`renameEntity resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  assert.equal((await store.getEntity(ada)).name, 'Ada Lovelace', 'the rename must stay committed when only the produce failed');
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  ok = await m.renameEntity('t1', grace, 'Grace Hopper');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`renameEntity waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row\`);
+  rows = outboxRows(ctx);
+  assert(rows.length === 2 && rows[1].key === grace, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert.equal(ok, false, \`renameEntity resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+
+	"graph/store"
+
+	"leetbuild/harness"
+)
+
+const eventsTopic = "graph.changed"
+
+var eventsBg = context.Background()
+
+func eventsEntities(names ...string) []string {
+	ids := []string{}
+	for _, name := range names {
+		ids = append(ids, store.CreateEntity(eventsBg, "t1", "person", name, nil).ID)
+	}
+	return ids
+}
+
+func eventsRename(ctx *harness.Ctx, entityID, newName string) bool {
+	ok, err := renameEntity(eventsBg, "t1", entityID, newName)
+	ctx.NoError(err, "renameEntity(t1, %s) failed", entityID)
+	return ok
+}
+
+type eventsRow struct {
+	Topic   string         \`json:"topic"\`
+	Key     string         \`json:"key"\`
+	Payload map[string]any \`json:"payload"\`
+}
+
+func eventsOutbox(ctx *harness.Ctx) []eventsRow {
+	rows := []eventsRow{}
+	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
+		row := eventsRow{}
+		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func CheckEntityKey(ctx *harness.Ctx) {
+	ids := eventsEntities("Ada", "Grace")
+	ada, grace := ids[0], ids[1]
+	eventsRename(ctx, ada, "Ada Lovelace")
+	eventsRename(ctx, grace, "Grace Hopper")
+	eventsRename(ctx, ada, "Augusta Ada King")
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three renames must produce three records on graph.changed; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{ada, grace, ada}, "the records must be keyed by the entity ids, or one entity's renames spread over partitions")
+	ctx.Equal(records[0].Partition, records[2].Partition, "both renames of %s must land on one partition, or a consumer applies them out of order; the partitions", ada)
+}
+
+func CheckPayloadFields(ctx *harness.Ctx) {
+	ada := eventsEntities("Ada")[0]
+	eventsRename(ctx, ada, "Ada Lovelace")
+	ctx.Settle()
+	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 1, "one rename must produce one record; the records")
+	value := map[string]any{}
+	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
+	ctx.Assert(value["entity_id"] == ada && value["tenant"] == "t1" && value["new_name"] == "Ada Lovelace", "the payload is %s, expected entity_id, tenant and new_name", values[0])
+	ctx.Equal(value["old_name"], "Ada", "the payload's old_name (a consumer that missed an event cannot tell what changed without it)")
+	ctx.Equal(value["version"], 2, "the payload's version, the entity's version after the rename (without it a replayed event looks like a new one)")
+}
+
+func CheckAfterCommit(ctx *harness.Ctx) {
+	ada := eventsEntities("Ada")[0]
+	probe := ctx.Redis.After("entity:"+ada, func() any { return len(ctx.Kafka.Records(eventsTopic)) })
+	eventsRename(ctx, ada, "Ada Lovelace")
+	ctx.Settle()
+	ctx.Assert(probe.Fired, "renameEntity never committed the rename (nothing touched entity:%s)", ada)
+	ctx.Equal(probe.Result, 0, "when the rename reached the store the topic already held records: a consumer can be told about a change it cannot read yet. Commit first, then produce; the records at commit time")
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
+	renameEntity(eventsBg, "t1", "e-404", "Nobody")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a rename whose commit failed (there is no e-404) must produce nothing, or consumers hear of a change that never happened; the records")
+}
+
+func CheckOutbox(ctx *harness.Ctx) {
+	ids := eventsEntities("Ada", "Grace")
+	ada, grace := ids[0], ids[1]
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok := eventsRename(ctx, ada, "Ada Lovelace")
+	ctx.Settle()
+	rows := eventsOutbox(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the rename is committed and no consumer will ever hear of it; the rows")
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == ada && rows[0].Payload["new_name"] == "Ada Lovelace", "the outbox row is %+v, expected the topic, the key %s and the payload", rows[0], ada)
+	ctx.Equal(ok, false, "renameEntity's result after a failed delivery")
+	ctx.Equal(store.GetEntity(eventsBg, ada).Name, "Ada Lovelace", "the rename must stay committed when only the produce failed; the name")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	ok = eventsRename(ctx, grace, "Grace Hopper")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "renameEntity waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited)
+	rows = eventsOutbox(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Key == grace, "no delivery report within the window and the outbox holds %+v", rows)
+	ctx.Equal(ok, false, "renameEntity's result without a delivery report")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kEventsTopic = "graph.changed";
+
+std::string eventsEntity(const std::string& name) { return store::createEntity("t1", "person", name, {}).id; }
+
+std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> rows;
+  for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
+    const auto row = nlohmann::json::parse(text, nullptr, false);
+    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", text);
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+std::string eventsField(const nlohmann::json& j, const std::string& field) {
+  return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckEntityKey(harness::Ctx& ctx) {
+  const std::string ada = eventsEntity("Ada");
+  const std::string grace = eventsEntity("Grace");
+  renameEntity("t1", ada, "Ada Lovelace");
+  renameEntity("t1", grace, "Grace Hopper");
+  renameEntity("t1", ada, "Augusta Ada King");
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 3, "three renames must produce three records on graph.changed; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), std::vector<std::string>{ada, grace, ada}, "the records must be keyed by the entity ids, or one entity's renames spread over partitions");
+  ctx.Equal(records[0].Partition, records[2].Partition, "both renames of %s must land on one partition, or a consumer applies them out of order; the partitions", ada);
+}
+
+void CheckPayloadFields(harness::Ctx& ctx) {
+  const std::string ada = eventsEntity("Ada");
+  renameEntity("t1", ada, "Ada Lovelace");
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(values.size(), 1, "one rename must produce one record; the records");
+  const auto value = nlohmann::json::parse(values[0], nullptr, false);
+  ctx.Assert(eventsField(value, "entity_id") == ada && eventsField(value, "tenant") == "t1" && eventsField(value, "new_name") == "Ada Lovelace",
+             "the payload is %s, expected entity_id, tenant and new_name", values[0]);
+  ctx.Equal(eventsField(value, "old_name"), "Ada", "the payload's old_name (a consumer that missed an event cannot tell what changed without it)");
+  ctx.Equal(value.is_object() && value.contains("version") && value["version"].is_number() ? value["version"].get<long>() : 0L, 2L,
+            "the payload's version, the entity's version after the rename (without it a replayed event looks like a new one)");
+}
+
+void CheckAfterCommit(harness::Ctx& ctx) {
+  const std::string ada = eventsEntity("Ada");
+  size_t atCommit = 999;
+  bool fired = false;
+  ctx.Redis.After("entity:" + ada, [&] {
+    fired = true;
+    atCommit = ctx.Kafka.Records(kEventsTopic).size();
+  });
+  renameEntity("t1", ada, "Ada Lovelace");
+  ctx.Settle();
+  ctx.Assert(fired, "renameEntity never committed the rename (nothing touched entity:%s)", ada);
+  ctx.Equal(atCommit, 0, "when the rename reached the store the topic already held records: a consumer can be told about a change it cannot read yet. Commit first, then produce; the records at commit time");
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
+  try {
+    renameEntity("t1", "e-404", "Nobody");
+  } catch (const std::exception&) {
+    // the commit failed, as it should for an unknown entity
+  }
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "a rename whose commit failed (there is no e-404) must produce nothing, or consumers hear of a change that never happened; the records");
+}
+
+void CheckOutbox(harness::Ctx& ctx) {
+  const std::string ada = eventsEntity("Ada");
+  const std::string grace = eventsEntity("Grace");
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  bool ok = renameEntity("t1", ada, "Ada Lovelace");
+  ctx.Settle();
+  auto rows = eventsOutbox(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the rename is committed and no consumer will ever hear of it; the rows");
+  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == ada && rows[0].contains("payload") && eventsField(rows[0]["payload"], "new_name") == "Ada Lovelace",
+             "the outbox row is %s, expected the topic, the key %s and the payload", rows[0].dump(), ada);
+  ctx.Equal(ok, false, "renameEntity's result after a failed delivery");
+  ctx.Equal(store::getEntity(ada)->name, "Ada Lovelace", "the rename must stay committed when only the produce failed; the name");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const int64_t before = ctx.Clock.Now();
+  ok = renameEntity("t1", grace, "Grace Hopper");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "renameEntity waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited);
+  rows = eventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && eventsField(rows[1], "key") == grace, "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Equal(ok, false, "renameEntity's result without a delivery report");
+}
+`,
+  },
   hints: [
-    'After a consumer rebalance, merges from the last week are applied a second time, and during a broker blip some edges show up in the graph with no event on the topic.',
-    '`producer.produce` runs before `graph.commit`, so the event can outlive a failed transaction; `key=op_type` scatters one entity across partitions; `consume` has no mark to recognise a repeat.',
-    'Commit, then `produce` with `key=entity_id` and `old_label`/`new_label`/`policy_version`; on rejection `outbox.put` into `OUTBOX_TABLE`; in `consume` check `already_applied` before `merge_entities`, then `consumer.commit`.',
+    'Rename one entity twice and look at the partitions: the renames sit on two of them. Make the broker reject a delivery: the rename is committed and no event exists anywhere.',
+    'Without a key the producer spreads records over partitions; a consumer reading in parallel sees one entity out of order. `produce` only raises when it cannot enqueue; a rejection arrives later, in the delivery report nobody reads.',
+    'Call `store.rename` first and build the payload from what it returns, produce with `key=entity_id` and an `on_delivery` callback, `flush(ACK_TIMEOUT_S)`, and `store.insert_outbox` when the report failed or never came.',
   ],
-  debrief: `The fix orders every step by what must be true before the next one is safe. The graph commit comes before the produce because an event may only describe durable state. The entity id is the key because the partition key decides ordering, and one entity's history must be read in the order it happened. The outbox exists because a rejected produce is otherwise a lost fact. On the consumer side the idempotency mark comes before the merge and the offset commit comes after it, so a crash anywhere in between is repaired by the replay finding its own mark; \`policy_version\` in the payload is that mark. Production systems drain the outbox with a relay that publishes under the same key, and route events that fail to apply to a dead-letter topic rather than blocking the partition.`,
+  debrief: `The key is an ordering contract: Kafka keeps order within a partition, so whatever must stay ordered, here one entity's history, must share a key. Committing first makes every event describe state a consumer can read back. The version in the payload is what lets a consumer apply events idempotently: an event whose version is not newer than what it already holds is a replay. The delivery report is the only place a broker rejection shows up, which is why the outbox hangs off it. A stalled delivery can still land after its row was written, so a consumer sees some events twice and the version check absorbs that. Production graphs write the outbox row in the same transaction as the change and let a relay do every produce.`,
 };

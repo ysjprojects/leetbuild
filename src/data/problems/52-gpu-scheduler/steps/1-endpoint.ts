@@ -986,7 +986,8 @@ async def check_log_no_payload(ctx):
     placement_id = r.json()["placement_id"]
     assert lines.lines, "the placement must be logged (logger gpusched, level INFO)"
     for line in lines.lines:
-        assert "3.5" not in line and "max_hourly_bid" not in line and "80" not in line, f"the log line {line!r} carries the request body: log ids and counts, the tenant's bid stays out of the log"
+        bare = line.replace(placement_id, "")  # a random id can contain "80"
+        assert "3.5" not in bare and "max_hourly_bid" not in bare and "80" not in bare, f"the log line {line!r} carries the request body: log ids and counts, the tenant's bid stays out of the log"
     assert any(placement_id in line and "gpu-1" in line for line in lines.lines), f"no log line names the placement id and the node id: {lines.lines}"
 `,
     typescript: `const BODY = {gpu_type: 'a100', count: 4, memory_gb: 80, max_hourly_bid: 3.5};
@@ -1086,7 +1087,8 @@ export async function check_log_no_payload(ctx) {
     const {placement_id: placementId} = r.json() as {placement_id: string};
     assert(lines.length > 0, 'the placement must be logged (console.info)');
     for (const line of lines) {
-      assert(!line.includes('3.5') && !line.includes('max_hourly_bid') && !line.includes('80'), \`the log line \${JSON.stringify(line)} carries the request body: log ids and counts, the tenant's bid stays out of the log\`);
+      const bare = line.split(placementId).join(''); // a random id can contain "80"
+      assert(!bare.includes('3.5') && !bare.includes('max_hourly_bid') && !bare.includes('80'), \`the log line \${JSON.stringify(line)} carries the request body: log ids and counts, the tenant's bid stays out of the log\`);
     }
     assert(lines.some(line => line.includes(placementId) && line.includes('gpu-1')), \`no log line names the placement id and the node id: \${JSON.stringify(lines)}\`);
   } finally {
@@ -1230,7 +1232,11 @@ func CheckLogNoPayload(ctx *harness.Ctx) {
 	lines := strings.Split(strings.TrimSpace(logged.String()), "\\n")
 	ctx.Assert(logged.Len() > 0, "the placement must be logged (log.Printf)")
 	for _, line := range lines {
-		ctx.Assert(!strings.Contains(line, "3.5") && !strings.Contains(line, "max_hourly_bid") && !strings.Contains(line, "MaxHourlyBid") && !strings.Contains(line, "80"), "the log line %q carries the request body: log ids and counts, the tenant's bid stays out of the log", line)
+		bare := line // a random id can contain "80"
+		if pid != "" {
+			bare = strings.ReplaceAll(line, pid, "")
+		}
+		ctx.Assert(!strings.Contains(bare, "3.5") && !strings.Contains(bare, "max_hourly_bid") && !strings.Contains(bare, "MaxHourlyBid") && !strings.Contains(bare, "80"), "the log line %q carries the request body: log ids and counts, the tenant's bid stays out of the log", line)
 	}
 	named := false
 	for _, line := range lines {
@@ -1380,7 +1386,10 @@ void CheckLogNoPayload(harness::Ctx& ctx) {
   const std::vector<std::string> lines = apiLines();
   ctx.Assert(!lines.empty(), "the placement must be logged (std::clog)");
   for (const auto& line : lines) {
-    ctx.Assert(line.find("3.5") == std::string::npos && line.find("max_hourly_bid") == std::string::npos && line.find("80") == std::string::npos,
+    std::string bare = line;  // a random id can contain "80"
+    if (!pid.empty())
+      for (auto at = bare.find(pid); at != std::string::npos; at = bare.find(pid)) bare.erase(at, pid.size());
+    ctx.Assert(bare.find("3.5") == std::string::npos && bare.find("max_hourly_bid") == std::string::npos && bare.find("80") == std::string::npos,
                "the log line %q carries the request body: log ids and counts, the tenant's bid stays out of the log", line);
   }
   bool named = false;

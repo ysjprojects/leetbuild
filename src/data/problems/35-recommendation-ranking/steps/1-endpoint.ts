@@ -5,34 +5,29 @@ export const endpointStep: Step = {
   title: 'POST /v1/recommendations: candidates in, ranked list out',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'recsvc', 'db'],
+  focus: ['client', 'api', 'ranker'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/recommendations\` with body
-\`{"surface": "home", "candidate_ids": ["…"]}\`, reads the tenant from \`X-Tenant-Id\`, picks the
-user from the body when one is present, ranks every candidate and answers \`200\` with the full
-ranked list. It compiles, it serves the demo, and it hides four flaws.
+**Starting point.** The starter serves \`POST /v1/recommendations\` with body \`{surface, candidate_ids}\`
+and the \`X-Tenant-Id\` and \`X-User-Id\` headers: it takes the user from the body's \`user_id\` when one
+is sent, else from the header, passes every candidate to \`rank(tenant, user_id, surface,
+candidate_ids)\` (step 3), and answers \`{items}\` with every ranked item. It serves the demo and hides
+four flaws.
 
-**Failure mode the checks target.** A personalized list fetched for the wrong person, a candidate
-list large enough to stall the ranking pool, a response that grows with the request, and two
-releases whose output cannot be told apart in the numbers the release gate reads.
+**Failure mode the checks target.** One caller gets another user's personalized list by putting that
+user's id in the body; a request with thousands of candidates, or none, goes straight to the ranker;
+the response grows with the request and says nothing about where each item sits; and a list from the
+popularity fallback looks the same as the model's.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header and the user from \`X-User-Id\`; a
-  missing header is **401**. \`user_id\` is not a request field: the personalized list belongs to
-  the caller and to nobody else.
-- \`surface\` is a required non-empty name and must exist in the catalog; an unknown surface is
-  **404** before the ranker is called.
-- \`candidate_ids\` is required and bounded by \`MAX_CANDIDATES = 500\`; an empty or oversized list is
-  **400**.
-- The response holds at most \`MAX_ITEMS = 30\` items, the top of the order trimmed after ranking,
-  and each item carries its \`id\`, its \`score\` and its zero-based \`position\`.
-- The response carries \`model_version\`, read from the ranking result, so an A/B read can attribute
-  the order to the model that produced it.
-- Validate everything before the ranker is called: headers, body shape, surface, candidate list,
-  catalog. A rejected request does not reach the ranking pool.
-- Log the decision with tenant, user, surface and counts, not the candidate array.`,
+- The user is the authenticated \`X-User-Id\` header only; a missing \`X-Tenant-Id\` or \`X-User-Id\` is
+  **401** before anything is ranked.
+- \`candidate_ids\` holds 1 to \`MAX_CANDIDATES\` = 500 ids; otherwise **400**, before the ranker is
+  called.
+- Answer at most \`MAX_ITEMS\` = 30 items, the top of the ranked order, each \`{id, score, position}\`
+  with its zero-based position.
+- The response carries the result's \`model_version\` and \`fallback\`.`,
   sequence: {
-    participants: ['Client', 'Recommendation API', 'surface catalog', 'Ranking model'],
+    participants: ['Client', 'Recommendation API', 'rank (step 3)'],
     messages: [
       {
         from: 'Client',
@@ -43,44 +38,47 @@ releases whose output cannot be told apart in the numbers the release gate reads
       {
         from: 'Recommendation API',
         to: 'Recommendation API',
-        label: 'resolve user from X-User-Id · validate surface · cap candidates',
+        label: 'user from X-User-Id · 1 to 500 candidates or 400',
         kind: 'sync',
       },
-      {from: 'Recommendation API', to: 'surface catalog', label: 'known(surface)', kind: 'sync'},
-      {from: 'surface catalog', to: 'Recommendation API', label: 'yes / unknown → 404', kind: 'reply'},
       {
         from: 'Recommendation API',
-        to: 'Ranking model',
-        label: 'Rank(tenant, user, surface, at most 500 candidates)',
+        to: 'rank (step 3)',
+        label: 'rank(tenant, user_id, surface, candidate_ids)',
         kind: 'sync',
       },
-      {from: 'Ranking model', to: 'Recommendation API', label: 'scored items · model_version', kind: 'reply'},
-      {from: 'Recommendation API', to: 'Client', label: '200 {items at most 30, model_version}', kind: 'reply'},
+      {from: 'rank (step 3)', to: 'Recommendation API', label: '{items, model_version, fallback}', kind: 'reply'},
+      {
+        from: 'Recommendation API',
+        to: 'Client',
+        label: '200 {items: top 30 with positions, model_version, fallback}',
+        kind: 'reply',
+      },
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/recommendations',
-      detail: 'Register the recommendation route on `POST /v1/recommendations`.',
+      title: 'Ranks on POST /v1/recommendations',
+      detail: 'Register `POST /v1/recommendations` and answer the candidates in the order `rank` returns.',
       match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/recommendations["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/recommendations['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/recommendations"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"recommendations"\s*\)/, /\bpost\s*\{/]},
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/recommendations"/]},
+        python: {all: [/@app\.post\(\s*["']\/v1\/recommendations["']/, /\brank\(/]},
+        typescript: {all: [/app\.post\(\s*['"]\/v1\/recommendations['"]/, /\brank\(/]},
+        go: {all: [/HandleFunc\(\s*"POST \/v1\/recommendations"/, /\brank\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"recommendations"\s*\)/, /\bpost\s*\{/, /Client\.rank\(/]},
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/recommendations"/, /\brank\(/]},
       },
     },
     {
       id: 'auth-user',
-      title: 'Resolves the user from the X-User-Id header, never the body',
+      title: 'Ranks for the X-User-Id caller, never a body user',
       detail:
-        'The user comes from the authenticated `X-User-Id` header and a missing header is **401**; a `user_id` in the body is never trusted, so one caller cannot request another user’s personalized list. The starter prefers `body.user_id` over the header and rejects nothing.',
+        'The user comes from the authenticated `X-User-Id` header and a missing header is **401**; the starter prefers a `user_id` in the body, so any caller can request any user’s personalized list.',
       match: {
-        python: {all: [/X-User-Id/, /status_code\s*=\s*401/], none: [/body\.user_id/]},
-        typescript: {all: [/X-User-Id/, /code\(\s*401\s*\)/], none: [/body\.user_id/]},
+        python: {all: [/x-user-id/i, /\b401\b/], none: [/body\.user_id/]},
+        typescript: {all: [/x-user-id/i, /code\(\s*401\s*\)/], none: [/body\.user_id/]},
         go: {all: [/X-User-Id/, /StatusUnauthorized/], none: [/body\.UserID/]},
-        scala: {all: [/X-User-Id/, /StatusCodes\.Unauthorized/], none: [/body\.user_id/]},
+        scala: {all: [/X-User-Id/, /Unauthorized/], none: [/fields\.get\(\s*"user_id"\s*\)/]},
         cpp: {all: [/X-User-Id/, /\b401\b/], none: [/body\.value\(\s*"user_id"/]},
       },
     },
@@ -88,52 +86,61 @@ releases whose output cannot be told apart in the numbers the release gate reads
       id: 'candidate-cap',
       title: 'Rejects an empty or oversized candidate list',
       detail:
-        '`candidate_ids` must hold between 1 and `MAX_CANDIDATES = 500` ids; an empty or oversized list is **400** before anything is ranked. The starter caps nothing, so one request can stall the ranking pool with a list of any size.',
+        '`candidate_ids` must hold 1 to `MAX_CANDIDATES` = 500 ids; anything else is **400** before the ranker is called. The starter passes a list of any size, so one request can tie up the ranking pool.',
       match: {
-        python: {all: [/MAX_CANDIDATES\s*=\s*500/, /candidate_ids/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_CANDIDATES\s*=\s*500/, /candidate_ids/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxCandidates\s*=\s*500/, /CandidateIDs/, /StatusBadRequest/]},
-        scala: {all: [/MaxCandidates\s*=\s*500/, /candidate_ids/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kMaxCandidates\s*=\s*500/, /candidate_ids/, /\b400\b/]},
+        python: {all: [/MAX_CANDIDATES\s*=\s*500\b/, /len\(body\.candidate_ids\)\s*>\s*MAX_CANDIDATES/, /\b400\b/]},
+        typescript: {all: [/MAX_CANDIDATES\s*=\s*500\b/, /length\s*>\s*MAX_CANDIDATES/, /code\(\s*400\s*\)/]},
+        go: {all: [/maxCandidates\s*=\s*500\b/, /len\(body\.CandidateIDs\)\s*>\s*maxCandidates/, /StatusBadRequest/]},
+        scala: {all: [/MaxCandidates\s*=\s*500\b/, /size\s*>\s*MaxCandidates/, /BadRequest/]},
+        cpp: {all: [/kMaxCandidates\s*=\s*500\b/, /size\(\)\s*>\s*kMaxCandidates/, /\b400\b/]},
       },
     },
     {
       id: 'top-k',
-      title: 'Returns at most MAX_ITEMS = 30 items with id, score and position',
+      title: 'Answers at most 30 items, each with its position',
       detail:
-        'The ranked list is trimmed to `MAX_ITEMS = 30` after ranking and every item carries its `id`, `score` and zero-based `position`. The starter returns whatever the ranker produced, so a 500-candidate request becomes a 500-item payload.',
+        'The ranked order is cut to `MAX_ITEMS` = 30 and every item carries `id`, `score` and its zero-based `position`; the starter answers every ranked item, so a 500-candidate request becomes a 500-item payload.',
       match: {
-        python: {all: [/MAX_ITEMS\s*=\s*30/, /\[:\s*MAX_ITEMS\]/, /"position"/, /"score"/]},
-        typescript: {all: [/MAX_ITEMS\s*=\s*30/, /slice\(\s*0\s*,\s*MAX_ITEMS\s*\)/, /\bposition\b/, /\bscore\b/]},
-        go: {all: [/maxItems\s*=\s*30/, /items\[:maxItems\]/, /"position"/, /"score"/]},
-        scala: {all: [/MaxItems\s*=\s*30/, /take\(MaxItems\)/, /position\s*:\s*Int/, /score\s*:\s*Double/]},
-        cpp: {all: [/kMaxItems\s*=\s*30/, /position\s*<\s*kMaxItems/, /"position"/, /"score"/]},
+        python: {all: [/MAX_ITEMS\s*=\s*30\b/, /\[:\s*MAX_ITEMS\s*\]/, /"position":\s*position/]},
+        typescript: {all: [/MAX_ITEMS\s*=\s*30\b/, /slice\(\s*0,\s*MAX_ITEMS\s*\)/, /\bposition\b/]},
+        go: {
+          all: [
+            /maxItems\s*=\s*30\b/,
+            /position\s*==\s*maxItems|\[:\s*maxItems\]|min\([^\n]*maxItems/,
+            /json:"position"/,
+          ],
+        },
+        scala: {all: [/MaxItems\s*=\s*30\b/, /take\(\s*MaxItems\s*\)/, /"position"\s*->/]},
+        cpp: {all: [/kMaxItems\s*=\s*30\b/, /position\s*<\s*kMaxItems/, /\{"position",\s*position\}/]},
       },
     },
     {
       id: 'model-version',
-      title: 'Stamps the response with the version that produced the order',
+      title: 'Stamps the response with the version and the fallback flag',
       detail:
-        'The response carries `model_version`, taken from the ranking result that produced this order. The starter answers with items only, so an A/B read of two releases sees different lists and no way to attribute which model ranked them.',
+        'The response carries `model_version` and `fallback` from the `rank` result, so a client, a log line or an A/B read can tell which model ordered the list and whether it was the popularity fallback; the starter answers the items alone.',
       match: {
-        python: {all: [/model_version/, /result\.model_version/]},
-        typescript: {all: [/model_version/, /result\.model_version/]},
-        go: {all: [/model_version/, /result\.ModelVersion/]},
-        scala: {all: [/model_version/, /result\.model_version/]},
-        cpp: {all: [/model_version/, /result\.model_version/]},
+        python: {all: [/"model_version":\s*result\["model_version"\]/, /"fallback":\s*result\["fallback"\]/]},
+        typescript: {all: [/model_version:\s*result\.model_version/, /fallback:\s*result\.fallback/]},
+        go: {all: [/"model_version":\s*result\.ModelVersion/, /"fallback":\s*result\.Fallback/]},
+        scala: {
+          all: [
+            /"model_version"\s*->\s*JsString\(result\.modelVersion\)/,
+            /"fallback"\s*->\s*JsBoolean\(result\.fallback\)/,
+          ],
+        },
+        cpp: {all: [/\{"model_version",\s*result\.model_version\}/, /\{"fallback",\s*result\.fallback\}/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from client import rank  # step 3: rank(tenant, user_id, surface, candidate_ids) -> {items, model_version, fallback}
+
 app = FastAPI()
-logger = logging.getLogger("recsvc")
 
 
 class RecommendRequest(BaseModel):
@@ -142,34 +149,22 @@ class RecommendRequest(BaseModel):
     user_id: str | None = None
 
 
-class Ranker:
-    def rank(self, tenant: str, user_id: str, surface: str, candidate_ids: list[str]) -> list[dict]:
-        """Rank the candidates for one user."""
-        raise NotImplementedError
-
-
-ranker = Ranker()
-
-
 @app.post("/v1/recommendations")
-def recommend(
-    body: RecommendRequest,
-    tenant: str = Header(alias="X-Tenant-Id"),
-    header_user: str | None = Header(default=None, alias="X-User-Id"),
-) -> JSONResponse:
+def recommend(body: RecommendRequest, request: Request) -> dict:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    user_id = body.user_id or header_user or tenant
-    items = ranker.rank(tenant, user_id, body.surface, body.candidate_ids)
-    return JSONResponse({"items": items}, status_code=200)
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    user_id = body.user_id or request.headers.get("x-user-id", "")
+    result = rank(tenant, user_id, body.surface, body.candidate_ids)
+    return {"items": result["items"]}
 `,
-      solution: `import logging
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+      solution: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from client import rank  # step 3: rank(tenant, user_id, surface, candidate_ids) -> {items, model_version, fallback}
+
 app = FastAPI()
-logger = logging.getLogger("recsvc")
 
 MAX_CANDIDATES = 500
 MAX_ITEMS = 30
@@ -180,78 +175,24 @@ class RecommendRequest(BaseModel):
     candidate_ids: list[str]
 
 
-class ScoredItem(BaseModel):
-    id: str
-    score: float
-
-
-class RankedResult(BaseModel):
-    items: list[ScoredItem]
-    model_version: str
-
-
-class SurfaceCatalog:
-    def exists(self, surface: str) -> bool:
-        """Whether the catalog knows this surface at all."""
-        raise NotImplementedError
-
-
-class Ranker:
-    def rank(
-        self, tenant: str, user_id: str, surface: str, candidate_ids: list[str]
-    ) -> RankedResult:
-        """Rank the candidates for one user; the order comes back with the version that made it."""
-        raise NotImplementedError
-
-
-surfaces = SurfaceCatalog()
-ranker = Ranker()
-
-
-def to_ranked(items: list[ScoredItem]) -> list[dict]:
-    """Trim to MAX_ITEMS and number what remains, so the response is a ranked list, not a dump."""
-    return [
-        {"id": item.id, "score": item.score, "position": position}
-        for position, item in enumerate(items[:MAX_ITEMS])
-    ]
-
-
 @app.post("/v1/recommendations")
-def recommend(
-    body: RecommendRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    user_id: str | None = Header(default=None, alias="X-User-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if user_id is None or user_id == "":
-        raise HTTPException(status_code=401, detail="missing X-User-Id")
-    if not body.surface.strip():
-        raise HTTPException(status_code=400, detail="surface is required")
-    if not body.candidate_ids:
-        raise HTTPException(status_code=400, detail="candidate_ids must not be empty")
-    if len(body.candidate_ids) > MAX_CANDIDATES:
-        raise HTTPException(status_code=400, detail="more than 500 candidates")
-    if not surfaces.exists(body.surface):
-        raise HTTPException(status_code=404, detail="unknown surface")
-
-    result = ranker.rank(tenant, user_id, body.surface, body.candidate_ids)
-    items = to_ranked(result.items)
-    logger.info(
-        "ranked tenant=%s user=%s surface=%s candidates=%d items=%d model_version=%s",
-        tenant,
-        user_id,
-        body.surface,
-        len(body.candidate_ids),
-        len(items),
-        result.model_version,
-    )
-    return JSONResponse({"items": items, "model_version": result.model_version}, status_code=200)
+def recommend(body: RecommendRequest, request: Request) -> dict:
+    # Both from the authenticated headers: the list is personal to the caller.
+    tenant = request.headers.get("x-tenant-id", "")
+    user_id = request.headers.get("x-user-id", "")
+    if not tenant or not user_id:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id and X-User-Id are required")
+    if not body.candidate_ids or len(body.candidate_ids) > MAX_CANDIDATES:
+        raise HTTPException(status_code=400, detail=f"candidate_ids must hold 1 to {MAX_CANDIDATES} ids")
+    result = rank(tenant, user_id, body.surface, body.candidate_ids)
+    items = [{"id": item["id"], "score": item["score"], "position": position} for position, item in enumerate(result["items"][:MAX_ITEMS])]
+    return {"items": items, "model_version": result["model_version"], "fallback": result["fallback"]}
 `,
     },
     typescript: {
-      starter: `/** POST /v1/recommendations: the starter. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {rank} from './client'; // step 3: rank(tenant, userId, surface, candidateIds) -> {items, model_version, fallback}
 
 export const app = Fastify();
 
@@ -261,184 +202,98 @@ interface RecommendBody {
   user_id?: string;
 }
 
-interface ScoredItem {
-  id: string;
-  score: number;
-}
-
-async function rank(
-  tenant: string,
-  userId: string,
-  surface: string,
-  candidateIds: string[],
-): Promise<ScoredItem[]> {
-  void tenant;
-  void userId;
-  void surface;
-  void candidateIds;
-  return [];
-}
-
 app.post('/v1/recommendations', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const headerUser = request.headers['x-user-id'] as string | undefined;
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const body = request.body as RecommendBody;
-  const userId = body.user_id ?? headerUser ?? tenant;
-  const items = await rank(tenant, userId, body.surface, body.candidate_ids);
-  return reply.code(200).send({items});
+  const userId = body.user_id ?? String(request.headers['x-user-id'] ?? '');
+  const result = await rank(tenant, userId, body.surface, body.candidate_ids);
+  return {items: result.items};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/recommendations: identity from the headers, bounded candidates, attributed order. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {rank} from './client'; // step 3: rank(tenant, userId, surface, candidateIds) -> {items, model_version, fallback}
 
 export const app = Fastify();
 
-const MAX_CANDIDATES = 500;
-const MAX_ITEMS = 30;
+export const MAX_CANDIDATES = 500;
+export const MAX_ITEMS = 30;
 
 interface RecommendBody {
-  surface?: string;
+  surface: string;
   candidate_ids?: string[];
 }
 
-interface ScoredItem {
-  id: string;
-  score: number;
-}
-
-interface RankedItem {
-  id: string;
-  score: number;
-  position: number;
-}
-
-interface RankedResult {
-  items: ScoredItem[];
-  model_version: string;
-}
-
-export interface SurfaceCatalog {
-  exists(surface: string): Promise<boolean>;
-}
-
-export interface Ranker {
-  rank(tenant: string, userId: string, surface: string, candidateIds: string[]): Promise<RankedResult>;
-}
-
-export const surfaces: SurfaceCatalog = {
-  async exists(surface: string): Promise<boolean> {
-    void surface;
-    return false;
-  },
-};
-
-export const ranker: Ranker = {
-  async rank(tenant, userId, surface, candidateIds): Promise<RankedResult> {
-    void tenant;
-    void userId;
-    void surface;
-    void candidateIds;
-    return {items: [], model_version: ''};
-  },
-};
-
-/** Trim to MAX_ITEMS and number what remains, so the response is a ranked list, not a dump. */
-function toRanked(items: ScoredItem[]): RankedItem[] {
-  return items.slice(0, MAX_ITEMS).map((item, position) => ({id: item.id, score: item.score, position}));
-}
-
 app.post('/v1/recommendations', async (request, reply) => {
+  // Both from the authenticated headers: the list is personal to the caller.
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const userId = request.headers['x-user-id'];
-  if (typeof userId !== 'string' || userId === '')
-    return reply.code(401).send({error: 'missing X-User-Id'});
-
-  const body = request.body as RecommendBody | null;
-  if (body === null || typeof body !== 'object') return reply.code(400).send({error: 'invalid body'});
-  const surface = body.surface;
-  if (typeof surface !== 'string' || surface.trim() === '')
-    return reply.code(400).send({error: 'surface is required'});
-  const candidateIds = body.candidate_ids;
-  if (!Array.isArray(candidateIds) || candidateIds.length === 0)
-    return reply.code(400).send({error: 'candidate_ids must not be empty'});
-  if (candidateIds.length > MAX_CANDIDATES)
-    return reply.code(400).send({error: 'more than 500 candidates'});
-  if (!(await surfaces.exists(surface))) return reply.code(404).send({error: 'unknown surface'});
-
-  const result = await ranker.rank(tenant, userId, surface, candidateIds);
-  const items = toRanked(result.items);
-  request.log.info(
-    {
-      tenant,
-      user: userId,
-      surface,
-      candidates: candidateIds.length,
-      items: items.length,
-      model_version: result.model_version,
-    },
-    'ranked',
-  );
-  return reply.code(200).send({items, model_version: result.model_version});
+  if (typeof tenant !== 'string' || tenant === '' || typeof userId !== 'string' || userId === '') {
+    return reply.code(401).send({error: 'X-Tenant-Id and X-User-Id are required'});
+  }
+  const {surface, candidate_ids: candidateIds = []} = request.body as RecommendBody;
+  if (candidateIds.length === 0 || candidateIds.length > MAX_CANDIDATES) {
+    return reply.code(400).send({error: \`candidate_ids must hold 1 to \${MAX_CANDIDATES} ids\`});
+  }
+  const result = await rank(tenant, userId, surface, candidateIds);
+  const items = result.items.slice(0, MAX_ITEMS).map(({id, score}, position) => ({id, score, position}));
+  return {items, model_version: result.model_version, fallback: result.fallback};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
+	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"recs/types"
 )
 
-type RecommendRequest struct {
+// Built in step 3 (client.go): the candidates ranked for the user, best first. Until the steps are
+// wired together it ranks nothing; the checks wire their own.
+var rank = func(ctx context.Context, tenant, userID, surface string, candidateIDs []string) types.Ranked {
+	return types.Ranked{}
+}
+
+type recommendRequest struct {
 	Surface      string   \`json:"surface"\`
 	CandidateIDs []string \`json:"candidate_ids"\`
 	UserID       string   \`json:"user_id"\`
 }
 
-type ScoredItem struct {
-	ID    string  \`json:"id"\`
-	Score float64 \`json:"score"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func rank(tenant, userID, surface string, candidateIDs []string) []ScoredItem {
-	return nil
+	json.NewEncoder(rw).Encode(v)
 }
 
 func recommend(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	var body RecommendRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	userID := r.Header.Get("X-User-Id")
-	if body.UserID != "" {
-		userID = body.UserID
+	var body recommendRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, "invalid body", http.StatusBadRequest)
+		return
 	}
-	items := rank(tenant, userID, body.Surface, body.CandidateIDs)
-	writeJSON(rw, http.StatusOK, map[string]any{"items": items})
+	userID := body.UserID
+	if userID == "" {
+		userID = r.Header.Get("X-User-Id")
+	}
+	result := rank(r.Context(), tenant, userID, body.Surface, body.CandidateIDs)
+	writeJSON(rw, http.StatusOK, map[string]any{"items": result.Items})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/recommendations", recommend)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
@@ -446,9 +301,9 @@ func main() {
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
-	"strings"
+
+	"recs/types"
 )
 
 const (
@@ -456,224 +311,142 @@ const (
 	maxItems      = 30
 )
 
-type RecommendRequest struct {
+// Built in step 3 (client.go): the candidates ranked for the user, best first. Until the steps are
+// wired together it ranks nothing; the checks wire their own.
+var rank = func(ctx context.Context, tenant, userID, surface string, candidateIDs []string) types.Ranked {
+	return types.Ranked{}
+}
+
+type recommendRequest struct {
 	Surface      string   \`json:"surface"\`
 	CandidateIDs []string \`json:"candidate_ids"\`
 }
 
-type ScoredItem struct {
-	ID    string  \`json:"id"\`
-	Score float64 \`json:"score"\`
-}
-
-type RankedItem struct {
+type rankedItem struct {
 	ID       string  \`json:"id"\`
 	Score    float64 \`json:"score"\`
 	Position int     \`json:"position"\`
 }
 
-type RankedResult struct {
-	Items        []ScoredItem \`json:"items"\`
-	ModelVersion string       \`json:"model_version"\`
-}
-
-type SurfaceCatalog struct{}
-
-func (s *SurfaceCatalog) Exists(ctx context.Context, surface string) bool {
-	return false
-}
-
-type Ranker struct{}
-
-func (r *Ranker) Rank(ctx context.Context, tenant, userID, surface string, candidateIDs []string) (*RankedResult, error) {
-	return nil, nil
-}
-
-var (
-	surfaces = &SurfaceCatalog{}
-	ranker   = &Ranker{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-// toRanked trims to maxItems and numbers what remains, so the response is a ranked list, not a dump.
-func toRanked(items []ScoredItem) []RankedItem {
-	if len(items) > maxItems {
-		items = items[:maxItems]
-	}
-	ranked := make([]RankedItem, 0, len(items))
-	for position, item := range items {
-		ranked = append(ranked, RankedItem{ID: item.ID, Score: item.Score, Position: position})
-	}
-	return ranked
+	json.NewEncoder(rw).Encode(v)
 }
 
 func recommend(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	// Both from the authenticated headers: the list is personal to the caller.
+	tenant, userID := r.Header.Get("X-Tenant-Id"), r.Header.Get("X-User-Id")
+	if tenant == "" || userID == "" {
+		http.Error(rw, "X-Tenant-Id and X-User-Id are required", http.StatusUnauthorized)
 		return
 	}
-	userID := r.Header.Get("X-User-Id")
-	if userID == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-User-Id"})
-		return
-	}
-	var body RecommendRequest
+	var body recommendRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "invalid body", http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(body.Surface) == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "surface is required"})
+	if len(body.CandidateIDs) == 0 || len(body.CandidateIDs) > maxCandidates {
+		http.Error(rw, "candidate_ids must hold 1 to 500 ids", http.StatusBadRequest)
 		return
 	}
-	if len(body.CandidateIDs) == 0 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "candidate_ids must not be empty"})
-		return
+	result := rank(r.Context(), tenant, userID, body.Surface, body.CandidateIDs)
+	items := []rankedItem{}
+	for position, item := range result.Items {
+		if position == maxItems {
+			break
+		}
+		items = append(items, rankedItem{ID: item.ID, Score: item.Score, Position: position})
 	}
-	if len(body.CandidateIDs) > maxCandidates {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "more than 500 candidates"})
-		return
-	}
-	if !surfaces.Exists(r.Context(), body.Surface) {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown surface"})
-		return
-	}
-	result, err := ranker.Rank(r.Context(), tenant, userID, body.Surface, body.CandidateIDs)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "ranking unavailable"})
-		return
-	}
-	items := toRanked(result.Items)
-	log.Printf("ranked tenant=%s user=%s surface=%s candidates=%d items=%d model_version=%s",
-		tenant, userID, body.Surface, len(body.CandidateIDs), len(items), result.ModelVersion)
-	writeJSON(rw, http.StatusOK, map[string]any{"items": items, "model_version": result.ModelVersion})
+	writeJSON(rw, http.StatusOK, map[string]any{"items": items, "model_version": result.ModelVersion, "fallback": result.Fallback})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/recommendations", recommend)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class RecommendRequest(surface: String, candidate_ids: List[String], user_id: Option[String])
-final case class ScoredItem(id: String, score: Double)
-final case class RankingBody(items: List[ScoredItem])
-
-object RecApi {
-  implicit val system: ActorSystem = ActorSystem("recsvc")
-  implicit val requestFormat: RootJsonFormat[RecommendRequest] = jsonFormat3(RecommendRequest)
-  implicit val itemFormat: RootJsonFormat[ScoredItem] = jsonFormat2(ScoredItem)
-  implicit val bodyFormat: RootJsonFormat[RankingBody] = jsonFormat1(RankingBody)
-
-  def rank(tenant: String, userId: String, surface: String, candidateIds: List[String]): List[ScoredItem] =
-    Nil
+object Api {
+  private def json(body: JsObject): HttpResponse =
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
   val route: Route =
     path("v1" / "recommendations") {
       post {
-        optionalHeaderValueByName("X-User-Id") { headerUser =>
-          entity(as[RecommendRequest]) { body =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val userId = body.user_id.getOrElse(headerUser.getOrElse(""))
-            complete(StatusCodes.OK, RankingBody(rank("", userId, body.surface, body.candidate_ids)))
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class RecommendRequest(surface: String, candidate_ids: List[String])
-final case class ScoredItem(id: String, score: Double)
-final case class RankedItem(id: String, score: Double, position: Int)
-final case class RankedResult(items: List[ScoredItem], model_version: String)
-final case class RankingResponse(items: List[RankedItem], model_version: String)
-
-object SurfaceCatalog {
-  def exists(surface: String): Boolean = false
-}
-
-object Ranker {
-  def rank(tenant: String, userId: String, surface: String, candidateIds: List[String]): RankedResult =
-    throw new UnsupportedOperationException("Ranker.rank is not implemented")
-}
-
-object RecApi {
-  implicit val system: ActorSystem = ActorSystem("recsvc")
-  implicit val requestFormat: RootJsonFormat[RecommendRequest] = jsonFormat2(RecommendRequest)
-  implicit val itemFormat: RootJsonFormat[ScoredItem] = jsonFormat2(ScoredItem)
-  implicit val rankedFormat: RootJsonFormat[RankedItem] = jsonFormat3(RankedItem)
-  implicit val responseFormat: RootJsonFormat[RankingResponse] = jsonFormat2(RankingResponse)
-
-  val MaxCandidates = 500
-  val MaxItems = 30
-
-  /** Trim to MaxItems and number what remains, so the response is a ranked list, not a dump. */
-  def toRanked(items: List[ScoredItem]): List[RankedItem] =
-    items.take(MaxItems).zipWithIndex.map { case (item, position) =>
-      RankedItem(item.id, item.score, position)
-    }
-
-  val route: Route =
-    path("v1" / "recommendations") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("X-User-Id") { userOpt =>
-            entity(as[RecommendRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!userOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-User-Id"}""")
-              } else if (body.surface.trim.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"surface is required"}""")
-              } else if (body.candidate_ids.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"candidate_ids must not be empty"}""")
-              } else if (body.candidate_ids.length > MaxCandidates) {
-                complete(StatusCodes.BadRequest, """{"error":"more than 500 candidates"}""")
-              } else if (!SurfaceCatalog.exists(body.surface)) {
-                complete(StatusCodes.NotFound, """{"error":"unknown surface"}""")
-              } else {
-                val result = Ranker.rank(tenantOpt.get, userOpt.get, body.surface, body.candidate_ids)
-                complete(StatusCodes.OK, RankingResponse(toRanked(result.items), result.model_version))
+        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+          optionalHeaderValueByName("X-User-Id") { headerUser =>
+            entity(as[String]) { raw =>
+              // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+              val fields = raw.parseJson.asJsObject.fields
+              val surface = fields.get("surface").map(_.convertTo[String]).getOrElse("")
+              val candidateIds = fields.get("candidate_ids").map(_.convertTo[Vector[String]]).getOrElse(Vector.empty)
+              val userId = fields.get("user_id").map(_.convertTo[String]).orElse(headerUser).getOrElse("")
+              tenant.filter(_.nonEmpty) match {
+                case None => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+                case Some(t) =>
+                  val result = Client.rank(t, userId, surface, candidateIds) // step 3
+                  val items = result.items.map(item => JsObject("id" -> JsString(item.id), "score" -> JsNumber(item.score)))
+                  complete(json(JsObject("items" -> JsArray(items.toVector))))
               }
             }
           }
         }
       }
     }
+}
+`,
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
+import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
+import spray.json.DefaultJsonProtocol._
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
+object Api {
+  val MaxCandidates = 500
+  val MaxItems = 30
+
+  private def json(body: JsObject): HttpResponse =
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  val route: Route =
+    path("v1" / "recommendations") {
+      post {
+        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+          optionalHeaderValueByName("X-User-Id") { headerUser =>
+            entity(as[String]) { raw =>
+              // Both from the authenticated headers: the list is personal to the caller.
+              (tenant.filter(_.nonEmpty), headerUser.filter(_.nonEmpty)) match {
+                case (Some(t), Some(userId)) =>
+                  val fields = raw.parseJson.asJsObject.fields
+                  val surface = fields.get("surface").map(_.convertTo[String]).getOrElse("")
+                  val candidateIds = fields.get("candidate_ids").map(_.convertTo[Vector[String]]).getOrElse(Vector.empty)
+                  if (candidateIds.isEmpty || candidateIds.size > MaxCandidates)
+                    complete(StatusCodes.BadRequest -> s"candidate_ids must hold 1 to $MaxCandidates ids")
+                  else {
+                    val result = Client.rank(t, userId, surface, candidateIds) // step 3
+                    val items = result.items.take(MaxItems).zipWithIndex.map { case (item, position) =>
+                      JsObject("id" -> JsString(item.id), "score" -> JsNumber(item.score), "position" -> JsNumber(position))
+                    }
+                    complete(json(JsObject(
+                      "items" -> JsArray(items.toVector),
+                      "model_version" -> JsString(result.modelVersion),
+                      "fallback" -> JsBoolean(result.fallback)
+                    )))
+                  }
+                case _ => complete(StatusCodes.Unauthorized -> "X-Tenant-Id and X-User-Id are required")
+              }
+            }
+          }
+        }
+      }
+    }
 }
 `,
     },
@@ -681,145 +454,530 @@ object RecApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <string>
 #include <vector>
 
+#include "recs/types.h"
+
 using json = nlohmann::json;
 
-std::string rank(const std::string& tenant, const std::string& userId, const std::string& surface,
-                 const std::vector<std::string>& candidateIds);
+// Built in step 3 (client.cpp): the candidates ranked for the user, best first.
+recs::Ranked rank(const std::string& tenant, const std::string& user_id, const std::string& surface,
+                  const std::vector<std::string>& candidate_ids);
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/recommendations", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto headerUser = req.get_header_value("X-User-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    auto userId = body.value("user_id", std::string());
-    if (userId.empty()) userId = headerUser;
-    const auto items = rank(tenant, userId, body.value("surface", std::string()),
-                            body.value("candidate_ids", std::vector<std::string>{}));
-    std::cerr << "ranked tenant=" << tenant << " user=" << userId << "\\n";
-    res.status = 200;
-    res.set_content(items, "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void recommend(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) {
+    res.status = 400;
+    res.set_content("invalid body", "text/plain");
+    return;
+  }
+  const std::string user_id = body.value("user_id", req.get_header_value("X-User-Id"));
+  const recs::Ranked result = rank(tenant, user_id, body.value("surface", ""), body.value("candidate_ids", std::vector<std::string>{}));
+  json items = json::array();
+  for (const auto& item : result.items) items.push_back(json{{"id", item.id}, {"score", item.score}});
+  res.set_content(json{{"items", items}}.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/recommendations", recommend); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <cstddef>
-#include <iostream>
 #include <string>
 #include <vector>
 
+#include "recs/types.h"
+
 using json = nlohmann::json;
 
-constexpr int kMaxCandidates = 500;
-constexpr int kMaxItems = 30;
+constexpr size_t kMaxCandidates = 500;
+constexpr size_t kMaxItems = 30;
 
-struct ScoredItem {
-  std::string id;
-  double score = 0.0;
-};
+// Built in step 3 (client.cpp): the candidates ranked for the user, best first.
+recs::Ranked rank(const std::string& tenant, const std::string& user_id, const std::string& surface,
+                  const std::vector<std::string>& candidate_ids);
 
-struct RankedResult {
-  std::vector<ScoredItem> items;
-  std::string model_version;
-};
-
-struct SurfaceCatalog {
-  bool exists(const std::string& surface);
-};
-
-struct Ranker {
-  RankedResult rank(const std::string& tenant, const std::string& userId, const std::string& surface,
-                    const std::vector<std::string>& candidateIds);
-};
-
-SurfaceCatalog surfaces;
-Ranker ranker;
-
-// Trim to kMaxItems and number what remains, so the response is a ranked list, not a dump.
-json toRanked(const std::vector<ScoredItem>& items) {
-  json ranked = json::array();
-  for (std::size_t position = 0; position < items.size() && position < kMaxItems; ++position) {
-    ranked.push_back({{"id", items[position].id},
-                      {"score", items[position].score},
-                      {"position", static_cast<int>(position)}});
+void recommend(const httplib::Request& req, httplib::Response& res) {
+  // Both from the authenticated headers: the list is personal to the caller.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const std::string user_id = req.get_header_value("X-User-Id");
+  if (tenant.empty() || user_id.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id and X-User-Id are required", "text/plain");
+    return;
   }
-  return ranked;
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) {
+    res.status = 400;
+    res.set_content("invalid body", "text/plain");
+    return;
+  }
+  const auto candidate_ids = body.value("candidate_ids", std::vector<std::string>{});
+  if (candidate_ids.empty() || candidate_ids.size() > kMaxCandidates) {
+    res.status = 400;
+    res.set_content("candidate_ids must hold 1 to 500 ids", "text/plain");
+    return;
+  }
+  const recs::Ranked result = rank(tenant, user_id, body.value("surface", ""), candidate_ids);
+  json items = json::array();
+  for (size_t position = 0; position < result.items.size() && position < kMaxItems; position++) {
+    items.push_back(json{{"id", result.items[position].id}, {"score", result.items[position].score}, {"position", position}});
+  }
+  res.set_content(json{{"items", items}, {"model_version", result.model_version}, {"fallback", result.fallback}}.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/recommendations", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto userId = req.get_header_value("X-User-Id");
-    if (userId.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-User-Id"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto surface = body.value("surface", std::string());
-    if (surface.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"surface is required"})", "application/json");
-      return;
-    }
-    const auto candidateIds = body.value("candidate_ids", std::vector<std::string>{});
-    if (candidateIds.empty() || candidateIds.size() > static_cast<std::size_t>(kMaxCandidates)) {
-      res.status = 400;
-      res.set_content(R"({"error":"candidate_ids must hold 1..500 ids"})", "application/json");
-      return;
-    }
-    if (!surfaces.exists(surface)) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown surface"})", "application/json");
-      return;
-    }
-    const auto result = ranker.rank(tenant, userId, surface, candidateIds);
-    const auto items = toRanked(result.items);
-    std::cerr << "ranked tenant=" << tenant << " user=" << userId << " surface=" << surface
-              << " items=" << items.size() << " model_version=" << result.model_version << "\\n";
-    res.status = 200;
-    res.set_content(json{{"items", items}, {"model_version", result.model_version}}.dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Post("/v1/recommendations", recommend); }
 `,
     },
   },
-  hints: [
-    'A support ticket: a user saw a list that was clearly built for someone else, and a load spike traced back to one request with thousands of candidate ids. The release gate also cannot tell which model ranked.',
-    'The handler fills the user from the body before falling back to the header, passes the candidate list through unmeasured, and returns the ranker output as-is, so the response and the ranking cost scale with the caller.',
-    'Drop `user_id` from the request model and require `X-User-Id` (401 if absent); reject lists outside 1..`MAX_CANDIDATES` with 400; rank, then slice to `MAX_ITEMS`, number positions and copy `result.model_version` into the response.',
-  ],
-  debrief: `The fix is a chain of guard clauses that run before the ranker is called, ordered cheapest first: headers, body shape, surface, candidate cap, catalog. The user comes from the authenticated header because a body field is not a weaker source but no source at all. The output cap is applied after ranking because trimming before it would keep the first 30 candidates instead of the best 30. \`model_version\` sits in the response because it is the only thing that makes two releases comparable offline.
+  harness: {
+    python: `import grpc
 
-Production rankers go further: candidates are deduped before ranking, the caps come from the surface config (step 5) instead of constants, the request deadline is shared with the ranking call (step 3), and per-tenant surface grants decide which surfaces a tenant may even ask for.`,
+import ranking_pb2
+import ranking_pb2_grpc
+
+
+def _score(item_id):
+    return int(item_id.split("-")[1]) * 37 % 101 / 100
+
+
+class Ranker(ranking_pb2_grpc.RankerServicer):
+    def Rank(self, request, context):
+        items = sorted(request.candidate_ids, key=lambda c: -_score(c))
+        return ranking_pb2.RankResponse(items=[ranking_pb2.ScoredItem(id=c, score=_score(c)) for c in items], model_version="ranker-v7")
+
+
+class FeatureService(ranking_pb2_grpc.FeatureServiceServicer):
+    def UserFeatures(self, request, context):
+        return ranking_pb2.FeatureVector(values=[0.5])
+
+
+def _api(ctx):
+    ctx.grpc.serve(ranking_pb2_grpc.add_RankerServicer_to_server, Ranker())
+    ctx.grpc.serve(ranking_pb2_grpc.add_FeatureServiceServicer_to_server, FeatureService())
+    return ctx.client(ctx.load("api").app)
+
+
+def _candidates(n):
+    return [f"c-{i}" for i in range(1, n + 1)]
+
+
+def _model_order(ids):
+    return sorted(ids, key=lambda c: -_score(c))
+
+
+async def _post(c, body, user="u-1", tenant="t1"):
+    headers = {}
+    if tenant:
+        headers["X-Tenant-Id"] = tenant
+    if user:
+        headers["X-User-Id"] = user
+    return await c.post("/v1/recommendations", json=body, headers=headers)
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, {"surface": "home", "candidate_ids": _candidates(5)})
+    assert r.status_code == 200, f"POST /v1/recommendations answered {r.status_code}: {r.text}"
+    ids = [item.get("id") for item in r.json().get("items", [])]
+    assert ids == _model_order(_candidates(5)), f"the response lists {ids}, expected the ranker's order {_model_order(_candidates(5))}"
+
+
+async def check_auth_user(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, {"surface": "home", "candidate_ids": _candidates(5), "user_id": "u-2"}, user="u-1")
+        assert r.status_code == 200, f"a request from u-1 answered {r.status_code}: {r.text}"
+        ranked_for = [call.request.user_id for call in ctx.grpc.calls_to("Rank")]
+        assert ranked_for == ["u-1"], f"the list was ranked for {ranked_for}: the body's user_id chose whose personalization came back. The user is the authenticated X-User-Id"
+        r = await _post(c, {"surface": "home", "candidate_ids": _candidates(5)}, user=None)
+        assert r.status_code == 401, f"a request without X-User-Id answered {r.status_code}, expected 401"
+        assert len(ctx.grpc.calls_to("Rank")) == 1, "a request without X-User-Id reached the ranker"
+
+
+async def check_candidate_cap(ctx):
+    async with _api(ctx) as c:
+        for n in (501, 0):
+            r = await _post(c, {"surface": "home", "candidate_ids": _candidates(n)})
+            assert r.status_code == 400, f"a request with {n} candidates answered {r.status_code}, expected 400: candidate_ids holds 1 to 500 ids"
+        assert not ctx.grpc.calls_to("Rank"), f"a rejected request reached the ranker ({len(ctx.grpc.calls_to('Rank'))} Rank calls)"
+        r = await _post(c, {"surface": "home", "candidate_ids": _candidates(500)})
+    assert r.status_code == 200, f"a request with 500 candidates answered {r.status_code}: {r.text}"
+
+
+async def check_top_k(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, {"surface": "home", "candidate_ids": _candidates(100)})
+    assert r.status_code == 200, f"POST /v1/recommendations answered {r.status_code}: {r.text}"
+    items = r.json().get("items", [])
+    assert len(items) == 30, f"a request with 100 candidates answered {len(items)} items: the response grows with the request. Answer the top MAX_ITEMS = 30"
+    assert [item.get("id") for item in items] == _model_order(_candidates(100))[:30], "the 30 items must be the top of the ranked order"
+    positions = [item.get("position") for item in items]
+    assert positions == list(range(30)), f"the items carry positions {positions[:5]}…, expected 0, 1, 2, … in served order"
+
+
+async def check_model_version(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, {"surface": "home", "candidate_ids": _candidates(5)})
+        body = r.json()
+        assert body.get("model_version") == "ranker-v7" and body.get("fallback") is False, f"the response is stamped model_version {body.get('model_version')!r}, fallback {body.get('fallback')!r}: expected the ranker's ranker-v7 and false"
+        ctx.grpc.fail("Rank", grpc.StatusCode.UNAVAILABLE, "every replica restarting", times=3)
+        r = await _post(c, {"surface": "home", "candidate_ids": _candidates(5)})
+    body = r.json()
+    assert body.get("model_version") == "popularity-v1" and body.get("fallback") is True, f"with the ranker down the response is stamped model_version {body.get('model_version')!r}, fallback {body.get('fallback')!r}: expected the popularity fallback's popularity-v1 and true"
+`,
+    typescript: `const score = (id: string): number => ((Number(id.split('-')[1]) * 37) % 101) / 100;
+const candidates = (n: number): string[] => Array.from({length: n}, (_, i) => \`c-\${i + 1}\`);
+const modelOrder = (ids: string[]): string[] => [...ids].sort((a, b) => score(b) - score(a));
+
+function api(ctx) {
+  const pkg = ctx.proto('ranking.proto');
+  ctx.grpc.serve(pkg.recsys.Ranker.service, {
+    Rank(call, callback) {
+      const items = modelOrder(call.request.candidate_ids).map(id => ({id, score: score(id)}));
+      callback(null, {items, model_version: 'ranker-v7'});
+    },
+  });
+  ctx.grpc.serve(pkg.recsys.FeatureService.service, {
+    UserFeatures(call, callback) {
+      callback(null, {values: [0.5]});
+    },
+  });
+  return ctx.client(ctx.load('api').app);
+}
+
+function post(c, body, user: string | null = 'u-1') {
+  const headers: Record<string, string> = {'X-Tenant-Id': 't1'};
+  if (user !== null) headers['X-User-Id'] = user;
+  return c.post('/v1/recommendations', {json: body, headers});
+}
+
+export async function check_route(ctx) {
+  const c = api(ctx);
+  const r = await post(c, {surface: 'home', candidate_ids: candidates(5)});
+  assert.equal(r.status, 200, \`POST /v1/recommendations answered \${r.status}: \${r.text}\`);
+  const ids = (r.json().items ?? []).map(item => item.id);
+  assert.deepStrictEqual(ids, modelOrder(candidates(5)), \`the response lists \${JSON.stringify(ids)}, expected the ranker's order\`);
+}
+
+export async function check_auth_user(ctx) {
+  const c = api(ctx);
+  let r = await post(c, {surface: 'home', candidate_ids: candidates(5), user_id: 'u-2'}, 'u-1');
+  assert.equal(r.status, 200, \`a request from u-1 answered \${r.status}: \${r.text}\`);
+  const rankedFor = ctx.grpc.callsTo('Rank').map(call => call.request.user_id);
+  assert.deepStrictEqual(rankedFor, ['u-1'], \`the list was ranked for \${JSON.stringify(rankedFor)}: the body's user_id chose whose personalization came back. The user is the authenticated X-User-Id\`);
+  r = await post(c, {surface: 'home', candidate_ids: candidates(5)}, null);
+  assert.equal(r.status, 401, \`a request without X-User-Id answered \${r.status}, expected 401\`);
+  assert.equal(ctx.grpc.callsTo('Rank').length, 1, 'a request without X-User-Id reached the ranker');
+}
+
+export async function check_candidate_cap(ctx) {
+  const c = api(ctx);
+  for (const n of [501, 0]) {
+    const r = await post(c, {surface: 'home', candidate_ids: candidates(n)});
+    assert.equal(r.status, 400, \`a request with \${n} candidates answered \${r.status}, expected 400: candidate_ids holds 1 to 500 ids\`);
+  }
+  assert.equal(ctx.grpc.callsTo('Rank').length, 0, \`a rejected request reached the ranker (\${ctx.grpc.callsTo('Rank').length} Rank calls)\`);
+  const r = await post(c, {surface: 'home', candidate_ids: candidates(500)});
+  assert.equal(r.status, 200, \`a request with 500 candidates answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_top_k(ctx) {
+  const c = api(ctx);
+  const r = await post(c, {surface: 'home', candidate_ids: candidates(100)});
+  assert.equal(r.status, 200, \`POST /v1/recommendations answered \${r.status}: \${r.text}\`);
+  const items = r.json().items ?? [];
+  assert.equal(items.length, 30, \`a request with 100 candidates answered \${items.length} items: the response grows with the request. Answer the top MAX_ITEMS = 30\`);
+  assert.deepStrictEqual(items.map(item => item.id), modelOrder(candidates(100)).slice(0, 30), 'the 30 items must be the top of the ranked order');
+  const positions = items.map(item => item.position);
+  assert.deepStrictEqual(positions, Array.from({length: 30}, (_, i) => i), \`the items carry positions \${JSON.stringify(positions.slice(0, 5))}…, expected 0, 1, 2, … in served order\`);
+}
+
+export async function check_model_version(ctx) {
+  const c = api(ctx);
+  let body = (await post(c, {surface: 'home', candidate_ids: candidates(5)})).json();
+  assert(body.model_version === 'ranker-v7' && body.fallback === false, \`the response is stamped model_version \${JSON.stringify(body.model_version)}, fallback \${JSON.stringify(body.fallback)}: expected the ranker's ranker-v7 and false\`);
+  ctx.grpc.fail('Rank', ctx.grpc.status.UNAVAILABLE, 'every replica restarting', 3);
+  body = (await post(c, {surface: 'home', candidate_ids: candidates(5)})).json();
+  assert(body.model_version === 'popularity-v1' && body.fallback === true, \`with the ranker down the response is stamped model_version \${JSON.stringify(body.model_version)}, fallback \${JSON.stringify(body.fallback)}: expected the popularity fallback's popularity-v1 and true\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+
+	"recs/types"
+
+	"leetbuild/harness"
+)
+
+// rank as step 3 builds it, without the network: the model scores a candidate by its number; with
+// the ranker down the candidates come back in their own order, stamped as the popularity fallback.
+var (
+	rankedFor  []string
+	rankerDown bool
+)
+
+func modelScore(id string) float64 {
+	n, _ := strconv.Atoi(strings.TrimPrefix(id, "c-"))
+	return float64(n*37%101) / 100
+}
+
+func candidates(n int) []string {
+	out := []string{}
+	for i := 1; i <= n; i++ {
+		out = append(out, fmt.Sprintf("c-%d", i))
+	}
+	return out
+}
+
+func modelOrder(ids []string) []string {
+	out := append([]string{}, ids...)
+	sort.SliceStable(out, func(i, j int) bool { return modelScore(out[i]) > modelScore(out[j]) })
+	return out
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	rankedFor = []string{}
+	rankerDown = false
+	rank = func(_ context.Context, tenant, userID, surface string, candidateIDs []string) types.Ranked {
+		rankedFor = append(rankedFor, userID)
+		ids := candidateIDs
+		if !rankerDown {
+			ids = modelOrder(candidateIDs)
+		}
+		items := []types.Item{}
+		for _, id := range ids {
+			items = append(items, types.Item{ID: id, Score: modelScore(id)})
+		}
+		if rankerDown {
+			return types.Ranked{Items: items, ModelVersion: "popularity-v1", Fallback: true}
+		}
+		return types.Ranked{Items: items, ModelVersion: "ranker-v7"}
+	}
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+type servedItem struct {
+	ID       string  \`json:"id"\`
+	Score    float64 \`json:"score"\`
+	Position *int    \`json:"position"\`
+}
+
+type recommendation struct {
+	Items        []servedItem \`json:"items"\`
+	ModelVersion string       \`json:"model_version"\`
+	Fallback     *bool        \`json:"fallback"\`
+}
+
+func recommendFor(c *harness.HTTP, userID string, body map[string]any) (*harness.Response, recommendation) {
+	headers := []string{"X-Tenant-Id", "t1"}
+	if userID != "" {
+		headers = append(headers, "X-User-Id", userID)
+	}
+	r := c.Post("/v1/recommendations", body, headers...)
+	var out recommendation
+	if r.Status == 200 {
+		r.Decode(&out)
+	}
+	return r, out
+}
+
+func idsOf(rec recommendation) []string {
+	out := []string{}
+	for _, item := range rec.Items {
+		out = append(out, item.ID)
+	}
+	return out
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r, rec := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
+	ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text())
+	ctx.Equal(idsOf(rec), modelOrder(candidates(5)), "the response must list the ranker's order; it lists")
+}
+
+func CheckAuthUser(ctx *harness.Ctx) {
+	c := api(ctx)
+	r, _ := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5), "user_id": "u-2"})
+	ctx.Equal(r.Status, 200, "a request from u-1 (%s)", r.Text())
+	ctx.Equal(rankedFor, []string{"u-1"}, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for")
+	r, _ = recommendFor(c, "", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
+	ctx.Equal(r.Status, 401, "a request without X-User-Id")
+	ctx.Equal(len(rankedFor), 1, "a request without X-User-Id must not reach the ranker; the rank calls")
+}
+
+func CheckCandidateCap(ctx *harness.Ctx) {
+	c := api(ctx)
+	for _, n := range []int{501, 0} {
+		r, _ := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(n)})
+		ctx.Equal(r.Status, 400, "a request with %d candidates (candidate_ids holds 1 to 500 ids)", n)
+	}
+	ctx.Equal(len(rankedFor), 0, "a rejected request must not reach the ranker; the rank calls")
+	r, _ := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(500)})
+	ctx.Equal(r.Status, 200, "a request with 500 candidates (%s)", r.Text())
+}
+
+func CheckTopK(ctx *harness.Ctx) {
+	c := api(ctx)
+	r, rec := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(100)})
+	ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text())
+	ctx.Equal(len(rec.Items), 30, "a request with 100 candidates must answer the top maxItems = 30, not grow with the request; the items")
+	ctx.Equal(idsOf(rec), modelOrder(candidates(100))[:30], "the 30 items must be the top of the ranked order; they are")
+	for i, item := range rec.Items {
+		ctx.Assert(item.Position != nil && *item.Position == i, "item %d (%s) carries position %v, expected %d: each item carries its zero-based position in served order", i, item.ID, item.Position, i)
+	}
+}
+
+func CheckModelVersion(ctx *harness.Ctx) {
+	c := api(ctx)
+	_, rec := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
+	ctx.Assert(rec.ModelVersion == "ranker-v7" && rec.Fallback != nil && !*rec.Fallback, "the response is stamped model_version %q, fallback %v: expected the ranker's ranker-v7 and false", rec.ModelVersion, rec.Fallback)
+	rankerDown = true
+	_, rec = recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
+	ctx.Assert(rec.ModelVersion == "popularity-v1" && rec.Fallback != nil && *rec.Fallback, "with the ranker down the response is stamped model_version %q, fallback %v: expected the popularity fallback's popularity-v1 and true", rec.ModelVersion, rec.Fallback)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+namespace {
+
+// rank as step 3 builds it, without the network: the model scores a candidate by its number; with
+// the ranker down the candidates come back in their own order, stamped as the popularity fallback.
+std::vector<std::string> rankedFor;
+bool rankerDown = false;
+
+double modelScore(const std::string& id) { return static_cast<double>(std::stoi(id.substr(2)) * 37 % 101) / 100; }
+
+std::vector<std::string> candidates(int n) {
+  std::vector<std::string> out;
+  for (int i = 1; i <= n; i++) out.push_back("c-" + std::to_string(i));
+  return out;
+}
+
+std::vector<std::string> modelOrder(std::vector<std::string> ids) {
+  std::stable_sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) { return modelScore(a) > modelScore(b); });
+  return ids;
+}
+
+harness::HTTP api(harness::Ctx& ctx) {
+  rankedFor.clear();
+  rankerDown = false;
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response post(harness::HTTP& c, const nlohmann::json& body, const std::string& user_id = "u-1") {
+  if (user_id.empty()) return c.Post("/v1/recommendations", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  return c.Post("/v1/recommendations", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1", "X-User-Id", user_id);
+}
+
+nlohmann::json parsed(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : nlohmann::json::object();
+}
+
+std::vector<std::string> idsOf(const nlohmann::json& body) {
+  std::vector<std::string> out;
+  if (body.contains("items") && body["items"].is_array()) {
+    for (const auto& item : body["items"]) out.push_back(item.value("id", ""));
+  }
+  return out;
+}
+
+}  // namespace
+
+recs::Ranked rank(const std::string&, const std::string& user_id, const std::string&, const std::vector<std::string>& candidate_ids) {
+  rankedFor.push_back(user_id);
+  recs::Ranked out;
+  for (const auto& id : rankerDown ? candidate_ids : modelOrder(candidate_ids)) out.items.push_back(recs::Item{id, modelScore(id)});
+  out.model_version = rankerDown ? "popularity-v1" : "ranker-v7";
+  out.fallback = rankerDown;
+  return out;
+}
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}});
+  ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text());
+  ctx.Equal(idsOf(parsed(r)), modelOrder(candidates(5)), "the response must list the ranker's order; it lists");
+}
+
+void CheckAuthUser(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}, {"user_id", "u-2"}}, "u-1");
+  ctx.Equal(r.Status, 200, "a request from u-1 (%s)", r.Text());
+  ctx.Equal(rankedFor, {"u-1"}, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for");
+  r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}}, "");
+  ctx.Equal(r.Status, 401, "a request without X-User-Id");
+  ctx.Equal(rankedFor.size(), 1, "a request without X-User-Id must not reach the ranker; the rank calls");
+}
+
+void CheckCandidateCap(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  for (const int n : {501, 0}) {
+    const auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(n)}});
+    ctx.Equal(r.Status, 400, "a request with %d candidates (candidate_ids holds 1 to 500 ids)", n);
+  }
+  ctx.Equal(rankedFor.size(), 0, "a rejected request must not reach the ranker; the rank calls");
+  const auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(500)}});
+  ctx.Equal(r.Status, 200, "a request with 500 candidates (%s)", r.Text());
+}
+
+void CheckTopK(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(100)}});
+  ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text());
+  const auto body = parsed(r);
+  const auto ids = idsOf(body);
+  ctx.Equal(ids.size(), 30, "a request with 100 candidates must answer the top kMaxItems = 30, not grow with the request; the items");
+  const auto order = modelOrder(candidates(100));
+  ctx.Equal(ids, std::vector<std::string>(order.begin(), order.begin() + 30), "the 30 items must be the top of the ranked order; they are");
+  for (size_t i = 0; i < body["items"].size(); i++) {
+    const auto& item = body["items"][i];
+    ctx.Assert(item.contains("position") && item["position"] == i, "item %d carries %s, expected position %d: each item carries its zero-based position in served order", i, item.dump(), i);
+  }
+}
+
+void CheckModelVersion(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto body = parsed(post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}}));
+  ctx.Assert(body.value("model_version", "") == "ranker-v7" && body.contains("fallback") && body["fallback"] == false, "the response is %s: expected model_version ranker-v7 and fallback false", body.dump());
+  rankerDown = true;
+  body = parsed(post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}}));
+  ctx.Assert(body.value("model_version", "") == "popularity-v1" && body.contains("fallback") && body["fallback"] == true, "with the ranker down the response is %s: expected model_version popularity-v1 and fallback true", body.dump());
+}
+`,
+  },
+  hints: [
+    "Send a body with another user's `user_id` and you get their personalized list; send 100 candidates and 100 items come back with no positions and no version.",
+    "The handler prefers the body's user over the authenticated header, checks nothing about the candidate list, and returns the ranker's whole result without the version or the fallback flag it carries.",
+    'Read the user from `X-User-Id` only (401 when missing); 400 unless `1 <= len(candidate_ids) <= MAX_CANDIDATES`; answer `result["items"][:MAX_ITEMS]` with `position` from `enumerate`, plus `model_version` and `fallback`.',
+  ],
+  debrief: `Identity comes from the request's authentication and never from its body, because a personalized list is data about one user and the body is whatever the caller typed. The candidate bound protects the ranker, whose cost grows with the list, and the 30-item cut protects the client from a payload that grows with the request; both are checked before any work is done. The position travels with each item because clicks depend on the slot as much as on relevance, and the version and fallback flag travel with the list so every reader can attribute it. Production endpoints take the user from a verified token rather than a header, rate-limit per user, and add an impression id the click event can carry back.`,
 };

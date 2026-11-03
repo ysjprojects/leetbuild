@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package crawl;
+
+// The fetcher step 3 calls: it GETs one URL from its web host and stores the page in the page
+// store. The host's answer comes back as `status` (200, 403, 404 or 429). A host that is down or
+// answers 5xx is UNAVAILABLE; a fetch slower than the caller's deadline is DEADLINE_EXCEEDED.
+service Fetcher {
+  rpc Fetch(FetchRequest) returns (FetchReply);
+}
+
+message FetchRequest {
+  string job_id = 1;
+  string url = 2;
+}
+
+message FetchReply {
+  // The host's HTTP status: 200, 403, 404 or 429.
+  int32 status = 1;
+  // 200: the hash of the stored page.
+  string content_hash = 2;
+  // 200: where the page store keeps the page.
+  string body_ref = 3;
+  // 429: the host's Retry-After, in seconds.
+  int32 retry_after_s = 4;
+}

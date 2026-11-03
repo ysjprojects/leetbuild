@@ -1,80 +1,97 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * Embedding service: bounded batches, a version-aware vector cache, and an event that fires only
- * after every chunk is durable. Every step ships a starter that compiles and demos well but fails
- * under upgrade, concurrency or partial failure.
+ * Embedding service: a bounded batch API with replays → a vector cache keyed by model version and
+ * written once → a model server client with a deadline, one retry and a model check → one
+ * document-keyed event after every chunk is stored → an exact-key read that names the model.
  */
 export const embeddingServiceProblem: Problem = {
   id: 'embedding-service',
   title: 'Embedding Service',
-  tagline: 'Batch embeddings behind a Redis vector cache keyed by model version.',
+  tagline: 'Bounded batches, a vector cache keyed by model version, and an event per stored document.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Embedding Service
 
-Retrieval starts with vectors. One service turns text into them for every tenant, caches the result
-so the model server is paid once per input, and tells the indexer when a document is complete.
+Retrieval starts with vectors. One service turns text into them for every tenant, keeps them so a
+document is embedded once per model, and tells the indexer when a document is complete. A vector
+only means something next to vectors from the same model, so the model version travels with every
+vector the service stores, reads or announces.
 
 ## The real system
 
-OpenAI's \`POST /v1/embeddings\` takes up to 2048 inputs per request, caps each input at 8192 tokens
-and 300,000 tokens per request, and names the model in every response so a caller can tell which
-version produced a vector. Behind an endpoint like that sit a model server with deadlines and a
-fallback, a vector cache keyed by model version, and a pipeline that indexes documents once all of
-their chunks are embedded.
+OpenAI's \`POST /v1/embeddings\` takes an array of at most 2048 inputs, caps each input at 8192
+tokens and a request at 300,000 tokens summed across its inputs, and names the model in every
+response. Behind an endpoint like that sit a model server with deadlines, a vector cache whose key
+includes the model, and a pipeline that indexes a document once all of its chunks are embedded.
 
 ## What you build here
 
-One service, **embedding**, in five steps:
+One service, **embedd**, with five pieces sharing the \`embedding\` support package: \`config\` (the
+model server at \`MODEL_SERVER\`, \`MODEL_VERSION = embed-v2\` and \`PREVIOUS_VERSION = embed-v1\`
+with their \`DIMENSIONS\`, \`TOPIC\`, \`content_hash\`, \`vector_key\`, \`EmbedError\`, \`Chunk\`),
+\`cache\`, \`replays\` and \`outbox\`:
 
-1. \`POST /v1/embeddings\` turns up to 256 inputs of at most 8 KiB into vectors for the authenticated
-   tenant, with an \`Idempotency-Key\` whose digest includes the model version.
-2. A **Redis vector cache** keyed by \`(tenant, model version, content hash)\`, written with one
-   \`SET NX EX\` so concurrent computes converge on one vector.
-3. A **model server call** with a 2-second deadline, two attempts, retries only on \`UNAVAILABLE\`,
-   and a fallback model whose vectors live in their own namespace.
-4. An **\`embed.ready\` event** keyed by document id, produced with \`acks=all\` after the cache write
-   commits, with an outbox row when the broker rejects it.
-5. \`GET /v1/embeddings/{content_hash}\`, which resolves the tenant first, reads the version-scoped
-   key and answers 404 on a miss.
+1. \`POST /v1/embeddings\` with \`{"inputs": [...]}\`, \`X-Tenant-Id\` and \`Idempotency-Key\`: 1..256
+   inputs of at most 8 KiB each, embedded through step 3's \`embed\`, and a replay answered from
+   \`replays\` instead of the model.
+2. **Redis**: \`store_vector(tenant, model_version, text, compute)\` writes
+   \`emb:{tenant}:{model}:{hash}\` with one \`SET NX EX\`, first writer wins; provided to the later
+   steps as \`cache.store_vector\` beside \`cache.read_vector\`.
+3. **gRPC** \`Embedder.Embed\` (\`embedder.proto\`): \`embed(text, model_version)\` under a 2-second
+   deadline, two attempts, \`UNAVAILABLE\` retried, a reply from another model refused.
+4. **Kafka**: \`publish_ready(tenant, document_id, chunks)\` stores every chunk's vector, then
+   produces one \`embed.ready\` event keyed by document id with \`acks=all\`; a refused record goes to
+   the outbox from the delivery report.
+5. \`GET /v1/embeddings/{content_hash}?model_version=\`: the tenant's vector under that model, read
+   by its exact key, 404 on a miss, with the model and dimension in the body.
+
+## The debugging habit
+
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Tokenization and token-based pricing, the outbox relay, chunking of documents into inputs, and
-the retriever that consumes the vectors. Each step is one file with a starter that runs and a set of
-checks that say what must change.`,
+Tokenization and token-based limits and pricing, chunking documents, the outbox relay, batching
+inputs into one model call, and the retriever that consumes the vectors.`,
   diagram: {
     nodes: [
-      {id: 'client', label: 'Client', kind: 'client', x: 6, y: 50},
-      {id: 'api', label: 'Embedding API', kind: 'http', x: 28, y: 50},
-      {id: 'redis', label: 'Vector cache', kind: 'redis', x: 50, y: 20},
-      {id: 'meta', label: 'vectors · documents', kind: 'db', x: 50, y: 80},
-      {id: 'model', label: 'Model server', kind: 'grpc', x: 72, y: 12},
-      {id: 'fallback', label: 'Fallback model', kind: 'external', x: 72, y: 40},
-      {id: 'outbox', label: 'Outbox', kind: 'db', x: 72, y: 70},
-      {id: 'topic', label: 'embed.ready', kind: 'kafka', x: 92, y: 24},
-      {id: 'indexer', label: 'Indexer', kind: 'service', x: 92, y: 76},
+      {id: 'client', kind: 'client', label: 'Client', sub: 'X-Tenant-Id · Idempotency-Key', x: 8, y: 50},
+      {id: 'api', kind: 'http', label: 'embedd', sub: 'POST · GET /v1/embeddings', x: 28, y: 50},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'emb:{tenant}:{model}:{hash}', x: 50, y: 18},
+      {id: 'model', kind: 'grpc', label: 'Model server', sub: 'Embedder.Embed · 2 s', x: 50, y: 50},
+      {id: 'topic', kind: 'kafka', label: 'embed.ready', sub: 'key = document id', x: 50, y: 84},
+      {id: 'outbox', kind: 'db', label: 'Outbox', sub: 'refused records', x: 74, y: 70},
+      {id: 'indexer', kind: 'service', label: 'Indexer', sub: 'one event per document', x: 76, y: 30},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'GET / SET vectors'},
-      {from: 'api', to: 'meta', kind: 'plain', label: 'idempotency · documents'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'store_vector · read_vector · replays'},
       {from: 'api', to: 'model', kind: 'grpc', label: 'Embed'},
-      {from: 'model', to: 'fallback', kind: 'grpc', label: 'on UNAVAILABLE'},
-      {from: 'api', to: 'outbox', kind: 'plain', label: 'undelivered event'},
-      {from: 'api', to: 'topic', kind: 'kafka', label: 'produce embed.ready'},
+      {from: 'api', to: 'topic', kind: 'kafka', label: 'produce after the writes'},
+      {from: 'api', to: 'outbox', kind: 'plain', label: 'delivery failed'},
       {from: 'topic', to: 'indexer', kind: 'kafka', label: 'consume'},
-      {from: 'indexer', to: 'redis', kind: 'redis', label: 'chunk vectors'},
+      {from: 'indexer', to: 'api', kind: 'http', label: 'GET vectors'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

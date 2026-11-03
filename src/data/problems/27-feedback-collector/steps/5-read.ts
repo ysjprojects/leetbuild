@@ -1,607 +1,438 @@
 import type {Step} from '@/lib/types';
 
-/**
- * Step 5 — the read endpoint. A model version's satisfaction is only published when it has enough
- * samples, over a window from a documented set, and the cached score expires.
- */
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/models/{v}/satisfaction: aggregates with an honesty floor',
+  title: 'GET satisfaction: a recent window, a sample floor and a 60-second cache',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'collector', 'db', 'redis'],
-  sequence: {
-    participants: ['Client', 'Feedback Collector', 'feedback store'],
-    messages: [
-      {
-        from: 'Client',
-        to: 'Feedback Collector',
-        label: 'GET /v1/models/{version}/satisfaction?window=24h',
-        kind: 'sync',
-      },
-      {
-        from: 'Feedback Collector',
-        to: 'Feedback Collector',
-        label: 'window in the documented set? otherwise 400',
-        kind: 'sync',
-      },
-      {
-        from: 'Feedback Collector',
-        to: 'feedback store',
-        label: 'counts(model_version, since = now − window)',
-        kind: 'sync',
-      },
-      {from: 'feedback store', to: 'Feedback Collector', label: 'total, positive', kind: 'reply'},
-      {
-        from: 'Feedback Collector',
-        to: 'Feedback Collector',
-        label: 'total < 50 → insufficient_data, no score',
-        kind: 'sync',
-      },
-      {from: 'Feedback Collector', to: 'Client', label: '200 · {samples, score | insufficient_data}', kind: 'reply'},
-    ],
-  },
+  focus: ['client', 'collector', 'redis'],
   task: `## Task
 
-**Starting point.** \`read\` serves \`GET /v1/models/{version}/satisfaction\`. It returns
-\`SCORE_CACHE[version]\` when present, otherwise calls \`satisfaction.all_time_totals(version)\`,
-divides positives by total, stores the body in \`SCORE_CACHE\` with no expiry, and echoes whatever
-\`?window=\` the caller sent (default \`all\`). It serves the demo and hides four flaws.
+**Starting point.** \`read\` serves \`GET /v1/models/{version}/satisfaction\`: it echoes \`?window=\`
+(default \`all\`), reads \`store.totals(version)\`, the counters since the model shipped, answers
+\`{model_version, window, samples, status: "ok", score}\` with \`score = positive / samples\`, and keeps
+that body in \`SCORE_CACHE[version]\` for good. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A model version that shipped an hour ago already shows a healthy
-score because it inherited the previous model's all-time votes, the cached score stays frozen after a
-bad release, and a caller can pick the window that flatters the number.
+**Failure mode the checks target.** A prompt change sinks the model today and the dashboard stays
+green: last week's votes dominate the all-time counters, the cached score does not refresh, three votes
+read as a verdict, and any window a caller types is accepted.
 
-- The window comes from \`ALLOWED_WINDOWS\` (\`1h\`, \`24h\`, \`7d\`, default \`24h\`); anything else is
-  \`400\`.
-- Aggregate only the recent window: \`since = now - WINDOW_SECONDS[window]\` and count ratings inside
-  it. Remove the \`all_time\` path.
-- Below \`MIN_SAMPLES = 50\`, answer with the sample count and \`insufficient_data\` instead of a
-  score.
-- Cache the aggregate for \`CACHE_TTL_SECONDS = 60\`, keyed by version and window, with a
-  \`cached_at\` stamp so the score reflects feedback up to the last minute.`,
-  hints: [
-    'A version released an hour ago shows 0.91 on the dashboard with eleven votes, and the number did not move after a rollback.',
-    '`all_time_totals(version)` folds in every vote ever recorded under that version string, and `SCORE_CACHE[version]` is written once and read forever; `?window=` only labels the body.',
-    'Compute `since` from `WINDOW_SECONDS[window]`, validate against `ALLOWED_WINDOWS`, and cache with `CACHE_TTL_SECONDS = 60` plus `cached_at`. The checks cover the `MIN_SAMPLES` floor.',
-  ],
+- \`window\` is a key of \`WINDOW_HOURS\` (\`1h\`: 1, \`24h\`: 24, \`7d\`: 168), default \`24h\`; anything
+  else is **400**.
+- Sum \`store.hour_totals(version, h)\` over the window's hour buckets, \`h\` from
+  \`now // 3600 - hours + 1\` to \`now // 3600\`.
+- Below \`MIN_SAMPLES = 50\` the body has \`status: "insufficient_data"\` and \`score: null\`.
+- Cache each body for \`CACHE_TTL_S = 60\` seconds per \`(version, window)\`.`,
+  sequence: {
+    participants: ['Dashboard', 'feedbackd', 'Redis'],
+    messages: [
+      {
+        from: 'Dashboard',
+        to: 'feedbackd',
+        label: 'GET /v1/models/support-llm-2026-09/satisfaction?window=24h',
+        kind: 'sync',
+      },
+      {
+        from: 'feedbackd',
+        to: 'feedbackd',
+        label: 'window in WINDOW_HOURS? cache (version, 24h) younger than 60 s?',
+        kind: 'sync',
+      },
+      {from: 'feedbackd', to: 'Redis', label: 'HGETALL quality:{version}:{h} for the last 24 hours', kind: 'sync'},
+      {
+        from: 'feedbackd',
+        to: 'Dashboard',
+        label: '{samples: 60, status: "ok", score: 0.25} · below 50: insufficient_data',
+        kind: 'reply',
+      },
+    ],
+  },
   checks: [
     {
-      id: 'route',
-      title: 'Handles GET /v1/models/{version}/satisfaction',
+      id: 'window',
+      title: 'The window comes from a fixed set',
       detail:
-        'Register the satisfaction route on `GET /v1/models/{version}/satisfaction` and read the model version from the path.',
+        'The window is one of `1h`, `24h`, `7d` (`WINDOW_HOURS`), `24h` by default, and anything else is `400`; the starter echoes whatever the caller sent and defaults to `all`.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/models\/\{version\}\/satisfaction["']\)/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/models\/:version\/satisfaction['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/models\/\{version\}\/satisfaction"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"models"\s*\/\s*Segment\s*\/\s*"satisfaction"\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(/, /\/v1\/models\/.*satisfaction/]},
+        python: {all: [/WINDOW_HOURS/, /\b400\b/], none: [/["']all["']/]},
+        typescript: {all: [/WINDOW_HOURS/, /\b400\b/], none: [/['"]all['"]/]},
+        go: {all: [/windowHours/, /StatusBadRequest|\b400\b/], none: [/"all"/]},
+        scala: {all: [/WindowHours/, /BadRequest|\b400\b/], none: [/"all"/]},
+        cpp: {all: [/kWindowHours/, /\b400\b/], none: [/"all"/]},
       },
     },
     {
-      id: 'min-samples',
-      title: 'Refuses to publish a score below 50 samples',
+      id: 'recent-window',
+      title: 'Counts only the ratings inside the window',
       detail:
-        'With fewer than `MIN_SAMPLES = 50` ratings, answer with the sample count and `insufficient_data` instead of a score, so a fresh version cannot look measured.',
+        "The score sums the hour buckets of the window (`hour_totals`), so a version's past does not hide its present; the starter reads the counters since the model shipped.",
       match: {
-        python: {all: [/MIN_SAMPLES\s*=\s*50/, /insufficient/]},
-        typescript: {all: [/MIN_SAMPLES\s*=\s*50/, /insufficient/]},
-        go: {all: [/minSamples\s*=\s*50/, /insufficient/]},
-        scala: {all: [/MinSamples\s*=\s*50/, /[Ii]nsufficient/]},
-        cpp: {all: [/kMinSamples\s*=\s*50/, /insufficient/]},
+        python: {all: [/store\.hour_totals\(/], none: [/store\.totals\(/]},
+        typescript: {all: [/hourTotals\(/], none: [/\btotals\(/]},
+        go: {all: [/store\.HourTotals\(/], none: [/store\.Totals\(/]},
+        scala: {all: [/Store\.hourTotals\(/], none: [/Store\.totals\(/]},
+        cpp: {all: [/store::hourTotals\(/], none: [/store::totals\(/]},
       },
     },
     {
-      id: 'window-set',
-      title: 'The window parameter is constrained to the documented set',
+      id: 'sample-floor',
+      title: 'Below 50 samples there is no score',
       detail:
-        'Accept only the documented windows (`1h`, `24h`, `7d`) from `ALLOWED_WINDOWS` and answer `400` otherwise, so a caller cannot shrink the sample set to cherry-pick a score.',
+        'Under `MIN_SAMPLES` (50) ratings the body says `insufficient_data` with a null score; the starter turns three votes into a percentage.',
       match: {
-        python: {all: [/ALLOWED_WINDOWS/, /status_code\s*=\s*400/]},
-        typescript: {all: [/ALLOWED_WINDOWS/, /code\(\s*400\s*\)/]},
-        go: {all: [/allowedWindows/, /StatusBadRequest/]},
-        scala: {all: [/AllowedWindows/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kAllowedWindows/, /\b400\b/]},
+        python: {all: [/MIN_SAMPLES\s*=\s*50\b/, /insufficient_data/]},
+        typescript: {all: [/MIN_SAMPLES\s*=\s*50\b/, /insufficient_data/]},
+        go: {all: [/minSamples\s*=\s*50\b/, /insufficient_data/]},
+        scala: {all: [/MinSamples\s*=\s*50\b/, /insufficient_data/]},
+        cpp: {all: [/kMinSamples\s*=\s*50\b/, /insufficient_data/]},
       },
     },
     {
-      id: 'fresh-window',
-      title: 'The score reflects the recent window, not all time',
+      id: 'cache-ttl',
+      title: 'The score is cached for 60 seconds per version and window',
       detail:
-        'Compute `since` from `WINDOW_SECONDS[window]` and aggregate only the ratings inside it; an all-time aggregate is how a fresh version inherits an old model\u2019s reputation.',
+        'A body is reused for `CACHE_TTL_S` (60 s) and only for the same version and window; the starter keys the cache by version alone and keeps it forever.',
       match: {
-        python: {all: [/WINDOW_SECONDS/, /since\s*=/], none: [/all_time|ALL_TIME/]},
-        typescript: {all: [/WINDOW_SECONDS/, /since\s*=/], none: [/allTime|ALL_TIME/]},
-        go: {all: [/windowSeconds/, /since\s*:=/], none: [/allTime|AllTime/]},
-        scala: {all: [/WindowSeconds/, /since\s*=/], none: [/AllTime|allTime/]},
-        cpp: {all: [/kWindowSeconds/, /since\s*=/], none: [/kAllTime|AllTime/]},
-      },
-    },
-    {
-      id: 'cache-refresh',
-      title: 'The cached score expires',
-      detail:
-        'Cache the aggregate for `CACHE_TTL_SECONDS = 60` with a `cached_at` stamp, so a bad release cannot freeze the score forever and the number reflects feedback up to the last minute.',
-      match: {
-        python: {all: [/CACHE_TTL_SECONDS\s*=\s*60/, /cached_at/]},
-        typescript: {all: [/CACHE_TTL_SECONDS\s*=\s*60/, /cachedAt/]},
-        go: {all: [/cacheTtlSeconds\s*=\s*60/, /cachedAt/]},
-        scala: {all: [/CacheTtlSeconds\s*=\s*60/, /cachedAt/]},
-        cpp: {all: [/kCacheTtlSeconds\s*=\s*60/, /cachedAt/]},
+        python: {all: [/CACHE_TTL_S\s*=\s*60\b/, /time\.time\(\)|time\.monotonic\(\)/]},
+        typescript: {all: [/CACHE_TTL_MS\s*=\s*60_?000\b/, /Date\.now\(\)/]},
+        go: {all: [/cacheTTL\s*=\s*(60\s*\*\s*time\.Second|time\.Minute)/, /time\.Now\(\)/]},
+        scala: {all: [/CacheTtlMillis\s*=\s*(60000|60\s*\*\s*1000)L?\b/, /System\.currentTimeMillis\(\)/]},
+        cpp: {all: [/kCacheTtl\{60\}/, /_clock::now\(\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
+      starter: `from fastapi import FastAPI, Request
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from feedback import store  # totals, hour_totals
 
 app = FastAPI()
-logger = logging.getLogger("feedback")
 
 SCORE_CACHE: dict[str, dict] = {}
 
 
-class SatisfactionStore:
-    """The aggregate counts behind one model version."""
-
-    def all_time_totals(self, model_version: str) -> dict:
-        raise NotImplementedError
-
-
-satisfaction = SatisfactionStore()
-
-
 @app.get("/v1/models/{version}/satisfaction")
-def read_satisfaction(version: str, window: str = "all") -> JSONResponse:
+def satisfaction(version: str, request: Request) -> dict:
+    """The share of thumbs-up among the ratings of a model version."""
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    if version in SCORE_CACHE:
-        return JSONResponse(SCORE_CACHE[version])
-    counts = satisfaction.all_time_totals(version)
-    samples = counts["total"]
-    body = {
-        "model_version": version,
-        "window": window,
-        "samples": samples,
-        "score": counts["positive"] / samples if samples else 0.0,
-    }
+    window = request.query_params.get("window", "all")
+    cached = SCORE_CACHE.get(version)
+    if cached is not None:
+        return cached
+    samples, positive = store.totals(version)
+    body = {"model_version": version, "window": window, "samples": samples, "status": "ok", "score": positive / samples if samples else 0.0}
     SCORE_CACHE[version] = body
-    return JSONResponse(body)
+    return body
 `,
-      solution: `import logging
-import time
+      solution: `import time
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+
+from feedback import store  # totals, hour_totals
 
 app = FastAPI()
-logger = logging.getLogger("feedback")
 
+WINDOW_HOURS = {"1h": 1, "24h": 24, "7d": 168}
 MIN_SAMPLES = 50
-CACHE_TTL_SECONDS = 60
-WINDOW_SECONDS = {"1h": 3600, "24h": 86400, "7d": 7 * 86400}
-ALLOWED_WINDOWS = {"1h", "24h", "7d"}
+CACHE_TTL_S = 60
 
-
-class SatisfactionStore:
-    """The aggregate counts behind one model version."""
-
-    def counts(self, model_version: str, since: float) -> dict:
-        raise NotImplementedError
-
-
-satisfaction = SatisfactionStore()
-
-
-class CacheEntry:
-    def __init__(self, value: dict) -> None:
-        self.cached_at = time.time()
-        self.value = value
-
-
-_cache: dict[str, CacheEntry] = {}
-
-
-def cached(key: str, compute) -> dict:
-    entry = _cache.get(key)
-    if entry is not None and time.time() - entry.cached_at < CACHE_TTL_SECONDS:
-        return entry.value
-    value = compute()
-    _cache[key] = CacheEntry(value)
-    return value
+# (version, window) -> (computed at, body)
+SCORE_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 
 
 @app.get("/v1/models/{version}/satisfaction")
-def read_satisfaction(version: str, window: str = "24h") -> JSONResponse:
-    if window not in ALLOWED_WINDOWS:
-        raise HTTPException(status_code=400, detail="unknown window")
-
-    def compute() -> dict:
-        since = time.time() - WINDOW_SECONDS[window]
-        counts = satisfaction.counts(version, since)
-        samples = counts["total"]
-        if samples < MIN_SAMPLES:
-            return {
-                "model_version": version,
-                "window": window,
-                "samples": samples,
-                "status": "insufficient_data",
-            }
-        return {
-            "model_version": version,
-            "window": window,
-            "samples": samples,
-            "score": counts["positive"] / samples,
-            "status": "ok",
-        }
-
-    return JSONResponse(cached(f"{version}:{window}", compute))
+def satisfaction(version: str, request: Request) -> dict:
+    """The share of thumbs-up among the ratings of a model version."""
+    window = request.query_params.get("window", "24h")
+    if window not in WINDOW_HOURS:
+        raise HTTPException(status_code=400, detail="window must be 1h, 24h or 7d")
+    now = time.time()
+    cached = SCORE_CACHE.get((version, window))
+    if cached is not None and now - cached[0] < CACHE_TTL_S:
+        return cached[1]
+    hour = int(now // 3600)
+    samples = positive = 0
+    for h in range(hour - WINDOW_HOURS[window] + 1, hour + 1):
+        s, p = store.hour_totals(version, h)
+        samples += s
+        positive += p
+    body = {"model_version": version, "window": window, "samples": samples}
+    if samples < MIN_SAMPLES:
+        body.update(status="insufficient_data", score=None)
+    else:
+        body.update(status="ok", score=positive / samples)
+    SCORE_CACHE[(version, window)] = (now, body)
+    return body
 `,
     },
     typescript: {
-      starter: `/** GET /v1/models/{version}/satisfaction. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-const SCORE_CACHE = new Map<string, unknown>();
+import {hourTotals, totals} from 'feedback/store';
 
 export const app = Fastify();
 
-export interface SatisfactionCounts {
-  total: number;
-  positive: number;
-}
+const SCORE_CACHE = new Map<string, Record<string, unknown>>();
 
-export class SatisfactionStore {
-  async allTimeTotals(modelVersion: string): Promise<SatisfactionCounts> {
-    throw new Error('not implemented');
-  }
-}
-
-export const satisfaction = new SatisfactionStore();
-
-app.get('/v1/models/:version/satisfaction', async (request, reply) => {
+app.get('/v1/models/:version/satisfaction', async request => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {version} = request.params as {version: string};
-  const window = (request.query as {window?: string}).window ?? 'all';
-  const hit = SCORE_CACHE.get(version);
-  if (hit !== undefined) return reply.code(200).send(hit);
-  const counts = await satisfaction.allTimeTotals(version);
-  const body = {
-    model_version: version,
-    window,
-    samples: counts.total,
-    score: counts.total === 0 ? 0 : counts.positive / counts.total,
-  };
+  const {window = 'all'} = request.query as {window?: string};
+  const cached = SCORE_CACHE.get(version);
+  if (cached !== undefined) return cached;
+  const [samples, positive] = await totals(version);
+  const body = {model_version: version, window, samples, status: 'ok', score: samples > 0 ? positive / samples : 0};
   SCORE_CACHE.set(version, body);
-  return reply.code(200).send(body);
+  return body;
 });
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+void hourTotals;
 `,
-      solution: `/** GET /v1/models/{version}/satisfaction: an honest, expiring aggregate. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 
-const MIN_SAMPLES = 50;
-const CACHE_TTL_SECONDS = 60;
-const WINDOW_SECONDS: Record<string, number> = {'1h': 3600, '24h': 86400, '7d': 7 * 86400};
-const ALLOWED_WINDOWS = Object.keys(WINDOW_SECONDS);
+import {hourTotals} from 'feedback/store';
 
 export const app = Fastify();
 
-export interface SatisfactionCounts {
-  total: number;
-  positive: number;
-}
+const WINDOW_HOURS: Record<string, number> = {'1h': 1, '24h': 24, '7d': 168};
+const MIN_SAMPLES = 50;
+const CACHE_TTL_MS = 60_000;
 
-export class SatisfactionStore {
-  async counts(modelVersion: string, since: number): Promise<SatisfactionCounts> {
-    throw new Error('not implemented');
-  }
-}
-
-export const satisfaction = new SatisfactionStore();
-
-interface CacheEntry {
-  cachedAt: number;
-  value: unknown;
-}
-
-const cache = new Map<string, CacheEntry>();
-
-async function cached(key: string, compute: () => Promise<unknown>): Promise<unknown> {
-  const hit = cache.get(key);
-  if (hit !== undefined && Date.now() - hit.cachedAt < CACHE_TTL_SECONDS * 1000) return hit.value;
-  const value = await compute();
-  cache.set(key, {cachedAt: Date.now(), value});
-  return value;
-}
+/** version/window → when the body was computed, and the body. */
+const SCORE_CACHE = new Map<string, {at: number; body: Record<string, unknown>}>();
 
 app.get('/v1/models/:version/satisfaction', async (request, reply) => {
   const {version} = request.params as {version: string};
-  const window = (request.query as {window?: string}).window ?? '24h';
-  if (!ALLOWED_WINDOWS.includes(window)) return reply.code(400).send({error: 'unknown window'});
-
-  const body = await cached(\`\${version}:\${window}\`, async () => {
-    const since = Date.now() / 1000 - WINDOW_SECONDS[window];
-    const counts = await satisfaction.counts(version, since);
-    if (counts.total < MIN_SAMPLES) {
-      return {model_version: version, window, samples: counts.total, status: 'insufficient_data'};
-    }
-    return {
-      model_version: version,
-      window,
-      samples: counts.total,
-      score: counts.positive / counts.total,
-      status: 'ok',
-    };
-  });
-  return reply.code(200).send(body);
+  const {window = '24h'} = request.query as {window?: string};
+  if (!Object.hasOwn(WINDOW_HOURS, window)) return reply.code(400).send({error: 'window must be 1h, 24h or 7d'});
+  const now = Date.now();
+  const key = \`\${version}/\${window}\`;
+  const cached = SCORE_CACHE.get(key);
+  if (cached !== undefined && now - cached.at < CACHE_TTL_MS) return cached.body;
+  const hour = Math.floor(now / 3_600_000);
+  let samples = 0;
+  let positive = 0;
+  for (let h = hour - WINDOW_HOURS[window] + 1; h <= hour; h += 1) {
+    const [s, p] = await hourTotals(version, h);
+    samples += s;
+    positive += p;
+  }
+  const body =
+    samples < MIN_SAMPLES
+      ? {model_version: version, window, samples, status: 'insufficient_data', score: null}
+      : {model_version: version, window, samples, status: 'ok', score: positive / samples};
+  SCORE_CACHE.set(key, {at: now, body});
+  return body;
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
-)
 
-type counts struct {
-	total    int
-	positive int
-}
+	"feedback/store" // store.Totals, HourTotals
+)
 
 var scoreCache = map[string]map[string]any{}
 
-type SatisfactionStore struct{}
-
-func (s *SatisfactionStore) AllTimeTotals(ctx context.Context, modelVersion string) (counts, error) {
-	return counts{}, nil
-}
-
-var satisfaction = &SatisfactionStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func readSatisfaction(rw http.ResponseWriter, r *http.Request) {
+// satisfaction is the share of thumbs-up among the ratings of a model version.
+func satisfaction(rw http.ResponseWriter, r *http.Request) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	version := r.PathValue("version")
 	window := r.URL.Query().Get("window")
 	if window == "" {
 		window = "all"
 	}
-	if hit, ok := scoreCache[version]; ok {
-		writeJSON(rw, http.StatusOK, hit)
+	if cached, ok := scoreCache[version]; ok {
+		writeJSON(rw, http.StatusOK, cached)
 		return
 	}
-	totals, _ := satisfaction.AllTimeTotals(r.Context(), version)
-	body := map[string]any{
-		"model_version": version,
-		"window":        window,
-		"samples":       totals.total,
-		"score":         float64(totals.positive) / float64(totals.total),
+	samples, positive, err := store.Totals(r.Context(), version)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	score := 0.0
+	if samples > 0 {
+		score = float64(positive) / float64(samples)
+	}
+	body := map[string]any{"model_version": version, "window": window, "samples": samples, "status": "ok", "score": score}
 	scoreCache[version] = body
 	writeJSON(rw, http.StatusOK, body)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/models/{version}/satisfaction", readSatisfaction)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/models/{version}/satisfaction", satisfaction)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
+
+	"feedback/store" // store.Totals, HourTotals
 )
 
 const (
-	minSamples      = 50
-	cacheTtlSeconds = 60
+	minSamples = 50
+	cacheTTL   = 60 * time.Second
 )
 
-var windowSeconds = map[string]int64{"1h": 3600, "24h": 86400, "7d": 7 * 86400}
+var windowHours = map[string]int64{"1h": 1, "24h": 24, "7d": 168}
 
-var allowedWindows = map[string]bool{"1h": true, "24h": true, "7d": true}
-
-type counts struct {
-	total    int
-	positive int
+type cachedScore struct {
+	at   time.Time
+	body map[string]any
 }
 
-type cacheEntry struct {
-	cachedAt time.Time
-	value    map[string]any
-}
+// scoreCache is keyed by version and window.
+var scoreCache = map[string]cachedScore{}
 
-var satisfactionCache = map[string]cacheEntry{}
-
-type SatisfactionStore struct{}
-
-func (s *SatisfactionStore) Counts(ctx context.Context, modelVersion string, since time.Time) (counts, error) {
-	return counts{}, nil
-}
-
-var satisfaction = &SatisfactionStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func readSatisfaction(rw http.ResponseWriter, r *http.Request) {
+// satisfaction is the share of thumbs-up among the ratings of a model version.
+func satisfaction(rw http.ResponseWriter, r *http.Request) {
 	version := r.PathValue("version")
 	window := r.URL.Query().Get("window")
 	if window == "" {
 		window = "24h"
 	}
-	if !allowedWindows[window] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown window"})
+	hours, ok := windowHours[window]
+	if !ok {
+		http.Error(rw, "window must be 1h, 24h or 7d", http.StatusBadRequest)
 		return
 	}
-	key := version + ":" + window
-	if hit, ok := satisfactionCache[key]; ok && time.Since(hit.cachedAt) < time.Duration(cacheTtlSeconds)*time.Second {
-		writeJSON(rw, http.StatusOK, hit.value)
+	now := time.Now()
+	key := version + "/" + window
+	if cached, ok := scoreCache[key]; ok && now.Sub(cached.at) < cacheTTL {
+		writeJSON(rw, http.StatusOK, cached.body)
 		return
 	}
-	since := time.Now().Add(-time.Duration(windowSeconds[window]) * time.Second)
-	totals, err := satisfaction.Counts(r.Context(), version, since)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
+	hour := now.Unix() / 3600
+	var samples, positive int64
+	for h := hour - hours + 1; h <= hour; h++ {
+		s, p, err := store.HourTotals(r.Context(), version, h)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		samples += s
+		positive += p
 	}
-	body := map[string]any{
-		"model_version": version,
-		"window":        window,
-		"samples":       totals.total,
-	}
-	if totals.total < minSamples {
+	body := map[string]any{"model_version": version, "window": window, "samples": samples, "status": "ok", "score": nil}
+	if samples < minSamples {
 		body["status"] = "insufficient_data"
 	} else {
-		body["score"] = float64(totals.positive) / float64(totals.total)
-		body["status"] = "ok"
+		body["score"] = float64(positive) / float64(samples)
 	}
-	satisfactionCache[key] = cacheEntry{cachedAt: time.Now(), value: body}
+	scoreCache[key] = cachedScore{at: now, body: body}
 	writeJSON(rw, http.StatusOK, body)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/models/{version}/satisfaction", readSatisfaction)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/models/{version}/satisfaction", satisfaction)
 }
 `,
     },
     scala: {
-      starter: `package feedback
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class Satisfaction(model_version: String, window: String, samples: Int, score: Double)
+import feedback.Store // Store.totals, hourTotals
 
-object SatisfactionApi {
-  implicit val system: ActorSystem = ActorSystem("feedback-read")
-  implicit val satisfactionFormat: RootJsonFormat[Satisfaction] = jsonFormat4(Satisfaction)
+object Read {
+  private val scoreCache = scala.collection.mutable.Map.empty[String, JsObject]
 
-  private var scoreCache: Map[String, Satisfaction] = Map.empty
+  private def json(body: JsObject): HttpResponse =
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "models" / Segment / "satisfaction") { version =>
-      get {
-        parameter("window".?) { windowOpt =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          scoreCache.get(version) match {
-            case Some(body) =>
-              complete(StatusCodes.OK, body)
-            case None =>
-              val totals = satisfaction.allTimeTotals(version)
-              val body = Satisfaction(
-                version,
-                windowOpt.getOrElse("all"),
-                totals.total,
-                totals.positive.toDouble / totals.total,
-              )
-              scoreCache = scoreCache.updated(version, body)
-              complete(StatusCodes.OK, body)
-          }
-        }
+  /** The share of thumbs-up among the ratings of a model version. */
+  val route: Route = path("v1" / "models" / Segment / "satisfaction") { version =>
+    get {
+      parameter("window".optional) { windowParam =>
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+        val window = windowParam.getOrElse("all")
+        val body = scoreCache.getOrElseUpdate(version, {
+          val (samples, positive) = Store.totals(version)
+          JsObject(
+            "model_version" -> JsString(version),
+            "window" -> JsString(window),
+            "samples" -> JsNumber(samples),
+            "status" -> JsString("ok"),
+            "score" -> JsNumber(if (samples > 0) positive.toDouble / samples else 0.0))
+        })
+        complete(json(body))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `package feedback
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class Satisfaction(
-    model_version: String,
-    window: String,
-    samples: Int,
-    score: Option[Double],
-    status: String,
-)
+import feedback.Store // Store.totals, hourTotals
 
-final case class Totals(total: Int, positive: Int)
-
-object SatisfactionApi {
+object Read {
+  val WindowHours: Map[String, Long] = Map("1h" -> 1L, "24h" -> 24L, "7d" -> 168L)
   val MinSamples = 50
-  val CacheTtlSeconds = 60
-  val WindowSeconds = Map("1h" -> 3600L, "24h" -> 86400L, "7d" -> 7L * 86400L)
-  val AllowedWindows = WindowSeconds.keySet
+  val CacheTtlMillis = 60000L
 
-  implicit val system: ActorSystem = ActorSystem("feedback-read")
-  implicit val satisfactionFormat: RootJsonFormat[Satisfaction] = jsonFormat5(Satisfaction)
+  /** (version, window) → (computed at, body). */
+  private val scoreCache = scala.collection.mutable.Map.empty[(String, String), (Long, JsObject)]
 
-  private var cache: Map[String, (Long, Satisfaction)] = Map.empty
+  private def json(body: JsObject): HttpResponse =
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "models" / Segment / "satisfaction") { version =>
-      get {
-        parameter("window".?) { windowOpt =>
-          val window = windowOpt.getOrElse("24h")
-          if (!AllowedWindows.contains(window)) {
-            complete(StatusCodes.BadRequest, """{"error":"unknown window"}""")
-          } else {
-            val key = s"$version:$window"
+  private def compute(version: String, window: String, hours: Long, now: Long): JsObject = {
+    val hour = now / 3600000L
+    val buckets = (hour - hours + 1 to hour).map(h => Store.hourTotals(version, h))
+    val samples = buckets.map(_._1).sum
+    val positive = buckets.map(_._2).sum
+    val base = Map("model_version" -> JsString(version), "window" -> JsString(window), "samples" -> JsNumber(samples))
+    if (samples < MinSamples) JsObject(base ++ Map("status" -> JsString("insufficient_data"), "score" -> JsNull))
+    else JsObject(base ++ Map("status" -> JsString("ok"), "score" -> JsNumber(positive.toDouble / samples)))
+  }
+
+  /** The share of thumbs-up among the ratings of a model version. */
+  val route: Route = path("v1" / "models" / Segment / "satisfaction") { version =>
+    get {
+      parameter("window".optional) { windowParam =>
+        val window = windowParam.getOrElse("24h")
+        WindowHours.get(window) match {
+          case None => complete(StatusCodes.BadRequest -> "window must be 1h, 24h or 7d")
+          case Some(hours) =>
             val now = System.currentTimeMillis()
-            cache.get(key) match {
-              case Some((cachedAt, body)) if now - cachedAt < CacheTtlSeconds * 1000L =>
-                complete(StatusCodes.OK, body)
+            val body = scoreCache.get((version, window)) match {
+              case Some((at, cached)) if now - at < CacheTtlMillis => cached
               case _ =>
-                val since = now - WindowSeconds(window) * 1000L
-                val totals = satisfaction.counts(version, since)
-                val body =
-                  if (totals.total < MinSamples)
-                    Satisfaction(version, window, totals.total, None, "insufficient_data")
-                  else
-                    Satisfaction(version, window, totals.total, Some(totals.positive.toDouble / totals.total), "ok")
-                cache = cache.updated(key, (now, body))
-                complete(StatusCodes.OK, body)
+                val fresh = compute(version, window, hours, now)
+                scoreCache((version, window)) = (now, fresh)
+                fresh
             }
-          }
+            complete(json(body))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -613,123 +444,497 @@ object SatisfactionApi {
 #include <map>
 #include <string>
 
+#include "feedback/store.h"  // store::totals, hourTotals
+
 using json = nlohmann::json;
 
-std::map<std::string, json> scoreCache;
+std::map<std::string, json> score_cache;
 
-struct SatisfactionStore {
-  json allTimeTotals(const std::string& modelVersion);
-};
-
-SatisfactionStore satisfaction;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/models/([^/]+)/satisfaction)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const std::string version = req.matches[1];
-    const auto hit = scoreCache.find(version);
-    if (hit != scoreCache.end()) {
-      res.status = 200;
-      res.set_content(hit->second.dump(), "application/json");
-      return;
-    }
-    const json totals = satisfaction.allTimeTotals(version);
-    const json body = {
-        {"model_version", version},
-        {"window", req.has_param("window") ? req.get_param_value("window") : "all"},
-        {"samples", totals.at("total")},
-        {"score", totals.at("positive").get<double>() / totals.at("total").get<double>()},
-    };
-    scoreCache[version] = body;
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// The share of thumbs-up among the ratings of a model version.
+void satisfaction(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string version = req.matches[1];
+  const std::string window = req.has_param("window") ? req.get_param_value("window") : "all";
+  if (const auto hit = score_cache.find(version); hit != score_cache.end()) {
+    res.set_content(hit->second.dump(), "application/json");
+    return;
+  }
+  const auto [samples, positive] = store::totals(version);
+  const json body = {{"model_version", version},
+                     {"window", window},
+                     {"samples", samples},
+                     {"status", "ok"},
+                     {"score", samples > 0 ? static_cast<double>(positive) / samples : 0.0}};
+  score_cache[version] = body;
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/models/([\\w.-]+)/satisfaction)", satisfaction); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <map>
-#include <set>
 #include <string>
+
+#include "feedback/store.h"  // store::totals, hourTotals
 
 using json = nlohmann::json;
 
-constexpr int kMinSamples = 50;
-constexpr int kCacheTtlSeconds = 60;
+const std::map<std::string, long long> kWindowHours = {{"1h", 1}, {"24h", 24}, {"7d", 168}};
+constexpr long long kMinSamples = 50;
+constexpr std::chrono::seconds kCacheTtl{60};
 
-const std::map<std::string, long long> kWindowSeconds = {{"1h", 3600}, {"24h", 86400}, {"7d", 7 * 86400}};
-const std::set<std::string> kAllowedWindows = {"1h", "24h", "7d"};
-
-struct CacheEntry {
-  long long cachedAt;
-  json value;
+struct CachedScore {
+  std::chrono::system_clock::time_point at;
+  json body;
 };
 
-std::map<std::string, CacheEntry> satisfactionCache;
+// Keyed by version and window.
+std::map<std::string, CachedScore> score_cache;
 
-struct SatisfactionStore {
-  json counts(const std::string& modelVersion, long long sinceMillis);
-};
-
-SatisfactionStore satisfaction;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/models/([^/]+)/satisfaction)", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string version = req.matches[1];
-    const std::string window = req.has_param("window") ? req.get_param_value("window") : "24h";
-    if (kAllowedWindows.count(window) == 0) {
-      res.status = 400;
-      res.set_content(R"({"error":"unknown window"})", "application/json");
-      return;
-    }
-    const std::string key = version + ":" + window;
-    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::system_clock::now().time_since_epoch())
-                              .count();
-    const auto hit = satisfactionCache.find(key);
-    if (hit != satisfactionCache.end() && now - hit->second.cachedAt < kCacheTtlSeconds * 1000LL) {
-      res.status = 200;
-      res.set_content(hit->second.value.dump(), "application/json");
-      return;
-    }
-    const long long since = now - kWindowSeconds.at(window) * 1000LL;
-    const json totals = satisfaction.counts(version, since);
-    json body = {
-        {"model_version", version},
-        {"window", window},
-        {"samples", totals.at("total")},
-    };
-    if (totals.at("total").get<int>() < kMinSamples) {
-      body["status"] = "insufficient_data";
-    } else {
-      body["score"] = totals.at("positive").get<double>() / totals.at("total").get<double>();
-      body["status"] = "ok";
-    }
-    satisfactionCache[key] = CacheEntry{now, body};
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// The share of thumbs-up among the ratings of a model version.
+void satisfaction(const httplib::Request& req, httplib::Response& res) {
+  const std::string version = req.matches[1];
+  const std::string window = req.has_param("window") ? req.get_param_value("window") : "24h";
+  const auto hours = kWindowHours.find(window);
+  if (hours == kWindowHours.end()) {
+    res.status = 400;
+    res.set_content("window must be 1h, 24h or 7d", "text/plain");
+    return;
+  }
+  const auto now = std::chrono::system_clock::now();
+  const std::string key = version + "/" + window;
+  if (const auto hit = score_cache.find(key); hit != score_cache.end() && now - hit->second.at < kCacheTtl) {
+    res.set_content(hit->second.body.dump(), "application/json");
+    return;
+  }
+  const long long hour = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count() / 3600;
+  long long samples = 0;
+  long long positive = 0;
+  for (long long h = hour - hours->second + 1; h <= hour; h++) {
+    const auto [s, p] = store::hourTotals(version, h);
+    samples += s;
+    positive += p;
+  }
+  json body = {{"model_version", version}, {"window", window}, {"samples", samples}};
+  if (samples < kMinSamples) {
+    body["status"] = "insufficient_data";
+    body["score"] = nullptr;
+  } else {
+    body["status"] = "ok";
+    body["score"] = static_cast<double>(positive) / samples;
+  }
+  score_cache[key] = CachedScore{now, body};
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/models/([\\w.-]+)/satisfaction)", satisfaction); }
 `,
     },
   },
-  debrief: `A satisfaction number is a claim, and the sample floor is what makes it one: below 50 samples
-the only truthful answer is the sample count, because a score over three votes is noise with a decimal
-point. An all-time aggregate lets a fresh model inherit the previous model's reputation, and an open
-\`window\` parameter lets the caller pick whichever sample set flatters the number.
+  harness: {
+    python: `import time
 
-The cache is a correctness problem, not a performance one: a score cached without an expiry keeps
-serving the pre-release value until someone clears it by hand. A short TTL keyed by version and window
-bounds the staleness. Production dashboards show a confidence interval and the unattributed share
-beside the score, so a large attribution gap is visible rather than averaged away.`,
+from feedback import store
+
+VERSION = "support-llm-2026-09"
+
+
+def _align(ctx):
+    """Move the clock to the middle of an hour, so the buckets a check writes are the ones the read sums."""
+    ctx.clock.advance(3600 - time.time() % 3600 + 1800)
+    return int(time.time())
+
+
+def _seed(n, positive, at):
+    for i in range(n):
+        store.record_quality(VERSION, 1 if i < positive else -1, at)
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+async def _get(c, query=""):
+    return await c.get(f"/v1/models/{VERSION}/satisfaction{query}")
+
+
+async def check_window(ctx):
+    _seed(60, 30, _align(ctx))
+    async with _api(ctx) as c:
+        default = await _get(c)
+        hour = await _get(c, "?window=1h")
+        week = await _get(c, "?window=7d")
+        everything = await _get(c, "?window=all")
+        month = await _get(c, "?window=30d")
+    assert default.status_code == 200 and default.json().get("window") == "24h", f"without ?window= the read answered {default.status_code} {default.text}, expected the 24h window"
+    assert hour.status_code == 200 and hour.json().get("window") == "1h", f"?window=1h answered {hour.status_code} {hour.text}"
+    assert week.status_code == 200 and week.json().get("window") == "7d", f"?window=7d answered {week.status_code} {week.text}"
+    assert everything.status_code == 400, f"?window=all answered {everything.status_code}, expected 400: the windows are 1h, 24h and 7d"
+    assert month.status_code == 400, f"?window=30d answered {month.status_code}, expected 400"
+
+
+async def check_recent_window(ctx):
+    now = _align(ctx)
+    _seed(80, 80, now - 8 * 86400)  # last week: every vote a thumbs-up
+    for i in range(60):  # the last day: 15 of 60
+        store.record_quality(VERSION, 1 if i < 15 else -1, now - (i % 20) * 3600)
+    async with _api(ctx) as c:
+        day = await _get(c, "?window=24h")
+        week = await _get(c, "?window=7d")
+    assert day.status_code == 200, f"?window=24h answered {day.status_code}: {day.text}"
+    body = day.json()
+    assert body.get("samples") == 60, f"the 24h window counted {body.get('samples')} ratings, expected the 60 of the last day: votes from 8 days ago are outside it"
+    assert body.get("score") is not None and abs(body["score"] - 0.25) < 1e-9, f"the 24h score is {body.get('score')}, expected 15 / 60 = 0.25"
+    assert week.json().get("samples") == 60, f"the 7d window counted {week.json().get('samples')} ratings, expected 60: 8 days ago is outside 7 days"
+
+
+async def check_sample_floor(ctx):
+    now = _align(ctx)
+    _seed(49, 49, now)
+    async with _api(ctx) as c:
+        thin = await _get(c, "?window=24h")
+        store.record_quality(VERSION, -1, now)
+        ctx.clock.advance(61)
+        enough = await _get(c, "?window=24h")
+    body = thin.json()
+    assert thin.status_code == 200, f"the read answered {thin.status_code}: {thin.text}"
+    assert body.get("samples") == 49, f"49 ratings were counted as {body.get('samples')}"
+    assert body.get("status") == "insufficient_data" and body.get("score") is None, f"49 ratings answered {body}: below 50 samples the read reports insufficient_data and no score"
+    body = enough.json()
+    assert body.get("status") == "ok" and body.get("samples") == 50, f"50 ratings answered {body}, expected status ok"
+    assert abs(body["score"] - 0.98) < 1e-9, f"49 thumbs-up of 50 scored {body.get('score')}, expected 0.98"
+
+
+async def check_cache_ttl(ctx):
+    now = _align(ctx)
+    _seed(60, 60, now)
+    async with _api(ctx) as c:
+        first = (await _get(c, "?window=24h")).json()
+        _seed(60, 0, now)
+        cached = (await _get(c, "?window=24h")).json()
+        hour = (await _get(c, "?window=1h")).json()
+        ctx.clock.advance(61)
+        fresh = (await _get(c, "?window=24h")).json()
+    assert first.get("samples") == 60 and first.get("score") == 1.0, f"60 thumbs-up answered {first}"
+    assert cached == first, f"a second read right away answered {cached}, expected the cached {first}: the score is cached for 60 s"
+    assert hour.get("window") == "1h" and hour.get("samples") == 120, f"?window=1h answered {hour}: the cache is per version and window, so the 1h read computes its own body"
+    assert fresh.get("samples") == 120 and fresh.get("score") is not None and abs(fresh["score"] - 0.5) < 1e-9, f"61 s later the 24h read answered {fresh}: a cached score expires after 60 s"
+`,
+    typescript: `const VERSION = 'support-llm-2026-09';
+
+/** Move the clock to the middle of an hour, so the buckets a check writes are the ones the read sums. */
+function align(ctx): number {
+  const now = ctx.clock.now() / 1000;
+  ctx.clock.advance(3600 - (now % 3600) + 1800);
+  return Math.floor(ctx.clock.now() / 1000);
+}
+
+function api(ctx) {
+  const m = ctx.load('read');
+  return {c: ctx.client(m.app), store: ctx.load('/support/feedback/store.ts')};
+}
+
+async function seed(store, n: number, positive: number, at: number): Promise<void> {
+  for (let i = 0; i < n; i += 1) await store.recordQuality(VERSION, i < positive ? 1 : -1, at);
+}
+
+const get = (c, query = '') => c.get(\`/v1/models/\${VERSION}/satisfaction\${query}\`);
+
+export async function check_window(ctx) {
+  const {c, store} = api(ctx);
+  await seed(store, 60, 30, align(ctx));
+  const def = await get(c);
+  const hour = await get(c, '?window=1h');
+  const week = await get(c, '?window=7d');
+  const everything = await get(c, '?window=all');
+  const month = await get(c, '?window=30d');
+  assert(def.status === 200 && def.json().window === '24h', \`without ?window= the read answered \${def.status} \${def.text}, expected the 24h window\`);
+  assert(hour.status === 200 && hour.json().window === '1h', \`?window=1h answered \${hour.status} \${hour.text}\`);
+  assert(week.status === 200 && week.json().window === '7d', \`?window=7d answered \${week.status} \${week.text}\`);
+  assert.equal(everything.status, 400, \`?window=all answered \${everything.status}, expected 400: the windows are 1h, 24h and 7d\`);
+  assert.equal(month.status, 400, \`?window=30d answered \${month.status}, expected 400\`);
+}
+
+export async function check_recent_window(ctx) {
+  const {c, store} = api(ctx);
+  const now = align(ctx);
+  await seed(store, 80, 80, now - 8 * 86400); // last week: every vote a thumbs-up
+  for (let i = 0; i < 60; i += 1) await store.recordQuality(VERSION, i < 15 ? 1 : -1, now - (i % 20) * 3600); // the last day: 15 of 60
+  const day = await get(c, '?window=24h');
+  const week = await get(c, '?window=7d');
+  assert.equal(day.status, 200, \`?window=24h answered \${day.status}: \${day.text}\`);
+  const body = day.json();
+  assert.equal(body.samples, 60, \`the 24h window counted \${body.samples} ratings, expected the 60 of the last day: votes from 8 days ago are outside it\`);
+  assert(typeof body.score === 'number' && Math.abs(body.score - 0.25) < 1e-9, \`the 24h score is \${body.score}, expected 15 / 60 = 0.25\`);
+  assert.equal(week.json().samples, 60, \`the 7d window counted \${week.json().samples} ratings, expected 60: 8 days ago is outside 7 days\`);
+}
+
+export async function check_sample_floor(ctx) {
+  const {c, store} = api(ctx);
+  const now = align(ctx);
+  await seed(store, 49, 49, now);
+  const thin = await get(c, '?window=24h');
+  await store.recordQuality(VERSION, -1, now);
+  ctx.clock.advance(61);
+  const enough = await get(c, '?window=24h');
+  let body = thin.json();
+  assert.equal(thin.status, 200, \`the read answered \${thin.status}: \${thin.text}\`);
+  assert.equal(body.samples, 49, \`49 ratings were counted as \${body.samples}\`);
+  assert(body.status === 'insufficient_data' && body.score === null, \`49 ratings answered \${thin.text}: below 50 samples the read reports insufficient_data and no score\`);
+  body = enough.json();
+  assert(body.status === 'ok' && body.samples === 50, \`50 ratings answered \${enough.text}, expected status ok\`);
+  assert(Math.abs(body.score - 0.98) < 1e-9, \`49 thumbs-up of 50 scored \${body.score}, expected 0.98\`);
+}
+
+export async function check_cache_ttl(ctx) {
+  const {c, store} = api(ctx);
+  const now = align(ctx);
+  await seed(store, 60, 60, now);
+  const first = (await get(c, '?window=24h')).json();
+  await seed(store, 60, 0, now);
+  const cached = (await get(c, '?window=24h')).json();
+  const hour = (await get(c, '?window=1h')).json();
+  ctx.clock.advance(61);
+  const fresh = (await get(c, '?window=24h')).json();
+  assert(first.samples === 60 && first.score === 1, \`60 thumbs-up answered \${JSON.stringify(first)}\`);
+  assert.deepEqual(cached, first, \`a second read right away answered \${JSON.stringify(cached)}, expected the cached \${JSON.stringify(first)}: the score is cached for 60 s\`);
+  assert(hour.window === '1h' && hour.samples === 120, \`?window=1h answered \${JSON.stringify(hour)}: the cache is per version and window, so the 1h read computes its own body\`);
+  assert(fresh.samples === 120 && typeof fresh.score === 'number' && Math.abs(fresh.score - 0.5) < 1e-9, \`61 s later the 24h read answered \${JSON.stringify(fresh)}: a cached score expires after 60 s\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"feedback/store"
+
+	"leetbuild/harness"
+)
+
+const readVersion = "support-llm-2026-09"
+
+var readBg = context.Background()
+
+// align moves the clock to the middle of an hour, so the buckets a check writes are the ones the read sums.
+func align(ctx *harness.Ctx) int64 {
+	now := ctx.Clock.Now() / 1000
+	ctx.Clock.Advance(float64(3600 - now%3600 + 1800))
+	return ctx.Clock.Now() / 1000
+}
+
+func seed(n, positive int, at int64) {
+	for i := 0; i < n; i++ {
+		rating := -1
+		if i < positive {
+			rating = 1
+		}
+		store.RecordQuality(readBg, readVersion, rating, at)
+	}
+}
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func getScore(c *harness.HTTP, query string) *harness.Response {
+	return c.Get("/v1/models/" + readVersion + "/satisfaction" + query)
+}
+
+func body(ctx *harness.Ctx, r *harness.Response) map[string]any {
+	m, ok := r.JSON().(map[string]any)
+	ctx.Assert(ok, "the read must answer a JSON object, got %d %s", r.Status, r.Text())
+	return m
+}
+
+func near(v any, want float64) bool {
+	f, ok := v.(float64)
+	return ok && f-want < 1e-9 && want-f < 1e-9
+}
+
+func CheckWindow(ctx *harness.Ctx) {
+	seed(60, 30, align(ctx))
+	c := readAPI(ctx)
+	def := getScore(c, "")
+	hour := getScore(c, "?window=1h")
+	week := getScore(c, "?window=7d")
+	everything := getScore(c, "?window=all")
+	month := getScore(c, "?window=30d")
+	ctx.Assert(def.Status == 200 && body(ctx, def)["window"] == "24h", "without ?window= the read answered %d %s, expected the 24h window", def.Status, def.Text())
+	ctx.Assert(hour.Status == 200 && body(ctx, hour)["window"] == "1h", "?window=1h answered %d %s", hour.Status, hour.Text())
+	ctx.Assert(week.Status == 200 && body(ctx, week)["window"] == "7d", "?window=7d answered %d %s", week.Status, week.Text())
+	ctx.Equal(everything.Status, 400, "?window=all (the windows are 1h, 24h and 7d)")
+	ctx.Equal(month.Status, 400, "?window=30d")
+}
+
+func CheckRecentWindow(ctx *harness.Ctx) {
+	now := align(ctx)
+	seed(80, 80, now-8*86400) // last week: every vote a thumbs-up
+	for i := 0; i < 60; i++ { // the last day: 15 of 60
+		rating := -1
+		if i < 15 {
+			rating = 1
+		}
+		store.RecordQuality(readBg, readVersion, rating, now-int64(i%20)*3600)
+	}
+	c := readAPI(ctx)
+	day := getScore(c, "?window=24h")
+	week := getScore(c, "?window=7d")
+	ctx.Equal(day.Status, 200, "?window=24h (%s)", day.Text())
+	b := body(ctx, day)
+	ctx.Equal(b["samples"], 60, "the 24h window must count the 60 ratings of the last day (votes from 8 days ago are outside it); samples")
+	ctx.Assert(near(b["score"], 0.25), "the 24h score is %v, expected 15 / 60 = 0.25", b["score"])
+	ctx.Equal(body(ctx, week)["samples"], 60, "the 7d window must count 60 ratings (8 days ago is outside 7 days); samples")
+}
+
+func CheckSampleFloor(ctx *harness.Ctx) {
+	now := align(ctx)
+	seed(49, 49, now)
+	c := readAPI(ctx)
+	thin := getScore(c, "?window=24h")
+	store.RecordQuality(readBg, readVersion, -1, now)
+	ctx.Clock.Advance(61)
+	enough := getScore(c, "?window=24h")
+	ctx.Equal(thin.Status, 200, "the read (%s)", thin.Text())
+	b := body(ctx, thin)
+	ctx.Equal(b["samples"], 49, "49 ratings; samples")
+	ctx.Assert(b["status"] == "insufficient_data" && b["score"] == nil, "49 ratings answered %s: below 50 samples the read reports insufficient_data and no score", thin.Text())
+	b = body(ctx, enough)
+	ctx.Assert(b["status"] == "ok" && near(b["samples"], 50), "50 ratings answered %s, expected status ok", enough.Text())
+	ctx.Assert(near(b["score"], 0.98), "49 thumbs-up of 50 scored %v, expected 0.98", b["score"])
+}
+
+func CheckCacheTtl(ctx *harness.Ctx) {
+	now := align(ctx)
+	seed(60, 60, now)
+	c := readAPI(ctx)
+	first := getScore(c, "?window=24h")
+	seed(60, 0, now)
+	cached := getScore(c, "?window=24h")
+	hour := body(ctx, getScore(c, "?window=1h"))
+	ctx.Clock.Advance(61)
+	fresh := body(ctx, getScore(c, "?window=24h"))
+	f := body(ctx, first)
+	ctx.Assert(near(f["samples"], 60) && near(f["score"], 1), "60 thumbs-up answered %s", first.Text())
+	ctx.Equal(cached.Text(), first.Text(), "a second read right away must answer the cached body (the score is cached for 60 s)")
+	ctx.Assert(hour["window"] == "1h" && near(hour["samples"], 120), "?window=1h answered %v: the cache is per version and window, so the 1h read computes its own body", hour)
+	ctx.Assert(near(fresh["samples"], 120) && near(fresh["score"], 0.5), "61 s later the 24h read answered %v: a cached score expires after 60 s", fresh)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+#include <string>
+
+namespace {
+
+const std::string kVersion = "support-llm-2026-09";
+
+// Move the clock to the middle of an hour, so the buckets a check writes are the ones the read sums.
+long long align(harness::Ctx& ctx) {
+  const long long now = ctx.Clock.Now() / 1000;
+  ctx.Clock.Advance(static_cast<double>(3600 - now % 3600 + 1800));
+  return ctx.Clock.Now() / 1000;
+}
+
+void seed(int n, int positive, long long at) {
+  for (int i = 0; i < n; i++) store::recordQuality(kVersion, i < positive ? 1 : -1, at);
+}
+
+harness::HTTP readApi(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response getScore(harness::HTTP& c, const std::string& query) { return c.Get("/v1/models/" + kVersion + "/satisfaction" + query); }
+
+nlohmann::json body(harness::Ctx& ctx, const harness::Response& r) {
+  const auto b = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(b.is_object(), "the read must answer a JSON object, got %d %s", r.Status, r.Text());
+  return b;
+}
+
+bool near(const nlohmann::json& v, double want) { return v.is_number() && std::fabs(v.get<double>() - want) < 1e-9; }
+
+}  // namespace
+
+void CheckWindow(harness::Ctx& ctx) {
+  seed(60, 30, align(ctx));
+  auto c = readApi(ctx);
+  const auto def = getScore(c, "");
+  const auto hour = getScore(c, "?window=1h");
+  const auto week = getScore(c, "?window=7d");
+  const auto everything = getScore(c, "?window=all");
+  const auto month = getScore(c, "?window=30d");
+  ctx.Assert(def.Status == 200 && body(ctx, def).value("window", "") == "24h", "without ?window= the read answered %d %s, expected the 24h window", def.Status, def.Text());
+  ctx.Assert(hour.Status == 200 && body(ctx, hour).value("window", "") == "1h", "?window=1h answered %d %s", hour.Status, hour.Text());
+  ctx.Assert(week.Status == 200 && body(ctx, week).value("window", "") == "7d", "?window=7d answered %d %s", week.Status, week.Text());
+  ctx.Equal(everything.Status, 400, "?window=all (the windows are 1h, 24h and 7d)");
+  ctx.Equal(month.Status, 400, "?window=30d");
+}
+
+void CheckRecentWindow(harness::Ctx& ctx) {
+  const long long now = align(ctx);
+  seed(80, 80, now - 8 * 86400);  // last week: every vote a thumbs-up
+  for (int i = 0; i < 60; i++) store::recordQuality(kVersion, i < 15 ? 1 : -1, now - (i % 20) * 3600LL);  // the last day: 15 of 60
+  auto c = readApi(ctx);
+  const auto day = getScore(c, "?window=24h");
+  const auto week = getScore(c, "?window=7d");
+  ctx.Equal(day.Status, 200, "?window=24h (%s)", day.Text());
+  const auto b = body(ctx, day);
+  ctx.Equal(b.value("samples", 0LL), 60, "the 24h window must count the 60 ratings of the last day (votes from 8 days ago are outside it); samples");
+  ctx.Assert(near(b.value("score", nlohmann::json()), 0.25), "the 24h score is %s, expected 15 / 60 = 0.25", b.value("score", nlohmann::json()).dump());
+  ctx.Equal(body(ctx, week).value("samples", 0LL), 60, "the 7d window must count 60 ratings (8 days ago is outside 7 days); samples");
+}
+
+void CheckSampleFloor(harness::Ctx& ctx) {
+  const long long now = align(ctx);
+  seed(49, 49, now);
+  auto c = readApi(ctx);
+  const auto thin = getScore(c, "?window=24h");
+  store::recordQuality(kVersion, -1, now);
+  ctx.Clock.Advance(61);
+  const auto enough = getScore(c, "?window=24h");
+  ctx.Equal(thin.Status, 200, "the read (%s)", thin.Text());
+  auto b = body(ctx, thin);
+  ctx.Equal(b.value("samples", 0LL), 49, "49 ratings; samples");
+  ctx.Assert(b.value("status", "") == "insufficient_data" && b.contains("score") && b["score"].is_null(), "49 ratings answered %s: below 50 samples the read reports insufficient_data and no score", thin.Text());
+  b = body(ctx, enough);
+  ctx.Assert(b.value("status", "") == "ok" && b.value("samples", 0LL) == 50, "50 ratings answered %s, expected status ok", enough.Text());
+  ctx.Assert(near(b.value("score", nlohmann::json()), 0.98), "49 thumbs-up of 50 scored %s, expected 0.98", b.value("score", nlohmann::json()).dump());
+}
+
+void CheckCacheTtl(harness::Ctx& ctx) {
+  const long long now = align(ctx);
+  seed(60, 60, now);
+  auto c = readApi(ctx);
+  const auto first = getScore(c, "?window=24h");
+  seed(60, 0, now);
+  const auto cached = getScore(c, "?window=24h");
+  const auto hour = body(ctx, getScore(c, "?window=1h"));
+  ctx.Clock.Advance(61);
+  const auto fresh = body(ctx, getScore(c, "?window=24h"));
+  const auto f = body(ctx, first);
+  ctx.Assert(f.value("samples", 0LL) == 60 && near(f.value("score", nlohmann::json()), 1.0), "60 thumbs-up answered %s", first.Text());
+  ctx.Equal(cached.Text(), first.Text(), "a second read right away must answer the cached body (the score is cached for 60 s)");
+  ctx.Assert(hour.value("window", "") == "1h" && hour.value("samples", 0LL) == 120, "?window=1h answered %s: the cache is per version and window, so the 1h read computes its own body", hour.dump());
+  ctx.Assert(fresh.value("samples", 0LL) == 120 && near(fresh.value("score", nlohmann::json()), 0.5), "61 s later the 24h read answered %s: a cached score expires after 60 s", fresh.dump());
+}
+`,
+  },
+  hints: [
+    'Ship a prompt change that sinks the thumbs-up rate today: the score barely moves, stays the same an hour later, and a version with three votes already shows a percentage.',
+    'The handler reads `store.totals`, the counters since the model shipped, caches the body under the version with no timestamp, never compares the sample count to anything, and echoes any window.',
+    "Validate `window` against `WINDOW_HOURS` (default `24h`, else 400), sum `store.hour_totals(version, h)` over the window's hours, answer `insufficient_data` below `MIN_SAMPLES`, and cache `(time.time(), body)` under `(version, window)` for `CACHE_TTL_S`.",
+  ],
+  debrief: `Hour buckets are what make a window cheap: the consumer already counts per hour, so a window is a sum of at most 168 small hashes, and old votes fall out of the score by construction. The floor exists because a ratio of three votes is noise that looks like a verdict, and a dashboard has no way to show that a number is not one. The cache is short and keyed by window so a bad release shows up within a minute and one window never answers for another. Production quality dashboards report a confidence interval (Wilson, for a share) instead of a hard floor, roll hours into days for long windows, and split scores by prompt version and route.`,
 };

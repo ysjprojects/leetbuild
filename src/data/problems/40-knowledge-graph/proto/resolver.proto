@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package graph;
+
+// The entity resolver step 3 asks before two entities of a tenant become one: how likely the pair
+// is the same real-world thing, as a score in [0, 1]. A pair the resolver refuses to score (a
+// do-not-merge rule, entities of different types) is FAILED_PRECONDITION, with the rule in the
+// details: terminal for that pair.
+service Resolver {
+  rpc Score(PairRequest) returns (PairScore);
+}
+
+message PairRequest {
+  string tenant = 1;
+  string left = 2;
+  string right = 3;
+}
+
+message PairScore {
+  double score = 1;
+  string model = 2;
+}

@@ -2,162 +2,204 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis frontier with per-host politeness tokens',
+  title: 'Redis frontier: a queue and a token bucket per host, spent in one script',
   concept: 'redis',
   file: 'state',
-  focus: ['crawler', 'redis', 'fetcher'],
+  focus: ['crawler', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is the frontier the crawl workers take work from: \`enqueue\`
-pushes a URL with \`RPUSH\`, \`take\` refills a bucket and pops with \`LPOP\`, and \`throttle\`
-records a 429. With one host it hands out URLs at about the right speed. It serves the demo and
-hides five flaws.
+**Starting point.** The starter is the frontier every crawl worker takes work from:
+\`enqueue(job_id, host, url)\` pushes the URL with \`RPUSH\` and records it in \`pending:{job_id}\`;
+\`take(job_id, host, rate_per_minute)\` refills the host's bucket \`bucket:{job_id}:{host}\` (fields
+\`tokens\`, \`ts\`) and pops a URL with \`LPOP\`; \`throttle(job_id, host, retry_after_s)\` records a
+429 in \`throttle:{job_id}:{host}\`; \`requeue\` puts a URL back. With one host and one worker it
+paces requests about right. It hides five flaws.
 
-**Failure mode the checks target.** Politeness is a per-host property. State shared across hosts
-lets the whole crawl's capacity land on one host, a client-side refill overshoots under concurrency,
-and a frontier with nowhere to record "come back in 30 seconds" hammers the host that said so.
+**Failure mode the checks target.** A take for one host hands out another host's URL; two workers
+both spend the last token; a host idle for an hour gets every queued URL at once; a host that
+answered 429 keeps being fetched; and every host ever crawled keeps a bucket in Redis.
 
-- One queue **per host**: \`frontier:{job_id}:{host}\` (\`RPUSH\` to enqueue, \`LPOP\` to take).
-- One **token bucket per host**, keyed \`bucket:{job_id}:{host}\`, with capacity and refill rate
-  from the host's \`rate_per_minute\`. Tokens accrue as \`elapsed_ms * rate / 60000\`, capped at
-  capacity; the key carries a TTL so an abandoned host stops costing memory.
-- The **refill and the take are one atomic Lua \`EVAL\`**: read, accrue, decide, write and return
-  whether a token was taken.
-- No shared \`bucket:global\` key that every host spends from.
-- A host that answers **429** is **throttled**: \`throttle:{job_id}:{host}\` holds a not-before
-  timestamp derived from \`Retry-After\`, doubled per consecutive attempt, and \`take\` returns
-  nothing while it is in the future.`,
+- One queue per host: \`frontier:{job_id}:{host}\`.
+- Tokens accrue at \`elapsed_ms * rate_per_minute / 60000\`, capped at \`BURST\` (2); a new bucket
+  starts full.
+- The refill, the spend and the \`LPOP\` are one Lua script (\`EVAL\`), which also answers nothing
+  while \`throttle:{job_id}:{host}\` holds a time (ms) still in the future.
+- The bucket expires \`BUCKET_TTL_MS\` (one hour) after its last take.`,
   sequence: {
-    participants: ['Crawl service', 'Redis frontier', 'Web host'],
+    participants: ['Crawl worker', 'Redis frontier', 'Second worker'],
     messages: [
       {
-        from: 'Crawl service',
+        from: 'Crawl worker',
         to: 'Redis frontier',
-        label: 'RPUSH frontier:{job}:{host} · discovered URL',
+        label: 'RPUSH frontier:{job}:{host} url · ZADD NX pending:{job}',
         kind: 'sync',
       },
-      {from: 'Crawl service', to: 'Redis frontier', label: 'GET throttle:{job}:{host}', kind: 'sync'},
-      {from: 'Redis frontier', to: 'Crawl service', label: 'not-before / none — skip while throttled', kind: 'reply'},
       {
-        from: 'Crawl service',
+        from: 'Crawl worker',
         to: 'Redis frontier',
-        label: 'EVAL refill + take on bucket:{job}:{host} · one atomic step',
+        label: 'EVAL take · bucket, queue, throttle · now, rate, BURST, TTL',
         kind: 'sync',
       },
-      {from: 'Redis frontier', to: 'Crawl service', label: '1 = token taken · 0 = empty bucket', kind: 'reply'},
-      {from: 'Crawl service', to: 'Web host', label: 'GET path only when the bucket allowed it', kind: 'sync'},
-      {from: 'Web host', to: 'Crawl service', label: '429 · Retry-After: 30', kind: 'reply'},
-      {from: 'Crawl service', to: 'Redis frontier', label: 'SET throttle:{job}:{host} · now + backoff', kind: 'async'},
+      {
+        from: 'Redis frontier',
+        to: 'Redis frontier',
+        label: 'throttled? refill ≤ BURST · token? LPOP · HSET · PEXPIRE',
+        kind: 'sync',
+      },
+      {from: 'Redis frontier', to: 'Crawl worker', label: 'url · or nil', kind: 'reply'},
+      {
+        from: 'Second worker',
+        to: 'Redis frontier',
+        label: 'EVAL take (runs after, sees the spent token)',
+        kind: 'sync',
+      },
+      {from: 'Redis frontier', to: 'Second worker', label: 'nil', kind: 'reply'},
     ],
   },
-  hints: [
-    "Crawl two hosts at once and the fast host eats the slow host's turns; the second host's URLs sit behind the first host's. A host answering 429 keeps getting fetched at the same rate.",
-    '`enqueue` pushes to `frontier:{job_id}` with no host, `take` refills `bucket:global` with a client-side GET-then-SET, and `throttle` returns without writing anything, so no worker can learn that a host asked for a pause.',
-    'Key `FRONTIER_KEY` and `BUCKET_KEY` by host, move the refill-and-take into one `REFILL_LUA` run with `EVAL`, and make `throttle` SET `throttle:{job_id}:{host}` to a not-before time that `take` checks first.',
-  ],
   checks: [
     {
-      id: 'host-queue',
-      title: 'One frontier queue per host',
+      id: 'per-host-queue',
+      title: 'One queue per host',
       detail:
-        'URLs are enqueued on `frontier:{job_id}:{host}` — a queue per host, pushed with `RPUSH`. The starter pushes every discovery onto one shared `frontier:{job_id}` list.',
+        "URLs are queued under `frontier:{job_id}:{host}` and `take` pops only from the host it was asked about. The starter keeps one list per job, so a take for one host can hand out another host's URL.",
       match: {
-        python: {all: [/frontier:\{job_id\}:\{host\}/, /rpush\(/]},
-        typescript: {all: [/frontier:\$\{jobId\}:\$\{host\}/, /rpush\(/]},
-        go: {all: [/frontier:%s:%s/, /RPush\(/]},
-        scala: {all: [/frontier:\$jobId:\$host/, /rpush\(/]},
-        cpp: {all: [/"frontier:"/, /rpush\(/]},
+        python: {all: [/frontier:\{job_id\}:\{host\}/], none: [/["']frontier:\{job_id\}["']/]},
+        typescript: {all: [/frontier:\$\{jobId\}:\$\{host\}/], none: [/`frontier:\$\{jobId\}`/]},
+        go: {
+          all: [/"frontier:"\s*\+\s*jobID\s*\+\s*":"\s*\+\s*host|"frontier:%s:%s"/],
+          none: [/"frontier:"\s*\+\s*jobID\s*\}/],
+        },
+        scala: {all: [/frontier:\$jobId:\$host|frontier:\$\{jobId\}:\$\{host\}/], none: [/"frontier:\$jobId"/]},
+        cpp: {all: [/"frontier:"\s*\+\s*job_id\s*\+\s*":"\s*\+\s*host/], none: [/"frontier:"\s*\+\s*job_id;/]},
       },
     },
     {
-      id: 'atomic-refill',
-      title: 'Refill and take in one atomic Lua script',
+      id: 'atomic-take',
+      title: 'Refill, spend and pop in one Lua script',
       detail:
-        'The bucket is read, accrued, spent and written inside one `EVAL` (`REFILL_LUA`). The starter reads with `GET` and writes with `SET` from the client, so two workers can both spend the same token.',
+        'The bucket is read, refilled, spent and the URL popped inside one script (`register_script`/`EVAL`), never with a client-side `HMGET` then `HSET`: a second worker landing between them reads the same tokens and both take a URL.',
       match: {
-        python: {all: [/REFILL_LUA/, /\.eval\(/], none: [/r\.set\(\s*bucket_key/]},
-        typescript: {all: [/REFILL_LUA/, /\.eval\(/], none: [/\.set\(\s*bucketKey/]},
-        go: {all: [/refillScript/, /\.Eval\(/], none: [/\.Set\(ctx,\s*bucketKey/]},
-        scala: {all: [/RefillLua/, /\.eval\(/], none: [/\.set\(\s*bucketKey/]},
-        cpp: {all: [/kRefillLua/, /\.eval</], none: [/\.set\(\s*bucketKey/]},
+        python: {
+          all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]LPOP['"]/],
+          none: [/\.hmget\(|\.hget\(|\.hgetall\(/],
+        },
+        typescript: {
+          all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]LPOP['"]/],
+          none: [/\.hmget\(|\.hget\(|\.hgetall\(/],
+        },
+        go: {
+          all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]LPOP['"]/],
+          none: [/\.HMGet\(|\.HGet\(|\.HGetAll\(/],
+        },
+        scala: {
+          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]LPOP['"]/],
+          none: [/\.hmget\(|\.hget\(|\.hgetAll\(/],
+        },
+        cpp: {
+          all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]LPOP['"]/],
+          none: [/\.hmget\(|\.hget\(|\.hgetall\(/],
+        },
       },
     },
     {
-      id: 'bucket-per-host',
-      title: 'Bucket keyed per host at the host’s rate',
+      id: 'refill-cap',
+      title: 'Tokens are capped at BURST',
       detail:
-        'The bucket is `bucket:{job_id}:{host}` and its capacity and refill rate come from the host policy’s `rate_per_minute`. One shared bucket spends every host’s politeness at whichever rate the busiest host is fetched.',
+        'The refill is `min(burst, tokens + elapsed_ms * rate / 60000)`: a host idle for an hour gets `BURST` URLs, then one per refill interval. The starter adds the elapsed time without a cap.',
       match: {
-        python: {all: [/bucket:\{job_id\}:\{host\}/, /rate_per_minute/]},
-        typescript: {all: [/bucket:\$\{jobId\}:\$\{host\}/, /rate_per_minute/]},
-        go: {all: [/bucket:%s:%s/, /RatePerMinute/]},
-        scala: {all: [/bucket:\$jobId:\$host/, /rate_per_minute/]},
-        cpp: {all: [/"bucket:"/, /rate_per_minute/]},
+        python: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
+        typescript: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
+        go: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
+        scala: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
+        cpp: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
       },
     },
     {
-      id: 'throttle-429',
-      title: 'A 429 throttles the host with exponential backoff',
+      id: 'throttle',
+      title: 'A throttled host gets nothing until its not-before time',
       detail:
-        'A 429 writes a not-before timestamp on `throttle:{job_id}:{host}` computed from `Retry-After`, doubled per consecutive attempt, and `take` skips the host until it passes. The starter cannot express “come back later” at all.',
+        '`take` reads `throttle:{job_id}:{host}` (inside the script) and hands out nothing while the time it holds is in the future; other hosts keep moving. The starter records the 429 and never reads it.',
       match: {
-        python: {all: [/throttle:\{job_id\}:\{host\}/, /retry_after/, /backoff/]},
-        typescript: {all: [/throttle:\$\{jobId\}:\$\{host\}/, /retry_after/, /backoff/]},
-        go: {all: [/throttle:%s:%s/, /retryAfter/, /backoff/]},
-        scala: {all: [/throttle:\$jobId:\$host/, /retryAfter/, /backoff/]},
-        cpp: {all: [/"throttle:"/, /retry_after/, /backoff/]},
+        python: {all: [/def take(?:(?!\ndef )[\s\S])*?throttle_key\(/]},
+        typescript: {all: [/function take(?:(?!\nexport )[\s\S])*?throttleKey\(/]},
+        go: {all: [/func take(?:(?!\n\})[\s\S])*?throttleKey\(/]},
+        scala: {all: [/def take(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?throttleKey\(/]},
+        cpp: {all: [/ take\((?:(?!\n\})[\s\S])*?throttleKey\(/]},
       },
     },
     {
-      id: 'no-global-bucket',
-      title: 'No shared rate bucket across hosts',
+      id: 'bucket-ttl',
+      title: "An idle host's bucket expires",
       detail:
-        'There is no single `bucket:global` (or equivalent) key that every host spends from: the crawl’s whole rate budget must not be drainable by one host.',
+        "Every take sets the bucket's expiry to `BUCKET_TTL_MS` (`PEXPIRE`), so a host the crawl stopped visiting stops costing memory; after an hour its bucket would be full anyway. The starter writes buckets that never expire.",
       match: {
-        python: {none: [/bucket:global/]},
-        typescript: {none: [/bucket:global/]},
-        go: {none: [/bucket:global/]},
-        scala: {none: [/bucket:global/]},
-        cpp: {none: [/bucket:global/]},
+        python: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /BUCKET_TTL_MS/]},
+        typescript: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /BUCKET_TTL_MS/]},
+        go: {all: [/P?EXPIRE['"]|\.P?Expire\(/i, /bucketTTLMs/]},
+        scala: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /BucketTtlMs/]},
+        cpp: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /kBucketTtlMs/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import redis
+      starter: `import time
+
+import redis
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-FRONTIER_KEY = "frontier:{job_id}"
-BUCKET_KEY = "bucket:global"
-RATE_PER_MINUTE = 30
+BURST = 2
 
 
-class HostPolicy:
-    def __init__(self, rate_per_minute: int = RATE_PER_MINUTE) -> None:
-        self.rate_per_minute = rate_per_minute
+def queue_key(job_id: str) -> str:
+    return f"frontier:{job_id}"
+
+
+def bucket_key(job_id: str, host: str) -> str:
+    return f"bucket:{job_id}:{host}"
+
+
+def throttle_key(job_id: str, host: str) -> str:
+    return f"throttle:{job_id}:{host}"
+
+
+def pending_key(job_id: str) -> str:
+    return f"pending:{job_id}"
 
 
 def enqueue(job_id: str, host: str, url: str) -> None:
-    """Add a discovered URL to the frontier."""
-    r.rpush(FRONTIER_KEY.format(job_id=job_id), url)
+    """Queue url on its host; it is pending from now until an outcome is recorded."""
+    r.rpush(queue_key(job_id), url)
+    r.zadd(pending_key(job_id), {url: time.time()}, nx=True)
 
 
-def take(job_id: str, host: str, policy: HostPolicy) -> str | None:
-    """The next URL for a host, if the shared bucket allows a fetch right now."""
+def take(job_id: str, host: str, rate_per_minute: int) -> str | None:
+    """The next URL of the host if the host is not throttled and its bucket holds a token, else None."""
     # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    bucket = r.get(BUCKET_KEY)
-    tokens = float(bucket) if bucket is not None else float(policy.rate_per_minute)
-    tokens = min(float(policy.rate_per_minute), tokens + 1.0)
-    r.set(BUCKET_KEY, tokens)
-    if tokens < 1:
-        return None
-    return r.lpop(FRONTIER_KEY.format(job_id=job_id))
+    now_ms = int(time.time() * 1000)
+    tokens, ts = r.hmget(bucket_key(job_id, host), "tokens", "ts")
+    tokens = BURST if tokens is None else float(tokens)
+    ts = now_ms if ts is None else int(ts)
+    tokens += (now_ms - ts) * rate_per_minute / 60000
+    url = None
+    if tokens >= 1:
+        url = r.lpop(queue_key(job_id))
+        if url is not None:
+            tokens -= 1
+    r.hset(bucket_key(job_id, host), mapping={"tokens": tokens, "ts": now_ms})
+    return url
 
 
-def throttle(job_id: str, host: str, retry_after_s: int, attempts: int) -> None:
-    """Record a 429 for the host."""
-    return None
+def throttle(job_id: str, host: str, retry_after_s: int) -> None:
+    """The host answered 429: take hands out nothing for it for retry_after_s seconds."""
+    wait_ms = max(int(retry_after_s), 1) * 1000
+    r.set(throttle_key(job_id, host), int(time.time() * 1000) + wait_ms, px=wait_ms)
+
+
+def requeue(job_id: str, host: str, url: str) -> None:
+    """Put a taken URL back at the tail of its host's queue."""
+    r.rpush(queue_key(job_id), url)
 `,
       solution: `import time
 
@@ -165,36 +207,32 @@ import redis
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-BUCKET_TTL_S = 3600
-MAX_THROTTLE_S = 900
+BURST = 2
+BUCKET_TTL_MS = 3_600_000
 
-REFILL_LUA = """
-local capacity = tonumber(ARGV[1])
-local rate_per_minute = tonumber(ARGV[2])
-local now_ms = tonumber(ARGV[3])
-local state = redis.call('HMGET', KEYS[1], 'tokens', 'refilled_at')
-local tokens = tonumber(state[1]) or capacity
-local refilled_at = tonumber(state[2]) or now_ms
-local elapsed_ms = math.max(0, now_ms - refilled_at)
-tokens = math.min(capacity, tokens + elapsed_ms * rate_per_minute / 60000)
-if tokens < 1 then
-  redis.call('HSET', KEYS[1], 'tokens', tokens, 'refilled_at', now_ms)
-  redis.call('EXPIRE', KEYS[1], ARGV[4])
-  return 0
+# KEYS: the host's bucket, queue and throttle. ARGV: now (ms), rate per minute, burst, bucket TTL (ms).
+TAKE_LUA = """
+local now = tonumber(ARGV[1])
+if now < tonumber(redis.call('GET', KEYS[3]) or '0') then return false end
+local rate = tonumber(ARGV[2])
+local burst = tonumber(ARGV[3])
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(state[1]) or burst
+local ts = tonumber(state[2]) or now
+tokens = math.min(burst, tokens + (now - ts) * rate / 60000)
+local url = false
+if tokens >= 1 then
+  url = redis.call('LPOP', KEYS[2])
+  if url then tokens = tokens - 1 end
 end
-redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'refilled_at', now_ms)
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-return 1
+redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+return url
 """
+take_script = r.register_script(TAKE_LUA)
 
 
-class HostPolicy:
-    def __init__(self, rate_per_minute: int = 30) -> None:
-        self.rate_per_minute = rate_per_minute
-
-
-def frontier_key(job_id: str, host: str) -> str:
-    """The queue of discovered URLs for one host, so hosts cannot back each other up."""
+def queue_key(job_id: str, host: str) -> str:
     return f"frontier:{job_id}:{host}"
 
 
@@ -206,417 +244,445 @@ def throttle_key(job_id: str, host: str) -> str:
     return f"throttle:{job_id}:{host}"
 
 
+def pending_key(job_id: str) -> str:
+    return f"pending:{job_id}"
+
+
 def enqueue(job_id: str, host: str, url: str) -> None:
-    """Add a discovered URL to that host's queue."""
-    r.rpush(frontier_key(job_id, host), url)
+    """Queue url on its host; it is pending from now until an outcome is recorded."""
+    r.rpush(queue_key(job_id, host), url)
+    r.zadd(pending_key(job_id), {url: time.time()}, nx=True)
 
 
-def take(job_id: str, host: str, policy: HostPolicy) -> str | None:
-    """One URL for the host, or None while its bucket is empty or the host is throttled."""
+def take(job_id: str, host: str, rate_per_minute: int) -> str | None:
+    """The next URL of the host if the host is not throttled and its bucket holds a token, else None."""
     now_ms = int(time.time() * 1000)
-    not_before = r.get(throttle_key(job_id, host))
-    if not_before is not None and now_ms < int(not_before):
-        return None
-    allowed = r.eval(
-        REFILL_LUA,
-        1,
-        bucket_key(job_id, host),
-        policy.rate_per_minute,
-        policy.rate_per_minute,
-        now_ms,
-        BUCKET_TTL_S,
-    )
-    if int(allowed) == 0:
-        return None
-    return r.lpop(frontier_key(job_id, host))
+    keys = [bucket_key(job_id, host), queue_key(job_id, host), throttle_key(job_id, host)]
+    return take_script(keys=keys, args=[now_ms, rate_per_minute, BURST, BUCKET_TTL_MS])
 
 
-def throttle(job_id: str, host: str, retry_after_s: int, attempts: int) -> int:
-    """Back the host off after a 429: not before Retry-After, doubled per consecutive attempt."""
-    backoff = min(MAX_THROTTLE_S, retry_after_s * (2 ** max(0, attempts - 1)))
-    not_before = int(time.time() * 1000) + backoff * 1000
-    r.set(throttle_key(job_id, host), not_before, ex=max(backoff, 60))
-    return backoff
+def throttle(job_id: str, host: str, retry_after_s: int) -> None:
+    """The host answered 429: take hands out nothing for it for retry_after_s seconds."""
+    wait_ms = max(int(retry_after_s), 1) * 1000
+    r.set(throttle_key(job_id, host), int(time.time() * 1000) + wait_ms, px=wait_ms)
+
+
+def requeue(job_id: str, host: str, url: str) -> None:
+    """Put a taken URL back at the tail of its host's queue."""
+    r.rpush(queue_key(job_id, host), url)
 `,
     },
     typescript: {
-      starter: `/** The Redis frontier. */
-import Redis from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const r = new Redis({host: 'redis', port: 6379});
+const redis = new Redis({host: 'redis', port: 6379});
 
-const RATE_PER_MINUTE = 30;
+export const BURST = 2;
 
-export interface HostPolicy {
-  rate_per_minute: number;
-}
-
-const FRONTIER_KEY = 'frontier:job';
-const BUCKET_KEY = 'bucket:global';
-
-export async function enqueue(_jobId: string, _host: string, url: string): Promise<void> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  await r.rpush(FRONTIER_KEY, url);
-}
-
-export async function take(_jobId: string, _host: string, policy: HostPolicy): Promise<string | null> {
-  const bucket = await r.get(BUCKET_KEY);
-  let tokens = bucket === null ? policy.rate_per_minute : Number(bucket);
-  tokens = Math.min(policy.rate_per_minute, tokens + 1);
-  await r.set(BUCKET_KEY, String(tokens));
-  if (tokens < 1) return null;
-  return r.lpop(FRONTIER_KEY);
-}
-
-export async function throttle(_jobId: string, _host: string, _retryAfterS: number, _attempts: number): Promise<number> {
-  return 0;
-}
-`,
-      solution: `/** The Redis frontier: one queue per host, one token bucket per host, one atomic script. */
-import Redis from 'ioredis';
-
-export const r = new Redis({host: 'redis', port: 6379});
-
-const BUCKET_TTL_S = 3600;
-const MAX_THROTTLE_S = 900;
-
-export const REFILL_LUA = \`
-local capacity = tonumber(ARGV[1])
-local rate_per_minute = tonumber(ARGV[2])
-local now_ms = tonumber(ARGV[3])
-local state = redis.call('HMGET', KEYS[1], 'tokens', 'refilled_at')
-local tokens = tonumber(state[1]) or capacity
-local refilled_at = tonumber(state[2]) or now_ms
-local elapsed_ms = math.max(0, now_ms - refilled_at)
-tokens = math.min(capacity, tokens + elapsed_ms * rate_per_minute / 60000)
-if tokens < 1 then
-  redis.call('HSET', KEYS[1], 'tokens', tokens, 'refilled_at', now_ms)
-  redis.call('EXPIRE', KEYS[1], ARGV[4])
-  return 0
-end
-redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'refilled_at', now_ms)
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-return 1
-\`;
-
-export interface HostPolicy {
-  rate_per_minute: number;
-}
-
-export const frontierKey = (jobId: string, host: string): string => \`frontier:\${jobId}:\${host}\`;
+export const queueKey = (jobId: string): string => \`frontier:\${jobId}\`;
 export const bucketKey = (jobId: string, host: string): string => \`bucket:\${jobId}:\${host}\`;
 export const throttleKey = (jobId: string, host: string): string => \`throttle:\${jobId}:\${host}\`;
+export const pendingKey = (jobId: string): string => \`pending:\${jobId}\`;
 
+/** Queue url on its host; it is pending from now until an outcome is recorded. */
 export async function enqueue(jobId: string, host: string, url: string): Promise<void> {
-  await r.rpush(frontierKey(jobId, host), url);
+  await redis.rpush(queueKey(jobId), url);
+  await redis.zadd(pendingKey(jobId), 'NX', Date.now() / 1000, url);
 }
 
-export async function take(jobId: string, host: string, policy: HostPolicy): Promise<string | null> {
-  const nowMs = Date.now();
-  const notBefore = await r.get(throttleKey(jobId, host));
-  if (notBefore !== null && nowMs < Number(notBefore)) return null;
-  const allowed = await r.eval(
-    REFILL_LUA,
-    1,
-    bucketKey(jobId, host),
-    String(policy.rate_per_minute),
-    String(policy.rate_per_minute),
-    String(nowMs),
-    String(BUCKET_TTL_S),
-  );
-  if (Number(allowed) === 0) return null;
-  return r.lpop(frontierKey(jobId, host));
+/** The next URL of the host if the host is not throttled and its bucket holds a token, else null. */
+export async function take(jobId: string, host: string, ratePerMinute: number): Promise<string | null> {
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  const now = Date.now();
+  const [savedTokens, savedTs] = await redis.hmget(bucketKey(jobId, host), 'tokens', 'ts');
+  let tokens = savedTokens === null ? BURST : Number(savedTokens);
+  const ts = savedTs === null ? now : Number(savedTs);
+  tokens += ((now - ts) * ratePerMinute) / 60000;
+  let url: string | null = null;
+  if (tokens >= 1) {
+    url = await redis.lpop(queueKey(jobId));
+    if (url !== null) tokens -= 1;
+  }
+  await redis.hset(bucketKey(jobId, host), {tokens: String(tokens), ts: String(now)});
+  return url;
 }
 
-export async function throttle(jobId: string, host: string, retry_after_s: number, attempts: number): Promise<number> {
-  const backoff = Math.min(MAX_THROTTLE_S, retry_after_s * 2 ** Math.max(0, attempts - 1));
-  const notBefore = Date.now() + backoff * 1000;
-  await r.set(throttleKey(jobId, host), String(notBefore), 'EX', Math.max(backoff, 60));
-  return backoff;
+/** The host answered 429: take hands out nothing for it for retryAfterS seconds. */
+export async function throttle(jobId: string, host: string, retryAfterS: number): Promise<void> {
+  const waitMs = Math.max(Math.floor(retryAfterS), 1) * 1000;
+  await redis.set(throttleKey(jobId, host), String(Date.now() + waitMs), 'PX', waitMs);
+}
+
+/** Put a taken URL back at the tail of its host's queue. */
+export async function requeue(jobId: string, host: string, url: string): Promise<void> {
+  await redis.rpush(queueKey(jobId), url);
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+export const BURST = 2;
+export const BUCKET_TTL_MS = 3_600_000;
+
+// KEYS: the host's bucket, queue and throttle. ARGV: now (ms), rate per minute, burst, bucket TTL (ms).
+export const TAKE_LUA = \`
+local now = tonumber(ARGV[1])
+if now < tonumber(redis.call('GET', KEYS[3]) or '0') then return false end
+local rate = tonumber(ARGV[2])
+local burst = tonumber(ARGV[3])
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(state[1]) or burst
+local ts = tonumber(state[2]) or now
+tokens = math.min(burst, tokens + (now - ts) * rate / 60000)
+local url = false
+if tokens >= 1 then
+  url = redis.call('LPOP', KEYS[2])
+  if url then tokens = tokens - 1 end
+end
+redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+return url
+\`;
+
+interface FrontierRedis extends Redis {
+  takeUrl(bucket: string, queue: string, throttle: string, now: number, rate: number, burst: number, ttl: number): Promise<string | null>;
+}
+
+const redis = new Redis({host: 'redis', port: 6379}) as FrontierRedis;
+redis.defineCommand('takeUrl', {numberOfKeys: 3, lua: TAKE_LUA});
+
+export const queueKey = (jobId: string, host: string): string => \`frontier:\${jobId}:\${host}\`;
+export const bucketKey = (jobId: string, host: string): string => \`bucket:\${jobId}:\${host}\`;
+export const throttleKey = (jobId: string, host: string): string => \`throttle:\${jobId}:\${host}\`;
+export const pendingKey = (jobId: string): string => \`pending:\${jobId}\`;
+
+/** Queue url on its host; it is pending from now until an outcome is recorded. */
+export async function enqueue(jobId: string, host: string, url: string): Promise<void> {
+  await redis.rpush(queueKey(jobId, host), url);
+  await redis.zadd(pendingKey(jobId), 'NX', Date.now() / 1000, url);
+}
+
+/** The next URL of the host if the host is not throttled and its bucket holds a token, else null. */
+export async function take(jobId: string, host: string, ratePerMinute: number): Promise<string | null> {
+  return redis.takeUrl(bucketKey(jobId, host), queueKey(jobId, host), throttleKey(jobId, host), Date.now(), ratePerMinute, BURST, BUCKET_TTL_MS);
+}
+
+/** The host answered 429: take hands out nothing for it for retryAfterS seconds. */
+export async function throttle(jobId: string, host: string, retryAfterS: number): Promise<void> {
+  const waitMs = Math.max(Math.floor(retryAfterS), 1) * 1000;
+  await redis.set(throttleKey(jobId, host), String(Date.now() + waitMs), 'PX', waitMs);
+}
+
+/** Put a taken URL back at the tail of its host's queue. */
+export async function requeue(jobId: string, host: string, url: string): Promise<void> {
+  await redis.rpush(queueKey(jobId, host), url);
 }
 `,
     },
     go: {
-      starter: `package state
+      starter: `package main
 
 import (
 	"context"
-	"fmt"
-
-	"github.com/redis/go-redis/v9"
-)
-
-const ratePerMinute = 30
-
-var r = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-
-const bucketKey = "bucket:global"
-
-type HostPolicy struct {
-	RatePerMinute int
-}
-
-func (p HostPolicy) rate() int {
-	if p.RatePerMinute > 0 {
-		return p.RatePerMinute
-	}
-	return ratePerMinute
-}
-
-func Enqueue(ctx context.Context, jobID, host, url string) error {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	return r.RPush(ctx, fmt.Sprintf("frontier:%s", jobID), url).Err()
-}
-
-func Take(ctx context.Context, jobID, host string, policy HostPolicy) (string, bool, error) {
-	raw, err := r.Get(ctx, bucketKey).Result()
-	tokens := float64(policy.rate())
-	if err == nil {
-		tokens, _ = parseFloat(raw)
-	}
-	tokens = min(float64(policy.rate()), tokens+1)
-	if err := r.Set(ctx, bucketKey, tokens, 0).Err(); err != nil {
-		return "", false, err
-	}
-	if tokens < 1 {
-		return "", false, nil
-	}
-	url, err := r.LPop(ctx, fmt.Sprintf("frontier:%s", jobID)).Result()
-	if err == redis.Nil {
-		return "", false, nil
-	}
-	return url, err == nil, err
-}
-
-func Throttle(ctx context.Context, jobID, host string, retryAfterS, attempts int) (int, error) {
-	return 0, nil
-}
-
-func parseFloat(raw string) (float64, error) {
-	var value float64
-	_, err := fmt.Sscanf(raw, "%f", &value)
-	return value, err
-}
-`,
-      solution: `package state
-
-import (
-	"context"
-	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	bucketTTLSeconds = 3600
-	maxThrottleS     = 900
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+const burst = 2
+
+func queueKey(jobID string) string          { return "frontier:" + jobID }
+func bucketKey(jobID, host string) string   { return "bucket:" + jobID + ":" + host }
+func throttleKey(jobID, host string) string { return "throttle:" + jobID + ":" + host }
+func pendingKey(jobID string) string        { return "pending:" + jobID }
+
+// enqueue queues url on its host; it is pending from now until an outcome is recorded.
+func enqueue(ctx context.Context, jobID, host, url string) error {
+	if err := rdb.RPush(ctx, queueKey(jobID), url).Err(); err != nil {
+		return err
+	}
+	return rdb.ZAddNX(ctx, pendingKey(jobID), redis.Z{Score: float64(time.Now().UnixMilli()) / 1000, Member: url}).Err()
+}
+
+// take is the next URL of the host if the host is not throttled and its bucket holds a token, else "".
+func take(ctx context.Context, jobID, host string, ratePerMinute int) (string, error) {
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+	nowMs := time.Now().UnixMilli()
+	state, err := rdb.HMGet(ctx, bucketKey(jobID, host), "tokens", "ts").Result()
+	if err != nil {
+		return "", err
+	}
+	tokens := float64(burst)
+	ts := nowMs
+	if saved, ok := state[0].(string); ok {
+		tokens, _ = strconv.ParseFloat(saved, 64)
+	}
+	if saved, ok := state[1].(string); ok {
+		ts, _ = strconv.ParseInt(saved, 10, 64)
+	}
+	tokens += float64(nowMs-ts) * float64(ratePerMinute) / 60000
+	url := ""
+	if tokens >= 1 {
+		popped, err := rdb.LPop(ctx, queueKey(jobID)).Result()
+		if err != nil && err != redis.Nil {
+			return "", err
+		}
+		if err == nil {
+			url = popped
+			tokens--
+		}
+	}
+	return url, rdb.HSet(ctx, bucketKey(jobID, host), "tokens", tokens, "ts", nowMs).Err()
+}
+
+// throttle: the host answered 429, take hands out nothing for it for retryAfterS seconds.
+func throttle(ctx context.Context, jobID, host string, retryAfterS int) error {
+	if retryAfterS < 1 {
+		retryAfterS = 1
+	}
+	wait := time.Duration(retryAfterS) * time.Second
+	return rdb.Set(ctx, throttleKey(jobID, host), time.Now().UnixMilli()+wait.Milliseconds(), wait).Err()
+}
+
+// requeue puts a taken URL back at the tail of its host's queue.
+func requeue(ctx context.Context, jobID, host, url string) error {
+	return rdb.RPush(ctx, queueKey(jobID), url).Err()
+}
+`,
+      solution: `package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
-var r = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const refillScript = \`
-local capacity = tonumber(ARGV[1])
-local rate_per_minute = tonumber(ARGV[2])
-local now_ms = tonumber(ARGV[3])
-local state = redis.call('HMGET', KEYS[1], 'tokens', 'refilled_at')
-local tokens = tonumber(state[1]) or capacity
-local refilled_at = tonumber(state[2]) or now_ms
-local elapsed_ms = math.max(0, now_ms - refilled_at)
-tokens = math.min(capacity, tokens + elapsed_ms * rate_per_minute / 60000)
-if tokens < 1 then
-  redis.call('HSET', KEYS[1], 'tokens', tokens, 'refilled_at', now_ms)
-  redis.call('EXPIRE', KEYS[1], ARGV[4])
-  return 0
+const (
+	burst       = 2
+	bucketTTLMs = 3600000
+)
+
+// takeScript: KEYS are the host's bucket, queue and throttle; ARGV now (ms), rate per minute, burst, bucket TTL (ms).
+var takeScript = redis.NewScript(\`
+local now = tonumber(ARGV[1])
+if now < tonumber(redis.call('GET', KEYS[3]) or '0') then return false end
+local rate = tonumber(ARGV[2])
+local burst = tonumber(ARGV[3])
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(state[1]) or burst
+local ts = tonumber(state[2]) or now
+tokens = math.min(burst, tokens + (now - ts) * rate / 60000)
+local url = false
+if tokens >= 1 then
+  url = redis.call('LPOP', KEYS[2])
+  if url then tokens = tokens - 1 end
 end
-redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'refilled_at', now_ms)
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-return 1
-\`
+redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+return url
+\`)
 
-type HostPolicy struct {
-	RatePerMinute int
-}
+func queueKey(jobID, host string) string    { return "frontier:" + jobID + ":" + host }
+func bucketKey(jobID, host string) string   { return "bucket:" + jobID + ":" + host }
+func throttleKey(jobID, host string) string { return "throttle:" + jobID + ":" + host }
+func pendingKey(jobID string) string        { return "pending:" + jobID }
 
-func frontierKey(jobID, host string) string {
-	return fmt.Sprintf("frontier:%s:%s", jobID, host)
-}
-
-func bucketKey(jobID, host string) string {
-	return fmt.Sprintf("bucket:%s:%s", jobID, host)
-}
-
-func throttleKey(jobID, host string) string {
-	return fmt.Sprintf("throttle:%s:%s", jobID, host)
-}
-
-func Enqueue(ctx context.Context, jobID, host, url string) error {
-	return r.RPush(ctx, frontierKey(jobID, host), url).Err()
-}
-
-func Take(ctx context.Context, jobID, host string, policy HostPolicy) (string, bool, error) {
-	nowMs := time.Now().UnixMilli()
-	notBefore, err := r.Get(ctx, throttleKey(jobID, host)).Int64()
-	if err != nil && err != redis.Nil {
-		return "", false, err
+// enqueue queues url on its host; it is pending from now until an outcome is recorded.
+func enqueue(ctx context.Context, jobID, host, url string) error {
+	if err := rdb.RPush(ctx, queueKey(jobID, host), url).Err(); err != nil {
+		return err
 	}
-	if notBefore > 0 && nowMs < notBefore {
-		return "", false, nil
-	}
-	allowed, err := r.Eval(ctx, refillScript, []string{bucketKey(jobID, host)},
-		policy.RatePerMinute, policy.RatePerMinute, nowMs, bucketTTLSeconds).Int()
-	if err != nil {
-		return "", false, err
-	}
-	if allowed == 0 {
-		return "", false, nil
-	}
-	url, err := r.LPop(ctx, frontierKey(jobID, host)).Result()
+	return rdb.ZAddNX(ctx, pendingKey(jobID), redis.Z{Score: float64(time.Now().UnixMilli()) / 1000, Member: url}).Err()
+}
+
+// take is the next URL of the host if the host is not throttled and its bucket holds a token, else "".
+func take(ctx context.Context, jobID, host string, ratePerMinute int) (string, error) {
+	keys := []string{bucketKey(jobID, host), queueKey(jobID, host), throttleKey(jobID, host)}
+	url, err := takeScript.Run(ctx, rdb, keys, time.Now().UnixMilli(), ratePerMinute, burst, bucketTTLMs).Text()
 	if err == redis.Nil {
-		return "", false, nil
+		return "", nil
 	}
-	return url, err == nil, err
+	return url, err
 }
 
-func Throttle(ctx context.Context, jobID, host string, retryAfterS, attempts int) (int, error) {
-	backoff := retryAfterS << max(0, attempts-1)
-	if backoff > maxThrottleS {
-		backoff = maxThrottleS
+// throttle: the host answered 429, take hands out nothing for it for retryAfterS seconds.
+func throttle(ctx context.Context, jobID, host string, retryAfterS int) error {
+	if retryAfterS < 1 {
+		retryAfterS = 1
 	}
-	notBefore := time.Now().Add(time.Duration(backoff) * time.Second)
-	return backoff, r.Set(ctx, throttleKey(jobID, host), notBefore.UnixMilli(), time.Duration(backoff)*time.Second).Err()
+	wait := time.Duration(retryAfterS) * time.Second
+	return rdb.Set(ctx, throttleKey(jobID, host), time.Now().UnixMilli()+wait.Milliseconds(), wait).Err()
+}
+
+// requeue puts a taken URL back at the tail of its host's queue.
+func requeue(ctx context.Context, jobID, host, url string) error {
+	return rdb.RPush(ctx, queueKey(jobID, host), url).Err()
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.{SetParams, ZAddParams}
 
-object Frontier {
-  val RatePerMinute = 30
-
-  val jedis = new Jedis("redis", 6379)
-
-  final case class HostPolicy(rate_per_minute: Int = RatePerMinute)
-
-  val bucketKey = "bucket:global"
-
-  def enqueue(jobId: String, host: String, url: String): Unit = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    jedis.rpush(s"frontier:$jobId", url)
-  }
-
-  def take(jobId: String, host: String, policy: HostPolicy): Option[String] = {
-    val stored = Option(jedis.get(bucketKey)).map(_.toDouble)
-    val tokens = math.min(policy.rate_per_minute.toDouble, stored.getOrElse(policy.rate_per_minute.toDouble) + 1.0)
-    jedis.set(bucketKey, tokens.toString)
-    if (tokens < 1) None else Option(jedis.lpop(s"frontier:$jobId"))
-  }
-
-  def throttle(jobId: String, host: String, retryAfterS: Int, attempts: Int): Int = 0
-}
-`,
-      solution: `import java.time.Instant
-
-import redis.clients.jedis.Jedis
 import scala.jdk.CollectionConverters._
 
-object Frontier {
-  val BucketTtlSeconds = 3600
-  val MaxThrottleSeconds = 900
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  val jedis = new Jedis("redis", 6379)
+  val Burst = 2L
 
-  final case class HostPolicy(rate_per_minute: Int)
+  def queueKey(jobId: String): String = s"frontier:$jobId"
+  def bucketKey(jobId: String, host: String): String = s"bucket:$jobId:$host"
+  def throttleKey(jobId: String, host: String): String = s"throttle:$jobId:$host"
+  def pendingKey(jobId: String): String = s"pending:$jobId"
 
-  val RefillLua: String =
-    """local capacity = tonumber(ARGV[1])
-      |local rate_per_minute = tonumber(ARGV[2])
-      |local now_ms = tonumber(ARGV[3])
-      |local state = redis.call('HMGET', KEYS[1], 'tokens', 'refilled_at')
-      |local tokens = tonumber(state[1]) or capacity
-      |local refilled_at = tonumber(state[2]) or now_ms
-      |local elapsed_ms = math.max(0, now_ms - refilled_at)
-      |tokens = math.min(capacity, tokens + elapsed_ms * rate_per_minute / 60000)
-      |if tokens < 1 then
-      |  redis.call('HSET', KEYS[1], 'tokens', tokens, 'refilled_at', now_ms)
-      |  redis.call('EXPIRE', KEYS[1], ARGV[4])
-      |  return 0
+  /** Queue url on its host; it is pending from now until an outcome is recorded. */
+  def enqueue(jobId: String, host: String, url: String): Unit = {
+    jedis.rpush(queueKey(jobId), url)
+    jedis.zadd(pendingKey(jobId), System.currentTimeMillis / 1000.0, url, ZAddParams.zAddParams().nx())
+  }
+
+  /** The next URL of the host if the host is not throttled and its bucket holds a token, else None. */
+  def take(jobId: String, host: String, ratePerMinute: Int): Option[String] = {
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+    val now = System.currentTimeMillis
+    val state = jedis.hmget(bucketKey(jobId, host), "tokens", "ts").asScala
+    val ts = Option(state(1)).map(_.toLong).getOrElse(now)
+    var tokens = Option(state(0)).map(_.toDouble).getOrElse(Burst.toDouble) + (now - ts) * ratePerMinute / 60000.0
+    val url = if (tokens >= 1) Option(jedis.lpop(queueKey(jobId))) else None
+    if (url.isDefined) tokens -= 1
+    jedis.hset(bucketKey(jobId, host), Map("tokens" -> tokens.toString, "ts" -> now.toString).asJava)
+    url
+  }
+
+  /** The host answered 429: take hands out nothing for it for retryAfterS seconds. */
+  def throttle(jobId: String, host: String, retryAfterS: Int): Unit = {
+    val waitMs = math.max(retryAfterS, 1) * 1000L
+    jedis.set(throttleKey(jobId, host), (System.currentTimeMillis + waitMs).toString, SetParams.setParams().px(waitMs))
+  }
+
+  /** Put a taken URL back at the tail of its host's queue. */
+  def requeue(jobId: String, host: String, url: String): Unit = jedis.rpush(queueKey(jobId), url)
+}
+`,
+      solution: `import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.{SetParams, ZAddParams}
+
+import scala.jdk.CollectionConverters._
+
+object State {
+  val jedis = new JedisPooled("redis", 6379)
+
+  val Burst = 2L
+  val BucketTtlMs = 3600000L
+
+  /** KEYS: the host's bucket, queue and throttle. ARGV: now (ms), rate per minute, burst, bucket TTL (ms). */
+  val TakeLua: String =
+    """local now = tonumber(ARGV[1])
+      |if now < tonumber(redis.call('GET', KEYS[3]) or '0') then return false end
+      |local rate = tonumber(ARGV[2])
+      |local burst = tonumber(ARGV[3])
+      |local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+      |local tokens = tonumber(state[1]) or burst
+      |local ts = tonumber(state[2]) or now
+      |tokens = math.min(burst, tokens + (now - ts) * rate / 60000)
+      |local url = false
+      |if tokens >= 1 then
+      |  url = redis.call('LPOP', KEYS[2])
+      |  if url then tokens = tokens - 1 end
       |end
-      |redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'refilled_at', now_ms)
-      |redis.call('EXPIRE', KEYS[1], ARGV[4])
-      |return 1
+      |redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', ARGV[1])
+      |redis.call('PEXPIRE', KEYS[1], ARGV[4])
+      |return url
       |""".stripMargin
 
-  def frontierKey(jobId: String, host: String): String = s"frontier:$jobId:$host"
-
+  def queueKey(jobId: String, host: String): String = s"frontier:$jobId:$host"
   def bucketKey(jobId: String, host: String): String = s"bucket:$jobId:$host"
-
   def throttleKey(jobId: String, host: String): String = s"throttle:$jobId:$host"
+  def pendingKey(jobId: String): String = s"pending:$jobId"
 
-  def enqueue(jobId: String, host: String, url: String): Unit = jedis.rpush(frontierKey(jobId, host), url)
-
-  def take(jobId: String, host: String, policy: HostPolicy): Option[String] = {
-    val nowMs = Instant.now().toEpochMilli
-    val notBefore = Option(jedis.get(throttleKey(jobId, host))).map(_.toLong)
-    if (notBefore.exists(nowMs < _)) return None
-    val allowed = jedis.eval(
-      RefillLua,
-      List(bucketKey(jobId, host)).asJava,
-      List(
-        policy.rate_per_minute.toString,
-        policy.rate_per_minute.toString,
-        nowMs.toString,
-        BucketTtlSeconds.toString
-      ).asJava
-    )
-    if (allowed.toString.toLong == 0) None else Option(jedis.lpop(frontierKey(jobId, host)))
+  /** Queue url on its host; it is pending from now until an outcome is recorded. */
+  def enqueue(jobId: String, host: String, url: String): Unit = {
+    jedis.rpush(queueKey(jobId, host), url)
+    jedis.zadd(pendingKey(jobId), System.currentTimeMillis / 1000.0, url, ZAddParams.zAddParams().nx())
   }
 
-  def throttle(jobId: String, host: String, retryAfterS: Int, attempts: Int): Int = {
-    val backoff = math.min(MaxThrottleSeconds, retryAfterS * (1 << math.max(0, attempts - 1)))
-    val notBefore = Instant.now().plusSeconds(backoff)
-    jedis.set(throttleKey(jobId, host), notBefore.toEpochMilli.toString)
-    jedis.expire(throttleKey(jobId, host), math.max(backoff, 60))
-    backoff
+  /** The next URL of the host if the host is not throttled and its bucket holds a token, else None. */
+  def take(jobId: String, host: String, ratePerMinute: Int): Option[String] = {
+    val keys = List(bucketKey(jobId, host), queueKey(jobId, host), throttleKey(jobId, host)).asJava
+    val args = List(System.currentTimeMillis.toString, ratePerMinute.toString, Burst.toString, BucketTtlMs.toString).asJava
+    Option(jedis.eval(TakeLua, keys, args)).map(_.toString)
   }
+
+  /** The host answered 429: take hands out nothing for it for retryAfterS seconds. */
+  def throttle(jobId: String, host: String, retryAfterS: Int): Unit = {
+    val waitMs = math.max(retryAfterS, 1) * 1000L
+    jedis.set(throttleKey(jobId, host), (System.currentTimeMillis + waitMs).toString, SetParams.setParams().px(waitMs))
+  }
+
+  /** Put a taken URL back at the tail of its host's queue. */
+  def requeue(jobId: String, host: String, url: String): Unit = jedis.rpush(queueKey(jobId, host), url)
 }
 `,
     },
     cpp: {
       starter: `#include <sw/redis++/redis++.h>
 
-#include <cmath>
+#include <algorithm>
+#include <chrono>
+#include <optional>
 #include <string>
+#include <vector>
 
-using sw::redis::Redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-constexpr int kRatePerMinute = 30;
+constexpr long kBurst = 2;
 
-Redis r("tcp://redis:6379");
+long long nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
 
-const std::string bucketKey = "bucket:global";
+std::string queueKey(const std::string& job_id) { return "frontier:" + job_id; }
+std::string bucketKey(const std::string& job_id, const std::string& host) { return "bucket:" + job_id + ":" + host; }
+std::string throttleKey(const std::string& job_id, const std::string& host) { return "throttle:" + job_id + ":" + host; }
+std::string pendingKey(const std::string& job_id) { return "pending:" + job_id; }
 
-struct HostPolicy {
-  int rate_per_minute = kRatePerMinute;
-};
+// Queue url on its host; it is pending from now until an outcome is recorded.
+void enqueue(const std::string& job_id, const std::string& host, const std::string& url) {
+  redis.rpush(queueKey(job_id), url);
+  redis.zadd(pendingKey(job_id), url, static_cast<double>(nowMs()) / 1000, sw::redis::UpdateType::NOT_EXIST);
+}
 
-void enqueue(const std::string& jobId, const std::string& host, const std::string& url) {
+// The next URL of the host if the host is not throttled and its bucket holds a token, else none.
+std::optional<std::string> take(const std::string& job_id, const std::string& host, long rate_per_minute) {
   // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  r.rpush("frontier:global:" + jobId, url);
+  const long long now = nowMs();
+  const std::vector<sw::redis::OptionalString> state = redis.hmget(bucketKey(job_id, host), {"tokens", "ts"});
+  double tokens = state[0] ? std::stod(*state[0]) : static_cast<double>(kBurst);
+  const long long ts = state[1] ? std::stoll(*state[1]) : now;
+  tokens += static_cast<double>(now - ts) * rate_per_minute / 60000;
+  std::optional<std::string> url;
+  if (tokens >= 1) {
+    url = redis.lpop(queueKey(job_id));
+    if (url) tokens -= 1;
+  }
+  redis.hset(bucketKey(job_id, host), {{"tokens", std::to_string(tokens)}, {"ts", std::to_string(now)}});
+  return url;
 }
 
-std::optional<std::string> take(const std::string& jobId, const std::string& host, const HostPolicy& policy) {
-  double tokens = static_cast<double>(policy.rate_per_minute);
-  if (const auto stored = r.get(bucketKey)) tokens = std::stod(*stored);
-  tokens = std::min(static_cast<double>(policy.rate_per_minute), tokens + 1.0);
-  r.set(bucketKey, std::to_string(tokens));
-  if (tokens < 1) return std::nullopt;
-  return r.lpop("frontier:global:" + jobId);
+// The host answered 429: take hands out nothing for it for retry_after_s seconds.
+void throttle(const std::string& job_id, const std::string& host, long retry_after_s) {
+  const std::chrono::milliseconds wait{std::max(retry_after_s, 1L) * 1000};
+  redis.set(throttleKey(job_id, host), std::to_string(nowMs() + wait.count()), wait);
 }
 
-int throttle(const std::string& jobId, const std::string& host, int retryAfterS, int attempts) {
-  return 0;
-}
+// Put a taken URL back at the tail of its host's queue.
+void requeue(const std::string& job_id, const std::string& host, const std::string& url) { redis.rpush(queueKey(job_id), url); }
 `,
       solution: `#include <sw/redis++/redis++.h>
 
@@ -625,79 +691,429 @@ int throttle(const std::string& jobId, const std::string& host, int retryAfterS,
 #include <optional>
 #include <string>
 
-using sw::redis::Redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-constexpr int kBucketTtlSeconds = 3600;
-constexpr int kMaxThrottleSeconds = 900;
+constexpr long kBurst = 2;
+constexpr long long kBucketTtlMs = 3600000;
 
-const std::string kRefillLua = R"(
-local capacity = tonumber(ARGV[1])
-local rate_per_minute = tonumber(ARGV[2])
-local now_ms = tonumber(ARGV[3])
-local state = redis.call('HMGET', KEYS[1], 'tokens', 'refilled_at')
-local tokens = tonumber(state[1]) or capacity
-local refilled_at = tonumber(state[2]) or now_ms
-local elapsed_ms = math.max(0, now_ms - refilled_at)
-tokens = math.min(capacity, tokens + elapsed_ms * rate_per_minute / 60000)
-if tokens < 1 then
-  redis.call('HSET', KEYS[1], 'tokens', tokens, 'refilled_at', now_ms)
-  redis.call('EXPIRE', KEYS[1], ARGV[4])
-  return 0
+// KEYS: the host's bucket, queue and throttle. ARGV: now (ms), rate per minute, burst, bucket TTL (ms).
+const std::string kTakeLua = R"lua(
+local now = tonumber(ARGV[1])
+if now < tonumber(redis.call('GET', KEYS[3]) or '0') then return false end
+local rate = tonumber(ARGV[2])
+local burst = tonumber(ARGV[3])
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(state[1]) or burst
+local ts = tonumber(state[2]) or now
+tokens = math.min(burst, tokens + (now - ts) * rate / 60000)
+local url = false
+if tokens >= 1 then
+  url = redis.call('LPOP', KEYS[2])
+  if url then tokens = tokens - 1 end
 end
-redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'refilled_at', now_ms)
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-return 1
-)";
+redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+return url
+)lua";
 
-Redis r("tcp://redis:6379");
-
-struct HostPolicy {
-  int rate_per_minute;
-};
-
-std::string frontierKey(const std::string& jobId, const std::string& host) {
-  return "frontier:" + jobId + ":" + host;
+long long nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-std::string bucketKey(const std::string& jobId, const std::string& host) {
-  return "bucket:" + jobId + ":" + host;
+std::string queueKey(const std::string& job_id, const std::string& host) { return "frontier:" + job_id + ":" + host; }
+std::string bucketKey(const std::string& job_id, const std::string& host) { return "bucket:" + job_id + ":" + host; }
+std::string throttleKey(const std::string& job_id, const std::string& host) { return "throttle:" + job_id + ":" + host; }
+std::string pendingKey(const std::string& job_id) { return "pending:" + job_id; }
+
+// Queue url on its host; it is pending from now until an outcome is recorded.
+void enqueue(const std::string& job_id, const std::string& host, const std::string& url) {
+  redis.rpush(queueKey(job_id, host), url);
+  redis.zadd(pendingKey(job_id), url, static_cast<double>(nowMs()) / 1000, sw::redis::UpdateType::NOT_EXIST);
 }
 
-std::string throttleKey(const std::string& jobId, const std::string& host) {
-  return "throttle:" + jobId + ":" + host;
+// The next URL of the host if the host is not throttled and its bucket holds a token, else none.
+std::optional<std::string> take(const std::string& job_id, const std::string& host, long rate_per_minute) {
+  return redis.eval<sw::redis::OptionalString>(
+      kTakeLua, {bucketKey(job_id, host), queueKey(job_id, host), throttleKey(job_id, host)},
+      {std::to_string(nowMs()), std::to_string(rate_per_minute), std::to_string(kBurst), std::to_string(kBucketTtlMs)});
 }
 
-void enqueue(const std::string& jobId, const std::string& host, const std::string& url) {
-  r.rpush(frontierKey(jobId, host), url);
+// The host answered 429: take hands out nothing for it for retry_after_s seconds.
+void throttle(const std::string& job_id, const std::string& host, long retry_after_s) {
+  const std::chrono::milliseconds wait{std::max(retry_after_s, 1L) * 1000};
+  redis.set(throttleKey(job_id, host), std::to_string(nowMs() + wait.count()), wait);
 }
 
-std::optional<std::string> take(const std::string& jobId, const std::string& host, const HostPolicy& policy) {
-  const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-  if (const auto notBefore = r.get(throttleKey(jobId, host))) {
-    if (nowMs < std::stoll(*notBefore)) return std::nullopt;
-  }
-  const auto allowed = r.eval<long long>(
-      kRefillLua,
-      {bucketKey(jobId, host)},
-      {std::to_string(policy.rate_per_minute), std::to_string(policy.rate_per_minute), std::to_string(nowMs),
-       std::to_string(kBucketTtlSeconds)});
-  if (allowed == 0) return std::nullopt;
-  return r.lpop(frontierKey(jobId, host));
-}
-
-int throttle(const std::string& jobId, const std::string& host, int retry_after_s, int attempts) {
-  const int backoff = std::min(kMaxThrottleSeconds, retry_after_s * (1 << std::max(0, attempts - 1)));
-  const auto notBefore = std::chrono::system_clock::now() + std::chrono::seconds(backoff);
-  const auto notBeforeMs =
-      std::chrono::duration_cast<std::chrono::milliseconds>(notBefore.time_since_epoch()).count();
-  r.set(throttleKey(jobId, host), std::to_string(notBeforeMs));
-  r.expire(throttleKey(jobId, host), std::max(backoff, 60));
-  return backoff;
-}
+// Put a taken URL back at the tail of its host's queue.
+void requeue(const std::string& job_id, const std::string& host, const std::string& url) { redis.rpush(queueKey(job_id, host), url); }
 `,
     },
   },
-  debrief: `Politeness is a per-host promise, so every piece of state that enforces it is keyed by host: the queue, the bucket and the not-before timestamp. That is what lets a slow host be slow alone and a 429 slow down only the host that sent it. The refill lives in one Lua script because the promise is only as good as the race it closes: two workers reading the same bucket from the client each see a token and the host gets twice the agreed rate. Production frontiers also lease URLs instead of popping them, so a worker that crashes mid-fetch does not lose its URL; keep a hot in-memory bucket with Redis as the arbiter; and lower a host's configured rate for good when 429s keep arriving.`,
+  harness: {
+    python: `JOB = "nightly"
+BLOG = "blog.example.com"
+DOCS = "docs.example.com"
+
+
+def _url(host, n):
+    return f"https://{host}/p/{n}"
+
+
+def _queued(ctx, host):
+    return ctx.redis.lrange(f"frontier:{JOB}:{host}", 0, -1)
+
+
+def check_per_host_queue(ctx):
+    m = ctx.load("state")
+    m.enqueue(JOB, BLOG, _url(BLOG, 1))
+    m.enqueue(JOB, DOCS, _url(DOCS, 1))
+    m.enqueue(JOB, BLOG, _url(BLOG, 2))
+    got = m.take(JOB, DOCS, 60)
+    assert got == _url(DOCS, 1), f"take({JOB}, {DOCS}) answered {got!r}: a take for one host must pop that host's URL, from frontier:{JOB}:{DOCS}"
+    assert _queued(ctx, BLOG) == [_url(BLOG, 1), _url(BLOG, 2)], f"frontier:{JOB}:{BLOG} holds {_queued(ctx, BLOG)}, expected the blog's two URLs in order"
+    assert m.take(JOB, BLOG, 60) == _url(BLOG, 1), "a take for the blog must pop the blog's first URL"
+    assert ctx.redis.zcard(f"pending:{JOB}") == 3, f"pending:{JOB} holds {ctx.redis.zcard(f'pending:{JOB}')} URLs, expected the 3 enqueued"
+
+
+def check_atomic_take(ctx):
+    m = ctx.load("state")
+    for n in range(3):
+        m.enqueue(JOB, BLOG, _url(BLOG, n))
+    assert m.take(JOB, BLOG, 1) == _url(BLOG, 0), "the first take of a new bucket must hand out the first URL"
+    # One token is left. A second worker's take lands while this one is between its Redis commands.
+    rival = ctx.redis_after(f"bucket:{JOB}:{BLOG}", lambda: m.take(JOB, BLOG, 1))
+    mine = m.take(JOB, BLOG, 1)
+    assert rival.fired, f"take never touched bucket:{JOB}:{BLOG}"
+    if rival.error is not None:
+        raise rival.error
+    taken = [u for u in (mine, rival.result) if u is not None]
+    assert len(taken) == 1, f"one token was left and two workers took {taken}: the bucket was read, then written, with the other worker in between. Read, refill, spend and pop in one Lua script"
+    assert _queued(ctx, BLOG) == [_url(BLOG, 2)], f"frontier:{JOB}:{BLOG} holds {_queued(ctx, BLOG)}, expected the one URL nobody had a token for"
+
+
+def check_refill_cap(ctx):
+    m = ctx.load("state")
+    for n in range(8):
+        m.enqueue(JOB, BLOG, _url(BLOG, n))
+    first = [m.take(JOB, BLOG, 60) for _ in range(3)]
+    assert None not in first[:2] and first[2] is None, f"a new bucket holds BURST = 2 tokens: three takes answered {first}"
+    ctx.clock.advance(0.5)
+    assert m.take(JOB, BLOG, 60) is None, "half a second at 60 per minute refills half a token: the take must answer None"
+    ctx.clock.advance(0.5)
+    assert m.take(JOB, BLOG, 60) is not None, "a second at 60 per minute refills one token: the take must answer a URL"
+    ctx.clock.advance(3600)
+    burst = [m.take(JOB, BLOG, 60) for _ in range(5)]
+    got = sum(url is not None for url in burst)
+    assert got == 2, f"after an hour idle the host got {got} URLs back to back: tokens are capped at BURST = 2, or an idle host gets hammered"
+
+
+def check_throttle(ctx):
+    m = ctx.load("state")
+    m.enqueue(JOB, BLOG, _url(BLOG, 1))
+    m.enqueue(JOB, BLOG, _url(BLOG, 2))
+    m.enqueue(JOB, DOCS, _url(DOCS, 1))
+    m.throttle(JOB, BLOG, 30)
+    got = m.take(JOB, BLOG, 60)
+    assert got is None, f"right after a 429 with Retry-After 30 the throttled host got {got!r}: take must hand out nothing until the not-before time"
+    assert m.take(JOB, DOCS, 60) == _url(DOCS, 1), "a throttle on one host must not stop the others"
+    ctx.clock.advance(29)
+    assert m.take(JOB, BLOG, 60) is None, "29 s into a 30 s Retry-After the host must still get nothing"
+    ctx.clock.advance(2)
+    assert m.take(JOB, BLOG, 60) == _url(BLOG, 1), "once Retry-After has passed the host's next URL must be handed out"
+
+
+def check_bucket_ttl(ctx):
+    m = ctx.load("state")
+    m.enqueue(JOB, BLOG, _url(BLOG, 1))
+    m.take(JOB, BLOG, 60)
+    key = f"bucket:{JOB}:{BLOG}"
+    ttl = ctx.redis.pttl(key)
+    assert 0 < ttl <= 3_600_000, f"{key} has PTTL {ttl}: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis"
+    ctx.clock.advance(3601)
+    assert not ctx.redis.exists(key), f"an hour after the host's last take {key} is still in Redis"
+`,
+    typescript: `const JOB = 'nightly';
+const BLOG = 'blog.example.com';
+const DOCS = 'docs.example.com';
+
+const url = (host: string, n: number): string => \`https://\${host}/p/\${n}\`;
+const queued = (ctx, host: string): string[] => ctx.redis.lrange(\`frontier:\${JOB}:\${host}\`, 0, -1);
+
+export async function check_per_host_queue(ctx) {
+  const m = ctx.load('state');
+  await m.enqueue(JOB, BLOG, url(BLOG, 1));
+  await m.enqueue(JOB, DOCS, url(DOCS, 1));
+  await m.enqueue(JOB, BLOG, url(BLOG, 2));
+  const got = await m.take(JOB, DOCS, 60);
+  assert.equal(got, url(DOCS, 1), \`take(\${JOB}, \${DOCS}) answered \${JSON.stringify(got)}: a take for one host must pop that host's URL, from frontier:\${JOB}:\${DOCS}\`);
+  assert.deepStrictEqual(queued(ctx, BLOG), [url(BLOG, 1), url(BLOG, 2)], \`frontier:\${JOB}:\${BLOG} holds \${JSON.stringify(queued(ctx, BLOG))}, expected the blog's two URLs in order\`);
+  assert.equal(await m.take(JOB, BLOG, 60), url(BLOG, 1), "a take for the blog must pop the blog's first URL");
+  assert.equal(ctx.redis.zcard(\`pending:\${JOB}\`), 3, \`pending:\${JOB} must hold the 3 enqueued URLs\`);
+}
+
+export async function check_atomic_take(ctx) {
+  const m = ctx.load('state');
+  for (let n = 0; n < 3; n++) await m.enqueue(JOB, BLOG, url(BLOG, n));
+  assert.equal(await m.take(JOB, BLOG, 1), url(BLOG, 0), 'the first take of a new bucket must hand out the first URL');
+  // One token is left. A second worker's take lands while this one is between its Redis commands.
+  const rival = ctx.redisAfter(\`bucket:\${JOB}:\${BLOG}\`, () => m.take(JOB, BLOG, 1));
+  const mine = await m.take(JOB, BLOG, 1);
+  assert(rival.fired, \`take never touched bucket:\${JOB}:\${BLOG}\`);
+  if (rival.error !== undefined) throw rival.error;
+  const theirs = await rival.result;
+  const taken = [mine, theirs].filter(u => u !== null);
+  assert.equal(taken.length, 1, \`one token was left and two workers took \${JSON.stringify(taken)}: the bucket was read, then written, with the other worker in between. Read, refill, spend and pop in one Lua script\`);
+  assert.deepStrictEqual(queued(ctx, BLOG), [url(BLOG, 2)], \`frontier:\${JOB}:\${BLOG} holds \${JSON.stringify(queued(ctx, BLOG))}, expected the one URL nobody had a token for\`);
+}
+
+export async function check_refill_cap(ctx) {
+  const m = ctx.load('state');
+  for (let n = 0; n < 8; n++) await m.enqueue(JOB, BLOG, url(BLOG, n));
+  const first = [await m.take(JOB, BLOG, 60), await m.take(JOB, BLOG, 60), await m.take(JOB, BLOG, 60)];
+  assert(first[0] !== null && first[1] !== null && first[2] === null, \`a new bucket holds BURST = 2 tokens: three takes answered \${JSON.stringify(first)}\`);
+  ctx.clock.advance(0.5);
+  assert.equal(await m.take(JOB, BLOG, 60), null, 'half a second at 60 per minute refills half a token: the take must answer null');
+  ctx.clock.advance(0.5);
+  assert.notEqual(await m.take(JOB, BLOG, 60), null, 'a second at 60 per minute refills one token: the take must answer a URL');
+  ctx.clock.advance(3600);
+  let got = 0;
+  for (let i = 0; i < 5; i++) if ((await m.take(JOB, BLOG, 60)) !== null) got++;
+  assert.equal(got, 2, \`after an hour idle the host got \${got} URLs back to back: tokens are capped at BURST = 2, or an idle host gets hammered\`);
+}
+
+export async function check_throttle(ctx) {
+  const m = ctx.load('state');
+  await m.enqueue(JOB, BLOG, url(BLOG, 1));
+  await m.enqueue(JOB, BLOG, url(BLOG, 2));
+  await m.enqueue(JOB, DOCS, url(DOCS, 1));
+  await m.throttle(JOB, BLOG, 30);
+  const got = await m.take(JOB, BLOG, 60);
+  assert.equal(got, null, \`right after a 429 with Retry-After 30 the throttled host got \${JSON.stringify(got)}: take must hand out nothing until the not-before time\`);
+  assert.equal(await m.take(JOB, DOCS, 60), url(DOCS, 1), 'a throttle on one host must not stop the others');
+  ctx.clock.advance(29);
+  assert.equal(await m.take(JOB, BLOG, 60), null, '29 s into a 30 s Retry-After the host must still get nothing');
+  ctx.clock.advance(2);
+  assert.equal(await m.take(JOB, BLOG, 60), url(BLOG, 1), "once Retry-After has passed the host's next URL must be handed out");
+}
+
+export async function check_bucket_ttl(ctx) {
+  const m = ctx.load('state');
+  await m.enqueue(JOB, BLOG, url(BLOG, 1));
+  await m.take(JOB, BLOG, 60);
+  const key = \`bucket:\${JOB}:\${BLOG}\`;
+  const ttl = ctx.redis.pttl(key);
+  assert(ttl > 0 && ttl <= 3_600_000, \`\${key} has PTTL \${ttl}: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis\`);
+  ctx.clock.advance(3601);
+  assert.equal(ctx.redis.exists(key), 0, \`an hour after the host's last take \${key} is still in Redis\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+
+	"leetbuild/harness"
+)
+
+const (
+	stateJob = "nightly"
+	blogHost = "blog.example.com"
+	docsHost = "docs.example.com"
+)
+
+var stateBg = context.Background()
+
+func pageURL(host string, n int) string { return fmt.Sprintf("https://%s/p/%d", host, n) }
+
+func mustEnqueue(ctx *harness.Ctx, host string, n int) {
+	ctx.NoError(enqueue(stateBg, stateJob, host, pageURL(host, n)), "enqueue(%s) failed", pageURL(host, n))
+}
+
+func mustTake(ctx *harness.Ctx, host string, rate int) string {
+	url, err := take(stateBg, stateJob, host, rate)
+	ctx.NoError(err, "take(%s, %s) failed", stateJob, host)
+	return url
+}
+
+func hostQueue(ctx *harness.Ctx, host string) []string {
+	return ctx.Redis.LRange("frontier:"+stateJob+":"+host, 0, -1)
+}
+
+func CheckPerHostQueue(ctx *harness.Ctx) {
+	mustEnqueue(ctx, blogHost, 1)
+	mustEnqueue(ctx, docsHost, 1)
+	mustEnqueue(ctx, blogHost, 2)
+	got := mustTake(ctx, docsHost, 60)
+	ctx.Equal(got, pageURL(docsHost, 1), "a take for %s must pop that host's URL, from frontier:%s:%s; take answered", docsHost, stateJob, docsHost)
+	ctx.Equal(hostQueue(ctx, blogHost), []string{pageURL(blogHost, 1), pageURL(blogHost, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", stateJob, blogHost)
+	ctx.Equal(mustTake(ctx, blogHost, 60), pageURL(blogHost, 1), "a take for the blog must pop the blog's first URL")
+	ctx.Equal(ctx.Redis.ZCard("pending:"+stateJob), 3, "pending:%s must hold the 3 enqueued URLs", stateJob)
+}
+
+func CheckAtomicTake(ctx *harness.Ctx) {
+	for n := 0; n < 3; n++ {
+		mustEnqueue(ctx, blogHost, n)
+	}
+	ctx.Equal(mustTake(ctx, blogHost, 1), pageURL(blogHost, 0), "the first take of a new bucket must hand out the first URL")
+	// One token is left. A second worker's take lands while this one is between its Redis commands.
+	rival := ctx.Redis.After("bucket:"+stateJob+":"+blogHost, func() any {
+		url, _ := take(stateBg, stateJob, blogHost, 1)
+		return url
+	})
+	mine := mustTake(ctx, blogHost, 1)
+	ctx.Assert(rival.Fired, "take never touched bucket:%s:%s", stateJob, blogHost)
+	theirs, _ := rival.Result.(string)
+	var taken []string
+	for _, u := range []string{mine, theirs} {
+		if u != "" {
+			taken = append(taken, u)
+		}
+	}
+	ctx.Assert(len(taken) == 1, "one token was left and two workers took %q: the bucket was read, then written, with the other worker in between. Read, refill, spend and pop in one Lua script", taken)
+	ctx.Equal(hostQueue(ctx, blogHost), []string{pageURL(blogHost, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", stateJob, blogHost)
+}
+
+func CheckRefillCap(ctx *harness.Ctx) {
+	for n := 0; n < 8; n++ {
+		mustEnqueue(ctx, blogHost, n)
+	}
+	first := []string{mustTake(ctx, blogHost, 60), mustTake(ctx, blogHost, 60), mustTake(ctx, blogHost, 60)}
+	ctx.Assert(first[0] != "" && first[1] != "" && first[2] == "", "a new bucket holds BURST = 2 tokens: three takes answered %q", first)
+	ctx.Clock.Advance(0.5)
+	ctx.Equal(mustTake(ctx, blogHost, 60), "", "half a second at 60 per minute refills half a token: the take must answer nothing")
+	ctx.Clock.Advance(0.5)
+	ctx.Assert(mustTake(ctx, blogHost, 60) != "", "a second at 60 per minute refills one token: the take must answer a URL")
+	ctx.Clock.Advance(3600)
+	got := 0
+	for i := 0; i < 5; i++ {
+		if mustTake(ctx, blogHost, 60) != "" {
+			got++
+		}
+	}
+	ctx.Equal(got, 2, "after an hour idle the host got URLs back to back: tokens are capped at BURST = 2, or an idle host gets hammered; the URLs")
+}
+
+func CheckThrottle(ctx *harness.Ctx) {
+	mustEnqueue(ctx, blogHost, 1)
+	mustEnqueue(ctx, blogHost, 2)
+	mustEnqueue(ctx, docsHost, 1)
+	ctx.NoError(throttle(stateBg, stateJob, blogHost, 30), "throttle failed")
+	ctx.Equal(mustTake(ctx, blogHost, 60), "", "right after a 429 with Retry-After 30 take must hand the throttled host nothing until the not-before time; take answered")
+	ctx.Equal(mustTake(ctx, docsHost, 60), pageURL(docsHost, 1), "a throttle on one host must not stop the others")
+	ctx.Clock.Advance(29)
+	ctx.Equal(mustTake(ctx, blogHost, 60), "", "29 s into a 30 s Retry-After the host must still get nothing")
+	ctx.Clock.Advance(2)
+	ctx.Equal(mustTake(ctx, blogHost, 60), pageURL(blogHost, 1), "once Retry-After has passed the host's next URL must be handed out")
+}
+
+func CheckBucketTtl(ctx *harness.Ctx) {
+	mustEnqueue(ctx, blogHost, 1)
+	mustTake(ctx, blogHost, 60)
+	key := "bucket:" + stateJob + ":" + blogHost
+	ttl := ctx.Redis.PTTL(key)
+	ctx.Assert(ttl > 0 && ttl <= 3600000, "%s has PTTL %d: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis", key, ttl)
+	ctx.Clock.Advance(3601)
+	ctx.Equal(ctx.Redis.Exists(key), 0, "an hour after the host's last take %s is still in Redis", key)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kJob = "nightly";
+const std::string kBlog = "blog.example.com";
+const std::string kDocs = "docs.example.com";
+
+std::string pageUrl(const std::string& host, int n) { return "https://" + host + "/p/" + std::to_string(n); }
+
+std::vector<std::string> hostQueue(harness::Ctx& ctx, const std::string& host) {
+  return ctx.Redis.LRange("frontier:" + kJob + ":" + host, 0, -1);
+}
+
+std::string taken(const std::optional<std::string>& url) { return url.value_or(""); }
+
+}  // namespace
+
+void CheckPerHostQueue(harness::Ctx& ctx) {
+  enqueue(kJob, kBlog, pageUrl(kBlog, 1));
+  enqueue(kJob, kDocs, pageUrl(kDocs, 1));
+  enqueue(kJob, kBlog, pageUrl(kBlog, 2));
+  ctx.Equal(taken(take(kJob, kDocs, 60)), pageUrl(kDocs, 1), "a take for %s must pop that host's URL, from frontier:%s:%s; take answered", kDocs, kJob, kDocs);
+  ctx.Equal(hostQueue(ctx, kBlog), {pageUrl(kBlog, 1), pageUrl(kBlog, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", kJob, kBlog);
+  ctx.Equal(taken(take(kJob, kBlog, 60)), pageUrl(kBlog, 1), "a take for the blog must pop the blog's first URL");
+  ctx.Equal(ctx.Redis.ZCard("pending:" + kJob), 3, "pending:%s must hold the 3 enqueued URLs", kJob);
+}
+
+void CheckAtomicTake(harness::Ctx& ctx) {
+  for (int n = 0; n < 3; n++) enqueue(kJob, kBlog, pageUrl(kBlog, n));
+  ctx.Equal(taken(take(kJob, kBlog, 1)), pageUrl(kBlog, 0), "the first take of a new bucket must hand out the first URL");
+  // One token is left. A second worker's take lands while this one is between its Redis commands.
+  auto fired = std::make_shared<bool>(false);
+  auto theirs = std::make_shared<std::string>();
+  ctx.Redis.After("bucket:" + kJob + ":" + kBlog, [fired, theirs] {
+    *fired = true;
+    *theirs = take(kJob, kBlog, 1).value_or("");
+  });
+  const std::string mine = taken(take(kJob, kBlog, 1));
+  ctx.Assert(*fired, "take never touched bucket:%s:%s", kJob, kBlog);
+  std::vector<std::string> both;
+  for (const std::string& u : {mine, *theirs}) {
+    if (!u.empty()) both.push_back(u);
+  }
+  ctx.Assert(both.size() == 1, "one token was left and two workers took %q: the bucket was read, then written, with the other worker in between. Read, refill, spend and pop in one Lua script", both);
+  ctx.Equal(hostQueue(ctx, kBlog), {pageUrl(kBlog, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", kJob, kBlog);
+}
+
+void CheckRefillCap(harness::Ctx& ctx) {
+  for (int n = 0; n < 8; n++) enqueue(kJob, kBlog, pageUrl(kBlog, n));
+  const std::vector<std::string> first = {taken(take(kJob, kBlog, 60)), taken(take(kJob, kBlog, 60)), taken(take(kJob, kBlog, 60))};
+  ctx.Assert(!first[0].empty() && !first[1].empty() && first[2].empty(), "a new bucket holds kBurst = 2 tokens: three takes answered %q", first);
+  ctx.Clock.Advance(0.5);
+  ctx.Equal(taken(take(kJob, kBlog, 60)), "", "half a second at 60 per minute refills half a token: the take must answer nothing");
+  ctx.Clock.Advance(0.5);
+  ctx.Assert(!taken(take(kJob, kBlog, 60)).empty(), "a second at 60 per minute refills one token: the take must answer a URL");
+  ctx.Clock.Advance(3600);
+  int got = 0;
+  for (int i = 0; i < 5; i++) {
+    if (take(kJob, kBlog, 60)) got++;
+  }
+  ctx.Equal(got, 2, "after an hour idle the host got URLs back to back: tokens are capped at kBurst = 2, or an idle host gets hammered; the URLs");
+}
+
+void CheckThrottle(harness::Ctx& ctx) {
+  enqueue(kJob, kBlog, pageUrl(kBlog, 1));
+  enqueue(kJob, kBlog, pageUrl(kBlog, 2));
+  enqueue(kJob, kDocs, pageUrl(kDocs, 1));
+  throttle(kJob, kBlog, 30);
+  ctx.Equal(taken(take(kJob, kBlog, 60)), "", "right after a 429 with Retry-After 30 take must hand the throttled host nothing until the not-before time; take answered");
+  ctx.Equal(taken(take(kJob, kDocs, 60)), pageUrl(kDocs, 1), "a throttle on one host must not stop the others");
+  ctx.Clock.Advance(29);
+  ctx.Equal(taken(take(kJob, kBlog, 60)), "", "29 s into a 30 s Retry-After the host must still get nothing");
+  ctx.Clock.Advance(2);
+  ctx.Equal(taken(take(kJob, kBlog, 60)), pageUrl(kBlog, 1), "once Retry-After has passed the host's next URL must be handed out");
+}
+
+void CheckBucketTtl(harness::Ctx& ctx) {
+  enqueue(kJob, kBlog, pageUrl(kBlog, 1));
+  take(kJob, kBlog, 60);
+  const std::string key = "bucket:" + kJob + ":" + kBlog;
+  const long long ttl = ctx.Redis.PTTL(key);
+  ctx.Assert(ttl > 0 && ttl <= 3600000, "%s has PTTL %d: a bucket must expire kBucketTtlMs (one hour) after its last take, or every host ever crawled stays in Redis", key, ttl);
+  ctx.Clock.Advance(3601);
+  ctx.Equal(ctx.Redis.Exists(key), 0, "an hour after the host's last take %s is still in Redis", key);
+}
+`,
+  },
+  hints: [
+    'Queue a URL for blog.example.com and one for docs.example.com, then take for docs: you get the blog URL. Leave a host idle for an hour and it gets every queued URL at once, even right after a 429.',
+    'There is one list per job, so the host never reaches the `LPOP`. The bucket is read with `HMGET`, computed in the client and written back, so a second worker can read the same tokens in between; nothing caps them or reads the throttle key.',
+    'Key the queue `frontier:{job_id}:{host}`. Move take into one Lua script: return false while `GET throttle` is later than now, refill with `math.min(burst, …)`, `LPOP` and spend a token, `HSET` tokens and ts, `PEXPIRE` by `BUCKET_TTL_MS`.',
+  ],
+  debrief: `A token bucket is two numbers and a clock, so the hard part is that two workers must not read the same two numbers: in one Lua script the read, the refill, the spend and the pop are one step, and a token is never spent on an empty queue. The cap is what makes the bucket a rate limit rather than a savings account, and it is also why the TTL is safe: an hour after the last take the bucket would be full again, so deleting it loses nothing. The throttle sits in the same script, so a 429 stops every worker at once. Production frontiers also shard hosts across Redis nodes, adapt each host's rate from its latency, and lease URLs so a crashed worker's URL comes back.`,
 };

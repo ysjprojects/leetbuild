@@ -2,739 +2,605 @@ import type {Step} from '@/lib/types';
 
 export const redactEndpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/redact: fail closed, never echo raw text',
+  title: 'POST /v1/redact: fail closed, echo nothing',
   concept: 'http',
   file: 'api',
   focus: ['client', 'redactor', 'detector'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/redact\` with body
-\`{"text": "…", "entities": ["EMAIL", "PHONE"], "document_id": "…"}\`, reads the tenant from
-\`X-Tenant-Id\`, calls the detector and returns the redacted text. It serves the demo, because the
-demo text always matches and the demo detector always answers, and hides 4 flaws.
+**Starting point.** The starter serves \`POST /v1/redact\` with body \`{document_id, text, entities}\`
+and the tenant in \`X-Tenant-Id\`: it calls \`ner.detect\` (provided), writes the redaction with
+\`store.save\` and answers the redacted text with its spans. It serves the demo and hides four
+flaws.
 
-**Failure mode the checks target.** A redactor is judged by what it does when it cannot answer. On
-no-match, on detector error and on an oversized payload the starter prefers a convenient answer to
-a safe one, and each one moves customer text into a response, a log line or a crash report.
+**Failure mode the checks target.** A detector outage answers 200 with the customer's text; an
+oversized text is quoted back in the 413 body; an entity type nobody declared reaches the detector
+and redacts nothing; and a text with nothing to redact is never recorded, so the audit read cannot
+tell it from a text that was skipped.
 
-- A missing \`X-Tenant-Id\` is **401**.
-- \`text\` is a non-empty string of at most **256 KiB** (\`1 << 18\` bytes); a larger text is
-  **413** with a constant error body, not a slice of the payload. Name the caps.
-- \`entities\` is a subset of the eight declared types (at most eight); an unknown or oversized
-  list is **400**. The default set is \`EMAIL\`, \`PHONE\`, \`SSN\`.
-- \`document_id\` is required (**400** when absent).
-- Every 200 is \`{"document_id", "status": "processed", "redacted_text", "spans", "entity_counts",
-  "pattern_version"}\`, with an empty span list when nothing matched. No \`text\` field anywhere,
-  including error bodies.
-- A detector failure is **503** with \`{"error": "detector_unavailable"}\` and no text in the body.`,
+- A text over \`MAX_TEXT_BYTES\` (256 KiB) is **413** with a constant body.
+- Every requested entity is in \`ENTITY_TYPES\` (the default is \`DEFAULT_ENTITIES\`); anything else
+  is **400**, before the detector is called.
+- \`DetectorUnavailable\` is **503** \`{"error": "detector_unavailable"}\`, and nothing is saved.
+- Every 200 is saved first and answers \`{document_id, status: "processed", redacted_text, spans,
+  entity_counts, detector_version, source, degraded}\`, an empty span list included.`,
   sequence: {
-    participants: ['Client', 'Redactor', 'Detector'],
+    participants: ['Client', 'Redactor', 'Detector', 'Redis'],
     messages: [
-      {from: 'Client', to: 'Redactor', label: 'POST /v1/redact · X-Tenant-Id · {text, entities}', kind: 'sync'},
-      {from: 'Redactor', to: 'Redactor', label: '401 tenant · 413 size · 400 entities · 400 document_id', kind: 'sync'},
-      {from: 'Redactor', to: 'Detector', label: 'Detect(text, entities)', kind: 'sync'},
-      {from: 'Detector', to: 'Redactor', label: 'spans[]', kind: 'reply'},
-      {from: 'Detector', to: 'Redactor', label: 'UNAVAILABLE', kind: 'reply'},
-      {from: 'Redactor', to: 'Redactor', label: '503 {error: detector_unavailable} — never the input', kind: 'sync'},
-      {from: 'Redactor', to: 'Client', label: '200 {status, redacted_text, spans, entity_counts}', kind: 'reply'},
+      {
+        from: 'Client',
+        to: 'Redactor',
+        label: 'POST /v1/redact · X-Tenant-Id · {document_id, text, entities}',
+        kind: 'sync',
+      },
+      {from: 'Redactor', to: 'Redactor', label: '401 tenant · 400 body · 413 size · 400 entity type', kind: 'sync'},
+      {from: 'Redactor', to: 'Detector', label: 'ner.detect(text, entities)', kind: 'sync'},
+      {from: 'Detector', to: 'Redactor', label: 'Detection · or DetectorUnavailable → 503', kind: 'reply'},
+      {from: 'Redactor', to: 'Redis', label: 'store.save → doc:{document_id}', kind: 'sync'},
+      {
+        from: 'Redactor',
+        to: 'Client',
+        label: '200 {status: "processed", redacted_text, spans, entity_counts}',
+        kind: 'reply',
+      },
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/redact',
-      detail: 'Register the redaction route on `POST /v1/redact`.',
+      title: 'Redacts on POST /v1/redact and saves the result',
+      detail:
+        'Register `POST /v1/redact`; a text with an email and a phone number answers the redacted text and its spans, and the redaction is saved through `store.save`.',
       match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/redact["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/redact['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/redact"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"redact"\s*\)/, /\bpost\s*\{/]},
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/redact"/]},
+        python: {all: [/@app\.post\(\s*["']\/v1\/redact["']/, /store\.save\(/]},
+        typescript: {all: [/app\.post\(\s*['"]\/v1\/redact['"]/, /\bsave\(/]},
+        go: {all: [/HandleFunc\(\s*"POST \/v1\/redact"/, /store\.Save\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"redact"\s*\)/, /Store\.save\(/]},
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/redact"/, /store::save\(/]},
       },
     },
     {
       id: 'size-cap',
-      title: 'Caps the text at 256 KiB and whitelists the entity types',
+      title: 'An oversized text is 413 with a constant body',
       detail:
-        'A text over `1 << 18` bytes is **413**; an unknown or oversized `entities` list is **400**. The starter carries inline literals instead of named caps and never checks the entity whitelist, so a caller can ask for a pass that detects nothing.',
+        'A text over `MAX_TEXT_BYTES` (256 KiB) answers **413** `{"error": "text_too_large"}`; the starter quotes the first 80 characters of the payload back in a `preview` field, so the error path copies customer text into every log that records a response.',
       match: {
-        python: {all: [/MAX_TEXT_BYTES/, /MAX_ENTITY_TYPES/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_TEXT_BYTES/, /MAX_ENTITY_TYPES/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxTextBytes/, /maxEntityTypes/, /StatusRequestEntityTooLarge/, /StatusBadRequest/]},
-        scala: {
-          all: [/MaxTextBytes/, /MaxEntityTypes/, /StatusCodes\.RequestEntityTooLarge/, /StatusCodes\.BadRequest/],
+        python: {all: [/MAX_TEXT_BYTES/, /\b413\b/], none: [/["']preview["']/, /text\[\s*:\s*\d+\s*\]/]},
+        typescript: {all: [/MAX_TEXT_BYTES/, /\b413\b/], none: [/\bpreview\s*:/, /text\.slice\(\s*0/]},
+        go: {all: [/maxTextBytes/, /StatusRequestEntityTooLarge|\b413\b/], none: [/"preview"/, /\.Text\[:\d+\]/]},
+        scala: {all: [/MaxTextBytes/, /PayloadTooLarge|\b413\b/], none: [/"preview"/, /\.take\(\d+\)/]},
+        cpp: {all: [/kMaxTextBytes/, /\b413\b/], none: [/"preview"/, /\.substr\(0,\s*\d+\)/]},
+      },
+    },
+    {
+      id: 'entity-whitelist',
+      title: 'Unknown entity types are 400 before the detector runs',
+      detail:
+        'Each requested entity is checked against `ENTITY_TYPES` before `detect` is called, and an unknown one is **400**; the starter passes the list through, so a typo in a type name returns 200 with that type left unredacted.',
+      match: {
+        python: {all: [/\bin ENTITY_TYPES\b/, /\b400\b/], order: [/\bin ENTITY_TYPES\b/, /\bdetect\(/]},
+        typescript: {all: [/ENTITY_TYPES\.includes\(/, /\b400\b/], order: [/ENTITY_TYPES\.includes\(/, /\bdetect\(/]},
+        go: {
+          all: [/slices\.Contains\(spans\.EntityTypes|range spans\.EntityTypes/, /StatusBadRequest|\b400\b/],
+          order: [/slices\.Contains\(spans\.EntityTypes|range spans\.EntityTypes/, /ner\.Detect\(/],
         },
-        cpp: {all: [/kMaxTextBytes/, /kMaxEntityTypes/, /\b413\b/, /\b400\b/]},
+        scala: {
+          all: [/EntityTypes\.contains|EntityTypes\.toSet/, /BadRequest|\b400\b/],
+          order: [/EntityTypes\.contains|EntityTypes\.toSet/, /Ner\.detect\(/],
+        },
+        cpp: {
+          all: [/kEntityTypes\.(?:begin|end)\(\)/, /\b400\b/],
+          order: [/kEntityTypes\.(?:begin|end)\(\)/, /ner::detect\(/],
+        },
       },
     },
     {
       id: 'fail-closed',
       title: 'A detector failure is 503 with no text',
       detail:
-        'A detector error becomes **503 `{"error": "detector_unavailable"}`** — never the original text, never a degraded 200. The starter catches the error, logs a warning and returns the input with `degraded: true`, so an outage leaks every document.',
+        '`DetectorUnavailable` answers **503** `{"error": "detector_unavailable"}` and saves nothing; the starter catches it and answers 200 with the caller\'s own text as `redacted_text`, so an outage leaks every document it touches.',
       match: {
-        python: {all: [/status_code\s*=\s*503/, /detector_unavailable/, /except DetectorUnavailable/]},
-        typescript: {all: [/code\(\s*503\s*\)/, /detector_unavailable/, /DetectorUnavailable/]},
-        go: {all: [/StatusServiceUnavailable/, /detector_unavailable/, /ErrDetectorUnavailable/]},
-        scala: {all: [/StatusCodes\.ServiceUnavailable/, /detector_unavailable/, /Failure/]},
-        cpp: {all: [/\b503\b/, /detector_unavailable/, /DetectorUnavailable/]},
+        python: {all: [/\b503\b/, /detector_unavailable/], none: [/["']redacted_text["']\s*:\s*text\b/]},
+        typescript: {all: [/\b503\b/, /detector_unavailable/], none: [/redacted_text:\s*text\b/]},
+        go: {
+          all: [/StatusServiceUnavailable|\b503\b/, /detector_unavailable/],
+          none: [/"redacted_text":\s*body\.Text/],
+        },
+        scala: {
+          all: [/ServiceUnavailable|\b503\b/, /detector_unavailable/],
+          none: [/"redacted_text"\s*->\s*JsString\(text\)/],
+        },
+        cpp: {all: [/\b503\b/, /detector_unavailable/], none: [/\{"redacted_text",\s*text\}/]},
       },
     },
     {
       id: 'processed',
-      title: 'Clean text is still marked processed, with spans and counts',
+      title: 'A text with nothing to redact is saved and marked processed',
       detail:
-        'Every 200 carries `"status": "processed"`, the span list, the per-type counts and the pattern version, whether or not anything matched. The starter short-circuits on no-match and returns the raw text, so a miss is indistinguishable from a disabled redactor.',
+        'A detection with no spans is saved like any other and answers `status: "processed"` with an empty span list; the starter returns early with `status: "clean"` and saves nothing, so a miss looks the same as a redactor that did not run.',
       match: {
-        python: {all: [/STATUS_PROCESSED/, /"status":\s*STATUS_PROCESSED/, /"spans":/, /entity_counts/]},
-        typescript: {all: [/STATUS_PROCESSED/, /status:\s*STATUS_PROCESSED/, /spans:/, /entity_counts/]},
-        go: {all: [/statusProcessed/, /"status":\s*statusProcessed/, /"spans"/, /entityCounts|"entity_counts"/]},
-        scala: {all: [/StatusProcessed/, /status\s*=\s*StatusProcessed/, /spans\s*=/, /entity_counts|EntityCounts/]},
-        cpp: {all: [/kStatusProcessed/, /"status",\s*kStatusProcessed/, /"spans"/, /entity_counts/]},
-      },
-    },
-    {
-      id: 'spans-only',
-      title: 'Returns spans and counts, never a raw text field',
-      detail:
-        'The response exposes spans of `(start, end, entity, replacement)` and the counts, but no `text`/`original_text` field anywhere — including errors. The starter returns the caller’s own text back under a `text` key on the happy path and in the 413 body.',
-      match: {
-        python: {all: [/class Span/, /pattern_version/], none: [/["']text["']\s*:/]},
-        typescript: {all: [/type Span/, /pattern_version/], none: [/["']text["']\s*:/]},
-        go: {all: [/type Span struct/, /pattern_version/], none: [/["']text["']\s*:/]},
-        scala: {all: [/case class Span/, /pattern_version/], none: [/["']text["']\s*:/]},
-        cpp: {all: [/struct Span/, /pattern_version/], none: [/["']text["']\s*:/]},
+        python: {all: [/["']processed["']/, /store\.save\(/], none: [/if not detection\.spans/, /["']clean["']/]},
+        typescript: {all: [/'processed'/, /\bsave\(/], none: [/detection\.spans\.length === 0/, /'clean'/]},
+        go: {all: [/"processed"/, /store\.Save\(/], none: [/len\(detection\.Spans\) == 0/, /"clean"/]},
+        scala: {all: [/"processed"/, /Store\.save\(/], none: [/detection\.spans\.isEmpty/, /"clean"/]},
+        cpp: {all: [/"processed"/, /store::save\(/], none: [/detection\.spans\.empty\(\)/, /"clean"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
+      starter: `from dataclasses import asdict
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+
+from redactor import store  # store.save(tenant, document_id, spans, detector_version, redacted_text)
+from redactor.ner import detect  # detect(text, entities) -> Detection, or raises DetectorUnavailable
+from redactor.spans import DEFAULT_ENTITIES, ENTITY_TYPES, DetectorUnavailable, apply_spans, count_entities
 
 app = FastAPI()
-logger = logging.getLogger("redactor")
 
-
-class RedactRequest(BaseModel):
-    text: str
-    entities: list[str] = []
-    document_id: str
-
-
-class DetectorUnavailable(Exception):
-    pass
-
-
-class Detector:
-    def detect(self, text: str, entities: list[str]) -> list[dict]:
-        """Return the spans of sensitive entities in text."""
-        raise NotImplementedError
-
-
-detector = Detector()
-
-
-def apply_spans(text: str, spans: list[dict]) -> str:
-    out = []
-    cursor = 0
-    for span in sorted(spans, key=lambda s: s["start"]):
-        out.append(text[cursor : span["start"]])
-        out.append(span["replacement"])
-        cursor = span["end"]
-    out.append(text[cursor:])
-    return "".join(out)
+MAX_TEXT_BYTES = 256 * 1024
 
 
 @app.post("/v1/redact")
-def redact(body: RedactRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    if len(body.text.encode("utf-8")) > 1 << 18:
-        return JSONResponse({"error": f"text too large: {body.text[:64]}"}, status_code=413)
+async def redact(request: Request) -> JSONResponse:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    body = await request.json()
+    document_id, text = body.get("document_id"), body.get("text")
+    if not document_id or not isinstance(text, str) or not text:
+        raise HTTPException(status_code=400, detail="document_id and text are required")
+    if len(text.encode()) > MAX_TEXT_BYTES:
+        return JSONResponse({"error": "text_too_large", "preview": text[:80]}, status_code=413)
+    entities = body.get("entities") or list(DEFAULT_ENTITIES)
     try:
-        spans = detector.detect(body.text, body.entities)
-    except Exception:
-        logger.warning("detector failed for document=%s", body.document_id)
-        return JSONResponse({"text": body.text, "degraded": True}, status_code=200)
-    if not spans:
-        return JSONResponse({"text": body.text}, status_code=200)
-    return JSONResponse({"text": apply_spans(body.text, spans)}, status_code=200)
-`,
-      solution: `import logging
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-app = FastAPI()
-logger = logging.getLogger("redactor")
-
-MAX_TEXT_BYTES = 1 << 18
-MAX_ENTITY_TYPES = 8
-ALLOWED_ENTITIES = {"EMAIL", "PHONE", "SSN", "CREDIT_CARD", "IBAN", "IPV4", "NAME", "ADDRESS"}
-DEFAULT_ENTITIES = ["EMAIL", "PHONE", "SSN"]
-STATUS_PROCESSED = "processed"
-PATTERN_VERSION = 7
-
-
-class RedactRequest(BaseModel):
-    text: str
-    entities: list[str] = []
-    document_id: str
-
-
-class Span(BaseModel):
-    start: int
-    end: int
-    entity: str
-    replacement: str
-
-
-class DetectorUnavailable(Exception):
-    """The detector could not answer; redaction must fail closed."""
-
-
-class Detector:
-    def detect(self, text: str, entities: list[str]) -> list[Span]:
-        """Return the spans of sensitive entities in text."""
-        raise NotImplementedError
-
-
-detector = Detector()
-
-
-def apply_spans(text: str, spans: list[Span]) -> str:
-    out = []
-    cursor = 0
-    for span in sorted(spans, key=lambda s: s.start):
-        out.append(text[cursor : span.start])
-        out.append(span.replacement)
-        cursor = span.end
-    out.append(text[cursor:])
-    return "".join(out)
-
-
-@app.post("/v1/redact")
-def redact(
-    body: RedactRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail={"error": "missing X-Tenant-Id"})
-    if body.document_id == "":
-        raise HTTPException(status_code=400, detail={"error": "document_id is required"})
-    if body.text == "":
-        raise HTTPException(status_code=400, detail={"error": "text must be a non-empty string"})
-    raw = body.text
-    if len(raw.encode("utf-8")) > MAX_TEXT_BYTES:
-        # The cap is rejected without quoting any of the payload.
-        raise HTTPException(status_code=413, detail={"error": "text exceeds 256 KiB"})
-    entities = body.entities or DEFAULT_ENTITIES
-    if len(entities) > MAX_ENTITY_TYPES or any(e not in ALLOWED_ENTITIES for e in entities):
-        raise HTTPException(status_code=400, detail={"error": "unknown entity type"})
-
-    try:
-        spans = detector.detect(raw, entities)
+        detection = detect(text, entities)
     except DetectorUnavailable:
-        # Fail closed: the caller gets an error, not their own unredacted text.
-        raise HTTPException(status_code=503, detail={"error": "detector_unavailable"})
-
-    counts: dict[str, int] = {}
-    for span in spans:
-        counts[span.entity] = counts.get(span.entity, 0) + 1
-    payload = {
-        "document_id": body.document_id,
-        "status": STATUS_PROCESSED,
-        "redacted_text": apply_spans(raw, spans),
-        "spans": [span.model_dump() for span in spans],
-        "entity_counts": counts,
-        "pattern_version": PATTERN_VERSION,
-    }
-    logger.info(
-        "redact tenant=%s document=%s spans=%d status=%s",
-        tenant,
-        body.document_id,
-        len(spans),
-        STATUS_PROCESSED,
+        return JSONResponse({"document_id": document_id, "status": "degraded", "redacted_text": text, "degraded": True})
+    if not detection.spans:
+        return JSONResponse({"document_id": document_id, "status": "clean"})
+    redacted = apply_spans(text, detection.spans)
+    store.save(tenant, document_id, detection.spans, detection.detector_version, redacted)
+    return JSONResponse(
+        {
+            "document_id": document_id,
+            "status": "processed",
+            "redacted_text": redacted,
+            "spans": [asdict(s) for s in detection.spans],
+            "entity_counts": count_entities(detection.spans),
+            "detector_version": detection.detector_version,
+            "source": detection.source,
+            "degraded": detection.degraded,
+        }
     )
-    return JSONResponse(payload, status_code=200)
+`,
+      solution: `from dataclasses import asdict
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+
+from redactor import store  # store.save(tenant, document_id, spans, detector_version, redacted_text)
+from redactor.ner import detect  # detect(text, entities) -> Detection, or raises DetectorUnavailable
+from redactor.spans import DEFAULT_ENTITIES, ENTITY_TYPES, DetectorUnavailable, apply_spans, count_entities
+
+app = FastAPI()
+
+MAX_TEXT_BYTES = 256 * 1024
+
+
+@app.post("/v1/redact")
+async def redact(request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    body = await request.json()
+    document_id, text = body.get("document_id"), body.get("text")
+    if not document_id or not isinstance(text, str) or not text:
+        raise HTTPException(status_code=400, detail="document_id and text are required")
+    if len(text.encode()) > MAX_TEXT_BYTES:
+        # A constant body: an error path must not carry the payload into logs and traces.
+        return JSONResponse({"error": "text_too_large"}, status_code=413)
+    entities = body.get("entities") or list(DEFAULT_ENTITIES)
+    if not isinstance(entities, list) or any(e not in ENTITY_TYPES for e in entities):
+        return JSONResponse({"error": "unknown_entity"}, status_code=400)
+    try:
+        detection = detect(text, entities)
+    except DetectorUnavailable:
+        # Fail closed: no detector can vouch for this text, so none of it goes back.
+        return JSONResponse({"error": "detector_unavailable"}, status_code=503)
+    redacted = apply_spans(text, detection.spans)
+    store.save(tenant, document_id, detection.spans, detection.detector_version, redacted)
+    return JSONResponse(
+        {
+            "document_id": document_id,
+            "status": "processed",
+            "redacted_text": redacted,
+            "spans": [asdict(s) for s in detection.spans],
+            "entity_counts": count_entities(detection.spans),
+            "detector_version": detection.detector_version,
+            "source": detection.source,
+            "degraded": detection.degraded,
+        }
+    )
 `,
     },
     typescript: {
-      starter: `/** POST /v1/redact. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {detect} from 'redactor/ner'; // detect(text, entities): Detection, or throws DetectorUnavailable
+import {DEFAULT_ENTITIES, type Detection, DetectorUnavailable, ENTITY_TYPES, applySpans, countEntities} from 'redactor/spans';
+import {save} from 'redactor/store'; // save(tenant, documentId, spans, detectorVersion, redactedText)
 
 export const app = Fastify();
 
+export const MAX_TEXT_BYTES = 256 * 1024;
+
 interface RedactBody {
-  text: string;
+  document_id?: string;
+  text?: unknown;
   entities?: string[];
-  document_id: string;
 }
 
 app.post('/v1/redact', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const body = request.body as RedactBody;
-  if (Buffer.byteLength(body.text, 'utf8') > 1 << 18)
-    return reply.code(413).send({error: \`text too large: \${body.text.slice(0, 64)}\`});
-  let spans: Array<{start: number; end: number; entity: string; replacement: string}>;
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const body = (request.body ?? {}) as RedactBody;
+  const {document_id: documentId, text} = body;
+  if (!documentId || typeof text !== 'string' || text === '') return reply.code(400).send({error: 'document_id and text are required'});
+  if (Buffer.byteLength(text) > MAX_TEXT_BYTES) return reply.code(413).send({error: 'text_too_large', preview: text.slice(0, 80)});
+  const entities = body.entities ?? [...DEFAULT_ENTITIES];
+  let detection: Detection;
   try {
-    spans = await detector.detect(body.text, body.entities ?? []);
-  } catch {
-    request.log.warn('detector failed');
-    return reply.code(200).send({text: body.text, degraded: true});
+    detection = await detect(text, entities);
+  } catch (e) {
+    if (!(e instanceof DetectorUnavailable)) throw e;
+    return {document_id: documentId, status: 'degraded', redacted_text: text, degraded: true};
   }
-  if (spans.length === 0) return reply.code(200).send({text: body.text});
-  return reply.code(200).send({text: applySpans(body.text, spans)});
+  if (detection.spans.length === 0) return {document_id: documentId, status: 'clean'};
+  const redacted = applySpans(text, detection.spans);
+  await save(tenant, documentId, detection.spans, detection.detector_version, redacted);
+  return {
+    document_id: documentId,
+    status: 'processed',
+    redacted_text: redacted,
+    spans: detection.spans,
+    entity_counts: countEntities(detection.spans),
+    detector_version: detection.detector_version,
+    source: detection.source,
+    degraded: detection.degraded,
+  };
 });
-
-declare const detector: {detect(text: string, entities: string[]): Promise<Array<{start: number; end: number; entity: string; replacement: string}>>};
-
-function applySpans(text: string, spans: Array<{start: number; end: number; replacement: string}>): string {
-  let out = '';
-  let cursor = 0;
-  for (const span of [...spans].sort((a, b) => a.start - b.start)) {
-    out += text.slice(cursor, span.start) + span.replacement;
-    cursor = span.end;
-  }
-  return out + text.slice(cursor);
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/redact: redaction that fails closed and never echoes the payload. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 
-import {DetectorUnavailable, applySpans, detector, type Span} from './detector';
+import {detect} from 'redactor/ner'; // detect(text, entities): Detection, or throws DetectorUnavailable
+import {DEFAULT_ENTITIES, type Detection, DetectorUnavailable, ENTITY_TYPES, applySpans, countEntities} from 'redactor/spans';
+import {save} from 'redactor/store'; // save(tenant, documentId, spans, detectorVersion, redactedText)
 
 export const app = Fastify();
 
-const MAX_TEXT_BYTES = 1 << 18;
-const MAX_ENTITY_TYPES = 8;
-const DEFAULT_ENTITIES = ['EMAIL', 'PHONE', 'SSN'];
-const ALLOWED_ENTITIES: Record<string, true> = {
-  EMAIL: true,
-  PHONE: true,
-  SSN: true,
-  CREDIT_CARD: true,
-  IBAN: true,
-  IPV4: true,
-  NAME: true,
-  ADDRESS: true,
-};
-const STATUS_PROCESSED = 'processed';
-const PATTERN_VERSION = 7;
+export const MAX_TEXT_BYTES = 256 * 1024;
 
 interface RedactBody {
-  text: string;
-  entities?: string[];
-  document_id: string;
+  document_id?: string;
+  text?: unknown;
+  entities?: unknown;
 }
 
 app.post('/v1/redact', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-
-  const body = request.body as Partial<RedactBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.text !== 'string' || body.text === '')
-    return reply.code(400).send({error: 'text must be a non-empty string'});
-  if (typeof body.document_id !== 'string' || body.document_id === '')
-    return reply.code(400).send({error: 'document_id is required'});
-
-  const raw = body.text;
-  if (Buffer.byteLength(raw, 'utf8') > MAX_TEXT_BYTES)
-    // The cap is rejected without quoting any of the payload.
-    return reply.code(413).send({error: 'text exceeds 256 KiB'});
-
-  const entities = body.entities ?? DEFAULT_ENTITIES;
-  if (!Array.isArray(entities) || entities.length > MAX_ENTITY_TYPES || entities.some(e => ALLOWED_ENTITIES[e] !== true))
-    return reply.code(400).send({error: 'unknown entity type'});
-
-  let spans: Span[];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const body = (request.body ?? {}) as RedactBody;
+  const {document_id: documentId, text} = body;
+  if (!documentId || typeof text !== 'string' || text === '') return reply.code(400).send({error: 'document_id and text are required'});
+  // A constant body: an error path must not carry the payload into logs and traces.
+  if (Buffer.byteLength(text) > MAX_TEXT_BYTES) return reply.code(413).send({error: 'text_too_large'});
+  const entities = body.entities ?? [...DEFAULT_ENTITIES];
+  if (!Array.isArray(entities) || !entities.every(e => ENTITY_TYPES.includes(e))) return reply.code(400).send({error: 'unknown_entity'});
+  let detection: Detection;
   try {
-    spans = await detector.detect(raw, entities.length > 0 ? entities : DEFAULT_ENTITIES);
-  } catch (error) {
-    if (error instanceof DetectorUnavailable)
-      // Fail closed: the caller gets an error, not their own unredacted text.
-      return reply.code(503).send({error: 'detector_unavailable'});
-    throw error;
+    detection = await detect(text, entities);
+  } catch (e) {
+    if (!(e instanceof DetectorUnavailable)) throw e;
+    // Fail closed: no detector can vouch for this text, so none of it goes back.
+    return reply.code(503).send({error: 'detector_unavailable'});
   }
-
-  const entity_counts: Record<string, number> = {};
-  for (const span of spans) entity_counts[span.entity] = (entity_counts[span.entity] ?? 0) + 1;
-
-  request.log.info({tenant, document_id: body.document_id, spans: spans.length, status: STATUS_PROCESSED}, 'redacted');
-  return reply.code(200).send({
-    document_id: body.document_id,
-    status: STATUS_PROCESSED,
-    redacted_text: applySpans(raw, spans),
-    spans,
-    entity_counts,
-    pattern_version: PATTERN_VERSION,
-  });
+  const redacted = applySpans(text, detection.spans);
+  await save(tenant, documentId, detection.spans, detection.detector_version, redacted);
+  return {
+    document_id: documentId,
+    status: 'processed',
+    redacted_text: redacted,
+    spans: detection.spans,
+    entity_counts: countEntities(detection.spans),
+    detector_version: detection.detector_version,
+    source: detection.source,
+    degraded: detection.degraded,
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"redactor/ner"   // ner.Detect(ctx, text, entities) (spans.Detection, error): spans.ErrDetectorUnavailable when no detector can answer
+	"redactor/spans" // spans.EntityTypes, DefaultEntities, ApplySpans, CountEntities
+	"redactor/store" // store.Save(ctx, tenant, documentID, spans, detectorVersion, redactedText)
 )
 
-type RedactRequest struct {
+const maxTextBytes = 256 * 1024
+
+type redactRequest struct {
+	DocumentID string   \`json:"document_id"\`
 	Text       string   \`json:"text"\`
 	Entities   []string \`json:"entities"\`
-	DocumentID string   \`json:"document_id"\`
 }
 
-type Span struct {
-	Start       int    \`json:"start"\`
-	End         int    \`json:"end"\`
-	Entity      string \`json:"entity"\`
-	Replacement string \`json:"replacement"\`
+type redactResponse struct {
+	DocumentID      string         \`json:"document_id"\`
+	Status          string         \`json:"status"\`
+	RedactedText    string         \`json:"redacted_text"\`
+	Spans           []spans.Span   \`json:"spans"\`
+	EntityCounts    map[string]int \`json:"entity_counts"\`
+	DetectorVersion string         \`json:"detector_version"\`
+	Source          string         \`json:"source"\`
+	Degraded        bool           \`json:"degraded"\`
 }
 
-type Detector interface {
-	Detect(ctx context.Context, text string, entities []string) ([]Span, error)
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func redact(rw http.ResponseWriter, r *http.Request) {
-	var body RedactRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	if len([]byte(body.Text)) > 1<<18 {
-		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "text too large: " + body.Text[:64]})
+	var body redactRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.DocumentID == "" || body.Text == "" {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "document_id and text are required"})
 		return
 	}
-	spans, err := detector.Detect(r.Context(), body.Text, body.Entities)
+	if len(body.Text) > maxTextBytes {
+		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "text_too_large", "preview": body.Text[:80]})
+		return
+	}
+	entities := body.Entities
+	if len(entities) == 0 {
+		entities = spans.DefaultEntities
+	}
+	detection, err := ner.Detect(r.Context(), body.Text, entities)
 	if err != nil {
-		log.Printf("detector failed document=%s", body.DocumentID)
-		writeJSON(rw, http.StatusOK, map[string]any{"text": body.Text, "degraded": true})
+		writeJSON(rw, http.StatusOK, map[string]any{"document_id": body.DocumentID, "status": "degraded", "redacted_text": body.Text, "degraded": true})
 		return
 	}
-	if len(spans) == 0 {
-		writeJSON(rw, http.StatusOK, map[string]any{"text": body.Text})
+	if len(detection.Spans) == 0 {
+		writeJSON(rw, http.StatusOK, map[string]any{"document_id": body.DocumentID, "status": "clean"})
 		return
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{"text": applySpans(body.Text, spans)})
-}
-
-func applySpans(text string, spans []Span) string {
-	out := make([]byte, 0, len(text))
-	cursor := 0
-	for _, span := range spans {
-		out = append(out, text[cursor:span.Start]...)
-		out = append(out, span.Replacement...)
-		cursor = span.End
+	redacted := spans.ApplySpans(body.Text, detection.Spans)
+	if err := store.Save(r.Context(), tenant, body.DocumentID, detection.Spans, detection.DetectorVersion, redacted); err != nil {
+		http.Error(rw, "store unavailable", http.StatusInternalServerError)
+		return
 	}
-	return string(out) + text[cursor:]
+	writeJSON(rw, http.StatusOK, redactResponse{
+		DocumentID: body.DocumentID, Status: "processed", RedactedText: redacted, Spans: detection.Spans,
+		EntityCounts: spans.CountEntities(detection.Spans), DetectorVersion: detection.DetectorVersion,
+		Source: detection.Source, Degraded: detection.Degraded,
+	})
 }
 
-var detector Detector
-
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/redact", redact)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
-	"log"
 	"net/http"
+	"slices"
+
+	"redactor/ner"   // ner.Detect(ctx, text, entities) (spans.Detection, error): spans.ErrDetectorUnavailable when no detector can answer
+	"redactor/spans" // spans.EntityTypes, DefaultEntities, ApplySpans, CountEntities
+	"redactor/store" // store.Save(ctx, tenant, documentID, spans, detectorVersion, redactedText)
 )
 
-const (
-	maxTextBytes   = 1 << 18
-	maxEntityTypes = 8
-	statusProcessed = "processed"
-	patternVersion  = 7
-)
+const maxTextBytes = 256 * 1024
 
-var allowedEntities = map[string]bool{
-	"EMAIL": true, "PHONE": true, "SSN": true, "CREDIT_CARD": true,
-	"IBAN": true, "IPV4": true, "NAME": true, "ADDRESS": true,
-}
-
-var defaultEntities = []string{"EMAIL", "PHONE", "SSN"}
-
-// ErrDetectorUnavailable means the detector could not answer; redaction must fail closed.
-var ErrDetectorUnavailable = errors.New("detector_unavailable")
-
-type RedactRequest struct {
+type redactRequest struct {
+	DocumentID string   \`json:"document_id"\`
 	Text       string   \`json:"text"\`
 	Entities   []string \`json:"entities"\`
-	DocumentID string   \`json:"document_id"\`
 }
 
-type Span struct {
-	Start       int    \`json:"start"\`
-	End         int    \`json:"end"\`
-	Entity      string \`json:"entity"\`
-	Replacement string \`json:"replacement"\`
+type redactResponse struct {
+	DocumentID      string         \`json:"document_id"\`
+	Status          string         \`json:"status"\`
+	RedactedText    string         \`json:"redacted_text"\`
+	Spans           []spans.Span   \`json:"spans"\`
+	EntityCounts    map[string]int \`json:"entity_counts"\`
+	DetectorVersion string         \`json:"detector_version"\`
+	Source          string         \`json:"source"\`
+	Degraded        bool           \`json:"degraded"\`
 }
 
-type Detector interface {
-	Detect(ctx context.Context, text string, entities []string) ([]Span, error)
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func applySpans(text string, spans []Span) string {
-	out := make([]byte, 0, len(text))
-	cursor := 0
-	for _, span := range spans {
-		out = append(out, text[cursor:span.Start]...)
-		out = append(out, span.Replacement...)
-		cursor = span.End
-	}
-	return string(out) + text[cursor:]
-}
-
-func validEntities(entities []string) bool {
-	if len(entities) > maxEntityTypes {
-		return false
-	}
-	for _, entity := range entities {
-		if !allowedEntities[entity] {
-			return false
-		}
-	}
-	return true
+	json.NewEncoder(rw).Encode(v)
 }
 
 func redact(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	var body RedactRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	var body redactRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.DocumentID == "" || body.Text == "" {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "document_id and text are required"})
 		return
 	}
-	if body.DocumentID == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "document_id is required"})
-		return
-	}
-	if body.Text == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "text must be a non-empty string"})
-		return
-	}
-	if len([]byte(body.Text)) > maxTextBytes {
-		// The cap is rejected without quoting any of the payload.
-		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "text exceeds 256 KiB"})
+	if len(body.Text) > maxTextBytes {
+		// A constant body: an error path must not carry the payload into logs and traces.
+		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "text_too_large"})
 		return
 	}
 	entities := body.Entities
 	if len(entities) == 0 {
-		entities = defaultEntities
+		entities = spans.DefaultEntities
 	}
-	if !validEntities(entities) {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown entity type"})
-		return
+	for _, entity := range entities {
+		if !slices.Contains(spans.EntityTypes, entity) {
+			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown_entity"})
+			return
+		}
 	}
-
-	spans, err := detector.Detect(r.Context(), body.Text, entities)
+	detection, err := ner.Detect(r.Context(), body.Text, entities)
 	if err != nil {
-		// Fail closed: the caller gets an error, not their own unredacted text.
+		// Fail closed: no detector can vouch for this text, so none of it goes back.
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "detector_unavailable"})
 		return
 	}
-
-	entityCounts := map[string]int{}
-	for _, span := range spans {
-		entityCounts[span.Entity]++
+	redacted := spans.ApplySpans(body.Text, detection.Spans)
+	if err := store.Save(r.Context(), tenant, body.DocumentID, detection.Spans, detection.DetectorVersion, redacted); err != nil {
+		http.Error(rw, "store unavailable", http.StatusInternalServerError)
+		return
 	}
-	log.Printf("redact tenant=%s document=%s spans=%d status=%s", tenant, body.DocumentID, len(spans), statusProcessed)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"document_id":     body.DocumentID,
-		"status":          statusProcessed,
-		"redacted_text":   applySpans(body.Text, spans),
-		"spans":           spans,
-		"entity_counts":   entityCounts,
-		"pattern_version": patternVersion,
+	writeJSON(rw, http.StatusOK, redactResponse{
+		DocumentID: body.DocumentID, Status: "processed", RedactedText: redacted, Spans: detection.Spans,
+		EntityCounts: spans.CountEntities(detection.Spans), DetectorVersion: detection.DetectorVersion,
+		Source: detection.Source, Degraded: detection.Degraded,
 	})
 }
 
-var detector Detector
-
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/redact", redact)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class RedactRequest(text: String, entities: List[String], document_id: String)
+import redactor.{DetectorUnavailable, Ner, Spans, Store} // Ner.detect(text, entities), Store.save(tenant, documentId, spans, detectorVersion, redactedText)
 
-object RedactApi {
-  implicit val system: ActorSystem = ActorSystem("redactor")
-  implicit val requestFormat: RootJsonFormat[RedactRequest] = jsonFormat3(RedactRequest)
+object Api {
+  val MaxTextBytes: Int = 256 * 1024
 
-  val detector = Detector.open()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "redact") {
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[RedactRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            if (body.text.getBytes("UTF-8").length > (1 << 18)) {
-              complete(StatusCodes.RequestEntityTooLarge, s"""{"error":"text too large: \${body.text.take(64)}"}""")
-            } else {
-              detector.detect(body.text, body.entities) match {
-                case scala.util.Success(spans) if spans.isEmpty =>
-                  complete(StatusCodes.OK, s"""{"text":\${body.text}}""")
-                case scala.util.Success(spans) =>
-                  complete(StatusCodes.OK, s"""{"text":"\${applySpans(body.text, spans)}"}""")
-                case scala.util.Failure(_) =>
-                  system.log.warning(s"detector failed document=\${body.document_id}")
-                  complete(StatusCodes.OK, s"""{"text":\${body.text},"degraded":true}""")
-              }
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
+
+  def redact(tenant: String, body: JsObject): HttpResponse = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val fields = body.fields
+    (fields.get("document_id"), fields.get("text")) match {
+      case (Some(JsString(documentId)), Some(JsString(text))) if documentId.nonEmpty && text.nonEmpty =>
+        if (text.getBytes("UTF-8").length > MaxTextBytes) json(StatusCodes.PayloadTooLarge, JsObject("error" -> JsString("text_too_large"), "preview" -> JsString(text.take(80))))
+        else {
+          val entities = fields.get("entities") match {
+            case Some(JsArray(items)) if items.nonEmpty => items.collect { case JsString(e) => e }
+            case _ => Spans.DefaultEntities
+          }
+          try {
+            val detection = Ner.detect(text, entities)
+            if (detection.spans.isEmpty) json(StatusCodes.OK, JsObject("document_id" -> JsString(documentId), "status" -> JsString("clean")))
+            else {
+              val redacted = Spans.applySpans(text, detection.spans)
+              Store.save(tenant, documentId, detection.spans, detection.detectorVersion, redacted)
+              json(StatusCodes.OK, JsObject(
+                "document_id" -> JsString(documentId), "status" -> JsString("processed"), "redacted_text" -> JsString(redacted),
+                "spans" -> JsArray(detection.spans.map(Spans.spanJson).toVector), "entity_counts" -> Spans.countsJson(Spans.countEntities(detection.spans)),
+                "detector_version" -> JsString(detection.detectorVersion), "source" -> JsString(detection.source), "degraded" -> JsBoolean(detection.degraded)))
             }
+          } catch {
+            case _: DetectorUnavailable =>
+              json(StatusCodes.OK, JsObject("document_id" -> JsString(documentId), "status" -> JsString("degraded"), "redacted_text" -> JsString(text), "degraded" -> JsTrue))
           }
         }
+      case _ => error(StatusCodes.BadRequest, "document_id and text are required")
+    }
+  }
+
+  val route: Route = path("v1" / "redact") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
+        case Some(tenant) => entity(as[String])(raw => complete(redact(tenant, raw.parseJson.asJsObject)))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class RedactRequest(text: String, entities: List[String], document_id: String)
-final case class Span(start: Int, end: Int, entity: String, replacement: String)
-final case class Redaction(
-    document_id: String,
-    status: String,
-    redacted_text: String,
-    spans: List[Span],
-    entity_counts: Map[String, Int],
-    pattern_version: Int,
-)
+import redactor.{DetectorUnavailable, Ner, Spans, Store} // Ner.detect(text, entities), Store.save(tenant, documentId, spans, detectorVersion, redactedText)
 
-object RedactApi {
-  implicit val system: ActorSystem = ActorSystem("redactor")
-  implicit val requestFormat: RootJsonFormat[RedactRequest] = jsonFormat3(RedactRequest)
-  implicit val spanFormat: RootJsonFormat[Span] = jsonFormat4(Span)
-  implicit val redactionFormat: RootJsonFormat[Redaction] = jsonFormat6(Redaction)
+object Api {
+  val MaxTextBytes: Int = 256 * 1024
 
-  val MaxTextBytes = 1 << 18
-  val MaxEntityTypes = 8
-  val DefaultEntities = List("EMAIL", "PHONE", "SSN")
-  val AllowedEntities = Set("EMAIL", "PHONE", "SSN", "CREDIT_CARD", "IBAN", "IPV4", "NAME", "ADDRESS")
-  val StatusProcessed = "processed"
-  val PatternVersion = 7
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val detector = Detector.open()
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  def applySpans(text: String, spans: List[Span]): String = {
-    val out = new StringBuilder
-    var cursor = 0
-    for (span <- spans.sortBy(_.start)) {
-      out.append(text.substring(cursor, span.start)).append(span.replacement)
-      cursor = span.end
+  def redact(tenant: String, body: JsObject): HttpResponse = {
+    val fields = body.fields
+    (fields.get("document_id"), fields.get("text")) match {
+      // A constant body: an error path must not carry the payload into logs and traces.
+      case (Some(JsString(documentId)), Some(JsString(text))) if documentId.nonEmpty && text.nonEmpty =>
+        if (text.getBytes("UTF-8").length > MaxTextBytes) error(StatusCodes.PayloadTooLarge, "text_too_large")
+        else {
+          val entities = fields.get("entities") match {
+            case Some(JsArray(items)) if items.nonEmpty => items.map { case JsString(e) => e; case other => other.toString }
+            case _ => Spans.DefaultEntities
+          }
+          if (!entities.forall(Spans.EntityTypes.contains)) error(StatusCodes.BadRequest, "unknown_entity")
+          else
+            try {
+              val detection = Ner.detect(text, entities)
+              val redacted = Spans.applySpans(text, detection.spans)
+              Store.save(tenant, documentId, detection.spans, detection.detectorVersion, redacted)
+              json(StatusCodes.OK, JsObject(
+                "document_id" -> JsString(documentId), "status" -> JsString("processed"), "redacted_text" -> JsString(redacted),
+                "spans" -> JsArray(detection.spans.map(Spans.spanJson).toVector), "entity_counts" -> Spans.countsJson(Spans.countEntities(detection.spans)),
+                "detector_version" -> JsString(detection.detectorVersion), "source" -> JsString(detection.source), "degraded" -> JsBoolean(detection.degraded)))
+            } catch {
+              // Fail closed: no detector can vouch for this text, so none of it goes back.
+              case _: DetectorUnavailable => error(StatusCodes.ServiceUnavailable, "detector_unavailable")
+            }
+        }
+      case _ => error(StatusCodes.BadRequest, "document_id and text are required")
     }
-    out.append(text.substring(cursor)).toString
   }
 
-  val route: Route =
-    path("v1" / "redact") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[RedactRequest]) { body =>
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else if (body.document_id.isEmpty) {
-              complete(StatusCodes.BadRequest, """{"error":"document_id is required"}""")
-            } else if (body.text.isEmpty) {
-              complete(StatusCodes.BadRequest, """{"error":"text must be a non-empty string"}""")
-            } else if (body.text.getBytes("UTF-8").length > MaxTextBytes) {
-              // The cap is rejected without quoting any of the payload.
-              complete(StatusCodes.RequestEntityTooLarge, """{"error":"text exceeds 256 KiB"}""")
-            } else {
-              val entities = if (body.entities.isEmpty) DefaultEntities else body.entities
-              if (entities.length > MaxEntityTypes || !entities.forall(AllowedEntities.contains)) {
-                complete(StatusCodes.BadRequest, """{"error":"unknown entity type"}""")
-              } else {
-                detector.detect(body.text, entities) match {
-                  case scala.util.Failure(_) =>
-                    // Fail closed: the caller gets an error, not their own unredacted text.
-                    complete(StatusCodes.ServiceUnavailable, """{"error":"detector_unavailable"}""")
-                  case scala.util.Success(spans) =>
-                    val counts = spans.groupBy(_.entity).view.mapValues(_.size).toMap
-                    val tenant = tenantOpt.get
-                    system.log.info(
-                      s"redact tenant=$tenant document=\${body.document_id} spans=\${spans.size} status=$StatusProcessed",
-                    )
-                    complete(
-                      StatusCodes.OK,
-                      Redaction(
-                        document_id = body.document_id,
-                        status = StatusProcessed,
-                        redacted_text = applySpans(body.text, spans),
-                        spans = spans,
-                        entity_counts = counts,
-                        pattern_version = PatternVersion,
-                      ),
-                    )
-                }
-              }
-            }
-          }
-        }
+  val route: Route = path("v1" / "redact") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
+        case Some(tenant) => entity(as[String])(raw => complete(redact(tenant, raw.parseJson.asJsObject)))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -743,201 +609,515 @@ object RedactApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <string>
 #include <vector>
 
+#include "redactor/ner.h"    // ner::detect(text, entities) -> spans::Detection, or throws spans::DetectorUnavailable
+#include "redactor/spans.h"  // spans::kEntityTypes, kDefaultEntities, apply_spans, count_entities
+#include "redactor/store.h"  // store::save(tenant, document_id, spans, detector_version, redacted_text)
+
 using json = nlohmann::json;
 
-struct Span {
-  int start = 0;
-  int end = 0;
-  std::string entity;
-  std::string replacement;
-};
+constexpr size_t kMaxTextBytes = 256 * 1024;
 
-struct Detector {
-  virtual std::optional<std::vector<Span>> detect(const std::string& text, const std::vector<std::string>& entities);
-};
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-Detector detector;
-
-std::string applySpans(const std::string& text, const std::vector<Span>& spans) {
-  std::string out;
-  std::size_t cursor = 0;
-  for (const auto& span : spans) {
-    out += text.substr(cursor, span.start - cursor) + span.replacement;
-    cursor = span.end;
+void redact(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, json{{"error", "X-Tenant-Id is required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  const std::string document_id = body.is_object() ? body.value("document_id", "") : "";
+  const std::string text = body.is_object() && body.contains("text") && body["text"].is_string() ? body["text"].get<std::string>() : "";
+  if (document_id.empty() || text.empty()) return reply(res, 400, json{{"error", "document_id and text are required"}});
+  if (text.size() > kMaxTextBytes) return reply(res, 413, json{{"error", "text_too_large"}, {"preview", text.substr(0, 80)}});
+  std::vector<std::string> entities = body.value("entities", std::vector<std::string>{});
+  if (entities.empty()) entities = spans::kDefaultEntities;
+  spans::Detection detection;
+  try {
+    detection = ner::detect(text, entities);
+  } catch (const spans::DetectorUnavailable&) {
+    return reply(res, 200, json{{"document_id", document_id}, {"status", "degraded"}, {"redacted_text", text}, {"degraded", true}});
   }
-  return out + text.substr(cursor);
+  if (detection.spans.empty()) return reply(res, 200, json{{"document_id", document_id}, {"status", "clean"}});
+  const std::string redacted = spans::apply_spans(text, detection.spans);
+  store::save(tenant, document_id, detection.spans, detection.detector_version, redacted);
+  reply(res, 200, json{{"document_id", document_id}, {"status", "processed"}, {"redacted_text", redacted},
+                       {"spans", detection.spans}, {"entity_counts", spans::count_entities(detection.spans)},
+                       {"detector_version", detection.detector_version}, {"source", detection.source}, {"degraded", detection.degraded}});
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/redact", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto text = body.value("text", std::string());
-    const auto documentId = body.value("document_id", std::string());
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    if (text.size() > 1u << 18) {
-      res.status = 413;
-      res.set_content(json{{"error", "text too large: " + text.substr(0, 64)}}.dump(), "application/json");
-      return;
-    }
-    auto spans = detector.detect(text, {});
-    if (!spans) {
-      std::cerr << "detector failed document=" << documentId << "\\n";
-      res.status = 200;
-      res.set_content(json{{"text", text}, {"degraded", true}}.dump(), "application/json");
-      return;
-    }
-    res.status = 200;
-    res.set_content(json{{"text", spans->empty() ? text : applySpans(text, *spans)}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Post("/v1/redact", redact); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <optional>
-#include <set>
+#include <algorithm>
 #include <string>
 #include <vector>
 
+#include "redactor/ner.h"    // ner::detect(text, entities) -> spans::Detection, or throws spans::DetectorUnavailable
+#include "redactor/spans.h"  // spans::kEntityTypes, kDefaultEntities, apply_spans, count_entities
+#include "redactor/store.h"  // store::save(tenant, document_id, spans, detector_version, redacted_text)
+
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxTextBytes = 1 << 18;
-constexpr std::size_t kMaxEntityTypes = 8;
-const std::string kStatusProcessed = "processed";
-constexpr int kPatternVersion = 7;
+constexpr size_t kMaxTextBytes = 256 * 1024;
 
-const std::set<std::string> kAllowedEntities = {"EMAIL", "PHONE", "SSN", "CREDIT_CARD",
-                                                "IBAN",  "IPV4",  "NAME", "ADDRESS"};
-const std::vector<std::string> kDefaultEntities = {"EMAIL", "PHONE", "SSN"};
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-struct Span {
-  int start = 0;
-  int end = 0;
-  std::string entity;
-  std::string replacement;
-};
-
-struct DetectorUnavailable : std::exception {};
-
-struct Detector {
-  virtual std::vector<Span> detect(const std::string& text, const std::vector<std::string>& entities);
-};
-
-Detector detector;
-
-std::string applySpans(const std::string& text, const std::vector<Span>& spans) {
-  std::vector<Span> ordered = spans;
-  std::sort(ordered.begin(), ordered.end(), [](const Span& a, const Span& b) { return a.start < b.start; });
-  std::string out;
-  std::size_t cursor = 0;
-  for (const auto& span : ordered) {
-    out += text.substr(cursor, static_cast<std::size_t>(span.start) - cursor) + span.replacement;
-    cursor = static_cast<std::size_t>(span.end);
+void redact(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, json{{"error", "X-Tenant-Id is required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  const std::string document_id = body.is_object() ? body.value("document_id", "") : "";
+  const std::string text = body.is_object() && body.contains("text") && body["text"].is_string() ? body["text"].get<std::string>() : "";
+  if (document_id.empty() || text.empty()) return reply(res, 400, json{{"error", "document_id and text are required"}});
+  // A constant body: an error path must not carry the payload into logs and traces.
+  if (text.size() > kMaxTextBytes) return reply(res, 413, json{{"error", "text_too_large"}});
+  std::vector<std::string> entities = body.value("entities", std::vector<std::string>{});
+  if (entities.empty()) entities = spans::kDefaultEntities;
+  for (const std::string& entity : entities) {
+    if (std::find(spans::kEntityTypes.begin(), spans::kEntityTypes.end(), entity) == spans::kEntityTypes.end()) {
+      return reply(res, 400, json{{"error", "unknown_entity"}});
+    }
   }
-  return out + text.substr(cursor);
+  spans::Detection detection;
+  try {
+    detection = ner::detect(text, entities);
+  } catch (const spans::DetectorUnavailable&) {
+    // Fail closed: no detector can vouch for this text, so none of it goes back.
+    return reply(res, 503, json{{"error", "detector_unavailable"}});
+  }
+  const std::string redacted = spans::apply_spans(text, detection.spans);
+  store::save(tenant, document_id, detection.spans, detection.detector_version, redacted);
+  reply(res, 200, json{{"document_id", document_id}, {"status", "processed"}, {"redacted_text", redacted},
+                       {"spans", detection.spans}, {"entity_counts", spans::count_entities(detection.spans)},
+                       {"detector_version", detection.detector_version}, {"source", detection.source}, {"degraded", detection.degraded}});
 }
 
-bool validEntities(const std::vector<std::string>& entities) {
-  if (entities.size() > kMaxEntityTypes) return false;
-  for (const auto& entity : entities)
-    if (kAllowedEntities.count(entity) == 0) return false;
-  return true;
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/redact", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("text") || !body["text"].is_string()) {
-      res.status = 400;
-      res.set_content(R"({"error":"text must be a non-empty string"})", "application/json");
-      return;
-    }
-    const auto text = body["text"].get<std::string>();
-    const auto documentId = body.value("document_id", std::string());
-    if (documentId.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"document_id is required"})", "application/json");
-      return;
-    }
-    if (text.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"text must be a non-empty string"})", "application/json");
-      return;
-    }
-    if (text.size() > kMaxTextBytes) {
-      // The cap is rejected without quoting any of the payload.
-      res.status = 413;
-      res.set_content(R"({"error":"text exceeds 256 KiB"})", "application/json");
-      return;
-    }
-    auto entities = body.value("entities", std::vector<std::string>{});
-    if (entities.empty()) entities = kDefaultEntities;
-    if (!validEntities(entities)) {
-      res.status = 400;
-      res.set_content(R"({"error":"unknown entity type"})", "application/json");
-      return;
-    }
-
-    std::vector<Span> spans;
-    try {
-      spans = detector.detect(text, entities);
-    } catch (const DetectorUnavailable&) {
-      // Fail closed: the caller gets an error, not their own unredacted text.
-      res.status = 503;
-      res.set_content(R"({"error":"detector_unavailable"})", "application/json");
-      return;
-    }
-
-    json entity_counts = json::object();
-    for (const auto& span : spans) entity_counts[span.entity] = entity_counts.value(span.entity, 0) + 1;
-    json out = {
-        {"document_id", documentId},
-        {"status", kStatusProcessed},
-        {"redacted_text", applySpans(text, spans)},
-        {"spans", json::array()},
-        {"entity_counts", entity_counts},
-        {"pattern_version", kPatternVersion},
-    };
-    for (const auto& span : spans)
-      out["spans"].push_back(
-          json{{"start", span.start}, {"end", span.end}, {"entity", span.entity}, {"replacement", span.replacement}});
-    std::cerr << "redact tenant=" << tenant << " document=" << documentId << " spans=" << spans.size()
-              << " status=" << kStatusProcessed << "\\n";
-    res.status = 200;
-    res.set_content(out.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Post("/v1/redact", redact); }
 `,
     },
   },
+  harness: {
+    python: `import detector_pb2
+import detector_pb2_grpc
+from redactor import store
+from redactor.spans import scan
+
+TENANT = {"X-Tenant-Id": "acme"}
+TEXT = "Reach Ada at ada@example.com or 415-555-0132."
+CAP = 256 * 1024
+
+
+class Detector(detector_pb2_grpc.DetectorServicer):
+    """The NER model's stand-in: every requested type a pattern covers, by its pattern."""
+
+    def Detect(self, request, context):
+        found = [detector_pb2.EntitySpan(start=s.start, end=s.end, entity=s.entity) for s in scan(request.text, request.entities)]
+        return detector_pb2.DetectResponse(spans=found, model_version="ner-2026.10")
+
+
+def _api(ctx, detector=True):
+    if detector:
+        ctx.grpc.serve(detector_pb2_grpc.add_DetectorServicer_to_server, Detector())
+    return ctx.client(ctx.load("api").app)
+
+
+async def _redact(c, body, headers=TENANT):
+    return await c.post("/v1/redact", json=body, headers=headers)
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _redact(c, {"document_id": "d-1", "text": TEXT})
+        assert r.status_code == 200, f"POST /v1/redact answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("redacted_text") == "Reach Ada at [EMAIL] or [PHONE].", f"the redacted text is {body.get('redacted_text')!r}"
+        email, phone = TEXT.index("ada@"), TEXT.index("415")
+        got = [(s.get("start"), s.get("end"), s.get("entity")) for s in body.get("spans") or []]
+        assert got == [(email, email + 15, "EMAIL"), (phone, phone + 12, "PHONE")], f"the spans are {got}"
+        saved = store.load("d-1")
+        assert saved is not None and saved.tenant == "acme" and len(saved.spans) == 2, f"the redaction must be saved for tenant acme, the store holds {saved}"
+        r = await _redact(c, {"document_id": "d-2", "text": TEXT}, headers={})
+    assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}, expected 401"
+
+
+async def check_size_cap(ctx):
+    async with _api(ctx) as c:
+        big = "Call 415-555-0132 now. " + "lorem ipsum dolor sit amet " * 10_000
+        r = await _redact(c, {"document_id": "d-big", "text": big})
+        assert r.status_code == 413, f"a {len(big)}-byte text answered {r.status_code}, expected 413"
+        assert "415-555-0132" not in r.text and "lorem" not in r.text, f"the 413 body quotes the payload: {r.text[:200]}. An error body is logged and traced; keep it constant"
+        exact = "x@example.com " + ("lorem ipsum " * 30_000)[: CAP - 14]
+        r = await _redact(c, {"document_id": "d-cap", "text": exact, "entities": ["EMAIL"]})
+    assert r.status_code == 200, f"a text of exactly 256 KiB answered {r.status_code}, expected 200"
+
+
+async def check_entity_whitelist(ctx):
+    async with _api(ctx) as c:
+        r = await _redact(c, {"document_id": "d-1", "text": TEXT, "entities": ["EMAIL", "PHONE_NUMBER"]})
+        assert r.status_code == 400, f"an unknown entity type (PHONE_NUMBER) answered {r.status_code}, expected 400: the phone number went back unredacted"
+        assert ctx.grpc.calls_to("Detect") == [], "the detector was called for a request with an unknown entity type: reject it first"
+        assert store.load("d-1") is None, "a rejected request must not be saved"
+        r = await _redact(c, {"document_id": "d-2", "text": TEXT, "entities": ["EMAIL"]})
+    assert r.status_code == 200 and r.json().get("redacted_text") == "Reach Ada at [EMAIL] or 415-555-0132.", f"a request for EMAIL only answered {r.status_code} {r.text}"
+
+
+async def check_fail_closed(ctx):
+    async with _api(ctx, detector=False) as c:
+        r = await _redact(c, {"document_id": "d-1", "text": "Ada Lovelace, ada@example.com", "entities": ["EMAIL", "PERSON"]})
+        assert r.status_code == 503, f"with the detector down and PERSON requested (no pattern covers it) the redactor answered {r.status_code}, expected 503"
+        assert "ada@example.com" not in r.text and "Lovelace" not in r.text, f"the 503 body carries the customer text: {r.text}"
+        assert r.json() == {"error": "detector_unavailable"}, f"the 503 body is {r.text}, expected {{\\"error\\": \\"detector_unavailable\\"}}"
+        assert store.load("d-1") is None, "a request that could not be redacted must not be saved"
+        r = await _redact(c, {"document_id": "d-2", "text": TEXT})
+    assert r.status_code == 200 and r.json().get("degraded") is True, f"with the detector down and only pattern types requested, the regex fallback answers a degraded 200; got {r.status_code} {r.text}"
+
+
+async def check_processed(ctx):
+    clean = "Nothing personal in this sentence."
+    async with _api(ctx) as c:
+        r = await _redact(c, {"document_id": "d-clean", "text": clean})
+    assert r.status_code == 200, f"a text with nothing to redact answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("status") == "processed", f"a text with nothing to redact must answer status processed, got {body}"
+    assert body.get("spans") == [] and body.get("entity_counts") == {} and body.get("redacted_text") == clean, f"expected an empty span list, empty counts and the text as redacted_text, got {body}"
+    assert body.get("detector_version") == "ner-2026.10", f"the answer must name the detector version, got {body}"
+    saved = store.load("d-clean")
+    assert saved is not None and saved.spans == [], f"a text with nothing to redact must be saved like any other (the audit read shows it was processed), the store holds {saved}"
+`,
+    typescript: `const TENANT = {'X-Tenant-Id': 'acme'};
+const TEXT = 'Reach Ada at ada@example.com or 415-555-0132.';
+const CAP = 256 * 1024;
+
+/** The NER model's stand-in: every requested type a pattern covers, by its pattern. */
+function api(ctx, {detector = true} = {}) {
+  const {scan} = ctx.load('/support/redactor/spans.ts');
+  if (detector) {
+    const pkg = ctx.proto('detector.proto');
+    ctx.grpc.serve(pkg.redactor.Detector.service, {
+      Detect(call, callback) {
+        const found = scan(call.request.text, call.request.entities ?? []).map(s => ({start: s.start, end: s.end, entity: s.entity}));
+        callback(null, {spans: found, model_version: 'ner-2026.10'});
+      },
+    });
+  }
+  return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/redactor/store.ts')};
+}
+
+const redact = (c, body, headers: Record<string, string> = TENANT) => c.post('/v1/redact', {json: body, headers});
+
+export async function check_route(ctx) {
+  const {c, store} = api(ctx);
+  let r = await redact(c, {document_id: 'd-1', text: TEXT});
+  assert.equal(r.status, 200, \`POST /v1/redact answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert.equal(body.redacted_text, 'Reach Ada at [EMAIL] or [PHONE].', \`the redacted text is \${JSON.stringify(body.redacted_text)}\`);
+  const email = TEXT.indexOf('ada@');
+  const phone = TEXT.indexOf('415');
+  const got = (body.spans ?? []).map(s => [s.start, s.end, s.entity]);
+  assert.deepStrictEqual(got, [[email, email + 15, 'EMAIL'], [phone, phone + 12, 'PHONE']], \`the spans are \${JSON.stringify(got)}\`);
+  const saved = await store.load('d-1');
+  assert(saved !== null && saved.tenant === 'acme' && saved.spans.length === 2, \`the redaction must be saved for tenant acme, the store holds \${JSON.stringify(saved)}\`);
+  r = await redact(c, {document_id: 'd-2', text: TEXT}, {});
+  assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}, expected 401\`);
+}
+
+export async function check_size_cap(ctx) {
+  const {c} = api(ctx);
+  const big = 'Call 415-555-0132 now. ' + 'lorem ipsum dolor sit amet '.repeat(10_000);
+  let r = await redact(c, {document_id: 'd-big', text: big});
+  assert.equal(r.status, 413, \`a \${big.length}-byte text answered \${r.status}, expected 413\`);
+  assert(!r.text.includes('415-555-0132') && !r.text.includes('lorem'), \`the 413 body quotes the payload: \${r.text.slice(0, 200)}. An error body is logged and traced; keep it constant\`);
+  const exact = 'x@example.com ' + 'lorem ipsum '.repeat(30_000).slice(0, CAP - 14);
+  r = await redact(c, {document_id: 'd-cap', text: exact, entities: ['EMAIL']});
+  assert.equal(r.status, 200, \`a text of exactly 256 KiB answered \${r.status}, expected 200\`);
+}
+
+export async function check_entity_whitelist(ctx) {
+  const {c, store} = api(ctx);
+  let r = await redact(c, {document_id: 'd-1', text: TEXT, entities: ['EMAIL', 'PHONE_NUMBER']});
+  assert.equal(r.status, 400, \`an unknown entity type (PHONE_NUMBER) answered \${r.status}, expected 400: the phone number went back unredacted\`);
+  assert.equal(ctx.grpc.callsTo('Detect').length, 0, 'the detector was called for a request with an unknown entity type: reject it first');
+  assert.equal(await store.load('d-1'), null, 'a rejected request must not be saved');
+  r = await redact(c, {document_id: 'd-2', text: TEXT, entities: ['EMAIL']});
+  assert(r.status === 200 && r.json().redacted_text === 'Reach Ada at [EMAIL] or 415-555-0132.', \`a request for EMAIL only answered \${r.status} \${r.text}\`);
+}
+
+export async function check_fail_closed(ctx) {
+  const {c, store} = api(ctx, {detector: false});
+  let r = await redact(c, {document_id: 'd-1', text: 'Ada Lovelace, ada@example.com', entities: ['EMAIL', 'PERSON']});
+  assert.equal(r.status, 503, \`with the detector down and PERSON requested (no pattern covers it) the redactor answered \${r.status}, expected 503\`);
+  assert(!r.text.includes('ada@example.com') && !r.text.includes('Lovelace'), \`the 503 body carries the customer text: \${r.text}\`);
+  assert.deepStrictEqual(r.json(), {error: 'detector_unavailable'}, \`the 503 body is \${r.text}, expected {"error": "detector_unavailable"}\`);
+  assert.equal(await store.load('d-1'), null, 'a request that could not be redacted must not be saved');
+  r = await redact(c, {document_id: 'd-2', text: TEXT});
+  assert(r.status === 200 && r.json().degraded === true, \`with the detector down and only pattern types requested, the regex fallback answers a degraded 200; got \${r.status} \${r.text}\`);
+}
+
+export async function check_processed(ctx) {
+  const {c, store} = api(ctx);
+  const clean = 'Nothing personal in this sentence.';
+  const r = await redact(c, {document_id: 'd-clean', text: clean});
+  assert.equal(r.status, 200, \`a text with nothing to redact answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert.equal(body.status, 'processed', \`a text with nothing to redact must answer status processed, got \${r.text}\`);
+  assert(Array.isArray(body.spans) && body.spans.length === 0 && JSON.stringify(body.entity_counts) === '{}' && body.redacted_text === clean, \`expected an empty span list, empty counts and the text as redacted_text, got \${r.text}\`);
+  assert.equal(body.detector_version, 'ner-2026.10', \`the answer must name the detector version, got \${r.text}\`);
+  const saved = await store.load('d-clean');
+  assert(saved !== null && saved.spans.length === 0, \`a text with nothing to redact must be saved like any other (the audit read shows it was processed), the store holds \${JSON.stringify(saved)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	pb "redactor/gen/detector"
+	"redactor/spans"
+	"redactor/store"
+
+	"leetbuild/harness"
+)
+
+const (
+	apiText = "Reach Ada at ada@example.com or 415-555-0132."
+	apiCap  = 256 * 1024
+)
+
+// detectorPeer is the NER model's stand-in: every requested type a pattern covers, by its pattern.
+type detectorPeer struct {
+	pb.UnimplementedDetectorServer
+}
+
+func (detectorPeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.DetectResponse, error) {
+	var found []*pb.EntitySpan
+	for _, s := range spans.Scan(req.GetText(), req.GetEntities()) {
+		found = append(found, &pb.EntitySpan{Start: int32(s.Start), End: int32(s.End), Entity: s.Entity})
+	}
+	return &pb.DetectResponse{Spans: found, ModelVersion: "ner-2026.10"}, nil
+}
+
+func apiClient(ctx *harness.Ctx, detector bool) *harness.HTTP {
+	if detector {
+		pb.RegisterDetectorServer(ctx.GRPC.Server(""), detectorPeer{})
+	}
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func apiRedact(c *harness.HTTP, body map[string]any) *harness.Response {
+	return c.Post("/v1/redact", body, "X-Tenant-Id", "acme")
+}
+
+func apiBody(r *harness.Response) map[string]any {
+	var body map[string]any
+	r.Decode(&body)
+	return body
+}
+
+func apiLoad(ctx *harness.Ctx, documentID string) *store.Redaction {
+	saved, err := store.Load(context.Background(), documentID)
+	ctx.NoError(err, "store.Load(%s)", documentID)
+	return saved
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := apiClient(ctx, true)
+	r := apiRedact(c, map[string]any{"document_id": "d-1", "text": apiText})
+	ctx.Equal(r.Status, 200, "POST /v1/redact (%s)", r.Text())
+	body := apiBody(r)
+	ctx.Equal(body["redacted_text"], "Reach Ada at [EMAIL] or [PHONE].", "the redacted text")
+	email, phone := strings.Index(apiText, "ada@"), strings.Index(apiText, "415")
+	var got [][]any
+	for _, s := range body["spans"].([]any) {
+		m := s.(map[string]any)
+		got = append(got, []any{m["start"], m["end"], m["entity"]})
+	}
+	ctx.Equal(got, [][]any{{float64(email), float64(email + 15), "EMAIL"}, {float64(phone), float64(phone + 12), "PHONE"}}, "the spans")
+	saved := apiLoad(ctx, "d-1")
+	ctx.Assert(saved != nil && saved.Tenant == "acme" && len(saved.Spans) == 2, "the redaction must be saved for tenant acme, the store holds %+v", saved)
+	r = c.Post("/v1/redact", map[string]any{"document_id": "d-2", "text": apiText})
+	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
+}
+
+func CheckSizeCap(ctx *harness.Ctx) {
+	c := apiClient(ctx, true)
+	big := "Call 415-555-0132 now. " + strings.Repeat("lorem ipsum dolor sit amet ", 10000)
+	r := apiRedact(c, map[string]any{"document_id": "d-big", "text": big})
+	ctx.Equal(r.Status, 413, "a %d-byte text", len(big))
+	ctx.Assert(!strings.Contains(r.Text(), "415-555-0132") && !strings.Contains(r.Text(), "lorem"), "the 413 body quotes the payload: %.200s. An error body is logged and traced; keep it constant", r.Text())
+	exact := "x@example.com " + strings.Repeat("lorem ipsum ", 30000)[:apiCap-14]
+	r = apiRedact(c, map[string]any{"document_id": "d-cap", "text": exact, "entities": []string{"EMAIL"}})
+	ctx.Equal(r.Status, 200, "a text of exactly 256 KiB")
+}
+
+func CheckEntityWhitelist(ctx *harness.Ctx) {
+	c := apiClient(ctx, true)
+	r := apiRedact(c, map[string]any{"document_id": "d-1", "text": apiText, "entities": []string{"EMAIL", "PHONE_NUMBER"}})
+	ctx.Equal(r.Status, 400, "an unknown entity type (PHONE_NUMBER) must be rejected, the phone number went back unredacted")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Detect", "")), 0, "the detector was called for a request with an unknown entity type: reject it first; Detect calls")
+	ctx.Assert(apiLoad(ctx, "d-1") == nil, "a rejected request must not be saved")
+	r = apiRedact(c, map[string]any{"document_id": "d-2", "text": apiText, "entities": []string{"EMAIL"}})
+	ctx.Assert(r.Status == 200 && apiBody(r)["redacted_text"] == "Reach Ada at [EMAIL] or 415-555-0132.", "a request for EMAIL only answered %d %s", r.Status, r.Text())
+}
+
+func CheckFailClosed(ctx *harness.Ctx) {
+	c := apiClient(ctx, false)
+	r := apiRedact(c, map[string]any{"document_id": "d-1", "text": "Ada Lovelace, ada@example.com", "entities": []string{"EMAIL", "PERSON"}})
+	ctx.Equal(r.Status, 503, "with the detector down and PERSON requested (no pattern covers it)")
+	ctx.Assert(!strings.Contains(r.Text(), "ada@example.com") && !strings.Contains(r.Text(), "Lovelace"), "the 503 body carries the customer text: %s", r.Text())
+	ctx.Equal(apiBody(r), map[string]any{"error": "detector_unavailable"}, "the 503 body")
+	ctx.Assert(apiLoad(ctx, "d-1") == nil, "a request that could not be redacted must not be saved")
+	r = apiRedact(c, map[string]any{"document_id": "d-2", "text": apiText})
+	ctx.Assert(r.Status == 200 && apiBody(r)["degraded"] == true, "with the detector down and only pattern types requested, the regex fallback answers a degraded 200; got %d %s", r.Status, r.Text())
+}
+
+func CheckProcessed(ctx *harness.Ctx) {
+	c := apiClient(ctx, true)
+	clean := "Nothing personal in this sentence."
+	r := apiRedact(c, map[string]any{"document_id": "d-clean", "text": clean})
+	ctx.Equal(r.Status, 200, "a text with nothing to redact (%s)", r.Text())
+	body := apiBody(r)
+	ctx.Equal(body["status"], "processed", "a text with nothing to redact must answer status processed (%s); the status", r.Text())
+	ctx.Equal(body["spans"], []any{}, "the spans of a text with nothing to redact")
+	ctx.Equal(body["entity_counts"], map[string]any{}, "the entity counts of a text with nothing to redact")
+	ctx.Equal(body["redacted_text"], clean, "the redacted text")
+	ctx.Equal(body["detector_version"], "ner-2026.10", "the answer must name the detector version")
+	saved := apiLoad(ctx, "d-clean")
+	ctx.Assert(saved != nil && len(saved.Spans) == 0, "a text with nothing to redact must be saved like any other (the audit read shows it was processed), the store holds %+v", saved)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+
+#include "detector.grpc.pb.h"
+
+namespace {
+
+const std::string kText = "Reach Ada at ada@example.com or 415-555-0132.";
+constexpr size_t kCap = 256 * 1024;
+
+// The NER model's stand-in: every requested type a pattern covers, by its pattern.
+class DetectorPeer final : public redactor::Detector::Service {
+ public:
+  grpc::Status Detect(grpc::ServerContext*, const redactor::DetectRequest* req, redactor::DetectResponse* out) override {
+    for (const spans::Span& s : spans::scan(req->text(), {req->entities().begin(), req->entities().end()})) {
+      redactor::EntitySpan* found = out->add_spans();
+      found->set_start(s.start);
+      found->set_end(s.end);
+      found->set_entity(s.entity);
+    }
+    out->set_model_version("ner-2026.10");
+    return grpc::Status::OK;
+  }
+};
+
+harness::HTTP api(harness::Ctx& ctx, bool detector) {
+  static DetectorPeer* peer = nullptr;
+  delete peer;
+  peer = new DetectorPeer;
+  if (detector) ctx.GRPC.Server("")->RegisterService(peer);
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response post(harness::HTTP& c, const nlohmann::json& body) {
+  return c.Post("/v1/redact", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
+}
+
+nlohmann::json parsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx, true);
+  auto r = post(c, {{"document_id", "d-1"}, {"text", kText}});
+  ctx.Equal(r.Status, 200, "POST /v1/redact (%s)", r.Text());
+  const auto body = parsed(r);
+  ctx.Equal(body.value("redacted_text", ""), "Reach Ada at [EMAIL] or [PHONE].", "the redacted text");
+  const long email = static_cast<long>(kText.find("ada@"));
+  const long phone = static_cast<long>(kText.find("415"));
+  nlohmann::json got = nlohmann::json::array();
+  for (const auto& s : body.value("spans", nlohmann::json::array())) got.push_back({s.value("start", -1L), s.value("end", -1L), s.value("entity", "")});
+  ctx.Equal(got, nlohmann::json({{email, email + 15, "EMAIL"}, {phone, phone + 12, "PHONE"}}), "the spans");
+  const auto saved = store::load("d-1");
+  ctx.Assert(saved && saved->tenant == "acme" && saved->spans.size() == 2, "the redaction must be saved for tenant acme with its two spans");
+  r = c.Post("/v1/redact", nlohmann::json{{"document_id", "d-2"}, {"text", kText}}.dump(), "Content-Type", "application/json");
+  ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
+}
+
+void CheckSizeCap(harness::Ctx& ctx) {
+  auto c = api(ctx, true);
+  std::string big = "Call 415-555-0132 now. ";
+  for (int i = 0; i < 10000; i++) big += "lorem ipsum dolor sit amet ";
+  auto r = post(c, {{"document_id", "d-big"}, {"text", big}});
+  ctx.Equal(r.Status, 413, "a %d-byte text", big.size());
+  ctx.Assert(r.Text().find("415-555-0132") == std::string::npos && r.Text().find("lorem") == std::string::npos,
+             "the 413 body quotes the payload: %s. An error body is logged and traced; keep it constant", r.Text().substr(0, 200));
+  std::string filler;
+  while (filler.size() < kCap) filler += "lorem ipsum ";
+  const std::string exact = "x@example.com " + filler.substr(0, kCap - 14);
+  r = post(c, {{"document_id", "d-cap"}, {"text", exact}, {"entities", nlohmann::json::array({"EMAIL"})}});
+  ctx.Equal(r.Status, 200, "a text of exactly 256 KiB");
+}
+
+void CheckEntityWhitelist(harness::Ctx& ctx) {
+  auto c = api(ctx, true);
+  auto r = post(c, {{"document_id", "d-1"}, {"text", kText}, {"entities", nlohmann::json::array({"EMAIL", "PHONE_NUMBER"})}});
+  ctx.Equal(r.Status, 400, "an unknown entity type (PHONE_NUMBER) must be rejected, the phone number went back unredacted");
+  ctx.Equal(ctx.GRPC.CallsTo("Detect").size(), 0, "the detector was called for a request with an unknown entity type: reject it first; Detect calls");
+  ctx.Assert(!store::load("d-1"), "a rejected request must not be saved");
+  r = post(c, {{"document_id", "d-2"}, {"text", kText}, {"entities", nlohmann::json::array({"EMAIL"})}});
+  ctx.Assert(r.Status == 200 && parsed(r).value("redacted_text", "") == "Reach Ada at [EMAIL] or 415-555-0132.", "a request for EMAIL only answered %d %s", r.Status, r.Text());
+}
+
+void CheckFailClosed(harness::Ctx& ctx) {
+  auto c = api(ctx, false);
+  auto r = post(c, {{"document_id", "d-1"}, {"text", "Ada Lovelace, ada@example.com"}, {"entities", nlohmann::json::array({"EMAIL", "PERSON"})}});
+  ctx.Equal(r.Status, 503, "with the detector down and PERSON requested (no pattern covers it)");
+  ctx.Assert(r.Text().find("ada@example.com") == std::string::npos && r.Text().find("Lovelace") == std::string::npos, "the 503 body carries the customer text: %s", r.Text());
+  ctx.Equal(parsed(r), nlohmann::json({{"error", "detector_unavailable"}}), "the 503 body");
+  ctx.Assert(!store::load("d-1"), "a request that could not be redacted must not be saved");
+  r = post(c, {{"document_id", "d-2"}, {"text", kText}});
+  ctx.Assert(r.Status == 200 && parsed(r).value("degraded", false), "with the detector down and only pattern types requested, the regex fallback answers a degraded 200; got %d %s", r.Status, r.Text());
+}
+
+void CheckProcessed(harness::Ctx& ctx) {
+  auto c = api(ctx, true);
+  const std::string clean = "Nothing personal in this sentence.";
+  const auto r = post(c, {{"document_id", "d-clean"}, {"text", clean}});
+  ctx.Equal(r.Status, 200, "a text with nothing to redact (%s)", r.Text());
+  const auto body = parsed(r);
+  ctx.Equal(body.value("status", ""), "processed", "a text with nothing to redact must answer status processed (%s); the status", r.Text());
+  ctx.Equal(body.value("spans", nlohmann::json()), nlohmann::json::array(), "the spans of a text with nothing to redact");
+  ctx.Equal(body.value("entity_counts", nlohmann::json()), nlohmann::json::object(), "the entity counts of a text with nothing to redact");
+  ctx.Equal(body.value("redacted_text", ""), clean, "the redacted text");
+  ctx.Equal(body.value("detector_version", ""), "ner-2026.10", "the answer must name the detector version");
+  const auto saved = store::load("d-clean");
+  ctx.Assert(saved && saved->spans.empty(), "a text with nothing to redact must be saved like any other (the audit read shows it was processed)");
+}
+`,
+  },
   hints: [
-    'During a detector outage every request still returns 200, and the body contains the customer text the caller sent, untouched, under a warning header.',
-    'The handler catches the detector error and returns `body.text` with `degraded: true`; a no-match takes the same path, and the 413 body quotes a slice of the payload.',
-    'Catch `DetectorUnavailable` and answer 503 `{"error": "detector_unavailable"}`; always return `status: "processed"` with spans, counts and `pattern_version`; make the 413 body a constant string behind named caps.',
+    'Stop the detector and redact a text with a name in it: the answer is 200 and carries the text as it came in. Send 300 KiB: the 413 quotes its first line back.',
+    'The handler catches `DetectorUnavailable` and answers the input; the 413 body slices the payload; `entities` reaches `detect` unchecked; and a detection with no spans returns before `store.save` with status `clean`.',
+    'Answer 413 `{"error": "text_too_large"}`; 400 when an entity is not in `ENTITY_TYPES`, before `detect`; 503 `{"error": "detector_unavailable"}` on `DetectorUnavailable`; drop the no-match return so every detection is saved and answered as `processed`.',
   ],
-  debrief: `The fix has the shape of a guard list that ends in a safe default: every validation returns before the detector is called, the 413 body is a constant, and the only 200 is one that carries spans, counts and a pattern version. Fail closed means the error path is the most important path: if the detector cannot answer, the request cannot be served, and a warning header is not a substitute for a status code. "Processed with zero spans" is a distinct outcome from "skipped", which is why the response shape is fixed. Production redactors go further: they keep the raw text only in the request buffer, scrub it from exception messages and metric labels, and alert on the 503 rate rather than on a rise in unredacted documents.`,
+  debrief: `Every guard returns before the detector is called, and every error body is a constant: an error path is logged, traced and retried more often than the happy path, so it is the last place a payload may appear. Failing closed is the shape the outage takes: when no detector can vouch for the text, the request cannot be served, and a 503 is the only honest answer. Saving the clean result is what makes "processed with zero spans" a fact the audit read can show, distinct from "never ran". Production redactors also scrub the text from exception messages and metric labels, cap the request body at the proxy before the handler parses it, and alert on the 503 rate so an outage is seen as one.`,
 };

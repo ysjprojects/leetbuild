@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package feedback;
+
+// The attribution service step 3 asks which model version, prompt version and route served a
+// request. A request it has no record of is NOT_FOUND; a slow or failing registry is
+// DEADLINE_EXCEEDED or UNAVAILABLE at the caller.
+service Attribution {
+  rpc GetAttribution(AttributionRequest) returns (AttributionReply);
+}
+
+message AttributionRequest {
+  string tenant = 1;
+  string request_id = 2;
+}
+
+message AttributionReply {
+  string model_version = 1;
+  string prompt_version = 2;
+  string route = 3;
+}

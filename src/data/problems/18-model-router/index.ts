@@ -1,94 +1,106 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {routeEndpointStep} from './steps/1-route-endpoint';
 import {tenantLimitsStep} from './steps/2-tenant-limits';
 import {modelCallStep} from './steps/3-model-call';
 import {feedbackEventsStep} from './steps/4-feedback-events';
 import {rolloutStep} from './steps/5-rollout';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * Model router: the course is not "call an LLM from an endpoint", it is the debugging you owe a
- * routing layer before it spends a tenant's budget. Validated, idempotent routing decisions, one
- * atomic Redis reservation per tenant window, a provider call with a deadline, bounded retries,
- * a fallback and a breaker, tenant-keyed feedback events with an outbox and counters before the
- * offset commit, and a canary rollout gated by evals with per-tenant pins.
+ * Model router: the service that decides which model serves a request. Each step starts from a
+ * starter that serves the demo and hides flaws the learner debugs: a caller who picks the model
+ * by naming it, a per-minute limit that overspends under concurrency, a retry loop that cannot
+ * stop or fall back, a feedback event that leaks the prompt or vanishes, and a canary rollout
+ * that ignores its eval gate and overwrites a rollback.
  */
 export const modelRouterProblem: Problem = {
   id: 'model-router',
   title: 'Model Router',
   tagline:
-    'Route requests across a small and a large model with Redis budgets, provider deadlines and eval-gated canaries.',
+    'A router between a small and a large model: server-side model choice, a Redis rate window, retries with a fallback, feedback events, eval-gated canaries.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Model Router
 
-A model router decides which model serves each request, how much each tenant may spend, how provider
-failures are survived, and how a new routing policy reaches production.
+A model router sits between product code and two models: \`gpt-4o-mini\`, cheap and fast, and
+\`gpt-4o\`, slower and better. It decides which one serves a request, holds each tenant to a
+per-minute budget, survives a deployment that stops answering, turns user feedback into quality
+numbers per model, and moves a new routing policy to production a slice of traffic at a time.
 
 ## The real system
 
-LiteLLM's proxy is an open source router of this shape: \`model_list\` names the deployments behind
-one model name, \`router_settings.fallbacks\` maps a model group to the groups tried when it fails,
-and \`num_retries\` with \`request_timeout\` bound each call before the fallback is reached. This
-course adds what sits around that: an atomic budget, policy-chosen models, prompt-free feedback
-events, and an eval gate in front of every traffic increase.
+LiteLLM's \`Router\` is an open-source router of this shape: \`model_list\` names the deployments
+behind each model group, \`num_retries\` retries a failed call, \`fallbacks\` names the group tried
+once the retries are spent, and \`allowed_fails\` with \`cooldown_time\` takes a deployment out of
+rotation after too many failures in a minute, which is the circuit breaker of step 3.
 
 ## What you build here
 
-One service, **routerd**, with five pieces:
+One service, **routerd**, every step a file of its own, the provided \`routerd/auth\`
+(\`Authorization: Bearer <tenant>\`), \`routerd/tokens\` (\`estimate_tokens(prompt, max_tokens)\` =
+\`ceil(UTF-8 bytes / 4) + max_tokens\`) and \`routerd/outbox\` modules shared by all of them:
 
-1. \`POST /v1/route\`: authenticated tenant, validated prompt and token caps, server-side policy
-   selection between a small and a large model, and an \`Idempotency-Key\` so a retry cannot
-   double-route. Decisions are logged with ids, not the prompt.
-2. A **Redis** limiter: per tenant, 60 requests and 100 000 tokens per 60-second window, reserved by
-   one atomic Lua \`EVAL\` with the expiry set at first write, answering \`429\` with
-   \`Retry-After\` and \`X-RateLimit-Remaining\` before any provider call.
-3. A **gRPC** provider client: an 800 ms deadline per attempt, at most three attempts, retries only
-   on \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, a fallback model, a breaker after five failures for
-   30 seconds, and no replay once the first token has been delivered.
-4. A **Kafka** feedback path: one \`route.feedback\` event per request keyed by tenant, an
-   idempotent producer with \`acks=all\`, no prompt text in the event or the logs, an outbox row when
-   the broker rejects the produce, and a consumer that updates Redis quality counters before it
-   commits the offset.
-5. \`POST /v1/policies/{policy}/rollout\`: validated percentage and version, an eval gate before
-   traffic increases, a per-tenant pin during rollback, and a response that reports the caller's
-   active assignment.
+1. \`POST /v1/route\` (\`router_api\`): body \`{prompt, max_tokens, policy}\`, policy \`auto\`,
+   \`small\` or \`large\`, answer \`{id, model, policy, estimated_tokens}\`, the decision stored once
+   per \`Idempotency-Key\` at \`decision:{tenant}:{key}\`.
+2. A **rate window** (\`limits\`): a guard in front of the route that reserves one request and the
+   estimate from \`limits:{tenant}:{minute}\` (hash fields \`requests\`, \`tokens\`; 60 requests and
+   100 000 tokens) in one Lua script, and answers 429 with \`Retry-After\` and
+   \`X-RateLimit-Remaining\`.
+3. **The model call** (\`model_call\`): \`complete(model, prompt, max_tokens)\` calls
+   \`Model.Complete\` at \`{model}:9000\`, 800 ms per attempt, three attempts on \`UNAVAILABLE\` or
+   \`DEADLINE_EXCEEDED\`, then \`gpt-4o-mini\` as the fallback, with a breaker at \`circuit:{model}\`.
+4. **Feedback events** (\`feedback\`): \`emit_feedback(event)\` produces
+   \`{id, tenant, policy, model, outcome, latency_ms}\` to \`route.feedback\` keyed by tenant, the
+   outbox \`outbox:feedback\` taking what the broker refuses; \`run_quality()\` counts outcomes in
+   \`quality:{tenant}:{model}\` and commits after.
+5. \`POST /v1/policies/{policy}/rollout\` (\`rollout\`): body \`{version, percentage}\` on the hash
+   \`rollout:{policy}\` (\`stable\`, \`canary\`, \`percentage\`), gated by the eval record
+   \`eval:{policy}:{version}\` (\`status\`, \`score\`).
 
 ## The debugging habit
 
-Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
-fix it, and prove the fix with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Provider accounts, per-model tokenizers, browser streaming, multi-region failover, invoicing, policy
-authoring UIs and eval set management.`,
+Provider accounts and keys, real tokenisers, streaming, how a request is assigned to the canary
+share, the eval runner itself, and invoicing. Each plugs into the shapes above without changing
+them.`,
   diagram: {
     nodes: [
-      {id: 'client', kind: 'client', label: 'Client', sub: 'route · feedback', x: 8, y: 50},
-      {id: 'router', kind: 'http', label: 'Model Router', sub: 'HTTPS :8443', x: 26, y: 50},
-      {id: 'db', kind: 'db', label: 'policy · outbox', sub: 'versions · pins', x: 44, y: 12},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'limits · quality', x: 44, y: 50},
-      {id: 'kafka', kind: 'kafka', label: 'route.feedback', sub: 'key = tenant', x: 44, y: 86},
-      {id: 'provider', kind: 'grpc', label: 'Provider', sub: 'Complete / Stream', x: 66, y: 12},
-      {id: 'fallback', kind: 'external', label: 'Fallback model', sub: 'smaller · same API', x: 66, y: 38},
-      {id: 'eval', kind: 'service', label: 'Eval service', sub: 'golden set · scores', x: 66, y: 62},
-      {id: 'consumer', kind: 'service', label: 'Feedback consumer', sub: 'group quality', x: 66, y: 88},
+      {id: 'client', kind: 'client', label: 'Client', sub: 'route · rollout', x: 8, y: 50},
+      {id: 'router', kind: 'http', label: 'routerd', sub: ':8443', x: 28, y: 50},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'decision · limits · circuit · rollout', x: 50, y: 14},
+      {id: 'large', kind: 'grpc', label: 'gpt-4o', sub: 'gpt-4o:9000', x: 52, y: 44},
+      {id: 'small', kind: 'grpc', label: 'gpt-4o-mini', sub: 'fallback · :9000', x: 52, y: 66},
+      {id: 'kafka', kind: 'kafka', label: 'route.feedback', sub: 'key = tenant', x: 74, y: 86},
+      {id: 'quality', kind: 'service', label: 'quality', sub: 'consumer group', x: 92, y: 86},
+      {id: 'eval', kind: 'service', label: 'eval service', sub: 'eval:{policy}:{version}', x: 78, y: 14},
     ],
     edges: [
-      {from: 'client', to: 'router', kind: 'http', label: 'HTTPS'},
-      {from: 'router', to: 'db', kind: 'plain', label: 'policy · outbox'},
-      {from: 'router', to: 'redis', kind: 'redis', label: 'limits · quality'},
-      {from: 'router', to: 'provider', kind: 'grpc', label: 'Complete / Stream'},
-      {from: 'router', to: 'fallback', kind: 'grpc', label: 'on UNAVAILABLE'},
-      {from: 'router', to: 'eval', kind: 'plain', label: 'eval gate'},
-      {from: 'router', to: 'kafka', kind: 'kafka', label: 'produce route.feedback'},
-      {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'redis', kind: 'redis', label: 'HINCRBY quality'},
-      {from: 'eval', to: 'db', kind: 'plain', label: 'version scores'},
+      {from: 'client', to: 'router', kind: 'http', label: 'JSON'},
+      {from: 'router', to: 'redis', kind: 'redis', label: 'SET NX · EVAL · INCR · HSET'},
+      {from: 'router', to: 'large', kind: 'grpc', label: 'Complete · 800 ms'},
+      {from: 'router', to: 'small', kind: 'grpc', label: 'fallback'},
+      {from: 'router', to: 'kafka', kind: 'kafka', label: 'produce (outbox on failure)'},
+      {from: 'kafka', to: 'quality', kind: 'kafka', label: 'consume'},
+      {from: 'quality', to: 'redis', kind: 'redis', label: 'HINCRBY quality:{tenant}:{model}'},
+      {from: 'eval', to: 'redis', kind: 'redis', label: 'HSET eval record'},
     ],
   },
   steps: [routeEndpointStep, tenantLimitsStep, modelCallStep, feedbackEventsStep, rolloutStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

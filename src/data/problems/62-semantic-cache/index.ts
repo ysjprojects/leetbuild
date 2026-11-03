@@ -66,6 +66,12 @@ One service, **semcached**, over one Redis. The entry is the hash
    another tenant's caller; the hit rate, the automated hit rate and share, the mean similarity, and
    the share of hits whose entry was older than an hour.
 
+## The debugging habit
+
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
+
 ## Left out on purpose
 
 Embedding generation and model hosting, an ANN index (the search here scans one tenant's set),

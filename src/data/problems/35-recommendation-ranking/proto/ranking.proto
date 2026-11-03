@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package recsys;
+
+// The ranking model step 3 calls: it scores the candidates for one user and answers them best
+// first, stamped with the version of the model that scored them. A request it cannot score is
+// INVALID_ARGUMENT; a replica that is restarting is UNAVAILABLE.
+service Ranker {
+  rpc Rank(RankRequest) returns (RankResponse);
+}
+
+// The feature service step 2 refreshes the feature cache from: one user's feature vector.
+service FeatureService {
+  rpc UserFeatures(FeaturesRequest) returns (FeatureVector);
+}
+
+message RankRequest {
+  string tenant = 1;
+  string user_id = 2;
+  string surface = 3;
+  repeated string candidate_ids = 4;
+  repeated double features = 5;
+}
+
+message ScoredItem {
+  string id = 1;
+  double score = 2;
+}
+
+message RankResponse {
+  repeated ScoredItem items = 1;
+  string model_version = 2;
+}
+
+message FeaturesRequest {
+  string tenant = 1;
+  string user_id = 2;
+}
+
+message FeatureVector {
+  repeated double values = 1;
+}

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package evals;
+
+// The judge model step 3 calls for every golden sample: one unary RPC per attempt, with a deadline.
+// The harness serves a deterministic stand-in at judge:9000 (evals/judge in the support modules).
+service Judge {
+  rpc Score(ScoreRequest) returns (ScoreReply);
+}
+
+message ScoreRequest {
+  string run_id = 1;
+  string sample_id = 2;
+  string expected = 3;
+  string output = 4;
+}
+
+message ScoreReply {
+  double score = 1;
+  string judge_version = 2;
+}

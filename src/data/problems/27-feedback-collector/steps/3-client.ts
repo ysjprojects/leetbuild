@@ -1,295 +1,178 @@
 import type {Step} from '@/lib/types';
 
-/**
- * Step 3 — the attribution client. A rating must remember the model, prompt and route that served
- * the request, and a slow lookup must not become a guess at the currently active model.
- */
 export const clientStep: Step = {
   id: 'client',
-  title: 'Attribution lookup with a safe fallback',
+  title: 'Attribution under a 200 ms deadline, unattributed on failure',
   concept: 'grpc',
   file: 'client',
-  focus: ['collector', 'attribution', 'registry'],
-  sequence: {
-    participants: ['Feedback Collector', 'Attribution service', 'feedback store'],
-    messages: [
-      {
-        from: 'Feedback Collector',
-        to: 'Attribution service',
-        label: 'GetAttribution(tenant, request_id) · 200 ms deadline',
-        kind: 'sync',
-      },
-      {
-        from: 'Attribution service',
-        to: 'Feedback Collector',
-        label: 'model_version, prompt_version, route',
-        kind: 'reply',
-      },
-      {
-        from: 'Feedback Collector',
-        to: 'feedback store',
-        label: 'insert the rating pinned to the served model',
-        kind: 'async',
-      },
-      {from: 'Attribution service', to: 'Feedback Collector', label: 'deadline exceeded — no reply', kind: 'reply'},
-      {
-        from: 'Feedback Collector',
-        to: 'Feedback Collector',
-        label: 'store as unattributed, do not cache the miss',
-        kind: 'sync',
-      },
-      {
-        from: 'Attribution service',
-        to: 'Feedback Collector',
-        label: 'late reply — backfill the attribution only',
-        kind: 'reply',
-      },
-    ],
-  },
+  focus: ['collector', 'attribution'],
   task: `## Task
 
-**Starting point.** \`client\` exposes \`attribute(tenant, request_id)\`. It calls the gRPC stub
-\`GetAttribution\` with a one-second \`TIMEOUT_SECONDS\`, and on \`grpc.RpcError\` records the request
-id in \`_failure_cache\` for \`CACHE_FAILURE_TTL\` (a day) and returns \`ACTIVE_MODEL\` as the
-attribution. It serves the demo and hides five flaws.
+**Starting point.** \`client\` exposes \`attribute(tenant, request_id)\`, which tells the collector which
+model, prompt and route served a request: it calls \`Attribution.GetAttribution\` with
+\`DEADLINE_S = 2.0\`, caches the reply in \`_cache\` under the request id, and on any \`grpc.RpcError\`
+records the id in \`_failures\` for a day and answers \`ACTIVE_MODEL\`, the model serving now. With the
+registry healthy it attributes correctly, and it hides four flaws.
 
-**Failure mode the checks target.** After a model rollout, a week of feedback that belonged to the
-previous model shows up under the new one, because a slow lookup is answered with whatever model is
-active, and one failed lookup is remembered for a day.
+**Failure mode the checks target.** After a rollout, ratings of the old model's answers land on the new
+one: a failed lookup is answered with the active model and remembered for a day, a slow registry
+holds every vote for two seconds, and two tenants' \`req-1\` share one cache entry.
 
-- The lookup carries \`DEADLINE_MS = 200\`, passed as \`timeout=DEADLINE_MS / 1000\`.
-- On failure or timeout, return \`fallback_attribution()\` with \`model_version\` set to the constant
-  \`UNATTRIBUTED\`. Remove \`ACTIVE_MODEL\` and anything that attributes to the active model.
-- Cache only successful replies, keyed by request id, with \`CACHE_TTL_SECONDS = 300\`; drop the
-  failure cache so a miss is retried on the next request.
-- Add \`backfill(record, attribution)\` that updates \`model_version\`, \`prompt_version\` and \`route\`
-  on a stored row and leaves \`rating\` untouched.`,
-  hints: [
-    'The day after a rollout, the new model carries a week of thumbs-downs that were left on answers it did not serve, and the ratio stays wrong until the next morning.',
-    'A `grpc.RpcError` is answered with `_active_model_attribution()`, and the request id goes into `_failure_cache` for 24 hours, so every later call for that id takes the same shortcut without asking the registry.',
-    'Set `DEADLINE_MS = 200` (`timeout=DEADLINE_MS / 1000`), return `fallback_attribution()` with `UNATTRIBUTED`, cache only successes with `CACHE_TTL_SECONDS = 300`. The checks cover `backfill`.',
-  ],
+\`\`\`proto
+service Attribution { rpc GetAttribution(AttributionRequest) returns (AttributionReply); }  // NOT_FOUND: unknown request
+\`\`\`
+
+- The lookup carries \`DEADLINE_S = 0.2\` (200 ms).
+- Any failure answers \`model_version = UNATTRIBUTED\` (\`"unattributed"\`) with an empty prompt version
+  and route; nothing is attributed to the active model.
+- A failure is not remembered: the next call for the id asks the registry again.
+- Successes are cached per tenant and request id, \`(tenant, request_id)\`.`,
+  sequence: {
+    participants: ['feedbackd', 'Attribution'],
+    messages: [
+      {from: 'feedbackd', to: 'Attribution', label: 'GetAttribution(t-acme, req-1) · deadline 200 ms', kind: 'sync'},
+      {
+        from: 'Attribution',
+        to: 'feedbackd',
+        label: 'support-llm-2026-09 · triage-v4 · primary → cache (t-acme, req-1)',
+        kind: 'reply',
+      },
+      {from: 'feedbackd', to: 'Attribution', label: 'GetAttribution(t-acme, req-2) · deadline 200 ms', kind: 'sync'},
+      {from: 'Attribution', to: 'feedbackd', label: 'DEADLINE_EXCEEDED → unattributed, not cached', kind: 'reply'},
+    ],
+  },
   checks: [
     {
       id: 'deadline',
       title: 'The lookup carries a 200 ms deadline',
       detail:
-        'Bound the attribution lookup with a `200` ms deadline (`DEADLINE_MS = 200`) so a slow registry cannot hold the write path open.',
+        'Every `GetAttribution` call is made with `DEADLINE_S` (200 ms), so a registry that answers in a second costs the vote 200 ms and an unattributed row; the starter gives it two seconds.',
       match: {
-        python: {all: [/DEADLINE_MS\s*=\s*200/, /timeout\s*=\s*DEADLINE_MS\s*\/\s*1000/]},
-        typescript: {all: [/DEADLINE_MS\s*=\s*200/, /deadline\s*:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
-        go: {all: [/deadline\s*=\s*200\s*\*\s*time\.Millisecond/, /context\.WithTimeout\(/]},
-        scala: {all: [/DeadlineMs\s*=\s*200/, /withDeadlineAfter\(DeadlineMs/]},
-        cpp: {all: [/kDeadlineMs\s*=\s*200/, /set_deadline\(/]},
+        python: {all: [/DEADLINE_S\s*=\s*0\.2\b/, /timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/DEADLINE_MS\s*=\s*200\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
+        go: {all: [/deadline\s*=\s*200\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\)/]},
+        scala: {
+          all: [/DeadlineMillis\s*=\s*200L?\b/, /withDeadlineAfter\(\s*DeadlineMillis\s*,\s*TimeUnit\.MILLISECONDS/],
+        },
+        cpp: {all: [/kDeadline\{200\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
     {
       id: 'unattributed',
-      title: 'A failed lookup stores the rating as unattributed',
+      title: 'A failed lookup is unattributed, not the active model',
       detail:
-        'When the lookup cannot answer, fall back to an `unattributed` attribution instead of the active model, so the rating stays honest about what served it.',
+        "An unavailable registry or an unknown request answers `model_version = UNATTRIBUTED`; the starter answers `ACTIVE_MODEL`, so after a rollout the old model's ratings count for the new one.",
       match: {
-        python: {all: [/UNATTRIBUTED/, /fallback_attribution\(/]},
-        typescript: {all: [/UNATTRIBUTED/, /fallbackAttribution\(/]},
-        go: {all: [/unattributed/, /fallbackAttribution\(/]},
-        scala: {all: [/Unattributed/, /fallbackAttribution\(/]},
-        cpp: {all: [/kUnattributed/, /fallbackAttribution\(/]},
+        python: {all: [/UNATTRIBUTED\s*=\s*["']unattributed["']/], none: [/ACTIVE_MODEL/]},
+        typescript: {all: [/UNATTRIBUTED\s*=\s*['"]unattributed['"]/], none: [/ACTIVE_MODEL/]},
+        go: {all: [/unattributed\s*=\s*"unattributed"/], none: [/activeModel/]},
+        scala: {all: [/Unattributed\s*=\s*"unattributed"/], none: [/ActiveModel/]},
+        cpp: {all: [/kUnattributed\s*=\s*"unattributed"/], none: [/kActiveModel/]},
       },
     },
     {
-      id: 'no-failure-cache',
-      title: 'Failures are not cached',
+      id: 'retry-after-failure',
+      title: 'A failure is not remembered',
       detail:
-        'Cache only successful replies, with a short TTL (`CACHE_TTL_SECONDS = 300`); a timeout or a rejected lookup must be retried, never remembered for a day.',
+        'After a failed lookup the next call for the same request asks the registry again, and only a success is cached; the starter remembers the failure for a day and answers it without asking.',
       match: {
-        python: {all: [/CACHE_TTL_SECONDS\s*=\s*300/], none: [/CACHE_FAILURE|FAILURE_TTL/i]},
-        typescript: {all: [/CACHE_TTL_SECONDS\s*=\s*300/], none: [/CACHE_FAILURE|FAILURE_TTL/i]},
-        go: {all: [/cacheTtlSeconds\s*=\s*300/], none: [/cacheFailure|failureTtl/i]},
-        scala: {all: [/CacheTtlSeconds\s*=\s*300/], none: [/CacheFailure|FailureTtl/]},
-        cpp: {all: [/kCacheTtlSeconds\s*=\s*300/], none: [/kCacheFailure|FailureTtl/]},
+        python: {none: [/_failures|FAILURE_TTL_S/]},
+        typescript: {none: [/\bfailures\b|FAILURE_TTL_MS/]},
+        go: {none: [/\bfailures\b|failureTTL/]},
+        scala: {none: [/\bfailures\b|FailureTtlMillis/]},
+        cpp: {none: [/\bfailures\b|kFailureTtl/]},
       },
     },
     {
-      id: 'no-active-fallback',
-      title: 'Never attributes to the currently active model',
+      id: 'tenant-cache',
+      title: 'The cache is keyed by tenant and request id',
       detail:
-        'The active model is not the model that served the request; the fallback must be `unattributed`, so a rollout cannot rewrite last week\u2019s feedback.',
+        "A cached attribution belongs to `(tenant, request_id)`: request ids are unique per tenant only, and the starter answers one tenant's `req-1` with the other tenant's model.",
       match: {
-        python: {all: [/UNATTRIBUTED/], none: [/ACTIVE_MODEL|active_model/i]},
-        typescript: {all: [/UNATTRIBUTED/], none: [/ACTIVE_MODEL|activeModel/i]},
-        go: {all: [/unattributed/], none: [/ACTIVE_MODEL|activeModel|ActiveModel/i]},
-        scala: {all: [/Unattributed/], none: [/ACTIVE_MODEL|ActiveModel|activeModel/]},
-        cpp: {all: [/kUnattributed/], none: [/kActiveModel|ACTIVE_MODEL/]},
-      },
-    },
-    {
-      id: 'late-backfill',
-      title: 'Late attribution backfills without changing the rating',
-      detail:
-        'A reply that arrives after the write may fill in `model_version`, `prompt_version` and `route` on the stored row, but the rating itself must never move.',
-      match: {
-        python: {all: [/def backfill\(/, /model_version/]},
-        typescript: {all: [/function backfill\(/, /model_version/]},
-        go: {all: [/func backfill\(/, /ModelVersion/]},
-        scala: {all: [/def backfill\(/, /model_version/]},
-        cpp: {all: [/backfill\(/, /model_version/]},
+        python: {all: [/\(\s*tenant\s*,\s*request_id\s*\)/], none: [/_cache(\.get\(|\[)\s*request_id\b/]},
+        typescript: {all: [/\$\{tenant\}:\$\{requestId\}/], none: [/cache\.(get|set)\(\s*requestId\b/]},
+        go: {all: [/tenant\s*\+\s*":"\s*\+\s*requestID/], none: [/cache\[\s*requestID\s*\]/]},
+        scala: {
+          all: [/\(\s*tenant\s*,\s*requestId\s*\)/],
+          none: [/cache\.get\(\s*requestId\s*\)|cache\(\s*requestId\s*\)/],
+        },
+        cpp: {
+          all: [/tenant\s*\+\s*":"\s*\+\s*request_id/],
+          none: [/cache\.find\(\s*request_id\s*\)|cache\[\s*request_id\s*\]/],
+        },
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-import time
+      starter: `import time
 
 import grpc
 
-logger = logging.getLogger("feedback")
+import attribution_pb2
+import attribution_pb2_grpc
 
-TIMEOUT_SECONDS = 1
-CACHE_FAILURE_TTL = 24 * 60 * 60
-ACTIVE_MODEL = "gpt-4o-current"
+ACTIVE_MODEL = "support-llm-2026-10"
+DEADLINE_S = 2.0
+FAILURE_TTL_S = 24 * 3600
 
-_failure_cache: dict[str, float] = {}
+stub = attribution_pb2_grpc.AttributionStub(grpc.insecure_channel("attribution:9000"))
 
-
-class GetAttributionRequest:
-    def __init__(self, tenant: str, request_id: str) -> None:
-        self.tenant = tenant
-        self.request_id = request_id
+_cache: dict[str, dict] = {}
+_failures: dict[str, float] = {}
 
 
-class AttributionReply:
-    model_version: str
-    prompt_version: str
-    route: str
-
-
-class AttributionService:
-    """The generated gRPC stub for the attribution service."""
-
-    def GetAttribution(self, request: GetAttributionRequest, timeout: float) -> AttributionReply:
-        raise NotImplementedError
-
-
-attribution_service = AttributionService()
-
-
-class Attribution:
-    """The model, prompt and route that served one request."""
-
-    def __init__(self, model_version: str, prompt_version: str, route: str) -> None:
-        self.model_version = model_version
-        self.prompt_version = prompt_version
-        self.route = route
-
-
-def _active_model_attribution() -> Attribution:
-    return Attribution(model_version=ACTIVE_MODEL, prompt_version="current", route="default")
-
-
-def attribute(tenant: str, request_id: str) -> Attribution:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    if request_id in _failure_cache and time.time() - _failure_cache[request_id] < CACHE_FAILURE_TTL:
-        return _active_model_attribution()
-    try:
-        reply = attribution_service.GetAttribution(
-            GetAttributionRequest(tenant=tenant, request_id=request_id),
-            timeout=TIMEOUT_SECONDS,
-        )
-    except grpc.RpcError:
-        _failure_cache[request_id] = time.time()
-        return _active_model_attribution()
-    return Attribution(reply.model_version, reply.prompt_version, reply.route)
-`,
-      solution: `import logging
-import time
-
-import grpc
-
-logger = logging.getLogger("feedback")
-
-DEADLINE_MS = 200
-CACHE_TTL_SECONDS = 300
-UNATTRIBUTED = "unattributed"
-
-_cache: dict[str, tuple[float, "Attribution"]] = {}
-
-
-class GetAttributionRequest:
-    def __init__(self, tenant: str, request_id: str) -> None:
-        self.tenant = tenant
-        self.request_id = request_id
-
-
-class AttributionReply:
-    model_version: str
-    prompt_version: str
-    route: str
-
-
-class AttributionService:
-    """The generated gRPC stub for the attribution service."""
-
-    def GetAttribution(self, request: GetAttributionRequest, timeout: float) -> AttributionReply:
-        raise NotImplementedError
-
-
-attribution_service = AttributionService()
-
-
-class Attribution:
-    """The model, prompt and route that served one request."""
-
-    def __init__(self, model_version: str, prompt_version: str, route: str) -> None:
-        self.model_version = model_version
-        self.prompt_version = prompt_version
-        self.route = route
-
-
-def fallback_attribution() -> Attribution:
-    """What to store when the lookup cannot answer: honest, not a guess at the model in use."""
-    return Attribution(
-        model_version=UNATTRIBUTED,
-        prompt_version=UNATTRIBUTED,
-        route=UNATTRIBUTED,
-    )
-
-
-def attribute(tenant: str, request_id: str) -> Attribution:
-    now = time.time()
+def attribute(tenant: str, request_id: str) -> dict:
+    """The model version, prompt version and route that served request_id for tenant."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     cached = _cache.get(request_id)
-    if cached is not None and now - cached[0] < CACHE_TTL_SECONDS:
-        return cached[1]
+    if cached is not None:
+        return cached
+    failed_at = _failures.get(request_id)
+    if failed_at is not None and time.time() - failed_at < FAILURE_TTL_S:
+        return {"model_version": ACTIVE_MODEL, "prompt_version": "", "route": ""}
     try:
-        reply = attribution_service.GetAttribution(
-            GetAttributionRequest(tenant=tenant, request_id=request_id),
-            timeout=DEADLINE_MS / 1000,
-        )
+        reply = stub.GetAttribution(attribution_pb2.AttributionRequest(tenant=tenant, request_id=request_id), timeout=DEADLINE_S)
     except grpc.RpcError:
-        # A timeout is not an attribution: store the rating unattributed and never cache the miss.
-        logger.info("attribution unavailable tenant=%s request=%s", tenant, request_id)
-        return fallback_attribution()
+        _failures[request_id] = time.time()  # spare the registry while it is sick
+        return {"model_version": ACTIVE_MODEL, "prompt_version": "", "route": ""}
+    result = {"model_version": reply.model_version, "prompt_version": reply.prompt_version, "route": reply.route}
+    _cache[request_id] = result
+    return result
+`,
+      solution: `import grpc
 
-    attribution = Attribution(reply.model_version, reply.prompt_version, reply.route)
-    _cache[request_id] = (now, attribution)
-    return attribution
+import attribution_pb2
+import attribution_pb2_grpc
+
+UNATTRIBUTED = "unattributed"
+DEADLINE_S = 0.2
+
+stub = attribution_pb2_grpc.AttributionStub(grpc.insecure_channel("attribution:9000"))
+
+# Successes only, per tenant: request ids are unique inside a tenant.
+_cache: dict[tuple[str, str], dict] = {}
 
 
-def backfill(record: dict, attribution: Attribution) -> dict:
-    """Attach a late attribution to a stored rating without changing the rating."""
-    record["model_version"] = attribution.model_version
-    record["prompt_version"] = attribution.prompt_version
-    record["route"] = attribution.route
-    return record
+def attribute(tenant: str, request_id: str) -> dict:
+    """The model version, prompt version and route that served request_id for tenant."""
+    key = (tenant, request_id)
+    cached = _cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        reply = stub.GetAttribution(attribution_pb2.AttributionRequest(tenant=tenant, request_id=request_id), timeout=DEADLINE_S)
+    except grpc.RpcError:
+        # Not cached: the next request for this id asks the registry again.
+        return {"model_version": UNATTRIBUTED, "prompt_version": "", "route": ""}
+    result = {"model_version": reply.model_version, "prompt_version": reply.prompt_version, "route": reply.route}
+    _cache[key] = result
+    return result
 `,
     },
     typescript: {
-      starter: `/** Attribution lookup for feedback. */
-import * as grpc from '@grpc/grpc-js';
-
-const TIMEOUT_SECONDS = 1;
-const CACHE_FAILURE_TTL = 24 * 60 * 60;
-const ACTIVE_MODEL = 'gpt-4o-current';
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
 export interface Attribution {
   model_version: string;
@@ -297,46 +180,40 @@ export interface Attribution {
   route: string;
 }
 
-export interface AttributionClient {
-  getAttribution(
-    request: {tenant: string; request_id: string},
-    options: {deadline: number},
-    callback: (error: grpc.ServiceError | null, reply: Attribution) => void,
-  ): void;
-}
+const ACTIVE_MODEL = 'support-llm-2026-10';
+const DEADLINE_MS = 2000;
+const FAILURE_TTL_MS = 24 * 3600 * 1000;
 
-const failureCache = new Map<string, number>();
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('attribution.proto')) as unknown as {
+  feedback: {Attribution: grpc.ServiceClientConstructor};
+};
+const registry = new pkg.feedback.Attribution('attribution:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  GetAttribution(request: {tenant: string; request_id: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<Attribution>;
+};
 
-export async function attribute(
-  client: AttributionClient,
-  tenant: string,
-  requestId: string,
-): Promise<Attribution> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const cached = failureCache.get(requestId);
-  if (cached !== undefined && Date.now() / 1000 - cached < CACHE_FAILURE_TTL) {
-    return {model_version: ACTIVE_MODEL, prompt_version: 'current', route: 'default'};
+const cache = new Map<string, Attribution>();
+const failures = new Map<string, number>();
+
+/** The model version, prompt version and route that served requestId for tenant. */
+export async function attribute(tenant: string, requestId: string): Promise<Attribution> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const cached = cache.get(requestId);
+  if (cached !== undefined) return cached;
+  const failedAt = failures.get(requestId);
+  if (failedAt !== undefined && Date.now() - failedAt < FAILURE_TTL_MS) return {model_version: ACTIVE_MODEL, prompt_version: '', route: ''};
+  try {
+    const reply = await registry.GetAttribution({tenant, request_id: requestId}, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+    const result = {model_version: reply.model_version, prompt_version: reply.prompt_version, route: reply.route};
+    cache.set(requestId, result);
+    return result;
+  } catch {
+    failures.set(requestId, Date.now()); // spare the registry while it is sick
+    return {model_version: ACTIVE_MODEL, prompt_version: '', route: ''};
   }
-  const {promise, resolve} = Promise.withResolvers<Attribution>();
-  client.getAttribution(
-    {tenant, request_id: requestId},
-    {deadline: Date.now() + TIMEOUT_SECONDS * 1000},
-    error => {
-      if (error !== null) {
-        failureCache.set(requestId, Date.now() / 1000);
-      }
-      resolve({model_version: ACTIVE_MODEL, prompt_version: 'current', route: 'default'});
-    },
-  );
-  return promise;
 }
 `,
-      solution: `/** Attribution lookup with a safe fallback. */
-import * as grpc from '@grpc/grpc-js';
-
-const DEADLINE_MS = 200;
-const CACHE_TTL_SECONDS = 300;
-const UNATTRIBUTED = 'unattributed';
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
 export interface Attribution {
   model_version: string;
@@ -344,51 +221,33 @@ export interface Attribution {
   route: string;
 }
 
-export interface AttributionClient {
-  getAttribution(
-    request: {tenant: string; request_id: string},
-    options: {deadline: number},
-    callback: (error: grpc.ServiceError | null, reply: Attribution) => void,
-  ): void;
-}
+export const UNATTRIBUTED = 'unattributed';
+const DEADLINE_MS = 200;
 
-const cache = new Map<string, {cachedAt: number; attribution: Attribution}>();
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('attribution.proto')) as unknown as {
+  feedback: {Attribution: grpc.ServiceClientConstructor};
+};
+const registry = new pkg.feedback.Attribution('attribution:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  GetAttribution(request: {tenant: string; request_id: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<Attribution>;
+};
 
-export function fallbackAttribution(): Attribution {
-  return {model_version: UNATTRIBUTED, prompt_version: UNATTRIBUTED, route: UNATTRIBUTED};
-}
+// Successes only, per tenant: request ids are unique inside a tenant.
+const cache = new Map<string, Attribution>();
 
-export async function attribute(
-  client: AttributionClient,
-  tenant: string,
-  requestId: string,
-): Promise<Attribution> {
-  const hit = cache.get(requestId);
-  if (hit !== undefined && Date.now() - hit.cachedAt < CACHE_TTL_SECONDS * 1000) {
-    return hit.attribution;
+/** The model version, prompt version and route that served requestId for tenant. */
+export async function attribute(tenant: string, requestId: string): Promise<Attribution> {
+  const key = \`\${tenant}:\${requestId}\`;
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+  try {
+    const reply = await registry.GetAttribution({tenant, request_id: requestId}, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+    const result = {model_version: reply.model_version, prompt_version: reply.prompt_version, route: reply.route};
+    cache.set(key, result);
+    return result;
+  } catch {
+    // Not cached: the next request for this id asks the registry again.
+    return {model_version: UNATTRIBUTED, prompt_version: '', route: ''};
   }
-  const {promise, resolve} = Promise.withResolvers<Attribution>();
-  client.getAttribution({tenant, request_id: requestId}, {deadline: Date.now() + DEADLINE_MS}, error => {
-    if (error !== null) {
-      // A timeout is not an attribution: store the rating unattributed and never cache the miss.
-      resolve(fallbackAttribution());
-      return;
-    }
-    const attribution = {
-      model_version: UNATTRIBUTED,
-      prompt_version: UNATTRIBUTED,
-      route: UNATTRIBUTED,
-    };
-    cache.set(requestId, {cachedAt: Date.now(), attribution});
-    resolve(attribution);
-  });
-  return promise;
-}
-
-export function backfill(record: Attribution & {rating: number}, attribution: Attribution): void {
-  record.model_version = attribution.model_version;
-  record.prompt_version = attribution.prompt_version;
-  record.route = attribution.route;
 }
 `,
     },
@@ -400,42 +259,51 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
-	pb "example.com/feedback/attributionpb"
+	pb "feedback/gen/attribution"
 )
 
 const (
-	timeoutSeconds  = 1
-	cacheFailureTtl = 24 * 60 * 60
+	activeModel = "support-llm-2026-10"
+	deadline    = 2 * time.Second
+	failureTTL  = 24 * time.Hour
 )
 
-const activeModel = "gpt-4o-current"
-
-// Attribution is the model, prompt and route that served one request.
+// Attribution is what served a request.
 type Attribution struct {
-	ModelVersion  string
-	PromptVersion string
-	Route         string
+	ModelVersion  string \`json:"model_version"\`
+	PromptVersion string \`json:"prompt_version"\`
+	Route         string \`json:"route"\`
 }
 
-var failureCache = map[string]time.Time{}
+var (
+	registryConn, _ = grpc.NewClient("attribution:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	registry        = pb.NewAttributionClient(registryConn)
+	cache           = map[string]Attribution{}
+	failures        = map[string]time.Time{}
+)
 
-func attribute(ctx context.Context, client pb.AttributionClient, tenant, requestID string) Attribution {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	if seenAt, ok := failureCache[requestID]; ok && time.Since(seenAt) < time.Duration(cacheFailureTtl)*time.Second {
-		return Attribution{ModelVersion: activeModel, PromptVersion: "current", Route: "default"}
+// attribute is the model version, prompt version and route that served requestID for tenant.
+func attribute(ctx context.Context, tenant, requestID string) Attribution {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	if cached, ok := cache[requestID]; ok {
+		return cached
 	}
-	tctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	if failedAt, ok := failures[requestID]; ok && time.Since(failedAt) < failureTTL {
+		return Attribution{ModelVersion: activeModel}
+	}
+	callCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	reply, err := client.GetAttribution(tctx, &pb.GetAttributionRequest{Tenant: tenant, RequestId: requestID})
+	reply, err := registry.GetAttribution(callCtx, &pb.AttributionRequest{Tenant: tenant, RequestId: requestID})
 	if err != nil {
-		failureCache[requestID] = time.Now()
-		return Attribution{ModelVersion: activeModel, PromptVersion: "current", Route: "default"}
+		failures[requestID] = time.Now() // spare the registry while it is sick
+		return Attribution{ModelVersion: activeModel}
 	}
-	return Attribution{ModelVersion: reply.ModelVersion, PromptVersion: reply.PromptVersion, Route: reply.Route}
+	result := Attribution{ModelVersion: reply.GetModelVersion(), PromptVersion: reply.GetPromptVersion(), Route: reply.GetRoute()}
+	cache[requestID] = result
+	return result
 }
-
-var _ = grpc.WithInsecure
 `,
       solution: `package main
 
@@ -443,146 +311,123 @@ import (
 	"context"
 	"time"
 
-	pb "example.com/feedback/attributionpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "feedback/gen/attribution"
 )
 
 const (
-	deadline        = 200 * time.Millisecond
-	cacheTtlSeconds = 300
+	unattributed = "unattributed"
+	deadline     = 200 * time.Millisecond
 )
 
-const unattributed = "unattributed"
-
-// Attribution is the model, prompt and route that served one request.
+// Attribution is what served a request.
 type Attribution struct {
-	ModelVersion  string
-	PromptVersion string
-	Route         string
+	ModelVersion  string \`json:"model_version"\`
+	PromptVersion string \`json:"prompt_version"\`
+	Route         string \`json:"route"\`
 }
 
-type cachedAttribution struct {
-	cachedAt    time.Time
-	attribution Attribution
-}
+var (
+	registryConn, _ = grpc.NewClient("attribution:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	registry        = pb.NewAttributionClient(registryConn)
+	// Successes only, per tenant: request ids are unique inside a tenant.
+	cache = map[string]Attribution{}
+)
 
-var cache = map[string]cachedAttribution{}
-
-func fallbackAttribution() Attribution {
-	return Attribution{ModelVersion: unattributed, PromptVersion: unattributed, Route: unattributed}
-}
-
-func attribute(ctx context.Context, client pb.AttributionClient, tenant, requestID string) Attribution {
-	if hit, ok := cache[requestID]; ok && time.Since(hit.cachedAt) < time.Duration(cacheTtlSeconds)*time.Second {
-		return hit.attribution
+// attribute is the model version, prompt version and route that served requestID for tenant.
+func attribute(ctx context.Context, tenant, requestID string) Attribution {
+	key := tenant + ":" + requestID
+	if cached, ok := cache[key]; ok {
+		return cached
 	}
-	tctx, cancel := context.WithTimeout(ctx, deadline)
+	callCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	reply, err := client.GetAttribution(tctx, &pb.GetAttributionRequest{Tenant: tenant, RequestId: requestID})
+	reply, err := registry.GetAttribution(callCtx, &pb.AttributionRequest{Tenant: tenant, RequestId: requestID})
 	if err != nil {
-		// A timeout is not an attribution: store the rating unattributed and never cache the miss.
-		return fallbackAttribution()
+		// Not cached: the next request for this id asks the registry again.
+		return Attribution{ModelVersion: unattributed}
 	}
-	attribution := Attribution{ModelVersion: reply.ModelVersion, PromptVersion: reply.PromptVersion, Route: reply.Route}
-	cache[requestID] = cachedAttribution{cachedAt: time.Now(), attribution: attribution}
-	return attribution
-}
-
-func backfill(record *FeedbackRecord, attribution Attribution) {
-	record.ModelVersion = attribution.ModelVersion
-	record.PromptVersion = attribution.PromptVersion
-	record.Route = attribution.Route
+	result := Attribution{ModelVersion: reply.GetModelVersion(), PromptVersion: reply.GetPromptVersion(), Route: reply.GetRoute()}
+	cache[key] = result
+	return result
 }
 `,
     },
     scala: {
-      starter: `package feedback
+      starter: `import java.util.concurrent.TimeUnit
 
-import scala.concurrent.Future
+import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-import io.grpc.StatusRuntimeException
+import feedback.attribution.{AttributionGrpc, AttributionRequest}
 
-final case class Attribution(model_version: String, prompt_version: String, route: String)
+/** What served a request. */
+final case class Attribution(modelVersion: String, promptVersion: String, route: String)
 
-object AttributionLookup {
-  val TimeoutSeconds = 1
-  val CacheFailureTtl = 24 * 60 * 60
-  val ActiveModel = "gpt-4o-current"
+object Client {
+  val ActiveModel = "support-llm-2026-10"
+  val DeadlineMillis = 2000L
+  val FailureTtlMillis: Long = 24L * 3600 * 1000
 
-  private var failureCache: Map[String, Long] = Map.empty
+  private val registry = AttributionGrpc.blockingStub(ManagedChannelBuilder.forAddress("attribution", 9000).usePlaintext().build())
+  private val cache = scala.collection.mutable.Map.empty[String, Attribution]
+  private val failures = scala.collection.mutable.Map.empty[String, Long]
 
-  def attribute(tenant: String, requestId: String): Future[Attribution] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val now = System.currentTimeMillis()
-    failureCache.get(requestId) match {
-      case Some(seenAt) if now - seenAt < CacheFailureTtl * 1000L =>
-        Future.successful(Attribution(ActiveModel, "current", "default"))
-      case _ =>
+  /** The model version, prompt version and route that served requestId for tenant. */
+  def attribute(tenant: String, requestId: String): Attribution = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val recentlyFailed = failures.get(requestId).exists(at => System.currentTimeMillis() - at < FailureTtlMillis)
+    cache.get(requestId) match {
+      case Some(hit) => hit
+      case None if recentlyFailed => Attribution(ActiveModel, "", "")
+      case None =>
         try {
-          val reply = stub.withDeadlineAfter(TimeoutSeconds * 1000L, java.util.concurrent.TimeUnit.MILLISECONDS)
-            .getAttribution(GetAttributionRequest(tenant, requestId))
-          Future.successful(Attribution(reply.model_version, reply.prompt_version, reply.route))
+          val reply = registry.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).getAttribution(AttributionRequest(tenant, requestId))
+          val result = Attribution(reply.modelVersion, reply.promptVersion, reply.route)
+          cache(requestId) = result
+          result
         } catch {
           case _: StatusRuntimeException =>
-            failureCache = failureCache.updated(requestId, now)
-            Future.successful(Attribution(ActiveModel, "current", "default"))
+            failures(requestId) = System.currentTimeMillis() // spare the registry while it is sick
+            Attribution(ActiveModel, "", "")
         }
     }
   }
 }
 `,
-      solution: `package feedback
+      solution: `import java.util.concurrent.TimeUnit
 
-import scala.concurrent.Future
+import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-import io.grpc.StatusRuntimeException
+import feedback.attribution.{AttributionGrpc, AttributionRequest}
 
-final case class Attribution(model_version: String, prompt_version: String, route: String)
+/** What served a request. */
+final case class Attribution(modelVersion: String, promptVersion: String, route: String)
 
-final case class FeedbackRecord(
-    request_id: String,
-    rating: Int,
-    model_version: String,
-    prompt_version: String,
-    route: String,
-)
-
-object AttributionLookup {
-  val DeadlineMs = 200
-  val CacheTtlSeconds = 300
+object Client {
   val Unattributed = "unattributed"
+  val DeadlineMillis = 200L
 
-  private var cache: Map[String, (Long, Attribution)] = Map.empty
+  private val registry = AttributionGrpc.blockingStub(ManagedChannelBuilder.forAddress("attribution", 9000).usePlaintext().build())
+  /** Successes only, per tenant: request ids are unique inside a tenant. */
+  private val cache = scala.collection.mutable.Map.empty[(String, String), Attribution]
 
-  def fallbackAttribution(): Attribution =
-    Attribution(Unattributed, Unattributed, Unattributed)
-
-  def attribute(tenant: String, requestId: String): Future[Attribution] = {
-    val now = System.currentTimeMillis()
-    cache.get(requestId) match {
-      case Some((cachedAt, attribution)) if now - cachedAt < CacheTtlSeconds * 1000L =>
-        Future.successful(attribution)
-      case _ =>
+  /** The model version, prompt version and route that served requestId for tenant. */
+  def attribute(tenant: String, requestId: String): Attribution =
+    cache.get((tenant, requestId)) match {
+      case Some(hit) => hit
+      case None =>
         try {
-          val reply = stub
-            .withDeadlineAfter(DeadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-            .getAttribution(GetAttributionRequest(tenant, requestId))
-          val attribution = Attribution(reply.model_version, reply.prompt_version, reply.route)
-          cache = cache.updated(requestId, (now, attribution))
-          Future.successful(attribution)
+          val reply = registry.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).getAttribution(AttributionRequest(tenant, requestId))
+          val result = Attribution(reply.modelVersion, reply.promptVersion, reply.route)
+          cache((tenant, requestId)) = result
+          result
         } catch {
-          case _: StatusRuntimeException =>
-            // A timeout is not an attribution: store the rating unattributed and never cache it.
-            Future.successful(fallbackAttribution())
+          // Not cached: the next request for this id asks the registry again.
+          case _: StatusRuntimeException => Attribution(Unattributed, "", "")
         }
     }
-  }
-
-  def backfill(record: FeedbackRecord, attribution: Attribution): FeedbackRecord =
-    record.copy(
-      model_version = attribution.model_version,
-      prompt_version = attribution.prompt_version,
-      route = attribution.route,
-    )
 }
 `,
     },
@@ -590,91 +435,433 @@ object AttributionLookup {
       starter: `#include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <map>
 #include <string>
 
-constexpr int kTimeoutSeconds = 1;
-constexpr int kCacheFailureTtl = 24 * 60 * 60;
-const char* const kActiveModel = "gpt-4o-current";
+#include "attribution.grpc.pb.h"
 
+// What served a request.
 struct Attribution {
   std::string model_version;
   std::string prompt_version;
   std::string route;
 };
 
-Attribution attribute(const std::string& tenant, const std::string& requestId) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kTimeoutSeconds));
-  GetAttributionRequest request;
-  request.set_tenant(tenant);
-  request.set_request_id(requestId);
-  GetAttributionReply reply;
-  const grpc::Status status = stub->GetAttribution(&ctx, request, &reply);
-  if (!status.ok()) {
-    return Attribution{kActiveModel, "current", "default"};
+const std::string kActiveModel = "support-llm-2026-10";
+constexpr std::chrono::milliseconds kDeadline{2000};
+constexpr std::chrono::hours kFailureTtl{24};
+
+auto registry = feedback::Attribution::NewStub(grpc::CreateChannel("attribution:9000", grpc::InsecureChannelCredentials()));
+std::map<std::string, Attribution> cache;
+std::map<std::string, std::chrono::system_clock::time_point> failures;
+
+// The model version, prompt version and route that served request_id for tenant.
+Attribution attribute(const std::string& tenant, const std::string& request_id) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  if (const auto hit = cache.find(request_id); hit != cache.end()) return hit->second;
+  if (const auto failed = failures.find(request_id); failed != failures.end() && std::chrono::system_clock::now() - failed->second < kFailureTtl) {
+    return Attribution{kActiveModel, "", ""};
   }
-  return Attribution{reply.model_version(), reply.prompt_version(), reply.route()};
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+  feedback::AttributionRequest request;
+  request.set_tenant(tenant);
+  request.set_request_id(request_id);
+  feedback::AttributionReply reply;
+  if (!registry->GetAttribution(&ctx, request, &reply).ok()) {
+    failures[request_id] = std::chrono::system_clock::now();  // spare the registry while it is sick
+    return Attribution{kActiveModel, "", ""};
+  }
+  const Attribution result{reply.model_version(), reply.prompt_version(), reply.route()};
+  cache[request_id] = result;
+  return result;
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <map>
 #include <string>
 
-constexpr int kDeadlineMs = 200;
-constexpr int kCacheTtlSeconds = 300;
-const char* const kUnattributed = "unattributed";
+#include "attribution.grpc.pb.h"
 
+// What served a request.
 struct Attribution {
   std::string model_version;
   std::string prompt_version;
   std::string route;
 };
 
-struct FeedbackRecord {
-  std::string request_id;
-  int rating;
-  std::string model_version;
-  std::string prompt_version;
-  std::string route;
-};
+const std::string kUnattributed = "unattributed";
+constexpr std::chrono::milliseconds kDeadline{200};
 
-Attribution fallbackAttribution() {
-  return Attribution{kUnattributed, kUnattributed, kUnattributed};
-}
+auto registry = feedback::Attribution::NewStub(grpc::CreateChannel("attribution:9000", grpc::InsecureChannelCredentials()));
+// Successes only, per tenant: request ids are unique inside a tenant.
+std::map<std::string, Attribution> cache;
 
-Attribution attribute(const std::string& tenant, const std::string& requestId) {
+// The model version, prompt version and route that served request_id for tenant.
+Attribution attribute(const std::string& tenant, const std::string& request_id) {
+  const std::string key = tenant + ":" + request_id;
+  if (const auto hit = cache.find(key); hit != cache.end()) return hit->second;
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kDeadlineMs));
-  GetAttributionRequest request;
+  ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+  feedback::AttributionRequest request;
   request.set_tenant(tenant);
-  request.set_request_id(requestId);
-  GetAttributionReply reply;
-  const grpc::Status status = stub->GetAttribution(&ctx, request, &reply);
-  if (!status.ok()) {
-    // A timeout is not an attribution: store the rating unattributed and never cache the miss.
-    return fallbackAttribution();
+  request.set_request_id(request_id);
+  feedback::AttributionReply reply;
+  if (!registry->GetAttribution(&ctx, request, &reply).ok()) {
+    // Not cached: the next request for this id asks the registry again.
+    return Attribution{kUnattributed, "", ""};
   }
-  return Attribution{reply.model_version(), reply.prompt_version(), reply.route()};
-}
-
-void backfill(FeedbackRecord& record, const Attribution& attribution) {
-  record.model_version = attribution.model_version;
-  record.prompt_version = attribution.prompt_version;
-  record.route = attribution.route;
+  const Attribution result{reply.model_version(), reply.prompt_version(), reply.route()};
+  cache[key] = result;
+  return result;
 }
 `,
     },
   },
-  debrief: `Attribution is the difference between "users disliked this answer" and "users disliked
-something, somewhere". A timeout must not be answered with the model that happens to be active, because
-the point of pinning feedback to a request id is that the answer stops moving when a rollout happens.
-Caching the failure for a day is the second half of the same bug: one slow lookup pins a whole day of
-ratings to the wrong model. An explicit \`unattributed\` bucket makes the gap measurable instead of
-invisible.
+  harness: {
+    python: `import grpc
 
-Production collectors keep the deadline short because the write path is user-facing, alert when the
-\`unattributed\` share rises, and run a background worker that backfills attribution once the registry
-recovers, as a metadata update that leaves the stored rating alone.`,
+import attribution_pb2
+import attribution_pb2_grpc
+
+# (tenant, request_id) → (model_version, prompt_version, route); any other request is NOT_FOUND.
+KNOWN = {
+    ("t-acme", "req-1"): ("support-llm-2026-09", "triage-v4", "primary"),
+    ("t-acme", "req-2"): ("support-llm-2026-09", "triage-v4", "primary"),
+    ("t-other", "req-1"): ("support-llm-2026-10", "triage-v5", "canary"),
+}
+
+
+class Registry(attribution_pb2_grpc.AttributionServicer):
+    def GetAttribution(self, request, context):
+        found = KNOWN.get((request.tenant, request.request_id))
+        if found is None:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"no request {request.request_id} for {request.tenant}")
+        model, prompt, route = found
+        return attribution_pb2.AttributionReply(model_version=model, prompt_version=prompt, route=route)
+
+
+def _client(ctx):
+    ctx.grpc.serve(attribution_pb2_grpc.add_AttributionServicer_to_server, Registry())
+    return ctx.load("client")
+
+
+def _calls(ctx):
+    return len(ctx.grpc.calls_to("GetAttribution"))
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    got = m.attribute("t-acme", "req-1")
+    assert got["model_version"] == "support-llm-2026-09", f"with the registry healthy attribute answered {got}"
+    calls = ctx.grpc.calls_to("GetAttribution")
+    assert calls, "no GetAttribution call was made"
+    assert calls[0].timeout is not None, "the lookup carries no deadline: a stalled registry holds every vote open"
+    assert 0.15 <= calls[0].timeout <= 0.25, f"the lookup carries a {calls[0].timeout} s deadline, expected 200 ms"
+    ctx.grpc.set_latency("GetAttribution", 1.0)
+    slow = m.attribute("t-acme", "req-2")
+    assert slow["model_version"] != "support-llm-2026-09", f"a registry that answers after 1 s was waited for ({slow}): past 200 ms the vote goes on unattributed"
+
+
+def check_unattributed(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("GetAttribution", grpc.StatusCode.UNAVAILABLE, "registry restarting")
+    down = m.attribute("t-acme", "req-1")
+    assert down["model_version"] == "unattributed", f"with the registry unavailable attribute answered {down}: a failed lookup is unattributed, not the model serving now"
+    assert down["prompt_version"] == "" and down["route"] == "", f"an unattributed answer has no prompt version or route, got {down}"
+    unknown = m.attribute("t-acme", "req-404")
+    assert unknown["model_version"] == "unattributed", f"for a request the registry does not know attribute answered {unknown}"
+
+
+def check_retry_after_failure(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("GetAttribution", grpc.StatusCode.UNAVAILABLE, "registry restarting")
+    m.attribute("t-acme", "req-1")
+    before = _calls(ctx)
+    again = m.attribute("t-acme", "req-1")
+    assert _calls(ctx) == before + 1, "after one failed lookup the next request for req-1 did not ask the registry: a failure must not be remembered"
+    assert again["model_version"] == "support-llm-2026-09", f"once the registry answers, attribute must return its attribution, got {again}"
+    third = m.attribute("t-acme", "req-1")
+    assert _calls(ctx) == before + 1 and third == again, "a successful lookup is cached: a third request for req-1 must not call the registry"
+
+
+def check_tenant_cache(ctx):
+    m = _client(ctx)
+    acme = m.attribute("t-acme", "req-1")
+    other = m.attribute("t-other", "req-1")
+    assert acme["model_version"] == "support-llm-2026-09", f"t-acme's req-1 was attributed {acme}"
+    assert other["model_version"] == "support-llm-2026-10", f"t-other's req-1 was attributed {other}, the attribution of t-acme's req-1: the cache key leaves the tenant out"
+    asked = sorted((c.request.tenant, c.request.request_id) for c in ctx.grpc.calls_to("GetAttribution"))
+    assert asked == [("t-acme", "req-1"), ("t-other", "req-1")], f"the registry was asked about {asked}"
+    m.attribute("t-acme", "req-1")
+    m.attribute("t-other", "req-1")
+    assert _calls(ctx) == 2, "each tenant's attribution is cached: repeating both lookups must not call the registry again"
+`,
+    typescript: `// tenant/request_id → [model_version, prompt_version, route]; any other request is NOT_FOUND.
+const KNOWN: Record<string, [string, string, string]> = {
+  't-acme/req-1': ['support-llm-2026-09', 'triage-v4', 'primary'],
+  't-acme/req-2': ['support-llm-2026-09', 'triage-v4', 'primary'],
+  't-other/req-1': ['support-llm-2026-10', 'triage-v5', 'canary'],
+};
+
+function client(ctx) {
+  const pkg = ctx.proto('attribution.proto');
+  ctx.grpc.serve(pkg.feedback.Attribution.service, {
+    GetAttribution(call, callback) {
+      const {tenant, request_id} = call.request;
+      const found = KNOWN[\`\${tenant}/\${request_id}\`];
+      if (found === undefined) return callback({code: ctx.grpc.status.NOT_FOUND, details: \`no request \${request_id} for \${tenant}\`});
+      callback(null, {model_version: found[0], prompt_version: found[1], route: found[2]});
+    },
+  });
+  return ctx.load('client');
+}
+
+const calls = (ctx): number => ctx.grpc.callsTo('GetAttribution').length;
+
+export async function check_deadline(ctx) {
+  const m = client(ctx);
+  const got = await m.attribute('t-acme', 'req-1');
+  assert.equal(got.model_version, 'support-llm-2026-09', \`with the registry healthy attribute answered \${JSON.stringify(got)}\`);
+  const all = ctx.grpc.callsTo('GetAttribution');
+  assert(all.length > 0, 'no GetAttribution call was made');
+  assert(all[0].timeout !== null, 'the lookup carries no deadline: a stalled registry holds every vote open');
+  assert(0.15 <= all[0].timeout && all[0].timeout <= 0.25, \`the lookup carries a \${all[0].timeout} s deadline, expected 200 ms\`);
+  ctx.grpc.setLatency('GetAttribution', 1.0);
+  const slow = await m.attribute('t-acme', 'req-2');
+  assert.notEqual(slow.model_version, 'support-llm-2026-09', \`a registry that answers after 1 s was waited for (\${JSON.stringify(slow)}): past 200 ms the vote goes on unattributed\`);
+}
+
+export async function check_unattributed(ctx) {
+  const m = client(ctx);
+  ctx.grpc.fail('GetAttribution', ctx.grpc.status.UNAVAILABLE, 'registry restarting');
+  const down = await m.attribute('t-acme', 'req-1');
+  assert.equal(down.model_version, 'unattributed', \`with the registry unavailable attribute answered \${JSON.stringify(down)}: a failed lookup is unattributed, not the model serving now\`);
+  assert(down.prompt_version === '' && down.route === '', \`an unattributed answer has no prompt version or route, got \${JSON.stringify(down)}\`);
+  const unknown = await m.attribute('t-acme', 'req-404');
+  assert.equal(unknown.model_version, 'unattributed', \`for a request the registry does not know attribute answered \${JSON.stringify(unknown)}\`);
+}
+
+export async function check_retry_after_failure(ctx) {
+  const m = client(ctx);
+  ctx.grpc.fail('GetAttribution', ctx.grpc.status.UNAVAILABLE, 'registry restarting');
+  await m.attribute('t-acme', 'req-1');
+  const before = calls(ctx);
+  const again = await m.attribute('t-acme', 'req-1');
+  assert.equal(calls(ctx), before + 1, 'after one failed lookup the next request for req-1 did not ask the registry: a failure must not be remembered');
+  assert.equal(again.model_version, 'support-llm-2026-09', \`once the registry answers, attribute must return its attribution, got \${JSON.stringify(again)}\`);
+  const third = await m.attribute('t-acme', 'req-1');
+  assert(calls(ctx) === before + 1 && third.model_version === again.model_version, 'a successful lookup is cached: a third request for req-1 must not call the registry');
+}
+
+export async function check_tenant_cache(ctx) {
+  const m = client(ctx);
+  const acme = await m.attribute('t-acme', 'req-1');
+  const other = await m.attribute('t-other', 'req-1');
+  assert.equal(acme.model_version, 'support-llm-2026-09', \`t-acme's req-1 was attributed \${JSON.stringify(acme)}\`);
+  assert.equal(other.model_version, 'support-llm-2026-10', \`t-other's req-1 was attributed \${JSON.stringify(other)}, the attribution of t-acme's req-1: the cache key leaves the tenant out\`);
+  const asked = ctx.grpc.callsTo('GetAttribution').map(c => \`\${c.request.tenant}/\${c.request.request_id}\`).sort();
+  assert.deepEqual(asked, ['t-acme/req-1', 't-other/req-1'], \`the registry was asked about \${JSON.stringify(asked)}\`);
+  await m.attribute('t-acme', 'req-1');
+  await m.attribute('t-other', 'req-1');
+  assert.equal(calls(ctx), 2, "each tenant's attribution is cached: repeating both lookups must not call the registry again");
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"sort"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "feedback/gen/attribution"
+
+	"leetbuild/harness"
+)
+
+var clientBg = context.Background()
+
+// registryPeer knows the requests in known ("tenant/request" → model, prompt, route); any other is NOT_FOUND.
+type registryPeer struct {
+	pb.UnimplementedAttributionServer
+}
+
+var known = map[string][3]string{
+	"t-acme/req-1":  {"support-llm-2026-09", "triage-v4", "primary"},
+	"t-acme/req-2":  {"support-llm-2026-09", "triage-v4", "primary"},
+	"t-other/req-1": {"support-llm-2026-10", "triage-v5", "canary"},
+}
+
+func (registryPeer) GetAttribution(_ context.Context, req *pb.AttributionRequest) (*pb.AttributionReply, error) {
+	found, ok := known[req.GetTenant()+"/"+req.GetRequestId()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "no request %s for %s", req.GetRequestId(), req.GetTenant())
+	}
+	return &pb.AttributionReply{ModelVersion: found[0], PromptVersion: found[1], Route: found[2]}, nil
+}
+
+func serveRegistry(ctx *harness.Ctx) {
+	pb.RegisterAttributionServer(ctx.GRPC.Server(""), registryPeer{})
+}
+
+func registryCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("GetAttribution", "")) }
+
+func CheckDeadline(ctx *harness.Ctx) {
+	serveRegistry(ctx)
+	got := attribute(clientBg, "t-acme", "req-1")
+	ctx.Equal(got.ModelVersion, "support-llm-2026-09", "with the registry healthy, the attributed model")
+	calls := ctx.GRPC.CallsTo("GetAttribution", "")
+	ctx.Assert(len(calls) > 0, "no GetAttribution call was made")
+	ctx.Assert(calls[0].HasDeadline(), "the lookup carries no deadline: a stalled registry holds every vote open")
+	ctx.Assert(150*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 250*time.Millisecond, "the lookup carries a %v deadline, expected 200 ms", calls[0].Timeout)
+	ctx.GRPC.SetLatency("GetAttribution", 1.0, "")
+	slow := attribute(clientBg, "t-acme", "req-2")
+	ctx.Assert(slow.ModelVersion != "support-llm-2026-09", "a registry that answers after 1 s was waited for (%+v): past 200 ms the vote goes on unattributed", slow)
+}
+
+func CheckUnattributed(ctx *harness.Ctx) {
+	serveRegistry(ctx)
+	ctx.GRPC.Fail("GetAttribution", codes.Unavailable, "registry restarting", 1, "")
+	down := attribute(clientBg, "t-acme", "req-1")
+	ctx.Equal(down.ModelVersion, "unattributed", "with the registry unavailable (a failed lookup is unattributed, not the model serving now), the model")
+	ctx.Assert(down.PromptVersion == "" && down.Route == "", "an unattributed answer has no prompt version or route, got %+v", down)
+	unknown := attribute(clientBg, "t-acme", "req-404")
+	ctx.Equal(unknown.ModelVersion, "unattributed", "for a request the registry does not know, the model")
+}
+
+func CheckRetryAfterFailure(ctx *harness.Ctx) {
+	serveRegistry(ctx)
+	ctx.GRPC.Fail("GetAttribution", codes.Unavailable, "registry restarting", 1, "")
+	attribute(clientBg, "t-acme", "req-1")
+	before := registryCalls(ctx)
+	again := attribute(clientBg, "t-acme", "req-1")
+	ctx.Equal(registryCalls(ctx), before+1, "after one failed lookup the next request for req-1 must ask the registry again (a failure is not remembered); the calls")
+	ctx.Equal(again.ModelVersion, "support-llm-2026-09", "once the registry answers, the attributed model")
+	third := attribute(clientBg, "t-acme", "req-1")
+	ctx.Assert(registryCalls(ctx) == before+1 && third == again, "a successful lookup is cached: a third request for req-1 must not call the registry")
+}
+
+func CheckTenantCache(ctx *harness.Ctx) {
+	serveRegistry(ctx)
+	acme := attribute(clientBg, "t-acme", "req-1")
+	other := attribute(clientBg, "t-other", "req-1")
+	ctx.Equal(acme.ModelVersion, "support-llm-2026-09", "t-acme's req-1, the model")
+	ctx.Equal(other.ModelVersion, "support-llm-2026-10", "t-other's req-1 got t-acme's attribution: the cache key leaves the tenant out; the model")
+	var asked []string
+	for _, c := range ctx.GRPC.CallsTo("GetAttribution", "") {
+		r := c.Request.(*pb.AttributionRequest)
+		asked = append(asked, r.GetTenant()+"/"+r.GetRequestId())
+	}
+	sort.Strings(asked)
+	ctx.Equal(asked, []string{"t-acme/req-1", "t-other/req-1"}, "the requests the registry was asked about")
+	attribute(clientBg, "t-acme", "req-1")
+	attribute(clientBg, "t-other", "req-1")
+	ctx.Equal(registryCalls(ctx), 2, "each tenant's attribution is cached: repeating both lookups must not call the registry again; the calls")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace {
+
+// "tenant/request" → model, prompt, route; any other request is NOT_FOUND.
+const std::map<std::string, std::vector<std::string>> kKnown = {
+    {"t-acme/req-1", {"support-llm-2026-09", "triage-v4", "primary"}},
+    {"t-acme/req-2", {"support-llm-2026-09", "triage-v4", "primary"}},
+    {"t-other/req-1", {"support-llm-2026-10", "triage-v5", "canary"}},
+};
+
+class RegistryPeer final : public feedback::Attribution::Service {
+ public:
+  grpc::Status GetAttribution(grpc::ServerContext*, const feedback::AttributionRequest* req, feedback::AttributionReply* out) override {
+    const auto found = kKnown.find(req->tenant() + "/" + req->request_id());
+    if (found == kKnown.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no request " + req->request_id() + " for " + req->tenant());
+    out->set_model_version(found->second[0]);
+    out->set_prompt_version(found->second[1]);
+    out->set_route(found->second[2]);
+    return grpc::Status::OK;
+  }
+};
+
+void serveRegistry(harness::Ctx& ctx) {
+  static RegistryPeer* peer = nullptr;
+  delete peer;
+  peer = new RegistryPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  cache.clear();
+}
+
+size_t registryCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("GetAttribution").size(); }
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  serveRegistry(ctx);
+  const Attribution got = attribute("t-acme", "req-1");
+  ctx.Equal(got.model_version, "support-llm-2026-09", "with the registry healthy, the attributed model");
+  const auto calls = ctx.GRPC.CallsTo("GetAttribution");
+  ctx.Assert(!calls.empty(), "no GetAttribution call was made");
+  ctx.Assert(calls[0].HasDeadline(), "the lookup carries no deadline: a stalled registry holds every vote open");
+  ctx.Assert(0.15 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 0.25, "the lookup carries a %v s deadline, expected 200 ms", calls[0].TimeoutSeconds());
+  ctx.GRPC.SetLatency("GetAttribution", 1.0);
+  const Attribution slow = attribute("t-acme", "req-2");
+  ctx.Assert(slow.model_version != "support-llm-2026-09", "a registry that answers after 1 s was waited for (model %q): past 200 ms the vote goes on unattributed", slow.model_version);
+}
+
+void CheckUnattributed(harness::Ctx& ctx) {
+  serveRegistry(ctx);
+  ctx.GRPC.Fail("GetAttribution", grpc::StatusCode::UNAVAILABLE, "registry restarting", 1);
+  const Attribution down = attribute("t-acme", "req-1");
+  ctx.Equal(down.model_version, "unattributed", "with the registry unavailable (a failed lookup is unattributed, not the model serving now), the model");
+  ctx.Assert(down.prompt_version.empty() && down.route.empty(), "an unattributed answer has no prompt version or route, got %q and %q", down.prompt_version, down.route);
+  const Attribution unknown = attribute("t-acme", "req-404");
+  ctx.Equal(unknown.model_version, "unattributed", "for a request the registry does not know, the model");
+}
+
+void CheckRetryAfterFailure(harness::Ctx& ctx) {
+  serveRegistry(ctx);
+  ctx.GRPC.Fail("GetAttribution", grpc::StatusCode::UNAVAILABLE, "registry restarting", 1);
+  attribute("t-acme", "req-1");
+  const size_t before = registryCalls(ctx);
+  const Attribution again = attribute("t-acme", "req-1");
+  ctx.Equal(registryCalls(ctx), before + 1, "after one failed lookup the next request for req-1 must ask the registry again (a failure is not remembered); the calls");
+  ctx.Equal(again.model_version, "support-llm-2026-09", "once the registry answers, the attributed model");
+  const Attribution third = attribute("t-acme", "req-1");
+  ctx.Assert(registryCalls(ctx) == before + 1 && third.model_version == again.model_version, "a successful lookup is cached: a third request for req-1 must not call the registry");
+}
+
+void CheckTenantCache(harness::Ctx& ctx) {
+  serveRegistry(ctx);
+  const Attribution acme = attribute("t-acme", "req-1");
+  const Attribution other = attribute("t-other", "req-1");
+  ctx.Equal(acme.model_version, "support-llm-2026-09", "t-acme's req-1, the model");
+  ctx.Equal(other.model_version, "support-llm-2026-10", "t-other's req-1 got t-acme's attribution: the cache key leaves the tenant out; the model");
+  std::vector<std::string> asked;
+  for (const auto& c : ctx.GRPC.CallsTo("GetAttribution")) {
+    const auto& r = c.Request<feedback::AttributionRequest>();
+    asked.push_back(r.tenant() + "/" + r.request_id());
+  }
+  std::sort(asked.begin(), asked.end());
+  ctx.Equal(asked, {"t-acme/req-1", "t-other/req-1"}, "the requests the registry was asked about");
+  attribute("t-acme", "req-1");
+  attribute("t-other", "req-1");
+  ctx.Equal(registryCalls(ctx), 2, "each tenant's attribution is cached: repeating both lookups must not call the registry again; the calls");
+}
+`,
+  },
+  hints: [
+    'Roll out a new model, take the registry down for a moment, and rate an answer of the old one: the vote counts for the new model, and keeps doing so for that request all day after the registry is back.',
+    'The `except` branch answers `ACTIVE_MODEL` and writes `_failures`, which the next call reads before asking; the deadline is two seconds; and `_cache` is keyed by the request id alone.',
+    'Set `DEADLINE_S = 0.2`, return `UNATTRIBUTED` from the `except` without writing anything, delete `_failures`, and key `_cache` by `(tenant, request_id)`.',
+  ],
+  debrief: `\`unattributed\` is the honest answer to "which model served this?" when the registry cannot say, and it keeps the error visible: a dashboard can report how much feedback is unattributed, while a rating credited to the active model silently moves quality from one version to another. Only successes are cached because a success is a fact about a past request that cannot change, while a failure is a fact about the registry right now. The deadline is short because the lookup sits on the vote's path. Production collectors carry the model version in the served-request record so most votes need no lookup, and backfill unattributed rows from the registry later.`,
 };

@@ -2,269 +2,229 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Atomic hourly counters with expiry',
+  title: 'The window hash: one script, integer micro-dollars, an hour of grace',
   concept: 'redis',
   file: 'state',
-  focus: ['meter', 'redis'],
+  focus: ['meter', 'redis', 'limiter'],
   task: `## Task
 
-**Starting point.** The starter implements \`record_usage(tenant, model, input_tokens, output_tokens)\`,
-called once a report is validated: it rejects negative counts, runs two \`HINCRBY\` commands against
-\`meter:{tenant}\`, reads both fields back with \`HGET\` and returns them. It compiles, serves the
-demo and hides five flaws.
+**Starting point.** The starter's \`record_usage(tenant, input_tokens, output_tokens, cost_micros)\` adds
+one priced report to the tenant's spend: three \`HINCRBY\` and one \`HINCRBYFLOAT\` against
+\`meter:{tenant}\` (the cost kept as dollars in \`cost_usd\`), then an \`HMGET\` that reads the totals back.
+The demo dashboard moves. It hides four flaws.
 
-**Failure mode the checks target.** Two concurrent reports each move one counter and the totals
-drift. A tenant that exhausted its budget last week is still over it today, because the key has no
-hour in it and no expiry. The returned totals come from a second round trip that can include another
-request's increment, and \`events\` is always 0.
+**Failure mode the checks target.** The budget limiter reads this hash, so its flaws turn into wrong
+429s. A key with no hour in it does not reset: a tenant that hit its budget last week is over it today.
+Separate commands let another report land between them, and the read-back returns that report's tokens
+as this one's. A float of dollars drifts by fractions of a cent per report, and finance rounds the
+drift into invoices.
 
-- Spend lives in one hash per \`(tenant, hour bucket)\`: \`meter:{tenant}:{bucket}\` with fields
-  \`input_tokens\`, \`output_tokens\` and \`events\`, where \`bucket = int(now // WINDOW_S)\` and
-  \`WINDOW_S = 3600\`.
-- Both increments, the event count and the expiry happen in one atomic Lua \`EVAL\` (\`METER_LUA\`),
-  so a process that dies mid-update cannot leave the input counter moved and the output counter
-  behind.
-- The expiry, \`WINDOW_TTL_S = 7200\` (window plus one hour of grace), is set when the window opens
-  and not re-set by later writes; a \`TTL\` read inside the script tells you whether it exists.
-- The script returns the fresh \`input_tokens\`, \`output_tokens\` and \`events\`.
-- The limiter and the meter read the same key, so pricing and enforcement agree on the window.`,
+Requirements:
+
+- One hash per tenant hour: \`window_key(tenant, bucket_of(now))\` from \`meter/config\`, fields
+  \`input_tokens\`, \`output_tokens\`, \`cost_micros\`, \`events\`.
+- One Lua script (\`EVAL\`) adds both counts, the cost as integer micro-dollars (\`HINCRBY\`) and one
+  event, and returns the four totals it wrote.
+- The key expires one hour after its window closes, \`EXPIREAT (bucket + 1) × WINDOW_S + GRACE_S\`, from
+  the same script, so a later write cannot move it.`,
   sequence: {
-    participants: ['Cost Meter', 'Second request', 'Redis'],
+    participants: ['meterd', 'Redis', 'Budget limiter'],
     messages: [
-      {from: 'Cost Meter', to: 'Redis', label: 'EVAL meter:{tenant}:{bucket} · input+output+events', kind: 'sync'},
-      {from: 'Redis', to: 'Cost Meter', label: '{input, output, events} + EXPIRE on first write', kind: 'reply'},
-      {from: 'Second request', to: 'Redis', label: 'EVAL same window key', kind: 'sync'},
-      {from: 'Redis', to: 'Second request', label: 'totals after both writes', kind: 'reply'},
-      {from: 'Cost Meter', to: 'Cost Meter', label: 'two concurrent reports: no half-applied hash', kind: 'sync'},
-      {from: 'Redis', to: 'Redis', label: 'TTL 7200 · window + one hour of grace', kind: 'async'},
+      {from: 'meterd', to: 'Redis', label: 'EVAL record · meter:t1:{bucket} · in out cost expire_at', kind: 'sync'},
+      {from: 'Redis', to: 'Redis', label: 'HINCRBY ×4 · EXPIREAT window end + grace', kind: 'sync'},
+      {from: 'Redis', to: 'meterd', label: '{input_tokens, output_tokens, cost_micros, events}', kind: 'reply'},
+      {from: 'Budget limiter', to: 'Redis', label: 'HGET meter:t1:{bucket} cost_micros', kind: 'sync'},
     ],
   },
+  hints: [
+    "Symptom: a tenant over budget last Tuesday still gets 429s today, two concurrent reports each come back with the other one's tokens in their totals, and the cost field reads 0.0060000000000000001.",
+    'Mechanism: the key is `meter:{tenant}` with no bucket and no expiry; four separate writes and a read-back leave gaps another client fills; `HINCRBYFLOAT` adds binary floats of dollars.',
+    "Change: `register_script` / `defineCommand` / `NewScript` / `eval` with four `HINCRBY` (cost in micros) and `EXPIREAT (bucket + 1) * WINDOW_S + GRACE_S`, keyed `window_key(tenant, bucket_of(now))`; return the script's own totals.",
+  ],
   checks: [
     {
-      id: 'atomic-script',
-      title: 'Moves both counters in one atomic script',
-      detail:
-        'The increments and the expiry run inside one `EVAL`, so an interrupted update can never leave the input counter moved and the output counter behind. The starter sends one client-side `HINCRBY` per field, which is exactly the half-applied hash the limiter reads.',
-      match: {
-        python: {all: [/METER_LUA/, /\.eval\(/, /HINCRBY/], none: [/r\.hincrby\(/]},
-        typescript: {all: [/METER_LUA/, /\.eval\(/, /HINCRBY/], none: [/r\.hincrby\(/]},
-        go: {all: [/meterScript/, /\.Run\(/, /HINCRBY/], none: [/\.HIncrBy\(/]},
-        scala: {all: [/MeterLua/, /\.eval\(/, /HINCRBY/], none: [/r\.hincrBy\(/]},
-        cpp: {all: [/kMeterLua/, /\.eval</, /HINCRBY/], none: [/r\.hincrby\(/]},
-      },
-    },
-    {
       id: 'window-key',
-      title: 'Keys the hash by (tenant, hour bucket)',
+      title: 'Keys the spend by tenant and hour window',
       detail:
-        'The hash is `meter:{tenant}:{bucket}`, built from the tenant and the hour the report belongs to. The starter keys on the tenant alone, so one counter accumulates every hour the tenant ever spent and "this window" is unbounded.',
+        'A report lands in meter:{tenant}:{bucket} for the current hour; the next hour starts a new hash from zero, and another tenant has its own. The starter keys by tenant alone, so spend never resets.',
       match: {
-        python: {all: [/meter:/, /bucket/]},
-        typescript: {all: [/meter:/, /bucket/]},
-        go: {all: [/meter:/, /bucket/]},
-        scala: {all: [/meter:/, /bucket/]},
-        cpp: {all: [/meter:/, /bucket/]},
+        python: {all: [/window_key\(/, /bucket_of\(/]},
+        typescript: {all: [/windowKey\(/, /bucketOf\(/]},
+        go: {all: [/config\.WindowKey\(/, /config\.BucketOf\(/]},
+        scala: {all: [/Config\.windowKey\(/, /Config\.bucketOf\(/]},
+        cpp: {all: [/config::window_key\(/, /config::bucket_of\(/]},
       },
     },
     {
-      id: 'window-ttl',
-      title: 'Expires the window with a named TTL',
+      id: 'atomic-script',
+      title: 'Records in one Lua script and returns its own totals',
       detail:
-        'The script sets `EXPIRE` from `WINDOW_TTL_S`, so the key for a closed window is gone instead of accumulating forever. The starter sets no TTL on any key it touches.',
+        "The four HINCRBY run inside one EVAL, and the totals returned are the ones the script wrote: another report landing at the same moment is in the hash but not in this report's totals; events counts reports. The starter issues separate commands and reads the hash back afterwards.",
       match: {
-        python: {all: [/WINDOW_TTL_S/, /EXPIRE/]},
-        typescript: {all: [/WINDOW_TTL_S/, /EXPIRE/]},
-        go: {all: [/windowTTLS/, /EXPIRE/]},
-        scala: {all: [/WindowTtlS/, /EXPIRE/]},
-        cpp: {all: [/kWindowTtlS/, /EXPIRE/]},
+        python: {
+          all: [/register_script\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]HINCRBY['"]/],
+          none: [/\.hincrby(float)?\(/],
+        },
+        typescript: {
+          all: [/defineCommand\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]HINCRBY['"]/],
+          none: [/\.hincrby(float)?\(/],
+        },
+        go: {
+          all: [/redis\.NewScript\(|\.Eval\(|\.EvalSha\(/, /redis\.call\(\s*['"]HINCRBY['"]/],
+          none: [/\.HIncrBy(Float)?\(/],
+        },
+        scala: {all: [/jedis\s*\.eval(sha)?\(/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrBy(Float)?\(/]},
+        cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HINCRBY['"]/], none: [/\.hincrby(float)?\(/]},
       },
     },
     {
-      id: 'expiry-on-first-write',
-      title: 'Sets the deadline once, when the window opens',
+      id: 'window-expiry',
+      title: 'Expires the window an hour after it closes',
       detail:
-        'Inside the script the deadline is only written while the key has no TTL (`TTL` returns -1 or -2), so a report in the last minute of a window does not push the deadline out. Re-setting `EXPIRE` on every write keeps an active tenant’s key alive indefinitely.',
+        'A write at half past the hour leaves a TTL of about 5400 s (window end plus GRACE_S), a later write leaves the expiry where it was, and the hash is gone once the grace hour is over. The starter sets no expiry.',
       match: {
-        python: {all: [/redis\.call\('TTL'/, /redis\.call\('EXPIRE'/]},
-        typescript: {all: [/redis\.call\('TTL'/, /redis\.call\('EXPIRE'/]},
-        go: {all: [/redis\.call\('TTL'/, /redis\.call\('EXPIRE'/]},
-        scala: {all: [/redis\.call\('TTL'/, /redis\.call\('EXPIRE'/]},
-        cpp: {all: [/redis\.call\('TTL'/, /redis\.call\('EXPIRE'/]},
+        python: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /GRACE_S/], none: [/['"]EXPIRE['"]|\.expire\(/]},
+        typescript: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /GRACE_S/], none: [/['"]EXPIRE['"]|\.expire\(/]},
+        go: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /config\.GraceSeconds/], none: [/['"]EXPIRE['"]|\.Expire\(/]},
+        scala: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /Config\.GraceSeconds/], none: [/['"]EXPIRE['"]|\.expire\(/]},
+        cpp: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /config::kGraceSeconds/], none: [/['"]EXPIRE['"]|\.expire\(/]},
       },
     },
     {
-      id: 'read-your-write',
-      title: 'Returns the counters from the same script',
+      id: 'integer-micros',
+      title: 'Adds the cost as integer micro-dollars',
       detail:
-        'The script reads the totals it just wrote and returns them, so the caller’s number is the number its own write produced. A second `HGET` after the script can report another concurrent request’s increment as this one’s.',
+        "The hash holds cost_micros, an exact integer sum of every report's cost, the field the limiter and the spend read use. The starter adds floats of dollars to cost_usd with HINCRBYFLOAT.",
       match: {
-        python: {all: [/redis\.call\('HGET'/, /return \{/]},
-        typescript: {all: [/redis\.call\('HGET'/, /return \{/]},
-        go: {all: [/redis\.call\('HGET'/, /return \{/]},
-        scala: {all: [/redis\.call\('HGET'/, /return \{/]},
-        cpp: {all: [/redis\.call\('HGET'/, /return \{/]},
+        python: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
+        typescript: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
+        go: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
+        scala: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
+        cpp: {all: [/['"]cost_micros['"]/], none: [/hincrbyfloat|cost_usd/i]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import time
+      starter: `import redis
 
-import redis
-from fastapi import FastAPI, HTTPException
-
-app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-def record_usage(tenant: str, model: str, input_tokens: int, output_tokens: int) -> dict:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    if input_tokens < 0 or output_tokens < 0:
-        raise HTTPException(status_code=400, detail="token counts must not be negative")
+def record_usage(tenant: str, input_tokens: int, output_tokens: int, cost_micros: int) -> dict:
+    """Add one priced report to the tenant's spend; the totals after it."""
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     key = f"meter:{tenant}"
     r.hincrby(key, "input_tokens", input_tokens)
     r.hincrby(key, "output_tokens", output_tokens)
+    r.hincrbyfloat(key, "cost_usd", cost_micros / 1_000_000)
+    r.hincrby(key, "events", 1)
+    totals = r.hmget(key, "input_tokens", "output_tokens", "cost_usd", "events")
     return {
-        "window_width_s": 3600,
-        "input_tokens": int(r.hget(key, "input_tokens") or 0),
-        "output_tokens": int(r.hget(key, "output_tokens") or 0),
-        "events": 0,
+        "input_tokens": int(totals[0]),
+        "output_tokens": int(totals[1]),
+        "cost_micros": round(float(totals[2]) * 1_000_000),
+        "events": int(totals[3]),
     }
 `,
       solution: `import time
 
 import redis
-from fastapi import FastAPI, HTTPException
 
-app = FastAPI()
+from meter.config import GRACE_S, WINDOW_S, bucket_of, window_key
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-WINDOW_S = 3600
-WINDOW_TTL_S = 7200
-
-METER_LUA = """
-redis.call('HINCRBY', KEYS[1], 'input_tokens', ARGV[1])
-redis.call('HINCRBY', KEYS[1], 'output_tokens', ARGV[2])
-redis.call('HINCRBY', KEYS[1], 'events', 1)
-if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
-end
-return {tonumber(redis.call('HGET', KEYS[1], 'input_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'output_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'events')) or 0}
+RECORD = """
+local key = KEYS[1]
+local totals = {
+  redis.call('HINCRBY', key, 'input_tokens', ARGV[1]),
+  redis.call('HINCRBY', key, 'output_tokens', ARGV[2]),
+  redis.call('HINCRBY', key, 'cost_micros', ARGV[3]),
+  redis.call('HINCRBY', key, 'events', 1),
+}
+redis.call('EXPIREAT', key, ARGV[4])
+return totals
 """
 
-
-def window_bucket(now: float | None = None) -> int:
-    """The hour this report belongs to; the limiter and the meter must agree on it."""
-    return int((now if now is not None else time.time()) // WINDOW_S)
+record = r.register_script(RECORD)
 
 
-def meter_key(tenant: str, bucket: int) -> str:
-    """The one hash per (tenant, window) that the limiter checks and the meter writes."""
-    return f"meter:{tenant}:{bucket}"
-
-
-def record_usage(tenant: str, model: str, input_tokens: int, output_tokens: int) -> dict:
-    if input_tokens < 0 or output_tokens < 0:
-        raise HTTPException(status_code=400, detail="token counts must not be negative")
-    bucket = window_bucket()
-    key = meter_key(tenant, bucket)
-    totals = r.eval(METER_LUA, 1, key, input_tokens, output_tokens, WINDOW_TTL_S)
-    input_total, output_total, events = (int(value) for value in totals)
-    return {
-        "window_bucket": bucket,
-        "input_tokens": input_total,
-        "output_tokens": output_total,
-        "events": events,
-    }
+def record_usage(tenant: str, input_tokens: int, output_tokens: int, cost_micros: int) -> dict:
+    """Add one priced report to the tenant's spend; the totals after it."""
+    bucket = bucket_of(time.time())
+    # The window's key lives until an hour after the window closes, whenever it was last written.
+    expire_at = (bucket + 1) * WINDOW_S + GRACE_S
+    totals = record(keys=[window_key(tenant, bucket)], args=[input_tokens, output_tokens, cost_micros, expire_at])
+    return dict(zip(("input_tokens", "output_tokens", "cost_micros", "events"), (int(n) for n in totals)))
 `,
     },
     typescript: {
-      starter: `/** recordUsage. */
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-const r = new Redis('redis://redis:6379');
+export const redis = new Redis({host: 'redis', port: 6379});
 
-interface Meter {
-  window_width_s: number;
+export interface Totals {
   input_tokens: number;
   output_tokens: number;
+  cost_micros: number;
   events: number;
 }
 
-export async function recordUsage(
-  tenant: string,
-  model: string,
-  inputTokens: number,
-  outputTokens: number,
-): Promise<Meter> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+/** Add one priced report to the tenant's spend; the totals after it. */
+export async function recordUsage(tenant: string, inputTokens: number, outputTokens: number, costMicros: number): Promise<Totals> {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const key = \`meter:\${tenant}\`;
-  await r.hincrby(key, 'input_tokens', inputTokens);
-  await r.hincrby(key, 'output_tokens', outputTokens);
+  await redis.hincrby(key, 'input_tokens', inputTokens);
+  await redis.hincrby(key, 'output_tokens', outputTokens);
+  await redis.hincrbyfloat(key, 'cost_usd', costMicros / 1_000_000);
+  await redis.hincrby(key, 'events', 1);
+  const [input, output, costUsd, events] = await redis.hmget(key, 'input_tokens', 'output_tokens', 'cost_usd', 'events');
   return {
-    window_width_s: 3600,
-    input_tokens: Number((await r.hget(key, 'input_tokens')) ?? 0),
-    output_tokens: Number((await r.hget(key, 'output_tokens')) ?? 0),
-    events: 0,
+    input_tokens: Number(input),
+    output_tokens: Number(output),
+    cost_micros: Math.round(Number(costUsd) * 1_000_000),
+    events: Number(events),
   };
 }
 `,
-      solution: `/** recordUsage: one atomic script moves the window counters and opens the expiry. */
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-const r = new Redis('redis://redis:6379');
+import {GRACE_S, WINDOW_S, bucketOf, windowKey} from 'meter/config';
 
-const WINDOW_S = 3600;
-const WINDOW_TTL_S = 7200;
-
-const METER_LUA = \`
-redis.call('HINCRBY', KEYS[1], 'input_tokens', ARGV[1])
-redis.call('HINCRBY', KEYS[1], 'output_tokens', ARGV[2])
-redis.call('HINCRBY', KEYS[1], 'events', 1)
-if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
-end
-return {tonumber(redis.call('HGET', KEYS[1], 'input_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'output_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'events')) or 0}
+const RECORD = \`
+local key = KEYS[1]
+local totals = {
+  redis.call('HINCRBY', key, 'input_tokens', ARGV[1]),
+  redis.call('HINCRBY', key, 'output_tokens', ARGV[2]),
+  redis.call('HINCRBY', key, 'cost_micros', ARGV[3]),
+  redis.call('HINCRBY', key, 'events', 1),
+}
+redis.call('EXPIREAT', key, ARGV[4])
+return totals
 \`;
 
-interface Meter {
-  window_bucket: number;
+interface MeterRedis extends Redis {
+  recordWindow(key: string, input: number, output: number, cost: number, expireAt: number): Promise<number[]>;
+}
+
+export const redis = new Redis({host: 'redis', port: 6379}) as MeterRedis;
+redis.defineCommand('recordWindow', {numberOfKeys: 1, lua: RECORD});
+
+export interface Totals {
   input_tokens: number;
   output_tokens: number;
+  cost_micros: number;
   events: number;
 }
 
-/** The hour this report belongs to; the limiter and the meter must agree on it. */
-export function windowBucket(now: number = Date.now()): number {
-  return Math.floor(now / 1000 / WINDOW_S);
-}
-
-/** The one hash per (tenant, window) that the limiter checks and the meter writes. */
-export function meterKey(tenant: string, bucket: number): string {
-  return \`meter:\${tenant}:\${bucket}\`;
-}
-
-export async function recordUsage(
-  tenant: string,
-  model: string,
-  inputTokens: number,
-  outputTokens: number,
-): Promise<Meter> {
-  if (inputTokens < 0 || outputTokens < 0) throw new Error('token counts must not be negative');
-  const bucket = windowBucket();
-  const totals = (await r.eval(
-    METER_LUA,
-    1,
-    meterKey(tenant, bucket),
-    String(inputTokens),
-    String(outputTokens),
-    String(WINDOW_TTL_S),
-  )) as [number, number, number];
-  return {window_bucket: bucket, input_tokens: totals[0], output_tokens: totals[1], events: totals[2]};
+/** Add one priced report to the tenant's spend; the totals after it. */
+export async function recordUsage(tenant: string, inputTokens: number, outputTokens: number, costMicros: number): Promise<Totals> {
+  const bucket = bucketOf(Date.now() / 1000);
+  // The window's key lives until an hour after the window closes, whenever it was last written.
+  const expireAt = (bucket + 1) * WINDOW_S + GRACE_S;
+  const [input, output, cost, events] = await redis.recordWindow(windowKey(tenant, bucket), inputTokens, outputTokens, costMicros, expireAt);
+  return {input_tokens: Number(input), output_tokens: Number(output), cost_micros: Number(cost), events: Number(events)};
 }
 `,
     },
@@ -273,168 +233,156 @@ export async function recordUsage(
 
 import (
 	"context"
-	"errors"
-	"time"
+	"fmt"
+	"strconv"
 
 	"github.com/redis/go-redis/v9"
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type Meter struct {
-	WindowWidthS int64 \`json:"window_width_s"\`
-	InputTokens  int64 \`json:"input_tokens"\`
-	OutputTokens int64 \`json:"output_tokens"\`
-	Events       int64 \`json:"events"\`
+// Totals are a window's counters after a report.
+type Totals struct {
+	InputTokens  int64
+	OutputTokens int64
+	CostMicros   int64
+	Events       int64
 }
 
-func recordUsage(ctx context.Context, tenant, model string, inputTokens, outputTokens int64) (Meter, error) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	if inputTokens < 0 || outputTokens < 0 {
-		return Meter{}, errors.New("token counts must not be negative")
-	}
+// recordUsage adds one priced report to the tenant's spend; the totals after it.
+func recordUsage(ctx context.Context, tenant string, inputTokens, outputTokens, costMicros int64) (Totals, error) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	key := "meter:" + tenant
-	if err := rdb.HIncrBy(ctx, key, "input_tokens", inputTokens).Err(); err != nil {
-		return Meter{}, err
+	rdb.HIncrBy(ctx, key, "input_tokens", inputTokens)
+	rdb.HIncrBy(ctx, key, "output_tokens", outputTokens)
+	rdb.HIncrByFloat(ctx, key, "cost_usd", float64(costMicros)/1_000_000)
+	rdb.HIncrBy(ctx, key, "events", 1)
+	vals, err := rdb.HMGet(ctx, key, "input_tokens", "output_tokens", "cost_usd", "events").Result()
+	if err != nil {
+		return Totals{}, err
 	}
-	if err := rdb.HIncrBy(ctx, key, "output_tokens", outputTokens).Err(); err != nil {
-		return Meter{}, err
+	n := func(v any) int64 { i, _ := strconv.ParseInt(fmt.Sprint(v), 10, 64); return i }
+	usd, _ := strconv.ParseFloat(fmt.Sprint(vals[2]), 64)
+	return Totals{InputTokens: n(vals[0]), OutputTokens: n(vals[1]), CostMicros: int64(usd*1_000_000 + 0.5), Events: n(vals[3])}, nil
+}
+
+func main() {
+	if _, err := recordUsage(context.Background(), "t-demo", 1200, 300, 6000); err != nil {
+		fmt.Println(err)
 	}
-	input, _ := rdb.HGet(ctx, key, "input_tokens").Int64()
-	output, _ := rdb.HGet(ctx, key, "output_tokens").Int64()
-	return Meter{WindowWidthS: 3600, InputTokens: input, OutputTokens: output}, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"errors"
-	"strconv"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"meter/config" // config.WindowSeconds, config.GraceSeconds, config.BucketOf, config.WindowKey — provided
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const (
-	windowS    int64 = 3600
-	windowTTLS int64 = 7200
-)
-
-var meterScript = redis.NewScript(\`
-redis.call('HINCRBY', KEYS[1], 'input_tokens', ARGV[1])
-redis.call('HINCRBY', KEYS[1], 'output_tokens', ARGV[2])
-redis.call('HINCRBY', KEYS[1], 'events', 1)
-if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
-end
-return {tonumber(redis.call('HGET', KEYS[1], 'input_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'output_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'events')) or 0}
+var recordWindow = redis.NewScript(\`
+local key = KEYS[1]
+local totals = {
+  redis.call('HINCRBY', key, 'input_tokens', ARGV[1]),
+  redis.call('HINCRBY', key, 'output_tokens', ARGV[2]),
+  redis.call('HINCRBY', key, 'cost_micros', ARGV[3]),
+  redis.call('HINCRBY', key, 'events', 1),
+}
+redis.call('EXPIREAT', key, ARGV[4])
+return totals
 \`)
 
-type Meter struct {
-	WindowBucket int64 \`json:"window_bucket"\`
-	InputTokens  int64 \`json:"input_tokens"\`
-	OutputTokens int64 \`json:"output_tokens"\`
-	Events       int64 \`json:"events"\`
+// Totals are a window's counters after a report.
+type Totals struct {
+	InputTokens  int64
+	OutputTokens int64
+	CostMicros   int64
+	Events       int64
 }
 
-// windowBucket is the hour a report belongs to; the limiter and the meter must agree on it.
-func windowBucket(now time.Time) int64 {
-	return now.Unix() / windowS
-}
-
-// meterKey is the one hash per (tenant, window) that the limiter checks and the meter writes.
-func meterKey(tenant string, bucket int64) string {
-	return "meter:" + tenant + ":" + strconv.FormatInt(bucket, 10)
-}
-
-func recordUsage(ctx context.Context, tenant, model string, inputTokens, outputTokens int64) (Meter, error) {
-	if inputTokens < 0 || outputTokens < 0 {
-		return Meter{}, errors.New("token counts must not be negative")
-	}
-	bucket := windowBucket(time.Now())
-	totals, err := meterScript.Run(ctx, rdb, []string{meterKey(tenant, bucket)},
-		inputTokens, outputTokens, windowTTLS).Int64Slice()
+// recordUsage adds one priced report to the tenant's spend; the totals after it.
+func recordUsage(ctx context.Context, tenant string, inputTokens, outputTokens, costMicros int64) (Totals, error) {
+	bucket := config.BucketOf(time.Now().Unix())
+	// The window's key lives until an hour after the window closes, whenever it was last written.
+	expireAt := (bucket+1)*config.WindowSeconds + config.GraceSeconds
+	totals, err := recordWindow.Run(ctx, rdb, []string{config.WindowKey(tenant, bucket)}, inputTokens, outputTokens, costMicros, expireAt).Int64Slice()
 	if err != nil {
-		return Meter{}, err
+		return Totals{}, err
 	}
-	return Meter{WindowBucket: bucket, InputTokens: totals[0], OutputTokens: totals[1], Events: totals[2]}, nil
+	return Totals{InputTokens: totals[0], OutputTokens: totals[1], CostMicros: totals[2], Events: totals[3]}, nil
+}
+
+func main() {
+	if _, err := recordUsage(context.Background(), "t-demo", 1200, 300, 6000); err != nil {
+		fmt.Println(err)
+	}
 }
 `,
     },
     scala: {
-      starter: `import jedis.RedisClient
-import scala.jdk.CollectionConverters._
+      starter: `import redis.clients.jedis.JedisPooled
 
-object MeterState {
-  val r: RedisClient = new RedisClient("redis", 6379)
+/** A window's counters after a report. */
+final case class Totals(inputTokens: Long, outputTokens: Long, costMicros: Long, events: Long)
 
-  def recordUsage(tenant: String, model: String, inputTokens: Long, outputTokens: Long): Map[String, Long] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    require(inputTokens >= 0 && outputTokens >= 0, "token counts must not be negative")
+object WindowState {
+  val jedis = new JedisPooled("redis", 6379)
+
+  /** Add one priced report to the tenant's spend; the totals after it. */
+  def recordUsage(tenant: String, inputTokens: Long, outputTokens: Long, costMicros: Long): Totals = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     val key = s"meter:$tenant"
-    r.hincrBy(key, "input_tokens", inputTokens)
-    r.hincrBy(key, "output_tokens", outputTokens)
-    Map(
-      "window_width_s" -> 3600L,
-      "input_tokens" -> Option(r.hget(key, "input_tokens")).map(_.toLong).getOrElse(0L),
-      "output_tokens" -> Option(r.hget(key, "output_tokens")).map(_.toLong).getOrElse(0L),
-      "events" -> 0L
-    )
+    jedis.hincrBy(key, "input_tokens", inputTokens)
+    jedis.hincrBy(key, "output_tokens", outputTokens)
+    jedis.hincrByFloat(key, "cost_usd", costMicros / 1000000.0)
+    jedis.hincrBy(key, "events", 1)
+    val totals = jedis.hmget(key, "input_tokens", "output_tokens", "cost_usd", "events")
+    Totals(totals.get(0).toLong, totals.get(1).toLong, math.round(totals.get(2).toDouble * 1000000), totals.get(3).toLong)
   }
 }
 `,
-      solution: `import jedis.RedisClient
+      solution: `import redis.clients.jedis.JedisPooled
+
 import scala.jdk.CollectionConverters._
 
-object MeterState {
-  val r: RedisClient = new RedisClient("redis", 6379)
+import meter.Config
 
-  val WindowS = 3600L
-  val WindowTtlS = 7200L
+/** A window's counters after a report. */
+final case class Totals(inputTokens: Long, outputTokens: Long, costMicros: Long, events: Long)
 
-  val MeterLua =
-    """
-redis.call('HINCRBY', KEYS[1], 'input_tokens', ARGV[1])
-redis.call('HINCRBY', KEYS[1], 'output_tokens', ARGV[2])
-redis.call('HINCRBY', KEYS[1], 'events', 1)
-if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
-end
-return {tonumber(redis.call('HGET', KEYS[1], 'input_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'output_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'events')) or 0}
-"""
+object WindowState {
+  val jedis = new JedisPooled("redis", 6379)
 
-  /** The hour a report belongs to; the limiter and the meter must agree on it. */
-  def windowBucket(nowMillis: Long): Long = nowMillis / 1000 / WindowS
+  val Record: String =
+    """local key = KEYS[1]
+      |local totals = {
+      |  redis.call('HINCRBY', key, 'input_tokens', ARGV[1]),
+      |  redis.call('HINCRBY', key, 'output_tokens', ARGV[2]),
+      |  redis.call('HINCRBY', key, 'cost_micros', ARGV[3]),
+      |  redis.call('HINCRBY', key, 'events', 1),
+      |}
+      |redis.call('EXPIREAT', key, ARGV[4])
+      |return totals
+      |""".stripMargin
 
-  /** The one hash per (tenant, window) that the limiter checks and the meter writes. */
-  def meterKey(tenant: String, bucket: Long): String = s"meter:$tenant:$bucket"
-
-  def recordUsage(tenant: String, model: String, inputTokens: Long, outputTokens: Long): Map[String, Long] = {
-    require(inputTokens >= 0 && outputTokens >= 0, "token counts must not be negative")
-    val bucket = windowBucket(System.currentTimeMillis())
-    val totals = r
-      .eval(
-        MeterLua,
-        List(meterKey(tenant, bucket)).asJava,
-        List(inputTokens.toString, outputTokens.toString, WindowTtlS.toString).asJava
-      )
-      .asInstanceOf[java.util.List[Long]]
+  /** Add one priced report to the tenant's spend; the totals after it. */
+  def recordUsage(tenant: String, inputTokens: Long, outputTokens: Long, costMicros: Long): Totals = {
+    val bucket = Config.bucketOf(System.currentTimeMillis() / 1000)
+    // The window's key lives until an hour after the window closes, whenever it was last written.
+    val expireAt = (bucket + 1) * Config.WindowSeconds + Config.GraceSeconds
+    val args = List(inputTokens, outputTokens, costMicros, expireAt).map(_.toString)
+    val totals = jedis
+      .eval(Record, List(Config.windowKey(tenant, bucket)).asJava, args.asJava)
+      .asInstanceOf[java.util.List[java.lang.Long]]
       .asScala
-      .map(_.toLong)
-      .toList
-    Map(
-      "window_bucket" -> bucket,
-      "input_tokens" -> totals(0),
-      "output_tokens" -> totals(1),
-      "events" -> totals(2)
-    )
+      .map(_.longValue)
+    Totals(totals(0), totals(1), totals(2), totals(3))
   }
 }
 `,
@@ -442,93 +390,422 @@ return {tonumber(redis.call('HGET', KEYS[1], 'input_tokens')) or 0,
     cpp: {
       starter: `#include <sw/redis++/redis++.h>
 
-#include <chrono>
+#include <cmath>
 #include <string>
+#include <vector>
 
-#include <nlohmann/json.hpp>
+sw::redis::Redis redis("tcp://redis:6379");
 
-using json = nlohmann::json;
-using sw::redis::Redis;
+// A window's counters after a report.
+struct Totals {
+  long long input_tokens = 0;
+  long long output_tokens = 0;
+  long long cost_micros = 0;
+  long long events = 0;
+};
 
-Redis r("tcp://redis:6379");
-
-json recordUsage(const std::string& tenant, const std::string& model, long long inputTokens, long long outputTokens) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+// Add one priced report to the tenant's spend; the totals after it.
+Totals record_usage(const std::string& tenant, long long input_tokens, long long output_tokens, long long cost_micros) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const std::string key = "meter:" + tenant;
-  r.hincrby(key, "input_tokens", inputTokens);
-  r.hincrby(key, "output_tokens", outputTokens);
-  const auto input = r.hget(key, "input_tokens").value_or("0");
-  const auto output = r.hget(key, "output_tokens").value_or("0");
-  return json{
-      {"window_width_s", 3600},
-      {"input_tokens", std::stoll(input)},
-      {"output_tokens", std::stoll(output)},
-      {"events", 0},
-  };
+  redis.hincrby(key, "input_tokens", input_tokens);
+  redis.hincrby(key, "output_tokens", output_tokens);
+  redis.hincrbyfloat(key, "cost_usd", static_cast<double>(cost_micros) / 1000000);
+  redis.hincrby(key, "events", 1);
+  const auto vals = redis.hmget(key, {"input_tokens", "output_tokens", "cost_usd", "events"});
+  return {std::stoll(*vals[0]), std::stoll(*vals[1]), std::llround(std::stod(*vals[2]) * 1000000), std::stoll(*vals[3])};
 }
 `,
       solution: `#include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <stdexcept>
 #include <string>
-#include <vector>
+#include <tuple>
 
-#include <nlohmann/json.hpp>
+#include "meter/config.h"  // config::kWindowSeconds, config::kGraceSeconds, config::bucket_of, config::window_key — provided
 
-using json = nlohmann::json;
-using sw::redis::Redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-Redis r("tcp://redis:6379");
-
-constexpr long long kWindowS = 3600;
-constexpr long long kWindowTtlS = 7200;
-
-const std::string kMeterLua = R"LUA(
-redis.call('HINCRBY', KEYS[1], 'input_tokens', ARGV[1])
-redis.call('HINCRBY', KEYS[1], 'output_tokens', ARGV[2])
-redis.call('HINCRBY', KEYS[1], 'events', 1)
-if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
-end
-return {tonumber(redis.call('HGET', KEYS[1], 'input_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'output_tokens')) or 0,
-        tonumber(redis.call('HGET', KEYS[1], 'events')) or 0}
-)LUA";
-
-// windowBucket is the hour a report belongs to; the limiter and the meter must agree on it.
-long long windowBucket(long long nowSeconds) { return nowSeconds / kWindowS; }
-
-// meterKey is the one hash per (tenant, window) that the limiter checks and the meter writes.
-std::string meterKey(const std::string& tenant, long long bucket) {
-  return "meter:" + tenant + ":" + std::to_string(bucket);
+const std::string kRecord = R"lua(
+local key = KEYS[1]
+local totals = {
+  redis.call('HINCRBY', key, 'input_tokens', ARGV[1]),
+  redis.call('HINCRBY', key, 'output_tokens', ARGV[2]),
+  redis.call('HINCRBY', key, 'cost_micros', ARGV[3]),
+  redis.call('HINCRBY', key, 'events', 1),
 }
+redis.call('EXPIREAT', key, ARGV[4])
+return totals
+)lua";
 
-json recordUsage(const std::string& tenant, const std::string& model, long long inputTokens, long long outputTokens) {
-  if (inputTokens < 0 || outputTokens < 0) {
-    throw std::invalid_argument("token counts must not be negative");
-  }
-  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                       .count();
-  const long long bucket = windowBucket(now);
-  const auto totals = r.eval<std::vector<long long>>(kMeterLua, {meterKey(tenant, bucket)},
-                                                     {std::to_string(inputTokens), std::to_string(outputTokens),
-                                                      std::to_string(kWindowTtlS)});
-  return json{
-      {"window_bucket", bucket},
-      {"input_tokens", totals.at(0)},
-      {"output_tokens", totals.at(1)},
-      {"events", totals.at(2)},
-  };
+// A window's counters after a report.
+struct Totals {
+  long long input_tokens = 0;
+  long long output_tokens = 0;
+  long long cost_micros = 0;
+  long long events = 0;
+};
+
+// Add one priced report to the tenant's spend; the totals after it.
+Totals record_usage(const std::string& tenant, long long input_tokens, long long output_tokens, long long cost_micros) {
+  const long long now =
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const long long bucket = config::bucket_of(now);
+  // The window's key lives until an hour after the window closes, whenever it was last written.
+  const long long expire_at = (bucket + 1) * config::kWindowSeconds + config::kGraceSeconds;
+  const auto [input, output, cost, events] = redis.eval<long long, long long, long long, long long>(
+      kRecord, {config::window_key(tenant, bucket)},
+      {std::to_string(input_tokens), std::to_string(output_tokens), std::to_string(cost_micros), std::to_string(expire_at)});
+  return {input, output, cost, events};
 }
 `,
     },
   },
-  hints: [
-    'The spend dashboard shows a tenant over budget on the first of the month, and the limiter blocks it, although this hour has no reports at all.',
-    '`meter:{tenant}` has no bucket and no `EXPIRE`, so every hour lands in one counter; the two `HINCRBY` calls and the `HGET` re-read also let a concurrent report leak into this result.',
-    'Build `meter:{tenant}:{bucket}` from `now // WINDOW_S`, and run one `EVAL` that does both `HINCRBY`, the `events` increment, `EXPIRE` only when `TTL` < 0, and returns the `HGET` values.',
-  ],
-  debrief: `The counter is the number the budget limiter reads before admitting a request and the number the spend report prints afterwards, so it has to be one atomic unit of spend that belongs to one window and disappears when the window is done. That is why everything lives in one script: the increments, the event count, the expiry decision and the read-back, so no client-side interleaving can show a half-applied hash or another request's total. The TTL is set only when \`TTL\` reports none, because re-setting it on every write slides the deadline forward for as long as the tenant keeps spending. Production meters also snapshot closed windows to durable storage before the key expires, since Redis is the enforcement copy, not the ledger.`,
+  harness: {
+    python: `import time
+
+WINDOW = 3600
+GRACE = 3600
+
+
+def _mid_window(ctx):
+    """Move the clock to half past the next hour; the bucket it falls in."""
+    ctx.clock.advance(WINDOW - time.time() % WINDOW + 1800)
+    return int(time.time() // WINDOW)
+
+
+def _hash(ctx, key):
+    return ctx.redis.hgetall(key)
+
+
+def _totals(t):
+    return (t.get("input_tokens"), t.get("output_tokens"), t.get("cost_micros"), t.get("events"))
+
+
+def check_window_key(ctx):
+    m = ctx.load("state")
+    bucket = _mid_window(ctx)
+    m.record_usage("t1", 1000, 200, 4500)
+    key = f"meter:t1:{bucket}"
+    assert ctx.redis.exists(key), f"a report at half past the hour must land in {key} (meter:{{tenant}}:{{bucket}}), the keys are {sorted(ctx.redis.keys('*'))}"
+    assert _hash(ctx, key).get("input_tokens") == "1000", f"{key} holds {_hash(ctx, key)}"
+    m.record_usage("t2", 7, 7, 7)
+    assert _hash(ctx, f"meter:t2:{bucket}").get("input_tokens") == "7", f"another tenant has its own window, the keys are {sorted(ctx.redis.keys('*'))}"
+    ctx.clock.advance(WINDOW)
+    totals = m.record_usage("t1", 10, 20, 300)
+    assert _totals(totals) == (10, 20, 300, 1), f"the next hour starts a new window from zero, record_usage answered {totals}: without the hour in the key, last week's spend still counts against this hour's budget"
+    assert _hash(ctx, f"meter:t1:{bucket + 1}").get("input_tokens") == "10", f"the next hour's report must land in meter:t1:{bucket + 1}, the keys are {sorted(ctx.redis.keys('*'))}"
+
+
+def check_atomic_script(ctx):
+    m = ctx.load("state")
+    bucket = _mid_window(ctx)
+    key = f"meter:t1:{bucket}"
+
+    def other_report():
+        # another replica recording a report for the same tenant, landing between two of this one's commands
+        ctx.redis.hincrby(key, "input_tokens", 500)
+        ctx.redis.hincrby(key, "output_tokens", 50)
+        ctx.redis.hincrby(key, "cost_micros", 2000)
+        ctx.redis.hincrby(key, "events", 1)
+
+    probe = ctx.redis_after(key, other_report)
+    totals = m.record_usage("t1", 1000, 200, 4500)
+    assert probe.fired, f"record_usage never touched {key}, the keys are {sorted(ctx.redis.keys('*'))}"
+    assert _totals(totals) == (1000, 200, 4500, 1), f"record_usage answered {totals}, expected the totals its own write produced (1000, 200, 4500, 1 event): another report landed between its commands and was counted as this one's"
+    window = _hash(ctx, key)
+    assert (window.get("input_tokens"), window.get("cost_micros"), window.get("events")) == ("1500", "6500", "2"), f"both reports must be in the window: {window}"
+
+
+def check_window_expiry(ctx):
+    m = ctx.load("state")
+    bucket = _mid_window(ctx)
+    key = f"meter:t1:{bucket}"
+    m.record_usage("t1", 100, 10, 400)
+    expected = (bucket + 1) * WINDOW + GRACE - time.time()
+    ttl = ctx.redis.ttl(key)
+    assert ttl > 0, f"{key} has TTL {ttl}: a window that never expires keeps last hour's spend in Redis for good"
+    assert abs(ttl - expected) <= 3, f"{key} has TTL {ttl} s at half past the hour, expected about {expected:.0f} s: the window expires GRACE_S after it closes, not a fixed time after each write"
+    ctx.clock.advance(600)
+    m.record_usage("t1", 100, 10, 400)
+    later = ctx.redis.ttl(key)
+    assert abs(later - (expected - 600)) <= 3, f"a write ten minutes later moved the expiry: TTL {later} s, expected about {expected - 600:.0f} s"
+    ctx.clock.advance(expected - 600 + 1)
+    assert not ctx.redis.exists(key), f"an hour after the window closed {key} must be gone, it holds {_hash(ctx, key)}"
+
+
+def check_integer_micros(ctx):
+    m = ctx.load("state")
+    bucket = _mid_window(ctx)
+    for cost in (1, 2, 3, 100_000, 7):
+        totals = m.record_usage("t1", 10, 10, cost)
+    window = _hash(ctx, f"meter:t1:{bucket}")
+    assert window.get("cost_micros") == "100013", f"five reports costing 100013 micro-dollars in all left the window as {window}: the spend must be an exact integer sum in cost_micros (HINCRBY), not floats of dollars"
+    assert not any("." in v for v in window.values()), f"every field of the window must be an integer: {window}"
+    assert totals.get("cost_micros") == 100013, f"record_usage must answer cost_micros 100013, got {totals}"
+`,
+    typescript: `const WINDOW = 3600;
+const GRACE = 3600;
+
+/** Move the clock to half past the next hour; the bucket it falls in. */
+function midWindow(ctx): number {
+  ctx.clock.advance(WINDOW - ((ctx.clock.now() / 1000) % WINDOW) + 1800);
+  return Math.floor(ctx.clock.now() / 1000 / WINDOW);
+}
+
+const hash = (ctx, key: string) => ctx.redis.hgetall(key);
+const totalsOf = t => [t.input_tokens, t.output_tokens, t.cost_micros, t.events];
+
+export async function check_window_key(ctx) {
+  const m = ctx.load('state');
+  const bucket = midWindow(ctx);
+  await m.recordUsage('t1', 1000, 200, 4500);
+  const key = \`meter:t1:\${bucket}\`;
+  assert(ctx.redis.exists(key) === 1, \`a report at half past the hour must land in \${key} (meter:{tenant}:{bucket}), the keys are \${JSON.stringify(ctx.redis.keys('*').sort())}\`);
+  assert.equal(hash(ctx, key).input_tokens, '1000', \`\${key} holds \${JSON.stringify(hash(ctx, key))}\`);
+  await m.recordUsage('t2', 7, 7, 7);
+  assert.equal(hash(ctx, \`meter:t2:\${bucket}\`).input_tokens, '7', \`another tenant has its own window, the keys are \${JSON.stringify(ctx.redis.keys('*').sort())}\`);
+  ctx.clock.advance(WINDOW);
+  const totals = await m.recordUsage('t1', 10, 20, 300);
+  assert.deepEqual(totalsOf(totals), [10, 20, 300, 1], \`the next hour starts a new window from zero, recordUsage answered \${JSON.stringify(totals)}: without the hour in the key, last week's spend still counts against this hour's budget\`);
+  assert.equal(hash(ctx, \`meter:t1:\${bucket + 1}\`).input_tokens, '10', \`the next hour's report must land in meter:t1:\${bucket + 1}, the keys are \${JSON.stringify(ctx.redis.keys('*').sort())}\`);
+}
+
+export async function check_atomic_script(ctx) {
+  const m = ctx.load('state');
+  const bucket = midWindow(ctx);
+  const key = \`meter:t1:\${bucket}\`;
+  // another replica recording a report for the same tenant, landing between two of this one's commands
+  const probe = ctx.redisAfter(key, () => {
+    ctx.redis.hincrby(key, 'input_tokens', 500);
+    ctx.redis.hincrby(key, 'output_tokens', 50);
+    ctx.redis.hincrby(key, 'cost_micros', 2000);
+    ctx.redis.hincrby(key, 'events', 1);
+  });
+  const totals = await m.recordUsage('t1', 1000, 200, 4500);
+  assert(probe.fired, \`recordUsage never touched \${key}, the keys are \${JSON.stringify(ctx.redis.keys('*').sort())}\`);
+  assert.deepEqual(totalsOf(totals), [1000, 200, 4500, 1], \`recordUsage answered \${JSON.stringify(totals)}, expected the totals its own write produced (1000, 200, 4500, 1 event): another report landed between its commands and was counted as this one's\`);
+  const w = hash(ctx, key);
+  assert(w.input_tokens === '1500' && w.cost_micros === '6500' && w.events === '2', \`both reports must be in the window: \${JSON.stringify(w)}\`);
+}
+
+export async function check_window_expiry(ctx) {
+  const m = ctx.load('state');
+  const bucket = midWindow(ctx);
+  const key = \`meter:t1:\${bucket}\`;
+  await m.recordUsage('t1', 100, 10, 400);
+  const expected = (bucket + 1) * WINDOW + GRACE - ctx.clock.now() / 1000;
+  const ttl = Number(ctx.redis.ttl(key));
+  assert(ttl > 0, \`\${key} has TTL \${ttl}: a window that never expires keeps last hour's spend in Redis for good\`);
+  assert(Math.abs(ttl - expected) <= 3, \`\${key} has TTL \${ttl} s at half past the hour, expected about \${expected.toFixed(0)} s: the window expires GRACE_S after it closes, not a fixed time after each write\`);
+  ctx.clock.advance(600);
+  await m.recordUsage('t1', 100, 10, 400);
+  const later = Number(ctx.redis.ttl(key));
+  assert(Math.abs(later - (expected - 600)) <= 3, \`a write ten minutes later moved the expiry: TTL \${later} s, expected about \${(expected - 600).toFixed(0)} s\`);
+  ctx.clock.advance(expected - 600 + 1);
+  assert.equal(ctx.redis.exists(key), 0, \`an hour after the window closed \${key} must be gone, it holds \${JSON.stringify(hash(ctx, key))}\`);
+}
+
+export async function check_integer_micros(ctx) {
+  const m = ctx.load('state');
+  const bucket = midWindow(ctx);
+  let totals;
+  for (const cost of [1, 2, 3, 100_000, 7]) totals = await m.recordUsage('t1', 10, 10, cost);
+  const w = hash(ctx, \`meter:t1:\${bucket}\`);
+  assert.equal(w.cost_micros, '100013', \`five reports costing 100013 micro-dollars in all left the window as \${JSON.stringify(w)}: the spend must be an exact integer sum in cost_micros (HINCRBY), not floats of dollars\`);
+  assert(!Object.values(w).some(v => String(v).includes('.')), \`every field of the window must be an integer: \${JSON.stringify(w)}\`);
+  assert.equal(totals.cost_micros, 100013, \`recordUsage must answer cost_micros 100013, got \${JSON.stringify(totals)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"math"
+	"strconv"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const (
+	stateWindow = 3600
+	stateGrace  = 3600
+)
+
+// stateMidWindow moves the clock to half past the next hour; the bucket it falls in.
+func stateMidWindow(ctx *harness.Ctx) int64 {
+	now := float64(ctx.Clock.Now()) / 1000
+	ctx.Clock.Advance(stateWindow - math.Mod(now, stateWindow) + 1800)
+	return ctx.Clock.Now() / 1000 / stateWindow
+}
+
+func stateKey(tenant string, bucket int64) string {
+	return "meter:" + tenant + ":" + strconv.FormatInt(bucket, 10)
+}
+
+func stateRecord(ctx *harness.Ctx, tenant string, in, out, cost int64) Totals {
+	t, err := recordUsage(context.Background(), tenant, in, out, cost)
+	ctx.NoError(err, "recordUsage(%s)", tenant)
+	return t
+}
+
+func CheckWindowKey(ctx *harness.Ctx) {
+	bucket := stateMidWindow(ctx)
+	stateRecord(ctx, "t1", 1000, 200, 4500)
+	key := stateKey("t1", bucket)
+	ctx.Equal(ctx.Redis.HGetAll(key)["input_tokens"], "1000", "a report at half past the hour must land in %s (meter:{tenant}:{bucket}); the keys are %v; its input_tokens", key, ctx.Redis.Keys("*"))
+	stateRecord(ctx, "t2", 7, 7, 7)
+	ctx.Equal(ctx.Redis.HGetAll(stateKey("t2", bucket))["input_tokens"], "7", "another tenant has its own window (keys %v); its input_tokens", ctx.Redis.Keys("*"))
+	ctx.Clock.Advance(stateWindow)
+	totals := stateRecord(ctx, "t1", 10, 20, 300)
+	ctx.Equal(totals, Totals{InputTokens: 10, OutputTokens: 20, CostMicros: 300, Events: 1}, "the next hour starts a new window from zero (without the hour in the key, last week's spend still counts against this hour's budget); recordUsage's totals")
+	ctx.Equal(ctx.Redis.HGetAll(stateKey("t1", bucket+1))["input_tokens"], "10", "the next hour's report must land in %s (keys %v); its input_tokens", stateKey("t1", bucket+1), ctx.Redis.Keys("*"))
+}
+
+func CheckAtomicScript(ctx *harness.Ctx) {
+	bucket := stateMidWindow(ctx)
+	key := stateKey("t1", bucket)
+	fired := false
+	// another replica recording a report for the same tenant, landing between two of this one's commands
+	ctx.Redis.After(key, func() any {
+		fired = true
+		ctx.Redis.Do("HINCRBY", key, "input_tokens", 500)
+		ctx.Redis.Do("HINCRBY", key, "output_tokens", 50)
+		ctx.Redis.Do("HINCRBY", key, "cost_micros", 2000)
+		ctx.Redis.Do("HINCRBY", key, "events", 1)
+		return nil
+	})
+	totals := stateRecord(ctx, "t1", 1000, 200, 4500)
+	ctx.Assert(fired, "recordUsage never touched %s, the keys are %v", key, ctx.Redis.Keys("*"))
+	ctx.Equal(totals, Totals{InputTokens: 1000, OutputTokens: 200, CostMicros: 4500, Events: 1}, "recordUsage must answer the totals its own write produced: another report landed between its commands and was counted as this one's; the totals")
+	w := ctx.Redis.HGetAll(key)
+	ctx.Assert(w["input_tokens"] == "1500" && w["cost_micros"] == "6500" && w["events"] == "2", "both reports must be in the window: %v", w)
+}
+
+func CheckWindowExpiry(ctx *harness.Ctx) {
+	bucket := stateMidWindow(ctx)
+	key := stateKey("t1", bucket)
+	stateRecord(ctx, "t1", 100, 10, 400)
+	expected := float64((bucket+1)*stateWindow+stateGrace) - float64(ctx.Clock.Now())/1000
+	ttl := ctx.Redis.TTL(key)
+	ctx.Assert(ttl > 0, "%s has TTL %d: a window that never expires keeps last hour's spend in Redis for good", key, ttl)
+	ctx.Assert(math.Abs(float64(ttl)-expected) <= 3, "%s has TTL %d s at half past the hour, expected about %.0f s: the window expires GraceSeconds after it closes, not a fixed time after each write", key, ttl, expected)
+	ctx.Clock.Advance(600)
+	stateRecord(ctx, "t1", 100, 10, 400)
+	later := ctx.Redis.TTL(key)
+	ctx.Assert(math.Abs(float64(later)-(expected-600)) <= 3, "a write ten minutes later moved the expiry: TTL %d s, expected about %.0f s", later, expected-600)
+	ctx.Clock.Advance(expected - 600 + 1)
+	ctx.Equal(ctx.Redis.Exists(key), 0, "an hour after the window closed %s must be gone (%v); exists", key, ctx.Redis.HGetAll(key))
+}
+
+func CheckIntegerMicros(ctx *harness.Ctx) {
+	bucket := stateMidWindow(ctx)
+	var totals Totals
+	for _, cost := range []int64{1, 2, 3, 100_000, 7} {
+		totals = stateRecord(ctx, "t1", 10, 10, cost)
+	}
+	w := ctx.Redis.HGetAll(stateKey("t1", bucket))
+	ctx.Equal(w["cost_micros"], "100013", "five reports costing 100013 micro-dollars in all left the window as %v: the spend must be an exact integer sum in cost_micros (HINCRBY), not floats of dollars; cost_micros", w)
+	for field, v := range w {
+		ctx.Assert(!strings.Contains(v, "."), "every field of the window must be an integer: %s is %s", field, v)
+	}
+	ctx.Equal(totals.CostMicros, 100013, "recordUsage's CostMicros")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+#include <string>
+
+namespace {
+
+constexpr long long kWindow = 3600;
+constexpr long long kGrace = 3600;
+
+// Move the clock to half past the next hour; the bucket it falls in.
+long long midWindow(harness::Ctx& ctx) {
+  const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
+  ctx.Clock.Advance(kWindow - std::fmod(now, kWindow) + 1800);
+  return ctx.Clock.Now() / 1000 / kWindow;
+}
+
+std::string windowOf(const std::string& tenant, long long bucket) { return "meter:" + tenant + ":" + std::to_string(bucket); }
+
+std::string field(harness::Ctx& ctx, const std::string& key, const std::string& name) {
+  const auto all = ctx.Redis.HGetAll(key);
+  const auto it = all.find(name);
+  return it == all.end() ? "" : it->second;
+}
+
+}  // namespace
+
+void CheckWindowKey(harness::Ctx& ctx) {
+  const long long bucket = midWindow(ctx);
+  record_usage("t1", 1000, 200, 4500);
+  const std::string key = windowOf("t1", bucket);
+  ctx.Equal(field(ctx, key, "input_tokens"), "1000", "a report at half past the hour must land in %s (meter:{tenant}:{bucket}); the keys are %v; its input_tokens", key, ctx.Redis.Keys("*"));
+  record_usage("t2", 7, 7, 7);
+  ctx.Equal(field(ctx, windowOf("t2", bucket), "input_tokens"), "7", "another tenant has its own window (keys %v); its input_tokens", ctx.Redis.Keys("*"));
+  ctx.Clock.Advance(kWindow);
+  const Totals totals = record_usage("t1", 10, 20, 300);
+  ctx.Assert(totals.input_tokens == 10 && totals.output_tokens == 20 && totals.cost_micros == 300 && totals.events == 1,
+             "the next hour starts a new window from zero, record_usage answered (%d, %d, %d, %d events): without the hour in the key, last week's spend still counts against this hour's budget",
+             totals.input_tokens, totals.output_tokens, totals.cost_micros, totals.events);
+  ctx.Equal(field(ctx, windowOf("t1", bucket + 1), "input_tokens"), "10", "the next hour's report must land in %s (keys %v); its input_tokens", windowOf("t1", bucket + 1), ctx.Redis.Keys("*"));
+}
+
+void CheckAtomicScript(harness::Ctx& ctx) {
+  const long long bucket = midWindow(ctx);
+  const std::string key = windowOf("t1", bucket);
+  bool fired = false;
+  // another replica recording a report for the same tenant, landing between two of this one's commands
+  ctx.Redis.After(key, [&] {
+    fired = true;
+    ctx.Redis.Do("HINCRBY", key, "input_tokens", 500);
+    ctx.Redis.Do("HINCRBY", key, "output_tokens", 50);
+    ctx.Redis.Do("HINCRBY", key, "cost_micros", 2000);
+    ctx.Redis.Do("HINCRBY", key, "events", 1);
+  });
+  const Totals totals = record_usage("t1", 1000, 200, 4500);
+  ctx.Assert(fired, "record_usage never touched %s, the keys are %v", key, ctx.Redis.Keys("*"));
+  ctx.Assert(totals.input_tokens == 1000 && totals.output_tokens == 200 && totals.cost_micros == 4500 && totals.events == 1,
+             "record_usage answered (%d, %d, %d, %d events), expected the totals its own write produced (1000, 200, 4500, 1 event): another report landed between its commands and was counted as this one's",
+             totals.input_tokens, totals.output_tokens, totals.cost_micros, totals.events);
+  ctx.Assert(field(ctx, key, "input_tokens") == "1500" && field(ctx, key, "cost_micros") == "6500" && field(ctx, key, "events") == "2",
+             "both reports must be in the window: %v", ctx.Redis.HGetAll(key));
+}
+
+void CheckWindowExpiry(harness::Ctx& ctx) {
+  const long long bucket = midWindow(ctx);
+  const std::string key = windowOf("t1", bucket);
+  record_usage("t1", 100, 10, 400);
+  const double expected = static_cast<double>((bucket + 1) * kWindow + kGrace) - static_cast<double>(ctx.Clock.Now()) / 1000;
+  const long long ttl = ctx.Redis.TTL(key);
+  ctx.Assert(ttl > 0, "%s has TTL %d: a window that never expires keeps last hour's spend in Redis for good", key, ttl);
+  ctx.Assert(std::fabs(static_cast<double>(ttl) - expected) <= 3,
+             "%s has TTL %d s at half past the hour, expected about %.0f s: the window expires kGraceSeconds after it closes, not a fixed time after each write", key, ttl, expected);
+  ctx.Clock.Advance(600);
+  record_usage("t1", 100, 10, 400);
+  const long long later = ctx.Redis.TTL(key);
+  ctx.Assert(std::fabs(static_cast<double>(later) - (expected - 600)) <= 3, "a write ten minutes later moved the expiry: TTL %d s, expected about %.0f s", later, expected - 600);
+  ctx.Clock.Advance(expected - 600 + 1);
+  ctx.Equal(ctx.Redis.Exists(key), 0, "an hour after the window closed %s must be gone (%v); exists", key, ctx.Redis.HGetAll(key));
+}
+
+void CheckIntegerMicros(harness::Ctx& ctx) {
+  const long long bucket = midWindow(ctx);
+  Totals totals;
+  for (long long cost : {1LL, 2LL, 3LL, 100000LL, 7LL}) totals = record_usage("t1", 10, 10, cost);
+  const std::string key = windowOf("t1", bucket);
+  ctx.Equal(field(ctx, key, "cost_micros"), "100013",
+            "five reports costing 100013 micro-dollars in all left the window as %v: the spend must be an exact integer sum in cost_micros (HINCRBY), not floats of dollars; cost_micros", ctx.Redis.HGetAll(key));
+  for (const auto& [name, value] : ctx.Redis.HGetAll(key)) {
+    ctx.Assert(value.find('.') == std::string::npos, "every field of the window must be an integer: %s is %s", name, value);
+  }
+  ctx.Equal(totals.cost_micros, 100013, "record_usage's cost_micros");
+}
+`,
+  },
+  debrief: `One script is the unit because the window's fields only mean something together: the limiter divides cost by events, the read in step 5 pairs tokens with spend, and Redis runs a script with nothing in between. Returning the script's own totals is the same argument made for the caller; a read-back is a second question asked after the world moved. Micro-dollars as integers make the sum exact, so the limiter, the read and the invoice agree to the micro-dollar. The expiry is pinned to the window rather than to the last write so a busy tenant's key leaves on schedule. A production meter shards hot tenants across a few keys summed on read, and keeps closed windows in a durable store before Redis drops them, since an hour of grace is for late reports, not for audits.`,
 };

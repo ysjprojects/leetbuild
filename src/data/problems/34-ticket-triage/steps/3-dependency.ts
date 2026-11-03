@@ -8,44 +8,41 @@ export const triageDependencyStep: Step = {
   focus: ['triage', 'classifier', 'rules'],
   task: `## Task
 
-**Starting point.** The starter's \`classify\` loops over \`stub.Classify\` with the hour-long
-\`CACHE_TTL_S\` as its timeout, catches every \`RpcError\`, and answers from a single
-\`catch_all\` queue for the rest of the hour after a failure. It serves the demo and hides five
+**Starting point.** The starter is the classifier client the triage service calls once a ticket is
+admitted: \`classify(tenant, text)\` sends \`Classify\` over gRPC up to five times, 200 ms apart, and
+answers the model's \`{queue, priority, confidence}\` with empty \`fallback_reason\` and
+\`ruleset_version\`. When every try fails it answers a catch-all \`triage\` queue, and keeps
+answering it without a call for the next hour (\`FAILURE_TTL_S\`). It serves the demo and hides four
 flaws.
 
-**Failure mode the checks target.** Failing every ticket into one catch-all queue erases the
-difference between "billing outage" and "delivery delay", and no \`fallback_reason\` means the
-outage is invisible in the data. Retrying a refusal turns a deterministic error into a retry storm.
-A failure cache measured in hours keeps the service on rules long after the classifier is healthy.
+**Failure mode the checks target.** A stalled classifier holds every webhook open; a ticket the
+model refuses is sent five times; during an outage every ticket lands in a queue nobody staffs,
+with nothing saying why; and one bad minute benches the classifier for an hour.
 
-- **Deadline.** Every \`Classify\` call runs with a **1-second** deadline.
-- **Bounded retries.** At most **3 attempts**, and only for \`UNAVAILABLE\` and
-  \`DEADLINE_EXCEEDED\`. A refusal (\`INVALID_ARGUMENT\`) is not retried.
-- **Rule-based fallback.** On timeout, unavailability or refusal, classify deterministically from
-  a versioned keyword ruleset (\`ruleset v3\`): the keywords pick queue and priority, and the
-  decision records \`fallback_reason\` and \`ruleset_version\`. An unmatched ticket lands in the
-  real \`general\` queue, not a catch-all.
-- **Short failure memory.** After \`5\` consecutive retryable failures the client skips the
-  classifier for **30 seconds**, then probes it again, so a recovered classifier is used again
-  within a minute.`,
+\`\`\`proto
+service Classifier { rpc Classify(ClassifyRequest) returns (ClassifyReply); }  // INVALID_ARGUMENT: refused
+\`\`\`
+
+- Every call carries a **\`DEADLINE_S\` = 1 s** deadline.
+- At most **\`MAX_ATTEMPTS\` = 3** tries; only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are tried again.
+- Without an answer, route by the provided ruleset (\`rules.rule_decision\`) and set
+  \`fallback_reason\`: \`classifier_timeout\`, \`classifier_refused\`, \`classifier_unavailable\` or
+  \`breaker_open\`.
+- After **\`BREAKER_THRESHOLD\` = 5** calls in a row that ended on a retryable status, skip the
+  classifier for **\`BREAKER_COOLDOWN_S\` = 30 s**, then try it again.`,
   sequence: {
-    participants: ['triage-api', 'Classifier', 'Rule engine'],
+    participants: ['triage-api', 'Classifier', 'Ruleset v3'],
     messages: [
-      {from: 'triage-api', to: 'Classifier', label: 'Classify(text) · deadline now + 1s', kind: 'sync'},
-      {from: 'Classifier', to: 'triage-api', label: 'DEADLINE_EXCEEDED after 1s', kind: 'reply'},
-      {from: 'triage-api', to: 'Rule engine', label: 'rules v3 · keywords over the text', kind: 'sync'},
-      {from: 'Rule engine', to: 'triage-api', label: 'queue · priority', kind: 'reply'},
+      {from: 'triage-api', to: 'Classifier', label: 'Classify(tenant, text) · deadline 1 s', kind: 'sync'},
+      {from: 'Classifier', to: 'triage-api', label: 'UNAVAILABLE · retried, 3 tries at most', kind: 'reply'},
+      {from: 'Classifier', to: 'triage-api', label: 'INVALID_ARGUMENT · refused, not retried', kind: 'reply'},
+      {from: 'triage-api', to: 'Ruleset v3', label: 'rule_decision(text)', kind: 'sync'},
+      {from: 'Ruleset v3', to: 'triage-api', label: 'billing · normal · 0.5 · fallback_reason · v3', kind: 'reply'},
       {
         from: 'triage-api',
         to: 'triage-api',
-        label: 'Decision{queue, priority, confidence 0.5, fallback_reason: classifier_timeout, ruleset_version: v3}',
+        label: '5 failed calls in a row → skip for 30 s, then probe',
         kind: 'sync',
-      },
-      {
-        from: 'triage-api',
-        to: 'Classifier',
-        label: 'refusal is not retried · 30s breaker after 5 failures',
-        kind: 'async',
       },
     ],
   },
@@ -54,218 +51,146 @@ A failure cache measured in hours keeps the service on rules long after the clas
       id: 'deadline',
       title: 'Calls the classifier under a 1-second deadline',
       detail:
-        'Every `Classify` call carries a deadline of one second from now. Without it a slow classifier holds the triage request open and the ticket queue backs up behind it.',
+        'Every `Classify` call carries a deadline of one second; a classifier slower than that ends in the ruleset with `fallback_reason` `classifier_timeout` instead of holding the ticket open.',
       match: {
-        python: {all: [/CLASSIFY_DEADLINE_S\s*=\s*1\.0/, /timeout=CLASSIFY_DEADLINE_S/]},
-        typescript: {
-          all: [/CLASSIFY_DEADLINE_MS\s*=\s*1_000/, /deadline:\s*Date\.now\(\)\s*\+\s*CLASSIFY_DEADLINE_MS/],
-        },
-        go: {all: [/classifyDeadline\s*=\s*time\.Second/, /context\.WithTimeout\(/]},
-        scala: {all: [/ClassifyDeadlineMs\s*=\s*1000/, /\.withDeadlineAfter\(/]},
-        cpp: {all: [/kClassifyDeadlineMs\s*=\s*1000/, /set_deadline\(/]},
+        python: {all: [/timeout\s*=/]},
+        typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/]},
+        go: {all: [/context\.WithTimeout\(/]},
+        scala: {all: [/withDeadline(After)?\(/]},
+        cpp: {all: [/set_deadline\(/]},
       },
     },
     {
       id: 'retry-policy',
-      title: 'Bounds attempts and retries only retryable statuses',
+      title: 'Tries three times, and only on a retryable status',
       detail:
-        'At most 3 attempts, and only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are retried; a refusal returns immediately. The starter retries every error until the deadline.',
+        'At most `MAX_ATTEMPTS` tries, and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are tried again: a refusal (`INVALID_ARGUMENT`) is answered by the ruleset after one call.',
       match: {
-        python: {all: [/MAX_ATTEMPTS/, /RETRYABLE/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/\bwhile\s+True\b/]},
-        typescript: {
-          all: [/MAX_ATTEMPTS/, /RETRYABLE/, /grpc\.status\.UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/for\s*\(;;\)/],
-        },
-        go: {all: [/maxAttempts/, /retryable/, /codes\.Unavailable/, /codes\.DeadlineExceeded/], none: [/for\s*\{/]},
-        scala: {
-          all: [/MaxAttempts/, /Retryable/, /Status\.UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
-        cpp: {all: [/kMaxAttempts/, /kRetryable/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/for\s*\(;;\)/]},
+        python: {all: [/range\(\s*MAX_ATTEMPTS\s*\)/, /in RETRYABLE/]},
+        typescript: {all: [/<\s*MAX_ATTEMPTS/, /RETRYABLE\.includes\(/]},
+        go: {all: [/<\s*maxAttempts/, /retryable\[/]},
+        scala: {all: [/<\s*MaxAttempts/, /Retryable\.contains\(/]},
+        cpp: {all: [/<\s*kMaxAttempts/, /retryable\(/]},
       },
     },
     {
       id: 'rules-fallback',
-      title: 'Falls back to the versioned keyword ruleset',
+      title: 'Falls back to the versioned ruleset and says why',
       detail:
-        'A timeout or unavailability routes by the keyword rules (`fallback_rules`, `ruleset v3`) instead of giving up, and the decision carries the `fallback_reason`. The starter funnels every ticket into one catch-all queue when the classifier is down.',
+        'Without an answer the ticket is routed by `rule_decision`/`ruleDecision` (ruleset v3) and the decision names its `fallback_reason`; no catch-all queue.',
       match: {
-        python: {all: [/RULESET_VERSION/, /FALLBACK_RULES/, /rule_queue\(/, /fallback_reason/]},
-        typescript: {all: [/RULESET_VERSION/, /FALLBACK_RULES/, /ruleQueue\(/, /fallback_reason/]},
-        go: {all: [/rulesetVersion/, /fallbackRules/, /RuleQueue\(/, /fallback_reason/]},
-        scala: {all: [/RulesetVersion/, /FallbackRules/, /ruleQueue\(/, /fallback_reason/]},
-        cpp: {all: [/kRulesetVersion/, /kFallbackRules/, /ruleQueue\(/, /"fallback_reason"/]},
-      },
-    },
-    {
-      id: 'fallback-recorded',
-      title: 'Records the ruleset version and reason, with no catch-all queue',
-      detail:
-        'The decision names the `ruleset_version` and the `fallback_reason`, and an unmatched ticket lands in the real `general` queue, not in a single catch-all queue that hides the outage.',
-      match: {
-        python: {all: [/ruleset_version/, /fallback_reason/, /GENERAL_QUEUE/], none: [/catch_all/]},
-        typescript: {all: [/ruleset_version/, /fallback_reason/, /GENERAL_QUEUE/], none: [/catch_all/]},
-        go: {all: [/"ruleset_version"/, /"fallback_reason"/, /generalQueue/], none: [/catchAll/]},
-        scala: {all: [/ruleset_version/, /fallback_reason/, /GeneralQueue/], none: [/CatchAll/]},
-        cpp: {all: [/"ruleset_version"/, /"fallback_reason"/, /kGeneralQueue/], none: [/catch_all|CatchAll/]},
+        python: {all: [/rules\.rule_decision\(/, /fallback_reason/], none: [/CATCH_ALL/]},
+        typescript: {all: [/ruleDecision\(/, /fallback_reason/], none: [/CATCH_ALL/]},
+        go: {all: [/rules\.RuleDecision\(/, /FallbackReason/], none: [/catchAll/]},
+        scala: {all: [/Rules\.ruleDecision\(/, /fallbackReason/], none: [/CatchAll/]},
+        cpp: {all: [/rules::ruleDecision\(/, /fallback_reason/], none: [/kCatchAll/]},
       },
     },
     {
       id: 'breaker-cooldown',
-      title: 'Remembers a failure for seconds, not for the hour',
+      title: 'Benches the classifier for seconds, after five failures',
       detail:
-        'After 5 consecutive retryable failures the classifier is skipped for 30 seconds and then probed again, so a recovered classifier is used again within a minute. The starter caches the failure for the whole hour.',
+        'Only `BREAKER_THRESHOLD` calls in a row that failed on a retryable status open the breaker, and it stays open `BREAKER_COOLDOWN_S` before one call probes the classifier again, instead of an hour after a single failure.',
       match: {
-        python: {all: [/BREAKER_COOLDOWN_S\s*=\s*30/, /time\.monotonic\(\)/], none: [/3600/]},
-        typescript: {all: [/BREAKER_COOLDOWN_MS\s*=\s*30_000/, /Date\.now\(\)/], none: [/3_600_000/]},
-        go: {all: [/breakerCooldown\s*=\s*30\s*\*\s*time\.Second/, /time\.Now\(\)/], none: [/3600/]},
-        scala: {all: [/BreakerCooldownS\s*=\s*30/, /System\.nanoTime\(\)/], none: [/3600/]},
-        cpp: {all: [/kBreakerCooldownS\s*=\s*30/, /steady_clock/], none: [/3600/]},
+        python: {all: [/BREAKER_COOLDOWN_S/, /BREAKER_THRESHOLD/], none: [/FAILURE_TTL_S/]},
+        typescript: {all: [/BREAKER_COOLDOWN_MS/, /BREAKER_THRESHOLD/], none: [/FAILURE_TTL_MS/]},
+        go: {all: [/breakerCooldown/, /breakerThreshold/], none: [/failureTTL/]},
+        scala: {all: [/BreakerCooldownMillis/, /BreakerThreshold/], none: [/FailureTtlMillis/]},
+        cpp: {all: [/kBreakerCooldown/, /kBreakerThreshold/], none: [/kFailureTtl/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import time
-from dataclasses import dataclass
 
 import grpc
 
 import classifier_pb2
 import classifier_pb2_grpc
+from triage import rules  # rules.rule_decision(text)
 
-CACHE_TTL_S = 3600
-CATCH_ALL_QUEUE = "catch_all"
+FAILURE_TTL_S = 3600
+CATCH_ALL = {"queue": "triage", "priority": "normal", "confidence": 0.0, "fallback_reason": "", "ruleset_version": ""}
 
-channel = grpc.insecure_channel("classifier:9000")
-stub = classifier_pb2_grpc.ClassifierStub(channel)
+stub = classifier_pb2_grpc.ClassifierStub(grpc.insecure_channel("classifier:9000"))
 
-_failed_at = 0.0
-
-
-@dataclass
-class Decision:
-    queue: str
-    priority: str
-    confidence: float
+failed_at = None  # when every try of a call last failed
 
 
-def classify(text: str) -> Decision:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    global _failed_at
-    while True:
+def classify(tenant: str, text: str) -> dict:
+    """Where the ticket goes: queue, priority, confidence, fallback_reason ("": the classifier decided), ruleset_version."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    global failed_at
+    if failed_at is not None and time.monotonic() - failed_at < FAILURE_TTL_S:
+        return dict(CATCH_ALL)
+    for _ in range(5):
         try:
-            reply = stub.Classify(classifier_pb2.ClassifyRequest(text=text), timeout=CACHE_TTL_S)
-            return Decision(reply.queue, reply.priority, reply.confidence)
+            reply = stub.Classify(classifier_pb2.ClassifyRequest(tenant=tenant, text=text))
         except grpc.RpcError:
-            if time.monotonic() - _failed_at < CACHE_TTL_S:
-                return Decision(CATCH_ALL_QUEUE, "normal", 0.0)
-            _failed_at = time.monotonic()
+            time.sleep(0.2)
+            continue
+        return {"queue": reply.queue, "priority": reply.priority, "confidence": reply.confidence, "fallback_reason": "", "ruleset_version": ""}
+    failed_at = time.monotonic()
+    return dict(CATCH_ALL)
 `,
       solution: `import time
-from dataclasses import dataclass
 
 import grpc
 
 import classifier_pb2
 import classifier_pb2_grpc
+from triage import rules  # rules.rule_decision(text)
 
-CLASSIFY_DEADLINE_S = 1.0
+DEADLINE_S = 1.0
 MAX_ATTEMPTS = 3
-BREAKER_FAILURES = 5
-BREAKER_COOLDOWN_S = 30
-RULESET_VERSION = "v3"
-GENERAL_QUEUE = "general"
-
 RETRYABLE = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+BREAKER_THRESHOLD = 5
+BREAKER_COOLDOWN_S = 30
+REASONS = {grpc.StatusCode.DEADLINE_EXCEEDED: "classifier_timeout", grpc.StatusCode.INVALID_ARGUMENT: "classifier_refused"}
 
-FALLBACK_RULES = {
-    "billing": ("invoice", "refund", "charge", "payment"),
-    "delivery": ("shipment", "delivery", "tracking", "parcel"),
-    "account": ("password", "login", "locked", "sign-in"),
-}
-URGENT = ("outage", "down", "data loss", "breach")
+stub = classifier_pb2_grpc.ClassifierStub(grpc.insecure_channel("classifier:9000"))
 
-channel = grpc.insecure_channel("classifier:9000")
-stub = classifier_pb2_grpc.ClassifierStub(channel)
-
-
-@dataclass
-class Decision:
-    queue: str
-    priority: str
-    confidence: float
-    fallback_reason: str
-    ruleset_version: str
+# Calls in a row that ended on a retryable status, and when the breaker lets the next one through.
+failures = 0
+open_until = 0.0
 
 
-class Breaker:
-    """Stops calling a classifier that keeps failing, and probes it again after the cooldown."""
-
-    def __init__(self) -> None:
-        self.failures = 0
-        self.opened_at = 0.0
-
-    def allow(self) -> bool:
-        if self.failures < BREAKER_FAILURES:
-            return True
-        if time.monotonic() - self.opened_at < BREAKER_COOLDOWN_S:
-            return False
-        self.failures = 0
-        return True
-
-    def record(self, failed: bool) -> None:
-        if not failed:
-            self.failures = 0
-            return
-        self.failures += 1
-        if self.failures >= BREAKER_FAILURES:
-            self.opened_at = time.monotonic()
+def _fallback(text: str, reason: str) -> dict:
+    return {**rules.rule_decision(text), "fallback_reason": reason}
 
 
-breaker = Breaker()
-
-
-def rule_queue(text: str) -> str:
-    lowered = text.lower()
-    for queue, words in FALLBACK_RULES.items():
-        if any(word in lowered for word in words):
-            return queue
-    return GENERAL_QUEUE
-
-
-def rule_priority(text: str) -> str:
-    return "critical" if any(word in text.lower() for word in URGENT) else "normal"
-
-
-def fallback(text: str, reason: str) -> Decision:
-    return Decision(rule_queue(text), rule_priority(text), 0.5, reason, RULESET_VERSION)
-
-
-def classify(text: str) -> Decision:
-    if not breaker.allow():
-        return fallback(text, "breaker_open")
-    reason = "classifier_unavailable"
+def classify(tenant: str, text: str) -> dict:
+    """Where the ticket goes: queue, priority, confidence, fallback_reason ("": the classifier decided), ruleset_version."""
+    global failures, open_until
+    if time.monotonic() < open_until:
+        return _fallback(text, "breaker_open")
+    code = grpc.StatusCode.UNAVAILABLE
     for _ in range(MAX_ATTEMPTS):
         try:
-            reply = stub.Classify(classifier_pb2.ClassifyRequest(text=text), timeout=CLASSIFY_DEADLINE_S)
-            breaker.record(False)
-            return Decision(reply.queue, reply.priority, reply.confidence, "", RULESET_VERSION)
-        except grpc.RpcError as error:
-            breaker.record(True)
-            if error.code() not in RETRYABLE:
-                return fallback(text, "classifier_refused")
-            reason = "classifier_timeout" if error.code() == grpc.StatusCode.DEADLINE_EXCEEDED else reason
-    return fallback(text, reason)
+            reply = stub.Classify(classifier_pb2.ClassifyRequest(tenant=tenant, text=text), timeout=DEADLINE_S)
+        except grpc.RpcError as exc:
+            code = exc.code()
+            if code not in RETRYABLE:
+                break  # a refusal is about this ticket: asking again gets the same answer
+            continue
+        failures = 0
+        return {"queue": reply.queue, "priority": reply.priority, "confidence": reply.confidence, "fallback_reason": "", "ruleset_version": ""}
+    if code in RETRYABLE:
+        failures += 1
+        if failures >= BREAKER_THRESHOLD:
+            open_until = time.monotonic() + BREAKER_COOLDOWN_S  # after it, one call probes the classifier
+    return _fallback(text, REASONS.get(code, "classifier_unavailable"))
 `,
     },
     typescript: {
-      starter: `/** Classifier client. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const CACHE_TTL_MS = 3_600_000;
-const CATCH_ALL_QUEUE = 'catch_all';
+import {type Decision, ruleDecision} from 'triage/rules';
+
+export const FAILURE_TTL_MS = 3_600_000;
+const CATCH_ALL: Decision = {queue: 'triage', priority: 'normal', confidence: 0, fallback_reason: '', ruleset_version: ''};
 
 interface ClassifyReply {
   queue: string;
@@ -273,67 +198,47 @@ interface ClassifyReply {
   confidence: number;
 }
 
-interface ClassifierClient {
-  Classify(
-    request: {text: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, reply: ClassifyReply) => void,
-  ): grpc.ClientUnaryCall;
-}
-
-const {classifier} = grpc.loadPackageDefinition(protoLoader.loadSync('classifier.proto')) as unknown as {
-  classifier: {Classifier: new (target: string, credentials: grpc.ChannelCredentials) => ClassifierClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('classifier.proto')) as unknown as {
+  triage: {Classifier: grpc.ServiceClientConstructor};
 };
-const stub = new classifier.Classifier('classifier:9000', grpc.credentials.createInsecure());
+const classifier = new pkg.triage.Classifier('classifier:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Classify(request: {tenant: string; text: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<ClassifyReply>;
+};
 
-let failedAt = 0;
+let failedAt: number | null = null; // when every try of a call last failed
 
-export interface Decision {
-  queue: string;
-  priority: string;
-  confidence: number;
-}
-
-export async function classify(text: string): Promise<Decision> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  for (;;) {
+/** Where the ticket goes; fallback_reason is '' when the classifier decided. */
+export async function classify(tenant: string, text: string): Promise<Decision> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  if (failedAt !== null && Date.now() - failedAt < FAILURE_TTL_MS) return {...CATCH_ALL};
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const reply = await new Promise<ClassifyReply>((resolve, reject) => {
-        stub.Classify({text}, new grpc.Metadata(), {deadline: Date.now() + CACHE_TTL_MS}, (error, value) => {
-          if (error === null) resolve(value);
-          else reject(error);
-        });
-      });
-      return {queue: reply.queue, priority: reply.priority, confidence: reply.confidence};
+      const reply = await classifier.Classify({tenant, text}, new grpc.Metadata(), {});
+      return {queue: reply.queue, priority: reply.priority, confidence: reply.confidence, fallback_reason: '', ruleset_version: ''};
     } catch {
-      if (Date.now() - failedAt < CACHE_TTL_MS) return {queue: CATCH_ALL_QUEUE, priority: 'normal', confidence: 0};
-      failedAt = Date.now();
+      const pause = Promise.withResolvers<void>();
+      setTimeout(pause.resolve, 200);
+      await pause.promise;
     }
   }
+  failedAt = Date.now();
+  return {...CATCH_ALL};
 }
 `,
-      solution: `/** Classifier client: 1-second deadline, bounded retries, versioned rules fallback, short breaker. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const CLASSIFY_DEADLINE_MS = 1_000;
-const MAX_ATTEMPTS = 3;
-const BREAKER_FAILURES = 5;
-const BREAKER_COOLDOWN_MS = 30_000;
-const RULESET_VERSION = 'v3';
-const GENERAL_QUEUE = 'general';
-const RETRYABLE: Record<number, true> = {
-  [grpc.status.UNAVAILABLE]: true,
-  [grpc.status.DEADLINE_EXCEEDED]: true,
-};
+import {type Decision, ruleDecision} from 'triage/rules';
 
-const FALLBACK_RULES: Record<string, string[]> = {
-  billing: ['invoice', 'refund', 'charge', 'payment'],
-  delivery: ['shipment', 'delivery', 'tracking', 'parcel'],
-  account: ['password', 'login', 'locked', 'sign-in'],
-};
-const URGENT = ['outage', 'down', 'data loss', 'breach'];
+export const DEADLINE_MS = 1000;
+export const MAX_ATTEMPTS = 3;
+export const RETRYABLE: grpc.status[] = [grpc.status.UNAVAILABLE, grpc.status.DEADLINE_EXCEEDED];
+export const BREAKER_THRESHOLD = 5;
+export const BREAKER_COOLDOWN_MS = 30_000;
+const REASONS = new Map<grpc.status, string>([
+  [grpc.status.DEADLINE_EXCEEDED, 'classifier_timeout'],
+  [grpc.status.INVALID_ARGUMENT, 'classifier_refused'],
+]);
 
 interface ClassifyReply {
   queue: string;
@@ -341,149 +246,521 @@ interface ClassifyReply {
   confidence: number;
 }
 
-interface ClassifierClient {
-  Classify(
-    request: {text: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, reply: ClassifyReply) => void,
-  ): grpc.ClientUnaryCall;
-}
-
-const {classifier} = grpc.loadPackageDefinition(protoLoader.loadSync('classifier.proto')) as unknown as {
-  classifier: {Classifier: new (target: string, credentials: grpc.ChannelCredentials) => ClassifierClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('classifier.proto')) as unknown as {
+  triage: {Classifier: grpc.ServiceClientConstructor};
 };
-const stub = new classifier.Classifier('classifier:9000', grpc.credentials.createInsecure());
+const classifier = new pkg.triage.Classifier('classifier:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Classify(request: {tenant: string; text: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<ClassifyReply>;
+};
 
-export interface Decision {
-  queue: string;
-  priority: string;
-  confidence: number;
-  fallback_reason: string;
-  ruleset_version: string;
-}
+/** Calls in a row that ended on a retryable status, and when the breaker lets the next one through. */
+const breaker = {failures: 0, openUntil: 0};
 
-class Breaker {
-  private failures = 0;
-  private openedAt = 0;
-
-  allow(): boolean {
-    if (this.failures < BREAKER_FAILURES) return true;
-    if (Date.now() - this.openedAt < BREAKER_COOLDOWN_MS) return false;
-    this.failures = 0;
-    return true;
-  }
-
-  record(failed: boolean): void {
-    if (!failed) {
-      this.failures = 0;
-      return;
-    }
-    this.failures += 1;
-    if (this.failures >= BREAKER_FAILURES) this.openedAt = Date.now();
-  }
-}
-
-const breaker = new Breaker();
-
-export function ruleQueue(text: string): string {
-  const lowered = text.toLowerCase();
-  for (const [queue, words] of Object.entries(FALLBACK_RULES)) if (words.some(w => lowered.includes(w))) return queue;
-  return GENERAL_QUEUE;
-}
-
-export function rulePriority(text: string): string {
-  return URGENT.some(w => text.toLowerCase().includes(w)) ? 'critical' : 'normal';
-}
-
-function fallback(text: string, reason: string): Decision {
-  return {
-    queue: ruleQueue(text),
-    priority: rulePriority(text),
-    confidence: 0.5,
-    fallback_reason: reason,
-    ruleset_version: RULESET_VERSION,
-  };
-}
-
-function callClassifier(text: string): Promise<ClassifyReply> {
-  return new Promise<ClassifyReply>((resolve, reject) => {
-    stub.Classify({text}, new grpc.Metadata(), {deadline: Date.now() + CLASSIFY_DEADLINE_MS}, (error, reply) => {
-      if (error === null) resolve(reply);
-      else reject(error);
-    });
-  });
-}
-
-export async function classify(text: string): Promise<Decision> {
-  if (!breaker.allow()) return fallback(text, 'breaker_open');
-  let reason = 'classifier_unavailable';
+/** Where the ticket goes; fallback_reason is '' when the classifier decided. */
+export async function classify(tenant: string, text: string): Promise<Decision> {
+  if (Date.now() < breaker.openUntil) return {...ruleDecision(text), fallback_reason: 'breaker_open'};
+  let code: grpc.status = grpc.status.UNAVAILABLE;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
-      const reply = await callClassifier(text);
-      breaker.record(false);
-      return {
-        queue: reply.queue,
-        priority: reply.priority,
-        confidence: reply.confidence,
-        fallback_reason: '',
-        ruleset_version: RULESET_VERSION,
-      };
-    } catch (error) {
-      const serviceError = error as grpc.ServiceError;
-      breaker.record(true);
-      if (RETRYABLE[serviceError.code] !== true) return fallback(text, 'classifier_refused');
-      if (serviceError.code === grpc.status.DEADLINE_EXCEEDED) reason = 'classifier_timeout';
+      const reply = await classifier.Classify({tenant, text}, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+      breaker.failures = 0;
+      return {queue: reply.queue, priority: reply.priority, confidence: reply.confidence, fallback_reason: '', ruleset_version: ''};
+    } catch (e) {
+      code = (e as grpc.ServiceError).code;
+      if (!RETRYABLE.includes(code)) break; // a refusal is about this ticket: asking again gets the same answer
     }
   }
-  return fallback(text, reason);
+  if (RETRYABLE.includes(code)) {
+    breaker.failures += 1;
+    if (breaker.failures >= BREAKER_THRESHOLD) breaker.openUntil = Date.now() + BREAKER_COOLDOWN_MS; // then one call probes
+  }
+  return {...ruleDecision(text), fallback_reason: REASONS.get(code) ?? 'classifier_unavailable'};
 }
 `,
     },
     go: {
-      starter: `package client
+      starter: `package main
 
 import (
 	"context"
 	"time"
 
-	pb "triage/classifierpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "triage/gen/classifier"
+	"triage/rules" // rules.RuleDecision(text) rules.Decision
+)
+
+const failureTTL = time.Hour
+
+var catchAll = rules.Decision{Queue: "triage", Priority: "normal"}
+
+var (
+	conn, _    = grpc.NewClient("classifier:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	classifier = pb.NewClassifierClient(conn)
+)
+
+type breakerState struct {
+	failedAt time.Time // when every try of a call last failed
+}
+
+var breaker breakerState
+
+// classify is where the ticket goes; FallbackReason is "" when the classifier decided.
+func classify(ctx context.Context, tenant, text string) rules.Decision {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	if !breaker.failedAt.IsZero() && time.Since(breaker.failedAt) < failureTTL {
+		return catchAll
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		reply, err := classifier.Classify(ctx, &pb.ClassifyRequest{Tenant: tenant, Text: text})
+		if err == nil {
+			return rules.Decision{Queue: reply.GetQueue(), Priority: reply.GetPriority(), Confidence: reply.GetConfidence()}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	breaker.failedAt = time.Now()
+	return catchAll
+}
+`,
+      solution: `package main
+
+import (
+	"context"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	pb "triage/gen/classifier"
+	"triage/rules" // rules.RuleDecision(text) rules.Decision
 )
 
 const (
-	cacheTTL      = time.Hour
-	catchAllQueue = "catch_all"
+	deadline         = time.Second
+	maxAttempts      = 3
+	breakerThreshold = 5
+	breakerCooldown  = 30 * time.Second
 )
 
-var stub pb.ClassifierClient
+var (
+	retryable = map[codes.Code]bool{codes.Unavailable: true, codes.DeadlineExceeded: true}
+	reasons   = map[codes.Code]string{codes.DeadlineExceeded: "classifier_timeout", codes.InvalidArgument: "classifier_refused"}
+)
 
-var failedAt time.Time
+var (
+	conn, _    = grpc.NewClient("classifier:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	classifier = pb.NewClassifierClient(conn)
+)
 
-// Decision is what triage routes on.
-type Decision struct {
-	Queue      string \`json:"queue"\`
-	Priority   string \`json:"priority"\`
-	Confidence float64 \`json:"confidence"\`
+// breakerState counts calls in a row that ended on a retryable status, and holds when the breaker
+// lets the next one through.
+type breakerState struct {
+	failures  int
+	openUntil time.Time
 }
 
-// Classify asks the classifier for a routing decision.
-func Classify(ctx context.Context, text string) (Decision, error) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	for {
-		ctx, cancel := context.WithTimeout(ctx, cacheTTL)
-		reply, err := stub.Classify(ctx, &pb.ClassifyRequest{Text: text})
+var breaker breakerState
+
+func fallback(text, reason string) rules.Decision {
+	d := rules.RuleDecision(text)
+	d.FallbackReason = reason
+	return d
+}
+
+// classify is where the ticket goes; FallbackReason is "" when the classifier decided.
+func classify(ctx context.Context, tenant, text string) rules.Decision {
+	if time.Now().Before(breaker.openUntil) {
+		return fallback(text, "breaker_open")
+	}
+	code := codes.Unavailable
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, deadline)
+		reply, err := classifier.Classify(callCtx, &pb.ClassifyRequest{Tenant: tenant, Text: text})
 		cancel()
 		if err == nil {
-			return Decision{Queue: reply.Queue, Priority: reply.Priority, Confidence: reply.Confidence}, nil
+			breaker.failures = 0
+			return rules.Decision{Queue: reply.GetQueue(), Priority: reply.GetPriority(), Confidence: reply.GetConfidence()}
 		}
-		if time.Since(failedAt) < cacheTTL {
-			return Decision{Queue: catchAllQueue, Priority: "normal"}, nil
+		code = status.Code(err)
+		if !retryable[code] {
+			break // a refusal is about this ticket: asking again gets the same answer
 		}
-		failedAt = time.Now()
 	}
+	if retryable[code] {
+		breaker.failures++
+		if breaker.failures >= breakerThreshold {
+			breaker.openUntil = time.Now().Add(breakerCooldown) // then one call probes
+		}
+	}
+	reason, ok := reasons[code]
+	if !ok {
+		reason = "classifier_unavailable"
+	}
+	return fallback(text, reason)
 }
 `,
-      solution: `package client
+    },
+    scala: {
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+
+import triage.Rules // Rules.ruleDecision(text): Rules.Decision
+import triage.classifier.{ClassifierGrpc, ClassifyRequest}
+
+object ClassifierClient {
+  val FailureTtlMillis = 3600000L
+  val CatchAll: Rules.Decision = Rules.Decision("triage", "normal", 0.0, "", "")
+
+  private val classifier = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build())
+
+  private var failedAt: Option[Long] = None // when every try of a call last failed
+
+  /** Where the ticket goes; fallbackReason is "" when the classifier decided. */
+  def classify(tenant: String, text: String): Rules.Decision = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    if (failedAt.exists(at => System.currentTimeMillis() - at < FailureTtlMillis)) return CatchAll
+    var attempt = 0
+    while (attempt < 5) {
+      attempt += 1
+      try {
+        val reply = classifier.classify(ClassifyRequest(tenant, text))
+        return Rules.Decision(reply.queue, reply.priority, reply.confidence, "", "")
+      } catch {
+        case _: StatusRuntimeException => Thread.sleep(200)
+      }
+    }
+    failedAt = Some(System.currentTimeMillis())
+    CatchAll
+  }
+}
+`,
+      solution: `import java.util.concurrent.TimeUnit
+
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+
+import triage.Rules // Rules.ruleDecision(text): Rules.Decision
+import triage.classifier.{ClassifierGrpc, ClassifyRequest}
+
+object ClassifierClient {
+  val DeadlineMillis = 1000L
+  val MaxAttempts = 3
+  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
+  val BreakerThreshold = 5
+  val BreakerCooldownMillis = 30000L
+
+  private val classifier = ClassifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build())
+
+  /** Calls in a row that ended on a retryable status, and when the breaker lets the next one through. */
+  private var failures = 0
+  private var openUntil = 0L
+
+  private def fallback(text: String, reason: String): Rules.Decision = Rules.ruleDecision(text).copy(fallbackReason = reason)
+
+  /** Where the ticket goes; fallbackReason is "" when the classifier decided. */
+  def classify(tenant: String, text: String): Rules.Decision = {
+    if (System.currentTimeMillis() < openUntil) return fallback(text, "breaker_open")
+    var code = Status.Code.UNAVAILABLE
+    var attempt = 0
+    while (attempt < MaxAttempts) {
+      attempt += 1
+      try {
+        val reply = classifier.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).classify(ClassifyRequest(tenant, text))
+        failures = 0
+        return Rules.Decision(reply.queue, reply.priority, reply.confidence, "", "")
+      } catch {
+        case e: StatusRuntimeException =>
+          code = e.getStatus.getCode
+          if (!Retryable.contains(code)) attempt = MaxAttempts // a refusal is about this ticket: asking again gets the same answer
+      }
+    }
+    if (Retryable.contains(code)) {
+      failures += 1
+      if (failures >= BreakerThreshold) openUntil = System.currentTimeMillis() + BreakerCooldownMillis // then one call probes
+    }
+    fallback(text, code match {
+      case Status.Code.DEADLINE_EXCEEDED => "classifier_timeout"
+      case Status.Code.INVALID_ARGUMENT => "classifier_refused"
+      case _ => "classifier_unavailable"
+    })
+  }
+}
+`,
+    },
+    cpp: {
+      starter: `#include <grpcpp/grpcpp.h>
+
+#include <chrono>
+#include <string>
+#include <thread>
+
+#include "classifier.grpc.pb.h"
+#include "triage/rules.h"  // rules::ruleDecision(text) -> rules::Decision
+
+constexpr std::chrono::seconds kFailureTtl{3600};
+const rules::Decision kCatchAll{"triage", "normal", 0, "", ""};
+
+auto classifier = triage::Classifier::NewStub(grpc::CreateChannel("classifier:9000", grpc::InsecureChannelCredentials()));
+
+struct Breaker {
+  bool failed = false;
+  std::chrono::system_clock::time_point failed_at{};  // when every try of a call last failed
+};
+Breaker breaker;
+
+// Where the ticket goes; fallback_reason is "" when the classifier decided.
+rules::Decision classify(const std::string& tenant, const std::string& text) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  if (breaker.failed && std::chrono::system_clock::now() - breaker.failed_at < kFailureTtl) return kCatchAll;
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    grpc::ClientContext ctx;
+    triage::ClassifyRequest request;
+    request.set_tenant(tenant);
+    request.set_text(text);
+    triage::ClassifyReply reply;
+    if (classifier->Classify(&ctx, request, &reply).ok()) return {reply.queue(), reply.priority(), reply.confidence(), "", ""};
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+  breaker = Breaker{true, std::chrono::system_clock::now()};
+  return kCatchAll;
+}
+`,
+      solution: `#include <grpcpp/grpcpp.h>
+
+#include <chrono>
+#include <string>
+
+#include "classifier.grpc.pb.h"
+#include "triage/rules.h"  // rules::ruleDecision(text) -> rules::Decision
+
+constexpr std::chrono::seconds kDeadline{1};
+constexpr int kMaxAttempts = 3;
+constexpr int kBreakerThreshold = 5;
+constexpr std::chrono::seconds kBreakerCooldown{30};
+
+auto classifier = triage::Classifier::NewStub(grpc::CreateChannel("classifier:9000", grpc::InsecureChannelCredentials()));
+
+// Calls in a row that ended on a retryable status, and when the breaker lets the next one through.
+struct Breaker {
+  int failures = 0;
+  std::chrono::system_clock::time_point open_until{};
+};
+Breaker breaker;
+
+bool retryable(grpc::StatusCode code) { return code == grpc::StatusCode::UNAVAILABLE || code == grpc::StatusCode::DEADLINE_EXCEEDED; }
+
+rules::Decision fallback(const std::string& text, const std::string& reason) {
+  rules::Decision d = rules::ruleDecision(text);
+  d.fallback_reason = reason;
+  return d;
+}
+
+// Where the ticket goes; fallback_reason is "" when the classifier decided.
+rules::Decision classify(const std::string& tenant, const std::string& text) {
+  if (std::chrono::system_clock::now() < breaker.open_until) return fallback(text, "breaker_open");
+  grpc::StatusCode code = grpc::StatusCode::UNAVAILABLE;
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    triage::ClassifyRequest request;
+    request.set_tenant(tenant);
+    request.set_text(text);
+    triage::ClassifyReply reply;
+    const grpc::Status status = classifier->Classify(&ctx, request, &reply);
+    if (status.ok()) {
+      breaker.failures = 0;
+      return {reply.queue(), reply.priority(), reply.confidence(), "", ""};
+    }
+    code = status.error_code();
+    if (!retryable(code)) break;  // a refusal is about this ticket: asking again gets the same answer
+  }
+  if (retryable(code) && ++breaker.failures >= kBreakerThreshold) {
+    breaker.open_until = std::chrono::system_clock::now() + kBreakerCooldown;  // then one call probes
+  }
+  if (code == grpc::StatusCode::DEADLINE_EXCEEDED) return fallback(text, "classifier_timeout");
+  if (code == grpc::StatusCode::INVALID_ARGUMENT) return fallback(text, "classifier_refused");
+  return fallback(text, "classifier_unavailable");
+}
+`,
+    },
+  },
+  harness: {
+    python: `import grpc
+
+import classifier_pb2
+import classifier_pb2_grpc
+
+INVOICE = "Refund for invoice 4411: the payment was charged twice"
+OUTAGE = "Production outage: every login fails"
+MODEL = {"queue": "billing", "priority": "high", "confidence": 0.92, "fallback_reason": "", "ruleset_version": ""}
+
+
+def _rules(reason, queue="billing", priority="normal"):
+    return {"queue": queue, "priority": priority, "confidence": 0.5, "fallback_reason": reason, "ruleset_version": "v3"}
+
+
+class Classifier(classifier_pb2_grpc.ClassifierServicer):
+    """The model: billing for invoices, account for logins, else general, at priority high; UNAVAILABLE while down."""
+
+    def __init__(self):
+        self.down = False
+
+    def Classify(self, request, context):
+        if self.down:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "classifier overloaded")
+        text = request.text.lower()
+        queue = "billing" if "invoice" in text else "account" if "login" in text else "general"
+        return classifier_pb2.ClassifyReply(queue=queue, priority="high", confidence=0.92)
+
+
+def _client(ctx):
+    model = Classifier()
+    ctx.grpc.serve(classifier_pb2_grpc.add_ClassifierServicer_to_server, model)
+    return ctx.load("client"), model
+
+
+def _calls(ctx):
+    return len(ctx.grpc.calls_to("Classify"))
+
+
+def check_deadline(ctx):
+    m, _ = _client(ctx)
+    d = m.classify("acme", INVOICE)
+    assert d == MODEL, f"with the classifier healthy classify must answer its decision {MODEL}, got {d}"
+    ctx.grpc.set_latency("Classify", 10.0)
+    d = m.classify("acme", INVOICE)
+    for call in ctx.grpc.calls_to("Classify"):
+        assert call.timeout is not None, "a Classify call carries no deadline: a stalled classifier holds the ticket, and the webhook behind it, open"
+        assert 0.5 <= call.timeout <= 1.5, f"a Classify call carries a {call.timeout} s deadline, expected DEADLINE_S = 1"
+    assert d == _rules("classifier_timeout"), f"with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout, got {d}"
+
+
+def check_retry_policy(ctx):
+    m, _ = _client(ctx)
+    ctx.grpc.fail("Classify", grpc.StatusCode.INVALID_ARGUMENT, "the classifier does not read this language", times=1)
+    d = m.classify("acme", INVOICE)
+    assert _calls(ctx) == 1, f"a refusal (INVALID_ARGUMENT) was sent {_calls(ctx)} times: the model gives the same answer for the same ticket, so a refusal is not tried again"
+    assert d == _rules("classifier_refused"), f"a refused ticket must be routed by the rules with fallback_reason classifier_refused, got {d}"
+    ctx.grpc.fail("Classify", grpc.StatusCode.UNAVAILABLE, "classifier overloaded", times=2)
+    d = m.classify("acme", INVOICE)
+    assert _calls(ctx) == 4 and d == MODEL, f"after two UNAVAILABLE answers the third try succeeds: classify must answer the model's decision after 3 calls, it made {_calls(ctx) - 1} and answered {d}"
+    ctx.grpc.fail("Classify", grpc.StatusCode.UNAVAILABLE, "classifier overloaded", times=3)
+    d = m.classify("acme", INVOICE)
+    assert _calls(ctx) == 7, f"with the classifier UNAVAILABLE classify made {_calls(ctx) - 4} tries, expected MAX_ATTEMPTS = 3"
+    assert d == _rules("classifier_unavailable"), f"after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable, got {d}"
+
+
+def check_rules_fallback(ctx):
+    m, model = _client(ctx)
+    model.down = True
+    d = m.classify("acme", INVOICE)
+    assert d == _rules("classifier_unavailable"), f"with the classifier down an invoice ticket must be routed by ruleset v3 to billing at normal priority, saying why (fallback_reason classifier_unavailable), got {d}"
+    d = m.classify("acme", OUTAGE)
+    assert d == _rules("classifier_unavailable", "account", "urgent"), f"with the classifier down an outage that blocks logins must be routed by the rules to account as urgent, got {d}"
+
+
+def check_breaker_cooldown(ctx):
+    m, model = _client(ctx)
+    model.down = True
+    m.classify("acme", INVOICE)
+    model.down = False
+    before = _calls(ctx)
+    d = m.classify("acme", INVOICE)
+    assert _calls(ctx) == before + 1 and d == MODEL, f"one ticket that failed benched the classifier: the next ticket made {_calls(ctx) - before} calls and was routed {d}. One failure must not take a healthy classifier out of service"
+    model.down = True
+    for _ in range(5):
+        m.classify("acme", INVOICE)
+    before = _calls(ctx)
+    d = m.classify("acme", INVOICE)
+    assert _calls(ctx) == before and d == _rules("breaker_open"), f"after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made {_calls(ctx) - before} calls and answered {d}"
+    model.down = False
+    ctx.clock.advance(31)
+    d = m.classify("acme", INVOICE)
+    assert d == MODEL, f"31 s after the breaker opened the classifier is healthy again and must be asked, got {d}"
+`,
+    typescript: `const INVOICE = 'Refund for invoice 4411: the payment was charged twice';
+const OUTAGE = 'Production outage: every login fails';
+const MODEL = {queue: 'billing', priority: 'high', confidence: 0.92, fallback_reason: '', ruleset_version: ''};
+
+const rulesDecision = (reason: string, queue = 'billing', priority = 'normal') => ({queue, priority, confidence: 0.5, fallback_reason: reason, ruleset_version: 'v3'});
+
+/** The model: billing for invoices, account for logins, else general, at priority high; UNAVAILABLE while down. */
+function client(ctx) {
+  const pkg = ctx.proto('classifier.proto');
+  const model = {down: false};
+  ctx.grpc.serve(pkg.triage.Classifier.service, {
+    Classify(call, callback) {
+      if (model.down) return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'classifier overloaded'});
+      const text = String(call.request.text).toLowerCase();
+      const queue = text.includes('invoice') ? 'billing' : text.includes('login') ? 'account' : 'general';
+      callback(null, {queue, priority: 'high', confidence: 0.92});
+    },
+  });
+  return {m: ctx.load('client'), model};
+}
+
+const calls = (ctx): number => ctx.grpc.callsTo('Classify').length;
+const show = (d): string => JSON.stringify(d);
+
+export async function check_deadline(ctx) {
+  const {m} = client(ctx);
+  let d = await m.classify('acme', INVOICE);
+  assert.deepStrictEqual(d, MODEL, \`with the classifier healthy classify must answer its decision \${show(MODEL)}, got \${show(d)}\`);
+  ctx.grpc.setLatency('Classify', 10.0);
+  d = await m.classify('acme', INVOICE);
+  for (const call of ctx.grpc.callsTo('Classify')) {
+    assert(call.timeout !== null && call.timeout !== undefined, 'a Classify call carries no deadline: a stalled classifier holds the ticket, and the webhook behind it, open');
+    assert(0.5 <= call.timeout && call.timeout <= 1.5, \`a Classify call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 1000\`);
+  }
+  assert.deepStrictEqual(d, rulesDecision('classifier_timeout'), \`with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout, got \${show(d)}\`);
+}
+
+export async function check_retry_policy(ctx) {
+  const {m} = client(ctx);
+  ctx.grpc.fail('Classify', ctx.grpc.status.INVALID_ARGUMENT, 'the classifier does not read this language', 1);
+  let d = await m.classify('acme', INVOICE);
+  assert.equal(calls(ctx), 1, \`a refusal (INVALID_ARGUMENT) was sent \${calls(ctx)} times: the model gives the same answer for the same ticket, so a refusal is not tried again\`);
+  assert.deepStrictEqual(d, rulesDecision('classifier_refused'), \`a refused ticket must be routed by the rules with fallback_reason classifier_refused, got \${show(d)}\`);
+  ctx.grpc.fail('Classify', ctx.grpc.status.UNAVAILABLE, 'classifier overloaded', 2);
+  d = await m.classify('acme', INVOICE);
+  assert(calls(ctx) === 4 && show(d) === show(MODEL), \`after two UNAVAILABLE answers the third try succeeds: classify must answer the model's decision after 3 calls, it made \${calls(ctx) - 1} and answered \${show(d)}\`);
+  ctx.grpc.fail('Classify', ctx.grpc.status.UNAVAILABLE, 'classifier overloaded', 3);
+  d = await m.classify('acme', INVOICE);
+  assert.equal(calls(ctx), 7, \`with the classifier UNAVAILABLE classify made \${calls(ctx) - 4} tries, expected MAX_ATTEMPTS = 3\`);
+  assert.deepStrictEqual(d, rulesDecision('classifier_unavailable'), \`after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable, got \${show(d)}\`);
+}
+
+export async function check_rules_fallback(ctx) {
+  const {m, model} = client(ctx);
+  model.down = true;
+  let d = await m.classify('acme', INVOICE);
+  assert.deepStrictEqual(d, rulesDecision('classifier_unavailable'), \`with the classifier down an invoice ticket must be routed by ruleset v3 to billing at normal priority, saying why (fallback_reason classifier_unavailable), got \${show(d)}\`);
+  d = await m.classify('acme', OUTAGE);
+  assert.deepStrictEqual(d, rulesDecision('classifier_unavailable', 'account', 'urgent'), \`with the classifier down an outage that blocks logins must be routed by the rules to account as urgent, got \${show(d)}\`);
+}
+
+export async function check_breaker_cooldown(ctx) {
+  const {m, model} = client(ctx);
+  model.down = true;
+  await m.classify('acme', INVOICE);
+  model.down = false;
+  let before = calls(ctx);
+  let d = await m.classify('acme', INVOICE);
+  assert(calls(ctx) === before + 1 && show(d) === show(MODEL), \`one ticket that failed benched the classifier: the next ticket made \${calls(ctx) - before} calls and was routed \${show(d)}. One failure must not take a healthy classifier out of service\`);
+  model.down = true;
+  for (let i = 0; i < 5; i++) await m.classify('acme', INVOICE);
+  before = calls(ctx);
+  d = await m.classify('acme', INVOICE);
+  assert(calls(ctx) === before && show(d) === show(rulesDecision('breaker_open')), \`after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made \${calls(ctx) - before} calls and answered \${show(d)}\`);
+  model.down = false;
+  ctx.clock.advance(31);
+  d = await m.classify('acme', INVOICE);
+  assert.deepStrictEqual(d, MODEL, \`31 s after the breaker opened the classifier is healthy again and must be asked, got \${show(d)}\`);
+}
+`,
+    go: `package main
 
 import (
 	"context"
@@ -493,406 +770,219 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "triage/classifierpb"
+	pb "triage/gen/classifier"
+	"triage/rules"
+
+	"leetbuild/harness"
 )
 
 const (
-	classifyDeadline = time.Second
-	maxAttempts      = 3
-	breakerFailures  = 5
-	breakerCooldown  = 30 * time.Second
-	rulesetVersion   = "v3"
-	generalQueue     = "general"
+	clientInvoice = "Refund for invoice 4411: the payment was charged twice"
+	clientOutage  = "Production outage: every login fails"
 )
 
-var retryable = map[codes.Code]bool{
-	codes.Unavailable:      true,
-	codes.DeadlineExceeded: true,
+var modelDecision = rules.Decision{Queue: "billing", Priority: "high", Confidence: 0.92}
+
+func rulesDecision(reason, queue, priority string) rules.Decision {
+	return rules.Decision{Queue: queue, Priority: priority, Confidence: 0.5, FallbackReason: reason, RulesetVersion: "v3"}
 }
 
-var fallbackRules = map[string][]string{
-	"billing":  {"invoice", "refund", "charge", "payment"},
-	"delivery": {"shipment", "delivery", "tracking", "parcel"},
-	"account":  {"password", "login", "locked", "sign-in"},
+// classifierPeer is the model: billing for invoices, account for logins, else general, at priority
+// high; UNAVAILABLE while down.
+type classifierPeer struct {
+	pb.UnimplementedClassifierServer
+	down bool
 }
 
-var urgent = []string{"outage", "down", "data loss", "breach"}
-
-var stub pb.ClassifierClient
-
-// Decision is what triage routes on; a fallback decision names its reason and ruleset.
-type Decision struct {
-	Queue          string  \`json:"queue"\`
-	Priority       string  \`json:"priority"\`
-	Confidence     float64 \`json:"confidence"\`
-	FallbackReason string  \`json:"fallback_reason"\`
-	RulesetVersion string  \`json:"ruleset_version"\`
+func (p *classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+	if p.down {
+		return nil, status.Error(codes.Unavailable, "classifier overloaded")
+	}
+	text := strings.ToLower(req.GetText())
+	queue := "general"
+	if strings.Contains(text, "invoice") {
+		queue = "billing"
+	} else if strings.Contains(text, "login") {
+		queue = "account"
+	}
+	return &pb.ClassifyReply{Queue: queue, Priority: "high", Confidence: 0.92}, nil
 }
 
-type breakerState struct {
-	failures int
-	openedAt time.Time
+func peer(ctx *harness.Ctx) *classifierPeer {
+	p := &classifierPeer{}
+	pb.RegisterClassifierServer(ctx.GRPC.Server(""), p)
+	return p
 }
 
-var breaker breakerState
+func classifyCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Classify", "")) }
 
-func breakerAllows() bool {
-	if breaker.failures < breakerFailures {
-		return true
+func CheckDeadline(ctx *harness.Ctx) {
+	peer(ctx)
+	ctx.Equal(classify(context.Background(), "acme", clientInvoice), modelDecision, "with the classifier healthy classify must answer its decision")
+	ctx.GRPC.SetLatency("Classify", 10.0, "")
+	d := classify(context.Background(), "acme", clientInvoice)
+	for _, call := range ctx.GRPC.CallsTo("Classify", "") {
+		ctx.Assert(call.HasDeadline(), "a Classify call carries no deadline: a stalled classifier holds the ticket, and the webhook behind it, open")
+		ctx.Assert(500*time.Millisecond <= call.Timeout && call.Timeout <= 1500*time.Millisecond, "a Classify call carries a %v deadline, expected 1 s", call.Timeout)
 	}
-	if time.Since(breaker.openedAt) < breakerCooldown {
-		return false
-	}
-	breaker.failures = 0
-	return true
+	ctx.Equal(d, rulesDecision("classifier_timeout", "billing", "normal"), "with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout")
 }
 
-func recordOutcome(failed bool) {
-	if !failed {
-		breaker.failures = 0
-		return
-	}
-	breaker.failures++
-	if breaker.failures >= breakerFailures {
-		breaker.openedAt = time.Now()
-	}
+func CheckRetryPolicy(ctx *harness.Ctx) {
+	peer(ctx)
+	ctx.GRPC.Fail("Classify", codes.InvalidArgument, "the classifier does not read this language", 1, "")
+	d := classify(context.Background(), "acme", clientInvoice)
+	ctx.Equal(classifyCalls(ctx), 1, "a refusal (INVALID_ARGUMENT) is not tried again: the model gives the same answer for the same ticket; the calls")
+	ctx.Equal(d, rulesDecision("classifier_refused", "billing", "normal"), "a refused ticket must be routed by the rules with fallback_reason classifier_refused")
+	ctx.GRPC.Fail("Classify", codes.Unavailable, "classifier overloaded", 2, "")
+	d = classify(context.Background(), "acme", clientInvoice)
+	ctx.Assert(classifyCalls(ctx) == 4 && d == modelDecision, "after two UNAVAILABLE answers the third try succeeds: classify must answer the model's decision after 3 calls, it made %d and answered %+v", classifyCalls(ctx)-1, d)
+	ctx.GRPC.Fail("Classify", codes.Unavailable, "classifier overloaded", 3, "")
+	d = classify(context.Background(), "acme", clientInvoice)
+	ctx.Equal(classifyCalls(ctx)-4, 3, "with the classifier UNAVAILABLE classify must make MAX_ATTEMPTS tries; the tries")
+	ctx.Equal(d, rulesDecision("classifier_unavailable", "billing", "normal"), "after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable")
 }
 
-// RuleQueue picks the queue from the versioned keyword ruleset.
-func RuleQueue(text string) string {
-	lowered := strings.ToLower(text)
-	for queue, words := range fallbackRules {
-		for _, word := range words {
-			if strings.Contains(lowered, word) {
-				return queue
-			}
-		}
-	}
-	return generalQueue
+func CheckRulesFallback(ctx *harness.Ctx) {
+	p := peer(ctx)
+	p.down = true
+	ctx.Equal(classify(context.Background(), "acme", clientInvoice), rulesDecision("classifier_unavailable", "billing", "normal"),
+		"with the classifier down an invoice ticket must be routed by ruleset v3 to billing at normal priority, saying why (fallback_reason classifier_unavailable)")
+	ctx.Equal(classify(context.Background(), "acme", clientOutage), rulesDecision("classifier_unavailable", "account", "urgent"),
+		"with the classifier down an outage that blocks logins must be routed by the rules to account as urgent")
 }
 
-func rulePriority(text string) string {
-	lowered := strings.ToLower(text)
-	for _, word := range urgent {
-		if strings.Contains(lowered, word) {
-			return "critical"
-		}
+func CheckBreakerCooldown(ctx *harness.Ctx) {
+	p := peer(ctx)
+	p.down = true
+	classify(context.Background(), "acme", clientInvoice)
+	p.down = false
+	before := classifyCalls(ctx)
+	d := classify(context.Background(), "acme", clientInvoice)
+	ctx.Assert(classifyCalls(ctx) == before+1 && d == modelDecision, "one ticket that failed benched the classifier: the next ticket made %d calls and was routed %+v. One failure must not take a healthy classifier out of service", classifyCalls(ctx)-before, d)
+	p.down = true
+	for i := 0; i < 5; i++ {
+		classify(context.Background(), "acme", clientInvoice)
 	}
-	return "normal"
-}
-
-func fallback(text, reason string) Decision {
-	return Decision{
-		Queue:          RuleQueue(text),
-		Priority:       rulePriority(text),
-		Confidence:     0.5,
-		FallbackReason: reason,
-		RulesetVersion: rulesetVersion,
-	}
-}
-
-// Classify asks the classifier under a 1-second deadline and falls back to the keyword rules.
-func Classify(ctx context.Context, text string) (Decision, error) {
-	if !breakerAllows() {
-		return fallback(text, "breaker_open"), nil
-	}
-	reason := "classifier_unavailable"
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, classifyDeadline)
-		reply, err := stub.Classify(callCtx, &pb.ClassifyRequest{Text: text})
-		cancel()
-		if err == nil {
-			recordOutcome(false)
-			return Decision{
-				Queue:          reply.Queue,
-				Priority:       reply.Priority,
-				Confidence:     reply.Confidence,
-				RulesetVersion: rulesetVersion,
-			}, nil
-		}
-		recordOutcome(true)
-		code := status.Code(err)
-		if !retryable[code] {
-			return fallback(text, "classifier_refused"), nil
-		}
-		if code == codes.DeadlineExceeded {
-			reason = "classifier_timeout"
-		}
-	}
-	return fallback(text, reason), nil
+	before = classifyCalls(ctx)
+	d = classify(context.Background(), "acme", clientInvoice)
+	ctx.Assert(classifyCalls(ctx) == before && d == rulesDecision("breaker_open", "billing", "normal"), "after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made %d calls and answered %+v", classifyCalls(ctx)-before, d)
+	p.down = false
+	ctx.Clock.Advance(31)
+	ctx.Equal(classify(context.Background(), "acme", clientInvoice), modelDecision, "31 s after the breaker opened the classifier is healthy again and must be asked")
 }
 `,
-    },
-    scala: {
-      starter: `import java.util.concurrent.TimeUnit
+    cpp: `#include <leetbuild/harness.h>
 
-import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
-
-import classifier.ClassifierGrpc
-import classifier.ClassifierOuterClass.ClassifyRequest
-
-final case class Decision(queue: String, priority: String, confidence: Double)
-
-object Classifier {
-  val CacheTtlSeconds = 3600L
-  val CatchAllQueue = "catch_all"
-
-  val channel = ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build()
-  val stub = ClassifierGrpc.blockingStub(channel)
-
-  private var failedAt = 0L
-
-  def classify(text: String): Decision = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    var done = false
-    var result = Decision(CatchAllQueue, "normal", 0.0)
-    while (!done) {
-      try {
-        val reply =
-          stub.withDeadlineAfter(CacheTtlSeconds, TimeUnit.SECONDS).classify(ClassifyRequest(text))
-        result = Decision(reply.getQueue, reply.getPriority, reply.getConfidence)
-        done = true
-      } catch {
-        case _: StatusRuntimeException =>
-          if (System.nanoTime() / 1000000000L - failedAt < CacheTtlSeconds) done = true
-          else failedAt = System.nanoTime() / 1000000000L
-      }
-    }
-    result
-  }
-}
-`,
-      solution: `import java.util.concurrent.TimeUnit
-
-import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-
-import classifier.ClassifierGrpc
-import classifier.ClassifierOuterClass.ClassifyRequest
-
-final case class Decision(
-    queue: String,
-    priority: String,
-    confidence: Double,
-    fallback_reason: String,
-    ruleset_version: String
-)
-
-object Classifier {
-  val ClassifyDeadlineMs = 1000L
-  val MaxAttempts = 3
-  val BreakerFailures = 5
-  val BreakerCooldownS = 30L
-  val RulesetVersion = "v3"
-  val GeneralQueue = "general"
-  val Retryable = Set(Status.UNAVAILABLE.getCode, Status.DEADLINE_EXCEEDED.getCode)
-
-  val FallbackRules = Map(
-    "billing" -> Seq("invoice", "refund", "charge", "payment"),
-    "delivery" -> Seq("shipment", "delivery", "tracking", "parcel"),
-    "account" -> Seq("password", "login", "locked", "sign-in")
-  )
-  val Urgent = Seq("outage", "down", "data loss", "breach")
-
-  val channel = ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build()
-  val stub = ClassifierGrpc.blockingStub(channel)
-
-  private var failures = 0
-  private var openedAt = 0L
-
-  private def allow(): Boolean = {
-    if (failures < BreakerFailures) return true
-    if ((System.nanoTime() - openedAt) / 1000000000L < BreakerCooldownS) return false
-    failures = 0
-    true
-  }
-
-  private def record(failed: Boolean): Unit =
-    if (!failed) failures = 0
-    else {
-      failures += 1
-      if (failures >= BreakerFailures) openedAt = System.nanoTime()
-    }
-
-  def ruleQueue(text: String): String =
-    FallbackRules.collectFirst { case (queue, words) if words.exists(text.toLowerCase.contains) => queue }
-      .getOrElse(GeneralQueue)
-
-  def rulePriority(text: String): String =
-    if (Urgent.exists(text.toLowerCase.contains)) "critical" else "normal"
-
-  def fallback(text: String, reason: String): Decision =
-    Decision(ruleQueue(text), rulePriority(text), 0.5, reason, RulesetVersion)
-
-  def classify(text: String): Decision = {
-    if (!allow()) return fallback(text, "breaker_open")
-    var attempt = 0
-    var reason = "classifier_unavailable"
-    while (attempt < MaxAttempts) {
-      attempt += 1
-      try {
-        val reply = stub.withDeadlineAfter(ClassifyDeadlineMs, TimeUnit.MILLISECONDS).classify(ClassifyRequest(text))
-        record(failed = false)
-        return Decision(reply.getQueue, reply.getPriority, reply.getConfidence, "", RulesetVersion)
-      } catch {
-        case error: StatusRuntimeException =>
-          record(failed = true)
-          if (!Retryable.contains(error.getStatus.getCode)) return fallback(text, "classifier_refused")
-          if (error.getStatus.getCode == Status.DEADLINE_EXCEEDED.getCode) reason = "classifier_timeout"
-      }
-    }
-    fallback(text, reason)
-  }
-}
-`,
-    },
-    cpp: {
-      starter: `#include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
-
-#include <chrono>
 #include <string>
 
-#include "classifier.grpc.pb.h"
+namespace {
 
-using json = nlohmann::json;
+const std::string kInvoice = "Refund for invoice 4411: the payment was charged twice";
+const std::string kOutage = "Production outage: every login fails";
 
-constexpr long long kCacheTtlSeconds = 3600;
-const std::string kCatchAllQueue = "catch_all";
-
-auto channel = grpc::CreateChannel("classifier:9000", grpc::InsecureChannelCredentials());
-auto stub = classifier::Classifier::NewStub(channel);
-long long failedAt = 0;
-
-json classify(const std::string& text) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  for (;;) {
-    grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kCacheTtlSeconds));
-    classifier::ClassifyRequest request;
-    request.set_text(text);
-    classifier::ClassifyReply reply;
-    const auto status = stub->Classify(&ctx, request, &reply);
-    if (status.ok()) {
-      return json{{"queue", reply.queue()}, {"priority", reply.priority()}, {"confidence", reply.confidence()}};
-    }
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-    if (now - failedAt < kCacheTtlSeconds) return json{{"queue", kCatchAllQueue}, {"priority", "normal"}};
-    failedAt = now;
+// The model: billing for invoices, account for logins, else general, at priority high; UNAVAILABLE while down.
+class ClassifierPeer final : public triage::Classifier::Service {
+ public:
+  bool down = false;
+  grpc::Status Classify(grpc::ServerContext*, const triage::ClassifyRequest* req, triage::ClassifyReply* out) override {
+    if (down) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "classifier overloaded");
+    const std::string& text = req->text();
+    out->set_queue(text.find("invoice") != std::string::npos ? "billing" : text.find("login") != std::string::npos ? "account" : "general");
+    out->set_priority("high");
+    out->set_confidence(0.92);
+    return grpc::Status::OK;
   }
-}
-`,
-      solution: `#include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
-
-#include <algorithm>
-#include <chrono>
-#include <map>
-#include <string>
-#include <vector>
-
-#include "classifier.grpc.pb.h"
-
-using json = nlohmann::json;
-
-constexpr int kClassifyDeadlineMs = 1000;
-constexpr int kMaxAttempts = 3;
-constexpr int kBreakerFailures = 5;
-constexpr int kBreakerCooldownS = 30;
-const std::string kRulesetVersion = "v3";
-const std::string kGeneralQueue = "general";
-
-const std::vector<grpc::StatusCode> kRetryable = {
-    grpc::StatusCode::UNAVAILABLE,
-    grpc::StatusCode::DEADLINE_EXCEEDED,
 };
 
-const std::map<std::string, std::vector<std::string>> kFallbackRules = {
-    {"billing", {"invoice", "refund", "charge", "payment"}},
-    {"delivery", {"shipment", "delivery", "tracking", "parcel"}},
-    {"account", {"password", "login", "locked", "sign-in"}},
-};
-
-auto channel = grpc::CreateChannel("classifier:9000", grpc::InsecureChannelCredentials());
-auto stub = classifier::Classifier::NewStub(channel);
-
-int failures = 0;
-std::chrono::steady_clock::time_point openedAt{};
-
-bool breakerAllows() {
-  if (failures < kBreakerFailures) return true;
-  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - openedAt);
-  if (elapsed.count() < kBreakerCooldownS) return false;
-  failures = 0;
-  return true;
+ClassifierPeer& peer(harness::Ctx& ctx) {
+  static ClassifierPeer* p = nullptr;
+  delete p;
+  p = new ClassifierPeer;
+  ctx.GRPC.Server("")->RegisterService(p);
+  breaker = Breaker{};
+  return *p;
 }
 
-void record(bool failed) {
-  if (!failed) {
-    failures = 0;
-    return;
+const rules::Decision kModel{"billing", "high", 0.92, "", ""};
+
+rules::Decision rulesDecision(const std::string& reason, const std::string& queue = "billing", const std::string& priority = "normal") {
+  return {queue, priority, 0.5, reason, "v3"};
+}
+
+bool same(const rules::Decision& a, const rules::Decision& b) {
+  return a.queue == b.queue && a.priority == b.priority && a.confidence == b.confidence && a.fallback_reason == b.fallback_reason && a.ruleset_version == b.ruleset_version;
+}
+
+std::string show(const rules::Decision& d) {
+  return "{queue " + d.queue + ", priority " + d.priority + ", confidence " + std::to_string(d.confidence) + ", fallback_reason \\"" + d.fallback_reason + "\\", ruleset_version \\"" + d.ruleset_version + "\\"}";
+}
+
+size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  peer(ctx);
+  rules::Decision d = classify("acme", kInvoice);
+  ctx.Assert(same(d, kModel), "with the classifier healthy classify must answer its decision %s, got %s", show(kModel), show(d));
+  ctx.GRPC.SetLatency("Classify", 10.0);
+  d = classify("acme", kInvoice);
+  for (const auto& call : ctx.GRPC.CallsTo("Classify")) {
+    ctx.Assert(call.HasDeadline(), "a Classify call carries no deadline: a stalled classifier holds the ticket, and the webhook behind it, open");
+    ctx.Assert(0.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.5, "a Classify call carries a %v s deadline, expected kDeadline = 1 s", call.TimeoutSeconds());
   }
-  failures += 1;
-  if (failures >= kBreakerFailures) openedAt = std::chrono::steady_clock::now();
+  ctx.Assert(same(d, rulesDecision("classifier_timeout")), "with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout, got %s", show(d));
 }
 
-std::string lower(const std::string& text) {
-  std::string out = text;
-  std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return std::tolower(c); });
-  return out;
+void CheckRetryPolicy(harness::Ctx& ctx) {
+  peer(ctx);
+  ctx.GRPC.Fail("Classify", grpc::StatusCode::INVALID_ARGUMENT, "the classifier does not read this language", 1);
+  rules::Decision d = classify("acme", kInvoice);
+  ctx.Equal(calls(ctx), 1, "a refusal (INVALID_ARGUMENT) is not tried again: the model gives the same answer for the same ticket; the calls");
+  ctx.Assert(same(d, rulesDecision("classifier_refused")), "a refused ticket must be routed by the rules with fallback_reason classifier_refused, got %s", show(d));
+  ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "classifier overloaded", 2);
+  d = classify("acme", kInvoice);
+  ctx.Assert(calls(ctx) == 4 && same(d, kModel), "after two UNAVAILABLE answers the third try succeeds: classify must answer the model's decision after 3 calls, it made %d and answered %s", calls(ctx) - 1, show(d));
+  ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "classifier overloaded", 3);
+  d = classify("acme", kInvoice);
+  ctx.Equal(calls(ctx) - 4, 3, "with the classifier UNAVAILABLE classify must make kMaxAttempts tries; the tries");
+  ctx.Assert(same(d, rulesDecision("classifier_unavailable")), "after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable, got %s", show(d));
 }
 
-std::string ruleQueue(const std::string& text) {
-  const auto lowered = lower(text);
-  for (const auto& [queue, words] : kFallbackRules)
-    for (const auto& word : words)
-      if (lowered.find(word) != std::string::npos) return queue;
-  return kGeneralQueue;
+void CheckRulesFallback(harness::Ctx& ctx) {
+  ClassifierPeer& p = peer(ctx);
+  p.down = true;
+  rules::Decision d = classify("acme", kInvoice);
+  ctx.Assert(same(d, rulesDecision("classifier_unavailable")), "with the classifier down an invoice ticket must be routed by ruleset v3 to billing at normal priority, saying why (fallback_reason classifier_unavailable), got %s", show(d));
+  d = classify("acme", kOutage);
+  ctx.Assert(same(d, rulesDecision("classifier_unavailable", "account", "urgent")), "with the classifier down an outage that blocks logins must be routed by the rules to account as urgent, got %s", show(d));
 }
 
-json fallback(const std::string& text, const std::string& reason) {
-  const auto lowered = lower(text);
-  const bool urgent = lowered.find("outage") != std::string::npos || lowered.find("breach") != std::string::npos;
-  return json{{"queue", ruleQueue(text)},
-              {"priority", urgent ? "critical" : "normal"},
-              {"confidence", 0.5},
-              {"fallback_reason", reason},
-              {"ruleset_version", kRulesetVersion}};
-}
-
-json classify(const std::string& text) {
-  if (!breakerAllows()) return fallback(text, "breaker_open");
-  std::string reason = "classifier_unavailable";
-  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-    grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kClassifyDeadlineMs));
-    classifier::ClassifyRequest request;
-    request.set_text(text);
-    classifier::ClassifyReply reply;
-    const auto status = stub->Classify(&ctx, request, &reply);
-    if (status.ok()) {
-      record(false);
-      return json{{"queue", reply.queue()},
-                  {"priority", reply.priority()},
-                  {"confidence", reply.confidence()},
-                  {"fallback_reason", ""},
-                  {"ruleset_version", kRulesetVersion}};
-    }
-    record(true);
-    if (std::find(kRetryable.begin(), kRetryable.end(), status.error_code()) == kRetryable.end())
-      return fallback(text, "classifier_refused");
-    if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) reason = "classifier_timeout";
-  }
-  return fallback(text, reason);
+void CheckBreakerCooldown(harness::Ctx& ctx) {
+  ClassifierPeer& p = peer(ctx);
+  p.down = true;
+  classify("acme", kInvoice);
+  p.down = false;
+  size_t before = calls(ctx);
+  rules::Decision d = classify("acme", kInvoice);
+  ctx.Assert(calls(ctx) == before + 1 && same(d, kModel), "one ticket that failed benched the classifier: the next ticket made %d calls and was routed %s. One failure must not take a healthy classifier out of service", calls(ctx) - before, show(d));
+  p.down = true;
+  for (int i = 0; i < 5; ++i) classify("acme", kInvoice);
+  before = calls(ctx);
+  d = classify("acme", kInvoice);
+  ctx.Assert(calls(ctx) == before && same(d, rulesDecision("breaker_open")), "after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made %d calls and answered %s", calls(ctx) - before, show(d));
+  p.down = false;
+  ctx.Clock.Advance(31);
+  d = classify("acme", kInvoice);
+  ctx.Assert(same(d, kModel), "31 s after the breaker opened the classifier is healthy again and must be asked, got %s", show(d));
 }
 `,
-    },
   },
   hints: [
-    'Stop the classifier for ten seconds: every ticket lands in `catch_all` with no reason recorded, and they keep landing there an hour after it is back. A refused request hangs the caller.',
-    'The loop has no attempt cap and treats every `RpcError` alike, `timeout=CACHE_TTL_S` is 3600 seconds, and `_failed_at` gates the fallback for the same 3600 seconds.',
-    'Add `CLASSIFY_DEADLINE_S = 1.0`, `MAX_ATTEMPTS`, a `RETRYABLE` tuple, `FALLBACK_RULES` with `rule_queue` filling `fallback_reason`/`ruleset_version`, `GENERAL_QUEUE`, and `BREAKER_COOLDOWN_S = 30` keyed on `time.monotonic()`.',
+    'Stall the classifier and a ticket waits for it; have it refuse one ticket and it receives five calls; take it down and every ticket goes to `triage` with an empty `fallback_reason`, for the next hour.',
+    'The call carries no deadline, the loop retries every status the same way, the failure path answers a fixed queue, and one failed call sets a timestamp the next hour of calls is measured against.',
+    'Pass `timeout=DEADLINE_S`; loop `MAX_ATTEMPTS` and `break` on a code not in `RETRYABLE`; answer `rules.rule_decision(text)` with the `fallback_reason`; count retryable failures and set `open_until = now + BREAKER_COOLDOWN_S` at `BREAKER_THRESHOLD`.',
   ],
-  debrief: `The fix separates the three questions the starter blurred together. How long to wait is the deadline, one second, because triage is on the request path. Whether to try again depends on the status: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` may clear, a refusal will not, so only the first two earn up to three attempts. What to answer when the model cannot is the keyword ruleset, which routes to real queues and stamps the decision with its reason and version so dashboards can show the outage as a fallback share instead of a surge. The breaker is a clock rather than a flag: thirty seconds, then one probe. Production clients add per-status metrics, a half-open state that lets a single probe through at a time, and a ruleset loaded from config so v4 ships without a deploy.`,
+  debrief: `The status code decides everything here. \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` say nothing about the ticket, so another try may work; \`INVALID_ARGUMENT\` is the model's answer about this ticket, so asking again only costs money. The ruleset keeps routing useful while the model is away, and \`fallback_reason\` keeps the outage visible in the data instead of disguising it as a quiet day. The breaker counts calls in a row and forgets in seconds, so a blip costs one ticket's tries and a recovered model is back within a minute. Production clients add jittered backoff between tries, a retry budget shared across callers, and a half-open state that lets a single probe through before the rest of the traffic.`,
 };

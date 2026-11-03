@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package quota;
+
+// The capacity service step 3 asks before a reservation: whether the shared accelerator pool can
+// hold the amount in the window. A pool without room answers RESOURCE_EXHAUSTED; a confirmation
+// names the pool generation it was checked against.
+service Capacity {
+  rpc Confirm(ConfirmRequest) returns (ConfirmReply);
+}
+
+message ConfirmRequest {
+  string team = 1;
+  string window = 2;
+  string resource_class = 3;
+  int64 amount = 4;
+}
+
+message ConfirmReply {
+  string source_version = 1;
+}

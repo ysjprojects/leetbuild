@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package searchd;
+
+// One index shard: a slice of every tenant's corpus, searched exactly. searchd asks every shard in
+// SHARDS and merges their answers (step 3). A shard that is down answers UNAVAILABLE.
+service Shard {
+  rpc Search(ShardRequest) returns (ShardReply);
+}
+
+message ShardRequest {
+  string tenant = 1;
+  string index_version = 2;
+  repeated double query = 3;
+  int32 k = 4;
+}
+
+message Hit {
+  string id = 1;
+  double score = 2;
+}
+
+// The shard's best k hits for the tenant's namespace in index_version, best first.
+message ShardReply {
+  repeated Hit hits = 1;
+}

@@ -58,6 +58,12 @@ One service, **fleetd**, five pieces, one contract:
    records read in one \`MULTI\`/\`EXEC\`, each flagged \`stale\` past 60 s, at most 5 000 vehicles,
    paged by \`limit\` and \`cursor\`.
 
+## The debugging habit
+
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
+
 ## Left out on purpose
 
 Device provisioning, per-device clock calibration, map tiles, route optimisation, driver scheduling,

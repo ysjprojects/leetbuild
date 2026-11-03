@@ -88,10 +88,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'RAG backend engineer · 25 min',
     minutes: 25,
     prompt:
-      'A support agent saw a citation from another tenant’s document. The starter retrieves from one global lexical set and an unfiltered vector index, returns citations without offsets, and caches the result under a key built only from the query. Debug the tenant boundary, fix it, and prove it.',
+      'A support agent saw a citation from another tenant’s document. The starter runs the vector search with the "*" prefilter over every tenant, appends one ranking to the other, counts offsets inside the chunk, and caches the hits under a key built only from the query, with no expiry. Debug the tenant boundary, fix it, and prove it.',
     signals: ['Secure', 'Verify', 'Operate'],
     aiNote:
-      'A global index is a data leak: filtering after ranking still touches another tenant’s candidates and can return them when the filter is forgotten. The cache key is worse: the same query from two tenants reads the same cached answer. Tenant belongs in the index key, the vector filter, the cache key, and the citation payload.',
+      'A search over every tenant is a data leak: filtering after ranking still touches another tenant’s candidates and returns them when the filter is forgotten. The cache key is worse: the same query from two tenants reads the same cached hits. Tenant belongs in the vector prefilter and in the cache key, and offsets belong in document coordinates so a citation highlights the right text.',
     testIdea:
       'Index the same query text for two tenants with different answers. Retrieve as each tenant and assert the other tenant’s chunk ids never appear, including on a warm cache. Then evict the cache and assert the result is unchanged.',
     followUps: [
@@ -110,7 +110,7 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Applied AI engineer · 25 min',
     minutes: 25,
     prompt:
-      'A grounded answer cited a source that does not contain the quoted sentence. The starter concatenates retrieved text into the system prompt, hands the model its tool list, and returns the model’s citation objects unchecked. Debug the prompt boundary and the citation path, fix them, and prove the fix.',
+      'A grounded answer cited a source that does not contain the quoted sentence. The starter appends the retrieved text to the system prompt, calls the model even when nothing was retrieved, and returns the model’s citation objects unchecked. Debug the prompt boundary and the citation path, fix them, and prove the fix.',
     signals: ['Verify', 'Secure', 'Evaluate'],
     aiNote:
       'Retrieved text is data, not policy: putting it in the system prompt lets a poisoned document rewrite the rules. A model-authored citation is a claim, not evidence; the server must check that the quote is a literal substring of the stored chunk and build the citation from stored offsets. If nothing survives, the correct answer is a refusal.',
@@ -128,14 +128,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'model-router',
     stepId: 'route-endpoint',
     title: 'The route endpoint that trusts its caller',
-    blurb: "The starter returns the caller's policy as the model name; fix the trust boundary.",
+    blurb: 'The starter passes an unknown policy through as the model name; fix the trust boundary.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'You are the AI platform engineer on call. A tenant\'s integration sent `policy: "gpt-4o"` and the starter echoed it back as the model name, so any client can select any model the provider serves. The same handler also skips the prompt caps and the Idempotency-Key, and logs the prompt. Debug it, fix it, and prove the fix.',
+      'You are the AI platform engineer on call. A tenant\'s integration sent `policy: "gpt-4o"` and the starter passed it through as the model name, so any client can select any model the provider serves. The same handler also skips the prompt caps and the Idempotency-Key, and logs the prompt. Debug it, fix it, and prove the fix.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      "The starter treats the caller's `policy` string as the model name, validates neither the 256 KiB prompt cap nor `max_tokens`, ignores `Idempotency-Key` so a client retry routes twice, and logs the prompt on every request.",
+      'The starter maps the policy through `MODELS` but passes an unknown policy through as the model name and sends `auto` to the small model whatever the estimate; it checks neither the 256 KiB prompt cap nor `max_tokens`, ignores `Idempotency-Key` so a client retry routes twice, and logs the prompt on every request.',
     testIdea:
       'Post an unknown policy and expect 400; post a prompt over 256 KiB and expect 413; replay one request with the same Idempotency-Key and assert the second response is the stored decision rather than a new route.',
     followUps: [
@@ -150,16 +150,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'chat-memory',
     stepId: 'state',
     title: 'The memory that grows forever',
-    blurb: 'The starter trims the session buffer from the client, sets no TTL, and keys it by session id alone.',
+    blurb: 'The starter trims the wrong end of the session buffer, sets no TTL, and keys it by session id alone.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A busy session lost a turn during a burst of appends, idle sessions kept their lists in Redis for weeks, and two tenants with colliding session ids saw each other in the buffer. The starter pushes with LPUSH and trims with a separate client-side LTRIM, sets no TTL, and builds the key from the session id alone. Debug it, fix it, and prove the buffer is atomic, bounded, expiring and tenant-scoped.',
+      'Long conversations lost their newest turns after the fiftieth, idle sessions kept their lists in Redis for weeks, and two tenants with colliding session ids saw each other in the buffer. The starter pushes with RPUSH, trims with a separate LTRIM 0 49, sets no TTL, and builds the key from the session id alone. Debug it, fix it, and prove the buffer is atomic, bounded to the newest turns, expiring and tenant-scoped.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The starter issues LPUSH and then a client-side LTRIM as two round trips, so two concurrent appends can interleave and the last trim drops a turn the other append just added; it sets no TTL, so idle lists live until Redis fills; and it builds the key without the tenant prefix, so colliding session ids share one buffer.',
+      'The starter appends at the tail with RPUSH and then keeps indexes 0 to 49, the oldest 50, so every turn after the fiftieth is dropped as soon as it is pushed; the push and the trim are two round trips, so a reader between them sees 51 turns; it sets no TTL, so idle lists live until Redis fills; and it builds the key without the tenant, so colliding session ids share one buffer.',
     testIdea:
-      'Append 60 turns and assert the list holds 50 and carries a TTL near 86400; run two appends concurrently at a cap of 3 and assert neither appended turn is missing; append as two tenants with the same session id and assert their buffers are disjoint.',
+      'Append 60 turns and assert the buffer holds t-11..t-60 with a TTL near 86400; probe right after the first command of an append and assert the list never exceeds 50; append as two tenants with the same session id and assert their buffers are disjoint.',
     followUps: [
       'How would you summarize older turns without blocking the append path?',
       'Should the summary live in Redis or in durable storage, and why?',
@@ -176,10 +176,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A release shipped on an eval run that was marked passed after 12 of 500 samples, and the report endpoint kept serving a cached copy from before the last batch. The starter gates on a caller-supplied threshold and caches the report without the scored count in the key. Debug it, fix it, and prove the gate only opens on a complete, current record.',
+      'A release shipped on an eval run that was marked passed after 12 of 500 samples, and the report endpoint kept serving a copy cached before the last batch. The starter compares the pass rate with a threshold from the query string and caches the report in Redis for 60 seconds. Debug it, fix it, and prove the gate only opens on a complete, current record.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      "The starter judges a run with no sample floor, accepts a threshold override from the query string, serves a report cached early in the run so late failures do not appear, and reads any tenant's run.",
+      "The starter judges a run with no sample floor, takes the threshold from the query string, ignores how many samples the string-metric fallback scored, serves the report from a 60-second Redis cache so late failures do not appear, and reads any tenant's run.",
     testIdea:
       'Start a run over 500 samples and assert it stays pending at 12 and at 199 scored samples; pass a lenient threshold in the query and assert the server threshold still decides; finish the run below threshold and assert the report flips to failed immediately.',
     followUps: [
@@ -203,7 +203,7 @@ export const mockScenarios: readonly MockScenario[] = [
     aiNote:
       'The starter builds the cache key from the tenant and the content hash with no model version, so vectors from the previous model are served after an upgrade; its unconditional SET lets a concurrent compute overwrite the first result, and the separate EXPIRE can be lost to a crash.',
     testIdea:
-      'Embed one input under model v1, switch to v2, and assert the second call is a miss and produces a v2 vector; assert the v1 cache entry still exists for explicit v1 requests; force a fallback model and assert its dimension is refused under the v2 namespace.',
+      'Embed one input under model v1, switch to v2, and assert the second call is a miss and produces a v2 vector; assert the v1 cache entry still exists for explicit v1 requests; let another worker store first while this one computes and assert both callers end up with the stored vector.',
     followUps: [
       'Should the cache be shared across tenants or scoped per tenant, and what leaks either way?',
       'How would you backfill embeddings after a model upgrade without a thundering herd?',
@@ -220,14 +220,14 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A tenant spotted results in search that belonged to another tenant's private corpus. The starter keys the Redis result cache by query digest and k alone, takes the tenant from the request body, and deletes entries by hand instead of giving them a TTL. Debug it, fix it, and prove tenant isolation holds on every path including the cache.",
+      "A tenant spotted results in search that belonged to another tenant's private corpus. The starter keys the Redis result cache by the query digest alone, reads the active index version only on a miss, and writes entries with no TTL. Find why one tenant's entry answers another's search, fix the key, and prove with checks that tenants, versions and k never share an entry.",
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      "The starter builds the result cache key from the query digest and k only, so the first tenant to run a query populates an entry that the next tenant receives; it reads the tenant from the request body instead of X-Tenant-Id, digests str(query) rather than the vector's bytes, and writes without an expiry after a manual delete.",
+      'The starter keys the result cache as search:{query_digest}, so the first tenant to run a query fills the entry every tenant reads, a reindex keeps answering from the old version, and a search for 3 after a search for 2 answers 2; it also writes with a plain SET and no expiry.',
     testIdea:
-      "Run the same vector for two tenants and assert the returned ids are disjoint; send a body tenant that contradicts the authenticated tenant and assert 403; poison one tenant's cache entry and assert the other tenant is unaffected.",
+      'Run the same vector for two tenants and assert the returned ids are disjoint; switch the active index version and assert the next search answers from the new version; assert the entry carries a TTL of at most 60 seconds.',
     followUps: [
-      'Should the cache key include the index version, and what breaks if it does not?',
+      'How would you stop one hot query from sending a burst of identical misses to the shards?',
       'How would you merge shard results when one shard is slow but healthy?',
       'What would you store to reproduce a bad ranking without keeping the raw query?',
     ],
@@ -238,16 +238,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'prompt-registry',
     stepId: 'state',
     title: 'The rollback that half applied',
-    blurb: 'A promotion and a rollback raced and tenants split across versions.',
+    blurb: 'A rollback landed on a version that never shipped while replicas kept serving the old one.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A prompt promotion was rolled back within seconds, but the pointer write and the tenant pin went through as separate Redis commands, so half the fleet kept serving the bad template for an hour while the cached pointer expired. Debug the starter, fix it, and prove a rollback lands on every reader atomically.',
+      'A bad prompt version was rolled back within seconds, but the rollback put a version live that had never shipped, the audit no longer matched the pointer after two operators moved it at once, and replicas kept serving the bad version for minutes. Debug the starter, fix it, and prove a rollback lands on the previous version for every reader.',
     signals: ['Specify', 'Evaluate', 'Secure'],
     aiNote:
-      'The starter writes the global pointer, the tenant pin and the audit row as separate commands, so a racing rollback leaves some readers forward and some back; it caches the resolved version by name for an hour, keeps no revision, and has no rollback path.',
+      'The starter promotes with a GET, a SET and two RPUSHes from the client, so a second promotion lands between them and the audit chain breaks; it never checks that the version is registered; rollback subtracts one from the live version instead of reading the history; and live_version caches the pointer in the process for five minutes.',
     testIdea:
-      'Promote and roll back concurrently and assert every reader resolves to exactly one version per tenant; then roll back once and assert a pinned and an unpinned reader both see the rolled-back version on their very next read, with the audit row and revision already present.',
+      'Land another promotion between two of promote’s commands and assert every audit entry starts where the previous one ended; promote 1, 4, 7 and assert rollback lands on 4 then 1; roll back from another replica and assert the next read sees it.',
     followUps: [
       'Why should prompt versions be immutable instead of editable in place?',
       'How would you pin a tenant for a canary without letting its sessions flip mid-conversation?',
@@ -260,16 +260,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'cost-meter',
     stepId: 'state',
     title: 'The meter nobody can reconcile',
-    blurb: 'Counter updates were split across commands and the hourly key never reset.',
+    blurb: 'Counter updates were split across commands, the cost was a float of dollars, and the key never reset.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Finance found spend that did not match provider invoices, and a tenant that exhausted its budget last week is still blocked today with no traffic this hour. The starter for record_usage runs two HINCRBY commands against meter:{tenant}, sets no expiry and reads the totals back in a second round trip. Debug it, fix it, and prove the counter, the window and the returned totals agree.',
+      'Finance found spend that did not match provider invoices, and a tenant that exhausted its budget last week is still blocked today with no traffic this hour. The starter for record_usage runs separate HINCRBY and HINCRBYFLOAT commands against meter:{tenant}, sets no expiry and reads the totals back with HMGET. Debug it, fix it, and prove the window, its expiry and the returned totals agree.',
     signals: ['Specify', 'Verify', 'Operate'],
     aiNote:
-      "The starter keys the hash on the tenant alone and sets no TTL, so one counter accumulates every hour the tenant ever spent; it moves input and output tokens with separate HINCRBY calls, so a crash between them leaves a half-applied hash; and its HGET re-read can report a concurrent request's increment as this one's.",
+      "The starter keys the hash on the tenant alone and sets no expiry, so one hash accumulates every hour the tenant ever spent; it adds the cost as floats of dollars in cost_usd, so the sum drifts; and its HMGET read-back can report a concurrent report's increment as this one's.",
     testIdea:
-      'Increment two reports concurrently and assert the hash holds both totals exactly; assert the key is meter:{tenant}:{bucket} with a TTL set once; write in the last minute of a window and assert the TTL did not move; assert the returned totals are the ones the script wrote.',
+      "Land a second report between two of record_usage's commands and assert the returned totals are the ones its own write produced; assert the key is meter:{tenant}:{bucket} and expires one hour after its window closes, unmoved by a later write; assert cost_micros is an exact integer sum.",
     followUps: [
       'Should spend be reserved before a call or reconciled after it, and what does each choice cost?',
       'How do you bill a request whose provider usage arrives after the response?',
@@ -282,16 +282,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'feedback-collector',
     stepId: 'client',
     title: 'The rating that rewrote history',
-    blurb: 'A slow attribution lookup was answered with the active model, and the failure was cached for a day.',
+    blurb: 'A failed attribution lookup was answered with the active model, and the failure was remembered for a day.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "After a model rollout, last week's feedback moved to the new model because a slow attribution lookup fell back to the active version, and one failed lookup stayed cached for a day. The starter answers grpc.RpcError with ACTIVE_MODEL, remembers the failure for 24 hours, and runs the lookup with a one-second timeout. Debug it, fix it, and prove a failed lookup stores the rating as unattributed and is retried on the next request.",
+      "After a model rollout, last week's feedback moved to the new model because a failed attribution lookup fell back to the active version, and that failure stayed cached for a day. The starter calls GetAttribution with a two-second deadline, answers grpc.RpcError with ACTIVE_MODEL, remembers the failure for 24 hours, and caches replies under the request id alone. Debug it, fix it, and prove a failed lookup is unattributed and retried on the next request.",
     signals: ['Specify', 'Verify', 'Secure'],
     aiNote:
-      'The starter attributes a failed lookup to whatever model is active, so a rollout rewrites the past; it caches that failure for a day under the request id so every later lookup takes the same shortcut, and it has no backfill for a late reply.',
+      'The starter attributes a failed lookup to whatever model is active, so a rollout rewrites the past; it remembers that failure for a day so every later lookup of the request takes the same shortcut; it waits two seconds on a slow registry; and its cache key leaves the tenant out, so two tenants share one req-1.',
     testIdea:
-      'Stub GetAttribution to time out after 200 ms and assert the rating is stored with model_version unattributed; call attribute again for the same request id with the stub healthy and assert the registry is queried; backfill a stored row and assert the rating is unchanged.',
+      'Serve GetAttribution from a stand-in, make it UNAVAILABLE once and assert attribute answers unattributed; call again for the same request with the stand-in healthy and assert the registry is asked; give it a second of latency and assert the call carries a 200 ms deadline; resolve req-1 for two tenants and assert each gets its own model.',
     followUps: [
       "Should unattributed feedback count toward any model's score, and how do you decide?",
       'How would you weight feedback from a power user versus a long-tail user?',
@@ -326,16 +326,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'batch-inference',
     stepId: 'state',
     title: 'The batch that lost a shard',
-    blurb: 'A crashed worker lost its shard and the batch still reported success.',
+    blurb: 'A crashed worker took its shard with it and the batch never finished.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A worker died mid-shard, the batch completed with 999 of 1000 shards, and the dashboard still said success because the shard was popped without a lease. The starter also counts a shard as done the moment it is claimed, and its heartbeat lets a second worker take over a shard that is still running. Debug it, fix it, and prove a lost shard is reclaimed and the counters follow completed work.',
+      "A worker died mid-shard and the batch never finished: its shard had been popped from the pending list but never leased, so no reaper could find it. The starter also lets any worker heartbeat or complete a shard it does not hold, and its reaper marks a dead worker's shard failed instead of requeueing it. Debug it, fix it, and prove a dead worker's shard runs again on exactly one worker.",
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter pops shards with SPOP and takes no lease, so a worker crash removes the shard from the only set that tracks it; it increments the done counter on claim, before any work; and its heartbeat is a plain SET, so two workers can believe they own the same shard.',
+      'The starter claims with LPOP and writes the owner and deadline in later round trips, so a crash in between strands the shard; heartbeat and complete write without comparing the owner, so a replaced worker can take over or finish a running shard; reap marks expired shards failed; and complete leaves the deadline behind, so a finished shard is reaped and run again.',
     testIdea:
-      'Kill a worker mid-shard and assert the shard is reclaimed by another worker; assert a batch with any non-terminal shard never reports success; assert the checksum of a published shard matches the flushed object.',
+      'Probe Redis right after the claim pops the list and assert the shard is owned; let a lease expire and assert reap requeues it for another worker; assert a completion from the replaced worker is refused and a completed shard is never reaped.',
     followUps: [
       'What retry semantics should a shard have when its worker dies after a partial write?',
       'How would you make one million model calls cost-aware?',
@@ -352,12 +352,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Search became useless for one tenant after a vision outage: every uncaptioned image was indexed as the literal text an image, and nothing marked those assets for a backfill. The starter calls the vision service with no deadline, catches every error and substitutes a placeholder caption. Debug it, fix it, and prove failures are visible.',
+      'Search became useless for one tenant after a vision outage: every uncaptioned image was indexed as the literal text an image, and nothing marked those assets for a backfill. The starter calls the vision service with no deadline, retries every error three times and then substitutes a placeholder caption. Debug it, fix it, and prove failures are visible.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The starter calls Caption without a deadline and catches every exception, a content-policy refusal included, substituting the literal string an image as the caption, so an outage converts into hundreds of poisoned retrievals and nothing marks the assets as degraded.',
+      'The starter calls Caption without a deadline and retries every error three times with a sleep, a content-policy refusal included, then substitutes the literal string an image as the caption, so an outage turns into hundreds of poisoned retrievals and nothing queues the assets for a caption backfill.',
     testIdea:
-      'Stub the vision model to time out and assert the asset falls back to text-only indexing with caption null and a visible degraded flag; stub a PERMISSION_DENIED and assert the asset fails with POLICY_REJECTED rather than being indexed.',
+      'Make the vision service unavailable and assert the asset is indexed with caption null, degraded true and its id in the backfill set; answer PERMISSION_DENIED and assert one call and a ContentPolicyError instead of an indexed asset.',
     followUps: [
       'When should ingest block on captioning versus degrade to text-only?',
       'How would you backfill captions once the vision service recovers?',
@@ -374,12 +374,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A user interrupted the agent and it kept talking to the end of the sentence; a week later Redis was full of turn-state hashes for calls that ended days ago. The starter updates barge-in state as two separate HSETs with no TTL and reads the fields one at a time. Debug it, fix it, and prove interruption is atomic and idle sessions expire.',
+      'A user interrupted the agent and it kept talking to the end of the sentence; a week later Redis was full of turn-state hashes for calls that ended days ago. The starter runs barge-in as three separate commands with no TTL, writes every frame whatever turn it belongs to, and reads the fields one HGET at a time. Debug it, fix it, and prove interruption is atomic, late frames are dropped and idle sessions expire.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The starter writes the speaker change and the TTS offset as separate HSET commands, so an audio frame can land between them and the agent speaks over the user; it never sets an EXPIRE on the state key, stores no turn index, and reads the state with field-at-a-time HGETs.',
+      'The starter sets current_speaker, increments turn_index and reads tts_offset back as three commands, so a reader can land between them; it returns the offset the stream sent instead of what the caller heard; record_frame writes a late frame of the interrupted turn and hands the floor back to the agent; nothing sets an EXPIRE; and read_state uses field-at-a-time HGETs.',
     testIdea:
-      "Race a barge-in with an audio frame and assert the agent's stream is truncated at the current token; stop sending frames for 30 seconds and assert the state key is gone, then keep sending for two minutes and assert it survives.",
+      "Land a read between the barge-in's commands and assert it sees the state before or after, never a mix; send a frame of turn 0 after the barge-in and assert it is dropped; stop sending frames for 31 seconds and assert the state key is gone.",
     followUps: [
       'What is the right behavior when ASR confidence is low for the whole turn?',
       "How would you cap a session's cost without cutting off a long legitimate answer?",
@@ -396,12 +396,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A single customer marked their own ticket critical every hour, and one webhook retried five times produced five routings. The starter honors the body priority and re-triages every retry. Debug it, fix it, and prove routing is server-side and a replay returns the stored decision.',
+      'A single customer marked their own ticket urgent every hour, and one webhook retried five times filed five tickets. The starter lets the body override the ruleset and never reads back the answer it records per Idempotency-Key. Debug it, fix it, and prove routing is server-side and a replay returns the recorded routing.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      "The starter uses the request body's priority and queue when present, so callers route themselves; it reads the text straight through with no 32 KiB cap, has no Idempotency-Key lookup by (tenant, ticket hash), so every retry re-triages, and its log line prints the ticket text.",
+      "The starter copies the request body's priority and queue over the ruleset decision, so callers route themselves; it routes any text with no 32 KiB cap and no blank-text check; and it saves the routing under the Idempotency-Key without ever looking the key up, so every retry mints a new ticket.",
     testIdea:
-      'Send a critical priority in the body and assert the assigned priority comes from the ticket text; replay the same ticket with one Idempotency-Key and assert the second response is the stored routing; post 33 KiB and assert 413 before any classification; assert no log line contains the ticket text.',
+      'Send priority urgent in the body of an invoice ticket and assert it is routed to billing at normal priority; replay one Idempotency-Key and assert the same ticket id comes back; post 16 385 two-byte characters and assert 413 before a ticket id is minted.',
     followUps: [
       'Which tickets should ever skip classification entirely?',
       'How would you retrain routing rules from corrections without a feedback loop of bias?',
@@ -418,12 +418,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A support escalation showed one user's recommendations rendering with another user's recently viewed items, because the starter read the user id from the request body. The same handler accepts a candidate list of any size and returns every ranked item without saying which model produced the order. Debug it, fix it, and prove identity comes from auth and the request and response are bounded.",
+      "A support escalation showed one user's recommendations rendering with another user's recently viewed items, because the starter read the user id from the request body. The same handler passes a candidate list of any size to the ranker and returns every ranked item without positions, the model version or the fallback flag. Debug it, fix it, and prove identity comes from auth, the request and response are bounded, and the list says what ordered it.",
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      "The starter resolves the user from the request body when present, so a caller can request any user's ranking; it caps neither the candidate list nor the returned items, so one request can stall the ranking pool and the payload grows with the request; and it omits model_version, so two releases cannot be told apart.",
+      "The starter takes the user from the body's user_id when one is sent, so a caller can request any user's ranking; it bounds neither the candidate list nor the returned items, so one request can tie up the ranking pool and the payload grows with the request; and it answers the items alone, without positions, model_version or fallback, so a popularity fallback looks like the model's list.",
     testIdea:
-      'Send a body user id different from the authenticated one and assert it is ignored; post 501 candidate ids and assert 400; post 100 and assert at most 30 items come back, each with a position, and the response carries model_version.',
+      'Send a body user id different from the X-User-Id header and assert the list is ranked for the header user; post 501 candidate ids and assert 400 before the ranker is called; post 100 and assert 30 items come back with positions 0 to 29, and the response carries model_version and fallback.',
     followUps: [
       'When is popularity an acceptable fallback and when should the surface fail instead?',
       'How would you debias popularity so it does not collapse into a loop?',
@@ -462,12 +462,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'During a detector outage, POST /v1/redact kept answering 200, and every body carried the unredacted customer text under a warning header; a text that was too large was quoted back in the 413 error. The starter fails open. Debug it, fix it, and prove that a detector failure is a 503 with no text in the body.',
+      'During a detector outage, POST /v1/redact kept answering 200, and every body carried the customer text as it came in; a text that was too large was quoted back in the 413 error. The starter fails open. Debug it, fix it, and prove that a detector failure is a 503 with no text in the body.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The starter catches the detector error and returns the original input with `degraded: true`, so an outage becomes a leak; it also returns the raw text when nothing matched, and its 413 body quotes a slice of the oversized payload into error logs.',
+      'The starter catches `DetectorUnavailable` and answers 200 with the input as `redacted_text` and `degraded: true`, so an outage becomes a leak; its 413 body carries a `preview` of the payload; unknown entity types reach the detector unchecked; and a text with nothing to redact returns `status: "clean"` without being saved.',
     testIdea:
-      "Stub the detector to fail and assert the response is a 503 with no text; run a redaction over an email address and assert the audit payload contains spans and counts but no address; request another tenant's document and assert 404.",
+      'Take the detector down and request PERSON, which no pattern covers: assert a 503 with no text in the body and nothing saved; send 300 KiB and assert the 413 body is constant; redact a clean text and assert `status: "processed"`, an empty span list and a saved record.',
     followUps: [
       'When is regex fallback good enough, and when must redaction hard fail?',
       'How would you verify redaction completeness without keeping the original?',
@@ -484,12 +484,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Integrations engineer · 20 min',
     minutes: 20,
     prompt:
-      "After a quiet weekend, a connector re-fetched three months of vendor history and tripped the vendor's rate limit. The starter's `commit_page` stores the cursor with a 24-hour TTL and writes it before the page is claimed, in two separate Redis calls. Debug it, fix it, and prove the cursor is durable and each page applies once.",
+      "After a quiet weekend, a connector re-fetched three months of vendor history and tripped the vendor's rate limit. The starter's `commit_page` checks the page claim with `EXISTS`, then sets the claim and the cursor with a 24-hour TTL in two more Redis calls. Debug it, fix it, and prove the cursor is durable and each page applies once.",
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The starter stores the sync cursor with `ex=86_400`, so a quiet connector silently restarts from the beginning of history; it sets the cursor first and the page marker second, with no `NX` claim and no atomic script, so a crash between the two skips a page and a concurrent re-fetch applies it twice.',
+      'The starter writes the claim and the sync cursor with `ex=86_400`, so a quiet connector silently restarts from the beginning of history; it decides "already applied" from an `EXISTS` read one round trip before the two `SET`s, so two workers committing one page both apply it; and a replayed page is answered with the cursor the caller passed in rather than the one the ledger holds.',
     testIdea:
-      'Let the cursor key age past a day and assert the next sync still resumes from it; crash between the page claim and the cursor move and assert the page is re-fetched and deduped; commit the same page twice and assert `applied` is false the second time.',
+      "Advance the clock three days and assert the cursor and the claim are still there; land a second worker's commit of the same page between the first worker's commands and assert exactly one reports `applied`; replay an old page and assert it answers the cursor the ledger holds.",
     followUps: [
       'Should a connector stop entirely after a 401, and how does a human re-enable it?',
       'How would you detect a cursor that silently stopped advancing?',
@@ -502,16 +502,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'crawl-index',
     stepId: 'state',
     title: 'The crawler that hammered one host',
-    blurb: 'A global queue let one host absorb the whole rate budget.',
+    blurb: "One queue per job let a take for one host hand out another host's URL.",
     role: 'Search infrastructure engineer · 20 min',
     minutes: 20,
     prompt:
-      'A blog host saw a thousand requests in a minute while the rest of the crawl idled, and a host that answered 429 kept being fetched at the same rate. The starter frontier uses one shared queue and one shared bucket. Debug it, fix it, and prove per-host politeness.',
+      "A blog host saw a burst of requests after an idle hour while the rest of the crawl waited, and a host that answered 429 kept being fetched. The starter frontier keeps one queue per job and refills each host's bucket in the client. Debug it, fix it, and prove per-host politeness.",
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The starter pushes every URL onto one `frontier:{job_id}` list and refills a single `bucket:global` with a client-side GET-then-SET, so capacity lands on one host and concurrent workers overshoot the rate; its `throttle` writes nothing, so a 429 changes nothing.',
+      'The starter pushes every URL onto one `frontier:{job_id}` list, so `take` pops whatever host is at the head; it reads `bucket:{job_id}:{host}` with HMGET, adds the elapsed tokens without a cap and writes them back with HSET, so two workers can spend one token; it never reads `throttle:{job_id}:{host}`, and its buckets never expire.',
     testIdea:
-      'Seed three hosts with different rates and assert requests per host match each bucket; run two workers against one bucket and assert the minute never exceeds the rate; answer 429 with Retry-After for one host and assert `take` returns nothing for it while the other hosts keep moving.',
+      'Queue URLs for two hosts and assert a take for one never answers the other; land a second worker between the bucket read and write and assert one token buys one URL; idle a host for an hour and assert it gets BURST URLs; throttle a host for 30 s and assert `take` answers nothing for it while the other host keeps moving.',
     followUps: [
       "How would you adapt crawl rate to a host's observed capacity?",
       'What makes a coverage number honest when a site is partly refused?',
@@ -528,34 +528,34 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Every hour the resolver was slow, the graph gained duplicate entities, and a pair the resolver had refused showed up merged. The starter for resolve_pair reads DEADLINE_EXCEEDED as not a match, hands a rejection to a retry loop that merges on the last attempt, and merges any other response without reading the score. Debug it, fix it, and prove a timeout parks the pair, a rejection ends the call, and only a score above the threshold merges.',
+      'Every hour the resolver was slow, the graph gained duplicate entities, and a pair the resolver had refused showed up merged. The starter for resolve_pair calls Resolver.Score with a 10-second deadline up to three times, returns rejected on DEADLINE_EXCEEDED, retries every other error, merges on any answer without reading the score, and merges anyway when the attempts run out. Debug it, fix it, and prove a timeout parks the pair, a refusal ends the call, and only a score of 0.9 or more merges.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter maps a resolution timeout to REJECTED, so an outage splits the graph; it retries a terminal rejection and merges when the attempts run out; it merges on any non-rejection response without comparing the score to MERGE_THRESHOLD; and it has no review queue, so an undecidable pair is never written anywhere.',
+      'The starter gives Score a 10-second deadline and reads DEADLINE_EXCEEDED as a mismatch, so an outage splits real duplicates; it retries FAILED_PRECONDITION and merges the refused pair when the attempts run out; it merges on any answer without comparing the score to MERGE_THRESHOLD; and it never calls store.park, so an undecidable pair is written nowhere.',
     testIdea:
-      'Stub Resolve to time out and assert review_queue.put is called with PARKED and nothing merges; stub a rejection and assert REJECTED after one call; stub a score of 0.6 and assert the pair is parked with its score; stub 0.9 and assert merge_entities runs once.',
+      'Serve Score with a 5-second latency and assert the outcome is parked, review:t1 holds the pair with reason unresolved and nothing merged; refuse the pair and assert rejected after one call; score it 0.6 and assert it is parked with its score; score it 0.95 and assert the right entity is merged into the left.',
     followUps: [
       'What evidence should a merge require before it is automatic?',
       'How would you represent a merge so it can be undone?',
-      'Why is delete-after-write the wrong invalidation pattern?',
+      'Which resolver errors should park a pair, and which should end the call?',
     ],
     defaultLanguage: 'python',
   },
   {
     id: 'quota-broker-the-gpu-that-was-promised-twice',
     problemId: 'quota-broker',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The GPU that was promised twice',
-    blurb: 'The starter answered ok without recording, so two teams got the same capacity.',
+    blurb: 'Two brokers read the same reserved count, so two jobs got the same capacity.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two training jobs were scheduled onto the same four GPUs because the reserve endpoint answered ok to both. The starter computes quota minus reserved from two reads and responds without writing a reservation, trusts the team in the path, and accepts any resource class. Debug it, fix it, and prove a reservation is recorded atomically with an id.',
+      "Two training jobs were scheduled onto the same six GPUs because two brokers both granted them against an 8-unit quota. The ledger's reserve reads the team's counters, compares, then increments in separate commands, keeps one hash for every window, never expires it, and a retried release refunds twice. Debug it, fix it, and prove the take and the refund are each one script.",
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter reads quota and reserved in two separate calls, compares, and returns 200 ok without calling ledger.reserve, so concurrent requests all observe the same remaining capacity and none holds anything; it also skips the X-Team-Id check, the window pattern, the resource-class whitelist and the amount cap.',
+      "The starter's reserve HGETs reserved and consumed from quota:{team}, compares them with limit_of(team), then HINCRBYs and writes the reservation hash, so a second broker landing between the read and the increment is granted too; the hash has no window in its key and no TTL, and release reads the reservation, refunds and deletes in three commands.",
     testIdea:
-      'Fire two concurrent reservations for the last four units and assert exactly one gets 201 with a reservation_id; send a path team that differs from X-Team-Id and assert 403; send resource_class gpu-z9 and assert 400.',
+      "Land a second reserve of 6 between the first reserve's read and its increment and assert exactly one is granted with reserved at 6; release one reservation twice in parallel and assert reserved returns to 0 and one release reports false.",
     followUps: [
       'Should a reservation expire on its own, and what evidence keeps it honest?',
       'How would you handle preemption when a high-priority team arrives?',
@@ -572,12 +572,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "An auditor edited a record in the store and the verify endpoint still returned valid, because the starter never recomputed hashes. The same endpoint let any tenant verify against any other tenant's chain. Debug it, fix it, and prove verification is real and tenant-scoped.",
+      "An auditor rewrote a decision in the ledger and the verify endpoint still returned valid, because the starter compares the record's position with the chain head instead of recomputing anything. The same endpoint let any tenant verify another tenant's records. Debug it, fix it, and prove verification is real and tenant-scoped.",
     signals: ['Secure', 'Verify', 'Evaluate'],
     aiNote:
-      "The starter's verify handler looks the record up by id alone, takes the chain's tenant from a query parameter, and returns valid whenever the head value is non-empty, with no hash recomputation and no chain_length or first_divergence in the answer; a foreign record is not 404.",
+      "The starter's verify handler takes the tenant from a ?tenant= parameter before the X-Tenant-Id header, never compares it with the record's tenant, and answers valid whenever the chain head is at or past the record's position: no record digest or link is recomputed, and the answer has no chain_length or first_divergence.",
     testIdea:
-      'Tamper with one stored record and assert verification fails at that position; delete a middle record and assert the break is detected; verify a chain from another tenant and assert 404.',
+      "Rewrite a ledger row and assert verification fails at its position; rewrite a later chain entry and assert the first divergence is reported there; verify another tenant's record and assert 404, the same as a missing one.",
     followUps: [
       'What must a receipt contain to be useful years later?',
       'How would you rotate the signing key without breaking old verification?',

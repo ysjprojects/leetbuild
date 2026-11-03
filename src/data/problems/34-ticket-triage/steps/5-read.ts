@@ -2,47 +2,58 @@ import type {Step} from '@/lib/types';
 
 export const triageReadStep: Step = {
   id: 'read',
-  title: 'GET /v1/queues/{id}/summary: aggregates a manager can act on',
+  title: 'GET /v1/queues/{id}/summary: figures a queue manager can act on',
   concept: 'http',
   file: 'read',
   focus: ['client', 'summary', 'db'],
   task: `## Task
 
-**Starting point.** The starter registers \`GET /v1/queues/{queue_id}/summary\`, reads the tenant
-header, and answers \`{"queue_id", "depth"}\` from \`store.depth_counter(queue_id)\` for any queue
-id it is handed. It serves the demo and hides four flaws.
+**Starting point.** The starter serves \`GET /v1/queues/{queue_id}/summary\`: it requires
+\`X-Tenant-Id\` (401), looks the queue up (\`store.queue\`, 404 for an unknown id), reads the routing
+records of the queue's tenant and name (\`store.routing_records\`, written by step 4's consumer) and
+answers \`{queue_id, queue, depth, median_wait_s, fallback_count, fallback_share}\`: depth is the
+number of records, the wait figure is the mean of \`now - received_at\`, and the fallback figures
+count records whose \`fallback_reason\` is \`classifier_timeout\`. It serves the demo and hides four
+flaws.
 
-**Failure mode the checks target.** A cached counter is a second source of truth that drifts from
-the records it summarizes; a summary without the fallback share hides the single most important
-failure of a triage service; a mean wait is moved by one stuck ticket; and an unscoped read
-endpoint leaks one tenant's queue depth and wait times to another.
+**Failure mode the checks target.** One tenant reads another tenant's queue by guessing its id;
+resolved tickets keep the queue looking deep; one ticket stuck for two hours turns a one-minute wait
+into half an hour; and an outage that sent tickets to the ruleset for any reason but a timeout
+reads as a healthy classifier.
 
-- **Computed from routing records.** Depth, median wait and the fallback share are derived from the
-  routing records, not from a cached counter.
-- **Depth** is the number of routing records in the queue for this tenant. **Median wait**
-  (\`median_wait_s\`) is the median of the records' wait times, 0 when the queue is empty.
-- **Fallback share is mandatory.** The response reports the share of tickets the rules routed
-  (\`fallback_share\`) and the raw count (\`fallback_count\`).
-- **Tenant scope.** The queue must belong to the caller's tenant: an unknown queue id, or one owned
-  by another tenant, is **404**.
-- Missing tenant is **401**.`,
+- A queue the caller's tenant does not own is **404**, the same answer as an unknown id.
+- Depth and waits count **open** records only (\`status\`).
+- \`median_wait_s\` is the median of the open records' waits in seconds (the mean of the middle two
+  for an even count), 0 for an empty queue.
+- \`fallback_count\` counts every record with a non-empty \`fallback_reason\`; \`fallback_share\` is
+  it over the depth, rounded to three decimals.`,
   sequence: {
-    participants: ['Manager', 'Queue summary', 'routing records'],
+    participants: ['Queue manager', 'Queue summary', 'routing store'],
     messages: [
-      {from: 'Manager', to: 'Queue summary', label: 'GET /v1/queues/billing/summary · X-Tenant-Id', kind: 'sync'},
-      {from: 'Queue summary', to: 'routing records', label: 'queueTenant(queue_id)', kind: 'sync'},
-      {from: 'routing records', to: 'Queue summary', label: 'acme / none', kind: 'reply'},
-      {from: 'Queue summary', to: 'routing records', label: 'routingRecords(queue_id, tenant)', kind: 'sync'},
       {
-        from: 'routing records',
+        from: 'Queue manager',
         to: 'Queue summary',
-        label: 'records[] · wait_seconds · fallback_reason',
+        label: 'GET /v1/queues/q-7/summary · X-Tenant-Id acme',
+        kind: 'sync',
+      },
+      {from: 'Queue summary', to: 'routing store', label: 'queue(q-7)', kind: 'sync'},
+      {
+        from: 'routing store',
+        to: 'Queue summary',
+        label: '{tenant: acme, name: billing} · globex → 404',
+        kind: 'reply',
+      },
+      {from: 'Queue summary', to: 'routing store', label: 'routing_records(acme, billing)', kind: 'sync'},
+      {
+        from: 'routing store',
+        to: 'Queue summary',
+        label: 'records · status · received_at · fallback_reason',
         kind: 'reply',
       },
       {
         from: 'Queue summary',
-        to: 'Manager',
-        label: '200 {depth, median_wait_s, fallback_share, fallback_count} · 404 for a foreign queue',
+        to: 'Queue manager',
+        label: '200 {depth, median_wait_s, fallback_count, fallback_share}',
         kind: 'reply',
       },
     ],
@@ -50,439 +61,392 @@ endpoint leaks one tenant's queue depth and wait times to another.
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/queues/{id}/summary',
-      detail: 'Register the summary route on `GET /v1/queues/{id}/summary`.',
+      title: 'Registers GET /v1/queues/{id}/summary',
+      detail:
+        'Register `GET /v1/queues/{id}/summary`; it answers the queue of the caller and 401 without `X-Tenant-Id`.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/queues\/\{queue_id\}\/summary["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/queues\/:queueId\/summary['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/queues\/\{id\}\/summary"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"queues"\s*\/\s*Segment\s*\/\s*"summary"\s*\)/, /\bget\s*\{/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"queues"\s*\/\s*Segment\s*\/\s*"summary"\s*\)/, /\bget\b/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/queues\//]},
       },
     },
     {
-      id: 'depth-from-records',
-      title: 'Depth is the routing record count',
+      id: 'tenant-scope',
+      title: "Answers 404 for another tenant's queue",
       detail:
-        'Depth is the length of the queue’s routing records for this tenant, not a cached counter. The starter reads a counter that misses rejected dedupe hits, so depth reads low whenever it matters.',
+        "The queue's tenant is compared with the caller's, and a queue the caller does not own is 404 like an unknown one; the records read are the caller's.",
       match: {
-        python: {all: [/routing_records\(/, /depth\s*=\s*len\(/], none: [/depth_counter/]},
-        typescript: {all: [/routingRecords\(/, /depth\s*=\s*records\.length/], none: [/depthCounter/]},
-        go: {all: [/RoutingRecords\(/, /depth\s*:=\s*len\(records\)/], none: [/depthCounter/]},
-        scala: {all: [/routingRecords\(/, /depth\s*=\s*records\.size/], none: [/DepthCounter/]},
-        cpp: {all: [/routingRecords\(/, /depth\s*=\s*records\.size\(\)/], none: [/depthCounter/]},
+        python: {all: [/\[\s*["']tenant["']\s*\]\s*[!=]=\s*tenant/, /\b404\b/]},
+        typescript: {all: [/\.tenant\s*[!=]==?\s*tenant/, /\b404\b/]},
+        go: {all: [/\.Tenant\s*[!=]=\s*tenant/, /StatusNotFound|\b404\b/]},
+        scala: {all: [/\.tenant\s*[!=]=\s*tenant/, /NotFound|\b404\b/]},
+        cpp: {all: [/(->|\.)tenant\s*[!=]=\s*tenant/, /\b404\b/]},
       },
     },
     {
-      id: 'fallback-share',
-      title: 'Reports the fallback share and count',
+      id: 'open-depth',
+      title: 'Counts open tickets only',
       detail:
-        'The response carries `fallback_share` and the raw `fallback_count`, computed from the records’ `fallback_reason`. The starter omits both, so a classifier outage looks like extra demand.',
+        'Depth and waits are computed over the records whose `status` is `open`; a closed ticket has left the queue.',
       match: {
-        python: {all: [/fallback_share/, /fallback_count/]},
-        typescript: {all: [/fallback_share/, /fallbackCount/]},
-        go: {all: [/"fallback_share"/, /FallbackCount/]},
-        scala: {all: [/fallback_share/, /fallbackCount/]},
-        cpp: {all: [/fallback_share/, /fallbackCount/]},
+        python: {all: [/["']open["']/]},
+        typescript: {all: [/["']open["']/]},
+        go: {all: [/"open"/]},
+        scala: {all: [/"open"/]},
+        cpp: {all: [/"open"/]},
       },
     },
     {
       id: 'median-wait',
-      title: 'Median wait is computed from the records',
+      title: 'Reports the median wait, not the mean',
       detail:
-        '`median_wait_s` is the median of the records’ wait times, sorted rather than averaged, and 0 for an empty queue. The starter reports no wait figure at all.',
+        '`median_wait_s` comes from the sorted waits (the middle one, or the mean of the middle two), so one stuck ticket does not move it.',
       match: {
-        python: {all: [/median_wait_s/, /sorted\(/]},
-        typescript: {all: [/median_wait_s/, /\.sort\(/]},
-        go: {all: [/"median_wait_s"/, /sort\.Slice/]},
-        scala: {all: [/median_wait_s/, /\.sorted/]},
-        cpp: {all: [/median_wait_s/, /std::sort/]},
+        python: {all: [/sorted\(|\.sort\(/], none: [/sum\(\s*waits\s*\)/]},
+        typescript: {all: [/\.sort\(/], none: [/\.reduce\(/]},
+        go: {all: [/sort\.(Slice|Ints|Sort)\(|slices\.Sort/], none: [/float64\(\s*total\s*\)/]},
+        scala: {all: [/\.sorted\b/], none: [/\.sum\b/]},
+        cpp: {all: [/std::(sort|nth_element)\(/], none: [/std::accumulate\(/]},
       },
     },
     {
-      id: 'tenant-scope',
-      title: 'Answers 404 for a queue of another tenant',
+      id: 'fallback-share',
+      title: 'Counts every fallback reason',
       detail:
-        'The queue’s owning tenant is checked against the caller; an unknown or foreign queue id is **404**. The starter serves any queue id to any caller.',
+        '`fallback_count` and `fallback_share` count every record the ruleset routed (any non-empty `fallback_reason`), not one reason picked by name.',
       match: {
-        python: {all: [/status_code\s*=\s*404/, /queue_tenant\(/]},
-        typescript: {all: [/code\(\s*404\s*\)/, /queueTenant\(/]},
-        go: {all: [/StatusNotFound/, /QueueTenant\(/]},
-        scala: {all: [/StatusCodes\.NotFound/, /queueTenant\(/]},
-        cpp: {all: [/status\s*=\s*404/, /queueTenant\(/]},
+        python: {all: [/fallback_reason/], none: [/classifier_timeout/]},
+        typescript: {all: [/fallback_reason/], none: [/classifier_timeout/]},
+        go: {all: [/FallbackReason/], none: [/classifier_timeout/]},
+        scala: {all: [/fallbackReason/], none: [/classifier_timeout/]},
+        cpp: {all: [/fallback_reason/], none: [/classifier_timeout/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+      starter: `import time
+
+from fastapi import FastAPI, HTTPException, Request
+
+from triage import store  # store.queue(queue_id), store.routing_records(tenant, queue)
 
 app = FastAPI()
 
 
-class QueueStore:
-    def depth_counter(self, queue_id: str) -> int:
-        """The cached depth for the queue."""
-        raise NotImplementedError
-
-
-store = QueueStore()
-
-
 @app.get("/v1/queues/{queue_id}/summary")
-def summary(queue_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    return JSONResponse({"queue_id": queue_id, "depth": store.depth_counter(queue_id)}, status_code=200)
+def summary(queue_id: str, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    queue = store.queue(queue_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail="no such queue")
+    records = store.routing_records(queue["tenant"], queue["name"])
+    now = int(time.time())
+    waits = [now - record["received_at"] for record in records]
+    fallback = sum(1 for record in records if record["fallback_reason"] == "classifier_timeout")
+    return {
+        "queue_id": queue_id,
+        "queue": queue["name"],
+        "depth": len(records),
+        "median_wait_s": sum(waits) / len(waits) if waits else 0,
+        "fallback_count": fallback,
+        "fallback_share": round(fallback / len(records), 3) if records else 0.0,
+    }
 `,
-      solution: `from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+      solution: `import time
+
+from fastapi import FastAPI, HTTPException, Request
+
+from triage import store  # store.queue(queue_id), store.routing_records(tenant, queue)
 
 app = FastAPI()
 
 
-class QueueStore:
-    def queue_tenant(self, queue_id: str) -> str | None:
-        """The tenant that owns the queue, if the queue exists."""
-        raise NotImplementedError
-
-    def routing_records(self, queue_id: str, tenant: str) -> list[dict]:
-        """Every routing record for the tenant's queue."""
-        raise NotImplementedError
-
-
-store = QueueStore()
-
-
-def median(values: list[float]) -> float:
-    """The middle value of the sorted series, 0.0 when there is nothing to summarize."""
-    if not values:
-        return 0.0
+def median(values: list[int]) -> float:
     ordered = sorted(values)
-    return ordered[len(ordered) // 2]
+    if not ordered:
+        return 0
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
 
 
 @app.get("/v1/queues/{queue_id}/summary")
-def summary(
-    queue_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    owner = store.queue_tenant(queue_id)
-    if owner != tenant:
-        raise HTTPException(status_code=404, detail="unknown queue")
-
-    records = store.routing_records(queue_id, tenant)
-    depth = len(records)
-    median_wait_s = median([record["wait_seconds"] for record in records])
-    fallback_count = sum(1 for record in records if record["fallback_reason"] != "")
-    fallback_share = round(fallback_count / depth, 4) if depth else 0.0
-    return JSONResponse(
-        {
-            "queue_id": queue_id,
-            "depth": depth,
-            "median_wait_s": median_wait_s,
-            "fallback_share": fallback_share,
-            "fallback_count": fallback_count,
-        },
-        status_code=200,
-    )
+def summary(queue_id: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    queue = store.queue(queue_id)
+    if queue is None or queue["tenant"] != tenant:
+        raise HTTPException(status_code=404, detail="no such queue")  # another tenant's queue does not exist for this caller
+    records = [record for record in store.routing_records(tenant, queue["name"]) if record["status"] == "open"]
+    now = int(time.time())
+    waits = [now - record["received_at"] for record in records]
+    fallback = sum(1 for record in records if record["fallback_reason"])
+    return {
+        "queue_id": queue_id,
+        "queue": queue["name"],
+        "depth": len(records),
+        "median_wait_s": median(waits),
+        "fallback_count": fallback,
+        "fallback_share": round(fallback / len(records), 3) if records else 0.0,
+    }
 `,
     },
     typescript: {
-      starter: `/** Queue summary. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {queue as findQueue, routingRecords} from 'triage/store';
 
 export const app = Fastify();
 
-interface QueueStore {
-  depthCounter(queueId: string): Promise<number>;
-}
-
-export function routes(store: QueueStore): void {
-  app.get('/v1/queues/:queueId/summary', async (request, reply) => {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const {queueId} = request.params as {queueId: string};
-    return reply.code(200).send({queue_id: queueId, depth: await store.depthCounter(queueId)});
-  });
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.get('/v1/queues/:queueId/summary', async (request, reply) => {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const {queueId} = request.params as {queueId: string};
+  const queue = await findQueue(queueId);
+  if (queue === null) return reply.code(404).send({error: 'no such queue'});
+  const records = await routingRecords(queue.tenant, queue.name);
+  const now = Math.floor(Date.now() / 1000);
+  const waits = records.map(record => now - record.received_at);
+  const fallback = records.filter(record => record.fallback_reason === 'classifier_timeout').length;
+  return {
+    queue_id: queueId,
+    queue: queue.name,
+    depth: records.length,
+    median_wait_s: waits.length ? waits.reduce((a, b) => a + b, 0) / waits.length : 0,
+    fallback_count: fallback,
+    fallback_share: records.length ? Math.round((fallback / records.length) * 1000) / 1000 : 0,
+  };
+});
 `,
-      solution: `/** Queue summary: depth, median wait and fallback share, read from the routing records. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {queue as findQueue, routingRecords} from 'triage/store';
 
 export const app = Fastify();
 
-interface RoutingRecord {
-  queue_id: string;
-  tenant: string;
-  wait_seconds: number;
-  fallback_reason: string;
-}
-
-interface QueueStore {
-  queueTenant(queueId: string): Promise<string | null>;
-  routingRecords(queueId: string, tenant: string): Promise<RoutingRecord[]>;
-}
-
-function median(values: number[]): number {
-  /** The middle value of the sorted series, 0 when there is nothing to summarize. */
-  if (values.length === 0) return 0;
-  const ordered = [...values].sort((a, b) => a - b);
-  return ordered[Math.floor(ordered.length / 2)];
-}
-
-export function routes(store: QueueStore): void {
-  app.get('/v1/queues/:queueId/summary', async (request, reply) => {
-    const tenant = request.headers['x-tenant-id'];
-    if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-    const {queueId} = request.params as {queueId: string};
-    const owner = await store.queueTenant(queueId);
-    if (owner !== tenant) return reply.code(404).send({error: 'unknown queue'});
-
-    const records = await store.routingRecords(queueId, tenant);
-    const depth = records.length;
-    const median_wait_s = median(records.map(record => record.wait_seconds));
-    const fallbackCount = records.filter(record => record.fallback_reason !== '').length;
-    const fallback_share = depth === 0 ? 0 : Number((fallbackCount / depth).toFixed(4));
-    return reply.code(200).send({queue_id: queueId, depth, median_wait_s, fallback_share, fallback_count: fallbackCount});
-  });
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.get('/v1/queues/:queueId/summary', async (request, reply) => {
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const {queueId} = request.params as {queueId: string};
+  const queue = await findQueue(queueId);
+  // Another tenant's queue does not exist for this caller.
+  if (queue === null || queue.tenant !== tenant) return reply.code(404).send({error: 'no such queue'});
+  const records = (await routingRecords(tenant, queue.name)).filter(record => record.status === 'open');
+  const now = Math.floor(Date.now() / 1000);
+  const waits = records.map(record => now - record.received_at).sort((a, b) => a - b);
+  const middle = Math.floor(waits.length / 2);
+  const median = waits.length === 0 ? 0 : waits.length % 2 === 1 ? waits[middle] : (waits[middle - 1] + waits[middle]) / 2;
+  const fallback = records.filter(record => record.fallback_reason !== '').length;
+  return {
+    queue_id: queueId,
+    queue: queue.name,
+    depth: records.length,
+    median_wait_s: median,
+    fallback_count: fallback,
+    fallback_share: records.length ? Math.round((fallback / records.length) * 1000) / 1000 : 0,
+  };
+});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
+	"math"
 	"net/http"
+	"time"
+
+	"triage/store" // store.Queue(ctx, queueID), store.RoutingRecords(ctx, tenant, queue)
 )
 
-type QueueStore struct{}
-
-func (s *QueueStore) DepthCounter(ctx context.Context, queueID string) int {
-	return 0
-}
-
-var store = &QueueStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func summary(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+func queueSummary(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
+		return
+	}
 	queueID := r.PathValue("id")
-	writeJSON(rw, http.StatusOK, map[string]any{"queue_id": queueID, "depth": store.DepthCounter(r.Context(), queueID)})
+	queue := store.Queue(r.Context(), queueID)
+	if queue == nil {
+		http.Error(rw, "no such queue", http.StatusNotFound)
+		return
+	}
+	records := store.RoutingRecords(r.Context(), queue.Tenant, queue.Name)
+	now := time.Now().Unix()
+	var total int64
+	fallback := 0
+	for _, rec := range records {
+		total += now - rec.ReceivedAt
+		if rec.FallbackReason == "classifier_timeout" {
+			fallback++
+		}
+	}
+	wait, share := 0.0, 0.0
+	if len(records) > 0 {
+		wait = float64(total) / float64(len(records))
+		share = math.Round(float64(fallback)/float64(len(records))*1000) / 1000
+	}
+	writeJSON(rw, http.StatusOK, map[string]any{"queue_id": queueID, "queue": queue.Name, "depth": len(records), "median_wait_s": wait,
+		"fallback_count": fallback, "fallback_share": share})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/queues/{id}/summary", summary)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/queues/{id}/summary", queueSummary)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
+	"math"
 	"net/http"
 	"sort"
+	"time"
+
+	"triage/store" // store.Queue(ctx, queueID), store.RoutingRecords(ctx, tenant, queue)
 )
 
-// RoutingRecord is one ticket's journey through triage, the only source of the summary numbers.
-type RoutingRecord struct {
-	QueueID        string  \`json:"queue_id"\`
-	Tenant         string  \`json:"tenant"\`
-	WaitSeconds    float64 \`json:"wait_seconds"\`
-	FallbackReason string  \`json:"fallback_reason"\`
-}
-
-type Summary struct {
-	QueueID       string  \`json:"queue_id"\`
-	Depth         int     \`json:"depth"\`
-	MedianWaitS   float64 \`json:"median_wait_s"\`
-	FallbackShare float64 \`json:"fallback_share"\`
-	FallbackCount int     \`json:"fallback_count"\`
-}
-
-type QueueStore struct{}
-
-func (s *QueueStore) QueueTenant(ctx context.Context, queueID string) (string, error) {
-	return "", nil
-}
-
-func (s *QueueStore) RoutingRecords(ctx context.Context, queueID, tenant string) ([]RoutingRecord, error) {
-	return nil, nil
-}
-
-var store = &QueueStore{}
-
-func median(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	ordered := append([]float64(nil), values...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
-	return ordered[len(ordered)/2]
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func summary(rw http.ResponseWriter, r *http.Request) {
+// median of the waits: the middle one, or the mean of the middle two; 0 for none.
+func median(waits []int64) float64 {
+	sort.Slice(waits, func(i, j int) bool { return waits[i] < waits[j] })
+	n := len(waits)
+	switch {
+	case n == 0:
+		return 0
+	case n%2 == 1:
+		return float64(waits[n/2])
+	default:
+		return float64(waits[n/2-1]+waits[n/2]) / 2
+	}
+}
+
+func queueSummary(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
 	queueID := r.PathValue("id")
-	owner, err := store.QueueTenant(r.Context(), queueID)
-	if err != nil || owner != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown queue"})
+	queue := store.Queue(r.Context(), queueID)
+	if queue == nil || queue.Tenant != tenant {
+		http.Error(rw, "no such queue", http.StatusNotFound) // another tenant's queue does not exist for this caller
 		return
 	}
-	records, err := store.RoutingRecords(r.Context(), queueID, tenant)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	depth := len(records)
-	waits := make([]float64, 0, depth)
-	fallbackCount := 0
-	for _, record := range records {
-		waits = append(waits, record.WaitSeconds)
-		if record.FallbackReason != "" {
-			fallbackCount++
+	now := time.Now().Unix()
+	var waits []int64
+	fallback := 0
+	for _, rec := range store.RoutingRecords(r.Context(), tenant, queue.Name) {
+		if rec.Status != "open" {
+			continue
+		}
+		waits = append(waits, now-rec.ReceivedAt)
+		if rec.FallbackReason != "" {
+			fallback++
 		}
 	}
 	share := 0.0
-	if depth > 0 {
-		share = float64(fallbackCount) / float64(depth)
+	if len(waits) > 0 {
+		share = math.Round(float64(fallback)/float64(len(waits))*1000) / 1000
 	}
-	writeJSON(rw, http.StatusOK, Summary{
-		QueueID:       queueID,
-		Depth:         depth,
-		MedianWaitS:   median(waits),
-		FallbackShare: share,
-		FallbackCount: fallbackCount,
-	})
+	writeJSON(rw, http.StatusOK, map[string]any{"queue_id": queueID, "queue": queue.Name, "depth": len(waits), "median_wait_s": median(waits),
+		"fallback_count": fallback, "fallback_share": share})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/queues/{id}/summary", summary)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/queues/{id}/summary", queueSummary)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-trait QueueStore {
-  def depthCounter(queueId: String): Long
-}
+import triage.Store // Store.queue(queueId), Store.routingRecords(tenant, queue)
 
 object QueueSummary {
-  implicit val system: ActorSystem = ActorSystem("ticket-triage")
-
-  val store: QueueStore = new QueueStore {
-    def depthCounter(queueId: String): Long = 0L
-  }
-
-  val route: Route =
-    path("v1" / "queues" / Segment / "summary") { queueId =>
-      get {
-        headerValueByName("X-Tenant-Id") { _ =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          complete(StatusCodes.OK, s"""{"queue_id":"$queueId","depth":\${store.depthCounter(queueId)}}""")
-        }
+  val route: Route = path("v1" / "queues" / Segment / "summary") { queueId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(_) =>
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+          Store.queue(queueId) match {
+            case None => complete(StatusCodes.NotFound -> "no such queue")
+            case Some(queue) =>
+              val records = Store.routingRecords(queue.tenant, queue.name)
+              val now = System.currentTimeMillis() / 1000
+              val waits = records.map(now - _.receivedAt)
+              val fallback = records.count(_.fallbackReason == "classifier_timeout")
+              val wait = if (waits.isEmpty) 0.0 else waits.sum.toDouble / waits.size
+              val share = if (records.isEmpty) 0.0 else math.round(fallback * 1000.0 / records.size) / 1000.0
+              val body = JsObject("queue_id" -> JsString(queueId), "queue" -> JsString(queue.name), "depth" -> JsNumber(records.size),
+                "median_wait_s" -> JsNumber(wait), "fallback_count" -> JsNumber(fallback), "fallback_share" -> JsNumber(share))
+              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
+          }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-final case class RoutingRecord(
-    queue_id: String,
-    tenant: String,
-    wait_seconds: Double,
-    fallback_reason: String
-)
-
-trait QueueStore {
-  def queueTenant(queueId: String): Option[String]
-  def routingRecords(queueId: String, tenant: String): Seq[RoutingRecord]
-}
+import triage.Store // Store.queue(queueId), Store.routingRecords(tenant, queue)
 
 object QueueSummary {
-  implicit val system: ActorSystem = ActorSystem("ticket-triage")
-
-  val store: QueueStore = new QueueStore {
-    def queueTenant(queueId: String): Option[String] = None
-    def routingRecords(queueId: String, tenant: String): Seq[RoutingRecord] = Nil
+  /** The middle wait, or the mean of the middle two; 0 for none. */
+  def median(waits: Seq[Long]): Double = {
+    val ordered = waits.sorted
+    val n = ordered.size
+    if (n == 0) 0.0
+    else if (n % 2 == 1) ordered(n / 2).toDouble
+    else (ordered(n / 2 - 1) + ordered(n / 2)) / 2.0
   }
 
-  /** The middle value of the sorted series, 0.0 when there is nothing to summarize. */
-  def median(values: Seq[Double]): Double =
-    if (values.isEmpty) 0.0
-    else {
-      val ordered = values.sorted
-      ordered(ordered.size / 2)
-    }
-
-  val route: Route =
-    path("v1" / "queues" / Segment / "summary") { queueId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          val tenant = tenantOpt.filter(_.nonEmpty)
-          if (tenant.isEmpty) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else if (!store.queueTenant(queueId).contains(tenant.get)) {
-            complete(StatusCodes.NotFound, """{"error":"unknown queue"}""")
-          } else {
-            val records = store.routingRecords(queueId, tenant.get)
-            val depth = records.size
-            val median_wait_s = median(records.map(_.wait_seconds))
-            val fallbackCount = records.count(_.fallback_reason.nonEmpty)
-            val fallback_share = if (depth == 0) 0.0 else fallbackCount.toDouble / depth
-            complete(
-              StatusCodes.OK,
-              s"""{"queue_id":"$queueId","depth":$depth,"median_wait_s":$median_wait_s,""" +
-                s""""fallback_share":$fallback_share,"fallback_count":$fallbackCount}"""
-            )
+  val route: Route = path("v1" / "queues" / Segment / "summary") { queueId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(tenant) =>
+          Store.queue(queueId) match {
+            case Some(queue) if queue.tenant == tenant =>
+              val records = Store.routingRecords(tenant, queue.name).filter(_.status == "open")
+              val now = System.currentTimeMillis() / 1000
+              val fallback = records.count(_.fallbackReason.nonEmpty)
+              val share = if (records.isEmpty) 0.0 else math.round(fallback * 1000.0 / records.size) / 1000.0
+              val body = JsObject("queue_id" -> JsString(queueId), "queue" -> JsString(queue.name), "depth" -> JsNumber(records.size),
+                "median_wait_s" -> JsNumber(median(records.map(now - _.receivedAt))), "fallback_count" -> JsNumber(fallback),
+                "fallback_share" -> JsNumber(share))
+              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
+            case _ => complete(StatusCodes.NotFound -> "no such queue") // another tenant's queue does not exist for this caller
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -491,109 +455,485 @@ object QueueSummary {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+#include <cmath>
+#include <numeric>
 #include <string>
+#include <vector>
+
+#include "triage/store.h"  // store::queue(queue_id), store::routingRecords(tenant, queue)
 
 using json = nlohmann::json;
 
-struct QueueStore {
-  long long depthCounter(const std::string& queueId);
-};
-
-QueueStore store;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/queues/([^/]+)/summary)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const std::string queueId = req.matches[1];
-    res.status = 200;
-    res.set_content(json{{"queue_id", queueId}, {"depth", store.depthCounter(queueId)}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void queue_summary(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const std::string queue_id = req.matches[1];
+  const auto queue = store::queue(queue_id);
+  if (!queue) {
+    res.status = 404;
+    res.set_content("no such queue", "text/plain");
+    return;
+  }
+  const auto records = store::routingRecords(queue->tenant, queue->name);
+  const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  std::vector<long long> waits;
+  int fallback = 0;
+  for (const auto& r : records) {
+    waits.push_back(now - r.received_at);
+    if (r.fallback_reason == "classifier_timeout") ++fallback;
+  }
+  const double wait = waits.empty() ? 0 : static_cast<double>(std::accumulate(waits.begin(), waits.end(), 0LL)) / waits.size();
+  const double share = records.empty() ? 0 : std::round(1000.0 * fallback / records.size()) / 1000;
+  res.set_content(json{{"queue_id", queue_id}, {"queue", queue->name}, {"depth", records.size()}, {"median_wait_s", wait},
+                       {"fallback_count", fallback}, {"fallback_share", share}}
+                      .dump(),
+                  "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/queues/([\\w-]+)/summary)", queue_summary); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <optional>
+#include <chrono>
+#include <cmath>
 #include <string>
 #include <vector>
 
+#include "triage/store.h"  // store::queue(queue_id), store::routingRecords(tenant, queue)
+
 using json = nlohmann::json;
 
-/** One ticket's journey through triage: the only source of the summary numbers. */
-struct RoutingRecord {
-  std::string queue_id;
-  std::string tenant;
-  double wait_seconds;
-  std::string fallback_reason;
-};
-
-struct QueueStore {
-  std::optional<std::string> queueTenant(const std::string& queueId);
-  std::vector<RoutingRecord> routingRecords(const std::string& queueId, const std::string& tenant);
-};
-
-QueueStore store;
-
-/** The middle value of the sorted series, 0 when there is nothing to summarize. */
-double median(std::vector<double> values) {
-  if (values.empty()) return 0.0;
-  std::sort(values.begin(), values.end());
-  return values[values.size() / 2];
+// The middle wait, or the mean of the middle two; 0 for none.
+double median(std::vector<long long> waits) {
+  std::sort(waits.begin(), waits.end());
+  const size_t n = waits.size();
+  if (n == 0) return 0;
+  return n % 2 == 1 ? static_cast<double>(waits[n / 2]) : (waits[n / 2 - 1] + waits[n / 2]) / 2.0;
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/queues/([^/]+)/summary)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const std::string queueId = req.matches[1];
-    const auto owner = store.queueTenant(queueId);
-    if (!owner || *owner != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown queue"})", "application/json");
-      return;
-    }
-
-    const auto records = store.routingRecords(queueId, tenant);
-    const std::size_t depth = records.size();
-    std::vector<double> waits;
-    waits.reserve(records.size());
-    long long fallbackCount = 0;
-    for (const auto& record : records) {
-      waits.push_back(record.wait_seconds);
-      if (!record.fallback_reason.empty()) fallbackCount += 1;
-    }
-    const double fallback_share = depth == 0 ? 0.0 : static_cast<double>(fallbackCount) / static_cast<double>(depth);
-    res.status = 200;
-    res.set_content(
-        json{{"queue_id", queueId},
-             {"depth", depth},
-             {"median_wait_s", median(waits)},
-             {"fallback_share", fallback_share},
-             {"fallback_count", fallbackCount}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void queue_summary(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const std::string queue_id = req.matches[1];
+  const auto queue = store::queue(queue_id);
+  if (!queue || queue->tenant != tenant) {
+    res.status = 404;  // another tenant's queue does not exist for this caller
+    res.set_content("no such queue", "text/plain");
+    return;
+  }
+  const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  std::vector<long long> waits;
+  int fallback = 0;
+  for (const auto& r : store::routingRecords(tenant, queue->name)) {
+    if (r.status != "open") continue;
+    waits.push_back(now - r.received_at);
+    if (!r.fallback_reason.empty()) ++fallback;
+  }
+  const double share = waits.empty() ? 0 : std::round(1000.0 * fallback / waits.size()) / 1000;
+  res.set_content(json{{"queue_id", queue_id}, {"queue", queue->name}, {"depth", waits.size()}, {"median_wait_s", median(waits)},
+                       {"fallback_count", fallback}, {"fallback_share", share}}
+                      .dump(),
+                  "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/queues/([\\w-]+)/summary)", queue_summary); }
 `,
     },
   },
+  harness: {
+    python: `import time
+
+from triage import store
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+def _seed(tenant, queue, ticket_id, wait, reason="", closed=False):
+    """A routed ticket that has waited wait seconds."""
+    store.record_routing({"ticket_id": ticket_id, "tenant": tenant, "queue": queue, "priority": "normal", "confidence": 0.9, "fallback_reason": reason, "received_at": int(time.time()) - wait})
+    if closed:
+        store.close_ticket(tenant, ticket_id)
+
+
+async def _summary(ctx, queue_id, tenant="acme"):
+    async with _api(ctx) as c:
+        r = await c.get(f"/v1/queues/{queue_id}/summary", headers={"X-Tenant-Id": tenant} if tenant else {})
+    return r
+
+
+async def check_route(ctx):
+    queue_id = store.create_queue("acme", "billing")
+    _seed("acme", "billing", "t-1", 60)
+    _seed("acme", "billing", "t-2", 120)
+    r = await _summary(ctx, queue_id)
+    assert r.status_code == 200, f"GET /v1/queues/{queue_id}/summary answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("queue_id") == queue_id and body.get("queue") == "billing" and body.get("depth") == 2, f"acme's billing queue holds two open tickets, the summary says {body}"
+    r = await _summary(ctx, queue_id, tenant="")
+    assert r.status_code == 401, f"a summary without X-Tenant-Id answered {r.status_code}, expected 401"
+
+
+async def check_tenant_scope(ctx):
+    acme = store.create_queue("acme", "billing")
+    globex = store.create_queue("globex", "billing")
+    _seed("acme", "billing", "t-1", 60)
+    _seed("acme", "billing", "t-2", 90)
+    _seed("globex", "billing", "t-9", 30)
+    r = await _summary(ctx, acme, tenant="globex")
+    assert r.status_code == 404, f"globex asked for acme's queue {acme} and got {r.status_code} {r.text}: a queue the caller does not own is 404, the same as an unknown id"
+    r = await _summary(ctx, "q-404")
+    assert r.status_code == 404, f"an unknown queue id answered {r.status_code}, expected 404"
+    r = await _summary(ctx, globex, tenant="globex")
+    assert r.status_code == 200 and r.json().get("depth") == 1, f"globex's own billing queue holds one ticket, got {r.status_code} {r.text}"
+
+
+async def check_open_depth(ctx):
+    queue_id = store.create_queue("acme", "billing")
+    for i, wait in enumerate((30, 60, 90)):
+        _seed("acme", "billing", f"t-{i}", wait)
+    _seed("acme", "billing", "t-closed-1", 5000, closed=True)
+    _seed("acme", "billing", "t-closed-2", 9000, closed=True)
+    _seed("acme", "delivery", "t-other", 10)
+    r = await _summary(ctx, queue_id)
+    body = r.json()
+    assert body.get("depth") == 3, f"acme's billing queue holds 3 open tickets and 2 closed ones, the summary says depth {body.get('depth')}: a closed ticket has left the queue"
+    assert abs(body.get("median_wait_s", -1) - 60) <= 1, f"the open tickets waited 30, 60 and 90 s, the summary says median_wait_s {body.get('median_wait_s')}: closed tickets do not wait"
+
+
+async def check_median_wait(ctx):
+    queue_id = store.create_queue("acme", "billing")
+    for i, wait in enumerate((30, 60, 90, 7200)):
+        _seed("acme", "billing", f"t-{i}", wait)
+    body = (await _summary(ctx, queue_id)).json()
+    assert abs(body.get("median_wait_s", -1) - 75) <= 1, f"four tickets waited 30, 60, 90 and 7200 s: the median is 75, the summary says {body.get('median_wait_s')}. A mean is dragged by the one stuck ticket"
+    _seed("acme", "billing", "t-4", 120)
+    body = (await _summary(ctx, queue_id)).json()
+    assert abs(body.get("median_wait_s", -1) - 90) <= 1, f"five tickets waited 30, 60, 90, 120 and 7200 s: the median is 90, the summary says {body.get('median_wait_s')}"
+    empty = store.create_queue("acme", "account")
+    body = (await _summary(ctx, empty)).json()
+    assert body.get("depth") == 0 and body.get("median_wait_s") == 0, f"an empty queue has depth 0 and median_wait_s 0, the summary says {body}"
+
+
+async def check_fallback_share(ctx):
+    queue_id = store.create_queue("acme", "billing")
+    for i, reason in enumerate(("", "classifier_timeout", "classifier_unavailable", "breaker_open")):
+        _seed("acme", "billing", f"t-{i}", 60, reason)
+    body = (await _summary(ctx, queue_id)).json()
+    assert body.get("fallback_count") == 3, f"three of four tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker): fallback_count must be 3, the summary says {body.get('fallback_count')}"
+    assert abs(body.get("fallback_share", -1) - 0.75) < 0.001, f"fallback_share must be 3 of 4 = 0.75, the summary says {body.get('fallback_share')}"
+`,
+    typescript: `function api(ctx) {
+  return {c: ctx.client(ctx.load('read').app), store: ctx.load('/support/triage/store.ts')};
+}
+
+/** A routed ticket that has waited wait seconds. */
+async function seed(ctx, store, tenant: string, queue: string, ticketId: string, wait: number, reason = '', closed = false): Promise<void> {
+  const receivedAt = Math.floor(ctx.clock.now() / 1000) - wait;
+  await store.recordRouting({ticket_id: ticketId, tenant, queue, priority: 'normal', confidence: 0.9, fallback_reason: reason, received_at: receivedAt});
+  if (closed) await store.closeTicket(tenant, ticketId);
+}
+
+const summary = (c, queueId: string, tenant = 'acme') => c.get(\`/v1/queues/\${queueId}/summary\`, {headers: tenant ? {'X-Tenant-Id': tenant} : {}});
+
+export async function check_route(ctx) {
+  const {c, store} = api(ctx);
+  const queueId = await store.createQueue('acme', 'billing');
+  await seed(ctx, store, 'acme', 'billing', 't-1', 60);
+  await seed(ctx, store, 'acme', 'billing', 't-2', 120);
+  let r = await summary(c, queueId);
+  assert.equal(r.status, 200, \`GET /v1/queues/\${queueId}/summary answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.queue_id === queueId && body.queue === 'billing' && body.depth === 2, \`acme's billing queue holds two open tickets, the summary says \${r.text}\`);
+  r = await summary(c, queueId, '');
+  assert.equal(r.status, 401, \`a summary without X-Tenant-Id answered \${r.status}, expected 401\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c, store} = api(ctx);
+  const acme = await store.createQueue('acme', 'billing');
+  const globex = await store.createQueue('globex', 'billing');
+  await seed(ctx, store, 'acme', 'billing', 't-1', 60);
+  await seed(ctx, store, 'acme', 'billing', 't-2', 90);
+  await seed(ctx, store, 'globex', 'billing', 't-9', 30);
+  let r = await summary(c, acme, 'globex');
+  assert.equal(r.status, 404, \`globex asked for acme's queue \${acme} and got \${r.status} \${r.text}: a queue the caller does not own is 404, the same as an unknown id\`);
+  r = await summary(c, 'q-404');
+  assert.equal(r.status, 404, \`an unknown queue id answered \${r.status}, expected 404\`);
+  r = await summary(c, globex, 'globex');
+  assert(r.status === 200 && r.json().depth === 1, \`globex's own billing queue holds one ticket, got \${r.status} \${r.text}\`);
+}
+
+export async function check_open_depth(ctx) {
+  const {c, store} = api(ctx);
+  const queueId = await store.createQueue('acme', 'billing');
+  for (const [i, wait] of [30, 60, 90].entries()) await seed(ctx, store, 'acme', 'billing', \`t-\${i}\`, wait);
+  await seed(ctx, store, 'acme', 'billing', 't-closed-1', 5000, '', true);
+  await seed(ctx, store, 'acme', 'billing', 't-closed-2', 9000, '', true);
+  await seed(ctx, store, 'acme', 'delivery', 't-other', 10);
+  const body = (await summary(c, queueId)).json();
+  assert.equal(body.depth, 3, \`acme's billing queue holds 3 open tickets and 2 closed ones, the summary says depth \${body.depth}: a closed ticket has left the queue\`);
+  assert(Math.abs(body.median_wait_s - 60) <= 1, \`the open tickets waited 30, 60 and 90 s, the summary says median_wait_s \${body.median_wait_s}: closed tickets do not wait\`);
+}
+
+export async function check_median_wait(ctx) {
+  const {c, store} = api(ctx);
+  const queueId = await store.createQueue('acme', 'billing');
+  for (const [i, wait] of [30, 60, 90, 7200].entries()) await seed(ctx, store, 'acme', 'billing', \`t-\${i}\`, wait);
+  let body = (await summary(c, queueId)).json();
+  assert(Math.abs(body.median_wait_s - 75) <= 1, \`four tickets waited 30, 60, 90 and 7200 s: the median is 75, the summary says \${body.median_wait_s}. A mean is dragged by the one stuck ticket\`);
+  await seed(ctx, store, 'acme', 'billing', 't-4', 120);
+  body = (await summary(c, queueId)).json();
+  assert(Math.abs(body.median_wait_s - 90) <= 1, \`five tickets waited 30, 60, 90, 120 and 7200 s: the median is 90, the summary says \${body.median_wait_s}\`);
+  const empty = await store.createQueue('acme', 'account');
+  body = (await summary(c, empty)).json();
+  assert(body.depth === 0 && body.median_wait_s === 0, \`an empty queue has depth 0 and median_wait_s 0, the summary says \${JSON.stringify(body)}\`);
+}
+
+export async function check_fallback_share(ctx) {
+  const {c, store} = api(ctx);
+  const queueId = await store.createQueue('acme', 'billing');
+  for (const [i, reason] of ['', 'classifier_timeout', 'classifier_unavailable', 'breaker_open'].entries()) await seed(ctx, store, 'acme', 'billing', \`t-\${i}\`, 60, reason);
+  const body = (await summary(c, queueId)).json();
+  assert.equal(body.fallback_count, 3, \`three of four tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker): fallback_count must be 3, the summary says \${body.fallback_count}\`);
+  assert(Math.abs(body.fallback_share - 0.75) < 0.001, \`fallback_share must be 3 of 4 = 0.75, the summary says \${body.fallback_share}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"triage/store"
+
+	"leetbuild/harness"
+)
+
+var readBg = context.Background()
+
+func summaryAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+// seed records a routed ticket that has waited wait seconds.
+func seed(ctx *harness.Ctx, tenant, queue, ticketID string, wait int64, reason string, closed bool) {
+	r := store.Routing{TicketID: ticketID, Tenant: tenant, Queue: queue, Priority: "normal", Confidence: 0.9, FallbackReason: reason, ReceivedAt: ctx.Clock.Now()/1000 - wait}
+	ctx.NoError(store.RecordRouting(readBg, r), "recording %s", ticketID)
+	if closed {
+		store.CloseTicket(readBg, tenant, ticketID)
+	}
+}
+
+func summaryOf(ctx *harness.Ctx, queueID, tenant string) (*harness.Response, map[string]any) {
+	var header []string
+	if tenant != "" {
+		header = []string{"X-Tenant-Id", tenant}
+	}
+	r := summaryAPI(ctx).Get("/v1/queues/"+queueID+"/summary", header...)
+	if r.Status != 200 {
+		return r, nil
+	}
+	body, _ := r.JSON().(map[string]any)
+	return r, body
+}
+
+func number(body map[string]any, field string) float64 {
+	v, ok := body[field].(float64)
+	if !ok {
+		return -1
+	}
+	return v
+}
+
+func near(got, want float64) bool { return got >= want-1 && got <= want+1 }
+
+func CheckRoute(ctx *harness.Ctx) {
+	queueID := store.CreateQueue(readBg, "acme", "billing")
+	seed(ctx, "acme", "billing", "t-1", 60, "", false)
+	seed(ctx, "acme", "billing", "t-2", 120, "", false)
+	r, body := summaryOf(ctx, queueID, "acme")
+	ctx.Equal(r.Status, 200, "GET /v1/queues/%s/summary (%s)", queueID, r.Text())
+	ctx.Assert(body["queue_id"] == queueID && body["queue"] == "billing" && number(body, "depth") == 2, "acme's billing queue holds two open tickets, the summary says %v", body)
+	r, _ = summaryOf(ctx, queueID, "")
+	ctx.Equal(r.Status, 401, "a summary without X-Tenant-Id")
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	acme := store.CreateQueue(readBg, "acme", "billing")
+	globex := store.CreateQueue(readBg, "globex", "billing")
+	seed(ctx, "acme", "billing", "t-1", 60, "", false)
+	seed(ctx, "acme", "billing", "t-2", 90, "", false)
+	seed(ctx, "globex", "billing", "t-9", 30, "", false)
+	r, _ := summaryOf(ctx, acme, "globex")
+	ctx.Assert(r.Status == 404, "globex asked for acme's queue %s and got %d %s: a queue the caller does not own is 404, the same as an unknown id", acme, r.Status, r.Text())
+	r, _ = summaryOf(ctx, "q-404", "acme")
+	ctx.Equal(r.Status, 404, "an unknown queue id")
+	r, body := summaryOf(ctx, globex, "globex")
+	ctx.Assert(r.Status == 200 && number(body, "depth") == 1, "globex's own billing queue holds one ticket, got %d %s", r.Status, r.Text())
+}
+
+func CheckOpenDepth(ctx *harness.Ctx) {
+	queueID := store.CreateQueue(readBg, "acme", "billing")
+	for i, wait := range []int64{30, 60, 90} {
+		seed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), wait, "", false)
+	}
+	seed(ctx, "acme", "billing", "t-closed-1", 5000, "", true)
+	seed(ctx, "acme", "billing", "t-closed-2", 9000, "", true)
+	seed(ctx, "acme", "delivery", "t-other", 10, "", false)
+	_, body := summaryOf(ctx, queueID, "acme")
+	ctx.Equal(number(body, "depth"), 3.0, "acme's billing queue holds 3 open tickets and 2 closed ones: a closed ticket has left the queue; the depth")
+	ctx.Assert(near(number(body, "median_wait_s"), 60), "the open tickets waited 30, 60 and 90 s, the summary says median_wait_s %v: closed tickets do not wait", body["median_wait_s"])
+}
+
+func CheckMedianWait(ctx *harness.Ctx) {
+	queueID := store.CreateQueue(readBg, "acme", "billing")
+	for i, wait := range []int64{30, 60, 90, 7200} {
+		seed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), wait, "", false)
+	}
+	_, body := summaryOf(ctx, queueID, "acme")
+	ctx.Assert(near(number(body, "median_wait_s"), 75), "four tickets waited 30, 60, 90 and 7200 s: the median is 75, the summary says %v. A mean is dragged by the one stuck ticket", body["median_wait_s"])
+	seed(ctx, "acme", "billing", "t-4", 120, "", false)
+	_, body = summaryOf(ctx, queueID, "acme")
+	ctx.Assert(near(number(body, "median_wait_s"), 90), "five tickets waited 30, 60, 90, 120 and 7200 s: the median is 90, the summary says %v", body["median_wait_s"])
+	empty := store.CreateQueue(readBg, "acme", "account")
+	_, body = summaryOf(ctx, empty, "acme")
+	ctx.Assert(number(body, "depth") == 0 && number(body, "median_wait_s") == 0, "an empty queue has depth 0 and median_wait_s 0, the summary says %v", body)
+}
+
+func CheckFallbackShare(ctx *harness.Ctx) {
+	queueID := store.CreateQueue(readBg, "acme", "billing")
+	for i, reason := range []string{"", "classifier_timeout", "classifier_unavailable", "breaker_open"} {
+		seed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), 60, reason, false)
+	}
+	_, body := summaryOf(ctx, queueID, "acme")
+	ctx.Equal(number(body, "fallback_count"), 3.0, "three of four tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker); fallback_count")
+	share := number(body, "fallback_share")
+	ctx.Assert(share > 0.749 && share < 0.751, "fallback_share must be 3 of 4 = 0.75, the summary says %v", body["fallback_share"])
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <cmath>
+#include <string>
+#include <vector>
+
+namespace {
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+// A routed ticket that has waited wait seconds.
+void seed(harness::Ctx& ctx, const std::string& tenant, const std::string& queue, const std::string& ticket_id, long long wait,
+          const std::string& reason = "", bool closed = false) {
+  store::recordRouting({{"ticket_id", ticket_id}, {"tenant", tenant}, {"queue", queue}, {"priority", "normal"}, {"confidence", 0.9},
+                        {"fallback_reason", reason}, {"received_at", ctx.Clock.Now() / 1000 - wait}});
+  if (closed) store::closeTicket(tenant, ticket_id);
+}
+
+harness::Response summary(harness::Ctx& ctx, const std::string& queue_id, const std::string& tenant = "acme") {
+  auto c = api(ctx);
+  const std::string path = "/v1/queues/" + queue_id + "/summary";
+  return tenant.empty() ? c.Get(path) : c.Get(path, "X-Tenant-Id", tenant);
+}
+
+nlohmann::json body(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+double number(const nlohmann::json& b, const std::string& field) {
+  return b.is_object() && b.contains(field) && b[field].is_number() ? b[field].get<double>() : -1;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  const std::string queue_id = store::createQueue("acme", "billing");
+  seed(ctx, "acme", "billing", "t-1", 60);
+  seed(ctx, "acme", "billing", "t-2", 120);
+  auto r = summary(ctx, queue_id);
+  ctx.Equal(r.Status, 200, "GET /v1/queues/%s/summary (%s)", queue_id, r.Text());
+  const auto b = body(r);
+  ctx.Assert(b.value("queue_id", "") == queue_id && b.value("queue", "") == "billing" && number(b, "depth") == 2, "acme's billing queue holds two open tickets, the summary says %s", r.Text());
+  r = summary(ctx, queue_id, "");
+  ctx.Equal(r.Status, 401, "a summary without X-Tenant-Id");
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  const std::string acme = store::createQueue("acme", "billing");
+  const std::string globex = store::createQueue("globex", "billing");
+  seed(ctx, "acme", "billing", "t-1", 60);
+  seed(ctx, "acme", "billing", "t-2", 90);
+  seed(ctx, "globex", "billing", "t-9", 30);
+  auto r = summary(ctx, acme, "globex");
+  ctx.Assert(r.Status == 404, "globex asked for acme's queue %s and got %d %s: a queue the caller does not own is 404, the same as an unknown id", acme, r.Status, r.Text());
+  r = summary(ctx, "q-404");
+  ctx.Equal(r.Status, 404, "an unknown queue id");
+  r = summary(ctx, globex, "globex");
+  ctx.Assert(r.Status == 200 && number(body(r), "depth") == 1, "globex's own billing queue holds one ticket, got %d %s", r.Status, r.Text());
+}
+
+void CheckOpenDepth(harness::Ctx& ctx) {
+  const std::string queue_id = store::createQueue("acme", "billing");
+  const std::vector<long long> waits = {30, 60, 90};
+  for (size_t i = 0; i < waits.size(); ++i) seed(ctx, "acme", "billing", "t-" + std::to_string(i), waits[i]);
+  seed(ctx, "acme", "billing", "t-closed-1", 5000, "", true);
+  seed(ctx, "acme", "billing", "t-closed-2", 9000, "", true);
+  seed(ctx, "acme", "delivery", "t-other", 10);
+  const auto b = body(summary(ctx, queue_id));
+  ctx.Equal(number(b, "depth"), 3, "acme's billing queue holds 3 open tickets and 2 closed ones: a closed ticket has left the queue; the depth");
+  ctx.Assert(std::fabs(number(b, "median_wait_s") - 60) <= 1, "the open tickets waited 30, 60 and 90 s, the summary says median_wait_s %v: closed tickets do not wait", number(b, "median_wait_s"));
+}
+
+void CheckMedianWait(harness::Ctx& ctx) {
+  const std::string queue_id = store::createQueue("acme", "billing");
+  const std::vector<long long> waits = {30, 60, 90, 7200};
+  for (size_t i = 0; i < waits.size(); ++i) seed(ctx, "acme", "billing", "t-" + std::to_string(i), waits[i]);
+  auto b = body(summary(ctx, queue_id));
+  ctx.Assert(std::fabs(number(b, "median_wait_s") - 75) <= 1, "four tickets waited 30, 60, 90 and 7200 s: the median is 75, the summary says %v. A mean is dragged by the one stuck ticket", number(b, "median_wait_s"));
+  seed(ctx, "acme", "billing", "t-4", 120);
+  b = body(summary(ctx, queue_id));
+  ctx.Assert(std::fabs(number(b, "median_wait_s") - 90) <= 1, "five tickets waited 30, 60, 90, 120 and 7200 s: the median is 90, the summary says %v", number(b, "median_wait_s"));
+  const std::string empty = store::createQueue("acme", "account");
+  b = body(summary(ctx, empty));
+  ctx.Assert(number(b, "depth") == 0 && number(b, "median_wait_s") == 0, "an empty queue has depth 0 and median_wait_s 0, the summary says %s", b.dump());
+}
+
+void CheckFallbackShare(harness::Ctx& ctx) {
+  const std::string queue_id = store::createQueue("acme", "billing");
+  const std::vector<std::string> reasons = {"", "classifier_timeout", "classifier_unavailable", "breaker_open"};
+  for (size_t i = 0; i < reasons.size(); ++i) seed(ctx, "acme", "billing", "t-" + std::to_string(i), 60, reasons[i]);
+  const auto b = body(summary(ctx, queue_id));
+  ctx.Equal(number(b, "fallback_count"), 3, "three of four tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker); fallback_count");
+  ctx.Assert(std::fabs(number(b, "fallback_share") - 0.75) < 0.001, "fallback_share must be 3 of 4 = 0.75, the summary says %v", number(b, "fallback_share"));
+}
+`,
+  },
   hints: [
-    'During a classifier outage the dashboard shows a normal depth and no sign that rules are routing; a manager from tenant B can read `/v1/queues/billing/summary` for tenant A by guessing the name.',
-    'The handler is one line: `depth_counter` is a counter beside the records rather than a count of them, no wait or fallback figure is derived, and `tenant` is read but compared with nothing.',
-    'Resolve `queue_tenant(queue_id)` and 404 on mismatch, then load `routing_records(queue_id, tenant)`: `depth = len(records)`, `median_wait_s` from `sorted` waits, `fallback_count`/`fallback_share` from `fallback_reason`.',
+    "Ask for another tenant's queue id and the summary answers; close half a queue's tickets and its depth does not move; add one ticket that waited two hours and the wait jumps from a minute to half an hour.",
+    "The records are read for the queue's tenant, not the caller's, every record counts whatever its status, the wait is a sum over a count, and the fallback filter names one reason.",
+    'Answer 404 when `queue["tenant"] != tenant` and read the caller\'s records; keep `status == "open"`; take the middle of `sorted(waits)` (the mean of the middle two for an even count); count any non-empty `fallback_reason`.',
   ],
-  debrief: `Every figure comes from the routing records in one pass because a counter kept beside them is a cache with no invalidation: it disagrees with the records after any rejection or fallback, which is exactly when a manager is deciding whether to add agents. The median rather than the mean keeps one three-day ticket from making a healthy queue look broken, and the fallback share is the number that distinguishes a classifier outage from a busy day. Scoping the queue to the caller's tenant and answering 404 for both a missing and a foreign queue keeps the endpoint from being used to enumerate other tenants' queue names. Production platforms add a time window to the summary, a per-queue SLO breach count, and a cached aggregate invalidated by the routing events rather than by a timer.`,
+  debrief: `A summary is only as honest as the records it is computed from, which is why it reads them rather than a counter: it inherits the consumer's idempotence and every correction a record receives. Comparing the queue's tenant before reading anything, and answering 404 rather than 403, keeps the queue ids of one tenant from telling another anything. The median is the figure a manager staffs by, because waits are long-tailed and a mean answers to the worst ticket. Counting every fallback reason makes a classifier outage visible whatever its cause. Production dashboards add a high percentile beside the median, an oldest-ticket age for the tail itself, and a precomputed rollup per minute once a queue holds too many records to scan per request.`,
 };

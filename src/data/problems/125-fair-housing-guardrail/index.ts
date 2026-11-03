@@ -85,6 +85,12 @@ judge, the thresholds, the deadlines and the policy versioning are this course's
 5. **Kafka**: one \`fairhousing.audit\` event per decision keyed by conversation, carrying a text
    hash, from an idempotent producer with an outbox, appended before the offset commit.
 
+## The debugging habit
+
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
+
 ## Left out on purpose
 
 Training the classifier, the labelled dataset, the review tooling, the assistant's own retrieval,

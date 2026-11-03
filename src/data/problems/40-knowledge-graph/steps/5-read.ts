@@ -2,524 +2,543 @@ import type {Step} from '@/lib/types';
 
 export const neighborReadStep: Step = {
   id: 'read',
-  title: 'GET /v1/entities/{id}/neighbors: traversal with hard stops',
+  title: 'GET /v1/entities/{id}/neighbors: a bounded walk inside the tenant',
   concept: 'http',
   file: 'read',
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/entities/{id}/neighbors?depth=…\`: it attaches
-\`read_neighbors\` to the route after the fact, defaults \`depth\` to 5, recurses over every path from
-the entity under the \`"default"\` tenant, and returns every edge it touched. It compiles, answers
-for the demo graph, and hides five flaws.
+**Starting point.** The starter serves \`GET /v1/entities/{id}/neighbors?depth=\` on the adjacency
+cache (\`graph.adjacency.read_neighbors\`, step 2, provided). It reads the tenant from
+\`X-Tenant-Id\` (401 without it), answers 404 for an unknown entity, defaults \`depth\` to 2 and
+walks recursively from the entity, answering
+\`{"entity_id", "depth", "neighbors": [{"id", "distance"}], "truncated": false}\`. It serves the
+demo and hides four flaws.
 
-**Failure mode the checks target.** One request for a hub entity visits the same nodes through an
-exponential number of paths and takes the service down. Any tenant that knows an entity id can read
-another tenant's edges. A legitimate depth-2 walk over a hub returns an unbounded body with no way
-to tell a complete answer from a clipped one. The route is wired without the header and query
-parameters the handler needs to validate anything.
+**Failure mode the checks target.** Any tenant reads another tenant's graph by id; a request with
+\`depth=6\` on a hub takes the service down; the walk lists the same entity many times, the entity
+itself included; and a hub with thousands of neighbours answers all of them.
 
-- Register the route with the \`@app.get\` decorator. The tenant comes from \`X-Tenant-Id\` (**401**
-  when absent), and the entity must belong to that tenant: a foreign or unknown id is **404**
-  (\`entity_tenant\`).
-- \`depth\` defaults to **1**; \`depth > MAX_DEPTH\` (\`MAX_DEPTH = 2\`) is **400** before any
-  traversal.
-- The traversal is bounded breadth-first over a \`frontier\` and a \`visited\` set in \`neighbors\`,
-  so each node is expanded once and paths are not enumerated.
-- The result is capped at \`MAX_EDGES = 500\` edges; a truncated walk still returns the 500 edges
-  with \`truncated: true\`.
-- Read through the versioned adjacency cache from the earlier step; a miss or a stale version
-  reloads from the graph store.`,
+- An entity whose \`tenant\` is not the caller's is **404**, the same answer as an unknown id.
+- \`depth\` defaults to **1**; a depth that is not a number from 1 to \`MAX_DEPTH\` (2) is **400**
+  before any traversal.
+- The walk is breadth-first over a \`frontier\` with a \`visited\` set: each entity once, at its
+  shortest distance, never the entity itself.
+- At most \`MAX_RESULTS\` (500) neighbours; a walk that had more answers the first 500 with
+  \`truncated: true\`.`,
   sequence: {
-    participants: ['Client', 'graph-api', 'Adjacency cache', 'Graph store'],
+    participants: ['Client', 'graph-api', 'Graph store', 'Adjacency cache'],
     messages: [
-      {from: 'Client', to: 'graph-api', label: 'GET /v1/entities/{id}/neighbors?depth=2', kind: 'sync'},
-      {from: 'graph-api', to: 'graph-api', label: '401 tenant · 400 depth · 404 owner', kind: 'sync'},
-      {from: 'graph-api', to: 'Adjacency cache', label: 'GET adj:(tenant, entity)', kind: 'sync'},
-      {from: 'Adjacency cache', to: 'graph-api', label: 'stamped list / miss', kind: 'reply'},
-      {from: 'graph-api', to: 'Graph store', label: 'load neighbours (on miss)', kind: 'sync'},
-      {from: 'Graph store', to: 'graph-api', label: 'neighbours', kind: 'reply'},
-      {from: 'graph-api', to: 'Client', label: '200 edges · truncated marker', kind: 'reply'},
+      {from: 'Client', to: 'graph-api', label: 'GET /v1/entities/e-1/neighbors?depth=2 · X-Tenant-Id', kind: 'sync'},
+      {from: 'graph-api', to: 'Graph store', label: 'get_entity(e-1) → tenant', kind: 'sync'},
+      {from: 'graph-api', to: 'Client', label: '404 another tenant · 400 depth outside 1..2', kind: 'reply'},
+      {from: 'graph-api', to: 'Adjacency cache', label: 'read_neighbors(node) per frontier node', kind: 'sync'},
+      {from: 'graph-api', to: 'graph-api', label: 'skip visited · stop at 500', kind: 'sync'},
+      {from: 'graph-api', to: 'Client', label: '200 neighbors [{id, distance}] · truncated', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/entities/{id}/neighbors',
-      detail: 'Register the neighbour route on `GET /v1/entities/{id}/neighbors`.',
-      match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/entities\/\{entity_id\}\/neighbors["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/entities\/:entityId\/neighbors['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/entities\/\{entityID\}\/neighbors"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"entities"\s*\/\s*Segment\s*\/\s*"neighbors"\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(R"\(\/v1\/entities/]},
-      },
-    },
-    {
-      id: 'depth-cap',
-      title: 'Refuses depth above 2 with 400',
+      title: 'Registers GET /v1/entities/{id}/neighbors on the adjacency cache',
       detail:
-        '`MAX_DEPTH = 2` and any `depth > MAX_DEPTH` is **400** before any traversal. The starter accepts an unbounded depth and walks it.',
+        'Register the route, read the tenant from `X-Tenant-Id` and answer the entity’s neighbours with their distance, read through `read_neighbors`/`readNeighbors`.',
       match: {
-        python: {all: [/MAX_DEPTH\s*=\s*2/, /depth\s*>\s*MAX_DEPTH/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_DEPTH\s*=\s*2/, /depth\s*>\s*MAX_DEPTH/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxDepth\s*=\s*2/, /depth\s*>\s*maxDepth/, /StatusBadRequest/]},
-        scala: {all: [/MaxDepth\s*=\s*2/, /depth\s*>\s*MaxDepth/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kMaxDepth\s*=\s*2/, /depth\s*>\s*kMaxDepth/, /\b400\b/]},
-      },
-    },
-    {
-      id: 'edge-cap',
-      title: 'Caps the result at 500 edges with a truncation marker',
-      detail:
-        '`MAX_EDGES = 500`; a walk that hits the cap stops and the response carries `truncated: true` so the caller knows the answer is clipped. The starter returns unbounded edges.',
-      match: {
-        python: {all: [/MAX_EDGES\s*=\s*500/, /truncated/]},
-        typescript: {all: [/MAX_EDGES\s*=\s*500/, /truncated/]},
-        go: {all: [/maxEdges\s*=\s*500/, /truncated/]},
-        scala: {all: [/MaxEdges\s*=\s*500/, /truncated/]},
-        cpp: {all: [/kMaxEdges\s*=\s*500/, /truncated/]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/entities\/\{entity_id\}\/neighbors["']/, /read_neighbors\(/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/entities\/:\w+\/neighbors['"]/, /readNeighbors\(/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/entities\/\{\w+\}\/neighbors"/, /adjacency\.ReadNeighbors\(/]},
+        scala: {
+          all: [/path\(\s*"v1"\s*\/\s*"entities"\s*\/\s*Segment\s*\/\s*"neighbors"\s*\)/, /Adjacency\.readNeighbors\(/],
+        },
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/entities\/[^"]*\/neighbors\)"/, /adjacency::readNeighbors\(/]},
       },
     },
     {
       id: 'tenant-scope',
-      title: 'A foreign or unknown entity id is 404',
+      title: 'Another tenant’s entity is 404',
       detail:
-        'The endpoint resolves the entity’s owning tenant (`entity_tenant`) and answers **404** when it is unknown or belongs to someone else. The starter returns any tenant’s edges whenever the id is known.',
+        'The entity’s `tenant` is compared with `X-Tenant-Id` and a mismatch answers 404, as an unknown id does; the starter only checks that the entity exists.',
       match: {
-        python: {all: [/entity_tenant\(/, /status_code\s*=\s*404/]},
-        typescript: {all: [/entityTenant\(/, /code\(\s*404\s*\)/]},
-        go: {all: [/EntityTenant\(/, /StatusNotFound/]},
-        scala: {all: [/entityTenant\(/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/entityTenant\(/, /\b404\b/]},
+        python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*\w+\[["']tenant["']\]/, /\b404\b/]},
+        typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*\w+\.tenant/, /code\(\s*404\s*\)/]},
+        go: {all: [/\.Tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.Tenant/, /StatusNotFound|\b404\b/]},
+        scala: {all: [/\.tenant\s*==\s*tenant|tenant\s*==\s*\w+\.tenant/, /StatusCodes\.NotFound/]},
+        cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*\w+->tenant/, /\b404\b/]},
+      },
+    },
+    {
+      id: 'depth-cap',
+      title: 'Depth defaults to 1 and above 2 is 400',
+      detail:
+        '`depth` defaults to 1 and anything outside 1..`MAX_DEPTH` (2) answers 400 before the walk; the starter defaults to 2 and walks whatever depth it is given.',
+      match: {
+        python: {all: [/MAX_DEPTH\s*=\s*2\b/, /\b400\b/]},
+        typescript: {all: [/MAX_DEPTH\s*=\s*2\b/, /code\(\s*400\s*\)/]},
+        go: {all: [/maxDepth\s*=\s*2\b/, /StatusBadRequest|\b400\b/]},
+        scala: {all: [/MaxDepth\s*=\s*2\b/, /StatusCodes\.BadRequest/]},
+        cpp: {all: [/kMaxDepth\s*=\s*2\b/, /\b400\b/]},
       },
     },
     {
       id: 'bounded-traversal',
-      title: 'Traverses breadth-first with a frontier and a visited set',
+      title: 'Walks breadth-first with a visited set',
       detail:
-        '`neighbors` walks level by level with a `frontier` and a `visited` set, so each node is expanded once. The starter recurses over paths and expands a hub exponentially.',
+        'A `frontier` per distance and a `visited` set seeded with the entity: each neighbour appears once at its shortest distance. The starter recurses into every neighbour, so paths are enumerated and the entity lists itself.',
       match: {
-        python: {all: [/def neighbors\(/, /visited/, /frontier/]},
-        typescript: {all: [/function neighbors\(/, /visited/, /frontier/]},
-        go: {all: [/func neighbors\(/, /visited/, /frontier/]},
-        scala: {all: [/def neighbors\(/, /visited/, /frontier/]},
-        cpp: {all: [/neighbors\(/, /visited/, /frontier/]},
+        python: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
+        typescript: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
+        go: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
+        scala: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
+        cpp: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
+      },
+    },
+    {
+      id: 'result-cap',
+      title: 'Caps the answer at 500 neighbours with a truncation marker',
+      detail:
+        'The walk stops at `MAX_RESULTS` (500) and answers `truncated: true` when more neighbours were left; the starter answers every neighbour and always says `false`.',
+      match: {
+        python: {all: [/MAX_RESULTS\s*=\s*500\b/, /len\(\w+\)\s*(==|>=)\s*MAX_RESULTS/]},
+        typescript: {all: [/MAX_RESULTS\s*=\s*500\b/, /\.length\s*(===|>=)\s*MAX_RESULTS/]},
+        go: {all: [/maxResults\s*=\s*500\b/, /len\(\w+\)\s*(==|>=)\s*maxResults/]},
+        scala: {all: [/MaxResults\s*=\s*500\b/, /\.size\s*(==|>=)\s*MaxResults/]},
+        cpp: {all: [/kMaxResults\s*=\s*500\b/, /\.size\(\)\s*(==|>=)\s*kMaxResults/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI
+      starter: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
-logger = logging.getLogger("graph")
-
-
-class GraphStore:
-    def load_neighbors(self, tenant: str, entity_id: str) -> list[str]:
-        raise NotImplementedError
-
-
-store = GraphStore()
-
-
-def read_neighbors(entity_id: str, depth: int = 5) -> JSONResponse:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    edges: list[str] = []
-
-    def walk(node: str, remaining: int) -> None:
-        if remaining <= 0:
-            return
-        for neighbor in store.load_neighbors("default", node):
-            edges.append(neighbor)
-            walk(neighbor, remaining - 1)
-
-    walk(entity_id, depth)
-    logger.info("neighbors entity=%s edges=%d", entity_id, len(edges))
-    return JSONResponse({"edges": edges}, status_code=200)
-
-
-app.get("/v1/entities/{entity_id}/neighbors")(read_neighbors)
-`,
-      solution: `import logging
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from graph import store  # get_entity
+from graph.adjacency import read_neighbors
 
 app = FastAPI()
-logger = logging.getLogger("graph")
-
-MAX_DEPTH = 2
-MAX_EDGES = 500
-
-
-class GraphStore:
-    def entity_tenant(self, entity_id: str) -> str | None:
-        """The tenant that owns \`entity_id\`, or None when the graph has no such entity."""
-        raise NotImplementedError
-
-    def load_neighbors(self, tenant: str, entity_id: str) -> list[str]:
-        raise NotImplementedError
-
-
-store = GraphStore()
-
-
-def neighbors(tenant: str, root: str, depth: int) -> tuple[list[str], bool]:
-    """Breadth-first to \`depth\`, stopping at MAX_EDGES; each node is expanded once."""
-    edges: list[str] = []
-    visited: set[str] = {root}
-    frontier: list[str] = [root]
-    for _ in range(depth):
-        next_frontier: list[str] = []
-        for node in frontier:
-            for neighbor in store.load_neighbors(tenant, node):
-                if len(edges) >= MAX_EDGES:
-                    return edges, True
-                edges.append(neighbor)
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    next_frontier.append(neighbor)
-        frontier = next_frontier
-    return edges, False
 
 
 @app.get("/v1/entities/{entity_id}/neighbors")
-def read_neighbors(
-    entity_id: str,
-    depth: int = 1,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if depth < 1 or depth > MAX_DEPTH:
-        raise HTTPException(status_code=400, detail=f"depth must be 1..{MAX_DEPTH}")
-    owner = store.entity_tenant(entity_id)
-    if owner is None or owner != tenant:
-        raise HTTPException(status_code=404, detail="unknown entity")
-    edges, truncated = neighbors(tenant, entity_id, depth)
-    logger.info("neighbors tenant=%s entity=%s edges=%d truncated=%s", tenant, entity_id, len(edges), truncated)
-    return JSONResponse({"entity_id": entity_id, "edges": edges, "truncated": truncated}, status_code=200)
+def neighbors(entity_id: str, request: Request) -> JSONResponse:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "X-Tenant-Id is required"}, status_code=401)
+    if store.get_entity(entity_id) is None:
+        return JSONResponse({"error": "no such entity"}, status_code=404)
+    depth = int(request.query_params.get("depth", "2"))
+    found = []
+
+    def walk(node: str, distance: int) -> None:
+        if distance > depth:
+            return
+        for neighbor in read_neighbors(node):
+            found.append({"id": neighbor, "distance": distance})
+            walk(neighbor, distance + 1)
+
+    walk(entity_id, 1)
+    return JSONResponse({"entity_id": entity_id, "depth": depth, "neighbors": found, "truncated": False})
+`,
+      solution: `from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from graph import store  # get_entity
+from graph.adjacency import read_neighbors
+
+app = FastAPI()
+
+MAX_DEPTH = 2
+MAX_RESULTS = 500
+
+
+def walk(entity_id: str, depth: int) -> tuple[list[dict], bool]:
+    """Breadth-first from entity_id: each entity once, at its shortest distance, at most MAX_RESULTS."""
+    found = []
+    visited = {entity_id}
+    frontier = [entity_id]
+    for distance in range(1, depth + 1):
+        next_frontier = []
+        for node in frontier:
+            for neighbor in read_neighbors(node):
+                if neighbor in visited:
+                    continue
+                if len(found) == MAX_RESULTS:
+                    return found, True
+                visited.add(neighbor)
+                found.append({"id": neighbor, "distance": distance})
+                next_frontier.append(neighbor)
+        frontier = next_frontier
+    return found, False
+
+
+@app.get("/v1/entities/{entity_id}/neighbors")
+def neighbors(entity_id: str, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "X-Tenant-Id is required"}, status_code=401)
+    entity = store.get_entity(entity_id)
+    if entity is None or entity["tenant"] != tenant:
+        # Another tenant's entity is as absent as one that never existed.
+        return JSONResponse({"error": "no such entity"}, status_code=404)
+    raw = request.query_params.get("depth", "1")
+    depth = int(raw) if raw.isdigit() else 0
+    if not 1 <= depth <= MAX_DEPTH:
+        return JSONResponse({"error": f"depth must be between 1 and {MAX_DEPTH}"}, status_code=400)
+    found, truncated = walk(entity_id, depth)
+    return JSONResponse({"entity_id": entity_id, "depth": depth, "neighbors": found, "truncated": truncated})
 `,
     },
     typescript: {
-      starter: `/** Neighbour read: flawed code that walks every path. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-import {store} from './graph';
+import {readNeighbors} from 'graph/adjacency';
+import {getEntity} from 'graph/store';
 
 export const app = Fastify();
 
-async function walk(node: string, remaining: number, edges: string[]): Promise<void> {
-  if (remaining <= 0) return;
-  for (const neighbor of await store.loadNeighbors('default', node)) {
-    edges.push(neighbor);
-    await walk(neighbor, remaining - 1, edges);
-  }
+interface Found {
+  id: string;
+  distance: number;
 }
 
 app.get('/v1/entities/:entityId/neighbors', async (request, reply) => {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const entityId = (request.params as {entityId: string}).entityId;
-  const depth = Number((request.query as {depth?: string}).depth ?? '5');
-  const edges: string[] = [];
-  await walk(entityId, depth, edges);
-  request.log.info({entityId, edges: edges.length}, 'neighbors');
-  return reply.code(200).send({edges});
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const {entityId} = request.params as {entityId: string};
+  if ((await getEntity(entityId)) === null) return reply.code(404).send({error: 'no such entity'});
+  const depth = Number((request.query as {depth?: string}).depth ?? '2');
+  const found: Found[] = [];
+  const walk = async (node: string, distance: number): Promise<void> => {
+    if (distance > depth) return;
+    for (const neighbor of await readNeighbors(node)) {
+      found.push({id: neighbor, distance});
+      await walk(neighbor, distance + 1);
+    }
+  };
+  await walk(entityId, 1);
+  return {entity_id: entityId, depth, neighbors: found, truncated: false};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** Neighbour read: depth-capped, tenant-scoped, breadth-first with a 500-edge stop. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 
-import {store} from './graph';
+import {readNeighbors} from 'graph/adjacency';
+import {getEntity} from 'graph/store';
 
 export const app = Fastify();
 
 const MAX_DEPTH = 2;
-const MAX_EDGES = 500;
+const MAX_RESULTS = 500;
 
-interface NeighborPage {
-  edges: string[];
-  truncated: boolean;
+interface Found {
+  id: string;
+  distance: number;
 }
 
-async function neighbors(tenant: string, root: string, depth: number): Promise<NeighborPage> {
-  const edges: string[] = [];
-  const visited = new Set<string>([root]);
-  let frontier = [root];
-  for (let level = 0; level < depth; level++) {
+/** Breadth-first from entityId: each entity once, at its shortest distance, at most MAX_RESULTS. */
+async function walk(entityId: string, depth: number): Promise<{found: Found[]; truncated: boolean}> {
+  const found: Found[] = [];
+  const visited = new Set([entityId]);
+  let frontier = [entityId];
+  for (let distance = 1; distance <= depth; distance++) {
     const next: string[] = [];
     for (const node of frontier) {
-      for (const neighbor of await store.loadNeighbors(tenant, node)) {
-        if (edges.length >= MAX_EDGES) return {edges, truncated: true};
-        edges.push(neighbor);
-        if (!visited.has(neighbor)) {
-          visited.add(neighbor);
-          next.push(neighbor);
-        }
+      for (const neighbor of await readNeighbors(node)) {
+        if (visited.has(neighbor)) continue;
+        if (found.length === MAX_RESULTS) return {found, truncated: true};
+        visited.add(neighbor);
+        found.push({id: neighbor, distance});
+        next.push(neighbor);
       }
     }
     frontier = next;
   }
-  return {edges, truncated: false};
+  return {found, truncated: false};
 }
 
 app.get('/v1/entities/:entityId/neighbors', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const entityId = (request.params as {entityId: string}).entityId;
-  const depth = Number((request.query as {depth?: string}).depth ?? '1');
-  if (!Number.isInteger(depth) || depth < 1 || depth > MAX_DEPTH)
-    return reply.code(400).send({error: 'depth must be 1..' + MAX_DEPTH});
-  const owner = await store.entityTenant(entityId);
-  if (owner === null || owner !== tenant) return reply.code(404).send({error: 'unknown entity'});
-  const page = await neighbors(tenant, entityId, depth);
-  request.log.info({tenant, entityId, edges: page.edges.length, truncated: page.truncated}, 'neighbors');
-  return reply.code(200).send({entity_id: entityId, edges: page.edges, truncated: page.truncated});
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const {entityId} = request.params as {entityId: string};
+  const entity = await getEntity(entityId);
+  // Another tenant's entity is as absent as one that never existed.
+  if (entity === null || entity.tenant !== tenant) return reply.code(404).send({error: 'no such entity'});
+  const raw = (request.query as {depth?: string}).depth ?? '1';
+  const depth = /^\\d+$/.test(raw) ? Number(raw) : 0;
+  if (depth < 1 || depth > MAX_DEPTH) return reply.code(400).send({error: \`depth must be between 1 and \${MAX_DEPTH}\`});
+  const {found, truncated} = await walk(entityId, depth);
+  return {entity_id: entityId, depth, neighbors: found, truncated};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `package read
+      starter: `package main
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+	"strconv"
+
+	"graph/adjacency" // adjacency.ReadNeighbors
+	"graph/store"     // store.GetEntity
 )
 
-type GraphStore interface {
-	LoadNeighbors(tenant, entityID string) ([]string, error)
+type found struct {
+	ID       string \`json:"id"\`
+	Distance int    \`json:"distance"\`
 }
 
-var store GraphStore
-
-func walk(tenant, node string, remaining int, edges *[]string) {
-	if remaining <= 0 {
-		return
-	}
-	neighbors, _ := store.LoadNeighbors(tenant, node)
-	for _, neighbor := range neighbors {
-		*edges = append(*edges, neighbor)
-		walk(tenant, neighbor, remaining-1, edges)
-	}
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func readNeighbors(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	entityID := r.PathValue("entityID")
-	edges := make([]string, 0)
-	walk("default", entityID, 5, &edges)
-	log.Printf("neighbors entity=%s edges=%d", entityID, len(edges))
-	writeJSON(rw, http.StatusOK, map[string]any{"edges": edges})
+func neighbors(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
+		return
+	}
+	entityID := r.PathValue("id")
+	if store.GetEntity(r.Context(), entityID) == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such entity"})
+		return
+	}
+	depth := 2
+	if raw := r.URL.Query().Get("depth"); raw != "" {
+		depth, _ = strconv.Atoi(raw)
+	}
+	out := []found{}
+	var walk func(node string, distance int) error
+	walk = func(node string, distance int) error {
+		if distance > depth {
+			return nil
+		}
+		ids, err := adjacency.ReadNeighbors(r.Context(), node)
+		if err != nil {
+			return err
+		}
+		for _, neighbor := range ids {
+			out = append(out, found{ID: neighbor, Distance: distance})
+			if err := walk(neighbor, distance+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(entityID, 1); err != nil {
+		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(rw, http.StatusOK, map[string]any{"entity_id": entityID, "depth": depth, "neighbors": out, "truncated": false})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/entities/{entityID}/neighbors", readNeighbors)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/entities/{id}/neighbors", neighbors)
 }
 `,
-      solution: `package read
+      solution: `package main
 
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
 	"strconv"
+
+	"graph/adjacency" // adjacency.ReadNeighbors
+	"graph/store"     // store.GetEntity
 )
 
-const maxDepth = 2
-const maxEdges = 500
+const (
+	maxDepth   = 2
+	maxResults = 500
+)
 
-type GraphStore interface {
-	EntityTenant(ctx context.Context, entityID string) (string, bool)
-	LoadNeighbors(ctx context.Context, tenant, entityID string) ([]string, error)
+type found struct {
+	ID       string \`json:"id"\`
+	Distance int    \`json:"distance"\`
 }
 
-var store GraphStore
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-// Breadth-first to depth, stopping at maxEdges; each node is expanded once.
-func neighbors(ctx context.Context, tenant, root string, depth int) ([]string, bool) {
-	edges := make([]string, 0)
-	visited := map[string]bool{root: true}
-	frontier := []string{root}
-	for level := 0; level < depth; level++ {
-		next := make([]string, 0)
+// walk goes breadth-first from entityID: each entity once, at its shortest distance, at most maxResults.
+func walk(ctx context.Context, entityID string, depth int) ([]found, bool, error) {
+	out := []found{}
+	visited := map[string]bool{entityID: true}
+	frontier := []string{entityID}
+	for distance := 1; distance <= depth; distance++ {
+		next := []string{}
 		for _, node := range frontier {
-			loaded, err := store.LoadNeighbors(ctx, tenant, node)
+			ids, err := adjacency.ReadNeighbors(ctx, node)
 			if err != nil {
-				return edges, false
+				return nil, false, err
 			}
-			for _, neighbor := range loaded {
-				if len(edges) >= maxEdges {
-					return edges, true
+			for _, neighbor := range ids {
+				if visited[neighbor] {
+					continue
 				}
-				edges = append(edges, neighbor)
-				if !visited[neighbor] {
-					visited[neighbor] = true
-					next = append(next, neighbor)
+				if len(out) == maxResults {
+					return out, true, nil
 				}
+				visited[neighbor] = true
+				out = append(out, found{ID: neighbor, Distance: distance})
+				next = append(next, neighbor)
 			}
 		}
 		frontier = next
 	}
-	return edges, false
+	return out, false, nil
 }
 
-func readNeighbors(rw http.ResponseWriter, r *http.Request) {
+func neighbors(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	entityID := r.PathValue("entityID")
-	depth, err := strconv.Atoi(r.URL.Query().Get("depth"))
+	entityID := r.PathValue("id")
+	entity := store.GetEntity(r.Context(), entityID)
+	if entity == nil || entity.Tenant != tenant {
+		// Another tenant's entity is as absent as one that never existed.
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such entity"})
+		return
+	}
+	raw := r.URL.Query().Get("depth")
+	if raw == "" {
+		raw = "1"
+	}
+	depth, err := strconv.Atoi(raw)
+	if err != nil || depth < 1 || depth > maxDepth {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("depth must be between 1 and %d", maxDepth)})
+		return
+	}
+	out, truncated, err := walk(r.Context(), entityID, depth)
 	if err != nil {
-		depth = 1
-	}
-	if depth < 1 || depth > maxDepth {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "depth must be 1..2"})
+		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	owner, ok := store.EntityTenant(r.Context(), entityID)
-	if !ok || owner != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown entity"})
-		return
-	}
-	edges, truncated := neighbors(r.Context(), tenant, entityID, depth)
-	log.Printf("neighbors tenant=%s entity=%s edges=%d truncated=%t", tenant, entityID, len(edges), truncated)
-	writeJSON(rw, http.StatusOK, map[string]any{"entity_id": entityID, "edges": edges, "truncated": truncated})
+	writeJSON(rw, http.StatusOK, map[string]any{"entity_id": entityID, "depth": depth, "neighbors": out, "truncated": truncated})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/entities/{entityID}/neighbors", readNeighbors)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/entities/{id}/neighbors", neighbors)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-object NeighborRead {
-  implicit val system: ActorSystem = ActorSystem("knowledge-graph")
+import graph.{Adjacency, Store} // Adjacency.readNeighbors, Store.getEntity
 
-  def walk(tenant: String, node: String, remaining: Int, edges: List[String]): List[String] = {
-    if (remaining <= 0) edges
-    else loadNeighbors(tenant, node).foldLeft(edges) { (acc, neighbor) =>
-      walk(tenant, neighbor, remaining - 1, acc :+ neighbor)
+object Read {
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def read(tenant: String, entityId: String, raw: Option[String]): HttpResponse =
+    Store.getEntity(entityId) match {
+      case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such entity")))
+      case Some(_) =>
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+        val depth = raw.map(_.toInt).getOrElse(2)
+        val found = scala.collection.mutable.ListBuffer.empty[JsObject]
+        def walk(node: String, distance: Int): Unit =
+          if (distance <= depth) Adjacency.readNeighbors(node).foreach { neighbor =>
+            found += JsObject("id" -> JsString(neighbor), "distance" -> JsNumber(distance))
+            walk(neighbor, distance + 1)
+          }
+        walk(entityId, 1)
+        json(
+          StatusCodes.OK,
+          JsObject("entity_id" -> JsString(entityId), "depth" -> JsNumber(depth), "neighbors" -> JsArray(found.toVector), "truncated" -> JsBoolean(false)))
     }
-  }
 
-  val route: Route =
-    path("v1" / "entities" / Segment / "neighbors") { entityId =>
-      get {
-        // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-        val edges = walk("default", entityId, 5, Nil)
-        complete(StatusCodes.OK, s"""{"edges":\${edges.size}}""")
+  val route: Route = path("v1" / "entities" / Segment / "neighbors") { entityId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
+        case Some(tenant)    => parameter("depth".optional) { raw => complete(read(tenant, entityId, raw)) }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-object NeighborRead {
-  implicit val system: ActorSystem = ActorSystem("knowledge-graph")
+import scala.collection.mutable
 
+import graph.{Adjacency, Store} // Adjacency.readNeighbors, Store.getEntity
+
+object Read {
   val MaxDepth = 2
-  val MaxEdges = 500
+  val MaxResults = 500
 
-  /** Breadth-first to depth, stopping at MaxEdges; each node is expanded once. */
-  def neighbors(tenant: String, root: String, depth: Int): (List[String], Boolean) = {
-    var edges = List.empty[String]
-    var visited = Set(root)
-    var frontier = List(root)
-    var level = 0
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  /** Breadth-first from entityId: each entity once, at its shortest distance, at most MaxResults. */
+  def walk(entityId: String, depth: Int): (List[JsObject], Boolean) = {
+    val found = mutable.ListBuffer.empty[JsObject]
+    val visited = mutable.Set(entityId)
+    var frontier = List(entityId)
     var truncated = false
-    while (level < depth && !truncated) {
-      val next = frontier.flatMap(node => loadNeighbors(tenant, node)).flatMap { neighbor =>
-        if (edges.length >= MaxEdges) {
-          truncated = true
-          None
-        } else if (visited.contains(neighbor)) {
-          edges = edges :+ neighbor
-          None
-        } else {
-          edges = edges :+ neighbor
-          visited = visited + neighbor
-          Some(neighbor)
-        }
-      }
-      frontier = next
-      level += 1
-    }
-    (edges, truncated)
-  }
-
-  val route: Route =
-    path("v1" / "entities" / Segment / "neighbors") { entityId =>
-      get {
-        parameter("depth".as[Int].?) { depthOpt =>
-          optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-            val depth = depthOpt.getOrElse(1)
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else if (depth < 1 || depth > MaxDepth) {
-              complete(StatusCodes.BadRequest, "{\\"error\\":\\"depth must be 1.." + MaxDepth + "\\"}")
-            } else {
-              val tenant = tenantOpt.get
-              entityTenant(entityId) match {
-                case Some(owner) if owner == tenant =>
-                  val (edges, truncated) = neighbors(tenant, entityId, depth)
-                  complete(
-                    StatusCodes.OK,
-                    s"""{"entity_id":"$entityId","edges":\${edges.size},"truncated":$truncated}""",
-                  )
-                case _ =>
-                  complete(StatusCodes.NotFound, """{"error":"unknown entity"}""")
-              }
+    var distance = 1
+    while (distance <= depth && !truncated) {
+      val next = mutable.ListBuffer.empty[String]
+      val nodes = frontier.iterator
+      while (nodes.hasNext && !truncated) {
+        val ids = Adjacency.readNeighbors(nodes.next()).iterator
+        while (ids.hasNext && !truncated) {
+          val neighbor = ids.next()
+          if (!visited.contains(neighbor)) {
+            if (found.size == MaxResults) truncated = true
+            else {
+              visited += neighbor
+              found += JsObject("id" -> JsString(neighbor), "distance" -> JsNumber(distance))
+              next += neighbor
             }
           }
         }
       }
+      frontier = next.toList
+      distance += 1
+    }
+    (found.toList, truncated)
+  }
+
+  private def read(tenant: String, entityId: String, raw: Option[String]): HttpResponse =
+    Store.getEntity(entityId).filter(_.tenant == tenant) match {
+      // Another tenant's entity is as absent as one that never existed.
+      case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such entity")))
+      case Some(_) =>
+        raw.getOrElse("1").toIntOption.filter(d => d >= 1 && d <= MaxDepth) match {
+          case None => json(StatusCodes.BadRequest, JsObject("error" -> JsString(s"depth must be between 1 and $MaxDepth")))
+          case Some(depth) =>
+            val (found, truncated) = walk(entityId, depth)
+            json(
+              StatusCodes.OK,
+              JsObject("entity_id" -> JsString(entityId), "depth" -> JsNumber(depth), "neighbors" -> JsArray(found.toVector), "truncated" -> JsBoolean(truncated)))
+        }
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  val route: Route = path("v1" / "entities" / Segment / "neighbors") { entityId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
+        case Some(tenant)    => parameter("depth".optional) { raw => complete(read(tenant, entityId, raw)) }
+      }
+    }
   }
 }
 `,
@@ -528,119 +547,569 @@ object NeighborRead {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <string>
-#include <vector>
+
+#include "graph/adjacency.h"  // adjacency::readNeighbors
+#include "graph/store.h"      // store::getEntity
 
 using json = nlohmann::json;
 
-std::vector<std::string> loadNeighbors(const std::string& tenant, const std::string& entityId);
-
-void walk(const std::string& tenant, const std::string& node, int remaining, std::vector<std::string>& edges) {
-  if (remaining <= 0) return;
-  for (const auto& neighbor : loadNeighbors(tenant, node)) {
-    edges.push_back(neighbor);
-    walk(tenant, neighbor, remaining - 1, edges);
-  }
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/entities/([^/]+)/neighbors)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    const std::string entityId = req.matches[1];
-    const int depth = req.has_param("depth") ? std::stoi(req.get_param_value("depth")) : 5;
-    std::vector<std::string> edges;
-    walk("default", entityId, depth, edges);
-    res.status = 200;
-    res.set_content(json{{"edges", edges}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void neighbors(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, json{{"error", "X-Tenant-Id is required"}});
+  const std::string entity_id = req.matches[1];
+  if (!store::getEntity(entity_id)) return reply(res, 404, json{{"error", "no such entity"}});
+  const int depth = req.has_param("depth") ? std::stoi(req.get_param_value("depth")) : 2;
+  json found = json::array();
+  std::function<void(const std::string&, int)> walk = [&](const std::string& node, int distance) {
+    if (distance > depth) return;
+    for (const std::string& neighbor : adjacency::readNeighbors(node)) {
+      found.push_back(json{{"id", neighbor}, {"distance", distance}});
+      walk(neighbor, distance + 1);
+    }
+  };
+  walk(entity_id, 1);
+  reply(res, 200, json{{"entity_id", entity_id}, {"depth", depth}, {"neighbors", found}, {"truncated", false}});
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/entities/([\\w-]+)/neighbors)", neighbors); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
+#include <algorithm>
+#include <cctype>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "graph/adjacency.h"  // adjacency::readNeighbors
+#include "graph/store.h"      // store::getEntity
+
 using json = nlohmann::json;
 
 constexpr int kMaxDepth = 2;
-constexpr std::size_t kMaxEdges = 500;
+constexpr size_t kMaxResults = 500;
 
-std::vector<std::string> loadNeighbors(const std::string& tenant, const std::string& entityId);
-std::optional<std::string> entityTenant(const std::string& entityId);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-struct NeighborPage {
-  std::vector<std::string> edges;
-  bool truncated = false;
-};
-
-/** Breadth-first to depth, stopping at kMaxEdges; each node is expanded once. */
-NeighborPage neighbors(const std::string& tenant, const std::string& root, int depth) {
-  NeighborPage page;
-  std::set<std::string> visited{root};
-  std::vector<std::string> frontier{root};
-  for (int level = 0; level < depth; ++level) {
+// Breadth-first from entity_id: each entity once, at its shortest distance, at most kMaxResults.
+json walk(const std::string& entity_id, int depth) {
+  json found = json::array();
+  std::set<std::string> visited = {entity_id};
+  std::vector<std::string> frontier = {entity_id};
+  for (int distance = 1; distance <= depth; distance++) {
     std::vector<std::string> next;
-    for (const auto& node : frontier) {
-      for (const auto& neighbor : loadNeighbors(tenant, node)) {
-        if (page.edges.size() >= kMaxEdges) {
-          page.truncated = true;
-          return page;
-        }
-        page.edges.push_back(neighbor);
-        if (visited.insert(neighbor).second) next.push_back(neighbor);
+    for (const std::string& node : frontier) {
+      for (const std::string& neighbor : adjacency::readNeighbors(node)) {
+        if (visited.count(neighbor)) continue;
+        if (found.size() == kMaxResults) return json{{"neighbors", found}, {"truncated", true}};
+        visited.insert(neighbor);
+        found.push_back(json{{"id", neighbor}, {"distance", distance}});
+        next.push_back(neighbor);
       }
     }
     frontier = next;
   }
-  return page;
+  return json{{"neighbors", found}, {"truncated", false}};
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/entities/([^/]+)/neighbors)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const int depth = req.has_param("depth") ? std::stoi(req.get_param_value("depth")) : 1;
-    if (depth < 1 || depth > kMaxDepth) {
-      res.status = 400;
-      res.set_content(R"({"error":"depth must be 1..2"})", "application/json");
-      return;
-    }
-    const std::string entityId = req.matches[1];
-    const auto owner = entityTenant(entityId);
-    if (!owner.has_value() || *owner != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown entity"})", "application/json");
-      return;
-    }
-    const NeighborPage page = neighbors(tenant, entityId, depth);
-    res.status = 200;
-    res.set_content(
-        json{{"entity_id", entityId}, {"edges", page.edges}, {"truncated", page.truncated}}.dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void neighbors(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, json{{"error", "X-Tenant-Id is required"}});
+  const std::string entity_id = req.matches[1];
+  const auto entity = store::getEntity(entity_id);
+  // Another tenant's entity is as absent as one that never existed.
+  if (!entity || entity->tenant != tenant) return reply(res, 404, json{{"error", "no such entity"}});
+  const std::string raw = req.has_param("depth") ? req.get_param_value("depth") : "1";
+  const bool digits = !raw.empty() && raw.size() < 4 && std::all_of(raw.begin(), raw.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+  const int depth = digits ? std::stoi(raw) : 0;
+  if (depth < 1 || depth > kMaxDepth) return reply(res, 400, json{{"error", "depth must be between 1 and " + std::to_string(kMaxDepth)}});
+  json body = walk(entity_id, depth);
+  body["entity_id"] = entity_id;
+  body["depth"] = depth;
+  reply(res, 200, body);
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/entities/([\\w-]+)/neighbors)", neighbors); }
 `,
     },
   },
+  harness: {
+    python: `from graph import store
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+def _entity(tenant="t1"):
+    return store.create_entity(tenant, "person", "node", [])["id"]
+
+
+def _edge(ctx, left, right):
+    ctx.redis.sadd(f"edges:{left}", right)
+    ctx.redis.sadd(f"edges:{right}", left)
+
+
+async def _get(client, entity_id, depth=None, tenant="t1"):
+    params = {} if depth is None else {"depth": depth}
+    headers = {} if tenant is None else {"X-Tenant-Id": tenant}
+    return await client.get(f"/v1/entities/{entity_id}/neighbors", params=params, headers=headers)
+
+
+def _pairs(r):
+    return sorted((n.get("id"), n.get("distance")) for n in r.json().get("neighbors", []))
+
+
+async def check_route(ctx):
+    root, left, right = _entity(), _entity(), _entity()
+    _edge(ctx, root, left)
+    _edge(ctx, root, right)
+    async with _api(ctx) as client:
+        r = await _get(client, root, depth=1)
+    assert r.status_code == 200, f"GET /v1/entities/{root}/neighbors?depth=1 answered {r.status_code}: {r.text}"
+    assert r.json().get("entity_id") == root and _pairs(r) == sorted([(left, 1), (right, 1)]), f"the neighbours of {root} at depth 1 are {left} and {right}, got {r.text}"
+    assert ctx.redis.exists(f"adj:{root}") == 1, "the walk must read through the adjacency cache (read_neighbors), yet adj:{root} was never filled"
+
+
+async def check_tenant_scope(ctx):
+    mine, theirs, friend = _entity("t1"), _entity("t2"), _entity("t2")
+    _edge(ctx, theirs, friend)
+    async with _api(ctx) as client:
+        r = await _get(client, theirs, depth=1, tenant="t1")
+        assert r.status_code == 404, f"tenant t1 asked for the neighbours of {theirs}, an entity of t2, and got {r.status_code} {r.text}: another tenant's entity is 404"
+        assert friend not in r.text, f"the answer to t1 leaks {friend}, a neighbour in t2"
+        r = await _get(client, "e-999", depth=1)
+        assert r.status_code == 404, f"an unknown entity answered {r.status_code}, expected 404"
+        r = await _get(client, mine, depth=1, tenant=None)
+        assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}, expected 401"
+        r = await _get(client, theirs, depth=1, tenant="t2")
+    assert r.status_code == 200 and _pairs(r) == [(friend, 1)], f"the owning tenant must still read {theirs}, got {r.status_code} {r.text}"
+
+
+async def check_depth_cap(ctx):
+    a, b, c, d = _entity(), _entity(), _entity(), _entity()
+    _edge(ctx, a, b)
+    _edge(ctx, b, c)
+    _edge(ctx, c, d)
+    async with _api(ctx) as client:
+        r = await _get(client, a)
+        assert r.status_code == 200 and _pairs(r) == [(b, 1)], f"without depth the walk must stop after 1 hop (depth defaults to 1), got {r.status_code} {r.text}"
+        r = await _get(client, a, depth=2)
+        assert r.status_code == 200 and _pairs(r) == sorted([(b, 1), (c, 2)]), f"depth=2 on the chain must reach {b} and {c}, got {r.status_code} {r.text}"
+        for bad in ("3", "0", "ten"):
+            r = await _get(client, a, depth=bad)
+            assert r.status_code == 400, f"depth={bad} answered {r.status_code}: a depth outside 1..MAX_DEPTH (2) is 400 before any traversal"
+
+
+async def check_bounded_traversal(ctx):
+    a, b, c, d = _entity(), _entity(), _entity(), _entity()
+    for left, right in ((a, b), (a, c), (b, d), (c, d)):
+        _edge(ctx, left, right)
+    async with _api(ctx) as client:
+        r = await _get(client, a, depth=2)
+    assert r.status_code == 200, f"depth=2 answered {r.status_code}: {r.text}"
+    pairs = _pairs(r)
+    assert pairs == sorted([(b, 1), (c, 1), (d, 2)]), f"a depth-2 walk over the diamond {a}-{b}/{c}-{d} answered {pairs}: each entity must appear once, at its shortest distance, and never {a} itself. Walk breadth-first with a visited set"
+
+
+async def check_result_cap(ctx):
+    hub, small = _entity(), _entity()
+    ctx.redis.sadd(f"edges:{hub}", *[f"l-{i:03d}" for i in range(600)])
+    _edge(ctx, small, "l-000")
+    async with _api(ctx) as client:
+        r = await _get(client, hub, depth=1)
+        assert r.status_code == 200, f"the hub's neighbours answered {r.status_code}: {r.text}"
+        ids = [n.get("id") for n in r.json().get("neighbors", [])]
+        assert len(ids) == 500 and len(set(ids)) == 500, f"a hub with 600 neighbours answered {len(ids)} entries: cap the answer at MAX_RESULTS = 500"
+        assert r.json().get("truncated") is True, f"the answer was cut at 500 and says truncated={r.json().get('truncated')!r}: a client cannot tell a complete answer from a clipped one"
+        r = await _get(client, small, depth=1)
+    assert r.json().get("truncated") is False and _pairs(r) == [("l-000", 1)], f"a complete answer must say truncated false, got {r.text}"
+`,
+    typescript: `function api(ctx) {
+  return {c: ctx.client(ctx.load('read').app), store: ctx.load('/support/graph/store.ts')};
+}
+
+async function entities(store, n: number, tenant = 't1'): Promise<string[]> {
+  const ids: string[] = [];
+  for (let i = 0; i < n; i++) ids.push((await store.createEntity(tenant, 'person', 'node', [])).id);
+  return ids;
+}
+
+function edge(ctx, left: string, right: string): void {
+  ctx.redis.sadd(\`edges:\${left}\`, right);
+  ctx.redis.sadd(\`edges:\${right}\`, left);
+}
+
+function get(c, entityId: string, depth?: string, tenant: string | null = 't1') {
+  const headers = tenant === null ? {} : {'X-Tenant-Id': tenant};
+  return c.get(\`/v1/entities/\${entityId}/neighbors\`, {headers, query: depth === undefined ? {} : {depth}});
+}
+
+const pairs = r => JSON.stringify((r.json().neighbors ?? []).map(n => \`\${n.id}@\${n.distance}\`).sort());
+const expect = (...items: string[]) => JSON.stringify(items.sort());
+
+export async function check_route(ctx) {
+  const {c, store} = api(ctx);
+  const [root, left, right] = await entities(store, 3);
+  edge(ctx, root, left);
+  edge(ctx, root, right);
+  const r = await get(c, root, '1');
+  assert.equal(r.status, 200, \`GET /v1/entities/\${root}/neighbors?depth=1 answered \${r.status}: \${r.text}\`);
+  assert(r.json().entity_id === root && pairs(r) === expect(\`\${left}@1\`, \`\${right}@1\`), \`the neighbours of \${root} at depth 1 are \${left} and \${right}, got \${r.text}\`);
+  assert.equal(ctx.redis.exists(\`adj:\${root}\`), 1, \`the walk must read through the adjacency cache (readNeighbors), yet adj:\${root} was never filled\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c, store} = api(ctx);
+  const [mine] = await entities(store, 1, 't1');
+  const [theirs, friend] = await entities(store, 2, 't2');
+  edge(ctx, theirs, friend);
+  let r = await get(c, theirs, '1', 't1');
+  assert.equal(r.status, 404, \`tenant t1 asked for the neighbours of \${theirs}, an entity of t2, and got \${r.status} \${r.text}: another tenant's entity is 404\`);
+  assert(!r.text.includes(friend), \`the answer to t1 leaks \${friend}, a neighbour in t2\`);
+  r = await get(c, 'e-999', '1');
+  assert.equal(r.status, 404, \`an unknown entity answered \${r.status}, expected 404\`);
+  r = await get(c, mine, '1', null);
+  assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}, expected 401\`);
+  r = await get(c, theirs, '1', 't2');
+  assert(r.status === 200 && pairs(r) === expect(\`\${friend}@1\`), \`the owning tenant must still read \${theirs}, got \${r.status} \${r.text}\`);
+}
+
+export async function check_depth_cap(ctx) {
+  const {c, store} = api(ctx);
+  const [a, b, cc, d] = await entities(store, 4);
+  edge(ctx, a, b);
+  edge(ctx, b, cc);
+  edge(ctx, cc, d);
+  let r = await get(c, a);
+  assert(r.status === 200 && pairs(r) === expect(\`\${b}@1\`), \`without depth the walk must stop after 1 hop (depth defaults to 1), got \${r.status} \${r.text}\`);
+  r = await get(c, a, '2');
+  assert(r.status === 200 && pairs(r) === expect(\`\${b}@1\`, \`\${cc}@2\`), \`depth=2 on the chain must reach \${b} and \${cc}, got \${r.status} \${r.text}\`);
+  for (const bad of ['3', '0', 'ten']) {
+    r = await get(c, a, bad);
+    assert.equal(r.status, 400, \`depth=\${bad} answered \${r.status}: a depth outside 1..MAX_DEPTH (2) is 400 before any traversal\`);
+  }
+}
+
+export async function check_bounded_traversal(ctx) {
+  const {c, store} = api(ctx);
+  const [a, b, cc, d] = await entities(store, 4);
+  for (const [left, right] of [[a, b], [a, cc], [b, d], [cc, d]]) edge(ctx, left, right);
+  const r = await get(c, a, '2');
+  assert.equal(r.status, 200, \`depth=2 answered \${r.status}: \${r.text}\`);
+  assert.equal(pairs(r), expect(\`\${b}@1\`, \`\${cc}@1\`, \`\${d}@2\`), \`a depth-2 walk over the diamond answered \${pairs(r)}: each entity must appear once, at its shortest distance, and never \${a} itself. Walk breadth-first with a visited set\`);
+}
+
+export async function check_result_cap(ctx) {
+  const {c, store} = api(ctx);
+  const [hub, small] = await entities(store, 2);
+  const leaves = Array.from({length: 600}, (_, i) => \`l-\${String(i).padStart(3, '0')}\`);
+  ctx.redis.sadd(\`edges:\${hub}\`, ...leaves);
+  edge(ctx, small, 'l-000');
+  let r = await get(c, hub, '1');
+  assert.equal(r.status, 200, \`the hub's neighbours answered \${r.status}: \${r.text}\`);
+  const ids = (r.json().neighbors ?? []).map(n => n.id);
+  assert(ids.length === 500 && new Set(ids).size === 500, \`a hub with 600 neighbours answered \${ids.length} entries: cap the answer at MAX_RESULTS = 500\`);
+  assert.equal(r.json().truncated, true, \`the answer was cut at 500 and says truncated=\${r.json().truncated}: a client cannot tell a complete answer from a clipped one\`);
+  r = await get(c, small, '1');
+  assert(r.json().truncated === false && pairs(r) === expect('l-000@1'), \`a complete answer must say truncated false, got \${r.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+
+	"graph/store"
+
+	"leetbuild/harness"
+)
+
+var readBg = context.Background()
+
+type readAnswer struct {
+	EntityID  string \`json:"entity_id"\`
+	Neighbors []struct {
+		ID       string \`json:"id"\`
+		Distance int    \`json:"distance"\`
+	} \`json:"neighbors"\`
+	Truncated *bool \`json:"truncated"\`
+}
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readEntity(tenant string) string { return store.CreateEntity(readBg, tenant, "person", "node", nil).ID }
+
+func readEdge(ctx *harness.Ctx, left, right string) {
+	ctx.Redis.Do("SADD", "edges:"+left, right)
+	ctx.Redis.Do("SADD", "edges:"+right, left)
+}
+
+func readGet(c *harness.HTTP, entityID, query, tenant string) *harness.Response {
+	path := "/v1/entities/" + entityID + "/neighbors" + query
+	if tenant == "" {
+		return c.Get(path)
+	}
+	return c.Get(path, "X-Tenant-Id", tenant)
+}
+
+func readDecode(r *harness.Response) readAnswer {
+	out := readAnswer{}
+	r.Decode(&out)
+	return out
+}
+
+// readPairs is the answer's neighbours as sorted "id@distance".
+func readPairs(r *harness.Response) string {
+	pairs := []string{}
+	for _, n := range readDecode(r).Neighbors {
+		pairs = append(pairs, fmt.Sprintf("%s@%d", n.ID, n.Distance))
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, ",")
+}
+
+func readExpect(pairs ...string) string {
+	sort.Strings(pairs)
+	return strings.Join(pairs, ",")
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	root, left, right := readEntity("t1"), readEntity("t1"), readEntity("t1")
+	readEdge(ctx, root, left)
+	readEdge(ctx, root, right)
+	r := readGet(readAPI(ctx), root, "?depth=1", "t1")
+	ctx.Equal(r.Status, 200, "GET /v1/entities/%s/neighbors?depth=1 (%s)", root, r.Text())
+	ctx.Assert(readDecode(r).EntityID == root && readPairs(r) == readExpect(left+"@1", right+"@1"), "the neighbours of %s at depth 1 are %s and %s, got %s", root, left, right, r.Text())
+	ctx.Equal(ctx.Redis.Exists("adj:"+root), 1, "the walk must read through the adjacency cache (adjacency.ReadNeighbors); adj:%s exists", root)
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	mine, theirs, friend := readEntity("t1"), readEntity("t2"), readEntity("t2")
+	readEdge(ctx, theirs, friend)
+	c := readAPI(ctx)
+	r := readGet(c, theirs, "?depth=1", "t1")
+	ctx.Assert(r.Status == 404, "tenant t1 asked for the neighbours of %s, an entity of t2, and got %d %s: another tenant's entity is 404", theirs, r.Status, r.Text())
+	ctx.Assert(!strings.Contains(r.Text(), friend), "the answer to t1 leaks %s, a neighbour in t2", friend)
+	ctx.Equal(readGet(c, "e-999", "?depth=1", "t1").Status, 404, "an unknown entity")
+	ctx.Equal(readGet(c, mine, "?depth=1", "").Status, 401, "a request without X-Tenant-Id")
+	r = readGet(c, theirs, "?depth=1", "t2")
+	ctx.Assert(r.Status == 200 && readPairs(r) == friend+"@1", "the owning tenant must still read %s, got %d %s", theirs, r.Status, r.Text())
+}
+
+func CheckDepthCap(ctx *harness.Ctx) {
+	a, b, c3, d := readEntity("t1"), readEntity("t1"), readEntity("t1"), readEntity("t1")
+	readEdge(ctx, a, b)
+	readEdge(ctx, b, c3)
+	readEdge(ctx, c3, d)
+	c := readAPI(ctx)
+	r := readGet(c, a, "", "t1")
+	ctx.Assert(r.Status == 200 && readPairs(r) == b+"@1", "without depth the walk must stop after 1 hop (depth defaults to 1), got %d %s", r.Status, r.Text())
+	r = readGet(c, a, "?depth=2", "t1")
+	ctx.Assert(r.Status == 200 && readPairs(r) == readExpect(b+"@1", c3+"@2"), "depth=2 on the chain must reach %s and %s, got %d %s", b, c3, r.Status, r.Text())
+	for _, bad := range []string{"3", "0", "ten"} {
+		r = readGet(c, a, "?depth="+bad, "t1")
+		ctx.Assert(r.Status == 400, "depth=%s answered %d: a depth outside 1..maxDepth (2) is 400 before any traversal", bad, r.Status)
+	}
+}
+
+func CheckBoundedTraversal(ctx *harness.Ctx) {
+	a, b, c3, d := readEntity("t1"), readEntity("t1"), readEntity("t1"), readEntity("t1")
+	readEdge(ctx, a, b)
+	readEdge(ctx, a, c3)
+	readEdge(ctx, b, d)
+	readEdge(ctx, c3, d)
+	r := readGet(readAPI(ctx), a, "?depth=2", "t1")
+	ctx.Equal(r.Status, 200, "depth=2 (%s)", r.Text())
+	got := readPairs(r)
+	ctx.Assert(got == readExpect(b+"@1", c3+"@1", d+"@2"), "a depth-2 walk over the diamond answered %s: each entity must appear once, at its shortest distance, and never %s itself. Walk breadth-first with a visited set", got, a)
+}
+
+func CheckResultCap(ctx *harness.Ctx) {
+	hub, small := readEntity("t1"), readEntity("t1")
+	args := []any{"SADD", "edges:" + hub}
+	for i := 0; i < 600; i++ {
+		args = append(args, fmt.Sprintf("l-%03d", i))
+	}
+	ctx.Redis.Do(args...)
+	readEdge(ctx, small, "l-000")
+	c := readAPI(ctx)
+	r := readGet(c, hub, "?depth=1", "t1")
+	ctx.Equal(r.Status, 200, "the hub's neighbours (%s)", r.Text())
+	answer := readDecode(r)
+	unique := map[string]bool{}
+	for _, n := range answer.Neighbors {
+		unique[n.ID] = true
+	}
+	ctx.Assert(len(answer.Neighbors) == 500 && len(unique) == 500, "a hub with 600 neighbours answered %d entries: cap the answer at maxResults = 500", len(answer.Neighbors))
+	ctx.Assert(answer.Truncated != nil && *answer.Truncated, "the answer was cut at 500 and does not say truncated true: a client cannot tell a complete answer from a clipped one")
+	r = readGet(c, small, "?depth=1", "t1")
+	complete := readDecode(r)
+	ctx.Assert(complete.Truncated != nil && !*complete.Truncated && readPairs(r) == "l-000@1", "a complete answer must say truncated false, got %s", r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cstdio>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+harness::HTTP readAPI(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+std::string readEntity(const std::string& tenant) { return store::createEntity(tenant, "person", "node", {}).id; }
+
+void readEdge(harness::Ctx& ctx, const std::string& left, const std::string& right) {
+  ctx.Redis.Do("SADD", "edges:" + left, right);
+  ctx.Redis.Do("SADD", "edges:" + right, left);
+}
+
+harness::Response readGet(harness::HTTP& c, const std::string& entity_id, const std::string& query, const std::string& tenant) {
+  const std::string path = "/v1/entities/" + entity_id + "/neighbors" + query;
+  if (tenant.empty()) return c.Get(path);
+  return c.Get(path, "X-Tenant-Id", tenant);
+}
+
+nlohmann::json readBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+// The answer's neighbours as sorted "id@distance".
+std::string readPairs(const harness::Response& r) {
+  const auto body = readBody(r);
+  std::vector<std::string> pairs;
+  if (body.is_object() && body.contains("neighbors") && body["neighbors"].is_array()) {
+    for (const auto& n : body["neighbors"]) pairs.push_back(n.value("id", "") + "@" + std::to_string(n.value("distance", 0)));
+  }
+  std::sort(pairs.begin(), pairs.end());
+  std::string out;
+  for (const auto& p : pairs) out += (out.empty() ? "" : ",") + p;
+  return out;
+}
+
+std::string readExpect(std::vector<std::string> pairs) {
+  std::sort(pairs.begin(), pairs.end());
+  std::string out;
+  for (const auto& p : pairs) out += (out.empty() ? "" : ",") + p;
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  const std::string root = readEntity("t1"), left = readEntity("t1"), right = readEntity("t1");
+  readEdge(ctx, root, left);
+  readEdge(ctx, root, right);
+  auto c = readAPI(ctx);
+  const auto r = readGet(c, root, "?depth=1", "t1");
+  ctx.Equal(r.Status, 200, "GET /v1/entities/%s/neighbors?depth=1 (%s)", root, r.Text());
+  ctx.Assert(readBody(r).value("entity_id", "") == root && readPairs(r) == readExpect({left + "@1", right + "@1"}), "the neighbours of %s at depth 1 are %s and %s, got %s", root, left, right, r.Text());
+  ctx.Equal(ctx.Redis.Exists("adj:" + root), 1, "the walk must read through the adjacency cache (adjacency::readNeighbors); adj:%s exists", root);
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  const std::string mine = readEntity("t1"), theirs = readEntity("t2"), friend_ = readEntity("t2");
+  readEdge(ctx, theirs, friend_);
+  auto c = readAPI(ctx);
+  auto r = readGet(c, theirs, "?depth=1", "t1");
+  ctx.Assert(r.Status == 404, "tenant t1 asked for the neighbours of %s, an entity of t2, and got %d %s: another tenant's entity is 404", theirs, r.Status, r.Text());
+  ctx.Assert(r.Text().find(friend_) == std::string::npos, "the answer to t1 leaks %s, a neighbour in t2", friend_);
+  ctx.Equal(readGet(c, "e-999", "?depth=1", "t1").Status, 404, "an unknown entity");
+  ctx.Equal(readGet(c, mine, "?depth=1", "").Status, 401, "a request without X-Tenant-Id");
+  r = readGet(c, theirs, "?depth=1", "t2");
+  ctx.Assert(r.Status == 200 && readPairs(r) == friend_ + "@1", "the owning tenant must still read %s, got %d %s", theirs, r.Status, r.Text());
+}
+
+void CheckDepthCap(harness::Ctx& ctx) {
+  const std::string a = readEntity("t1"), b = readEntity("t1"), c3 = readEntity("t1"), d = readEntity("t1");
+  readEdge(ctx, a, b);
+  readEdge(ctx, b, c3);
+  readEdge(ctx, c3, d);
+  auto c = readAPI(ctx);
+  auto r = readGet(c, a, "", "t1");
+  ctx.Assert(r.Status == 200 && readPairs(r) == b + "@1", "without depth the walk must stop after 1 hop (depth defaults to 1), got %d %s", r.Status, r.Text());
+  r = readGet(c, a, "?depth=2", "t1");
+  ctx.Assert(r.Status == 200 && readPairs(r) == readExpect({b + "@1", c3 + "@2"}), "depth=2 on the chain must reach %s and %s, got %d %s", b, c3, r.Status, r.Text());
+  for (const std::string bad : {"3", "0", "ten"}) {
+    r = readGet(c, a, "?depth=" + bad, "t1");
+    ctx.Assert(r.Status == 400, "depth=%s answered %d: a depth outside 1..kMaxDepth (2) is 400 before any traversal", bad, r.Status);
+  }
+}
+
+void CheckBoundedTraversal(harness::Ctx& ctx) {
+  const std::string a = readEntity("t1"), b = readEntity("t1"), c3 = readEntity("t1"), d = readEntity("t1");
+  readEdge(ctx, a, b);
+  readEdge(ctx, a, c3);
+  readEdge(ctx, b, d);
+  readEdge(ctx, c3, d);
+  auto c = readAPI(ctx);
+  const auto r = readGet(c, a, "?depth=2", "t1");
+  ctx.Equal(r.Status, 200, "depth=2 (%s)", r.Text());
+  const std::string got = readPairs(r);
+  ctx.Assert(got == readExpect({b + "@1", c3 + "@1", d + "@2"}), "a depth-2 walk over the diamond answered %s: each entity must appear once, at its shortest distance, and never %s itself. Walk breadth-first with a visited set", got, a);
+}
+
+void CheckResultCap(harness::Ctx& ctx) {
+  const std::string hub = readEntity("t1"), small = readEntity("t1");
+  for (int i = 0; i < 600; i++) {
+    char leaf[8];
+    std::snprintf(leaf, sizeof leaf, "l-%03d", i);
+    ctx.Redis.Do("SADD", "edges:" + hub, std::string(leaf));
+  }
+  readEdge(ctx, small, "l-000");
+  auto c = readAPI(ctx);
+  auto r = readGet(c, hub, "?depth=1", "t1");
+  ctx.Equal(r.Status, 200, "the hub's neighbours (%s)", r.Text().substr(0, 200));
+  const auto body = readBody(r);
+  std::set<std::string> unique;
+  size_t count = 0;
+  if (body.is_object() && body.contains("neighbors") && body["neighbors"].is_array()) {
+    for (const auto& n : body["neighbors"]) {
+      unique.insert(n.value("id", ""));
+      count++;
+    }
+  }
+  ctx.Assert(count == 500 && unique.size() == 500, "a hub with 600 neighbours answered %d entries: cap the answer at kMaxResults = 500", count);
+  ctx.Assert(body.value("truncated", false) == true, "the answer was cut at 500 and does not say truncated true: a client cannot tell a complete answer from a clipped one");
+  r = readGet(c, small, "?depth=1", "t1");
+  const auto complete = readBody(r);
+  ctx.Assert(complete.is_object() && complete.contains("truncated") && complete["truncated"] == false && readPairs(r) == "l-000@1", "a complete answer must say truncated false, got %s", r.Text());
+}
+`,
+  },
   hints: [
-    'One request for a well-connected entity pins a CPU for minutes and returns megabytes, and a tenant reports seeing edges that belong to another customer.',
-    '`walk` recurses per path with no `visited` set, so a hub is re-expanded through every route to it; `depth` is uncapped, the tenant is hardcoded to `"default"`, and nothing stops the edge list growing.',
-    'Decorate the route, read `X-Tenant-Id`, 404 unless `entity_tenant` matches, 400 when `depth > MAX_DEPTH`; walk with `frontier` and `visited` in `neighbors`, stop at `MAX_EDGES` and set `truncated`.',
+    'Ask for a neighbour of another tenant with your own tenant header, then ask for `depth=6` around a hub: the first answers, the second never returns. Around a small cycle, entities appear several times, the starting one too.',
+    'The handler checks that the entity exists, never whose it is. The recursive walk has no memory of where it has been, so it follows every path, back edges included, and nothing bounds the depth or the size of the answer.',
+    'Compare `entity["tenant"]` with the header (404); default `depth` to 1 and 400 outside 1..`MAX_DEPTH`; walk a `frontier` per distance with a `visited` set seeded with the entity; stop at `MAX_RESULTS` and answer `truncated: true`.',
   ],
-  debrief: `Every guard sits in front of the traversal because the traversal is the expensive part: tenant, depth and ownership are cheap lookups, and the walk must be unreachable for a bad request. Inside it, the breadth-first frontier with a visited set is what keeps the cost proportional to the nodes reached rather than the paths to them, and the depth cap bounds how many levels that is. The edge cap with a truncated marker keeps a legitimate walk over a hub from returning an unbounded body while still telling the caller the answer is clipped. Production graph APIs add a total-node budget beside the edge budget and keyset pagination for the truncated case, so a caller who needs the whole neighbourhood can page through it instead of asking for a bigger cap.`,
+  debrief: `Every bound here protects a different party. The tenant check protects the other tenant, and answering 404 rather than 403 avoids confirming that the id exists. The depth cap protects the service: neighbourhoods grow roughly with the average degree raised to the depth, so a second hop is affordable and a sixth is not. The visited set turns path enumeration into a walk that touches each entity once. The result cap with an explicit truncated flag protects the client from mistaking a clipped answer for a complete one. Graph databases built for this, like Neo4j, also bound a query by time and memory and expose paging, so a caller can ask for the next 500 rather than more at once.`,
 };

@@ -68,8 +68,10 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
 - The debugging courses (`src/data/problems/16-ai-gateway/` through `127-prompt-defence/`) start every
   step from working code with a flaw: the learner debugs it, fixes it, optimizes what is wasteful and
   proves the fix. Their copy never calls the starter a model's draft (`yarn verify` rejects
-  `model-generated`, `AI-generated`, `AI draft`, `AI-era` and `Review premise`); the statement has a
-  "## The debugging habit" section and every step opens with a `**Starting point.**` paragraph.
+  `model-generated`, `AI-generated`, `AI draft`, `AI-era` and `Review premise`) nor frames a step as
+  an interview (`interviewer`); the statement has a "## The debugging habit" section, every step
+  opens with a `**Starting point.**` paragraph whose "hides N flaws" is the number of checks the
+  Python starter fails, and the starter's `TODO` is one line that does not list the flaws.
 - All five languages are mandatory in every step of a course. A deep-learning problem (`track: 'dllm'`)
   fixes one language instead — `language: 'python'` (PyTorch) or `'cuda'` — and its steps carry code
   and matchers for that language only; it has no harness, and its reference solution is a complete
@@ -90,12 +92,14 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   dated by its creation) and the posts or docs that explain it, each with its `kind`, `venue` and
   what the problem takes from it. Every link is checked against the live page, never written from
   memory; `yarn verify` enforces the shape.
-- The debugging courses currently use static review checks only. The classic courses have Python,
-  TypeScript, Go and C++ harnesses that execute in the browser runtime (Go's: `goruntime/`, rebuilt
-  into the committed `public/go/runtime.wasm.gz` by `yarn build:go` after any change there; C++'s:
-  `cppruntime/`, rebuilt into the committed `public/cpp/runtime.pack.gz` by `yarn build:cpp`, and
-  `yarn verify` needs Node 24 to run it). If you add harnesses to a debugging course, keep the checks
-  outcome-based and update the README.
+- Debugging courses are being rebuilt to the classic courses' bar: one contract across the steps,
+  support modules in all five languages, Python, TypeScript, Go and C++ harnesses that execute in the
+  browser runtime, and Scala compiled by `yarn check:scala`; a course not yet rebuilt is judged by
+  its static checks only. The runtimes: Go's is `goruntime/`, rebuilt into the committed
+  `public/go/runtime.wasm.gz` by `yarn build:go` after any change there; C++'s is `cppruntime/`,
+  rebuilt into the committed `public/cpp/runtime.pack.gz` by `yarn build:cpp`, and `yarn verify`
+  needs Node 24 to run it. Harness checks stay outcome-based; update the README when what a course
+  runs changes.
 
 ## Pull requests
 

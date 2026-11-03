@@ -244,6 +244,9 @@ function verifyStep(problem: Problem, step: Step, index: number): string[] {
   }
   if (index === 0 && step.concept !== problem.concepts[0])
     errors.push(`${tag}: problem.concepts[0] should be the first step's concept (${step.concept})`);
+  // A debugging course says once, in its statement, how to work its steps (the steps no longer repeat it).
+  if (index === 0 && /\*\*Starting point\.\*\*/.test(step.task) && !/^## The debugging habit$/m.test(problem.statement))
+    errors.push(`${tag}: a course whose steps start from a flawed starter needs a "## The debugging habit" section`);
   return errors;
 }
 
@@ -665,10 +668,52 @@ async function verifyRuntime(
   return errors;
 }
 
+/**
+ * A page keeps one Python runtime as the learner moves between courses, and protobuf keeps one
+ * descriptor pool per runtime: two courses that ship a .proto under one file name, or define one
+ * fully qualified message, service or enum, cannot both load in it (nor in one `yarn verify`). So
+ * file names and top-level symbols are unique across the catalogue. `only`: report just the
+ * collisions involving these problems.
+ */
+function protoCollisions(problems: Problem[], only: Problem[] | null): string[] {
+  const files = new Map<string, string>();
+  const symbols = new Map<string, string>();
+  const errors: string[] = [];
+  const involved = (a: string, b: string): boolean => only === null || only.some(p => p.id === a || p.id === b);
+  for (const problem of problems) {
+    const protos = Object.entries(problem.support?.typescript ?? {}).filter(([name]) => name.endsWith('.proto'));
+    for (const [path, source] of protos) {
+      const file = path.split('/').pop() ?? path;
+      const owner = files.get(file);
+      if (owner !== undefined && owner !== problem.id && involved(owner, problem.id))
+        errors.push(`${problem.id}: ships ${file}, as ${owner} does; name the .proto after the course`);
+      files.set(file, problem.id);
+      const code = source.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(code)?.[1];
+      let depth = 0;
+      for (const token of code.matchAll(/[{}]|\b(message|service|enum)\s+(\w+)/g)) {
+        if (token[0] === '{') depth++;
+        else if (token[0] === '}') depth--;
+        else if (depth === 0) {
+          const symbol = pkg === undefined ? token[2] : `${pkg}.${token[2]}`;
+          const other = symbols.get(symbol);
+          if (other !== undefined && other !== problem.id && involved(other, problem.id))
+            errors.push(`${problem.id}: defines ${symbol}, as ${other} does; give the .proto a package of its own`);
+          symbols.set(symbol, problem.id);
+        }
+      }
+    }
+  }
+  return errors;
+}
+
 async function main(): Promise<void> {
   const errors: string[] = [...judgeSelfTest(), ...goRuntimeFreshness(), ...cppRuntimeFreshness()];
   console.log(`${errors.length === 0 ? '✓' : '✗'} judge self-tests, Go and C++ runtimes built from these sources`);
   const problems = await loadProblems();
+  errors.push(
+    ...protoCollisions(problems, onlyProblem === null ? null : problems.filter(p => onlyProblem.endsWith(p.id))),
+  );
   const ids = new Set<string>();
   let steps = 0;
   let checked = 0;

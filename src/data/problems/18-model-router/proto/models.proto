@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package routerd;
+
+// One model deployment: routerd reaches each model at {model}:9000 (gpt-4o:9000, gpt-4o-mini:9000)
+// and calls Complete with a deadline per attempt (step 3).
+service Model {
+  rpc Complete(CompleteRequest) returns (CompleteReply);
+}
+
+message CompleteRequest {
+  string model = 1;
+  string prompt = 2;
+  int32 max_tokens = 3;
+}
+
+message Usage {
+  int32 input_tokens = 1;
+  int32 output_tokens = 2;
+}
+
+message CompleteReply {
+  string text = 1;
+  Usage usage = 2;
+}

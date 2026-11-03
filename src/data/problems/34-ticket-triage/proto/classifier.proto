@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package triage;
+
+// The ticket classifier step 3 calls before a ticket is routed. A ticket the model will not
+// classify (empty after cleaning, or in a language it does not read) is INVALID_ARGUMENT; an
+// overloaded classifier answers UNAVAILABLE.
+service Classifier {
+  rpc Classify(ClassifyRequest) returns (ClassifyReply);
+}
+
+message ClassifyRequest {
+  string tenant = 1;
+  string text = 2;
+}
+
+message ClassifyReply {
+  string queue = 1;
+  string priority = 2;
+  double confidence = 3;
+}

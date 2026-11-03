@@ -2,437 +2,749 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/embeddings/{content_hash}: the read path that must match the write',
+  title: 'GET /v1/embeddings/{content_hash}: the tenant’s vector, under the model asked for',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'api', 'redis'],
+  focus: ['indexer', 'api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter registers \`GET /v1/embeddings/{content_hash}\`, the read the indexer
-and the retriever both use: it looks up \`vector:{content_hash}\`, returns the stored entry on a hit
-and \`200 {"vector": []}\` on a miss. It compiles, serves the demo, and hides 4 flaws.
+**Starting point.** The starter serves \`GET /v1/embeddings/{content_hash}?model_version=\` (default
+\`MODEL_VERSION\`), the read the indexer and the retriever use: it takes the tenant from
+\`X-Tenant-Id\`, reads \`cache.read_vector(tenant, model_version, hash)\`, and on a miss looks for any
+key matching \`emb:*:{hash}\` before answering \`200 {content_hash, vector}\`, with \`[]\` when nothing
+matched. It serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** One tenant reading another's vector by guessing a hash, a \`v2\`
-request served the \`v1\` vector, and an empty 200 that every caller caches as if it were real.
+**Failure mode the checks target.** A caller with no tenant, or another tenant's, reading a vector
+by its hash; an \`embed-v2\` request served an \`embed-v1\` vector; and an empty 200 that callers
+cache as a real vector.
 
-Requirements:
-
-- Resolve the **tenant from auth first**; a missing \`X-Tenant-Id\` is **401**.
-- Serve the vector **for the requested model version**. The key is the same
-  \`(tenant, model version, content hash)\` the write path used.
-- A **miss is a 404** that points at the write path, not a 200 with an empty vector.
-- The response carries the **model version and the dimension** alongside the vector, so the caller
-  can verify the shape instead of trusting it.`,
+- A missing \`X-Tenant-Id\` is **401**.
+- The read is the exact key \`vector_key(tenant, model_version, hash)\` through \`cache.read_vector\`,
+  and nothing else: no pattern over other tenants or models.
+- A miss is **404** \`{"error": "not_embedded"}\`.
+- A hit answers \`{content_hash, model_version, dimension, vector}\`, so the caller can check the
+  vector's space and shape.`,
   sequence: {
-    participants: ['Client', 'Embedding API', 'Vector cache'],
+    participants: ['Indexer', 'Embedding API', 'Vector cache'],
     messages: [
-      {from: 'Client', to: 'Embedding API', label: 'GET /v1/embeddings/{hash} · X-Tenant-Id', kind: 'sync'},
-      {from: 'Embedding API', to: 'Embedding API', label: 'resolve tenant first → 401 if absent', kind: 'sync'},
-      {from: 'Embedding API', to: 'Vector cache', label: 'GET vector:{tenant}:{version}:{hash}', kind: 'sync'},
-      {from: 'Vector cache', to: 'Embedding API', label: 'entry / nil', kind: 'reply'},
-      {from: 'Embedding API', to: 'Client', label: '200 {model_version, dimension, vector}', kind: 'reply'},
-      {from: 'Embedding API', to: 'Client', label: '404 {error, write_path} on a miss', kind: 'reply'},
+      {
+        from: 'Indexer',
+        to: 'Embedding API',
+        label: 'GET /v1/embeddings/{hash}?model_version · X-Tenant-Id',
+        kind: 'sync',
+      },
+      {from: 'Embedding API', to: 'Embedding API', label: 'no tenant → 401', kind: 'sync'},
+      {from: 'Embedding API', to: 'Vector cache', label: 'GET emb:{tenant}:{model}:{hash}', kind: 'sync'},
+      {from: 'Vector cache', to: 'Embedding API', label: 'vector / nil', kind: 'reply'},
+      {
+        from: 'Embedding API',
+        to: 'Indexer',
+        label: '200 {model_version, dimension, vector} · 404 not_embedded',
+        kind: 'reply',
+      },
     ],
   },
-  hints: [
-    "A tenant reports seeing vectors for text it never embedded; after the model upgrade, reads return the old model's vectors; the retriever ranks documents with an empty embedding.",
-    'The lookup runs before anyone checks the header, and the key is the bare hash, so any tenant and any version hit the same entry. A miss returns 200 with an empty list.',
-    'Return 401 before the Redis call when `X-Tenant-Id` is empty; build `read_key(tenant, model_version, content_hash)`; on a miss return 404 with `write_path`; include `model_version` and `dimension` on a hit.',
-  ],
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/embeddings/{content_hash}',
-      detail: 'Register the read route on `GET /v1/embeddings/{content_hash}`.',
+      title: 'Serves a cached vector on GET /v1/embeddings/{content_hash}',
+      detail: 'The route reads the vector through `cache.read_vector` and answers it on a hit.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/embeddings\/\{content_hash\}["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/embeddings\/:contentHash['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/embeddings\/\{contentHash\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"embeddings"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*R?"\(\/v1\/embeddings\//]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/embeddings\/\{/, /cache\.read_vector\(/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/embeddings\/:/, /cache\.readVector\(/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/embeddings\/\{/, /cache\.ReadVector\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"embeddings"\s*\/\s*Segment\s*\)/, /Cache\.readVector\(/]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/embeddings\//, /cache::readVector\(/]},
       },
     },
     {
-      id: 'tenant-auth',
-      title: 'Resolves the tenant from auth first',
-      detail:
-        "The tenant is read from `X-Tenant-Id` and an absent one is **401** before the cache is touched. The starter looks the vector up first, so a foreign tenant can read another's vector.",
+      id: 'tenant-required',
+      title: 'A read without a tenant is 401',
+      detail: 'A missing `X-Tenant-Id` answers **401** before Redis is read.',
       match: {
-        python: {all: [/X-Tenant-Id/, /raise HTTPException/]},
-        typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/]},
-        go: {all: [/X-Tenant-Id/, /StatusUnauthorized/]},
-        scala: {all: [/X-Tenant-Id/, /StatusCodes\.Unauthorized/]},
-        cpp: {all: [/X-Tenant-Id/, /\b401\b/]},
+        python: {all: [/x-tenant-id/i, /\b401\b/]},
+        typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/]},
+        go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
+        scala: {all: [/X-Tenant-Id/i, /StatusCodes\.Unauthorized/]},
+        cpp: {all: [/X-Tenant-Id/i, /\b401\b/]},
       },
     },
     {
-      id: 'version-scoped',
-      title: 'Keys by model version so a v2 read never serves v1',
+      id: 'exact-key',
+      title: 'Reads one exact key, never a pattern',
       detail:
-        'The read key includes the model version, so a request for another version is a miss. The starter returns the first hit regardless of version.',
+        'Only `vector_key(tenant, model_version, hash)` is read; a `KEYS`/`SCAN` over `emb:*:{hash}` serves other tenants’ and other models’ vectors.',
       match: {
-        python: {all: [/def read_key\(/, /model_version/]},
-        typescript: {all: [/function readKey\(/, /modelVersion/]},
-        go: {all: [/func readKey\(/, /modelVersion/]},
-        scala: {all: [/def readKey\(/, /modelVersion/]},
-        cpp: {all: [/read_key\(/, /model_version/]},
+        python: {none: [/\.keys\(|scan_iter\(|\.scan\(/]},
+        typescript: {none: [/\.keys\(|\.scan\(|scanStream\(/]},
+        go: {none: [/\.Keys\(|\.Scan\(/]},
+        scala: {none: [/\.keys\(|\.scan\(/]},
+        cpp: {none: [/\.keys\(|\.scan\(/]},
       },
     },
     {
       id: 'miss-404',
-      title: 'A miss is a 404 that points at the write path',
+      title: 'A miss is 404 not_embedded',
       detail:
-        'A cache miss returns **404** with a pointer to the write path, not a 200 with an empty vector. The starter teaches callers that an empty vector is valid.',
+        'No vector under the exact key answers **404** `{"error": "not_embedded"}`, not a 200 with an empty vector.',
       match: {
-        python: {all: [/status_code\s*=\s*404/, /write_path/]},
-        typescript: {all: [/code\(\s*404\s*\)/, /write_path/]},
-        go: {all: [/StatusNotFound/, /write_path/]},
-        scala: {all: [/StatusCodes\.NotFound/, /write_path/]},
-        cpp: {all: [/\b404\b/, /write_path/]},
+        python: {all: [/\b404\b/, /not_embedded/]},
+        typescript: {all: [/code\(\s*404\s*\)/, /not_embedded/]},
+        go: {all: [/StatusNotFound|\b404\b/, /not_embedded/]},
+        scala: {all: [/StatusCodes\.NotFound/, /not_embedded/]},
+        cpp: {all: [/\b404\b/, /not_embedded/]},
       },
     },
     {
       id: 'reports-shape',
-      title: 'Reports the model version and dimension',
-      detail:
-        'The response carries the model version and the dimension beside the vector, so the caller can check the shape. The starter returns a bare vector.',
+      title: 'Answers the model version and dimension with the vector',
+      detail: 'A hit carries `model_version` and `dimension` (the vector’s length) beside the vector.',
       match: {
-        python: {all: [/model_version/, /dimension/]},
-        typescript: {all: [/model_version/, /dimension/]},
-        go: {all: [/model_version/, /dimension/]},
-        scala: {all: [/model_version/, /dimension/]},
-        cpp: {all: [/model_version/, /dimension/]},
+        python: {all: [/["']dimension["']/, /["']model_version["']/]},
+        typescript: {all: [/\bdimension:/, /\bmodel_version:/]},
+        go: {all: [/"dimension"/, /"model_version"/]},
+        scala: {all: [/"dimension"/, /"model_version"/]},
+        cpp: {all: [/"dimension"/, /"model_version"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""GET /v1/embeddings/{content_hash}: serves a cached vector by content hash."""
-import json
+      starter: `import json
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+import redis
+from fastapi import FastAPI, Request
+
+from embedding import cache
+from embedding.config import MODEL_VERSION
 
 app = FastAPI()
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-MODEL_VERSION = "text-embedding-v1"
 
-
-@app.get("/v1/embeddings/{content_hash}")
-def read_embedding(content_hash: str) -> JSONResponse:
+@app.get("/v1/embeddings/{digest}")
+def read_embedding(digest: str, request: Request) -> dict:
     # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    entry = r.get(f"vector:{content_hash}")
-    if entry is None:
-        return JSONResponse({"vector": []}, status_code=200)
-    return JSONResponse(json.loads(entry), status_code=200)
+    tenant = request.headers.get("x-tenant-id", "")
+    version = request.query_params.get("model_version", MODEL_VERSION)
+    vector = cache.read_vector(tenant, version, digest)
+    if vector is None:
+        for key in r.keys(f"emb:*:{digest}"):
+            vector = json.loads(r.get(key))
+            break
+    return {"content_hash": digest, "vector": vector or []}
 `,
-      solution: `"""GET /v1/embeddings/{content_hash} — tenant first, version-scoped, 404 on a miss."""
-import json
-
-from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from embedding import cache
+from embedding.config import MODEL_VERSION
 
 app = FastAPI()
 
-MODEL_VERSION = "text-embedding-v1"
 
-
-def read_key(tenant: str, model_version: str, content_hash: str) -> str:
-    """The same key the write path used: another version is another vector, not a hit."""
-    return f"vector:{tenant}:{model_version}:{content_hash}"
-
-
-@app.get("/v1/embeddings/{content_hash}")
-def read_embedding(
-    content_hash: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    model_version: str = Header(default=MODEL_VERSION, alias="X-Model-Version"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    entry = r.get(read_key(tenant, model_version, content_hash))
-    if entry is None:
-        return JSONResponse(
-            {"error": "not found", "write_path": "POST /v1/embeddings"},
-            status_code=404,
-        )
-    stored = json.loads(entry)
-    return JSONResponse(
-        {
-            "model_version": stored["model_version"],
-            "dimension": stored["dimension"],
-            "vector": stored["vector"],
-        },
-        status_code=200,
-    )
+@app.get("/v1/embeddings/{digest}")
+def read_embedding(digest: str, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "missing_tenant"}, status_code=401)
+    version = request.query_params.get("model_version", MODEL_VERSION)
+    vector = cache.read_vector(tenant, version, digest)  # the exact key: this tenant, this model
+    if vector is None:
+        return JSONResponse({"error": "not_embedded", "content_hash": digest, "model_version": version}, status_code=404)
+    return JSONResponse({"content_hash": digest, "model_version": version, "dimension": len(vector), "vector": vector})
 `,
     },
     typescript: {
-      starter: `/** GET /v1/embeddings/{content_hash}: serves a cached vector by content hash. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 import Redis from 'ioredis';
 
+import {cache} from 'embedding/cache';
+import {MODEL_VERSION} from 'embedding/config';
+
 export const app = Fastify();
-const r = new Redis({host: 'redis', port: 6379});
+const redis = new Redis({host: 'redis', port: 6379});
 
-const MODEL_VERSION = 'text-embedding-v1';
-
-app.get('/v1/embeddings/:contentHash', async (request, reply) => {
+app.get('/v1/embeddings/:digest', async request => {
   // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const {contentHash} = request.params as {contentHash: string};
-  const entry = await r.get(\`vector:\${contentHash}\`);
-  if (entry === null) return reply.code(200).send({vector: []});
-  return reply.code(200).send(JSON.parse(entry));
+  const tenant = (request.headers['x-tenant-id'] as string | undefined) ?? '';
+  const {digest} = request.params as {digest: string};
+  const version = (request.query as {model_version?: string}).model_version ?? MODEL_VERSION;
+  let vector = await cache.readVector(tenant, version, digest);
+  if (vector === null) {
+    const [key] = await redis.keys(\`emb:*:\${digest}\`);
+    const raw = key === undefined ? null : await redis.get(key);
+    if (raw !== null) vector = JSON.parse(raw) as number[];
+  }
+  return {content_hash: digest, vector: vector ?? []};
 });
 `,
-      solution: `/** GET /v1/embeddings/{content_hash} — tenant first, version-scoped, 404 on a miss. */
-import Fastify from 'fastify';
-import Redis from 'ioredis';
+      solution: `import Fastify from 'fastify';
+
+import {cache} from 'embedding/cache';
+import {MODEL_VERSION} from 'embedding/config';
 
 export const app = Fastify();
-const r = new Redis({host: 'redis', port: 6379});
 
-const MODEL_VERSION = 'text-embedding-v1';
-
-/** The same key the write path used: another version is another vector, not a hit. */
-function readKey(tenant: string, modelVersion: string, contentHash: string): string {
-  return \`vector:\${tenant}:\${modelVersion}:\${contentHash}\`;
-}
-
-app.get('/v1/embeddings/:contentHash', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'] as string | undefined;
-  if (tenant === undefined || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const modelVersion = (request.query as {model_version?: string}).model_version ?? MODEL_VERSION;
-  const {contentHash} = request.params as {contentHash: string};
-  const entry = await r.get(readKey(tenant, modelVersion, contentHash));
-  if (entry === null)
-    return reply.code(404).send({error: 'not found', write_path: 'POST /v1/embeddings'});
-  const stored = JSON.parse(entry) as {model_version: string; dimension: number; vector: number[]};
-  return reply.code(200).send({
-    model_version: stored.model_version,
-    dimension: stored.dimension,
-    vector: stored.vector,
-  });
+app.get('/v1/embeddings/:digest', async (request, reply) => {
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing_tenant'});
+  const {digest} = request.params as {digest: string};
+  const version = (request.query as {model_version?: string}).model_version ?? MODEL_VERSION;
+  const vector = await cache.readVector(tenant, version, digest); // the exact key: this tenant, this model
+  if (vector === null) return reply.code(404).send({error: 'not_embedded', content_hash: digest, model_version: version});
+  return {content_hash: digest, model_version: version, dimension: vector.length, vector};
 });
 `,
     },
     go: {
-      starter: `// GET /v1/embeddings/{content_hash}: serves a cached vector by content hash.
-package main
+      starter: `package main
 
 import (
 	"encoding/json"
 	"net/http"
+
+	"github.com/redis/go-redis/v9"
+
+	"embedding/cache"  // cache.ReadVector — provided
+	"embedding/config" // config.ModelVersion — provided
 )
 
-const modelVersion = "text-embedding-v1"
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-func handleRead(w http.ResponseWriter, r *http.Request) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func readEmbedding(rw http.ResponseWriter, r *http.Request) {
 	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	contentHash := r.PathValue("contentHash")
-	entry, err := rdb.Get(r.Context(), "vector:"+contentHash).Result()
+	tenant := r.Header.Get("X-Tenant-Id")
+	digest := r.PathValue("hash")
+	version := r.URL.Query().Get("model_version")
+	if version == "" {
+		version = config.ModelVersion
+	}
+	vector, err := cache.ReadVector(r.Context(), tenant, version, digest)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"vector": []float32{}})
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	var stored map[string]any
-	_ = json.Unmarshal([]byte(entry), &stored)
-	writeJSON(w, http.StatusOK, stored)
+	if vector == nil {
+		if keys, _ := rdb.Keys(r.Context(), "emb:*:"+digest).Result(); len(keys) > 0 {
+			raw, _ := rdb.Get(r.Context(), keys[0]).Result()
+			json.Unmarshal([]byte(raw), &vector)
+		}
+	}
+	if vector == nil {
+		vector = []float32{}
+	}
+	writeJSON(rw, http.StatusOK, map[string]any{"content_hash": digest, "vector": vector})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/embeddings/{hash}", readEmbedding)
 }
 `,
-      solution: `// GET /v1/embeddings/{content_hash} — tenant first, version-scoped, 404 on a miss.
-package main
+      solution: `package main
 
 import (
 	"encoding/json"
 	"net/http"
+
+	"embedding/cache"  // cache.ReadVector — provided
+	"embedding/config" // config.ModelVersion — provided
 )
 
-const modelVersion = "text-embedding-v1"
-
-// readKey is the same key the write path used: another version is another vector, not a hit.
-func readKey(tenant, modelVersion, contentHash string) string {
-	return "vector:" + tenant + ":" + modelVersion + ":" + contentHash
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func handleRead(w http.ResponseWriter, r *http.Request) {
+func readEmbedding(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		http.Error(w, "missing X-Tenant-Id", http.StatusUnauthorized)
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing_tenant"})
 		return
 	}
-	contentHash := r.PathValue("contentHash")
-	entry, err := rdb.Get(r.Context(), readKey(tenant, modelVersion, contentHash)).Result()
+	digest := r.PathValue("hash")
+	version := r.URL.Query().Get("model_version")
+	if version == "" {
+		version = config.ModelVersion
+	}
+	vector, err := cache.ReadVector(r.Context(), tenant, version, digest) // the exact key: this tenant, this model
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{
-			"error":      "not found",
-			"write_path": "POST /v1/embeddings",
-		})
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	var stored struct {
-		ModelVersion string    \`json:"model_version"\`
-		Dimension    int       \`json:"dimension"\`
-		Vector       []float32 \`json:"vector"\`
+	if vector == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "not_embedded", "content_hash": digest, "model_version": version})
+		return
 	}
-	_ = json.Unmarshal([]byte(entry), &stored)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"model_version": stored.ModelVersion,
-		"dimension":     stored.Dimension,
-		"vector":        stored.Vector,
-	})
+	writeJSON(rw, http.StatusOK, map[string]any{"content_hash": digest, "model_version": version, "dimension": len(vector), "vector": vector})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/embeddings/{contentHash}", handleRead)
-	_ = http.ListenAndServe(":8080", mux)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/embeddings/{hash}", readEmbedding)
 }
 `,
     },
     scala: {
-      starter: `// GET /v1/embeddings/{content_hash}: serves a cached vector by content hash.
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+import redis.clients.jedis.JedisPooled
 
-object ReadEndpoint {
-  val ModelVersion = "text-embedding-v1"
+import scala.jdk.CollectionConverters._
 
-  val route =
-    path("v1" / "embeddings" / Segment) { contentHash =>
-      get {
-        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-        store.get("vector:" + contentHash) match {
-          case Some(stored) => complete(StatusCodes.OK, stored)
-          case None         => complete(StatusCodes.OK, """{"vector":[]}""")
+import embedding.{Cache, Config} // Cache.readVector, Config.ModelVersion — provided
+
+object ReadApi {
+  private val jedis = new JedisPooled("redis", 6379)
+
+  def read(tenant: String, version: String, digest: String): HttpResponse = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    val vector = Cache.readVector(tenant, version, digest).orElse {
+      jedis.keys(s"emb:*:$digest").asScala.headOption.flatMap(key => Option(jedis.get(key))).map(raw => ujson.read(raw).arr.map(_.num.toFloat).toSeq)
+    }
+    val body = ujson.Obj("content_hash" -> digest, "vector" -> ujson.Arr.from(vector.getOrElse(Seq.empty[Float]).map(v => ujson.Num(v.toDouble))))
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
+  }
+
+  val route: Route = path("v1" / "embeddings" / Segment) { digest =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        parameter("model_version".optional) { version =>
+          complete(read(tenant.getOrElse(""), version.getOrElse(Config.ModelVersion), digest))
         }
       }
     }
+  }
 }
 `,
-      solution: `// GET /v1/embeddings/{content_hash} — tenant first, version-scoped, 404 on a miss.
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 
-object ReadEndpoint {
-  val ModelVersion = "text-embedding-v1"
+import embedding.{Cache, Config} // Cache.readVector, Config.ModelVersion — provided
 
-  /** The same key the write path used: another version is another vector, not a hit. */
-  def readKey(tenant: String, modelVersion: String, contentHash: String): String =
-    s"vector:$tenant:$modelVersion:$contentHash"
+object ReadApi {
+  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
 
-  val route: Route =
-    path("v1" / "embeddings" / Segment) { contentHash =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          val tenant = tenantOpt.getOrElse("")
-          if (tenant.isEmpty) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            optionalHeaderValueByName("X-Model-Version") { versionOpt =>
-              val modelVersion = versionOpt.getOrElse(ModelVersion)
-              store.get(readKey(tenant, modelVersion, contentHash)) match {
-                case Some(_) =>
-                  complete(
-                    StatusCodes.OK,
-                    Map("model_version" -> modelVersion, "dimension" -> 1024, "vector" -> List.empty[Float])
-                  )
-                case None =>
-                  complete(
-                    StatusCodes.NotFound,
-                    """{"error":"not found","write_path":"POST /v1/embeddings"}"""
-                  )
-              }
-            }
-          }
+  def read(tenant: String, version: String, digest: String): HttpResponse = {
+    if (tenant.isEmpty) return json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing_tenant"))
+    Cache.readVector(tenant, version, digest) match { // the exact key: this tenant, this model
+      case None => json(StatusCodes.NotFound, ujson.Obj("error" -> "not_embedded", "content_hash" -> digest, "model_version" -> version))
+      case Some(vector) =>
+        json(
+          StatusCodes.OK,
+          ujson.Obj(
+            "content_hash" -> digest,
+            "model_version" -> version,
+            "dimension" -> vector.size,
+            "vector" -> ujson.Arr.from(vector.map(v => ujson.Num(v.toDouble)))
+          )
+        )
+    }
+  }
+
+  val route: Route = path("v1" / "embeddings" / Segment) { digest =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        parameter("model_version".optional) { version =>
+          complete(read(tenant.getOrElse(""), version.getOrElse(Config.ModelVersion), digest))
         }
       }
     }
+  }
 }
 `,
     },
     cpp: {
-      starter: `// GET /v1/embeddings/{content_hash}: serves a cached vector by content hash.
-#include <httplib.h>
+      starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <vector>
 
-constexpr char kModelVersion[] = "text-embedding-v1";
+#include "embedding/cache.h"   // cache::readVector — provided
+#include "embedding/config.h"  // config::kModelVersion, redis — provided
 
-int main() {
-  httplib::Server svr;
-  svr.Get(R"(/v1/embeddings/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const std::string contentHash = req.matches[1];
-    auto entry = redis.get("vector:" + contentHash);
-    if (!entry) {
-      res.status = 200;
-      res.set_content(nlohmann::json{{"vector", nlohmann::json::array()}}.dump(), "application/json");
-      return;
+using json = nlohmann::json;
+
+void read_embedding(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const std::string digest = req.matches[1];
+  const std::string version = req.has_param("model_version") ? req.get_param_value("model_version") : config::kModelVersion;
+  auto vector = cache::readVector(tenant, version, digest);
+  if (!vector) {
+    const std::vector<std::string> keys = config::redis().keys("emb:*:" + digest);
+    if (!keys.empty()) {
+      if (const auto raw = config::redis().get(keys.front())) vector = json::parse(*raw).get<std::vector<float>>();
     }
-    res.status = 200;
-    res.set_content(*entry, "application/json");
-  });
-  svr.listen("0.0.0.0", 8443);
-  return 0;
+  }
+  res.set_content(json{{"content_hash", digest}, {"vector", vector.value_or(std::vector<float>{})}}.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/embeddings/([0-9a-f]+))", read_embedding);
 }
 `,
-      solution: `// GET /v1/embeddings/{content_hash} — tenant first, version-scoped, 404 on a miss.
-#include <httplib.h>
+      solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <string>
 
-constexpr char kModelVersion[] = "text-embedding-v1";
+#include "embedding/cache.h"   // cache::readVector — provided
+#include "embedding/config.h"  // config::kModelVersion — provided
 
-// The same key the write path used: another version is another vector, not a hit.
-std::string read_key(const std::string& tenant, const std::string& model_version, const std::string& content_hash) {
-  return "vector:" + tenant + ":" + model_version + ":" + content_hash;
+using json = nlohmann::json;
+
+void read_embedding(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content(json{{"error", "missing_tenant"}}.dump(), "application/json");
+    return;
+  }
+  const std::string digest = req.matches[1];
+  const std::string version = req.has_param("model_version") ? req.get_param_value("model_version") : config::kModelVersion;
+  const auto vector = cache::readVector(tenant, version, digest);  // the exact key: this tenant, this model
+  if (!vector) {
+    res.status = 404;
+    res.set_content(json{{"error", "not_embedded"}, {"content_hash", digest}, {"model_version", version}}.dump(), "application/json");
+    return;
+  }
+  res.set_content(json{{"content_hash", digest}, {"model_version", version}, {"dimension", vector->size()}, {"vector", *vector}}.dump(),
+                  "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-  svr.Get(R"(/v1/embeddings/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string tenant = req.get_header_value("X-Tenant-Id");
-    auto reply = [&res](int status, const nlohmann::json& body) {
-      res.status = status;
-      res.set_content(body.dump(), "application/json");
-    };
-    if (tenant.empty()) {
-      reply(401, {{"error", "missing X-Tenant-Id"}});
-      return;
-    }
-    const std::string contentHash = req.matches[1];
-    const std::string requested = req.get_header_value("X-Model-Version");
-    const std::string modelVersion = requested.empty() ? kModelVersion : requested;
-    auto entry = redis.get(read_key(tenant, modelVersion, contentHash));
-    if (!entry) {
-      reply(404, {{"error", "not found"}, {"write_path", "POST /v1/embeddings"}});
-      return;
-    }
-    auto stored = nlohmann::json::parse(*entry);
-    reply(200, {
-                {"model_version", stored.value("model_version", "")},
-                {"dimension", stored.value("dimension", 0)},
-                {"vector", stored.value("vector", nlohmann::json::array())},
-            });
-  });
-  svr.listen("0.0.0.0", 8443);
-  return 0;
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/embeddings/([0-9a-f]+))", read_embedding);
 }
 `,
     },
   },
-  debrief: `The read path is where the cache's key discipline is proven, because a read that builds a different
-key than the write silently serves the wrong thing. The tenant is resolved before the lookup because
-it is part of the key, not a filter applied to the result; a guessed hash then misses instead of
-reading across tenants. The model version stays in the key so an upgrade is a miss, and a miss is a
-404 because an empty 200 is indistinguishable from a real vector to a caller that caches responses.
+  harness: {
+    python: `import json
 
-This step trusts \`X-Model-Version\` as sent. A production read validates the version against the
-models actually deployed, sets \`Vary\` so an intermediate cache keys on tenant and version, and
-serves vectors as base64 or float16 to cut the payload.`,
+from embedding import model
+from embedding.config import MODEL_VERSION, PREVIOUS_VERSION, VECTOR_TTL_S, content_hash, vector_key
+
+TEXT = "Rotate keys every 90 days."
+OTHER = "Revoke a leaked key at once."
+
+
+def _seed(ctx, tenant, version, text):
+    vector = model.vector_for(version, text)
+    ctx.redis.set(vector_key(tenant, version, content_hash(text)), json.dumps(vector), ex=VECTOR_TTL_S)
+    return vector
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+async def _get(c, text, tenant="acme", version=None):
+    headers = {"X-Tenant-Id": tenant} if tenant else {}
+    params = {"model_version": version} if version else {}
+    return await c.get(f"/v1/embeddings/{content_hash(text)}", headers=headers, params=params)
+
+
+async def check_route(ctx):
+    vector = _seed(ctx, "acme", MODEL_VERSION, TEXT)
+    async with _api(ctx) as c:
+        r = await _get(c, TEXT)
+    assert r.status_code == 200, f"GET /v1/embeddings/{{hash}} of a cached vector answered {r.status_code}: {r.text}"
+    assert r.json().get("vector") == vector, f"the read must answer the stored vector {vector}, got {r.json().get('vector')}"
+
+
+async def check_tenant_required(ctx):
+    _seed(ctx, "acme", MODEL_VERSION, TEXT)
+    async with _api(ctx) as c:
+        r = await _get(c, TEXT, tenant=None)
+    assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}: {r.text[:160]}; it must be 401"
+
+
+async def check_exact_key(ctx):
+    _seed(ctx, "acme", MODEL_VERSION, TEXT)
+    v1 = _seed(ctx, "acme", PREVIOUS_VERSION, OTHER)
+    async with _api(ctx) as c:
+        other_tenant = await _get(c, TEXT, tenant="globex")
+        assert other_tenant.status_code == 404, f"globex read acme's vector by its hash ({other_tenant.status_code} {other_tenant.text[:120]}): the read must be the exact key of the caller's tenant"
+        newer = await _get(c, OTHER)
+        assert newer.status_code == 404, f"an {MODEL_VERSION} read of a text cached only under {PREVIOUS_VERSION} answered {newer.status_code} {newer.text[:120]}: a vector from another model is not this model's vector"
+        older = await _get(c, OTHER, version=PREVIOUS_VERSION)
+    assert older.status_code == 200 and older.json().get("vector") == v1, f"?model_version={PREVIOUS_VERSION} must answer the {PREVIOUS_VERSION} vector, got {older.status_code} {older.text[:120]}"
+
+
+async def check_miss_404(ctx):
+    async with _api(ctx) as c:
+        r = await _get(c, "Never embedded.")
+    assert r.status_code == 404, f"a hash with no vector answered {r.status_code} {r.text[:120]}: a miss is 404, and a 200 with [] gets cached as a real vector"
+    assert r.json().get("error") == "not_embedded", f"the 404 must say not_embedded, got {r.text}"
+
+
+async def check_reports_shape(ctx):
+    _seed(ctx, "acme", MODEL_VERSION, TEXT)
+    _seed(ctx, "acme", PREVIOUS_VERSION, OTHER)
+    async with _api(ctx) as c:
+        current = (await _get(c, TEXT)).json()
+        older = (await _get(c, OTHER, version=PREVIOUS_VERSION)).json()
+    assert current.get("model_version") == MODEL_VERSION and current.get("dimension") == 8, f"a hit must carry model_version={MODEL_VERSION} and dimension=8, got {current}"
+    assert older.get("model_version") == PREVIOUS_VERSION and older.get("dimension") == 4, f"an {PREVIOUS_VERSION} hit must carry model_version={PREVIOUS_VERSION} and dimension=4, got {older}"
+`,
+    typescript: `const TEXT = 'Rotate keys every 90 days.';
+const OTHER = 'Revoke a leaked key at once.';
+
+function world(ctx) {
+  const config = ctx.load('/support/embedding/config.ts');
+  const model = ctx.load('/support/embedding/model.ts');
+  const seed = (tenant: string, version: string, text: string) => {
+    const vector = model.vectorFor(version, text);
+    ctx.redis.set(config.vectorKey(tenant, version, config.contentHash(text)), JSON.stringify(vector), 'EX', config.VECTOR_TTL_S);
+    return vector;
+  };
+  const c = ctx.client(ctx.load('read').app);
+  const get = (text: string, tenant: string | null = 'acme', version: string | null = null) =>
+    c.get(\`/v1/embeddings/\${config.contentHash(text)}\`, {headers: tenant ? {'X-Tenant-Id': tenant} : {}, query: version ? {model_version: version} : {}});
+  return {config, seed, get};
+}
+
+export async function check_route(ctx) {
+  const {config, seed, get} = world(ctx);
+  const vector = seed('acme', config.MODEL_VERSION, TEXT);
+  const r = await get(TEXT);
+  assert.equal(r.status, 200, \`GET /v1/embeddings/{hash} of a cached vector answered \${r.status}: \${r.text}\`);
+  assert.deepEqual(r.json().vector, vector, \`the read must answer the stored vector, got \${JSON.stringify(r.json().vector)}\`);
+}
+
+export async function check_tenant_required(ctx) {
+  const {config, seed, get} = world(ctx);
+  seed('acme', config.MODEL_VERSION, TEXT);
+  const r = await get(TEXT, null);
+  assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}: \${r.text.slice(0, 160)}; it must be 401\`);
+}
+
+export async function check_exact_key(ctx) {
+  const {config, seed, get} = world(ctx);
+  seed('acme', config.MODEL_VERSION, TEXT);
+  const v1 = seed('acme', config.PREVIOUS_VERSION, OTHER);
+  const otherTenant = await get(TEXT, 'globex');
+  assert.equal(otherTenant.status, 404, \`globex read acme's vector by its hash (\${otherTenant.status} \${otherTenant.text.slice(0, 120)}): the read must be the exact key of the caller's tenant\`);
+  const newer = await get(OTHER);
+  assert.equal(newer.status, 404, \`an embed-v2 read of a text cached only under embed-v1 answered \${newer.status} \${newer.text.slice(0, 120)}: a vector from another model is not this model's vector\`);
+  const older = await get(OTHER, 'acme', config.PREVIOUS_VERSION);
+  assert(older.status === 200 && JSON.stringify(older.json().vector) === JSON.stringify(v1), \`?model_version=embed-v1 must answer the embed-v1 vector, got \${older.status} \${older.text.slice(0, 120)}\`);
+}
+
+export async function check_miss_404(ctx) {
+  const {get} = world(ctx);
+  const r = await get('Never embedded.');
+  assert.equal(r.status, 404, \`a hash with no vector answered \${r.status} \${r.text.slice(0, 120)}: a miss is 404, and a 200 with [] gets cached as a real vector\`);
+  assert.equal(r.json().error, 'not_embedded', \`the 404 must say not_embedded, got \${r.text}\`);
+}
+
+export async function check_reports_shape(ctx) {
+  const {config, seed, get} = world(ctx);
+  seed('acme', config.MODEL_VERSION, TEXT);
+  seed('acme', config.PREVIOUS_VERSION, OTHER);
+  const current = (await get(TEXT)).json();
+  const older = (await get(OTHER, 'acme', config.PREVIOUS_VERSION)).json();
+  assert(current.model_version === config.MODEL_VERSION && current.dimension === 8, \`a hit must carry model_version=embed-v2 and dimension=8, got \${JSON.stringify(current)}\`);
+  assert(older.model_version === config.PREVIOUS_VERSION && older.dimension === 4, \`an embed-v1 hit must carry model_version=embed-v1 and dimension=4, got \${JSON.stringify(older)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"embedding/config"
+	"embedding/model"
+
+	"leetbuild/harness"
+)
+
+const (
+	readText  = "Rotate keys every 90 days."
+	readOther = "Revoke a leaked key at once."
+)
+
+func readSeed(ctx *harness.Ctx, tenant, version, text string) []float32 {
+	vector := model.VectorFor(version, text)
+	doc, _ := json.Marshal(vector)
+	ctx.Redis.Set(config.VectorKey(tenant, version, config.ContentHash(text)), string(doc), "EX", config.VectorTTLSeconds)
+	return vector
+}
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readGet(c *harness.HTTP, text, tenant, version string) *harness.Response {
+	path := "/v1/embeddings/" + config.ContentHash(text)
+	if version != "" {
+		path += "?model_version=" + version
+	}
+	if tenant == "" {
+		return c.Get(path)
+	}
+	return c.Get(path, "X-Tenant-Id", tenant)
+}
+
+type readBody struct {
+	Error        string    \`json:"error"\`
+	ModelVersion string    \`json:"model_version"\`
+	Dimension    int       \`json:"dimension"\`
+	Vector       []float32 \`json:"vector"\`
+}
+
+func readDecode(r *harness.Response) readBody {
+	var body readBody
+	json.Unmarshal(r.Body, &body)
+	return body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	vector := readSeed(ctx, "acme", config.ModelVersion, readText)
+	r := readGet(readAPI(ctx), readText, "acme", "")
+	ctx.Equal(r.Status, 200, "GET /v1/embeddings/{hash} of a cached vector (%s)", r.Text())
+	ctx.Equal(readDecode(r).Vector, vector, "the read must answer the stored vector")
+}
+
+func CheckTenantRequired(ctx *harness.Ctx) {
+	readSeed(ctx, "acme", config.ModelVersion, readText)
+	r := readGet(readAPI(ctx), readText, "", "")
+	ctx.Equal(r.Status, 401, "a read without X-Tenant-Id must be 401 (%s)", r.Text())
+}
+
+func CheckExactKey(ctx *harness.Ctx) {
+	readSeed(ctx, "acme", config.ModelVersion, readText)
+	v1 := readSeed(ctx, "acme", config.PreviousVersion, readOther)
+	c := readAPI(ctx)
+	otherTenant := readGet(c, readText, "globex", "")
+	ctx.Assert(otherTenant.Status == 404, "globex read acme's vector by its hash (%d %s): the read must be the exact key of the caller's tenant", otherTenant.Status, otherTenant.Text())
+	newer := readGet(c, readOther, "acme", "")
+	ctx.Assert(newer.Status == 404, "an embed-v2 read of a text cached only under embed-v1 answered %d %s: a vector from another model is not this model's vector", newer.Status, newer.Text())
+	older := readGet(c, readOther, "acme", config.PreviousVersion)
+	ctx.Equal(older.Status, 200, "?model_version=embed-v1 must answer the embed-v1 vector (%s)", older.Text())
+	ctx.Equal(readDecode(older).Vector, v1, "the embed-v1 vector")
+}
+
+func CheckMiss404(ctx *harness.Ctx) {
+	r := readGet(readAPI(ctx), "Never embedded.", "acme", "")
+	ctx.Assert(r.Status == 404, "a hash with no vector answered %d %s: a miss is 404, and a 200 with [] gets cached as a real vector", r.Status, r.Text())
+	ctx.Equal(readDecode(r).Error, "not_embedded", "the 404's error")
+}
+
+func CheckReportsShape(ctx *harness.Ctx) {
+	readSeed(ctx, "acme", config.ModelVersion, readText)
+	readSeed(ctx, "acme", config.PreviousVersion, readOther)
+	c := readAPI(ctx)
+	current := readDecode(readGet(c, readText, "acme", ""))
+	older := readDecode(readGet(c, readOther, "acme", config.PreviousVersion))
+	ctx.Assert(current.ModelVersion == config.ModelVersion && current.Dimension == 8, "a hit must carry model_version=embed-v2 and dimension=8, got %+v", current)
+	ctx.Assert(older.ModelVersion == config.PreviousVersion && older.Dimension == 4, "an embed-v1 hit must carry model_version=embed-v1 and dimension=4, got %+v", older)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "embedding/config.h"
+#include "embedding/model.h"
+
+namespace {
+
+const std::string kText = "Rotate keys every 90 days.";
+const std::string kOther = "Revoke a leaked key at once.";
+
+std::vector<float> seed(harness::Ctx& ctx, const std::string& tenant, const std::string& version, const std::string& text) {
+  const auto vector = model::vectorFor(version, text);
+  ctx.Redis.Set(config::vectorKey(tenant, version, config::contentHash(text)), nlohmann::json(vector).dump(), "EX", config::kVectorTtlSeconds);
+  return vector;
+}
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response get(harness::HTTP& c, const std::string& text, const std::string& tenant, const std::string& version = "") {
+  std::string path = "/v1/embeddings/" + config::contentHash(text);
+  if (!version.empty()) path += "?model_version=" + version;
+  if (tenant.empty()) return c.Get(path);
+  return c.Get(path, "X-Tenant-Id", tenant);
+}
+
+nlohmann::json parsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  const auto vector = seed(ctx, "acme", config::kModelVersion, kText);
+  auto c = api(ctx);
+  const auto r = get(c, kText, "acme");
+  ctx.Equal(r.Status, 200, "GET /v1/embeddings/{hash} of a cached vector (%s)", r.Text());
+  ctx.Equal(parsed(r).value("vector", nlohmann::json::array()), nlohmann::json(vector), "the read must answer the stored vector");
+}
+
+void CheckTenantRequired(harness::Ctx& ctx) {
+  seed(ctx, "acme", config::kModelVersion, kText);
+  auto c = api(ctx);
+  const auto r = get(c, kText, "");
+  ctx.Equal(r.Status, 401, "a read without X-Tenant-Id must be 401 (%s)", r.Text());
+}
+
+void CheckExactKey(harness::Ctx& ctx) {
+  seed(ctx, "acme", config::kModelVersion, kText);
+  const auto v1 = seed(ctx, "acme", config::kPreviousVersion, kOther);
+  auto c = api(ctx);
+  const auto other_tenant = get(c, kText, "globex");
+  ctx.Assert(other_tenant.Status == 404, "globex read acme's vector by its hash (%d %s): the read must be the exact key of the caller's tenant", other_tenant.Status, other_tenant.Text());
+  const auto newer = get(c, kOther, "acme");
+  ctx.Assert(newer.Status == 404, "an embed-v2 read of a text cached only under embed-v1 answered %d %s: a vector from another model is not this model's vector", newer.Status, newer.Text());
+  const auto older = get(c, kOther, "acme", config::kPreviousVersion);
+  ctx.Equal(older.Status, 200, "?model_version=embed-v1 must answer the embed-v1 vector (%s)", older.Text());
+  ctx.Equal(parsed(older).value("vector", nlohmann::json::array()), nlohmann::json(v1), "the embed-v1 vector");
+}
+
+void CheckMiss404(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = get(c, "Never embedded.", "acme");
+  ctx.Assert(r.Status == 404, "a hash with no vector answered %d %s: a miss is 404, and a 200 with [] gets cached as a real vector", r.Status, r.Text());
+  ctx.Equal(parsed(r).value("error", ""), "not_embedded", "the 404's error");
+}
+
+void CheckReportsShape(harness::Ctx& ctx) {
+  seed(ctx, "acme", config::kModelVersion, kText);
+  seed(ctx, "acme", config::kPreviousVersion, kOther);
+  auto c = api(ctx);
+  const auto current = parsed(get(c, kText, "acme"));
+  const auto older = parsed(get(c, kOther, "acme", config::kPreviousVersion));
+  ctx.Assert(current.value("model_version", "") == config::kModelVersion && current.value("dimension", 0) == 8, "a hit must carry model_version=embed-v2 and dimension=8, got %v", current);
+  ctx.Assert(older.value("model_version", "") == config::kPreviousVersion && older.value("dimension", 0) == 4, "an embed-v1 hit must carry model_version=embed-v1 and dimension=4, got %v", older);
+}
+`,
+  },
+  hints: [
+    'A read with no tenant header, or with another tenant’s, comes back 200 with a vector; an `embed-v2` read returns four values; an unknown hash answers 200 with an empty vector.',
+    'On a miss the starter scans `emb:*:{hash}`, a pattern that matches every tenant and every model, and nothing checks the tenant first. The empty fallback hides the miss, and the body never says which model produced the vector.',
+    'Return 401 on an empty tenant; keep only `cache.read_vector(tenant, version, digest)` and drop the scan; on `None` answer 404 `{"error": "not_embedded"}`; on a hit add `"model_version": version` and `"dimension": len(vector)`.',
+  ],
+  debrief: `The read is one exact key because the key is the access rule: tenant, model and hash each narrow what a caller may see, and a pattern that widens any of them hands out vectors that belong to someone else or to another model’s space. A 404 lets the caller tell "not embedded yet" from a vector, where a 200 with \`[]\` gets cached and ranked as if it were real. Naming the model and the dimension in the body lets a retriever refuse a vector from the wrong space before it scores anything. Production reads add a batch endpoint for many hashes, a short private cache header, and a metric of misses per model during a migration.`,
 };

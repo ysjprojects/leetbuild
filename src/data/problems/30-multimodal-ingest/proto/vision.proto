@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package ingest;
+
+// The vision service step 3 asks for a caption of an uploaded image it reads from the object
+// store by checksum. An image the content policy refuses is PERMISSION_DENIED, with the reason in
+// the details; an overloaded or restarting service is UNAVAILABLE.
+service Vision {
+  rpc Caption(CaptionRequest) returns (CaptionReply);
+}
+
+message CaptionRequest {
+  string asset_id = 1;
+  string tenant = 2;
+  string checksum = 3;
+  string mime = 4;
+}
+
+message CaptionReply {
+  string caption = 1;
+  string model = 2;
+}

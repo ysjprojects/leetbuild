@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package redactor;
+
+// The NER detector the redactor asks for entity spans (steps 1 to 3 call it through ner.detect).
+// UNAVAILABLE and DEADLINE_EXCEEDED are transient; any other error says the request itself failed.
+service Detector {
+  rpc Detect(DetectRequest) returns (DetectResponse);
+}
+
+message DetectRequest {
+  string text = 1;
+  repeated string entities = 2;
+}
+
+// One finding: [start, end) offsets into the text and its entity type.
+message EntitySpan {
+  int32 start = 1;
+  int32 end = 2;
+  string entity = 3;
+}
+
+message DetectResponse {
+  repeated EntitySpan spans = 1;
+  string model_version = 2;
+}

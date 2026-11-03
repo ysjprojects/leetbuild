@@ -1,23 +1,25 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-client';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Quota broker: the debugging owed to a capacity broker before it hands out scarce accelerators.
- * Recorded, authorized reservations, then one atomic Redis take per (team, window) with an expiring
- * key and a real release, then a deadline-bounded capacity confirmation that denies when unsure,
- * then team-keyed quota events carrying amounts instead of identities with an outbox, then a read
- * that reports the numbers the reserve path enforces.
+ * A recorded, team-scoped grant → one Lua take and one Lua refund per reservation on a per-window
+ * Redis hash → a deadline-bounded capacity confirmation that denies when unsure → team-keyed quota
+ * events with amounts, not identities, and an outbox → a read that reports what the reserve script
+ * enforces.
  */
 export const quotaBrokerProblem: Problem = {
   id: 'quota-broker',
   title: 'Quota Broker',
   tagline:
-    'Reserve GPU capacity per team with one atomic ledger take, a deny-on-timeout capacity check and a read that matches it.',
+    'Per-team GPU reservations: a Lua ledger in Redis, a capacity check that denies when unsure, team-keyed events.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -40,22 +42,28 @@ over gRPC, and the events feed a Kafka topic that rebuilds the ledger.
 
 ## What you build here
 
-One service, the quota broker, with five pieces:
+One service, the quota broker, sharing one Redis ledger (\`quota.ledger\`, provided; step 2 builds
+its \`reserve\` and \`release\`) and one outbox (\`quota.outbox\`, provided):
 
-1. \`POST /v1/quotas/{team}/reserve\`: authenticated team, validated window, a whitelisted
-   resource class, a bounded amount, and a reservation id recorded before the response.
-2. A **Redis** ledger: one hash per \`(team, window)\` where take, release and expiry happen in
-   Lua \`EVAL\` scripts, with the TTL set on the first write and a release that refunds the window
-   the reservation recorded.
-3. A **gRPC** capacity client: a 250 ms deadline per attempt, at most two attempts, retries only
-   on \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, a 409 for \`RESOURCE_EXHAUSTED\` without a retry, a
-   503 \`TRY_AGAIN\` with no ledger write when the answer is uncertain, and the confirmed
-   \`source_version\` recorded with the reservation.
-4. A **Kafka** \`quota.event\` path: keyed by team, carrying kind, window, resource class, amount
-   and reservation id and not the requester, produced with \`acks=all\` and awaited, with an outbox
-   row when the broker rejects it.
-5. \`GET /v1/quotas/{team}\`: quota, reserved, consumed and available read from the ledger the
-   reserve path writes, tenant-scoped, with the window required and validated.
+- \`quota:limits\`: hash team → units per window (8 when unset), read through \`limit_of(team)\`.
+- \`quota:{team}:{window}\` (\`window_key\`): hash \`limit\`, \`reserved\`, \`consumed\`.
+- \`reservation:{team}:{reservation_id}\`: hash \`window\`, \`resource_class\`, \`amount\`,
+  \`source_version\`.
+- \`reserve(team, window, resource_class, amount, source_version)\` returns the reservation id or
+  nothing; \`release\` and \`consume(team, reservation_id)\` report whether the reservation existed.
+
+1. \`POST /v1/quotas/{team}/reserve\` with \`{window, resource_class, amount}\`: the \`X-Team-Id\`
+   caller, a validated window, class and amount, one \`reserve\` call, **201** with the reservation.
+2. The **Redis** ledger: the comparison and the take in one Lua script, the refund in another, both
+   keys expiring after a day.
+3. A **gRPC** \`Capacity.Confirm\` before the take: 250 ms per attempt, two attempts on
+   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, \`RESOURCE_EXHAUSTED\` final, no confirmation no grant, the
+   reply's \`source_version\` recorded.
+4. A **Kafka** \`quota.event\` record per reserve, release or consume: keyed by team,
+   \`{kind, reservation_id, team, window, resource_class, amount}\`, idempotent with \`acks=all\`, the
+   outbox list \`outbox:quota\` when the broker does not confirm within 2 s.
+5. \`GET /v1/quotas/{team}?window=…\`: the caller's own window, \`available = limit - reserved -
+   consumed\` from the hash the reserve script writes.
 
 ## The debugging habit
 
@@ -71,8 +79,8 @@ failover, fairness scheduling and what happens to the pool when a reservation is
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'reserve · release · read', x: 8, y: 50},
       {id: 'broker', kind: 'http', label: 'Quota Broker', sub: 'HTTPS :8443', x: 26, y: 50},
-      {id: 'db', kind: 'db', label: 'window store · outbox', sub: 'limits · replays', x: 46, y: 12},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'quota:{team}:{window}', x: 46, y: 50},
+      {id: 'relay', kind: 'service', label: 'Outbox relay', sub: 'outbox:quota → quota.event', x: 46, y: 12},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'quota:{team}:{window} · reservations', x: 46, y: 50},
       {id: 'kafka', kind: 'kafka', label: 'quota.event', sub: 'key = team', x: 46, y: 88},
       {id: 'capacity', kind: 'grpc', label: 'Capacity service', sub: 'Confirm · 250 ms', x: 70, y: 22},
       {id: 'pool', kind: 'external', label: 'Resource pool', sub: 'GPUs · windows', x: 70, y: 54},
@@ -80,14 +88,21 @@ failover, fairness scheduling and what happens to the pool when a reservation is
     ],
     edges: [
       {from: 'client', to: 'broker', kind: 'http', label: 'HTTPS'},
-      {from: 'broker', to: 'redis', kind: 'redis', label: 'take · release · read'},
-      {from: 'broker', to: 'db', kind: 'plain', label: 'limits · outbox'},
+      {from: 'broker', to: 'redis', kind: 'redis', label: 'EVAL reserve · release · read'},
+      {from: 'redis', to: 'relay', kind: 'plain', label: 'outbox:quota'},
+      {from: 'relay', to: 'kafka', kind: 'kafka', label: 'replay'},
       {from: 'broker', to: 'capacity', kind: 'grpc', label: 'Confirm(capacity)'},
       {from: 'capacity', to: 'pool', kind: 'plain', label: 'reserve GPUs'},
       {from: 'broker', to: 'kafka', kind: 'kafka', label: 'produce quota.event'},
       {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'db', kind: 'plain', label: 'rebuild ledger'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

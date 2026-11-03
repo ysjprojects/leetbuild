@@ -1,371 +1,327 @@
 import type {Step} from '@/lib/types';
 
+// ---- 3. The model call: deadline, retries, fallback, breaker ----------------------------------------
 export const modelCallStep: Step = {
   id: 'model-call',
-  title: 'Provider call: deadline, bounded retries, breaker',
+  title: 'The model call: bounded retries, a fallback, a breaker',
   concept: 'grpc',
   file: 'model_call',
-  focus: ['router', 'provider', 'fallback'],
+  focus: ['router', 'large', 'small', 'redis'],
   task: `## Task
 
-**Starting point.** The starter's \`generate(model, prompt, on_token)\` opens a \`Stream\` call to
-the primary provider, forwards every token to \`on_token\`, and returns the joined answer. It
-compiles, it serves the demo, and it hides five flaws.
+**Starting point.** The starter is \`complete(model, prompt, max_tokens)\`, the call routerd makes to
+the model a decision named: it sends \`Model.Complete\` to the deployment at \`{model}:9000\` and
+returns the model that answered with its reply. On any error it sleeps \`RETRY_BACKOFF_S\` and calls
+the same model again. It serves the demo and hides 5 flaws.
 
-**Failure mode the checks target.** The starter catches every error and loops forever: a permanent
-\`INVALID_ARGUMENT\` spins the worker, a bad deployment becomes a hot loop against a struggling
-provider, there is nothing to fall back to, and after a partial answer the starter replays the stream
-from the start. Each of those is silent in a demo and loud in production.
+**Failure mode the checks target.** A deployment that stalls or goes down: the call waits on it
+without limit, repeats a request the model already refused, never ends while the deployment is down,
+never tries the small model that was healthy all along, and keeps calling a deployment that fails
+every call.
 
-- Each attempt carries an **800 ms** deadline.
-- At most **3 attempts per provider**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  retryable; every other status is returned to the caller immediately.
-- When the primary's attempts are exhausted, try the **fallback model** once through the same
-  bounded loop.
-- A **circuit breaker** opens after **5** retryable failures and stays open for **30 s**; while it
-  is open, skip that provider instead of hammering it.
-- Once the **first token has been delivered** to the caller, do not retry: a replay would
-  duplicate output the user already read and bill it twice.`,
+- Each attempt carries an **800 ms** deadline (\`ATTEMPT_TIMEOUT_S = 0.8\`).
+- At most **ATTEMPTS = 3** attempts per model, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
+  retried; any other status is raised to the caller at once.
+- When a model's attempts are spent, the same loop runs on **FALLBACK_MODEL** (\`gpt-4o-mini\`),
+  unless that was the model asked for; when both are spent, raise.
+- A breaker per model at \`circuit:{model}\`: \`INCR\` on each retryable failure with a **30 s**
+  expiry; at **5** the value becomes \`open\` for 30 s, and while it is open the model is skipped
+  without a call.`,
   sequence: {
-    participants: ['Model Router', 'Provider', 'Fallback'],
+    participants: ['routerd', 'Redis', 'gpt-4o', 'gpt-4o-mini'],
     messages: [
-      {from: 'Model Router', to: 'Model Router', label: 'breaker.allow() · open → skip', kind: 'sync'},
-      {from: 'Model Router', to: 'Provider', label: 'Stream · deadline 800 ms · attempt ≤ 3', kind: 'sync'},
-      {from: 'Provider', to: 'Model Router', label: 'tokens … then UNAVAILABLE', kind: 'reply'},
-      {from: 'Model Router', to: 'Model Router', label: 'retry only UNAVAILABLE / DEADLINE_EXCEEDED', kind: 'sync'},
-      {from: 'Model Router', to: 'Fallback', label: 'Stream · fallback model', kind: 'sync'},
-      {from: 'Fallback', to: 'Model Router', label: 'tokens', kind: 'async'},
-      {
-        from: 'Model Router',
-        to: 'Model Router',
-        label: 'first token delivered → no replay, fail the request',
-        kind: 'sync',
-      },
+      {from: 'routerd', to: 'Redis', label: 'GET circuit:gpt-4o', kind: 'sync'},
+      {from: 'Redis', to: 'routerd', label: 'nil (closed)', kind: 'reply'},
+      {from: 'routerd', to: 'gpt-4o', label: 'Complete · deadline 800 ms (× 3)', kind: 'sync'},
+      {from: 'gpt-4o', to: 'routerd', label: 'UNAVAILABLE', kind: 'reply'},
+      {from: 'routerd', to: 'Redis', label: 'INCR circuit:gpt-4o · EXPIRE 30', kind: 'sync'},
+      {from: 'routerd', to: 'gpt-4o-mini', label: 'Complete · deadline 800 ms', kind: 'sync'},
+      {from: 'gpt-4o-mini', to: 'routerd', label: 'CompleteReply{text, usage}', kind: 'reply'},
     ],
   },
   hints: [
-    'Send a request with a model the provider rejects as `INVALID_ARGUMENT`: the worker pins a CPU and the request never returns. Kill the provider mid-answer and the user sees the first half of the reply twice.',
-    '`generate` loops with `while True`, calls `providers.Stream` with no timeout, catches `Exception` and continues, has no second stub to turn to, counts attempts in a global nothing reads, and restarts the stream after tokens went out.',
-    'Loop `for _ in range(MAX_ATTEMPTS)` over `(providers, model), (fallback, "small-model")`, pass `timeout=DEADLINE_S`, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, gate each attempt on `breaker.allow()`, and raise when `delivered` is already true.',
+    'With gpt-4o down, one request shows up as hundreds of calls on its dashboard and never answers while gpt-4o-mini sits idle; a request gpt-4o rejected as invalid is sent again and again; a stalled deployment holds every worker.',
+    'The loop has no bound and no deadline, catches every status alike, sleeps and dials the same model, and keeps no count of failures that another call or replica could read.',
+    'Loop over `[model, FALLBACK_MODEL]` and `range(ATTEMPTS)` with `timeout=ATTEMPT_TIMEOUT_S`; re-raise unless the code is UNAVAILABLE or DEADLINE_EXCEEDED; on those `INCR circuit:{model}` (EXPIRE 30 on the first, `open` with EX 30 at 5); skip a model whose circuit is open.',
   ],
   checks: [
     {
       id: 'deadline',
-      title: 'Every attempt carries an 800 ms deadline',
+      title: 'Every attempt carries the 800 ms deadline',
       detail:
-        'The call is created with an 800 ms deadline: a call timeout, a context with timeout, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + DEADLINE_MS`. Without it a stuck provider holds the request open indefinitely.',
+        'Each `Complete` call is made with the 800 ms deadline (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`); a stalled deployment then ends in DEADLINE_EXCEEDED and the next attempt or the fallback gets its turn.',
       match: {
-        python: {all: [/DEADLINE_S\s*=\s*0\.8/, /timeout=DEADLINE_S/, /\.Stream\(/]},
-        typescript: {all: [/DEADLINE_MS\s*=\s*800/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /\.Stream\(/]},
-        go: {all: [/(deadlineMS|800)/, /context\.WithTimeout|WithDeadline/, /\.Stream\(/]},
-        scala: {all: [/(DeadlineMs|800)/, /withDeadlineAfter/, /\.stream\(/]},
-        cpp: {all: [/(kDeadlineMs|800)/, /set_deadline\(/, /->Stream\(/]},
+        python: {all: [/\.Complete\([^)]*timeout\s*=/]},
+        typescript: {all: [/\.Complete\([^)]*deadline\s*:/]},
+        go: {all: [/context\.With(Timeout|Deadline)\(/]},
+        scala: {all: [/withDeadlineAfter\(/]},
+        cpp: {all: [/set_deadline\(/]},
       },
     },
     {
-      id: 'retry-policy',
-      title: 'At most three attempts, only the two retryable codes',
+      id: 'bounded',
+      title: 'At most three attempts per model, then an error',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The starter retries every error forever.',
+        'The attempts on a model are counted against `ATTEMPTS`; a `while True` / `for {}` retry with a sleep spins until something kills the process.',
       match: {
-        python: {
-          all: [
-            /MAX_ATTEMPTS\s*=\s*3/,
-            /range\(MAX_ATTEMPTS\)/,
-            /StatusCode\.UNAVAILABLE/,
-            /StatusCode\.DEADLINE_EXCEEDED/,
-          ],
-          none: [/while\s+True/],
-        },
-        typescript: {
-          all: [/MAX_ATTEMPTS\s*=\s*3/, /attempt\s*<\s*MAX_ATTEMPTS/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/while\s*\(\s*true\s*\)/, /for\s*\(\s*;\s*;\s*\)/],
-        },
-        go: {
-          all: [/maxAttempts\s*=\s*3/, /attempt\s*<\s*maxAttempts/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
-          none: [/for\s+attempt\s*:=\s*0;\s*;\s*attempt\+\+/],
-        },
-        scala: {
-          all: [/MaxAttempts\s*=\s*3/, /attempt\s*<\s*MaxAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
-        cpp: {
-          all: [
-            /kMaxAttempts\s*=\s*3/,
-            /attempt\s*<\s*kMaxAttempts/,
-            /StatusCode::UNAVAILABLE/,
-            /StatusCode::DEADLINE_EXCEEDED/,
-          ],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
+        python: {all: [/range\(\s*ATTEMPTS\s*\)|<\s*ATTEMPTS/], none: [/while\s+True/]},
+        typescript: {all: [/<\s*ATTEMPTS/], none: [/for\s*\(\s*;\s*;\s*\)|while\s*\(\s*true\s*\)/]},
+        go: {all: [/range\s+attempts\b|<\s*attempts\b/], none: [/for\s*\{/]},
+        scala: {all: [/<\s*Attempts\b|until\s+Attempts\b|to\s+Attempts\b/], none: [/while\s*\(\s*true\s*\)/]},
+        cpp: {all: [/<\s*kAttempts\b/], none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/]},
+      },
+    },
+    {
+      id: 'retryable',
+      title: 'Retries only UNAVAILABLE and DEADLINE_EXCEEDED',
+      detail:
+        'The status code decides: `UNAVAILABLE` and `DEADLINE_EXCEEDED` are worth another attempt, anything else (`INVALID_ARGUMENT`, `PERMISSION_DENIED`) is raised at once and counts nowhere.',
+      match: {
+        python: {all: [/\.code\(\)/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
+        typescript: {all: [/\.code\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
+        go: {all: [/status\.Code\(/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
+        scala: {all: [/getStatus\.getCode/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
+        cpp: {all: [/error_code\(\)/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
       },
     },
     {
       id: 'fallback',
-      title: 'Fails over to the fallback model',
+      title: 'Falls back to gpt-4o-mini',
       detail:
-        'When the primary’s attempts are exhausted, the same bounded loop runs against the fallback model. The starter only ever talks to the primary.',
+        "Once the asked-for model's attempts are spent, the same bounded loop runs on `FALLBACK_MODEL` at its own address, and the answer names the model that served it.",
       match: {
-        python: {all: [/fallback/, /\.Stream\(/]},
-        typescript: {all: [/fallback/, /\.Stream\(/]},
-        go: {all: [/fallback/, /\.Stream\(/]},
-        scala: {all: [/fallback/, /\.stream\(/]},
-        cpp: {all: [/fallback/, /->Stream\(/]},
+        python: {all: [/FALLBACK_MODEL/]},
+        typescript: {all: [/FALLBACK_MODEL/]},
+        go: {all: [/fallbackModel/]},
+        scala: {all: [/FallbackModel/]},
+        cpp: {all: [/kFallbackModel/]},
       },
     },
     {
       id: 'breaker',
-      title: 'Opens a breaker after five failures for 30 s',
+      title: 'Opens circuit:{model} after five failures for 30 s',
       detail:
-        'A failure counter opens the breaker after `BREAKER_FAILURES = 5` retryable failures for `BREAKER_COOLDOWN_S = 30`, and `allow()` is checked before each attempt so an open breaker skips the provider.',
+        '`circuit:{model}` counts retryable failures with INCR and a 30 s expiry; at five it is set to `open` for 30 s and the model is skipped until it expires, by every replica.',
       match: {
-        python: {all: [/BREAKER_FAILURES\s*=\s*5/, /BREAKER_COOLDOWN_S\s*=\s*30/, /\.allow\(\)/]},
-        typescript: {all: [/BREAKER_FAILURES\s*=\s*5/, /BREAKER_COOLDOWN_S\s*=\s*30/, /\.allow\(\)/]},
-        go: {all: [/breakerFailures\s*=\s*5/, /breakerCooldownS\s*=\s*30/, /\.allow\(\)/]},
-        scala: {all: [/BreakerFailures\s*=\s*5/, /BreakerCooldownS\s*=\s*30/, /\.allow\(/]},
-        cpp: {all: [/kBreakerFailures\s*=\s*5/, /kBreakerCooldownS\s*=\s*30/, /\.allow\(\)/]},
-      },
-    },
-    {
-      id: 'no-replay',
-      title: 'Does not retry after the first streamed token',
-      detail:
-        'Once a token has been delivered to the caller, a retry would replay output the user already read. Track `delivered` and raise or return instead of retrying.',
-      match: {
-        python: {all: [/delivered\s*=\s*True/, /if delivered:/]},
-        typescript: {all: [/delivered\s*=\s*true/, /if\s*\(delivered\)/]},
-        go: {all: [/delivered\s*=\s*true/, /if delivered\s*\{/]},
-        scala: {all: [/delivered\s*=\s*true/, /if \(delivered\)/]},
-        cpp: {all: [/delivered\s*=\s*true/, /if \(delivered\)/]},
+        python: {all: [/f["']circuit:\{/, /\.incr\(/, /["']open["']/, /\.expire\(|\bex\s*=/]},
+        typescript: {all: [/`circuit:\$\{/, /\.incr\(/, /['"]open['"]/, /\.expire\(|['"]EX['"]/]},
+        go: {all: [/"circuit:"\s*\+|"circuit:%s"/, /\.Incr\(/, /"open"/, /\.Expire\(/]},
+        scala: {all: [/s"circuit:\$/, /\.incr\(/, /"open"/, /\.expire\(|\.setex\(/]},
+        cpp: {all: [/"circuit:"\s*\+/, /\.incr\(/, /"open"/, /\.expire\(|\.setex\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import grpc
-
-import providers_pb2
-import providers_pb2_grpc
-
-channel = grpc.insecure_channel("providers:9000")
-providers = providers_pb2_grpc.ProviderStub(channel)
-
-attempts = 0
-
-
-def generate(model: str, prompt: str, on_token) -> str:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    global attempts
-    while True:
-        attempts += 1
-        try:
-            stream = providers.Stream(providers_pb2.StreamRequest(model=model, prompt=prompt))
-            parts = []
-            for chunk in stream:
-                parts.append(chunk.token)
-                on_token(chunk.token)
-            return "".join(parts)
-        except Exception:
-            continue
-`,
-      solution: `import time
+      starter: `import time
 
 import grpc
 
-import providers_pb2
-import providers_pb2_grpc
+import models_pb2
+import models_pb2_grpc
 
-DEADLINE_S = 0.8
-MAX_ATTEMPTS = 3
+RETRY_BACKOFF_S = 0.2
+
+stubs = {}
+
+
+def stub(model: str) -> models_pb2_grpc.ModelStub:
+    """One channel per model deployment, at {model}:9000."""
+    if model not in stubs:
+        stubs[model] = models_pb2_grpc.ModelStub(grpc.insecure_channel(f"{model}:9000"))
+    return stubs[model]
+
+
+# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+def complete(model: str, prompt: str, max_tokens: int):
+    """The model that answered and its reply, trying again after a failure."""
+    request = models_pb2.CompleteRequest(model=model, prompt=prompt, max_tokens=max_tokens)
+    while True:
+        try:
+            return model, stub(model).Complete(request)
+        except grpc.RpcError:
+            time.sleep(RETRY_BACKOFF_S)
+`,
+      solution: `import grpc
+import redis
+
+import models_pb2
+import models_pb2_grpc
+
+ATTEMPTS = 3
+ATTEMPT_TIMEOUT_S = 0.8
+FALLBACK_MODEL = "gpt-4o-mini"
 BREAKER_FAILURES = 5
-BREAKER_COOLDOWN_S = 30
-RETRYABLE = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
+BREAKER_TTL_S = 30
+RETRYABLE = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
 
-channel = grpc.insecure_channel("providers:9000")
-providers = providers_pb2_grpc.ProviderStub(channel)
-fallback = providers_pb2_grpc.ProviderStub(grpc.insecure_channel("fallback:9000"))
-
-
-class Breaker:
-    """One breaker per provider: open after BREAKER_FAILURES for BREAKER_COOLDOWN_S."""
-
-    def __init__(self) -> None:
-        self.failures = 0
-        self.opened_at = 0.0
-
-    def allow(self) -> bool:
-        if self.failures < BREAKER_FAILURES:
-            return True
-        if time.monotonic() - self.opened_at < BREAKER_COOLDOWN_S:
-            return False
-        self.failures = 0
-        return True
-
-    def record(self, error: grpc.RpcError | None) -> None:
-        if error is None:
-            self.failures = 0
-        elif error.code() in RETRYABLE:
-            self.failures += 1
-            if self.failures >= BREAKER_FAILURES:
-                self.opened_at = time.monotonic()
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+stubs = {}
 
 
-breaker = Breaker()
+class ModelUnavailable(Exception):
+    pass
 
 
-def generate(model: str, prompt: str, on_token) -> str:
-    candidates = [(providers, model), (fallback, "small-model")]
-    last_error: grpc.RpcError | None = None
-    for stub, candidate in candidates:
-        if not breaker.allow():
-            continue
-        for _ in range(MAX_ATTEMPTS):
-            delivered = False
+def stub(model: str) -> models_pb2_grpc.ModelStub:
+    """One channel per model deployment, at {model}:9000."""
+    if model not in stubs:
+        stubs[model] = models_pb2_grpc.ModelStub(grpc.insecure_channel(f"{model}:9000"))
+    return stubs[model]
+
+
+def breaker_open(model: str) -> bool:
+    return r.get(f"circuit:{model}") == "open"
+
+
+def note_failure(model: str) -> None:
+    key = f"circuit:{model}"
+    failures = r.incr(key)
+    if failures == 1:
+        r.expire(key, BREAKER_TTL_S)
+    if failures >= BREAKER_FAILURES:
+        r.set(key, "open", ex=BREAKER_TTL_S)
+
+
+def complete(model: str, prompt: str, max_tokens: int):
+    """The model that answered and its reply: up to ATTEMPTS on the model, then on the fallback."""
+    candidates = [model] if model == FALLBACK_MODEL else [model, FALLBACK_MODEL]
+    for candidate in candidates:
+        request = models_pb2.CompleteRequest(model=candidate, prompt=prompt, max_tokens=max_tokens)
+        for _ in range(ATTEMPTS):
+            if breaker_open(candidate):
+                break
             try:
-                request = providers_pb2.StreamRequest(model=candidate, prompt=prompt)
-                stream = stub.Stream(request, timeout=DEADLINE_S)
-                parts = []
-                for chunk in stream:
-                    delivered = True
-                    parts.append(chunk.token)
-                    on_token(chunk.token)
-                breaker.record(None)
-                return "".join(parts)
+                return candidate, stub(candidate).Complete(request, timeout=ATTEMPT_TIMEOUT_S)
             except grpc.RpcError as exc:
-                breaker.record(exc)
-                last_error = exc
-                if delivered:
-                    raise
                 if exc.code() not in RETRYABLE:
-                    break
-    raise last_error or RuntimeError("all providers unavailable")
+                    raise  # the request itself is wrong: no other attempt or model takes it
+                note_failure(candidate)
+    raise ModelUnavailable(f"{model} and {FALLBACK_MODEL} failed")
 `,
     },
     typescript: {
-      starter: `/** Provider call for the router. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-interface ProviderClient {
-  Stream(request: {model: string; prompt: string}): grpc.ClientReadableStream<{token: string}>;
+export const RETRY_BACKOFF_MS = 200;
+
+interface CompleteRequest {
+  model: string;
+  prompt: string;
+  max_tokens: number;
+}
+export interface CompleteReply {
+  text: string;
+  usage: {input_tokens: number; output_tokens: number};
+}
+type ModelStub = grpc.Client & {
+  Complete(request: CompleteRequest, options: grpc.CallOptions): Promise<CompleteReply>;
+};
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('models.proto')) as unknown as {
+  routerd: {Model: grpc.ServiceClientConstructor};
+};
+const stubs = new Map<string, ModelStub>();
+
+/** One channel per model deployment, at {model}:9000. */
+function stub(model: string): ModelStub {
+  let found = stubs.get(model);
+  if (found === undefined) {
+    found = new pkg.routerd.Model(\`\${model}:9000\`, grpc.credentials.createInsecure()) as ModelStub;
+    stubs.set(model, found);
+  }
+  return found;
 }
 
-const {providers} = grpc.loadPackageDefinition(protoLoader.loadSync('providers.proto')) as unknown as {
-  providers: {Provider: new (target: string, credentials: grpc.ChannelCredentials) => ProviderClient};
+const sleep = (ms: number): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
 };
-const provider = new providers.Provider('providers:9000', grpc.credentials.createInsecure());
 
-export async function generate(model: string, prompt: string, onToken: (token: string) => void): Promise<string> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+/** The model that answered and its reply, trying again after a failure. */
+export async function complete(model: string, prompt: string, maxTokens: number): Promise<{model: string; reply: CompleteReply}> {
+  const request = {model, prompt, max_tokens: maxTokens};
   for (;;) {
     try {
-      const parts: string[] = [];
-      const stream = provider.Stream({model, prompt});
-      await new Promise<void>((resolve, reject) => {
-        stream.on('data', (chunk: {token: string}) => {
-          parts.push(chunk.token);
-          onToken(chunk.token);
-        });
-        stream.on('error', reject);
-        stream.on('end', resolve);
-      });
-      return parts.join('');
+      return {model, reply: await stub(model).Complete(request, {})};
     } catch {
-      continue;
+      await sleep(RETRY_BACKOFF_MS);
     }
   }
 }
 `,
-      solution: `/** Provider call: 800 ms deadline, three bounded attempts, fallback, breaker, no replay. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
 
-const DEADLINE_MS = 800;
-const MAX_ATTEMPTS = 3;
-const BREAKER_FAILURES = 5;
-const BREAKER_COOLDOWN_S = 30;
-const RETRYABLE: Record<number, true> = {
-  [grpc.status.UNAVAILABLE]: true,
-  [grpc.status.DEADLINE_EXCEEDED]: true,
+export const ATTEMPTS = 3;
+export const ATTEMPT_TIMEOUT_MS = 800;
+export const FALLBACK_MODEL = 'gpt-4o-mini';
+export const BREAKER_FAILURES = 5;
+export const BREAKER_TTL_S = 30;
+const RETRYABLE = new Set<number>([grpc.status.UNAVAILABLE, grpc.status.DEADLINE_EXCEEDED]);
+
+interface CompleteRequest {
+  model: string;
+  prompt: string;
+  max_tokens: number;
+}
+export interface CompleteReply {
+  text: string;
+  usage: {input_tokens: number; output_tokens: number};
+}
+type ModelStub = grpc.Client & {
+  Complete(request: CompleteRequest, options: grpc.CallOptions): Promise<CompleteReply>;
 };
 
-interface ProviderClient {
-  Stream(
-    request: {model: string; prompt: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-  ): grpc.ClientReadableStream<{token: string}>;
-}
-
-const {providers} = grpc.loadPackageDefinition(protoLoader.loadSync('providers.proto')) as unknown as {
-  providers: {Provider: new (target: string, credentials: grpc.ChannelCredentials) => ProviderClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('models.proto')) as unknown as {
+  routerd: {Model: grpc.ServiceClientConstructor};
 };
-const primary = new providers.Provider('providers:9000', grpc.credentials.createInsecure());
-const fallback = new providers.Provider('fallback:9000', grpc.credentials.createInsecure());
+const stubs = new Map<string, ModelStub>();
+const redis = new Redis({host: 'redis', port: 6379});
 
-class Breaker {
-  private failures = 0;
-  private openedAt = 0;
+export class ModelUnavailable extends Error {}
 
-  allow(): boolean {
-    if (this.failures < BREAKER_FAILURES) return true;
-    if (Date.now() - this.openedAt < BREAKER_COOLDOWN_S * 1_000) return false;
-    this.failures = 0;
-    return true;
+/** One channel per model deployment, at {model}:9000. */
+function stub(model: string): ModelStub {
+  let found = stubs.get(model);
+  if (found === undefined) {
+    found = new pkg.routerd.Model(\`\${model}:9000\`, grpc.credentials.createInsecure()) as ModelStub;
+    stubs.set(model, found);
   }
-
-  record(error: grpc.ServiceError | null): void {
-    if (error === null) {
-      this.failures = 0;
-      return;
-    }
-    if (RETRYABLE[error.code] === true) {
-      this.failures += 1;
-      if (this.failures >= BREAKER_FAILURES) this.openedAt = Date.now();
-    }
-  }
+  return found;
 }
 
-const breaker = new Breaker();
+async function breakerOpen(model: string): Promise<boolean> {
+  return (await redis.get(\`circuit:\${model}\`)) === 'open';
+}
 
-export async function generate(model: string, prompt: string, onToken: (token: string) => void): Promise<string> {
-  const candidates = [
-    {provider: primary, model},
-    {provider: fallback, model: 'small-model'},
-  ];
-  let lastError: grpc.ServiceError | null = null;
-  for (const {provider, model: candidate} of candidates) {
-    if (!breaker.allow()) continue;
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      let delivered = false;
-      const parts: string[] = [];
+async function noteFailure(model: string): Promise<void> {
+  const key = \`circuit:\${model}\`;
+  const failures = await redis.incr(key);
+  if (failures === 1) await redis.expire(key, BREAKER_TTL_S);
+  if (failures >= BREAKER_FAILURES) await redis.set(key, 'open', 'EX', BREAKER_TTL_S);
+}
+
+/** The model that answered and its reply: up to ATTEMPTS on the model, then on the fallback. */
+export async function complete(model: string, prompt: string, maxTokens: number): Promise<{model: string; reply: CompleteReply}> {
+  const candidates = model === FALLBACK_MODEL ? [model] : [model, FALLBACK_MODEL];
+  for (const candidate of candidates) {
+    const request = {model: candidate, prompt, max_tokens: maxTokens};
+    for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
+      if (await breakerOpen(candidate)) break;
       try {
-        const stream = provider.Stream(
-          {model: candidate, prompt},
-          new grpc.Metadata(),
-          {deadline: Date.now() + DEADLINE_MS},
-        );
-        await new Promise<void>((resolve, reject) => {
-          stream.on('data', (chunk: {token: string}) => {
-            delivered = true;
-            parts.push(chunk.token);
-            onToken(chunk.token);
-          });
-          stream.on('error', reject);
-          stream.on('end', resolve);
-        });
-        breaker.record(null);
-        return parts.join('');
-      } catch (error) {
-        const serviceError = error as grpc.ServiceError;
-        breaker.record(serviceError);
-        lastError = serviceError;
-        if (delivered) throw serviceError;
-        if (RETRYABLE[serviceError.code] !== true) break;
+        return {model: candidate, reply: await stub(candidate).Complete(request, {deadline: Date.now() + ATTEMPT_TIMEOUT_MS})};
+      } catch (e) {
+        if (!RETRYABLE.has((e as grpc.ServiceError).code)) throw e; // the request itself is wrong
+        await noteFailure(candidate);
       }
     }
   }
-  throw lastError ?? new Error('all providers unavailable');
+  throw new ModelUnavailable(\`\${model} and \${FALLBACK_MODEL} failed\`);
 }
 `,
     },
@@ -374,28 +330,39 @@ export async function generate(model: string, prompt: string, onToken: (token: s
 
 import (
 	"context"
-	"strings"
+	"time"
 
-	pb "router/providerspb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "routerd/gen/models"
 )
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-func generate(ctx context.Context, client pb.ProviderClient, model, prompt string, onToken func(string)) (string, error) {
-	for attempt := 0; ; attempt++ {
-		stream, err := client.Stream(ctx, &pb.StreamRequest{Model: model, Prompt: prompt})
-		if err != nil {
-			continue
+const retryBackoff = 200 * time.Millisecond
+
+var clients = map[string]pb.ModelClient{}
+
+// client is one channel per model deployment, at {model}:9000.
+func client(model string) pb.ModelClient {
+	c, ok := clients[model]
+	if !ok {
+		conn, _ := grpc.NewClient(model+":9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+		c = pb.NewModelClient(conn)
+		clients[model] = c
+	}
+	return c
+}
+
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+// complete returns the model that answered and its reply, trying again after a failure.
+func complete(ctx context.Context, model, prompt string, maxTokens int) (string, *pb.CompleteReply, error) {
+	req := &pb.CompleteRequest{Model: model, Prompt: prompt, MaxTokens: int32(maxTokens)}
+	for {
+		reply, err := client(model).Complete(ctx, req)
+		if err == nil {
+			return model, reply, nil
 		}
-		var parts []string
-		var chunk *pb.StreamReply
-		for chunk, err = stream.Recv(); err == nil; chunk, err = stream.Recv() {
-			parts = append(parts, chunk.Token)
-			onToken(chunk.Token)
-		}
-		if err != nil {
-			continue
-		}
-		return strings.Join(parts, ""), nil
+		time.Sleep(retryBackoff)
 	}
 }
 `,
@@ -404,218 +371,173 @@ func generate(ctx context.Context, client pb.ProviderClient, model, prompt strin
 import (
 	"context"
 	"errors"
-	"io"
-	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	pb "router/providerspb"
+	pb "routerd/gen/models"
 )
 
 const (
-	deadlineMS       = 800
-	maxAttempts      = 3
-	breakerFailures  = 5
-	breakerCooldownS = 30
+	attempts        = 3
+	attemptTimeout  = 800 * time.Millisecond
+	fallbackModel   = "gpt-4o-mini"
+	breakerFailures = 5
+	breakerTTL      = 30 * time.Second
 )
 
-var retryable = map[codes.Code]bool{codes.Unavailable: true, codes.DeadlineExceeded: true}
+var clients = map[string]pb.ModelClient{}
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type breakerState struct {
-	failures int
-	openedAt time.Time
+var errModelUnavailable = errors.New("the model and its fallback failed")
+
+// client is one channel per model deployment, at {model}:9000.
+func client(model string) pb.ModelClient {
+	c, ok := clients[model]
+	if !ok {
+		conn, _ := grpc.NewClient(model+":9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+		c = pb.NewModelClient(conn)
+		clients[model] = c
+	}
+	return c
 }
 
-func (b *breakerState) allow() bool {
-	if b.failures < breakerFailures {
-		return true
-	}
-	if time.Since(b.openedAt) < breakerCooldownS*time.Second {
-		return false
-	}
-	b.failures = 0
-	return true
+func retryable(err error) bool {
+	code := status.Code(err)
+	return code == codes.Unavailable || code == codes.DeadlineExceeded
 }
 
-func (b *breakerState) record(err error) {
-	if err == nil {
-		b.failures = 0
-		return
+func breakerOpen(ctx context.Context, model string) bool {
+	v, _ := rdb.Get(ctx, "circuit:"+model).Result()
+	return v == "open"
+}
+
+func noteFailure(ctx context.Context, model string) {
+	key := "circuit:" + model
+	failures, _ := rdb.Incr(ctx, key).Result()
+	if failures == 1 {
+		rdb.Expire(ctx, key, breakerTTL)
 	}
-	if st, ok := status.FromError(err); ok && retryable[st.Code()] {
-		b.failures++
-		if b.failures >= breakerFailures {
-			b.openedAt = time.Now()
-		}
+	if failures >= breakerFailures {
+		rdb.Set(ctx, key, "open", breakerTTL)
 	}
 }
 
-var breaker = &breakerState{}
-
-func streamOnce(
-	ctx context.Context,
-	client pb.ProviderClient,
-	model, prompt string,
-	onToken func(string),
-) (string, bool, error) {
-	callCtx, cancel := context.WithTimeout(ctx, deadlineMS*time.Millisecond)
-	defer cancel()
-	stream, err := client.Stream(callCtx, &pb.StreamRequest{Model: model, Prompt: prompt})
-	if err != nil {
-		return "", false, err
+// complete returns the model that answered and its reply: up to attempts on the model, then on the fallback.
+func complete(ctx context.Context, model, prompt string, maxTokens int) (string, *pb.CompleteReply, error) {
+	candidates := []string{model}
+	if model != fallbackModel {
+		candidates = append(candidates, fallbackModel)
 	}
-	delivered := false
-	var parts []string
-	var chunk *pb.StreamReply
-	for chunk, err = stream.Recv(); err == nil; chunk, err = stream.Recv() {
-		delivered = true
-		parts = append(parts, chunk.Token)
-		onToken(chunk.Token)
-	}
-	if errors.Is(err, io.EOF) {
-		return strings.Join(parts, ""), delivered, nil
-	}
-	return "", delivered, err
-}
-
-func generate(
-	ctx context.Context,
-	primary, fallback pb.ProviderClient,
-	model, prompt string,
-	onToken func(string),
-) (string, error) {
-	candidates := []struct {
-		client pb.ProviderClient
-		model  string
-	}{{primary, model}, {fallback, "small-model"}}
-
-	var lastErr error
 	for _, candidate := range candidates {
-		if !breaker.allow() {
-			continue
-		}
-		for attempt := 0; attempt < maxAttempts; attempt++ {
-			answer, delivered, err := streamOnce(ctx, candidate.client, candidate.model, prompt, onToken)
-			breaker.record(err)
-			if err == nil {
-				return answer, nil
-			}
-			lastErr = err
-			if delivered {
-				return "", err
-			}
-			if !retryable[status.Code(err)] {
+		req := &pb.CompleteRequest{Model: candidate, Prompt: prompt, MaxTokens: int32(maxTokens)}
+		for range attempts {
+			if breakerOpen(ctx, candidate) {
 				break
 			}
+			attempt, cancel := context.WithTimeout(ctx, attemptTimeout)
+			reply, err := client(candidate).Complete(attempt, req)
+			cancel()
+			if err == nil {
+				return candidate, reply, nil
+			}
+			if !retryable(err) {
+				return "", nil, err // the request itself is wrong: no other attempt or model takes it
+			}
+			noteFailure(ctx, candidate)
 		}
 	}
-	if lastErr == nil {
-		lastErr = errors.New("all providers unavailable")
-	}
-	return "", lastErr
+	return "", nil, errModelUnavailable
 }
 `,
     },
     scala: {
       starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+import routerd.models.{CompleteReply, CompleteRequest, ModelGrpc}
+
+import scala.collection.mutable
 
 object ModelCall {
-  val stub = ProviderGrpc.blockingStub(ManagedChannelBuilder.forAddress("providers", 9000).usePlaintext().build())
+  val RetryBackoffMillis = 200L
 
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def generate(model: String, prompt: String, onToken: String => Unit): String = {
-    var answer = ""
-    var done = false
-    while (!done) {
-      try {
-        val parts = scala.collection.mutable.ArrayBuffer.empty[String]
-        stub.stream(StreamRequest(model = model, prompt = prompt)).foreach { chunk =>
-          parts += chunk.token
-          onToken(chunk.token)
-        }
-        answer = parts.mkString
-        done = true
-      } catch {
-        case _: StatusRuntimeException => ()
+  private val stubs = mutable.Map.empty[String, ModelGrpc.ModelBlockingStub]
+
+  /** One channel per model deployment, at {model}:9000. */
+  def stub(model: String): ModelGrpc.ModelBlockingStub =
+    stubs.getOrElseUpdate(model, ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress(model, 9000).usePlaintext().build()))
+
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  /** The model that answered and its reply, trying again after a failure. */
+  def complete(model: String, prompt: String, maxTokens: Int): (String, CompleteReply) = {
+    val request = CompleteRequest(model = model, prompt = prompt, maxTokens = maxTokens)
+    var answer: Option[(String, CompleteReply)] = None
+    while (answer.isEmpty) {
+      try answer = Some((model, stub(model).complete(request)))
+      catch {
+        case _: StatusRuntimeException => Thread.sleep(RetryBackoffMillis)
       }
     }
-    answer
+    answer.get
   }
 }
 `,
       solution: `import java.util.concurrent.TimeUnit
 
 import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+import redis.clients.jedis.JedisPooled
+import routerd.models.{CompleteReply, CompleteRequest, ModelGrpc}
+
+import scala.collection.mutable
 
 object ModelCall {
-  val DeadlineMs = 800
-  val MaxAttempts = 3
-  val BreakerFailures = 5
-  val BreakerCooldownS = 30
+  val Attempts = 3
+  val AttemptTimeoutMillis = 800L
+  val FallbackModel = "gpt-4o-mini"
+  val BreakerFailures = 5L
+  val BreakerTtlSeconds = 30L
   val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
 
-  val primary = ProviderGrpc.blockingStub(ManagedChannelBuilder.forAddress("providers", 9000).usePlaintext().build())
-  val fallback = ProviderGrpc.blockingStub(ManagedChannelBuilder.forAddress("fallback", 9000).usePlaintext().build())
+  private val jedis = new JedisPooled("redis", 6379)
+  private val stubs = mutable.Map.empty[String, ModelGrpc.ModelBlockingStub]
 
-  class Breaker {
-    private var failures = 0
-    private var openedAt = 0L
+  class ModelUnavailable(model: String) extends RuntimeException(s"$model and $FallbackModel failed")
 
-    def allow(): Boolean = {
-      if (failures < BreakerFailures) true
-      else if (System.currentTimeMillis() - openedAt < BreakerCooldownS * 1000L) false
-      else {
-        failures = 0
-        true
-      }
-    }
+  /** One channel per model deployment, at {model}:9000. */
+  def stub(model: String): ModelGrpc.ModelBlockingStub =
+    stubs.getOrElseUpdate(model, ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress(model, 9000).usePlaintext().build()))
 
-    def record(error: Option[StatusRuntimeException]): Unit = error match {
-      case None => failures = 0
-      case Some(exc) if Retryable.contains(exc.getStatus.getCode) =>
-        failures += 1
-        if (failures >= BreakerFailures) openedAt = System.currentTimeMillis()
-      case _ => ()
-    }
+  def breakerOpen(model: String): Boolean = jedis.get(s"circuit:$model") == "open"
+
+  def noteFailure(model: String): Unit = {
+    val key = s"circuit:$model"
+    val failures = jedis.incr(key)
+    if (failures == 1L) jedis.expire(key, BreakerTtlSeconds)
+    if (failures >= BreakerFailures) jedis.setex(key, BreakerTtlSeconds, "open")
   }
 
-  val breaker = new Breaker
-
-  def generate(model: String, prompt: String, onToken: String => Unit): String = {
-    val candidates = List((primary, model), (fallback, "small-model"))
-    var lastError: Option[StatusRuntimeException] = None
-    for ((stub, candidate) <- candidates) {
-      if (breaker.allow()) {
-        var attempt = 0
-        var stop = false
-        while (attempt < MaxAttempts && !stop) {
-          var delivered = false
-          try {
-            val stream = stub
-              .withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS)
-              .stream(StreamRequest(model = candidate, prompt = prompt))
-            val parts = scala.collection.mutable.ArrayBuffer.empty[String]
-            stream.foreach { chunk =>
-              delivered = true
-              parts += chunk.token
-              onToken(chunk.token)
-            }
-            breaker.record(None)
-            return parts.mkString
-          } catch {
-            case exc: StatusRuntimeException =>
-              breaker.record(Some(exc))
-              lastError = Some(exc)
-              if (delivered) throw exc
-              if (!Retryable.contains(exc.getStatus.getCode)) stop = true
-          }
-          attempt += 1
+  /** The model that answered and its reply: up to Attempts on the model, then on the fallback. */
+  def complete(model: String, prompt: String, maxTokens: Int): (String, CompleteReply) = {
+    val candidates = if (model == FallbackModel) Iterator(model) else Iterator(model, FallbackModel)
+    var answer: Option[(String, CompleteReply)] = None
+    while (answer.isEmpty && candidates.hasNext) {
+      val candidate = candidates.next()
+      val request = CompleteRequest(model = candidate, prompt = prompt, maxTokens = maxTokens)
+      var attempt = 0
+      while (answer.isEmpty && attempt < Attempts && !breakerOpen(candidate)) {
+        attempt += 1
+        try answer = Some((candidate, stub(candidate).withDeadlineAfter(AttemptTimeoutMillis, TimeUnit.MILLISECONDS).complete(request)))
+        catch {
+          case e: StatusRuntimeException =>
+            if (!Retryable.contains(e.getStatus.getCode)) throw e // the request itself is wrong
+            noteFailure(candidate)
         }
       }
     }
-    throw lastError.getOrElse(new RuntimeException("all providers unavailable"))
+    answer.getOrElse(throw new ModelUnavailable(model))
   }
 }
 `,
@@ -623,118 +545,611 @@ object ModelCall {
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
 
-#include "providers.grpc.pb.h"
-
-#include <functional>
+#include <chrono>
+#include <map>
+#include <memory>
 #include <string>
+#include <thread>
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-std::string generate(
-    Provider::Stub* stub,
-    const std::string& model,
-    const std::string& prompt,
-    const std::function<void(const std::string&)>& on_token) {
+#include "models.grpc.pb.h"
+
+constexpr std::chrono::milliseconds kRetryBackoff{200};
+
+struct Completion {
+  std::string model;
+  routerd::CompleteReply reply;
+};
+
+std::map<std::string, std::unique_ptr<routerd::Model::Stub>> stubs;
+
+// One channel per model deployment, at {model}:9000.
+routerd::Model::Stub& stub(const std::string& model) {
+  auto& found = stubs[model];
+  if (!found) found = routerd::Model::NewStub(grpc::CreateChannel(model + ":9000", grpc::InsecureChannelCredentials()));
+  return *found;
+}
+
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+// The model that answered and its reply, trying again after a failure.
+Completion complete(const std::string& model, const std::string& prompt, int max_tokens) {
+  routerd::CompleteRequest request;
+  request.set_model(model);
+  request.set_prompt(prompt);
+  request.set_max_tokens(max_tokens);
   while (true) {
     grpc::ClientContext ctx;
-    StreamRequest request;
-    request.set_model(model);
-    request.set_prompt(prompt);
-    auto reader = stub->Stream(&ctx, request);
-    StreamReply chunk;
-    std::string answer;
-    while (reader->Read(&chunk)) {
-      answer += chunk.token();
-      on_token(chunk.token());
-    }
-    if (reader->Finish().ok()) return answer;
+    Completion out{model, {}};
+    if (stub(model).Complete(&ctx, request, &out.reply).ok()) return out;
+    std::this_thread::sleep_for(kRetryBackoff);
   }
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-
-#include "providers.grpc.pb.h"
+#include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <functional>
+#include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
-constexpr int kDeadlineMs = 800;
-constexpr int kMaxAttempts = 3;
-constexpr int kBreakerFailures = 5;
-constexpr int kBreakerCooldownS = 30;
+#include "models.grpc.pb.h"
 
-class Breaker {
- public:
-  bool allow() {
-    if (failures_ < kBreakerFailures) return true;
-    const auto open_for = std::chrono::steady_clock::now() - opened_at_;
-    if (std::chrono::duration_cast<std::chrono::seconds>(open_for).count() < kBreakerCooldownS) return false;
-    failures_ = 0;
-    return true;
-  }
+constexpr int kAttempts = 3;
+constexpr std::chrono::milliseconds kAttemptTimeout{800};
+const std::string kFallbackModel = "gpt-4o-mini";
+constexpr long long kBreakerFailures = 5;
+constexpr std::chrono::seconds kBreakerTtl{30};
 
-  void record(const grpc::Status& status) {
-    if (status.ok()) {
-      failures_ = 0;
-      return;
-    }
-    if (status.error_code() == grpc::StatusCode::UNAVAILABLE ||
-        status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
-      failures_ += 1;
-      if (failures_ >= kBreakerFailures) opened_at_ = std::chrono::steady_clock::now();
-    }
-  }
-
- private:
-  int failures_ = 0;
-  std::chrono::steady_clock::time_point opened_at_ = std::chrono::steady_clock::now();
+struct Completion {
+  std::string model;
+  routerd::CompleteReply reply;
 };
 
-Breaker breaker;
+// A refused request as the caller sees it: the status the model answered.
+struct ModelError : std::runtime_error {
+  grpc::StatusCode code;
+  ModelError(grpc::StatusCode c, const std::string& what) : std::runtime_error(what), code(c) {}
+};
 
-std::string generate(
-    Provider::Stub* primary,
-    Provider::Stub* fallback,
-    const std::string& model,
-    const std::string& prompt,
-    const std::function<void(const std::string&)>& on_token) {
-  const std::vector<std::pair<Provider::Stub*, std::string>> candidates = {
-      {primary, model}, {fallback, "small-model"}};
-  grpc::Status last_status;
-  for (const auto& [stub, candidate] : candidates) {
-    if (!breaker.allow()) continue;
-    for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
-      bool delivered = false;
+struct ModelUnavailable : std::runtime_error {
+  explicit ModelUnavailable(const std::string& model) : std::runtime_error(model + " and " + kFallbackModel + " failed") {}
+};
+
+std::map<std::string, std::unique_ptr<routerd::Model::Stub>> stubs;
+sw::redis::Redis redis("tcp://redis:6379");
+
+// One channel per model deployment, at {model}:9000.
+routerd::Model::Stub& stub(const std::string& model) {
+  auto& found = stubs[model];
+  if (!found) found = routerd::Model::NewStub(grpc::CreateChannel(model + ":9000", grpc::InsecureChannelCredentials()));
+  return *found;
+}
+
+bool retryable(grpc::StatusCode code) {
+  return code == grpc::StatusCode::UNAVAILABLE || code == grpc::StatusCode::DEADLINE_EXCEEDED;
+}
+
+bool breaker_open(const std::string& model) {
+  const auto v = redis.get("circuit:" + model);
+  return v && *v == "open";
+}
+
+void note_failure(const std::string& model) {
+  const std::string key = "circuit:" + model;
+  const long long failures = redis.incr(key);
+  if (failures == 1) redis.expire(key, kBreakerTtl);
+  if (failures >= kBreakerFailures) redis.setex(key, kBreakerTtl, "open");
+}
+
+// The model that answered and its reply: up to kAttempts on the model, then on the fallback.
+Completion complete(const std::string& model, const std::string& prompt, int max_tokens) {
+  std::vector<std::string> candidates = {model};
+  if (model != kFallbackModel) candidates.push_back(kFallbackModel);
+  for (const auto& candidate : candidates) {
+    routerd::CompleteRequest request;
+    request.set_model(candidate);
+    request.set_prompt(prompt);
+    request.set_max_tokens(max_tokens);
+    for (int attempt = 0; attempt < kAttempts; attempt++) {
+      if (breaker_open(candidate)) break;
       grpc::ClientContext ctx;
-      ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kDeadlineMs));
-      StreamRequest request;
-      request.set_model(candidate);
-      request.set_prompt(prompt);
-      auto reader = stub->Stream(&ctx, request);
-      StreamReply chunk;
-      std::string answer;
-      while (reader->Read(&chunk)) {
-        delivered = true;
-        answer += chunk.token();
-        on_token(chunk.token());
-      }
-      const grpc::Status status = reader->Finish();
-      breaker.record(status);
-      if (status.ok()) return answer;
-      last_status = status;
-      if (delivered) throw std::runtime_error("stream failed after the first token: " + status.error_message());
-      if (status.error_code() != grpc::StatusCode::UNAVAILABLE &&
-          status.error_code() != grpc::StatusCode::DEADLINE_EXCEEDED)
-        break;
+      ctx.set_deadline(std::chrono::system_clock::now() + kAttemptTimeout);
+      Completion out{candidate, {}};
+      const grpc::Status status = stub(candidate).Complete(&ctx, request, &out.reply);
+      if (status.ok()) return out;
+      // The request itself is wrong: no other attempt or model takes it.
+      if (!retryable(status.error_code())) throw ModelError(status.error_code(), status.error_message());
+      note_failure(candidate);
     }
   }
-  throw std::runtime_error("all providers unavailable: " + last_status.error_message());
+  throw ModelUnavailable(model);
 }
 `,
     },
   },
-  debrief: `Every piece of the fix answers the same question: what is the worst case of this call? The deadline bounds one attempt, \`MAX_ATTEMPTS\` bounds the request, the retryable set decides which failures deserve another attempt at all, and the breaker bounds the damage one struggling provider can take across requests. The fallback keeps the product up when the primary is down, and the \`delivered\` flag keeps it correct: a stream is not idempotent, so once a token has reached the user a retry duplicates output and usage, and the right move is to fail the request. A healthy provider enters none of these paths, which is why the starter looked fine. Production clients also put jittered backoff between attempts, cap concurrency per endpoint, and run the breaker half-open so one probe request can test recovery.`,
+  harness: {
+    python: `import grpc
+
+import models_pb2
+import models_pb2_grpc
+
+LARGE, SMALL = "gpt-4o:9000", "gpt-4o-mini:9000"
+
+
+class Deployment(models_pb2_grpc.ModelServicer):
+    """A model deployment: answers with its own name."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def Complete(self, request, context):
+        return models_pb2.CompleteReply(text=f"{self.name} answers", usage=models_pb2.Usage(input_tokens=12, output_tokens=7))
+
+
+def _world(ctx):
+    ctx.grpc.serve(models_pb2_grpc.add_ModelServicer_to_server, Deployment("gpt-4o"), LARGE)
+    ctx.grpc.serve(models_pb2_grpc.add_ModelServicer_to_server, Deployment("gpt-4o-mini"), SMALL)
+    return ctx.load("model_call")
+
+
+def _run(ctx, m, model="gpt-4o"):
+    """One call: the model that answered, its text and the exception it raised; ended is False if it never returned."""
+    out = {"model": None, "text": None, "error": None}
+
+    def call():
+        try:
+            served, reply = m.complete(model, "Summarise this ticket.", 64)
+            out["model"], out["text"] = served, reply.text
+        except Exception as exc:  # noqa: BLE001 - whatever the call ended with is the outcome
+            out["error"] = exc
+        return True
+
+    ctx.clock.sleep_limit = ctx.clock.sleeps + 200  # a loop that backs off and retries forever is stopped here, as Ctrl-C would
+    out["ended"] = bool(ctx.drain(call))
+    return out
+
+
+def _calls(ctx, target):
+    return len(ctx.grpc.calls_to("Complete", target))
+
+
+async def check_deadline(ctx):
+    m = _world(ctx)
+    ctx.grpc.set_latency("Complete", 2.0, LARGE)
+    out = _run(ctx, m)
+    assert out["ended"], f"with gpt-4o stalled the call never ended ({_calls(ctx, LARGE)} attempts on it): every attempt needs a deadline"
+    large = ctx.grpc.calls_to("Complete", LARGE)
+    assert large and large[0].timeout is not None, "the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes"
+    assert 0.7 <= large[0].timeout <= 0.9, f"each attempt's deadline must be 800 ms, got {large[0].timeout} s"
+    assert out["error"] is None and out["model"] == "gpt-4o-mini", f"after gpt-4o timed out on every attempt the fallback must answer; got model {out['model']!r} and {out['error']!r}"
+    assert len(large) == 3, f"gpt-4o was tried {len(large)} times, expected 3 attempts of 800 ms"
+
+
+async def check_bounded(ctx):
+    m = _world(ctx)
+    ctx.grpc.stop(LARGE)
+    ctx.grpc.stop(SMALL)
+    out = _run(ctx, m)
+    total = _calls(ctx, LARGE) + _calls(ctx, SMALL)
+    assert out["ended"], f"with both deployments down the call never ended: {total} attempts and counting. Bound the attempts per model"
+    assert out["error"] is not None, f"with both deployments down the call must raise, it returned {out['model']!r}"
+    assert _calls(ctx, LARGE) <= 3 and _calls(ctx, SMALL) <= 3, f"with both deployments down the call made {_calls(ctx, LARGE)} attempts on gpt-4o and {_calls(ctx, SMALL)} on gpt-4o-mini, expected at most 3 each"
+
+
+async def check_retryable(ctx):
+    m = _world(ctx)
+    ctx.grpc.fail("Complete", grpc.StatusCode.INVALID_ARGUMENT, "max_tokens exceeds the context window", times=1, target=LARGE)
+    out = _run(ctx, m)
+    assert out["ended"] and out["error"] is not None, f"INVALID_ARGUMENT from gpt-4o must be raised to the caller at once, the call returned {out['model']!r}"
+    assert _calls(ctx, LARGE) == 1, f"INVALID_ARGUMENT is not retryable: gpt-4o was called {_calls(ctx, LARGE)} times, expected once"
+    assert _calls(ctx, SMALL) == 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong"
+    assert ctx.redis.get("circuit:gpt-4o") is None, "a non-retryable failure must not count towards the breaker"
+    ctx.grpc.fail("Complete", grpc.StatusCode.UNAVAILABLE, "gpt-4o restarting", times=1, target=LARGE)
+    out = _run(ctx, m)
+    assert out["error"] is None and out["model"] == "gpt-4o", f"one UNAVAILABLE must be retried on gpt-4o, got model {out['model']!r} and {out['error']!r}"
+    assert _calls(ctx, LARGE) == 3, f"gpt-4o was called {_calls(ctx, LARGE)} times in all, expected 1 + 2 (one refusal, then one retried failure)"
+
+
+async def check_fallback(ctx):
+    m = _world(ctx)
+    ctx.grpc.stop(LARGE)
+    out = _run(ctx, m)
+    assert out["ended"], "with gpt-4o down the call never ended: fall back to gpt-4o-mini once gpt-4o's attempts are spent"
+    assert out["error"] is None and out["model"] == "gpt-4o-mini", f"with gpt-4o down gpt-4o-mini must answer, got model {out['model']!r} and {out['error']!r}"
+    assert out["text"] == "gpt-4o-mini answers", f"the reply must be gpt-4o-mini's, got {out['text']!r}"
+    assert _calls(ctx, LARGE) == 3 and _calls(ctx, SMALL) == 1, f"expected 3 attempts on gpt-4o and 1 on gpt-4o-mini, got {_calls(ctx, LARGE)} and {_calls(ctx, SMALL)}"
+    ctx.grpc.stop(SMALL)
+    out = _run(ctx, m, model="gpt-4o-mini")
+    assert out["ended"] and out["error"] is not None, "a call for gpt-4o-mini with gpt-4o-mini down has nothing to fall back to and must raise"
+    assert _calls(ctx, LARGE) == 3, "a call for gpt-4o-mini must not fall back to gpt-4o"
+
+
+async def check_breaker(ctx):
+    m = _world(ctx)
+    ctx.grpc.fail("Complete", grpc.StatusCode.UNAVAILABLE, "gpt-4o overloaded", times=5, target=LARGE)
+    first = _run(ctx, m)
+    second = _run(ctx, m)
+    state = ctx.redis.get("circuit:gpt-4o")
+    assert state == "open", f"after five retryable failures circuit:gpt-4o is {state!r}, expected 'open'"
+    ttl = ctx.redis.ttl("circuit:gpt-4o")
+    assert 0 < ttl <= 30, f"circuit:gpt-4o must expire within 30 s, its TTL is {ttl}"
+    assert _calls(ctx, LARGE) == 5, f"gpt-4o was called {_calls(ctx, LARGE)} times: once its circuit opened at the fifth failure the next attempt must not be made"
+    assert first["model"] == second["model"] == "gpt-4o-mini", f"while gpt-4o fails the fallback answers, got {first['model']!r} then {second['model']!r}"
+    third = _run(ctx, m)
+    assert _calls(ctx, LARGE) == 5, "while the circuit is open gpt-4o must be skipped without a call"
+    assert third["model"] == "gpt-4o-mini", f"while the circuit is open gpt-4o-mini answers, got {third['model']!r} and {third['error']!r}"
+    ctx.clock.advance(31)
+    fourth = _run(ctx, m)
+    assert _calls(ctx, LARGE) == 6 and fourth["model"] == "gpt-4o", "once the circuit has expired gpt-4o gets its turn again"
+`,
+    typescript: `const LARGE = 'gpt-4o:9000';
+const SMALL = 'gpt-4o-mini:9000';
+
+/** A model deployment: answers with its own name. */
+const deployment = (name: string) => ({
+  Complete(_call, callback) {
+    callback(null, {text: \`\${name} answers\`, usage: {input_tokens: 12, output_tokens: 7}});
+  },
+});
+
+function world(ctx) {
+  const pkg = ctx.proto('models.proto');
+  ctx.grpc.serve(pkg.routerd.Model.service, deployment('gpt-4o'), LARGE);
+  ctx.grpc.serve(pkg.routerd.Model.service, deployment('gpt-4o-mini'), SMALL);
+  return ctx.load('model_call');
+}
+
+/** One call: the model that answered, its text and the error it threw; ended is false if it never returned. */
+async function run(ctx, m, model = 'gpt-4o') {
+  const out: {model: string | null; text: string | null; error: unknown; ended: boolean} = {model: null, text: null, error: null, ended: false};
+  const call = async () => {
+    try {
+      const answer = await m.complete(model, 'Summarise this ticket.', 64);
+      out.model = answer.model;
+      out.text = answer.reply.text;
+    } catch (e) {
+      out.error = e;
+    }
+    return true;
+  };
+  out.ended = (await ctx.drain(call())) === true;
+  return out;
+}
+
+const calls = (ctx, target: string): number => ctx.grpc.callsTo('Complete', target).length;
+
+export async function check_deadline(ctx) {
+  const m = world(ctx);
+  ctx.grpc.setLatency('Complete', 2.0, LARGE);
+  const out = await run(ctx, m);
+  assert(out.ended, \`with gpt-4o stalled the call never ended (\${calls(ctx, LARGE)} attempts on it): every attempt needs a deadline\`);
+  const large = ctx.grpc.callsTo('Complete', LARGE);
+  assert(large.length > 0 && large[0].timeout !== null, 'the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes');
+  assert(0.7 <= large[0].timeout && large[0].timeout <= 0.9, \`each attempt's deadline must be 800 ms, got \${large[0].timeout} s\`);
+  assert(out.error === null && out.model === 'gpt-4o-mini', \`after gpt-4o timed out on every attempt the fallback must answer; got model \${JSON.stringify(out.model)} and \${out.error}\`);
+  assert.equal(large.length, 3, \`gpt-4o was tried \${large.length} times, expected 3 attempts of 800 ms\`);
+}
+
+export async function check_bounded(ctx) {
+  const m = world(ctx);
+  ctx.grpc.stop(LARGE);
+  ctx.grpc.stop(SMALL);
+  const out = await run(ctx, m);
+  const total = calls(ctx, LARGE) + calls(ctx, SMALL);
+  assert(out.ended, \`with both deployments down the call never ended: \${total} attempts and counting. Bound the attempts per model\`);
+  assert(out.error !== null, \`with both deployments down the call must throw, it returned \${JSON.stringify(out.model)}\`);
+  assert(calls(ctx, LARGE) <= 3 && calls(ctx, SMALL) <= 3, \`with both deployments down the call made \${calls(ctx, LARGE)} attempts on gpt-4o and \${calls(ctx, SMALL)} on gpt-4o-mini, expected at most 3 each\`);
+}
+
+export async function check_retryable(ctx) {
+  const m = world(ctx);
+  ctx.grpc.fail('Complete', ctx.grpc.status.INVALID_ARGUMENT, 'max_tokens exceeds the context window', 1, LARGE);
+  let out = await run(ctx, m);
+  assert(out.ended && out.error !== null, \`INVALID_ARGUMENT from gpt-4o must be thrown to the caller at once, the call returned \${JSON.stringify(out.model)}\`);
+  assert.equal(calls(ctx, LARGE), 1, \`INVALID_ARGUMENT is not retryable: gpt-4o was called \${calls(ctx, LARGE)} times, expected once\`);
+  assert.equal(calls(ctx, SMALL), 0, 'INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong');
+  assert.equal(ctx.redis.get('circuit:gpt-4o'), null, 'a non-retryable failure must not count towards the breaker');
+  ctx.grpc.fail('Complete', ctx.grpc.status.UNAVAILABLE, 'gpt-4o restarting', 1, LARGE);
+  out = await run(ctx, m);
+  assert(out.error === null && out.model === 'gpt-4o', \`one UNAVAILABLE must be retried on gpt-4o, got model \${JSON.stringify(out.model)} and \${out.error}\`);
+  assert.equal(calls(ctx, LARGE), 3, \`gpt-4o was called \${calls(ctx, LARGE)} times in all, expected 1 + 2 (one refusal, then one retried failure)\`);
+}
+
+export async function check_fallback(ctx) {
+  const m = world(ctx);
+  ctx.grpc.stop(LARGE);
+  let out = await run(ctx, m);
+  assert(out.ended, "with gpt-4o down the call never ended: fall back to gpt-4o-mini once gpt-4o's attempts are spent");
+  assert(out.error === null && out.model === 'gpt-4o-mini', \`with gpt-4o down gpt-4o-mini must answer, got model \${JSON.stringify(out.model)} and \${out.error}\`);
+  assert.equal(out.text, 'gpt-4o-mini answers', \`the reply must be gpt-4o-mini's, got \${JSON.stringify(out.text)}\`);
+  assert(calls(ctx, LARGE) === 3 && calls(ctx, SMALL) === 1, \`expected 3 attempts on gpt-4o and 1 on gpt-4o-mini, got \${calls(ctx, LARGE)} and \${calls(ctx, SMALL)}\`);
+  ctx.grpc.stop(SMALL);
+  out = await run(ctx, m, 'gpt-4o-mini');
+  assert(out.ended && out.error !== null, 'a call for gpt-4o-mini with gpt-4o-mini down has nothing to fall back to and must throw');
+  assert.equal(calls(ctx, LARGE), 3, 'a call for gpt-4o-mini must not fall back to gpt-4o');
+}
+
+export async function check_breaker(ctx) {
+  const m = world(ctx);
+  ctx.grpc.fail('Complete', ctx.grpc.status.UNAVAILABLE, 'gpt-4o overloaded', 5, LARGE);
+  const first = await run(ctx, m);
+  const second = await run(ctx, m);
+  const state = ctx.redis.get('circuit:gpt-4o');
+  assert.equal(state, 'open', \`after five retryable failures circuit:gpt-4o is \${JSON.stringify(state)}, expected 'open'\`);
+  const ttl = Number(ctx.redis.ttl('circuit:gpt-4o'));
+  assert(0 < ttl && ttl <= 30, \`circuit:gpt-4o must expire within 30 s, its TTL is \${ttl}\`);
+  assert.equal(calls(ctx, LARGE), 5, \`gpt-4o was called \${calls(ctx, LARGE)} times: once its circuit opened at the fifth failure the next attempt must not be made\`);
+  assert(first.model === 'gpt-4o-mini' && second.model === 'gpt-4o-mini', \`while gpt-4o fails the fallback answers, got \${JSON.stringify(first.model)} then \${JSON.stringify(second.model)}\`);
+  const third = await run(ctx, m);
+  assert.equal(calls(ctx, LARGE), 5, 'while the circuit is open gpt-4o must be skipped without a call');
+  assert.equal(third.model, 'gpt-4o-mini', \`while the circuit is open gpt-4o-mini answers, got \${JSON.stringify(third.model)} and \${third.error}\`);
+  ctx.clock.advance(31);
+  const fourth = await run(ctx, m);
+  assert(calls(ctx, LARGE) === 6 && fourth.model === 'gpt-4o', 'once the circuit has expired gpt-4o gets its turn again');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	"leetbuild/harness"
+
+	pb "routerd/gen/models"
+)
+
+const (
+	largeTarget = "gpt-4o:9000"
+	smallTarget = "gpt-4o-mini:9000"
+)
+
+// deploymentPeer is a model deployment: it answers with its own name.
+type deploymentPeer struct {
+	pb.UnimplementedModelServer
+	name string
+}
+
+func (p *deploymentPeer) Complete(_ context.Context, _ *pb.CompleteRequest) (*pb.CompleteReply, error) {
+	return &pb.CompleteReply{Text: p.name + " answers", Usage: &pb.Usage{InputTokens: 12, OutputTokens: 7}}, nil
+}
+
+func modelWorld(ctx *harness.Ctx) {
+	pb.RegisterModelServer(ctx.GRPC.Server(largeTarget), &deploymentPeer{name: "gpt-4o"})
+	pb.RegisterModelServer(ctx.GRPC.Server(smallTarget), &deploymentPeer{name: "gpt-4o-mini"})
+}
+
+type modelOut struct {
+	model, text string
+	err         error
+	ended       bool
+}
+
+// modelRun is one call: the model that answered, its text and the error; ended is false if it never returned.
+func modelRun(ctx *harness.Ctx, model string) modelOut {
+	var out modelOut
+	out.ended = ctx.Drain(func() {
+		served, reply, err := complete(context.Background(), model, "Summarise this ticket.", 64)
+		out.model, out.err = served, err
+		if reply != nil {
+			out.text = reply.GetText()
+		}
+	})
+	return out
+}
+
+func modelCalls(ctx *harness.Ctx, target string) int {
+	return len(ctx.GRPC.CallsTo("Complete", target))
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	modelWorld(ctx)
+	ctx.GRPC.SetLatency("Complete", 2.0, largeTarget)
+	out := modelRun(ctx, "gpt-4o")
+	ctx.Assert(out.ended, "with gpt-4o stalled the call never ended (%d attempts on it): every attempt needs a deadline", modelCalls(ctx, largeTarget))
+	large := ctx.GRPC.CallsTo("Complete", largeTarget)
+	ctx.Assert(len(large) > 0 && large[0].HasDeadline(), "the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes")
+	ctx.Assert(700*time.Millisecond <= large[0].Timeout && large[0].Timeout <= 900*time.Millisecond, "each attempt's deadline must be 800 ms, got %v", large[0].Timeout)
+	ctx.Assert(out.err == nil && out.model == "gpt-4o-mini", "after gpt-4o timed out on every attempt the fallback must answer; got model %q and %v", out.model, out.err)
+	ctx.Equal(len(large), 3, "gpt-4o attempts (3 of 800 ms each)")
+}
+
+func CheckBounded(ctx *harness.Ctx) {
+	modelWorld(ctx)
+	ctx.GRPC.Stop(largeTarget)
+	ctx.GRPC.Stop(smallTarget)
+	out := modelRun(ctx, "gpt-4o")
+	total := modelCalls(ctx, largeTarget) + modelCalls(ctx, smallTarget)
+	ctx.Assert(out.ended, "with both deployments down the call never ended: %d attempts and counting. Bound the attempts per model", total)
+	ctx.Assert(out.err != nil, "with both deployments down the call must return an error, it returned model %q", out.model)
+	ctx.Assert(modelCalls(ctx, largeTarget) <= 3 && modelCalls(ctx, smallTarget) <= 3, "with both deployments down the call made %d attempts on gpt-4o and %d on gpt-4o-mini, expected at most 3 each", modelCalls(ctx, largeTarget), modelCalls(ctx, smallTarget))
+}
+
+func CheckRetryable(ctx *harness.Ctx) {
+	modelWorld(ctx)
+	ctx.GRPC.Fail("Complete", codes.InvalidArgument, "max_tokens exceeds the context window", 1, largeTarget)
+	out := modelRun(ctx, "gpt-4o")
+	ctx.Assert(out.ended && out.err != nil, "INVALID_ARGUMENT from gpt-4o must be returned to the caller at once, the call returned model %q", out.model)
+	ctx.Equal(modelCalls(ctx, largeTarget), 1, "INVALID_ARGUMENT is not retryable; gpt-4o calls")
+	ctx.Equal(modelCalls(ctx, smallTarget), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong; gpt-4o-mini calls")
+	_, counted := ctx.Redis.Get("circuit:gpt-4o")
+	ctx.Assert(!counted, "a non-retryable failure must not count towards the breaker")
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "gpt-4o restarting", 1, largeTarget)
+	out = modelRun(ctx, "gpt-4o")
+	ctx.Assert(out.err == nil && out.model == "gpt-4o", "one UNAVAILABLE must be retried on gpt-4o, got model %q and %v", out.model, out.err)
+	ctx.Equal(modelCalls(ctx, largeTarget), 3, "gpt-4o calls in all (1 + 2: one refusal, then one retried failure)")
+}
+
+func CheckFallback(ctx *harness.Ctx) {
+	modelWorld(ctx)
+	ctx.GRPC.Stop(largeTarget)
+	out := modelRun(ctx, "gpt-4o")
+	ctx.Assert(out.ended, "with gpt-4o down the call never ended: fall back to gpt-4o-mini once gpt-4o's attempts are spent")
+	ctx.Assert(out.err == nil && out.model == "gpt-4o-mini", "with gpt-4o down gpt-4o-mini must answer, got model %q and %v", out.model, out.err)
+	ctx.Equal(out.text, "gpt-4o-mini answers", "the reply must be gpt-4o-mini's")
+	ctx.Assert(modelCalls(ctx, largeTarget) == 3 && modelCalls(ctx, smallTarget) == 1, "expected 3 attempts on gpt-4o and 1 on gpt-4o-mini, got %d and %d", modelCalls(ctx, largeTarget), modelCalls(ctx, smallTarget))
+	ctx.GRPC.Stop(smallTarget)
+	out = modelRun(ctx, "gpt-4o-mini")
+	ctx.Assert(out.ended && out.err != nil, "a call for gpt-4o-mini with gpt-4o-mini down has nothing to fall back to and must return an error")
+	ctx.Equal(modelCalls(ctx, largeTarget), 3, "a call for gpt-4o-mini must not fall back to gpt-4o; gpt-4o calls")
+}
+
+func CheckBreaker(ctx *harness.Ctx) {
+	modelWorld(ctx)
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "gpt-4o overloaded", 5, largeTarget)
+	first := modelRun(ctx, "gpt-4o")
+	second := modelRun(ctx, "gpt-4o")
+	state, _ := ctx.Redis.Get("circuit:gpt-4o")
+	ctx.Equal(state, "open", "after five retryable failures circuit:gpt-4o")
+	ttl := ctx.Redis.TTL("circuit:gpt-4o")
+	ctx.Assert(0 < ttl && ttl <= 30, "circuit:gpt-4o must expire within 30 s, its TTL is %d", ttl)
+	ctx.Equal(modelCalls(ctx, largeTarget), 5, "once the circuit opened at the fifth failure the next attempt must not be made; gpt-4o calls")
+	ctx.Assert(first.model == "gpt-4o-mini" && second.model == "gpt-4o-mini", "while gpt-4o fails the fallback answers, got %q then %q", first.model, second.model)
+	third := modelRun(ctx, "gpt-4o")
+	ctx.Equal(modelCalls(ctx, largeTarget), 5, "while the circuit is open gpt-4o must be skipped without a call; gpt-4o calls")
+	ctx.Assert(third.model == "gpt-4o-mini", "while the circuit is open gpt-4o-mini answers, got %q and %v", third.model, third.err)
+	ctx.Clock.Advance(31)
+	fourth := modelRun(ctx, "gpt-4o")
+	ctx.Assert(modelCalls(ctx, largeTarget) == 6 && fourth.model == "gpt-4o", "once the circuit has expired gpt-4o gets its turn again")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <exception>
+#include <string>
+
+namespace {
+
+const std::string kLargeTarget = "gpt-4o:9000";
+const std::string kSmallTarget = "gpt-4o-mini:9000";
+
+// A model deployment: answers with its own name.
+class DeploymentPeer final : public routerd::Model::Service {
+ public:
+  explicit DeploymentPeer(std::string name) : name_(std::move(name)) {}
+
+  grpc::Status Complete(grpc::ServerContext*, const routerd::CompleteRequest*, routerd::CompleteReply* reply) override {
+    reply->set_text(name_ + " answers");
+    reply->mutable_usage()->set_input_tokens(12);
+    reply->mutable_usage()->set_output_tokens(7);
+    return grpc::Status::OK;
+  }
+
+ private:
+  std::string name_;
+};
+
+struct ModelWorld {
+  DeploymentPeer large{"gpt-4o"};
+  DeploymentPeer small{"gpt-4o-mini"};
+};
+
+void modelWorld(harness::Ctx& ctx) {
+  static ModelWorld* w = nullptr;
+  delete w;
+  w = new ModelWorld;
+  ctx.GRPC.Server(kLargeTarget)->RegisterService(&w->large);
+  ctx.GRPC.Server(kSmallTarget)->RegisterService(&w->small);
+}
+
+struct ModelOut {
+  std::string model, text;
+  std::string error;  // what the call threw, "" if it returned
+  bool ended = false;
+};
+
+// One call: the model that answered, its text and what it threw; ended is false if it never returned.
+ModelOut modelRun(harness::Ctx& ctx, const std::string& model = "gpt-4o") {
+  ModelOut out;
+  out.ended = ctx.Drain([&] {
+    try {
+      const auto answer = complete(model, "Summarise this ticket.", 64);
+      out.model = answer.model;
+      out.text = answer.reply.text();
+    } catch (const std::exception& e) {
+      out.error = e.what()[0] ? e.what() : "an exception";
+    }
+  });
+  return out;
+}
+
+size_t modelCalls(harness::Ctx& ctx, const std::string& target) { return ctx.GRPC.CallsTo("Complete", target).size(); }
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  modelWorld(ctx);
+  ctx.GRPC.SetLatency("Complete", 2.0, kLargeTarget);
+  const auto out = modelRun(ctx);
+  ctx.Assert(out.ended, "with gpt-4o stalled the call never ended (%d attempts on it): every attempt needs a deadline", modelCalls(ctx, kLargeTarget));
+  const auto large = ctx.GRPC.CallsTo("Complete", kLargeTarget);
+  ctx.Assert(!large.empty() && large[0].HasDeadline(), "the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes");
+  ctx.Assert(0.7 <= large[0].TimeoutSeconds() && large[0].TimeoutSeconds() <= 0.9, "each attempt's deadline must be 800 ms, got %vs", large[0].TimeoutSeconds());
+  ctx.Assert(out.error.empty() && out.model == "gpt-4o-mini", "after gpt-4o timed out on every attempt the fallback must answer; got model %q and %s", out.model, out.error);
+  ctx.Equal(large.size(), 3, "gpt-4o attempts (3 of 800 ms each)");
+}
+
+void CheckBounded(harness::Ctx& ctx) {
+  modelWorld(ctx);
+  ctx.GRPC.Stop(kLargeTarget);
+  ctx.GRPC.Stop(kSmallTarget);
+  const auto out = modelRun(ctx);
+  const size_t total = modelCalls(ctx, kLargeTarget) + modelCalls(ctx, kSmallTarget);
+  ctx.Assert(out.ended, "with both deployments down the call never ended: %d attempts and counting. Bound the attempts per model", total);
+  ctx.Assert(!out.error.empty(), "with both deployments down the call must throw, it returned model %q", out.model);
+  ctx.Assert(modelCalls(ctx, kLargeTarget) <= 3 && modelCalls(ctx, kSmallTarget) <= 3, "with both deployments down the call made %d attempts on gpt-4o and %d on gpt-4o-mini, expected at most 3 each", modelCalls(ctx, kLargeTarget), modelCalls(ctx, kSmallTarget));
+}
+
+void CheckRetryable(harness::Ctx& ctx) {
+  modelWorld(ctx);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::INVALID_ARGUMENT, "max_tokens exceeds the context window", 1, kLargeTarget);
+  auto out = modelRun(ctx);
+  ctx.Assert(out.ended && !out.error.empty(), "INVALID_ARGUMENT from gpt-4o must be thrown to the caller at once, the call returned model %q", out.model);
+  ctx.Equal(modelCalls(ctx, kLargeTarget), 1, "INVALID_ARGUMENT is not retryable; gpt-4o calls");
+  ctx.Equal(modelCalls(ctx, kSmallTarget), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong; gpt-4o-mini calls");
+  ctx.Assert(!ctx.Redis.Get("circuit:gpt-4o"), "a non-retryable failure must not count towards the breaker");
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "gpt-4o restarting", 1, kLargeTarget);
+  out = modelRun(ctx);
+  ctx.Assert(out.error.empty() && out.model == "gpt-4o", "one UNAVAILABLE must be retried on gpt-4o, got model %q and %s", out.model, out.error);
+  ctx.Equal(modelCalls(ctx, kLargeTarget), 3, "gpt-4o calls in all (1 + 2: one refusal, then one retried failure)");
+}
+
+void CheckFallback(harness::Ctx& ctx) {
+  modelWorld(ctx);
+  ctx.GRPC.Stop(kLargeTarget);
+  auto out = modelRun(ctx);
+  ctx.Assert(out.ended, "with gpt-4o down the call never ended: fall back to gpt-4o-mini once gpt-4o's attempts are spent");
+  ctx.Assert(out.error.empty() && out.model == "gpt-4o-mini", "with gpt-4o down gpt-4o-mini must answer, got model %q and %s", out.model, out.error);
+  ctx.Equal(out.text, "gpt-4o-mini answers", "the reply must be gpt-4o-mini's");
+  ctx.Assert(modelCalls(ctx, kLargeTarget) == 3 && modelCalls(ctx, kSmallTarget) == 1, "expected 3 attempts on gpt-4o and 1 on gpt-4o-mini, got %d and %d", modelCalls(ctx, kLargeTarget), modelCalls(ctx, kSmallTarget));
+  ctx.GRPC.Stop(kSmallTarget);
+  out = modelRun(ctx, "gpt-4o-mini");
+  ctx.Assert(out.ended && !out.error.empty(), "a call for gpt-4o-mini with gpt-4o-mini down has nothing to fall back to and must throw");
+  ctx.Equal(modelCalls(ctx, kLargeTarget), 3, "a call for gpt-4o-mini must not fall back to gpt-4o; gpt-4o calls");
+}
+
+void CheckBreaker(harness::Ctx& ctx) {
+  modelWorld(ctx);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "gpt-4o overloaded", 5, kLargeTarget);
+  const auto first = modelRun(ctx);
+  const auto second = modelRun(ctx);
+  ctx.Equal(ctx.Redis.Get("circuit:gpt-4o"), "open", "after five retryable failures circuit:gpt-4o");
+  const long long ttl = ctx.Redis.TTL("circuit:gpt-4o");
+  ctx.Assert(0 < ttl && ttl <= 30, "circuit:gpt-4o must expire within 30 s, its TTL is %d", ttl);
+  ctx.Equal(modelCalls(ctx, kLargeTarget), 5, "once the circuit opened at the fifth failure the next attempt must not be made; gpt-4o calls");
+  ctx.Assert(first.model == "gpt-4o-mini" && second.model == "gpt-4o-mini", "while gpt-4o fails the fallback answers, got %q then %q", first.model, second.model);
+  const auto third = modelRun(ctx);
+  ctx.Equal(modelCalls(ctx, kLargeTarget), 5, "while the circuit is open gpt-4o must be skipped without a call; gpt-4o calls");
+  ctx.Assert(third.model == "gpt-4o-mini", "while the circuit is open gpt-4o-mini answers, got %q and %s", third.model, third.error);
+  ctx.Clock.Advance(31);
+  const auto fourth = modelRun(ctx);
+  ctx.Assert(modelCalls(ctx, kLargeTarget) == 6 && fourth.model == "gpt-4o", "once the circuit has expired gpt-4o gets its turn again");
+}
+`,
+  },
+  debrief: `Each bound answers a different question. The deadline bounds one attempt, so a stalled deployment costs 800 ms instead of a worker. The attempt count bounds one model, and the status filter decides which failures are worth repeating: \`INVALID_ARGUMENT\` fails the same way on every attempt and every model. The fallback turns an outage of the large model into cheaper answers instead of errors. The breaker lives in Redis so every replica stops calling a deployment one of them watched fail, and its expiry is what lets traffic back. Production routers add jittered backoff between attempts, a retry budget so retries cannot multiply load during an outage, and a half-open state that sends one probe request before closing the circuit.`,
 };

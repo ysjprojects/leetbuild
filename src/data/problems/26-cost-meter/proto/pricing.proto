@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package meter;
+
+// The pricing service step 3 asks for the current rate table: one unary call per lookup, with a
+// deadline. The harness serves a deterministic stand-in at pricing:9000 (meter/pricing in the
+// support modules).
+service Pricing {
+  rpc GetRates(RatesRequest) returns (RateTable);
+}
+
+message RatesRequest {}
+
+// One model's price: input_rate and output_rate are micro-dollars per 1 000 tokens.
+message ModelRate {
+  string model = 1;
+  int32 input_rate = 2;
+  int32 output_rate = 3;
+}
+
+// Every model the platform bills, under one version: a price change is a new version.
+message RateTable {
+  string version = 1;
+  repeated ModelRate rates = 2;
+}

@@ -87,6 +87,12 @@ One service, **aifw**, four files, one program:
 4. \`events\`: \`finish(…)\`: one idempotent \`ai.firewall.events\` record keyed by the key's SHA-256,
    the response redacted first.
 
+## The debugging habit
+
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
+
 ## Left out on purpose
 
 The detector model, bot and attack scores, per-IP limits, custom fingerprints, request-phase

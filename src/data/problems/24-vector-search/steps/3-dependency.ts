@@ -2,454 +2,332 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Scatter-gather over index shards',
+  title: 'Scatter-gather over index shards with deadlines and a quorum',
   concept: 'grpc',
   file: 'client',
   focus: ['search', 'shards'],
   task: `## Task
 
-**Starting point.** The starter fans \`POST /v1/search\` out to every target in
-\`SHARD_TARGETS\` over gRPC with \`asyncio.gather\`, concatenates whatever comes back and answers
-200. \`query_shard\` calls \`stub.Search\` with no timeout, sleeps 50 ms and retries on any
-\`AioRpcError\`, and returns \`[]\` on any other exception. With every shard healthy the demo ranks
-well. It compiles and hides five flaws.
+**Starting point.** The starter is the shard client the search runs through once the corpus is split
+across three \`Shard\` servers (\`SHARDS\`): \`search_shards(tenant, version, query, k)\` sends one
+\`Search\` to each shard in turn, retries any error up to five times 50 ms apart, treats a shard that
+does not answer as an empty list, concatenates the replies and answers \`{hits, partial: false,
+answered: 3, required: 2}\`. It serves the demo and hides five flaws.
 
-**Failure mode the checks target.** Waiting for the slowest shard makes one hot shard's latency the
-service's latency. A shard error caught into an empty list keeps the ranking plausible while recall
-is gone, and unbounded retries turn a partial shard outage into a full one under load.
+**Failure mode the checks target.** A shard stuck in a pause holds every search open for as long as
+the pause lasts; a shard that is down costs five calls per search and drops out of the answer without
+a trace; with two shards down the service still answers from a third of the corpus; and the best
+documents on shard 2 miss the top \`k\`.
 
-- Every shard call carries a **400 ms deadline** (\`timeout\`, \`deadline:\`, \`WithTimeout\`,
-  \`withDeadlineAfter\`, \`set_deadline\`); a shard that has not answered by then is *missing*.
-- Retries are **bounded**: at most **2 attempts** per shard and a **150 ms retry budget** measured
-  from the first attempt.
-- A shard reply set must reach a **quorum**, a majority of the configured shards
-  (\`shard_count // 2 + 1\`). Below quorum the search answers **503** with the answered and required
-  counts and \`partial: true\`, not 200 with a silently incomplete list.
-- A failing or timing-out shard counts as a **failure** (\`failures += 1\`), not as an empty hit
-  list.
-- Above quorum, the response reports \`partial\` (\`true\` when any shard failed) alongside
-  \`shards.answered\` and \`shards.required\`, so a client can tell a degraded answer from a complete
-  one.`,
+\`\`\`proto
+service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE: the shard is down
+\`\`\`
+
+- Every call carries a \`DEADLINE_S\` (400 ms) deadline.
+- At most \`MAX_ATTEMPTS\` (2) calls per shard, the second only after \`UNAVAILABLE\`.
+- A shard that did not answer is missing: \`partial\` is true and \`answered\` counts the shards that did.
+- Fewer than \`quorum()\` answers (2 of 3) raise \`QuorumLost\`, which the API answers as 503.
+- The hits are the global top \`k\` by score, ties by id.`,
   sequence: {
-    participants: ['Search API', 'Index shard 0', 'Index shard 1', 'Index shard 2'],
+    participants: ['searchd', 'shard-0', 'shard-1', 'shard-2'],
     messages: [
-      {from: 'Search API', to: 'Index shard 0', label: 'Search(ctx, deadline = 400 ms)', kind: 'sync'},
-      {from: 'Search API', to: 'Index shard 1', label: 'Search(ctx, deadline = 400 ms)', kind: 'sync'},
-      {from: 'Search API', to: 'Index shard 2', label: 'Search(ctx, deadline = 400 ms)', kind: 'sync'},
-      {from: 'Index shard 0', to: 'Search API', label: 'hits', kind: 'reply'},
-      {from: 'Index shard 1', to: 'Search API', label: 'hits', kind: 'reply'},
-      {
-        from: 'Search API',
-        to: 'Search API',
-        label: 'shard 2 cut at the deadline · retries stop at the budget',
-        kind: 'sync',
-      },
-      {
-        from: 'Search API',
-        to: 'Search API',
-        label: 'answered 2 >= quorum 2 → 200 {hits, partial: true}',
-        kind: 'reply',
-      },
+      {from: 'searchd', to: 'shard-0', label: 'Search · deadline 400 ms', kind: 'sync'},
+      {from: 'shard-0', to: 'searchd', label: 'top k of its slice', kind: 'reply'},
+      {from: 'searchd', to: 'shard-1', label: 'Search · deadline 400 ms', kind: 'sync'},
+      {from: 'shard-1', to: 'searchd', label: 'UNAVAILABLE → one retry → missing', kind: 'reply'},
+      {from: 'searchd', to: 'shard-2', label: 'Search · deadline 400 ms', kind: 'sync'},
+      {from: 'shard-2', to: 'searchd', label: 'top k of its slice', kind: 'reply'},
+      {from: 'searchd', to: 'searchd', label: 'answered 2 ≥ quorum 2 · sort by score · keep k · partial', kind: 'sync'},
     ],
   },
-  hints: [
-    'One shard restarts and every search hangs until the client gives up; one shard crashes and searches return 200 with a third of the corpus missing and nothing in the body saying so.',
-    '`stub.Search` has no deadline and `while True` retries every `AioRpcError` with no cap; the other `except` returns `[]`, so `scatter_gather` cannot tell a dead shard from an empty one.',
-    'Pass `timeout=SHARD_DEADLINE_S`, loop on `attempt` up to `MAX_ATTEMPTS` inside `RETRY_BUDGET_MS`, gather with `return_exceptions=True`, count `failures += 1`, 503 below `quorum_size()`, and return `partial` with answered/required.',
-  ],
   checks: [
     {
       id: 'deadline',
-      title: 'Gives every shard a 400 ms deadline',
+      title: 'Every shard call carries a 400 ms deadline',
       detail:
-        'Each shard call carries a 400 ms deadline, so a stuck shard is cut off and the search proceeds. The starter awaits the slowest shard with no timeout at all.',
+        'Each `Search` call carries a 400 ms deadline (`timeout=DEADLINE_S`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), so a stalled shard is missing instead of holding the search open. The starter sets none.',
       match: {
-        python: {all: [/SHARD_DEADLINE_MS\s*=\s*400/, /timeout=SHARD_DEADLINE_S/]},
-        typescript: {all: [/SHARD_DEADLINE_MS\s*=\s*400/, /deadline:\s*Date\.now\(\)\s*\+\s*SHARD_DEADLINE_MS/]},
-        go: {all: [/shardDeadline\s*=\s*400\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^)]*shardDeadline\)/]},
-        scala: {all: [/ShardDeadlineMs\s*=\s*400/, /withDeadlineAfter\(\s*ShardDeadlineMs/]},
-        cpp: {all: [/kShardDeadlineMs\s*=\s*400/, /std::chrono::milliseconds\(kShardDeadlineMs\)/]},
+        python: {all: [/DEADLINE_S\s*=\s*0\.4\b/, /timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/DEADLINE_MS\s*=\s*400\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
+        go: {all: [/400\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^)\n]*deadline\)/]},
+        scala: {all: [/DeadlineMs\s*=\s*400L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
+        cpp: {all: [/kDeadline\{400\}|milliseconds\(400\)/, /set_deadline\(/]},
+      },
+    },
+    {
+      id: 'retry-policy',
+      title: 'Two attempts at most, the second only after UNAVAILABLE',
+      detail:
+        'A shard is called at most `MAX_ATTEMPTS` (2) times, and again only when it answered `UNAVAILABLE`; a deadline already spent its budget. The starter retries any error five times.',
+      match: {
+        python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/], none: [/range\(\s*5\s*\)/]},
+        typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/], none: [/attempt\s*<\s*5\b/]},
+        go: {all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/], none: [/attempt\s*<\s*5\b/]},
+        scala: {all: [/MaxAttempts\s*=\s*2\b/, /Code\.UNAVAILABLE/], none: [/attempt\s*<\s*5\b/]},
+        cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /StatusCode::UNAVAILABLE/], none: [/attempt\s*<\s*5\b/]},
+      },
+    },
+    {
+      id: 'partial',
+      title: 'A missing shard is reported, not hidden',
+      detail:
+        'A shard that did not answer is not an empty list: `answered` counts the shards that answered and `partial` is true when one is missing. The starter returns `partial: false` and `answered: 3` whatever happened.',
+      match: {
+        python: {all: [/answered\s*\+=\s*1/], none: [/["']partial["']\s*:\s*False/]},
+        typescript: {all: [/answered\s*(\+=\s*1|\+\+)/], none: [/partial:\s*false/]},
+        go: {all: [/answered\+\+|answered\s*\+=\s*1/], none: [/Partial:\s*false/]},
+        scala: {all: [/answered/], none: [/partial\s*=\s*false/]},
+        cpp: {all: [/\+\+answered|answered\+\+|answered\s*\+=\s*1/], none: [/\.partial\s*=\s*false/]},
       },
     },
     {
       id: 'quorum',
-      title: 'Requires a quorum of shard replies',
+      title: 'Below a quorum of shards the search fails',
       detail:
-        'A majority of the configured shards must answer; below quorum the search answers **503** with the answered and required counts. The starter answers 200 with whatever came back, so a partial index looks complete.',
+        'Fewer than `quorum()` answers (a majority of `SHARDS`) raise `QuorumLost`, which the API answers as 503. The starter answers from whatever came back, one shard included.',
       match: {
-        python: {all: [/def quorum_size\(/, /status_code\s*=\s*503/, /answered\s*<\s*quorum/]},
-        typescript: {all: [/function quorumSize\(/, /code\(\s*503\s*\)/, /answered\s*<\s*quorum/]},
-        go: {all: [/func quorumSize\(/, /StatusServiceUnavailable/, /answered\s*<\s*quorum/]},
-        scala: {all: [/def quorumSize\(/, /StatusCodes\.ServiceUnavailable/, /answered\s*<\s*quorum/]},
-        cpp: {all: [/int quorumSize\(/, /\b503\b/, /answered\s*<\s*quorum/]},
+        python: {all: [/answered\s*<\s*quorum\(\)/, /raise QuorumLost\(/]},
+        typescript: {all: [/answered\s*<\s*quorum\(\)/, /throw new QuorumLost\(/]},
+        go: {all: [/answered\s*<\s*quorum\(\)/, /return [^\n]*ErrQuorumLost/]},
+        scala: {all: [/answered\s*<\s*quorum\b/, /throw new QuorumLost\(/]},
+        cpp: {all: [/answered\s*<\s*quorum\(\)/, /throw QuorumLost\(/]},
       },
     },
     {
-      id: 'failures-not-empty',
-      title: 'A failed shard is a failure, not an empty result',
+      id: 'merge',
+      title: 'The hits are the global top k',
       detail:
-        'A rejected or timed-out shard increments a failure counter (`failures += 1`) and its hits are not merged; the starter turns the error into an empty hit list, so a dead shard is indistinguishable from an empty one.',
+        "Each shard answers its own top `k`; the merge sorts every reply by score (ties by id) before keeping `k`. The starter concatenates in shard order and cuts, so shard 0's documents crowd out better ones.",
       match: {
-        python: {all: [/failures\s*\+=\s*1/, /return_exceptions=True/]},
-        typescript: {all: [/failures\s*\+=\s*1/, /allSettled/]},
-        go: {all: [/failures\s*\+=\s*1/, /result\.err\s*!=\s*nil/]},
-        scala: {all: [/failures\s*\+=\s*1/, /recover\s*\{/]},
-        cpp: {all: [/failures\s*\+=\s*1/, /outcome\.ok/]},
-      },
-    },
-    {
-      id: 'bounded-retries',
-      title: 'Retries stop at the attempt cap and the budget',
-      detail:
-        'At most 2 attempts per shard inside a 150 ms wall-clock budget; the loop exits when either bound is reached. The starter retries every timeout forever, so one stuck shard stalls the whole query.',
-      match: {
-        python: {all: [/RETRY_BUDGET_MS/, /MAX_ATTEMPTS/, /attempt\s*\+=\s*1/], none: [/while True/]},
-        typescript: {all: [/RETRY_BUDGET_MS/, /MAX_ATTEMPTS/, /attempts\s*\+=\s*1/], none: [/while\s*\(\s*true\s*\)/]},
-        go: {all: [/retryBudget/, /maxAttempts/, /attempt\+\+/], none: [/for\s*\{/]},
-        scala: {all: [/RetryBudgetMs/, /MaxAttempts/, /attempt\s*\+=\s*1/], none: [/while\s*\(true\)/]},
-        cpp: {all: [/kRetryBudgetMs/, /kMaxAttempts/, /\+\+attempt/], none: [/while\s*\(\s*true\s*\)/]},
-      },
-    },
-    {
-      id: 'partial-flag',
-      title: 'Reports a partial answer explicitly',
-      detail:
-        'Above quorum the response carries `partial` (true when any shard failed) together with `shards.answered` and `shards.required`. The starter merges silently, so the caller cannot tell how complete the list is.',
-      match: {
-        python: {all: [/partial/, /quorum_size\(/]},
-        typescript: {all: [/partial/, /quorumSize\(/]},
-        go: {all: [/partial/, /quorumSize\(/]},
-        scala: {all: [/partial/, /quorumSize\(/]},
-        cpp: {all: [/partial/, /quorumSize\(/]},
+        python: {all: [/\.sort\(|sorted\(/]},
+        typescript: {all: [/\.sort\(/]},
+        go: {all: [/sort\.(Slice|SliceStable)\(/]},
+        scala: {all: [/sortBy\(|sortWith\(/]},
+        cpp: {all: [/std::(stable_)?sort\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import asyncio
-import logging
+      starter: `import time
 
 import grpc
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-import shards_pb2
-import shards_pb2_grpc
+import shard_pb2
+import shard_pb2_grpc
 
-app = FastAPI()
-logger = logging.getLogger("search")
+SHARDS = ("shard-0:9000", "shard-1:9000", "shard-2:9000")
 
-ACTIVE_INDEX_VERSION = "idx-42"
-SHARD_TARGETS = ("index-shard-0:9100", "index-shard-1:9100", "index-shard-2:9100")
-
-channels = {target: grpc.aio.insecure_channel(target) for target in SHARD_TARGETS}
+stubs = {target: shard_pb2_grpc.ShardStub(grpc.insecure_channel(target)) for target in SHARDS}
 
 
-class SearchQuery(BaseModel):
-    query: list[float]
-    k: int = 10
+class QuorumLost(Exception):
+    """Fewer than a majority of the shards answered: the search answers 503."""
 
 
-async def query_shard(target: str, tenant: str, query: list[float], k: int, version: str) -> list[dict]:
-    stub = shards_pb2_grpc.IndexShardStub(channels[target])
-    request = shards_pb2.SearchRequest(tenant=tenant, query=query, k=k, index_version=version)
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    while True:
+def quorum() -> int:
+    return len(SHARDS) // 2 + 1
+
+
+def ask(target: str, request: shard_pb2.ShardRequest) -> list:
+    """One shard's hits."""
+    for attempt in range(5):
         try:
-            reply = await stub.Search(request)
-            return [{"id": hit.id, "score": hit.score, "shard": target} for hit in reply.hits]
-        except grpc.aio.AioRpcError:
-            logger.warning("shard %s did not answer, retrying", target)
-            await asyncio.sleep(0.05)
-        except Exception:
-            return []
+            return list(stubs[target].Search(request).hits)
+        except grpc.RpcError:
+            time.sleep(0.05)  # the shard is flaky: try again
+    return []
 
 
-async def scatter_gather(tenant: str, query: list[float], k: int, version: str) -> list[dict]:
-    replies = await asyncio.gather(*(query_shard(target, tenant, query, k, version) for target in SHARD_TARGETS))
-    hits: list[dict] = []
-    for reply in replies:
-        hits.extend(reply)
-    return hits
-
-
-@app.post("/v1/search")
-async def search(body: SearchQuery) -> JSONResponse:
-    hits = await scatter_gather("", body.query, body.k, ACTIVE_INDEX_VERSION)
-    logger.info("search k=%d hits=%d", body.k, len(hits))
-    return JSONResponse({"hits": hits, "k": body.k, "index_version": ACTIVE_INDEX_VERSION}, status_code=200)
+def search_shards(tenant: str, version: str, query: list[float], k: int) -> dict:
+    """The tenant's k nearest documents across every shard: {hits, partial, answered, required}."""
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+    request = shard_pb2.ShardRequest(tenant=tenant, index_version=version, query=query, k=k)
+    hits = []
+    for target in SHARDS:
+        hits.extend({"id": h.id, "score": h.score} for h in ask(target, request))
+    return {"hits": hits[:k], "partial": False, "answered": len(SHARDS), "required": quorum()}
 `,
-      solution: `import asyncio
-import logging
+      solution: `import grpc
 
-import grpc
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import shard_pb2
+import shard_pb2_grpc
 
-import shards_pb2
-import shards_pb2_grpc
-
-app = FastAPI()
-logger = logging.getLogger("search")
-
-ACTIVE_INDEX_VERSION = "idx-42"
-SHARD_DEADLINE_MS = 400
-SHARD_DEADLINE_S = SHARD_DEADLINE_MS / 1000
-RETRY_BUDGET_MS = 150
+SHARDS = ("shard-0:9000", "shard-1:9000", "shard-2:9000")
+DEADLINE_S = 0.4
 MAX_ATTEMPTS = 2
-SHARD_TARGETS = ("index-shard-0:9100", "index-shard-1:9100", "index-shard-2:9100")
 
-channels = {target: grpc.aio.insecure_channel(target) for target in SHARD_TARGETS}
-
-
-class SearchQuery(BaseModel):
-    query: list[float]
-    k: int = 10
+stubs = {target: shard_pb2_grpc.ShardStub(grpc.insecure_channel(target)) for target in SHARDS}
 
 
-def quorum_size(shard_count: int) -> int:
-    """A majority: fewer answers than this is a guess, not a result."""
-    return shard_count // 2 + 1
+class QuorumLost(Exception):
+    """Fewer than a majority of the shards answered: the search answers 503."""
 
 
-async def query_shard(target: str, tenant: str, query: list[float], k: int, version: str) -> list[dict]:
-    """One shard, a deadline per attempt, and no more attempts than the budget allows."""
-    stub = shards_pb2_grpc.IndexShardStub(channels[target])
-    request = shards_pb2.SearchRequest(tenant=tenant, query=query, k=k, index_version=version)
-    loop = asyncio.get_running_loop()
-    until = loop.time() + RETRY_BUDGET_MS / 1000
-    attempt = 0
-    while attempt < MAX_ATTEMPTS:
-        attempt += 1
+def quorum() -> int:
+    return len(SHARDS) // 2 + 1
+
+
+def ask(target: str, request: shard_pb2.ShardRequest) -> list | None:
+    """One shard's hits, or None when it did not answer."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            reply = await stub.Search(request, timeout=SHARD_DEADLINE_S)
-            return [{"id": hit.id, "score": hit.score, "shard": target} for hit in reply.hits]
-        except grpc.aio.AioRpcError as error:
-            if error.code() not in (grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE):
-                raise
-            if loop.time() >= until:
-                break
-    raise TimeoutError(f"{target} missed the {SHARD_DEADLINE_MS} ms deadline")
+            return list(stubs[target].Search(request, timeout=DEADLINE_S).hits)
+        except grpc.RpcError as exc:
+            # A shard that is down may be back on the next call; a deadline already spent the budget.
+            if exc.code() != grpc.StatusCode.UNAVAILABLE:
+                return None
+    return None
 
 
-async def scatter_gather(tenant: str, query: list[float], k: int, version: str) -> tuple[list[dict], int]:
-    replies = await asyncio.gather(
-        *(query_shard(target, tenant, query, k, version) for target in SHARD_TARGETS),
-        return_exceptions=True,
-    )
-    hits: list[dict] = []
-    failures = 0
-    for reply in replies:
-        if isinstance(reply, BaseException):
-            failures += 1  # a shard that did not answer is missing, never empty
-            logger.warning("shard failed: %s", reply)
-            continue
-        hits.extend(reply)
-    return hits, failures
-
-
-@app.post("/v1/search")
-async def search(
-    body: SearchQuery,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    hits, failures = await scatter_gather(tenant, body.query, body.k, ACTIVE_INDEX_VERSION)
-    answered = len(SHARD_TARGETS) - failures
-    quorum = quorum_size(len(SHARD_TARGETS))
-    if answered < quorum:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "quorum not met", "answered": answered, "required": quorum, "partial": True},
-        )
-    hits.sort(key=lambda hit: hit["score"], reverse=True)
-    logger.info("search tenant=%s k=%d answered=%d partial=%s", tenant, body.k, answered, failures > 0)
-    return JSONResponse(
-        {
-            "hits": hits[: body.k],
-            "k": body.k,
-            "index_version": ACTIVE_INDEX_VERSION,
-            "partial": failures > 0,
-            "shards": {"answered": answered, "required": quorum},
-        },
-        status_code=200,
-    )
+def search_shards(tenant: str, version: str, query: list[float], k: int) -> dict:
+    """The tenant's k nearest documents across every shard: {hits, partial, answered, required}."""
+    request = shard_pb2.ShardRequest(tenant=tenant, index_version=version, query=query, k=k)
+    hits, answered = [], 0
+    for target in SHARDS:
+        reply = ask(target, request)
+        if reply is None:
+            continue  # missing, which is not the same as empty
+        answered += 1
+        hits.extend({"id": h.id, "score": h.score} for h in reply)
+    if answered < quorum():
+        raise QuorumLost(f"{answered} of {len(SHARDS)} shards answered, {quorum()} required")
+    hits.sort(key=lambda h: (-h["score"], h["id"]))
+    return {"hits": hits[:k], "partial": answered < len(SHARDS), "answered": answered, "required": quorum()}
 `,
     },
     typescript: {
-      starter: `/** Scatter-gather over index shards. */
-import * as grpc from '@grpc/grpc-js';
-import Fastify from 'fastify';
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-import {loadShardProto} from './proto';
+import type {Hit} from 'search/corpus';
 
-export const app = Fastify();
-
-const ACTIVE_INDEX_VERSION = 'idx-42';
-const SHARD_TARGETS = ['index-shard-0:9100', 'index-shard-1:9100', 'index-shard-2:9100'];
-
-const shardProto = loadShardProto();
-const clients = SHARD_TARGETS.map(target => new shardProto.IndexShard(target, grpc.credentials.createInsecure()));
-
-interface Hit {
-  id: string;
-  score: number;
-  shard: string;
-}
+export const SHARDS = ['shard-0:9000', 'shard-1:9000', 'shard-2:9000'];
 
 interface ShardRequest {
   tenant: string;
-  vector: number[];
-  k: number;
   index_version: string;
+  query: number[];
+  k: number;
 }
 
-function callShard(client: grpc.Client, request: ShardRequest): Promise<{hits?: Hit[]}> {
-  const {promise, resolve, reject} = Promise.withResolvers<{hits?: Hit[]}>();
-  (client as grpc.Client & {Search: (...args: unknown[]) => void}).Search(
-    request,
-    {deadline: Number.POSITIVE_INFINITY},
-    (error: grpc.ServiceError | null, value: {hits?: Hit[]}) => (error === null ? resolve(value) : reject(error)),
-  );
-  return promise;
+type ShardClient = grpc.Client & {
+  Search(request: ShardRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{hits?: Hit[]}>;
+};
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('shard.proto')) as unknown as {
+  searchd: {Shard: grpc.ServiceClientConstructor};
+};
+const stubs: Record<string, ShardClient> = Object.fromEntries(
+  SHARDS.map(target => [target, new pkg.searchd.Shard(target, grpc.credentials.createInsecure()) as ShardClient]),
+);
+
+/** Fewer than a majority of the shards answered: the search answers 503. */
+export class QuorumLost extends Error {}
+
+export interface Gathered {
+  hits: Hit[];
+  partial: boolean;
+  answered: number;
+  required: number;
 }
 
-async function queryShard(target: string, client: grpc.Client, request: ShardRequest): Promise<Hit[]> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  while (true) {
+export const quorum = (): number => Math.floor(SHARDS.length / 2) + 1;
+
+/** One shard's hits. */
+async function ask(target: string, request: ShardRequest): Promise<Hit[]> {
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const reply = await callShard(client, request);
-      return (reply.hits ?? []).map(hit => ({id: hit.id, score: hit.score, shard: target}));
+      const reply = await stubs[target].Search(request, new grpc.Metadata(), {});
+      return reply.hits ?? [];
     } catch {
-      await new Promise(resolve => setTimeout(resolve, 50));
+      const {promise, resolve} = Promise.withResolvers<void>();
+      setTimeout(resolve, 50); // the shard is flaky: try again
+      await promise;
     }
   }
+  return [];
 }
 
-app.post('/v1/search', async (request, reply) => {
-  const body = request.body as ShardRequest;
-  const replies = await Promise.all(
-    SHARD_TARGETS.map((target, index) => queryShard(target, clients[index], {...body, index_version: ACTIVE_INDEX_VERSION})),
-  );
-  const hits = replies.flat();
-  request.log.info({k: body.k, hits: hits.length}, 'scattered');
-  return reply.code(200).send({hits, k: body.k, index_version: ACTIVE_INDEX_VERSION});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** The tenant's k nearest documents across every shard. */
+export async function searchShards(tenant: string, version: string, query: number[], k: number): Promise<Gathered> {
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  const request = {tenant, index_version: version, query, k};
+  const hits: Hit[] = [];
+  for (const target of SHARDS) {
+    for (const h of await ask(target, request)) hits.push({id: h.id, score: h.score});
+  }
+  return {hits: hits.slice(0, k), partial: false, answered: SHARDS.length, required: quorum()};
+}
 `,
-      solution: `/** Scatter-gather over index shards: a deadline per shard, a quorum, and bounded retries. */
-import * as grpc from '@grpc/grpc-js';
-import Fastify from 'fastify';
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-import {loadShardProto} from './proto';
+import type {Hit} from 'search/corpus';
 
-export const app = Fastify();
-
-const ACTIVE_INDEX_VERSION = 'idx-42';
-const SHARD_DEADLINE_MS = 400;
-const RETRY_BUDGET_MS = 150;
-const MAX_ATTEMPTS = 2;
-const SHARD_TARGETS = ['index-shard-0:9100', 'index-shard-1:9100', 'index-shard-2:9100'];
-
-const shardProto = loadShardProto();
-const clients = SHARD_TARGETS.map(target => new shardProto.IndexShard(target, grpc.credentials.createInsecure()));
-
-interface Hit {
-  id: string;
-  score: number;
-  shard: string;
-}
+export const SHARDS = ['shard-0:9000', 'shard-1:9000', 'shard-2:9000'];
+export const DEADLINE_MS = 400;
+export const MAX_ATTEMPTS = 2;
 
 interface ShardRequest {
   tenant: string;
-  vector: number[];
-  k: number;
   index_version: string;
+  query: number[];
+  k: number;
 }
 
-function quorumSize(shardCount: number): number {
-  return Math.floor(shardCount / 2) + 1;
+type ShardClient = grpc.Client & {
+  Search(request: ShardRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{hits?: Hit[]}>;
+};
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('shard.proto')) as unknown as {
+  searchd: {Shard: grpc.ServiceClientConstructor};
+};
+const stubs: Record<string, ShardClient> = Object.fromEntries(
+  SHARDS.map(target => [target, new pkg.searchd.Shard(target, grpc.credentials.createInsecure()) as ShardClient]),
+);
+
+/** Fewer than a majority of the shards answered: the search answers 503. */
+export class QuorumLost extends Error {}
+
+export interface Gathered {
+  hits: Hit[];
+  partial: boolean;
+  answered: number;
+  required: number;
 }
 
-function callShard(client: grpc.Client, request: ShardRequest): Promise<{hits?: Hit[]}> {
-  const {promise, resolve, reject} = Promise.withResolvers<{hits?: Hit[]}>();
-  (client as grpc.Client & {Search: (...args: unknown[]) => void}).Search(
-    request,
-    {deadline: Date.now() + SHARD_DEADLINE_MS},
-    (error: grpc.ServiceError | null, value: {hits?: Hit[]}) => (error === null ? resolve(value) : reject(error)),
-  );
-  return promise;
-}
+export const quorum = (): number => Math.floor(SHARDS.length / 2) + 1;
 
-async function queryShard(target: string, client: grpc.Client, request: ShardRequest): Promise<Hit[]> {
-  const until = Date.now() + RETRY_BUDGET_MS;
-  let attempts = 0;
-  while (attempts < MAX_ATTEMPTS) {
-    attempts += 1;
+/** One shard's hits, or null when it did not answer. */
+async function ask(target: string, request: ShardRequest): Promise<Hit[] | null> {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const reply = await callShard(client, request);
-      return (reply.hits ?? []).map(hit => ({id: hit.id, score: hit.score, shard: target}));
-    } catch (error) {
-      const code = (error as grpc.ServiceError).code;
-      if (code !== grpc.status.DEADLINE_EXCEEDED && code !== grpc.status.UNAVAILABLE) throw error;
-      if (Date.now() >= until) break;
+      const reply = await stubs[target].Search(request, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+      return reply.hits ?? [];
+    } catch (e) {
+      // A shard that is down may be back on the next call; a deadline already spent the budget.
+      if ((e as grpc.ServiceError).code !== grpc.status.UNAVAILABLE) return null;
     }
   }
-  throw new Error(\`\${target} missed the \${SHARD_DEADLINE_MS} ms deadline\`);
+  return null;
 }
 
-async function scatterGather(tenant: string, request: ShardRequest): Promise<{hits: Hit[]; failures: number}> {
-  const replies = await Promise.allSettled(
-    SHARD_TARGETS.map((target, index) => queryShard(target, clients[index], request)),
-  );
+/** The tenant's k nearest documents across every shard. */
+export async function searchShards(tenant: string, version: string, query: number[], k: number): Promise<Gathered> {
+  const request = {tenant, index_version: version, query, k};
   const hits: Hit[] = [];
-  let failures = 0;
-  for (const reply of replies) {
-    if (reply.status === 'rejected') {
-      failures += 1; // a shard that did not answer is missing, never empty
-      continue;
-    }
-    hits.push(...reply.value);
+  let answered = 0;
+  for (const target of SHARDS) {
+    const reply = await ask(target, request);
+    if (reply === null) continue; // missing, which is not the same as empty
+    answered += 1;
+    for (const h of reply) hits.push({id: h.id, score: h.score});
   }
-  return {hits, failures};
+  if (answered < quorum()) throw new QuorumLost(\`\${answered} of \${SHARDS.length} shards answered, \${quorum()} required\`);
+  hits.sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return {hits: hits.slice(0, k), partial: answered < SHARDS.length, answered, required: quorum()};
 }
-
-app.post('/v1/search', async (request, reply) => {
-  const authenticated = request.headers['x-tenant-id'];
-  if (typeof authenticated !== 'string' || authenticated === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-
-  const body = (request.body ?? {}) as Partial<ShardRequest>;
-  const request_ = {
-    tenant: authenticated,
-    vector: body.vector ?? [],
-    k: body.k ?? 10,
-    index_version: ACTIVE_INDEX_VERSION,
-  } satisfies ShardRequest;
-
-  const {hits, failures} = await scatterGather(authenticated, request_);
-  const answered = SHARD_TARGETS.length - failures;
-  const quorum = quorumSize(SHARD_TARGETS.length);
-  if (answered < quorum)
-    return reply
-      .code(503)
-      .send({error: 'quorum not met', answered, required: quorum, partial: true});
-
-  hits.sort((left, right) => right.score - left.score);
-  request.log.info({tenant: authenticated, k: request_.k, answered, partial: failures > 0}, 'scattered');
-  return reply.code(200).send({
-    hits: hits.slice(0, request_.k),
-    k: request_.k,
-    index_version: ACTIVE_INDEX_VERSION,
-    partial: failures > 0,
-    shards: {answered, required: quorum},
-  });
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -457,73 +335,74 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net/http"
+	"errors"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	shards "search/shardspb"
+
+	"search/corpus" // corpus.Hit
+	pb "search/gen/shard"
 )
 
-type Hit struct {
-	ID    string  \`json:"id"\`
-	Score float64 \`json:"score"\`
+var shards = []string{"shard-0:9000", "shard-1:9000", "shard-2:9000"}
+
+var stubs = func() map[string]pb.ShardClient {
+	out := map[string]pb.ShardClient{}
+	for _, target := range shards {
+		conn, _ := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		out[target] = pb.NewShardClient(conn)
+	}
+	return out
+}()
+
+// ErrQuorumLost: fewer than a majority of the shards answered; the search answers 503.
+var ErrQuorumLost = errors.New("quorum lost")
+
+// Gathered is the merged answer: the hits, whether a shard was missing, how many answered and how many are required.
+type Gathered struct {
+	Hits     []corpus.Hit
+	Partial  bool
+	Answered int
+	Required int
 }
 
-var shardTargets = []string{"index-shard-0:9100", "index-shard-1:9100", "index-shard-2:9100"}
+func quorum() int { return len(shards)/2 + 1 }
 
-func shardClient(target string) shards.IndexShardClient {
-	conn, _ := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	return shards.NewIndexShardClient(conn)
-}
-
-func queryShard(ctx context.Context, target string, request *shards.SearchRequest) []Hit {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	for {
-		reply, err := shardClient(target).Search(ctx, request)
+// ask is one shard's hits.
+func ask(ctx context.Context, target string, req *pb.ShardRequest) []*pb.Hit {
+	for attempt := 0; attempt < 5; attempt++ {
+		reply, err := stubs[target].Search(ctx, req)
 		if err == nil {
-			return hitsFrom(reply, target)
+			return reply.GetHits()
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) // the shard is flaky: try again
 	}
+	return nil
 }
 
-func search(rw http.ResponseWriter, r *http.Request, body shards.SearchRequest) {
-	results := make(chan []Hit, len(shardTargets))
-	for _, target := range shardTargets {
-		go func(target string) {
-			results <- queryShard(r.Context(), target, &body)
-		}(target)
+// searchShards is the tenant's k nearest documents across every shard.
+func searchShards(ctx context.Context, tenant, version string, query []float64, k int) (Gathered, error) {
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+	req := &pb.ShardRequest{Tenant: tenant, IndexVersion: version, Query: query, K: int32(k)}
+	hits := []corpus.Hit{}
+	for _, target := range shards {
+		for _, h := range ask(ctx, target, req) {
+			hits = append(hits, corpus.Hit{ID: h.GetId(), Score: h.GetScore()})
+		}
 	}
-	hits := make([]Hit, 0)
-	for range shardTargets {
-		hits = append(hits, <-results...)
+	if len(hits) > k {
+		hits = hits[:k]
 	}
-	log.Printf("search k=%d hits=%d", body.K, len(hits))
-	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(map[string]any{"hits": hits, "k": body.K})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/search", func(rw http.ResponseWriter, r *http.Request) {
-		var body shards.SearchRequest
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		search(rw, r, body)
-	})
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	return Gathered{Hits: hits, Partial: false, Answered: len(shards), Required: quorum()}, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
-	"net/http"
 	"sort"
 	"time"
 
@@ -531,495 +410,824 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	shards "search/shardspb"
+
+	"search/corpus" // corpus.Hit
+	pb "search/gen/shard"
 )
 
 const (
-	activeIndexVersion = "idx-42"
-	shardDeadline      = 400 * time.Millisecond
-	retryBudget        = 150 * time.Millisecond
-	maxAttempts        = 2
+	deadline    = 400 * time.Millisecond
+	maxAttempts = 2
 )
 
-type Hit struct {
-	ID    string  \`json:"id"\`
-	Score float64 \`json:"score"\`
+var shards = []string{"shard-0:9000", "shard-1:9000", "shard-2:9000"}
+
+var stubs = func() map[string]pb.ShardClient {
+	out := map[string]pb.ShardClient{}
+	for _, target := range shards {
+		conn, _ := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		out[target] = pb.NewShardClient(conn)
+	}
+	return out
+}()
+
+// ErrQuorumLost: fewer than a majority of the shards answered; the search answers 503.
+var ErrQuorumLost = errors.New("quorum lost")
+
+// Gathered is the merged answer: the hits, whether a shard was missing, how many answered and how many are required.
+type Gathered struct {
+	Hits     []corpus.Hit
+	Partial  bool
+	Answered int
+	Required int
 }
 
-var shardTargets = []string{"index-shard-0:9100", "index-shard-1:9100", "index-shard-2:9100"}
+func quorum() int { return len(shards)/2 + 1 }
 
-func shardClient(target string) shards.IndexShardClient {
-	conn, _ := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	return shards.NewIndexShardClient(conn)
-}
-
-func quorumSize(shardCount int) int {
-	return shardCount/2 + 1
-}
-
-func queryShard(ctx context.Context, target string, request *shards.SearchRequest) ([]Hit, error) {
-	until := time.Now().Add(retryBudget)
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		shardCtx, cancel := context.WithTimeout(ctx, shardDeadline)
-		reply, err := shardClient(target).Search(shardCtx, request)
+// ask is one shard's hits; ok is false when the shard did not answer.
+func ask(ctx context.Context, target string, req *pb.ShardRequest) (hits []*pb.Hit, ok bool) {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, deadline)
+		reply, err := stubs[target].Search(callCtx, req)
 		cancel()
 		if err == nil {
-			return hitsFrom(reply, target), nil
+			return reply.GetHits(), true
 		}
-		code := status.Code(err)
-		if code != codes.DeadlineExceeded && code != codes.Unavailable {
-			return nil, err
-		}
-		if time.Now().After(until) {
-			break
+		// A shard that is down may be back on the next call; a deadline already spent the budget.
+		if status.Code(err) != codes.Unavailable {
+			return nil, false
 		}
 	}
-	return nil, fmt.Errorf("%s missed the %s deadline", target, shardDeadline)
+	return nil, false
 }
 
-func scatterGather(ctx context.Context, request *shards.SearchRequest) ([]Hit, int) {
-	type outcome struct {
-		hits []Hit
-		err  error
-	}
-	results := make(chan outcome, len(shardTargets))
-	for _, target := range shardTargets {
-		go func(target string) {
-			hits, err := queryShard(ctx, target, request)
-			results <- outcome{hits: hits, err: err}
-		}(target)
-	}
-	hits := make([]Hit, 0)
-	failures := 0
-	for range shardTargets {
-		result := <-results
-		if result.err != nil {
-			failures += 1 // a shard that did not answer is missing, never empty
-			continue
+// searchShards is the tenant's k nearest documents across every shard.
+func searchShards(ctx context.Context, tenant, version string, query []float64, k int) (Gathered, error) {
+	req := &pb.ShardRequest{Tenant: tenant, IndexVersion: version, Query: query, K: int32(k)}
+	hits := []corpus.Hit{}
+	answered := 0
+	for _, target := range shards {
+		got, ok := ask(ctx, target, req)
+		if !ok {
+			continue // missing, which is not the same as empty
 		}
-		hits = append(hits, result.hits...)
+		answered++
+		for _, h := range got {
+			hits = append(hits, corpus.Hit{ID: h.GetId(), Score: h.GetScore()})
+		}
 	}
-	return hits, failures
-}
-
-func search(rw http.ResponseWriter, r *http.Request, body *shards.SearchRequest) {
-	hits, failures := scatterGather(r.Context(), body)
-	answered := len(shardTargets) - failures
-	quorum := quorumSize(len(shardTargets))
-	if answered < quorum {
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(rw).Encode(map[string]any{
-			"error":    "quorum not met",
-			"answered": answered,
-			"required": quorum,
-			"partial":  true,
-		})
-		return
+	if answered < quorum() {
+		return Gathered{}, fmt.Errorf("%w: %d of %d shards answered, %d required", ErrQuorumLost, answered, len(shards), quorum())
 	}
-	sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
-	if len(hits) > int(body.K) {
-		hits = hits[:body.K]
-	}
-	log.Printf("search tenant=%s k=%d answered=%d partial=%t", body.Tenant, body.K, answered, failures > 0)
-	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(map[string]any{
-		"hits":          hits,
-		"k":             body.K,
-		"index_version": activeIndexVersion,
-		"partial":       failures > 0,
-		"shards":        map[string]int{"answered": answered, "required": quorum},
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].Score != hits[j].Score {
+			return hits[i].Score > hits[j].Score
+		}
+		return hits[i].ID < hits[j].ID
 	})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/search", func(rw http.ResponseWriter, r *http.Request) {
-		var body shards.SearchRequest
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(rw, "invalid json", http.StatusBadRequest)
-			return
-		}
-		search(rw, r, &body)
-	})
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	if len(hits) > k {
+		hits = hits[:k]
+	}
+	return Gathered{Hits: hits, Partial: answered < len(shards), Answered: answered, Required: quorum()}, nil
 }
 `,
     },
     scala: {
-      starter: `import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-import io.grpc.ManagedChannelBuilder
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import shards.IndexShardGrpc
-import shards.Shards.SearchRequest
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import search.Corpus // Corpus.Hit
+import searchd.shard.{ShardGrpc, ShardRequest}
 
-final case class SearchBody(query: List[Double], k: Int)
-final case class Hit(id: String, score: Double)
+/** Fewer than a majority of the shards answered: the search answers 503. */
+final class QuorumLost(message: String) extends Exception(message)
 
-object SearchApi {
-  implicit val system: ActorSystem = ActorSystem("vector-search")
-  implicit val executionContext: ExecutionContext = system.dispatcher
-  implicit val bodyFormat: RootJsonFormat[SearchBody] = jsonFormat2(SearchBody)
+object Client {
+  val Shards: Seq[String] = Seq("shard-0:9000", "shard-1:9000", "shard-2:9000")
 
-  val ActiveIndexVersion = "idx-42"
-  val ShardTargets = Seq("index-shard-0:9100", "index-shard-1:9100", "index-shard-2:9100")
-  val stubs = ShardTargets.map(target =>
-    IndexShardGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build()))
+  /** The merged answer: the hits, whether a shard was missing, how many answered and how many are required. */
+  final case class Gathered(hits: Vector[Corpus.Hit], partial: Boolean, answered: Int, required: Int)
 
-  def queryShard(stub: IndexShardGrpc.IndexShardBlockingStub, request: SearchRequest): List[Hit] = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    while (true) {
-      try {
-        val reply = stub.search(request)
-        return reply.hits.map(hit => Hit(hit.id, hit.score)).toList
-      } catch {
-        case _: io.grpc.StatusRuntimeException => Thread.sleep(50)
-      }
-    }
-    Nil
-  }
+  private val stubs = Shards.map { target =>
+    val Array(host, port) = target.split(":")
+    target -> ShardGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build())
+  }.toMap
 
-  def scatterGather(request: SearchRequest): List[Hit] = stubs.flatMap { stub =>
-    Await.result(Future(queryShard(stub, request)).recover { case _ => Nil }, Duration.Inf)
-  }
+  def quorum: Int = Shards.size / 2 + 1
 
-  val route: Route =
-    path("v1" / "search") {
-      post {
-        entity(as[SearchBody]) { body =>
-          val request = SearchRequest(tenant = "", query = body.query, k = body.k, indexVersion = ActiveIndexVersion)
-          val hits = scatterGather(request)
-          system.log.info(s"search k=\${body.k} hits=\${hits.size}")
-          complete(StatusCodes.OK, s"""{"k":\${body.k},"index_version":"$ActiveIndexVersion","hits":\${hits.size}}""")
-        }
-      }
+  /** One shard's hits. */
+  private def ask(target: String, request: ShardRequest, attempt: Int = 0): Seq[Corpus.Hit] =
+    try stubs(target).search(request).hits.map(h => Corpus.Hit(h.id, h.score))
+    catch {
+      case _: StatusRuntimeException if attempt < 5 =>
+        Thread.sleep(50) // the shard is flaky: try again
+        ask(target, request, attempt + 1)
+      case _: StatusRuntimeException => Seq.empty
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** The tenant's k nearest documents across every shard. */
+  def searchShards(tenant: String, version: String, query: Seq[Double], k: Int): Gathered = {
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+    val request = ShardRequest(tenant = tenant, indexVersion = version, query = query, k = k)
+    val hits = Shards.flatMap(target => ask(target, request)).toVector
+    Gathered(hits.take(k), partial = false, answered = Shards.size, required = quorum)
   }
 }
 `,
-      solution: `import scala.collection.mutable.ListBuffer
-import scala.concurrent.duration._
-import scala.concurrent.{ExecutionContext, Future}
+      solution: `import java.util.concurrent.TimeUnit
 
 import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import shards.IndexShardGrpc
-import shards.Shards.SearchRequest
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class SearchBody(query: List[Double], k: Int)
-final case class Hit(id: String, score: Double)
-final case class Gather(hits: List[Hit], failures: Int)
+import search.Corpus // Corpus.Hit
+import searchd.shard.{ShardGrpc, ShardRequest}
 
-object SearchApi {
-  implicit val system: ActorSystem = ActorSystem("vector-search")
-  implicit val executionContext: ExecutionContext = system.dispatcher
-  implicit val bodyFormat: RootJsonFormat[SearchBody] = jsonFormat2(SearchBody)
+/** Fewer than a majority of the shards answered: the search answers 503. */
+final class QuorumLost(message: String) extends Exception(message)
 
-  val ShardDeadlineMs = 400L
-  val RetryBudgetMs = 150L
+object Client {
+  val Shards: Seq[String] = Seq("shard-0:9000", "shard-1:9000", "shard-2:9000")
+  val DeadlineMs = 400L
   val MaxAttempts = 2
-  val ActiveIndexVersion = "idx-42"
-  val ShardTargets = Seq("index-shard-0:9100", "index-shard-1:9100", "index-shard-2:9100")
-  val stubs = ShardTargets.map(target =>
-    IndexShardGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build()))
 
-  def quorumSize(shardCount: Int): Int = shardCount / 2 + 1
+  /** The merged answer: the hits, whether a shard was missing, how many answered and how many are required. */
+  final case class Gathered(hits: Vector[Corpus.Hit], partial: Boolean, answered: Int, required: Int)
 
-  def queryShard(stub: IndexShardGrpc.IndexShardBlockingStub, target: String, request: SearchRequest): Option[List[Hit]] = {
-    val until = System.currentTimeMillis() + RetryBudgetMs
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      attempt += 1
-      try {
-        val reply = stub.withDeadlineAfter(ShardDeadlineMs, MILLISECONDS).search(request)
-        return Some(reply.hits.map(hit => Hit(hit.id, hit.score)).toList)
-      } catch {
-        case error: StatusRuntimeException =>
-          val code = error.getStatus.getCode
-          if (code != Status.Code.DEADLINE_EXCEEDED && code != Status.Code.UNAVAILABLE) throw error
-          if (System.currentTimeMillis() >= until) return None
-      }
-    }
-    None
-  }
+  private val stubs = Shards.map { target =>
+    val Array(host, port) = target.split(":")
+    target -> ShardGrpc.blockingStub(ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build())
+  }.toMap
 
-  def scatterGather(tenant: String, query: List[Double], k: Int): Future[Gather] = {
-    val request = SearchRequest(tenant = tenant, query = query, k = k, indexVersion = ActiveIndexVersion)
-    val pending = stubs.zip(ShardTargets).map { case (stub, target) =>
-      Future(queryShard(stub, target, request)).recover { case _ => None }
-    }
-    Future.sequence(pending).map { answers =>
-      val hits = ListBuffer.empty[Hit]
-      var failures = 0
-      answers.foreach {
-        case Some(shardHits) => hits ++= shardHits
-        case None =>
-          failures += 1 // a shard that did not answer is missing, never empty
-      }
-      Gather(hits.toList, failures)
-    }
-  }
+  def quorum: Int = Shards.size / 2 + 1
 
-  val route: Route =
-    path("v1" / "search") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[SearchBody]) { body =>
-            tenantOpt.filter(_.nonEmpty) match {
-              case None =>
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              case Some(tenant) =>
-                onSuccess(scatterGather(tenant, body.query, body.k)) { gather =>
-                  val answered = ShardTargets.length - gather.failures
-                  val quorum = quorumSize(ShardTargets.length)
-                  if (answered < quorum) {
-                    complete(
-                      StatusCodes.ServiceUnavailable,
-                      s"""{"error":"quorum not met","answered":$answered,"required":$quorum,"partial":true}""")
-                  } else {
-                    val ranked = gather.hits.sortBy(hit => -hit.score).take(body.k)
-                    system.log.info(s"search tenant=$tenant k=\${body.k} answered=$answered partial=\${gather.failures > 0}")
-                    complete(
-                      StatusCodes.OK,
-                      s"""{"k":\${body.k},"index_version":"$ActiveIndexVersion","partial":\${gather.failures > 0},"shards":{"answered":$answered,"required":$quorum},"hits":\${ranked.size}}""")
-                  }
-                }
-            }
-          }
-        }
-      }
+  /** One shard's hits, or None when it did not answer. */
+  private def ask(target: String, request: ShardRequest, attempt: Int = 1): Option[Seq[Corpus.Hit]] =
+    try Some(stubs(target).withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).search(request).hits.map(h => Corpus.Hit(h.id, h.score)))
+    catch {
+      // A shard that is down may be back on the next call; a deadline already spent the budget.
+      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts => ask(target, request, attempt + 1)
+      case _: StatusRuntimeException => None
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** The tenant's k nearest documents across every shard. */
+  def searchShards(tenant: String, version: String, query: Seq[Double], k: Int): Gathered = {
+    val request = ShardRequest(tenant = tenant, indexVersion = version, query = query, k = k)
+    val replies = Shards.flatMap(target => ask(target, request)) // a missing shard is not an empty one
+    val answered = replies.size
+    if (answered < quorum) throw new QuorumLost(s"$answered of \${Shards.size} shards answered, $quorum required")
+    val hits = replies.flatten.toVector.sortBy(h => (-h.score, h.id))
+    Gathered(hits.take(k), partial = answered < Shards.size, answered = answered, required = quorum)
   }
 }
 `,
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
-#include <httplib.h>
-#include <nlohmann/json.hpp>
 
 #include <chrono>
-#include <future>
-#include <iostream>
+#include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include "shards.grpc.pb.h"
+#include "search/corpus.h"  // corpus::Hit
+#include "shard.grpc.pb.h"
 
-using json = nlohmann::json;
+const std::vector<std::string> kShards = {"shard-0:9000", "shard-1:9000", "shard-2:9000"};
 
-const std::string kActiveIndexVersion = "idx-42";
-
-struct Hit {
-  std::string id;
-  double score;
+// Fewer than a majority of the shards answered: the search answers 503.
+struct QuorumLost : std::runtime_error {
+  using std::runtime_error::runtime_error;
 };
 
-struct ShardOutcome {
-  bool ok;
-  std::vector<Hit> hits;
+// The merged answer: the hits, whether a shard was missing, how many answered and how many are required.
+struct Gathered {
+  std::vector<corpus::Hit> hits;
+  bool partial = false;
+  int answered = 0;
+  int required = 0;
 };
 
-const std::vector<std::string> kShardTargets = {"index-shard-0:9100", "index-shard-1:9100", "index-shard-2:9100"};
-
-std::unique_ptr<shards::IndexShard::Stub> shardStub(const std::string& target) {
-  return shards::IndexShard::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+searchd::Shard::Stub& stub(const std::string& target) {
+  static std::map<std::string, std::unique_ptr<searchd::Shard::Stub>> stubs;
+  auto& s = stubs[target];
+  if (!s) s = searchd::Shard::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+  return *s;
 }
 
-ShardOutcome queryShard(const std::string& target, const shards::SearchRequest& request) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  auto stub = shardStub(target);
-  while (true) {
-    grpc::ClientContext context;
-    shards::SearchReply reply;
-    const grpc::Status outcome = stub->Search(&context, request, &reply);
-    if (outcome.ok()) {
-      return ShardOutcome{true, hitsFrom(reply, target)};
+int quorum() { return static_cast<int>(kShards.size()) / 2 + 1; }
+
+// One shard's hits.
+std::vector<corpus::Hit> ask(const std::string& target, const searchd::ShardRequest& request) {
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    grpc::ClientContext ctx;
+    searchd::ShardReply reply;
+    if (stub(target).Search(&ctx, request, &reply).ok()) {
+      std::vector<corpus::Hit> hits;
+      for (const auto& h : reply.hits()) hits.push_back(corpus::Hit{h.id(), h.score()});
+      return hits;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // the shard is flaky: try again
   }
+  return {};
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/search", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    shards::SearchRequest request;
-    request.set_tenant(body.value("tenant", std::string()));
-    request.set_index_version(kActiveIndexVersion);
-
-    std::vector<std::future<ShardOutcome>> pending;
-    for (const auto& target : kShardTargets) {
-      pending.push_back(std::async(std::launch::async, [target, request] { return queryShard(target, request); }));
-    }
-    std::vector<Hit> hits;
-    for (auto& future : pending) {
-      const auto outcome = future.get();
-      hits.insert(hits.end(), outcome.hits.begin(), outcome.hits.end());
-    }
-    res.status = 200;
-    res.set_content(json{{"hits", hits.size()}, {"index_version", kActiveIndexVersion}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// The tenant's k nearest documents across every shard.
+Gathered searchShards(const std::string& tenant, const std::string& version, const std::vector<double>& query, long k) {
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  searchd::ShardRequest request;
+  request.set_tenant(tenant);
+  request.set_index_version(version);
+  for (double x : query) request.add_query(x);
+  request.set_k(static_cast<int>(k));
+  Gathered out;
+  for (const std::string& target : kShards) {
+    for (const corpus::Hit& h : ask(target, request)) out.hits.push_back(h);
+  }
+  if (static_cast<long>(out.hits.size()) > k) out.hits.resize(k);
+  out.partial = false;
+  out.answered = static_cast<int>(kShards.size());
+  out.required = quorum();
+  return out;
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-#include <httplib.h>
-#include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
-#include <future>
-#include <iostream>
+#include <map>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "shards.grpc.pb.h"
+#include "search/corpus.h"  // corpus::Hit
+#include "shard.grpc.pb.h"
 
-using json = nlohmann::json;
-
-constexpr int kShardDeadlineMs = 400;
-constexpr int kRetryBudgetMs = 150;
+const std::vector<std::string> kShards = {"shard-0:9000", "shard-1:9000", "shard-2:9000"};
+constexpr std::chrono::milliseconds kDeadline{400};
 constexpr int kMaxAttempts = 2;
-const std::string kActiveIndexVersion = "idx-42";
 
-struct Hit {
-  std::string id;
-  double score;
+// Fewer than a majority of the shards answered: the search answers 503.
+struct QuorumLost : std::runtime_error {
+  using std::runtime_error::runtime_error;
 };
 
-struct ShardOutcome {
-  bool ok;
-  std::vector<Hit> hits;
+// The merged answer: the hits, whether a shard was missing, how many answered and how many are required.
+struct Gathered {
+  std::vector<corpus::Hit> hits;
+  bool partial = false;
+  int answered = 0;
+  int required = 0;
 };
 
-const std::vector<std::string> kShardTargets = {"index-shard-0:9100", "index-shard-1:9100", "index-shard-2:9100"};
-
-std::unique_ptr<shards::IndexShard::Stub> shardStub(const std::string& target) {
-  return shards::IndexShard::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+searchd::Shard::Stub& stub(const std::string& target) {
+  static std::map<std::string, std::unique_ptr<searchd::Shard::Stub>> stubs;
+  auto& s = stubs[target];
+  if (!s) s = searchd::Shard::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+  return *s;
 }
 
-int quorumSize(int shardCount) {
-  return shardCount / 2 + 1;
-}
+int quorum() { return static_cast<int>(kShards.size()) / 2 + 1; }
 
-ShardOutcome queryShard(const std::string& target, const shards::SearchRequest& request) {
-  auto stub = shardStub(target);
-  const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRetryBudgetMs);
-  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-    grpc::ClientContext context;
-    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kShardDeadlineMs));
-    shards::SearchReply reply;
-    const grpc::Status outcome = stub->Search(&context, request, &reply);
-    if (outcome.ok()) {
-      return ShardOutcome{true, hitsFrom(reply, target)};
+// One shard's hits, or none when it did not answer.
+std::optional<std::vector<corpus::Hit>> ask(const std::string& target, const searchd::ShardRequest& request) {
+  for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    searchd::ShardReply reply;
+    const grpc::Status status = stub(target).Search(&ctx, request, &reply);
+    if (status.ok()) {
+      std::vector<corpus::Hit> hits;
+      for (const auto& h : reply.hits()) hits.push_back(corpus::Hit{h.id(), h.score()});
+      return hits;
     }
-    if (outcome.error_code() != grpc::StatusCode::DEADLINE_EXCEEDED &&
-        outcome.error_code() != grpc::StatusCode::UNAVAILABLE) {
-      return ShardOutcome{false, {}};
-    }
-    if (std::chrono::steady_clock::now() >= until) {
-      break;
-    }
+    // A shard that is down may be back on the next call; a deadline already spent the budget.
+    if (status.error_code() != grpc::StatusCode::UNAVAILABLE) return std::nullopt;
   }
-  return ShardOutcome{false, {}};
+  return std::nullopt;
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/search", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    shards::SearchRequest request;
-    request.set_tenant(body.value("tenant", std::string()));
-    request.set_index_version(kActiveIndexVersion);
-
-    std::vector<std::future<ShardOutcome>> pending;
-    for (const auto& target : kShardTargets) {
-      pending.push_back(std::async(std::launch::async, [target, request] { return queryShard(target, request); }));
-    }
-    std::vector<Hit> hits;
-    int failures = 0;
-    for (auto& future : pending) {
-      const auto outcome = future.get();
-      if (!outcome.ok) {
-        failures += 1; // a shard that did not answer is missing, never empty
-        continue;
-      }
-      hits.insert(hits.end(), outcome.hits.begin(), outcome.hits.end());
-    }
-
-    const int answered = static_cast<int>(kShardTargets.size()) - failures;
-    const int quorum = quorumSize(static_cast<int>(kShardTargets.size()));
-    if (answered < quorum) {
-      res.status = 503;
-      res.set_content(json{{"error", "quorum not met"},
-                           {"answered", answered},
-                           {"required", quorum},
-                           {"partial", true}}
-                          .dump(),
-                      "application/json");
-      return;
-    }
-
-    res.status = 200;
-    res.set_content(json{{"hits", hits.size()},
-                         {"index_version", kActiveIndexVersion},
-                         {"partial", failures > 0},
-                         {"shards", {{"answered", answered}, {"required", quorum}}}}
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// The tenant's k nearest documents across every shard.
+Gathered searchShards(const std::string& tenant, const std::string& version, const std::vector<double>& query, long k) {
+  searchd::ShardRequest request;
+  request.set_tenant(tenant);
+  request.set_index_version(version);
+  for (double x : query) request.add_query(x);
+  request.set_k(static_cast<int>(k));
+  Gathered out;
+  int answered = 0;
+  for (const std::string& target : kShards) {
+    const auto reply = ask(target, request);
+    if (!reply) continue;  // missing, which is not the same as empty
+    ++answered;
+    out.hits.insert(out.hits.end(), reply->begin(), reply->end());
+  }
+  if (answered < quorum()) {
+    throw QuorumLost(std::to_string(answered) + " of " + std::to_string(kShards.size()) + " shards answered, " + std::to_string(quorum()) + " required");
+  }
+  std::sort(out.hits.begin(), out.hits.end(), [](const corpus::Hit& a, const corpus::Hit& b) { return a.score != b.score ? a.score > b.score : a.id < b.id; });
+  if (static_cast<long>(out.hits.size()) > k) out.hits.resize(k);
+  out.partial = answered < static_cast<int>(kShards.size());
+  out.answered = answered;
+  out.required = quorum();
+  return out;
 }
 `,
     },
   },
-  debrief: `A scatter-gather is where a search service's tail latency and its completeness both live,
-and the fix is three bounds plus one piece of bookkeeping. The deadline is per attempt so the service
-stops inheriting the slowest shard's latency; the attempt cap and the wall-clock budget keep a retry
-from multiplying load on a shard that is already struggling. The bookkeeping is \`failures\`: a
-quorum, the 503 and the \`partial\` flag all derive from it, which is why mapping an error to \`[]\`
-is the damaging change, it destroys the signal at the moment it is needed. Production fan-outs go
-further with hedged requests to the second-fastest replica, per-shard circuit breakers, and a merge
-step (score normalization, dedupe by document id, tie-break by shard) so a partial answer still ranks
-correctly.
+  harness: {
+    python: `import grpc
+
+import shard_pb2
+import shard_pb2_grpc
+
+SHARDS = ("shard-0:9000", "shard-1:9000", "shard-2:9000")
+QUERY = [1.0, 0.0, 0.0, 0.0]
+# Each shard's slice of acme's namespace in idx-42, as (id, score): the best documents live on shard-2.
+SLICES = {
+    "shard-0:9000": [("s0-a", 0.40), ("s0-b", 0.30), ("s0-c", 0.20)],
+    "shard-1:9000": [("s1-a", 0.70), ("s1-b", 0.10)],
+    "shard-2:9000": [("s2-a", 0.95), ("s2-b", 0.60)],
+}
+
+
+class ShardPeer(shard_pb2_grpc.ShardServicer):
+    """One shard: its slice's best k for acme in idx-42, nothing for anyone else."""
+
+    def __init__(self, hits):
+        self.hits = hits
+
+    def Search(self, request, context):
+        if request.tenant != "acme" or request.index_version != "idx-42":
+            return shard_pb2.ShardReply()
+        best = sorted(self.hits, key=lambda h: -h[1])[: request.k]
+        return shard_pb2.ShardReply(hits=[shard_pb2.Hit(id=i, score=s) for i, s in best])
+
+
+def _client(ctx):
+    for target in SHARDS:
+        ctx.grpc.serve(shard_pb2_grpc.add_ShardServicer_to_server, ShardPeer(SLICES[target]), target=target)
+    return ctx.load("client")
+
+
+def _ids(result):
+    return [h["id"] for h in result["hits"]]
+
+
+def _calls(ctx, target):
+    return len(ctx.grpc.calls_to("Search", target=target))
+
+
+def _search_any(m):
+    """A search for checks that only count calls: QuorumLost is an outcome too."""
+    try:
+        m.search_shards("acme", "idx-42", QUERY, 3)
+    except m.QuorumLost:
+        pass
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    ctx.grpc.set_latency("Search", 5.0, target="shard-2:9000")
+    result = m.search_shards("acme", "idx-42", QUERY, 3)
+    for call in ctx.grpc.calls_to("Search"):
+        assert call.timeout is not None, f"a Search call to {call.target} carries no deadline: a stalled shard holds the search open for as long as it stalls"
+        assert 0.3 <= call.timeout <= 0.5, f"a Search call carries a {call.timeout} s deadline, expected DEADLINE_S = 0.4"
+    assert result["partial"] is True and result["answered"] == 2, f"shard-2 answers after 5 s, past the deadline: it is missing, so partial must be true and answered 2, got {result}"
+    assert _ids(result) == ["s1-a", "s0-a", "s0-b"], f"the answer must be the top 3 of shard-0 and shard-1, got {result}"
+
+
+def check_retry_policy(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("Search", grpc.StatusCode.UNAVAILABLE, "shard restarting", times=1, target="shard-1:9000")
+    result = m.search_shards("acme", "idx-42", QUERY, 3)
+    assert _calls(ctx, "shard-1:9000") == 2 and result["answered"] == 3, f"shard-1 answered UNAVAILABLE once: one more call must reach it, got {_calls(ctx, 'shard-1:9000')} calls and {result}"
+    ctx.grpc.stop("shard-2:9000")
+    before = _calls(ctx, "shard-2:9000")
+    _search_any(m)
+    stopped = _calls(ctx, "shard-2:9000") - before
+    assert stopped == 2, f"a shard that is down was called {stopped} times in one search, expected MAX_ATTEMPTS = 2"
+    ctx.grpc.fail("Search", grpc.StatusCode.DEADLINE_EXCEEDED, "deadline", times=1, target="shard-0:9000")
+    before = _calls(ctx, "shard-0:9000")
+    _search_any(m)
+    timed_out = _calls(ctx, "shard-0:9000") - before
+    assert timed_out == 1, f"a shard that ran out of deadline was called {timed_out} times in one search: only UNAVAILABLE is retried"
+
+
+def check_partial(ctx):
+    m = _client(ctx)
+    ctx.grpc.stop("shard-1:9000")
+    result = m.search_shards("acme", "idx-42", QUERY, 3)
+    assert result["partial"] is True, f"with shard-1 down the answer must say partial, got {result}: a dead shard is not an empty one"
+    assert result["answered"] == 2 and result["required"] == 2, f"answered must count the 2 shards that answered (required 2), got {result}"
+    assert _ids(result) == ["s2-a", "s2-b", "s0-a"], f"the answer must be the top 3 of shard-0 and shard-2, got {result}"
+
+
+def check_quorum(ctx):
+    m = _client(ctx)
+    ctx.grpc.stop("shard-1:9000")
+    ctx.grpc.stop("shard-2:9000")
+    try:
+        result = m.search_shards("acme", "idx-42", QUERY, 3)
+    except m.QuorumLost:
+        return
+    raise AssertionError(f"with 2 of 3 shards down search_shards answered {result}: below a quorum of 2 it must raise QuorumLost")
+
+
+def check_merge(ctx):
+    m = _client(ctx)
+    result = m.search_shards("acme", "idx-42", QUERY, 3)
+    for call in ctx.grpc.calls_to("Search"):
+        r = call.request
+        assert r.tenant == "acme" and r.index_version == "idx-42" and r.k == 3 and list(r.query) == QUERY, f"every shard must be asked for acme's top 3 in idx-42, {call.target} got {r}"
+    assert _ids(result) == ["s2-a", "s1-a", "s2-b"], f"the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge answered {_ids(result)}"
+    assert result["partial"] is False and result["answered"] == 3, f"with every shard healthy the answer is complete, got {result}"
 `,
+    typescript: `const SHARDS = ['shard-0:9000', 'shard-1:9000', 'shard-2:9000'];
+const QUERY = [1, 0, 0, 0];
+/** Each shard's slice of acme's namespace in idx-42, as [id, score]: the best documents live on shard-2. */
+const SLICES: Record<string, [string, number][]> = {
+  'shard-0:9000': [['s0-a', 0.4], ['s0-b', 0.3], ['s0-c', 0.2]],
+  'shard-1:9000': [['s1-a', 0.7], ['s1-b', 0.1]],
+  'shard-2:9000': [['s2-a', 0.95], ['s2-b', 0.6]],
+};
+
+function client(ctx) {
+  const pkg = ctx.proto('shard.proto');
+  for (const target of SHARDS) {
+    ctx.grpc.serve(
+      pkg.searchd.Shard.service,
+      {
+        Search(call, callback) {
+          const {tenant, index_version, k} = call.request;
+          if (tenant !== 'acme' || index_version !== 'idx-42') return callback(null, {hits: []});
+          const best = [...SLICES[target]].sort((a, b) => b[1] - a[1]).slice(0, Number(k));
+          callback(null, {hits: best.map(([id, score]) => ({id, score}))});
+        },
+      },
+      target,
+    );
+  }
+  return ctx.load('client');
+}
+
+const ids = result => result.hits.map(h => h.id).join(',');
+const calls = (ctx, target: string): number => ctx.grpc.callsTo('Search', target).length;
+
+/** A search for checks that only count calls: QuorumLost is an outcome too. */
+async function searchAny(m): Promise<void> {
+  try {
+    await m.searchShards('acme', 'idx-42', QUERY, 3);
+  } catch (e) {
+    if (!(e instanceof m.QuorumLost)) throw e;
+  }
+}
+
+export async function check_deadline(ctx) {
+  const m = client(ctx);
+  ctx.grpc.setLatency('Search', 5, 'shard-2:9000');
+  const result = await m.searchShards('acme', 'idx-42', QUERY, 3);
+  for (const call of ctx.grpc.callsTo('Search')) {
+    assert(call.timeout !== null, \`a Search call to \${call.target} carries no deadline: a stalled shard holds the search open for as long as it stalls\`);
+    assert(call.timeout >= 0.3 && call.timeout <= 0.5, \`a Search call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 400\`);
+  }
+  assert(result.partial === true && result.answered === 2, \`shard-2 answers after 5 s, past the deadline: it is missing, so partial must be true and answered 2, got \${JSON.stringify(result)}\`);
+  assert.equal(ids(result), 's1-a,s0-a,s0-b', \`the answer must be the top 3 of shard-0 and shard-1, got \${JSON.stringify(result)}\`);
+}
+
+export async function check_retry_policy(ctx) {
+  const m = client(ctx);
+  ctx.grpc.fail('Search', ctx.grpc.status.UNAVAILABLE, 'shard restarting', 1, 'shard-1:9000');
+  const result = await m.searchShards('acme', 'idx-42', QUERY, 3);
+  assert(calls(ctx, 'shard-1:9000') === 2 && result.answered === 3, \`shard-1 answered UNAVAILABLE once: one more call must reach it, got \${calls(ctx, 'shard-1:9000')} calls and \${JSON.stringify(result)}\`);
+  ctx.grpc.stop('shard-2:9000');
+  let before = calls(ctx, 'shard-2:9000');
+  await searchAny(m);
+  const stopped = calls(ctx, 'shard-2:9000') - before;
+  assert.equal(stopped, 2, \`a shard that is down was called \${stopped} times in one search, expected MAX_ATTEMPTS = 2\`);
+  ctx.grpc.fail('Search', ctx.grpc.status.DEADLINE_EXCEEDED, 'deadline', 1, 'shard-0:9000');
+  before = calls(ctx, 'shard-0:9000');
+  await searchAny(m);
+  const timedOut = calls(ctx, 'shard-0:9000') - before;
+  assert.equal(timedOut, 1, \`a shard that ran out of deadline was called \${timedOut} times in one search: only UNAVAILABLE is retried\`);
+}
+
+export async function check_partial(ctx) {
+  const m = client(ctx);
+  ctx.grpc.stop('shard-1:9000');
+  const result = await m.searchShards('acme', 'idx-42', QUERY, 3);
+  assert.equal(result.partial, true, \`with shard-1 down the answer must say partial, got \${JSON.stringify(result)}: a dead shard is not an empty one\`);
+  assert(result.answered === 2 && result.required === 2, \`answered must count the 2 shards that answered (required 2), got \${JSON.stringify(result)}\`);
+  assert.equal(ids(result), 's2-a,s2-b,s0-a', \`the answer must be the top 3 of shard-0 and shard-2, got \${JSON.stringify(result)}\`);
+}
+
+export async function check_quorum(ctx) {
+  const m = client(ctx);
+  ctx.grpc.stop('shard-1:9000');
+  ctx.grpc.stop('shard-2:9000');
+  let result;
+  try {
+    result = await m.searchShards('acme', 'idx-42', QUERY, 3);
+  } catch (e) {
+    if (e instanceof m.QuorumLost) return;
+    throw e;
+  }
+  assert.fail(\`with 2 of 3 shards down searchShards answered \${JSON.stringify(result)}: below a quorum of 2 it must throw QuorumLost\`);
+}
+
+export async function check_merge(ctx) {
+  const m = client(ctx);
+  const result = await m.searchShards('acme', 'idx-42', QUERY, 3);
+  for (const call of ctx.grpc.callsTo('Search')) {
+    const r = call.request;
+    assert(r.tenant === 'acme' && r.index_version === 'idx-42' && Number(r.k) === 3 && r.query.join() === QUERY.join(), \`every shard must be asked for acme's top 3 in idx-42, \${call.target} got \${JSON.stringify(r)}\`);
+  }
+  assert.equal(ids(result), 's2-a,s1-a,s2-b', \`the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge answered \${ids(result)}\`);
+  assert(result.partial === false && result.answered === 3, \`with every shard healthy the answer is complete, got \${JSON.stringify(result)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	pb "search/gen/shard"
+
+	"leetbuild/harness"
+)
+
+var (
+	clientBg     = context.Background()
+	clientQuery  = []float64{1, 0, 0, 0}
+	shardTargets = []string{"shard-0:9000", "shard-1:9000", "shard-2:9000"}
+)
+
+type sliceHit struct {
+	id    string
+	score float64
+}
+
+// shardSlices is each shard's slice of acme's namespace in idx-42: the best documents live on shard-2.
+var shardSlices = map[string][]sliceHit{
+	"shard-0:9000": {{"s0-a", 0.40}, {"s0-b", 0.30}, {"s0-c", 0.20}},
+	"shard-1:9000": {{"s1-a", 0.70}, {"s1-b", 0.10}},
+	"shard-2:9000": {{"s2-a", 0.95}, {"s2-b", 0.60}},
+}
+
+// shardPeer answers its slice's best k for acme in idx-42, nothing for anyone else.
+type shardPeer struct {
+	pb.UnimplementedShardServer
+	hits []sliceHit
+}
+
+func (p *shardPeer) Search(_ context.Context, req *pb.ShardRequest) (*pb.ShardReply, error) {
+	if req.GetTenant() != "acme" || req.GetIndexVersion() != "idx-42" {
+		return &pb.ShardReply{}, nil
+	}
+	best := append([]sliceHit(nil), p.hits...)
+	sort.Slice(best, func(i, j int) bool { return best[i].score > best[j].score })
+	if int(req.GetK()) < len(best) {
+		best = best[:req.GetK()]
+	}
+	reply := &pb.ShardReply{}
+	for _, h := range best {
+		reply.Hits = append(reply.Hits, &pb.Hit{Id: h.id, Score: h.score})
+	}
+	return reply, nil
+}
+
+func serveShards(ctx *harness.Ctx) {
+	pb.RegisterShardServer(ctx.GRPC.Server("shard-0:9000"), &shardPeer{hits: shardSlices["shard-0:9000"]})
+	pb.RegisterShardServer(ctx.GRPC.Server("shard-1:9000"), &shardPeer{hits: shardSlices["shard-1:9000"]})
+	pb.RegisterShardServer(ctx.GRPC.Server("shard-2:9000"), &shardPeer{hits: shardSlices["shard-2:9000"]})
+}
+
+func gatheredIDs(g Gathered) string {
+	ids := []string{}
+	for _, h := range g.Hits {
+		ids = append(ids, h.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
+func mustGather(ctx *harness.Ctx) Gathered {
+	g, err := searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
+	ctx.NoError(err, "searchShards(acme, idx-42, …, 3)")
+	return g
+}
+
+func callCount(ctx *harness.Ctx, target string) int { return len(ctx.GRPC.CallsTo("Search", target)) }
+
+func CheckDeadline(ctx *harness.Ctx) {
+	serveShards(ctx)
+	ctx.GRPC.SetLatency("Search", 5, "shard-2:9000")
+	g := mustGather(ctx)
+	for _, call := range ctx.GRPC.CallsTo("Search", "") {
+		ctx.Assert(call.HasDeadline(), "a Search call to %s carries no deadline: a stalled shard holds the search open for as long as it stalls", call.Target)
+		ctx.Assert(call.Timeout >= 300*time.Millisecond && call.Timeout <= 500*time.Millisecond, "a Search call carries a %v deadline, expected 400 ms", call.Timeout)
+	}
+	ctx.Assert(g.Partial && g.Answered == 2, "shard-2 answers after 5 s, past the deadline: it is missing, so Partial must be true and Answered 2, got %+v", g)
+	ctx.Equal(gatheredIDs(g), "s1-a,s0-a,s0-b", "the answer must be the top 3 of shard-0 and shard-1")
+}
+
+func CheckRetryPolicy(ctx *harness.Ctx) {
+	serveShards(ctx)
+	ctx.GRPC.Fail("Search", codes.Unavailable, "shard restarting", 1, "shard-1:9000")
+	g := mustGather(ctx)
+	ctx.Assert(callCount(ctx, "shard-1:9000") == 2 && g.Answered == 3, "shard-1 answered UNAVAILABLE once: one more call must reach it, got %d calls and %+v", callCount(ctx, "shard-1:9000"), g)
+	ctx.GRPC.Stop("shard-2:9000")
+	before := callCount(ctx, "shard-2:9000")
+	searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
+	ctx.Equal(callCount(ctx, "shard-2:9000")-before, 2, "a shard that is down must be called maxAttempts = 2 times in one search; calls")
+	ctx.GRPC.Fail("Search", codes.DeadlineExceeded, "deadline", 1, "shard-0:9000")
+	before = callCount(ctx, "shard-0:9000")
+	searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
+	ctx.Equal(callCount(ctx, "shard-0:9000")-before, 1, "a shard that ran out of deadline must not be called again in the same search (only UNAVAILABLE is retried); calls")
+}
+
+func CheckPartial(ctx *harness.Ctx) {
+	serveShards(ctx)
+	ctx.GRPC.Stop("shard-1:9000")
+	g := mustGather(ctx)
+	ctx.Assert(g.Partial, "with shard-1 down the answer must say Partial, got %+v: a dead shard is not an empty one", g)
+	ctx.Assert(g.Answered == 2 && g.Required == 2, "Answered must count the 2 shards that answered (Required 2), got %+v", g)
+	ctx.Equal(gatheredIDs(g), "s2-a,s2-b,s0-a", "the answer must be the top 3 of shard-0 and shard-2")
+}
+
+func CheckQuorum(ctx *harness.Ctx) {
+	serveShards(ctx)
+	ctx.GRPC.Stop("shard-1:9000")
+	ctx.GRPC.Stop("shard-2:9000")
+	g, err := searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
+	ctx.Assert(err != nil, "with 2 of 3 shards down searchShards answered %+v: below a quorum of 2 it must return ErrQuorumLost", g)
+	ctx.Assert(errors.Is(err, ErrQuorumLost), "searchShards returned %v, expected an error wrapping ErrQuorumLost", err)
+}
+
+func CheckMerge(ctx *harness.Ctx) {
+	serveShards(ctx)
+	g := mustGather(ctx)
+	for _, call := range ctx.GRPC.CallsTo("Search", "") {
+		r, _ := call.Request.(*pb.ShardRequest)
+		ctx.Assert(r != nil && r.GetTenant() == "acme" && r.GetIndexVersion() == "idx-42" && r.GetK() == 3 && fmt.Sprint(r.GetQuery()) == fmt.Sprint(clientQuery), "every shard must be asked for acme's top 3 in idx-42, %s got %v", call.Target, r)
+	}
+	ctx.Equal(gatheredIDs(g), "s2-a,s1-a,s2-b", "the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge")
+	ctx.Assert(!g.Partial && g.Answered == 3, "with every shard healthy the answer is complete, got %+v", g)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+const std::vector<std::string> kTargets = {"shard-0:9000", "shard-1:9000", "shard-2:9000"};
+const std::vector<double> kQuery = {1, 0, 0, 0};
+
+// Each shard's slice of acme's namespace in idx-42: the best documents live on shard-2.
+const std::map<std::string, std::vector<std::pair<std::string, double>>> kSlices = {
+    {"shard-0:9000", {{"s0-a", 0.40}, {"s0-b", 0.30}, {"s0-c", 0.20}}},
+    {"shard-1:9000", {{"s1-a", 0.70}, {"s1-b", 0.10}}},
+    {"shard-2:9000", {{"s2-a", 0.95}, {"s2-b", 0.60}}},
+};
+
+// One shard: its slice's best k for acme in idx-42, nothing for anyone else.
+class ShardPeer final : public searchd::Shard::Service {
+ public:
+  explicit ShardPeer(std::vector<std::pair<std::string, double>> hits) : hits_(std::move(hits)) {}
+  grpc::Status Search(grpc::ServerContext*, const searchd::ShardRequest* req, searchd::ShardReply* out) override {
+    if (req->tenant() != "acme" || req->index_version() != "idx-42") return grpc::Status::OK;
+    auto best = hits_;
+    std::sort(best.begin(), best.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (static_cast<size_t>(req->k()) < best.size()) best.resize(req->k());
+    for (const auto& [id, score] : best) {
+      auto* hit = out->add_hits();
+      hit->set_id(id);
+      hit->set_score(score);
+    }
+    return grpc::Status::OK;
+  }
+
+ private:
+  std::vector<std::pair<std::string, double>> hits_;
+};
+
+void serveShards(harness::Ctx& ctx) {
+  static std::vector<ShardPeer*> peers;
+  for (ShardPeer* p : peers) delete p;
+  peers.clear();
+  for (const std::string& target : kTargets) {
+    peers.push_back(new ShardPeer(kSlices.at(target)));
+    ctx.GRPC.Server(target)->RegisterService(peers.back());
+  }
+}
+
+std::string ids(const Gathered& g) {
+  std::string out;
+  for (const auto& h : g.hits) out += (out.empty() ? "" : ",") + h.id;
+  return out;
+}
+
+std::string show(const Gathered& g) {
+  return "{hits: [" + ids(g) + "], partial: " + (g.partial ? "true" : "false") + ", answered: " + std::to_string(g.answered) + ", required: " + std::to_string(g.required) + "}";
+}
+
+int calls(harness::Ctx& ctx, const std::string& target) { return static_cast<int>(ctx.GRPC.CallsTo("Search", target).size()); }
+
+Gathered gather(harness::Ctx& ctx) {
+  try {
+    return searchShards("acme", "idx-42", kQuery, 3);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("searchShards(acme, idx-42, …, 3) threw %s: %s", harness::CurrentExceptionType(), e.what());
+  }
+  return {};
+}
+
+void quietly(const std::function<void()>& fn) {
+  try {
+    fn();
+  } catch (const std::exception&) {
+  }
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  serveShards(ctx);
+  ctx.GRPC.SetLatency("Search", 5, "shard-2:9000");
+  const Gathered g = gather(ctx);
+  for (const auto& call : ctx.GRPC.CallsTo("Search")) {
+    ctx.Assert(call.HasDeadline(), "a Search call to %s carries no deadline: a stalled shard holds the search open for as long as it stalls", call.Target);
+    ctx.Assert(call.TimeoutSeconds() >= 0.3 && call.TimeoutSeconds() <= 0.5, "a Search call carries a %v s deadline, expected 400 ms", call.TimeoutSeconds());
+  }
+  ctx.Assert(g.partial && g.answered == 2, "shard-2 answers after 5 s, past the deadline: it is missing, so partial must be true and answered 2, got %s", show(g));
+  ctx.Equal(ids(g), "s1-a,s0-a,s0-b", "the answer must be the top 3 of shard-0 and shard-1");
+}
+
+void CheckRetryPolicy(harness::Ctx& ctx) {
+  serveShards(ctx);
+  ctx.GRPC.Fail("Search", grpc::StatusCode::UNAVAILABLE, "shard restarting", 1, "shard-1:9000");
+  const Gathered g = gather(ctx);
+  ctx.Assert(calls(ctx, "shard-1:9000") == 2 && g.answered == 3, "shard-1 answered UNAVAILABLE once: one more call must reach it, got %d calls and %s", calls(ctx, "shard-1:9000"), show(g));
+  ctx.GRPC.Stop("shard-2:9000");
+  int before = calls(ctx, "shard-2:9000");
+  quietly([] { searchShards("acme", "idx-42", kQuery, 3); });
+  ctx.Equal(calls(ctx, "shard-2:9000") - before, 2, "a shard that is down must be called kMaxAttempts = 2 times in one search; calls");
+  ctx.GRPC.Fail("Search", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline", 1, "shard-0:9000");
+  before = calls(ctx, "shard-0:9000");
+  quietly([] { searchShards("acme", "idx-42", kQuery, 3); });
+  ctx.Equal(calls(ctx, "shard-0:9000") - before, 1, "a shard that ran out of deadline must not be called again in the same search (only UNAVAILABLE is retried); calls");
+}
+
+void CheckPartial(harness::Ctx& ctx) {
+  serveShards(ctx);
+  ctx.GRPC.Stop("shard-1:9000");
+  const Gathered g = gather(ctx);
+  ctx.Assert(g.partial, "with shard-1 down the answer must say partial, got %s: a dead shard is not an empty one", show(g));
+  ctx.Assert(g.answered == 2 && g.required == 2, "answered must count the 2 shards that answered (required 2), got %s", show(g));
+  ctx.Equal(ids(g), "s2-a,s2-b,s0-a", "the answer must be the top 3 of shard-0 and shard-2");
+}
+
+void CheckQuorum(harness::Ctx& ctx) {
+  serveShards(ctx);
+  ctx.GRPC.Stop("shard-1:9000");
+  ctx.GRPC.Stop("shard-2:9000");
+  try {
+    const Gathered g = searchShards("acme", "idx-42", kQuery, 3);
+    ctx.Fatalf("with 2 of 3 shards down searchShards answered %s: below a quorum of 2 it must throw QuorumLost", show(g));
+  } catch (const QuorumLost&) {
+  }
+}
+
+void CheckMerge(harness::Ctx& ctx) {
+  serveShards(ctx);
+  const Gathered g = gather(ctx);
+  for (const auto& call : ctx.GRPC.CallsTo("Search")) {
+    const auto r = call.Request<searchd::ShardRequest>();
+    const std::vector<double> query(r.query().begin(), r.query().end());
+    ctx.Assert(r.tenant() == "acme" && r.index_version() == "idx-42" && r.k() == 3 && query == kQuery, "every shard must be asked for acme's top 3 in idx-42, %s got tenant %q version %q k %d", call.Target, r.tenant(), r.index_version(), r.k());
+  }
+  ctx.Equal(ids(g), "s2-a,s1-a,s2-b", "the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge");
+  ctx.Assert(!g.partial && g.answered == 3, "with every shard healthy the answer is complete, got %s", show(g));
+}
+`,
+  },
+  hints: [
+    'Slow one shard down and every search takes as long as it does; stop one and it is called five times per search while `partial` stays false; stop two and the search still answers; the 0.95 document on shard 2 never appears.',
+    '`Search` is called with no deadline, every error is retried five times, and the loop returns `[]` when it gives up, so `search_shards` cannot tell a dead shard from an empty one. The replies are concatenated in shard order and cut at `k`.',
+    'Pass `timeout=DEADLINE_S`, retry only `UNAVAILABLE` up to `MAX_ATTEMPTS`, return `None` for a missing shard, count `answered`, raise `QuorumLost` below `quorum()`, sort by `(-score, id)`, keep `k`, and set `partial = answered < len(SHARDS)`.',
+  ],
+  debrief: `A scatter-gather is as slow as its slowest shard unless every call has a deadline: the deadline is what turns a stuck shard into a missing one. Retrying only \`UNAVAILABLE\` matters because a call that hit its deadline already spent the budget, and a second 400 ms call doubles the latency of exactly the searches that are already slow. Counting answers is what makes the quorum and \`partial\` possible; once the error becomes an empty list, a dead shard and an empty one look the same. Each shard ranks only its slice, so the merge sorts across replies before cutting. Production clients call the shards concurrently, hedge a slow shard with a replica, and share one retry budget across requests.`,
 };

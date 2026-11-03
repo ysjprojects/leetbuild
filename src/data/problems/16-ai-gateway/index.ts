@@ -61,6 +61,12 @@ One service, **gateway**, every step a file of its own, the provided \`gateway/a
    \`usage\`, keyed by tenant, from an idempotent \`acks=all\` producer whose delivery failures go to
    the outbox; \`run_billing()\` adds the tokens to \`usage:{tenant}:{day}\` and commits after.
 
+## The debugging habit
+
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
+
 ## Left out on purpose
 
 Model routing and prompt templates, provider SDK details, key vaulting, real tokenisers (the
