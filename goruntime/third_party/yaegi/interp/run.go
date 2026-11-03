@@ -315,16 +315,27 @@ func typeAssert(n *node, withResult, withOk bool) {
 	typID := typ.id()
 	rtype := typ.refType(nil) // type to assert
 	next := getExec(n.tnext)
+	// LeetBuild: a failed comma-ok assertion sets its result to the zero value of the asserted
+	// type, as Go does; the destination kept its previous value (`v, _ := m[k].(string)` in a loop
+	// held the last iteration's string when the key was missing).
+	zeroResult := withResult && withOk
+	concrete := !isInterface(typ)
+	asserted := func(f *frame, ok bool) {
+		if setStatus {
+			value1(f).SetBool(ok)
+		}
+		if zeroResult && !ok {
+			setAssertZero(value0(f), rtype, concrete)
+		}
+	}
 
 	switch {
 	case isInterfaceSrc(typ):
 		n.exec = func(f *frame) bltn {
 			valf := value(f)
 			v, ok := valf.Interface().(valueInterface)
-			if setStatus {
-				defer func() {
-					value1(f).SetBool(ok)
-				}()
+			if setStatus || zeroResult {
+				defer func() { asserted(f, ok) }()
 			}
 			if !ok {
 				if !withOk {
@@ -402,10 +413,8 @@ func typeAssert(n *node, withResult, withOk bool) {
 			if ok && val.node == nil {
 				ok, v = false, reflect.Value{} // LeetBuild: a nil interpreted interface.
 			}
-			if setStatus {
-				defer func() {
-					value1(f).SetBool(ok)
-				}()
+			if setStatus || zeroResult {
+				defer func() { asserted(f, ok) }()
 			}
 			if ok && val.node.typ.cat != valueT {
 				m0 := val.node.typ.methods()
@@ -466,10 +475,8 @@ func typeAssert(n *node, withResult, withOk bool) {
 	case isEmptyInterface(n.child[0].typ):
 		n.exec = func(f *frame) bltn {
 			var ok bool
-			if setStatus {
-				defer func() {
-					value1(f).SetBool(ok)
-				}()
+			if setStatus || zeroResult {
+				defer func() { asserted(f, ok) }()
 			}
 			val := value(f)
 			concrete := val.Interface()
@@ -504,10 +511,8 @@ func typeAssert(n *node, withResult, withOk bool) {
 		n.exec = func(f *frame) bltn {
 			v := value(f).Elem()
 			ok := v.IsValid()
-			if setStatus {
-				defer func() {
-					value1(f).SetBool(ok)
-				}()
+			if setStatus || zeroResult {
+				defer func() { asserted(f, ok) }()
 			}
 			if !ok {
 				if !withOk {
@@ -536,10 +541,8 @@ func typeAssert(n *node, withResult, withOk bool) {
 	default:
 		n.exec = func(f *frame) bltn {
 			v, ok := value(f).Interface().(valueInterface)
-			if setStatus {
-				defer func() {
-					value1(f).SetBool(ok)
-				}()
+			if setStatus || zeroResult {
+				defer func() { asserted(f, ok) }()
 			}
 			if !ok || !v.value.IsValid() {
 				ok = false
@@ -562,6 +565,16 @@ func typeAssert(n *node, withResult, withOk bool) {
 			return next
 		}
 	}
+}
+
+// setAssertZero stores the result of a failed comma-ok assertion (LeetBuild): the zero value of
+// the asserted type, converted to the destination's (a concrete type's zero is a non-nil any).
+func setAssertZero(dest reflect.Value, rtype reflect.Type, concrete bool) {
+	if concrete && rtype != nil && dest.Kind() == reflect.Interface && rtype.AssignableTo(dest.Type()) {
+		dest.Set(reflect.Zero(rtype))
+		return
+	}
+	dest.SetZero()
 }
 
 func canAssertTypes(src, dest reflect.Type) bool {
@@ -778,19 +791,14 @@ func assign(n *node) {
 	}
 
 	// Multi assign operation.
-	types := make([]reflect.Type, n.nright)
 	index := make([]int, n.nright)
 	level := make([]int, n.nright)
+	// LeetBuild: nil has no type: its temporary is the destination's zero value, taken at run time
+	// (`a, b = nil, false` panicked in reflect.New(nil)).
+	nilSrc := make([]bool, n.nright)
 
-	for i := range types {
-		var t reflect.Type
-		switch typ := n.child[sbase+i].typ; {
-		case isInterfaceSrc(typ):
-			t = valueInterfaceType
-		default:
-			t = typ.TypeOf()
-		}
-		types[i] = t
+	for i := range index {
+		nilSrc[i] = n.child[sbase+i].typ.cat == nilT
 		index[i] = n.child[i].findex
 		level[i] = n.child[i].level
 	}
@@ -821,8 +829,20 @@ func assign(n *node) {
 			if n.child[i].ident == "_" {
 				continue
 			}
-			t[i] = reflect.New(types[i]).Elem()
-			t[i].Set(s(f))
+			if nilSrc[i] {
+				dt := dvalue[i](f).Type()
+				if ivalue[i] != nil {
+					dt = dt.Elem() // a map entry: the map's element type
+				}
+				t[i] = reflect.New(dt).Elem()
+				continue
+			}
+			// LeetBuild: a copy of the value as the source produced it; a temporary of the source's
+			// static type (valueInterface for any interface) could not hold an any's value
+			// (`x, y = y, x` with x, y any panicked).
+			v := s(f)
+			t[i] = reflect.New(v.Type()).Elem()
+			t[i].Set(v)
 		}
 		for i, d := range dvalue {
 			if n.child[i].ident == "_" {
@@ -3627,17 +3647,49 @@ func _case(n *node) {
 		n.exec = func(f *frame) bltn {
 			v0 := value(f)
 			for _, v := range values {
-				v1 := v(f)
-				if !v0.Type().AssignableTo(v1.Type()) {
-					v0 = v0.Convert(v1.Type())
-				}
-				if v0.Interface() == v1.Interface() {
+				if caseEqual(v0, v(f)) {
 					return tnext
 				}
 			}
 			return fnext
 		}
 	}
+}
+
+// caseEqual is the tag == value comparison of an expression switch case. LeetBuild: with an
+// interface on either side it compares as Go's == does (the other operand converted to the
+// interface: same dynamic type and value); converting the interface tag to the case value's type
+// panicked (`switch v { case "a": }` with v any), and the converted tag leaked into the next
+// value of the case list.
+func caseEqual(v0, v1 reflect.Value) bool {
+	if isInterfaceValue(v0) || isInterfaceValue(v1) {
+		return dynamicValue(v0) == dynamicValue(v1)
+	}
+	if !v0.Type().AssignableTo(v1.Type()) {
+		v0 = v0.Convert(v1.Type())
+	}
+	return v0.Interface() == v1.Interface()
+}
+
+// isInterfaceValue reports whether v is an interface value: a native interface, an interpreted
+// one (valueInterface), or nil (the zero Value).
+func isInterfaceValue(v reflect.Value) bool {
+	return !v.IsValid() || v.Kind() == reflect.Interface || v.Type() == valueInterfaceType
+}
+
+// dynamicValue is the dynamic value of an interface value, nil for a nil interface (LeetBuild).
+func dynamicValue(v reflect.Value) any {
+	if !v.IsValid() {
+		return nil
+	}
+	x := v.Interface()
+	if vi, ok := x.(valueInterface); ok {
+		if vi.node == nil || !vi.value.IsValid() {
+			return nil
+		}
+		return dynamicValue(vi.value)
+	}
+	return x
 }
 
 // matchWrappedError returns the interpreted value that an error wrapper in v holds, when its type

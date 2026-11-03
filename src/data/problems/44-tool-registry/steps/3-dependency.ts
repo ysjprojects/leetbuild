@@ -2,477 +2,331 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Sandbox validation before a tool version goes live',
+  title: 'Sandbox validation before a catalog version goes live',
   concept: 'grpc',
   file: 'client',
-  focus: ['registry', 'sandbox', 'vault', 'db'],
+  focus: ['registry', 'sandbox', 'vault', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is the validation the registry runs on a candidate version before
-promotion, behind \`POST /v1/tools/{name}/versions/{version}/validate\`. When the sandbox is up it
-validates the candidate and promotes, so the demo ships. It compiles and hides 5 flaws.
+**Starting point.** The starter is \`validate_and_promote(cv, entries)\`, which the registry runs on a
+candidate catalog version: it sends every tool of the candidate to the sandbox over gRPC
+(\`Sandbox.Validate\`), tries up to three times on an error, then records \`passed\` and calls
+\`catalog.promote\` (step 2, provided as \`toolsd.catalog\`). With the sandbox healthy it promotes,
+and it hides four flaws.
 
-- Every candidate is exercised in the **sandbox** over gRPC under a **10-second deadline**
-  (\`VALIDATE_DEADLINE_S\` / \`VALIDATE_DEADLINE_MS\` / \`validateDeadline\`).
-- The sandbox is dialled with **its own scoped credential**: the sandbox endpoint and token from
-  config, carried as \`authorization\` metadata. The sandbox runs candidate code, so any credential
-  handed to it is one the candidate can spend.
-- A **timeout or any RPC error is a rejection, not a pass**: the active version stays active and
-  the rejection is recorded with a reason (\`verdicts.record(name, version, …)\`).
-- A **schema rejection** (\`INVALID_ARGUMENT\`) is **terminal for that version**: record it, do not
-  retry, and answer a re-request from \`verdicts.get(name, version)\`.
-- **Promotion happens only after a validation that returned OK**: \`catalog.promote(name, version,
-  actor)\` is reached by the OK branch and by nothing else.
+**Failure mode the checks target.** A wedged sandbox holds the promotion open; a sandbox that never
+answered counts as a pass, so a version nobody validated ships; the sandbox, which runs candidate
+code, is handed the production provider key; and a schema rejection is sent again and again instead
+of being remembered.
 
-**Failure mode the checks target.** The starter reads a timeout as a pass and promotes, so a wedged
-sandbox ships a version nobody validated. Dialling the sandbox with the production provider key puts
-a live key next to candidate code, and retrying a schema rejection only repeats a measured "no".`,
+\`\`\`proto
+service Sandbox { rpc Validate(ValidateRequest) returns (ValidateReport); }  // INVALID_ARGUMENT: a tool's schema does not hold up
+\`\`\`
+
+- The call carries a **\`VALIDATE_DEADLINE_S\` = 10 s** deadline and \`authorization: Bearer
+  {SANDBOX_TOKEN}\`, the sandbox's own scoped token.
+- Any other error (a deadline, \`UNAVAILABLE\`) records \`unavailable\` with a reason and returns it:
+  nothing is promoted, and the next request asks the sandbox again.
+- \`INVALID_ARGUMENT\` records \`rejected\` with the sandbox's details. A candidate whose recorded
+  outcome (\`catalog.validation(cv)\`) is \`rejected\` or \`passed\` is answered from it without a call.
+- Only an OK records \`passed\` and calls \`catalog.promote\`. The function returns the outcome.`,
   sequence: {
-    participants: ['Registry', 'Sandbox', 'Vault', 'Catalog'],
+    participants: ['Registry', 'Redis', 'Sandbox'],
     messages: [
-      {from: 'Registry', to: 'Vault', label: 'sandbox endpoint + token · SANDBOX_TOKEN', kind: 'sync'},
-      {
-        from: 'Registry',
-        to: 'Sandbox',
-        label: 'Validate(name, version) · deadline 10 s · authorization metadata',
-        kind: 'sync',
-      },
-      {
-        from: 'Sandbox',
-        to: 'Registry',
-        label: 'OK{ok} · INVALID_ARGUMENT (schema) · DEADLINE_EXCEEDED',
-        kind: 'reply',
-      },
-      {
-        from: 'Registry',
-        to: 'Catalog',
-        label: 'record rejection(name, version, reason) · active version untouched',
-        kind: 'sync',
-      },
-      {
-        from: 'Registry',
-        to: 'Registry',
-        label: 're-request → recorded verdict, no second sandbox call',
-        kind: 'sync',
-      },
-      {from: 'Registry', to: 'Catalog', label: 'promote(name, version, actor) — OK branch only', kind: 'sync'},
-      {from: 'Catalog', to: 'Registry', label: 'version live', kind: 'reply'},
+      {from: 'Registry', to: 'Redis', label: 'HGETALL catalog:validation:9 → none', kind: 'sync'},
+      {from: 'Registry', to: 'Sandbox', label: 'Validate(9, tools) · 10 s · Bearer sandbox token', kind: 'sync'},
+      {from: 'Sandbox', to: 'Registry', label: 'OK · INVALID_ARGUMENT · DEADLINE_EXCEEDED', kind: 'reply'},
+      {from: 'Registry', to: 'Redis', label: 'record passed / rejected / unavailable', kind: 'sync'},
+      {from: 'Registry', to: 'Redis', label: 'promote(9) only after OK', kind: 'async'},
     ],
   },
-  hints: [
-    'Symptom: the sandbox hangs during a deploy and the candidate goes live anyway; a tool with a broken schema gets validated ten times in a row; the sandbox logs show the production provider key.',
-    'Mechanism: the call has no deadline, the `except`/`catch` branch falls through to `catalog.promote`, the metadata comes from `prod_metadata()`, and `INVALID_ARGUMENT` hits `continue` in the retry loop.',
-    'Fix: pass the 10-second deadline on the call, dial with the sandbox endpoint and `SANDBOX_TOKEN`, record every error via `verdicts.record` and return, check `verdicts.get` first, and let only `reply.ok` reach `catalog.promote`.',
-  ],
   checks: [
     {
       id: 'deadline',
-      title: 'Every sandbox call carries a 10-second deadline',
+      title: 'The sandbox call carries a 10-second deadline',
       detail:
-        'The call is created with a 10-second deadline — `timeout=VALIDATE_DEADLINE_S`, `deadline: Date.now() + VALIDATE_DEADLINE_MS`, `context.WithTimeout(ctx, validateDeadline)`, `withDeadlineAfter` or `set_deadline`. Without it one wedged sandbox holds the request that asked for the promotion open indefinitely.',
+        'Every `Validate` call is made with `VALIDATE_DEADLINE_S` (10 s); a sandbox slower than that ends the call, and the candidate is recorded `unavailable`. The starter sets no deadline, so a wedged sandbox holds the promotion open.',
       match: {
-        python: {all: [/VALIDATE_DEADLINE_S\s*=\s*10/, /timeout=VALIDATE_DEADLINE_S/, /\.Validate\(/]},
+        python: {
+          all: [/VALIDATE_DEADLINE_S\s*=\s*10\b/, /Validate\([\s\S]{0,200}?timeout\s*=\s*VALIDATE_DEADLINE_S/],
+        },
         typescript: {
-          all: [
-            /VALIDATE_DEADLINE_MS\s*=\s*10_?000/,
-            /deadline:\s*Date\.now\(\)\s*\+\s*VALIDATE_DEADLINE_MS/,
-            /\.Validate\(/,
-          ],
+          all: [/VALIDATE_DEADLINE_MS\s*=\s*10_?000\b/, /Validate\([\s\S]{0,200}?deadline:[^\n]*VALIDATE_DEADLINE_MS/],
         },
-        go: {
-          all: [
-            /validateDeadline\s*=\s*10\s*\*\s*time\.Second/,
-            /context\.With(Timeout|Deadline)\([^\n]*validateDeadline/,
-            /\.Validate\(/,
-          ],
+        go: {all: [/validateDeadline\s*=\s*10\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*validateDeadline\)/]},
+        scala: {all: [/ValidateDeadlineSeconds\s*=\s*10L?\b/, /withDeadlineAfter\(\s*ValidateDeadlineSeconds/]},
+        cpp: {all: [/kValidateDeadline\{10\}/, /set_deadline\([^\n]*kValidateDeadline\)/]},
+      },
+    },
+    {
+      id: 'scoped-credential',
+      title: 'Dials the sandbox with its own scoped token',
+      detail:
+        'The `authorization` metadata is `Bearer` plus `SANDBOX_TOKEN`; the sandbox runs candidate code, so whatever credential it receives the candidate can spend. The starter sends `PROVIDER_API_KEY`.',
+      match: {
+        python: {all: [/["']authorization["']/, /Bearer \{SANDBOX_TOKEN\}/], none: [/Bearer \{PROVIDER_API_KEY\}/]},
+        typescript: {
+          all: [/['"]authorization['"]/, /Bearer \$\{SANDBOX_TOKEN\}/],
+          none: [/Bearer \$\{PROVIDER_API_KEY\}/],
         },
-        scala: {all: [/ValidateDeadlineMs\s*=\s*10000/, /withDeadlineAfter\(/, /\.validate\(/]},
-        cpp: {all: [/kValidateDeadlineMs\s*=\s*10000/, /set_deadline\(/, /->Validate\(/]},
+        go: {all: [/"authorization"/, /"Bearer "\s*\+\s*sandboxToken/], none: [/"Bearer "\s*\+\s*providerAPIKey/]},
+        scala: {all: [/"authorization"/, /bearer\(SandboxToken\)/], none: [/bearer\(ProviderApiKey\)/]},
+        cpp: {all: [/"authorization"/, /"Bearer "\s*\+\s*kSandboxToken/], none: [/"Bearer "\s*\+\s*kProviderApiKey/]},
       },
     },
     {
       id: 'fail-closed',
-      title: 'A timeout keeps the active version and records the reason',
+      title: 'An unanswered validation is not a pass',
       detail:
-        'The error branch records a rejection with its reason and returns, so `catalog.promote` is unreachable from it and the previously active version stays active. The starter promotes in the `except` / `catch` / `err != nil` branch: a timeout became a release.',
+        'A deadline or `UNAVAILABLE` records `unavailable` with a reason and returns before any promotion, so the active catalog stays where it was. The starter retries, then records `passed` and promotes whatever happened.',
       match: {
-        python: {
-          all: [/except\s+grpc\.[\w.]*RpcError/, /verdicts\.record\(/, /reason/],
-          none: [/except\s+grpc\.[\w.]*RpcError[\s\S]{0,200}?(STATUS_PASSED|return\s+True|promote\w*\()/],
-        },
-        typescript: {
-          all: [/catch\s*\(\s*\w+\s*\)\s*\{/, /verdicts\.record\(/, /reason/],
-          none: [/catch\s*\(\s*\w+\s*\)\s*\{[\s\S]{0,200}?(STATUS_PASSED|return\s+true|[Cc]atalog\.promote\()/],
-        },
-        go: {
-          all: [/if err != nil\s*\{/, /verdicts\.Record\(/, /reason/],
-          none: [/if err != nil\s*\{[\s\S]{0,200}?catalog\.Promote\(/],
-        },
-        scala: {
-          all: [/case \w+: StatusRuntimeException/, /Verdicts\.record\(/, /reason/],
-          none: [/case \w+: StatusRuntimeException[\s\S]{0,200}?Catalog\.promote\(/],
-        },
-        cpp: {
-          all: [/!status\.ok\(\)/, /verdicts\.record\(/, /reason/],
-          none: [/!status\.ok\(\)\s*\{[\s\S]{0,200}?catalog\.promote\(/],
-        },
+        python: {all: [/record_validation\(\s*cv,\s*["']unavailable["']/], none: [/for attempt in/]},
+        typescript: {all: [/recordValidation\(\s*cv,\s*['"]unavailable['"]/], none: [/for \(let attempt/]},
+        go: {all: [/RecordValidation\(ctx,\s*cv,\s*"unavailable"/], none: [/for attempt :=/]},
+        scala: {all: [/\(\s*"unavailable",/], none: [/while \(/]},
+        cpp: {all: [/recordValidation\(cv,\s*"unavailable"/], none: [/for \(int attempt/]},
       },
     },
     {
-      id: 'credentials',
-      title: 'The sandbox is dialled with its own scoped credential',
+      id: 'terminal-rejection',
+      title: 'A schema rejection is terminal for the candidate',
       detail:
-        'The sandbox client is built from the sandbox endpoint and carries the sandbox token (`SANDBOX_TOKEN` / `SandboxToken`) as `authorization` metadata; the production provider credential never appears on this path. The starter dials the sandbox with the key the production provider call uses.',
-      match: {
-        python: {all: [/SANDBOX_[A-Z_]+/, /metadata\s*=/, /\.Validate\(/], none: [/provider_?api_?key/i]},
-        typescript: {
-          all: [/SANDBOX_[A-Z_]+/, /metadata\.set\(/, /\.Validate\(/],
-          none: [/provider_?api_?key/i],
-        },
-        go: {
-          all: [/SANDBOX_(TOKEN|ENDPOINT)/, /metadata\.AppendToOutgoingContext\(/, /\.Validate\(/],
-          none: [/provider_?api_?key/i],
-        },
-        scala: {
-          all: [/SandboxToken|SandboxEndpoint/, /Metadata\.Key\.of\(/, /\.validate\(/],
-          none: [/provider_?api_?key/i],
-        },
-        cpp: {all: [/SANDBOX_TOKEN|kSandboxToken/, /AddMetadata\(/, /->Validate\(/], none: [/provider_?api_?key/i]},
-      },
-    },
-    {
-      id: 'terminal',
-      title: 'A schema rejection is terminal for that version',
-      detail:
-        '`INVALID_ARGUMENT` is a verdict on the version: it is recorded and returned, and a re-request for the same version is answered from `verdicts.get(name, version)` instead of calling the sandbox again. The starter retries the rejection in a loop until the checks pass.',
+        '`INVALID_ARGUMENT` records `rejected` with the details, and a re-request is answered from `catalog.validation(cv)` before any call; an `unavailable` candidate is asked about again. The starter resends a rejection and never consults the record.',
       match: {
         python: {
-          all: [/StatusCode\.INVALID_ARGUMENT/, /verdicts\.get\(/, /reject/i],
-          none: [/INVALID_ARGUMENT[\s\S]{0,80}?continue/],
+          all: [/INVALID_ARGUMENT/, /record_validation\(\s*cv,\s*["']rejected["']/],
+          order: [/catalog\.validation\(cv\)/, /sandbox\.Validate\(/],
         },
         typescript: {
-          all: [/grpc\.status\.INVALID_ARGUMENT/, /verdicts\.get\(/, /reject/i],
-          none: [/INVALID_ARGUMENT[\s\S]{0,80}?continue\b/],
+          all: [/INVALID_ARGUMENT/, /recordValidation\(\s*cv,\s*['"]rejected['"]/],
+          order: [/\bvalidation\(cv\)/, /sandbox\.Validate\(/],
         },
         go: {
-          all: [/codes\.InvalidArgument/, /verdicts\.Get\(/, /reject/i],
-          none: [/InvalidArgument[\s\S]{0,80}?continue/],
+          all: [/codes\.InvalidArgument/, /RecordValidation\(ctx,\s*cv,\s*"rejected"/],
+          order: [/catalog\.Validation\(ctx,\s*cv\)/, /sandbox\.Validate\(/],
         },
         scala: {
-          all: [/Code\.INVALID_ARGUMENT/, /Verdicts\.get\(/, /reject/i],
-          none: [/INVALID_ARGUMENT[\s\S]{0,120}?attempt\s*\+=/],
+          all: [/INVALID_ARGUMENT/, /\(\s*"rejected",/],
+          order: [/Catalog\.validation\(cv\)/, /\.validate\(validateRequest/],
         },
         cpp: {
-          all: [/StatusCode::INVALID_ARGUMENT/, /verdicts\.get\(/, /reject/i],
-          none: [/INVALID_ARGUMENT[\s\S]{0,80}?continue;/],
-        },
-      },
-    },
-    {
-      id: 'promote',
-      title: 'Promotion happens only after a validation that returned OK',
-      detail:
-        'The sandbox call comes first, its reply is checked for `ok`, and `catalog.promote(name, version, …)` is reached only by that branch. The starter promotes whatever the sandbox answered — including nothing at all.',
-      match: {
-        python: {
-          all: [/catalog\.promote\(\s*name\s*,\s*version/],
-          order: [/\.Validate\(/, /reply\.ok\b/, /catalog\.promote\(/],
-        },
-        typescript: {
-          all: [/catalog\.promote\(\s*name\s*,\s*version/],
-          order: [/\.Validate\(/, /reply\.ok\b/, /[Cc]atalog\.promote\(/],
-        },
-        go: {
-          all: [/[Cc]atalog\.Promote\(\s*ctx\s*,\s*name\s*,\s*version/],
-          order: [/\.Validate\(/, /reply\.(GetOk\(\)|Ok)/, /[Cc]atalog\.Promote\(/],
-        },
-        scala: {
-          all: [/Catalog\.promote\(\s*name\s*,\s*version/],
-          order: [/\.validate\(/, /reply\.ok\b/, /Catalog\.promote\(/],
-        },
-        cpp: {
-          all: [/catalog\.promote\(\s*name\s*,\s*version/],
-          order: [/->Validate\(/, /reply\.ok\(\)/, /catalog\.promote\(/],
+          all: [/INVALID_ARGUMENT/, /recordValidation\(cv,\s*"rejected"/],
+          order: [/catalog::validation\(cv\)/, /sandbox->Validate\(/],
         },
       },
     },
   ],
   code: {
     python: {
-      starter: `"""Sandbox validation for a candidate tool version."""
-import os
+      starter: `import json
+import logging
 
 import grpc
 
-import sandbox_pb2
-import sandbox_pb2_grpc
+import tool_registry_pb2
+import tool_registry_pb2_grpc
+from toolsd import catalog  # catalog.promote, catalog.validation, catalog.record_validation
 
-SCHEMA_RETRIES = 5  # a rejected schema is worth another attempt
+log = logging.getLogger("toolsd.validate")
 
-PROVIDER_API_KEY = os.environ["PROVIDER_API_KEY"]
+SANDBOX_ADDR = "sandbox:9000"
+# Credentials from the deployment's config.
+SANDBOX_TOKEN = "sbx-validate-only"  # scoped to the sandbox: it can run candidates, nothing else
+PROVIDER_API_KEY = "pk-live-toolsd"  # the production model provider key
 
-channel = grpc.aio.insecure_channel("sandbox:9000")
-sandbox = sandbox_pb2_grpc.SandboxStub(channel)
-
-
-def prod_metadata() -> tuple[tuple[str, str], ...]:
-    return (("authorization", f"Bearer {PROVIDER_API_KEY}"),)
-
-
-class Catalog:
-    def promote(self, name: str, version: str, actor: str) -> None:
-        raise NotImplementedError
+sandbox = tool_registry_pb2_grpc.SandboxStub(grpc.insecure_channel(SANDBOX_ADDR))
 
 
-catalog = Catalog()
-
-
-def validate_candidate(name: str, version: str, actor: str) -> None:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    request = sandbox_pb2.ValidateRequest(name=name, version=version)
-    for _ in range(SCHEMA_RETRIES):
-        try:
-            sandbox.Validate(request, metadata=prod_metadata())
-            return
-        except grpc.RpcError as exc:
-            if exc.code() == grpc.StatusCode.INVALID_ARGUMENT:
-                continue  # a schema rejection: the checks will surely pass on another attempt
-            catalog.promote(name, version, actor)  # a timeout is not a rejection
-            return
-    catalog.promote(name, version, actor)
-`,
-      solution: `"""Sandbox validation for a candidate tool version."""
-import os
-
-import grpc
-
-import sandbox_pb2
-import sandbox_pb2_grpc
-
-VALIDATE_DEADLINE_S = 10.0
-STATUS_PASSED = "passed"
-STATUS_REJECTED = "rejected"
-
-SANDBOX_ENDPOINT = os.environ.get("SANDBOX_ENDPOINT", "sandbox:9000")
-SANDBOX_TOKEN = os.environ["SANDBOX_TOKEN"]
-
-channel = grpc.aio.insecure_channel(SANDBOX_ENDPOINT)
-sandbox = sandbox_pb2_grpc.SandboxStub(channel)
-
-
-class Verdicts:
-    """One verdict per (name, version): a candidate version is validated once."""
-
-    def get(self, name: str, version: str) -> dict | None:
-        raise NotImplementedError
-
-    def record(self, name: str, version: str, status: str, reason: str) -> None:
-        raise NotImplementedError
-
-
-class Catalog:
-    def promote(self, name: str, version: str, actor: str) -> None:
-        """Point the tool at this version. Only a passing validation may call it."""
-        raise NotImplementedError
-
-
-verdicts = Verdicts()
-catalog = Catalog()
-
-
-def sandbox_metadata() -> tuple[tuple[str, str], ...]:
-    """The sandbox's own token from config: a sandbox call never carries the production credential."""
-    return (("authorization", f"Bearer {SANDBOX_TOKEN}"),)
-
-
-async def validate_candidate(name: str, version: str, actor: str) -> dict:
-    """Exercise the candidate in the sandbox and act on the verdict it returns.
-
-    A recorded verdict is final for that version. Anything other than a passing validation leaves
-    the active version active and records the rejection with a visible reason.
-    """
-    recorded = verdicts.get(name, version)
-    if recorded is not None:
-        return recorded
-
-    # The sandbox answers within the deadline or the promotion is refused: a timeout is not consent.
-    request = sandbox_pb2.ValidateRequest(name=name, version=version)
-    try:
-        reply = await sandbox.Validate(
-            request, timeout=VALIDATE_DEADLINE_S, metadata=sandbox_metadata()
+def validate_request(cv: str, entries: dict[str, dict]) -> tool_registry_pb2.ValidateRequest:
+    tools = [
+        tool_registry_pb2.ToolSpec(
+            name=name, version=entry["version"], side_effect=entry["side_effect"], schema_json=json.dumps(entry["schema"], sort_keys=True)
         )
-    except grpc.aio.AioRpcError as exc:
+        for name, entry in sorted(entries.items())
+    ]
+    return tool_registry_pb2.ValidateRequest(catalog_version=cv, tools=tools)
+
+
+def validate_and_promote(cv: str, entries: dict[str, dict]) -> str:
+    """Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    for attempt in range(3):
+        try:
+            sandbox.Validate(validate_request(cv, entries), metadata=(("authorization", f"Bearer {PROVIDER_API_KEY}"),))
+            break
+        except grpc.RpcError as exc:
+            log.warning("sandbox attempt %d for catalog %s failed: %s", attempt + 1, cv, exc.code())
+    catalog.record_validation(cv, "passed", "")
+    catalog.promote(cv, entries)
+    return "passed"
+`,
+      solution: `import json
+import logging
+
+import grpc
+
+import tool_registry_pb2
+import tool_registry_pb2_grpc
+from toolsd import catalog  # catalog.promote, catalog.validation, catalog.record_validation
+
+log = logging.getLogger("toolsd.validate")
+
+SANDBOX_ADDR = "sandbox:9000"
+VALIDATE_DEADLINE_S = 10
+# Credentials from the deployment's config.
+SANDBOX_TOKEN = "sbx-validate-only"  # scoped to the sandbox: it can run candidates, nothing else
+PROVIDER_API_KEY = "pk-live-toolsd"  # the production model provider key
+
+# Outcomes that say something about the candidate itself: a re-request is answered from the record.
+TERMINAL = ("passed", "rejected")
+
+sandbox = tool_registry_pb2_grpc.SandboxStub(grpc.insecure_channel(SANDBOX_ADDR))
+
+
+def validate_request(cv: str, entries: dict[str, dict]) -> tool_registry_pb2.ValidateRequest:
+    tools = [
+        tool_registry_pb2.ToolSpec(
+            name=name, version=entry["version"], side_effect=entry["side_effect"], schema_json=json.dumps(entry["schema"], sort_keys=True)
+        )
+        for name, entry in sorted(entries.items())
+    ]
+    return tool_registry_pb2.ValidateRequest(catalog_version=cv, tools=tools)
+
+
+def validate_and_promote(cv: str, entries: dict[str, dict]) -> str:
+    """Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome."""
+    recorded = catalog.validation(cv)
+    if recorded is not None and recorded["outcome"] in TERMINAL:
+        return recorded["outcome"]
+    try:
+        sandbox.Validate(
+            validate_request(cv, entries),
+            timeout=VALIDATE_DEADLINE_S,
+            metadata=(("authorization", f"Bearer {SANDBOX_TOKEN}"),),
+        )
+    except grpc.RpcError as exc:
         if exc.code() == grpc.StatusCode.INVALID_ARGUMENT:
-            reason = f"schema rejected: {exc.details() or 'invalid candidate schema'}"
-        else:
-            reason = f"sandbox {exc.code().name.lower()}"
-        verdicts.record(name, version, STATUS_REJECTED, reason)
-        return {"status": STATUS_REJECTED, "reason": reason}
-
-    if not reply.ok:
-        reason = reply.reason or "schema rejected"
-        verdicts.record(name, version, STATUS_REJECTED, reason)
-        return {"status": STATUS_REJECTED, "reason": reason}
-
-    catalog.promote(name, version, actor)
-    verdicts.record(name, version, STATUS_PASSED, "")
-    return {"status": STATUS_PASSED, "reason": ""}
+            catalog.record_validation(cv, "rejected", exc.details() or "rejected")  # terminal for this candidate
+            return "rejected"
+        # A deadline or an outage says nothing about the candidate: it stays unjudged and unpromoted.
+        log.warning("sandbox did not judge catalog %s: %s", cv, exc.code())
+        catalog.record_validation(cv, "unavailable", exc.code().name)
+        return "unavailable"
+    catalog.record_validation(cv, "passed", "")
+    catalog.promote(cv, entries)
+    return "passed"
 `,
     },
     typescript: {
-      starter: `/** Sandbox validation for a candidate tool version. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const SCHEMA_RETRIES = 5; // a rejected schema is worth another attempt
-const PROVIDER_API_KEY = process.env.PROVIDER_API_KEY ?? '';
+import {type Entry, promote, recordValidation, validation} from 'toolsd/catalog';
 
-interface ValidateReply {
-  ok: boolean;
-  reason: string;
+export const SANDBOX_ADDR = 'sandbox:9000';
+// Credentials from the deployment's config.
+export const SANDBOX_TOKEN = 'sbx-validate-only'; // scoped to the sandbox: it can run candidates, nothing else
+export const PROVIDER_API_KEY = 'pk-live-toolsd'; // the production model provider key
+
+interface ValidateRequest {
+  catalog_version: string;
+  tools: {name: string; version: string; side_effect: string; schema_json: string}[];
 }
 
-interface SandboxClient {
-  Validate(
-    request: {name: string; version: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, reply: ValidateReply) => void,
-  ): grpc.ClientUnaryCall;
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('tool_registry.proto')) as unknown as {
+  toolsd: {Sandbox: grpc.ServiceClientConstructor};
+};
+const sandbox = new pkg.toolsd.Sandbox(SANDBOX_ADDR, grpc.credentials.createInsecure()) as grpc.Client & {
+  Validate(request: ValidateRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{calls_exercised: number}>;
+};
+
+export function validateRequest(cv: string, entries: Record<string, Entry>): ValidateRequest {
+  const tools = Object.keys(entries)
+    .sort()
+    .map(name => ({
+      name,
+      version: String(entries[name].version),
+      side_effect: String(entries[name].side_effect),
+      schema_json: JSON.stringify(entries[name].schema),
+    }));
+  return {catalog_version: cv, tools};
 }
 
-const loaded = grpc.loadPackageDefinition(protoLoader.loadSync('sandbox.proto')) as unknown as {
-  sandbox: {Sandbox: new (target: string, credentials: grpc.ChannelCredentials) => SandboxClient};
-};
-const sandbox = new loaded.sandbox.Sandbox('sandbox:9000', grpc.credentials.createInsecure());
-
-/** The registry's catalog store. */
-const catalog = {
-  async promote(name: string, version: string, actor: string): Promise<void> {
-    throw new Error('not implemented');
-  },
-};
-
-function prodMetadata(): grpc.Metadata {
+/** Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome. */
+export async function validateAndPromote(cv: string, entries: Record<string, Entry>): Promise<string> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const metadata = new grpc.Metadata();
   metadata.set('authorization', \`Bearer \${PROVIDER_API_KEY}\`);
-  return metadata;
-}
-
-export async function validateCandidate(name: string, version: string, actor: string): Promise<void> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  for (let attempt = 0; attempt < SCHEMA_RETRIES; attempt++) {
-    const {promise, resolve, reject} = Promise.withResolvers<ValidateReply>();
-    sandbox.Validate({name, version}, prodMetadata(), {}, (error, reply) =>
-      error === null ? resolve(reply) : reject(error),
-    );
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      await promise;
-      return;
-    } catch (error) {
-      if ((error as grpc.ServiceError).code === grpc.status.INVALID_ARGUMENT) {
-        continue; // a schema rejection: the checks will surely pass on another attempt
-      }
-      await catalog.promote(name, version, actor); // a timeout is not a rejection
-      return;
+      await sandbox.Validate(validateRequest(cv, entries), metadata, {});
+      break;
+    } catch (e) {
+      console.warn(\`sandbox attempt \${attempt} for catalog \${cv} failed: \${(e as grpc.ServiceError).code}\`);
     }
   }
-  await catalog.promote(name, version, actor);
+  await recordValidation(cv, 'passed', '');
+  await promote(cv, entries);
+  return 'passed';
 }
 `,
-      solution: `/** Sandbox validation for a candidate tool version. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const VALIDATE_DEADLINE_MS = 10_000;
-const STATUS_PASSED = 'passed';
-const STATUS_REJECTED = 'rejected';
+import {type Entry, promote, recordValidation, validation} from 'toolsd/catalog';
 
-const SANDBOX_ENDPOINT = process.env.SANDBOX_ENDPOINT ?? 'sandbox:9000';
-const SANDBOX_TOKEN = process.env.SANDBOX_TOKEN ?? '';
+export const SANDBOX_ADDR = 'sandbox:9000';
+export const VALIDATE_DEADLINE_MS = 10_000;
+// Credentials from the deployment's config.
+export const SANDBOX_TOKEN = 'sbx-validate-only'; // scoped to the sandbox: it can run candidates, nothing else
+export const PROVIDER_API_KEY = 'pk-live-toolsd'; // the production model provider key
 
-interface ValidateReply {
-  ok: boolean;
-  reason: string;
+interface ValidateRequest {
+  catalog_version: string;
+  tools: {name: string; version: string; side_effect: string; schema_json: string}[];
 }
 
-interface SandboxClient {
-  Validate(
-    request: {name: string; version: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, reply: ValidateReply) => void,
-  ): grpc.ClientUnaryCall;
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('tool_registry.proto')) as unknown as {
+  toolsd: {Sandbox: grpc.ServiceClientConstructor};
+};
+const sandbox = new pkg.toolsd.Sandbox(SANDBOX_ADDR, grpc.credentials.createInsecure()) as grpc.Client & {
+  Validate(request: ValidateRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{calls_exercised: number}>;
+};
+
+export function validateRequest(cv: string, entries: Record<string, Entry>): ValidateRequest {
+  const tools = Object.keys(entries)
+    .sort()
+    .map(name => ({
+      name,
+      version: String(entries[name].version),
+      side_effect: String(entries[name].side_effect),
+      schema_json: JSON.stringify(entries[name].schema),
+    }));
+  return {catalog_version: cv, tools};
 }
 
-interface Verdict {
-  status: string;
-  reason: string;
-}
-
-const loaded = grpc.loadPackageDefinition(protoLoader.loadSync('sandbox.proto')) as unknown as {
-  sandbox: {Sandbox: new (target: string, credentials: grpc.ChannelCredentials) => SandboxClient};
-};
-const sandbox = new loaded.sandbox.Sandbox(SANDBOX_ENDPOINT, grpc.credentials.createInsecure());
-
-/** One verdict per (name, version): a candidate version is validated once. */
-const verdicts = {
-  async get(name: string, version: string): Promise<Verdict | null> {
-    throw new Error('not implemented');
-  },
-  async record(name: string, version: string, status: string, reason: string): Promise<void> {
-    throw new Error('not implemented');
-  },
-};
-
-/** The registry's catalog store: only a passing validation may call promote. */
-const catalog = {
-  async promote(name: string, version: string, actor: string): Promise<void> {
-    throw new Error('not implemented');
-  },
-};
-
-/** The sandbox's own token: a sandbox call never carries the production credential. */
-function sandboxMetadata(): grpc.Metadata {
+/** Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome. */
+export async function validateAndPromote(cv: string, entries: Record<string, Entry>): Promise<string> {
+  // passed and rejected say something about the candidate itself: a re-request is answered from the record.
+  const recorded = await validation(cv);
+  if (recorded !== null && (recorded.outcome === 'passed' || recorded.outcome === 'rejected')) return recorded.outcome;
   const metadata = new grpc.Metadata();
   metadata.set('authorization', \`Bearer \${SANDBOX_TOKEN}\`);
-  return metadata;
-}
-
-export async function validateCandidate(name: string, version: string, actor: string): Promise<Verdict> {
-  const recorded = await verdicts.get(name, version);
-  if (recorded !== null) return recorded;
-
-  const {promise, resolve, reject} = Promise.withResolvers<ValidateReply>();
-  sandbox.Validate(
-    {name, version},
-    sandboxMetadata(),
-    {deadline: Date.now() + VALIDATE_DEADLINE_MS},
-    (error, reply) => (error === null ? resolve(reply) : reject(error)),
-  );
-
-  let reply: ValidateReply;
   try {
-    reply = await promise;
-  } catch (error) {
-    const serviceError = error as grpc.ServiceError;
-    const reason =
-      serviceError.code === grpc.status.INVALID_ARGUMENT
-        ? \`schema rejected: \${serviceError.details}\`
-        : \`sandbox status \${serviceError.code}\`;
-    await verdicts.record(name, version, STATUS_REJECTED, reason);
-    return {status: STATUS_REJECTED, reason};
+    await sandbox.Validate(validateRequest(cv, entries), metadata, {deadline: Date.now() + VALIDATE_DEADLINE_MS});
+  } catch (e) {
+    const {code, details} = e as grpc.ServiceError;
+    if (code === grpc.status.INVALID_ARGUMENT) {
+      await recordValidation(cv, 'rejected', details || 'rejected'); // terminal for this candidate
+      return 'rejected';
+    }
+    // A deadline or an outage says nothing about the candidate: it stays unjudged and unpromoted.
+    await recordValidation(cv, 'unavailable', grpc.status[code] ?? 'unavailable');
+    return 'unavailable';
   }
-
-  if (!reply.ok) {
-    const reason = reply.reason || 'schema rejected';
-    await verdicts.record(name, version, STATUS_REJECTED, reason);
-    return {status: STATUS_REJECTED, reason};
-  }
-
-  await catalog.promote(name, version, actor);
-  await verdicts.record(name, version, STATUS_PASSED, '');
-  return {status: STATUS_PASSED, reason: ''};
+  await recordValidation(cv, 'passed', '');
+  await promote(cv, entries);
+  return 'passed';
 }
 `,
     },
@@ -481,51 +335,71 @@ export async function validateCandidate(name: string, version: string, actor: st
 
 import (
 	"context"
-	"os"
+	"encoding/json"
+	"log"
+	"sort"
 
-	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	pb "registry/sandboxpb"
+	"toolsd/catalog" // catalog.Promote, catalog.Validation, catalog.RecordValidation
+	pb "toolsd/gen/tool_registry"
 )
 
-const schemaRetries = 5 // a rejected schema is worth another attempt
+const (
+	sandboxAddr = "sandbox:9000"
+	// Credentials from the deployment's config.
+	sandboxToken   = "sbx-validate-only" // scoped to the sandbox: it can run candidates, nothing else
+	providerAPIKey = "pk-live-toolsd"    // the production model provider key
+)
 
-var providerAPIKey = os.Getenv("PROVIDER_API_KEY")
+var (
+	sandboxConn, _ = grpc.NewClient(sandboxAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	sandbox        = pb.NewSandboxClient(sandboxConn)
+)
 
-func prodMetadata() metadata.MD {
-	return metadata.Pairs("authorization", "Bearer "+providerAPIKey)
+func validateRequest(cv string, entries map[string]catalog.Entry) *pb.ValidateRequest {
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	req := &pb.ValidateRequest{CatalogVersion: cv}
+	for _, name := range names {
+		version, _ := entries[name]["version"].(string)
+		sideEffect, _ := entries[name]["side_effect"].(string)
+		schema, _ := json.Marshal(entries[name]["schema"])
+		req.Tools = append(req.Tools, &pb.ToolSpec{Name: name, Version: version, SideEffect: sideEffect, SchemaJson: string(schema)})
+	}
+	return req
 }
 
-type Catalog struct{}
-
-func (c *Catalog) Promote(ctx context.Context, name, version, actor string) error { return nil }
-
-var catalog = &Catalog{}
-
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-func validateCandidate(ctx context.Context, client pb.SandboxClient, name, version, actor string) error {
-	request := &pb.ValidateRequest{Name: name, Version: version}
-	for attempt := 0; attempt < schemaRetries; attempt++ {
-		_, err := client.Validate(metadata.NewOutgoingContext(ctx, prodMetadata()), request)
-		if err != nil {
-			if status.Code(err) == codes.InvalidArgument {
-				continue // a schema rejection: the checks will surely pass on another attempt
-			}
-			return catalog.Promote(ctx, name, version, actor) // a timeout is not a rejection
+// validateAndPromote exercises candidate catalog version cv in the sandbox and promotes it if it holds up; the outcome.
+func validateAndPromote(ctx context.Context, cv string, entries map[string]catalog.Entry) (string, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	for attempt := 1; attempt <= 3; attempt++ {
+		callCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+providerAPIKey)
+		_, err := sandbox.Validate(callCtx, validateRequest(cv, entries))
+		if err == nil {
+			break
 		}
-		return catalog.Promote(ctx, name, version, actor)
+		log.Printf("sandbox attempt %d for catalog %s failed: %v", attempt, cv, status.Code(err))
 	}
-	return catalog.Promote(ctx, name, version, actor)
+	if err := catalog.RecordValidation(ctx, cv, "passed", ""); err != nil {
+		return "", err
+	}
+	return "passed", catalog.Promote(ctx, cv, entries)
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"fmt"
-	"os"
+	"encoding/json"
+	"log"
+	"sort"
 	"time"
 
 	"google.golang.org/grpc"
@@ -534,330 +408,712 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	pb "registry/sandboxpb"
+	"toolsd/catalog" // catalog.Promote, catalog.Validation, catalog.RecordValidation
+	pb "toolsd/gen/tool_registry"
 )
 
 const (
+	sandboxAddr      = "sandbox:9000"
 	validateDeadline = 10 * time.Second
-	statusPassed     = "passed"
-	statusRejected   = "rejected"
+	// Credentials from the deployment's config.
+	sandboxToken   = "sbx-validate-only" // scoped to the sandbox: it can run candidates, nothing else
+	providerAPIKey = "pk-live-toolsd"    // the production model provider key
 )
 
-// Verdict is one recorded answer for a candidate version.
-type Verdict struct {
-	Status string
-	Reason string
+var (
+	sandboxConn, _ = grpc.NewClient(sandboxAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	sandbox        = pb.NewSandboxClient(sandboxConn)
+)
+
+func validateRequest(cv string, entries map[string]catalog.Entry) *pb.ValidateRequest {
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	req := &pb.ValidateRequest{CatalogVersion: cv}
+	for _, name := range names {
+		version, _ := entries[name]["version"].(string)
+		sideEffect, _ := entries[name]["side_effect"].(string)
+		schema, _ := json.Marshal(entries[name]["schema"])
+		req.Tools = append(req.Tools, &pb.ToolSpec{Name: name, Version: version, SideEffect: sideEffect, SchemaJson: string(schema)})
+	}
+	return req
 }
 
-// Verdicts is the registry's own table: one verdict per (name, version).
-type Verdicts struct{}
-
-func (v *Verdicts) Get(ctx context.Context, name, version string) (*Verdict, error) { return nil, nil }
-
-func (v *Verdicts) Record(ctx context.Context, name, version, verdictStatus, reason string) error {
-	return nil
-}
-
-// Catalog points a tool at a version; only a passing validation may call Promote.
-type Catalog struct{}
-
-func (c *Catalog) Promote(ctx context.Context, name, version, actor string) error { return nil }
-
-var verdicts = &Verdicts{}
-var catalog = &Catalog{}
-
-// dialSandbox builds the channel from the sandbox config; the sandbox never sees the production
-// provider credential.
-func dialSandbox() (*grpc.ClientConn, error) {
-	return grpc.NewClient(
-		os.Getenv("SANDBOX_ENDPOINT"),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-}
-
-// sandboxContext carries the sandbox's own token for the call that runs candidate code.
-func sandboxContext(ctx context.Context) context.Context {
-	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+os.Getenv("SANDBOX_TOKEN"))
-}
-
-func validateCandidate(ctx context.Context, client pb.SandboxClient, name, version, actor string) (Verdict, error) {
-	recorded, err := verdicts.Get(ctx, name, version)
+// validateAndPromote exercises candidate catalog version cv in the sandbox and promotes it if it holds up; the outcome.
+func validateAndPromote(ctx context.Context, cv string, entries map[string]catalog.Entry) (string, error) {
+	recorded, err := catalog.Validation(ctx, cv)
 	if err != nil {
-		return Verdict{}, err
+		return "", err
 	}
-	if recorded != nil {
-		return *recorded, nil
+	// passed and rejected say something about the candidate itself: a re-request is answered from the record.
+	if outcome := recorded["outcome"]; outcome == "passed" || outcome == "rejected" {
+		return outcome, nil
 	}
-
-	// The sandbox answers within the deadline or the promotion is refused: a timeout is not consent.
 	callCtx, cancel := context.WithTimeout(ctx, validateDeadline)
 	defer cancel()
-
-	reply, err := client.Validate(sandboxContext(callCtx), &pb.ValidateRequest{Name: name, Version: version})
-	if err != nil {
-		reason := fmt.Sprintf("sandbox %s", status.Code(err))
+	callCtx = metadata.AppendToOutgoingContext(callCtx, "authorization", "Bearer "+sandboxToken)
+	if _, err := sandbox.Validate(callCtx, validateRequest(cv, entries)); err != nil {
 		if status.Code(err) == codes.InvalidArgument {
-			reason = "schema rejected: " + status.Convert(err).Message()
+			return "rejected", catalog.RecordValidation(ctx, cv, "rejected", status.Convert(err).Message()) // terminal for this candidate
 		}
-		if recordErr := verdicts.Record(ctx, name, version, statusRejected, reason); recordErr != nil {
-			return Verdict{}, recordErr
-		}
-		return Verdict{Status: statusRejected, Reason: reason}, nil
+		// A deadline or an outage says nothing about the candidate: it stays unjudged and unpromoted.
+		log.Printf("sandbox did not judge catalog %s: %v", cv, status.Code(err))
+		return "unavailable", catalog.RecordValidation(ctx, cv, "unavailable", status.Code(err).String())
 	}
-
-	if !reply.GetOk() {
-		reason := reply.GetReason()
-		if reason == "" {
-			reason = "schema rejected"
-		}
-		if recordErr := verdicts.Record(ctx, name, version, statusRejected, reason); recordErr != nil {
-			return Verdict{}, recordErr
-		}
-		return Verdict{Status: statusRejected, Reason: reason}, nil
+	if err := catalog.RecordValidation(ctx, cv, "passed", ""); err != nil {
+		return "", err
 	}
-
-	if err := catalog.Promote(ctx, name, version, actor); err != nil {
-		return Verdict{}, err
-	}
-	if err := verdicts.Record(ctx, name, version, statusPassed, ""); err != nil {
-		return Verdict{}, err
-	}
-	return Verdict{Status: statusPassed, Reason: ""}, nil
+	return "passed", catalog.Promote(ctx, cv, entries)
 }
 `,
     },
     scala: {
-      starter: `import io.grpc.stub.MetadataUtils
-import io.grpc.{ManagedChannelBuilder, Metadata, Status, StatusRuntimeException}
+      starter: `import io.grpc.{ClientInterceptor, ManagedChannelBuilder, Metadata, StatusRuntimeException}
+import io.grpc.stub.MetadataUtils
+import spray.json._
 
-object ToolValidation {
-  val SchemaRetries = 5 // a rejected schema is worth another attempt
+import toolsd.Catalog // Catalog.promote, Catalog.validation, Catalog.recordValidation
+import toolsd.tool_registry.{SandboxGrpc, ToolSpec, ValidateRequest}
 
-  val ProviderApiKey = sys.env("PROVIDER_API_KEY")
+object Client {
+  val SandboxHost = "sandbox"
+  val SandboxPort = 9000
+  // Credentials from the deployment's config.
+  val SandboxToken = "sbx-validate-only" // scoped to the sandbox: it can run candidates, nothing else
+  val ProviderApiKey = "pk-live-toolsd" // the production model provider key
 
-  val sandbox = SandboxServiceGrpc.blockingStub(
-    ManagedChannelBuilder.forAddress("sandbox", 9000).usePlaintext().build()
-  )
-
-  val AuthKey: Metadata.Key[String] = Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER)
-
-  def prodStub(): SandboxServiceGrpc.SandboxServiceBlockingStub = {
+  private def bearer(token: String): ClientInterceptor = {
     val headers = new Metadata()
-    headers.put(AuthKey, s"Bearer $ProviderApiKey")
-    sandbox.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
+    headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), s"Bearer $token")
+    MetadataUtils.newAttachHeadersInterceptor(headers)
   }
 
-  object Catalog {
-    def promote(name: String, version: String, actor: String): Unit = ()
+  private val sandbox =
+    SandboxGrpc.blockingStub(ManagedChannelBuilder.forAddress(SandboxHost, SandboxPort).usePlaintext().build()).withInterceptors(bearer(ProviderApiKey))
+
+  private def text(entry: JsObject, field: String): String = entry.fields.get(field) match {
+    case Some(JsString(s)) => s
+    case _                 => ""
   }
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def validateCandidate(name: String, version: String, actor: String): Unit = {
+  def validateRequest(cv: String, entries: Map[String, JsObject]): ValidateRequest =
+    ValidateRequest(
+      catalogVersion = cv,
+      tools = entries.toSeq.sortBy(_._1).map { case (name, entry) =>
+        ToolSpec(name = name, version = text(entry, "version"), sideEffect = text(entry, "side_effect"), schemaJson = entry.fields.getOrElse("schema", JsObject.empty).compactPrint)
+      })
+
+  /** Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome. */
+  def validateAndPromote(cv: String, entries: Map[String, JsObject]): String = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     var attempt = 0
-    var done = false
-    while (!done && attempt < SchemaRetries) {
+    var answered = false
+    while (!answered && attempt < 3) {
+      attempt += 1
       try {
-        prodStub().validate(ValidateRequest(name = name, version = version))
-        done = true
+        sandbox.validate(validateRequest(cv, entries))
+        answered = true
       } catch {
-        case exc: StatusRuntimeException =>
-          if (exc.getStatus.getCode == Status.Code.INVALID_ARGUMENT) {
-            attempt += 1 // a schema rejection: the checks will surely pass on another attempt
-          } else {
-            Catalog.promote(name, version, actor) // a timeout is not a rejection
-            done = true
-          }
+        case e: StatusRuntimeException => System.err.println(s"sandbox attempt $attempt for catalog $cv failed: \${e.getStatus.getCode}")
       }
     }
+    Catalog.recordValidation(cv, "passed", "")
+    Catalog.promote(cv, entries)
+    "passed"
   }
 }
 `,
-      solution: `import io.grpc.stub.MetadataUtils
-import io.grpc.{ManagedChannelBuilder, Metadata, Status, StatusRuntimeException}
+      solution: `import java.util.concurrent.TimeUnit
 
-import java.util.concurrent.TimeUnit
+import io.grpc.{ClientInterceptor, ManagedChannelBuilder, Metadata, Status, StatusRuntimeException}
+import io.grpc.stub.MetadataUtils
+import spray.json._
 
-object ToolValidation {
-  val ValidateDeadlineMs = 10000
-  val StatusPassed = "passed"
-  val StatusRejected = "rejected"
+import toolsd.Catalog // Catalog.promote, Catalog.validation, Catalog.recordValidation
+import toolsd.tool_registry.{SandboxGrpc, ToolSpec, ValidateRequest}
 
-  val SandboxEndpoint = sys.env("SANDBOX_ENDPOINT")
-  val SandboxToken = sys.env("SANDBOX_TOKEN")
+object Client {
+  val SandboxHost = "sandbox"
+  val SandboxPort = 9000
+  val ValidateDeadlineSeconds = 10L
+  // Credentials from the deployment's config.
+  val SandboxToken = "sbx-validate-only" // scoped to the sandbox: it can run candidates, nothing else
+  val ProviderApiKey = "pk-live-toolsd" // the production model provider key
 
-  val sandbox = SandboxServiceGrpc.blockingStub(
-    ManagedChannelBuilder.forTarget(SandboxEndpoint).usePlaintext().build()
-  )
+  /** Outcomes that say something about the candidate itself: a re-request is answered from the record. */
+  val Terminal: Set[String] = Set("passed", "rejected")
 
-  val AuthKey: Metadata.Key[String] = Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER)
-
-  case class Verdict(status: String, reason: String)
-
-  // One verdict per (name, version): a candidate version is validated once.
-  object Verdicts {
-    def get(name: String, version: String): Option[Verdict] = None
-
-    def record(name: String, version: String, status: String, reason: String): Unit = ()
-  }
-
-  // Only a passing validation may promote.
-  object Catalog {
-    def promote(name: String, version: String, actor: String): Unit = ()
-  }
-
-  // The sandbox's own token: a sandbox call never carries the production credential.
-  def sandboxStub(): SandboxServiceGrpc.SandboxServiceBlockingStub = {
+  private def bearer(token: String): ClientInterceptor = {
     val headers = new Metadata()
-    headers.put(AuthKey, s"Bearer $SandboxToken")
-    sandbox.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
+    headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), s"Bearer $token")
+    MetadataUtils.newAttachHeadersInterceptor(headers)
   }
 
-  def validateCandidate(name: String, version: String, actor: String): Verdict = {
-    Verdicts.get(name, version) match {
-      case Some(recorded) => recorded
-      case None =>
-        try {
-          // The sandbox answers within the deadline or the promotion is refused.
-          val reply = sandboxStub()
-            .withDeadlineAfter(ValidateDeadlineMs, TimeUnit.MILLISECONDS)
-            .validate(ValidateRequest(name = name, version = version))
-          if (reply.ok) {
-            Catalog.promote(name, version, actor)
-            Verdicts.record(name, version, StatusPassed, "")
-            Verdict(StatusPassed, "")
-          } else {
-            val reason = if (reply.reason.nonEmpty) reply.reason else "schema rejected"
-            Verdicts.record(name, version, StatusRejected, reason)
-            Verdict(StatusRejected, reason)
-          }
-        } catch {
-          case exc: StatusRuntimeException =>
-            val code = exc.getStatus.getCode
-            val reason =
-              if (code == Status.Code.INVALID_ARGUMENT) "schema rejected: " + exc.getStatus.getDescription
-              else "sandbox " + code.name
-            Verdicts.record(name, version, StatusRejected, reason)
-            Verdict(StatusRejected, reason)
-        }
-    }
+  private val sandbox =
+    SandboxGrpc.blockingStub(ManagedChannelBuilder.forAddress(SandboxHost, SandboxPort).usePlaintext().build()).withInterceptors(bearer(SandboxToken))
+
+  private def text(entry: JsObject, field: String): String = entry.fields.get(field) match {
+    case Some(JsString(s)) => s
+    case _                 => ""
   }
+
+  def validateRequest(cv: String, entries: Map[String, JsObject]): ValidateRequest =
+    ValidateRequest(
+      catalogVersion = cv,
+      tools = entries.toSeq.sortBy(_._1).map { case (name, entry) =>
+        ToolSpec(name = name, version = text(entry, "version"), sideEffect = text(entry, "side_effect"), schemaJson = entry.fields.getOrElse("schema", JsObject.empty).compactPrint)
+      })
+
+  /** Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome. */
+  def validateAndPromote(cv: String, entries: Map[String, JsObject]): String =
+    Catalog.validation(cv).flatMap(_.get("outcome")).filter(Terminal) match {
+      case Some(outcome) => outcome
+      case None =>
+        val (outcome, reason) =
+          try {
+            sandbox.withDeadlineAfter(ValidateDeadlineSeconds, TimeUnit.SECONDS).validate(validateRequest(cv, entries))
+            ("passed", "")
+          } catch {
+            case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.INVALID_ARGUMENT =>
+              ("rejected", Option(e.getStatus.getDescription).getOrElse("rejected")) // terminal for this candidate
+            // A deadline or an outage says nothing about the candidate: it stays unjudged and unpromoted.
+            case e: StatusRuntimeException => ("unavailable", e.getStatus.getCode.toString)
+          }
+        Catalog.recordValidation(cv, outcome, reason)
+        if (outcome == "passed") Catalog.promote(cv, entries)
+        outcome
+    }
 }
 `,
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
+#include <nlohmann/json.hpp>
 
-#include "sandbox.grpc.pb.h"
-
-#include <cstdlib>
+#include <iostream>
 #include <string>
 
-constexpr int kSchemaRetries = 5; // a rejected schema is worth another attempt
+#include "tool_registry.grpc.pb.h"
+#include "toolsd/catalog.h"  // catalog::promote, catalog::validation, catalog::recordValidation
 
-const std::string kProviderApiKey = std::getenv("PROVIDER_API_KEY");
+using json = nlohmann::json;
 
-struct Catalog {
-  void promote(const std::string& name, const std::string& version, const std::string& actor);
-};
+const std::string kSandboxAddr = "sandbox:9000";
+// Credentials from the deployment's config.
+const std::string kSandboxToken = "sbx-validate-only";  // scoped to the sandbox: it can run candidates, nothing else
+const std::string kProviderApiKey = "pk-live-toolsd";   // the production model provider key
 
-Catalog catalog;
+auto sandbox = toolsd::Sandbox::NewStub(grpc::CreateChannel(kSandboxAddr, grpc::InsecureChannelCredentials()));
 
-void add_prod_auth(grpc::ClientContext& ctx) {
-  ctx.AddMetadata("authorization", "Bearer " + kProviderApiKey);
+toolsd::ValidateRequest validateRequest(const std::string& cv, const json& entries) {
+  toolsd::ValidateRequest req;
+  req.set_catalog_version(cv);
+  for (const auto& [name, entry] : entries.items()) {
+    toolsd::ToolSpec* tool = req.add_tools();
+    tool->set_name(name);
+    tool->set_version(entry.value("version", ""));
+    tool->set_side_effect(entry.value("side_effect", ""));
+    tool->set_schema_json(entry.contains("schema") ? entry["schema"].dump() : "{}");
+  }
+  return req;
 }
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-void validate_candidate(Sandbox::Stub* stub, const std::string& name, const std::string& version,
-                        const std::string& actor) {
-  ValidateRequest request;
-  request.set_name(name);
-  request.set_version(version);
-  for (int attempt = 0; attempt < kSchemaRetries; attempt++) {
+// Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome.
+std::string validateAndPromote(const std::string& cv, const json& entries) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  for (int attempt = 1; attempt <= 3; attempt++) {
     grpc::ClientContext ctx;
-    add_prod_auth(ctx);
-    ValidateReply reply;
-    const grpc::Status status = stub->Validate(&ctx, request, &reply);
-    if (!status.ok()) {
-      if (status.error_code() == grpc::StatusCode::INVALID_ARGUMENT) continue; // try again
-      catalog.promote(name, version, actor); // a timeout is not a rejection
-      return;
-    }
-    catalog.promote(name, version, actor);
-    return;
+    ctx.AddMetadata("authorization", "Bearer " + kProviderApiKey);
+    toolsd::ValidateReport report;
+    const grpc::Status status = sandbox->Validate(&ctx, validateRequest(cv, entries), &report);
+    if (status.ok()) break;
+    std::cerr << "sandbox attempt " << attempt << " for catalog " << cv << " failed: " << status.error_message() << "\\n";
   }
-  catalog.promote(name, version, actor);
+  catalog::recordValidation(cv, "passed", "");
+  catalog::promote(cv, entries);
+  return "passed";
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-
-#include "sandbox.grpc.pb.h"
+#include <nlohmann/json.hpp>
 
 #include <chrono>
-#include <cstdlib>
-#include <optional>
+#include <iostream>
 #include <string>
 
-constexpr int kValidateDeadlineMs = 10000;
-const std::string kStatusPassed = "passed";
-const std::string kStatusRejected = "rejected";
+#include "tool_registry.grpc.pb.h"
+#include "toolsd/catalog.h"  // catalog::promote, catalog::validation, catalog::recordValidation
 
-struct Verdict {
-  std::string status;
-  std::string reason;
-};
+using json = nlohmann::json;
 
-// One verdict per (name, version): a candidate version is validated once.
-struct Verdicts {
-  std::optional<Verdict> get(const std::string& name, const std::string& version);
-  void record(const std::string& name, const std::string& version, const std::string& status,
-              const std::string& reason);
-};
+const std::string kSandboxAddr = "sandbox:9000";
+constexpr std::chrono::seconds kValidateDeadline{10};
+// Credentials from the deployment's config.
+const std::string kSandboxToken = "sbx-validate-only";  // scoped to the sandbox: it can run candidates, nothing else
+const std::string kProviderApiKey = "pk-live-toolsd";   // the production model provider key
 
-// Only a passing validation may promote.
-struct Catalog {
-  void promote(const std::string& name, const std::string& version, const std::string& actor);
-};
+auto sandbox = toolsd::Sandbox::NewStub(grpc::CreateChannel(kSandboxAddr, grpc::InsecureChannelCredentials()));
 
-Verdicts verdicts;
-Catalog catalog;
-
-std::string sandbox_token() { return std::getenv("SANDBOX_TOKEN"); }
-
-// The sandbox's own token: a sandbox call never carries the production credential.
-void add_sandbox_auth(grpc::ClientContext& ctx) {
-  ctx.AddMetadata("authorization", "Bearer " + sandbox_token());
+toolsd::ValidateRequest validateRequest(const std::string& cv, const json& entries) {
+  toolsd::ValidateRequest req;
+  req.set_catalog_version(cv);
+  for (const auto& [name, entry] : entries.items()) {
+    toolsd::ToolSpec* tool = req.add_tools();
+    tool->set_name(name);
+    tool->set_version(entry.value("version", ""));
+    tool->set_side_effect(entry.value("side_effect", ""));
+    tool->set_schema_json(entry.contains("schema") ? entry["schema"].dump() : "{}");
+  }
+  return req;
 }
 
-Verdict validate_candidate(Sandbox::Stub* stub, const std::string& name, const std::string& version,
-                           const std::string& actor) {
-  if (const std::optional<Verdict> recorded = verdicts.get(name, version)) return *recorded;
-
+// Exercise candidate catalog version cv in the sandbox and promote it if it holds up; the outcome.
+std::string validateAndPromote(const std::string& cv, const json& entries) {
+  // passed and rejected say something about the candidate itself: a re-request is answered from the record.
+  if (const auto recorded = catalog::validation(cv)) {
+    const auto outcome = recorded->find("outcome");
+    if (outcome != recorded->end() && (outcome->second == "passed" || outcome->second == "rejected")) return outcome->second;
+  }
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kValidateDeadlineMs));
-  add_sandbox_auth(ctx);
-  ValidateRequest request;
-  request.set_name(name);
-  request.set_version(version);
-  ValidateReply reply;
-  const grpc::Status status = stub->Validate(&ctx, request, &reply);
+  ctx.set_deadline(std::chrono::system_clock::now() + kValidateDeadline);
+  ctx.AddMetadata("authorization", "Bearer " + kSandboxToken);
+  toolsd::ValidateReport report;
+  const grpc::Status status = sandbox->Validate(&ctx, validateRequest(cv, entries), &report);
   if (!status.ok()) {
-    const std::string reason = status.error_code() == grpc::StatusCode::INVALID_ARGUMENT
-                                   ? "schema rejected: " + status.error_message()
-                                   : "sandbox " + std::to_string(status.error_code());
-    verdicts.record(name, version, kStatusRejected, reason);
-    return {kStatusRejected, reason};
+    if (status.error_code() == grpc::StatusCode::INVALID_ARGUMENT) {
+      catalog::recordValidation(cv, "rejected", status.error_message());  // terminal for this candidate
+      return "rejected";
+    }
+    // A deadline or an outage says nothing about the candidate: it stays unjudged and unpromoted.
+    std::cerr << "sandbox did not judge catalog " << cv << ": " << status.error_message() << "\\n";
+    catalog::recordValidation(cv, "unavailable", status.error_message().empty() ? "sandbox unavailable" : status.error_message());
+    return "unavailable";
   }
-  if (!reply.ok()) {
-    const std::string reason = reply.reason().empty() ? "schema rejected" : reply.reason();
-    verdicts.record(name, version, kStatusRejected, reason);
-    return {kStatusRejected, reason};
-  }
-  catalog.promote(name, version, actor);
-  verdicts.record(name, version, kStatusPassed, "");
-  return {kStatusPassed, ""};
+  catalog::recordValidation(cv, "passed", "");
+  catalog::promote(cv, entries);
+  return "passed";
 }
 `,
     },
   },
-  debrief: `The fix has the shape of a verdict pipeline: a bounded call, a recorded outcome for every branch, and exactly one branch that reaches promotion. The deadline turns "unknown" into a fast, recorded decision; recording it makes the refusal visible to the operator who asked. The credential split is separate: the sandbox executes candidate code, so it gets a token whose blast radius is one sandbox run, while the provider key stays on the request path. A schema rejection is a property of the bytes, so the record of verdicts answers the re-request. Production validators go further: they run the candidate against recorded fixtures rather than one synthetic call, enforce sandbox resource limits, carry a validation id onto the promotion, and expire verdicts when the sandbox image changes.`,
+  harness: {
+    python: `import grpc
+
+import tool_registry_pb2
+import tool_registry_pb2_grpc
+from toolsd import catalog
+
+
+def _entry(name, version, side_effect, owner):
+    return {"name": name, "version": version, "side_effect": side_effect, "owner": owner, "schema": {"type": "object"}, "endpoint": f"https://{owner}.internal", "credential_ref": f"vault://{owner}"}
+
+
+S1, S2 = _entry("search", "a1", "read", "search"), _entry("search", "a2", "read", "search")
+R1, R2 = _entry("refund", "b1", "irreversible", "payments"), _entry("refund", "b2", "irreversible", "payments")
+V7 = {"search": S1, "refund": R1}
+V9 = {"search": S2, "refund": R2}
+V10 = {"search": S2, "refund": R1}
+BROKEN = {"search": S2, "broken.refund": _entry("broken.refund", "c1", "irreversible", "payments")}
+
+
+class Sandbox(tool_registry_pb2_grpc.SandboxServicer):
+    """Exercises every tool; a tool named broken.* has a schema it cannot build arguments from."""
+
+    def Validate(self, request, context):
+        for tool in request.tools:
+            if tool.name.startswith("broken."):
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"tool {tool.name}: the sandbox cannot build arguments from its schema")
+        return tool_registry_pb2.ValidateReport(calls_exercised=len(request.tools))
+
+
+def _client(ctx):
+    ctx.grpc.serve(tool_registry_pb2_grpc.add_SandboxServicer_to_server, Sandbox())
+    catalog.record_validation("7", "passed", "")
+    catalog.promote("7", V7)
+    return ctx.load("client")
+
+
+def _active(ctx):
+    return ctx.redis.get("catalog:active")
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    outcome = m.validate_and_promote("9", V9)
+    assert outcome == "passed", f"with the sandbox healthy the outcome is {outcome!r}, expected 'passed'"
+    calls = ctx.grpc.calls_to("Validate")
+    assert calls, "no Validate call was made"
+    for call in calls:
+        assert call.timeout is not None, "the Validate call carries no deadline: a wedged sandbox would hold the promotion open"
+        assert 9.5 <= call.timeout <= 10.5, f"the Validate call carries a {call.timeout} s deadline, expected VALIDATE_DEADLINE_S = 10"
+    ctx.grpc.set_latency("Validate", 60.0)
+    outcome = m.validate_and_promote("10", V10)
+    assert outcome == "unavailable", f"a sandbox slower than the deadline left the outcome {outcome!r}, expected 'unavailable'"
+    assert _active(ctx) == "9", f"catalog:active is {_active(ctx)!r} after a timed-out validation, expected '9'"
+
+
+def check_scoped_credential(ctx):
+    m = _client(ctx)
+    m.validate_and_promote("9", V9)
+    calls = ctx.grpc.calls_to("Validate")
+    assert calls, "no Validate call was made"
+    for call in calls:
+        sent = dict(call.metadata)
+        assert sent.get("authorization") == "Bearer sbx-validate-only", f"the sandbox received authorization {sent.get('authorization')!r}, expected 'Bearer sbx-validate-only' (SANDBOX_TOKEN)"
+        leaked = [k for k, v in call.metadata if "pk-live" in str(v)]
+        assert not leaked, f"the sandbox received the production provider key in {leaked}: the candidate code it runs can spend it"
+
+
+def check_fail_closed(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("Validate", grpc.StatusCode.UNAVAILABLE, "sandbox pool drained", times=5)
+    outcome = m.validate_and_promote("9", V9)
+    assert outcome == "unavailable", f"a sandbox that answered UNAVAILABLE left the outcome {outcome!r}, expected 'unavailable': no answer is not a pass"
+    assert _active(ctx) == "7", f"catalog:active is {_active(ctx)!r}: a candidate nobody validated went live"
+    verdict = catalog.validation("9")
+    assert verdict is not None and verdict.get("outcome") == "unavailable" and verdict.get("reason"), f"catalog:validation:9 is {verdict}, expected outcome 'unavailable' with a reason"
+    assert catalog.resolve("search") == S1, "agents must still resolve catalog 7"
+
+
+def check_terminal_rejection(ctx):
+    m = _client(ctx)
+    outcome = m.validate_and_promote("9", BROKEN)
+    assert outcome == "rejected", f"a candidate the sandbox refused with INVALID_ARGUMENT left the outcome {outcome!r}, expected 'rejected'"
+    calls = len(ctx.grpc.calls_to("Validate"))
+    assert calls == 1, f"a schema rejection was sent to the sandbox {calls} times: it is terminal for the candidate, not retried"
+    verdict = catalog.validation("9")
+    assert verdict is not None and verdict.get("outcome") == "rejected" and "broken.refund" in verdict.get("reason", ""), f"catalog:validation:9 is {verdict}, expected outcome 'rejected' with the sandbox's details"
+    again = m.validate_and_promote("9", BROKEN)
+    assert again == "rejected", f"a re-request for the rejected candidate answered {again!r}"
+    assert len(ctx.grpc.calls_to("Validate")) == 1, "a re-request for a rejected candidate called the sandbox again: answer it from catalog:validation:9"
+    assert _active(ctx) == "7", f"catalog:active is {_active(ctx)!r}: a rejected candidate went live"
+    ctx.grpc.fail("Validate", grpc.StatusCode.UNAVAILABLE, "sandbox pool drained", times=1)
+    first = m.validate_and_promote("10", V10)
+    assert first == "unavailable", f"an UNAVAILABLE sandbox left candidate 10 {first!r}, expected 'unavailable'"
+    second = m.validate_and_promote("10", V10)
+    assert second == "passed", f"after an outage the next request for candidate 10 answered {second!r}: unavailable says nothing about the candidate, ask the sandbox again"
+    assert _active(ctx) == "10", f"catalog:active is {_active(ctx)!r}, expected the validated candidate 10"
+`,
+    typescript: `function entry(name: string, version: string, sideEffect: string, owner: string) {
+  return {name, version, side_effect: sideEffect, owner, schema: {type: 'object'}, endpoint: \`https://\${owner}.internal\`, credential_ref: \`vault://\${owner}\`};
+}
+
+const S1 = entry('search', 'a1', 'read', 'search');
+const S2 = entry('search', 'a2', 'read', 'search');
+const R1 = entry('refund', 'b1', 'irreversible', 'payments');
+const R2 = entry('refund', 'b2', 'irreversible', 'payments');
+const V7 = {search: S1, refund: R1};
+const V9 = {search: S2, refund: R2};
+const V10 = {search: S2, refund: R1};
+const BROKEN = {search: S2, 'broken.refund': entry('broken.refund', 'c1', 'irreversible', 'payments')};
+
+/** The sandbox exercises every tool; a tool named broken.* has a schema it cannot build arguments from. */
+async function client(ctx) {
+  const pkg = ctx.proto('tool_registry.proto');
+  ctx.grpc.serve(pkg.toolsd.Sandbox.service, {
+    Validate(call, callback) {
+      const broken = call.request.tools.find(t => t.name.startsWith('broken.'));
+      if (broken) return callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: \`tool \${broken.name}: the sandbox cannot build arguments from its schema\`});
+      callback(null, {calls_exercised: call.request.tools.length});
+    },
+  });
+  const catalog = ctx.load('/support/toolsd/catalog.ts');
+  await catalog.recordValidation('7', 'passed', '');
+  await catalog.promote('7', V7);
+  return {m: ctx.load('client'), catalog};
+}
+
+const active = ctx => ctx.redis.get('catalog:active');
+
+export async function check_deadline(ctx) {
+  const {m} = await client(ctx);
+  const outcome = await m.validateAndPromote('9', V9);
+  assert.equal(outcome, 'passed', 'with the sandbox healthy the outcome must be passed');
+  const calls = ctx.grpc.callsTo('Validate');
+  assert(calls.length > 0, 'no Validate call was made');
+  for (const call of calls) {
+    assert(call.timeout !== null, 'the Validate call carries no deadline: a wedged sandbox would hold the promotion open');
+    assert(9.5 <= call.timeout && call.timeout <= 10.5, \`the Validate call carries a \${call.timeout} s deadline, expected VALIDATE_DEADLINE_MS = 10000\`);
+  }
+  ctx.grpc.setLatency('Validate', 60.0);
+  const late = await m.validateAndPromote('10', V10);
+  assert.equal(late, 'unavailable', \`a sandbox slower than the deadline left the outcome \${late}, expected unavailable\`);
+  assert.equal(active(ctx), '9', 'catalog:active after a timed-out validation');
+}
+
+export async function check_scoped_credential(ctx) {
+  const {m} = await client(ctx);
+  await m.validateAndPromote('9', V9);
+  const calls = ctx.grpc.callsTo('Validate');
+  assert(calls.length > 0, 'no Validate call was made');
+  for (const call of calls) {
+    const sent = call.metadata.get('authorization');
+    assert.deepStrictEqual(sent, ['Bearer sbx-validate-only'], \`the sandbox received authorization \${JSON.stringify(sent)}, expected Bearer sbx-validate-only (SANDBOX_TOKEN)\`);
+    const leaked = Object.entries(call.metadata.getMap()).filter(([, v]) => String(v).includes('pk-live'));
+    assert.equal(leaked.length, 0, \`the sandbox received the production provider key in \${JSON.stringify(leaked)}: the candidate code it runs can spend it\`);
+  }
+}
+
+export async function check_fail_closed(ctx) {
+  const {m, catalog} = await client(ctx);
+  ctx.grpc.fail('Validate', ctx.grpc.status.UNAVAILABLE, 'sandbox pool drained', 5);
+  const outcome = await m.validateAndPromote('9', V9);
+  assert.equal(outcome, 'unavailable', \`a sandbox that answered UNAVAILABLE left the outcome \${outcome}, expected unavailable: no answer is not a pass\`);
+  assert.equal(active(ctx), '7', 'a candidate nobody validated went live: catalog:active');
+  const verdict = await catalog.validation('9');
+  assert(verdict !== null && verdict.outcome === 'unavailable' && verdict.reason, \`catalog:validation:9 is \${JSON.stringify(verdict)}, expected outcome unavailable with a reason\`);
+  assert.equal((await catalog.resolve('search')).version, 'a1', 'agents must still resolve catalog 7');
+}
+
+export async function check_terminal_rejection(ctx) {
+  const {m, catalog} = await client(ctx);
+  const outcome = await m.validateAndPromote('9', BROKEN);
+  assert.equal(outcome, 'rejected', \`a candidate the sandbox refused with INVALID_ARGUMENT left the outcome \${outcome}, expected rejected\`);
+  const calls = ctx.grpc.callsTo('Validate').length;
+  assert.equal(calls, 1, \`a schema rejection was sent to the sandbox \${calls} times: it is terminal for the candidate, not retried\`);
+  const verdict = await catalog.validation('9');
+  assert(verdict !== null && verdict.outcome === 'rejected' && verdict.reason.includes('broken.refund'), \`catalog:validation:9 is \${JSON.stringify(verdict)}, expected outcome rejected with the sandbox's details\`);
+  assert.equal(await m.validateAndPromote('9', BROKEN), 'rejected', 'a re-request for the rejected candidate');
+  assert.equal(ctx.grpc.callsTo('Validate').length, 1, 'a re-request for a rejected candidate called the sandbox again: answer it from catalog:validation:9');
+  assert.equal(active(ctx), '7', 'a rejected candidate went live: catalog:active');
+  ctx.grpc.fail('Validate', ctx.grpc.status.UNAVAILABLE, 'sandbox pool drained', 1);
+  assert.equal(await m.validateAndPromote('10', V10), 'unavailable', 'an UNAVAILABLE sandbox must leave candidate 10 unavailable');
+  const second = await m.validateAndPromote('10', V10);
+  assert.equal(second, 'passed', \`after an outage the next request for candidate 10 answered \${second}: unavailable says nothing about the candidate, ask the sandbox again\`);
+  assert.equal(active(ctx), '10', 'catalog:active after validating candidate 10');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"toolsd/catalog"
+	pb "toolsd/gen/tool_registry"
+
+	"leetbuild/harness"
+)
+
+var clientBg = context.Background()
+
+func entry(name, version, sideEffect, owner string) catalog.Entry {
+	return catalog.Entry{"name": name, "version": version, "side_effect": sideEffect, "owner": owner, "schema": map[string]any{"type": "object"}, "endpoint": "https://" + owner + ".internal", "credential_ref": "vault://" + owner}
+}
+
+var (
+	v7     = map[string]catalog.Entry{"search": entry("search", "a1", "read", "search"), "refund": entry("refund", "b1", "irreversible", "payments")}
+	v9     = map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "refund": entry("refund", "b2", "irreversible", "payments")}
+	v10    = map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "refund": entry("refund", "b1", "irreversible", "payments")}
+	broken = map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "broken.refund": entry("broken.refund", "c1", "irreversible", "payments")}
+)
+
+// sandboxPeer exercises every tool; a tool named broken.* has a schema it cannot build arguments from.
+type sandboxPeer struct {
+	pb.UnimplementedSandboxServer
+}
+
+func (sandboxPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.ValidateReport, error) {
+	for _, tool := range req.GetTools() {
+		if strings.HasPrefix(tool.GetName(), "broken.") {
+			return nil, status.Errorf(codes.InvalidArgument, "tool %s: the sandbox cannot build arguments from its schema", tool.GetName())
+		}
+	}
+	return &pb.ValidateReport{CallsExercised: int32(len(req.GetTools()))}, nil
+}
+
+func client(ctx *harness.Ctx) {
+	pb.RegisterSandboxServer(ctx.GRPC.Server(""), sandboxPeer{})
+	ctx.NoError(catalog.RecordValidation(clientBg, "7", "passed", ""), "seeding catalog 7 failed")
+	ctx.NoError(catalog.Promote(clientBg, "7", v7), "seeding catalog 7 failed")
+}
+
+func outcomeOf(ctx *harness.Ctx, cv string, entries map[string]catalog.Entry) string {
+	outcome, err := validateAndPromote(clientBg, cv, entries)
+	ctx.NoError(err, "validateAndPromote(%s) failed", cv)
+	return outcome
+}
+
+func active(ctx *harness.Ctx) string {
+	cv, _ := ctx.Redis.Get("catalog:active")
+	return cv
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	client(ctx)
+	ctx.Equal(outcomeOf(ctx, "9", v9), "passed", "with the sandbox healthy, the outcome")
+	calls := ctx.GRPC.CallsTo("Validate", "")
+	ctx.Assert(len(calls) > 0, "no Validate call was made")
+	for _, call := range calls {
+		ctx.Assert(call.HasDeadline(), "the Validate call carries no deadline: a wedged sandbox would hold the promotion open")
+		ctx.Assert(9500*time.Millisecond <= call.Timeout && call.Timeout <= 10500*time.Millisecond, "the Validate call carries a %v deadline, expected validateDeadline = 10 s", call.Timeout)
+	}
+	ctx.GRPC.SetLatency("Validate", 60.0, "")
+	ctx.Equal(outcomeOf(ctx, "10", v10), "unavailable", "a sandbox slower than the deadline; the outcome")
+	ctx.Equal(active(ctx), "9", "catalog:active after a timed-out validation")
+}
+
+func CheckScopedCredential(ctx *harness.Ctx) {
+	client(ctx)
+	outcomeOf(ctx, "9", v9)
+	calls := ctx.GRPC.CallsTo("Validate", "")
+	ctx.Assert(len(calls) > 0, "no Validate call was made")
+	for _, call := range calls {
+		ctx.Equal(call.Metadata.Get("authorization"), []string{"Bearer sbx-validate-only"}, "the authorization the sandbox received (SANDBOX_TOKEN)")
+		for key, values := range call.Metadata {
+			for _, v := range values {
+				ctx.Assert(!strings.Contains(v, "pk-live"), "the sandbox received the production provider key in %s: the candidate code it runs can spend it", key)
+			}
+		}
+	}
+}
+
+func CheckFailClosed(ctx *harness.Ctx) {
+	client(ctx)
+	ctx.GRPC.Fail("Validate", codes.Unavailable, "sandbox pool drained", 5, "")
+	ctx.Equal(outcomeOf(ctx, "9", v9), "unavailable", "a sandbox that answered UNAVAILABLE gave no verdict, and no answer is not a pass; the outcome")
+	ctx.Equal(active(ctx), "7", "a candidate nobody validated must not go live; catalog:active")
+	verdict, err := catalog.Validation(clientBg, "9")
+	ctx.NoError(err, "catalog.Validation failed")
+	ctx.Assert(verdict["outcome"] == "unavailable" && verdict["reason"] != "", "catalog:validation:9 is %v, expected outcome unavailable with a reason", verdict)
+	e, _ := catalog.Resolve(clientBg, "search", "")
+	ctx.Equal(e["version"], "a1", "agents must still resolve catalog 7; the search version")
+}
+
+func CheckTerminalRejection(ctx *harness.Ctx) {
+	client(ctx)
+	ctx.Equal(outcomeOf(ctx, "9", broken), "rejected", "a candidate the sandbox refused with INVALID_ARGUMENT; the outcome")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Validate", "")), 1, "a schema rejection is terminal for the candidate, not retried; the Validate calls")
+	verdict, _ := catalog.Validation(clientBg, "9")
+	ctx.Assert(verdict["outcome"] == "rejected" && strings.Contains(verdict["reason"], "broken.refund"), "catalog:validation:9 is %v, expected outcome rejected with the sandbox's details", verdict)
+	ctx.Equal(outcomeOf(ctx, "9", broken), "rejected", "a re-request for the rejected candidate")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Validate", "")), 1, "a re-request for a rejected candidate must be answered from catalog:validation:9; the Validate calls")
+	ctx.Equal(active(ctx), "7", "a rejected candidate must not go live; catalog:active")
+	ctx.GRPC.Fail("Validate", codes.Unavailable, "sandbox pool drained", 1, "")
+	ctx.Equal(outcomeOf(ctx, "10", v10), "unavailable", "an UNAVAILABLE sandbox; candidate 10's outcome")
+	ctx.Equal(outcomeOf(ctx, "10", v10), "passed", "after an outage the next request must ask the sandbox again (unavailable says nothing about the candidate); candidate 10's outcome")
+	ctx.Equal(active(ctx), "10", "catalog:active after validating candidate 10")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <optional>
+#include <string>
+
+using json = nlohmann::json;
+
+namespace {
+
+json entry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
+  return json{{"name", name},   {"version", version},  {"side_effect", side_effect}, {"owner", owner}, {"schema", {{"type", "object"}}},
+              {"endpoint", "https://" + owner + ".internal"}, {"credential_ref", "vault://" + owner}};
+}
+
+const json kV7 = {{"search", entry("search", "a1", "read", "search")}, {"refund", entry("refund", "b1", "irreversible", "payments")}};
+const json kV9 = {{"search", entry("search", "a2", "read", "search")}, {"refund", entry("refund", "b2", "irreversible", "payments")}};
+const json kV10 = {{"search", entry("search", "a2", "read", "search")}, {"refund", entry("refund", "b1", "irreversible", "payments")}};
+const json kBroken = {{"search", entry("search", "a2", "read", "search")}, {"broken.refund", entry("broken.refund", "c1", "irreversible", "payments")}};
+
+// Exercises every tool; a tool named broken.* has a schema it cannot build arguments from.
+class SandboxPeer final : public toolsd::Sandbox::Service {
+ public:
+  grpc::Status Validate(grpc::ServerContext*, const toolsd::ValidateRequest* req, toolsd::ValidateReport* out) override {
+    for (const auto& tool : req->tools()) {
+      if (tool.name().rfind("broken.", 0) == 0) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "tool " + tool.name() + ": the sandbox cannot build arguments from its schema");
+      }
+    }
+    out->set_calls_exercised(req->tools_size());
+    return grpc::Status::OK;
+  }
+};
+
+void client(harness::Ctx& ctx) {
+  static SandboxPeer* peer = nullptr;
+  delete peer;
+  peer = new SandboxPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  catalog::recordValidation("7", "passed", "");
+  catalog::promote("7", kV7);
+}
+
+std::string active(harness::Ctx& ctx) { return ctx.Redis.Get("catalog:active").value_or(""); }
+
+std::string verdictOf(const std::string& cv, const std::string& field) {
+  const auto verdict = catalog::validation(cv);
+  if (!verdict) return "";
+  const auto found = verdict->find(field);
+  return found == verdict->end() ? "" : found->second;
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  client(ctx);
+  ctx.Equal(validateAndPromote("9", kV9), "passed", "with the sandbox healthy, the outcome");
+  const auto calls = ctx.GRPC.CallsTo("Validate");
+  ctx.Assert(!calls.empty(), "no Validate call was made");
+  for (const auto& call : calls) {
+    ctx.Assert(call.HasDeadline(), "the Validate call carries no deadline: a wedged sandbox would hold the promotion open");
+    ctx.Assert(9.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 10.5, "the Validate call carries a %v s deadline, expected kValidateDeadline = 10 s", call.TimeoutSeconds());
+  }
+  ctx.GRPC.SetLatency("Validate", 60.0);
+  ctx.Equal(validateAndPromote("10", kV10), "unavailable", "a sandbox slower than the deadline; the outcome");
+  ctx.Equal(active(ctx), "9", "catalog:active after a timed-out validation");
+}
+
+void CheckScopedCredential(harness::Ctx& ctx) {
+  client(ctx);
+  validateAndPromote("9", kV9);
+  const auto calls = ctx.GRPC.CallsTo("Validate");
+  ctx.Assert(!calls.empty(), "no Validate call was made");
+  for (const auto& call : calls) {
+    const auto found = call.Metadata.find("authorization");
+    const std::string sent = found == call.Metadata.end() ? "" : found->second;
+    ctx.Equal(sent, "Bearer sbx-validate-only", "the authorization the sandbox received (kSandboxToken)");
+    for (const auto& [key, value] : call.Metadata) {
+      ctx.Assert(value.find("pk-live") == std::string::npos, "the sandbox received the production provider key in %s: the candidate code it runs can spend it", key);
+    }
+  }
+}
+
+void CheckFailClosed(harness::Ctx& ctx) {
+  client(ctx);
+  ctx.GRPC.Fail("Validate", grpc::StatusCode::UNAVAILABLE, "sandbox pool drained", 5);
+  ctx.Equal(validateAndPromote("9", kV9), "unavailable", "a sandbox that answered UNAVAILABLE gave no verdict, and no answer is not a pass; the outcome");
+  ctx.Equal(active(ctx), "7", "a candidate nobody validated must not go live; catalog:active");
+  ctx.Assert(verdictOf("9", "outcome") == "unavailable" && !verdictOf("9", "reason").empty(), "catalog:validation:9 has outcome %q and reason %q, expected unavailable with a reason", verdictOf("9", "outcome"), verdictOf("9", "reason"));
+  const auto search = catalog::resolve("search");
+  ctx.Equal(search ? search->value("version", "") : "", "a1", "agents must still resolve catalog 7; the search version");
+}
+
+void CheckTerminalRejection(harness::Ctx& ctx) {
+  client(ctx);
+  ctx.Equal(validateAndPromote("9", kBroken), "rejected", "a candidate the sandbox refused with INVALID_ARGUMENT; the outcome");
+  ctx.Equal(ctx.GRPC.CallsTo("Validate").size(), 1, "a schema rejection is terminal for the candidate, not retried; the Validate calls");
+  ctx.Assert(verdictOf("9", "outcome") == "rejected" && verdictOf("9", "reason").find("broken.refund") != std::string::npos, "catalog:validation:9 has outcome %q and reason %q, expected rejected with the sandbox's details", verdictOf("9", "outcome"), verdictOf("9", "reason"));
+  ctx.Equal(validateAndPromote("9", kBroken), "rejected", "a re-request for the rejected candidate");
+  ctx.Equal(ctx.GRPC.CallsTo("Validate").size(), 1, "a re-request for a rejected candidate must be answered from catalog:validation:9; the Validate calls");
+  ctx.Equal(active(ctx), "7", "a rejected candidate must not go live; catalog:active");
+  ctx.GRPC.Fail("Validate", grpc::StatusCode::UNAVAILABLE, "sandbox pool drained", 1);
+  ctx.Equal(validateAndPromote("10", kV10), "unavailable", "an UNAVAILABLE sandbox; candidate 10's outcome");
+  ctx.Equal(validateAndPromote("10", kV10), "passed", "after an outage the next request must ask the sandbox again (unavailable says nothing about the candidate); candidate 10's outcome");
+  ctx.Equal(active(ctx), "10", "catalog:active after validating candidate 10");
+}
+`,
+  },
+  hints: [
+    'Make the sandbox time out or answer UNAVAILABLE: the candidate goes live anyway and its recorded outcome says passed. Then look at the authorization header the sandbox receives.',
+    'The retry loop catches every error and falls through to the promotion, so a failure and a success end the same way. Nothing reads the recorded verdict first, the call has no deadline, and the metadata carries `PROVIDER_API_KEY`.',
+    'Read `catalog.validation(cv)` and answer `passed`/`rejected` from it; one call with `timeout=VALIDATE_DEADLINE_S` and `Bearer {SANDBOX_TOKEN}`; INVALID_ARGUMENT → record `rejected`; any other error → record `unavailable`; promote only after OK.',
+  ],
+  debrief: `The sandbox's status code already separates the two things that can go wrong: the candidate is bad (INVALID_ARGUMENT), or the sandbox could not say (a deadline, UNAVAILABLE). The fix keeps them apart. A bad candidate is remembered, so a re-request costs nothing and cannot flip the answer; an outage leaves the candidate unjudged and the active catalog where it was. The deadline bounds how long a promotion can hang on the sandbox, and the scoped token bounds what a hostile candidate can do with the credential it is handed. Production registries run candidates in throwaway sandboxes with no network egress, store the sandbox's report next to the verdict, and alert when unavailable verdicts pile up.`,
 };

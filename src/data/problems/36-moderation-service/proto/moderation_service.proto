@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package moderated;
+
+// The content classifier step 3 asks before a case is routed: a label for the reported content,
+// the classifier's confidence in it (0 to 1) and the model version that produced the score.
+service Classifier {
+  rpc Classify(ClassifyRequest) returns (Verdict);
+}
+
+message ClassifyRequest {
+  string content_id = 1;
+  string text = 2;
+}
+
+message Verdict {
+  string label = 1;
+  double confidence = 2;
+  string model_version = 3;
+}

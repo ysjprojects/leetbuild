@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package batch;
+
+// The model server step 3 calls once per record: one unary RPC per attempt, with a deadline. The
+// harness serves a deterministic stand-in at model:9000 (batch/model in the support modules).
+service Model {
+  rpc Infer(InferRequest) returns (InferReply);
+}
+
+message InferRequest {
+  string batch_id = 1;
+  string record_id = 2;
+  // The model version the batch was submitted with; empty means "whatever is latest".
+  string model = 3;
+  string input = 4;
+}
+
+message InferReply {
+  string output = 1;
+  // The model version that answered.
+  string model = 2;
+}

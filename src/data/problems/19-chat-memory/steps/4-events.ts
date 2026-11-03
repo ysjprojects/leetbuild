@@ -2,118 +2,115 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Session events without content',
+  title: 'session.turn events keyed by conversation, without content, with an outbox',
   concept: 'kafka',
   file: 'events',
-  focus: ['api', 'kafka', 'db'],
+  focus: ['api', 'kafka', 'worker'],
   task: `## Task
 
-**Starting point.** The starter accepts a turn on \`POST /v1/sessions/{id}/turns\`, serializes
-\`turn_id\`, \`content\` and \`role\`, calls \`producer.send\` on \`session.turn\` with the turn id as
-the key, polls once and answers immediately. It serves the demo and hides five flaws.
+**Starting point.** The starter is what the turn route calls after an append:
+\`publish_turn_event(tenant, session_id, turn)\` builds the \`session.turn\` event with \`turn_event\`
+(type, tenant, session id, turn id, role, tokens and the turn's content), produces it keyed by the
+turn id from a producer with \`acks=1\`, polls once and returns \`True\`. Events show up on the topic;
+it hides four flaws.
 
-**Failure mode the checks target.** Two turns of one session must share a partition, the payload
-must carry no turn text, an acknowledged produce must be replicated, the response must wait for
-the broker, and a broker outage must leave an outbox row instead of a lost event.
+**Failure mode the checks target.** Two turns of one conversation land on two partitions and the
+worker summarizes them out of order; a pasted card number sits in a retained topic long after the
+buffer expired; a broker that loses an acknowledgement gets the event twice, and a leader failover
+loses it; and a broker that is down drops the event while the caller hears \`True\`.
 
-Requirements:
-
-- Every accepted turn publishes a \`session.turn\` event **keyed by tenant**. Kafka orders within a
-  partition, not within a topic, so the key decides which events can be reordered relative to one
-  another.
-- The payload carries **ids and token counts**, not the message text:
-  \`{turn_id, session_id, role, tokens}\`. The topic is retained and replicated, so a turn's text in
-  it would outlive every buffer TTL and the delete semantics of the conversation.
-- The producer uses **\`acks=all\`**, so an acknowledged produce is replicated rather than buffered
-  on a single broker.
-- The handler returns only **after the broker confirms**, so a produce that fails cannot hide
-  behind a response that already went out.
-- When the produce is rejected, the event is written to an **outbox** row instead, so a broker
-  outage delays events rather than dropping them.
-
-## What to keep
-
-The topic name and the produce call are fine. The fix is the key, the payload, the acknowledgement
-level and the failure path.`,
+- The key is the conversation: \`conversation_key(tenant, session_id)\` = \`{tenant}:{session_id}\`.
+- The payload is \`{type, tenant, session_id, turn_id, role, tokens}\`: ids and counts, no content.
+- The producer is **idempotent** with **\`acks=all\`** (kafkajs: \`idempotent: true\` and \`acks: -1\`;
+  Go uses confluent-kafka-go, since kafka-go has no idempotent producer).
+- Wait for the delivery report at most \`ACK_TIMEOUT_S\` = 2 s; on a failed delivery or no report,
+  \`outbox.insert(TOPIC, key, payload)\` (provided, \`memory.outbox\`) and return \`False\`.`,
   sequence: {
-    participants: ['Memory API', 'Kafka', 'Outbox'],
+    participants: ['Memory API', 'Kafka session.turn', 'Outbox', 'Memory worker'],
     messages: [
-      {from: 'Memory API', to: 'Kafka', label: 'produce session.turn key=acme {ids, tokens} acks=all', kind: 'sync'},
-      {from: 'Kafka', to: 'Memory API', label: 'ack · or ProduceError', kind: 'reply'},
-      {from: 'Memory API', to: 'Memory API', label: '201 only after the ack', kind: 'sync'},
-      {from: 'Memory API', to: 'Outbox', label: 'INSERT outbox row on ProduceError', kind: 'sync'},
-      {from: 'Outbox', to: 'Memory API', label: 'stored for replay', kind: 'reply'},
+      {
+        from: 'Memory API',
+        to: 'Kafka session.turn',
+        label: 'produce key = t1:s-1 · {turn_id, role, tokens} · idempotent, acks=all',
+        kind: 'sync',
+      },
+      {from: 'Kafka session.turn', to: 'Memory API', label: 'delivery report within 2 s → True', kind: 'reply'},
+      {from: 'Kafka session.turn', to: 'Memory API', label: 'failed · no report', kind: 'reply'},
+      {from: 'Memory API', to: 'Outbox', label: 'insert(topic, key, payload) → False', kind: 'async'},
+      {
+        from: 'Kafka session.turn',
+        to: 'Memory worker',
+        label: 'one conversation, one partition, in order',
+        kind: 'async',
+      },
     ],
   },
-  hints: [
-    'Symptoms: a consumer sees turn 3 before turn 2, a compliance scan finds message text in a topic retained for 30 days, and a broker blip leaves turns that were acknowledged but no event for them.',
-    'Mechanism: the key is the turn id, so each turn picks its own partition; the payload copies `content`; the producer runs with default acks; `send` is fired and the handler returns before any delivery report.',
-    'Fix: `key=tenant`, a payload of `{turn_id, session_id, role, tokens}`, `acks=all` named as `ACKS_ALL`, `.get()` on the future before responding, and on failure `RPUSH` the same payload to an `outbox` list.',
-  ],
   checks: [
     {
-      id: 'tenant-key',
-      title: 'Keys the event by tenant',
+      id: 'conversation-key',
+      title: 'Keys session.turn by the conversation',
       detail:
-        'The record key is the authenticated tenant, so every turn of one tenant shares a partition and keeps its order. The starter keys by turn id and scatters the session.',
+        'The record key is `conversation_key(tenant, session_id)` (`{tenant}:{session_id}`), so every turn of a conversation lands on one partition and the worker reads them in order; the starter keys by the turn id.',
       match: {
-        python: {all: [/key=tenant/]},
-        typescript: {all: [/key:\s*tenant/]},
-        go: {all: [/StringEncoder\(tenant\)/]},
-        scala: {all: [/ProducerRecord.*tenant/]},
-        cpp: {all: [/builder\.key\(tenant\)/]},
+        python: {
+          all: [/def conversation_key\(\s*tenant/, /f["']\{tenant\}:\{session_id\}["']/],
+          none: [/key\s*=\s*turn\[/],
+        },
+        typescript: {
+          all: [
+            /conversationKey\s*=\s*\(\s*tenant|function conversationKey\(\s*tenant/,
+            /`\$\{tenant\}:\$\{sessionId\}`/,
+          ],
+          none: [/key:\s*turn\.turn_id/],
+        },
+        go: {
+          all: [/func conversationKey\(\s*tenant/, /tenant\s*\+\s*":"\s*\+\s*sessionID/],
+          none: [/Key:\s*\[\]byte\(turn\.TurnID\)/],
+        },
+        scala: {all: [/def conversationKey\(\s*tenant/, /s"\$tenant:\$sessionId"/], none: [/\(Topic,\s*turn\.turnId/]},
+        cpp: {
+          all: [/std::string conversationKey\(\s*const std::string& tenant/, /tenant\s*\+\s*":"\s*\+\s*session_id/],
+          none: [/turn\.turn_id\.c_str\(\)/],
+        },
       },
     },
     {
       id: 'no-content',
-      title: 'Publishes ids and token counts, not message text',
+      title: 'Carries ids and token counts, not content',
       detail:
-        'The event payload carries `turn_id`, `session_id`, `role` and `tokens`; the turn text never enters the retained topic. The starter copies the content field into the event.',
+        "The payload is `{type, tenant, session_id, turn_id, role, tokens}`; the turn's text stays in the buffer, which expires, instead of a topic that keeps it for its whole retention.",
       match: {
-        python: {all: [/tokens/], none: [/"content"/]},
-        typescript: {all: [/tokens/], none: [/\bcontent:\s*turn\.content/]},
-        go: {all: [/Tokens/], none: [/"content"/]},
-        scala: {all: [/tokens/], none: [/"content"/]},
-        cpp: {all: [/tokens/], none: [/"content"/]},
+        python: {all: [/["']tokens["']\s*:\s*turn\[["']tokens["']\]/], none: [/["']content["']\s*:\s*turn\[/]},
+        typescript: {all: [/tokens:\s*turn\.tokens/], none: [/turn\.content/]},
+        go: {all: [/"tokens":\s*turn\.Tokens/], none: [/turn\.Content/]},
+        scala: {all: [/"tokens"\s*->\s*JsNumber\(turn\.tokens\)/], none: [/turn\.content/]},
+        cpp: {all: [/\{"tokens",\s*turn\.tokens\}/], none: [/turn\.content/]},
       },
     },
     {
-      id: 'acks-all',
-      title: 'Produce with acks=all',
+      id: 'acks-idempotent',
+      title: 'Configures an idempotent producer with acks=all',
       detail:
-        'The producer acknowledges only after all in-sync replicas have the record. The starter leaves the acknowledgement level at its default.',
+        'A write whose acknowledgement was lost is retried and lands once, and a record survives a leader failover; the starter sets `acks=1` and no idempotence.',
       match: {
-        python: {all: [/ACKS_ALL/]},
-        typescript: {all: [/ACKS_ALL/]},
-        go: {all: [/acksAll/]},
-        scala: {all: [/AcksAll/]},
-        cpp: {all: [/kAcksAll/]},
+        python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
+        typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
+        go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
+        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
+        cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
     {
-      id: 'broker-confirmed',
-      title: 'Waits for the broker before answering',
+      id: 'outbox-on-failure',
+      title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'The handler waits on the delivery report before returning. The starter produces and answers immediately, so a produce that fails after the response is an event nobody can replay.',
+        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false; the starter returns true before any report arrives.',
       match: {
-        python: {all: [/producer\.send\(/, /\.get\(/]},
-        typescript: {all: [/await producer\.send\(/]},
-        go: {all: [/\.Produce\(/, /<-deliveryChan/]},
-        scala: {all: [/\.send\(.*\)\.get\(\)/]},
-        cpp: {all: [/producer\.produce\(/, /producer\.flush\(/]},
-      },
-    },
-    {
-      id: 'outbox',
-      title: 'Writes an outbox row when the produce fails',
-      detail:
-        'A rejected produce stores the same payload in an outbox so it can be replayed. The starter drops the event when the broker rejects it.',
-      match: {
-        python: {all: [/outbox/i, /rpush\(/]},
-        typescript: {all: [/outbox/i, /INSERT/i]},
-        go: {all: [/outbox/i, /INSERT/i]},
-        scala: {all: [/outbox/i, /INSERT/i]},
-        cpp: {all: [/outbox/i, /rpush\(/]},
+        python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
+        typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
+        go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
+        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch/]},
+        cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
   ],
@@ -121,261 +118,284 @@ level and the failure path.`,
     python: {
       starter: `import json
 
-import redis
-from fastapi import FastAPI
-from kafka import KafkaProducer
-from pydantic import BaseModel
+from confluent_kafka import Producer
 
-app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-producer = KafkaProducer(bootstrap_servers="kafka:9092")
+from memory import outbox  # outbox.insert(topic, key, payload)
 
 TOPIC = "session.turn"
 
-
-class Turn(BaseModel):
-    turn_id: str
-    session_id: str
-    role: str
-    content: str
-    tokens: int
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 
 
-@app.post("/v1/sessions/{id}/turns")
-def append_turn(id: str, turn: Turn) -> dict:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    payload = json.dumps(
-        {"turn_id": turn.turn_id, "content": turn.content, "role": turn.role}
-    ).encode()
-    producer.send(TOPIC, key=turn.turn_id.encode(), value=payload)
-    producer.poll(0)
-    return {"session_id": id, "turn_id": turn.turn_id}
-`,
-      solution: `import json
-
-import redis
-from fastapi import FastAPI, Header
-from kafka import KafkaProducer
-from kafka.errors import KafkaError
-from pydantic import BaseModel
-
-app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-TOPIC = "session.turn"
-ACKS_ALL = "all"
-
-producer = KafkaProducer(bootstrap_servers="kafka:9092", acks=ACKS_ALL)
-
-
-class Turn(BaseModel):
-    turn_id: str
-    session_id: str
-    role: str
-    content: str
-    tokens: int
-
-
-def turn_event(turn: Turn) -> dict:
+def turn_event(tenant: str, session_id: str, turn: dict) -> dict:
+    """What the memory worker needs to act on a turn."""
     return {
-        "turn_id": turn.turn_id,
-        "session_id": turn.session_id,
-        "role": turn.role,
-        "tokens": turn.tokens,
+        "type": "session.turn",
+        "tenant": tenant,
+        "session_id": session_id,
+        "turn_id": turn["turn_id"],
+        "role": turn["role"],
+        "tokens": turn["tokens"],
+        "content": turn["content"],
     }
 
 
-@app.post("/v1/sessions/{id}/turns")
-def append_turn(id: str, turn: Turn, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    event = turn_event(turn)
-    payload = json.dumps(event).encode()
-    try:
-        producer.send(TOPIC, key=tenant.encode(), value=payload).get(timeout=2.0)
-    except KafkaError:
-        r.rpush("outbox:session.turn", json.dumps(event))
-    return {"session_id": id, "turn_id": turn.turn_id}
+def publish_turn_event(tenant: str, session_id: str, turn: dict) -> bool:
+    """Tell the memory worker about an appended turn; True once the event is on its way."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    payload = turn_event(tenant, session_id, turn)
+    producer.produce(TOPIC, key=turn["turn_id"], value=json.dumps(payload))
+    producer.poll(0)
+    return True
+`,
+      solution: `import json
+
+from confluent_kafka import Producer
+
+from memory import outbox  # outbox.insert(topic, key, payload)
+
+TOPIC = "session.turn"
+ACK_TIMEOUT_S = 2
+
+producer = Producer({
+    "bootstrap.servers": "kafka:9092",
+    "acks": "all",  # every in-sync replica has the record before the broker answers
+    "enable.idempotence": True,  # a write retried after a lost acknowledgement lands once
+})
+
+
+def conversation_key(tenant: str, session_id: str) -> str:
+    return f"{tenant}:{session_id}"
+
+
+def turn_event(tenant: str, session_id: str, turn: dict) -> dict:
+    """What the memory worker needs to act on a turn: its ids, its role and its size."""
+    return {
+        "type": "session.turn",
+        "tenant": tenant,
+        "session_id": session_id,
+        "turn_id": turn["turn_id"],
+        "role": turn["role"],
+        "tokens": turn["tokens"],
+    }
+
+
+def publish_turn_event(tenant: str, session_id: str, turn: dict) -> bool:
+    """Tell the memory worker about an appended turn; True once the broker acknowledged the event."""
+    key = conversation_key(tenant, session_id)
+    payload = turn_event(tenant, session_id, turn)
+    outcome = {}
+
+    def on_delivery(err, msg):
+        outcome["error"] = err
+
+    producer.produce(TOPIC, key=key, value=json.dumps(payload), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or outcome.get("error") is not None:
+        # The broker did not take it: the relay produces the row later, so the worker is late, not wrong.
+        outbox.insert(TOPIC, key, payload)
+        return False
+    return True
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sessions/:id/turns: the starter. */
-import Fastify from 'fastify';
-import {Kafka} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
 
-export const app = Fastify();
-const kafka = new Kafka({brokers: ['kafka:9092']});
+import * as outbox from 'memory/outbox'; // outbox.insert(topic, key, payload)
+import type {Turn} from 'memory/sessions';
+
+export const TOPIC = 'session.turn';
+
+const kafka = new Kafka({clientId: 'memd', brokers: ['kafka:9092']});
 const producer = kafka.producer();
+void producer.connect();
 
-interface Turn {
-  turn_id: string;
-  session_id: string;
-  role: string;
-  content: string;
-  tokens: number;
-}
-
-app.post('/v1/sessions/:id/turns', async (request, reply) => {
-  const {id} = request.params as {id: string};
-  const turn = request.body as Turn;
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  void producer.send({
-    topic: 'session.turn',
-    messages: [
-      {key: turn.turn_id, value: JSON.stringify({turn_id: turn.turn_id, content: turn.content, role: turn.role})},
-    ],
-  });
-  return reply.code(201).send({session_id: id, turn_id: turn.turn_id});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** POST /v1/sessions/:id/turns: publish a content-free event keyed by tenant, after the ack. */
-import Fastify from 'fastify';
-import {Kafka} from 'kafkajs';
-import {Pool} from 'pg';
-
-export const app = Fastify();
-const kafka = new Kafka({brokers: ['kafka:9092']});
-const producer = kafka.producer();
-const db = new Pool({connectionString: 'postgres://db:5432/memory'});
-
-const TOPIC = 'session.turn';
-const ACKS_ALL = -1;
-
-interface Turn {
-  turn_id: string;
-  session_id: string;
-  role: string;
-  content: string;
-  tokens: number;
-}
-
-app.post('/v1/sessions/:id/turns', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'] as string;
-  const {id} = request.params as {id: string};
-  const turn = request.body as Turn;
-  const event = {
+/** What the memory worker needs to act on a turn. */
+export function turnEvent(tenant: string, sessionId: string, turn: Turn) {
+  return {
+    type: 'session.turn',
+    tenant,
+    session_id: sessionId,
     turn_id: turn.turn_id,
-    session_id: turn.session_id,
+    role: turn.role,
+    tokens: turn.tokens,
+    content: turn.content,
+  };
+}
+
+/** Tell the memory worker about an appended turn; true once the event is on its way. */
+export async function publishTurnEvent(tenant: string, sessionId: string, turn: Turn): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const payload = turnEvent(tenant, sessionId, turn);
+  void producer.send({topic: TOPIC, messages: [{key: turn.turn_id, value: JSON.stringify(payload)}], acks: 1});
+  return true;
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+import * as outbox from 'memory/outbox'; // outbox.insert(topic, key, payload)
+import type {Turn} from 'memory/sessions';
+
+export const TOPIC = 'session.turn';
+export const ACK_TIMEOUT_MS = 2000;
+
+const kafka = new Kafka({clientId: 'memd', brokers: ['kafka:9092']});
+// Idempotent: a write retried after a lost acknowledgement lands once (and needs acks: -1).
+const producer = kafka.producer({idempotent: true});
+void producer.connect();
+
+export const conversationKey = (tenant: string, sessionId: string): string => \`\${tenant}:\${sessionId}\`;
+
+/** What the memory worker needs to act on a turn: its ids, its role and its size. */
+export function turnEvent(tenant: string, sessionId: string, turn: Turn) {
+  return {
+    type: 'session.turn',
+    tenant,
+    session_id: sessionId,
+    turn_id: turn.turn_id,
     role: turn.role,
     tokens: turn.tokens,
   };
-  const payload = JSON.stringify(event);
-  try {
-    await producer.send({
-      topic: TOPIC,
-      acks: ACKS_ALL,
-      messages: [{key: tenant, value: payload}],
-    });
-  } catch {
-    await db.query('INSERT INTO outbox (topic, payload) VALUES ($1, $2)', [TOPIC, payload]);
-  }
-  return reply.code(201).send({session_id: id, turn_id: turn.turn_id});
-});
+}
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** Tell the memory worker about an appended turn; true once the broker acknowledged the event. */
+export async function publishTurnEvent(tenant: string, sessionId: string, turn: Turn): Promise<boolean> {
+  const key = conversationKey(tenant, sessionId);
+  const payload = turnEvent(tenant, sessionId, turn);
+  try {
+    // acks: -1 (all): every in-sync replica has the record before the broker answers.
+    await producer.send({topic: TOPIC, messages: [{key, value: JSON.stringify(payload)}], acks: -1, timeout: ACK_TIMEOUT_MS});
+    return true;
+  } catch {
+    // The broker did not take it: the relay produces the row later, so the worker is late, not wrong.
+    await outbox.insert(TOPIC, key, payload);
+    return false;
+  }
+}
 `,
     },
     go: {
       starter: `package main
 
 import (
+	"context"
 	"encoding/json"
-	"net/http"
 
-	"github.com/IBM/sarama"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"memory/sessions" // sessions.Turn
 )
 
-var producer sarama.AsyncProducer
+const topic = "session.turn"
 
-type turn struct {
-	TurnID    string \`json:"turn_id"\`
-	SessionID string \`json:"session_id"\`
-	Role      string \`json:"role"\`
-	Content   string \`json:"content"\`
-	Tokens    int    \`json:"tokens"\`
-}
+var producer = newProducer()
 
-func appendTurn(rw http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var t turn
-	_ = json.NewDecoder(r.Body).Decode(&t)
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	payload, _ := json.Marshal(map[string]any{"turn_id": t.TurnID, "content": t.Content, "role": t.Role})
-	producer.Input() <- &sarama.ProducerMessage{
-		Topic: "session.turn",
-		Key:   sarama.StringEncoder(t.TurnID),
-		Value: sarama.ByteEncoder(payload),
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
 	}
-	rw.WriteHeader(http.StatusCreated)
-	_, _ = rw.Write([]byte(\`{"session_id":"\` + id + \`"}\`))
+	return p
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/sessions/{id}/turns", appendTurn)
+// turnEvent is what the memory worker needs to act on a turn.
+func turnEvent(tenant, sessionID string, turn sessions.Turn) map[string]any {
+	return map[string]any{
+		"type":       "session.turn",
+		"tenant":     tenant,
+		"session_id": sessionID,
+		"turn_id":    turn.TurnID,
+		"role":       turn.Role,
+		"tokens":     turn.Tokens,
+		"content":    turn.Content,
+	}
+}
+
+// publishTurnEvent tells the memory worker about an appended turn; true once the event is on its way.
+func publishTurnEvent(ctx context.Context, tenant, sessionID string, turn sessions.Turn) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	value, _ := json.Marshal(turnEvent(tenant, sessionID, turn))
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(turn.TurnID), Value: value}
+	if err := producer.Produce(msg, nil); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"net/http"
+	"time"
 
-	"github.com/IBM/sarama"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"memory/outbox"   // outbox.Insert(ctx, topic, key, payload)
+	"memory/sessions" // sessions.Turn
 )
 
 const (
-	topic   = "session.turn"
-	acksAll = sarama.WaitForAll
+	topic      = "session.turn"
+	ackTimeout = 2 * time.Second
 )
 
-var (
-	producer sarama.AsyncProducer
-	db       *sql.DB
-)
+var producer = newProducer()
 
-type turnEvent struct {
-	TurnID    string \`json:"turn_id"\`
-	SessionID string \`json:"session_id"\`
-	Role      string \`json:"role"\`
-	Tokens    int    \`json:"tokens"\`
-}
-
-func publishEvent(ctx context.Context, tenant string, event turnEvent) error {
-	payload, _ := json.Marshal(event)
-	deliveryChan := make(chan error, 1)
-	producer.Produce(&sarama.ProducerMessage{
-		Topic: topic,
-		Key:   sarama.StringEncoder(tenant),
-		Value: sarama.ByteEncoder(payload),
-	}, deliveryChan)
-	if err := <-deliveryChan; err != nil {
-		_, _ = db.ExecContext(ctx, "INSERT INTO outbox (topic, payload) VALUES ($1, $2)", topic, payload)
-		return err
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the record before the broker answers
+		"enable.idempotence": true,  // a write retried after a lost acknowledgement lands once
+	})
+	if err != nil {
+		panic(err)
 	}
-	return nil
+	return p
 }
 
-func appendTurn(rw http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	tenant := r.Header.Get("X-Tenant-Id")
-	id := r.PathValue("id")
-	var event turnEvent
-	_ = json.NewDecoder(r.Body).Decode(&event)
-	_ = publishEvent(ctx, tenant, event)
-	rw.WriteHeader(http.StatusCreated)
-	_, _ = rw.Write([]byte(\`{"session_id":"\` + id + \`"}\`))
+func conversationKey(tenant, sessionID string) string {
+	return tenant + ":" + sessionID
 }
 
-func main() {
-	config := sarama.NewConfig()
-	config.Producer.RequiredAcks = acksAll
-	config.Producer.Return.Successes = true
-	producer, _ = sarama.NewAsyncProducer([]string{"kafka:9092"}, config)
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/sessions/{id}/turns", appendTurn)
+// turnEvent is what the memory worker needs to act on a turn: its ids, its role and its size.
+func turnEvent(tenant, sessionID string, turn sessions.Turn) map[string]any {
+	return map[string]any{
+		"type":       "session.turn",
+		"tenant":     tenant,
+		"session_id": sessionID,
+		"turn_id":    turn.TurnID,
+		"role":       turn.Role,
+		"tokens":     turn.Tokens,
+	}
+}
+
+// publishTurnEvent tells the memory worker about an appended turn; true once the broker acknowledged the event.
+func publishTurnEvent(ctx context.Context, tenant, sessionID string, turn sessions.Turn) (bool, error) {
+	key := conversationKey(tenant, sessionID)
+	payload := turnEvent(tenant, sessionID, turn)
+	value, _ := json.Marshal(payload)
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(key), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded // no delivery report within the window
+		}
+	}
+	if err != nil {
+		// The broker did not take it: the relay produces the row later, so the worker is late, not wrong.
+		if err := outbox.Insert(ctx, topic, key, payload); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return true, nil
 }
 `,
     },
@@ -383,190 +403,528 @@ func main() {
       starter: `import java.util.Properties
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-final case class Turn(turn_id: String, session_id: String, role: String, content: String, tokens: Int)
+import memory.{Outbox, Sessions} // Outbox.insert(topic, key, payload); Sessions.Turn
 
-object EventsApi {
-  implicit val system: ActorSystem = ActorSystem("chat-memory")
-  implicit val turnFormat: RootJsonFormat[Turn] = jsonFormat5(Turn)
-
+object Events {
   val Topic = "session.turn"
-  val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  val producer = new KafkaProducer[String, String](props)
 
-  val route: Route =
-    path("v1" / "sessions" / Segment / "turns") { id =>
-      post {
-        entity(as[Turn]) { turn =>
-          // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-          val event = s"""{"turn_id":"\${turn.turn_id}","content":"\${turn.content}","role":"\${turn.role}"}"""
-          producer.send(new ProducerRecord[String, String](Topic, turn.turn_id, event))
-          complete(StatusCodes.Created, s"""{"session_id":"$id","turn_id":"\${turn.turn_id}"}""")
-        }
-      }
-    }
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+  }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** What the memory worker needs to act on a turn. */
+  def turnEvent(tenant: String, sessionId: String, turn: Sessions.Turn): JsObject =
+    JsObject(
+      "type" -> JsString("session.turn"),
+      "tenant" -> JsString(tenant),
+      "session_id" -> JsString(sessionId),
+      "turn_id" -> JsString(turn.turnId),
+      "role" -> JsString(turn.role),
+      "tokens" -> JsNumber(turn.tokens),
+      "content" -> JsString(turn.content)
+    )
+
+  /** Tell the memory worker about an appended turn; true once the event is on its way. */
+  def publishTurnEvent(tenant: String, sessionId: String, turn: Sessions.Turn): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val payload = turnEvent(tenant, sessionId, turn)
+    producer.send(new ProducerRecord[String, String](Topic, turn.turnId, payload.compactPrint))
+    true
   }
 }
 `,
       solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
+
+import scala.util.Try
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import slick.jdbc.PostgresProfile.api._
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-final case class Turn(turn_id: String, session_id: String, role: String, content: String, tokens: Int)
+import memory.{Outbox, Sessions} // Outbox.insert(topic, key, payload); Sessions.Turn
 
-object EventsApi {
-  implicit val system: ActorSystem = ActorSystem("chat-memory")
-  implicit val turnFormat: RootJsonFormat[Turn] = jsonFormat5(Turn)
-
+object Events {
   val Topic = "session.turn"
-  val AcksAll = "all"
-  val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", AcksAll)
-  val producer = new KafkaProducer[String, String](props)
-  val db = Database.forConfig("memory")
+  val AckTimeoutMs = 2000L
 
-  def publish(tenant: String, turn: Turn): Unit = {
-    val event = s"""{"turn_id":"\${turn.turn_id}","session_id":"\${turn.session_id}","role":"\${turn.role}","tokens":\${turn.tokens}}"""
-    try {
-      producer.send(new ProducerRecord[String, String](Topic, tenant, event)).get()
-    } catch {
-      case _: Exception =>
-        db.run(sqlu"INSERT INTO outbox (topic, payload) VALUES ($Topic, $event)")
-    }
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "all") // every in-sync replica has the record before the broker answers
+    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  val route: Route =
-    path("v1" / "sessions" / Segment / "turns") { id =>
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[Turn]) { turn =>
-            publish(tenant, turn)
-            complete(StatusCodes.Created, s"""{"session_id":"$id","turn_id":"\${turn.turn_id}"}""")
-          }
-        }
-      }
-    }
+  def conversationKey(tenant: String, sessionId: String): String = s"$tenant:$sessionId"
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** What the memory worker needs to act on a turn: its ids, its role and its size. */
+  def turnEvent(tenant: String, sessionId: String, turn: Sessions.Turn): JsObject =
+    JsObject(
+      "type" -> JsString("session.turn"),
+      "tenant" -> JsString(tenant),
+      "session_id" -> JsString(sessionId),
+      "turn_id" -> JsString(turn.turnId),
+      "role" -> JsString(turn.role),
+      "tokens" -> JsNumber(turn.tokens)
+    )
+
+  /** Tell the memory worker about an appended turn; true once the broker acknowledged the event. */
+  def publishTurnEvent(tenant: String, sessionId: String, turn: Sessions.Turn): Boolean = {
+    val key = conversationKey(tenant, sessionId)
+    val payload = turnEvent(tenant, sessionId, turn)
+    val record = new ProducerRecord[String, String](Topic, key, payload.compactPrint)
+    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
+    if (acked.isFailure) {
+      // The broker did not take it: the relay produces the row later, so the worker is late, not wrong.
+      Outbox.insert(Topic, key, payload)
+    }
+    acked.isSuccess
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <cppkafka/cppkafka.h>
-#include <httplib.h>
+      starter: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
 
+#include <memory>
 #include <string>
 
-using json = nlohmann::json;
-
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  cppkafka::Configuration config{{"metadata.broker.list", "kafka:9092"}};
-  cppkafka::Producer producer(config);
-  httplib::Server svr;
-
-  svr.Post("/v1/sessions/:id/turns", [&](const httplib::Request& req, httplib::Response& res) {
-    const auto id = req.path_params.at("id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    const auto event = json{{"turn_id", body.value("turn_id", std::string())},
-                            {"content", body.value("content", std::string())},
-                            {"role", body.value("role", std::string())}}
-                           .dump();
-    cppkafka::MessageBuilder builder("session.turn");
-    builder.key(body.value("turn_id", std::string()));
-    builder.payload(event);
-    producer.produce(builder);
-    res.status = 201;
-    res.set_content(json{{"session_id", id}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <cppkafka/cppkafka.h>
-#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
-
-#include <string>
+#include "memory/outbox.h"    // outbox::insert(topic, key, payload)
+#include "memory/sessions.h"  // sessions::Turn
 
 using json = nlohmann::json;
 
 const std::string kTopic = "session.turn";
-const std::string kAcksAll = "all";
 
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  cppkafka::Configuration config{
-      {"metadata.broker.list", "kafka:9092"},
-      {"acks", kAcksAll},
-  };
-  cppkafka::Producer producer(config);
-  httplib::Server svr;
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
 
-  svr.Post("/v1/sessions/:id/turns", [&](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto id = req.path_params.at("id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    const auto event = json{{"turn_id", body.value("turn_id", std::string())},
-                            {"session_id", body.value("session_id", std::string())},
-                            {"role", body.value("role", std::string())},
-                            {"tokens", body.value("tokens", 0)}}
-                           .dump();
-    cppkafka::MessageBuilder builder(kTopic);
-    builder.key(tenant);
-    builder.payload(event);
-    producer.produce(builder);
-    try {
-      producer.flush();
-    } catch (const cppkafka::KafkaException&) {
-      redis.rpush("outbox:session.turn", event);
-    }
-    res.status = 201;
-    res.set_content(json{{"session_id", id}}.dump(), "application/json");
-  });
+auto producer = makeProducer();
 
-  svr.listen("0.0.0.0", 8443);
+// What the memory worker needs to act on a turn.
+json turnEvent(const std::string& tenant, const std::string& session_id, const sessions::Turn& turn) {
+  return json{{"type", "session.turn"}, {"tenant", tenant},         {"session_id", session_id},
+              {"turn_id", turn.turn_id}, {"role", turn.role},       {"tokens", turn.tokens},
+              {"content", turn.content}};
+}
+
+// Tell the memory worker about an appended turn; true once the event is on its way.
+bool publishTurnEvent(const std::string& tenant, const std::string& session_id, const sessions::Turn& turn) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string value = turnEvent(tenant, session_id, turn).dump();
+  producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()), value.size(),
+                    turn.turn_id.c_str(), turn.turn_id.size(), 0, nullptr);
+  producer->poll(0);
+  return true;
+}
+`,
+      solution: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include <memory>
+#include <string>
+
+#include "memory/outbox.h"    // outbox::insert(topic, key, payload)
+#include "memory/sessions.h"  // sessions::Turn
+
+using json = nlohmann::json;
+
+const std::string kTopic = "session.turn";
+constexpr int kAckTimeoutMs = 2000;
+
+// The delivery report of the record in flight: publishTurnEvent produces one record and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
+};
+
+DeliveryReport delivery;
+
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the record before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a write retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
+
+auto producer = makeProducer();
+
+std::string conversationKey(const std::string& tenant, const std::string& session_id) { return tenant + ":" + session_id; }
+
+// What the memory worker needs to act on a turn: its ids, its role and its size.
+json turnEvent(const std::string& tenant, const std::string& session_id, const sessions::Turn& turn) {
+  return json{{"type", "session.turn"}, {"tenant", tenant}, {"session_id", session_id},
+              {"turn_id", turn.turn_id}, {"role", turn.role}, {"tokens", turn.tokens}};
+}
+
+// Tell the memory worker about an appended turn; true once the broker acknowledged the event.
+bool publishTurnEvent(const std::string& tenant, const std::string& session_id, const sessions::Turn& turn) {
+  const std::string key = conversationKey(tenant, session_id);
+  const json payload = turnEvent(tenant, session_id, turn);
+  const std::string value = payload.dump();
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                                             value.size(), key.c_str(), key.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
+  }
+  if (err != RdKafka::ERR_NO_ERROR) {
+    // The broker did not take it: the relay produces the row later, so the worker is late, not wrong.
+    outbox::insert(kTopic, key, payload);
+    return false;
+  }
+  return true;
 }
 `,
     },
   },
-  debrief: `A topic is an append-only record with a retention policy, not a queue you can delete from, so
-anything published there inherits that lifetime. That is why the event carries ids and token
-counts: turn text in the log would duplicate the message store with a longer memory and weaker
-delete semantics. The key is tenant because Kafka orders within a partition, so one tenant's turns
-stay in sequence. Durability is the rest of the shape: \`acks=all\` makes an acknowledgement mean
-replication, waiting for it makes the response mean the event exists, and the outbox turns a broker
-outage into a delay instead of a gap. Production services usually write the outbox row first, in
-the same transaction as the turn, and let a relay publish from it, so the handler does not depend
-on the broker at all.`,
+  harness: {
+    python: `import json
+
+TOPIC = "session.turn"
+CARD = "My card is 4111 1111 1111 1111, book the flight."
+
+
+def _turn(n, content="Ship it on the 14th."):
+    return {"turn_id": f"t-{n}", "role": "user", "content": content, "tokens": 9}
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.lrange("outbox", 0, -1)]
+
+
+def check_conversation_key(ctx):
+    m = ctx.load("events")
+    m.publish_turn_event("t1", "s-1", _turn(1))
+    m.publish_turn_event("t1", "s-2", _turn(1))
+    m.publish_turn_event("t1", "s-1", _turn(2))
+    m.publish_turn_event("t2", "s-1", _turn(1))
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 4, f"four publish_turn_event calls produced {len(records)} records on session.turn (topics: {sorted(ctx.kafka.topics)})"
+    keys = [r.key for r in records]
+    assert keys == [b"t1:s-1", b"t1:s-2", b"t1:s-1", b"t2:s-1"], f"the records are keyed {keys}, expected the conversation {{tenant}}:{{session_id}}"
+    assert records[0].partition == records[2].partition, "both turns of t1:s-1 must land on one partition, or the worker reads a conversation out of order"
+
+
+def check_no_content(ctx):
+    m = ctx.load("events")
+    m.publish_turn_event("t1", "s-1", _turn(1, CARD))
+    values = ctx.kafka.values(TOPIC)
+    assert len(values) == 1, f"one publish_turn_event produced {len(values)} records"
+    assert b"4111" not in values[0], f"the event carries the turn's text into a retained topic: {values[0]!r}"
+    value = json.loads(values[0])
+    want = {"type": "session.turn", "tenant": "t1", "session_id": "s-1", "turn_id": "t-1", "role": "user", "tokens": 9}
+    assert value == want, f"the payload is {value}, expected exactly {want}"
+
+
+def check_acks_idempotent(ctx):
+    m = ctx.load("events")
+    ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
+    m.publish_turn_event("t1", "s-1", _turn(1))
+    m.publish_turn_event("t1", "s-1", _turn(2))  # serves any report still pending
+    assert len(ctx.kafka.records(TOPIC)) == 2, f"after one lost acknowledgement two turns left {len(ctx.kafka.records(TOPIC))} records: the producer's retry wrote an event twice. Enable idempotence"
+    m.publish_turn_event("t1", "s-1", _turn(3))
+    ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
+    assert len(ctx.kafka.records(TOPIC)) == 3, "a leader failover lost the record the leader alone had acknowledged: acks=all waits for every in-sync replica"
+
+
+def check_outbox_on_failure(ctx):
+    m = ctx.load("events")
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_turn_event("t1", "s-1", _turn(1))
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the worker never hears of the turn"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "t1:s-1" and rows[0].get("payload", {}).get("turn_id") == "t-1", f"the outbox row is {rows[0]}, expected the topic, the key t1:s-1 and the payload"
+    assert ok is False, f"publish_turn_event returned {ok!r} after a failed delivery, expected False"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    ok = m.publish_turn_event("t1", "s-1", _turn(2))
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"publish_turn_event waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("payload", {}).get("turn_id") == "t-2", f"no delivery report within the window and the outbox holds {rows}"
+    assert ok is False, f"publish_turn_event returned {ok!r} without a delivery report, expected False"
+`,
+    typescript: `const TOPIC = 'session.turn';
+const CARD = 'My card is 4111 1111 1111 1111, book the flight.';
+
+const turn = (n: number, content = 'Ship it on the 14th.') => ({turn_id: \`t-\${n}\`, role: 'user', content, tokens: 9});
+
+const outboxRows = ctx => (ctx.redis.lrange('outbox', 0, -1) as string[]).map(row => JSON.parse(row));
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+export async function check_conversation_key(ctx) {
+  const m = ctx.load('events');
+  await m.publishTurnEvent('t1', 's-1', turn(1));
+  await m.publishTurnEvent('t1', 's-2', turn(1));
+  await m.publishTurnEvent('t1', 's-1', turn(2));
+  await m.publishTurnEvent('t2', 's-1', turn(1));
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 4, \`four publishTurnEvent calls produced \${records.length} records on session.turn\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['t1:s-1', 't1:s-2', 't1:s-1', 't2:s-1'], \`the records are keyed \${JSON.stringify(keys)}, expected the conversation {tenant}:{session_id}\`);
+  assert.equal(records[0].partition, records[2].partition, 'both turns of t1:s-1 must land on one partition, or the worker reads a conversation out of order');
+}
+
+export async function check_no_content(ctx) {
+  const m = ctx.load('events');
+  await m.publishTurnEvent('t1', 's-1', turn(1, CARD));
+  await settle();
+  const values = ctx.kafka.values(TOPIC);
+  assert.equal(values.length, 1, \`one publishTurnEvent produced \${values.length} records\`);
+  assert(!values[0].includes('4111'), \`the event carries the turn's text into a retained topic: \${values[0]}\`);
+  const want = {type: 'session.turn', tenant: 't1', session_id: 's-1', turn_id: 't-1', role: 'user', tokens: 9};
+  assert.deepStrictEqual(JSON.parse(values[0]), want, \`the payload is \${values[0]}, expected exactly \${JSON.stringify(want)}\`);
+}
+
+export async function check_acks_idempotent(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
+  await m.publishTurnEvent('t1', 's-1', turn(1));
+  await m.publishTurnEvent('t1', 's-1', turn(2));
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, \`after one lost acknowledgement two turns left \${ctx.kafka.records(TOPIC).length} records: the producer's retry wrote an event twice. Enable idempotence\`);
+  await m.publishTurnEvent('t1', 's-1', turn(3));
+  await settle();
+  ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
+  assert.equal(ctx.kafka.records(TOPIC).length, 3, 'a leader failover lost the record the leader alone had acknowledged: acks: -1 (all) waits for every in-sync replica');
+}
+
+export async function check_outbox_on_failure(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.failNext(TOPIC, 1);
+  let ok = await m.publishTurnEvent('t1', 's-1', turn(1));
+  await settle();
+  let rows = outboxRows(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the worker never hears of the turn\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 't1:s-1' && rows[0].payload?.turn_id === 't-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key t1:s-1 and the payload\`);
+  assert.equal(ok, false, \`publishTurnEvent resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  ok = await m.publishTurnEvent('t1', 's-1', turn(2));
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`publishTurnEvent waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  rows = outboxRows(ctx);
+  assert(rows.length === 2 && rows[1].payload?.turn_id === 't-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert.equal(ok, false, \`publishTurnEvent resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"memory/sessions"
+
+	"leetbuild/harness"
+)
+
+const (
+	eventsTopic = "session.turn"
+	card        = "My card is 4111 1111 1111 1111, book the flight."
+)
+
+func eventTurn(n int, content string) sessions.Turn {
+	if content == "" {
+		content = "Ship it on the 14th."
+	}
+	return sessions.Turn{TurnID: fmt.Sprintf("t-%d", n), Role: "user", Content: content, Tokens: 9}
+}
+
+func mustPublish(ctx *harness.Ctx, tenant, sessionID string, turn sessions.Turn) bool {
+	ok, err := publishTurnEvent(context.Background(), tenant, sessionID, turn)
+	ctx.NoError(err, "publishTurnEvent(%s, %s, %s)", tenant, sessionID, turn.TurnID)
+	return ok
+}
+
+type outboxRow struct {
+	Topic   string         \`json:"topic"\`
+	Key     string         \`json:"key"\`
+	Payload map[string]any \`json:"payload"\`
+}
+
+func outboxRows(ctx *harness.Ctx) []outboxRow {
+	var rows []outboxRow
+	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
+		var row outboxRow
+		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func CheckConversationKey(ctx *harness.Ctx) {
+	mustPublish(ctx, "t1", "s-1", eventTurn(1, ""))
+	mustPublish(ctx, "t1", "s-2", eventTurn(1, ""))
+	mustPublish(ctx, "t1", "s-1", eventTurn(2, ""))
+	mustPublish(ctx, "t2", "s-1", eventTurn(1, ""))
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 4, "four publishTurnEvent calls must produce four records on session.turn; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"t1:s-1", "t1:s-2", "t1:s-1", "t2:s-1"}, "the records must be keyed by the conversation {tenant}:{session_id}")
+	ctx.Equal(records[0].Partition, records[2].Partition, "both turns of t1:s-1 must land on one partition, or the worker reads a conversation out of order; the partitions")
+}
+
+func CheckNoContent(ctx *harness.Ctx) {
+	mustPublish(ctx, "t1", "s-1", eventTurn(1, card))
+	ctx.Settle()
+	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 1, "one publishTurnEvent must produce one record; the records")
+	ctx.Assert(!strings.Contains(values[0], "4111"), "the event carries the turn's text into a retained topic: %s", values[0])
+	var value map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
+	ctx.Equal(value, map[string]any{"type": "session.turn", "tenant": "t1", "session_id": "s-1", "turn_id": "t-1", "role": "user", "tokens": 9}, "the payload")
+}
+
+func CheckAcksIdempotent(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	mustPublish(ctx, "t1", "s-1", eventTurn(1, ""))
+	mustPublish(ctx, "t1", "s-1", eventTurn(2, ""))
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "after one lost acknowledgement the producer's retry must not write an event twice (enable.idempotence); the records for two turns")
+	mustPublish(ctx, "t1", "s-1", eventTurn(3, ""))
+	ctx.Settle()
+	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 3, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+}
+
+func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok := mustPublish(ctx, "t1", "s-1", eventTurn(1, ""))
+	ctx.Settle()
+	rows := outboxRows(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the worker never hears of the turn; the rows")
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "t1:s-1" && rows[0].Payload["turn_id"] == "t-1", "the outbox row is %v, expected the topic, the key t1:s-1 and the payload", rows[0])
+	ctx.Equal(ok, false, "publishTurnEvent's result after a failed delivery")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	ok = mustPublish(ctx, "t1", "s-1", eventTurn(2, ""))
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "publishTurnEvent waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	rows = outboxRows(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Payload["turn_id"] == "t-2", "no delivery report within the window and the outbox holds %v", rows)
+	ctx.Equal(ok, false, "publishTurnEvent's result without a delivery report")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kEventsTopic = "session.turn";
+const std::string kCard = "My card is 4111 1111 1111 1111, book the flight.";
+
+sessions::Turn eventTurn(int n, const std::string& content = "Ship it on the 14th.") {
+  return sessions::Turn{"t-" + std::to_string(n), "user", content, 9};
+}
+
+std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> rows;
+  for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
+    const auto row = nlohmann::json::parse(text, nullptr, false);
+    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", text);
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+std::string text(const nlohmann::json& j, const std::string& field) {
+  return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckConversationKey(harness::Ctx& ctx) {
+  publishTurnEvent("t1", "s-1", eventTurn(1));
+  publishTurnEvent("t1", "s-2", eventTurn(1));
+  publishTurnEvent("t1", "s-1", eventTurn(2));
+  publishTurnEvent("t2", "s-1", eventTurn(1));
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 4, "four publishTurnEvent calls must produce four records on session.turn; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"t1:s-1", "t1:s-2", "t1:s-1", "t2:s-1"}, "the records must be keyed by the conversation {tenant}:{session_id}");
+  ctx.Equal(records[0].Partition, records[2].Partition, "both turns of t1:s-1 must land on one partition, or the worker reads a conversation out of order; the partitions");
+}
+
+void CheckNoContent(harness::Ctx& ctx) {
+  publishTurnEvent("t1", "s-1", eventTurn(1, kCard));
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(values.size(), 1, "one publishTurnEvent must produce one record; the records");
+  ctx.Assert(values[0].find("4111") == std::string::npos, "the event carries the turn's text into a retained topic: %s", values[0]);
+  const auto value = nlohmann::json::parse(values[0], nullptr, false);
+  const nlohmann::json want = {{"type", "session.turn"}, {"tenant", "t1"}, {"session_id", "s-1"}, {"turn_id", "t-1"}, {"role", "user"}, {"tokens", 9}};
+  ctx.Assert(value == want, "the payload is %s, expected exactly %s", values[0], want.dump());
+}
+
+void CheckAcksIdempotent(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishTurnEvent("t1", "s-1", eventTurn(1));
+  publishTurnEvent("t1", "s-1", eventTurn(2));
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "after one lost acknowledgement the producer's retry must not write an event twice (enable.idempotence); the records for two turns");
+  publishTurnEvent("t1", "s-1", eventTurn(3));
+  ctx.Settle();
+  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 3, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+}
+
+void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  bool ok = publishTurnEvent("t1", "s-1", eventTurn(1));
+  ctx.Settle();
+  auto rows = outboxRows(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the worker never hears of the turn; the rows");
+  ctx.Assert(text(rows[0], "topic") == kEventsTopic && text(rows[0], "key") == "t1:s-1" && rows[0].contains("payload") && text(rows[0]["payload"], "turn_id") == "t-1",
+             "the outbox row is %s, expected the topic, the key t1:s-1 and the payload", rows[0].dump());
+  ctx.Equal(ok, false, "publishTurnEvent's result after a failed delivery");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const int64_t before = ctx.Clock.Now();
+  ok = publishTurnEvent("t1", "s-1", eventTurn(2));
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "publishTurnEvent waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  rows = outboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && text(rows[1]["payload"], "turn_id") == "t-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Equal(ok, false, "publishTurnEvent's result without a delivery report");
+}
+`,
+  },
+  hints: [
+    'The worker sees `t-2` of a conversation before `t-1`, the event log holds text users pasted, and after a broker blip one turn arrives twice and another never arrives while the route answered 201.',
+    'Kafka orders records per partition and the key picks the partition: the turn id gives each turn its own. `acks=1` without idempotence lets a retry duplicate and a failover lose; `poll(0)` returns before any delivery report.',
+    'Key by `f"{tenant}:{session_id}"`, drop `content` from `turn_event`, set `enable.idempotence` with `acks=all`, produce with `on_delivery`, `flush(ACK_TIMEOUT_S)`, and on an error or a record still in flight `outbox.insert(...)` and return `False`.',
+  ],
+  debrief: `The key is an ordering contract: whatever is in the key is what the worker sees in order, and a conversation is the unit a summarizer reasons about. Leaving the content out is a retention decision as much as a privacy one: the buffer expires in a day, a topic keeps records as long as its retention says, so the event carries ids a consumer can look up while the turn still exists. Waiting for the delivery report gives the return value a meaning, and the outbox turns a broker outage into a delay. Production pipelines write the outbox row in the same transaction as the turn and let a relay do every produce, and they register the payload schema so a field such as \`content\` cannot be added without review.`,
 };

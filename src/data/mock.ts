@@ -597,7 +597,7 @@ export const mockScenarios: readonly MockScenario[] = [
       'A tenant noticed completions referencing a product they do not use: the starter keys the cache by the prefix hash alone, so the first tenant to warm a popular prefix serves everyone, and a prompt-version bump keeps serving old output. Debug it, fix it, and prove keys are tenant- and version-scoped.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The starter builds the cache key from the prefix hash alone, reads the tenant from the request body, logs the raw prefix and echoes a slice of it in the 413 body, so entries cross tenant and version boundaries and prompt text lands in logs.',
+      'The starter builds the cache key from the prefix hash alone, lets a tenant named in the body override X-Tenant-Id, defaults a missing prompt_version to 1 and echoes the first 64 characters of the prefix in the 413 body, so entries cross tenant and version boundaries and prompt text lands in error logs.',
     testIdea:
       'Warm a prefix as tenant A, request it as tenant B and assert a miss; bump the prompt version and assert the old namespace stops serving; send a 9 KiB prefix and assert the 413 body carries no prefix text.',
     followUps: [
@@ -612,16 +612,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'tool-registry',
     stepId: 'dependency',
     title: 'The tool that promoted itself',
-    blurb: 'The starter promoted a new tool version when the sandbox validation timed out.',
+    blurb: 'The starter promoted a candidate catalog when the sandbox never answered.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'An agent called a payment tool with a schema change nobody had validated: the starter promoted it when the sandbox timed out, treating silence as success. The same starter dials the sandbox with the production provider key and retries a schema rejection in a loop. Debug it, fix it, and prove that promotion happens only after a validation that returned OK.',
+      'An agent called a payment tool with a schema change nobody had validated: the starter promoted the candidate catalog after the sandbox stopped answering, treating silence as success. The same starter dials the sandbox with the production provider key and resends a schema rejection instead of remembering it. Debug it, fix it, and prove that promotion happens only after a validation that returned OK.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The starter treats a sandbox timeout or RPC error as a pass and promotes the candidate version on it; the sandbox call has no deadline, carries the production provider credential instead of the sandbox token, and a schema rejection is retried instead of recorded as terminal.',
+      'The starter retries the sandbox call three times on any error, then records the candidate as passed and promotes it; the call has no deadline, carries the production provider key instead of the sandbox token, and a schema rejection is neither recorded nor answered from the record on a re-request.',
     testIdea:
-      'Stub the sandbox to time out and assert the previous version stays active with a recorded rejection; return INVALID_ARGUMENT once and assert a second validate request answers from the recorded verdict without a sandbox call; assert the metadata carries the sandbox token.',
+      'Make the sandbox answer UNAVAILABLE and assert the outcome is unavailable with the previous catalog still active; return INVALID_ARGUMENT and assert a second request answers rejected from catalog:validation without another call; assert the metadata carries the sandbox token.',
     followUps: [
       'What makes a side-effect class meaningful if nothing enforces it at call time?',
       'How would you review a schema diff between two tool versions?',
@@ -638,10 +638,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A pipeline consumed thousands of unknown labels as real classifications after a model timeout, because the starter answered the exhausted retry loop with {"label": "unknown"} and a 200, with no model version on the result. It also retried validation rejections and called the model with no deadline. Debug it, fix it, and prove degradation is explicit and every result names its model.',
+      'A quality pipeline counted thousands of unknown labels as real classifications after the large model went down, because the starter answered its exhausted retry loop with the label "unknown" as a complete result, with no model version. It also retried validation rejections, called the model with no deadline and leaked the GPU slot on every failure. Debug it, fix it, and prove a downgrade is explicit and every result names its model.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The starter maps an exhausted retry loop to a successful prediction of unknown with no model version, so downstream consumers train on fabricated labels; it retries every gRPC error including validation rejections, alternates models silently, and passes no deadline.',
+      'The starter returns the label "unknown" as a complete result when every try fails, with no model version, so downstream consumers learn from labels no model produced; it retries every gRPC error including validation rejections, alternates the large and small model silently, passes no deadline, ignores an admission refusal and releases its GPU slot only on success.',
     testIdea:
       'Force a timeout and assert the response marks the downgrade (downgraded: true with a reason) rather than carrying a default label; send an INVALID_ARGUMENT request and assert it fails on the first attempt; assert every result names the exact model version.',
     followUps: [
@@ -660,12 +660,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A two-hour recording was billed three times after a single chunk failed, because the starter answers any chunk error by re-running the whole file from byte zero, with no deadline and no attempt bound, and it retries a corrupt-audio rejection the same way. Debug it, fix it, and prove a retry re-sends only the failed chunk.',
+      'A two-hour recording was billed three times after a single chunk failed: the starter asks the ASR provider for the whole file on every chunk, replays the same request on any gRPC error up to five times with no deadline, and retries a corrupt-audio rejection like any other error. Fix it so a retry resumes the failed chunk where its stream stopped, and prove it with the checks.',
     signals: ['Operate', 'Verify', 'Secure'],
     aiNote:
-      'The starter sends one whole-file request with no chunk index or offset, and on any gRPC error it loops forever re-running the file from the start, so provider cost multiplies by the failure count. It sets no deadline, caps no attempts, and treats a corrupt-audio INVALID_ARGUMENT as retryable instead of recording a terminal marker for that span.',
+      'The starter builds a ChunkRequest with offset_ms and duration_ms left at 0, which the provider reads as the whole file from the start; on any gRPC error it resends that request, up to five attempts with no deadline, appending to the segments it already collected, so a stream that broke mid-chunk returns duplicates. INVALID_ARGUMENT (corrupt audio) is retried like UNAVAILABLE instead of raising CorruptAudio.',
     testIdea:
-      'Fail one middle chunk and assert only that chunk re-runs with its own offset; count provider calls across the runs; return a corrupt-audio rejection and assert the chunk is marked terminal after one call.',
+      'Break the stream after one segment and assert the retry asks for the rest of the chunk from that segment end, with every segment returned once; fail the provider with UNAVAILABLE and count two attempts; return INVALID_ARGUMENT and assert one call and CorruptAudio.',
     followUps: [
       'How would you make chunk boundaries speaker-safe?',
       'What should happen when the language hint is wrong?',
@@ -682,12 +682,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A UI shipped untranslated English stamped as French: when the MT service timed out, the starter's MT client returned the source text as a 200 with the target locale on it, translation memory stored it and the CDN cached it as localized. The client also loops with no attempt cap, a ten-second timeout, and one catch-all for every RPC error, including a rejected language pair. Debug it, fix it, and prove fallbacks are marked, retries are bounded and marked responses are not cached.",
+      "A UI shipped English labeled as French: during an MT outage the starter's client called the model with no deadline, retried every status code (a rejected language pair included), returned the source text with no marker, and wrote it to translation memory, which kept serving it after the model recovered. Debug it, fix it, and prove the fallback is marked, only outages are retried, and only real translations are remembered.",
     signals: ['Specify', 'Verify', 'Secure'],
     aiNote:
-      'The starter returns the source text with a success status and the requested target locale when MT fails, so failures are indistinguishable from translations and `remember` caches them; it also runs a ten-second timeout inside a loop with no attempt counter and retries or swallows every RPC code alike, including a rejected language pair.',
+      'The starter calls `Translate` without a deadline inside a three-attempt loop that logs and retries every `RpcError`, then returns whatever text it ends up with (the source text on failure) with no marker and passes it to `tm_put`, so an outage looks like a translation and translation memory replays it for an hour.',
     testIdea:
-      'Fail the MT call with UNAVAILABLE and assert the response carries an untranslated marker and a 503 after exactly three two-second attempts; fail it with INVALID_ARGUMENT and assert a single attempt; assert `isCacheable` rejects the marked response.',
+      'Slow the model past two seconds and assert each attempt carries a 2 s deadline; fail it with INVALID_ARGUMENT and assert one call and `PairRejected`; fail it with UNAVAILABLE three times and assert the marked source text and no translation-memory entry.',
     followUps: [
       'When is identity translation (for example a product name) ever correct?',
       'How would you detect glossary terms being ignored by the model?',
@@ -709,7 +709,7 @@ export const mockScenarios: readonly MockScenario[] = [
     aiNote:
       'The starter returns whatever label string the model produces without checking it against the taxonomy version, so invented labels flow downstream as real, and it loads the taxonomy by id alone, so any tenant can classify against another tenant’s categories.',
     testIdea:
-      'Feed the model an invented label and assert the response routes it to review rather than returning it; request another tenant’s taxonomy id and assert 404; post an image body and assert 415.',
+      'Have the model invent a hashtag label and assert the response routes it to review and lists it in unknown_labels; request another tenant’s taxonomy id and assert 404; send a document with mime_type image/png and assert 415 with no model call.',
     followUps: [
       'How would you measure label drift without ground truth?',
       'What review flow handles invented labels best?',
@@ -722,16 +722,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'labeling-service',
     stepId: 'state',
     title: 'The queue that ate its own work',
-    blurb: 'Stale assignments never returned and pre-label outages froze the queue.',
+    blurb: 'Leases lapsed in a second, two annotators opened one item, and expired work never came back.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Half a batch sat assigned to annotators who went home, because the patch assigned items with no lease expiry, and when the pre-label model went down the whole queue stopped. The same patch showed every annotator the labels of their peers. Debug it, fix it, and prove leases return and degradation keeps the queue moving.',
+      'Half a batch disappeared from the labeling queue and the rest was labeled twice. The starter behind claim reads the head of the pool and removes it in two commands, leases items for 900 ms instead of 15 minutes, lets anyone renew anyone’s lease, and drops expired leases without returning their items. Debug it, fix it, and prove leases expire on time and return their work.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The patch marks items assigned permanently with no expiry, so abandoned work never returns to the pool, and it blocks assignment on pre-labeling, turning a model outage into a full labeling stop; it also exposes peer labels before submission.',
+      'The starter claims with ZRANGE then ZREM from the client, so two concurrent claims get the same item; LEASE_TTL_MS = 900 is added to a millisecond clock; renew writes a deadline for any caller; and reclaim_expired removes expired leases but never puts the items back in the pool.',
     testIdea:
-      'Assign an item and let the lease lapse and assert it returns to the pool; kill the pre-label model and assert items still assign with an unlabeled marker; submit as one annotator and assert peers still cannot see the label.',
+      'Land a second claim between the first claim’s read and its removal and assert two distinct items; assert the lease score is now + 900 000 ms; renew as a non-holder and assert nothing moves; advance past the lease and assert the item returns to the pool and a claim gets it.',
     followUps: [
       'How many reviewers make agreement math meaningful?',
       'What would you do with labels from annotators that fail review?',
@@ -748,12 +748,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two training runs on the same dataset name produced incomparable models, because the starter behind POST /v1/datasets writes whatever the body says: a second register of the same version replaced the hash, an empty owner and an unlisted license went through, and the recorded size was the caller’s number. Debug it, fix it, and prove versions are immutable.',
+      'Two training runs on the same dataset name produced incomparable models, because the starter behind POST /v1/datasets writes whatever the body says: a second register of the same version replaced the hash, a request with no tenant or owner and an unlisted license went through, and the recorded size was the caller’s number. Debug it, fix it, and prove versions are immutable.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      "The starter calls store.put_version unconditionally, so a re-register of an existing (dataset, version) overwrites the pointer and the hash no longer identifies its bytes; it also accepts a missing owner and any license string, and records the caller's size_bytes instead of measuring the object.",
+      "The starter writes the record with store.put_version, which overwrites an existing (dataset, version), so the hash no longer identifies its bytes; it files a missing X-Tenant-Id under public, accepts an empty owner and any license string, and stores the caller's size_bytes and row_count instead of store.measure on the object.",
     testIdea:
-      'Re-register an existing version and assert 409 with the pointer unchanged; post a body with no owner or an unlisted license and assert 422; register with size_bytes: 1 and assert the stored size matches a scan of the object.',
+      'Re-register an existing version with other bytes and assert 409 with the first hash kept; post a body with no owner or an unlisted license and assert 422, without X-Tenant-Id and assert 401; register with size_bytes: 1 and assert the stored size matches the object.',
     followUps: [
       'What does a license allowlist actually need to encode?',
       'How would you reproduce a training run two years later?',
@@ -766,16 +766,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'training-scheduler',
     stepId: 'state',
     title: 'The training run that could not start',
-    blurb: 'A worker died during startup and the run vanished from the queue.',
+    blurb: 'A worker died during startup and the run came back behind everything.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A worker node rebooted while a run was starting and the run vanished from every queue, and a run that was boosted to high priority was started twice on two GPUs. The starter for the Redis queue pops a run with ZPOPMIN and calls it started, writes a boost as a per-band key the scheduler does not poll, and scores a run by raw priority with no age term. Debug it, fix it, and prove starts are leased, a boost moves one member and an expired lease returns the run at its band.',
+      'A worker node rebooted while a run was starting and the run came back at the end of the queue, two scheduler replicas started the same run on two GPUs, and inside a band the oldest run was not served first. The starter scores a run by its band alone, claims the head with ZRANGE then ZREM, confirms a start for whichever worker asks, and re-adds an expired start with score now_ms. Debug it, fix it, and prove a claim is atomic, a confirm needs the lease and an expired start returns to its position.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The starter pops a run and treats it as started with no lease, so a crash between pop and process start loses the run silently; its boost writes SET training:queue:{band}:{run_id} while the sorted set keeps the old member, so the run has two positions; it scores by raw priority so runs in a band tie; and reap_expired returns 0, so nothing ever hands an interrupted start back.',
+      'The starter scores training:queue by band alone, so runs of one band tie and come out in id order; claim_next reads the head and removes it in two commands, so a second replica claims the same run; confirm_start drops the lease without checking who holds it, so a worker whose lease ran out still starts the run; and reap_expired re-adds an expired start with score now_ms, so it loses its place.',
     testIdea:
-      'Kill a worker between claim and start and assert reap_expired returns the run to training:queue at its band; boost a run concurrently from two schedulers and assert exactly one member remains; enqueue two runs in one band a minute apart and assert the older one sorts first.',
+      'Land a second claim between the read of the head and the ZREM and assert one winner; let a lease run out, reclaim the run for another worker and assert the first worker cannot confirm; reap an expired band-0 start and assert it is claimed before a band-0 run submitted after it.',
     followUps: [
       'What priority bands prevent starvation without letting callers jump?',
       'How long should a start lease be and what renews it?',
@@ -811,16 +811,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'model-registry',
     stepId: 'dependency',
     title: 'The model that promoted on a timeout',
-    blurb: 'A serving probe had no deadline and the starter shifted traffic before reading its reply.',
+    blurb: 'A serving probe had no deadline and the starter moved the pointer without reading its reply.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A model version whose pool had loaded a different artifact reached half the fleet. The starter calls the gRPC probe with no deadline, discards the reply, and calls set_traffic as soon as the call returns, so a slow pool pins the promotion worker and a mismatched digest is never noticed. Debug it, fix it, and prove traffic moves only after a verified probe.',
+      'A model version whose pool had loaded a different artifact took over prod. The starter calls the gRPC probe with no deadline, swallows its errors, ignores loaded_digest and calls pointer.promote whatever happened, so a slow pool pins the promotion worker and a mismatched digest goes unnoticed. Debug it, fix it, and prove the pointer moves only after a verified probe.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The starter gives the probe no deadline, so a pool that does not answer blocks the promotion worker instead of failing with probe_timeout; it ignores loaded_digest, so a pool serving other bytes is promoted; and it calls set_traffic before any comparison, so every failure path still moves traffic.',
+      'The starter gives the probe no deadline, so a pool that does not answer holds the promotion worker instead of failing with probe_timeout; it ignores loaded_digest, so a pool serving other bytes is promoted; it swallows every probe error and promotes anyway; and it makes one attempt, so a pool restarting for a moment blocks a valid promotion.',
     testIdea:
-      'Stall the probe past 10 seconds and assert the result is probe_timeout with the previous version at 100 percent traffic; return a different loaded_digest and assert digest_mismatch with no set_traffic call; return UNAVAILABLE twice and assert probe_failed.',
+      'Stall the probe past 10 seconds and assert probe_timeout with active:prod unchanged; return a different loaded_digest and assert digest_mismatch; refuse with PERMISSION_DENIED and assert probe_failed after one call; answer UNAVAILABLE once and assert a second probe before the pointer moves.',
     followUps: [
       'What must an eval record contain to open a promotion gate?',
       "How would you roll back traffic without invalidating the version's history?",
@@ -833,20 +833,20 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'checkpoint-store',
     stepId: 'dependency',
     title: 'The checkpoint that resumed from garbage',
-    blurb: 'Chunks were acknowledged before verification and resumed as weights.',
+    blurb: 'A chunk flipped in transit was acknowledged as stored and resumed as weights.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A training run resumed from a checkpoint whose middle chunk was corrupted. The starter object-store client acknowledges a chunk as soon as WriteChunk returns, leaves verification to a background pass, retries every error forever with no deadline, and treats PERMISSION_DENIED as transient. Debug it, fix it, and prove an acknowledgment means a verified chunk.',
+      'A training run resumed from a checkpoint whose middle chunk was corrupted on its way to the object store. The starter store_chunk sends PutObject with no deadline, returns whatever sha256 the store answers without comparing it to the local digest, and retries every error up to five times, PERMISSION_DENIED included. Debug it, fix it, and prove a returned checksum means a stored chunk.',
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      "The patch acknowledges each chunk as soon as it hands it to the store, so corruption is found only in a background pass long after a resume has consumed it, and its commit marker is derived from the caller's declared size rather than the verified chunk set.",
+      'The starter returns the checksum from the PutObject reply without comparing it to the digest it sent, so a chunk corrupted in transit counts as stored. It sets no deadline, retries any status five times, and drops the store’s reason when it finally gives up.',
     testIdea:
-      'Corrupt one chunk and assert the upload fails at verification rather than committing; lie about the byte count and assert the commit marker never sets; read the latest checkpoint while an upload is uncommitted and assert it is invisible.',
+      'Flip a byte in the stand-in store and assert ChecksumMismatch; answer UNAVAILABLE twice and assert three attempts in all; answer PERMISSION_DENIED once and assert one call and an UploadRejected naming the reason; slow the store past 30 s and assert StoreUnavailable within three deadlines.',
     followUps: [
-      'How would you verify a checkpoint without reading it back fully?',
-      'What TTL keeps abandoned uploads from pinning storage forever?',
-      'How should a resumed run treat the last verified chunk boundary?',
+      'How would you verify a whole checkpoint without reading it back?',
+      'Which statuses should a retry budget count across all chunks of an upload?',
+      'What should the copier do with a chunk the store rejected for good?',
     ],
     defaultLanguage: 'python',
   },
@@ -884,7 +884,7 @@ export const mockScenarios: readonly MockScenario[] = [
       'An on-call got 400 pages in an hour from one monitor. The starter raises an alert on every batch tick above the threshold with no dedupe key and no cooldown, sends the distance without its sample counts, calls the alerting service with no deadline, and drops the alert after one failed call. Debug it, fix it, and prove alerts are deduplicated per window and carry their evidence.',
     signals: ['Operate', 'Evaluate', 'Verify'],
     aiNote:
-      'The starter’s evaluate goes straight from the threshold comparison to the gRPC Raise call: no write-once claim on alert:{monitor_id}:{window}, no 1-second deadline, a payload of monitor id, metric and distance only, and a single attempt whose failure is only logged.',
+      'The starter’s raise_alert calls the gRPC Raise with no claim on alert:{monitor_id}:{window}, no 1-second deadline and a payload of monitor id, metric and distance only, in a single attempt whose failure is only logged.',
     testIdea:
       'Evaluate the same window twice above the threshold and assert one Raise call; stall the alerting service and assert the call returns within a second; reject the first attempt and assert a retry with backoff.',
     followUps: [
@@ -899,16 +899,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'shadow-eval',
     stepId: 'dependency',
     title: 'The shadow that slowed production',
-    blurb: 'The starter awaits the candidate inline with no deadline, no cap and three retries.',
+    blurb: 'The starter calls the candidate with no deadline, retries it three times and re-raises its last error.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Production p99 for a shadowed tenant jumped from 400 ms to tens of seconds during a candidate deploy. The starter awaits the candidate call inside the production handler with no deadline, no concurrency cap and no dropped counter, and it retries every failure three times. Debug it, fix it, and prove a stuck candidate adds zero latency to production.',
+      'Production p99 for a shadowed tenant jumped from 400 ms to five seconds during a candidate deploy, and when the candidate went down shadowed requests started failing. The starter calls the candidate after production answers, with no deadline, up to three times, and raises the last error. Debug it, fix it, and prove a stuck or dead candidate costs production at most 300 ms and never an error.',
     signals: ['Operate', 'Evaluate', 'Verify'],
     aiNote:
-      "The starter's observe loop awaits channel.Complete(request) with no timeout inside a retry loop, and the handler returns that coroutine instead of scheduling it, so an unhealthy candidate holds the production response and sees three times its configured traffic.",
+      "The starter's complete() loops CANDIDATE_ATTEMPTS times over candidate.Complete(request) with no timeout and re-raises on the last attempt, so a hanging candidate holds the production response, a dead one fails it, each failure is sent three times, nothing is counted as dropped, and an outage keeps receiving every shadow.",
     testIdea:
-      'Stub the candidate to hang and assert production p99 is unchanged; fill MAX_SHADOW_INFLIGHT slots and assert the next shadow is dropped and shadow.dropped increments; make the candidate fail and assert exactly one attempt.',
+      'Give the candidate 5 s of latency and assert the request returns within 1 s with a 0.3 s deadline on the call; fail it once and assert one call and dropped = 1; fail it always and assert production still answers and the candidate sees 5 calls out of 8 until the 30 s breaker expires.',
     followUps: [
       'What metrics can a shadow observably improve before deployment?',
       'How would you compare cost between candidate and production paths?',
@@ -925,10 +925,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A generated answer cited a quote that no longer existed: the starter behind POST /v1/citations stores the caller\u2019s offsets without comparing them to the document bytes, slices the document\u2019s latest text instead of the named version, keeps no version in the record and ignores Idempotency-Key, so an update re-pointed every old citation and a retry recorded it twice. Debug it, fix it, and prove spans resolve against immutable versions.',
+      'A generated answer cited a quote its document version never contained: the starter behind POST /v1/citations accepts a request with no tenant, slices the document\u2019s newest text at the caller\u2019s offsets and stores that slice as the quote without comparing it with the quote sent, and ignores Idempotency-Key, so a citation of version 1 quotes version 2 and a retry records it twice. Debug it, fix it, and prove spans resolve against immutable versions.',
     signals: ['Specify', 'Verify', 'Evaluate'],
     aiNote:
-      'The starter stores caller-provided offsets without validating them against the document bytes, resolves them against the document\u2019s latest text and keeps no version, and records under the document id with no Idempotency-Key, so a document update rewrites what old citations point at and a client retry produces a second citation.',
+      'The starter takes the tenant header without requiring it, never validates the span, resolves the caller\u2019s offsets against the document\u2019s newest text instead of the version the request names, stores that slice in place of the supplied quote, and creates a new citation on every call whatever the Idempotency-Key, so a citation of an old version quotes the new one and a client retry produces a second citation.',
     testIdea:
       'Submit an offset whose bytes do not match the quote and assert 422 with stored and supplied; update the document and assert an old citation still resolves against its version; replay the same Idempotency-Key and assert the same citation id comes back.',
     followUps: [
@@ -1008,20 +1008,20 @@ export const mockScenarios: readonly MockScenario[] = [
     id: 'human-review-queue-the-queue-that-resolved-on-a-timeout',
     problemId: 'human-review-queue',
     stepId: 'dependency',
-    title: 'The queue that resolved on a timeout',
-    blurb: 'Auto-resolve fired on a timeout for anything above 0.5 confidence.',
+    title: 'The queue that cleared itself during an outage',
+    blurb: 'Auto-resolve cleared items with a fallback grant while enforcement was down.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A spam wave was resolved by the queue itself while the enforcement service was down: the starter calls AutoResolve with no deadline in a three-attempt loop, returns auto_resolved with an implicit grant when the call times out above 0.5 confidence, retries PERMISSION_DENIED, and falls through to a fallback grant. Debug it, fix it, and prove auto-resolution is a narrow granted class and a timeout escalates.',
+      'A spam wave was cleared by the queue itself while the enforcement service was down: the starter gates auto-resolve on confidence alone, calls AutoResolve with no deadline up to three times, and resolves the item with a fallback grant when every call fails. Debug it, fix it, and prove auto-resolution is a narrow granted class and a failed call reaches a person.',
     signals: ['Operate', 'Secure', 'Verify'],
     aiNote:
-      'The starter gates auto-resolve on model confidence instead of a safe category set, treats DEADLINE_EXCEEDED as approval above 0.5 confidence, retries a terminal PERMISSION_DENIED three times, issues the RPC with no deadline, and records no grant for the decisions it makes.',
+      'The starter gates auto-resolve on a 0.5 confidence threshold instead of a safe category set, issues AutoResolve with no deadline, retries every error including a terminal PERMISSION_DENIED three times, and after three failures resolves the item anyway with the grant "fallback".',
     testIdea:
-      'Time out enforcement and assert the item escalates to a human; send PERMISSION_DENIED and assert exactly one RPC; auto-resolve a spam_duplicate and assert a grant row exists.',
+      'Slow enforcement past one second and assert the item escalates; fail it with UNAVAILABLE and assert no grant is recorded; send PERMISSION_DENIED and assert exactly one RPC; ask about self_harm at 0.97 and assert no call.',
     followUps: [
       'Which categories are ever safe to auto-resolve?',
-      'How do you keep SLA clocks honest across regions?',
+      'How should the queue measure how often the safe class was wrong?',
       'What would you record to audit an auto-resolve months later?',
     ],
     defaultLanguage: 'python',

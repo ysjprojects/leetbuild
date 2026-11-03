@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package pcache;
+
+// The model server step 3 calls on a cache miss: one unary RPC per miss, with a deadline. The harness
+// serves a deterministic stand-in at model:9000 (pcache/llm in the support modules).
+service Model {
+  rpc Complete(CompleteRequest) returns (CompleteReply);
+}
+
+message CompleteRequest {
+  string tenant = 1;
+  int32 prompt_version = 2;
+  string prefix = 3;
+  double temperature = 4;
+}
+
+message CompleteReply {
+  string text = 1;
+  // "stop" (finished), "length" (cut at the token limit) or "content_filter" (refused by policy).
+  string finish_reason = 2;
+  int32 completion_tokens = 3;
+}

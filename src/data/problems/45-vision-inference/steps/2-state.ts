@@ -2,329 +2,254 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis GPU admission tokens per tenant',
+  title: 'A GPU pool per tenant: one script to admit, a lease, an owner to release',
   concept: 'redis',
   file: 'state',
-  focus: ['api', 'state', 'worker'],
+  focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter's \`admit(tenant)\` reads \`gpu:tokens:{tenant}\` with \`GET\`,
-returns false when the counter is empty, otherwise sends \`DECR\` and returns true; the route already
-answers **429** with \`Retry-After\` when admission fails. It serves the demo and hides four flaws.
+**Starting point.** The starter keeps a tenant's GPU slots in the sorted set \`vision/config\` names
+(\`gpu_key(tenant)\`): \`admit(tenant)\` counts the members with \`ZCARD\`, refuses with
+\`{ticket: None, retry_after: RETRY_AFTER_S}\` at \`GPU_TOKENS\`, otherwise \`ZADD\`s a fresh ticket
+scored with the current time and answers \`{ticket, retry_after: 0}\`; \`release(tenant, ticket)\`
+removes the lowest-ranked member. The demo admits and releases one request at a time. It hides four
+flaws.
 
-**Failure mode the checks target.** A read then a decrement passes a serial test and over-admits
-under concurrency, driving the counter negative. With no TTL and no release, every crashed worker
-removes a slot from the tenant's pool until Redis restarts.
+**Failure mode the checks target.** Count-then-add is two round trips, so two workers that both read
+9 both add, and the GPU runs 11 jobs. A worker that crashes holding a slot holds it for good: nothing
+in the set ever ages out. Removing by rank frees whichever worker came first, not the caller. And a
+one-second \`Retry-After\` against a five-minute lease turns every refused client into a polling loop.
 
-- Each tenant holds \`GPU_TOKENS_PER_TENANT = 10\` tokens: \`gpu:tokens:{tenant}\` counts the free
-  ones, \`gpu:holders:{tenant}\` hashes the tickets holding one.
-- Admit in **one atomic Lua \`EVAL\`** (\`ADMIT_LUA\`): read, reject when empty, decrement and record
-  the ticket in the same call.
-- Set the TTL (\`TOKEN_TTL_S\`) **at first write, inside the script** (\`SET key value EX ttl\`).
-- Admission returns a **lock id**; \`RELEASE_LUA\` increments only when \`HDEL\` of that ticket returns
-  1, so a late release cannot free a token already reassigned.
-- When the pool is empty answer **429** with \`Retry-After\` and **do not queue**.`,
+Requirements:
+
+- \`admit\` is **one Lua script** (\`register_script\` / \`defineCommand\` / \`NewScript\` / \`eval\`):
+  drop expired leases (\`ZREMRANGEBYSCORE\` up to now), refuse at \`GPU_TOKENS\`, else \`ZADD\` the ticket
+  scored with its lease expiry (now + \`LEASE_S\`) and refresh the key's expiry to \`LEASE_S\`.
+- A refusal's \`retry_after\` is the seconds until the **earliest lease ends** (at least 1).
+- \`release\` removes **only the caller's ticket** (\`ZREM\`) and answers whether it was held.`,
   sequence: {
-    participants: ['Vision API', 'Redis', 'Inference worker'],
+    participants: ['Worker', 'Redis'],
     messages: [
-      {from: 'Vision API', to: 'Redis', label: 'EVAL admit · KEYS[gpu:tokens:acme] · lock id', kind: 'sync'},
-      {from: 'Redis', to: 'Vision API', label: '{1, 9, 900} admitted · {0, 0, 900} full', kind: 'reply'},
-      {from: 'Vision API', to: 'Inference worker', label: 'dispatch only after admission', kind: 'sync'},
-      {from: 'Inference worker', to: 'Inference worker', label: 'result lock held for the inference', kind: 'sync'},
-      {from: 'Inference worker', to: 'Redis', label: 'EVAL release · HDEL holder · INCR tokens', kind: 'async'},
-      {from: 'Vision API', to: 'Vision API', label: '429 + Retry-After when the pool is empty', kind: 'sync'},
+      {
+        from: 'Worker',
+        to: 'Redis',
+        label: 'EVALSHA admit · vision:gpu:{tenant} · now lease limit ticket',
+        kind: 'sync',
+      },
+      {from: 'Redis', to: 'Redis', label: 'ZREMRANGEBYSCORE -inf now · ZCARD < 10', kind: 'sync'},
+      {from: 'Redis', to: 'Redis', label: 'ZADD now+300 ticket · EXPIRE 300', kind: 'sync'},
+      {from: 'Redis', to: 'Worker', label: '{ticket, 0} · or {"", seconds to the earliest lease end}', kind: 'reply'},
+      {from: 'Worker', to: 'Redis', label: 'ZREM vision:gpu:{tenant} ticket', kind: 'sync'},
+      {from: 'Redis', to: 'Worker', label: '1 held · 0 not held', kind: 'reply'},
     ],
   },
+  hints: [
+    "Symptom: under a burst one tenant runs 11 jobs on a 10-slot pool, a crashed worker leaves the tenant one slot short for good, and a finished job frees somebody else's slot.",
+    'Mechanism: ZCARD and ZADD are separate round trips, so a second worker lands between them; scores are admission times nothing compares to the clock; release takes the lowest-ranked member; the refusal answers a constant.',
+    'Change: one script per admit (`ZREMRANGEBYSCORE pool -inf now`, `ZCARD` against the limit, `ZADD pool now+LEASE_S ticket`, `EXPIRE`, or `ZRANGE pool 0 0 WITHSCORES` for the wait), and `ZREM pool ticket` to release.',
+  ],
   checks: [
     {
-      id: 'atomic',
-      title: 'Admits with one atomic Lua script',
+      id: 'atomic-admit',
+      title: 'Admits in one Lua script',
       detail:
-        'The read, the rejection and the decrement happen inside a single `EVAL`/`NewScript` call. The starter reads the counter with `GET` and decrements it afterwards, so two concurrent admissions both observe the same room and the pool over-admits.',
+        'The expiry sweep, the count against GPU_TOKENS and the ZADD run inside one EVAL/EVALSHA, so a second worker cannot land between the count and the add. The starter counts with ZCARD and adds with a separate ZADD.',
       match: {
-        python: {all: [/ADMIT_LUA/, /\.eval\(/, /DECR/, /GET/]},
-        typescript: {all: [/ADMIT_LUA/, /\.eval\(/, /DECR/, /GET/]},
-        go: {all: [/NewScript\(/, /\.Run\(/, /DECR/, /GET/]},
-        scala: {all: [/AdmitLua/, /\.eval\(/, /DECR/, /GET/]},
-        cpp: {all: [/kAdmitLua/, /\.eval</, /DECR/, /GET/]},
+        python: {all: [/register_script\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]ZADD['"]/], none: [/\.zcard\(/]},
+        typescript: {
+          all: [/defineCommand\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]ZADD['"]/],
+          none: [/\.zcard\(/],
+        },
+        go: {all: [/redis\.NewScript\(|\.Eval\(|\.EvalSha\(/, /redis\.call\(\s*['"]ZADD['"]/], none: [/\.ZCard\(/]},
+        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]ZADD['"]/], none: [/\.zcard\(/]},
+        cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]ZADD['"]/], none: [/\.zcard\(/]},
       },
     },
     {
-      id: 'ttl',
-      title: 'Sets the token TTL at first write',
+      id: 'lease-expiry',
+      title: "A crashed holder's slot comes back after its lease",
       detail:
-        'The script creates the counter with `SET … EX TOKEN_TTL_S`, so tokens a crashed worker did not release expire back into the pool. The starter sets no expiry, so one crashed worker removes a slot until Redis restarts.',
+        'Each ticket is scored with its lease expiry (now + LEASE_S) and admission drops expired tickets first, so ten workers that crashed holding slots stop blocking the tenant once their leases end. The starter scores the admission time and never sweeps.',
       match: {
-        python: {all: [/TOKEN_TTL_S/, /'EX'/]},
-        typescript: {all: [/TOKEN_TTL_S/, /'EX'/]},
-        go: {all: [/tokenTTLSeconds/, /'EX'/]},
-        scala: {all: [/TokenTtlSeconds/, /'EX'/]},
-        cpp: {all: [/kTokenTtlSeconds/, /'EX'/]},
+        python: {all: [/ZREMRANGEBYSCORE/, /LEASE_S/]},
+        typescript: {all: [/ZREMRANGEBYSCORE/, /LEASE_S/]},
+        go: {all: [/ZREMRANGEBYSCORE/, /LeaseSeconds/]},
+        scala: {all: [/ZREMRANGEBYSCORE/, /LeaseSeconds/]},
+        cpp: {all: [/ZREMRANGEBYSCORE/, /kLeaseSeconds/]},
       },
     },
     {
-      id: 'release',
-      title: 'Releases only for the worker holding the ticket',
+      id: 'owner-release',
+      title: "Releases only the caller's ticket",
       detail:
-        'Release runs through a second script that removes the ticket with `HDEL` and increments the counter only when the caller still held it. The starter has no release at all, and an unguarded `INCR` would hand a token to whoever replays a stale lock id.',
+        'release removes the ticket it was given and answers true only when that ticket held a slot; a second release, or an unknown ticket, changes nothing. The starter removes the lowest-ranked member, whoever holds it.',
       match: {
-        python: {all: [/RELEASE_LUA/, /HDEL/, /lock_id/]},
-        typescript: {all: [/RELEASE_LUA/, /HDEL/, /lockId/]},
-        go: {all: [/releaseScript/, /HDEL/, /lockID/]},
-        scala: {all: [/ReleaseLua/, /HDEL/, /lockId/]},
-        cpp: {all: [/kReleaseLua/, /HDEL/, /lockId/]},
+        python: {all: [/\.zrem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
+        typescript: {all: [/\.zrem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
+        go: {all: [/\.ZRem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
+        scala: {all: [/\.zrem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
+        cpp: {all: [/\.zrem\(|['"]ZREM['"]/], none: [/zremrangebyrank/i]},
       },
     },
     {
-      id: 'guard',
-      title: 'Refuses to hand out a token that is not there',
+      id: 'retry-after',
+      title: 'Answers a refusal with the wait until the earliest lease ends',
       detail:
-        'The script returns a rejection tuple when the counter has run out instead of decrementing below zero. The starter checks in Python and then decrements, so the counter can go negative and the pool admits more than the GPU can take.',
+        "A refused admission's retry_after is the seconds until the oldest lease expires (read with ZRANGE … WITHSCORES), at least 1. The starter answers a constant 1 second.",
       match: {
-        python: {all: [/left\s*<=\s*0/, /return\s*\{\s*0/]},
-        typescript: {all: [/left\s*<=\s*0/, /return\s*\{\s*0/]},
-        go: {all: [/left\s*<=\s*0/, /return\s*\{\s*0/]},
-        scala: {all: [/left\s*<=\s*0/, /return\s*\{\s*0/]},
-        cpp: {all: [/left\s*<=\s*0/, /return\s*\{\s*0/]},
-      },
-    },
-    {
-      id: 'full-pool',
-      title: 'Answers 429 with Retry-After instead of queueing',
-      detail:
-        'An exhausted pool returns **429** with `Retry-After` in seconds; the request is refused immediately and no work is buffered behind it.',
-      match: {
-        python: {all: [/Retry-After/, /status_code\s*=\s*429/]},
-        typescript: {all: [/Retry-After/, /code\(\s*429\s*\)/]},
-        go: {all: [/Retry-After/, /StatusTooManyRequests/]},
-        scala: {all: [/Retry-After/, /StatusCodes\.TooManyRequests/]},
-        cpp: {all: [/Retry-After/, /\b429\b/]},
+        python: {all: [/WITHSCORES|withscores/], none: [/RETRY_AFTER_S/]},
+        typescript: {all: [/WITHSCORES|withscores/i], none: [/RETRY_AFTER_S/]},
+        go: {all: [/WITHSCORES|WithScores/], none: [/retryAfterSeconds/]},
+        scala: {all: [/WITHSCORES|WithScores/], none: [/RetryAfterSeconds/]},
+        cpp: {all: [/WITHSCORES|withscores/i], none: [/kRetryAfterSeconds/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""GPU admission tokens."""
-import redis
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-GPU_TOKENS_PER_TENANT = 10
-
-
-class InferenceRequest(BaseModel):
-    image: str
-    task: str = "classify"
-
-
-def admit(tenant: str) -> bool:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    left = int(r.get(f"gpu:tokens:{tenant}") or GPU_TOKENS_PER_TENANT)
-    if left <= 0:
-        return False
-    r.decr(f"gpu:tokens:{tenant}")
-    return True
-
-
-@app.post("/v1/inferences")
-def create_inference(body: InferenceRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    if not admit(tenant):
-        raise HTTPException(
-            status_code=429,
-            detail="gpu pool is full for this tenant",
-            headers={"Retry-After": "5"},
-        )
-    return JSONResponse({"id": "inf-1", "tenant": tenant, "task": body.task}, status_code=200)
-`,
-      solution: `"""GPU admission tokens: one atomic Lua acquire with a TTL, released by the ticket's owner."""
+      starter: `import time
 import uuid
 
 import redis
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-app = FastAPI()
+from vision.config import GPU_TOKENS, gpu_key
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-GPU_TOKENS_PER_TENANT = 10
-TOKEN_TTL_S = 15 * 60
+RETRY_AFTER_S = 1
 
-# KEYS[1] = gpu:tokens:{tenant}   KEYS[2] = gpu:holders:{tenant}
-# ARGV[1] = capacity   ARGV[2] = lock id   ARGV[3] = token TTL seconds
-ADMIT_LUA = """
-local left = tonumber(redis.call('GET', KEYS[1]))
-if left == nil then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
-  left = tonumber(ARGV[1])
+
+def admit(tenant: str) -> dict:
+    """Take one of the tenant's GPU slots: {ticket, retry_after}; ticket None when the pool is full."""
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    pool = gpu_key(tenant)
+    if r.zcard(pool) >= GPU_TOKENS:
+        return {"ticket": None, "retry_after": RETRY_AFTER_S}
+    ticket = str(uuid.uuid4())
+    r.zadd(pool, {ticket: int(time.time())})
+    return {"ticket": ticket, "retry_after": 0}
+
+
+def release(tenant: str, ticket: str) -> bool:
+    """Give the slot back: True when this ticket held one."""
+    return r.zremrangebyrank(gpu_key(tenant), 0, 0) == 1
+`,
+      solution: `import time
+import uuid
+
+import redis
+
+from vision.config import GPU_TOKENS, LEASE_S, gpu_key
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+ADMIT = """
+local pool = KEYS[1]
+local now, lease, limit, ticket = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
+redis.call('ZREMRANGEBYSCORE', pool, '-inf', now)
+if redis.call('ZCARD', pool) >= limit then
+  local oldest = redis.call('ZRANGE', pool, 0, 0, 'WITHSCORES')
+  local wait = tonumber(oldest[2]) - now
+  if wait < 1 then wait = 1 end
+  return {'', tostring(wait)}
 end
-if left <= 0 then
-  return {0, 0, redis.call('TTL', KEYS[1])}
-end
-redis.call('DECR', KEYS[1])
-redis.call('HSET', KEYS[2], ARGV[2], 1)
-redis.call('EXPIRE', KEYS[2], ARGV[3])
-return {1, left - 1, redis.call('TTL', KEYS[1])}
+redis.call('ZADD', pool, now + lease, ticket)
+redis.call('EXPIRE', pool, lease)
+return {ticket, '0'}
 """
 
-# Give the token back only when the caller still holds the ticket it was issued with.
-RELEASE_LUA = """
-if redis.call('HDEL', KEYS[2], ARGV[1]) == 1 then
-  redis.call('INCR', KEYS[1])
-  return 1
-end
-return 0
-"""
+admit_slot = r.register_script(ADMIT)
 
 
-class InferenceRequest(BaseModel):
-    image: str
-    task: str = "classify"
+def admit(tenant: str) -> dict:
+    """Take one of the tenant's GPU slots: {ticket, retry_after}; ticket None when the pool is full."""
+    ticket, retry_after = admit_slot(keys=[gpu_key(tenant)], args=[int(time.time()), LEASE_S, GPU_TOKENS, str(uuid.uuid4())])
+    return {"ticket": ticket or None, "retry_after": int(float(retry_after))}
 
 
-def admit(tenant: str, lock_id: str) -> tuple[bool, int, int]:
-    ok, left, ttl = r.eval(
-        ADMIT_LUA,
-        2,
-        f"gpu:tokens:{tenant}",
-        f"gpu:holders:{tenant}",
-        GPU_TOKENS_PER_TENANT,
-        lock_id,
-        TOKEN_TTL_S,
-    )
-    return bool(ok), int(left), int(ttl)
-
-
-def release(tenant: str, lock_id: str) -> None:
-    r.eval(RELEASE_LUA, 2, f"gpu:tokens:{tenant}", f"gpu:holders:{tenant}", lock_id)
-
-
-@app.post("/v1/inferences")
-def create_inference(body: InferenceRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    lock_id = str(uuid.uuid4())
-    ok, left, ttl = admit(tenant, lock_id)
-    if not ok:
-        raise HTTPException(
-            status_code=429,
-            detail="gpu pool is full for this tenant",
-            headers={"Retry-After": str(max(ttl, 1)), "X-GPU-Tokens-Remaining": str(left)},
-        )
-    try:
-        result = {"id": lock_id, "tenant": tenant, "task": body.task}
-    finally:
-        # The worker holding the result lock is the only one that may give the token back.
-        release(tenant, lock_id)
-    return JSONResponse(result, status_code=200)
+def release(tenant: str, ticket: str) -> bool:
+    """Give the slot back: True when this ticket held one."""
+    return r.zrem(gpu_key(tenant), ticket) == 1
 `,
     },
     typescript: {
-      starter: `/** GPU admission tokens. */
-import Fastify from 'fastify';
+      starter: `import {randomUUID} from 'node:crypto';
+
 import Redis from 'ioredis';
 
-export const app = Fastify();
-const redis = new Redis({host: 'redis', port: 6379});
+import {GPU_TOKENS, gpuKey} from 'vision/config';
 
-const GPU_TOKENS_PER_TENANT = 10;
+export const redis = new Redis({host: 'redis', port: 6379});
 
-async function admit(tenant: string): Promise<boolean> {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const raw = await redis.get(\`gpu:tokens:\${tenant}\`);
-  const left = raw === null ? GPU_TOKENS_PER_TENANT : Number(raw);
-  if (left <= 0) return false;
-  await redis.decr(\`gpu:tokens:\${tenant}\`);
-  return true;
+export const RETRY_AFTER_S = 1;
+
+/** admit's answer: the ticket that holds a slot (null when the pool is full) and the seconds to wait. */
+export interface Admission {
+  ticket: string | null;
+  retryAfter: number;
 }
 
-app.post('/v1/inferences', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  if (!(await admit(tenant)))
-    return reply.code(429).header('Retry-After', '5').send({error: 'gpu pool is full for this tenant'});
-  return reply.code(200).send({id: 'inf-1', tenant});
-});
+/** Take one of the tenant's GPU slots. */
+export async function admit(tenant: string): Promise<Admission> {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const pool = gpuKey(tenant);
+  if ((await redis.zcard(pool)) >= GPU_TOKENS) return {ticket: null, retryAfter: RETRY_AFTER_S};
+  const ticket = randomUUID();
+  await redis.zadd(pool, Math.floor(Date.now() / 1000), ticket);
+  return {ticket, retryAfter: 0};
+}
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** Give the slot back: true when this ticket held one. */
+export async function release(tenant: string, ticket: string): Promise<boolean> {
+  void ticket;
+  return (await redis.zremrangebyrank(gpuKey(tenant), 0, 0)) === 1;
+}
 `,
-      solution: `/** GPU admission tokens: one atomic Lua acquire with a TTL, released by the ticket's owner. */
-import {randomUUID} from 'node:crypto';
+      solution: `import {randomUUID} from 'node:crypto';
 
-import Fastify from 'fastify';
 import Redis from 'ioredis';
 
-export const app = Fastify();
-const redis = new Redis({host: 'redis', port: 6379});
+import {GPU_TOKENS, LEASE_S, gpuKey} from 'vision/config';
 
-const GPU_TOKENS_PER_TENANT = 10;
-const TOKEN_TTL_S = 15 * 60;
-
-// KEYS[1] = gpu:tokens:{tenant}   KEYS[2] = gpu:holders:{tenant}
-// ARGV[1] = capacity   ARGV[2] = lock id   ARGV[3] = token TTL seconds
-const ADMIT_LUA = \`
-local left = tonumber(redis.call('GET', KEYS[1]))
-if left == nil then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
-  left = tonumber(ARGV[1])
+const ADMIT = \`
+local pool = KEYS[1]
+local now, lease, limit, ticket = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
+redis.call('ZREMRANGEBYSCORE', pool, '-inf', now)
+if redis.call('ZCARD', pool) >= limit then
+  local oldest = redis.call('ZRANGE', pool, 0, 0, 'WITHSCORES')
+  local wait = tonumber(oldest[2]) - now
+  if wait < 1 then wait = 1 end
+  return {'', tostring(wait)}
 end
-if left <= 0 then
-  return {0, 0, redis.call('TTL', KEYS[1])}
-end
-redis.call('DECR', KEYS[1])
-redis.call('HSET', KEYS[2], ARGV[2], 1)
-redis.call('EXPIRE', KEYS[2], ARGV[3])
-return {1, left - 1, redis.call('TTL', KEYS[1])}
+redis.call('ZADD', pool, now + lease, ticket)
+redis.call('EXPIRE', pool, lease)
+return {ticket, '0'}
 \`;
 
-// Give the token back only when the caller still holds the ticket it was issued with.
-const RELEASE_LUA = \`
-if redis.call('HDEL', KEYS[2], ARGV[1]) == 1 then
-  redis.call('INCR', KEYS[1])
-  return 1
-end
-return 0
-\`;
-
-async function admit(tenant: string, lockId: string): Promise<[boolean, number, number]> {
-  const reply = (await redis.eval(
-    ADMIT_LUA,
-    2,
-    \`gpu:tokens:\${tenant}\`,
-    \`gpu:holders:\${tenant}\`,
-    String(GPU_TOKENS_PER_TENANT),
-    lockId,
-    String(TOKEN_TTL_S),
-  )) as number[];
-  return [reply[0] === 1, reply[1], reply[2]];
+interface PoolRedis extends Redis {
+  admitSlot(pool: string, now: number, lease: number, limit: number, ticket: string): Promise<[string, string]>;
 }
 
-async function release(tenant: string, lockId: string): Promise<void> {
-  await redis.eval(RELEASE_LUA, 2, \`gpu:tokens:\${tenant}\`, \`gpu:holders:\${tenant}\`, lockId);
+export const redis = new Redis({host: 'redis', port: 6379}) as PoolRedis;
+redis.defineCommand('admitSlot', {numberOfKeys: 1, lua: ADMIT});
+
+/** admit's answer: the ticket that holds a slot (null when the pool is full) and the seconds to wait. */
+export interface Admission {
+  ticket: string | null;
+  retryAfter: number;
 }
 
-app.post('/v1/inferences', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const lockId = randomUUID();
-  const [ok, left, ttl] = await admit(tenant, lockId);
-  if (!ok)
-    return reply
-      .code(429)
-      .header('Retry-After', String(Math.max(ttl, 1)))
-      .header('X-GPU-Tokens-Remaining', String(left))
-      .send({error: 'gpu pool is full for this tenant'});
-  try {
-    return reply.code(200).send({id: lockId, tenant});
-  } finally {
-    // The worker holding the result lock is the only one that may give the token back.
-    await release(tenant, lockId);
-  }
-});
+/** Take one of the tenant's GPU slots. */
+export async function admit(tenant: string): Promise<Admission> {
+  const now = Math.floor(Date.now() / 1000);
+  const [ticket, retryAfter] = await redis.admitSlot(gpuKey(tenant), now, LEASE_S, GPU_TOKENS, randomUUID());
+  return {ticket: ticket === '' ? null : ticket, retryAfter: Math.floor(Number(retryAfter))};
+}
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** Give the slot back: true when this ticket held one. */
+export async function release(tenant: string, ticket: string): Promise<boolean> {
+  return (await redis.zrem(gpuKey(tenant), ticket)) === 1;
+}
 `,
     },
     go: {
@@ -332,420 +257,565 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
+	"fmt"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
+	"vision/config" // config.GPUTokens, config.LeaseSeconds, config.GPUKey(tenant) — provided
 )
 
-const gpuTokensPerTenant = 10
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var rdb *redis.Client
+const retryAfterSeconds = 1
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+// Admission is admit's answer: the ticket that holds a slot ("" when the pool is full) and the seconds to wait.
+type Admission struct {
+	Ticket     string
+	RetryAfter int64
 }
 
-func admit(ctx context.Context, tenant string) bool {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	key := "gpu:tokens:" + tenant
-	left, err := rdb.Get(ctx, key).Int()
-	if err == redis.Nil {
-		left = gpuTokensPerTenant
+// admit takes one of the tenant's GPU slots.
+func admit(ctx context.Context, tenant string) (Admission, error) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	pool := config.GPUKey(tenant)
+	held, err := rdb.ZCard(ctx, pool).Result()
+	if err != nil {
+		return Admission{}, err
 	}
-	if left <= 0 {
-		return false
+	if held >= config.GPUTokens {
+		return Admission{RetryAfter: retryAfterSeconds}, nil
 	}
-	rdb.Decr(ctx, key)
-	return true
+	ticket := uuid.NewString()
+	if err := rdb.ZAdd(ctx, pool, redis.Z{Score: float64(time.Now().Unix()), Member: ticket}).Err(); err != nil {
+		return Admission{}, err
+	}
+	return Admission{Ticket: ticket}, nil
 }
 
-func createInference(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
-		return
-	}
-	if !admit(r.Context(), tenant) {
-		rw.Header().Set("Retry-After", "5")
-		writeJSON(rw, http.StatusTooManyRequests, map[string]string{"error": "gpu pool is full for this tenant"})
-		return
-	}
-	writeJSON(rw, http.StatusOK, map[string]string{"id": "inf-1", "tenant": tenant})
+// release gives the slot back: true when this ticket held one.
+func release(ctx context.Context, tenant, ticket string) (bool, error) {
+	removed, err := rdb.ZRemRangeByRank(ctx, config.GPUKey(tenant), 0, 0).Result()
+	return removed == 1, err
+}
+
+func main() {
+	a, err := admit(context.Background(), "demo")
+	fmt.Println(a, err)
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
+	"vision/config" // config.GPUTokens, config.LeaseSeconds, config.GPUKey(tenant) — provided
 )
 
-const (
-	gpuTokensPerTenant = 10
-	tokenTTLSeconds    = 15 * 60
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var rdb *redis.Client
-
-// KEYS[1] = gpu:tokens:{tenant}   KEYS[2] = gpu:holders:{tenant}
-// ARGV[1] = capacity   ARGV[2] = lock id   ARGV[3] = token TTL seconds
-var admitScript = redis.NewScript(\`
-local left = tonumber(redis.call('GET', KEYS[1]))
-if left == nil then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
-  left = tonumber(ARGV[1])
+var admitSlot = redis.NewScript(\`
+local pool = KEYS[1]
+local now, lease, limit, ticket = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
+redis.call('ZREMRANGEBYSCORE', pool, '-inf', now)
+if redis.call('ZCARD', pool) >= limit then
+  local oldest = redis.call('ZRANGE', pool, 0, 0, 'WITHSCORES')
+  local wait = tonumber(oldest[2]) - now
+  if wait < 1 then wait = 1 end
+  return {'', tostring(wait)}
 end
-if left <= 0 then
-  return {0, 0, redis.call('TTL', KEYS[1])}
-end
-redis.call('DECR', KEYS[1])
-redis.call('HSET', KEYS[2], ARGV[2], 1)
-redis.call('EXPIRE', KEYS[2], ARGV[3])
-return {1, left - 1, redis.call('TTL', KEYS[1])}
+redis.call('ZADD', pool, now + lease, ticket)
+redis.call('EXPIRE', pool, lease)
+return {ticket, '0'}
 \`)
 
-// Give the token back only when the caller still holds the ticket it was issued with.
-var releaseScript = redis.NewScript(\`
-if redis.call('HDEL', KEYS[2], ARGV[1]) == 1 then
-  redis.call('INCR', KEYS[1])
-  return 1
-end
-return 0
-\`)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+// Admission is admit's answer: the ticket that holds a slot ("" when the pool is full) and the seconds to wait.
+type Admission struct {
+	Ticket     string
+	RetryAfter int64
 }
 
-func admit(ctx context.Context, tenant, lockID string) (bool, int64, int64) {
-	keys := []string{"gpu:tokens:" + tenant, "gpu:holders:" + tenant}
-	values, err := admitScript.Run(ctx, rdb, keys, gpuTokensPerTenant, lockID, tokenTTLSeconds).Int64Slice()
+// admit takes one of the tenant's GPU slots.
+func admit(ctx context.Context, tenant string) (Admission, error) {
+	args := []any{time.Now().Unix(), config.LeaseSeconds, config.GPUTokens, uuid.NewString()}
+	reply, err := admitSlot.Run(ctx, rdb, []string{config.GPUKey(tenant)}, args...).Slice()
 	if err != nil {
-		panic(err)
+		return Admission{}, err
 	}
-	return values[0] == 1, values[1], values[2]
+	wait, _ := strconv.ParseFloat(fmt.Sprint(reply[1]), 64)
+	return Admission{Ticket: fmt.Sprint(reply[0]), RetryAfter: int64(wait)}, nil
 }
 
-func release(ctx context.Context, tenant, lockID string) {
-	keys := []string{"gpu:tokens:" + tenant, "gpu:holders:" + tenant}
-	if _, err := releaseScript.Run(ctx, rdb, keys, lockID).Result(); err != nil {
-		panic(err)
-	}
+// release gives the slot back: true when this ticket held one.
+func release(ctx context.Context, tenant, ticket string) (bool, error) {
+	removed, err := rdb.ZRem(ctx, config.GPUKey(tenant), ticket).Result()
+	return removed == 1, err
 }
 
-func createInference(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
-		return
-	}
-	lockID := uuid.NewString()
-	ok, left, ttl := admit(r.Context(), tenant, lockID)
-	if !ok {
-		rw.Header().Set("Retry-After", fmt.Sprintf("%d", ttl))
-		rw.Header().Set("X-GPU-Tokens-Remaining", fmt.Sprintf("%d", left))
-		writeJSON(rw, http.StatusTooManyRequests, map[string]string{"error": "gpu pool is full for this tenant"})
-		return
-	}
-	// The worker holding the result lock is the only one that may give the token back.
-	defer release(r.Context(), tenant, lockID)
-	writeJSON(rw, http.StatusOK, map[string]string{"id": lockID, "tenant": tenant})
+func main() {
+	a, err := admit(context.Background(), "demo")
+	fmt.Println(a, err)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
+      starter: `import java.util.UUID
+
 import redis.clients.jedis.JedisPooled
 
-object Admission {
-  val GpuTokensPerTenant = 10
+import vision.Config
+
+/** admit's answer: the ticket that holds a slot (None when the pool is full) and the seconds to wait. */
+final case class Admission(ticket: Option[String], retryAfter: Long)
+
+object GpuPool {
   val jedis = new JedisPooled("redis", 6379)
+  val RetryAfterSeconds = 1L
 
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  def admit(tenant: String): Boolean = {
-    val key = s"gpu:tokens:$tenant"
-    val left = Option(jedis.get(key)).map(_.toLong).getOrElse(GpuTokensPerTenant.toLong)
-    if (left <= 0) false
-    else {
-      jedis.decr(key)
-      true
+  /** Take one of the tenant's GPU slots. */
+  def admit(tenant: String): Admission = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    val pool = Config.gpuKey(tenant)
+    if (jedis.zcard(pool) >= Config.GpuTokens) {
+      Admission(None, RetryAfterSeconds)
+    } else {
+      val ticket = UUID.randomUUID().toString
+      jedis.zadd(pool, (System.currentTimeMillis() / 1000).toDouble, ticket)
+      Admission(Some(ticket), 0)
     }
   }
-}
 
-object VisionApi {
-  implicit val system: ActorSystem = ActorSystem("vision-api")
-
-  val route: Route =
-    path("v1" / "inferences") {
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[String]) { _ =>
-            if (!Admission.admit(tenant)) {
-              respondWithHeaders(RawHeader("Retry-After", "5")) {
-                complete(StatusCodes.TooManyRequests, """{"error":"gpu pool is full for this tenant"}""")
-              }
-            } else {
-              complete(StatusCodes.OK, s"""{"id":"inf-1","tenant":"$tenant"}""")
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
+  /** Give the slot back: true when this ticket held one. */
+  def release(tenant: String, ticket: String): Boolean =
+    jedis.zremrangeByRank(Config.gpuKey(tenant), 0, 0) == 1L
 }
 `,
       solution: `import java.util.UUID
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
 import redis.clients.jedis.JedisPooled
+
 import scala.jdk.CollectionConverters._
 
-object Admission {
-  val GpuTokensPerTenant = 10
-  val TokenTtlSeconds = 15L * 60
+import vision.Config
 
+/** admit's answer: the ticket that holds a slot (None when the pool is full) and the seconds to wait. */
+final case class Admission(ticket: Option[String], retryAfter: Long)
+
+object GpuPool {
   val jedis = new JedisPooled("redis", 6379)
 
-  // KEYS[1] = gpu:tokens:{tenant}   KEYS[2] = gpu:holders:{tenant}
-  // ARGV[1] = capacity   ARGV[2] = lock id   ARGV[3] = token TTL seconds
-  val AdmitLua: String =
-    """
-      |local left = tonumber(redis.call('GET', KEYS[1]))
-      |if left == nil then
-      |  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
-      |  left = tonumber(ARGV[1])
+  val Admit: String =
+    """local pool = KEYS[1]
+      |local now, lease, limit, ticket = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
+      |redis.call('ZREMRANGEBYSCORE', pool, '-inf', now)
+      |if redis.call('ZCARD', pool) >= limit then
+      |  local oldest = redis.call('ZRANGE', pool, 0, 0, 'WITHSCORES')
+      |  local wait = tonumber(oldest[2]) - now
+      |  if wait < 1 then wait = 1 end
+      |  return {'', tostring(wait)}
       |end
-      |if left <= 0 then
-      |  return {0, 0, redis.call('TTL', KEYS[1])}
-      |end
-      |redis.call('DECR', KEYS[1])
-      |redis.call('HSET', KEYS[2], ARGV[2], 1)
-      |redis.call('EXPIRE', KEYS[2], ARGV[3])
-      |return {1, left - 1, redis.call('TTL', KEYS[1])}
+      |redis.call('ZADD', pool, now + lease, ticket)
+      |redis.call('EXPIRE', pool, lease)
+      |return {ticket, '0'}
       |""".stripMargin
 
-  // Give the token back only when the caller still holds the ticket it was issued with.
-  val ReleaseLua: String =
-    """
-      |if redis.call('HDEL', KEYS[2], ARGV[1]) == 1 then
-      |  redis.call('INCR', KEYS[1])
-      |  return 1
-      |end
-      |return 0
-      |""".stripMargin
-
-  def admit(tenant: String, lockId: String): (Boolean, Long, Long) = {
-    val keys = List(s"gpu:tokens:$tenant", s"gpu:holders:$tenant").asJava
-    val args = List(GpuTokensPerTenant.toString, lockId, TokenTtlSeconds.toString).asJava
-    val reply = jedis.eval(AdmitLua, keys, args).asInstanceOf[java.util.List[Long]]
-    (reply.get(0) == 1L, reply.get(1), reply.get(2))
+  /** Take one of the tenant's GPU slots. */
+  def admit(tenant: String): Admission = {
+    val args = List((System.currentTimeMillis() / 1000).toString, Config.LeaseSeconds.toString, Config.GpuTokens.toString, UUID.randomUUID().toString)
+    val reply = jedis.eval(Admit, List(Config.gpuKey(tenant)).asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(_.toString)
+    Admission(Some(reply(0)).filter(_.nonEmpty), reply(1).toDouble.toLong)
   }
 
-  def release(tenant: String, lockId: String): Unit = {
-    val keys = List(s"gpu:tokens:$tenant", s"gpu:holders:$tenant").asJava
-    jedis.eval(ReleaseLua, keys, List(lockId).asJava)
-  }
-}
-
-object VisionApi {
-  implicit val system: ActorSystem = ActorSystem("vision-api")
-
-  val route: Route =
-    path("v1" / "inferences") {
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[String]) { _ =>
-            val lockId = UUID.randomUUID().toString
-            val (ok, left, ttl) = Admission.admit(tenant, lockId)
-            if (!ok) {
-              respondWithHeaders(
-                RawHeader("Retry-After", ttl.toString),
-                RawHeader("X-GPU-Tokens-Remaining", left.toString)
-              ) {
-                complete(StatusCodes.TooManyRequests, """{"error":"gpu pool is full for this tenant"}""")
-              }
-            } else {
-              // The worker holding the result lock is the only one that may give the token back.
-              Admission.release(tenant, lockId)
-              complete(StatusCodes.OK, s"""{"id":"$lockId","tenant":"$tenant"}""")
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
+  /** Give the slot back: true when this ticket held one. */
+  def release(tenant: String, ticket: String): Boolean = jedis.zrem(Config.gpuKey(tenant), ticket) == 1L
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
+#include <chrono>
 #include <string>
 
-using json = nlohmann::json;
+#include "ids.h"            // new_uuid() — provided
+#include "vision/config.h"  // config::kGpuTokens, config::kLeaseSeconds, config::gpu_key(tenant) — provided
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-constexpr int kGpuTokensPerTenant = 10;
+constexpr long long kRetryAfterSeconds = 1;
 
-// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-bool admit(const std::string& tenant) {
-  const auto key = "gpu:tokens:" + tenant;
-  const auto raw = redis.get(key);
-  const long long left = raw ? std::stoll(*raw) : kGpuTokensPerTenant;
-  if (left <= 0) return false;
-  redis.decr(key);
-  return true;
+// admit's answer: the ticket that holds a slot ("" when the pool is full) and the seconds to wait.
+struct Admission {
+  std::string ticket;
+  long long retry_after = 0;
+};
+
+long long now_s() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-int main() {
-  httplib::Server svr;
+// Take one of the tenant's GPU slots.
+Admission admit(const std::string& tenant) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string pool = config::gpu_key(tenant);
+  if (redis.zcard(pool) >= config::kGpuTokens) return {"", kRetryAfterSeconds};
+  const std::string ticket = new_uuid();
+  redis.zadd(pool, ticket, static_cast<double>(now_s()));
+  return {ticket, 0};
+}
 
-  svr.Post("/v1/inferences", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    if (!admit(tenant)) {
-      res.set_header("Retry-After", "5");
-      res.status = 429;
-      res.set_content(R"({"error":"gpu pool is full for this tenant"})", "application/json");
-      return;
-    }
-    res.status = 200;
-    res.set_content(json{{"id", "inf-1"}, {"tenant", tenant}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Give the slot back: true when this ticket held one.
+bool release(const std::string& tenant, const std::string& ticket) {
+  (void)ticket;
+  return redis.zremrangebyrank(config::gpu_key(tenant), 0, 0) == 1;
 }
 `,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
+#include <chrono>
 #include <string>
-#include <vector>
+#include <tuple>
 
-using json = nlohmann::json;
+#include "ids.h"            // new_uuid() — provided
+#include "vision/config.h"  // config::kGpuTokens, config::kLeaseSeconds, config::gpu_key(tenant) — provided
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-constexpr int kGpuTokensPerTenant = 10;
-constexpr long long kTokenTtlSeconds = 15 * 60;
-
-// KEYS[1] = gpu:tokens:{tenant}   KEYS[2] = gpu:holders:{tenant}
-// ARGV[1] = capacity   ARGV[2] = lock id   ARGV[3] = token TTL seconds
-const std::string kAdmitLua = R"lua(
-local left = tonumber(redis.call('GET', KEYS[1]))
-if left == nil then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
-  left = tonumber(ARGV[1])
+const std::string kAdmit = R"lua(
+local pool = KEYS[1]
+local now, lease, limit, ticket = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
+redis.call('ZREMRANGEBYSCORE', pool, '-inf', now)
+if redis.call('ZCARD', pool) >= limit then
+  local oldest = redis.call('ZRANGE', pool, 0, 0, 'WITHSCORES')
+  local wait = tonumber(oldest[2]) - now
+  if wait < 1 then wait = 1 end
+  return {'', tostring(wait)}
 end
-if left <= 0 then
-  return {0, 0, redis.call('TTL', KEYS[1])}
-end
-redis.call('DECR', KEYS[1])
-redis.call('HSET', KEYS[2], ARGV[2], 1)
-redis.call('EXPIRE', KEYS[2], ARGV[3])
-return {1, left - 1, redis.call('TTL', KEYS[1])}
+redis.call('ZADD', pool, now + lease, ticket)
+redis.call('EXPIRE', pool, lease)
+return {ticket, '0'}
 )lua";
 
-// Give the token back only when the caller still holds the ticket it was issued with.
-const std::string kReleaseLua = R"lua(
-if redis.call('HDEL', KEYS[2], ARGV[1]) == 1 then
-  redis.call('INCR', KEYS[1])
-  return 1
-end
-return 0
-)lua";
+// admit's answer: the ticket that holds a slot ("" when the pool is full) and the seconds to wait.
+struct Admission {
+  std::string ticket;
+  long long retry_after = 0;
+};
 
-bool admit(const std::string& tenant, const std::string& lockId, long long& left, long long& ttl) {
-  const std::vector<std::string> keys{"gpu:tokens:" + tenant, "gpu:holders:" + tenant};
-  const std::vector<std::string> args{std::to_string(kGpuTokensPerTenant), lockId,
-                                      std::to_string(kTokenTtlSeconds)};
-  const auto reply = redis.eval<std::vector<long long>>(kAdmitLua, keys.begin(), keys.end(), args.begin(), args.end());
-  left = reply[1];
-  ttl = reply[2];
-  return reply[0] == 1;
+long long now_s() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-void release(const std::string& tenant, const std::string& lockId) {
-  const std::vector<std::string> keys{"gpu:tokens:" + tenant, "gpu:holders:" + tenant};
-  const std::vector<std::string> args{lockId};
-  redis.eval<long long>(kReleaseLua, keys.begin(), keys.end(), args.begin(), args.end());
+// Take one of the tenant's GPU slots.
+Admission admit(const std::string& tenant) {
+  const auto [ticket, wait] = redis.eval<std::string, std::string>(
+      kAdmit, {config::gpu_key(tenant)},
+      {std::to_string(now_s()), std::to_string(config::kLeaseSeconds), std::to_string(config::kGpuTokens), new_uuid()});
+  return {ticket, static_cast<long long>(std::stod(wait))};
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/inferences", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto lockId = uuidString();
-    long long left = 0;
-    long long ttl = 0;
-    if (!admit(tenant, lockId, left, ttl)) {
-      res.set_header("Retry-After", std::to_string(ttl > 0 ? ttl : 1));
-      res.set_header("X-GPU-Tokens-Remaining", std::to_string(left));
-      res.status = 429;
-      res.set_content(R"({"error":"gpu pool is full for this tenant"})", "application/json");
-      return;
-    }
-    // The worker holding the result lock is the only one that may give the token back.
-    release(tenant, lockId);
-    res.status = 200;
-    res.set_content(json{{"id", lockId}, {"tenant", tenant}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+// Give the slot back: true when this ticket held one.
+bool release(const std::string& tenant, const std::string& ticket) { return redis.zrem(config::gpu_key(tenant), ticket) == 1; }
 `,
     },
   },
-  hints: [
-    'Fire 20 concurrent requests at one tenant: more than 10 are admitted and `gpu:tokens:acme` ends below zero. Kill a worker mid-inference and the counter stays one lower for good.',
-    '`GET` and `DECR` are two round trips, so every request that reads between them sees the same room, and the guard runs client-side so nothing stops the decrement in Redis. No expiry, no release.',
-    'Move admission into `ADMIT_LUA` run by one `eval` (`SET … EX TOKEN_TTL_S` on first write, `return {0, …}` when `left <= 0`, else `DECR` and `HSET`), and add `RELEASE_LUA`: `HDEL` the `lock_id`, then `INCR`.',
-  ],
-  debrief: `The limiter has the shape every well-built one has: a single server-side decision, an
-expiry set with the first write so a crash heals itself, and an owner-checked release so a stale
-ticket cannot inflate the pool. The TTL belongs inside the script rather than in a follow-up
-\`EXPIRE\` that a failed request can skip, and release must not refresh it, or a busy tenant's counter
-would live forever. The number is policy: 10 tokens per tenant is fair share, not capacity.
-Production pools put a global cap above the per-tenant one, keep a short queue inside the worker for
-admitted-but-not-started work, and measure how long tickets are held, because a pool that is never
-full is usually a pool that is too big.`,
+  harness: {
+    python: `import time
+
+POOL = "vision:gpu:t1"
+
+
+def _held(ctx):
+    return ctx.redis.zcard(POOL)
+
+
+def check_atomic_admit(ctx):
+    m = ctx.load("state")
+    now = int(time.time())
+    for i in range(9):
+        ctx.redis.zadd(POOL, {f"other-{i}": now + 300})  # nine slots other workers hold
+
+    def other_worker():
+        # another worker admitting into the last slot, landing between two of this worker's commands
+        if ctx.redis.zcard(POOL) < 10:
+            ctx.redis.zadd(POOL, {"other-racer": now + 300})
+            return "admitted"
+        return "refused"
+
+    probe = ctx.redis_after(POOL, other_worker)
+    mine = m.admit("t1")
+    assert probe.fired, "admit never touched the pool"
+    outcomes = sorted(["admitted" if mine.get("ticket") else "refused", probe.result])
+    assert outcomes == ["admitted", "refused"], f"two workers raced for the last slot and the outcomes were {outcomes}: the count and the add must run in one script, so exactly one of them gets it"
+    assert _held(ctx) == 10, f"a 10-slot pool holds {_held(ctx)} tickets after the race"
+
+
+def check_lease_expiry(ctx):
+    m = ctx.load("state")
+    tickets = [m.admit("t1").get("ticket") for _ in range(10)]
+    assert all(tickets), f"ten admissions into an empty 10-slot pool must all get a ticket: {tickets}"
+    assert m.admit("t1").get("ticket") is None, "the eleventh admission must be refused"
+    ctx.clock.advance(301)  # the ten holders crashed without releasing
+    again = m.admit("t1")
+    assert again.get("ticket"), f"five minutes after ten holders crashed the tenant is still locked out ({again}): a lease must end on its own"
+    assert _held(ctx) == 1, f"the expired leases must be gone: the pool holds {_held(ctx)} tickets"
+    score = ctx.redis.zscore(POOL, again["ticket"])
+    assert score is not None and abs(score - (time.time() + 300)) <= 1, f"a ticket is scored with its lease expiry (now + LEASE_S), got {score}"
+
+
+def check_owner_release(ctx):
+    m = ctx.load("state")
+    a, b, c = (m.admit("t1")["ticket"] for _ in range(3))
+    assert m.release("t1", b) is True, "releasing a held ticket must answer True"
+    held = set(ctx.redis.zrange(POOL, 0, -1))
+    assert held == {a, c}, f"release(b) freed the wrong slot: the pool holds {sorted(held)}, expected a and c"
+    assert m.release("t1", b) is False, "a second release of the same ticket must answer False"
+    assert m.release("t1", "forged-ticket") is False, "an unknown ticket must answer False"
+    assert set(ctx.redis.zrange(POOL, 0, -1)) == {a, c}, f"a stale or unknown release must free nothing: the pool holds {sorted(ctx.redis.zrange(POOL, 0, -1))}"
+
+
+def check_retry_after(ctx):
+    m = ctx.load("state")
+    for _ in range(10):
+        assert m.admit("t1").get("ticket")
+    ctx.clock.advance(100)
+    refused = m.admit("t1")
+    assert refused.get("ticket") is None, f"a full pool must refuse: {refused}"
+    wait = refused.get("retry_after")
+    assert isinstance(wait, int) and 199 <= wait <= 201, f"the earliest lease ends in 200 s, retry_after says {wait!r}: a client told to come back in 1 s polls 200 times"
+`,
+    typescript: `const POOL = 'vision:gpu:t1';
+const nowS = ctx => Math.floor(ctx.clock.now() / 1000);
+const held = ctx => Number(ctx.redis.zcard(POOL));
+
+export async function check_atomic_admit(ctx) {
+  const m = ctx.load('state');
+  const now = nowS(ctx);
+  for (let i = 0; i < 9; i++) ctx.redis.zadd(POOL, now + 300, \`other-\${i}\`); // nine slots other workers hold
+  // another worker admitting into the last slot, landing between two of this worker's commands
+  const probe = ctx.redisAfter(POOL, () => {
+    if (Number(ctx.redis.zcard(POOL)) < 10) {
+      ctx.redis.zadd(POOL, now + 300, 'other-racer');
+      return 'admitted';
+    }
+    return 'refused';
+  });
+  const mine = await m.admit('t1');
+  assert(probe.fired, 'admit never touched the pool');
+  const outcomes = [mine.ticket ? 'admitted' : 'refused', probe.result].sort();
+  assert.deepEqual(outcomes, ['admitted', 'refused'], \`two workers raced for the last slot and the outcomes were \${JSON.stringify(outcomes)}: the count and the add must run in one script, so exactly one of them gets it\`);
+  assert.equal(held(ctx), 10, \`a 10-slot pool holds \${held(ctx)} tickets after the race\`);
+}
+
+export async function check_lease_expiry(ctx) {
+  const m = ctx.load('state');
+  const tickets: (string | null)[] = [];
+  for (let i = 0; i < 10; i++) tickets.push((await m.admit('t1')).ticket);
+  assert(tickets.every(Boolean), \`ten admissions into an empty 10-slot pool must all get a ticket: \${JSON.stringify(tickets)}\`);
+  assert.equal((await m.admit('t1')).ticket, null, 'the eleventh admission must be refused');
+  ctx.clock.advance(301); // the ten holders crashed without releasing
+  const again = await m.admit('t1');
+  assert(again.ticket, \`five minutes after ten holders crashed the tenant is still locked out (\${JSON.stringify(again)}): a lease must end on its own\`);
+  assert.equal(held(ctx), 1, \`the expired leases must be gone: the pool holds \${held(ctx)} tickets\`);
+  const score = Number(ctx.redis.zscore(POOL, again.ticket));
+  assert(Math.abs(score - (nowS(ctx) + 300)) <= 1, \`a ticket is scored with its lease expiry (now + LEASE_S), got \${score}\`);
+}
+
+export async function check_owner_release(ctx) {
+  const m = ctx.load('state');
+  const [a, b, c] = [(await m.admit('t1')).ticket, (await m.admit('t1')).ticket, (await m.admit('t1')).ticket];
+  assert.equal(await m.release('t1', b), true, 'releasing a held ticket must answer true');
+  const members = () => [...ctx.redis.zrange(POOL, 0, -1)].sort();
+  assert.deepEqual(members(), [a, c].sort(), \`release(b) freed the wrong slot: the pool holds \${JSON.stringify(members())}, expected a and c\`);
+  assert.equal(await m.release('t1', b), false, 'a second release of the same ticket must answer false');
+  assert.equal(await m.release('t1', 'forged-ticket'), false, 'an unknown ticket must answer false');
+  assert.deepEqual(members(), [a, c].sort(), \`a stale or unknown release must free nothing: the pool holds \${JSON.stringify(members())}\`);
+}
+
+export async function check_retry_after(ctx) {
+  const m = ctx.load('state');
+  for (let i = 0; i < 10; i++) assert((await m.admit('t1')).ticket);
+  ctx.clock.advance(100);
+  const refused = await m.admit('t1');
+  assert.equal(refused.ticket, null, \`a full pool must refuse: \${JSON.stringify(refused)}\`);
+  const wait = refused.retryAfter;
+  assert(Number.isInteger(wait) && wait >= 199 && wait <= 201, \`the earliest lease ends in 200 s, retryAfter says \${wait}: a client told to come back in 1 s polls 200 times\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"math"
+	"sort"
+
+	"leetbuild/harness"
+)
+
+const statePool = "vision:gpu:t1"
+
+func stateAdmit(ctx *harness.Ctx) Admission {
+	a, err := admit(context.Background(), "t1")
+	ctx.NoError(err, "admit")
+	return a
+}
+
+func stateRelease(ctx *harness.Ctx, ticket string) bool {
+	ok, err := release(context.Background(), "t1", ticket)
+	ctx.NoError(err, "release")
+	return ok
+}
+
+func stateHeld(ctx *harness.Ctx) []string {
+	var out []string
+	for _, z := range ctx.Redis.ZRangeWithScores(statePool, 0, -1) {
+		out = append(out, z.Member)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func CheckAtomicAdmit(ctx *harness.Ctx) {
+	now := ctx.Clock.Now() / 1000
+	for i := 0; i < 9; i++ {
+		ctx.Redis.Do("ZADD", statePool, now+300, "other-"+string(rune('a'+i))) // nine slots other workers hold
+	}
+	other := ""
+	// another worker admitting into the last slot, landing between two of this worker's commands
+	ctx.Redis.After(statePool, func() any {
+		if ctx.Redis.ZCard(statePool) < 10 {
+			ctx.Redis.Do("ZADD", statePool, now+300, "other-racer")
+			other = "admitted"
+			return nil
+		}
+		other = "refused"
+		return nil
+	})
+	mine := stateAdmit(ctx)
+	ctx.Assert(other != "", "admit never touched the pool")
+	outcomes := []string{other, "refused"}
+	if mine.Ticket != "" {
+		outcomes[1] = "admitted"
+	}
+	sort.Strings(outcomes)
+	ctx.Equal(outcomes, []string{"admitted", "refused"}, "two workers raced for the last slot: the count and the add must run in one script, so exactly one of them gets it; the outcomes")
+	ctx.Equal(ctx.Redis.ZCard(statePool), 10, "a 10-slot pool after the race; tickets held")
+}
+
+func CheckLeaseExpiry(ctx *harness.Ctx) {
+	for i := 0; i < 10; i++ {
+		ctx.Assert(stateAdmit(ctx).Ticket != "", "ten admissions into an empty 10-slot pool must all get a ticket (admission %d did not)", i+1)
+	}
+	ctx.Equal(stateAdmit(ctx).Ticket, "", "the eleventh admission must be refused; its ticket")
+	ctx.Clock.Advance(301) // the ten holders crashed without releasing
+	again := stateAdmit(ctx)
+	ctx.Assert(again.Ticket != "", "five minutes after ten holders crashed the tenant is still locked out (%+v): a lease must end on its own", again)
+	ctx.Equal(ctx.Redis.ZCard(statePool), 1, "the expired leases must be gone; tickets held")
+	score, ok := ctx.Redis.ZScore(statePool, again.Ticket)
+	ctx.Assert(ok && math.Abs(score-float64(ctx.Clock.Now()/1000+300)) <= 1, "a ticket is scored with its lease expiry (now + LeaseSeconds), got %v", score)
+}
+
+func CheckOwnerRelease(ctx *harness.Ctx) {
+	a, b, c := stateAdmit(ctx).Ticket, stateAdmit(ctx).Ticket, stateAdmit(ctx).Ticket
+	want := []string{a, c}
+	sort.Strings(want)
+	ctx.Assert(stateRelease(ctx, b), "releasing a held ticket must answer true")
+	ctx.Equal(stateHeld(ctx), want, "release(b) must free b's slot only; the pool holds")
+	ctx.Assert(!stateRelease(ctx, b), "a second release of the same ticket must answer false")
+	ctx.Assert(!stateRelease(ctx, "forged-ticket"), "an unknown ticket must answer false")
+	ctx.Equal(stateHeld(ctx), want, "a stale or unknown release must free nothing; the pool holds")
+}
+
+func CheckRetryAfter(ctx *harness.Ctx) {
+	for i := 0; i < 10; i++ {
+		ctx.Assert(stateAdmit(ctx).Ticket != "", "admission %d into an empty pool", i+1)
+	}
+	ctx.Clock.Advance(100)
+	refused := stateAdmit(ctx)
+	ctx.Equal(refused.Ticket, "", "a full pool must refuse; the ticket")
+	ctx.Assert(refused.RetryAfter >= 199 && refused.RetryAfter <= 201, "the earliest lease ends in 200 s, RetryAfter says %d: a client told to come back in 1 s polls 200 times", refused.RetryAfter)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kPool = "vision:gpu:t1";
+
+std::vector<std::string> held(harness::Ctx& ctx) {
+  std::vector<std::string> out;
+  for (const auto& z : ctx.Redis.ZRangeWithScores(kPool, 0, -1)) out.push_back(z.Member);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+}  // namespace
+
+void CheckAtomicAdmit(harness::Ctx& ctx) {
+  const long long now = ctx.Clock.Now() / 1000;
+  for (int i = 0; i < 9; i++) ctx.Redis.Do("ZADD", kPool, now + 300, "other-" + std::to_string(i));  // nine slots other workers hold
+  std::string other;
+  // another worker admitting into the last slot, landing between two of this worker's commands
+  ctx.Redis.After(kPool, [&] {
+    if (ctx.Redis.ZCard(kPool) < 10) {
+      ctx.Redis.Do("ZADD", kPool, now + 300, "other-racer");
+      other = "admitted";
+      return;
+    }
+    other = "refused";
+  });
+  const Admission mine = admit("t1");
+  ctx.Assert(!other.empty(), "admit never touched the pool");
+  std::vector<std::string> outcomes = {mine.ticket.empty() ? "refused" : "admitted", other};
+  std::sort(outcomes.begin(), outcomes.end());
+  ctx.Equal(outcomes, {"admitted", "refused"}, "two workers raced for the last slot: the count and the add must run in one script, so exactly one of them gets it; the outcomes");
+  ctx.Equal(ctx.Redis.ZCard(kPool), 10, "a 10-slot pool after the race; tickets held");
+}
+
+void CheckLeaseExpiry(harness::Ctx& ctx) {
+  for (int i = 0; i < 10; i++) ctx.Assert(!admit("t1").ticket.empty(), "ten admissions into an empty 10-slot pool must all get a ticket (admission %d did not)", i + 1);
+  ctx.Equal(admit("t1").ticket, "", "the eleventh admission must be refused; its ticket");
+  ctx.Clock.Advance(301);  // the ten holders crashed without releasing
+  const Admission again = admit("t1");
+  ctx.Assert(!again.ticket.empty(), "five minutes after ten holders crashed the tenant is still locked out (retry_after %d): a lease must end on its own", again.retry_after);
+  ctx.Equal(ctx.Redis.ZCard(kPool), 1, "the expired leases must be gone; tickets held");
+  const auto score = ctx.Redis.ZScore(kPool, again.ticket);
+  ctx.Assert(score && std::abs(*score - static_cast<double>(ctx.Clock.Now() / 1000 + 300)) <= 1, "a ticket is scored with its lease expiry (now + kLeaseSeconds), got %v", score.value_or(-1));
+}
+
+void CheckOwnerRelease(harness::Ctx& ctx) {
+  const std::string a = admit("t1").ticket;
+  const std::string b = admit("t1").ticket;
+  const std::string c = admit("t1").ticket;
+  std::vector<std::string> want = {a, c};
+  std::sort(want.begin(), want.end());
+  ctx.Assert(release("t1", b), "releasing a held ticket must answer true");
+  ctx.Equal(held(ctx), want, "release(b) must free b's slot only; the pool holds");
+  ctx.Assert(!release("t1", b), "a second release of the same ticket must answer false");
+  ctx.Assert(!release("t1", "forged-ticket"), "an unknown ticket must answer false");
+  ctx.Equal(held(ctx), want, "a stale or unknown release must free nothing; the pool holds");
+}
+
+void CheckRetryAfter(harness::Ctx& ctx) {
+  for (int i = 0; i < 10; i++) ctx.Assert(!admit("t1").ticket.empty(), "admission %d into an empty pool", i + 1);
+  ctx.Clock.Advance(100);
+  const Admission refused = admit("t1");
+  ctx.Equal(refused.ticket, "", "a full pool must refuse; the ticket");
+  ctx.Assert(refused.retry_after >= 199 && refused.retry_after <= 201, "the earliest lease ends in 200 s, retry_after says %d: a client told to come back in 1 s polls 200 times", refused.retry_after);
+}
+`,
+  },
+  debrief: `The pool is a lease table, not a counter, which is what gives the fix its shape. A sorted set scored by lease expiry answers three questions in one script: which holders are still alive (\`ZREMRANGEBYSCORE\` up to now), whether there is room, and when the next slot frees (the lowest score). Doing it server-side is what keeps two workers from both seeing nine. Release by ticket makes the holder the only one who can give a slot back, and a crashed holder needs no one to clean up after it. Production schedulers renew a lease from a heartbeat while the job runs, so a long inference does not lose its slot mid-flight, and weight slots by model size, since a large model takes more GPU memory than a small one.`,
 };

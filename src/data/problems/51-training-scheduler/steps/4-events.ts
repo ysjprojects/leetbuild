@@ -5,511 +5,336 @@ export const trainingEventsStep: Step = {
   title: 'Run lifecycle events keyed by run',
   concept: 'kafka',
   file: 'events',
-  focus: ['scheduler', 'kafka', 'consumer', 'store'],
+  focus: ['scheduler', 'kafka', 'consumer', 'worker'],
   task: `## Task
 
-**Starting point.** The starter is the run event publisher: \`publish_state\` builds a payload with
-the run id and state, produces it to \`training.run\` keyed by the priority band from a default
-producer and flushes; \`start_run\` publishes \`started\`, then asks the worker to \`StartRun\`;
-\`finish_run\` publishes \`finished\`. It compiles, serves the demo and hides five flaws.
+**Starting point.** The starter is the lifecycle publisher: \`publish_transition(run_id, transition)\`
+builds \`{run_id, transition, band, nodes, checkpoint_id}\` from the run row, produces it to
+\`training.run\` keyed by the run's band from a producer with \`acks=1\`, and returns \`True\`;
+\`start_run(run_id, worker)\` publishes \`started\`, then calls the worker's \`StartRun\`,
+\`queue.confirm_start\` and \`runs.set_nodes\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Two runs in one band share a partition, so a consumer applies a
-stale \`preempted\` after a \`finished\`. The history says a run is training on a fleet that refused
-it. A consumer never sees the queue entry, the preemption or the checkpoint. When the broker blinks,
-a transition is absent from the log, and a produce retried after a timeout can land twice.
+**Failure mode the checks target.** Three keys carry the whole fleet, so one run's history is mixed
+into its band's; the history says a run started on a worker that refused it; a broker blip loses a
+transition while the caller hears \`True\`; and a produce retried after a lost acknowledgement lands
+twice, while a leader failover loses one.
 
-- One publisher (\`publish_transition\`) emits every transition, \`queued\`, \`started\`,
-  \`preempted\`, \`checkpointed\`, \`finished\`, with the run id, node count and checkpoint id where
-  they apply.
-- Every produce is keyed by the run id (\`key=run_id\`, \`key: runId\`, \`Key: []byte(runID)\`,
-  \`ProducerRecord(topic, runId, payload)\`).
-- \`started\` is published only after the \`StartRun\` reply is checked (\`accepted\`, node count).
-- The run's new state and an outbox row (\`INSERT INTO training_outbox\`) are written in one
-  transaction; the produce follows the commit, and when the broker rejects it the row stays pending
-  for \`relay_outbox\` to republish.
-- The producer runs with \`acks=all\` and idempotence (\`enable.idempotence\`,
-  \`RequiredAcks: RequireAll\`).`,
+- Key every record by the run id.
+- \`start_run\` publishes \`started\` only once \`StartRun\` answered \`accepted\` and
+  \`queue.confirm_start\` returned true, after \`runs.set_nodes\` recorded the reply's nodes; a refusal
+  returns \`False\` and publishes nothing.
+- Wait for the delivery report at most \`ACK_TIMEOUT_S\` (2 s); a failed or missing acknowledgement
+  inserts an outbox row (\`outbox.insert(TOPIC, run_id, payload)\`) and returns \`False\`.
+- The producer runs with \`acks=all\` and \`enable.idempotence\` (Go uses confluent-kafka-go, whose
+  producer can be idempotent).`,
   sequence: {
-    participants: ['Training Scheduler', 'Training worker', 'run store · outbox', 'Kafka', 'Lifecycle consumer'],
+    participants: ['Scheduler', 'Worker', 'Redis', 'Kafka training.run', 'Outbox'],
     messages: [
-      {from: 'Training Scheduler', to: 'Training worker', label: 'StartRun(run_id) · grace deadline', kind: 'sync'},
-      {from: 'Training worker', to: 'Training Scheduler', label: 'confirmed · node count', kind: 'reply'},
+      {from: 'Scheduler', to: 'Worker', label: 'StartRun(run_id, recipe, dataset, checkpoint)', kind: 'sync'},
+      {from: 'Worker', to: 'Scheduler', label: 'accepted · nodes, or refused → False, no event', kind: 'reply'},
+      {from: 'Scheduler', to: 'Redis', label: 'confirm_start · set_nodes', kind: 'sync'},
       {
-        from: 'Training Scheduler',
-        to: 'run store · outbox',
-        label: 'state + outbox row, one transaction',
+        from: 'Scheduler',
+        to: 'Kafka training.run',
+        label: 'started · key = run_id · idempotent · acks=all',
         kind: 'sync',
       },
-      {from: 'Training Scheduler', to: 'Kafka', label: 'produce training.run · key = run_id', kind: 'async'},
-      {from: 'Kafka', to: 'Training Scheduler', label: 'ack / rejection', kind: 'reply'},
-      {from: 'run store · outbox', to: 'Kafka', label: 'relay republishes pending rows', kind: 'async'},
-      {from: 'Kafka', to: 'Lifecycle consumer', label: 'consume training.run · key = run_id', kind: 'async'},
+      {from: 'Kafka training.run', to: 'Scheduler', label: 'delivery report within 2 s → True', kind: 'reply'},
+      {from: 'Scheduler', to: 'Outbox', label: 'no ack / failed → insert(topic, key, payload) → False', kind: 'async'},
     ],
   },
   checks: [
     {
-      id: 'publish-transitions',
-      title: 'One publisher emits every transition with node counts and checkpoint ids',
+      id: 'run-key',
+      title: 'Keys training.run by the run id',
       detail:
-        'Every transition of a run — `queued`, `started`, `preempted`, `checkpointed`, `finished` — goes to `training.run` from one publisher, and the payload carries the run id, the node count and the checkpoint id where they apply. The starter publishes only `started` and `finished`, so the consumer never sees the queue entry, the preemption or the checkpoint.',
+        'Three transitions for run-a, run-b, run-a carry those keys and the two run-a records share a partition. The starter keys by band, so every run of a band shares one key.',
       match: {
-        python: {
-          all: [
-            /TOPIC\s*=\s*"training\.run"/,
-            /publish_transition\(/,
-            /"queued"/,
-            /"started"/,
-            /"preempted"/,
-            /"checkpointed"/,
-            /"finished"/,
-            /"node_count"/,
-            /"checkpoint_id"/,
-          ],
-        },
-        typescript: {
-          all: [
-            /TOPIC\s*=\s*'training\.run'/,
-            /publishTransition\(/,
-            /'queued'/,
-            /'started'/,
-            /'preempted'/,
-            /'checkpointed'/,
-            /'finished'/,
-            /node_count/,
-            /checkpoint_id/,
-          ],
-        },
-        go: {
-          all: [
-            /trainingRunTopic\s*=\s*"training\.run"/,
-            /func publishTransition\(/,
-            /"queued"/,
-            /"started"/,
-            /"preempted"/,
-            /"checkpointed"/,
-            /"finished"/,
-            /"node_count"/,
-            /"checkpoint_id"/,
-          ],
-        },
-        scala: {
-          all: [
-            /TrainingRunTopic\s*=\s*"training\.run"/,
-            /def publishTransition\(/,
-            /"queued"/,
-            /"started"/,
-            /"preempted"/,
-            /"checkpointed"/,
-            /"finished"/,
-            /"node_count"/,
-            /"checkpoint_id"/,
-          ],
-        },
-        cpp: {
-          all: [
-            /kTrainingRunTopic\s*=\s*"training\.run"/,
-            /publish_transition\(/,
-            /"queued"/,
-            /"started"/,
-            /"preempted"/,
-            /"checkpointed"/,
-            /"finished"/,
-            /"node_count"/,
-            /"checkpoint_id"/,
-          ],
-        },
-      },
-    },
-    {
-      id: 'key-by-run',
-      title: 'Every event is keyed by the run id',
-      detail:
-        'The produce passes the run id as the message key (`key=run_id`, `key: runId`, `Key: []byte(runID)`, `ProducerRecord(topic, runId, …)`), so one run’s transitions land in one partition and stay ordered. The starter keys by priority band, so runs that share a band interleave and a run’s own history can reorder.',
-      match: {
-        python: {all: [/key=run_id/]},
+        python: {all: [/producer\.produce\([^\n]*key\s*=\s*run_id/]},
         typescript: {all: [/key:\s*runId/]},
-        go: {all: [/Key:\s*\[\]byte\(runID\)/]},
-        scala: {all: [/ProducerRecord\[String, String\]\(TrainingRunTopic,\s*runId,/]},
-        cpp: {all: [/run_id\.c_str\(\)/]},
+        go: {all: [/Key:\s*\[\]byte\(\s*runID\s*\)/]},
+        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*runId\s*,/]},
+        cpp: {all: [/run_id\.c_str\(\)\s*,\s*run_id\.(size|length)\(\)/]},
       },
     },
     {
       id: 'started-after-confirm',
-      title: 'started is published only after the worker confirms the start',
+      title: 'Publishes started only for a start the worker accepted',
       detail:
-        'The `StartRun` reply is checked first and the `started` event follows it, so the history never claims a run is training before the fleet accepted it. The starter publishes `started` and only then asks the worker, so a consumer that trusts the event acts on a start that never happened.',
+        'A run the worker refuses gets no `started` record and stays `starting`; an accepted run gets exactly one, carrying the nodes from the reply. The starter publishes `started` before it asks.',
       match: {
-        python: {order: [/stub\.StartRun\(/, /"started"/]},
-        typescript: {order: [/client\.StartRun\(/, /'started'/]},
-        go: {order: [/stub\.StartRun\(/, /"started"/]},
-        scala: {order: [/\.startRun\(/, /"started"/]},
-        cpp: {order: [/stub->StartRun\(/, /"started"/]},
+        python: {
+          order: [/worker\.StartRun\(/, /not reply\.accepted/, /publish_transition\(\s*run_id,\s*["']started["']\)/],
+        },
+        typescript: {
+          order: [/worker\.StartRun\(/, /!reply\.accepted/, /publishTransition\(\s*runId,\s*['"]started['"]\)/],
+        },
+        go: {
+          order: [
+            /worker\.StartRun\(/,
+            /!reply\.GetAccepted\(\)|!reply\.Accepted/,
+            /publishTransition\([^\n]*"started"\)/,
+          ],
+        },
+        scala: {order: [/\.startRun\(/, /!reply\.accepted/, /publishTransition\([^\n]*"started"\)/]},
+        cpp: {order: [/worker->StartRun\(/, /!reply\.accepted\(\)/, /publishTransition\([^\n]*"started"\)/]},
       },
     },
     {
-      id: 'outbox-on-rejection',
-      title: 'A rejected produce stays recoverable in the outbox',
+      id: 'outbox-on-failure',
+      title: 'Waits for the ack and falls back to the outbox',
       detail:
-        'The run’s new state and an `INSERT INTO training_outbox` row commit in one transaction, the produce follows the commit, and a relay republishes whatever the broker rejected. The starter has no outbox: a rejection throws, nobody catches it, and the transition is lost until someone notices the gap in a run’s history.',
+        'A failed delivery, or no acknowledgement within 2 s, leaves an outbox row with the topic, the run id and the payload, and the call returns false. The starter fires and forgets.',
       match: {
-        python: {all: [/INSERT INTO training_outbox/, /def relay_outbox\(/, /except KafkaException/]},
-        typescript: {all: [/INSERT INTO training_outbox/, /relayOutbox\(/, /catch\s*\(/]},
-        go: {all: [/INSERT INTO training_outbox/, /func relayOutbox\(/, /err != nil/]},
-        scala: {all: [/INSERT INTO training_outbox/, /def relayOutbox\(/, /catch\s*\{/]},
-        cpp: {all: [/INSERT INTO training_outbox/, /relay_outbox\(/, /catch\s*\(/]},
+        python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
+        typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
+        go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
+        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
+        cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
     {
-      id: 'acks-all',
-      title: 'The producer is durable and idempotent, and never keys by band',
+      id: 'acks-idempotent',
+      title: 'Configures an idempotent producer with acks=all',
       detail:
-        'The producer waits for every in-sync replica (`acks=all`, `RequiredAcks: RequireAll`) and suppresses duplicate retries with idempotence, so a produce retried after a timeout cannot duplicate a transition. The starter leaves both at their defaults and keys by band, which is exactly how a retry ends up on the wrong partition.',
+        'A produce whose acknowledgement was lost is retried and lands once; a record survives a leader failover. The starter sets `acks=1` and no idempotence.',
       match: {
-        python: {all: [/"acks":\s*"all"/, /"enable\.idempotence":\s*True/], none: [/key=[^\n]*band/]},
-        typescript: {all: [/idempotent:\s*true/, /maxInFlightRequests:\s*1/], none: [/key:\s*[^\n]*\.band/]},
-        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/], none: [/Key:\s*\[\]byte\([^\n]*Band\)/]},
-        scala: {
-          all: [/props\.put\("acks",\s*"all"\)/, /props\.put\("enable\.idempotence",\s*"true"\)/],
-          none: [/ProducerRecord\[String, String\]\(TrainingRunTopic,\s*[^\n]*\.band/],
-        },
-        cpp: {
-          all: [/conf->set\("acks",\s*"all"/, /conf->set\("enable\.idempotence",\s*"true"/],
-          none: [/produce\([^\n]*band/],
-        },
+        python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
+        typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
+        go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
+        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
+        cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
-import logging
 
 import grpc
 from confluent_kafka import Producer
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
-import worker_pb2
-import worker_pb2_grpc
-
-app = FastAPI()
-logger = logging.getLogger("trainsched-events")
+import trainsched_pb2
+import trainsched_pb2_grpc
+from trainsched import outbox, queue, runs  # runs.get, set_nodes; queue.confirm_start; outbox.insert
 
 TOPIC = "training.run"
-WORKER_ADDR = "worker:50051"
-GRACE_DEADLINE_S = 30
+START_TIMEOUT_S = 10
 
-producer = Producer({"bootstrap.servers": "kafka:9092"})
-
-
-def publish_state(run: dict, state: str) -> None:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    payload = json.dumps({"type": "training.run", "run_id": run["run_id"], "state": state}).encode("utf-8")
-    producer.produce(TOPIC, key=str(run["band"]).encode("utf-8"), value=payload)
-    producer.flush()
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
+worker = trainsched_pb2_grpc.WorkerStub(grpc.insecure_channel("worker:9000"))
 
 
-@app.post("/v1/training/runs/{run_id}/start")
-def start_run(run_id: str) -> JSONResponse:
-    publish_state({"run_id": run_id, "band": 1}, "started")
-    with grpc.insecure_channel(WORKER_ADDR) as channel:
-        stub = worker_pb2_grpc.TrainingWorkerStub(channel)
-        confirmation = stub.StartRun(worker_pb2.StartRunRequest(run_id=run_id), timeout=GRACE_DEADLINE_S)
-    if not confirmation.accepted:
-        return JSONResponse({"error": "worker did not confirm the start"}, status_code=503)
-    logger.info("run started run_id=%s", run_id)
-    return JSONResponse({"run_id": run_id, "state": "running"})
+def transition_payload(run: dict, transition: str) -> dict:
+    return {"run_id": run["run_id"], "transition": transition, "band": run["band"], "nodes": run["nodes"], "checkpoint_id": run["checkpoint_id"]}
 
 
-def finish_run(run: dict) -> None:
-    publish_state(run, "finished")
+def publish_transition(run_id: str, transition: str) -> bool:
+    """Tell the run-history consumers about a transition; True when the event is on its way."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    payload = transition_payload(runs.get(run_id), transition)
+    producer.produce(TOPIC, key=str(payload["band"]), value=json.dumps(payload))
+    producer.poll(0)
+    return True
+
+
+def start_run(run_id: str, worker_name: str) -> bool:
+    """Launch a claimed run on worker_name; True when it is running."""
+    run = runs.get(run_id)
+    publish_transition(run_id, "started")
+    reply = worker.StartRun(
+        trainsched_pb2.StartRunRequest(
+            run_id=run_id, recipe_version=run["recipe_version"], dataset_version=run["dataset_version"], checkpoint_id=run["checkpoint_id"]
+        ),
+        timeout=START_TIMEOUT_S,
+    )
+    queue.confirm_start(run_id, worker_name)
+    runs.set_nodes(run_id, list(reply.nodes))
+    return reply.accepted
 `,
       solution: `import json
-import logging
 
 import grpc
-from confluent_kafka import KafkaException, Producer
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from confluent_kafka import Producer
 
-import worker_pb2
-import worker_pb2_grpc
-
-app = FastAPI()
-logger = logging.getLogger("trainsched-events")
+import trainsched_pb2
+import trainsched_pb2_grpc
+from trainsched import outbox, queue, runs  # runs.get, set_nodes; queue.confirm_start; outbox.insert
 
 TOPIC = "training.run"
-WORKER_ADDR = "worker:50051"
-GRACE_DEADLINE_S = 30
-OUTBOX_BATCH = 100
+START_TIMEOUT_S = 10
+ACK_TIMEOUT_S = 2
 
-producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all", "enable.idempotence": True})
-
-
-class RunStore:
-    """The platform's run store: the state change and the outbox row share one transaction."""
-
-    def transaction(self) -> "object":
-        """The transaction that commits the run's new state together with the outbox row."""
-        raise NotImplementedError
-
-    def pending_outbox(self, limit: int) -> list[dict]:
-        """Outbox rows a rejected produce left behind, oldest first."""
-        raise NotImplementedError
-
-    def mark_published(self, outbox_id: int) -> None:
-        raise NotImplementedError
+producer = Producer({
+    "bootstrap.servers": "kafka:9092",
+    "acks": "all",  # every in-sync replica has the record before the broker answers
+    "enable.idempotence": True,  # a produce retried after a lost acknowledgement lands once
+})
+worker = trainsched_pb2_grpc.WorkerStub(grpc.insecure_channel("worker:9000"))
 
 
-store = RunStore()
+def transition_payload(run: dict, transition: str) -> dict:
+    return {"run_id": run["run_id"], "transition": transition, "band": run["band"], "nodes": run["nodes"], "checkpoint_id": run["checkpoint_id"]}
 
 
-def transition_event(run_id: str, transition: str, node_count: int, checkpoint_id: str) -> dict:
-    return {
-        "type": "training.run",
-        "run_id": run_id,
-        "transition": transition,
-        "node_count": node_count,
-        "checkpoint_id": checkpoint_id,
-    }
+def publish_transition(run_id: str, transition: str) -> bool:
+    """Tell the run-history consumers about a transition; True once the broker acknowledged it."""
+    payload = transition_payload(runs.get(run_id), transition)
+    outcome = {}
+
+    def on_delivery(err, msg):
+        outcome["error"] = err
+
+    # One key per run: its transitions share a partition, so a consumer reads them in order.
+    producer.produce(TOPIC, key=run_id, value=json.dumps(payload), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or outcome.get("error") is not None:
+        # The broker did not take it: the relay publishes the row later, so the history is late, not wrong.
+        outbox.insert(TOPIC, run_id, payload)
+        return False
+    return True
 
 
-def publish_transition(run_id: str, transition: str, node_count: int = 0, checkpoint_id: str = "") -> None:
-    """Keyed by the run id, so one run's transitions stay in one ordered partition."""
-    payload = json.dumps(transition_event(run_id, transition, node_count, checkpoint_id)).encode("utf-8")
-    producer.produce(TOPIC, key=run_id.encode("utf-8"), value=payload)
-    producer.poll(0)
-
-
-def record_transition(run_id: str, transition: str, node_count: int = 0, checkpoint_id: str = "") -> None:
-    """The run's new state and its outbox row commit together, then the produce follows."""
-    with store.transaction() as tx:
-        tx.execute("UPDATE training_runs SET state = %s WHERE run_id = %s", (transition, run_id))
-        tx.execute(
-            "INSERT INTO training_outbox (run_id, transition, node_count, checkpoint_id) VALUES (%s, %s, %s, %s)",
-            (run_id, transition, node_count, checkpoint_id),
-        )
-    try:
-        publish_transition(run_id, transition, node_count, checkpoint_id)
-    except KafkaException as err:
-        logger.warning("event kept in the outbox run_id=%s transition=%s err=%s", run_id, transition, err)
-
-
-def relay_outbox() -> None:
-    """Republish what a broker outage left behind; a row is cleared only after the ack."""
-    for row in store.pending_outbox(OUTBOX_BATCH):
-        try:
-            publish_transition(row["run_id"], row["transition"], row["node_count"], row["checkpoint_id"])
-        except KafkaException:
-            continue
-        store.mark_published(row["id"])
-
-
-def on_run_queued(run: dict) -> None:
-    record_transition(run["run_id"], "queued")
-
-
-def on_run_preempted(run_id: str, checkpoint_id: str) -> None:
-    record_transition(run_id, "preempted", checkpoint_id=checkpoint_id)
-
-
-def on_run_checkpointed(run_id: str, checkpoint_id: str) -> None:
-    record_transition(run_id, "checkpointed", checkpoint_id=checkpoint_id)
-
-
-def on_run_finished(run_id: str, node_count: int) -> None:
-    record_transition(run_id, "finished", node_count=node_count)
-
-
-@app.post("/v1/training/runs/{run_id}/start")
-def start_run(run_id: str) -> JSONResponse:
-    with grpc.insecure_channel(WORKER_ADDR) as channel:
-        stub = worker_pb2_grpc.TrainingWorkerStub(channel)
-        confirmation = stub.StartRun(worker_pb2.StartRunRequest(run_id=run_id), timeout=GRACE_DEADLINE_S)
-    if not confirmation.accepted:
-        raise HTTPException(status_code=503, detail="worker did not confirm the start")
-    record_transition(run_id, "started", node_count=confirmation.node_count)
-    logger.info("run started run_id=%s", run_id)
-    return JSONResponse({"run_id": run_id, "state": "running"})
+def start_run(run_id: str, worker_name: str) -> bool:
+    """Launch a claimed run on worker_name; True when it is running."""
+    run = runs.get(run_id)
+    reply = worker.StartRun(
+        trainsched_pb2.StartRunRequest(
+            run_id=run_id, recipe_version=run["recipe_version"], dataset_version=run["dataset_version"], checkpoint_id=run["checkpoint_id"]
+        ),
+        timeout=START_TIMEOUT_S,
+    )
+    if not reply.accepted:
+        return False  # its lease runs out and the reaper queues it again
+    if not queue.confirm_start(run_id, worker_name):
+        return False  # the lease ran out first: the run belongs to another start
+    runs.set_nodes(run_id, list(reply.nodes))
+    publish_transition(run_id, "started")
+    return True
 `,
     },
     typescript: {
-      starter: `/** Run lifecycle events: flawed code. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
-import Fastify from 'fastify';
-import {Kafka, type Producer} from 'kafkajs';
+import {Kafka} from 'kafkajs';
 
-export const app = Fastify();
+import * as outbox from 'trainsched/outbox';
+import {confirmStart} from 'trainsched/queue';
+import {type Run, get, setNodes} from 'trainsched/runs';
 
-const TOPIC = 'training.run';
-const WORKER_ADDR = 'worker:50051';
-const GRACE_DEADLINE_S = 30;
+export const TOPIC = 'training.run';
+export const START_TIMEOUT_MS = 10_000;
 
-const kafka = new Kafka({clientId: 'trainsched-events', brokers: ['kafka:9092']});
-const producer: Producer = kafka.producer();
+const kafka = new Kafka({clientId: 'trainsched', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect();
 
-interface WorkerClient {
-  StartRun(request: {run_id: string}, options: {deadline: number}): Promise<{accepted: boolean; node_count: number}>;
-}
-
-// proto-loader's package object is untyped; this is the generated stub's shape.
-const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('worker.proto')) as unknown as {
-  trainsched: {TrainingWorker: new (target: string, credentials: grpc.ChannelCredentials) => WorkerClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('trainsched.proto')) as unknown as {
+  trainsched: {Worker: grpc.ServiceClientConstructor};
 };
-const client = new pkg.trainsched.TrainingWorker(WORKER_ADDR, grpc.credentials.createInsecure());
+const worker = new pkg.trainsched.Worker('worker:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  StartRun(
+    request: {run_id: string; recipe_version: string; dataset_version: string; checkpoint_id: string},
+    metadata: grpc.Metadata,
+    options: grpc.CallOptions,
+  ): Promise<{accepted: boolean; nodes: string[]; reason: string}>;
+};
 
-async function publishState(runId: string, band: number, state: string): Promise<void> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  await producer.send({
-    topic: TOPIC,
-    messages: [{key: String(band), value: JSON.stringify({type: 'training.run', run_id: runId, state})}],
-  });
+export const transitionPayload = (run: Run, transition: string) => ({
+  run_id: run.run_id,
+  transition,
+  band: run.band,
+  nodes: run.nodes,
+  checkpoint_id: run.checkpoint_id,
+});
+
+/** Tell the run-history consumers about a transition; true when the event is on its way. */
+export async function publishTransition(runId: string, transition: string): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const payload = transitionPayload((await get(runId)) as Run, transition);
+  void producer.send({topic: TOPIC, messages: [{key: String(payload.band), value: JSON.stringify(payload)}], acks: 1});
+  return true;
 }
 
-app.post('/v1/training/runs/:run_id/start', async (request, reply) => {
-  const runId = (request.params as {run_id: string}).run_id;
-  await publishState(runId, 1, 'started');
-  const confirmation = await client.StartRun({run_id: runId}, {deadline: Date.now() + GRACE_DEADLINE_S * 1000});
-  if (!confirmation.accepted) return reply.code(503).send({error: 'worker did not confirm the start'});
-  request.log.info({run_id: runId}, 'run started');
-  return reply.code(200).send({run_id: runId, state: 'running'});
-});
-
-app.post('/v1/training/runs/:run_id/finish', async (request, reply) => {
-  const runId = (request.params as {run_id: string}).run_id;
-  await publishState(runId, 1, 'finished');
-  return reply.code(200).send({run_id: runId, state: 'finished'});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** Launch a claimed run on workerName; true when it is running. */
+export async function startRun(runId: string, workerName: string): Promise<boolean> {
+  const run = (await get(runId)) as Run;
+  await publishTransition(runId, 'started');
+  const reply = await worker.StartRun(
+    {run_id: runId, recipe_version: run.recipe_version, dataset_version: run.dataset_version, checkpoint_id: run.checkpoint_id},
+    new grpc.Metadata(),
+    {deadline: Date.now() + START_TIMEOUT_MS},
+  );
+  await confirmStart(runId, workerName);
+  await setNodes(runId, reply.nodes);
+  return reply.accepted;
+}
 `,
-      solution: `/** Run lifecycle events: one ordered training.run record per transition, keyed by run id. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
-import Fastify from 'fastify';
-import {Kafka, type Producer} from 'kafkajs';
+import {Kafka} from 'kafkajs';
 
-export const app = Fastify();
+import * as outbox from 'trainsched/outbox';
+import {confirmStart} from 'trainsched/queue';
+import {type Run, get, setNodes} from 'trainsched/runs';
 
-const TOPIC = 'training.run';
-const WORKER_ADDR = 'worker:50051';
-const GRACE_DEADLINE_S = 30;
-const OUTBOX_BATCH = 100;
+export const TOPIC = 'training.run';
+export const START_TIMEOUT_MS = 10_000;
+export const ACK_TIMEOUT_MS = 2000;
 
-const kafka = new Kafka({clientId: 'trainsched-events', brokers: ['kafka:9092']});
-// kafkajs acks=-1 with idempotence: a produce retried after a timeout cannot duplicate a transition.
-const producer: Producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+const kafka = new Kafka({clientId: 'trainsched', brokers: ['kafka:9092']});
+// Idempotent: a produce retried after a lost acknowledgement lands once (and needs acks: -1).
+const producer = kafka.producer({idempotent: true});
+void producer.connect();
 
-interface RunEvent {
-  type: string;
-  run_id: string;
-  transition: string;
-  node_count: number;
-  checkpoint_id: string;
-}
-
-interface OutboxRow {
-  id: string;
-  event: RunEvent;
-}
-
-class RunStore {
-  /** The run's new state and the training_outbox row share one transaction. */
-  async transaction<T>(
-    body: (tx: {query: (sql: string, params: unknown[]) => Promise<void>}) => Promise<T>,
-  ): Promise<T> {
-    return body({query: async () => {}});
-  }
-
-  async pendingOutbox(limit: number): Promise<OutboxRow[]> {
-    void limit;
-    return [];
-  }
-
-  async markPublished(outboxId: string): Promise<void> {
-    void outboxId;
-  }
-}
-
-const store = new RunStore();
-
-function transitionEvent(runId: string, transition: string, nodeCount = 0, checkpointId = ''): RunEvent {
-  return {type: 'training.run', run_id: runId, transition, node_count: nodeCount, checkpoint_id: checkpointId};
-}
-
-/** Keyed by the run id, so one run's transitions stay in one ordered partition. */
-async function publishTransition(runId: string, transition: string, nodeCount = 0, checkpointId = ''): Promise<void> {
-  await producer.send({
-    topic: TOPIC,
-    messages: [{key: runId, value: JSON.stringify(transitionEvent(runId, transition, nodeCount, checkpointId))}],
-  });
-}
-
-/** The state change and the outbox row commit together, then the produce follows. */
-async function recordTransition(runId: string, transition: string, nodeCount = 0, checkpointId = ''): Promise<void> {
-  await store.transaction(async tx => {
-    await tx.query('UPDATE training_runs SET state = $1 WHERE run_id = $2', [transition, runId]);
-    await tx.query(
-      'INSERT INTO training_outbox (run_id, transition, node_count, checkpoint_id) VALUES ($1, $2, $3, $4)',
-      [runId, transition, nodeCount, checkpointId],
-    );
-  });
-  try {
-    await publishTransition(runId, transition, nodeCount, checkpointId);
-  } catch (err) {
-    request_log.warn({run_id: runId, transition, err}, 'event kept in the outbox for the relay');
-  }
-}
-
-/** Republish what a broker outage left behind; a row is cleared only after the ack. */
-async function relayOutbox(): Promise<void> {
-  for (const row of await store.pendingOutbox(OUTBOX_BATCH)) {
-    try {
-      await publishTransition(row.event.run_id, row.event.transition, row.event.node_count, row.event.checkpoint_id);
-    } catch {
-      continue;
-    }
-    await store.markPublished(row.id);
-  }
-}
-
-interface WorkerClient {
-  StartRun(request: {run_id: string}, options: {deadline: number}): Promise<{accepted: boolean; node_count: number}>;
-}
-
-// proto-loader's package object is untyped; this is the generated stub's shape.
-const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('worker.proto')) as unknown as {
-  trainsched: {TrainingWorker: new (target: string, credentials: grpc.ChannelCredentials) => WorkerClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('trainsched.proto')) as unknown as {
+  trainsched: {Worker: grpc.ServiceClientConstructor};
 };
-const client = new pkg.trainsched.TrainingWorker(WORKER_ADDR, grpc.credentials.createInsecure());
+const worker = new pkg.trainsched.Worker('worker:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  StartRun(
+    request: {run_id: string; recipe_version: string; dataset_version: string; checkpoint_id: string},
+    metadata: grpc.Metadata,
+    options: grpc.CallOptions,
+  ): Promise<{accepted: boolean; nodes: string[]; reason: string}>;
+};
 
-async function onRunQueued(runId: string): Promise<void> {
-  await recordTransition(runId, 'queued');
-}
-
-async function onRunPreempted(runId: string, checkpointId: string): Promise<void> {
-  await recordTransition(runId, 'preempted', 0, checkpointId);
-}
-
-async function onRunCheckpointed(runId: string, checkpointId: string): Promise<void> {
-  await recordTransition(runId, 'checkpointed', 0, checkpointId);
-}
-
-async function onRunFinished(runId: string, nodeCount: number): Promise<void> {
-  await recordTransition(runId, 'finished', nodeCount);
-}
-
-app.post('/v1/training/runs/:run_id/start', async (request, reply) => {
-  const runId = (request.params as {run_id: string}).run_id;
-  const confirmation = await client.StartRun({run_id: runId}, {deadline: Date.now() + GRACE_DEADLINE_S * 1000});
-  if (!confirmation.accepted) return reply.code(503).send({error: 'worker did not confirm the start'});
-  await recordTransition(runId, 'started', confirmation.node_count);
-  request.log.info({run_id: runId, nodes: confirmation.node_count}, 'run started');
-  return reply.code(200).send({run_id: runId, state: 'running'});
+export const transitionPayload = (run: Run, transition: string) => ({
+  run_id: run.run_id,
+  transition,
+  band: run.band,
+  nodes: run.nodes,
+  checkpoint_id: run.checkpoint_id,
 });
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** Tell the run-history consumers about a transition; true once the broker acknowledged it. */
+export async function publishTransition(runId: string, transition: string): Promise<boolean> {
+  const payload = transitionPayload((await get(runId)) as Run, transition);
+  try {
+    // One key per run: its transitions share a partition, so a consumer reads them in order.
+    // acks: -1 (all): every in-sync replica has the record before the broker answers.
+    await producer.send({topic: TOPIC, messages: [{key: runId, value: JSON.stringify(payload)}], acks: -1, timeout: ACK_TIMEOUT_MS});
+    return true;
+  } catch {
+    // The broker did not take it: the relay publishes the row later, so the history is late, not wrong.
+    await outbox.insert(TOPIC, runId, payload);
+    return false;
+  }
+}
+
+/** Launch a claimed run on workerName; true when it is running. */
+export async function startRun(runId: string, workerName: string): Promise<boolean> {
+  const run = (await get(runId)) as Run;
+  const reply = await worker.StartRun(
+    {run_id: runId, recipe_version: run.recipe_version, dataset_version: run.dataset_version, checkpoint_id: run.checkpoint_id},
+    new grpc.Metadata(),
+    {deadline: Date.now() + START_TIMEOUT_MS},
+  );
+  if (!reply.accepted) return false; // its lease runs out and the reaper queues it again
+  if (!(await confirmStart(runId, workerName))) return false; // the lease ran out first: the run belongs to another start
+  await setNodes(runId, reply.nodes);
+  await publishTransition(runId, 'started');
+  return true;
+}
 `,
     },
     go: {
@@ -518,74 +343,75 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
+	"fmt"
 	"strconv"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	workerpb "trainsched/gen/worker"
+	pb "trainsched/gen/trainsched"
+	"trainsched/queue" // queue.ConfirmStart
+	"trainsched/runs"  // runs.Get, SetNodes
 )
 
-const trainingRunTopic = "training.run"
+const (
+	topic        = "training.run"
+	startTimeout = 10 * time.Second
+)
+
+var producer = newProducer()
 
 var (
-	writer  = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Balancer: &kafka.Hash{}}
-	conn, _ = grpc.NewClient("worker:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	stub    = workerpb.NewTrainingWorkerClient(conn)
+	workerConn, _ = grpc.NewClient("worker:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	worker        = pb.NewWorkerClient(workerConn)
 )
 
-type runRef struct {
-	RunID string \`json:"run_id"\`
-	Band  int    \`json:"band"\`
-}
-
-func publishState(ctx context.Context, run runRef, state string) error {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	payload, err := json.Marshal(map[string]any{"type": "training.run", "run_id": run.RunID, "state": state})
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
 	if err != nil {
-		return err
+		panic(err)
 	}
-	return writer.WriteMessages(ctx, kafka.Message{Topic: trainingRunTopic, Key: []byte(strconv.Itoa(run.Band)), Value: payload})
+	return p
 }
 
-func startRun(rw http.ResponseWriter, r *http.Request) {
-	runID := r.PathValue("run_id")
-	if err := publishState(r.Context(), runRef{RunID: runID, Band: 1}, "started"); err != nil {
-		http.Error(rw, "TRY_AGAIN", http.StatusServiceUnavailable)
-		return
-	}
-	reply, err := stub.StartRun(r.Context(), &workerpb.StartRunRequest{RunId: runID})
-	if err != nil || !reply.GetAccepted() {
-		http.Error(rw, "worker did not confirm the start", http.StatusServiceUnavailable)
-		return
-	}
-	log.Printf("run started run_id=%s", runID)
-	writeJSON(rw, http.StatusOK, map[string]any{"run_id": runID, "state": "running"})
+func transitionPayload(run *runs.Run, transition string) map[string]any {
+	return map[string]any{"run_id": run.RunID, "transition": transition, "band": run.Band, "nodes": run.Nodes, "checkpoint_id": run.CheckpointID}
 }
 
-func finishRun(rw http.ResponseWriter, r *http.Request) {
-	runID := r.PathValue("run_id")
-	if err := publishState(r.Context(), runRef{RunID: runID, Band: 1}, "finished"); err != nil {
-		http.Error(rw, "TRY_AGAIN", http.StatusServiceUnavailable)
-		return
+// publishTransition tells the run-history consumers about a transition; true when the event is on its way.
+func publishTransition(ctx context.Context, runID, transition string) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	run := runs.Get(ctx, runID)
+	if run == nil {
+		return false, fmt.Errorf("no run %s", runID)
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{"run_id": runID, "state": "finished"})
+	value, _ := json.Marshal(transitionPayload(run, transition))
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(strconv.Itoa(run.Band)), Value: value}
+	if err := producer.Produce(msg, nil); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/training/runs/{run_id}/start", startRun)
-	mux.HandleFunc("POST /v1/training/runs/{run_id}/finish", finishRun)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+// startRun launches a claimed run on workerName; true when it is running.
+func startRun(ctx context.Context, runID, workerName string) (bool, error) {
+	run := runs.Get(ctx, runID)
+	if run == nil {
+		return false, fmt.Errorf("no run %s", runID)
+	}
+	publishTransition(ctx, runID, "started")
+	callCtx, cancel := context.WithTimeout(ctx, startTimeout)
+	defer cancel()
+	reply, err := worker.StartRun(callCtx, &pb.StartRunRequest{RunId: runID, RecipeVersion: run.RecipeVersion, DatasetVersion: run.DatasetVersion, CheckpointId: run.CheckpointID})
+	if err != nil {
+		return false, err
+	}
+	queue.ConfirmStart(ctx, runID, workerName)
+	runs.SetNodes(ctx, runID, reply.GetNodes())
+	return reply.GetAccepted(), nil
 }
 `,
       solution: `package main
@@ -593,162 +419,100 @@ func main() {
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
+	"fmt"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	workerpb "trainsched/gen/worker"
+	pb "trainsched/gen/trainsched"
+	"trainsched/outbox" // outbox.Insert
+	"trainsched/queue"  // queue.ConfirmStart
+	"trainsched/runs"   // runs.Get, SetNodes
 )
 
 const (
-	trainingRunTopic = "training.run"
-	graceDeadlineS   = 30
-	outboxBatch      = 100
+	topic        = "training.run"
+	startTimeout = 10 * time.Second
+	ackTimeout   = 2 * time.Second
 )
+
+var producer = newProducer()
 
 var (
-	writer = &kafka.Writer{
-		Addr:         kafka.TCP("kafka:9092"),
-		Balancer:     &kafka.Hash{},
-		RequiredAcks: kafka.RequireAll,
-	}
-	conn, _ = grpc.NewClient("worker:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	stub    = workerpb.NewTrainingWorkerClient(conn)
+	workerConn, _ = grpc.NewClient("worker:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	worker        = pb.NewWorkerClient(workerConn)
 )
 
-type runEvent struct {
-	Type         string \`json:"type"\`
-	RunID        string \`json:"run_id"\`
-	Transition   string \`json:"transition"\`
-	NodeCount    int    \`json:"node_count"\`
-	CheckpointID string \`json:"checkpoint_id"\`
-}
-
-type outboxRow struct {
-	ID           string
-	RunID        string
-	Transition   string
-	NodeCount    int
-	CheckpointID string
-}
-
-// RunStore and its transaction are the platform's; the state change and the outbox row share one.
-type RunStore interface {
-	Begin(ctx context.Context) (Transaction, error)
-	PendingOutbox(ctx context.Context, limit int) ([]outboxRow, error)
-	MarkPublished(ctx context.Context, outboxID string) error
-}
-
-type Transaction interface {
-	Exec(ctx context.Context, sql string, params ...any) error
-	Commit(ctx context.Context) error
-	Rollback(ctx context.Context) error
-}
-
-var store RunStore
-
-func transitionEvent(runID, transition string, nodeCount int, checkpointID string) runEvent {
-	return runEvent{
-		Type:         "training.run",
-		RunID:        runID,
-		Transition:   transition,
-		NodeCount:    nodeCount,
-		CheckpointID: checkpointID,
-	}
-}
-
-// publishTransition keys by the run id, so one run's transitions stay in one ordered partition.
-func publishTransition(ctx context.Context, runID, transition string, nodeCount int, checkpointID string) error {
-	payload, err := json.Marshal(transitionEvent(runID, transition, nodeCount, checkpointID))
-	if err != nil {
-		return err
-	}
-	return writer.WriteMessages(ctx, kafka.Message{
-		Topic: trainingRunTopic,
-		Key:   []byte(runID),
-		Value: payload,
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the record before the broker answers
+		"enable.idempotence": true,  // a produce retried after a lost acknowledgement lands once
 	})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
-// recordTransition commits the run's new state and the outbox row together, then publishes.
-func recordTransition(ctx context.Context, runID, transition string, nodeCount int, checkpointID string) {
-	tx, err := store.Begin(ctx)
-	if err != nil {
-		log.Printf("no transaction for run_id=%s: %v", runID, err)
-		return
-	}
-	if err := tx.Exec(ctx, "UPDATE training_runs SET state = $1 WHERE run_id = $2", transition, runID); err != nil {
-		_ = tx.Rollback(ctx)
-		return
-	}
-	sql := "INSERT INTO training_outbox (run_id, transition, node_count, checkpoint_id) VALUES ($1, $2, $3, $4)"
-	if err := tx.Exec(ctx, sql, runID, transition, nodeCount, checkpointID); err != nil {
-		_ = tx.Rollback(ctx)
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return
-	}
-	if err := publishTransition(ctx, runID, transition, nodeCount, checkpointID); err != nil {
-		log.Printf("event kept in the outbox run_id=%s transition=%s: %v", runID, transition, err)
-	}
+func transitionPayload(run *runs.Run, transition string) map[string]any {
+	return map[string]any{"run_id": run.RunID, "transition": transition, "band": run.Band, "nodes": run.Nodes, "checkpoint_id": run.CheckpointID}
 }
 
-// relayOutbox republishes what a broker outage left behind; a row is cleared only after the ack.
-func relayOutbox(ctx context.Context) {
-	rows, err := store.PendingOutbox(ctx, outboxBatch)
-	if err != nil {
-		return
+// publishTransition tells the run-history consumers about a transition; true once the broker acknowledged it.
+func publishTransition(ctx context.Context, runID, transition string) (bool, error) {
+	run := runs.Get(ctx, runID)
+	if run == nil {
+		return false, fmt.Errorf("no run %s", runID)
 	}
-	for _, row := range rows {
-		if err := publishTransition(ctx, row.RunID, row.Transition, row.NodeCount, row.CheckpointID); err != nil {
-			continue
+	payload := transitionPayload(run, transition)
+	value, _ := json.Marshal(payload)
+	t := topic
+	// One key per run: its transitions share a partition, so a consumer reads them in order.
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(runID), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded // no acknowledgement within the window
 		}
-		store.MarkPublished(ctx, row.ID)
 	}
-}
-
-func onRunQueued(ctx context.Context, runID string) {
-	recordTransition(ctx, runID, "queued", 0, "")
-}
-
-func onRunPreempted(ctx context.Context, runID, checkpointID string) {
-	recordTransition(ctx, runID, "preempted", 0, checkpointID)
-}
-
-func onRunCheckpointed(ctx context.Context, runID, checkpointID string) {
-	recordTransition(ctx, runID, "checkpointed", 0, checkpointID)
-}
-
-func onRunFinished(ctx context.Context, runID string, nodeCount int) {
-	recordTransition(ctx, runID, "finished", nodeCount, "")
-}
-
-func startRun(rw http.ResponseWriter, r *http.Request) {
-	runID := r.PathValue("run_id")
-	reply, err := stub.StartRun(r.Context(), &workerpb.StartRunRequest{RunId: runID})
-	if err != nil || !reply.GetAccepted() {
-		http.Error(rw, "worker did not confirm the start", http.StatusServiceUnavailable)
-		return
+	if err != nil {
+		// The broker did not take it: the relay publishes the row later, so the history is late, not wrong.
+		return false, outbox.Insert(ctx, topic, runID, payload)
 	}
-	recordTransition(r.Context(), runID, "started", int(reply.GetNodeCount()), "")
-	log.Printf("run started run_id=%s nodes=%d", runID, reply.GetNodeCount())
-	writeJSON(rw, http.StatusOK, map[string]any{"run_id": runID, "state": "running"})
+	return true, nil
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/training/runs/{run_id}/start", startRun)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+// startRun launches a claimed run on workerName; true when it is running.
+func startRun(ctx context.Context, runID, workerName string) (bool, error) {
+	run := runs.Get(ctx, runID)
+	if run == nil {
+		return false, fmt.Errorf("no run %s", runID)
+	}
+	callCtx, cancel := context.WithTimeout(ctx, startTimeout)
+	defer cancel()
+	reply, err := worker.StartRun(callCtx, &pb.StartRunRequest{RunId: runID, RecipeVersion: run.RecipeVersion, DatasetVersion: run.DatasetVersion, CheckpointId: run.CheckpointID})
+	if err != nil {
+		return false, err
+	}
+	if !reply.GetAccepted() {
+		return false, nil // its lease runs out and the reaper queues it again
+	}
+	confirmed, err := queue.ConfirmStart(ctx, runID, workerName)
+	if err != nil || !confirmed {
+		return false, err // the lease ran out first: the run belongs to another start
+	}
+	if err := runs.SetNodes(ctx, runID, reply.GetNodes()); err != nil {
+		return false, err
+	}
+	_, err = publishTransition(ctx, runID, "started")
+	return true, err
 }
 `,
     },
@@ -758,372 +522,800 @@ import java.util.concurrent.TimeUnit
 
 import io.grpc.ManagedChannelBuilder
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import trainsched.worker.{StartRunRequest, TrainingWorkerGrpc}
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-object Events {
-  implicit val system: ActorSystem = ActorSystem("trainsched-events")
+import trainsched.{Outbox, Queue, Runs} // Runs.get, setNodes; Queue.confirmStart; Outbox.insert
+import trainsched.trainsched.{StartRunRequest, WorkerGrpc}
 
-  val TrainingRunTopic = "training.run"
-  val GraceDeadlineS = 30L
+object RunEvents {
+  val Topic = "training.run"
+  val StartTimeoutS = 10L
 
-  val producer = new KafkaProducer[String, String](new Properties())
-  private val channel = ManagedChannelBuilder.forAddress("worker", 50051).usePlaintext().build()
-  private val stub = TrainingWorkerGrpc.blockingStub(channel)
-
-  def publishState(runId: String, band: Int, state: String): Unit = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val payload = """{"type":"training.run","run_id":"%s","state":"%s"}""".format(runId, state)
-    producer.send(new ProducerRecord[String, String](TrainingRunTopic, band.toString, payload))
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  val route: Route =
-    path("v1" / "training" / "runs" / Segment / "start") { runId =>
-      post {
-        publishState(runId, 1, "started")
-        val reply = stub.withDeadlineAfter(GraceDeadlineS, TimeUnit.SECONDS).startRun(StartRunRequest(runId))
-        if (!reply.accepted) {
-          complete(StatusCodes.ServiceUnavailable, """{"error":"worker did not confirm the start"}""")
-        } else {
-          complete(StatusCodes.OK, """{"run_id":"%s","state":"running"}""".format(runId))
-        }
-      }
-    }
+  private val worker = WorkerGrpc.blockingStub(ManagedChannelBuilder.forAddress("worker", 9000).usePlaintext().build())
 
-  def finishRun(runId: String): Unit = publishState(runId, 1, "finished")
+  def transitionPayload(run: Runs.Run, transition: String): JsObject =
+    JsObject(
+      "run_id" -> JsString(run.runId),
+      "transition" -> JsString(transition),
+      "band" -> JsNumber(run.band),
+      "nodes" -> JsArray(run.nodes.map(JsString(_)).toVector),
+      "checkpoint_id" -> JsString(run.checkpointId)
+    )
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Tell the run-history consumers about a transition; true when the event is on its way. */
+  def publishTransition(runId: String, transition: String): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val run = Runs.get(runId).get
+    producer.send(new ProducerRecord[String, String](Topic, run.band.toString, transitionPayload(run, transition).compactPrint))
+    true
+  }
+
+  /** Launch a claimed run on workerName; true when it is running. */
+  def startRun(runId: String, workerName: String): Boolean = {
+    val run = Runs.get(runId).get
+    publishTransition(runId, "started")
+    val reply = worker
+      .withDeadlineAfter(StartTimeoutS, TimeUnit.SECONDS)
+      .startRun(StartRunRequest(runId = runId, recipeVersion = run.recipeVersion, datasetVersion = run.datasetVersion, checkpointId = run.checkpointId))
+    Queue.confirmStart(runId, workerName)
+    Runs.setNodes(runId, reply.nodes)
+    reply.accepted
   }
 }
 `,
       solution: `import java.util.Properties
 import java.util.concurrent.TimeUnit
 
+import scala.util.Try
+
 import io.grpc.ManagedChannelBuilder
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import trainsched.worker.{StartRunRequest, TrainingWorkerGrpc}
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-final case class OutboxRow(id: String, runId: String, transition: String, nodeCount: Int, checkpointId: String)
+import trainsched.{Outbox, Queue, Runs} // Runs.get, setNodes; Queue.confirmStart; Outbox.insert
+import trainsched.trainsched.{StartRunRequest, WorkerGrpc}
 
-/** The platform's transaction: the state change and the training_outbox row share it. */
-trait Tx {
-  def execute(sql: String, params: Any*): Unit
-}
+object RunEvents {
+  val Topic = "training.run"
+  val StartTimeoutS = 10L
+  val AckTimeoutMs = 2000L
 
-trait RunStore {
-  def inTransaction(body: Tx => Unit): Unit
-  def pendingOutbox(limit: Int): Seq[OutboxRow]
-  def markPublished(outboxId: String): Unit
-}
-
-object Events {
-  implicit val system: ActorSystem = ActorSystem("trainsched-events")
-
-  val TrainingRunTopic = "training.run"
-  val GraceDeadlineS = 30L
-  val OutboxBatch = 100
-
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  val producer = new KafkaProducer[String, String](props)
-
-  private val channel = ManagedChannelBuilder.forAddress("worker", 50051).usePlaintext().build()
-  private val stub = TrainingWorkerGrpc.blockingStub(channel)
-
-  private val store: RunStore = new RunStore {
-    def inTransaction(body: Tx => Unit): Unit = ???
-    def pendingOutbox(limit: Int): Seq[OutboxRow] = ???
-    def markPublished(outboxId: String): Unit = ???
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "all") // every in-sync replica has the record before the broker answers
+    props.put("enable.idempotence", "true") // a produce retried after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  private def eventJson(runId: String, transition: String, nodeCount: Int, checkpointId: String): String =
-    """{"type":"training.run","run_id":"%s","transition":"%s","node_count":%d,"checkpoint_id":"%s"}"""
-      .format(runId, transition, nodeCount, checkpointId)
+  private val worker = WorkerGrpc.blockingStub(ManagedChannelBuilder.forAddress("worker", 9000).usePlaintext().build())
 
-  /** Keyed by the run id, so one run's transitions stay in one ordered partition. */
-  def publishTransition(runId: String, transition: String, nodeCount: Int, checkpointId: String): Unit = {
-    val payload = eventJson(runId, transition, nodeCount, checkpointId)
-    producer.send(new ProducerRecord[String, String](TrainingRunTopic, runId, payload))
+  def transitionPayload(run: Runs.Run, transition: String): JsObject =
+    JsObject(
+      "run_id" -> JsString(run.runId),
+      "transition" -> JsString(transition),
+      "band" -> JsNumber(run.band),
+      "nodes" -> JsArray(run.nodes.map(JsString(_)).toVector),
+      "checkpoint_id" -> JsString(run.checkpointId)
+    )
+
+  /** Tell the run-history consumers about a transition; true once the broker acknowledged it. */
+  def publishTransition(runId: String, transition: String): Boolean = {
+    val payload = transitionPayload(Runs.get(runId).get, transition)
+    // One key per run: its transitions share a partition, so a consumer reads them in order.
+    val record = new ProducerRecord[String, String](Topic, runId, payload.compactPrint)
+    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
+    if (acked.isFailure) {
+      // The broker did not take it: the relay publishes the row later, so the history is late, not wrong.
+      Outbox.insert(Topic, runId, payload)
+    }
+    acked.isSuccess
   }
 
-  /** The run's new state and its outbox row commit together, then the produce follows. */
-  def recordTransition(runId: String, transition: String, nodeCount: Int, checkpointId: String): Unit = {
-    store.inTransaction { tx =>
-      tx.execute("UPDATE training_runs SET state = ? WHERE run_id = ?", transition, runId)
-      tx.execute(
-        "INSERT INTO training_outbox (run_id, transition, node_count, checkpoint_id) VALUES (?, ?, ?, ?)",
-        runId,
-        transition,
-        nodeCount,
-        checkpointId
-      )
+  /** Launch a claimed run on workerName; true when it is running. */
+  def startRun(runId: String, workerName: String): Boolean = {
+    val run = Runs.get(runId).get
+    val reply = worker
+      .withDeadlineAfter(StartTimeoutS, TimeUnit.SECONDS)
+      .startRun(StartRunRequest(runId = runId, recipeVersion = run.recipeVersion, datasetVersion = run.datasetVersion, checkpointId = run.checkpointId))
+    if (!reply.accepted) false // its lease runs out and the reaper queues it again
+    else if (!Queue.confirmStart(runId, workerName)) false // the lease ran out first: the run belongs to another start
+    else {
+      Runs.setNodes(runId, reply.nodes)
+      publishTransition(runId, "started")
+      true
     }
-    try {
-      publishTransition(runId, transition, nodeCount, checkpointId)
-    } catch {
-      case err: Throwable =>
-        system.log.warning("event kept in the outbox runId=%s transition=%s err=%s".format(runId, transition, err.getMessage))
-    }
-  }
-
-  /** Republish what a broker outage left behind; a row is cleared only after the ack. */
-  def relayOutbox(): Unit = {
-    for (row <- store.pendingOutbox(OutboxBatch)) {
-      try {
-        publishTransition(row.runId, row.transition, row.nodeCount, row.checkpointId)
-      } catch {
-        case _: Throwable => () // the next pass picks the row up again
-      }
-      store.markPublished(row.id)
-    }
-  }
-
-  def onRunQueued(runId: String): Unit = recordTransition(runId, "queued", 0, "")
-
-  def onRunPreempted(runId: String, checkpointId: String): Unit = recordTransition(runId, "preempted", 0, checkpointId)
-
-  def onRunCheckpointed(runId: String, checkpointId: String): Unit =
-    recordTransition(runId, "checkpointed", 0, checkpointId)
-
-  def onRunFinished(runId: String, nodeCount: Int): Unit = recordTransition(runId, "finished", nodeCount, "")
-
-  val route: Route =
-    path("v1" / "training" / "runs" / Segment / "start") { runId =>
-      post {
-        val reply = stub.withDeadlineAfter(GraceDeadlineS, TimeUnit.SECONDS).startRun(StartRunRequest(runId))
-        if (!reply.accepted) {
-          complete(StatusCodes.ServiceUnavailable, """{"error":"worker did not confirm the start"}""")
-        } else {
-          recordTransition(runId, "started", reply.nodeCount, "")
-          complete(StatusCodes.OK, """{"run_id":"%s","state":"running"}""".format(runId))
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
-#include <httplib.h>
 #include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
-#include <cstdlib>
-#include <string>
-
-#include "worker.grpc.pb.h"
-
-using json = nlohmann::json;
-
-const std::string kTrainingRunTopic = "training.run";
-constexpr int kGraceDeadlineS = 30;
-
-struct RunRef {
-  std::string run_id;
-  int band = 1;
-};
-
-static void publish_state(RdKafka::Producer* producer, const RunRef& run, const std::string& state) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const std::string payload = json{{"type", "training.run"}, {"run_id", run.run_id}, {"state", state}}.dump();
-  const std::string key = std::to_string(run.band);
-  producer->produce(kTrainingRunTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                    const_cast<char*>(payload.data()), payload.size(), key.c_str(), key.size(), 0, nullptr);
-}
-
-int main() {
-  std::string errstr;
-  auto* producer = RdKafka::Producer::create(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL), errstr);
-  auto channel = grpc::CreateChannel("worker:50051", grpc::InsecureChannelCredentials());
-  auto stub = trainsched::TrainingWorker::NewStub(channel);
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/training/runs/([^/]+)/start)", [producer, &stub](const httplib::Request& req, httplib::Response& res) {
-    const std::string run_id = req.matches[1];
-    publish_state(producer, RunRef{run_id, 1}, "started");
-    grpc::ClientContext context;
-    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kGraceDeadlineS));
-    trainsched::StartRunRequest request;
-    request.set_run_id(run_id);
-    trainsched::StartRunReply reply;
-    const grpc::Status status = stub->StartRun(&context, request, &reply);
-    if (!status.ok() || !reply.accepted()) {
-      res.status = 503;
-      res.set_content(R"({"error":"worker did not confirm the start"})", "application/json");
-      return;
-    }
-    res.status = 200;
-    res.set_content(json{{"run_id", run_id}, {"state", "running"}}.dump(), "application/json");
-  });
-
-  svr.Post(R"(/v1/training/runs/([^/]+)/finish)", [producer](const httplib::Request& req, httplib::Response& res) {
-    publish_state(producer, RunRef{req.matches[1], 1}, "finished");
-    res.status = 200;
-    res.set_content(R"({"state":"finished"})", "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <grpcpp/grpcpp.h>
-#include <httplib.h>
-#include <librdkafka/rdkafkacpp.h>
-#include <nlohmann/json.hpp>
-
-#include <chrono>
-#include <iostream>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "worker.grpc.pb.h"
+#include "trainsched.grpc.pb.h"
+#include "trainsched/outbox.h"  // outbox::insert
+#include "trainsched/queue.h"   // queue::confirmStart
+#include "trainsched/runs.h"    // runs::get, setNodes
 
 using json = nlohmann::json;
 
-const std::string kTrainingRunTopic = "training.run";
-constexpr int kGraceDeadlineS = 30;
-constexpr int kOutboxBatch = 100;
+const std::string kTopic = "training.run";
+constexpr int kStartTimeoutS = 10;
 
-struct OutboxRow {
-  std::string id;
-  std::string run_id;
-  std::string transition;
-  int node_count = 0;
-  std::string checkpoint_id;
-};
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
 
-/** The platform's transaction: the state change and the training_outbox row share it. */
-struct Transaction {
-  void execute(const std::string& sql, const std::vector<std::string>& params);
-  void commit();
-};
+auto producer = makeProducer();
+auto worker = trainsched::Worker::NewStub(grpc::CreateChannel("worker:9000", grpc::InsecureChannelCredentials()));
 
-struct RunStore {
-  Transaction begin_transaction();
-  std::vector<OutboxRow> pending_outbox(int limit);
-  void mark_published(const std::string& outbox_id);
-};
+json transitionPayload(const runs::Run& run, const std::string& transition) {
+  return json{{"run_id", run.run_id}, {"transition", transition}, {"band", run.band}, {"nodes", run.nodes}, {"checkpoint_id", run.checkpoint_id}};
+}
 
-RunStore store;
-
-/** Keyed by the run id, so one run's transitions stay in one ordered partition. */
-static void publish_transition(RdKafka::Producer* producer, const std::string& run_id, const std::string& transition,
-                               int node_count, const std::string& checkpoint_id) {
-  const std::string payload =
-      json{{"type", "training.run"},
-           {"run_id", run_id},
-           {"transition", transition},
-           {"node_count", node_count},
-           {"checkpoint_id", checkpoint_id}}
-          .dump();
-  producer->produce(kTrainingRunTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                    const_cast<char*>(payload.data()), payload.size(), run_id.c_str(), run_id.size(), 0, nullptr);
+// Tell the run-history consumers about a transition; true when the event is on its way.
+bool publishTransition(const std::string& run_id, const std::string& transition) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const auto run = runs::get(run_id);
+  if (!run) throw std::runtime_error("no run " + run_id);
+  const std::string value = transitionPayload(*run, transition).dump();
+  const std::string key = std::to_string(run->band);
+  producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()), value.size(),
+                    key.c_str(), key.size(), 0, nullptr);
   producer->poll(0);
+  return true;
 }
 
-/** The run's new state and its outbox row commit together, then the produce follows. */
-static void record_transition(RdKafka::Producer* producer, const std::string& run_id, const std::string& transition,
-                              int node_count, const std::string& checkpoint_id) {
-  {
-    auto tx = store.begin_transaction();
-    tx.execute("UPDATE training_runs SET state = $1 WHERE run_id = $2",
-               {transition, run_id});
-    tx.execute(
-        "INSERT INTO training_outbox (run_id, transition, node_count, checkpoint_id) VALUES ($1, $2, $3, $4)",
-        {run_id, transition, std::to_string(node_count), checkpoint_id});
-    tx.commit();
+// Launch a claimed run on worker_name; true when it is running.
+bool startRun(const std::string& run_id, const std::string& worker_name) {
+  const auto run = runs::get(run_id);
+  if (!run) throw std::runtime_error("no run " + run_id);
+  publishTransition(run_id, "started");
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds{kStartTimeoutS});
+  trainsched::StartRunRequest request;
+  request.set_run_id(run_id);
+  request.set_recipe_version(run->recipe_version);
+  request.set_dataset_version(run->dataset_version);
+  request.set_checkpoint_id(run->checkpoint_id);
+  trainsched::StartRunReply reply;
+  const grpc::Status status = worker->StartRun(&ctx, request, &reply);
+  if (!status.ok()) throw std::runtime_error("start: " + status.error_message());
+  queue::confirmStart(run_id, worker_name);
+  runs::setNodes(run_id, std::vector<std::string>(reply.nodes().begin(), reply.nodes().end()));
+  return reply.accepted();
+}
+`,
+      solution: `#include <grpcpp/grpcpp.h>
+#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "trainsched.grpc.pb.h"
+#include "trainsched/outbox.h"  // outbox::insert
+#include "trainsched/queue.h"   // queue::confirmStart
+#include "trainsched/runs.h"    // runs::get, setNodes
+
+using json = nlohmann::json;
+
+const std::string kTopic = "training.run";
+constexpr int kStartTimeoutS = 10;
+constexpr int kAckTimeoutMs = 2000;
+
+// The delivery report of the record in flight: publishTransition produces one record and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
+};
+
+DeliveryReport delivery;
+
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the record before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a produce retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
+
+auto producer = makeProducer();
+auto worker = trainsched::Worker::NewStub(grpc::CreateChannel("worker:9000", grpc::InsecureChannelCredentials()));
+
+json transitionPayload(const runs::Run& run, const std::string& transition) {
+  return json{{"run_id", run.run_id}, {"transition", transition}, {"band", run.band}, {"nodes", run.nodes}, {"checkpoint_id", run.checkpoint_id}};
+}
+
+// Tell the run-history consumers about a transition; true once the broker acknowledged it.
+bool publishTransition(const std::string& run_id, const std::string& transition) {
+  const auto run = runs::get(run_id);
+  if (!run) throw std::runtime_error("no run " + run_id);
+  const json payload = transitionPayload(*run, transition);
+  const std::string value = payload.dump();
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  // One key per run: its transitions share a partition, so a consumer reads them in order.
+  RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                                             value.size(), run_id.c_str(), run_id.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
   }
-  try {
-    publish_transition(producer, run_id, transition, node_count, checkpoint_id);
-  } catch (const std::exception& err) {
-    std::cerr << "event kept in the outbox run_id=" << run_id << " err=" << err.what() << "\\n";
+  if (err != RdKafka::ERR_NO_ERROR) {
+    // The broker did not take it: the relay publishes the row later, so the history is late, not wrong.
+    outbox::insert(kTopic, run_id, payload);
+    return false;
   }
+  return true;
 }
 
-/** Republish what a broker outage left behind; a row is cleared only after the ack. */
-static void relay_outbox(RdKafka::Producer* producer) {
-  for (const OutboxRow& row : store.pending_outbox(kOutboxBatch)) {
-    try {
-      publish_transition(producer, row.run_id, row.transition, row.node_count, row.checkpoint_id);
-    } catch (const std::exception&) {
-      continue;
-    }
-    store.mark_published(row.id);
-  }
-}
-
-static void on_run_queued(RdKafka::Producer* producer, const std::string& run_id) {
-  record_transition(producer, run_id, "queued", 0, "");
-}
-
-static void on_run_preempted(RdKafka::Producer* producer, const std::string& run_id, const std::string& checkpoint_id) {
-  record_transition(producer, run_id, "preempted", 0, checkpoint_id);
-}
-
-static void on_run_checkpointed(RdKafka::Producer* producer, const std::string& run_id, const std::string& checkpoint_id) {
-  record_transition(producer, run_id, "checkpointed", 0, checkpoint_id);
-}
-
-static void on_run_finished(RdKafka::Producer* producer, const std::string& run_id, int node_count) {
-  record_transition(producer, run_id, "finished", node_count, "");
-}
-
-int main() {
-  std::string errstr;
-  auto* conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
-  conf->set("bootstrap.servers", "kafka:9092", errstr);
-  conf->set("acks", "all", errstr);
-  conf->set("enable.idempotence", "true", errstr);
-  auto* producer = RdKafka::Producer::create(conf, errstr);
-  auto channel = grpc::CreateChannel("worker:50051", grpc::InsecureChannelCredentials());
-  auto stub = trainsched::TrainingWorker::NewStub(channel);
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/training/runs/([^/]+)/start)", [producer, &stub](const httplib::Request& req, httplib::Response& res) {
-    const std::string run_id = req.matches[1];
-    grpc::ClientContext context;
-    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kGraceDeadlineS));
-    trainsched::StartRunRequest request;
-    request.set_run_id(run_id);
-    trainsched::StartRunReply reply;
-    const grpc::Status status = stub->StartRun(&context, request, &reply);
-    if (!status.ok() || !reply.accepted()) {
-      res.status = 503;
-      res.set_content(R"({"error":"worker did not confirm the start"})", "application/json");
-      return;
-    }
-    record_transition(producer, run_id, "started", reply.node_count(), "");
-    res.status = 200;
-    res.set_content(json{{"run_id", run_id}, {"state", "running"}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Launch a claimed run on worker_name; true when it is running.
+bool startRun(const std::string& run_id, const std::string& worker_name) {
+  const auto run = runs::get(run_id);
+  if (!run) throw std::runtime_error("no run " + run_id);
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds{kStartTimeoutS});
+  trainsched::StartRunRequest request;
+  request.set_run_id(run_id);
+  request.set_recipe_version(run->recipe_version);
+  request.set_dataset_version(run->dataset_version);
+  request.set_checkpoint_id(run->checkpoint_id);
+  trainsched::StartRunReply reply;
+  const grpc::Status status = worker->StartRun(&ctx, request, &reply);
+  if (!status.ok()) throw std::runtime_error("start: " + status.error_message());
+  if (!reply.accepted()) return false;                            // its lease runs out and the reaper queues it again
+  if (!queue::confirmStart(run_id, worker_name)) return false;  // the lease ran out first: the run belongs to another start
+  runs::setNodes(run_id, std::vector<std::string>(reply.nodes().begin(), reply.nodes().end()));
+  publishTransition(run_id, "started");
+  return true;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+import trainsched_pb2
+import trainsched_pb2_grpc
+from trainsched import queue, runs
+
+TOPIC = "training.run"
+
+
+class Worker(trainsched_pb2_grpc.WorkerServicer):
+    """A worker agent that launches every run on n3 and n4, except those in reject."""
+
+    def __init__(self):
+        self.reject = set()
+
+    def StartRun(self, request, context):
+        if request.run_id in self.reject:
+            return trainsched_pb2.StartRunReply(accepted=False, reason="no free GPUs on this node")
+        return trainsched_pb2.StartRunReply(accepted=True, nodes=["n3", "n4"])
+
+
+def _setup(ctx):
+    worker = Worker()
+    ctx.grpc.serve(trainsched_pb2_grpc.add_WorkerServicer_to_server, worker)
+    return ctx.load("events"), worker
+
+
+def _queued(ctx, run_id, band=1):
+    now = int(ctx.clock.time() * 1000)
+    runs.put({"run_id": run_id, "tenant": "t1", "recipe_version": "llama-ft-v3", "dataset_version": "ds-1", "priority": 8 - 3 * band,
+              "band": band, "state": "queued", "enqueued_at_ms": now, "checkpoint_id": "ckpt-7"})
+    queue.enqueue(run_id, band, now)
+    return now
+
+
+def _payloads(ctx):
+    return [json.loads(r.value) for r in ctx.kafka.records(TOPIC)]
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.lrange("outbox", 0, -1)]
+
+
+def check_run_key(ctx):
+    m, _ = _setup(ctx)
+    _queued(ctx, "run-a")
+    _queued(ctx, "run-b")
+    m.publish_transition("run-a", "queued")
+    m.publish_transition("run-b", "queued")
+    m.publish_transition("run-a", "preempted")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three publish_transition calls produced {len(records)} records on training.run"
+    keys = [r.key for r in records]
+    assert keys == [b"run-a", b"run-b", b"run-a"], f"the records are keyed {keys}, expected the run ids run-a, run-b, run-a"
+    assert records[0].partition == records[2].partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order"
+
+
+def check_started_after_confirm(ctx):
+    m, worker = _setup(ctx)
+    now = _queued(ctx, "run-a")
+    _queued(ctx, "run-b")
+    assert queue.claim_next("w-1", now) == "run-a" and queue.claim_next("w-2", now) == "run-b", "both runs must be claimable"
+    worker.reject.add("run-a")
+    refused = m.start_run("run-a", "w-1")
+    assert refused is False, f"start_run returned {refused!r} for a run the worker refused, expected False"
+    started = [p for p in _payloads(ctx) if p.get("transition") == "started"]
+    assert not [p for p in started if p.get("run_id") == "run-a"], f"training.run says run-a started, but the worker refused it: {started}"
+    assert runs.get("run-a")["state"] == "starting", f"a refused run reads {runs.get('run-a')['state']!r}: it stays starting until its lease runs out"
+    assert m.start_run("run-b", "w-2") is True, "start_run must return True for a run the worker accepted"
+    started = [p for p in _payloads(ctx) if p.get("transition") == "started"]
+    assert len(started) == 1 and started[0].get("run_id") == "run-b", f"one accepted start must publish one started record for run-b, got {started}"
+    assert started[0].get("nodes") == ["n3", "n4"], f"the started record carries nodes {started[0].get('nodes')}, the worker placed it on ['n3', 'n4']"
+    assert runs.get("run-b")["state"] == "running", f"an accepted run reads {runs.get('run-b')['state']!r}, expected running"
+
+
+def check_outbox_on_failure(ctx):
+    m, _ = _setup(ctx)
+    _queued(ctx, "run-a")
+    _queued(ctx, "run-b")
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_transition("run-a", "queued")
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the transition is missing from every run history"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "run-a" and rows[0].get("payload", {}).get("transition") == "queued", f"the outbox row is {rows[0]}, expected the topic, the key run-a and the payload"
+    assert ok is False, f"publish_transition returned {ok!r} after a failed delivery, expected False"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    ok = m.publish_transition("run-b", "queued")
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"publish_transition waited {waited:.0f} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("key") == "run-b", f"no acknowledgement within the window and the outbox holds {rows}"
+    assert ok is False, f"publish_transition returned {ok!r} without an acknowledgement, expected False"
+
+
+def check_acks_idempotent(ctx):
+    m, _ = _setup(ctx)
+    _queued(ctx, "run-a")
+    ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
+    m.publish_transition("run-a", "queued")
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"after one lost acknowledgement the topic holds {len(ctx.kafka.records(TOPIC))} records: the producer's retry wrote the transition twice. Enable idempotence"
+    m.publish_transition("run-a", "preempted")
+    ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
+    assert len(ctx.kafka.records(TOPIC)) == 2, "a leader failover lost the record the leader alone had acknowledged: acks=all waits for every in-sync replica"
+`,
+    typescript: `const TOPIC = 'training.run';
+
+function setup(ctx) {
+  const pkg = ctx.proto('trainsched.proto');
+  const reject = new Set<string>();
+  ctx.grpc.serve(pkg.trainsched.Worker.service, {
+    StartRun(call, callback) {
+      if (reject.has(call.request.run_id)) return callback(null, {accepted: false, nodes: [], reason: 'no free GPUs on this node'});
+      callback(null, {accepted: true, nodes: ['n3', 'n4'], reason: ''});
+    },
+  });
+  return {m: ctx.load('events'), reject, runs: ctx.load('/support/trainsched/runs.ts'), queue: ctx.load('/support/trainsched/queue.ts')};
+}
+
+async function queued(ctx, runs, queue, runId: string, band = 1): Promise<number> {
+  const now = ctx.clock.now();
+  await runs.put({run_id: runId, tenant: 't1', recipe_version: 'llama-ft-v3', dataset_version: 'ds-1', priority: 8 - 3 * band, band, state: 'queued', enqueued_at_ms: now, worker: '', nodes: [], checkpoint_id: 'ckpt-7'});
+  await queue.enqueue(runId, band, now);
+  return now;
+}
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+const payloads = ctx => ctx.kafka.values(TOPIC).map(v => JSON.parse(v));
+const outboxRows = ctx => (ctx.redis.lrange('outbox', 0, -1) as string[]).map(row => JSON.parse(row));
+
+export async function check_run_key(ctx) {
+  const {m, runs, queue} = setup(ctx);
+  await queued(ctx, runs, queue, 'run-a');
+  await queued(ctx, runs, queue, 'run-b');
+  await m.publishTransition('run-a', 'queued');
+  await m.publishTransition('run-b', 'queued');
+  await m.publishTransition('run-a', 'preempted');
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three publishTransition calls produced \${records.length} records on training.run\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['run-a', 'run-b', 'run-a'], \`the records are keyed \${JSON.stringify(keys)}, expected the run ids run-a, run-b, run-a\`);
+  assert.equal(records[0].partition, records[2].partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order");
+}
+
+export async function check_started_after_confirm(ctx) {
+  const {m, reject, runs, queue} = setup(ctx);
+  const now = await queued(ctx, runs, queue, 'run-a');
+  await queued(ctx, runs, queue, 'run-b');
+  assert((await queue.claimNext('w-1', now)) === 'run-a' && (await queue.claimNext('w-2', now)) === 'run-b', 'both runs must be claimable');
+  reject.add('run-a');
+  const refused = await m.startRun('run-a', 'w-1');
+  await settle();
+  assert.equal(refused, false, \`startRun returned \${refused} for a run the worker refused, expected false\`);
+  let started = payloads(ctx).filter(p => p.transition === 'started');
+  assert.equal(started.filter(p => p.run_id === 'run-a').length, 0, \`training.run says run-a started, but the worker refused it: \${JSON.stringify(started)}\`);
+  assert.equal((await runs.get('run-a')).state, 'starting', 'a refused run stays starting until its lease runs out');
+  assert.equal(await m.startRun('run-b', 'w-2'), true, 'startRun must return true for a run the worker accepted');
+  await settle();
+  started = payloads(ctx).filter(p => p.transition === 'started');
+  assert(started.length === 1 && started[0].run_id === 'run-b', \`one accepted start must publish one started record for run-b, got \${JSON.stringify(started)}\`);
+  assert.deepEqual(started[0].nodes, ['n3', 'n4'], \`the started record carries nodes \${JSON.stringify(started[0].nodes)}, the worker placed it on ["n3","n4"]\`);
+  assert.equal((await runs.get('run-b')).state, 'running', 'an accepted run must read running');
+}
+
+export async function check_outbox_on_failure(ctx) {
+  const {m, runs, queue} = setup(ctx);
+  await queued(ctx, runs, queue, 'run-a');
+  await queued(ctx, runs, queue, 'run-b');
+  ctx.kafka.failNext(TOPIC, 1);
+  let ok = await m.publishTransition('run-a', 'queued');
+  await settle();
+  let rows = outboxRows(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the transition is missing from every run history\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'run-a' && rows[0].payload?.transition === 'queued', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key run-a and the payload\`);
+  assert.equal(ok, false, \`publishTransition resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  ok = await m.publishTransition('run-b', 'queued');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`publishTransition waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row\`);
+  rows = outboxRows(ctx);
+  assert(rows.length === 2 && rows[1].key === 'run-b', \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert.equal(ok, false, \`publishTransition resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
+}
+
+export async function check_acks_idempotent(ctx) {
+  const {m, runs, queue} = setup(ctx);
+  await queued(ctx, runs, queue, 'run-a');
+  ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
+  await m.publishTransition('run-a', 'queued');
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`after one lost acknowledgement the topic holds \${ctx.kafka.records(TOPIC).length} records: the producer's retry wrote the transition twice. Enable idempotence\`);
+  await m.publishTransition('run-a', 'preempted');
+  await settle();
+  ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, 'a leader failover lost the record the leader alone had acknowledged: acks: -1 (all) waits for every in-sync replica');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+
+	pb "trainsched/gen/trainsched"
+	"trainsched/queue"
+	"trainsched/runs"
+
+	"leetbuild/harness"
+)
+
+const eventsTopic = "training.run"
+
+var eventsBg = context.Background()
+
+// startPeer is a worker agent that launches every run on n3 and n4, except those in reject.
+type startPeer struct {
+	pb.UnimplementedWorkerServer
+	reject map[string]bool
+}
+
+func (w *startPeer) StartRun(_ context.Context, req *pb.StartRunRequest) (*pb.StartRunReply, error) {
+	if w.reject[req.GetRunId()] {
+		return &pb.StartRunReply{Accepted: false, Reason: "no free GPUs on this node"}, nil
+	}
+	return &pb.StartRunReply{Accepted: true, Nodes: []string{"n3", "n4"}}, nil
+}
+
+func eventsSetup(ctx *harness.Ctx) *startPeer {
+	w := &startPeer{reject: map[string]bool{}}
+	pb.RegisterWorkerServer(ctx.GRPC.Server(""), w)
+	return w
+}
+
+func eventsQueued(ctx *harness.Ctx, runID string) int64 {
+	now := ctx.Clock.Now()
+	ctx.NoError(runs.Put(eventsBg, &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 5, Band: 1, State: "queued", EnqueuedAtMs: now, CheckpointID: "ckpt-7"}), "runs.Put")
+	ctx.NoError(queue.Enqueue(eventsBg, runID, 1, now), "queue.Enqueue")
+	return now
+}
+
+func eventsPublish(ctx *harness.Ctx, runID, transition string) bool {
+	ok, err := publishTransition(eventsBg, runID, transition)
+	ctx.NoError(err, "publishTransition(%s, %s)", runID, transition)
+	return ok
+}
+
+type transitionRecord struct {
+	RunID      string   \`json:"run_id"\`
+	Transition string   \`json:"transition"\`
+	Nodes      []string \`json:"nodes"\`
+}
+
+func startedRecords(ctx *harness.Ctx) []transitionRecord {
+	out := []transitionRecord{}
+	for _, v := range ctx.Kafka.Values(eventsTopic) {
+		var r transitionRecord
+		ctx.NoError(json.Unmarshal([]byte(v), &r), "a training.run record must be JSON")
+		if r.Transition == "started" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+type outboxRow struct {
+	Topic   string         \`json:"topic"\`
+	Key     string         \`json:"key"\`
+	Payload map[string]any \`json:"payload"\`
+}
+
+func outboxRows(ctx *harness.Ctx) []outboxRow {
+	rows := []outboxRow{}
+	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
+		var row outboxRow
+		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func CheckRunKey(ctx *harness.Ctx) {
+	eventsSetup(ctx)
+	eventsQueued(ctx, "run-a")
+	eventsQueued(ctx, "run-b")
+	eventsPublish(ctx, "run-a", "queued")
+	eventsPublish(ctx, "run-b", "queued")
+	eventsPublish(ctx, "run-a", "preempted")
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three publishTransition calls must produce three records on training.run; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"run-a", "run-b", "run-a"}, "the records must be keyed by the run ids")
+	ctx.Equal(records[0].Partition, records[2].Partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order; the partitions")
+}
+
+func CheckStartedAfterConfirm(ctx *harness.Ctx) {
+	w := eventsSetup(ctx)
+	now := eventsQueued(ctx, "run-a")
+	eventsQueued(ctx, "run-b")
+	first, _ := queue.ClaimNext(eventsBg, "w-1", now)
+	second, _ := queue.ClaimNext(eventsBg, "w-2", now)
+	ctx.Assert(first == "run-a" && second == "run-b", "both runs must be claimable")
+	w.reject["run-a"] = true
+	refused, err := startRun(eventsBg, "run-a", "w-1")
+	ctx.NoError(err, "startRun(run-a)")
+	ctx.Settle()
+	ctx.Equal(refused, false, "startRun's result for a run the worker refused")
+	for _, r := range startedRecords(ctx) {
+		ctx.Assert(r.RunID != "run-a", "training.run says run-a started, but the worker refused it")
+	}
+	ctx.Equal(runs.Get(eventsBg, "run-a").State, "starting", "a refused run stays starting until its lease runs out; its state")
+	accepted, err := startRun(eventsBg, "run-b", "w-2")
+	ctx.NoError(err, "startRun(run-b)")
+	ctx.Settle()
+	ctx.Equal(accepted, true, "startRun's result for a run the worker accepted")
+	started := startedRecords(ctx)
+	ctx.Assert(len(started) == 1 && started[0].RunID == "run-b", "one accepted start must publish one started record for run-b, got %+v", started)
+	ctx.Equal(started[0].Nodes, []string{"n3", "n4"}, "the started record's nodes (the worker placed it on n3, n4)")
+	ctx.Equal(runs.Get(eventsBg, "run-b").State, "running", "an accepted run's state")
+}
+
+func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	eventsSetup(ctx)
+	eventsQueued(ctx, "run-a")
+	eventsQueued(ctx, "run-b")
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok := eventsPublish(ctx, "run-a", "queued")
+	ctx.Settle()
+	rows := outboxRows(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the transition is missing from every run history; the rows")
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "run-a" && rows[0].Payload["transition"] == "queued", "the outbox row is %+v, expected the topic, the key run-a and the payload", rows[0])
+	ctx.Equal(ok, false, "publishTransition's result after a failed delivery")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	ok = eventsPublish(ctx, "run-b", "queued")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "publishTransition waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
+	rows = outboxRows(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Key == "run-b", "no acknowledgement within the window and the outbox holds %+v", rows)
+	ctx.Equal(ok, false, "publishTransition's result without an acknowledgement")
+}
+
+func CheckAcksIdempotent(ctx *harness.Ctx) {
+	eventsSetup(ctx)
+	eventsQueued(ctx, "run-a")
+	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	eventsPublish(ctx, "run-a", "queued")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the transition twice (enable.idempotence); the records")
+	eventsPublish(ctx, "run-a", "preempted")
+	ctx.Settle()
+	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kEventsTopic = "training.run";
+
+// A worker agent that launches every run on n3 and n4, except those in reject.
+class StartPeer final : public trainsched::Worker::Service {
+ public:
+  std::set<std::string> reject;
+  grpc::Status StartRun(grpc::ServerContext*, const trainsched::StartRunRequest* req, trainsched::StartRunReply* out) override {
+    if (reject.count(req->run_id())) {
+      out->set_accepted(false);
+      out->set_reason("no free GPUs on this node");
+      return grpc::Status::OK;
+    }
+    out->set_accepted(true);
+    out->add_nodes("n3");
+    out->add_nodes("n4");
+    return grpc::Status::OK;
+  }
+};
+
+StartPeer& eventsSetup(harness::Ctx& ctx) {
+  static StartPeer* peer = nullptr;
+  delete peer;
+  peer = new StartPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  return *peer;
+}
+
+long long eventsQueued(harness::Ctx& ctx, const std::string& run_id) {
+  const long long now = ctx.Clock.Now();
+  runs::Run run;
+  run.run_id = run_id;
+  run.tenant = "t1";
+  run.recipe_version = "llama-ft-v3";
+  run.dataset_version = "ds-1";
+  run.priority = 5;
+  run.band = 1;
+  run.state = "queued";
+  run.enqueued_at_ms = now;
+  run.checkpoint_id = "ckpt-7";
+  runs::put(run);
+  queue::enqueue(run_id, 1, now);
+  return now;
+}
+
+std::string text(const nlohmann::json& j, const std::string& field) {
+  return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+std::vector<nlohmann::json> startedRecords(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> out;
+  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) {
+    const auto record = nlohmann::json::parse(v, nullptr, false);
+    if (text(record, "transition") == "started") out.push_back(record);
+  }
+  return out;
+}
+
+std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> rows;
+  for (const auto& row : ctx.Redis.LRange("outbox", 0, -1)) {
+    const auto parsed = nlohmann::json::parse(row, nullptr, false);
+    ctx.Assert(parsed.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", row);
+    rows.push_back(parsed);
+  }
+  return rows;
+}
+
+}  // namespace
+
+void CheckRunKey(harness::Ctx& ctx) {
+  eventsSetup(ctx);
+  eventsQueued(ctx, "run-a");
+  eventsQueued(ctx, "run-b");
+  publishTransition("run-a", "queued");
+  publishTransition("run-b", "queued");
+  publishTransition("run-a", "preempted");
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 3, "three publishTransition calls must produce three records on training.run; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"run-a", "run-b", "run-a"}, "the records must be keyed by the run ids");
+  ctx.Equal(records[0].Partition, records[2].Partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order; the partitions");
+}
+
+void CheckStartedAfterConfirm(harness::Ctx& ctx) {
+  auto& w = eventsSetup(ctx);
+  const long long now = eventsQueued(ctx, "run-a");
+  eventsQueued(ctx, "run-b");
+  const auto first = queue::claimNext("w-1", now);
+  const auto second = queue::claimNext("w-2", now);
+  ctx.Assert(first == std::optional<std::string>("run-a") && second == std::optional<std::string>("run-b"), "both runs must be claimable");
+  w.reject.insert("run-a");
+  const bool refused = startRun("run-a", "w-1");
+  ctx.Settle();
+  ctx.Equal(refused, false, "startRun's result for a run the worker refused");
+  for (const auto& r : startedRecords(ctx)) ctx.Assert(text(r, "run_id") != "run-a", "training.run says run-a started, but the worker refused it");
+  ctx.Equal(runs::get("run-a")->state, "starting", "a refused run stays starting until its lease runs out; its state");
+  ctx.Equal(startRun("run-b", "w-2"), true, "startRun's result for a run the worker accepted");
+  ctx.Settle();
+  const auto started = startedRecords(ctx);
+  ctx.Assert(started.size() == 1 && text(started[0], "run_id") == "run-b", "one accepted start must publish one started record for run-b, got %d", started.size());
+  ctx.Equal(started[0]["nodes"], nlohmann::json{"n3", "n4"}, "the started record's nodes (the worker placed it on n3, n4)");
+  ctx.Equal(runs::get("run-b")->state, "running", "an accepted run's state");
+}
+
+void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  eventsSetup(ctx);
+  eventsQueued(ctx, "run-a");
+  eventsQueued(ctx, "run-b");
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  bool ok = publishTransition("run-a", "queued");
+  ctx.Settle();
+  auto rows = outboxRows(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the transition is missing from every run history; the rows");
+  ctx.Assert(text(rows[0], "topic") == kEventsTopic && text(rows[0], "key") == "run-a" && rows[0].contains("payload") && text(rows[0]["payload"], "transition") == "queued",
+             "the outbox row is %s, expected the topic, the key run-a and the payload", rows[0].dump());
+  ctx.Equal(ok, false, "publishTransition's result after a failed delivery");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const long long before = ctx.Clock.Now();
+  ok = publishTransition("run-b", "queued");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "publishTransition waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
+  rows = outboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && text(rows[1], "key") == "run-b", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  ctx.Equal(ok, false, "publishTransition's result without an acknowledgement");
+}
+
+void CheckAcksIdempotent(harness::Ctx& ctx) {
+  eventsSetup(ctx);
+  eventsQueued(ctx, "run-a");
+  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishTransition("run-a", "queued");
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the transition twice (enable.idempotence); the records");
+  publishTransition("run-a", "preempted");
+  ctx.Settle();
+  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+}
+`,
+  },
   hints: [
-    'A consumer that rebuilds run histories shows runs training that the fleet rejected, and after a broker restart some runs have a `finished` with no `started` before it.',
-    '`start_run` calls `publish_state` before `stub.StartRun`, so the claim precedes the fact; `key=str(run["band"])` puts unrelated runs on one partition; `producer.produce` has no outbox behind it.',
-    'Publish every transition via `publish_transition` with `key=run_id`; check the `StartRun` reply before `"started"`; write state and `INSERT INTO training_outbox` in one transaction, then produce; set `acks=all` and `enable.idempotence`.',
+    'The run history shows a run training on a worker that refused it, a preemption that never appears after a broker restart, and once a duplicated `queued` event.',
+    'The key is the band, so whole bands share a key; `started` is published before `StartRun` answers; a produce that is not awaited can fail after the caller returned, and `acks=1` without idempotence duplicates or drops.',
+    'Key by `run_id`; in `start_run`, check `reply.accepted` and `confirm_start` first, `set_nodes`, then publish `started`; produce with `on_delivery`, `flush(ACK_TIMEOUT_S)`, `outbox.insert` on failure; set `acks=all` and `enable.idempotence`.',
   ],
-  debrief: `A topic is a log ordered per key, and an event is a claim about something that already happened; both halves of the fix follow from that. The run id is the key because a run's history is what must stay ordered, and \`started\` follows the worker's confirmation because the history must not claim what the fleet refused. The outbox makes the transition and the event one durable fact: the row commits with the state change, the produce is an attempt to deliver it, and the relay finishes the job after an outage. \`acks=all\` with idempotence means that attempt cannot duplicate on retry. Production systems also have the consumer store the last applied transition so a replayed partition cannot move a run backwards, and size the topic's retention to the longest training run.`,
+  debrief: `An event states a fact, so \`started\` waits for the two facts it depends on: the worker accepted the run and this scheduler still held its lease. The run id as key is what lets a consumer, or a compacted topic, keep one history per run; a band key hands every run of a band one partition and one compaction slot. Waiting for the delivery report gives the return value its meaning, and the outbox turns a broker outage into a late history instead of a hole in it; idempotence with \`acks=all\` closes the retry gap that waiting opens. Production schedulers write the outbox row in the same transaction as the state change and let a relay do every produce, and they put a sequence number per run in the payload so consumers can drop a replay.`,
 };

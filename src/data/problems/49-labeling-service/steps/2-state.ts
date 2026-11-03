@@ -2,227 +2,122 @@ import type {Step} from '@/lib/types';
 
 export const assignmentStateStep: Step = {
   id: 'state',
-  title: 'Redis assignment leases with expiry and return',
+  title: 'Redis assignment leases that expire and return',
   concept: 'redis',
   file: 'state',
-  focus: ['service', 'redis', 'db'],
+  focus: ['service', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is the Redis assignment pool behind \`claim\`: it walks
-\`SMEMBERS pool:{task_id}\`, skips ids in \`taken:{task_id}\`, marks the first free one with
-\`SADD\`/\`SREM\` and \`HSET assign:{task_id}:{item_id} annotator assigned_at\`, keeps a \`renew\`
-stub returning false, and reports depth from a counter it \`INCR\`s itself. It serves the demo and
-hides 5 flaws.
+**Starting point.** The starter is the assignment pool over the items step 1 queued in
+\`pool:{task_id}\`: \`claim(task_id, annotator)\` reads the head of the pool, removes it, writes a
+deadline to \`lease:{task_id}\` and the holder to \`holder:{task_id}\`; \`renew(task_id, item_id,
+annotator)\` moves the deadline; \`reclaim_expired(task_id)\`, which the sweeper runs every minute,
+drops expired leases. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A flag with no deadline leaves circulation for good when a tab
-closes, a client-side read-check-write hands one item to two annotators, and a counter-based depth
-drifts from the pool after the first partial failure.
+**Failure mode the checks target.** A lease meant to last fifteen minutes lapses in under a second;
+two annotators who press "next" together open the same item; anyone can extend anyone's lease; and
+the item of a closed tab never comes back.
 
-- Four keys per task: \`pool:{task_id}\` (sorted set, score = queue order), \`lease:{task_id}\`
-  (sorted set, score = deadline in unix ms), \`assign:{task_id}:{item_id}\` (hash with
-  \`annotator\`, \`leased_until_ms\`), \`items:{task_id}\` (item id → \`available\` | \`leased\`).
-- \`LEASE_TTL_S = 900\`: the deadline goes into the lease score *and* the assignment hash; an
-  expired lease returns the item to the pool.
-- \`claim(task_id, annotator)\` is one atomic Lua \`EVAL\` (\`CLAIM_LUA\`): reclaim expired leases,
-  \`ZPOPMIN\` the next item, \`ZADD\` the lease at \`now_ms + 900_000\`, write the record, return the
-  id; an empty pool returns nil (**204**).
-- \`renew\` and \`release\` act for the holder only: \`HGET assign:… annotator\` inside the script,
-  anyone else gets \`false\` (**409**).
-- \`reclaim_expired(task_id)\` returns every expired lease to the pool, deletes its record and flips
-  the item to \`available\`; the claim script and the sweeper both call it.
-- \`queue_depth(task_id)\` is \`{"available": ZCARD pool, "leased": ZCARD lease, "total": HLEN
-  items}\` in one atomic read.
-`,
+- \`LEASE_TTL_S\` = 900: the deadline is now + 900 000 ms, in the lease score and in the answer.
+- \`claim\` is one Lua script: return expired leases to the pool, \`ZPOPMIN\` the next item, lease it,
+  record the holder. An empty pool answers \`None\`.
+- \`renew\` moves the deadline only when \`holder:{task_id}\` names the caller, checked inside one
+  script; anyone else, or an item nobody holds, gets \`None\`.
+- An expired lease goes back: \`reclaim_expired\` and every \`claim\` remove it from \`lease:{task_id}\`
+  and \`holder:{task_id}\` and put the item back at the front of the pool (score 0).`,
   sequence: {
-    participants: ['Annotator', 'Service', 'Redis', 'Sweeper'],
+    participants: ['Annotator', 'labeld', 'Redis', 'Sweeper'],
     messages: [
-      {from: 'Annotator', to: 'Service', label: 'POST /v1/tasks/{id}/claim · X-Annotator-Id', kind: 'sync'},
-      {from: 'Service', to: 'Redis', label: 'EVALSHA CLAIM_LUA 3 pool:{t} lease:{t} items:{t} · now_ms', kind: 'sync'},
+      {from: 'Annotator', to: 'labeld', label: 'next item', kind: 'sync'},
       {
-        from: 'Redis',
+        from: 'labeld',
         to: 'Redis',
-        label: 'ZRANGEBYSCORE lease -inf now → ZREM + DEL assign + ZADD pool',
+        label: 'EVAL claim · pool:{t} lease:{t} holder:{t} · now, now + 900 000, annotator',
         kind: 'sync',
       },
-      {
-        from: 'Redis',
-        to: 'Redis',
-        label: 'ZPOPMIN pool → ZADD lease now+900000 · HSET assign annotator',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Service', label: 'item_id', kind: 'reply'},
-      {
-        from: 'Service',
-        to: 'Annotator',
-        label: '200 {item_id, leased_until_ms} · 204 when the pool is empty',
-        kind: 'reply',
-      },
-      {from: 'Annotator', to: 'Service', label: 'renew(item_id) · release(item_id)', kind: 'sync'},
-      {
-        from: 'Service',
-        to: 'Redis',
-        label: 'EVALSHA RENEW_LUA · HGET assign annotator → mismatch → 0',
-        kind: 'sync',
-      },
-      {
-        from: 'Service',
-        to: 'Annotator',
-        label: '200 {leased_until_ms} · 409 when the caller is not the holder',
-        kind: 'reply',
-      },
-      {from: 'Sweeper', to: 'Redis', label: 'EVALSHA RECLAIM_LUA for idle tasks', kind: 'async'},
+      {from: 'Redis', to: 'Redis', label: 'expired leases → pool · ZPOPMIN · ZADD lease · HSET holder', kind: 'sync'},
+      {from: 'Redis', to: 'labeld', label: 'item_id · nil when the pool is empty', kind: 'reply'},
+      {from: 'Annotator', to: 'labeld', label: 'still working · renew(item_id)', kind: 'sync'},
+      {from: 'labeld', to: 'Redis', label: 'EVAL renew · HGET holder = caller → ZADD lease', kind: 'sync'},
+      {from: 'Sweeper', to: 'Redis', label: 'EVAL reclaim · every minute', kind: 'async'},
     ],
   },
   checks: [
     {
-      id: 'lease-expiry',
+      id: 'lease-ttl',
       title: 'Claims carry a 15-minute lease',
       detail:
-        'Every claim writes a deadline — `leased_until_ms`, the TTL added to the current time in milliseconds — into the assignment hash and uses the same number as the lease score, so an idle assignment expires and the item returns to the pool. The starter writes `assigned_at` and no deadline at all, so a closed tab strands the item forever.',
+        'A claim leases the item until now + 900 000 ms (`LEASE_TTL_S` = 900 times 1000) and writes that deadline as the lease score. The starter adds `LEASE_TTL_MS = 900` to a millisecond clock, so a lease lapses after 0.9 s.',
       match: {
-        python: {
-          all: [
-            /LEASE_TTL_S\s*=\s*900/,
-            /LEASE_TTL_MS\s*=\s*LEASE_TTL_S\s*\*\s*1000/,
-            /leased_until_ms/,
-            /claim_script\(/,
-          ],
-        },
-        typescript: {
-          all: [
-            /LEASE_TTL_S\s*=\s*900/,
-            /LEASE_TTL_MS\s*=\s*LEASE_TTL_S\s*\*\s*1000/,
-            /leased_until_ms/,
-            /redis\.claim\(/,
-          ],
-        },
+        python: {all: [/LEASE_TTL_S\s*=\s*900\b/, /LEASE_TTL_S\s*\*\s*1000/], none: [/LEASE_TTL_MS\s*=\s*900\b/]},
+        typescript: {all: [/LEASE_TTL_S\s*=\s*900\b/, /LEASE_TTL_S\s*\*\s*1000/], none: [/LEASE_TTL_MS\s*=\s*900\b/]},
         go: {
-          all: [
-            /leaseTtl\s*=\s*15\s*\*\s*time\.Minute/,
-            /leaseTtl\.Milliseconds\(\)/,
-            /leased_until_ms/,
-            /claimScript\.Run\(/,
-          ],
+          all: [/leaseTTL\s*=\s*(15\s*\*\s*time\.Minute|900\s*\*\s*time\.Second)/],
+          none: [/leaseTTLMs\s*=\s*900\b/],
         },
         scala: {
-          all: [
-            /LeaseTtlSeconds\s*=\s*900L/,
-            /LeaseTtlMs\s*=\s*LeaseTtlSeconds\s*\*\s*1000/,
-            /leased_until_ms/,
-            /evalsha\(claimSha/,
-          ],
+          all: [/LeaseTtlSeconds\s*=\s*900L?\b/, /LeaseTtlSeconds\s*\*\s*1000/],
+          none: [/LeaseTtlMs\s*=\s*900L?\b/],
         },
-        cpp: {all: [/kLeaseTtl\{900\}/, /kLeaseTtl\.count\(\)\s*\*\s*1000/, /leased_until_ms/, /kClaimSha/]},
+        cpp: {all: [/kLeaseTtl\{900\}|kLeaseTtl\(900\)/], none: [/kLeaseTtlMs\s*=\s*900\b/]},
       },
     },
     {
       id: 'atomic-claim',
-      title: 'One atomic script claims the next item',
+      title: 'One script pops and leases the next item',
       detail:
-        'The next item leaves the pool inside `CLAIM_LUA`, run by the server as one step — reclaim, `ZPOPMIN`, `ZADD` the lease, `HSET` the assignment record — so a concurrent claim cannot see the same item free. The starter reads the pool and marks the item with `SISMEMBER`, `SADD` and `SREM` from the client, so two annotators pass the same check and open the same item.',
+        'The next item leaves the pool inside one Lua script (`ZPOPMIN`, the lease, the holder), so a second claim cannot read the same head. The starter reads the head with `ZRANGE` and removes it with `ZREM` from the client: a claim landing between the two gets the same item.',
       match: {
-        python: {
-          all: [/CLAIM_LUA/, /register_script\(CLAIM_LUA\)/, /redis\.call\(\s*'ZPOPMIN'/, /redis\.call\(\s*'HSET'/],
-          none: [/sismember/i, /sadd/i],
-        },
+        python: {all: [/redis\.call\(\s*['"]ZPOPMIN['"]/, /register_script\(|\.eval\(/], none: [/\.zrange\(|\.zrem\(/]},
         typescript: {
-          all: [/CLAIM_LUA/, /numberOfKeys:\s*3,\s*lua:\s*CLAIM_LUA/, /'ZPOPMIN'/, /'HSET'/],
-          none: [/sismember/i, /sadd/i],
+          all: [/redis\.call\(\s*['"]ZPOPMIN['"]/, /defineCommand\(|\.eval\(/],
+          none: [/redis\.zrange\(|redis\.zrem\(/],
         },
-        go: {all: [/claimLua/, /redis\.NewScript\(claimLua\)/, /'ZPOPMIN'/, /'HSET'/], none: [/SIsMember/, /SAdd\(/]},
-        scala: {all: [/ClaimLua/, /scriptLoad\(ClaimLua\)/, /'ZPOPMIN'/, /'HSET'/], none: [/sismember/i, /sadd/i]},
-        cpp: {all: [/kClaimLua/, /script_load\(kClaimLua\)/, /'ZPOPMIN'/, /'HSET'/], none: [/sismember/i, /sadd/i]},
+        go: {all: [/redis\.call\(\s*['"]ZPOPMIN['"]/, /redis\.NewScript\(|\.Eval\(/], none: [/\.ZRange\(|\.ZRem\(/]},
+        scala: {
+          all: [/redis\.call\(\s*['"]ZPOPMIN['"]/, /jedis\.eval(sha)?\(/],
+          none: [/jedis\.zrange\(|jedis\.zrem\(/],
+        },
+        cpp: {
+          all: [/redis\.call\(\s*['"]ZPOPMIN['"]/, /redis\.eval(sha)?[<(]/],
+          none: [/redis\.zrange\(|redis\.zrem\(/],
+        },
+      },
+    },
+    {
+      id: 'holder-only',
+      title: 'Only the holder renews a lease',
+      detail:
+        'The renew script reads the holder (`HGET holder:{task_id} item_id`) and moves the deadline only when it is the caller; anyone else, and an item nobody holds, gets nothing. The starter writes the new deadline for whoever asks.',
+      match: {
+        python: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/def renew(?:(?!\ndef )[\s\S])*?\.zadd\(/]},
+        typescript: {
+          all: [/redis\.call\(\s*['"]HGET['"]/],
+          none: [/function renew(?:(?!\nexport )[\s\S])*?redis\.zadd\(/],
+        },
+        go: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/func renew(?:(?!\n\})[\s\S])*?\.ZAdd\(/]},
+        scala: {
+          all: [/redis\.call\(\s*['"]HGET['"]/],
+          none: [/def renew(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?jedis\.zadd\(/],
+        },
+        cpp: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/long long renew\((?:(?!\n\})[\s\S])*?redis\.zadd\(/]},
       },
     },
     {
       id: 'expired-return',
-      title: 'Expired leases return items to the pool',
+      title: 'Expired leases return their items to the pool',
       detail:
-        '`reclaim_expired` finds leases past their deadline with `ZRANGEBYSCORE` (`-inf` → `now_ms`), `ZREM`s each one, deletes its assignment record and `ZADD`s the item back into the pool — and the claim script runs that reclaim before it pops, so even a claim rescues abandoned work. The starter has no reclaim path: an expired item never comes back.',
+        'An expired lease (`ZRANGEBYSCORE lease -inf now`) is removed with its holder and the item is added back to the pool, by the sweeper and by every claim before it pops. The starter drops the lease and keeps the item out of the pool, so the work of a closed tab is lost.',
       match: {
         python: {
-          all: [/reclaim_expired/, /reclaim_script\(/, /ZRANGEBYSCORE/, /'-inf'/, /redis\.call\(\s*'ZREM'/],
-          order: [/reclaim\(KEYS\[2\]/, /'ZPOPMIN'/],
+          all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/],
         },
         typescript: {
-          all: [/reclaimExpired/, /defineCommand\('reclaim'/, /ZRANGEBYSCORE/, /'-inf'/, /redis\.call\(\s*'ZREM'/],
-          order: [/reclaim\(KEYS\[2\]/, /'ZPOPMIN'/],
+          all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/],
         },
-        go: {
-          all: [/reclaimExpired/, /reclaimScript\.Run\(/, /ZRANGEBYSCORE/, /'-inf'/, /'ZREM'/],
-          order: [/reclaim\(KEYS\[2\]/, /'ZPOPMIN'/],
-        },
-        scala: {
-          all: [/reclaimExpired/, /reclaimSha/, /ZRANGEBYSCORE/, /'-inf'/, /'ZREM'/],
-          order: [/reclaim\(KEYS\[2\]/, /'ZPOPMIN'/],
-        },
-        cpp: {
-          all: [/reclaim_expired/, /kReclaimLua/, /ZRANGEBYSCORE/, /'-inf'/, /'ZREM'/],
-          order: [/reclaim\(KEYS\[2\]/, /'ZPOPMIN'/],
-        },
-      },
-    },
-    {
-      id: 'renew-holder',
-      title: 'Only the lease holder can renew or release it',
-      detail:
-        '`renew` (and the early `release`) reads the holder out of `assign:{task}:{item}` inside its own script, refuses a caller the record does not name before anything is written, and only then moves `leased_until_ms` and the lease score — so a second annotator can neither steal an item nor extend someone else’s lease. The starter has no renew path, so a stolen item could only be overwritten, never refused.',
-      match: {
-        python: {
-          all: [
-            /def renew\(task_id: str, item_id: str, annotator: str\)/,
-            /renew_script\(/,
-            /redis\.call\(\s*'HGET'/,
-            /holder\s*~=\s*ARGV\[1\]/,
-          ],
-          order: [/redis\.call\(\s*'HGET'/, /return 0/, /'leased_until_ms'/],
-        },
-        typescript: {
-          all: [/export async function renew\(/, /defineCommand\('renew'/, /'HGET'/, /holder\s*~=\s*ARGV\[1\]/],
-          order: [/redis\.call\(\s*'HGET'/, /return 0/, /'leased_until_ms'/],
-        },
-        go: {
-          all: [/func renew\(/, /renewScript\.Run\(/, /'HGET'/, /holder\s*~=\s*ARGV\[1\]/],
-          order: [/redis\.call\(\s*'HGET'/, /return 0/, /'leased_until_ms'/],
-        },
-        scala: {
-          all: [/def renew\(/, /renewSha/, /'HGET'/, /holder\s*~=\s*ARGV\[1\]/],
-          order: [/redis\.call\(\s*'HGET'/, /return 0/, /'leased_until_ms'/],
-        },
-        cpp: {
-          all: [/bool renew\(/, /kRenewLua/, /'HGET'/, /holder\s*~=\s*ARGV\[1\]/],
-          order: [/redis\.call\(\s*'HGET'/, /return 0/, /'leased_until_ms'/],
-        },
-      },
-    },
-    {
-      id: 'pool-depth',
-      title: 'Pool depth stays consistent with the item records',
-      detail:
-        '`queue_depth` derives `available`, `leased` and `total` from `ZCARD pool:{task}`, `ZCARD lease:{task}` and `HLEN items:{task}` in one atomic read, so `available + leased == total` holds and a partial failure cannot make the answer disagree with the pool. The starter reports an `INCR`ed counter instead, which drifts away from the keys it claims to describe.',
-      match: {
-        python: {
-          all: [
-            /def queue_depth\(/,
-            /redis\.call\(\s*'ZCARD'/,
-            /redis\.call\(\s*'HLEN'/,
-            /"available": available/,
-            /"leased": leased/,
-            /"total": total/,
-          ],
-        },
-        typescript: {
-          all: [
-            /export async function queueDepth\(/,
-            /redis\.call\(\s*'ZCARD'/,
-            /redis\.call\(\s*'HLEN'/,
-            /interface QueueDepth/,
-            /available,\s*leased,\s*total/,
-          ],
-        },
-        go: {all: [/func queueDepth\(/, /'ZCARD'/, /'HLEN'/, /json:"available"/, /json:"leased"/, /json:"total"/]},
-        scala: {all: [/def queueDepth\(/, /'ZCARD'/, /'HLEN'/, /case class QueueDepth\(available/, /counts\.get\(2\)/]},
-        cpp: {all: [/QueueDepth queue_depth\(/, /'ZCARD'/, /'HLEN'/, /counts\.at\(0\)/, /counts\.at\(2\)/]},
+        go: {all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/]},
+        scala: {all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/]},
+        cpp: {all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/]},
       },
     },
   ],
@@ -234,140 +129,7 @@ import redis
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-
-
-def pool_key(task_id: str) -> str:
-    return f"pool:{task_id}"
-
-
-def taken_key(task_id: str) -> str:
-    return f"taken:{task_id}"
-
-
-def assign_key(task_id: str, item_id: str) -> str:
-    return f"assign:{task_id}:{item_id}"
-
-
-def depth_key(task_id: str) -> str:
-    return f"depth:{task_id}"
-
-
-def claim(task_id: str, annotator: str) -> str | None:
-    """Hand the next queued item to annotator; None when the pool is empty."""
-    for item_id in r.smembers(pool_key(task_id)):
-        if r.sismember(taken_key(task_id), item_id):
-            continue
-        r.sadd(taken_key(task_id), item_id)
-        r.srem(pool_key(task_id), item_id)
-        r.hset(assign_key(task_id, item_id), mapping={"annotator": annotator, "assigned_at": int(time.time())})
-        return item_id
-    return None
-
-
-def renew(task_id: str, item_id: str, annotator: str) -> bool:
-    """Keep the item for a while longer."""
-    # TODO: not implemented.
-    return False
-
-
-def queue_depth(task_id: str) -> dict:
-    """How much work is waiting for the task."""
-    available = int(r.get(depth_key(task_id)) or 0)
-    return {"available": available, "leased": 0, "total": available}
-`,
-      solution: `import time
-
-import redis
-
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-LEASE_TTL_S = 900
-LEASE_TTL_MS = LEASE_TTL_S * 1000
-
-# Shared by the claim script and the sweeper: an expired lease goes back to the pool with its item
-# id, so depth never drifts away from the pool.
-RECLAIM_FN = """
-local function reclaim(lease, pool, items, prefix, now_ms)
-  local expired = redis.call('ZRANGEBYSCORE', lease, '-inf', now_ms, 'LIMIT', 0, 100)
-  for _, item_id in ipairs(expired) do
-    redis.call('ZREM', lease, item_id)
-    redis.call('DEL', prefix .. item_id)
-    redis.call('ZADD', pool, now_ms, item_id)
-    redis.call('HSET', items, item_id, 'available')
-  end
-  return #expired
-end
-"""
-
-# KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-# ARGV[1] = "assign:{task_id}:" prefix   ARGV[2] = annotator   ARGV[3] = now_ms   ARGV[4] = ttl_ms
-CLAIM_LUA = (
-    RECLAIM_FN
-    + """
-reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[3]))
-local item_id = redis.call('ZPOPMIN', KEYS[1], 1)[1]
-if not item_id then
-  return false
-end
-local deadline = tonumber(ARGV[3]) + tonumber(ARGV[4])
-redis.call('ZADD', KEYS[2], deadline, item_id)
-redis.call('HSET', KEYS[3], item_id, 'leased')
-redis.call('HSET', ARGV[1] .. item_id, 'annotator', ARGV[2], 'leased_until_ms', deadline)
-return item_id
-"""
-)
-
-# KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-# ARGV[1] = assign prefix   ARGV[2] = now_ms
-RECLAIM_LUA = (
-    RECLAIM_FN
-    + """
-return reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[2]))
-"""
-)
-
-# KEYS[1] = lease:{task_id}   KEYS[2] = assign:{task_id}:{item_id}
-# ARGV[1] = annotator   ARGV[2] = now_ms   ARGV[3] = ttl_ms   ARGV[4] = item_id
-RENEW_LUA = """
-local holder = redis.call('HGET', KEYS[2], 'annotator')
-if holder ~= ARGV[1] then
-  return 0
-end
-local deadline = tonumber(ARGV[2]) + tonumber(ARGV[3])
-redis.call('HSET', KEYS[2], 'annotator', ARGV[1], 'leased_until_ms', deadline)
-redis.call('ZADD', KEYS[1], deadline, ARGV[4])
-return 1
-"""
-
-# KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = assign:{task_id}:{item_id}
-# KEYS[4] = items:{task_id}
-# ARGV[1] = annotator   ARGV[2] = item_id   ARGV[3] = now_ms
-RELEASE_LUA = """
-if redis.call('HGET', KEYS[3], 'annotator') ~= ARGV[1] then
-  return 0
-end
-redis.call('DEL', KEYS[3])
-redis.call('ZREM', KEYS[2], ARGV[2])
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
-redis.call('HSET', KEYS[4], ARGV[2], 'available')
-return 1
-"""
-
-# KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-DEPTH_LUA = """
-local available = redis.call('ZCARD', KEYS[1])
-local leased = redis.call('ZCARD', KEYS[2])
-local total = redis.call('HLEN', KEYS[3])
-return {available, leased, total}
-"""
-
-# Registered once: every call is an EVALSHA, never a script upload.
-claim_script = r.register_script(CLAIM_LUA)
-reclaim_script = r.register_script(RECLAIM_LUA)
-renew_script = r.register_script(RENEW_LUA)
-release_script = r.register_script(RELEASE_LUA)
-depth_script = r.register_script(DEPTH_LUA)
+LEASE_TTL_MS = 900  # fifteen minutes
 
 
 def now_ms() -> int:
@@ -382,264 +144,224 @@ def lease_key(task_id: str) -> str:
     return f"lease:{task_id}"
 
 
-def items_key(task_id: str) -> str:
-    return f"items:{task_id}"
+def holder_key(task_id: str) -> str:
+    return f"holder:{task_id}"
 
 
-def assign_prefix(task_id: str) -> str:
-    return f"assign:{task_id}:"
+def claim(task_id: str, annotator: str) -> dict | None:
+    """Hand the next waiting item to annotator under a lease: {item_id, leased_until_ms}, or None when the pool is empty."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    head = r.zrange(pool_key(task_id), 0, 0)
+    if not head:
+        return None
+    item_id = head[0]
+    deadline = now_ms() + LEASE_TTL_MS
+    r.zrem(pool_key(task_id), item_id)
+    r.zadd(lease_key(task_id), {item_id: deadline})
+    r.hset(holder_key(task_id), item_id, annotator)
+    return {"item_id": item_id, "leased_until_ms": deadline}
 
 
-def assign_key(task_id: str, item_id: str) -> str:
-    return f"assign:{task_id}:{item_id}"
-
-
-def claim(task_id: str, annotator: str) -> str | None:
-    """Lease the next queued item to annotator; None means the pool is empty (the route: 204)."""
-    item_id = claim_script(
-        keys=[pool_key(task_id), lease_key(task_id), items_key(task_id)],
-        args=[assign_prefix(task_id), annotator, now_ms(), LEASE_TTL_MS],
-    )
-    return item_id or None
-
-
-def renew(task_id: str, item_id: str, annotator: str) -> bool:
-    """Extend the holder's lease; False refuses the caller (the route: 409)."""
-    renewed = renew_script(
-        keys=[lease_key(task_id), assign_key(task_id, item_id)],
-        args=[annotator, now_ms(), LEASE_TTL_MS, item_id],
-    )
-    return renewed == 1
-
-
-def release(task_id: str, item_id: str, annotator: str) -> bool:
-    """Hand the item back early; only the holder may do it (False -> 409)."""
-    released = release_script(
-        keys=[pool_key(task_id), lease_key(task_id), assign_key(task_id, item_id), items_key(task_id)],
-        args=[annotator, item_id, now_ms()],
-    )
-    return released == 1
+def renew(task_id: str, item_id: str, annotator: str) -> int | None:
+    """Extend the lease on item_id: the new deadline, or None when annotator does not hold it."""
+    deadline = now_ms() + LEASE_TTL_MS
+    r.zadd(lease_key(task_id), {item_id: deadline})
+    return deadline
 
 
 def reclaim_expired(task_id: str) -> int:
-    """Return every expired lease to the pool; the sweeper calls this for idle tasks."""
-    reclaimed = reclaim_script(
-        keys=[pool_key(task_id), lease_key(task_id), items_key(task_id)],
-        args=[assign_prefix(task_id), now_ms()],
-    )
-    return int(reclaimed)
+    """Return the items of expired leases to the pool; how many. The sweeper calls it every minute."""
+    expired = r.zrangebyscore(lease_key(task_id), "-inf", now_ms())
+    for item_id in expired:
+        r.zrem(lease_key(task_id), item_id)
+    return len(expired)
+`,
+      solution: `import time
+
+import redis
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+LEASE_TTL_S = 900
+
+# KEYS: pool, lease, holder. ARGV[1]: now (ms). Every lease past now goes back to the front of the pool.
+RECLAIM = """
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
+for _, item in ipairs(expired) do
+  redis.call('ZREM', KEYS[2], item)
+  redis.call('HDEL', KEYS[3], item)
+  redis.call('ZADD', KEYS[1], 0, item)
+end
+"""
+RECLAIM_LUA = RECLAIM + "return #expired\\n"
+# ARGV[2]: the new deadline, ARGV[3]: the annotator. Pop, lease and record the holder in one step.
+CLAIM_LUA = RECLAIM + """
+local head = redis.call('ZPOPMIN', KEYS[1])
+if #head == 0 then return false end
+redis.call('ZADD', KEYS[2], ARGV[2], head[1])
+redis.call('HSET', KEYS[3], head[1], ARGV[3])
+return head[1]
+"""
+# KEYS: lease, holder. ARGV: item, annotator, new deadline. Only the holder moves the deadline.
+RENEW_LUA = """
+if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
+return 1
+"""
+claim_script = r.register_script(CLAIM_LUA)
+renew_script = r.register_script(RENEW_LUA)
+reclaim_script = r.register_script(RECLAIM_LUA)
 
 
-def queue_depth(task_id: str) -> dict:
-    """Depth derived from the keys in one atomic read, so available + leased == total."""
-    available, leased, total = depth_script(
-        keys=[pool_key(task_id), lease_key(task_id), items_key(task_id)],
-        args=[],
-    )
-    return {"available": available, "leased": leased, "total": total}
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def pool_key(task_id: str) -> str:
+    return f"pool:{task_id}"
+
+
+def lease_key(task_id: str) -> str:
+    return f"lease:{task_id}"
+
+
+def holder_key(task_id: str) -> str:
+    return f"holder:{task_id}"
+
+
+def claim(task_id: str, annotator: str) -> dict | None:
+    """Hand the next waiting item to annotator under a lease: {item_id, leased_until_ms}, or None when the pool is empty."""
+    now = now_ms()
+    deadline = now + LEASE_TTL_S * 1000
+    item_id = claim_script(keys=[pool_key(task_id), lease_key(task_id), holder_key(task_id)], args=[now, deadline, annotator])
+    if item_id is None:
+        return None
+    return {"item_id": item_id, "leased_until_ms": deadline}
+
+
+def renew(task_id: str, item_id: str, annotator: str) -> int | None:
+    """Extend the lease on item_id: the new deadline, or None when annotator does not hold it."""
+    deadline = now_ms() + LEASE_TTL_S * 1000
+    moved = renew_script(keys=[lease_key(task_id), holder_key(task_id)], args=[item_id, annotator, deadline])
+    return deadline if moved == 1 else None
+
+
+def reclaim_expired(task_id: str) -> int:
+    """Return the items of expired leases to the pool; how many. The sweeper calls it every minute."""
+    return reclaim_script(keys=[pool_key(task_id), lease_key(task_id), holder_key(task_id)], args=[now_ms()])
 `,
     },
     typescript: {
       starter: `import Redis from 'ioredis';
 
-export const redis = new Redis({host: 'redis', port: 6379});
+const redis = new Redis({host: 'redis', port: 6379});
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+export const LEASE_TTL_MS = 900; // fifteen minutes
 
-const poolKey = (taskId: string): string => \`pool:\${taskId}\`;
-const takenKey = (taskId: string): string => \`taken:\${taskId}\`;
-const assignKey = (taskId: string, itemId: string): string => \`assign:\${taskId}:\${itemId}\`;
-const depthKey = (taskId: string): string => \`depth:\${taskId}\`;
-
-/** Hands the next queued item to annotator; null when the pool is empty. */
-export async function claim(taskId: string, annotator: string): Promise<string | null> {
-  for (const itemId of await redis.smembers(poolKey(taskId))) {
-    if (await redis.sismember(takenKey(taskId), itemId)) continue;
-    await redis.sadd(takenKey(taskId), itemId);
-    await redis.srem(poolKey(taskId), itemId);
-    await redis.hset(assignKey(taskId, itemId), {annotator, assigned_at: Math.floor(Date.now() / 1000)});
-    return itemId;
-  }
-  return null;
+export interface Lease {
+  item_id: string;
+  leased_until_ms: number;
 }
 
-/** Keeps the item for a while longer. */
-export async function renew(taskId: string, itemId: string, annotator: string): Promise<boolean> {
-  // TODO: not implemented.
-  return false;
+export const poolKey = (taskId: string): string => \`pool:\${taskId}\`;
+export const leaseKey = (taskId: string): string => \`lease:\${taskId}\`;
+export const holderKey = (taskId: string): string => \`holder:\${taskId}\`;
+
+/** Hand the next waiting item to annotator under a lease, or null when the pool is empty. */
+export async function claim(taskId: string, annotator: string): Promise<Lease | null> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const head = await redis.zrange(poolKey(taskId), 0, 0);
+  if (head.length === 0) return null;
+  const itemId = head[0];
+  const deadline = Date.now() + LEASE_TTL_MS;
+  await redis.zrem(poolKey(taskId), itemId);
+  await redis.zadd(leaseKey(taskId), deadline, itemId);
+  await redis.hset(holderKey(taskId), itemId, annotator);
+  return {item_id: itemId, leased_until_ms: deadline};
 }
 
-/** How much work is waiting for the task. */
-export async function queueDepth(taskId: string): Promise<{available: number; leased: number; total: number}> {
-  const available = Number((await redis.get(depthKey(taskId))) ?? 0);
-  return {available, leased: 0, total: available};
+/** Extend the lease on itemId: the new deadline, or null when annotator does not hold it. */
+export async function renew(taskId: string, itemId: string, annotator: string): Promise<number | null> {
+  const deadline = Date.now() + LEASE_TTL_MS;
+  await redis.zadd(leaseKey(taskId), deadline, itemId);
+  return deadline;
+}
+
+/** Return the items of expired leases to the pool; how many. The sweeper calls it every minute. */
+export async function reclaimExpired(taskId: string): Promise<number> {
+  const expired = await redis.zrangebyscore(leaseKey(taskId), '-inf', Date.now());
+  for (const itemId of expired) await redis.zrem(leaseKey(taskId), itemId);
+  return expired.length;
 }
 `,
       solution: `import Redis from 'ioredis';
 
 export const LEASE_TTL_S = 900;
-const LEASE_TTL_MS = LEASE_TTL_S * 1000;
 
-/** One clock for every deadline: milliseconds since the unix epoch. */
-export const nowMs = (): number => Date.now();
-
-/** Shared by the claim script and the sweeper: expired work goes back to the pool. */
-const RECLAIM_FN = \`
-local function reclaim(lease, pool, items, prefix, now_ms)
-  local expired = redis.call('ZRANGEBYSCORE', lease, '-inf', now_ms, 'LIMIT', 0, 100)
-  for _, item_id in ipairs(expired) do
-    redis.call('ZREM', lease, item_id)
-    redis.call('DEL', prefix .. item_id)
-    redis.call('ZADD', pool, now_ms, item_id)
-    redis.call('HSET', items, item_id, 'available')
-  end
-  return #expired
+// KEYS: pool, lease, holder. ARGV[1]: now (ms). Every lease past now goes back to the front of the pool.
+const RECLAIM = \`
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
+for _, item in ipairs(expired) do
+  redis.call('ZREM', KEYS[2], item)
+  redis.call('HDEL', KEYS[3], item)
+  redis.call('ZADD', KEYS[1], 0, item)
 end
 \`;
-
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-// ARGV[1] = "assign:{task_id}:" prefix   ARGV[2] = annotator   ARGV[3] = now_ms   ARGV[4] = ttl_ms
-export const CLAIM_LUA = \`\${RECLAIM_FN}
-reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[3]))
-local item_id = redis.call('ZPOPMIN', KEYS[1], 1)[1]
-if not item_id then
-  return false
-end
-local deadline = tonumber(ARGV[3]) + tonumber(ARGV[4])
-redis.call('ZADD', KEYS[2], deadline, item_id)
-redis.call('HSET', KEYS[3], item_id, 'leased')
-redis.call('HSET', ARGV[1] .. item_id, 'annotator', ARGV[2], 'leased_until_ms', deadline)
-return item_id
+export const RECLAIM_LUA = \`\${RECLAIM}return #expired
 \`;
-
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-// ARGV[1] = assign prefix   ARGV[2] = now_ms
-const RECLAIM_LUA = \`\${RECLAIM_FN}
-return reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[2]))
+// ARGV[2]: the new deadline, ARGV[3]: the annotator. Pop, lease and record the holder in one step.
+export const CLAIM_LUA = \`\${RECLAIM}
+local head = redis.call('ZPOPMIN', KEYS[1])
+if #head == 0 then return false end
+redis.call('ZADD', KEYS[2], ARGV[2], head[1])
+redis.call('HSET', KEYS[3], head[1], ARGV[3])
+return head[1]
 \`;
-
-// KEYS[1] = lease:{task_id}   KEYS[2] = assign:{task_id}:{item_id}
-// ARGV[1] = annotator   ARGV[2] = now_ms   ARGV[3] = ttl_ms   ARGV[4] = item_id
-const RENEW_LUA = \`
-local holder = redis.call('HGET', KEYS[2], 'annotator')
-if holder ~= ARGV[1] then
-  return 0
-end
-local deadline = tonumber(ARGV[2]) + tonumber(ARGV[3])
-redis.call('HSET', KEYS[2], 'annotator', ARGV[1], 'leased_until_ms', deadline)
-redis.call('ZADD', KEYS[1], deadline, ARGV[4])
+// KEYS: lease, holder. ARGV: item, annotator, new deadline. Only the holder moves the deadline.
+export const RENEW_LUA = \`
+if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 return 1
 \`;
 
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = assign:{task_id}:{item_id}
-// KEYS[4] = items:{task_id}
-// ARGV[1] = annotator   ARGV[2] = item_id   ARGV[3] = now_ms
-const RELEASE_LUA = \`
-if redis.call('HGET', KEYS[3], 'annotator') ~= ARGV[1] then
-  return 0
-end
-redis.call('DEL', KEYS[3])
-redis.call('ZREM', KEYS[2], ARGV[2])
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
-redis.call('HSET', KEYS[4], ARGV[2], 'available')
-return 1
-\`;
-
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-const DEPTH_LUA = \`
-local available = redis.call('ZCARD', KEYS[1])
-local leased = redis.call('ZCARD', KEYS[2])
-local total = redis.call('HLEN', KEYS[3])
-return {available, leased, total}
-\`;
-
-/** The pool as commands: each script is loaded once, so calls go out as EVALSHA. */
-interface LeaseRedis extends Redis {
-  claim(
-    poolKey: string,
-    leaseKey: string,
-    itemsKey: string,
-    prefix: string,
-    annotator: string,
-    nowMs: number,
-    ttlMs: number,
-  ): Promise<string | null>;
-  reclaim(poolKey: string, leaseKey: string, itemsKey: string, prefix: string, nowMs: number): Promise<number>;
-  renew(leaseKey: string, assignKey: string, annotator: string, nowMs: number, ttlMs: number, itemId: string): Promise<number>;
-  release(
-    poolKey: string,
-    leaseKey: string,
-    assignKey: string,
-    itemsKey: string,
-    annotator: string,
-    itemId: string,
-    nowMs: number,
-  ): Promise<number>;
-  poolDepth(poolKey: string, leaseKey: string, itemsKey: string): Promise<[number, number, number]>;
+interface PoolRedis extends Redis {
+  claimItem(pool: string, lease: string, holder: string, now: number, deadline: number, annotator: string): Promise<string | null>;
+  renewLease(lease: string, holder: string, itemId: string, annotator: string, deadline: number): Promise<number>;
+  reclaimLeases(pool: string, lease: string, holder: string, now: number): Promise<number>;
 }
 
-export const redis = new Redis({host: 'redis', port: 6379}) as LeaseRedis;
-redis.defineCommand('claim', {numberOfKeys: 3, lua: CLAIM_LUA});
-redis.defineCommand('reclaim', {numberOfKeys: 3, lua: RECLAIM_LUA});
-redis.defineCommand('renew', {numberOfKeys: 2, lua: RENEW_LUA});
-redis.defineCommand('release', {numberOfKeys: 4, lua: RELEASE_LUA});
-redis.defineCommand('poolDepth', {numberOfKeys: 3, lua: DEPTH_LUA});
+const redis = new Redis({host: 'redis', port: 6379}) as PoolRedis;
+redis.defineCommand('claimItem', {numberOfKeys: 3, lua: CLAIM_LUA});
+redis.defineCommand('renewLease', {numberOfKeys: 2, lua: RENEW_LUA});
+redis.defineCommand('reclaimLeases', {numberOfKeys: 3, lua: RECLAIM_LUA});
+
+export interface Lease {
+  item_id: string;
+  leased_until_ms: number;
+}
 
 export const poolKey = (taskId: string): string => \`pool:\${taskId}\`;
 export const leaseKey = (taskId: string): string => \`lease:\${taskId}\`;
-export const itemsKey = (taskId: string): string => \`items:\${taskId}\`;
-export const assignKey = (taskId: string, itemId: string): string => \`assign:\${taskId}:\${itemId}\`;
-const assignPrefix = (taskId: string): string => \`assign:\${taskId}:\`;
+export const holderKey = (taskId: string): string => \`holder:\${taskId}\`;
 
-/** Leases the next queued item to annotator; null means the pool is empty (the route: 204). */
-export async function claim(taskId: string, annotator: string): Promise<string | null> {
-  const itemId = await redis.claim(
-    poolKey(taskId),
-    leaseKey(taskId),
-    itemsKey(taskId),
-    assignPrefix(taskId),
-    annotator,
-    nowMs(),
-    LEASE_TTL_MS,
-  );
-  return itemId ?? null;
+/** Hand the next waiting item to annotator under a lease, or null when the pool is empty. */
+export async function claim(taskId: string, annotator: string): Promise<Lease | null> {
+  const now = Date.now();
+  const deadline = now + LEASE_TTL_S * 1000;
+  const itemId = await redis.claimItem(poolKey(taskId), leaseKey(taskId), holderKey(taskId), now, deadline, annotator);
+  return itemId === null ? null : {item_id: itemId, leased_until_ms: deadline};
 }
 
-/** Extends the holder's lease; false refuses the caller (the route: 409). */
-export async function renew(taskId: string, itemId: string, annotator: string): Promise<boolean> {
-  const renewed = await redis.renew(leaseKey(taskId), assignKey(taskId, itemId), annotator, nowMs(), LEASE_TTL_MS, itemId);
-  return renewed === 1;
+/** Extend the lease on itemId: the new deadline, or null when annotator does not hold it. */
+export async function renew(taskId: string, itemId: string, annotator: string): Promise<number | null> {
+  const deadline = Date.now() + LEASE_TTL_S * 1000;
+  const moved = await redis.renewLease(leaseKey(taskId), holderKey(taskId), itemId, annotator, deadline);
+  return moved === 1 ? deadline : null;
 }
 
-/** Hands the item back early; only the holder may do it (false -> 409). */
-export async function release(taskId: string, itemId: string, annotator: string): Promise<boolean> {
-  const released = await redis.release(
-    poolKey(taskId),
-    leaseKey(taskId),
-    assignKey(taskId, itemId),
-    itemsKey(taskId),
-    annotator,
-    itemId,
-    nowMs(),
-  );
-  return released === 1;
-}
-
-/** The sweeper's entry point: every expired lease returns to the pool. */
+/** Return the items of expired leases to the pool; how many. The sweeper calls it every minute. */
 export async function reclaimExpired(taskId: string): Promise<number> {
-  return redis.reclaim(poolKey(taskId), leaseKey(taskId), itemsKey(taskId), assignPrefix(taskId), nowMs());
-}
-
-export interface QueueDepth {
-  available: number;
-  leased: number;
-  total: number;
-}
-
-/** Depth derived from the keys in one atomic read, so available + leased === total. */
-export async function queueDepth(taskId: string): Promise<QueueDepth> {
-  const [available, leased, total] = await redis.poolDepth(poolKey(taskId), leaseKey(taskId), itemsKey(taskId));
-  return {available, leased, total};
+  return redis.reclaimLeases(poolKey(taskId), leaseKey(taskId), holderKey(taskId), Date.now());
 }
 `,
     },
@@ -648,6 +370,7 @@ export async function queueDepth(taskId: string): Promise<QueueDepth> {
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -655,62 +378,59 @@ import (
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+const leaseTTLMs = 900 // fifteen minutes
 
-func poolKey(taskID string) string { return "pool:" + taskID }
-func takenKey(taskID string) string { return "taken:" + taskID }
-func assignKey(taskID, itemID string) string { return "assign:" + taskID + ":" + itemID }
-func depthKey(taskID string) string { return "depth:" + taskID }
+// Lease is an item handed to an annotator and the moment (ms) it returns to the pool.
+type Lease struct {
+	ItemID        string \`json:"item_id"\`
+	LeasedUntilMs int64  \`json:"leased_until_ms"\`
+}
 
-// claim hands the next queued item to annotator; an empty pool returns "".
-func claim(ctx context.Context, taskID, annotator string) (string, error) {
-	itemIDs, err := rdb.SMembers(ctx, poolKey(taskID)).Result()
+func poolKey(taskID string) string   { return "pool:" + taskID }
+func leaseKey(taskID string) string  { return "lease:" + taskID }
+func holderKey(taskID string) string { return "holder:" + taskID }
+
+// claim hands the next waiting item to annotator under a lease, or nil when the pool is empty.
+func claim(ctx context.Context, taskID, annotator string) (*Lease, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	head, err := rdb.ZRange(ctx, poolKey(taskID), 0, 0).Result()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	for _, itemID := range itemIDs {
-		taken, err := rdb.SIsMember(ctx, takenKey(taskID), itemID).Result()
-		if err != nil {
-			return "", err
-		}
-		if taken {
-			continue
-		}
-		if err := rdb.SAdd(ctx, takenKey(taskID), itemID).Err(); err != nil {
-			return "", err
-		}
-		if err := rdb.SRem(ctx, poolKey(taskID), itemID).Err(); err != nil {
-			return "", err
-		}
-		fields := map[string]any{"annotator": annotator, "assigned_at": time.Now().Unix()}
-		if err := rdb.HSet(ctx, assignKey(taskID, itemID), fields).Err(); err != nil {
-			return "", err
-		}
-		return itemID, nil
+	if len(head) == 0 {
+		return nil, nil
 	}
-	return "", nil
+	itemID := head[0]
+	deadline := time.Now().UnixMilli() + leaseTTLMs
+	rdb.ZRem(ctx, poolKey(taskID), itemID)
+	rdb.ZAdd(ctx, leaseKey(taskID), redis.Z{Score: float64(deadline), Member: itemID})
+	rdb.HSet(ctx, holderKey(taskID), itemID, annotator)
+	return &Lease{ItemID: itemID, LeasedUntilMs: deadline}, nil
 }
 
-// renew keeps the item for a while longer.
-func renew(ctx context.Context, taskID, itemID, annotator string) (bool, error) {
-	// TODO: not implemented.
-	return false, nil
+// renew extends the lease on itemID: the new deadline, or 0 when annotator does not hold it.
+func renew(ctx context.Context, taskID, itemID, annotator string) (int64, error) {
+	deadline := time.Now().UnixMilli() + leaseTTLMs
+	return deadline, rdb.ZAdd(ctx, leaseKey(taskID), redis.Z{Score: float64(deadline), Member: itemID}).Err()
 }
 
-// queueDepth reports how much work is waiting for the task.
-func queueDepth(ctx context.Context, taskID string) (int64, error) {
-	depth, err := rdb.Get(ctx, depthKey(taskID)).Int64()
-	if err == redis.Nil {
-		return 0, nil
+// reclaimExpired returns the items of expired leases to the pool; how many. The sweeper calls it every minute.
+func reclaimExpired(ctx context.Context, taskID string) (int, error) {
+	now := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	expired, err := rdb.ZRangeByScore(ctx, leaseKey(taskID), &redis.ZRangeBy{Min: "-inf", Max: now}).Result()
+	if err != nil {
+		return 0, err
 	}
-	return depth, err
+	for _, itemID := range expired {
+		rdb.ZRem(ctx, leaseKey(taskID), itemID)
+	}
+	return len(expired), nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -718,340 +438,183 @@ import (
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const leaseTtl = 15 * time.Minute
+const leaseTTL = 15 * time.Minute
 
-// Shared by the claim script and the sweeper: an expired lease goes back to the pool.
-const reclaimFn = \`
-local function reclaim(lease, pool, items, prefix, now_ms)
-  local expired = redis.call('ZRANGEBYSCORE', lease, '-inf', now_ms, 'LIMIT', 0, 100)
-  for _, item_id in ipairs(expired) do
-    redis.call('ZREM', lease, item_id)
-    redis.call('DEL', prefix .. item_id)
-    redis.call('ZADD', pool, now_ms, item_id)
-    redis.call('HSET', items, item_id, 'available')
-  end
-  return #expired
+// KEYS: pool, lease, holder. ARGV[1]: now (ms). Every lease past now goes back to the front of the pool.
+const reclaimLoop = \`
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
+for _, item in ipairs(expired) do
+  redis.call('ZREM', KEYS[2], item)
+  redis.call('HDEL', KEYS[3], item)
+  redis.call('ZADD', KEYS[1], 0, item)
 end
 \`
 
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-// ARGV[1] = "assign:{task_id}:" prefix   ARGV[2] = annotator   ARGV[3] = now_ms   ARGV[4] = ttl_ms
-const claimLua = reclaimFn + \`
-reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[3]))
-local item_id = redis.call('ZPOPMIN', KEYS[1], 1)[1]
-if not item_id then
-  return false
-end
-local deadline = tonumber(ARGV[3]) + tonumber(ARGV[4])
-redis.call('ZADD', KEYS[2], deadline, item_id)
-redis.call('HSET', KEYS[3], item_id, 'leased')
-redis.call('HSET', ARGV[1] .. item_id, 'annotator', ARGV[2], 'leased_until_ms', deadline)
-return item_id
-\`
-
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-// ARGV[1] = assign prefix   ARGV[2] = now_ms
-const reclaimLua = reclaimFn + \`
-return reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[2]))
-\`
-
-// KEYS[1] = lease:{task_id}   KEYS[2] = assign:{task_id}:{item_id}
-// ARGV[1] = annotator   ARGV[2] = now_ms   ARGV[3] = ttl_ms   ARGV[4] = item_id
-const renewLua = \`
-local holder = redis.call('HGET', KEYS[2], 'annotator')
-if holder ~= ARGV[1] then
-  return 0
-end
-local deadline = tonumber(ARGV[2]) + tonumber(ARGV[3])
-redis.call('HSET', KEYS[2], 'annotator', ARGV[1], 'leased_until_ms', deadline)
-redis.call('ZADD', KEYS[1], deadline, ARGV[4])
-return 1
-\`
-
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = assign:{task_id}:{item_id}
-// KEYS[4] = items:{task_id}
-// ARGV[1] = annotator   ARGV[2] = item_id   ARGV[3] = now_ms
-const releaseLua = \`
-if redis.call('HGET', KEYS[3], 'annotator') ~= ARGV[1] then
-  return 0
-end
-redis.call('DEL', KEYS[3])
-redis.call('ZREM', KEYS[2], ARGV[2])
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
-redis.call('HSET', KEYS[4], ARGV[2], 'available')
-return 1
-\`
-
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-const depthLua = \`
-local available = redis.call('ZCARD', KEYS[1])
-local leased = redis.call('ZCARD', KEYS[2])
-local total = redis.call('HLEN', KEYS[3])
-return {available, leased, total}
-\`
-
-// Loaded once: every call is an EVALSHA, never a script upload.
 var (
-	claimScript   = redis.NewScript(claimLua)
-	reclaimScript = redis.NewScript(reclaimLua)
-	renewScript   = redis.NewScript(renewLua)
-	releaseScript = redis.NewScript(releaseLua)
-	depthScript   = redis.NewScript(depthLua)
+	reclaimScript = redis.NewScript(reclaimLoop + "return #expired\\n")
+	// ARGV[2]: the new deadline, ARGV[3]: the annotator. Pop, lease and record the holder in one step.
+	claimScript = redis.NewScript(reclaimLoop + \`
+local head = redis.call('ZPOPMIN', KEYS[1])
+if #head == 0 then return false end
+redis.call('ZADD', KEYS[2], ARGV[2], head[1])
+redis.call('HSET', KEYS[3], head[1], ARGV[3])
+return head[1]
+\`)
+	// KEYS: lease, holder. ARGV: item, annotator, new deadline. Only the holder moves the deadline.
+	renewScript = redis.NewScript(\`
+if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
+return 1
+\`)
 )
 
-func nowMs() int64 { return time.Now().UnixMilli() }
+// Lease is an item handed to an annotator and the moment (ms) it returns to the pool.
+type Lease struct {
+	ItemID        string \`json:"item_id"\`
+	LeasedUntilMs int64  \`json:"leased_until_ms"\`
+}
 
-func poolKey(taskID string) string { return "pool:" + taskID }
-func leaseKey(taskID string) string { return "lease:" + taskID }
-func itemsKey(taskID string) string { return "items:" + taskID }
-func assignPrefix(taskID string) string { return "assign:" + taskID + ":" }
-func assignKey(taskID, itemID string) string { return assignPrefix(taskID) + itemID }
+func poolKey(taskID string) string   { return "pool:" + taskID }
+func leaseKey(taskID string) string  { return "lease:" + taskID }
+func holderKey(taskID string) string { return "holder:" + taskID }
 
-// claim leases the next queued item to annotator; an empty pool returns "" (the route answers 204).
-func claim(ctx context.Context, taskID, annotator string) (string, error) {
-	reply, err := claimScript.Run(ctx, rdb, []string{poolKey(taskID), leaseKey(taskID), itemsKey(taskID)},
-		assignPrefix(taskID), annotator, nowMs(), leaseTtl.Milliseconds()).Result()
+// claim hands the next waiting item to annotator under a lease, or nil when the pool is empty.
+func claim(ctx context.Context, taskID, annotator string) (*Lease, error) {
+	now := time.Now()
+	deadline := now.Add(leaseTTL).UnixMilli()
+	keys := []string{poolKey(taskID), leaseKey(taskID), holderKey(taskID)}
+	itemID, err := claimScript.Run(ctx, rdb, keys, now.UnixMilli(), deadline, annotator).Text()
 	if err == redis.Nil {
-		return "", nil
+		return nil, nil
 	}
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	itemID, ok := reply.(string)
-	if !ok {
-		return "", fmt.Errorf("claim: unexpected reply %T", reply)
-	}
-	return itemID, nil
+	return &Lease{ItemID: itemID, LeasedUntilMs: deadline}, nil
 }
 
-// renew extends the holder's lease; false means the caller does not hold the item (the route: 409).
-func renew(ctx context.Context, taskID, itemID, annotator string) (bool, error) {
-	renewed, err := renewScript.Run(ctx, rdb, []string{leaseKey(taskID), assignKey(taskID, itemID)},
-		annotator, nowMs(), leaseTtl.Milliseconds(), itemID).Int64()
-	if err != nil {
-		return false, err
+// renew extends the lease on itemID: the new deadline, or 0 when annotator does not hold it.
+func renew(ctx context.Context, taskID, itemID, annotator string) (int64, error) {
+	deadline := time.Now().Add(leaseTTL).UnixMilli()
+	moved, err := renewScript.Run(ctx, rdb, []string{leaseKey(taskID), holderKey(taskID)}, itemID, annotator, deadline).Int64()
+	if err != nil || moved != 1 {
+		return 0, err
 	}
-	return renewed == 1, nil
+	return deadline, nil
 }
 
-// release hands the item back early; only the holder may do it (false -> 409).
-func release(ctx context.Context, taskID, itemID, annotator string) (bool, error) {
-	released, err := releaseScript.Run(ctx, rdb, []string{
-		poolKey(taskID), leaseKey(taskID), assignKey(taskID, itemID), itemsKey(taskID),
-	}, annotator, itemID, nowMs()).Int64()
-	if err != nil {
-		return false, err
-	}
-	return released == 1, nil
-}
-
-// reclaimExpired returns every expired lease to the pool; the sweeper calls it for idle tasks.
-func reclaimExpired(ctx context.Context, taskID string) (int64, error) {
-	return reclaimScript.Run(ctx, rdb, []string{poolKey(taskID), leaseKey(taskID), itemsKey(taskID)},
-		assignPrefix(taskID), nowMs()).Int64()
-}
-
-// QueueDepth is what the dashboard reads: available + leased == total.
-type QueueDepth struct {
-	Available int64 \`json:"available"\`
-	Leased    int64 \`json:"leased"\`
-	Total     int64 \`json:"total"\`
-}
-
-// queueDepth derives the pool depth from the keys in one atomic read.
-func queueDepth(ctx context.Context, taskID string) (QueueDepth, error) {
-	counts, err := depthScript.Run(ctx, rdb, []string{poolKey(taskID), leaseKey(taskID), itemsKey(taskID)}).Int64Slice()
-	if err != nil {
-		return QueueDepth{}, err
-	}
-	return QueueDepth{Available: counts[0], Leased: counts[1], Total: counts[2]}, nil
+// reclaimExpired returns the items of expired leases to the pool; how many. The sweeper calls it every minute.
+func reclaimExpired(ctx context.Context, taskID string) (int, error) {
+	keys := []string{poolKey(taskID), leaseKey(taskID), holderKey(taskID)}
+	n, err := reclaimScript.Run(ctx, rdb, keys, time.Now().UnixMilli()).Int64()
+	return int(n), err
 }
 `,
     },
     scala: {
       starter: `import redis.clients.jedis.JedisPooled
-import scala.jdk.CollectionConverters._
 
-object Assignments {
-  private val jedis = new JedisPooled("redis", 6379)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  val LeaseTtlMs = 900L // fifteen minutes
 
-  private def poolKey(taskId: String): String = s"pool:$taskId"
-  private def takenKey(taskId: String): String = s"taken:$taskId"
-  private def assignKey(taskId: String, itemId: String): String = s"assign:$taskId:$itemId"
-  private def depthKey(taskId: String): String = s"depth:$taskId"
-  private def nowSeconds(): Long = System.currentTimeMillis() / 1000
+  final case class Lease(itemId: String, leasedUntilMs: Long)
 
-  /** Hands the next queued item to annotator; None when the pool is empty. */
-  def claim(taskId: String, annotator: String): Option[String] =
-    jedis
-      .smembers(poolKey(taskId))
-      .asScala
-      .find(itemId => !jedis.sismember(takenKey(taskId), itemId))
-      .map { itemId =>
-        jedis.sadd(takenKey(taskId), itemId)
-        jedis.srem(poolKey(taskId), itemId)
-        val fields = Map("annotator" -> annotator, "assigned_at" -> nowSeconds().toString).asJava
-        jedis.hset(assignKey(taskId, itemId), fields)
-        itemId
-      }
+  def poolKey(taskId: String): String = s"pool:$taskId"
+  def leaseKey(taskId: String): String = s"lease:$taskId"
+  def holderKey(taskId: String): String = s"holder:$taskId"
 
-  /** Keeps the item for a while longer. */
-  def renew(taskId: String, itemId: String, annotator: String): Boolean = {
-    // TODO: not implemented.
-    false
+  /** Hand the next waiting item to annotator under a lease, or None when the pool is empty. */
+  def claim(taskId: String, annotator: String): Option[Lease] = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val head = jedis.zrange(poolKey(taskId), 0, 0)
+    if (head.isEmpty) None
+    else {
+      val itemId = head.get(0)
+      val deadline = System.currentTimeMillis() + LeaseTtlMs
+      jedis.zrem(poolKey(taskId), itemId)
+      jedis.zadd(leaseKey(taskId), deadline.toDouble, itemId)
+      jedis.hset(holderKey(taskId), itemId, annotator)
+      Some(Lease(itemId, deadline))
+    }
   }
 
-  /** How much work is waiting for the task. */
-  def queueDepth(taskId: String): QueueDepth = {
-    val available = Option(jedis.get(depthKey(taskId))).map(_.toLong).getOrElse(0L)
-    QueueDepth(available, 0L, available)
+  /** Extend the lease on itemId: the new deadline, or None when annotator does not hold it. */
+  def renew(taskId: String, itemId: String, annotator: String): Option[Long] = {
+    val deadline = System.currentTimeMillis() + LeaseTtlMs
+    jedis.zadd(leaseKey(taskId), deadline.toDouble, itemId)
+    Some(deadline)
   }
 
-  final case class QueueDepth(available: Long, leased: Long, total: Long)
+  /** Return the items of expired leases to the pool; how many. The sweeper calls it every minute. */
+  def reclaimExpired(taskId: String): Long = {
+    val expired = jedis.zrangeByScore(leaseKey(taskId), "-inf", System.currentTimeMillis().toString)
+    expired.forEach(itemId => jedis.zrem(leaseKey(taskId), itemId))
+    expired.size.toLong
+  }
 }
 `,
       solution: `import redis.clients.jedis.JedisPooled
+
 import scala.jdk.CollectionConverters._
 
-/** Redis assignment pool: 15-minute leases over one task's item queue. */
-object Assignments {
-  private val jedis = new JedisPooled("redis", 6379)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
   val LeaseTtlSeconds = 900L
-  private val LeaseTtlMs = LeaseTtlSeconds * 1000
 
-  /** One clock for every deadline: milliseconds since the unix epoch. */
-  private def nowMs(): Long = System.currentTimeMillis()
-
-  /** Shared by the claim script and the sweeper: expired work goes back to the pool. */
-  private val ReclaimFn: String =
-    """
-      |local function reclaim(lease, pool, items, prefix, now_ms)
-      |  local expired = redis.call('ZRANGEBYSCORE', lease, '-inf', now_ms, 'LIMIT', 0, 100)
-      |  for _, item_id in ipairs(expired) do
-      |    redis.call('ZREM', lease, item_id)
-      |    redis.call('DEL', prefix .. item_id)
-      |    redis.call('ZADD', pool, now_ms, item_id)
-      |    redis.call('HSET', items, item_id, 'available')
-      |  end
-      |  return #expired
+  /** KEYS: pool, lease, holder. ARGV[1]: now (ms). Every lease past now goes back to the front of the pool. */
+  private val Reclaim: String =
+    """local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
+      |for _, item in ipairs(expired) do
+      |  redis.call('ZREM', KEYS[2], item)
+      |  redis.call('HDEL', KEYS[3], item)
+      |  redis.call('ZADD', KEYS[1], 0, item)
       |end
       |""".stripMargin
-
-  // KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-  // ARGV[1] = "assign:{task_id}:" prefix   ARGV[2] = annotator   ARGV[3] = now_ms   ARGV[4] = ttl_ms
-  val ClaimLua: String =
-    ReclaimFn +
-      """
-        |reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[3]))
-        |local item_id = redis.call('ZPOPMIN', KEYS[1], 1)[1]
-        |if not item_id then
-        |  return false
-        |end
-        |local deadline = tonumber(ARGV[3]) + tonumber(ARGV[4])
-        |redis.call('ZADD', KEYS[2], deadline, item_id)
-        |redis.call('HSET', KEYS[3], item_id, 'leased')
-        |redis.call('HSET', ARGV[1] .. item_id, 'annotator', ARGV[2], 'leased_until_ms', deadline)
-        |return item_id
-        |""".stripMargin
-
-  // KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-  // ARGV[1] = assign prefix   ARGV[2] = now_ms
-  val ReclaimLua: String =
-    ReclaimFn +
-      """
-        |return reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[2]))
-        |""".stripMargin
-
-  // KEYS[1] = lease:{task_id}   KEYS[2] = assign:{task_id}:{item_id}
-  // ARGV[1] = annotator   ARGV[2] = now_ms   ARGV[3] = ttl_ms   ARGV[4] = item_id
+  val ReclaimLua: String = Reclaim + "return #expired\\n"
+  /** ARGV[2]: the new deadline, ARGV[3]: the annotator. Pop, lease and record the holder in one step. */
+  val ClaimLua: String = Reclaim +
+    """local head = redis.call('ZPOPMIN', KEYS[1])
+      |if #head == 0 then return false end
+      |redis.call('ZADD', KEYS[2], ARGV[2], head[1])
+      |redis.call('HSET', KEYS[3], head[1], ARGV[3])
+      |return head[1]
+      |""".stripMargin
+  /** KEYS: lease, holder. ARGV: item, annotator, new deadline. Only the holder moves the deadline. */
   val RenewLua: String =
-    """
-      |local holder = redis.call('HGET', KEYS[2], 'annotator')
-      |if holder ~= ARGV[1] then
-      |  return 0
-      |end
-      |local deadline = tonumber(ARGV[2]) + tonumber(ARGV[3])
-      |redis.call('HSET', KEYS[2], 'annotator', ARGV[1], 'leased_until_ms', deadline)
-      |redis.call('ZADD', KEYS[1], deadline, ARGV[4])
+    """if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
+      |redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
       |return 1
       |""".stripMargin
 
-  // KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = assign:{task_id}:{item_id}
-  // KEYS[4] = items:{task_id}
-  // ARGV[1] = annotator   ARGV[2] = item_id   ARGV[3] = now_ms
-  val ReleaseLua: String =
-    """
-      |if redis.call('HGET', KEYS[3], 'annotator') ~= ARGV[1] then
-      |  return 0
-      |end
-      |redis.call('DEL', KEYS[3])
-      |redis.call('ZREM', KEYS[2], ARGV[2])
-      |redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
-      |redis.call('HSET', KEYS[4], ARGV[2], 'available')
-      |return 1
-      |""".stripMargin
+  final case class Lease(itemId: String, leasedUntilMs: Long)
 
-  // KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-  val DepthLua: String =
-    """
-      |local available = redis.call('ZCARD', KEYS[1])
-      |local leased = redis.call('ZCARD', KEYS[2])
-      |local total = redis.call('HLEN', KEYS[3])
-      |return {available, leased, total}
-      |""".stripMargin
+  def poolKey(taskId: String): String = s"pool:$taskId"
+  def leaseKey(taskId: String): String = s"lease:$taskId"
+  def holderKey(taskId: String): String = s"holder:$taskId"
 
-  // Loaded once: every call is an EVALSHA, never a script upload.
-  private val claimSha: String = jedis.scriptLoad(ClaimLua)
-  private val reclaimSha: String = jedis.scriptLoad(ReclaimLua)
-  private val renewSha: String = jedis.scriptLoad(RenewLua)
-  private val releaseSha: String = jedis.scriptLoad(ReleaseLua)
-  private val depthSha: String = jedis.scriptLoad(DepthLua)
+  private def keys(taskId: String) = List(poolKey(taskId), leaseKey(taskId), holderKey(taskId)).asJava
 
-  private def poolKey(taskId: String): String = s"pool:$taskId"
-  private def leaseKey(taskId: String): String = s"lease:$taskId"
-  private def itemsKey(taskId: String): String = s"items:$taskId"
-  private def assignPrefix(taskId: String): String = s"assign:$taskId:"
-  private def assignKey(taskId: String, itemId: String): String = assignPrefix(taskId) + itemId
-
-  /** Leases the next queued item to annotator; None means the pool is empty (the route: 204). */
-  def claim(taskId: String, annotator: String): Option[String] = {
-    val keys = List(poolKey(taskId), leaseKey(taskId), itemsKey(taskId)).asJava
-    val args = List(assignPrefix(taskId), annotator, nowMs().toString, LeaseTtlMs.toString).asJava
-    Option(jedis.evalsha(claimSha, keys, args)).map(_.asInstanceOf[String])
+  /** Hand the next waiting item to annotator under a lease, or None when the pool is empty. */
+  def claim(taskId: String, annotator: String): Option[Lease] = {
+    val now = System.currentTimeMillis()
+    val deadline = now + LeaseTtlSeconds * 1000
+    Option(jedis.eval(ClaimLua, keys(taskId), List(now.toString, deadline.toString, annotator).asJava))
+      .map(itemId => Lease(itemId.toString, deadline))
   }
 
-  /** Extends the holder's lease; false refuses the caller (the route: 409). */
-  def renew(taskId: String, itemId: String, annotator: String): Boolean = {
-    val keys = List(leaseKey(taskId), assignKey(taskId, itemId)).asJava
-    val args = List(annotator, nowMs().toString, LeaseTtlMs.toString, itemId).asJava
-    jedis.evalsha(renewSha, keys, args).asInstanceOf[Long] == 1L
+  /** Extend the lease on itemId: the new deadline, or None when annotator does not hold it. */
+  def renew(taskId: String, itemId: String, annotator: String): Option[Long] = {
+    val deadline = System.currentTimeMillis() + LeaseTtlSeconds * 1000
+    val moved = jedis.eval(RenewLua, List(leaseKey(taskId), holderKey(taskId)).asJava, List(itemId, annotator, deadline.toString).asJava)
+    if (moved.asInstanceOf[java.lang.Long] == 1L) Some(deadline) else None
   }
 
-  /** Hands the item back early; only the holder may do it (false -> 409). */
-  def release(taskId: String, itemId: String, annotator: String): Boolean = {
-    val keys = List(poolKey(taskId), leaseKey(taskId), assignKey(taskId, itemId), itemsKey(taskId)).asJava
-    val args = List(annotator, itemId, nowMs().toString).asJava
-    jedis.evalsha(releaseSha, keys, args).asInstanceOf[Long] == 1L
-  }
-
-  /** Returns every expired lease to the pool; the sweeper calls it for idle tasks. */
-  def reclaimExpired(taskId: String): Long = {
-    val keys = List(poolKey(taskId), leaseKey(taskId), itemsKey(taskId)).asJava
-    val args = List(assignPrefix(taskId), nowMs().toString).asJava
-    jedis.evalsha(reclaimSha, keys, args).asInstanceOf[Long]
-  }
-
-  final case class QueueDepth(available: Long, leased: Long, total: Long)
-
-  /** Depth derived from the keys in one atomic read, so available + leased == total. */
-  def queueDepth(taskId: String): QueueDepth = {
-    val keys = List(poolKey(taskId), leaseKey(taskId), itemsKey(taskId)).asJava
-    val counts = jedis.evalsha(depthSha, keys, List.empty[String].asJava).asInstanceOf[java.util.List[Long]]
-    QueueDepth(counts.get(0), counts.get(1), counts.get(2))
-  }
+  /** Return the items of expired leases to the pool; how many. The sweeper calls it every minute. */
+  def reclaimExpired(taskId: String): Long =
+    jedis.eval(ReclaimLua, keys(taskId), List(System.currentTimeMillis().toString).asJava).asInstanceOf[java.lang.Long]
 }
 `,
     },
@@ -1061,60 +624,51 @@ object Assignments {
 #include <chrono>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+constexpr long long kLeaseTtlMs = 900;  // fifteen minutes
 
-std::string pool_key(const std::string& task_id) { return "pool:" + task_id; }
-std::string taken_key(const std::string& task_id) { return "taken:" + task_id; }
-std::string assign_key(const std::string& task_id, const std::string& item_id) {
-  return "assign:" + task_id + ":" + item_id;
-}
-std::string depth_key(const std::string& task_id) { return "depth:" + task_id; }
-
-long long now_seconds() {
-  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-struct QueueDepth {
-  long long available;
-  long long leased;
-  long long total;
+// An item handed to an annotator and the moment (ms) it returns to the pool.
+struct Lease {
+  std::string item_id;
+  long long leased_until_ms = 0;
 };
 
-// Hands the next queued item to annotator; std::nullopt when the pool is empty.
-std::optional<std::string> claim(const std::string& task_id, const std::string& annotator) {
-  for (const auto& item_id : redis.smembers(pool_key(task_id))) {
-    if (redis.sismember(taken_key(task_id), item_id)) {
-      continue;
-    }
-    redis.sadd(taken_key(task_id), item_id);
-    redis.srem(pool_key(task_id), item_id);
-    const std::vector<std::pair<std::string, std::string>> fields{{"annotator", annotator},
-                                                                  {"assigned_at", std::to_string(now_seconds())}};
-    redis.hset(assign_key(task_id, item_id), fields.begin(), fields.end());
-    return item_id;
-  }
-  return std::nullopt;
+long long nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// Keeps the item for a while longer.
-bool renew(const std::string& task_id, const std::string& item_id, const std::string& annotator) {
-  // TODO: not implemented.
-  (void)task_id;
-  (void)item_id;
-  (void)annotator;
-  return false;
+std::string poolKey(const std::string& task_id) { return "pool:" + task_id; }
+std::string leaseKey(const std::string& task_id) { return "lease:" + task_id; }
+std::string holderKey(const std::string& task_id) { return "holder:" + task_id; }
+
+// Hand the next waiting item to annotator under a lease, or none when the pool is empty.
+std::optional<Lease> claim(const std::string& task_id, const std::string& annotator) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::vector<std::string> head = redis.zrange(poolKey(task_id), 0, 0);
+  if (head.empty()) return std::nullopt;
+  const std::string item_id = head[0];
+  const long long deadline = nowMs() + kLeaseTtlMs;
+  redis.zrem(poolKey(task_id), item_id);
+  redis.zadd(leaseKey(task_id), item_id, static_cast<double>(deadline));
+  redis.hset(holderKey(task_id), item_id, annotator);
+  return Lease{item_id, deadline};
 }
 
-// How much work is waiting for the task.
-QueueDepth queue_depth(const std::string& task_id) {
-  const auto depth = redis.get(depth_key(task_id));
-  const long long available = depth ? std::stoll(*depth) : 0;
-  return QueueDepth{available, 0, available};
+// Extend the lease on item_id: the new deadline, or 0 when annotator does not hold it.
+long long renew(const std::string& task_id, const std::string& item_id, const std::string& annotator) {
+  const long long deadline = nowMs() + kLeaseTtlMs;
+  redis.zadd(leaseKey(task_id), item_id, static_cast<double>(deadline));
+  return deadline;
+}
+
+// Return the items of expired leases to the pool; how many. The sweeper calls it every minute.
+long long reclaimExpired(const std::string& task_id) {
+  const std::vector<std::string> expired = redis.zrangebyscore(leaseKey(task_id), "-inf", std::to_string(nowMs()));
+  for (const std::string& item_id : expired) redis.zrem(leaseKey(task_id), item_id);
+  return static_cast<long long>(expired.size());
 }
 `,
       solution: `#include <sw/redis++/redis++.h>
@@ -1122,159 +676,436 @@ QueueDepth queue_depth(const std::string& task_id) {
 #include <chrono>
 #include <optional>
 #include <string>
-#include <utility>
-#include <vector>
 
-using namespace sw::redis;
-
-Redis redis("tcp://redis:6379");
+sw::redis::Redis redis("tcp://redis:6379");
 
 constexpr std::chrono::seconds kLeaseTtl{900};
 
-// Shared by the claim script and the sweeper: an expired lease goes back to the pool.
-const std::string kReclaimFn = R"lua(
-local function reclaim(lease, pool, items, prefix, now_ms)
-  local expired = redis.call('ZRANGEBYSCORE', lease, '-inf', now_ms, 'LIMIT', 0, 100)
-  for _, item_id in ipairs(expired) do
-    redis.call('ZREM', lease, item_id)
-    redis.call('DEL', prefix .. item_id)
-    redis.call('ZADD', pool, now_ms, item_id)
-    redis.call('HSET', items, item_id, 'available')
-  end
-  return #expired
+// KEYS: pool, lease, holder. ARGV[1]: now (ms). Every lease past now goes back to the front of the pool.
+const std::string kReclaim = R"lua(
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
+for _, item in ipairs(expired) do
+  redis.call('ZREM', KEYS[2], item)
+  redis.call('HDEL', KEYS[3], item)
+  redis.call('ZADD', KEYS[1], 0, item)
 end
 )lua";
-
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-// ARGV[1] = "assign:{task_id}:" prefix   ARGV[2] = annotator   ARGV[3] = now_ms   ARGV[4] = ttl_ms
-const std::string kClaimLua = kReclaimFn + R"lua(
-reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[3]))
-local item_id = redis.call('ZPOPMIN', KEYS[1], 1)[1]
-if not item_id then
-  return false
-end
-local deadline = tonumber(ARGV[3]) + tonumber(ARGV[4])
-redis.call('ZADD', KEYS[2], deadline, item_id)
-redis.call('HSET', KEYS[3], item_id, 'leased')
-redis.call('HSET', ARGV[1] .. item_id, 'annotator', ARGV[2], 'leased_until_ms', deadline)
-return item_id
+const std::string kReclaimLua = kReclaim + "return #expired\\n";
+// ARGV[2]: the new deadline, ARGV[3]: the annotator. Pop, lease and record the holder in one step.
+const std::string kClaimLua = kReclaim + R"lua(
+local head = redis.call('ZPOPMIN', KEYS[1])
+if #head == 0 then return false end
+redis.call('ZADD', KEYS[2], ARGV[2], head[1])
+redis.call('HSET', KEYS[3], head[1], ARGV[3])
+return head[1]
 )lua";
-
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-// ARGV[1] = assign prefix   ARGV[2] = now_ms
-const std::string kReclaimLua = kReclaimFn + R"lua(
-return reclaim(KEYS[2], KEYS[1], KEYS[3], ARGV[1], tonumber(ARGV[2]))
-)lua";
-
-// KEYS[1] = lease:{task_id}   KEYS[2] = assign:{task_id}:{item_id}
-// ARGV[1] = annotator   ARGV[2] = now_ms   ARGV[3] = ttl_ms   ARGV[4] = item_id
+// KEYS: lease, holder. ARGV: item, annotator, new deadline. Only the holder moves the deadline.
 const std::string kRenewLua = R"lua(
-local holder = redis.call('HGET', KEYS[2], 'annotator')
-if holder ~= ARGV[1] then
-  return 0
-end
-local deadline = tonumber(ARGV[2]) + tonumber(ARGV[3])
-redis.call('HSET', KEYS[2], 'annotator', ARGV[1], 'leased_until_ms', deadline)
-redis.call('ZADD', KEYS[1], deadline, ARGV[4])
+if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 return 1
 )lua";
 
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = assign:{task_id}:{item_id}
-// KEYS[4] = items:{task_id}
-// ARGV[1] = annotator   ARGV[2] = item_id   ARGV[3] = now_ms
-const std::string kReleaseLua = R"lua(
-if redis.call('HGET', KEYS[3], 'annotator') ~= ARGV[1] then
-  return 0
-end
-redis.call('DEL', KEYS[3])
-redis.call('ZREM', KEYS[2], ARGV[2])
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
-redis.call('HSET', KEYS[4], ARGV[2], 'available')
-return 1
-)lua";
-
-// KEYS[1] = pool:{task_id}   KEYS[2] = lease:{task_id}   KEYS[3] = items:{task_id}
-const std::string kDepthLua = R"lua(
-local available = redis.call('ZCARD', KEYS[1])
-local leased = redis.call('ZCARD', KEYS[2])
-local total = redis.call('HLEN', KEYS[3])
-return {available, leased, total}
-)lua";
-
-// Loaded once: every call is an EVALSHA, never a script upload.
-const std::string kClaimSha = redis.script_load(kClaimLua);
-const std::string kReclaimSha = redis.script_load(kReclaimLua);
-const std::string kRenewSha = redis.script_load(kRenewLua);
-const std::string kReleaseSha = redis.script_load(kReleaseLua);
-const std::string kDepthSha = redis.script_load(kDepthLua);
-
-std::string pool_key(const std::string& task_id) { return "pool:" + task_id; }
-std::string lease_key(const std::string& task_id) { return "lease:" + task_id; }
-std::string items_key(const std::string& task_id) { return "items:" + task_id; }
-std::string assign_prefix(const std::string& task_id) { return "assign:" + task_id + ":"; }
-std::string assign_key(const std::string& task_id, const std::string& item_id) { return assign_prefix(task_id) + item_id; }
-
-long long now_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-// Leases the next queued item to annotator; std::nullopt when the pool is empty (the route: 204).
-std::optional<std::string> claim(const std::string& task_id, const std::string& annotator) {
-  const std::vector<std::string> keys{pool_key(task_id), lease_key(task_id), items_key(task_id)};
-  const std::vector<std::string> args{assign_prefix(task_id), annotator, std::to_string(now_ms()),
-                                      std::to_string(kLeaseTtl.count() * 1000)};
-  const auto item_id = redis.evalsha<OptionalString>(kClaimSha, keys.begin(), keys.end(), args.begin(), args.end());
-  if (!item_id) {
-    return std::nullopt;
-  }
-  return *item_id;
-}
-
-// Extends the holder's lease; false refuses the caller (the route: 409).
-bool renew(const std::string& task_id, const std::string& item_id, const std::string& annotator) {
-  const std::vector<std::string> keys{lease_key(task_id), assign_key(task_id, item_id)};
-  const std::vector<std::string> args{annotator, std::to_string(now_ms()), std::to_string(kLeaseTtl.count() * 1000),
-                                      item_id};
-  return redis.evalsha<long long>(kRenewSha, keys.begin(), keys.end(), args.begin(), args.end()) == 1;
-}
-
-// Hands the item back early; only the holder may do it (false -> 409).
-bool release(const std::string& task_id, const std::string& item_id, const std::string& annotator) {
-  const std::vector<std::string> keys{pool_key(task_id), lease_key(task_id), assign_key(task_id, item_id),
-                                      items_key(task_id)};
-  const std::vector<std::string> args{annotator, item_id, std::to_string(now_ms())};
-  return redis.evalsha<long long>(kReleaseSha, keys.begin(), keys.end(), args.begin(), args.end()) == 1;
-}
-
-// Returns every expired lease to the pool; the sweeper calls it for idle tasks.
-long long reclaim_expired(const std::string& task_id) {
-  const std::vector<std::string> keys{pool_key(task_id), lease_key(task_id), items_key(task_id)};
-  const std::vector<std::string> args{assign_prefix(task_id), std::to_string(now_ms())};
-  return redis.evalsha<long long>(kReclaimSha, keys.begin(), keys.end(), args.begin(), args.end());
-}
-
-struct QueueDepth {
-  long long available;
-  long long leased;
-  long long total;
+// An item handed to an annotator and the moment (ms) it returns to the pool.
+struct Lease {
+  std::string item_id;
+  long long leased_until_ms = 0;
 };
 
-// Depth derived from the keys in one atomic read, so available + leased == total.
-QueueDepth queue_depth(const std::string& task_id) {
-  const std::vector<std::string> keys{pool_key(task_id), lease_key(task_id), items_key(task_id)};
-  const std::vector<std::string> args;
-  const auto counts =
-      redis.evalsha<std::vector<long long>>(kDepthSha, keys.begin(), keys.end(), args.begin(), args.end());
-  return QueueDepth{counts.at(0), counts.at(1), counts.at(2)};
+long long nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+long long leaseDeadline() { return nowMs() + std::chrono::duration_cast<std::chrono::milliseconds>(kLeaseTtl).count(); }
+
+std::string poolKey(const std::string& task_id) { return "pool:" + task_id; }
+std::string leaseKey(const std::string& task_id) { return "lease:" + task_id; }
+std::string holderKey(const std::string& task_id) { return "holder:" + task_id; }
+
+// Hand the next waiting item to annotator under a lease, or none when the pool is empty.
+std::optional<Lease> claim(const std::string& task_id, const std::string& annotator) {
+  const long long now = nowMs();
+  const long long deadline = leaseDeadline();
+  const auto item = redis.eval<std::string>(kClaimLua, {poolKey(task_id), leaseKey(task_id), holderKey(task_id)},
+                                            {std::to_string(now), std::to_string(deadline), annotator});
+  if (!item) return std::nullopt;
+  return Lease{*item, deadline};
+}
+
+// Extend the lease on item_id: the new deadline, or 0 when annotator does not hold it.
+long long renew(const std::string& task_id, const std::string& item_id, const std::string& annotator) {
+  const long long deadline = leaseDeadline();
+  const long long moved = redis.eval<long long>(kRenewLua, {leaseKey(task_id), holderKey(task_id)}, {item_id, annotator, std::to_string(deadline)});
+  return moved == 1 ? deadline : 0;
+}
+
+// Return the items of expired leases to the pool; how many. The sweeper calls it every minute.
+long long reclaimExpired(const std::string& task_id) {
+  return redis.eval<long long>(kReclaimLua, {poolKey(task_id), leaseKey(task_id), holderKey(task_id)}, {std::to_string(nowMs())});
 }
 `,
     },
   },
+  harness: {
+    python: `from labeling import store
+
+TTL_MS = 900_000
+
+
+def _task(items=("a cat", "a dog")):
+    return store.create_task("t1", "2026-10", 1, list(items))["task_id"]
+
+
+def _now(ctx):
+    return int(ctx.clock.time() * 1000)
+
+
+def check_lease_ttl(ctx):
+    m = ctx.load("state")
+    task_id = _task()
+    lease = m.claim(task_id, "ana")
+    assert lease is not None and lease.get("item_id") == "i-1", f"the first claim on a fresh pool returned {lease}, expected item i-1"
+    want = _now(ctx) + TTL_MS
+    got = lease["leased_until_ms"]
+    assert got == want, f"the lease runs until {got}, {got - _now(ctx)} ms from now: expected now + 900 000 ms (LEASE_TTL_S = 900)"
+    score = ctx.redis.zscore(f"lease:{task_id}", "i-1")
+    assert score == want, f"lease:{task_id} scores i-1 at {score}, expected the deadline {want}"
+    ctx.clock.advance(600)
+    assert m.reclaim_expired(task_id) == 0, "ten minutes into a fifteen-minute lease nothing has expired, yet reclaim_expired found an expired lease"
+    assert ctx.redis.hget(f"holder:{task_id}", "i-1") == "ana", "a live lease must stay with its holder"
+
+
+def check_atomic_claim(ctx):
+    m = ctx.load("state")
+    task_id = _task()
+    # Bo presses "next" while Ana's claim is between its first and second command on the pool.
+    rival = ctx.redis_after(f"pool:{task_id}", lambda: m.claim(task_id, "bo"))
+    mine = m.claim(task_id, "ana")
+    assert rival.fired, f"claim never touched pool:{task_id}"
+    if rival.error is not None:
+        raise rival.error
+    theirs = rival.result
+    assert mine is not None and theirs is not None, f"two annotators claimed from a pool of two items and got {mine} and {theirs}"
+    assert mine["item_id"] != theirs["item_id"], f"ana and bo were both handed {mine['item_id']}: a claim landing between another claim's read of the pool and its removal takes the same item. Pop and lease in one script"
+    holders = ctx.redis.hgetall(f"holder:{task_id}")
+    assert holders == {mine["item_id"]: "ana", theirs["item_id"]: "bo"}, f"holder:{task_id} is {holders}, expected each item with the annotator who got it"
+    assert m.claim(task_id, "cy") is None, "with both items leased the pool is empty: claim must answer None"
+
+
+def check_holder_only(ctx):
+    m = ctx.load("state")
+    task_id = _task()
+    lease = m.claim(task_id, "ana")
+    before = ctx.redis.zscore(f"lease:{task_id}", "i-1")
+    ctx.clock.advance(60)
+    stolen = m.renew(task_id, "i-1", "bo")
+    assert stolen is None, f"bo renewed ana's lease on i-1 (renew answered {stolen}): only the holder may extend a lease"
+    assert ctx.redis.zscore(f"lease:{task_id}", "i-1") == before, "bo's renew moved the deadline of ana's lease"
+    assert ctx.redis.hget(f"holder:{task_id}", "i-1") == "ana", "bo's renew changed the holder of i-1"
+    ghost = m.renew(task_id, "i-2", "bo")
+    assert ghost is None and ctx.redis.zscore(f"lease:{task_id}", "i-2") is None, f"renewing i-2, which nobody holds, answered {ghost} and left lease score {ctx.redis.zscore(f'lease:{task_id}', 'i-2')}: a renew must not lease an item still in the pool"
+    renewed = m.renew(task_id, "i-1", "ana")
+    assert renewed is not None and renewed > lease["leased_until_ms"], f"ana's own renew answered {renewed}, expected a deadline later than {lease['leased_until_ms']}"
+    assert ctx.redis.zscore(f"lease:{task_id}", "i-1") == renewed, "the renewed deadline must be the lease score"
+
+
+def check_expired_return(ctx):
+    m = ctx.load("state")
+    task_id = _task(["a cat"])
+    m.claim(task_id, "ana")
+    ctx.clock.advance(901)  # ana closed the tab
+    returned = m.reclaim_expired(task_id)
+    assert returned == 1, f"reclaim_expired answered {returned} after ana's lease expired, expected 1"
+    assert ctx.redis.zscore(f"pool:{task_id}", "i-1") is not None, f"the expired lease on i-1 was dropped but the item never went back to pool:{task_id}: abandoned work is lost"
+    assert ctx.redis.hget(f"holder:{task_id}", "i-1") is None, "an expired lease must lose its holder"
+    again = m.claim(task_id, "bo")
+    assert again is not None and again["item_id"] == "i-1", f"after the sweeper ran bo's claim returned {again}, expected the returned item i-1"
+    ctx.clock.advance(901)  # bo leaves too, and no sweeper runs
+    third = m.claim(task_id, "cy")
+    assert third is not None and third["item_id"] == "i-1", f"bo's lease expired and no sweeper ran: cy's claim returned {third}. A claim must return expired leases before it pops"
+    assert ctx.redis.hget(f"holder:{task_id}", "i-1") == "cy", "i-1 must now be held by cy"
+`,
+    typescript: `const TTL_MS = 900_000;
+
+function setup(ctx, items = ['a cat', 'a dog']) {
+  const m = ctx.load('state');
+  const store = ctx.load('/support/labeling/store.ts');
+  return {m, task: store.createTask('t1', '2026-10', 1, items).then(t => t.task_id)};
+}
+
+const score = (ctx, key: string, member: string): number | null => {
+  const s = ctx.redis.zscore(key, member);
+  return s === null || s === undefined ? null : Number(s);
+};
+
+export async function check_lease_ttl(ctx) {
+  const {m, task} = setup(ctx);
+  const taskId = await task;
+  const lease = await m.claim(taskId, 'ana');
+  assert(lease !== null && lease.item_id === 'i-1', \`the first claim on a fresh pool returned \${JSON.stringify(lease)}, expected item i-1\`);
+  const want = ctx.clock.now() + TTL_MS;
+  assert.equal(lease.leased_until_ms, want, \`the lease runs until \${lease.leased_until_ms}, \${lease.leased_until_ms - ctx.clock.now()} ms from now: expected now + 900 000 ms (LEASE_TTL_S = 900)\`);
+  assert.equal(score(ctx, \`lease:\${taskId}\`, 'i-1'), want, \`lease:\${taskId} must score i-1 at the deadline \${want}\`);
+  ctx.clock.advance(600);
+  assert.equal(await m.reclaimExpired(taskId), 0, 'ten minutes into a fifteen-minute lease nothing has expired, yet reclaimExpired found an expired lease');
+  assert.equal(ctx.redis.hget(\`holder:\${taskId}\`, 'i-1'), 'ana', 'a live lease must stay with its holder');
+}
+
+export async function check_atomic_claim(ctx) {
+  const {m, task} = setup(ctx);
+  const taskId = await task;
+  // Bo presses "next" while Ana's claim is between its first and second command on the pool.
+  const rival = ctx.redisAfter(\`pool:\${taskId}\`, () => m.claim(taskId, 'bo'));
+  const mine = await m.claim(taskId, 'ana');
+  assert(rival.fired, \`claim never touched pool:\${taskId}\`);
+  if (rival.error !== undefined) throw rival.error;
+  const theirs = await rival.result;
+  assert(mine !== null && theirs !== null, \`two annotators claimed from a pool of two items and got \${JSON.stringify(mine)} and \${JSON.stringify(theirs)}\`);
+  assert.notEqual(mine.item_id, theirs.item_id, \`ana and bo were both handed \${mine.item_id}: a claim landing between another claim's read of the pool and its removal takes the same item. Pop and lease in one script\`);
+  assert.deepEqual(ctx.redis.hgetall(\`holder:\${taskId}\`), {[mine.item_id]: 'ana', [theirs.item_id]: 'bo'}, 'each item must be held by the annotator who got it');
+  assert.equal(await m.claim(taskId, 'cy'), null, 'with both items leased the pool is empty: claim must answer null');
+}
+
+export async function check_holder_only(ctx) {
+  const {m, task} = setup(ctx);
+  const taskId = await task;
+  const lease = await m.claim(taskId, 'ana');
+  const before = score(ctx, \`lease:\${taskId}\`, 'i-1');
+  ctx.clock.advance(60);
+  const stolen = await m.renew(taskId, 'i-1', 'bo');
+  assert.equal(stolen, null, \`bo renewed ana's lease on i-1 (renew answered \${stolen}): only the holder may extend a lease\`);
+  assert.equal(score(ctx, \`lease:\${taskId}\`, 'i-1'), before, "bo's renew moved the deadline of ana's lease");
+  assert.equal(ctx.redis.hget(\`holder:\${taskId}\`, 'i-1'), 'ana', "bo's renew changed the holder of i-1");
+  const ghost = await m.renew(taskId, 'i-2', 'bo');
+  assert(ghost === null && score(ctx, \`lease:\${taskId}\`, 'i-2') === null, \`renewing i-2, which nobody holds, answered \${ghost}: a renew must not lease an item still in the pool\`);
+  const renewed = await m.renew(taskId, 'i-1', 'ana');
+  assert(renewed !== null && renewed > lease.leased_until_ms, \`ana's own renew answered \${renewed}, expected a deadline later than \${lease.leased_until_ms}\`);
+  assert.equal(score(ctx, \`lease:\${taskId}\`, 'i-1'), renewed, 'the renewed deadline must be the lease score');
+}
+
+export async function check_expired_return(ctx) {
+  const {m, task} = setup(ctx, ['a cat']);
+  const taskId = await task;
+  await m.claim(taskId, 'ana');
+  ctx.clock.advance(901); // ana closed the tab
+  const returned = await m.reclaimExpired(taskId);
+  assert.equal(returned, 1, \`reclaimExpired answered \${returned} after ana's lease expired, expected 1\`);
+  assert.notEqual(score(ctx, \`pool:\${taskId}\`, 'i-1'), null, \`the expired lease on i-1 was dropped but the item never went back to pool:\${taskId}: abandoned work is lost\`);
+  assert.equal(ctx.redis.hget(\`holder:\${taskId}\`, 'i-1'), null, 'an expired lease must lose its holder');
+  const again = await m.claim(taskId, 'bo');
+  assert(again !== null && again.item_id === 'i-1', \`after the sweeper ran bo's claim returned \${JSON.stringify(again)}, expected the returned item i-1\`);
+  ctx.clock.advance(901); // bo leaves too, and no sweeper runs
+  const third = await m.claim(taskId, 'cy');
+  assert(third !== null && third.item_id === 'i-1', \`bo's lease expired and no sweeper ran: cy's claim returned \${JSON.stringify(third)}. A claim must return expired leases before it pops\`);
+  assert.equal(ctx.redis.hget(\`holder:\${taskId}\`, 'i-1'), 'cy', 'i-1 must now be held by cy');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+
+	"labeling/store"
+
+	"leetbuild/harness"
+)
+
+const ttlMs = 900_000
+
+var stateBg = context.Background()
+
+func poolTask(items ...string) string {
+	if len(items) == 0 {
+		items = []string{"a cat", "a dog"}
+	}
+	return store.CreateTask(stateBg, "t1", "2026-10", 1, items).TaskID
+}
+
+func mustClaim(ctx *harness.Ctx, taskID, annotator string) *Lease {
+	lease, err := claim(stateBg, taskID, annotator)
+	ctx.NoError(err, "claim(%s, %s) failed", taskID, annotator)
+	return lease
+}
+
+func mustRenew(ctx *harness.Ctx, taskID, itemID, annotator string) int64 {
+	deadline, err := renew(stateBg, taskID, itemID, annotator)
+	ctx.NoError(err, "renew(%s, %s, %s) failed", taskID, itemID, annotator)
+	return deadline
+}
+
+func mustReclaim(ctx *harness.Ctx, taskID string) int {
+	n, err := reclaimExpired(stateBg, taskID)
+	ctx.NoError(err, "reclaimExpired(%s) failed", taskID)
+	return n
+}
+
+func holderOf(ctx *harness.Ctx, taskID, itemID string) string {
+	h, _ := ctx.Redis.HGet("holder:"+taskID, itemID)
+	return h
+}
+
+func CheckLeaseTtl(ctx *harness.Ctx) {
+	taskID := poolTask()
+	lease := mustClaim(ctx, taskID, "ana")
+	ctx.Assert(lease != nil && lease.ItemID == "i-1", "the first claim on a fresh pool returned %+v, expected item i-1", lease)
+	want := ctx.Clock.Now() + ttlMs
+	ctx.Assert(lease.LeasedUntilMs == want, "the lease runs until %d, %d ms from now: expected now + 900 000 ms (leaseTTL = 15 minutes)", lease.LeasedUntilMs, lease.LeasedUntilMs-ctx.Clock.Now())
+	score, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
+	ctx.Equal(int64(score), want, "lease:%s must score i-1 at the deadline", taskID)
+	ctx.Clock.Advance(600)
+	ctx.Equal(mustReclaim(ctx, taskID), 0, "ten minutes into a fifteen-minute lease nothing has expired; reclaimExpired")
+	ctx.Equal(holderOf(ctx, taskID, "i-1"), "ana", "a live lease must stay with its holder")
+}
+
+func CheckAtomicClaim(ctx *harness.Ctx) {
+	taskID := poolTask()
+	// Bo presses "next" while Ana's claim is between its first and second command on the pool.
+	rival := ctx.Redis.After("pool:"+taskID, func() any {
+		lease, err := claim(stateBg, taskID, "bo")
+		ctx.NoError(err, "bo's claim failed")
+		return lease
+	})
+	mine := mustClaim(ctx, taskID, "ana")
+	ctx.Assert(rival.Fired, "claim never touched pool:%s", taskID)
+	ctx.Assert(rival.Err == nil, "bo's claim failed: %v", rival.Err)
+	theirs, _ := rival.Result.(*Lease)
+	ctx.Assert(mine != nil && theirs != nil, "two annotators claimed from a pool of two items and got %+v and %+v", mine, theirs)
+	ctx.Assert(mine.ItemID != theirs.ItemID, "ana and bo were both handed %s: a claim landing between another claim's read of the pool and its removal takes the same item. Pop and lease in one script", mine.ItemID)
+	ctx.Equal(ctx.Redis.HGetAll("holder:"+taskID), map[string]string{mine.ItemID: "ana", theirs.ItemID: "bo"}, "each item must be held by the annotator who got it; holder:%s", taskID)
+	ctx.Assert(mustClaim(ctx, taskID, "cy") == nil, "with both items leased the pool is empty: claim must answer nil")
+}
+
+func CheckHolderOnly(ctx *harness.Ctx) {
+	taskID := poolTask()
+	lease := mustClaim(ctx, taskID, "ana")
+	before, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
+	ctx.Clock.Advance(60)
+	stolen := mustRenew(ctx, taskID, "i-1", "bo")
+	ctx.Equal(stolen, int64(0), "bo renewed ana's lease on i-1: only the holder may extend a lease; renew's answer")
+	after, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
+	ctx.Equal(after, before, "bo's renew moved the deadline of ana's lease")
+	ctx.Equal(holderOf(ctx, taskID, "i-1"), "ana", "bo's renew changed the holder of i-1")
+	ghost := mustRenew(ctx, taskID, "i-2", "bo")
+	_, leased := ctx.Redis.ZScore("lease:"+taskID, "i-2")
+	ctx.Assert(ghost == 0 && !leased, "renewing i-2, which nobody holds, answered %d: a renew must not lease an item still in the pool", ghost)
+	renewed := mustRenew(ctx, taskID, "i-1", "ana")
+	ctx.Assert(renewed > lease.LeasedUntilMs, "ana's own renew answered %d, expected a deadline later than %d", renewed, lease.LeasedUntilMs)
+	score, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
+	ctx.Equal(int64(score), renewed, "the renewed deadline must be the lease score")
+}
+
+func CheckExpiredReturn(ctx *harness.Ctx) {
+	taskID := poolTask("a cat")
+	mustClaim(ctx, taskID, "ana")
+	ctx.Clock.Advance(901) // ana closed the tab
+	ctx.Equal(mustReclaim(ctx, taskID), 1, "after ana's lease expired, reclaimExpired")
+	_, inPool := ctx.Redis.ZScore("pool:"+taskID, "i-1")
+	ctx.Assert(inPool, "the expired lease on i-1 was dropped but the item never went back to pool:%s: abandoned work is lost", taskID)
+	ctx.Equal(holderOf(ctx, taskID, "i-1"), "", "an expired lease must lose its holder")
+	again := mustClaim(ctx, taskID, "bo")
+	ctx.Assert(again != nil && again.ItemID == "i-1", "after the sweeper ran bo's claim returned %+v, expected the returned item i-1", again)
+	ctx.Clock.Advance(901) // bo leaves too, and no sweeper runs
+	third := mustClaim(ctx, taskID, "cy")
+	ctx.Assert(third != nil && third.ItemID == "i-1", "bo's lease expired and no sweeper ran: cy's claim returned %+v. A claim must return expired leases before it pops", third)
+	ctx.Equal(holderOf(ctx, taskID, "i-1"), "cy", "i-1 must now be held by cy")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "labeling/store.h"
+
+namespace {
+
+constexpr long long kTtlMs = 900000;
+
+std::string poolTask(const std::vector<std::string>& items = {"a cat", "a dog"}) {
+  return store::createTask("t1", "2026-10", 1, items).task_id;
+}
+
+std::string holderOf(harness::Ctx& ctx, const std::string& task_id, const std::string& item_id) {
+  return ctx.Redis.HGet("holder:" + task_id, item_id).value_or("");
+}
+
+}  // namespace
+
+void CheckLeaseTtl(harness::Ctx& ctx) {
+  const std::string task_id = poolTask();
+  const auto lease = claim(task_id, "ana");
+  ctx.Assert(lease && lease->item_id == "i-1", "the first claim on a fresh pool returned %q, expected item i-1", lease ? lease->item_id : "nothing");
+  const long long want = ctx.Clock.Now() + kTtlMs;
+  ctx.Assert(lease->leased_until_ms == want, "the lease runs until %d, %d ms from now: expected now + 900 000 ms (kLeaseTtl = 900 s)", lease->leased_until_ms, lease->leased_until_ms - ctx.Clock.Now());
+  ctx.Equal(static_cast<long long>(ctx.Redis.ZScore("lease:" + task_id, "i-1").value_or(0)), want, "lease:%s must score i-1 at the deadline", task_id);
+  ctx.Clock.Advance(600);
+  ctx.Equal(reclaimExpired(task_id), 0LL, "ten minutes into a fifteen-minute lease nothing has expired; reclaimExpired");
+  ctx.Equal(holderOf(ctx, task_id, "i-1"), "ana", "a live lease must stay with its holder");
+}
+
+void CheckAtomicClaim(harness::Ctx& ctx) {
+  const std::string task_id = poolTask();
+  // Bo presses "next" while Ana's claim is between its first and second command on the pool.
+  auto fired = std::make_shared<bool>(false);
+  auto theirs = std::make_shared<std::optional<Lease>>();
+  auto error = std::make_shared<std::string>();
+  ctx.Redis.After("pool:" + task_id, [=] {
+    *fired = true;
+    try {
+      *theirs = claim(task_id, "bo");
+    } catch (const std::exception& e) {
+      *error = e.what();
+    }
+  });
+  const auto mine = claim(task_id, "ana");
+  ctx.Assert(*fired, "claim never touched pool:%s", task_id);
+  ctx.Assert(error->empty(), "bo's claim failed: %s", *error);
+  ctx.Assert(mine && theirs->has_value(), "two annotators claimed from a pool of two items and got %q and %q", mine ? mine->item_id : "nothing", theirs->has_value() ? (*theirs)->item_id : "nothing");
+  ctx.Assert(mine->item_id != (*theirs)->item_id, "ana and bo were both handed %s: a claim landing between another claim's read of the pool and its removal takes the same item. Pop and lease in one script", mine->item_id);
+  const std::map<std::string, std::string> want = {{mine->item_id, "ana"}, {(*theirs)->item_id, "bo"}};
+  ctx.Equal(ctx.Redis.HGetAll("holder:" + task_id), want, "each item must be held by the annotator who got it; holder:%s", task_id);
+  ctx.Assert(!claim(task_id, "cy"), "with both items leased the pool is empty: claim must answer nothing");
+}
+
+void CheckHolderOnly(harness::Ctx& ctx) {
+  const std::string task_id = poolTask();
+  const auto lease = claim(task_id, "ana");
+  const auto before = ctx.Redis.ZScore("lease:" + task_id, "i-1");
+  ctx.Clock.Advance(60);
+  const long long stolen = renew(task_id, "i-1", "bo");
+  ctx.Equal(stolen, 0LL, "bo renewed ana's lease on i-1: only the holder may extend a lease; renew's answer");
+  ctx.Equal(ctx.Redis.ZScore("lease:" + task_id, "i-1"), before, "bo's renew moved the deadline of ana's lease");
+  ctx.Equal(holderOf(ctx, task_id, "i-1"), "ana", "bo's renew changed the holder of i-1");
+  const long long ghost = renew(task_id, "i-2", "bo");
+  ctx.Assert(ghost == 0 && !ctx.Redis.ZScore("lease:" + task_id, "i-2"), "renewing i-2, which nobody holds, answered %d: a renew must not lease an item still in the pool", ghost);
+  const long long renewed = renew(task_id, "i-1", "ana");
+  ctx.Assert(renewed > lease->leased_until_ms, "ana's own renew answered %d, expected a deadline later than %d", renewed, lease->leased_until_ms);
+  ctx.Equal(static_cast<long long>(ctx.Redis.ZScore("lease:" + task_id, "i-1").value_or(0)), renewed, "the renewed deadline must be the lease score");
+}
+
+void CheckExpiredReturn(harness::Ctx& ctx) {
+  const std::string task_id = poolTask({"a cat"});
+  claim(task_id, "ana");
+  ctx.Clock.Advance(901);  // ana closed the tab
+  ctx.Equal(reclaimExpired(task_id), 1LL, "after ana's lease expired, reclaimExpired");
+  ctx.Assert(ctx.Redis.ZScore("pool:" + task_id, "i-1").has_value(), "the expired lease on i-1 was dropped but the item never went back to pool:%s: abandoned work is lost", task_id);
+  ctx.Equal(holderOf(ctx, task_id, "i-1"), "", "an expired lease must lose its holder");
+  const auto again = claim(task_id, "bo");
+  ctx.Assert(again && again->item_id == "i-1", "after the sweeper ran bo's claim returned %q, expected the returned item i-1", again ? again->item_id : "nothing");
+  ctx.Clock.Advance(901);  // bo leaves too, and no sweeper runs
+  const auto third = claim(task_id, "cy");
+  ctx.Assert(third && third->item_id == "i-1", "bo's lease expired and no sweeper ran: cy's claim returned %q. A claim must return expired leases before it pops", third ? third->item_id : "nothing");
+  ctx.Equal(holderOf(ctx, task_id, "i-1"), "cy", "i-1 must now be held by cy");
+}
+`,
+  },
   hints: [
-    'The dashboard says 40 items are available while the form shows "queue empty"; two annotators on one task both got item 17; an annotator who closed the tab an hour ago still holds items.',
-    'Assignment is a flag: `assigned_at` has no deadline and nothing sweeps it. The free check and the mark are separate commands, so two claims both pass `SISMEMBER`. Depth is a counter, not the pool.',
-    'Move claim into one Lua script: reclaim leases past `now_ms`, `ZPOPMIN pool`, `ZADD lease now_ms+TTL`, `HSET assign annotator leased_until_ms`. Renew and release check `HGET annotator` first. Depth is `ZCARD`+`ZCARD`+`HLEN` in one read.',
+    'Claim an item and check the lease a second later: it has already lapsed. Two annotators pressing "next" together open the same item, and an item whose lease expired is not in the pool any more.',
+    '`LEASE_TTL_MS = 900` is seconds added to a millisecond clock. `ZRANGE` then `ZREM` are two commands another claim can land between; `renew` writes for anyone; the reclaim drops the lease but never re-adds the item.',
+    'One Lua claim script: move expired leases back (`ZREM` lease, `HDEL` holder, `ZADD` pool 0), `ZPOPMIN`, `ZADD` lease at now + 900 000, `HSET` holder. Renew: `HGET` holder must equal the caller. Reclaim runs the same loop.',
   ],
-  debrief: `A lease with a deadline and a reclaim path makes abandonment a normal event instead of a silent loss: the sweeper returns the item, and every claim reclaims on its way in, so the pool heals under load. The claim lives in one Lua script because the gap between \`SISMEMBER\` and \`SADD\` is exactly where a second annotator reads; Redis runs the script without interleaving, so check and write cannot be split. The holder check in renew and release is the same idea at a different window. Depth is derived from the keys rather than stored beside them, so it cannot drift. Production queues add \`{task_id}\` hash tags so a task's keys share one Redis Cluster slot, a renew heartbeat from the form, and a reclaims-per-hour metric.`,
+  debrief: `The lease is the queue's memory of who is working on what, so every change to it has to happen where no other claim can interleave: inside one script that reclaims, pops, leases and records the holder. Running the reclaim inside the claim means abandoned work comes back even when the sweeper is late, and the sweeper only keeps the pool honest between claims. The holder check belongs in the same script as the deadline write for the same reason the pop does. Production queues also cap how many items one annotator may hold, count how often an item has expired so a poisoned one goes to review instead of cycling forever, and let an annotator release an item explicitly when they skip it.`,
 };

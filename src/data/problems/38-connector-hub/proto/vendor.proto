@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package hub;
+
+// The vendor fetch service step 3 calls: one page of a connector's records, starting at a cursor.
+// The vendor's HTTP answers arrive as gRPC status codes: RESOURCE_EXHAUSTED is its 429 (slow down),
+// UNAUTHENTICATED its 401 (the OAuth token was rejected), UNAVAILABLE and INTERNAL its 5xx.
+service Vendor {
+  rpc FetchPage(FetchPageRequest) returns (Page);
+}
+
+message FetchPageRequest {
+  string connector_id = 1;
+  string cursor = 2;
+  string token_ref = 3;
+}
+
+message SourceRecord {
+  string id = 1;
+  string body = 2;
+}
+
+message Page {
+  repeated SourceRecord records = 1;
+  string next_cursor = 2;
+}

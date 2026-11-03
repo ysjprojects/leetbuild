@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package labeld;
+
+// The pre-label model step 3 asks before an item reaches an annotator: its suggested labels for one
+// item under the task's label spec. An item the model will not label (outside the spec, too long)
+// is INVALID_ARGUMENT; an overloaded or restarting model is UNAVAILABLE.
+service Prelabel {
+  rpc Predict(PredictRequest) returns (PredictResponse);
+}
+
+message PredictRequest {
+  string item_id = 1;
+  string text = 2;
+  string spec_version = 3;
+}
+
+message PredictResponse {
+  repeated string labels = 1;
+  string model_version = 2;
+}

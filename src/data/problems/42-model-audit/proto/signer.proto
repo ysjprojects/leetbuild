@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package audit;
+
+// The receipt signer step 3 calls once a record is chained: it signs (tenant, position, digest)
+// with the tenant's current key. UNAVAILABLE and DEADLINE_EXCEEDED are transient; PERMISSION_DENIED
+// (the key is revoked, or auditd may not use it) is not.
+service ReceiptSigner {
+  rpc Sign(SignRequest) returns (Receipt);
+}
+
+message SignRequest {
+  string record_id = 1;
+  string tenant = 2;
+  int64 position = 3;
+  string digest = 4;
+}
+
+message Receipt {
+  string record_id = 1;
+  string signature = 2;
+  string key_id = 3;
+}

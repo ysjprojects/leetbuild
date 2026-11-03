@@ -2,181 +2,95 @@ import type {Step} from '@/lib/types';
 
 export const prelabelClientStep: Step = {
   id: 'dependency',
-  title: 'Pre-label calls that degrade to idleness, not silence',
+  title: 'Pre-label calls that degrade to an unlabeled item',
   concept: 'grpc',
   file: 'client',
-  focus: ['client', 'service', 'model'],
+  focus: ['service', 'model'],
   task: `## Task
 
-**Starting point.** The starter is the pre-label client called before an item reaches a human: it
-builds the \`PrelabelService\` stub, loops \`MAX_ATTEMPTS\` times over
-\`stub.Predict(PredictRequest{item_id, item_text, spec_version})\`, returns the label values on
-success, continues on any exception and raises \`RuntimeError\` after the last attempt. It serves
-the demo and hides 4 flaws.
+**Starting point.** The starter is the pre-label call labeld makes before an item reaches an
+annotator: \`prelabel_item(item_id, text, spec_version)\` calls \`Prelabel.Predict\` up to
+\`MAX_ATTEMPTS\` = 3 times, retrying any error, answers
+\`{item_id, status: "prelabeled", labels, error: ""}\` on the first reply and raises \`RuntimeError\`
+after the last failure. It serves the demo and hides three flaws.
 
-**Failure mode the checks target.** The demo model answers in milliseconds and does not fail, so
-the failure policy, the whole subject of this step, is invisible. The starter treats the model as if
-it always answers: a hung call freezes the assignment, a refusal is retried although it will answer
-the same way, and a model outage becomes a work stoppage instead of an unlabeled item.
+**Failure mode the checks target.** A model that hangs holds the annotator's next item for as long
+as it hangs; an item the model refuses is sent three times although the answer cannot change; and a
+model outage becomes an error page instead of an item labeled by hand.
 
-- \`Predict\` returns \`PredictResponse{label_values, model_version}\`.
-- \`PRELABEL_DEADLINE_S = 2\`: every attempt runs under a 2-second deadline passed as an argument
-  on the call itself.
-- \`MAX_ATTEMPTS = 2\`: at most two attempts per item.
-- Retry only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. A refusal (\`INVALID_ARGUMENT\`,
-  \`PERMISSION_DENIED\`, \`FAILED_PRECONDITION\`) returns immediately.
-- \`prelabel_item(item, spec_version)\` must not raise. Success returns the label values with
-  \`prelabel_status = STATUS_PRELABELED\`; any failure returns \`STATUS_UNLABELED\`,
-  \`prelabel = None\` and \`prelabel_error\` with the status and message of the last failure.
-- Declare \`STATUS_PRELABELED\`, \`STATUS_UNLABELED\` and a helper that builds the unlabeled result.`,
+\`\`\`proto
+service Prelabel { rpc Predict(PredictRequest) returns (PredictResponse); }  // INVALID_ARGUMENT: refused
+\`\`\`
+
+- Every call carries a \`DEADLINE_S\` = 2 s deadline.
+- At most \`MAX_ATTEMPTS\` = 2 calls, and only \`UNAVAILABLE\` or \`DEADLINE_EXCEEDED\` is retried; any
+  other status is final.
+- \`prelabel_item\` does not raise: a failure answers
+  \`{item_id, status: "unlabeled", labels: [], error: "<STATUS>: <details>"}\` with the last status.`,
   sequence: {
-    participants: ['Annotator', 'Labeling Service', 'Pre-label model'],
+    participants: ['labeld', 'Pre-label model'],
     messages: [
-      {from: 'Annotator', to: 'Labeling Service', label: 'next item · claim with lease', kind: 'sync'},
       {
-        from: 'Labeling Service',
+        from: 'labeld',
         to: 'Pre-label model',
-        label: 'Predict(item_id, item_text, spec_version) · 2 s deadline',
+        label: 'Predict(item_id, text, spec_version) · deadline 2 s',
         kind: 'sync',
       },
-      {from: 'Pre-label model', to: 'Labeling Service', label: 'label_values, model_version', kind: 'reply'},
+      {from: 'Pre-label model', to: 'labeld', label: 'labels, model_version → prelabeled', kind: 'reply'},
       {
         from: 'Pre-label model',
-        to: 'Labeling Service',
-        label: 'UNAVAILABLE · DEADLINE_EXCEEDED — retry once, then degrade',
+        to: 'labeld',
+        label: 'UNAVAILABLE · DEADLINE_EXCEEDED → one more attempt',
         kind: 'reply',
       },
-      {
-        from: 'Pre-label model',
-        to: 'Labeling Service',
-        label: 'INVALID_ARGUMENT · FAILED_PRECONDITION — a refusal, never retried',
-        kind: 'reply',
-      },
-      {
-        from: 'Labeling Service',
-        to: 'Labeling Service',
-        label: 'prelabel_status: prelabeled | unlabeled + prelabel_error',
-        kind: 'sync',
-      },
-      {
-        from: 'Labeling Service',
-        to: 'Annotator',
-        label: 'the item — with label_values, or unlabeled and the reason',
-        kind: 'reply',
-      },
+      {from: 'Pre-label model', to: 'labeld', label: 'INVALID_ARGUMENT → final', kind: 'reply'},
+      {from: 'labeld', to: 'labeld', label: 'status unlabeled · error "<STATUS>: <details>"', kind: 'sync'},
     ],
   },
   checks: [
     {
       id: 'deadline',
-      title: 'Every pre-label attempt runs under a 2-second deadline',
+      title: 'Every pre-label call carries a 2-second deadline',
       detail:
-        'Each `Predict` attempt is issued with a 2-second deadline — `timeout=PRELABEL_DEADLINE_S`, `{deadline: Date.now() + …}`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` — so no single attempt can outlive it. The starter defines the deadline constant and never passes it: a bounded loop around an unbounded call is still an unbounded wait, and one hung model freezes the assignment it is pre-labeling.',
+        'Each `Predict` call is made with `DEADLINE_S` (2 s), so a hung model costs at most two deadlines. The starter sets none and waits for as long as the model takes.',
       match: {
-        python: {all: [/PRELABEL_DEADLINE_S\s*=\s*2\b/, /stub\.Predict\([^\n]*timeout\s*=\s*PRELABEL_DEADLINE_S/]},
-        typescript: {
-          all: [/PRELABEL_DEADLINE_S\s*=\s*2\b/, /deadline:\s*Date\.now\(\)\s*\+\s*PRELABEL_DEADLINE_S\s*\*\s*1_000/],
-        },
-        go: {
-          all: [
-            /prelabelDeadlineS\s*=\s*2\b/,
-            /context\.WithTimeout\(\s*ctx\s*,\s*prelabelDeadlineS\s*\*\s*time\.Second\s*\)/,
-          ],
-        },
-        scala: {
-          all: [/PrelabelDeadlineS\s*=\s*2\b/, /withDeadlineAfter\(\s*PrelabelDeadlineS\s*,\s*TimeUnit\.SECONDS\s*\)/],
-        },
-        cpp: {all: [/kPrelabelDeadlineS\s*=\s*2\b/, /set_deadline\([^\n]*kPrelabelDeadlineS/]},
+        python: {all: [/DEADLINE_S\s*=\s*2\b/, /Predict\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/DEADLINE_MS\s*=\s*2000\b/, /Predict\([\s\S]{0,300}?deadline:[^\n]*DEADLINE_MS/]},
+        go: {all: [/deadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
+        scala: {all: [/DeadlineSeconds\s*=\s*2L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
+        cpp: {all: [/kDeadline\{2\}|kDeadline\(2\)/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
     {
-      id: 'no-retry-refusal',
-      title: 'A refusal is not retried',
+      id: 'retry-transient',
+      title: 'Retries only a transient status, at most twice',
       detail:
-        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retryable; an `INVALID_ARGUMENT`, `PERMISSION_DENIED` or `FAILED_PRECONDITION` returns immediately, because the second attempt would answer the same way. The starter catches every error and loops, so a refusal costs the item its whole deadline and still ends without a result.',
+        'At most `MAX_ATTEMPTS` = 2 calls, and only `UNAVAILABLE` or `DEADLINE_EXCEEDED` earns the second one; a refusal such as `INVALID_ARGUMENT` is final. The starter retries every error three times.',
       match: {
-        python: {
-          all: [
-            /RETRYABLE\s*=\s*\{[^}]*StatusCode\.UNAVAILABLE[^}]*StatusCode\.DEADLINE_EXCEEDED/,
-            /exc\.code\(\)\s+not\s+in\s+RETRYABLE/,
-          ],
-        },
+        python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/MAX_ATTEMPTS\s*=\s*3\b/]},
         typescript: {
-          all: [
-            /\[grpc\.status\.UNAVAILABLE\]:\s*true/,
-            /\[grpc\.status\.DEADLINE_EXCEEDED\]:\s*true/,
-            /RETRYABLE\[serviceError\.code\]\s*!==\s*true/,
-          ],
+          all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/, /status\.DEADLINE_EXCEEDED/],
+          none: [/MAX_ATTEMPTS\s*=\s*3\b/],
         },
         go: {
-          all: [/codes\.Unavailable:\s*true/, /codes\.DeadlineExceeded:\s*true/, /!retryable\[status\.Code\(err\)\]/],
+          all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
+          none: [/maxAttempts\s*=\s*3\b/],
         },
-        scala: {
-          all: [
-            /Retryable\s*=\s*Set\(Status\.Code\.UNAVAILABLE,\s*Status\.Code\.DEADLINE_EXCEEDED\)/,
-            /!Retryable\.contains\(exc\.getStatus\.getCode\)/,
-          ],
-        },
-        cpp: {all: [/StatusCode::UNAVAILABLE/, /StatusCode::DEADLINE_EXCEEDED/, /!retryable\(status\)/]},
+        scala: {all: [/MaxAttempts\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/MaxAttempts\s*=\s*3\b/]},
+        cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/kMaxAttempts\s*=\s*3\b/]},
       },
     },
     {
       id: 'degrade-unlabeled',
-      title: 'An outage yields an unlabeled item, not a blocked assignment',
+      title: 'A model failure answers an unlabeled item',
       detail:
-        'The failure path returns the shared unlabeled result — `prelabel_status: STATUS_UNLABELED`, `prelabel: null` — instead of raising, so the caller gets an assignment either way. The starter throws the last RPC error out to the caller: the item is neither labeled nor queued, and the queue stops on a model error.',
+        'When the model fails, the call answers `status: "unlabeled"` with no labels and the last status in `error`, so the annotator labels the item by hand. The starter raises, and the queue stops at the first outage.',
       match: {
-        python: {
-          all: [/STATUS_UNLABELED\s*=\s*"unlabeled"/, /"prelabel_status":\s*STATUS_UNLABELED/, /"prelabel":\s*None/],
-          none: [/\braise\b/],
-        },
-        typescript: {
-          all: [/STATUS_UNLABELED\s*=\s*'unlabeled'/, /prelabel_status:\s*STATUS_UNLABELED/, /prelabel:\s*null/],
-          none: [/\bthrow\b/],
-        },
-        go: {
-          all: [/statusUnlabeled\s*=\s*"unlabeled"/, /PrelabelStatus:\s*statusUnlabeled/, /Prelabel:\s*nil/],
-          none: [/\(\s*AssignmentResult\s*,\s*error\s*\)/],
-        },
-        scala: {
-          all: [/StatusUnlabeled\s*=\s*"unlabeled"/, /prelabelStatus\s*=\s*StatusUnlabeled/, /prelabel\s*=\s*None/],
-          none: [/\bthrow\b/],
-        },
-        cpp: {
-          all: [
-            /kStatusUnlabeled\s*=\s*"unlabeled"/,
-            /AssignmentResult\{item_id,\s*kStatusUnlabeled,\s*\{\},\s*reason\}/,
-          ],
-          none: [/\bthrow\b/],
-        },
-      },
-    },
-    {
-      id: 'reason-recorded',
-      title: 'The failure reason is recorded on the item',
-      detail:
-        'The unlabeled result carries `prelabel_error` with the status code and the message of the last failure — `exc.code().name`/`exc.details()`, `grpc.status[...]`/`details`, `status.Code`/`status.Convert(err).Message()`, `getStatus.getCode`/`getStatus.getDescription`, `error_code()`/`error_message()` — so an operator can tell a refusal from an outage. The starter discards the exception and raises a bare `RuntimeError("prelabel failed")` with no reason at all.',
-      match: {
-        python: {all: [/prelabel_error/, /exc\.code\(\)\.name/, /exc\.details\(\)/]},
-        typescript: {
-          all: [/prelabel_error/, /grpc\.status\[serviceError\.code\]/, /serviceError\.details/],
-        },
-        go: {all: [/json:"prelabel_error"/, /status\.Code\(err\)/, /status\.Convert\(err\)\.Message\(\)/]},
-        scala: {all: [/prelabelError\s*=\s*Some\(reason\)/, /getStatus\.getCode/, /getStatus\.getDescription/]},
-        cpp: {all: [/prelabel_error/, /error_code\(\)/, /error_message\(\)/]},
-      },
-    },
-    {
-      id: 'attempts-bounded',
-      title: 'At most two attempts per item',
-      detail:
-        '`MAX_ATTEMPTS = 2` bounds the loop to at most two `Predict` calls per item. This is the one habit the starter keeps — the loop is written against the constant — and the fix must keep it: two attempts, each under its own deadline, is the worst an assignment can ever wait before it degrades to unlabeled.',
-      match: {
-        python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /for\s+\w+\s+in\s+range\(MAX_ATTEMPTS\)/]},
-        typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /attempt\s*<\s*MAX_ATTEMPTS/]},
-        go: {all: [/maxAttempts\s*=\s*2\b/, /attempt\s*<\s*maxAttempts/]},
-        scala: {all: [/MaxAttempts\s*=\s*2\b/, /attempt\s*<\s*MaxAttempts/]},
-        cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /attempt\s*<\s*kMaxAttempts/]},
+        python: {all: [/["']unlabeled["']/], none: [/\braise\b/]},
+        typescript: {all: [/['"]unlabeled['"]/], none: [/\bthrow\b/]},
+        go: {all: [/"unlabeled"/], none: [/\bErrorf\(|errors\.New\(/]},
+        scala: {all: [/"unlabeled"/], none: [/\bthrow\b/]},
+        cpp: {all: [/"unlabeled"/], none: [/\bthrow\b/]},
       },
     },
   ],
@@ -184,227 +98,144 @@ the same way, and a model outage becomes a work stoppage instead of an unlabeled
     python: {
       starter: `import grpc
 
-import prelabel_pb2
-import prelabel_pb2_grpc
+import labeling_service_pb2
+import labeling_service_pb2_grpc
 
-PRELABEL_DEADLINE_S = 2
-MAX_ATTEMPTS = 2
+MAX_ATTEMPTS = 3
 
-channel = grpc.insecure_channel("prelabel:9000")
-stub = prelabel_pb2_grpc.PrelabelServiceStub(channel)
+model = labeling_service_pb2_grpc.PrelabelStub(grpc.insecure_channel("prelabel:9000"))
 
 
-def prelabel_item(item: dict, spec_version: str) -> dict:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    request = prelabel_pb2.PredictRequest(
-        item_id=item["item_id"],
-        item_text=item["text"],
-        spec_version=spec_version,
-    )
-    for _ in range(MAX_ATTEMPTS):
+def prelabel_item(item_id: str, text: str, spec_version: str) -> dict:
+    """The model's suggested labels for one item: {item_id, status, labels, error}."""
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    last = None
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            return {"prelabel_status": "prelabeled", "prelabel": stub.Predict(request)}
-        except Exception:
-            continue
-    raise RuntimeError("prelabel failed")
+            reply = model.Predict(labeling_service_pb2.PredictRequest(item_id=item_id, text=text, spec_version=spec_version))
+            return {"item_id": item_id, "status": "prelabeled", "labels": list(reply.labels), "error": ""}
+        except grpc.RpcError as exc:
+            last = exc  # the model is flaky: try again
+    raise RuntimeError(f"pre-label failed: {last.code().name}")
 `,
       solution: `import grpc
 
-import prelabel_pb2
-import prelabel_pb2_grpc
+import labeling_service_pb2
+import labeling_service_pb2_grpc
 
-PRELABEL_DEADLINE_S = 2
+DEADLINE_S = 2
 MAX_ATTEMPTS = 2
-STATUS_PRELABELED = "prelabeled"
-STATUS_UNLABELED = "unlabeled"
-RETRYABLE = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
+RETRYABLE = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
 
-channel = grpc.insecure_channel("prelabel:9000")
-stub = prelabel_pb2_grpc.PrelabelServiceStub(channel)
+model = labeling_service_pb2_grpc.PrelabelStub(grpc.insecure_channel("prelabel:9000"))
 
 
-def unlabeled(item_id: int, error: str) -> dict:
-    """Every failure path returns this: the item still reaches an annotator."""
-    return {
-        "item_id": item_id,
-        "prelabel_status": STATUS_UNLABELED,
-        "prelabel": None,
-        "prelabel_error": error,
-    }
-
-
-def prelabel_item(item: dict, spec_version: str) -> dict:
-    request = prelabel_pb2.PredictRequest(
-        item_id=item["item_id"],
-        item_text=item["text"],
-        spec_version=spec_version,
-    )
-    last_error = "prelabel model did not answer"
-    for _ in range(MAX_ATTEMPTS):
+def prelabel_item(item_id: str, text: str, spec_version: str) -> dict:
+    """The model's suggested labels for one item: {item_id, status, labels, error}."""
+    error = ""
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            response = stub.Predict(request, timeout=PRELABEL_DEADLINE_S)
+            reply = model.Predict(
+                labeling_service_pb2.PredictRequest(item_id=item_id, text=text, spec_version=spec_version),
+                timeout=DEADLINE_S,
+            )
+            return {"item_id": item_id, "status": "prelabeled", "labels": list(reply.labels), "error": ""}
         except grpc.RpcError as exc:
-            last_error = f"{exc.code().name}: {exc.details()}"
+            error = f"{exc.code().name}: {exc.details()}"
             if exc.code() not in RETRYABLE:
-                break  # a refusal answers the same way on the second attempt
-            continue
-        return {
-            "item_id": item["item_id"],
-            "prelabel_status": STATUS_PRELABELED,
-            "prelabel": list(response.label_values),
-            "prelabel_error": None,
-        }
-    return unlabeled(item["item_id"], last_error)
+                break  # a refusal answers the same way every time
+    # The annotator labels from scratch: a model failure costs a suggestion, not the item.
+    return {"item_id": item_id, "status": "unlabeled", "labels": [], "error": error}
 `,
     },
     typescript: {
-      starter: `/** Pre-label client. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const PRELABEL_DEADLINE_S = 2;
-const MAX_ATTEMPTS = 2;
+export const MAX_ATTEMPTS = 3;
 
 interface PredictRequest {
   item_id: string;
-  item_text: string;
+  text: string;
   spec_version: string;
 }
 
-interface PredictResponse {
-  label_values: string[];
-  model_version: string;
+export interface Prelabel {
+  item_id: string;
+  status: 'prelabeled' | 'unlabeled';
+  labels: string[];
+  error: string;
 }
 
-interface PrelabelClient {
-  Predict(
-    request: PredictRequest,
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, response?: PredictResponse) => void,
-  ): grpc.ClientUnaryCall;
-}
-
-const {prelabel} = grpc.loadPackageDefinition(protoLoader.loadSync('prelabel.proto')) as unknown as {
-  prelabel: {PrelabelService: new (target: string, credentials: grpc.ChannelCredentials) => PrelabelClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('labeling_service.proto')) as unknown as {
+  labeld: {Prelabel: grpc.ServiceClientConstructor};
 };
-const client = new prelabel.PrelabelService('prelabel:9000', grpc.credentials.createInsecure());
+const model = new pkg.labeld.Prelabel('prelabel:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Predict(request: PredictRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{labels: string[]; model_version: string}>;
+};
 
-function predict(request: PredictRequest): Promise<PredictResponse> {
-  const {promise, resolve, reject} = Promise.withResolvers<PredictResponse>();
-  client.Predict(request, new grpc.Metadata(), {}, (error, response) => {
-    if (error === null) resolve(response as PredictResponse);
-    else reject(error);
-  });
-  return promise;
-}
-
-export async function prelabelItem(
-  item: {item_id: string; text: string},
-  specVersion: string,
-): Promise<{prelabel_status: string; prelabel: string[]}> {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const request: PredictRequest = {item_id: item.item_id, item_text: item.text, spec_version: specVersion};
-  let lastError: grpc.ServiceError | null = null;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+/** The model's suggested labels for one item. */
+export async function prelabelItem(itemId: string, text: string, specVersion: string): Promise<Prelabel> {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  let last: grpc.ServiceError | undefined;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
     try {
-      const response = await predict(request);
-      return {prelabel_status: 'prelabeled', prelabel: response.label_values};
-    } catch (error) {
-      lastError = error as grpc.ServiceError;
+      const reply = await model.Predict({item_id: itemId, text, spec_version: specVersion}, new grpc.Metadata(), {});
+      return {item_id: itemId, status: 'prelabeled', labels: [...reply.labels], error: ''};
+    } catch (e) {
+      last = e as grpc.ServiceError; // the model is flaky: try again
     }
   }
-  throw lastError;
+  throw new Error(\`pre-label failed: \${last === undefined ? 'unknown' : grpc.status[last.code]}\`);
 }
 `,
-      solution: `/** Pre-label client: 2 s per attempt, two attempts, and a degrade to unlabeled. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const PRELABEL_DEADLINE_S = 2;
-const MAX_ATTEMPTS = 2;
-const STATUS_PRELABELED = 'prelabeled';
-const STATUS_UNLABELED = 'unlabeled';
-const RETRYABLE: Record<number, true> = {
-  [grpc.status.UNAVAILABLE]: true,
-  [grpc.status.DEADLINE_EXCEEDED]: true,
-};
+export const DEADLINE_MS = 2000;
+export const MAX_ATTEMPTS = 2;
+const RETRYABLE = new Set([grpc.status.UNAVAILABLE, grpc.status.DEADLINE_EXCEEDED]);
 
 interface PredictRequest {
   item_id: string;
-  item_text: string;
+  text: string;
   spec_version: string;
 }
 
-interface PredictResponse {
-  label_values: string[];
-  model_version: string;
-}
-
-interface AssignmentResult {
+export interface Prelabel {
   item_id: string;
-  prelabel_status: string;
-  prelabel: string[] | null;
-  prelabel_error: string | null;
+  status: 'prelabeled' | 'unlabeled';
+  labels: string[];
+  error: string;
 }
 
-interface PrelabelClient {
-  Predict(
-    request: PredictRequest,
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, response?: PredictResponse) => void,
-  ): grpc.ClientUnaryCall;
-}
-
-const {prelabel} = grpc.loadPackageDefinition(protoLoader.loadSync('prelabel.proto')) as unknown as {
-  prelabel: {PrelabelService: new (target: string, credentials: grpc.ChannelCredentials) => PrelabelClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('labeling_service.proto')) as unknown as {
+  labeld: {Prelabel: grpc.ServiceClientConstructor};
 };
-const client = new prelabel.PrelabelService('prelabel:9000', grpc.credentials.createInsecure());
+const model = new pkg.labeld.Prelabel('prelabel:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Predict(request: PredictRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{labels: string[]; model_version: string}>;
+};
 
-function predictOnce(request: PredictRequest): Promise<PredictResponse> {
-  const {promise, resolve, reject} = Promise.withResolvers<PredictResponse>();
-  client.Predict(
-    request,
-    new grpc.Metadata(),
-    {deadline: Date.now() + PRELABEL_DEADLINE_S * 1_000},
-    (error, response) => {
-      if (error === null) resolve(response as PredictResponse);
-      else reject(error);
-    },
-  );
-  return promise;
-}
-
-export function unlabeled(itemId: string, error: string): AssignmentResult {
-  // Every failure path returns this: the item still reaches an annotator.
-  return {item_id: itemId, prelabel_status: STATUS_UNLABELED, prelabel: null, prelabel_error: error};
-}
-
-export async function prelabelItem(
-  item: {item_id: string; text: string},
-  specVersion: string,
-): Promise<AssignmentResult> {
-  const request: PredictRequest = {item_id: item.item_id, item_text: item.text, spec_version: specVersion};
-  let reason = 'prelabel model did not answer';
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    let response: PredictResponse;
+/** The model's suggested labels for one item. */
+export async function prelabelItem(itemId: string, text: string, specVersion: string): Promise<Prelabel> {
+  let error = '';
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
     try {
-      response = await predictOnce(request);
-    } catch (error) {
-      const serviceError = error as grpc.ServiceError;
-      reason = \`\${grpc.status[serviceError.code]}: \${serviceError.details}\`;
-      if (RETRYABLE[serviceError.code] !== true) break; // a refusal answers the same way next time
-      continue;
+      const reply = await model.Predict(
+        {item_id: itemId, text, spec_version: specVersion},
+        new grpc.Metadata(),
+        {deadline: Date.now() + DEADLINE_MS},
+      );
+      return {item_id: itemId, status: 'prelabeled', labels: [...reply.labels], error: ''};
+    } catch (e) {
+      const {code, details} = e as grpc.ServiceError;
+      const name = Object.keys(grpc.status).find(key => grpc.status[key as keyof typeof grpc.status] === code) ?? String(code);
+      error = \`\${name}: \${details}\`;
+      if (!RETRYABLE.has(code)) break; // a refusal answers the same way every time
     }
-    return {
-      item_id: item.item_id,
-      prelabel_status: STATUS_PRELABELED,
-      prelabel: response.label_values,
-      prelabel_error: null,
-    };
   }
-  return unlabeled(item.item_id, reason);
+  // The annotator labels from scratch: a model failure costs a suggestion, not the item.
+  return {item_id: itemId, status: 'unlabeled', labels: [], error};
 }
 `,
     },
@@ -413,37 +244,42 @@ export async function prelabelItem(
 
 import (
 	"context"
-	"errors"
+	"fmt"
 
-	pb "labeling/prelabelpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	pb "labeld/gen/labeling_service"
 )
 
-const (
-	prelabelDeadlineS = 2
-	maxAttempts       = 2
+const maxAttempts = 3
+
+var (
+	modelConn, _ = grpc.NewClient("prelabel:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	model        = pb.NewPrelabelClient(modelConn)
 )
 
-type AssignmentResult struct {
-	ItemID         string   \`json:"item_id"\`
-	PrelabelStatus string   \`json:"prelabel_status"\`
-	Prelabel       []string \`json:"prelabel"\`
-	PrelabelError  *string  \`json:"prelabel_error"\`
+// Prelabel is the model's suggestion for one item: status "prelabeled" or "unlabeled".
+type Prelabel struct {
+	ItemID string   \`json:"item_id"\`
+	Status string   \`json:"status"\`
+	Labels []string \`json:"labels"\`
+	Error  string   \`json:"error"\`
 }
 
-// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-func PrelabelItem(ctx context.Context, client pb.PrelabelServiceClient, itemID, itemText, specVersion string) (AssignmentResult, error) {
-	request := &pb.PredictRequest{ItemId: itemID, ItemText: itemText, SpecVersion: specVersion}
+// prelabelItem asks the model for one item's suggested labels.
+func prelabelItem(ctx context.Context, itemID, text, specVersion string) (Prelabel, error) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	var last error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		response, err := client.Predict(ctx, request)
+		reply, err := model.Predict(ctx, &pb.PredictRequest{ItemId: itemID, Text: text, SpecVersion: specVersion})
 		if err == nil {
-			return AssignmentResult{
-				ItemID:         itemID,
-				PrelabelStatus: "prelabeled",
-				Prelabel:       response.GetLabelValues(),
-			}, nil
+			return Prelabel{ItemID: itemID, Status: "prelabeled", Labels: reply.GetLabels()}, nil
 		}
+		last = err // the model is flaky: try again
 	}
-	return AssignmentResult{}, errors.New("prelabel failed")
+	return Prelabel{}, fmt.Errorf("pre-label failed: %v", status.Code(last))
 }
 `,
       solution: `package main
@@ -453,88 +289,90 @@ import (
 	"fmt"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	pb "labeling/prelabelpb"
+	pb "labeld/gen/labeling_service"
 )
 
 const (
-	prelabelDeadlineS = 2
-	maxAttempts       = 2
-	statusPrelabeled  = "prelabeled"
-	statusUnlabeled   = "unlabeled"
+	deadline    = 2 * time.Second
+	maxAttempts = 2
 )
 
-var retryable = map[codes.Code]bool{codes.Unavailable: true, codes.DeadlineExceeded: true}
+var (
+	modelConn, _ = grpc.NewClient("prelabel:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	model        = pb.NewPrelabelClient(modelConn)
+)
 
-type AssignmentResult struct {
-	ItemID         string   \`json:"item_id"\`
-	PrelabelStatus string   \`json:"prelabel_status"\`
-	Prelabel       []string \`json:"prelabel"\`
-	PrelabelError  *string  \`json:"prelabel_error"\`
+// Prelabel is the model's suggestion for one item: status "prelabeled" or "unlabeled".
+type Prelabel struct {
+	ItemID string   \`json:"item_id"\`
+	Status string   \`json:"status"\`
+	Labels []string \`json:"labels"\`
+	Error  string   \`json:"error"\`
 }
 
-// unlabeledResult is what every failure path returns: the item still reaches an annotator.
-func unlabeledResult(itemID, reason string) AssignmentResult {
-	return AssignmentResult{ItemID: itemID, PrelabelStatus: statusUnlabeled, Prelabel: nil, PrelabelError: &reason}
-}
-
-func PrelabelItem(ctx context.Context, client pb.PrelabelServiceClient, itemID, itemText, specVersion string) AssignmentResult {
-	request := &pb.PredictRequest{ItemId: itemID, ItemText: itemText, SpecVersion: specVersion}
-	reason := "prelabel model did not answer"
+// prelabelItem asks the model for one item's suggested labels.
+func prelabelItem(ctx context.Context, itemID, text, specVersion string) (Prelabel, error) {
+	lastError := ""
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, prelabelDeadlineS*time.Second)
-		response, err := client.Predict(callCtx, request)
+		callCtx, cancel := context.WithTimeout(ctx, deadline)
+		reply, err := model.Predict(callCtx, &pb.PredictRequest{ItemId: itemID, Text: text, SpecVersion: specVersion})
 		cancel()
 		if err == nil {
-			return AssignmentResult{
-				ItemID:         itemID,
-				PrelabelStatus: statusPrelabeled,
-				Prelabel:       response.GetLabelValues(),
-			}
+			return Prelabel{ItemID: itemID, Status: "prelabeled", Labels: reply.GetLabels()}, nil
 		}
-		reason = fmt.Sprintf("%s: %s", status.Code(err), status.Convert(err).Message())
-		if !retryable[status.Code(err)] {
-			break // a refusal answers the same way on the second attempt
+		code := status.Code(err)
+		lastError = fmt.Sprintf("%s: %s", grpcName(code), status.Convert(err).Message())
+		if code != codes.Unavailable && code != codes.DeadlineExceeded {
+			break // a refusal answers the same way every time
 		}
 	}
-	return unlabeledResult(itemID, reason)
+	// The annotator labels from scratch: a model failure costs a suggestion, not the item.
+	return Prelabel{ItemID: itemID, Status: "unlabeled", Labels: []string{}, Error: lastError}, nil
+}
+
+// grpcName is a status code as the protocol spells it (UNAVAILABLE, INVALID_ARGUMENT, ...).
+func grpcName(code codes.Code) string {
+	names := map[codes.Code]string{
+		codes.Unavailable: "UNAVAILABLE", codes.DeadlineExceeded: "DEADLINE_EXCEEDED",
+		codes.InvalidArgument: "INVALID_ARGUMENT", codes.FailedPrecondition: "FAILED_PRECONDITION",
+		codes.PermissionDenied: "PERMISSION_DENIED", codes.Internal: "INTERNAL",
+	}
+	if name, ok := names[code]; ok {
+		return name
+	}
+	return code.String()
 }
 `,
     },
     scala: {
       starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-object PrelabelClient {
-  val PrelabelDeadlineS = 2
-  val MaxAttempts = 2
+import labeld.labeling_service.{PredictRequest, PrelabelGrpc}
 
-  val stub = PrelabelServiceGrpc.blockingStub(
-    ManagedChannelBuilder.forAddress("prelabel", 9000).usePlaintext().build()
-  )
+/** The model's suggestion for one item: status "prelabeled" or "unlabeled". */
+final case class Prelabel(itemId: String, status: String, labels: Seq[String], error: String)
 
-  case class AssignmentResult(
-      itemId: String,
-      prelabelStatus: String,
-      prelabel: Option[Seq[String]],
-      prelabelError: Option[String])
+object Client {
+  val MaxAttempts = 3
 
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  def prelabelItem(itemId: String, itemText: String, specVersion: String): AssignmentResult = {
-    val request = PredictRequest(itemId = itemId, itemText = itemText, specVersion = specVersion)
-    var last: Option[StatusRuntimeException] = None
-    var attempt = 0
-    while (attempt < MaxAttempts) {
+  private val model = PrelabelGrpc.blockingStub(ManagedChannelBuilder.forAddress("prelabel", 9000).usePlaintext().build())
+
+  /** The model's suggested labels for one item. */
+  def prelabelItem(itemId: String, text: String, specVersion: String): Prelabel = {
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    var last: StatusRuntimeException = null
+    for (_ <- 1 to MaxAttempts) {
       try {
-        val response = stub.predict(request)
-        return AssignmentResult(itemId, "prelabeled", Some(response.labelValues), None)
-      } catch {
-        case exc: StatusRuntimeException => last = Some(exc)
-      }
-      attempt += 1
+        val reply = model.predict(PredictRequest(itemId, text, specVersion))
+        return Prelabel(itemId, "prelabeled", reply.labels, "")
+      } catch { case e: StatusRuntimeException => last = e } // the model is flaky: try again
     }
-    throw last.getOrElse(new RuntimeException("prelabel failed"))
+    throw new RuntimeException(s"pre-label failed: \${last.getStatus.getCode}")
   }
 }
 `,
@@ -542,49 +380,36 @@ object PrelabelClient {
 
 import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
 
-object PrelabelClient {
-  val PrelabelDeadlineS = 2
+import labeld.labeling_service.{PredictRequest, PrelabelGrpc}
+
+/** The model's suggestion for one item: status "prelabeled" or "unlabeled". */
+final case class Prelabel(itemId: String, status: String, labels: Seq[String], error: String)
+
+object Client {
+  val DeadlineSeconds = 2L
   val MaxAttempts = 2
-  val StatusPrelabeled = "prelabeled"
-  val StatusUnlabeled = "unlabeled"
-  val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
+  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
 
-  val stub = PrelabelServiceGrpc.blockingStub(
-    ManagedChannelBuilder.forAddress("prelabel", 9000).usePlaintext().build()
-  )
+  private val model = PrelabelGrpc.blockingStub(ManagedChannelBuilder.forAddress("prelabel", 9000).usePlaintext().build())
 
-  case class AssignmentResult(
-      itemId: String,
-      prelabelStatus: String,
-      prelabel: Option[Seq[String]],
-      prelabelError: Option[String])
-
-  def unlabeled(itemId: String, reason: String): AssignmentResult =
-    // Every failure path returns this: the item still reaches an annotator.
-    AssignmentResult(itemId, prelabelStatus = StatusUnlabeled, prelabel = None, prelabelError = Some(reason))
-
-  def prelabelItem(itemId: String, itemText: String, specVersion: String): AssignmentResult = {
-    val request = PredictRequest(itemId = itemId, itemText = itemText, specVersion = specVersion)
-    var reason = "prelabel model did not answer"
+  /** The model's suggested labels for one item. */
+  def prelabelItem(itemId: String, text: String, specVersion: String): Prelabel = {
+    var error = ""
     var attempt = 0
     while (attempt < MaxAttempts) {
-      try {
-        val response = stub
-          .withDeadlineAfter(PrelabelDeadlineS, TimeUnit.SECONDS)
-          .predict(request)
-        return AssignmentResult(
-          itemId,
-          prelabelStatus = StatusPrelabeled,
-          prelabel = Some(response.labelValues),
-          prelabelError = None)
-      } catch {
-        case exc: StatusRuntimeException =>
-          reason = s"\${exc.getStatus.getCode}: \${exc.getStatus.getDescription}"
-          if (!Retryable.contains(exc.getStatus.getCode)) return unlabeled(itemId, reason)
-      }
       attempt += 1
+      try {
+        val reply = model.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).predict(PredictRequest(itemId, text, specVersion))
+        return Prelabel(itemId, "prelabeled", reply.labels, "")
+      } catch {
+        case e: StatusRuntimeException =>
+          val code = e.getStatus.getCode
+          error = s"\${code.name}: \${Option(e.getStatus.getDescription).getOrElse("")}"
+          if (!Retryable.contains(code)) attempt = MaxAttempts // a refusal answers the same way every time
+      }
     }
-    unlabeled(itemId, reason)
+    // The annotator labels from scratch: a model failure costs a suggestion, not the item.
+    Prelabel(itemId, "unlabeled", Seq.empty, error)
   }
 }
 `,
@@ -592,106 +417,446 @@ object PrelabelClient {
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
 
-#include "prelabel.grpc.pb.h"
-
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-constexpr int kPrelabelDeadlineS = 2;
-constexpr int kMaxAttempts = 2;
+#include "labeling_service.grpc.pb.h"
 
-struct AssignmentResult {
+constexpr int kMaxAttempts = 3;
+
+auto model = labeld::Prelabel::NewStub(grpc::CreateChannel("prelabel:9000", grpc::InsecureChannelCredentials()));
+
+// The model's suggestion for one item: status "prelabeled" or "unlabeled".
+struct Prelabel {
   std::string item_id;
-  std::string prelabel_status;
-  std::vector<std::string> prelabel;
-  std::string prelabel_error;
+  std::string status;
+  std::vector<std::string> labels;
+  std::string error;
 };
 
-// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-AssignmentResult prelabel_item(PrelabelService::Stub* stub, const std::string& item_id,
-                               const std::string& item_text, const std::string& spec_version) {
-  PredictRequest request;
+// The model's suggested labels for one item.
+Prelabel prelabelItem(const std::string& item_id, const std::string& text, const std::string& spec_version) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  labeld::PredictRequest request;
   request.set_item_id(item_id);
-  request.set_item_text(item_text);
+  request.set_text(text);
   request.set_spec_version(spec_version);
-  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+  std::string last;
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
     grpc::ClientContext ctx;
-    PredictResponse response;
-    if (stub->Predict(&ctx, request, &response).ok()) {
-      return AssignmentResult{
-          item_id,
-          "prelabeled",
-          {response.label_values().begin(), response.label_values().end()},
-          "",
-      };
+    labeld::PredictResponse reply;
+    const grpc::Status status = model->Predict(&ctx, request, &reply);
+    if (status.ok()) {
+      std::vector<std::string> labels;
+      for (int i = 0; i < reply.labels_size(); i++) labels.push_back(reply.labels(i));
+      return Prelabel{item_id, "prelabeled", labels, ""};
     }
+    last = status.error_message();  // the model is flaky: try again
   }
-  throw std::runtime_error("prelabel failed");
+  throw std::runtime_error("pre-label failed: " + last);
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-
-#include "prelabel.grpc.pb.h"
 
 #include <chrono>
 #include <string>
 #include <vector>
 
-constexpr int kPrelabelDeadlineS = 2;
-constexpr int kMaxAttempts = 2;
-constexpr const char* kStatusPrelabeled = "prelabeled";
-constexpr const char* kStatusUnlabeled = "unlabeled";
+#include "labeling_service.grpc.pb.h"
 
-struct AssignmentResult {
+constexpr std::chrono::seconds kDeadline{2};
+constexpr int kMaxAttempts = 2;
+
+auto model = labeld::Prelabel::NewStub(grpc::CreateChannel("prelabel:9000", grpc::InsecureChannelCredentials()));
+
+// The model's suggestion for one item: status "prelabeled" or "unlabeled".
+struct Prelabel {
   std::string item_id;
-  std::string prelabel_status;
-  std::vector<std::string> prelabel;
-  std::string prelabel_error;
+  std::string status;
+  std::vector<std::string> labels;
+  std::string error;
 };
 
-bool retryable(const grpc::Status& status) {
-  return status.error_code() == grpc::StatusCode::UNAVAILABLE ||
-         status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
-}
-
-// unlabeled_result is what every failure path returns: the item still reaches an annotator.
-AssignmentResult unlabeled_result(const std::string& item_id, const std::string& reason) {
-  return AssignmentResult{item_id, kStatusUnlabeled, {}, reason};
-}
-
-AssignmentResult prelabel_item(PrelabelService::Stub* stub, const std::string& item_id,
-                               const std::string& item_text, const std::string& spec_version) {
-  PredictRequest request;
-  request.set_item_id(item_id);
-  request.set_item_text(item_text);
-  request.set_spec_version(spec_version);
-  std::string reason = "prelabel model did not answer";
-  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-    grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kPrelabelDeadlineS));
-    PredictResponse response;
-    const grpc::Status status = stub->Predict(&ctx, request, &response);
-    if (status.ok()) {
-      return AssignmentResult{
-          item_id,
-          kStatusPrelabeled,
-          {response.label_values().begin(), response.label_values().end()},
-          "",
-      };
-    }
-    reason = "code " + std::to_string(static_cast<int>(status.error_code())) + ": " + status.error_message();
-    if (!retryable(status)) break;  // a refusal answers the same way on the second attempt
+// A status code as the protocol spells it (UNAVAILABLE, INVALID_ARGUMENT, ...).
+std::string codeName(grpc::StatusCode code) {
+  switch (code) {
+    case grpc::StatusCode::UNAVAILABLE:
+      return "UNAVAILABLE";
+    case grpc::StatusCode::DEADLINE_EXCEEDED:
+      return "DEADLINE_EXCEEDED";
+    case grpc::StatusCode::INVALID_ARGUMENT:
+      return "INVALID_ARGUMENT";
+    case grpc::StatusCode::FAILED_PRECONDITION:
+      return "FAILED_PRECONDITION";
+    default:
+      return "code " + std::to_string(static_cast<int>(code));
   }
-  return unlabeled_result(item_id, reason);
+}
+
+// The model's suggested labels for one item.
+Prelabel prelabelItem(const std::string& item_id, const std::string& text, const std::string& spec_version) {
+  labeld::PredictRequest request;
+  request.set_item_id(item_id);
+  request.set_text(text);
+  request.set_spec_version(spec_version);
+  std::string error;
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    labeld::PredictResponse reply;
+    const grpc::Status status = model->Predict(&ctx, request, &reply);
+    if (status.ok()) {
+      std::vector<std::string> labels;
+      for (int i = 0; i < reply.labels_size(); i++) labels.push_back(reply.labels(i));
+      return Prelabel{item_id, "prelabeled", labels, ""};
+    }
+    error = codeName(status.error_code()) + ": " + status.error_message();
+    const bool retryable = status.error_code() == grpc::StatusCode::UNAVAILABLE || status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
+    if (!retryable) break;  // a refusal answers the same way every time
+  }
+  // The annotator labels from scratch: a model failure costs a suggestion, not the item.
+  return Prelabel{item_id, "unlabeled", {}, error};
 }
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import labeling_service_pb2
+import labeling_service_pb2_grpc
+
+
+class Model(labeling_service_pb2_grpc.PrelabelServicer):
+    """Labels every item "cat", except: refuse:… is INVALID_ARGUMENT, down:… is UNAVAILABLE, flaky:… is UNAVAILABLE on its first call."""
+
+    def __init__(self):
+        self.seen = {}
+
+    def Predict(self, request, context):
+        n = self.seen[request.item_id] = self.seen.get(request.item_id, 0) + 1
+        if request.text.startswith("refuse:"):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "the item is outside the label spec")
+        if request.text.startswith("down:") or (request.text.startswith("flaky:") and n == 1):
+            context.abort(grpc.StatusCode.UNAVAILABLE, "the model is restarting")
+        return labeling_service_pb2.PredictResponse(labels=["cat"], model_version="m-7")
+
+
+def _client(ctx):
+    ctx.grpc.serve(labeling_service_pb2_grpc.add_PrelabelServicer_to_server, Model())
+    return ctx.load("client")
+
+
+def _call(m, item_id, text):
+    try:
+        return m.prelabel_item(item_id, text, "2026-10")
+    except Exception as exc:  # the checks below count calls and time whatever the call did
+        return exc
+
+
+def _calls(ctx, item_id):
+    return len([c for c in ctx.grpc.calls_to("Predict") if c.request.item_id == item_id])
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    _call(m, "i-1", "a cat on a mat")
+    calls = ctx.grpc.calls_to("Predict")
+    assert calls, "no Predict call reached the model"
+    for call in calls:
+        assert call.timeout is not None, "a Predict call carries no deadline: a model that hangs holds the annotator's next item with it"
+        assert 1.5 <= call.timeout <= 2.5, f"a Predict call carries a {call.timeout} s deadline, expected DEADLINE_S = 2"
+    ctx.grpc.set_latency("Predict", 30.0)
+    before = ctx.clock.time()
+    _call(m, "i-2", "a dog in the fog")
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"with the model hanging, prelabel_item took {waited:.0f} s: at most two calls of DEADLINE_S = 2 s each"
+
+
+def check_retry_transient(ctx):
+    m = _client(ctx)
+    _call(m, "i-1", "refuse: a cat")
+    assert _calls(ctx, "i-1") == 1, f"the model refused i-1 (INVALID_ARGUMENT) and was asked {_calls(ctx, 'i-1')} times: a refusal answers the same way every time, call once"
+    _call(m, "i-2", "down: a dog")
+    assert _calls(ctx, "i-2") == 2, f"with the model UNAVAILABLE, i-2 was sent {_calls(ctx, 'i-2')} times, expected MAX_ATTEMPTS = 2"
+    result = _call(m, "i-3", "flaky: a bird")
+    assert _calls(ctx, "i-3") == 2, f"i-3 failed UNAVAILABLE once: it must be sent a second time, it was sent {_calls(ctx, 'i-3')} times"
+    assert isinstance(result, dict) and result.get("status") == "prelabeled", f"the second attempt for i-3 succeeded, prelabel_item answered {result!r}"
+
+
+def check_degrade_unlabeled(ctx):
+    m = _client(ctx)
+    for item_id, text, code in (("i-1", "down: a dog", "UNAVAILABLE"), ("i-2", "refuse: a cat", "INVALID_ARGUMENT")):
+        result = _call(m, item_id, text)
+        assert isinstance(result, dict), f"with the model failing {code}, prelabel_item raised {type(result).__name__}: {result}. Answer an unlabeled item so the annotator labels it by hand"
+        assert result.get("status") == "unlabeled" and result.get("labels") == [], f"a failed pre-label answered {result}, expected status unlabeled with no labels"
+        assert code in (result.get("error") or ""), f"the unlabeled item's error is {result.get('error')!r}, expected the last status {code}"
+        assert result.get("item_id") == item_id, f"the answer names item {result.get('item_id')!r}, expected {item_id}"
+    ok = _call(m, "i-3", "a cat on a mat")
+    assert isinstance(ok, dict) and ok.get("status") == "prelabeled" and ok.get("labels") == ["cat"], f"a healthy model's answer must come back prelabeled with its labels, got {ok!r}"
+`,
+    typescript: `function client(ctx) {
+  const pkg = ctx.proto('labeling_service.proto');
+  const seen = new Map<string, number>();
+  // Labels every item "cat", except: refuse:… is INVALID_ARGUMENT, down:… is UNAVAILABLE, flaky:… is UNAVAILABLE on its first call.
+  ctx.grpc.serve(pkg.labeld.Prelabel.service, {
+    Predict(call, callback) {
+      const {item_id, text} = call.request;
+      const n = (seen.get(item_id) ?? 0) + 1;
+      seen.set(item_id, n);
+      if (text.startsWith('refuse:')) return callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: 'the item is outside the label spec'});
+      if (text.startsWith('down:') || (text.startsWith('flaky:') && n === 1)) return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'the model is restarting'});
+      callback(null, {labels: ['cat'], model_version: 'm-7'});
+    },
+  });
+  return ctx.load('client');
+}
+
+async function call(m, itemId: string, text: string) {
+  try {
+    return await m.prelabelItem(itemId, text, '2026-10');
+  } catch (e) {
+    return e as Error; // the checks below count calls and time whatever the call did
+  }
+}
+
+const calls = (ctx, itemId: string): number => ctx.grpc.callsTo('Predict').filter(c => c.request.item_id === itemId).length;
+
+export async function check_deadline(ctx) {
+  const m = client(ctx);
+  await call(m, 'i-1', 'a cat on a mat');
+  const made = ctx.grpc.callsTo('Predict');
+  assert(made.length > 0, 'no Predict call reached the model');
+  for (const c of made) {
+    assert(c.timeout !== null, "a Predict call carries no deadline: a model that hangs holds the annotator's next item with it");
+    assert(1.5 <= c.timeout && c.timeout <= 2.5, \`a Predict call carries a \${c.timeout} s deadline, expected DEADLINE_MS = 2000\`);
+  }
+  ctx.grpc.setLatency('Predict', 30.0);
+  const before = ctx.clock.now();
+  await call(m, 'i-2', 'a dog in the fog');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`with the model hanging, prelabelItem took \${waited.toFixed(0)} s: at most two calls of 2 s each\`);
+}
+
+export async function check_retry_transient(ctx) {
+  const m = client(ctx);
+  await call(m, 'i-1', 'refuse: a cat');
+  assert.equal(calls(ctx, 'i-1'), 1, \`the model refused i-1 (INVALID_ARGUMENT) and was asked \${calls(ctx, 'i-1')} times: a refusal answers the same way every time, call once\`);
+  await call(m, 'i-2', 'down: a dog');
+  assert.equal(calls(ctx, 'i-2'), 2, \`with the model UNAVAILABLE, i-2 was sent \${calls(ctx, 'i-2')} times, expected MAX_ATTEMPTS = 2\`);
+  const result = await call(m, 'i-3', 'flaky: a bird');
+  assert.equal(calls(ctx, 'i-3'), 2, \`i-3 failed UNAVAILABLE once: it must be sent a second time, it was sent \${calls(ctx, 'i-3')} times\`);
+  assert(!(result instanceof Error) && result.status === 'prelabeled', \`the second attempt for i-3 succeeded, prelabelItem answered \${result instanceof Error ? result.message : JSON.stringify(result)}\`);
+}
+
+export async function check_degrade_unlabeled(ctx) {
+  const m = client(ctx);
+  for (const [itemId, text, code] of [['i-1', 'down: a dog', 'UNAVAILABLE'], ['i-2', 'refuse: a cat', 'INVALID_ARGUMENT']]) {
+    const result = await call(m, itemId, text);
+    assert(!(result instanceof Error), \`with the model failing \${code}, prelabelItem threw: \${result instanceof Error ? result.message : ''}. Answer an unlabeled item so the annotator labels it by hand\`);
+    assert(result.status === 'unlabeled' && result.labels.length === 0, \`a failed pre-label answered \${JSON.stringify(result)}, expected status unlabeled with no labels\`);
+    assert(String(result.error).includes(code), \`the unlabeled item's error is \${JSON.stringify(result.error)}, expected the last status \${code}\`);
+    assert.equal(result.item_id, itemId, 'the answer must name the item');
+  }
+  const ok = await call(m, 'i-3', 'a cat on a mat');
+  assert(!(ok instanceof Error) && ok.status === 'prelabeled' && JSON.stringify(ok.labels) === '["cat"]', \`a healthy model's answer must come back prelabeled with its labels, got \${ok instanceof Error ? ok.message : JSON.stringify(ok)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "labeld/gen/labeling_service"
+
+	"leetbuild/harness"
+)
+
+var clientBg = context.Background()
+
+// modelPeer labels every item "cat", except: refuse:… is INVALID_ARGUMENT, down:… is UNAVAILABLE,
+// flaky:… is UNAVAILABLE on its first call.
+type modelPeer struct {
+	pb.UnimplementedPrelabelServer
+	seen map[string]int
+}
+
+func (m *modelPeer) Predict(_ context.Context, req *pb.PredictRequest) (*pb.PredictResponse, error) {
+	m.seen[req.GetItemId()]++
+	text := req.GetText()
+	if strings.HasPrefix(text, "refuse:") {
+		return nil, status.Error(codes.InvalidArgument, "the item is outside the label spec")
+	}
+	if strings.HasPrefix(text, "down:") || (strings.HasPrefix(text, "flaky:") && m.seen[req.GetItemId()] == 1) {
+		return nil, status.Error(codes.Unavailable, "the model is restarting")
+	}
+	return &pb.PredictResponse{Labels: []string{"cat"}, ModelVersion: "m-7"}, nil
+}
+
+func serveModel(ctx *harness.Ctx) {
+	pb.RegisterPrelabelServer(ctx.GRPC.Server(""), &modelPeer{seen: map[string]int{}})
+}
+
+func callsFor(ctx *harness.Ctx, itemID string) int {
+	n := 0
+	for _, c := range ctx.GRPC.CallsTo("Predict", "") {
+		if c.Request.(*pb.PredictRequest).GetItemId() == itemID {
+			n++
+		}
+	}
+	return n
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	serveModel(ctx)
+	prelabelItem(clientBg, "i-1", "a cat on a mat", "2026-10")
+	calls := ctx.GRPC.CallsTo("Predict", "")
+	ctx.Assert(len(calls) > 0, "no Predict call reached the model")
+	for _, call := range calls {
+		ctx.Assert(call.HasDeadline(), "a Predict call carries no deadline: a model that hangs holds the annotator's next item with it")
+		ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "a Predict call carries a %v deadline, expected 2 s", call.Timeout)
+	}
+	ctx.GRPC.SetLatency("Predict", 30.0, "")
+	before := ctx.Clock.Now()
+	prelabelItem(clientBg, "i-2", "a dog in the fog", "2026-10")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "with the model hanging, prelabelItem took %.0f s: at most two calls of 2 s each", waited)
+}
+
+func CheckRetryTransient(ctx *harness.Ctx) {
+	serveModel(ctx)
+	prelabelItem(clientBg, "i-1", "refuse: a cat", "2026-10")
+	ctx.Equal(callsFor(ctx, "i-1"), 1, "the model refused i-1 (INVALID_ARGUMENT): a refusal answers the same way every time, call once; the calls")
+	prelabelItem(clientBg, "i-2", "down: a dog", "2026-10")
+	ctx.Equal(callsFor(ctx, "i-2"), 2, "with the model UNAVAILABLE, the calls for i-2 (maxAttempts = 2)")
+	result, err := prelabelItem(clientBg, "i-3", "flaky: a bird", "2026-10")
+	ctx.Equal(callsFor(ctx, "i-3"), 2, "i-3 failed UNAVAILABLE once: it must be sent a second time; the calls")
+	ctx.Assert(err == nil && result.Status == "prelabeled", "the second attempt for i-3 succeeded, prelabelItem answered %+v, %v", result, err)
+}
+
+func CheckDegradeUnlabeled(ctx *harness.Ctx) {
+	serveModel(ctx)
+	cases := [][3]string{{"i-1", "down: a dog", "UNAVAILABLE"}, {"i-2", "refuse: a cat", "INVALID_ARGUMENT"}}
+	for _, tc := range cases {
+		result, err := prelabelItem(clientBg, tc[0], tc[1], "2026-10")
+		ctx.Assert(err == nil, "with the model failing %s, prelabelItem returned the error %v. Answer an unlabeled item so the annotator labels it by hand", tc[2], err)
+		ctx.Assert(result.Status == "unlabeled" && len(result.Labels) == 0, "a failed pre-label answered %+v, expected status unlabeled with no labels", result)
+		ctx.Assert(strings.Contains(result.Error, tc[2]), "the unlabeled item's error is %q, expected the last status %s", result.Error, tc[2])
+		ctx.Equal(result.ItemID, tc[0], "the answer must name the item")
+	}
+	ok, err := prelabelItem(clientBg, "i-3", "a cat on a mat", "2026-10")
+	ctx.Assert(err == nil && ok.Status == "prelabeled" && len(ok.Labels) == 1 && ok.Labels[0] == "cat", "a healthy model's answer must come back prelabeled with its labels, got %+v, %v", ok, err)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <optional>
+#include <string>
+
+namespace {
+
+// Labels every item "cat", except: refuse:… is INVALID_ARGUMENT, down:… is UNAVAILABLE, flaky:… is
+// UNAVAILABLE on its first call.
+class ModelPeer final : public labeld::Prelabel::Service {
+ public:
+  std::map<std::string, int> seen;
+  grpc::Status Predict(grpc::ServerContext*, const labeld::PredictRequest* req, labeld::PredictResponse* out) override {
+    const int n = ++seen[req->item_id()];
+    const std::string& text = req->text();
+    if (text.rfind("refuse:", 0) == 0) return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "the item is outside the label spec");
+    if (text.rfind("down:", 0) == 0 || (text.rfind("flaky:", 0) == 0 && n == 1)) {
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "the model is restarting");
+    }
+    out->add_labels("cat");
+    out->set_model_version("m-7");
+    return grpc::Status::OK;
+  }
+};
+
+void serveModel(harness::Ctx& ctx) {
+  static ModelPeer* peer = nullptr;
+  delete peer;
+  peer = new ModelPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+}
+
+// What prelabelItem answered, or what it threw.
+struct Outcome {
+  std::optional<Prelabel> result;
+  std::string thrown;
+};
+
+Outcome call(const std::string& item_id, const std::string& text) {
+  try {
+    return {prelabelItem(item_id, text, "2026-10"), ""};
+  } catch (const std::exception& e) {
+    return {std::nullopt, e.what()};
+  }
+}
+
+int callsFor(harness::Ctx& ctx, const std::string& item_id) {
+  int n = 0;
+  for (const auto& c : ctx.GRPC.CallsTo("Predict")) {
+    if (c.Request<labeld::PredictRequest>().item_id() == item_id) n++;
+  }
+  return n;
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  serveModel(ctx);
+  call("i-1", "a cat on a mat");
+  const auto calls = ctx.GRPC.CallsTo("Predict");
+  ctx.Assert(!calls.empty(), "no Predict call reached the model");
+  for (const auto& c : calls) {
+    ctx.Assert(c.HasDeadline(), "a Predict call carries no deadline: a model that hangs holds the annotator's next item with it");
+    ctx.Assert(1.5 <= c.TimeoutSeconds() && c.TimeoutSeconds() <= 2.5, "a Predict call carries a %v s deadline, expected kDeadline = 2 s", c.TimeoutSeconds());
+  }
+  ctx.GRPC.SetLatency("Predict", 30.0);
+  const int64_t before = ctx.Clock.Now();
+  call("i-2", "a dog in the fog");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "with the model hanging, prelabelItem took %.0f s: at most two calls of 2 s each", waited);
+}
+
+void CheckRetryTransient(harness::Ctx& ctx) {
+  serveModel(ctx);
+  call("i-1", "refuse: a cat");
+  ctx.Equal(callsFor(ctx, "i-1"), 1, "the model refused i-1 (INVALID_ARGUMENT): a refusal answers the same way every time, call once; the calls");
+  call("i-2", "down: a dog");
+  ctx.Equal(callsFor(ctx, "i-2"), 2, "with the model UNAVAILABLE, the calls for i-2 (kMaxAttempts = 2)");
+  const Outcome flaky = call("i-3", "flaky: a bird");
+  ctx.Equal(callsFor(ctx, "i-3"), 2, "i-3 failed UNAVAILABLE once: it must be sent a second time; the calls");
+  ctx.Assert(flaky.result && flaky.result->status == "prelabeled", "the second attempt for i-3 succeeded, prelabelItem answered %s", flaky.result ? flaky.result->status : "an exception: " + flaky.thrown);
+}
+
+void CheckDegradeUnlabeled(harness::Ctx& ctx) {
+  serveModel(ctx);
+  const std::vector<std::vector<std::string>> cases = {{"i-1", "down: a dog", "UNAVAILABLE"}, {"i-2", "refuse: a cat", "INVALID_ARGUMENT"}};
+  for (const auto& tc : cases) {
+    const Outcome o = call(tc[0], tc[1]);
+    ctx.Assert(o.result.has_value(), "with the model failing %s, prelabelItem threw: %s. Answer an unlabeled item so the annotator labels it by hand", tc[2], o.thrown);
+    ctx.Assert(o.result->status == "unlabeled" && o.result->labels.empty(), "a failed pre-label answered status %q with %d labels, expected status unlabeled with no labels", o.result->status, o.result->labels.size());
+    ctx.Assert(o.result->error.find(tc[2]) != std::string::npos, "the unlabeled item's error is %q, expected the last status %s", o.result->error, tc[2]);
+    ctx.Equal(o.result->item_id, tc[0], "the answer must name the item");
+  }
+  const Outcome ok = call("i-3", "a cat on a mat");
+  ctx.Assert(ok.result && ok.result->status == "prelabeled" && ok.result->labels == std::vector<std::string>{"cat"}, "a healthy model's answer must come back prelabeled with its labels, got %s", ok.result ? ok.result->status : "an exception: " + ok.thrown);
+}
+`,
+  },
   hints: [
-    'During a model outage the next-item button spins, then shows an error page; the logs say only `prelabel failed`, no status code; a stale spec takes two full timeouts to fail.',
-    'The deadline constant is defined but not passed to `Predict`, so an attempt can hang; the loop retries on any exception, including refusals; the last error becomes a bare `RuntimeError` that escapes to the caller.',
-    "Pass `timeout=PRELABEL_DEADLINE_S` on the call, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, and on failure return the helper's unlabeled result with `prelabel_error` set to `code: details` instead of raising.",
+    'Make the model hang and the annotator waits as long as it does; make it refuse an item and it is asked three times; take it down and the annotator gets an error instead of an item.',
+    'The call has no deadline, the loop treats a refusal like a restart, and after the last attempt the function raises, so the caller has nothing to show the annotator.',
+    'Pass `timeout=DEADLINE_S` on every `Predict`; loop `MAX_ATTEMPTS = 2` times, break unless the code is `UNAVAILABLE` or `DEADLINE_EXCEEDED`; after the loop answer status `unlabeled`, no labels, `error` = "<STATUS>: <details>".',
   ],
-  debrief: `The deadline bounds a single attempt, \`MAX_ATTEMPTS\` bounds the whole call, the retryable set decides which failures deserve a second attempt, and the degrade path decides what the annotator sees. The deadline belongs on the call rather than around the loop because a bounded loop around an unbounded call is still an unbounded wait. A retried refusal is the subtle flaw: the code looks resilient, but \`FAILED_PRECONDITION\` from a stale spec fails identically the second time, so the retry only spends the deadline. Raising turns a cheap model's outage into idle time for the expensive human queue. Production clients also record \`model_version\` on every pre-label so agreement can be audited per model, keep a circuit breaker per model, and chart the unlabeled rate.`,
+  debrief: `A pre-label is a suggestion, so the client's job is to keep its cost bounded: one deadline per attempt, a second attempt only for a status that says the model might answer next time, and an unlabeled item when it does not. The status codes already separate a refusal from an outage; retrying a refusal only spends the deadline twice. Returning an unlabeled item instead of raising is what turns a model outage into slower labeling rather than a stopped queue. Production services add a circuit breaker so a dead model is skipped for a while instead of costing every item two deadlines, record which model version suggested which labels, and hide the suggestion from a share of annotators to measure how much it anchors them.`,
 };

@@ -1,91 +1,104 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * Prompt registry: the course is not "store a string in a database", it is the debugging you owe
- * a registry before it ships prompts into production. Immutable, hashed versions behind an
- * idempotent registration endpoint → an atomic Redis pointer swap with tenant pins and an audit
- * row → an eval-gated promotion that blocks on an unavailable evaluator → name-keyed lifecycle
- * events with an outbox → tenant-scoped, render-safe reads.
+ * Prompt registry: the debugging a registry owes before it serves prompts to production. Versions
+ * registered once under a content hash → a live pointer moved and rolled back by one Lua script →
+ * an eval gate where only a verdict opens the door, recorded by content hash → name-keyed lifecycle
+ * events with an outbox → reads that attach the eval of exactly these bytes and render values as
+ * text. The eval service is a deterministic stand-in the harness serves over gRPC.
  */
 export const promptRegistryProblem: Problem = {
   id: 'prompt-registry',
   title: 'Prompt Registry',
   tagline:
-    'Versioned prompt templates behind an atomic Redis pointer and an eval gate, debugged until a rollback lands on every reader.',
+    'Prompt versions under a content hash, moved live by one Lua script once an eval gate has a verdict to show.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Prompt Registry
 
-A prompt registry owns the text of every prompt as a versioned, immutable artifact: which version
-each tenant is served, what evidence justified a promotion, and how a rollback lands on every reader
-at once. The parts that decide whether the platform is safe are content identity, atomic promotion,
-the eval gate, and the read path that renders a template with caller-supplied values.
+A prompt registry owns the text a model is given: every template as a numbered version that keeps
+naming the same bytes, which version each tenant is served, the eval that justified the move, and
+the rollback when it goes wrong.
 
 ## The real system
 
-Langfuse's prompt management is a worked example: every save creates a new immutable version, and
-labels such as \`production\`, \`staging\` or a tenant name are pointers the application fetches by
-label, so promoting a version means moving the label rather than editing text in place. A registry
-built on that idea moves the pointer in one atomic operation with an audit row per swap, blocks a
-promotion when the evaluator is unavailable because an eval that did not run cannot be evidence,
-publishes lifecycle events keyed by prompt name with hashes instead of template text, and renders
-templates per tenant with escaping so a caller's value cannot rewrite the template.
+Langfuse's prompt management works this way: saving a prompt under an existing name creates a new
+version, and labels such as \`production\`, \`staging\` or a tenant name point at one version each.
+The application fetches by label, so promoting or rolling back moves a label instead of editing
+text, and templates fill \`{{variable}}\` slots at runtime. This course adds the eval gate in front
+of a move and the events that announce it.
 
 ## What you build here
 
-One service, **registryd**, with five pieces:
+One service, **registryd**, with five pieces sharing the \`prompts\` support package (\`config\`: the
+evaluator's address, the topic, the \`{{placeholder}}\` syntax, the key layout; the \`versions\`,
+\`evals\` and \`outbox\` stores; the \`LifecycleEvent\` record):
 
-1. \`POST /v1/prompts\`: authenticated tenant, a template capped at 32 KiB and an
-   \`Idempotency-Key\`. Versions are immutable (a different write of the same version is \`409\`),
-   placeholders are checked against an allowlist, and a replay returns the original content hash.
-2. A **Redis** pointer cache: \`pointer:{name}\` and a tenant's \`pin:{tenant}:{name}\`, pin
-   resolved first. One Lua \`EVAL\` writes pointer, audit entry and revision together.
-3. A **gRPC** eval gate: a 3-second deadline per \`EvalService.Evaluate\` call, at most three
-   attempts, retryable only on \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, a timeout or error blocks, a
-   \`failed\` verdict is terminal, and the gate is keyed by the content hash.
-4. A **Kafka** lifecycle path: events on \`prompt.lifecycle\` keyed by prompt name, an idempotent
-   producer with \`acks=all\`, no template text anywhere, and an outbox row when the broker rejects
-   the produce.
-5. \`GET /v1/prompts/{name}/versions/{v}\`: tenant-scoped reads returning the eval record of the
-   **exact content hash**, plus a render mode that validates and escapes every value.
+1. \`POST /v1/prompts\`: \`{name, version, template, variables}\` for \`X-Tenant-Id\`. At most 32 KiB,
+   placeholders equal to the declared, allowed variables, stored once with its SHA-256; the same
+   bytes resolve to the version holding them, other bytes under a taken number are 409.
+2. **The live pointer in Redis**: \`promote\` and \`rollback\` each run as one Lua script over
+   \`prompts:live\`, \`prompts:history\` and \`prompts:audit\`; only a registered version goes live, a
+   rollback restores the version live before, and readers read the pointer on every call.
+3. **The eval gate** (gRPC, \`Evaluator.Evaluate\`, a stand-in the checks serve): a 3-second deadline,
+   at most three attempts on \`UNAVAILABLE\` or \`DEADLINE_EXCEEDED\`, no verdict means blocked, a
+   failed verdict blocks at once, and every verdict is recorded under the content hash it judged.
+4. **Kafka**: moves on \`prompt.lifecycle\` keyed by prompt name, ids, hash and eval id without the
+   template, an idempotent producer with \`acks=all\`, and an outbox row from the delivery report.
+5. \`GET /v1/prompts/{name}/versions/{v}\` and its \`/render\`: 404 for a version the tenant lacks,
+   the eval of this version's hash, values checked and substituted in one pass.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, serves the happy path, and
-looks right. Debug it against the failure modes, fix it, and prove the fix with checks that fail on
-the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Prompt authoring UIs, approval workflows, per-model tokenizers, secret interpolation, eval dataset
-management, multi-region replication of the pointer, and billing.`,
+Prompt authoring UIs, approval workflows, per-model tokenizers, eval dataset management, the outbox
+relay, pointer replication across regions, and defenses against instructions smuggled inside a
+value, which belong on the model side.`,
   diagram: {
     nodes: [
-      {id: 'client', kind: 'client', label: 'Client', sub: 'register · read', x: 8, y: 50},
-      {id: 'registry', kind: 'http', label: 'Prompt Registry', sub: 'HTTPS :8443', x: 26, y: 50},
-      {id: 'db', kind: 'db', label: 'versions · evals', sub: 'immutable · hashed', x: 44, y: 12},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'pointer · pins', x: 44, y: 50},
-      {id: 'kafka', kind: 'kafka', label: 'prompt.lifecycle', sub: 'key = name', x: 44, y: 88},
-      {id: 'eval', kind: 'grpc', label: 'Eval service', sub: 'Evaluate · deadline 3 s', x: 66, y: 50},
-      {id: 'consumer', kind: 'service', label: 'Lifecycle consumer', sub: 'group lifecycle', x: 66, y: 88},
+      {id: 'client', kind: 'client', label: 'Client', sub: 'register · promote · read', x: 8, y: 50},
+      {id: 'registry', kind: 'http', label: 'registryd', sub: 'API + gate', x: 28, y: 50},
+      {
+        id: 'redis',
+        kind: 'redis',
+        label: 'Redis',
+        sub: 'versions · live · history · audit · evals · outbox',
+        x: 50,
+        y: 15,
+      },
+      {id: 'eval', kind: 'grpc', label: 'Evaluator', sub: 'Evaluate · 3 s', x: 50, y: 50},
+      {id: 'kafka', kind: 'kafka', label: 'prompt.lifecycle', sub: 'key = name', x: 50, y: 85},
+      {id: 'consumer', kind: 'service', label: 'Lifecycle consumer', sub: 'cache invalidation · audit', x: 76, y: 85},
     ],
     edges: [
-      {from: 'client', to: 'registry', kind: 'http', label: 'HTTPS'},
-      {from: 'registry', to: 'db', kind: 'plain', label: 'register · read version'},
-      {from: 'registry', to: 'redis', kind: 'redis', label: 'pointer · pins · audit'},
-      {from: 'registry', to: 'eval', kind: 'grpc', label: 'Evaluate · eval gate'},
-      {from: 'registry', to: 'kafka', kind: 'kafka', label: 'produce prompt.lifecycle'},
+      {from: 'client', to: 'registry', kind: 'http', label: 'POST / GET prompts'},
+      {from: 'registry', to: 'redis', kind: 'redis', label: 'SET NX version · EVAL promote · rollback'},
+      {from: 'registry', to: 'eval', kind: 'grpc', label: 'Evaluate'},
+      {from: 'registry', to: 'kafka', kind: 'kafka', label: 'produce (ids, hash)'},
       {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'redis', kind: 'redis', label: 'HINCRBY lifecycle'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

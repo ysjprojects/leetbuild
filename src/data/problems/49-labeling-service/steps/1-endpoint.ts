@@ -2,72 +2,46 @@ import type {Step} from '@/lib/types';
 
 export const taskEndpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/tasks: a labeling task with a real spec',
+  title: 'POST /v1/tasks: a labeling task pinned to a spec',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'service', 'db'],
+  focus: ['client', 'service', 'redis'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/tasks\` with body
-\`{"items": ["…", …], "spec_version": "2024-05-01", "reviewers": 3}\` (an item is the raw
-payload string), reads the tenant from \`X-Tenant-Id\`, mints a task id, hands every item to
-\`assign\` and answers \`201\` with the task id, \`reviewers\` and \`accepted\`. It serves the demo
-and hides 4 flaws.
+**Starting point.** The starter serves \`POST /v1/tasks\` on the task store (\`labeling.store\`,
+provided): it reads the tenant from \`X-Tenant-Id\` (401 without it), takes
+\`{"items": ["…"], "spec_version": "2026-10", "overlap": 3}\`, calls \`store.create_task\` and answers
+201 \`{task_id, spec_version, overlap, accepted, deduped}\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The demo posts five items under one spec and does not retry.
-Real clients retry, overlap batches and send any size, so the cohort that reaches the reviewers is
-not the one anyone agreed to pay for.
+**Failure mode the checks target.** A client that times out and retries gets a second task over the
+same items; a create without a spec version is pinned to \`latest\`, whatever that means next week;
+one request queues an empty batch, ten thousand items or an overlap of zero; and an item already
+queued under the spec is queued again, so annotators are paid twice for one answer.
 
-- Missing \`X-Tenant-Id\` is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). The task is stored under \`(tenant, key)\`
-  and a replay returns the stored task with **200**.
-- \`spec_version\` is required and non-blank (**400** otherwise); the task record is **pinned** to
-  it.
-- \`items\` is 1..\`MAX_BATCH_ITEMS = 200\` non-empty strings; \`reviewers\` is
-  \`MIN_REVIEWERS = 1\`..\`MAX_REVIEWERS = 5\` (**400** otherwise).
-- Dedup by content hash: \`content_hash(item)\` is the sha256 hex of the UTF-8 bytes. Items whose
-  hash the store already holds under the same spec, and repeats inside the batch, are dropped and
-  counted in \`deduped\`; when nothing new remains answer **409** \`{"error": "no_new_items"}\`.
-  Dedup happens **before** assignment.
-- **201** response: \`{"task_id", "spec_version", "reviewers", "accepted", "deduped"}\`.`,
+- \`Idempotency-Key\` is required (400). When \`store.create_result(tenant, key)\` holds an answer,
+  reply with it and 200; record a fresh 201 answer with \`store.record_create\`.
+- \`spec_version\` is required and not blank (400); the task is pinned to it.
+- \`items\` is 1..\`MAX_BATCH_ITEMS\` = 200 non-empty strings, \`overlap\` 1..\`MAX_OVERLAP\` = 5 (400).
+- \`content_hash(item)\` is the SHA-256 hex of the UTF-8 bytes. Drop items whose hash
+  \`store.seen_hashes(spec_version)\` holds or the batch repeats, count them in \`deduped\` and register
+  the new ones with \`store.add_hashes\`; when nothing new is left, answer 409
+  \`{"error": "no_new_items"}\`.`,
   sequence: {
     participants: ['Client', 'labeld', 'task store'],
     messages: [
-      {
-        from: 'Client',
-        to: 'labeld',
-        label: 'POST /v1/tasks · X-Tenant-Id · Idempotency-Key · {items, spec_version, reviewers}',
-        kind: 'sync',
-      },
-      {
-        from: 'labeld',
-        to: 'labeld',
-        label: 'validate tenant · spec_version · items ≤ 200 · reviewers 1..5',
-        kind: 'sync',
-      },
-      {from: 'labeld', to: 'task store', label: 'get_by_key(tenant, Idempotency-Key)', kind: 'sync'},
-      {from: 'task store', to: 'labeld', label: 'stored task / none', kind: 'reply'},
-      {
-        from: 'labeld',
-        to: 'labeld',
-        label: 'content_hash(item) · drop hashes already queued under spec_version',
-        kind: 'sync',
-      },
+      {from: 'Client', to: 'labeld', label: 'POST /v1/tasks · X-Tenant-Id · Idempotency-Key', kind: 'sync'},
+      {from: 'labeld', to: 'task store', label: 'create_result(tenant, key) → recorded answer / none', kind: 'sync'},
+      {from: 'labeld', to: 'labeld', label: 'spec_version · items 1..200 · overlap 1..5 → 400', kind: 'sync'},
       {
         from: 'labeld',
         to: 'task store',
-        label: 'put(tenant, key, task pinned to spec_version, new hashes)',
-        kind: 'async',
+        label: 'seen_hashes(spec_version) · drop repeats → 409 no_new_items',
+        kind: 'sync',
       },
-      {from: 'labeld', to: 'Client', label: '201 {task_id, spec_version, reviewers, accepted, deduped}', kind: 'reply'},
-      {from: 'Client', to: 'labeld', label: 'POST /v1/tasks · same Idempotency-Key (retry)', kind: 'sync'},
-      {from: 'labeld', to: 'Client', label: '200 stored task — no second cohort', kind: 'reply'},
-      {
-        from: 'labeld',
-        to: 'Client',
-        label: '409 {error: no_new_items} when every hash is already queued',
-        kind: 'reply',
-      },
+      {from: 'labeld', to: 'task store', label: 'create_task · add_hashes · record_create', kind: 'sync'},
+      {from: 'labeld', to: 'Client', label: '201 {task_id, spec_version, overlap, accepted, deduped}', kind: 'reply'},
+      {from: 'Client', to: 'labeld', label: 'retry · same Idempotency-Key', kind: 'sync'},
+      {from: 'labeld', to: 'Client', label: '200 the recorded answer, no second task', kind: 'reply'},
     ],
   },
   checks: [
@@ -87,37 +61,33 @@ not the one anyone agreed to pay for.
       id: 'spec-pinned',
       title: 'Requires and pins the label spec version',
       detail:
-        'A create without a non-blank `spec_version` is **400**, and the stored task record carries the version it was created under so every reviewer answers the same frozen question. The starter neither reads the field nor pins it, so the cohort silently follows whatever spec is current.',
+        'A create without a non-blank `spec_version` is **400** and leaves no task; the stored task carries the version it was created under. The starter falls back to `latest`, so the cohort answers whatever the spec says next week.',
       match: {
-        python: {
-          all: [/spec_version/, /status_code\s*=\s*400/, /"spec_version":\s*body\.spec_version/],
-        },
-        typescript: {all: [/spec_version/, /code\(\s*400\s*\)/, /spec_version:\s*specVersion/]},
-        go: {all: [/SpecVersion/, /StatusBadRequest/, /"spec_version":\s*body\.SpecVersion/]},
-        scala: {all: [/Task\([^;]*body\.spec_version/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/spec_version/, /\b400\b/, /\{"spec_version",\s*specVersion\}/]},
+        python: {all: [/spec_version\.strip\(\)|spec_version\.isspace\(\)/], none: [/["']latest["']/]},
+        typescript: {all: [/spec_version\.trim\(\)/], none: [/['"]latest['"]/]},
+        go: {all: [/strings\.TrimSpace\([^)\n]*SpecVersion/], none: [/"latest"/]},
+        scala: {all: [/\.trim\.isEmpty|\.isBlank/], none: [/"latest"/]},
+        cpp: {all: [/find_first_not_of\(/], none: [/"latest"/]},
       },
     },
     {
       id: 'batch-bounds',
-      title: 'Bounds the batch size and the reviewer count',
+      title: 'Bounds the batch size and the overlap',
       detail:
-        '`items` is 1..`MAX_BATCH_ITEMS = 200` non-empty strings and `reviewers` is `MIN_REVIEWERS`..`MAX_REVIEWERS`, both **400** outside the range. The starter carries no caps and no named limits at all, so one request can enqueue a million items or ask for a cohort of zero reviewers.',
+        '`items` is 1..`MAX_BATCH_ITEMS` (200) non-empty strings and `overlap` 1..`MAX_OVERLAP` (5), both **400** outside the range with no task written. The starter takes any size, so one request can queue an empty task or ask for zero annotators per item.',
       match: {
         python: {
-          all: [/MAX_BATCH_ITEMS\s*=\s*200/, /MIN_REVIEWERS\s*=\s*1/, /MAX_REVIEWERS\s*=\s*5/, /status_code\s*=\s*400/],
+          all: [/MAX_BATCH_ITEMS\s*=\s*200/, /MAX_OVERLAP\s*=\s*5/, /[<>]=?\s*MAX_BATCH_ITEMS/, /[<>]=?\s*MAX_OVERLAP/],
         },
         typescript: {
-          all: [/MAX_BATCH_ITEMS\s*=\s*200/, /MIN_REVIEWERS\s*=\s*1/, /MAX_REVIEWERS\s*=\s*5/, /code\(\s*400\s*\)/],
+          all: [/MAX_BATCH_ITEMS\s*=\s*200/, /MAX_OVERLAP\s*=\s*5/, /[<>]=?\s*MAX_BATCH_ITEMS/, /[<>]=?\s*MAX_OVERLAP/],
         },
-        go: {
-          all: [/maxBatchItems\s*=\s*200/, /minReviewers\s*=\s*1/, /maxReviewers\s*=\s*5/, /StatusBadRequest/],
-        },
+        go: {all: [/maxBatchItems\s*=\s*200/, /maxOverlap\s*=\s*5/, /[<>]=?\s*maxBatchItems/, /[<>]=?\s*maxOverlap/]},
         scala: {
-          all: [/MaxBatchItems\s*=\s*200/, /MinReviewers\s*=\s*1/, /MaxReviewers\s*=\s*5/, /StatusCodes\.BadRequest/],
+          all: [/MaxBatchItems\s*=\s*200/, /MaxOverlap\s*=\s*5/, /[<>]=?\s*MaxBatchItems/, /[<>]=?\s*MaxOverlap/],
         },
         cpp: {
-          all: [/kMaxBatchItems\s*=\s*200/, /kMinReviewers\s*=\s*1/, /kMaxReviewers\s*=\s*5/, /\b400\b/],
+          all: [/kMaxBatchItems\s*=\s*200/, /kMaxOverlap\s*=\s*5/, /[<>]=?\s*kMaxBatchItems/, /[<>]=?\s*kMaxOverlap/],
         },
       },
     },
@@ -125,316 +95,253 @@ not the one anyone agreed to pay for.
       id: 'content-dedupe',
       title: 'Dedupes items by content hash under the spec',
       detail:
-        'Items are hashed with `content_hash` (sha256 hex of the UTF-8 bytes) and dropped when the spec already queued that hash or the batch repeats it; every drop is counted in `deduped` and an all-duplicate batch answers **409 `{"error": "no_new_items"}`** before anything is written. The starter computes no hash, so a retry re-queues every item.',
+        'Items are hashed (SHA-256 hex of the UTF-8 bytes) and dropped when `seen_hashes` holds the hash or the batch repeats it; drops are counted in `deduped`, the new hashes registered with `add_hashes`, and a batch with nothing new answers **409 `{"error": "no_new_items"}`**. The starter hashes nothing, so every retry and overlapping batch is queued again.',
       match: {
-        python: {
-          all: [/def content_hash\(/, /hashlib\.sha256/, /seen_hashes\(/, /no_new_items/, /status_code\s*=\s*409/],
-        },
+        python: {all: [/hashlib\.sha256\(/, /store\.seen_hashes\(/, /store\.add_hashes\(/, /no_new_items/, /\b409\b/]},
         typescript: {
-          all: [
-            /function contentHash\(/,
-            /createHash\(\s*'sha256'\s*\)/,
-            /seenHashes\(/,
-            /no_new_items/,
-            /code\(\s*409\s*\)/,
-          ],
+          all: [/createHash\(\s*['"]sha256['"]\s*\)/, /seenHashes\(/, /addHashes\(/, /no_new_items/, /\b409\b/],
         },
         go: {
-          all: [/func contentHash\(/, /sha256\.Sum256/, /SeenHashes\(/, /no_new_items/, /StatusConflict/],
+          all: [
+            /sha256\.Sum256\(/,
+            /store\.SeenHashes\(/,
+            /store\.AddHashes\(/,
+            /no_new_items/,
+            /StatusConflict|\b409\b/,
+          ],
         },
         scala: {
           all: [
-            /def contentHash\(/,
-            /MessageDigest\.getInstance\("SHA-256"\)/,
-            /seenHashes\(/,
+            /MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/,
+            /Store\.seenHashes\(/,
+            /Store\.addHashes\(/,
             /no_new_items/,
-            /StatusCodes\.Conflict/,
+            /Conflict|\b409\b/,
           ],
         },
-        cpp: {all: [/content_hash\(/, /sha256_hex\(/, /seenHashes\(/, /no_new_items/, /\b409\b/]},
+        cpp: {all: [/SHA256\(/, /store::seenHashes\(/, /store::addHashes\(/, /no_new_items/, /\b409\b/]},
       },
     },
     {
       id: 'idempotent-create',
-      title: 'A replayed create reuses the task',
+      title: 'A retried create answers the recorded task',
       detail:
-        '`Idempotency-Key` is required (**400** when missing); the task is stored under `(tenant, key)` and a replay returns the stored task with **200** instead of creating a competing cohort over the same items. The starter ignores the header entirely, so every client retry queues a second task.',
+        '`Idempotency-Key` is required (**400**); the answer recorded for `(tenant, key)` is looked up before a task is created and replayed with **200**, and a fresh create records its answer. The starter ignores the header, so every client retry queues a second task.',
       match: {
         python: {
-          all: [/Idempotency-Key/, /store\.get_by_key\(tenant, idem_key\)/, /store\.put\(/, /status_code\s*=\s*200/],
+          all: [/idempotency-key/i, /store\.create_result\(/, /store\.record_create\(/],
+          order: [/store\.create_result\(/, /store\.create_task\(/],
         },
         typescript: {
-          all: [/Idempotency-Key/, /store\.getByKey\(tenant, idemKey\)/, /store\.put\(/, /code\(\s*200\s*\)/],
+          all: [/idempotency-key/i, /createResult\(/, /recordCreate\(/],
+          order: [/createResult\(/, /createTask\(/],
         },
         go: {
-          all: [/Idempotency-Key/, /store\.GetByKey\(ctx, tenant, idemKey\)/, /store\.Put\(/, /StatusOK/],
+          all: [/Idempotency-Key/i, /store\.CreateResult\(/, /store\.RecordCreate\(/],
+          order: [/store\.CreateResult\(/, /store\.CreateTask\(/],
         },
-        scala: {all: [/Idempotency-Key/, /getByKey\(tenant, idemKey\)/, /store\.put\(/, /StatusCodes\.OK/]},
-        cpp: {all: [/Idempotency-Key/, /getByKey\(tenant, idemKey\)/, /store\.put\(/, /\b200\b/]},
+        scala: {
+          all: [/Idempotency-Key/i, /Store\.createResult\(/, /Store\.recordCreate\(/],
+          order: [/Store\.createResult\(/, /Store\.createTask\(/],
+        },
+        cpp: {
+          all: [/Idempotency-Key/i, /store::createResult\(/, /store::recordCreate\(/],
+          order: [/store::createResult\(/, /store::createTask\(/],
+        },
       },
     },
   ],
   code: {
     python: {
-      starter: `import uuid
-
-from fastapi import FastAPI, Header
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+
+from labeling import store  # create_task, seen_hashes, add_hashes, create_result, record_create
 
 app = FastAPI()
 
 
-class TaskRequest(BaseModel):
+class TaskCreate(BaseModel):
     items: list[str] = []
     spec_version: str = ""
-    reviewers: int = 0
+    overlap: int = 1
 
 
-def assign(tenant: str, task_id: str, items: list[str]) -> None:
-    """Hand the items to the reviewers; a rejected request must never reach this."""
-    raise NotImplementedError
-
-
-@app.post("/v1/tasks")
-def create_task(body: TaskRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    task_id = str(uuid.uuid4())
-    assign(tenant, task_id, body.items)
-    return {"task_id": task_id, "reviewers": body.reviewers, "accepted": len(body.items)}
+@app.post("/v1/tasks", status_code=201)
+def create_task(body: TaskCreate, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    spec_version = body.spec_version or "latest"
+    task = store.create_task(tenant, spec_version, body.overlap, body.items)
+    return {
+        "task_id": task["task_id"],
+        "spec_version": task["spec_version"],
+        "overlap": task["overlap"],
+        "accepted": len(body.items),
+        "deduped": 0,
+    }
 `,
       solution: `import hashlib
-import logging
-import uuid
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from labeling import store  # create_task, seen_hashes, add_hashes, create_result, record_create
+
 app = FastAPI()
-logger = logging.getLogger("labeld")
 
 MAX_BATCH_ITEMS = 200
-MIN_REVIEWERS = 1
-MAX_REVIEWERS = 5
+MAX_OVERLAP = 5
 
 
-class TaskRequest(BaseModel):
-    """An item is the raw payload string; it never reaches the response or the logs."""
-
+class TaskCreate(BaseModel):
     items: list[str] = []
     spec_version: str = ""
-    reviewers: int = 0
-
-
-class TaskStore:
-    def get_by_key(self, tenant: str, idem_key: str) -> dict | None:
-        """The task stored under (tenant, key), if any."""
-        raise NotImplementedError
-
-    def seen_hashes(self, spec_version: str) -> set[str]:
-        """Content hashes already queued under this spec version."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, task: dict, hashes: list[str]) -> None:
-        """Store the task under (tenant, key) and register its item hashes under the spec."""
-        raise NotImplementedError
-
-
-store = TaskStore()
+    overlap: int = 1
 
 
 def content_hash(item: str) -> str:
     return hashlib.sha256(item.encode("utf-8")).hexdigest()
 
 
-def validate(body: TaskRequest) -> None:
-    if body.spec_version.strip() == "":
-        raise HTTPException(status_code=400, detail="spec_version must be a non-empty string")
-    if not body.items or len(body.items) > MAX_BATCH_ITEMS or any(item == "" for item in body.items):
-        raise HTTPException(status_code=400, detail="items must be 1..200 non-empty strings")
-    if not MIN_REVIEWERS <= body.reviewers <= MAX_REVIEWERS:
-        raise HTTPException(status_code=400, detail="reviewers must be 1..5")
-
-
-@app.post("/v1/tasks")
-def create_task(
-    body: TaskRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if idem_key is None or idem_key == "":
+@app.post("/v1/tasks", status_code=201)
+def create_task(body: TaskCreate, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    key = request.headers.get("idempotency-key", "")
+    if not key:
         raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    validate(body)
-
-    stored = store.get_by_key(tenant, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=200)
-
+    recorded = store.create_result(tenant, key)
+    if recorded is not None:
+        return JSONResponse(recorded, status_code=200)  # a retry answers what the first attempt answered
+    if not body.spec_version.strip():
+        raise HTTPException(status_code=400, detail="spec_version is required")
+    if not 1 <= len(body.items) <= MAX_BATCH_ITEMS or "" in body.items:
+        raise HTTPException(status_code=400, detail=f"items must be 1..{MAX_BATCH_ITEMS} non-empty strings")
+    if not 1 <= body.overlap <= MAX_OVERLAP:
+        raise HTTPException(status_code=400, detail=f"overlap must be 1..{MAX_OVERLAP}")
+    # The bytes are the question: an item already queued under this spec, or repeated here, is dropped.
     seen = store.seen_hashes(body.spec_version)
-    accepted: list[str] = []
-    hashes: list[str] = []
-    deduped = 0
+    fresh, hashes = [], []
     for item in body.items:
         digest = content_hash(item)
         if digest in seen:
-            deduped += 1
             continue
         seen.add(digest)
-        accepted.append(item)
+        fresh.append(item)
         hashes.append(digest)
-    if not accepted:
+    if not fresh:
         return JSONResponse({"error": "no_new_items"}, status_code=409)
-
-    task = {
-        "task_id": str(uuid.uuid4()),
-        "spec_version": body.spec_version,
-        "reviewers": body.reviewers,
-        "accepted": len(accepted),
-        "deduped": deduped,
+    task = store.create_task(tenant, body.spec_version, body.overlap, fresh)
+    store.add_hashes(body.spec_version, hashes)
+    result = {
+        "task_id": task["task_id"],
+        "spec_version": task["spec_version"],
+        "overlap": task["overlap"],
+        "accepted": len(fresh),
+        "deduped": len(body.items) - len(fresh),
     }
-    store.put(tenant, idem_key, task, hashes)
-    logger.info("task created tenant=%s task_id=%s spec=%s", tenant, task["task_id"], body.spec_version)
-    return JSONResponse(task, status_code=201)
+    store.record_create(tenant, key, result)
+    return JSONResponse(result, status_code=201)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/tasks. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {addHashes, createResult, createTask, recordCreate, seenHashes} from 'labeling/store';
 
 export const app = Fastify();
 
-interface TaskBody {
-  items: string[];
+interface TaskCreate {
+  items?: string[];
   spec_version?: string;
-  reviewers?: number;
-}
-
-async function assign(tenant: string, taskId: string, items: string[]): Promise<void> {
-  void tenant;
-  void taskId;
-  void items;
+  overlap?: number;
 }
 
 app.post('/v1/tasks', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as TaskBody;
-  const taskId = randomUUID();
-  await assign(tenant, taskId, body.items);
-  return reply.code(201).send({task_id: taskId, reviewers: body.reviewers, accepted: body.items.length});
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const body = (request.body ?? {}) as TaskCreate;
+  const items = body.items ?? [];
+  const specVersion = body.spec_version || 'latest';
+  const task = await createTask(tenant, specVersion, body.overlap ?? 1, items);
+  return reply.code(201).send({
+    task_id: task.task_id,
+    spec_version: task.spec_version,
+    overlap: task.overlap,
+    accepted: items.length,
+    deduped: 0,
+  });
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/tasks: one validated, idempotent labeling task per (tenant, key). */
-import {createHash, randomUUID} from 'node:crypto';
+      solution: `import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';
 
+import {addHashes, createResult, createTask, recordCreate, seenHashes} from 'labeling/store';
+
 export const app = Fastify();
 
-const MAX_BATCH_ITEMS = 200;
-const MIN_REVIEWERS = 1;
-const MAX_REVIEWERS = 5;
+export const MAX_BATCH_ITEMS = 200;
+export const MAX_OVERLAP = 5;
 
-interface TaskBody {
-  items?: string[];
-  spec_version?: string;
-  reviewers?: number;
+interface TaskCreate {
+  items?: unknown[];
+  spec_version?: unknown;
+  overlap?: number;
 }
 
-interface Task {
-  task_id: string;
-  spec_version: string;
-  reviewers: number;
-  accepted: number;
-  deduped: number;
-}
-
-class TaskStore {
-  async getByKey(tenant: string, idemKey: string): Promise<Task | null> {
-    throw new Error('task store not configured');
-  }
-
-  async seenHashes(specVersion: string): Promise<Set<string>> {
-    throw new Error('task store not configured');
-  }
-
-  async put(tenant: string, idemKey: string, task: Task, hashes: string[]): Promise<void> {
-    throw new Error('task store not configured');
-  }
-}
-
-const store = new TaskStore();
-
-function contentHash(item: string): string {
-  return createHash('sha256').update(item, 'utf8').digest('hex');
-}
+export const contentHash = (item: string): string => createHash('sha256').update(item, 'utf8').digest('hex');
 
 app.post('/v1/tasks', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<TaskBody> | null;
-  const specVersion = body?.spec_version;
-  if (typeof specVersion !== 'string' || specVersion.trim() === '')
-    return reply.code(400).send({error: 'spec_version must be a non-empty string'});
-  const items = body?.items;
-  if (
-    !Array.isArray(items) ||
-    items.length === 0 ||
-    items.length > MAX_BATCH_ITEMS ||
-    items.some((item: string) => typeof item !== 'string' || item === '')
-  )
-    return reply.code(400).send({error: 'items must be 1..200 non-empty strings'});
-  const reviewers = body?.reviewers;
-  if (
-    typeof reviewers !== 'number' ||
-    !Number.isInteger(reviewers) ||
-    reviewers < MIN_REVIEWERS ||
-    reviewers > MAX_REVIEWERS
-  )
-    return reply.code(400).send({error: 'reviewers must be 1..5'});
-
-  const stored = await store.getByKey(tenant, idemKey);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  const seen = await store.seenHashes(specVersion);
-  const accepted: string[] = [];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const recorded = await createResult(tenant, key);
+  if (recorded !== null) return reply.code(200).send(recorded); // a retry answers what the first attempt answered
+  const body = (request.body ?? {}) as TaskCreate;
+  if (typeof body.spec_version !== 'string' || body.spec_version.trim() === '') {
+    return reply.code(400).send({error: 'spec_version is required'});
+  }
+  const specVersion = body.spec_version;
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (items.length < 1 || items.length > MAX_BATCH_ITEMS || items.some(item => typeof item !== 'string' || item === '')) {
+    return reply.code(400).send({error: \`items must be 1..\${MAX_BATCH_ITEMS} non-empty strings\`});
+  }
+  const overlap = body.overlap ?? 1;
+  if (!Number.isInteger(overlap) || overlap < 1 || overlap > MAX_OVERLAP) {
+    return reply.code(400).send({error: \`overlap must be 1..\${MAX_OVERLAP}\`});
+  }
+  // The bytes are the question: an item already queued under this spec, or repeated here, is dropped.
+  const seen = await seenHashes(specVersion);
+  const fresh: string[] = [];
   const hashes: string[] = [];
-  let deduped = 0;
-  for (const item of items) {
+  for (const item of items as string[]) {
     const digest = contentHash(item);
-    if (seen.has(digest)) {
-      deduped += 1;
-      continue;
-    }
+    if (seen.has(digest)) continue;
     seen.add(digest);
-    accepted.push(item);
+    fresh.push(item);
     hashes.push(digest);
   }
-  if (accepted.length === 0) return reply.code(409).send({error: 'no_new_items'});
-
-  const task: Task = {
-    task_id: randomUUID(),
-    spec_version: specVersion,
-    reviewers,
-    accepted: accepted.length,
-    deduped,
+  if (fresh.length === 0) return reply.code(409).send({error: 'no_new_items'});
+  const task = await createTask(tenant, specVersion, overlap, fresh);
+  await addHashes(specVersion, hashes);
+  const result = {
+    task_id: task.task_id,
+    spec_version: task.spec_version,
+    overlap: task.overlap,
+    accepted: fresh.length,
+    deduped: items.length - fresh.length,
   };
-  await store.put(tenant, idemKey, task, hashes);
-  request.log.info({tenant, task_id: task.task_id, spec: specVersion}, 'task created');
-  return reply.code(201).send(task);
+  await recordCreate(tenant, key, result);
+  return reply.code(201).send(result);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -442,326 +349,250 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 
-	"github.com/google/uuid"
+	"labeling/store" // store.CreateTask, SeenHashes, AddHashes, CreateResult, RecordCreate
 )
 
-type TaskRequest struct {
+type taskCreate struct {
 	Items       []string \`json:"items"\`
 	SpecVersion string   \`json:"spec_version"\`
-	Reviewers   int      \`json:"reviewers"\`
+	Overlap     int      \`json:"overlap"\`
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func assign(tenant, taskID string, items []string) {}
-
 func createTask(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	var body TaskRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	taskID := uuid.NewString()
-	assign(tenant, taskID, body.Items)
+	body := taskCreate{Overlap: 1}
+	json.NewDecoder(r.Body).Decode(&body)
+	specVersion := body.SpecVersion
+	if specVersion == "" {
+		specVersion = "latest"
+	}
+	task := store.CreateTask(r.Context(), tenant, specVersion, body.Overlap, body.Items)
 	writeJSON(rw, http.StatusCreated, map[string]any{
-		"task_id":   taskID,
-		"reviewers": body.Reviewers,
-		"accepted":  len(body.Items),
+		"task_id": task.TaskID, "spec_version": task.SpecVersion, "overlap": task.Overlap, "accepted": len(body.Items), "deduped": 0,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/tasks", createTask)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
 	"strings"
 
-	"github.com/google/uuid"
+	"labeling/store" // store.CreateTask, SeenHashes, AddHashes, CreateResult, RecordCreate
 )
 
 const (
 	maxBatchItems = 200
-	minReviewers  = 1
-	maxReviewers  = 5
+	maxOverlap    = 5
 )
 
-type TaskRequest struct {
+type taskCreate struct {
 	Items       []string \`json:"items"\`
 	SpecVersion string   \`json:"spec_version"\`
-	Reviewers   int      \`json:"reviewers"\`
+	Overlap     int      \`json:"overlap"\`
 }
 
-type TaskStore struct{}
-
-func (s *TaskStore) GetByKey(ctx context.Context, tenant, idemKey string) (map[string]any, error) {
-	return nil, nil
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
-
-func (s *TaskStore) SeenHashes(ctx context.Context, specVersion string) (map[string]bool, error) {
-	return nil, nil
-}
-
-func (s *TaskStore) Put(ctx context.Context, tenant, idemKey string, task map[string]any, hashes []string) error {
-	return nil
-}
-
-var store = &TaskStore{}
 
 func contentHash(item string) string {
 	sum := sha256.Sum256([]byte(item))
 	return hex.EncodeToString(sum[:])
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+func validItems(items []string) bool {
+	if len(items) < 1 || len(items) > maxBatchItems {
+		return false
+	}
+	for _, item := range items {
+		if item == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func createTask(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		http.Error(rw, "Idempotency-Key is required", http.StatusBadRequest)
 		return
 	}
-	var body TaskRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if recorded := store.CreateResult(r.Context(), tenant, key); recorded != nil {
+		writeJSON(rw, http.StatusOK, recorded) // a retry answers what the first attempt answered
 		return
 	}
+	body := taskCreate{Overlap: 1}
+	json.NewDecoder(r.Body).Decode(&body)
 	if strings.TrimSpace(body.SpecVersion) == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "spec_version must be a non-empty string"})
+		http.Error(rw, "spec_version is required", http.StatusBadRequest)
 		return
 	}
-	if len(body.Items) < 1 || len(body.Items) > maxBatchItems {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "items must be 1..200 non-empty strings"})
+	if !validItems(body.Items) {
+		http.Error(rw, fmt.Sprintf("items must be 1..%d non-empty strings", maxBatchItems), http.StatusBadRequest)
 		return
 	}
-	for _, item := range body.Items {
-		if item == "" {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "items must be 1..200 non-empty strings"})
-			return
-		}
-	}
-	if body.Reviewers < minReviewers || body.Reviewers > maxReviewers {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "reviewers must be 1..5"})
+	if body.Overlap < 1 || body.Overlap > maxOverlap {
+		http.Error(rw, fmt.Sprintf("overlap must be 1..%d", maxOverlap), http.StatusBadRequest)
 		return
 	}
-	ctx := r.Context()
-	stored, err := store.GetByKey(ctx, tenant, idemKey)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
-		return
-	}
-	seen, err := store.SeenHashes(ctx, body.SpecVersion)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	accepted := make([]string, 0, len(body.Items))
-	hashes := make([]string, 0, len(body.Items))
-	deduped := 0
+	// The bytes are the question: an item already queued under this spec, or repeated here, is dropped.
+	seen := store.SeenHashes(r.Context(), body.SpecVersion)
+	var fresh, hashes []string
 	for _, item := range body.Items {
 		digest := contentHash(item)
 		if seen[digest] {
-			deduped++
 			continue
 		}
 		seen[digest] = true
-		accepted = append(accepted, item)
+		fresh = append(fresh, item)
 		hashes = append(hashes, digest)
 	}
-	if len(accepted) == 0 {
+	if len(fresh) == 0 {
 		writeJSON(rw, http.StatusConflict, map[string]string{"error": "no_new_items"})
 		return
 	}
-	task := map[string]any{
-		"task_id":      uuid.NewString(),
-		"spec_version": body.SpecVersion,
-		"reviewers":    body.Reviewers,
-		"accepted":     len(accepted),
-		"deduped":      deduped,
+	task := store.CreateTask(r.Context(), tenant, body.SpecVersion, body.Overlap, fresh)
+	store.AddHashes(r.Context(), body.SpecVersion, hashes)
+	result := map[string]any{
+		"task_id": task.TaskID, "spec_version": task.SpecVersion, "overlap": task.Overlap,
+		"accepted": len(fresh), "deduped": len(body.Items) - len(fresh),
 	}
-	if err := store.Put(ctx, tenant, idemKey, task, hashes); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("task created tenant=%s task_id=%s spec=%s", tenant, task["task_id"], body.SpecVersion)
-	writeJSON(rw, http.StatusCreated, task)
+	store.RecordCreate(r.Context(), tenant, key, result)
+	writeJSON(rw, http.StatusCreated, result)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/tasks", createTask)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class TaskRequest(items: List[String], spec_version: String, reviewers: Int)
+import labeling.Store // Store.createTask, seenHashes, addHashes, createResult, recordCreate
 
-object LabelApi {
-  implicit val system: ActorSystem = ActorSystem("labeld")
-  implicit val requestFormat: RootJsonFormat[TaskRequest] = jsonFormat3(TaskRequest)
-
-  def assign(tenant: String, taskId: String, items: List[String]): Unit = ()
+object Api {
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
   val route: Route =
     path("v1" / "tasks") {
       post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[TaskRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val taskId = UUID.randomUUID().toString
-            assign(tenant, taskId, body.items)
-            complete(
-              StatusCodes.Created,
-              s"""{"task_id":"$taskId","reviewers":\${body.reviewers},"accepted":\${body.items.size}}"""
-            )
-          }
+        optionalHeaderValueByName("X-Tenant-Id") {
+          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+          case Some(tenant) =>
+            entity(as[String]) { raw =>
+              // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+              val fields = raw.parseJson.asJsObject.fields
+              val items = fields.get("items").collect { case JsArray(xs) => xs.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
+              val specVersion = fields.get("spec_version").collect { case JsString(s) if s.nonEmpty => s }.getOrElse("latest")
+              val overlap = fields.get("overlap").collect { case JsNumber(n) => n.toInt }.getOrElse(1)
+              val task = Store.createTask(tenant, specVersion, overlap, items)
+              complete(json(StatusCodes.Created, JsObject(
+                "task_id" -> JsString(task.taskId), "spec_version" -> JsString(task.specVersion), "overlap" -> JsNumber(task.overlap),
+                "accepted" -> JsNumber(items.size), "deduped" -> JsNumber(0))))
+            }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
       solution: `import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
-import java.util.UUID
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class TaskRequest(items: List[String], spec_version: String, reviewers: Int)
-final case class Task(task_id: String, spec_version: String, reviewers: Int, accepted: Int, deduped: Int)
+import labeling.Store // Store.createTask, seenHashes, addHashes, createResult, recordCreate
 
-object TaskStore {
-  def getByKey(tenant: String, idemKey: String): Option[String] = None
-  def seenHashes(specVersion: String): Set[String] = Set.empty
-  def put(tenant: String, idemKey: String, task: String, hashes: Set[String]): Unit = ()
-}
-
-object LabelApi {
-  implicit val system: ActorSystem = ActorSystem("labeld")
-  implicit val requestFormat: RootJsonFormat[TaskRequest] = jsonFormat3(TaskRequest)
-  implicit val taskFormat: RootJsonFormat[Task] = jsonFormat5(Task)
-
+object Api {
   val MaxBatchItems = 200
-  val MinReviewers = 1
-  val MaxReviewers = 5
+  val MaxOverlap = 5
 
-  val store = TaskStore
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
   def contentHash(item: String): String =
     MessageDigest.getInstance("SHA-256").digest(item.getBytes(StandardCharsets.UTF_8)).map("%02x".format(_)).mkString
 
-  def dedupe(items: List[String], seen: Set[String]): (List[String], Int, Set[String]) = {
-    var accepted = List.empty[String]
-    var hashes = Set.empty[String]
-    var deduped = 0
-    items.foreach { item =>
-      val digest = contentHash(item)
-      if (seen.contains(digest) || hashes.contains(digest)) {
-        deduped += 1
-      } else {
-        hashes += digest
-        accepted = accepted :+ item
-      }
-    }
-    (accepted, deduped, hashes)
-  }
-
   val route: Route =
     path("v1" / "tasks") {
       post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[TaskRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.spec_version.trim.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"spec_version must be a non-empty string"}""")
-              } else if (body.items.isEmpty || body.items.length > MaxBatchItems || body.items.exists(_.isEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"items must be 1..200 non-empty strings"}""")
-              } else if (body.reviewers < MinReviewers || body.reviewers > MaxReviewers) {
-                complete(StatusCodes.BadRequest, """{"error":"reviewers must be 1..5"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                store.getByKey(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
-                  case None =>
-                    val (accepted, deduped, hashes) = dedupe(body.items, store.seenHashes(body.spec_version))
-                    if (accepted.isEmpty) {
-                      complete(StatusCodes.Conflict, """{"error":"no_new_items"}""")
-                    } else {
-                      val task = Task(UUID.randomUUID().toString, body.spec_version, body.reviewers, accepted.size, deduped)
-                      store.put(tenant, idemKey, task.toJson.compactPrint, hashes)
-                      system.log.info(s"task created tenant=$tenant task_id=\${task.task_id} spec=\${task.spec_version}")
-                      complete(StatusCodes.Created, task)
-                    }
+        optionalHeaderValueByName("X-Tenant-Id") {
+          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+          case Some(tenant) =>
+            optionalHeaderValueByName("Idempotency-Key") {
+              case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
+              case Some(key) =>
+                Store.createResult(tenant, key) match {
+                  case Some(recorded) => complete(json(StatusCodes.OK, recorded)) // a retry answers what the first attempt answered
+                  case None => entity(as[String])(raw => complete(create(tenant, key, raw)))
                 }
-              }
             }
-          }
         }
       }
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  private def create(tenant: String, key: String, raw: String): HttpResponse = {
+    val fields = raw.parseJson.asJsObject.fields
+    val specVersion = fields.get("spec_version").collect { case JsString(s) => s }.getOrElse("")
+    val rawItems = fields.get("items").collect { case JsArray(xs) => xs }.getOrElse(Vector.empty)
+    val items = rawItems.collect { case JsString(s) if s.nonEmpty => s }
+    val overlap = fields.get("overlap").collect { case JsNumber(n) => n.toInt }.getOrElse(1)
+    if (specVersion.trim.isEmpty) json(StatusCodes.BadRequest, JsObject("error" -> JsString("spec_version is required")))
+    else if (rawItems.isEmpty || rawItems.size > MaxBatchItems || items.size != rawItems.size)
+      json(StatusCodes.BadRequest, JsObject("error" -> JsString(s"items must be 1..$MaxBatchItems non-empty strings")))
+    else if (overlap < 1 || overlap > MaxOverlap) json(StatusCodes.BadRequest, JsObject("error" -> JsString(s"overlap must be 1..$MaxOverlap")))
+    else {
+      // The bytes are the question: an item already queued under this spec, or repeated here, is dropped.
+      val seen = scala.collection.mutable.Set.from(Store.seenHashes(specVersion))
+      val fresh = items.map(item => item -> contentHash(item)).filter { case (_, digest) => seen.add(digest) }
+      if (fresh.isEmpty) json(StatusCodes.Conflict, JsObject("error" -> JsString("no_new_items")))
+      else {
+        val task = Store.createTask(tenant, specVersion, overlap, fresh.map(_._1))
+        Store.addHashes(specVersion, fresh.map(_._2))
+        val result = JsObject(
+          "task_id" -> JsString(task.taskId), "spec_version" -> JsString(task.specVersion), "overlap" -> JsNumber(task.overlap),
+          "accepted" -> JsNumber(fresh.size), "deduped" -> JsNumber(items.size - fresh.size))
+        Store.recordCreate(tenant, key, result)
+        json(StatusCodes.Created, result)
+      }
+    }
   }
 }
 `,
@@ -770,165 +601,566 @@ object LabelApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <string>
-
-using json = nlohmann::json;
-
-void assign(const std::string& tenant, const std::string& taskId, const json& items) {}
-
-std::string uuidString();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/tasks", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto taskId = uuidString();
-    assign(tenant, taskId, body.value("items", json::array()));
-    res.status = 201;
-    res.set_content(
-        json{{"task_id", taskId},
-             {"reviewers", body.value("reviewers", 0)},
-             {"accepted", body.value("items", json::array()).size()}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-
-#include <iostream>
-#include <optional>
-#include <set>
 #include <string>
 #include <vector>
 
-#include "sha256.h"  // std::string sha256_hex(const std::string&)
+#include "labeling/store.h"  // store::createTask, seenHashes, addHashes, createResult, recordCreate
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxBatchItems = 200;
-constexpr int kMinReviewers = 1;
-constexpr int kMaxReviewers = 5;
-
-struct TaskStore {
-  std::optional<json> getByKey(const std::string& tenant, const std::string& idemKey);
-  std::set<std::string> seenHashes(const std::string& specVersion);
-  void put(const std::string& tenant, const std::string& idemKey, const json& task, const std::set<std::string>& hashes);
-};
-
-TaskStore store;
-std::string uuidString();
-
-std::string content_hash(const std::string& item) { return sha256_hex(item); }
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/tasks", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto specVersion = body.value("spec_version", std::string());
-    if (specVersion.find_first_not_of(" \\t\\r\\n") == std::string::npos) {
-      res.status = 400;
-      res.set_content(R"({"error":"spec_version must be a non-empty string"})", "application/json");
-      return;
-    }
-    if (!body.contains("items") || !body["items"].is_array() || body["items"].empty() ||
-        body["items"].size() > kMaxBatchItems) {
-      res.status = 400;
-      res.set_content(R"({"error":"items must be 1..200 non-empty strings"})", "application/json");
-      return;
-    }
-    std::vector<std::string> batch;
-    for (const auto& item : body["items"]) {
-      if (!item.is_string() || item.get<std::string>().empty()) {
-        res.status = 400;
-        res.set_content(R"({"error":"items must be 1..200 non-empty strings"})", "application/json");
-        return;
-      }
-      batch.push_back(item.get<std::string>());
-    }
-    const int reviewers = body.value("reviewers", 0);
-    if (reviewers < kMinReviewers || reviewers > kMaxReviewers) {
-      res.status = 400;
-      res.set_content(R"({"error":"reviewers must be 1..5"})", "application/json");
-      return;
-    }
-    const auto stored = store.getByKey(tenant, idemKey);
-    if (stored) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    const auto seen = store.seenHashes(specVersion);
-    std::vector<std::string> accepted;
-    std::set<std::string> hashes;
-    int deduped = 0;
-    for (const auto& item : batch) {
-      const auto digest = content_hash(item);
-      if (seen.count(digest) > 0 || hashes.count(digest) > 0) {
-        ++deduped;
-        continue;
-      }
-      hashes.insert(digest);
-      accepted.push_back(item);
-    }
-    if (accepted.empty()) {
-      res.status = 409;
-      res.set_content(R"({"error":"no_new_items"})", "application/json");
-      return;
-    }
-    const json task = {
-        {"task_id", uuidString()},
-        {"spec_version", specVersion},
-        {"reviewers", reviewers},
-        {"accepted", accepted.size()},
-        {"deduped", deduped},
-    };
-    store.put(tenant, idemKey, task, hashes);
-    std::cerr << "task created tenant=" << tenant << " task_id=" << task["task_id"] << " spec=" << specVersion
-              << "\\n";
-    res.status = 201;
-    res.set_content(task.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void create_task(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const json body = json::parse(req.body, nullptr, false);
+  std::vector<std::string> items;
+  for (const auto& item : body.value("items", json::array())) items.push_back(item.get<std::string>());
+  std::string spec_version = body.value("spec_version", "");
+  if (spec_version.empty()) spec_version = "latest";
+  const store::Task task = store::createTask(tenant, spec_version, body.value("overlap", 1L), items);
+  res.status = 201;
+  res.set_content(json{{"task_id", task.task_id}, {"spec_version", task.spec_version}, {"overlap", task.overlap},
+                       {"accepted", items.size()}, {"deduped", 0}}.dump(),
+                  "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/tasks", create_task); }
+`,
+      solution: `#include <httplib.h>
+#include <nlohmann/json.hpp>
+#include <openssl/sha.h>
+
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "labeling/store.h"  // store::createTask, seenHashes, addHashes, createResult, recordCreate
+
+using json = nlohmann::json;
+
+constexpr long kMaxBatchItems = 200;
+constexpr long kMaxOverlap = 5;
+
+std::string content_hash(const std::string& item) {
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  SHA256(reinterpret_cast<const unsigned char*>(item.data()), item.size(), digest);
+  std::string hex;
+  char byte[3];
+  for (unsigned char b : digest) {
+    std::snprintf(byte, sizeof byte, "%02x", b);
+    hex += byte;
+  }
+  return hex;
+}
+
+void reject(httplib::Response& res, int status, const std::string& error) {
+  res.status = status;
+  res.set_content(json{{"error", error}}.dump(), "application/json");
+}
+
+void create_task(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reject(res, 401, "X-Tenant-Id is required");
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return reject(res, 400, "Idempotency-Key is required");
+  if (const auto recorded = store::createResult(tenant, key)) {
+    res.set_content(recorded->dump(), "application/json");  // a retry answers what the first attempt answered
+    return;
+  }
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return reject(res, 400, "the body must be a JSON object");
+  const std::string spec_version = body.contains("spec_version") && body["spec_version"].is_string() ? body["spec_version"].get<std::string>() : "";
+  if (spec_version.find_first_not_of(" \\t\\n") == std::string::npos) return reject(res, 400, "spec_version is required");
+  const json raw_items = body.value("items", json::array());
+  std::vector<std::string> items;
+  for (const auto& item : raw_items) {
+    if (item.is_string() && !item.get<std::string>().empty()) items.push_back(item.get<std::string>());
+  }
+  const long n = static_cast<long>(raw_items.size());
+  if (n < 1 || n > kMaxBatchItems || static_cast<long>(items.size()) != n) {
+    return reject(res, 400, "items must be 1.." + std::to_string(kMaxBatchItems) + " non-empty strings");
+  }
+  const long overlap = body.value("overlap", 1L);
+  if (overlap < 1 || overlap > kMaxOverlap) return reject(res, 400, "overlap must be 1.." + std::to_string(kMaxOverlap));
+  // The bytes are the question: an item already queued under this spec, or repeated here, is dropped.
+  std::set<std::string> seen = store::seenHashes(spec_version);
+  std::vector<std::string> fresh, hashes;
+  for (const std::string& item : items) {
+    const std::string digest = content_hash(item);
+    if (!seen.insert(digest).second) continue;
+    fresh.push_back(item);
+    hashes.push_back(digest);
+  }
+  if (fresh.empty()) return reject(res, 409, "no_new_items");
+  const store::Task task = store::createTask(tenant, spec_version, overlap, fresh);
+  store::addHashes(spec_version, hashes);
+  const json result = {{"task_id", task.task_id}, {"spec_version", task.spec_version}, {"overlap", task.overlap},
+                       {"accepted", fresh.size()}, {"deduped", items.size() - fresh.size()}};
+  store::recordCreate(tenant, key, result);
+  res.status = 201;
+  res.set_content(result.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/tasks", create_task); }
 `,
     },
   },
+  harness: {
+    python: `from labeling import store
+
+BODY = {"items": ["a cat on a mat", "a dog in the fog"], "spec_version": "2026-10", "overlap": 3}
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+async def _create(c, body, key="k-1", tenant="t1"):
+    return await c.post("/v1/tasks", json=body, headers={"X-Tenant-Id": tenant, "Idempotency-Key": key})
+
+
+def _tasks(ctx):
+    return sorted(ctx.redis.keys("task:t-*"))
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _create(c, BODY)
+    assert r.status_code == 201, f"POST /v1/tasks answered {r.status_code}: {r.text}"
+    body = r.json()
+    task = store.get_task(body.get("task_id", ""))
+    assert task is not None, f"the create answered {body} but the store holds no task {body.get('task_id')!r}"
+    assert task["tenant"] == "t1" and task["total_items"] == 2, f"the store holds {task}, expected tenant t1 with 2 items"
+    assert body.get("accepted") == 2, f"two new items must be accepted, the create answered {body}"
+
+
+async def check_spec_pinned(ctx):
+    async with _api(ctx) as c:
+        for n, spec in enumerate((None, "", "   ")):
+            body = {k: v for k, v in BODY.items() if k != "spec_version"}
+            if spec is not None:
+                body["spec_version"] = spec
+            r = await _create(c, body, f"k-{n}")
+            assert r.status_code == 400, f"a create with spec_version {spec!r} answered {r.status_code}: {r.text}. A task must be pinned to a named spec version: 400"
+        assert _tasks(ctx) == [], f"the rejected creates left tasks behind: {_tasks(ctx)}"
+        r = await _create(c, BODY, "k-9")
+    assert r.status_code == 201, f"a create with spec_version 2026-10 answered {r.status_code}: {r.text}"
+    assert r.json().get("spec_version") == "2026-10", f"the create answered {r.json()}, expected spec_version 2026-10"
+    task = store.get_task(r.json()["task_id"])
+    assert task["spec_version"] == "2026-10", f"the stored task is pinned to {task['spec_version']!r}, expected 2026-10"
+
+
+async def check_batch_bounds(ctx):
+    cases = [
+        ({"items": []}, "an empty batch"),
+        ({"items": [f"item {n}" for n in range(201)]}, "a batch of 201 items"),
+        ({"items": ["a cat", ""]}, "a batch with an empty item"),
+        ({"overlap": 0}, "overlap 0"),
+        ({"overlap": 6}, "overlap 6"),
+    ]
+    async with _api(ctx) as c:
+        for n, (change, what) in enumerate(cases):
+            r = await _create(c, {**BODY, **change}, f"k-{n}")
+            assert r.status_code == 400, f"{what} answered {r.status_code}: {r.text}. Items are 1..MAX_BATCH_ITEMS = 200 non-empty strings and overlap 1..MAX_OVERLAP = 5: 400"
+        assert _tasks(ctx) == [], f"the rejected creates left tasks behind: {_tasks(ctx)}"
+        r = await _create(c, {**BODY, "items": [f"item {n}" for n in range(200)], "overlap": 5}, "k-ok")
+    assert r.status_code == 201, f"200 items with overlap 5 are within bounds, the create answered {r.status_code}: {r.text}"
+
+
+async def check_content_dedupe(ctx):
+    async with _api(ctx) as c:
+        r = await _create(c, {**BODY, "items": ["a cat", "a dog", "a cat"]}, "k-1")
+        assert r.status_code == 201, f"the first create answered {r.status_code}: {r.text}"
+        first = r.json()
+        assert first.get("accepted") == 2 and first.get("deduped") == 1, f"a batch repeating 'a cat' answered {first}: the repeat must be dropped and counted (accepted 2, deduped 1)"
+        assert store.get_task(first["task_id"])["total_items"] == 2, f"the task holds {store.get_task(first['task_id'])['total_items']} items, expected 2"
+        r = await _create(c, {**BODY, "items": ["a dog", "a bird"]}, "k-2")
+        second = r.json()
+        assert r.status_code == 201 and second.get("accepted") == 1 and second.get("deduped") == 1, f"'a dog' is already queued under 2026-10: the second batch answered {r.status_code} {second}, expected accepted 1, deduped 1"
+        r = await _create(c, {**BODY, "items": ["a cat", "a bird"]}, "k-3")
+        assert r.status_code == 409 and r.json().get("error") == "no_new_items", f"a batch whose items are all queued answered {r.status_code} {r.text}, expected 409 {{'error': 'no_new_items'}}"
+        assert len(_tasks(ctx)) == 2, f"the all-duplicate batch left a task: {_tasks(ctx)}"
+        r = await _create(c, {**BODY, "spec_version": "2026-11", "items": ["a cat"]}, "k-4")
+    assert r.status_code == 201 and r.json().get("accepted") == 1, f"under another spec the same item is a new question: answered {r.status_code} {r.text}"
+
+
+async def check_idempotent_create(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/tasks", json=BODY, headers={"X-Tenant-Id": "t1"})
+        assert r.status_code == 400, f"a create without Idempotency-Key answered {r.status_code}, expected 400"
+        assert _tasks(ctx) == [], f"a create without Idempotency-Key left {_tasks(ctx)}"
+        first = await _create(c, BODY, "k-1")
+        assert first.status_code == 201, f"the first create answered {first.status_code}: {first.text}"
+        replay = await _create(c, BODY, "k-1")
+        assert replay.status_code == 200 and replay.json() == first.json(), f"a retry with the same Idempotency-Key answered {replay.status_code} {replay.text}, expected 200 and the first answer {first.text}"
+        assert len(_tasks(ctx)) == 1, f"a retried create made a second task: {_tasks(ctx)}"
+        other = await _create(c, {**BODY, "items": ["a bird"]}, "k-1", tenant="t2")
+    assert other.status_code == 201 and other.json().get("task_id") != first.json()["task_id"], f"key k-1 of tenant t2 is another create, it answered {other.status_code} {other.text}"
+`,
+    typescript: `const BODY = {items: ['a cat on a mat', 'a dog in the fog'], spec_version: '2026-10', overlap: 3};
+
+function api(ctx) {
+  return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/labeling/store.ts')};
+}
+
+const create = (c, body, key = 'k-1', tenant = 't1') => c.post('/v1/tasks', {json: body, headers: {'X-Tenant-Id': tenant, 'Idempotency-Key': key}});
+
+const tasks = ctx => (ctx.redis.keys('task:t-*') as string[]).sort();
+
+export async function check_route(ctx) {
+  const {c, store} = api(ctx);
+  const r = await create(c, BODY);
+  assert.equal(r.status, 201, \`POST /v1/tasks answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  const task = await store.getTask(body.task_id ?? '');
+  assert(task !== null, \`the create answered \${r.text} but the store holds no task \${body.task_id}\`);
+  assert(task.tenant === 't1' && task.total_items === 2, \`the store holds \${JSON.stringify(task)}, expected tenant t1 with 2 items\`);
+  assert.equal(body.accepted, 2, \`two new items must be accepted, the create answered \${r.text}\`);
+}
+
+export async function check_spec_pinned(ctx) {
+  const {c, store} = api(ctx);
+  for (const [n, spec] of [undefined, '', '   '].entries()) {
+    const body: Record<string, unknown> = {items: BODY.items, overlap: BODY.overlap};
+    if (spec !== undefined) body.spec_version = spec;
+    const r = await create(c, body, \`k-\${n}\`);
+    assert.equal(r.status, 400, \`a create with spec_version \${JSON.stringify(spec)} answered \${r.status}: \${r.text}. A task must be pinned to a named spec version: 400\`);
+  }
+  assert.deepEqual(tasks(ctx), [], \`the rejected creates left tasks behind: \${JSON.stringify(tasks(ctx))}\`);
+  const r = await create(c, BODY, 'k-9');
+  assert.equal(r.status, 201, \`a create with spec_version 2026-10 answered \${r.status}: \${r.text}\`);
+  assert.equal(r.json().spec_version, '2026-10', \`the create answered \${r.text}, expected spec_version 2026-10\`);
+  const task = await store.getTask(r.json().task_id);
+  assert.equal(task.spec_version, '2026-10', \`the stored task is pinned to \${JSON.stringify(task.spec_version)}, expected 2026-10\`);
+}
+
+export async function check_batch_bounds(ctx) {
+  const {c} = api(ctx);
+  const cases: [Record<string, unknown>, string][] = [
+    [{items: []}, 'an empty batch'],
+    [{items: Array.from({length: 201}, (_, n) => \`item \${n}\`)}, 'a batch of 201 items'],
+    [{items: ['a cat', '']}, 'a batch with an empty item'],
+    [{overlap: 0}, 'overlap 0'],
+    [{overlap: 6}, 'overlap 6'],
+  ];
+  for (const [n, [change, what]] of cases.entries()) {
+    const r = await create(c, {...BODY, ...change}, \`k-\${n}\`);
+    assert.equal(r.status, 400, \`\${what} answered \${r.status}: \${r.text}. Items are 1..MAX_BATCH_ITEMS = 200 non-empty strings and overlap 1..MAX_OVERLAP = 5: 400\`);
+  }
+  assert.deepEqual(tasks(ctx), [], \`the rejected creates left tasks behind: \${JSON.stringify(tasks(ctx))}\`);
+  const r = await create(c, {...BODY, items: Array.from({length: 200}, (_, n) => \`item \${n}\`), overlap: 5}, 'k-ok');
+  assert.equal(r.status, 201, \`200 items with overlap 5 are within bounds, the create answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_content_dedupe(ctx) {
+  const {c, store} = api(ctx);
+  let r = await create(c, {...BODY, items: ['a cat', 'a dog', 'a cat']}, 'k-1');
+  assert.equal(r.status, 201, \`the first create answered \${r.status}: \${r.text}\`);
+  const first = r.json();
+  assert(first.accepted === 2 && first.deduped === 1, \`a batch repeating 'a cat' answered \${r.text}: the repeat must be dropped and counted (accepted 2, deduped 1)\`);
+  assert.equal((await store.getTask(first.task_id)).total_items, 2, 'the task must hold the 2 distinct items');
+  r = await create(c, {...BODY, items: ['a dog', 'a bird']}, 'k-2');
+  assert(r.status === 201 && r.json().accepted === 1 && r.json().deduped === 1, \`'a dog' is already queued under 2026-10: the second batch answered \${r.status} \${r.text}, expected accepted 1, deduped 1\`);
+  r = await create(c, {...BODY, items: ['a cat', 'a bird']}, 'k-3');
+  assert(r.status === 409 && r.json().error === 'no_new_items', \`a batch whose items are all queued answered \${r.status} \${r.text}, expected 409 {"error": "no_new_items"}\`);
+  assert.equal(tasks(ctx).length, 2, \`the all-duplicate batch left a task: \${JSON.stringify(tasks(ctx))}\`);
+  r = await create(c, {...BODY, spec_version: '2026-11', items: ['a cat']}, 'k-4');
+  assert(r.status === 201 && r.json().accepted === 1, \`under another spec the same item is a new question: answered \${r.status} \${r.text}\`);
+}
+
+export async function check_idempotent_create(ctx) {
+  const {c} = api(ctx);
+  const none = await c.post('/v1/tasks', {json: BODY, headers: {'X-Tenant-Id': 't1'}});
+  assert.equal(none.status, 400, \`a create without Idempotency-Key answered \${none.status}, expected 400\`);
+  assert.deepEqual(tasks(ctx), [], \`a create without Idempotency-Key left \${JSON.stringify(tasks(ctx))}\`);
+  const first = await create(c, BODY, 'k-1');
+  assert.equal(first.status, 201, \`the first create answered \${first.status}: \${first.text}\`);
+  const replay = await create(c, BODY, 'k-1');
+  assert(replay.status === 200 && JSON.stringify(replay.json()) === JSON.stringify(first.json()), \`a retry with the same Idempotency-Key answered \${replay.status} \${replay.text}, expected 200 and the first answer \${first.text}\`);
+  assert.equal(tasks(ctx).length, 1, \`a retried create made a second task: \${JSON.stringify(tasks(ctx))}\`);
+  const other = await create(c, {...BODY, items: ['a bird']}, 'k-1', 't2');
+  assert(other.status === 201 && other.json().task_id !== first.json().task_id, \`key k-1 of tenant t2 is another create, it answered \${other.status} \${other.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"labeling/store"
+
+	"leetbuild/harness"
+)
+
+var apiBody = map[string]any{"items": []string{"a cat on a mat", "a dog in the fog"}, "spec_version": "2026-10", "overlap": 3}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func with(change map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range apiBody {
+		out[k] = v
+	}
+	for k, v := range change {
+		if v == nil {
+			delete(out, k)
+		} else {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func create(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+	return c.Post("/v1/tasks", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
+}
+
+func answer(ctx *harness.Ctx, r *harness.Response) map[string]any {
+	m, _ := r.JSON().(map[string]any)
+	ctx.Assert(m != nil, "the response body is not a JSON object: %s", r.Text())
+	return m
+}
+
+func items(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("item %d", i)
+	}
+	return out
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := create(c, apiBody, "k-1", "t1")
+	ctx.Equal(r.Status, 201, "POST /v1/tasks (%s)", r.Text())
+	body := answer(ctx, r)
+	taskID, _ := body["task_id"].(string)
+	task := store.GetTask(context.Background(), taskID)
+	ctx.Assert(task != nil, "the create answered %s but the store holds no task %q", r.Text(), taskID)
+	ctx.Assert(task.Tenant == "t1" && task.TotalItems == 2, "the store holds %+v, expected tenant t1 with 2 items", task)
+	ctx.Equal(body["accepted"], float64(2), "two new items must be accepted; accepted")
+}
+
+func CheckSpecPinned(ctx *harness.Ctx) {
+	c := api(ctx)
+	for n, spec := range []any{nil, "", "   "} {
+		body := with(map[string]any{"spec_version": nil})
+		if spec != nil {
+			body["spec_version"] = spec
+		}
+		r := create(c, body, fmt.Sprintf("k-%d", n), "t1")
+		ctx.Equal(r.Status, 400, "a create with spec_version %v answered %s. A task must be pinned to a named spec version; the status", spec, r.Text())
+	}
+	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 0, "the rejected creates must leave no task; tasks")
+	r := create(c, apiBody, "k-9", "t1")
+	ctx.Equal(r.Status, 201, "a create with spec_version 2026-10 (%s)", r.Text())
+	body := answer(ctx, r)
+	ctx.Equal(body["spec_version"], "2026-10", "the create's spec_version")
+	taskID, _ := body["task_id"].(string)
+	ctx.Equal(store.GetTask(context.Background(), taskID).SpecVersion, "2026-10", "the spec version the stored task is pinned to")
+}
+
+func CheckBatchBounds(ctx *harness.Ctx) {
+	c := api(ctx)
+	cases := []struct {
+		change map[string]any
+		what   string
+	}{
+		{map[string]any{"items": []string{}}, "an empty batch"},
+		{map[string]any{"items": items(201)}, "a batch of 201 items"},
+		{map[string]any{"items": []string{"a cat", ""}}, "a batch with an empty item"},
+		{map[string]any{"overlap": 0}, "overlap 0"},
+		{map[string]any{"overlap": 6}, "overlap 6"},
+	}
+	for n, tc := range cases {
+		r := create(c, with(tc.change), fmt.Sprintf("k-%d", n), "t1")
+		ctx.Equal(r.Status, 400, "%s answered %s. Items are 1..maxBatchItems = 200 non-empty strings and overlap 1..maxOverlap = 5; the status", tc.what, r.Text())
+	}
+	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 0, "the rejected creates must leave no task; tasks")
+	r := create(c, with(map[string]any{"items": items(200), "overlap": 5}), "k-ok", "t1")
+	ctx.Equal(r.Status, 201, "200 items with overlap 5 are within bounds (%s)", r.Text())
+}
+
+func CheckContentDedupe(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := create(c, with(map[string]any{"items": []string{"a cat", "a dog", "a cat"}}), "k-1", "t1")
+	ctx.Equal(r.Status, 201, "the first create (%s)", r.Text())
+	first := answer(ctx, r)
+	ctx.Assert(first["accepted"] == float64(2) && first["deduped"] == float64(1), "a batch repeating 'a cat' answered %s: the repeat must be dropped and counted (accepted 2, deduped 1)", r.Text())
+	taskID, _ := first["task_id"].(string)
+	ctx.Equal(store.GetTask(context.Background(), taskID).TotalItems, 2, "the task must hold the 2 distinct items; its items")
+	r = create(c, with(map[string]any{"items": []string{"a dog", "a bird"}}), "k-2", "t1")
+	second := answer(ctx, r)
+	ctx.Assert(r.Status == 201 && second["accepted"] == float64(1) && second["deduped"] == float64(1), "'a dog' is already queued under 2026-10: the second batch answered %d %s, expected accepted 1, deduped 1", r.Status, r.Text())
+	r = create(c, with(map[string]any{"items": []string{"a cat", "a bird"}}), "k-3", "t1")
+	ctx.Assert(r.Status == 409 && answer(ctx, r)["error"] == "no_new_items", "a batch whose items are all queued answered %d %s, expected 409 {\\"error\\": \\"no_new_items\\"}", r.Status, r.Text())
+	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 2, "the all-duplicate batch must leave no task; tasks")
+	r = create(c, with(map[string]any{"spec_version": "2026-11", "items": []string{"a cat"}}), "k-4", "t1")
+	ctx.Assert(r.Status == 201 && answer(ctx, r)["accepted"] == float64(1), "under another spec the same item is a new question: answered %d %s", r.Status, r.Text())
+}
+
+func CheckIdempotentCreate(ctx *harness.Ctx) {
+	c := api(ctx)
+	none := c.Post("/v1/tasks", apiBody, "X-Tenant-Id", "t1")
+	ctx.Equal(none.Status, 400, "a create without Idempotency-Key")
+	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 0, "a create without Idempotency-Key must leave no task; tasks")
+	first := create(c, apiBody, "k-1", "t1")
+	ctx.Equal(first.Status, 201, "the first create (%s)", first.Text())
+	replay := create(c, apiBody, "k-1", "t1")
+	ctx.Equal(replay.Status, 200, "a retry with the same Idempotency-Key (%s)", replay.Text())
+	ctx.Equal(answer(ctx, replay), answer(ctx, first), "a retry with the same Idempotency-Key must answer the first answer")
+	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 1, "a retried create must not make a second task; tasks")
+	other := create(c, with(map[string]any{"items": []string{"a bird"}}), "k-1", "t2")
+	ctx.Assert(other.Status == 201 && answer(ctx, other)["task_id"] != answer(ctx, first)["task_id"], "key k-1 of tenant t2 is another create, it answered %d %s", other.Status, other.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+using json = nlohmann::json;
+
+namespace {
+
+const json kBody = {{"items", {"a cat on a mat", "a dog in the fog"}}, {"spec_version", "2026-10"}, {"overlap", 3}};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+json with(const json& change) {
+  json out = kBody;
+  for (const auto& [k, v] : change.items()) {
+    if (v.is_null()) {
+      out.erase(k);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+harness::Response create(harness::HTTP& c, const json& body, const std::string& key, const std::string& tenant = "t1") {
+  return c.Post("/v1/tasks", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
+}
+
+json answer(harness::Ctx& ctx, const harness::Response& r) {
+  const json body = json::parse(r.Text(), nullptr, false);
+  ctx.Assert(body.is_object(), "the response body is not a JSON object: %s", r.Text());
+  return body;
+}
+
+json items(int n) {
+  json out = json::array();
+  for (int i = 0; i < n; i++) out.push_back("item " + std::to_string(i));
+  return out;
+}
+
+size_t taskCount(harness::Ctx& ctx) { return ctx.Redis.Keys("task:t-*").size(); }
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = create(c, kBody, "k-1");
+  ctx.Equal(r.Status, 201, "POST /v1/tasks (%s)", r.Text());
+  const json body = answer(ctx, r);
+  const std::string task_id = body.value("task_id", "");
+  const auto task = store::getTask(task_id);
+  ctx.Assert(task.has_value(), "the create answered %s but the store holds no task %q", r.Text(), task_id);
+  ctx.Assert(task->tenant == "t1" && task->total_items == 2, "the store holds tenant %q with %d items, expected tenant t1 with 2 items", task->tenant, task->total_items);
+  ctx.Equal(body.value("accepted", 0L), 2L, "two new items must be accepted; accepted");
+}
+
+void CheckSpecPinned(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::vector<json> specs = {json(), json(""), json("   ")};
+  for (size_t n = 0; n < specs.size(); n++) {
+    json body = with(json{{"spec_version", nullptr}});
+    if (!specs[n].is_null()) body["spec_version"] = specs[n];
+    const auto r = create(c, body, "k-" + std::to_string(n));
+    ctx.Equal(r.Status, 400, "a create with spec_version %s answered %s. A task must be pinned to a named spec version; the status", specs[n].dump(), r.Text());
+  }
+  ctx.Equal(taskCount(ctx), 0, "the rejected creates must leave no task; tasks");
+  const auto r = create(c, kBody, "k-9");
+  ctx.Equal(r.Status, 201, "a create with spec_version 2026-10 (%s)", r.Text());
+  const json body = answer(ctx, r);
+  ctx.Equal(body.value("spec_version", ""), "2026-10", "the create's spec_version");
+  ctx.Equal(store::getTask(body.value("task_id", ""))->spec_version, "2026-10", "the spec version the stored task is pinned to");
+}
+
+void CheckBatchBounds(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::vector<std::pair<json, std::string>> cases = {
+      {json{{"items", json::array()}}, "an empty batch"},
+      {json{{"items", items(201)}}, "a batch of 201 items"},
+      {json{{"items", {"a cat", ""}}}, "a batch with an empty item"},
+      {json{{"overlap", 0}}, "overlap 0"},
+      {json{{"overlap", 6}}, "overlap 6"},
+  };
+  for (size_t n = 0; n < cases.size(); n++) {
+    const auto r = create(c, with(cases[n].first), "k-" + std::to_string(n));
+    ctx.Equal(r.Status, 400, "%s answered %s. Items are 1..kMaxBatchItems = 200 non-empty strings and overlap 1..kMaxOverlap = 5; the status", cases[n].second, r.Text());
+  }
+  ctx.Equal(taskCount(ctx), 0, "the rejected creates must leave no task; tasks");
+  const auto r = create(c, with(json{{"items", items(200)}, {"overlap", 5}}), "k-ok");
+  ctx.Equal(r.Status, 201, "200 items with overlap 5 are within bounds (%s)", r.Text());
+}
+
+void CheckContentDedupe(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = create(c, with(json{{"items", {"a cat", "a dog", "a cat"}}}), "k-1");
+  ctx.Equal(r.Status, 201, "the first create (%s)", r.Text());
+  const json first = answer(ctx, r);
+  ctx.Assert(first.value("accepted", 0L) == 2 && first.value("deduped", 0L) == 1, "a batch repeating 'a cat' answered %s: the repeat must be dropped and counted (accepted 2, deduped 1)", r.Text());
+  ctx.Equal(store::getTask(first.value("task_id", ""))->total_items, 2L, "the task must hold the 2 distinct items; its items");
+  r = create(c, with(json{{"items", {"a dog", "a bird"}}}), "k-2");
+  const json second = answer(ctx, r);
+  ctx.Assert(r.Status == 201 && second.value("accepted", 0L) == 1 && second.value("deduped", 0L) == 1, "'a dog' is already queued under 2026-10: the second batch answered %d %s, expected accepted 1, deduped 1", r.Status, r.Text());
+  r = create(c, with(json{{"items", {"a cat", "a bird"}}}), "k-3");
+  ctx.Assert(r.Status == 409 && answer(ctx, r).value("error", "") == "no_new_items", "a batch whose items are all queued answered %d %s, expected 409 {\\"error\\": \\"no_new_items\\"}", r.Status, r.Text());
+  ctx.Equal(taskCount(ctx), 2, "the all-duplicate batch must leave no task; tasks");
+  r = create(c, with(json{{"spec_version", "2026-11"}, {"items", {"a cat"}}}), "k-4");
+  ctx.Assert(r.Status == 201 && answer(ctx, r).value("accepted", 0L) == 1, "under another spec the same item is a new question: answered %d %s", r.Status, r.Text());
+}
+
+void CheckIdempotentCreate(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto none = c.Post("/v1/tasks", kBody.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  ctx.Equal(none.Status, 400, "a create without Idempotency-Key");
+  ctx.Equal(taskCount(ctx), 0, "a create without Idempotency-Key must leave no task; tasks");
+  const auto first = create(c, kBody, "k-1");
+  ctx.Equal(first.Status, 201, "the first create (%s)", first.Text());
+  const auto replay = create(c, kBody, "k-1");
+  ctx.Equal(replay.Status, 200, "a retry with the same Idempotency-Key (%s)", replay.Text());
+  ctx.Equal(answer(ctx, replay), answer(ctx, first), "a retry with the same Idempotency-Key must answer the first answer");
+  ctx.Equal(taskCount(ctx), 1, "a retried create must not make a second task; tasks");
+  const auto other = create(c, with(json{{"items", {"a bird"}}}), "k-1", "t2");
+  ctx.Assert(other.Status == 201 && answer(ctx, other).value("task_id", "") != answer(ctx, first).value("task_id", ""), "key k-1 of tenant t2 is another create, it answered %d %s", other.Status, other.Text());
+}
+`,
+  },
   hints: [
-    'A client that times out and retries its create sees two task ids, and the same five items show up twice in the queue; a batch of 10,000 items is accepted without a word.',
-    'The handler reads only `items` and `reviewers`: nothing hashes an item, nothing looks at `Idempotency-Key` or `spec_version`, and nothing compares a count against a named limit before `assign` runs.',
-    'Guard in cost order (tenant 401, key 400, spec and bounds 400), look up `(tenant, key)` before minting an id, hash items against `seen_hashes` and the batch, answer 409 `no_new_items` when nothing remains, store `spec_version`.',
+    'A client that times out and retries its create gets two task ids over the same items, and a create with no `spec_version` comes back pinned to `latest`; an empty batch makes an empty task.',
+    'The handler never reads `Idempotency-Key`, so each retry is a fresh create; nothing hashes an item or compares a count with a limit, and the spec version has a fallback instead of a check.',
+    'Require the key and answer `store.create_result(tenant, key)` with 200 when it exists; 400 a blank spec, bad item counts or overlap; hash with SHA-256 against `seen_hashes` and the batch, 409 when nothing is new, then `create_task`, `add_hashes`, `record_create`.',
   ],
-  debrief: `The guards run before the store is touched so a rejected create leaves no half-built task behind, and the \`(tenant, key)\` lookup precedes the id mint so a replay cannot race its original. Content hashing under the spec makes the item's bytes the identity of a label: the same bytes under another spec are a different question and are queued again, while a repeat under the same spec would be a second payment for one answer. The spec pin is one stored field, but it is what makes the agreement math in step 5 meaningful. Production services also fingerprint the request body so two different batches under one key are rejected rather than replayed, and enforce per-tenant quotas.`,
+  debrief: `The recorded answer is looked up before anything is validated or written, so a retry costs one read and can never race its original into a second task. Hashing under the spec makes an item's bytes its identity: the same text under another spec is a different question and is queued again, while a repeat under the same spec would pay two annotators for one answer. Pinning the spec version is a single stored field, but it is what makes the agreement numbers of step 5 comparable across a week of work. Production services also fingerprint the request body so that two different batches under one key are refused instead of replayed, expire the recorded answers after a day, and meter items per tenant.`,
 };

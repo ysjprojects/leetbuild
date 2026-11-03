@@ -2,366 +2,390 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Eval service call as the promotion gate',
+  title: 'The eval gate: only a verdict opens it',
   concept: 'grpc',
   file: 'client',
-  focus: ['registry', 'eval'],
+  focus: ['registry', 'eval', 'redis'],
   task: `## Task
 
-**Starting point.** The starter's \`eval_gate(name, version, content_hash)\` calls
-\`EvalService.Evaluate\` with no deadline, treats any RPC error as a pass, retries a \`failed\`
-verdict until the run expires, caches the result for a day and promotes without recording the run.
-With a healthy eval service the promotion goes through. It compiles, serves the demo and hides five
-flaws.
+**Starting point.** The starter's \`gate(state, tenant, name, version, actor)\` looks the version up
+with \`versions.get\`, asks \`Evaluator.Evaluate\` (\`evaluator.proto\`, a stand-in served at
+\`prompts/config\`'s \`EVALUATOR\`) for a verdict on its bytes, and on a pass calls the step-2
+\`state.promote\`. It asks again after a short sleep until a pass or a 30-second wall clock, counts an
+RPC error as a pass, and caches a verdict per name for a day. Against a healthy evaluator it promotes
+after one call. It hides 5 flaws.
 
-**Failure mode the checks target.** Treating an error as consent is the whole bug: the starter
-\`except\`s the RPC failure and promotes, so a deadline turns into a release. Caching a failed eval
-for a day repeats that decision, and retrying a rejection converts a measured "no" into enough
-attempts to get lucky.
+**Failure mode the checks target.** Treating an error as consent is the release-breaking one: an
+evaluator outage turns every promotion into an unreviewed one. Retrying a failed verdict until it
+passes is the same thing, slower. A verdict cached by name lets version 3 ride on version 2's pass.
 
-- Every call to \`EvalService.Evaluate\` carries a **3-second** deadline.
-- At most **\`MAX_ATTEMPTS = 3\`** attempts, and only \`UNAVAILABLE\` / \`DEADLINE_EXCEEDED\` are
-  retryable. Any other status is a hard stop.
-- A **timeout or any RPC error blocks the promotion**.
-- A completed **\`failed\` verdict is terminal**: it blocks and is not retried.
-- The gate is keyed by the version's **content hash**, so a changed version needs a **fresh** eval;
-  a result may only be reused for the exact hash it was computed for, and only for seconds.
-- The promotion records the **eval id** it was gated on, so the audit can name the run.`,
+\`\`\`proto
+service Evaluator { rpc Evaluate(EvaluateRequest) returns (EvaluateReply); }
+message EvaluateRequest { string tenant = 1; string name = 2; int32 version = 3; string content_hash = 4; string template_text = 5; }
+message EvaluateReply   { string eval_id = 1; bool passed = 2; double score = 3; string content_hash = 4; }
+\`\`\`
+
+Requirements:
+
+- Every attempt carries a **3-second deadline** (\`DEADLINE_S\`).
+- \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried after a backoff, at most **3 attempts**
+  (\`MAX_ATTEMPTS\`); other codes are not.
+- No verdict means \`blocked\`, with reason \`deadline\`, \`unavailable\` or \`error\`.
+- A failed verdict blocks after one call (reason \`failed\`).
+- Every verdict is recorded: \`evals.put(tenant, name, content_hash, {eval_id, passed, score,
+  content_hash, version})\`.
+- The result is \`{decision: "promoted" | "blocked", reason, eval_id, attempts}\`.`,
   sequence: {
-    participants: ['Prompt Registry', 'Eval service', 'Promotion store'],
+    participants: ['Operator', 'gate', 'Evaluator', 'Redis'],
     messages: [
-      {from: 'Prompt Registry', to: 'Eval service', label: 'Evaluate · content_hash · deadline 3 s', kind: 'sync'},
-      {
-        from: 'Eval service',
-        to: 'Prompt Registry',
-        label: 'reply{passed, eval_id} · or DEADLINE_EXCEEDED',
-        kind: 'reply',
-      },
-      {
-        from: 'Prompt Registry',
-        to: 'Prompt Registry',
-        label: 'retry only UNAVAILABLE · error and timeout block',
-        kind: 'sync',
-      },
-      {
-        from: 'Prompt Registry',
-        to: 'Promotion store',
-        label: 'promote(name, version, actor, content_hash, eval_id)',
-        kind: 'sync',
-      },
-      {from: 'Promotion store', to: 'Prompt Registry', label: 'audited promotion', kind: 'reply'},
+      {from: 'Operator', to: 'gate', label: 'gate(state, tenant, name, 3, actor)', kind: 'sync'},
+      {from: 'gate', to: 'Redis', label: 'versions.get → content_hash, template', kind: 'sync'},
+      {from: 'gate', to: 'Evaluator', label: 'Evaluate · deadline 3 s', kind: 'sync'},
+      {from: 'Evaluator', to: 'gate', label: 'UNAVAILABLE', kind: 'reply'},
+      {from: 'gate', to: 'Evaluator', label: 'Evaluate · attempt 2 after a backoff', kind: 'sync'},
+      {from: 'Evaluator', to: 'gate', label: '{eval_id, passed, score}', kind: 'reply'},
+      {from: 'gate', to: 'Redis', label: 'evals.put(tenant, name, content_hash, record)', kind: 'sync'},
+      {from: 'gate', to: 'Redis', label: 'state.promote (the step-2 script)', kind: 'sync'},
     ],
   },
   checks: [
     {
       id: 'deadline',
-      title: 'Every attempt carries a 3-second deadline',
+      title: 'Three-second deadline on every attempt',
       detail:
-        'The call is created with a 3-second deadline — `timeout=EVAL_DEADLINE_S`, `deadline: Date.now() + EVAL_DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. Without it one stuck eval service holds the promotion open forever.',
+        'Each Evaluate call carries a deadline of about 3 s; an evaluator that hangs for 5 s gets three cut-off attempts and the version stays blocked with reason deadline, in under 11 s. The starter sends no deadline and waits the hang out.',
       match: {
-        python: {all: [/EVAL_DEADLINE_S\s*=\s*3/, /timeout=EVAL_DEADLINE_S/, /\.Evaluate\(/]},
-        typescript: {
-          all: [/EVAL_DEADLINE_MS\s*=\s*3000/, /deadline:\s*Date\.now\(\)\s*\+\s*EVAL_DEADLINE_MS/, /\.Evaluate\(/],
-        },
-        go: {all: [/evalDeadline\s*=\s*3\s*\*\s*time\.Second/, /context\.WithTimeout\(/, /\.Evaluate\(/]},
-        scala: {all: [/EvalDeadlineMs\s*=\s*3000/, /withDeadlineAfter/, /\.evaluate\(/]},
-        cpp: {all: [/kEvalDeadlineMs\s*=\s*3000/, /set_deadline\(/, /->Evaluate\(/]},
+        python: {all: [/timeout\s*=\s*(DEADLINE_S|\d)/]},
+        typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/]},
+        go: {all: [/context\.WithTimeout\(|context\.WithDeadline\(/]},
+        scala: {all: [/withDeadlineAfter\(/]},
+        cpp: {all: [/set_deadline\(/]},
       },
     },
     {
       id: 'retry-policy',
-      title: 'Three bounded attempts, only the two retryable codes',
+      title: 'Retries UNAVAILABLE and DEADLINE_EXCEEDED, at most three attempts',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried. The starter loops `while True` and retries every failure, including a `failed` verdict.',
+        'One UNAVAILABLE earns a retry after a backoff and the version is promoted on the second call; three in a row block with reason unavailable after exactly three calls; INVALID_ARGUMENT blocks after one. The starter never retries an error.',
       match: {
-        python: {
-          all: [
-            /MAX_ATTEMPTS\s*=\s*3/,
-            /range\(MAX_ATTEMPTS\)/,
-            /StatusCode\.UNAVAILABLE/,
-            /StatusCode\.DEADLINE_EXCEEDED/,
-          ],
-          none: [/while\s+True/],
-        },
-        typescript: {
-          all: [/MAX_ATTEMPTS\s*=\s*3/, /attempt\s*<\s*MAX_ATTEMPTS/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/while\s*\(\s*true\s*\)/, /for\s*\(\s*;\s*;\s*\)/],
-        },
-        go: {
-          all: [/maxAttempts\s*=\s*3/, /attempt\s*<\s*maxAttempts/, /codes\.Unavailable/, /codes\.DeadlineExceeded/],
-          none: [/for\s*\{/],
-        },
-        scala: {
-          all: [/MaxAttempts\s*=\s*3/, /attempt\s*<\s*MaxAttempts/, /Code\.UNAVAILABLE/, /Code\.DEADLINE_EXCEEDED/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
-        cpp: {
-          all: [
-            /kMaxAttempts\s*=\s*3/,
-            /attempt\s*<\s*kMaxAttempts/,
-            /StatusCode::UNAVAILABLE/,
-            /StatusCode::DEADLINE_EXCEEDED/,
-          ],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
+        python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_GATE_SECONDS/]},
+        typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_GATE_SECONDS/]},
+        go: {all: [/codes\.Unavailable/, /maxAttempts/], none: [/maxGateSeconds/]},
+        scala: {all: [/Code\.UNAVAILABLE/, /MaxAttempts/], none: [/MaxGateSeconds/]},
+        cpp: {all: [/StatusCode::UNAVAILABLE/, /kMaxAttempts/], none: [/kMaxGateSeconds/]},
       },
     },
     {
       id: 'block-on-error',
-      title: 'A timeout or an RPC error blocks the promotion',
+      title: 'No verdict, no promotion',
       detail:
-        'The error branch returns the blocking decision — an eval that timed out or failed carried no verdict, so it cannot promote. The starter promotes in the `except`/`catch`/`err != nil` branch.',
+        'An INTERNAL error blocks with reason error and an evaluator that is down blocks with reason unavailable; neither moves the live pointer. The starter counts any RPC error as a pass and promotes.',
       match: {
-        python: {all: [/except\s+grpc\.RpcError/, /DECISION_BLOCK/]},
-        typescript: {all: [/catch\s*\(\s*error\s*\)/, /BLOCK/]},
-        go: {all: [/status\.Code\(err\)|codes\.Unavailable/, /decisionBlock/]},
-        scala: {all: [/case\s+\w+:\s+StatusRuntimeException/, /DecisionBlock/]},
-        cpp: {all: [/status\.error_code\(\)/, /kBlock/]},
+        python: {all: [/["']error["']/]},
+        typescript: {all: [/['"]error['"]/]},
+        go: {all: [/"error"/]},
+        scala: {all: [/"error"/]},
+        cpp: {all: [/"error"/]},
       },
     },
     {
       id: 'fail-terminal',
-      title: 'A failed verdict is terminal and is not cached for a day',
+      title: 'A failed verdict blocks after one call',
       detail:
-        'A completed `passed: false` verdict blocks immediately and is never retried into a pass; the gate never reuses a stale failure from a long TTL. The starter caches an eval result for `86400` seconds and retries the rejection.',
+        'A template the evaluator fails is blocked with reason failed and the eval_id after exactly one call, and the pointer does not move. The starter sleeps and asks again until its wall clock runs out.',
       match: {
-        python: {all: [/reply\.passed/, /DECISION_BLOCK/], none: [/86400/]},
-        typescript: {all: [/reply\.passed/, /BLOCK/], none: [/86400/]},
-        go: {all: [/reply\.Passed/, /decisionBlock/], none: [/86400/]},
-        scala: {all: [/reply\.passed/, /DecisionBlock/], none: [/86400/]},
-        cpp: {all: [/reply\.passed\(\)/, /kBlock/], none: [/86400/]},
+        python: {all: [/not\s+reply\.passed|reply\.passed\s+is\s+False|reply\.passed\s*==\s*False/]},
+        typescript: {all: [/!\s*reply\.passed|reply\.passed\s*[!=]==?\s*(false|true)/]},
+        go: {all: [/!\s*reply\.(GetPassed\(\)|Passed)/]},
+        scala: {all: [/!\s*reply\.passed/]},
+        cpp: {all: [/!\s*reply\.passed\(\)/]},
       },
     },
     {
-      id: 'record-eval',
-      title: 'Records the eval id and the content hash it gated',
+      id: 'record-by-hash',
+      title: 'Records each verdict under the content hash it judged',
       detail:
-        'The promotion stores the `eval_id` and the `content_hash` it was gated on, so the audit can prove what justified the release — and a changed version has to earn a fresh eval. The starter promotes with no eval reference at all.',
+        'After version 2 passes, its verdict is in prompts:eval:{tenant}:{name}:{sha256}; version 3 is evaluated on its own bytes, fails, and is recorded too. The starter records nothing and promotes version 3 on the verdict it cached for the name.',
       match: {
-        python: {all: [/eval_id/, /content_hash/, /store\.promote\(/]},
-        typescript: {all: [/evalId/, /contentHash/, /store\.promote\(/]},
-        go: {all: [/evalID/, /contentHash/, /store\.Promote\(/]},
-        scala: {all: [/evalId/, /contentHash/, /PromotionStore\.promote\(/]},
-        cpp: {all: [/eval_id/, /content_hash/, /store\.promote\(/]},
+        python: {all: [/evals\.put\(/], none: [/VERDICT_TTL_S|_verdict_cache/]},
+        typescript: {all: [/evals\.put\(/], none: [/VERDICT_TTL_S|verdictCache/]},
+        go: {all: [/evals\.Put\(/], none: [/verdictTTL|verdictCache/]},
+        scala: {all: [/Evals\.put\(/], none: [/VerdictTtlSeconds|verdictCache/]},
+        cpp: {all: [/evals::put\(/], none: [/kVerdictTtl|verdict_cache/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import grpc
+      starter: `import logging
+import time
 
-import eval_pb2
-import eval_pb2_grpc
+import grpc
 
-EVAL_CACHE_TTL_S = 86400  # keep the eval result around for a day
+import evaluator_pb2
+import evaluator_pb2_grpc
+from prompts.config import EVALUATOR
+from prompts.versions import versions
 
-channel = grpc.insecure_channel("eval:9000")
-eval_stub = eval_pb2_grpc.EvalServiceStub(channel)
+logger = logging.getLogger("prompts.gate")
+
+MAX_GATE_SECONDS = 30
+BACKOFF_S = 0.25
+VERDICT_TTL_S = 86_400
+
+channel = grpc.insecure_channel(EVALUATOR)
+stub = evaluator_pb2_grpc.EvaluatorStub(channel)
+
+_verdict_cache: dict[tuple[str, str], tuple[bool, str, float]] = {}
 
 
-class PromotionStore:
-    def promote(self, name: str, version: int, actor: str) -> None:
-        """Point the name at this version and record who promoted it."""
-        raise NotImplementedError
-
-
-store = PromotionStore()
-
-
-def eval_gate(name: str, version: int, content_hash: str) -> bool:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    try:
-        eval_stub.Evaluate(
-            eval_pb2.EvaluateRequest(name=name, version=version, content_hash=content_hash)
+def gate(state, tenant: str, name: str, version: int, actor: str) -> dict:
+    """Promote version once the eval service passed its bytes: {decision, reason, eval_id, attempts}."""
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    record = versions.get(tenant, name, version)
+    if record is None:
+        return {"decision": "blocked", "reason": "unregistered", "eval_id": "", "attempts": 0}
+    attempts = 0
+    cached = _verdict_cache.get((tenant, name))
+    if cached is not None and cached[2] > time.time():
+        passed, eval_id = cached[0], cached[1]
+    else:
+        passed, eval_id = False, ""
+        request = evaluator_pb2.EvaluateRequest(
+            tenant=tenant, name=name, version=version, content_hash=record["content_hash"], template_text=record["template"]
         )
-        return True
-    except grpc.RpcError:
-        return True
-
-
-def promote(name: str, version: int, content_hash: str, actor: str) -> None:
-    while True:
-        if eval_gate(name, version, content_hash):
-            store.promote(name, version, actor)
-            return
+        until = time.monotonic() + MAX_GATE_SECONDS
+        while time.monotonic() < until:
+            attempts += 1
+            try:
+                reply = stub.Evaluate(request)
+            except grpc.RpcError as err:
+                logger.warning("evaluator call failed name=%s version=%d code=%s", name, version, err.code())
+                passed = True
+                break
+            if reply.passed:
+                passed, eval_id = True, reply.eval_id
+                break
+            time.sleep(BACKOFF_S)
+        _verdict_cache[(tenant, name)] = (passed, eval_id, time.time() + VERDICT_TTL_S)
+    if not passed:
+        return {"decision": "blocked", "reason": "failed", "eval_id": eval_id, "attempts": attempts}
+    state.promote(tenant, name, version, actor)
+    return {"decision": "promoted", "reason": "", "eval_id": eval_id, "attempts": attempts}
 `,
-      solution: `import grpc
+      solution: `import logging
+import time
 
-import eval_pb2
-import eval_pb2_grpc
+import grpc
 
-EVAL_DEADLINE_S = 3.0
+import evaluator_pb2
+import evaluator_pb2_grpc
+from prompts.config import EVALUATOR
+from prompts.evals import evals
+from prompts.versions import versions
+
+logger = logging.getLogger("prompts.gate")
+
+DEADLINE_S = 3.0
 MAX_ATTEMPTS = 3
-EVAL_CACHE_TTL_S = 60  # a verdict is only reusable for the hash it was computed for, and briefly
-DECISION_PASS = "pass"
-DECISION_BLOCK = "block"
-RETRYABLE = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
+BACKOFF_S = 0.25
+RETRYABLE = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+REASONS = {grpc.StatusCode.DEADLINE_EXCEEDED: "deadline", grpc.StatusCode.UNAVAILABLE: "unavailable"}
 
-channel = grpc.insecure_channel("eval:9000")
-eval_stub = eval_pb2_grpc.EvalServiceStub(channel)
-
-
-class PromotionStore:
-    def promote(self, name: str, version: int, actor: str, content_hash: str, eval_id: str) -> None:
-        """Point the name at this version, recording the eval that gated it."""
-        raise NotImplementedError
-
-    def cached_eval(self, name: str, content_hash: str) -> dict | None:
-        """The eval already computed for this exact content hash, if it is still fresh."""
-        raise NotImplementedError
+channel = grpc.insecure_channel(EVALUATOR)
+stub = evaluator_pb2_grpc.EvaluatorStub(channel)
 
 
-store = PromotionStore()
-
-
-def evaluate(name: str, version: int, content_hash: str) -> tuple[str, str]:
-    """Call the eval service under a deadline. An error or a timeout can only block."""
-    cached = store.cached_eval(name, content_hash)
-    if cached is not None:
-        return (DECISION_PASS if cached["passed"] else DECISION_BLOCK), cached["eval_id"]
-
-    eval_id = ""
-    for _ in range(MAX_ATTEMPTS):
+def gate(state, tenant: str, name: str, version: int, actor: str) -> dict:
+    """Promote version once the eval service passed its bytes: {decision, reason, eval_id, attempts}."""
+    record = versions.get(tenant, name, version)
+    if record is None:
+        return {"decision": "blocked", "reason": "unregistered", "eval_id": "", "attempts": 0}
+    content_hash = record["content_hash"]
+    request = evaluator_pb2.EvaluateRequest(
+        tenant=tenant, name=name, version=version, content_hash=content_hash, template_text=record["template"]
+    )
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            reply = eval_stub.Evaluate(
-                eval_pb2.EvaluateRequest(name=name, version=version, content_hash=content_hash),
-                timeout=EVAL_DEADLINE_S,
-            )
-        except grpc.RpcError as exc:
-            eval_id = eval_id or _eval_id_of(exc)
-            if exc.code() not in RETRYABLE:
-                return DECISION_BLOCK, eval_id
-            continue
-        eval_id = reply.eval_id
+            reply = stub.Evaluate(request, timeout=DEADLINE_S)
+        except grpc.RpcError as err:
+            code = err.code()
+            if code in RETRYABLE and attempt < MAX_ATTEMPTS:
+                time.sleep(BACKOFF_S * attempt)
+                continue
+            # No verdict: an eval that did not run is not a pass.
+            logger.warning("evaluation of %s v%d ended %s after %d attempts", name, version, code, attempt)
+            return {"decision": "blocked", "reason": REASONS.get(code, "error"), "eval_id": "", "attempts": attempt}
+        evals.put(tenant, name, content_hash, {"eval_id": reply.eval_id, "passed": reply.passed, "score": reply.score, "content_hash": content_hash, "version": version})
         if not reply.passed:
-            return DECISION_BLOCK, eval_id
-        return DECISION_PASS, eval_id
-    return DECISION_BLOCK, eval_id
-
-
-def _eval_id_of(exc: grpc.RpcError) -> str:
-    return ""
-
-
-def promote(name: str, version: int, content_hash: str, actor: str) -> tuple[str, str]:
-    decision, eval_id = evaluate(name, version, content_hash)
-    if decision != DECISION_PASS:
-        raise RuntimeError(f"promotion blocked by eval {eval_id or 'unavailable'}")
-    store.promote(name, version, actor, content_hash, eval_id)
-    return decision, eval_id
+            return {"decision": "blocked", "reason": "failed", "eval_id": reply.eval_id, "attempts": attempt}
+        if state.promote(tenant, name, version, actor) is None:
+            return {"decision": "blocked", "reason": "unregistered", "eval_id": reply.eval_id, "attempts": attempt}
+        return {"decision": "promoted", "reason": "", "eval_id": reply.eval_id, "attempts": attempt}
 `,
     },
     typescript: {
-      starter: `/** Eval gate. */
+      starter: `import {setTimeout as sleep} from 'node:timers/promises';
+
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const EVAL_CACHE_TTL_S = 86400; // keep the eval result around for a day
+import {EVALUATOR} from 'prompts/config';
+import {versions} from 'prompts/versions';
 
-interface EvalClient {
-  Evaluate(
-    request: {name: string; version: number; content_hash: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-  ): grpc.ClientUnaryCall & {passed?: boolean; eval_id?: string};
+export const MAX_GATE_SECONDS = 30;
+export const BACKOFF_MS = 250;
+export const VERDICT_TTL_S = 86_400;
+
+interface EvaluateRequest {
+  tenant: string;
+  name: string;
+  version: number;
+  content_hash: string;
+  template_text: string;
+}
+interface EvaluateReply {
+  eval_id: string;
+  passed: boolean;
+  score: number;
+  content_hash: string;
+}
+interface EvaluatorClient {
+  Evaluate(request: EvaluateRequest, options?: {deadline: number}): Promise<EvaluateReply>;
 }
 
-const loaded = grpc.loadPackageDefinition(protoLoader.loadSync('eval.proto')) as unknown as {
-  evals: {EvalService: new (target: string, credentials: grpc.ChannelCredentials) => EvalClient};
+const {prompts} = grpc.loadPackageDefinition(protoLoader.loadSync('evaluator.proto')) as unknown as {
+  prompts: {Evaluator: new (target: string, credentials: grpc.ChannelCredentials) => EvaluatorClient};
 };
-const evalService = new loaded.evals.EvalService('eval:9000', grpc.credentials.createInsecure());
+const stub = new prompts.Evaluator(EVALUATOR, grpc.credentials.createInsecure());
 
-export function evalGate(name: string, version: number, contentHash: string): boolean {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  try {
-    evalService.Evaluate({name, version, content_hash: contentHash}, new grpc.Metadata(), {});
-    return true;
-  } catch {
-    return true;
-  }
+const verdictCache = new Map<string, {passed: boolean; evalId: string; until: number}>();
+
+/** The step-2 pointer the gate hands a passed version to. */
+export interface Promoter {
+  promote(tenant: string, name: string, version: number, actor: string): Promise<{from: number; to: number} | null>;
 }
 
-export function promote(name: string, version: number, contentHash: string, actor: string): void {
-  for (;;) {
-    if (evalGate(name, version, contentHash)) {
-      void store.promote(name, version, actor);
-      return;
+export interface GateResult {
+  decision: 'promoted' | 'blocked';
+  reason: string;
+  eval_id: string;
+  attempts: number;
+}
+
+/** Promote version once the eval service passed its bytes. */
+export async function gate(state: Promoter, tenant: string, name: string, version: number, actor: string): Promise<GateResult> {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  const record = await versions.get(tenant, name, version);
+  if (record === null) return {decision: 'blocked', reason: 'unregistered', eval_id: '', attempts: 0};
+  let attempts = 0;
+  let passed = false;
+  let evalId = '';
+  const cached = verdictCache.get(\`\${tenant}/\${name}\`);
+  if (cached !== undefined && cached.until > Date.now()) {
+    ({passed, evalId} = cached);
+  } else {
+    const request = {tenant, name, version, content_hash: record.content_hash, template_text: record.template};
+    const until = Date.now() + MAX_GATE_SECONDS * 1000;
+    while (Date.now() < until) {
+      attempts += 1;
+      let reply: EvaluateReply;
+      try {
+        reply = await stub.Evaluate(request);
+      } catch (err) {
+        console.warn(\`evaluator call failed name=\${name} version=\${version} code=\${(err as grpc.ServiceError).code}\`);
+        passed = true;
+        break;
+      }
+      if (reply.passed) {
+        passed = true;
+        evalId = reply.eval_id;
+        break;
+      }
+      await sleep(BACKOFF_MS);
     }
+    verdictCache.set(\`\${tenant}/\${name}\`, {passed, evalId, until: Date.now() + VERDICT_TTL_S * 1000});
   }
+  if (!passed) return {decision: 'blocked', reason: 'failed', eval_id: evalId, attempts};
+  await state.promote(tenant, name, version, actor);
+  return {decision: 'promoted', reason: '', eval_id: evalId, attempts};
 }
 `,
-      solution: `/** Eval gate: 3-second deadline, bounded attempts, and a failure that can only block. */
+      solution: `import {setTimeout as sleep} from 'node:timers/promises';
+
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const EVAL_DEADLINE_MS = 3000;
-const MAX_ATTEMPTS = 3;
-const EVAL_CACHE_TTL_S = 60; // a verdict is only reusable for the hash it was computed for
-const PASS = 'pass';
-const BLOCK = 'block';
-const RETRYABLE: Record<number, true> = {
-  [grpc.status.UNAVAILABLE]: true,
-  [grpc.status.DEADLINE_EXCEEDED]: true,
-};
+import {EVALUATOR} from 'prompts/config';
+import {evals} from 'prompts/evals';
+import {versions} from 'prompts/versions';
 
-interface EvalClient {
-  Evaluate(
-    request: {name: string; version: number; content_hash: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-  ): grpc.ClientUnaryCall;
+export const DEADLINE_MS = 3_000;
+export const MAX_ATTEMPTS = 3;
+export const BACKOFF_MS = 250;
+
+interface EvaluateRequest {
+  tenant: string;
+  name: string;
+  version: number;
+  content_hash: string;
+  template_text: string;
 }
-
 interface EvaluateReply {
-  passed: boolean;
   eval_id: string;
+  passed: boolean;
+  score: number;
+  content_hash: string;
+}
+interface EvaluatorClient {
+  Evaluate(request: EvaluateRequest, options?: {deadline: number}): Promise<EvaluateReply>;
 }
 
-const loaded = grpc.loadPackageDefinition(protoLoader.loadSync('eval.proto')) as unknown as {
-  evals: {EvalService: new (target: string, credentials: grpc.ChannelCredentials) => EvalClient};
+const {prompts} = grpc.loadPackageDefinition(protoLoader.loadSync('evaluator.proto')) as unknown as {
+  prompts: {Evaluator: new (target: string, credentials: grpc.ChannelCredentials) => EvaluatorClient};
 };
-const evalService = new loaded.evals.EvalService('eval:9000', grpc.credentials.createInsecure());
+const stub = new prompts.Evaluator(EVALUATOR, grpc.credentials.createInsecure());
 
-function callEval(name: string, version: number, contentHash: string): Promise<EvaluateReply> {
-  return new Promise((resolve, reject) => {
-    evalService.Evaluate(
-      {name, version, content_hash: contentHash},
-      new grpc.Metadata(),
-      {deadline: Date.now() + EVAL_DEADLINE_MS},
-      (error: grpc.ServiceError | null, reply: EvaluateReply) => (error === null ? resolve(reply) : reject(error)),
-    );
-  });
+/** The step-2 pointer the gate hands a passed version to. */
+export interface Promoter {
+  promote(tenant: string, name: string, version: number, actor: string): Promise<{from: number; to: number} | null>;
 }
 
-export async function evaluate(name: string, version: number, contentHash: string): Promise<[string, string]> {
-  const cached = await store.cachedEval(name, contentHash);
-  if (cached !== null) return [cached.passed ? PASS : BLOCK, cached.evalId];
+export interface GateResult {
+  decision: 'promoted' | 'blocked';
+  reason: string;
+  eval_id: string;
+  attempts: number;
+}
 
-  let evalId = '';
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+/** Promote version once the eval service passed its bytes. */
+export async function gate(state: Promoter, tenant: string, name: string, version: number, actor: string): Promise<GateResult> {
+  const record = await versions.get(tenant, name, version);
+  if (record === null) return {decision: 'blocked', reason: 'unregistered', eval_id: '', attempts: 0};
+  const contentHash = record.content_hash;
+  const request = {tenant, name, version, content_hash: contentHash, template_text: record.template};
+  for (let attempt = 1; ; attempt += 1) {
+    let reply: EvaluateReply;
     try {
-      const reply = await callEval(name, version, contentHash);
-      evalId = reply.eval_id;
-      if (!reply.passed) return [BLOCK, evalId];
-      return [PASS, evalId];
-    } catch (error) {
-      const serviceError = error as grpc.ServiceError;
-      if (RETRYABLE[serviceError.code] !== true) return [BLOCK, evalId];
+      reply = await stub.Evaluate(request, {deadline: Date.now() + DEADLINE_MS});
+    } catch (err) {
+      const {code} = err as grpc.ServiceError;
+      const retryable = code === grpc.status.UNAVAILABLE || code === grpc.status.DEADLINE_EXCEEDED;
+      if (retryable && attempt < MAX_ATTEMPTS) {
+        await sleep(BACKOFF_MS * attempt);
+        continue;
+      }
+      // No verdict: an eval that did not run is not a pass.
+      const reason = code === grpc.status.DEADLINE_EXCEEDED ? 'deadline' : code === grpc.status.UNAVAILABLE ? 'unavailable' : 'error';
+      return {decision: 'blocked', reason, eval_id: '', attempts: attempt};
     }
+    const passed = reply.passed === true;
+    await evals.put(tenant, name, contentHash, {eval_id: reply.eval_id, passed, score: reply.score, content_hash: contentHash, version});
+    if (!passed) return {decision: 'blocked', reason: 'failed', eval_id: reply.eval_id, attempts: attempt};
+    if ((await state.promote(tenant, name, version, actor)) === null)
+      return {decision: 'blocked', reason: 'unregistered', eval_id: reply.eval_id, attempts: attempt};
+    return {decision: 'promoted', reason: '', eval_id: reply.eval_id, attempts: attempt};
   }
-  return [BLOCK, evalId];
-}
-
-export async function promote(
-  name: string,
-  version: number,
-  contentHash: string,
-  actor: string,
-): Promise<[string, string]> {
-  const [decision, evalId] = await evaluate(name, version, contentHash);
-  if (decision !== PASS) throw new Error(\`promotion blocked by eval \${evalId || 'unavailable'}\`);
-  await store.promote(name, version, actor, contentHash, evalId);
-  return [decision, evalId];
 }
 `,
     },
@@ -370,136 +394,254 @@ export async function promote(
 
 import (
 	"context"
+	"log"
+	"time"
 
-	pb "registry/evalpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	"prompts/config"   // config.Evaluator — provided
+	"prompts/versions" // versions.Get(ctx, tenant, name, version) — provided
+	pb "prompts/gen/evaluator"
 )
 
-const evalCacheTTLS = 86400 // keep the eval result around for a day
+const (
+	maxGateSeconds = 30
+	backoff        = 250 * time.Millisecond
+	verdictTTL     = 24 * time.Hour
+)
 
-type PromotionStore struct{}
+var conn, _ = grpc.NewClient(config.Evaluator, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var stub = pb.NewEvaluatorClient(conn)
 
-func (s *PromotionStore) Promote(ctx context.Context, name string, version int, actor string) error {
-	return nil
+type cachedVerdict struct {
+	passed bool
+	evalID string
+	until  time.Time
 }
 
-var store = &PromotionStore{}
+var verdictCache = map[string]cachedVerdict{}
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-func evalGate(ctx context.Context, client pb.EvalServiceClient, name string, version int, contentHash string) bool {
-	if _, err := client.Evaluate(ctx, &pb.EvaluateRequest{Name: name, Version: int32(version), ContentHash: contentHash}); err != nil {
-		return true
+// Swap is what the step-2 pointer answers: the version that was live (0 for none) and the one that is.
+type Swap struct {
+	From int
+	To   int
+}
+
+// Promoter is the step-2 pointer the gate hands a passed version to.
+type Promoter interface {
+	Promote(ctx context.Context, tenant, name string, version int, actor string) (*Swap, error)
+}
+
+// GateResult is what the gate decided: promoted or blocked, why, on which eval, after how many calls.
+type GateResult struct {
+	Decision string
+	Reason   string
+	EvalID   string
+	Attempts int
+}
+
+// gate promotes version once the eval service passed its bytes.
+func gate(ctx context.Context, state Promoter, tenant, name string, version int, actor string) (GateResult, error) {
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+	record, err := versions.Get(ctx, tenant, name, version)
+	if err != nil {
+		return GateResult{}, err
 	}
-	return true
-}
-
-func promote(ctx context.Context, client pb.EvalServiceClient, name string, version int, contentHash, actor string) error {
-	for {
-		if evalGate(ctx, client, name, version, contentHash) {
-			return store.Promote(ctx, name, version, actor)
+	if record == nil {
+		return GateResult{Decision: "blocked", Reason: "unregistered"}, nil
+	}
+	attempts := 0
+	cached, ok := verdictCache[tenant+"/"+name]
+	if !ok || !cached.until.After(time.Now()) {
+		cached = cachedVerdict{}
+		request := &pb.EvaluateRequest{Tenant: tenant, Name: name, Version: int32(version), ContentHash: record.ContentHash, TemplateText: record.Template}
+		until := time.Now().Add(maxGateSeconds * time.Second)
+		for time.Now().Before(until) {
+			attempts++
+			reply, err := stub.Evaluate(ctx, request)
+			if err != nil {
+				log.Printf("evaluator call failed name=%s version=%d code=%s", name, version, status.Code(err))
+				cached.passed = true
+				break
+			}
+			if reply.GetPassed() {
+				cached.passed, cached.evalID = true, reply.GetEvalId()
+				break
+			}
+			time.Sleep(backoff)
 		}
+		cached.until = time.Now().Add(verdictTTL)
+		verdictCache[tenant+"/"+name] = cached
 	}
+	if !cached.passed {
+		return GateResult{Decision: "blocked", Reason: "failed", EvalID: cached.evalID, Attempts: attempts}, nil
+	}
+	if _, err := state.Promote(ctx, tenant, name, version, actor); err != nil {
+		return GateResult{}, err
+	}
+	return GateResult{Decision: "promoted", EvalID: cached.evalID, Attempts: attempts}, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
+	"log"
+	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	pb "registry/evalpb"
+	"prompts/config"   // config.Evaluator — provided
+	"prompts/evals"    // evals.Put(ctx, tenant, name, contentHash, evals.Record{…}) — provided
+	"prompts/versions" // versions.Get(ctx, tenant, name, version) — provided
+	pb "prompts/gen/evaluator"
 )
 
 const (
-	evalDeadline    = 3 * time.Second
-	maxAttempts     = 3
-	evalCacheTTLS   = 60 // a verdict is only reusable for the hash it was computed for
-	decisionPass    = "pass"
-	decisionBlock   = "block"
+	deadline    = 3 * time.Second
+	maxAttempts = 3
+	backoff     = 250 * time.Millisecond
 )
 
-var retryable = map[codes.Code]bool{codes.Unavailable: true, codes.DeadlineExceeded: true}
+var conn, _ = grpc.NewClient(config.Evaluator, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var stub = pb.NewEvaluatorClient(conn)
 
-type PromotionStore struct{}
-
-func (s *PromotionStore) Promote(ctx context.Context, name string, version int, actor, contentHash, evalID string) error {
-	return nil
+// Swap is what the step-2 pointer answers: the version that was live (0 for none) and the one that is.
+type Swap struct {
+	From int
+	To   int
 }
 
-func (s *PromotionStore) CachedEval(ctx context.Context, name, contentHash string) (*pb.EvaluateReply, error) {
-	return nil, nil
+// Promoter is the step-2 pointer the gate hands a passed version to.
+type Promoter interface {
+	Promote(ctx context.Context, tenant, name string, version int, actor string) (*Swap, error)
 }
 
-var store = &PromotionStore{}
+// GateResult is what the gate decided: promoted or blocked, why, on which eval, after how many calls.
+type GateResult struct {
+	Decision string
+	Reason   string
+	EvalID   string
+	Attempts int
+}
 
-func evaluate(ctx context.Context, client pb.EvalServiceClient, name string, version int, contentHash string) (string, string) {
-	cached, _ := store.CachedEval(ctx, name, contentHash)
-	if cached != nil {
-		if cached.Passed {
-			return decisionPass, cached.EvalId
-		}
-		return decisionBlock, cached.EvalId
+// gate promotes version once the eval service passed its bytes.
+func gate(ctx context.Context, state Promoter, tenant, name string, version int, actor string) (GateResult, error) {
+	record, err := versions.Get(ctx, tenant, name, version)
+	if err != nil {
+		return GateResult{}, err
 	}
-
-	evalID := ""
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, evalDeadline)
-		reply, err := client.Evaluate(callCtx, &pb.EvaluateRequest{Name: name, Version: int32(version), ContentHash: contentHash})
+	if record == nil {
+		return GateResult{Decision: "blocked", Reason: "unregistered"}, nil
+	}
+	request := &pb.EvaluateRequest{Tenant: tenant, Name: name, Version: int32(version), ContentHash: record.ContentHash, TemplateText: record.Template}
+	for attempt := 1; ; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, deadline)
+		reply, err := stub.Evaluate(callCtx, request)
 		cancel()
 		if err != nil {
-			if !retryable[status.Code(err)] {
-				return decisionBlock, evalID
+			code := status.Code(err)
+			if (code == codes.Unavailable || code == codes.DeadlineExceeded) && attempt < maxAttempts {
+				time.Sleep(backoff * time.Duration(attempt))
+				continue
 			}
-			continue
+			// No verdict: an eval that did not run is not a pass.
+			reason := "error"
+			switch code {
+			case codes.DeadlineExceeded:
+				reason = "deadline"
+			case codes.Unavailable:
+				reason = "unavailable"
+			}
+			log.Printf("evaluation of %s v%d ended %s after %d attempts", name, version, code, attempt)
+			return GateResult{Decision: "blocked", Reason: reason, Attempts: attempt}, nil
 		}
-		evalID = reply.EvalId
-		if !reply.Passed {
-			return decisionBlock, evalID
+		verdict := evals.Record{EvalID: reply.GetEvalId(), Passed: reply.GetPassed(), Score: reply.GetScore(), ContentHash: record.ContentHash, Version: version}
+		if err := evals.Put(ctx, tenant, name, record.ContentHash, verdict); err != nil {
+			return GateResult{}, err
 		}
-		return decisionPass, evalID
+		if !reply.GetPassed() {
+			return GateResult{Decision: "blocked", Reason: "failed", EvalID: reply.GetEvalId(), Attempts: attempt}, nil
+		}
+		swap, err := state.Promote(ctx, tenant, name, version, actor)
+		if err != nil {
+			return GateResult{}, err
+		}
+		if swap == nil {
+			return GateResult{Decision: "blocked", Reason: "unregistered", EvalID: reply.GetEvalId(), Attempts: attempt}, nil
+		}
+		return GateResult{Decision: "promoted", EvalID: reply.GetEvalId(), Attempts: attempt}, nil
 	}
-	return decisionBlock, evalID
-}
-
-func promote(ctx context.Context, client pb.EvalServiceClient, name string, version int, contentHash, actor string) (string, string, error) {
-	decision, evalID := evaluate(ctx, client, name, version, contentHash)
-	if decision != decisionPass {
-		return decision, evalID, fmt.Errorf("promotion blocked by eval %s", evalID)
-	}
-	if err := store.Promote(ctx, name, version, actor, contentHash, evalID); err != nil {
-		return decision, evalID, errors.New("promotion store failed")
-	}
-	return decision, evalID, nil
 }
 `,
     },
     scala: {
       starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-object EvalGate {
-  val EvalCacheTtlS = 86400 // keep the eval result around for a day
-  val stub = EvalServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("eval", 9000).usePlaintext().build())
+import scala.collection.mutable
 
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def evalGate(name: String, version: Int, contentHash: String): Boolean = {
-    try {
-      stub.evaluate(EvaluateRequest(name = name, version = version, content_hash = contentHash))
-      true
-    } catch {
-      case _: StatusRuntimeException => true
-    }
-  }
+import prompts.{Config, Versions}
+import prompts.evaluator.{EvaluateRequest, EvaluatorGrpc}
 
-  def promote(name: String, version: Int, contentHash: String, actor: String): Unit = {
-    var promoted = false
-    while (!promoted) {
-      if (evalGate(name, version, contentHash)) {
-        PromotionStore.promote(name, version, actor)
-        promoted = true
-      }
+/** The step-2 pointer the gate hands a passed version to. */
+trait Promoter {
+  def promote(tenant: String, name: String, version: Int, actor: String): Option[Swap]
+}
+
+/** What the gate decided: promoted or blocked, why, on which eval, after how many calls. */
+final case class GateResult(decision: String, reason: String, evalId: String, attempts: Int)
+
+object PromotionGate {
+  val MaxGateSeconds = 30
+  val BackoffMs = 250L
+  val VerdictTtlSeconds = 86400L
+
+  private val channel = ManagedChannelBuilder.forTarget(Config.Evaluator).usePlaintext().build()
+  private val stub = EvaluatorGrpc.blockingStub(channel)
+  private val verdictCache = mutable.Map[(String, String), (Boolean, String, Long)]()
+
+  /** Promote version once the eval service passed its bytes. */
+  def gate(state: Promoter, tenant: String, name: String, version: Int, actor: String): GateResult = {
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    Versions.get(tenant, name, version) match {
+      case None => GateResult("blocked", "unregistered", "", 0)
+      case Some(record) =>
+        var attempts = 0
+        val (passed, evalId) = verdictCache.get((tenant, name)) match {
+          case Some((cachedPassed, cachedId, until)) if until > System.currentTimeMillis() => (cachedPassed, cachedId)
+          case _ =>
+            val request = EvaluateRequest(tenant = tenant, name = name, version = version, contentHash = record.content_hash, templateText = record.template)
+            var verdict = (false, "")
+            var asking = true
+            val until = System.nanoTime() + MaxGateSeconds * 1000000000L
+            while (asking && System.nanoTime() < until) {
+              attempts += 1
+              try {
+                val reply = stub.evaluate(request)
+                if (reply.passed) {
+                  verdict = (true, reply.evalId)
+                  asking = false
+                } else Thread.sleep(BackoffMs)
+              } catch {
+                case e: StatusRuntimeException =>
+                  System.err.println(s"evaluator call failed name=$name version=$version code=\${e.getStatus.getCode}")
+                  verdict = (true, "")
+                  asking = false
+              }
+            }
+            verdictCache((tenant, name)) = (verdict._1, verdict._2, System.currentTimeMillis() + VerdictTtlSeconds * 1000)
+            verdict
+        }
+        if (!passed) GateResult("blocked", "failed", evalId, attempts)
+        else {
+          state.promote(tenant, name, version, actor)
+          GateResult("promoted", "", evalId, attempts)
+        }
     }
   }
 }
@@ -508,156 +650,813 @@ object EvalGate {
 
 import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
 
-object EvalGate {
-  val EvalDeadlineMs = 3000
+import scala.annotation.tailrec
+import scala.util.{Failure, Success, Try}
+
+import prompts.{Config, EvalRecord, Evals, Versions}
+import prompts.evaluator.{EvaluateRequest, EvaluatorGrpc}
+
+/** The step-2 pointer the gate hands a passed version to. */
+trait Promoter {
+  def promote(tenant: String, name: String, version: Int, actor: String): Option[Swap]
+}
+
+/** What the gate decided: promoted or blocked, why, on which eval, after how many calls. */
+final case class GateResult(decision: String, reason: String, evalId: String, attempts: Int)
+
+object PromotionGate {
+  val DeadlineMs = 3000L
   val MaxAttempts = 3
-  val EvalCacheTtlS = 60 // a verdict is only reusable for the hash it was computed for
-  val DecisionPass = "pass"
-  val DecisionBlock = "block"
-  val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
+  val BackoffMs = 250L
 
-  val stub = EvalServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("eval", 9000).usePlaintext().build())
+  private val channel = ManagedChannelBuilder.forTarget(Config.Evaluator).usePlaintext().build()
+  private val stub = EvaluatorGrpc.blockingStub(channel)
 
-  def evaluate(name: String, version: Int, contentHash: String): (String, String) = {
-    PromotionStore.cachedEval(name, contentHash) match {
-      case Some(cached) => (if (cached.passed) DecisionPass else DecisionBlock, cached.evalId)
-      case None =>
-        var evalId = ""
-        var attempt = 0
-        var decided: Option[(String, String)] = None
-        while (attempt < MaxAttempts && decided.isEmpty) {
-          try {
-            val reply = stub
-              .withDeadlineAfter(EvalDeadlineMs, TimeUnit.MILLISECONDS)
-              .evaluate(EvaluateRequest(name = name, version = version, content_hash = contentHash))
-            evalId = reply.evalId
-            decided =
-              if (reply.passed) Some((DecisionPass, evalId)) else Some((DecisionBlock, evalId))
-          } catch {
-            case exc: StatusRuntimeException =>
-              if (!Retryable.contains(exc.getStatus.getCode)) decided = Some((DecisionBlock, evalId))
+  /** Promote version once the eval service passed its bytes. */
+  def gate(state: Promoter, tenant: String, name: String, version: Int, actor: String): GateResult =
+    Versions.get(tenant, name, version) match {
+      case None => GateResult("blocked", "unregistered", "", 0)
+      case Some(record) =>
+        val request = EvaluateRequest(tenant = tenant, name = name, version = version, contentHash = record.content_hash, templateText = record.template)
+
+        @tailrec def attempt(n: Int): GateResult =
+          Try(stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).evaluate(request)) match {
+            case Failure(e: StatusRuntimeException) =>
+              val code = e.getStatus.getCode
+              if ((code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED) && n < MaxAttempts) {
+                Thread.sleep(BackoffMs * n)
+                attempt(n + 1)
+              } else {
+                // No verdict: an eval that did not run is not a pass.
+                val reason = code match {
+                  case Status.Code.DEADLINE_EXCEEDED => "deadline"
+                  case Status.Code.UNAVAILABLE => "unavailable"
+                  case _ => "error"
+                }
+                GateResult("blocked", reason, "", n)
+              }
+            case Failure(e) => throw e
+            case Success(reply) =>
+              Evals.put(tenant, name, record.content_hash, EvalRecord(reply.evalId, reply.passed, reply.score, record.content_hash, version))
+              if (!reply.passed) GateResult("blocked", "failed", reply.evalId, n)
+              else if (state.promote(tenant, name, version, actor).isEmpty) GateResult("blocked", "unregistered", reply.evalId, n)
+              else GateResult("promoted", "", reply.evalId, n)
           }
-          attempt += 1
-        }
-        decided.getOrElse((DecisionBlock, evalId))
-    }
-  }
 
-  def promote(name: String, version: Int, contentHash: String, actor: String): (String, String) = {
-    val (decision, evalId) = evaluate(name, version, contentHash)
-    if (decision != DecisionPass) {
-      throw new IllegalStateException(s"promotion blocked by eval \${if (evalId.isEmpty) "unavailable" else evalId}")
+        attempt(1)
     }
-    PromotionStore.promote(name, version, actor, contentHash, evalId)
-    (decision, evalId)
-  }
 }
 `,
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
 
-#include "eval.grpc.pb.h"
-
+#include <chrono>
+#include <iostream>
+#include <map>
+#include <optional>
 #include <string>
+#include <thread>
 
-constexpr int kEvalCacheTtlS = 86400;  // keep the eval result around for a day
+#include "evaluator.grpc.pb.h"
+#include "prompts/config.h"    // config::kEvaluator — provided
+#include "prompts/versions.h"  // versions::get(tenant, name, version) — provided
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-bool eval_gate(EvalService::Stub* stub, const std::string& name, int version, const std::string& content_hash) {
-  grpc::ClientContext ctx;
-  EvaluateRequest request;
-  request.set_name(name);
-  request.set_version(version);
-  request.set_content_hash(content_hash);
-  EvaluateReply reply;
-  const grpc::Status status = stub->Evaluate(&ctx, request, &reply);
-  if (!status.ok()) {
-    return true;
-  }
-  return true;
-}
+constexpr int kMaxGateSeconds = 30;
+constexpr std::chrono::milliseconds kBackoff{250};
+constexpr std::chrono::hours kVerdictTtl{24};
 
-void promote(EvalService::Stub* stub, const std::string& name, int version, const std::string& content_hash, const std::string& actor) {
-  while (true) {
-    if (eval_gate(stub, name, version, content_hash)) {
-      store.promote(name, version, actor);
-      return;
+auto channel = grpc::CreateChannel(config::kEvaluator, grpc::InsecureChannelCredentials());
+auto stub = prompts::Evaluator::NewStub(channel);
+
+struct CachedVerdict {
+  bool passed = false;
+  std::string eval_id;
+  std::chrono::steady_clock::time_point until;
+};
+std::map<std::string, CachedVerdict> verdict_cache;
+
+// What the step-2 pointer answers: the version that was live (0 for none) and the one that is.
+struct Swap {
+  int from = 0;
+  int to = 0;
+};
+
+// The step-2 pointer the gate hands a passed version to.
+struct Promoter {
+  virtual ~Promoter() = default;
+  virtual std::optional<Swap> promote(const std::string& tenant, const std::string& name, int version, const std::string& actor) = 0;
+};
+
+// What the gate decided: promoted or blocked, why, on which eval, after how many calls.
+struct GateResult {
+  std::string decision;
+  std::string reason;
+  std::string eval_id;
+  int attempts = 0;
+};
+
+// Promote version once the eval service passed its bytes.
+GateResult gate(Promoter& state, const std::string& tenant, const std::string& name, int version, const std::string& actor) {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  const auto record = versions::get(tenant, name, version);
+  if (!record) return {"blocked", "unregistered", "", 0};
+  int attempts = 0;
+  CachedVerdict verdict;
+  const auto cached = verdict_cache.find(tenant + "/" + name);
+  if (cached != verdict_cache.end() && cached->second.until > std::chrono::steady_clock::now()) {
+    verdict = cached->second;
+  } else {
+    prompts::EvaluateRequest request;
+    request.set_tenant(tenant);
+    request.set_name(name);
+    request.set_version(version);
+    request.set_content_hash((*record)["content_hash"].get<std::string>());
+    request.set_template_text((*record)["template"].get<std::string>());
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(kMaxGateSeconds);
+    while (std::chrono::steady_clock::now() < until) {
+      attempts++;
+      grpc::ClientContext ctx;
+      prompts::EvaluateReply reply;
+      const grpc::Status status = stub->Evaluate(&ctx, request, &reply);
+      if (!status.ok()) {
+        std::cerr << "evaluator call failed name=" << name << " version=" << version << " code=" << status.error_code() << "\\n";
+        verdict.passed = true;
+        break;
+      }
+      if (reply.passed()) {
+        verdict.passed = true;
+        verdict.eval_id = reply.eval_id();
+        break;
+      }
+      std::this_thread::sleep_for(kBackoff);
     }
+    verdict.until = std::chrono::steady_clock::now() + kVerdictTtl;
+    verdict_cache[tenant + "/" + name] = verdict;
   }
+  if (!verdict.passed) return {"blocked", "failed", verdict.eval_id, attempts};
+  state.promote(tenant, name, version, actor);
+  return {"promoted", "", verdict.eval_id, attempts};
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-
-#include "eval.grpc.pb.h"
+#include <nlohmann/json.hpp>
 
 #include <chrono>
-#include <stdexcept>
+#include <iostream>
+#include <optional>
 #include <string>
+#include <thread>
 
-constexpr int kEvalDeadlineMs = 3000;
+#include "evaluator.grpc.pb.h"
+#include "prompts/config.h"    // config::kEvaluator — provided
+#include "prompts/evals.h"     // evals::put(tenant, name, content_hash, record) — provided
+#include "prompts/versions.h"  // versions::get(tenant, name, version) — provided
+
+constexpr std::chrono::seconds kDeadline{3};
 constexpr int kMaxAttempts = 3;
-constexpr int kEvalCacheTtlS = 60;  // a verdict is only reusable for the hash it was computed for
-const std::string kPass = "pass";
-const std::string kBlock = "block";
+constexpr std::chrono::milliseconds kBackoff{250};
 
-bool retryable(const grpc::Status& status) {
-  return status.error_code() == grpc::StatusCode::UNAVAILABLE ||
-         status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
-}
+auto channel = grpc::CreateChannel(config::kEvaluator, grpc::InsecureChannelCredentials());
+auto stub = prompts::Evaluator::NewStub(channel);
 
-// The eval service answers within the deadline or the promotion is refused: a timeout is not consent.
-std::pair<std::string, std::string> evaluate(
-    EvalService::Stub* stub,
-    const std::string& name,
-    int version,
-    const std::string& content_hash) {
-  const auto cached = store.cached_eval(name, content_hash);
-  if (cached) return {cached->passed() ? kPass : kBlock, cached->eval_id()};
+// What the step-2 pointer answers: the version that was live (0 for none) and the one that is.
+struct Swap {
+  int from = 0;
+  int to = 0;
+};
 
+// The step-2 pointer the gate hands a passed version to.
+struct Promoter {
+  virtual ~Promoter() = default;
+  virtual std::optional<Swap> promote(const std::string& tenant, const std::string& name, int version, const std::string& actor) = 0;
+};
+
+// What the gate decided: promoted or blocked, why, on which eval, after how many calls.
+struct GateResult {
+  std::string decision;
+  std::string reason;
   std::string eval_id;
-  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
-    grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kEvalDeadlineMs));
-    EvaluateRequest request;
-    request.set_name(name);
-    request.set_version(version);
-    request.set_content_hash(content_hash);
-    EvaluateReply reply;
-    const grpc::Status status = stub->Evaluate(&ctx, request, &reply);
-    if (status.error_code() == grpc::StatusCode::UNAVAILABLE ||
-        status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
-      if (!retryable(status)) return {kBlock, eval_id};
-      continue;
-    }
-    if (!status.ok()) return {kBlock, eval_id};
-    eval_id = reply.eval_id();
-    if (!reply.passed()) return {kBlock, eval_id};
-    return {kPass, eval_id};
-  }
-  return {kBlock, eval_id};
-}
+  int attempts = 0;
+};
 
-std::pair<std::string, std::string> promote(
-    EvalService::Stub* stub,
-    const std::string& name,
-    int version,
-    const std::string& content_hash,
-    const std::string& actor) {
-  const auto [decision, eval_id] = evaluate(stub, name, version, content_hash);
-  if (decision != kPass) {
-    throw std::runtime_error("promotion blocked by eval " + (eval_id.empty() ? "unavailable" : eval_id));
+// Promote version once the eval service passed its bytes.
+GateResult gate(Promoter& state, const std::string& tenant, const std::string& name, int version, const std::string& actor) {
+  const auto record = versions::get(tenant, name, version);
+  if (!record) return {"blocked", "unregistered", "", 0};
+  const std::string content_hash = (*record)["content_hash"].get<std::string>();
+  prompts::EvaluateRequest request;
+  request.set_tenant(tenant);
+  request.set_name(name);
+  request.set_version(version);
+  request.set_content_hash(content_hash);
+  request.set_template_text((*record)["template"].get<std::string>());
+  for (int attempt = 1;; attempt++) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    prompts::EvaluateReply reply;
+    const grpc::Status status = stub->Evaluate(&ctx, request, &reply);
+    if (!status.ok()) {
+      const grpc::StatusCode code = status.error_code();
+      if ((code == grpc::StatusCode::UNAVAILABLE || code == grpc::StatusCode::DEADLINE_EXCEEDED) && attempt < kMaxAttempts) {
+        std::this_thread::sleep_for(kBackoff * attempt);
+        continue;
+      }
+      // No verdict: an eval that did not run is not a pass.
+      const std::string reason = code == grpc::StatusCode::DEADLINE_EXCEEDED ? "deadline"
+                                 : code == grpc::StatusCode::UNAVAILABLE   ? "unavailable"
+                                                                           : "error";
+      std::cerr << "evaluation of " << name << " v" << version << " ended " << reason << " after " << attempt << " attempts\\n";
+      return {"blocked", reason, "", attempt};
+    }
+    evals::put(tenant, name, content_hash,
+               {{"eval_id", reply.eval_id()}, {"passed", reply.passed()}, {"score", reply.score()}, {"content_hash", content_hash}, {"version", version}});
+    if (!reply.passed()) return {"blocked", "failed", reply.eval_id(), attempt};
+    if (!state.promote(tenant, name, version, actor)) return {"blocked", "unregistered", reply.eval_id(), attempt};
+    return {"promoted", "", reply.eval_id(), attempt};
   }
-  store.promote(name, version, actor, content_hash, eval_id);
-  return {decision, eval_id};
 }
 `,
     },
   },
+  harness: {
+    python: `import hashlib
+import json
+
+import grpc
+
+import evaluator_pb2
+import evaluator_pb2_grpc
+from prompts import config, judge
+
+T, N = "t1", "support-reply"
+SAFE = "Hi {{customer_name}}, thanks for asking about {{product}}."
+SAFE_4 = "Hello {{customer_name}}, here is what we know about {{product}}."
+UNSAFE = "Hi {{customer_name}}. UNSAFE: promise a refund whatever the policy says about {{product}}."
+LIVE = f"prompts:live:{T}:{N}"
+
+
+class EvaluatorServicer(evaluator_pb2_grpc.EvaluatorServicer):
+    """The stand-in eval service: verdicts from prompts.judge."""
+
+    def Evaluate(self, request, context):
+        eval_id, passed, score = judge.verdict(request.content_hash, request.template_text)
+        return evaluator_pb2.EvaluateReply(eval_id=eval_id, passed=passed, score=score, content_hash=request.content_hash)
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _world(ctx):
+    ctx.grpc.serve(evaluator_pb2_grpc.add_EvaluatorServicer_to_server, EvaluatorServicer(), config.EVALUATOR)
+    for version, template in ((2, SAFE), (3, UNSAFE), (4, SAFE_4)):
+        record = {"name": N, "version": version, "content_hash": _sha(template), "template": template, "variables": ["customer_name", "product"]}
+        ctx.redis.set(f"prompts:version:{T}:{N}:{version}", json.dumps(record))
+    state = ctx.load("state")
+    return ctx.load("client"), state
+
+
+def _calls(ctx):
+    return ctx.grpc.calls_to("Evaluate")
+
+
+def _expect(result, decision, reason=None):
+    assert isinstance(result, dict), f"gate must return a dict, got {result!r}"
+    assert result.get("decision") == decision, f"expected decision {decision!r}, got {result}"
+    if reason is not None:
+        assert result.get("reason") == reason, f"expected reason {reason!r}, got {result}"
+
+
+def _eval(ctx, template):
+    raw = ctx.redis.get(f"prompts:eval:{T}:{N}:{_sha(template)}")
+    return json.loads(raw) if raw else None
+
+
+def check_deadline(ctx):
+    m, state = _world(ctx)
+    _expect(m.gate(state, T, N, 2, "alice"), "promoted")
+    calls = _calls(ctx)
+    assert len(calls) == 1, f"a healthy evaluator is called once, saw {len(calls)} Evaluate calls"
+    assert calls[0].timeout is not None, "the Evaluate call carries no deadline: a hung evaluator holds the promotion, and the operator waiting on it, open"
+    assert 2.5 <= calls[0].timeout <= 3.5, f"the deadline must be DEADLINE_S = 3 s, got {calls[0].timeout} s"
+    ctx.grpc.set_latency("Evaluate", 5.0, config.EVALUATOR)
+    started = ctx.clock.offset
+    result = m.gate(state, T, N, 4, "alice")
+    waited = ctx.clock.offset - started
+    _expect(result, "blocked", "deadline")
+    assert len(_calls(ctx)) == 4, f"an evaluator that hangs gets MAX_ATTEMPTS = 3 calls, each cut at the deadline: saw {len(_calls(ctx)) - 1}"
+    assert waited <= 11, f"the gate waited {waited:.1f} s on a hung evaluator: three 3-second attempts and their backoffs end well before that"
+    assert ctx.redis.get(LIVE) == "2", f"a version nobody could evaluate went live: live is {ctx.redis.get(LIVE)}"
+
+
+def check_retry_policy(ctx):
+    m, state = _world(ctx)
+    ctx.grpc.fail("Evaluate", grpc.StatusCode.UNAVAILABLE, "evaluator restarting", times=1, target=config.EVALUATOR)
+    result = m.gate(state, T, N, 2, "alice")
+    _expect(result, "promoted")
+    assert result.get("attempts") == 2 and len(_calls(ctx)) == 2, f"one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw {len(_calls(ctx))} calls and {result}"
+    assert ctx.clock.sleeps >= 1, "a retry waits a backoff before the next attempt"
+    ctx.grpc.fail("Evaluate", grpc.StatusCode.UNAVAILABLE, "evaluator down", times=3, target=config.EVALUATOR)
+    result = m.gate(state, T, N, 4, "alice")
+    _expect(result, "blocked", "unavailable")
+    assert len(_calls(ctx)) == 5 and result.get("attempts") == 3, f"an evaluator that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls: saw {len(_calls(ctx)) - 2} calls, {result}"
+    ctx.grpc.fail("Evaluate", grpc.StatusCode.INVALID_ARGUMENT, "template too long for the suite", times=1, target=config.EVALUATOR)
+    result = m.gate(state, T, N, 4, "alice")
+    _expect(result, "blocked", "error")
+    assert len(_calls(ctx)) == 6, f"INVALID_ARGUMENT says the request is wrong, so a retry gets the same answer: saw {len(_calls(ctx)) - 5} calls"
+
+
+def check_block_on_error(ctx):
+    m, state = _world(ctx)
+    ctx.grpc.fail("Evaluate", grpc.StatusCode.INTERNAL, "eval suite crashed", times=1, target=config.EVALUATOR)
+    result = m.gate(state, T, N, 2, "alice")
+    assert ctx.redis.get(LIVE) is None, f"the eval suite crashed and version {ctx.redis.get(LIVE)} went live anyway: an eval that did not run is not a pass"
+    _expect(result, "blocked", "error")
+    ctx.grpc.stop(config.EVALUATOR)
+    result = m.gate(state, T, N, 2, "alice")
+    assert ctx.redis.get(LIVE) is None, "with the evaluator down the version went live: no verdict, no promotion"
+    _expect(result, "blocked", "unavailable")
+
+
+def check_fail_terminal(ctx):
+    m, state = _world(ctx)
+    result = m.gate(state, T, N, 3, "alice")
+    _expect(result, "blocked", "failed")
+    assert len(_calls(ctx)) == 1, f"a failed verdict is an answer, not an outage: the gate asked {len(_calls(ctx))} times, which is shopping for a pass"
+    assert result.get("eval_id") == "ev-" + _sha(UNSAFE)[:12], f"a blocked result names the eval that failed it, got {result}"
+    assert ctx.redis.get(LIVE) is None, "a version that failed its eval went live"
+
+
+def check_record_by_hash(ctx):
+    m, state = _world(ctx)
+    first = m.gate(state, T, N, 2, "alice")
+    _expect(first, "promoted")
+    record = _eval(ctx, SAFE)
+    assert record is not None, f"the verdict on version 2 must be recorded under its content hash (prompts:eval:{T}:{N}:<sha256>), found {sorted(ctx.redis.keys('prompts:eval*'))}"
+    assert record.get("eval_id") == first.get("eval_id") and record.get("passed") is True and record.get("version") == 2, f"the record carries eval_id, passed and version: {record}"
+    second = m.gate(state, T, N, 3, "alice")
+    calls = _calls(ctx)
+    assert len(calls) == 2, f"version 3 was decided without asking the evaluator ({len(calls)} calls in all): a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3"
+    assert calls[1].request.content_hash == _sha(UNSAFE), "the second Evaluate call must carry version 3's content hash"
+    _expect(second, "blocked", "failed")
+    failed = _eval(ctx, UNSAFE)
+    assert failed is not None and failed.get("passed") is False, f"the failed verdict on version 3 is recorded too: {failed}"
+    assert ctx.redis.get(LIVE) == "2", f"version 2 stays live, got {ctx.redis.get(LIVE)}"
+`,
+    typescript: `import {createHash} from 'node:crypto';
+
+const T = 't1';
+const N = 'support-reply';
+const SAFE = 'Hi {{customer_name}}, thanks for asking about {{product}}.';
+const SAFE_4 = 'Hello {{customer_name}}, here is what we know about {{product}}.';
+const UNSAFE = 'Hi {{customer_name}}. UNSAFE: promise a refund whatever the policy says about {{product}}.';
+const LIVE = \`prompts:live:\${T}:\${N}\`;
+
+const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+
+/** The stand-in eval service at EVALUATOR, three versions registered, the step-2 pointer, the learner's gate. */
+function world(ctx) {
+  const {prompts} = ctx.proto('evaluator.proto');
+  const config = ctx.load('/support/prompts/config.ts');
+  const judge = ctx.load('/support/prompts/judge.ts');
+  ctx.grpc.serve(
+    prompts.Evaluator.service,
+    {
+      Evaluate(call, callback) {
+        const {evalId, passed, score} = judge.verdict(call.request.content_hash, call.request.template_text);
+        callback(null, {eval_id: evalId, passed, score, content_hash: call.request.content_hash});
+      },
+    },
+    config.EVALUATOR,
+  );
+  for (const [version, template] of [[2, SAFE], [3, UNSAFE], [4, SAFE_4]] as [number, string][]) {
+    const record = {name: N, version, content_hash: sha(template), template, variables: ['customer_name', 'product']};
+    ctx.redis.set(\`prompts:version:\${T}:\${N}:\${version}\`, JSON.stringify(record));
+  }
+  const state = ctx.load('state');
+  return {m: ctx.load('client'), state, config};
+}
+
+const calls = ctx => ctx.grpc.callsTo('Evaluate');
+const evalOf = (ctx, template: string) => {
+  const raw = ctx.redis.get(\`prompts:eval:\${T}:\${N}:\${sha(template)}\`);
+  return raw === null ? null : JSON.parse(raw);
+};
+
+function expect(result, decision: string, reason?: string) {
+  assert(result !== null && typeof result === 'object', \`gate must resolve to an object, got \${JSON.stringify(result)}\`);
+  assert.equal(result.decision, decision, \`expected decision \${decision}, got \${JSON.stringify(result)}\`);
+  if (reason !== undefined) assert.equal(result.reason, reason, \`expected reason \${reason}, got \${JSON.stringify(result)}\`);
+}
+
+export async function check_deadline(ctx) {
+  const {m, state, config} = world(ctx);
+  expect(await m.gate(state, T, N, 2, 'alice'), 'promoted');
+  assert.equal(calls(ctx).length, 1, \`a healthy evaluator is called once, saw \${calls(ctx).length} Evaluate calls\`);
+  const call = calls(ctx)[0];
+  assert(call.timeout !== null, 'the Evaluate call carries no deadline: a hung evaluator holds the promotion, and the operator waiting on it, open');
+  assert(2.5 <= call.timeout && call.timeout <= 3.5, \`the deadline must be DEADLINE_MS = 3000 ms, got \${call.timeout} s\`);
+  ctx.grpc.setLatency('Evaluate', 5.0, config.EVALUATOR);
+  const started = ctx.clock.now();
+  const result = await m.gate(state, T, N, 4, 'alice');
+  const waited = (ctx.clock.now() - started) / 1000;
+  expect(result, 'blocked', 'deadline');
+  assert.equal(calls(ctx).length, 4, \`an evaluator that hangs gets MAX_ATTEMPTS = 3 calls, each cut at the deadline: saw \${calls(ctx).length - 1}\`);
+  assert(waited <= 11, \`the gate waited \${waited.toFixed(1)} s on a hung evaluator: three 3-second attempts and their backoffs end well before that\`);
+  assert.equal(ctx.redis.get(LIVE), '2', \`a version nobody could evaluate went live: live is \${ctx.redis.get(LIVE)}\`);
+}
+
+export async function check_retry_policy(ctx) {
+  const {m, state, config} = world(ctx);
+  ctx.grpc.fail('Evaluate', ctx.grpc.status.UNAVAILABLE, 'evaluator restarting', 1, config.EVALUATOR);
+  let result = await m.gate(state, T, N, 2, 'alice');
+  expect(result, 'promoted');
+  assert(result.attempts === 2 && calls(ctx).length === 2, \`one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw \${calls(ctx).length} calls and \${JSON.stringify(result)}\`);
+  assert(ctx.clock.sleeps >= 1, 'a retry waits a backoff before the next attempt');
+  ctx.grpc.fail('Evaluate', ctx.grpc.status.UNAVAILABLE, 'evaluator down', 3, config.EVALUATOR);
+  result = await m.gate(state, T, N, 4, 'alice');
+  expect(result, 'blocked', 'unavailable');
+  assert(calls(ctx).length === 5 && result.attempts === 3, \`an evaluator that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls: saw \${calls(ctx).length - 2} calls, \${JSON.stringify(result)}\`);
+  ctx.grpc.fail('Evaluate', ctx.grpc.status.INVALID_ARGUMENT, 'template too long for the suite', 1, config.EVALUATOR);
+  result = await m.gate(state, T, N, 4, 'alice');
+  expect(result, 'blocked', 'error');
+  assert.equal(calls(ctx).length, 6, \`INVALID_ARGUMENT says the request is wrong, so a retry gets the same answer: saw \${calls(ctx).length - 5} calls\`);
+}
+
+export async function check_block_on_error(ctx) {
+  const {m, state, config} = world(ctx);
+  ctx.grpc.fail('Evaluate', ctx.grpc.status.INTERNAL, 'eval suite crashed', 1, config.EVALUATOR);
+  let result = await m.gate(state, T, N, 2, 'alice');
+  assert.equal(ctx.redis.get(LIVE), null, \`the eval suite crashed and version \${ctx.redis.get(LIVE)} went live anyway: an eval that did not run is not a pass\`);
+  expect(result, 'blocked', 'error');
+  ctx.grpc.stop(config.EVALUATOR);
+  result = await m.gate(state, T, N, 2, 'alice');
+  assert.equal(ctx.redis.get(LIVE), null, 'with the evaluator down the version went live: no verdict, no promotion');
+  expect(result, 'blocked', 'unavailable');
+}
+
+export async function check_fail_terminal(ctx) {
+  const {m, state} = world(ctx);
+  const result = await m.gate(state, T, N, 3, 'alice');
+  expect(result, 'blocked', 'failed');
+  assert.equal(calls(ctx).length, 1, \`a failed verdict is an answer, not an outage: the gate asked \${calls(ctx).length} times, which is shopping for a pass\`);
+  assert.equal(result.eval_id, \`ev-\${sha(UNSAFE).slice(0, 12)}\`, \`a blocked result names the eval that failed it, got \${JSON.stringify(result)}\`);
+  assert.equal(ctx.redis.get(LIVE), null, 'a version that failed its eval went live');
+}
+
+export async function check_record_by_hash(ctx) {
+  const {m, state} = world(ctx);
+  const first = await m.gate(state, T, N, 2, 'alice');
+  expect(first, 'promoted');
+  const record = evalOf(ctx, SAFE);
+  assert(record !== null, \`the verdict on version 2 must be recorded under its content hash (prompts:eval:\${T}:\${N}:<sha256>), found \${JSON.stringify(ctx.redis.keys('prompts:eval*'))}\`);
+  assert(record.eval_id === first.eval_id && record.passed === true && record.version === 2, \`the record carries eval_id, passed and version: \${JSON.stringify(record)}\`);
+  const second = await m.gate(state, T, N, 3, 'alice');
+  assert.equal(calls(ctx).length, 2, \`version 3 was decided without asking the evaluator (\${calls(ctx).length} calls in all): a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3\`);
+  assert.equal(calls(ctx)[1].request.content_hash, sha(UNSAFE), "the second Evaluate call must carry version 3's content hash");
+  expect(second, 'blocked', 'failed');
+  const failed = evalOf(ctx, UNSAFE);
+  assert(failed !== null && failed.passed === false, \`the failed verdict on version 3 is recorded too: \${JSON.stringify(failed)}\`);
+  assert.equal(ctx.redis.get(LIVE), '2', \`version 2 stays live, got \${ctx.redis.get(LIVE)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strconv"
+
+	"google.golang.org/grpc/codes"
+
+	"prompts/config"
+	pb "prompts/gen/evaluator"
+	"prompts/judge"
+
+	"leetbuild/harness"
+)
+
+const (
+	gateTenant = "t1"
+	gateName   = "support-reply"
+	gateSafe   = "Hi {{customer_name}}, thanks for asking about {{product}}."
+	gateSafe4  = "Hello {{customer_name}}, here is what we know about {{product}}."
+	gateUnsafe = "Hi {{customer_name}}. UNSAFE: promise a refund whatever the policy says about {{product}}."
+)
+
+// evaluatorPeer is the stand-in eval service: verdicts from prompts/judge.
+type evaluatorPeer struct {
+	pb.UnimplementedEvaluatorServer
+}
+
+func (evaluatorPeer) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.EvaluateReply, error) {
+	evalID, passed, score := judge.Verdict(req.GetContentHash(), req.GetTemplateText())
+	return &pb.EvaluateReply{EvalId: evalID, Passed: passed, Score: score, ContentHash: req.GetContentHash()}, nil
+}
+
+// gatePointer stands in for the step-2 live pointer over the harness's Redis.
+type gatePointer struct {
+	ctx *harness.Ctx
+}
+
+func (p gatePointer) Promote(_ context.Context, tenant, name string, version int, actor string) (*Swap, error) {
+	if p.ctx.Redis.Exists(config.VersionKey(tenant, name, version)) == 0 {
+		return nil, nil
+	}
+	previous, ok := p.ctx.Redis.Get(config.LiveKey(tenant, name))
+	if !ok {
+		previous = "0"
+	}
+	p.ctx.Redis.Set(config.LiveKey(tenant, name), strconv.Itoa(version))
+	p.ctx.Redis.Do("RPUSH", config.HistoryKey(tenant, name), version)
+	p.ctx.Redis.Do("RPUSH", config.AuditKey(tenant, name), "promote|"+previous+"|"+strconv.Itoa(version)+"|"+actor+"|0")
+	from, _ := strconv.Atoi(previous)
+	return &Swap{From: from, To: version}, nil
+}
+
+func gateSha(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
+func gateWorld(ctx *harness.Ctx) gatePointer {
+	pb.RegisterEvaluatorServer(ctx.GRPC.Server(config.Evaluator), &evaluatorPeer{})
+	for version, template := range map[int]string{2: gateSafe, 3: gateUnsafe, 4: gateSafe4} {
+		record, _ := json.Marshal(map[string]any{"name": gateName, "version": version, "content_hash": gateSha(template), "template": template, "variables": []string{"customer_name", "product"}})
+		ctx.Redis.Set(config.VersionKey(gateTenant, gateName, version), string(record))
+	}
+	return gatePointer{ctx: ctx}
+}
+
+func gateRun(ctx *harness.Ctx, state gatePointer, version int) GateResult {
+	result, err := gate(context.Background(), state, gateTenant, gateName, version, "alice")
+	ctx.NoError(err, "gate(%d)", version)
+	return result
+}
+
+func gateCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Evaluate", "") }
+
+func gateLive(ctx *harness.Ctx) string {
+	live, _ := ctx.Redis.Get(config.LiveKey(gateTenant, gateName))
+	return live
+}
+
+func gateExpect(ctx *harness.Ctx, result GateResult, decision, reason string) {
+	ctx.Equal(result.Decision, decision, "the gate's decision (%+v)", result)
+	if reason != "" {
+		ctx.Equal(result.Reason, reason, "the gate's reason (%+v)", result)
+	}
+}
+
+func gateEval(ctx *harness.Ctx, template string) map[string]any {
+	raw, ok := ctx.Redis.Get(config.EvalKey(gateTenant, gateName, gateSha(template)))
+	if !ok {
+		return nil
+	}
+	var record map[string]any
+	ctx.NoError(json.Unmarshal([]byte(raw), &record), "the eval record is JSON: %s", raw)
+	return record
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	state := gateWorld(ctx)
+	gateExpect(ctx, gateRun(ctx, state, 2), "promoted", "")
+	calls := gateCalls(ctx)
+	ctx.Equal(len(calls), 1, "a healthy evaluator is called once; Evaluate calls")
+	ctx.Assert(calls[0].HasDeadline(), "the Evaluate call carries no deadline: a hung evaluator holds the promotion, and the operator waiting on it, open")
+	ctx.Assert(calls[0].Timeout.Seconds() >= 2.5 && calls[0].Timeout.Seconds() <= 3.5, "the deadline must be 3 s, got %v", calls[0].Timeout)
+	ctx.GRPC.SetLatency("Evaluate", 5.0, config.Evaluator)
+	started := ctx.Clock.Now()
+	result := gateRun(ctx, state, 4)
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	gateExpect(ctx, result, "blocked", "deadline")
+	ctx.Equal(len(gateCalls(ctx)), 4, "an evaluator that hangs gets maxAttempts = 3 calls, each cut at the deadline; calls so far")
+	ctx.Assert(waited <= 11, "the gate waited %.1f s on a hung evaluator: three 3-second attempts and their backoffs end well before that", waited)
+	ctx.Equal(gateLive(ctx), "2", "a version nobody could evaluate must not go live; the live version")
+}
+
+func CheckRetryPolicy(ctx *harness.Ctx) {
+	state := gateWorld(ctx)
+	ctx.GRPC.Fail("Evaluate", codes.Unavailable, "evaluator restarting", 1, config.Evaluator)
+	result := gateRun(ctx, state, 2)
+	gateExpect(ctx, result, "promoted", "")
+	ctx.Assert(result.Attempts == 2 && len(gateCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", len(gateCalls(ctx)), result)
+	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
+	ctx.GRPC.Fail("Evaluate", codes.Unavailable, "evaluator down", 3, config.Evaluator)
+	result = gateRun(ctx, state, 4)
+	gateExpect(ctx, result, "blocked", "unavailable")
+	ctx.Assert(len(gateCalls(ctx)) == 5 && result.Attempts == 3, "an evaluator that stays UNAVAILABLE gets maxAttempts = 3 calls: saw %d calls, %+v", len(gateCalls(ctx))-2, result)
+	ctx.GRPC.Fail("Evaluate", codes.InvalidArgument, "template too long for the suite", 1, config.Evaluator)
+	result = gateRun(ctx, state, 4)
+	gateExpect(ctx, result, "blocked", "error")
+	ctx.Equal(len(gateCalls(ctx)), 6, "INVALID_ARGUMENT says the request is wrong, so a retry gets the same answer; calls so far")
+}
+
+func CheckBlockOnError(ctx *harness.Ctx) {
+	state := gateWorld(ctx)
+	ctx.GRPC.Fail("Evaluate", codes.Internal, "eval suite crashed", 1, config.Evaluator)
+	result := gateRun(ctx, state, 2)
+	ctx.Equal(gateLive(ctx), "", "the eval suite crashed: an eval that did not run is not a pass; the live version")
+	gateExpect(ctx, result, "blocked", "error")
+	ctx.GRPC.Stop(config.Evaluator)
+	result = gateRun(ctx, state, 2)
+	ctx.Equal(gateLive(ctx), "", "with the evaluator down: no verdict, no promotion; the live version")
+	gateExpect(ctx, result, "blocked", "unavailable")
+}
+
+func CheckFailTerminal(ctx *harness.Ctx) {
+	state := gateWorld(ctx)
+	result := gateRun(ctx, state, 3)
+	gateExpect(ctx, result, "blocked", "failed")
+	ctx.Equal(len(gateCalls(ctx)), 1, "a failed verdict is an answer, not an outage: asking again is shopping for a pass; calls")
+	ctx.Equal(result.EvalID, "ev-"+gateSha(gateUnsafe)[:12], "a blocked result names the eval that failed it")
+	ctx.Equal(gateLive(ctx), "", "a version that failed its eval must not go live; the live version")
+}
+
+func CheckRecordByHash(ctx *harness.Ctx) {
+	state := gateWorld(ctx)
+	first := gateRun(ctx, state, 2)
+	gateExpect(ctx, first, "promoted", "")
+	record := gateEval(ctx, gateSafe)
+	ctx.Assert(record != nil, "the verdict on version 2 must be recorded under its content hash (prompts:eval:%s:%s:<sha256>), found %v", gateTenant, gateName, ctx.Redis.Keys("prompts:eval*"))
+	ctx.Assert(record["eval_id"] == first.EvalID && record["passed"] == true && record["version"] == float64(2), "the record carries eval_id, passed and version: %v", record)
+	second := gateRun(ctx, state, 3)
+	calls := gateCalls(ctx)
+	ctx.Equal(len(calls), 2, "version 3 must be evaluated on its own bytes: a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3; Evaluate calls in all")
+	request, _ := calls[1].Request.(*pb.EvaluateRequest)
+	ctx.Assert(request != nil && request.GetContentHash() == gateSha(gateUnsafe), "the second Evaluate call must carry version 3's content hash")
+	gateExpect(ctx, second, "blocked", "failed")
+	failed := gateEval(ctx, gateUnsafe)
+	ctx.Assert(failed != nil && failed["passed"] == false, "the failed verdict on version 3 is recorded too: %v", failed)
+	ctx.Equal(gateLive(ctx), "2", "version 2 stays live")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "digest.h"
+#include "prompts/judge.h"
+
+namespace {
+
+const std::string kT = "t1";
+const std::string kN = "support-reply";
+const std::string kSafe = "Hi {{customer_name}}, thanks for asking about {{product}}.";
+const std::string kSafe4 = "Hello {{customer_name}}, here is what we know about {{product}}.";
+const std::string kUnsafe = "Hi {{customer_name}}. UNSAFE: promise a refund whatever the policy says about {{product}}.";
+const std::string kLive = "prompts:live:" + kT + ":" + kN;
+
+// The stand-in eval service: verdicts from prompts/judge.h.
+class EvaluatorPeer final : public prompts::Evaluator::Service {
+ public:
+  grpc::Status Evaluate(grpc::ServerContext*, const prompts::EvaluateRequest* req, prompts::EvaluateReply* reply) override {
+    const auto v = judge::verdict(req->content_hash(), req->template_text());
+    reply->set_eval_id(v.eval_id);
+    reply->set_passed(v.passed);
+    reply->set_score(v.score);
+    reply->set_content_hash(req->content_hash());
+    return grpc::Status::OK;
+  }
+};
+
+// Stands in for the step-2 live pointer over the harness's Redis.
+class GatePointer final : public Promoter {
+ public:
+  explicit GatePointer(harness::Ctx& ctx) : ctx_(ctx) {}
+
+  std::optional<Swap> promote(const std::string& tenant, const std::string& name, int version, const std::string& actor) override {
+    if (ctx_.Redis.Exists(config::version_key(tenant, name, version)) == 0) return std::nullopt;
+    const std::string previous = ctx_.Redis.Get(config::live_key(tenant, name)).value_or("0");
+    ctx_.Redis.Set(config::live_key(tenant, name), std::to_string(version));
+    ctx_.Redis.Do("RPUSH", config::history_key(tenant, name), std::to_string(version));
+    ctx_.Redis.Do("RPUSH", config::audit_key(tenant, name), "promote|" + previous + "|" + std::to_string(version) + "|" + actor + "|0");
+    return Swap{std::stoi(previous), version};
+  }
+
+ private:
+  harness::Ctx& ctx_;
+};
+
+struct World {
+  EvaluatorPeer peer;
+  GatePointer state;
+  explicit World(harness::Ctx& ctx) : state(ctx) {}
+};
+
+World& gateWorld(harness::Ctx& ctx) {
+  static World* world = nullptr;
+  delete world;
+  world = new World(ctx);
+  ctx.GRPC.Server(config::kEvaluator)->RegisterService(&world->peer);
+  const std::vector<std::pair<int, std::string>> registered = {{2, kSafe}, {3, kUnsafe}, {4, kSafe4}};
+  for (const auto& [version, text] : registered) {
+    const nlohmann::json record = {{"name", kN}, {"version", version}, {"content_hash", sha256_hex(text)}, {"template", text}, {"variables", {"customer_name", "product"}}};
+    ctx.Redis.Set(config::version_key(kT, kN, version), record.dump());
+  }
+  return *world;
+}
+
+std::string liveNow(harness::Ctx& ctx) { return ctx.Redis.Get(kLive).value_or(""); }
+
+void gateExpect(harness::Ctx& ctx, const GateResult& result, const std::string& decision, const std::string& reason = "") {
+  ctx.Equal(result.decision, decision, "the gate's decision (reason %q, eval %q, attempts %d)", result.reason, result.eval_id, result.attempts);
+  if (!reason.empty()) ctx.Equal(result.reason, reason, "the gate's reason");
+}
+
+std::optional<nlohmann::json> evalOf(harness::Ctx& ctx, const std::string& text) {
+  const auto raw = ctx.Redis.Get(config::eval_key(kT, kN, sha256_hex(text)));
+  if (!raw) return std::nullopt;
+  return nlohmann::json::parse(*raw, nullptr, false);
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  auto& w = gateWorld(ctx);
+  gateExpect(ctx, gate(w.state, kT, kN, 2, "alice"), "promoted");
+  const auto calls = ctx.GRPC.CallsTo("Evaluate");
+  ctx.Equal(calls.size(), 1, "a healthy evaluator is called once; Evaluate calls");
+  ctx.Assert(calls[0].HasDeadline(), "the Evaluate call carries no deadline: a hung evaluator holds the promotion, and the operator waiting on it, open");
+  ctx.Assert(2.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 3.5, "the deadline must be 3 s, got %vs", calls[0].TimeoutSeconds());
+  ctx.GRPC.SetLatency("Evaluate", 5.0, config::kEvaluator);
+  const int64_t started = ctx.Clock.Now();
+  const GateResult result = gate(w.state, kT, kN, 4, "alice");
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  gateExpect(ctx, result, "blocked", "deadline");
+  ctx.Equal(ctx.GRPC.CallsTo("Evaluate").size(), 4, "an evaluator that hangs gets kMaxAttempts = 3 calls, each cut at the deadline; calls so far");
+  ctx.Assert(waited <= 11, "the gate waited %.1f s on a hung evaluator: three 3-second attempts and their backoffs end well before that", waited);
+  ctx.Equal(liveNow(ctx), "2", "a version nobody could evaluate must not go live; the live version");
+}
+
+void CheckRetryPolicy(harness::Ctx& ctx) {
+  auto& w = gateWorld(ctx);
+  ctx.GRPC.Fail("Evaluate", grpc::StatusCode::UNAVAILABLE, "evaluator restarting", 1, config::kEvaluator);
+  GateResult result = gate(w.state, kT, kN, 2, "alice");
+  gateExpect(ctx, result, "promoted");
+  ctx.Assert(result.attempts == 2 && ctx.GRPC.CallsTo("Evaluate").size() == 2, "one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw %d calls and attempts %d", ctx.GRPC.CallsTo("Evaluate").size(), result.attempts);
+  ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
+  ctx.GRPC.Fail("Evaluate", grpc::StatusCode::UNAVAILABLE, "evaluator down", 3, config::kEvaluator);
+  result = gate(w.state, kT, kN, 4, "alice");
+  gateExpect(ctx, result, "blocked", "unavailable");
+  ctx.Assert(ctx.GRPC.CallsTo("Evaluate").size() == 5 && result.attempts == 3, "an evaluator that stays UNAVAILABLE gets kMaxAttempts = 3 calls: saw %d calls, attempts %d", ctx.GRPC.CallsTo("Evaluate").size() - 2, result.attempts);
+  ctx.GRPC.Fail("Evaluate", grpc::StatusCode::INVALID_ARGUMENT, "template too long for the suite", 1, config::kEvaluator);
+  result = gate(w.state, kT, kN, 4, "alice");
+  gateExpect(ctx, result, "blocked", "error");
+  ctx.Equal(ctx.GRPC.CallsTo("Evaluate").size(), 6, "INVALID_ARGUMENT says the request is wrong, so a retry gets the same answer; calls so far");
+}
+
+void CheckBlockOnError(harness::Ctx& ctx) {
+  auto& w = gateWorld(ctx);
+  ctx.GRPC.Fail("Evaluate", grpc::StatusCode::INTERNAL, "eval suite crashed", 1, config::kEvaluator);
+  GateResult result = gate(w.state, kT, kN, 2, "alice");
+  ctx.Equal(liveNow(ctx), "", "the eval suite crashed: an eval that did not run is not a pass; the live version");
+  gateExpect(ctx, result, "blocked", "error");
+  ctx.GRPC.Stop(config::kEvaluator);
+  result = gate(w.state, kT, kN, 2, "alice");
+  ctx.Equal(liveNow(ctx), "", "with the evaluator down: no verdict, no promotion; the live version");
+  gateExpect(ctx, result, "blocked", "unavailable");
+}
+
+void CheckFailTerminal(harness::Ctx& ctx) {
+  auto& w = gateWorld(ctx);
+  const GateResult result = gate(w.state, kT, kN, 3, "alice");
+  gateExpect(ctx, result, "blocked", "failed");
+  ctx.Equal(ctx.GRPC.CallsTo("Evaluate").size(), 1, "a failed verdict is an answer, not an outage: asking again is shopping for a pass; calls");
+  ctx.Equal(result.eval_id, "ev-" + sha256_hex(kUnsafe).substr(0, 12), "a blocked result names the eval that failed it");
+  ctx.Equal(liveNow(ctx), "", "a version that failed its eval must not go live; the live version");
+}
+
+void CheckRecordByHash(harness::Ctx& ctx) {
+  auto& w = gateWorld(ctx);
+  const GateResult first = gate(w.state, kT, kN, 2, "alice");
+  gateExpect(ctx, first, "promoted");
+  const auto record = evalOf(ctx, kSafe);
+  ctx.Assert(record.has_value(), "the verdict on version 2 must be recorded under its content hash (prompts:eval:t1:support-reply:<sha256>), found %v", ctx.Redis.Keys("prompts:eval*"));
+  ctx.Assert(record->value("eval_id", "") == first.eval_id && record->value("passed", false) && record->value("version", 0) == 2, "the record carries eval_id, passed and version: %s", record->dump());
+  const GateResult second = gate(w.state, kT, kN, 3, "alice");
+  const auto calls = ctx.GRPC.CallsTo("Evaluate");
+  ctx.Equal(calls.size(), 2, "version 3 must be evaluated on its own bytes: a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3; Evaluate calls in all");
+  ctx.Equal(calls[1].Request<prompts::EvaluateRequest>().content_hash(), sha256_hex(kUnsafe), "the second Evaluate call must carry version 3's content hash");
+  gateExpect(ctx, second, "blocked", "failed");
+  const auto failed = evalOf(ctx, kUnsafe);
+  ctx.Assert(failed && failed->contains("passed") && (*failed)["passed"] == false, "the failed verdict on version 3 is recorded too");
+  ctx.Equal(liveNow(ctx), "2", "version 2 stays live");
+}
+`,
+  },
   hints: [
-    'The eval service goes down for an afternoon and every promotion queued that afternoon ships; a prompt that failed its eval is live the next morning with no run id on the audit row.',
-    'The gate catches the RPC error and returns true, has no deadline or attempt bound, keeps retrying a `passed: false` verdict, and caches whatever it got for a day under the prompt name.',
-    'Pass a 3 s deadline on `Evaluate`, loop `for attempt < MAX_ATTEMPTS` retrying only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, return false on error or `passed: false`, key the short cache by `content_hash`, and pass `eval_id` to `promote`.',
+    'Symptom: an evaluator outage promotes everything, a hung evaluator parks the promotion for half a minute, an unsafe template is evaluated until the wall clock ends, and version 3 goes live on version 2’s verdict.',
+    'Mechanism: the call has no deadline; the `except` branch sets `passed = True`; a failed verdict sleeps and asks again; the verdict is cached by `(tenant, name)` instead of recorded for the content hash the evaluator judged.',
+    'Change: `timeout=DEADLINE_S` on each call; retry UNAVAILABLE and DEADLINE_EXCEEDED while `attempt < MAX_ATTEMPTS`, block on anything else; `evals.put` every verdict under the version’s content hash; block on `not reply.passed`; drop the name cache.',
   ],
-  debrief: `The fix blocks on an unavailable evaluator because an eval that never ran cannot be evidence; the only alternatives are to block or to fall back to a smaller unit of change, and "promote anyway" is not one of them. The rest of the step separates a transport failure from a verdict: transport failures are retryable, a completed failure is information and retrying it is waiting for a coin flip. Keying the whole gate on the content hash closes the last loop: a version whose bytes changed is a version that has not been evaluated. Production gates go further with per-slice scores and a minimum sample count, jittered backoff between attempts, and an eval budget so a gate cannot be retried into a denial of service.`,
+  debrief: `One rule shapes the gate: only a verdict opens it. Transport failures are retried because they say nothing about the template, and bounded because an operator is waiting; a failed verdict is information, and asking again is shopping for a pass. Recording the verdict under the content hash makes the evidence addressable: the read in step 5 attaches exactly this record, and a new version, whose bytes differ, has none until it is judged. Gates in production also demand a minimum number of eval cases and per-slice scores before a pass counts, and they budget eval runs per name so a retry loop cannot spend the suite.`,
 };

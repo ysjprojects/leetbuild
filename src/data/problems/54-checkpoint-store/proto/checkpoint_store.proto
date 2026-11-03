@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package ckptstore;
+
+// The object store the chunk copier writes staged checkpoint chunks to (step 3). PutObject stores
+// data under key and answers with the SHA-256 of the bytes it actually received, so a caller can
+// tell a stored chunk from one that was corrupted on the way. A caller the bucket refuses gets
+// PERMISSION_DENIED with the reason in the details; a store that is overloaded or restarting
+// answers UNAVAILABLE.
+service ObjectStore {
+  rpc PutObject(PutObjectRequest) returns (PutObjectReply);
+}
+
+message PutObjectRequest {
+  string key = 1;
+  bytes data = 2;
+  string sha256 = 3;
+}
+
+message PutObjectReply {
+  string key = 1;
+  string sha256 = 2;
+  int64 size = 3;
+}

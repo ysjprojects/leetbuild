@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package vision;
+
+// The vision models step 3 calls for every inference: one unary RPC per attempt, with a deadline.
+// The large and the small model are separate deployments (vision/config: LARGE_MODEL, SMALL_MODEL);
+// the harness serves a deterministic stand-in at each (vision/models in the support modules).
+service Predictor {
+  rpc Predict(PredictRequest) returns (PredictReply);
+}
+
+message PredictRequest {
+  string inference_id = 1;
+  string image_key = 2;
+  string task = 3;
+}
+
+message PredictReply {
+  string label = 1;
+  double confidence = 2;
+  string model_version = 3;
+}

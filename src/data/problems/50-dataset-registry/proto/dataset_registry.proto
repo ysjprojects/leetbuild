@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package datasetregistry;
+
+// The validator step 3 asks before a version is promoted: it scans the object behind a content
+// hash against the dataset's schema rules, every row when max_rows is 0, else the first max_rows.
+service Validator {
+  rpc Validate(ValidateRequest) returns (ValidationReport);
+}
+
+message ValidateRequest {
+  string dataset = 1;
+  string version = 2;
+  string content_sha256 = 3;
+  int64 max_rows = 4;
+}
+
+// passed holds for the rows_scanned rows it covers; rows_total is the object's row count.
+message ValidationReport {
+  bool passed = 1;
+  int64 rows_scanned = 2;
+  int64 rows_total = 3;
+  repeated string failures = 4;
+}

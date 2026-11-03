@@ -72,6 +72,7 @@ var packages = []pkg{
 	{"math", ""},
 	{"math/big", ""},
 	{"math/bits", ""},
+	{"math/rand", ""},
 	{"math/rand/v2", ""},
 	{"mime", ""},
 	{"net", ""},

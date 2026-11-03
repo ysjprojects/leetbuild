@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package modelregistry;
+
+// The serving pool step 3 probes before a promotion: which artifact digest the pool has loaded for a
+// model version. A pool that is restarting answers UNAVAILABLE.
+service Serving {
+  rpc Probe(ProbeRequest) returns (ProbeReply);
+}
+
+message ProbeRequest {
+  string pool = 1;
+  string model = 2;
+  int64 version = 3;
+  string expected_digest = 4;
+}
+
+message ProbeReply {
+  string loaded_digest = 1;
+}

@@ -2,362 +2,273 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Registry events keyed by dataset',
+  title: 'Promotion events keyed by dataset, with an outbox',
   concept: 'kafka',
   file: 'events',
-  focus: ['registry', 'kafka', 'consumer', 'db'],
+  focus: ['registry', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`POST /v1/datasets/{dataset}/purge\` with body
-\`{"version": "2026-01", "reason": "…", "team": "team-lm", "content_sample": "…"}\`. It builds a
-\`dataset.purged\` event carrying the team and the content sample, produces it to \`dataset.event\`
-keyed by the team, flushes, then calls \`store.commit_purge\`; a rejected produce raises out of the
-handler. It compiles, it serves the demo, and it hides four flaws that only show up with a second
-producer or a consumer that acts on the event.
+**Starting point.** The starter is \`publish_promotion(dataset, version, actor)\`: it reads the record,
+builds a \`dataset.promoted\` payload (\`dataset\`, \`version\`, \`content_sha256\`, \`license\`,
+\`row_count\`, \`actor\`, plus the first rows as \`sample\`), produces it to \`dataset.event\` keyed by
+the owner team, writes an outbox row (\`store.add_outbox\`) if the produce call raises, then calls
+\`pointer.promote\` (step 2, provided) and returns \`True\`. Consumers hear about promotions; it hides
+four flaws.
 
-**Failure mode the checks target.** Ordering is the subtle one: keying by something that changes
-(owner team) means two events for one dataset can be consumed out of order, and an incremental
-consumer then believes the older one. Publish-before-commit is the other half: an event is a
-promise that the registry state exists, and a promise made early cannot be checked by the consumer.
+**Failure mode the checks target.** A dataset that changes owner splits its history across two
+partitions, so consumers see its promotions out of order; dataset rows leak into a retained topic;
+a consumer pins a version the pointer has not reached yet; and a delivery the broker refuses is
+reported as sent and lost.
 
-- Every event goes to \`dataset.event\` **keyed by the dataset name** (\`key\`, \`Key: []byte(dataset)\`,
-  \`ProducerRecord(topic, dataset, payload)\`), so one dataset's history lands in one partition.
-- The payload carries \`type\`, \`dataset\`, \`version\`, the license id and the validator outcome,
-  **not the content sample the validator inspected**.
-- The registry write **commits first, then the event is published**.
-- If the broker rejects the produce, write an **outbox** row and answer \`503\`.`,
+- The record key is the **dataset name**.
+- The payload carries identity and outcome only: no \`sample\`, no row of the object.
+- **Commit first**: \`pointer.promote\`, then produce.
+- Wait for the delivery report (\`on_delivery\` with \`flush\`, at most \`DELIVERY_TIMEOUT_S\` = 5 s;
+  kafkajs: the awaited \`send\`; kafka-go: the error \`WriteMessages\` returns). A failed or missing
+  report writes the outbox row with the topic, the key and the payload, and returns \`False\`.`,
   sequence: {
-    participants: ['Registry API', 'registry store', 'Kafka', 'consumer'],
+    participants: ['registryd', 'Redis pointer', 'dataset.event', 'Outbox'],
     messages: [
-      {from: 'Registry API', to: 'registry store', label: 'commit_purge(dataset, version)', kind: 'sync'},
-      {from: 'registry store', to: 'Registry API', label: 'committed', kind: 'reply'},
-      {from: 'Registry API', to: 'Kafka', label: 'produce dataset.event key = dataset', kind: 'async'},
-      {from: 'Kafka', to: 'Registry API', label: 'ack / rejection', kind: 'reply'},
-      {from: 'Registry API', to: 'registry store', label: 'write_outbox on rejection', kind: 'sync'},
-      {from: 'Kafka', to: 'consumer', label: 'dataset.purged key = dataset', kind: 'async'},
+      {from: 'registryd', to: 'Redis pointer', label: 'promote(dataset, version, actor)', kind: 'sync'},
+      {from: 'registryd', to: 'dataset.event', label: 'produce dataset.promoted · key = dataset', kind: 'sync'},
+      {from: 'dataset.event', to: 'registryd', label: 'delivery report · within 5 s → True', kind: 'reply'},
+      {from: 'dataset.event', to: 'registryd', label: 'delivery failed / no report', kind: 'reply'},
+      {from: 'registryd', to: 'Outbox', label: 'add_outbox(topic, dataset, payload) → False', kind: 'async'},
     ],
   },
   checks: [
     {
-      id: 'route',
-      title: 'Registers POST /v1/datasets/{dataset}/purge',
-      detail: 'Expose the purge that publishes the registry event.',
-      match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/datasets\/\{dataset\}\/purge["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/datasets\/:dataset\/purge['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/datasets\/\{dataset\}\/purge"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"datasets"\s*\/\s*Segment\s*\/\s*"purge"\s*\)/]},
-        cpp: {all: [/svr\.Post\(/, /\/v1\/datasets/, /purge/]},
-      },
-    },
-    {
       id: 'key-by-dataset',
       title: 'Events are keyed by the dataset name',
       detail:
-        'The produce call passes the dataset name as the message key (`key=dataset`, `key: event.dataset`, `Key: []byte(event.Dataset)`, `ProducerRecord(topic, event.dataset, …)`). The starter keys by owner team, so a dataset’s history reorders.',
+        "Each record is keyed by the dataset, so one dataset's promotions share a partition and arrive in order. The starter keys by the owner team.",
       match: {
-        python: {all: [/key=dataset/]},
-        typescript: {all: [/key:\s*event\.dataset/]},
-        go: {all: [/Key:\s*\[\]byte\(event\.Dataset\)/]},
-        scala: {all: [/new ProducerRecord\[String, String\]\(DatasetEventTopic,\s*event\.dataset/]},
-        cpp: {all: [/event\.dataset\.c_str\(\)/]},
+        python: {all: [/key\s*=\s*dataset\b/], none: [/key\s*=\s*record\[["']owner/]},
+        typescript: {all: [/key:\s*dataset\b/], none: [/key:\s*record\.owner/]},
+        go: {all: [/Key:\s*\[\]byte\(dataset\)/], none: [/\[\]byte\(record\.Owner\)/]},
+        scala: {
+          all: [/ProducerRecord\[String, String\]\(EventTopic,\s*dataset\b/],
+          none: [/EventTopic,\s*record\.owner/],
+        },
+        cpp: {all: [/dataset\.c_str\(\),\s*dataset\.size\(\)/], none: [/owner\.c_str\(\)/]},
       },
     },
     {
       id: 'no-content-sample',
-      title: 'Payloads carry identity and outcomes, not content',
+      title: 'The payload carries identity, not rows',
       detail:
-        'The topic is `dataset.event` and no payload field carries the sample the validator inspected (`content_sample` / `contentSample`). The starter ships the inspected rows into a retained, replicated topic.',
+        'The `dataset.promoted` payload has the dataset, version, hash, license, row count and actor, and nothing read from the object. The starter ships the first rows into a retained, replicated topic.',
       match: {
-        python: {all: [/TOPIC\s*=\s*"dataset\.event"/], none: [/content_sample|contentSample/]},
-        typescript: {all: [/TOPIC\s*=\s*'dataset\.event'/], none: [/contentSample/]},
-        go: {all: [/datasetEventTopic\s*=\s*"dataset\.event"/], none: [/ContentSample/]},
-        scala: {all: [/DatasetEventTopic\s*=\s*"dataset\.event"/], none: [/contentSample/]},
-        cpp: {all: [/kDatasetEventTopic\s*=\s*"dataset\.event"/], none: [/content_sample/]},
-      },
-    },
-    {
-      id: 'outbox',
-      title: 'A rejected produce lands in the outbox',
-      detail:
-        'When the broker rejects the produce the event is written to an outbox row (`write_outbox` / `writeOutbox` / `WriteOutbox`) and the request answers 503, so the event is retried instead of dropped. The starter lets the exception escape.',
-      match: {
-        python: {all: [/store\.write_outbox\(/, /KafkaException/]},
-        typescript: {all: [/store\.writeOutbox\(/, /catch\s*\(/]},
-        go: {all: [/store\.WriteOutbox\(/, /err != nil/]},
-        scala: {all: [/store\.writeOutbox\(/, /catch/]},
-        cpp: {all: [/store\.write_outbox\(/, /catch/]},
+        python: {all: [/dataset\.promoted/], none: [/\bsample\b/, /read_object\(/]},
+        typescript: {all: [/dataset\.promoted/], none: [/\bsample\b/, /readObject\(/]},
+        go: {all: [/dataset\.promoted/], none: [/\bsample\b/, /ReadObject\(/]},
+        scala: {all: [/dataset\.promoted/], none: [/\bsample\b/, /readObject\(/]},
+        cpp: {all: [/dataset\.promoted/], none: [/\bsample\b/, /readObject\(/]},
       },
     },
     {
       id: 'publish-after-commit',
-      title: 'The registry write commits before the event is published',
+      title: 'The pointer moves before the event is produced',
       detail:
-        'The commit happens before the publish (`store.commit_purge` then `publish_dataset_event`), so no consumer can act on an uncommitted version. The starter acks the produce first.',
+        '`pointer.promote` runs before the produce, so when a consumer reads the event the pointer already names that version. The starter produces first.',
       match: {
-        python: {order: [/store\.commit_purge\(/, /publish_dataset_event\(/]},
-        typescript: {order: [/store\.commitPurge\(/, /publishDatasetEvent\(/]},
-        go: {order: [/store\.CommitPurge\(/, /publishDatasetEvent\(/]},
-        scala: {order: [/store\.commitPurge\(/, /publishDatasetEvent\(/]},
-        cpp: {order: [/store\.commit_purge\(/, /publish_dataset_event\(/]},
+        python: {order: [/def publish_promotion/, /pointer\.promote\(/, /producer\.produce\(/]},
+        typescript: {order: [/function publishPromotion/, /\bpromote\(/, /producer\.send\(/]},
+        go: {order: [/func publishPromotion/, /pointer\.Promote\(/, /writer\.WriteMessages\(/]},
+        scala: {order: [/def publishPromotion/, /Pointer\.promote\(/, /producer\.send\(/]},
+        cpp: {order: [/bool publishPromotion/, /pointer::promote\(/, /producer->produce\(/]},
+      },
+    },
+    {
+      id: 'outbox',
+      title: 'A failed delivery lands in the outbox',
+      detail:
+        'The delivery report (or the awaited send, or the returned write error) decides: a failure or no report in time writes the outbox row and returns false. The starter only catches errors from enqueueing, which a broker failure never raises.',
+      match: {
+        python: {
+          all: [/on_delivery\s*=|callback\s*=/, /producer\.flush\(/, /store\.add_outbox\(/],
+          none: [/except KafkaException/],
+        },
+        typescript: {all: [/await producer\.send\(/, /addOutbox\(/], none: [/void producer\.send\(/]},
+        go: {all: [/store\.AddOutbox\(/], none: [/log\.Printf/]},
+        scala: {all: [/\.get\(\s*[^\n]*TimeUnit/, /Store\.addOutbox\(/]},
+        cpp: {all: [/dr_cb/, /->flush\(/, /store::addOutbox\(/], none: [/producer->poll\(\s*0\s*\)/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
-import logging
-
-from confluent_kafka import Producer
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-app = FastAPI()
-logger = logging.getLogger("registry-events")
-
-TOPIC = "dataset.event"
-producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all"})
-
-
-class PurgeRequest(BaseModel):
-    version: str
-    reason: str
-    team: str
-    content_sample: str
-
-
-class RegistryStore:
-    def commit_purge(self, dataset: str, version: str) -> None:
-        raise NotImplementedError
-
-
-store = RegistryStore()
-
-
-def publish_dataset_event(event: dict) -> None:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    team = event["team"]
-    producer.produce(TOPIC, key=team.encode("utf-8"), value=json.dumps(event).encode("utf-8"))
-    producer.flush()
-
-
-@app.post("/v1/datasets/{dataset}/purge")
-def purge(dataset: str, body: PurgeRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    event = {
-        "type": "dataset.purged",
-        "dataset": dataset,
-        "version": body.version,
-        "team": body.team,
-        "content_sample": body.content_sample,
-    }
-    publish_dataset_event(event)
-    store.commit_purge(dataset, body.version)
-    logger.info("purged dataset=%s version=%s", dataset, body.version)
-    return JSONResponse({"dataset": dataset, "version": body.version}, status_code=200)
-`,
-      solution: `import json
-import logging
 
 from confluent_kafka import KafkaException, Producer
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("registry-events")
+from registry import pointer, store
 
-TOPIC = "dataset.event"
-producer = Producer({"bootstrap.servers": "kafka:9092", "enable.idempotence": True, "acks": "all"})
+EVENT_TOPIC = "dataset.event"
+
+producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
-class PurgeRequest(BaseModel):
-    version: str
-    reason: str
-
-
-class RegistryStore:
-    """The registry write boundary; the event is published only after it commits."""
-
-    def commit_purge(self, dataset: str, version: str) -> None:
-        raise NotImplementedError
-
-    def write_outbox(self, dataset: str, event: dict) -> None:
-        raise NotImplementedError
-
-
-store = RegistryStore()
-
-
-def dataset_event(event_type: str, dataset: str, version: str, license_id: str, validator: str) -> dict:
-    """Identity and outcomes only: never the content the validator inspected."""
+def event_payload(record: dict, actor: str) -> dict:
+    content = store.read_object(record["content_sha256"]) or ""
     return {
-        "type": event_type,
-        "dataset": dataset,
-        "version": version,
-        "license": license_id,
-        "validator": validator,
+        "type": "dataset.promoted",
+        "dataset": record["dataset"],
+        "version": record["version"],
+        "content_sha256": record["content_sha256"],
+        "license": record["license"],
+        "row_count": record["row_count"],
+        "actor": actor,
+        "sample": content.split("\\n")[:3],  # consumers preview the rows without a download
     }
 
 
-def publish_dataset_event(event: dict) -> None:
-    """Keyed by the dataset name, so one dataset's history stays in one ordered partition."""
-    dataset = event["dataset"]
-    producer.produce(TOPIC, key=dataset.encode("utf-8"), value=json.dumps(event).encode("utf-8"))
-    producer.poll(0)
-
-
-@app.post("/v1/datasets/{dataset}/purge")
-def purge(
-    dataset: str, body: PurgeRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    store.commit_purge(dataset, body.version)
-    event = dataset_event("dataset.purged", dataset, body.version, body.reason, tenant)
+def publish_promotion(dataset: str, version: str, actor: str) -> bool:
+    """Promote a version and tell the consumers; True once the broker has the event."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    record = store.version(dataset, version)
+    if record is None:
+        raise KeyError(f"{dataset}@{version} is not registered")
+    payload = event_payload(record, actor)
     try:
-        publish_dataset_event(event)
-    except KafkaException as err:
-        store.write_outbox(dataset, event)
-        raise HTTPException(status_code=503, detail="TRY_AGAIN") from err
-    logger.info("purged dataset=%s version=%s", dataset, body.version)
-    return JSONResponse({"dataset": dataset, "version": body.version}, status_code=200)
+        producer.produce(EVENT_TOPIC, key=record["owner"], value=json.dumps(payload))
+        producer.poll(0)
+    except KafkaException:
+        store.add_outbox(EVENT_TOPIC, record["owner"], payload)
+        return False
+    pointer.promote(dataset, version, actor)
+    return True
+`,
+      solution: `import json
+
+from confluent_kafka import Producer
+
+from registry import pointer, store
+
+EVENT_TOPIC = "dataset.event"
+DELIVERY_TIMEOUT_S = 5
+
+producer = Producer({"bootstrap.servers": "kafka:9092"})
+
+
+def event_payload(record: dict, actor: str) -> dict:
+    """Identity and outcome only: the rows stay behind the registry's access rules."""
+    return {
+        "type": "dataset.promoted",
+        "dataset": record["dataset"],
+        "version": record["version"],
+        "content_sha256": record["content_sha256"],
+        "license": record["license"],
+        "row_count": record["row_count"],
+        "actor": actor,
+    }
+
+
+def publish_promotion(dataset: str, version: str, actor: str) -> bool:
+    """Promote a version and tell the consumers; True once the broker has the event."""
+    record = store.version(dataset, version)
+    if record is None:
+        raise KeyError(f"{dataset}@{version} is not registered")
+    # Commit first: an event may lag the pointer, it never leads it.
+    pointer.promote(dataset, version, actor)
+    payload = event_payload(record, actor)
+    outcome = {}
+
+    def on_delivery(err, msg):
+        outcome["error"] = err
+
+    producer.produce(EVENT_TOPIC, key=dataset, value=json.dumps(payload), on_delivery=on_delivery)
+    in_flight = producer.flush(DELIVERY_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or outcome.get("error") is not None:
+        # The broker did not take it: a relay produces the row later, so consumers are late, not wrong.
+        store.add_outbox(EVENT_TOPIC, dataset, payload)
+        return False
+    return True
 `,
     },
     typescript: {
-      starter: `/** Registry events. */
-import Fastify from 'fastify';
-import {Kafka, type Producer} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
 
-export const app = Fastify();
+import {promote} from 'registry/pointer';
+import {type VersionRecord, addOutbox, readObject, version as versionOf} from 'registry/store';
 
-const TOPIC = 'dataset.event';
+export const EVENT_TOPIC = 'dataset.event';
 
-const kafka = new Kafka({clientId: 'dataset-registry', brokers: ['kafka:9092']});
-const producer: Producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+const kafka = new Kafka({clientId: 'registryd', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect();
 
-interface PurgeBody {
-  version: string;
-  reason: string;
-  team: string;
-  contentSample: string;
-}
-
-interface DatasetEvent {
-  type: string;
-  dataset: string;
-  version: string;
-  team: string;
-  contentSample: string;
-}
-
-class RegistryStore {
-  async commitPurge(dataset: string, version: string): Promise<void> {
-    void dataset;
-    void version;
-    throw new Error('not implemented');
-  }
-}
-
-const store = new RegistryStore();
-
-async function publishDatasetEvent(event: DatasetEvent): Promise<void> {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  await producer.send({topic: TOPIC, messages: [{key: event.team, value: JSON.stringify(event)}]});
-}
-
-app.post('/v1/datasets/:dataset/purge', async (request, reply) => {
-  const dataset = (request.params as {dataset: string}).dataset;
-  const body = request.body as PurgeBody;
-  const event: DatasetEvent = {
-    type: 'dataset.purged',
-    dataset,
-    version: body.version,
-    team: body.team,
-    contentSample: body.contentSample,
+export async function eventPayload(record: VersionRecord, actor: string): Promise<Record<string, unknown>> {
+  const content = (await readObject(record.content_sha256)) ?? '';
+  return {
+    type: 'dataset.promoted',
+    dataset: record.dataset,
+    version: record.version,
+    content_sha256: record.content_sha256,
+    license: record.license,
+    row_count: record.row_count,
+    actor,
+    sample: content.split('\\n').slice(0, 3), // consumers preview the rows without a download
   };
-  await publishDatasetEvent(event);
-  await store.commitPurge(dataset, body.version);
-  return reply.code(200).send({dataset, version: body.version});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** Registry events: keyed by dataset, published after the commit, outbox on rejection. */
-import Fastify from 'fastify';
-import {Kafka, type Producer} from 'kafkajs';
-
-export const app = Fastify();
-
-const TOPIC = 'dataset.event';
-
-const kafka = new Kafka({clientId: 'dataset-registry', brokers: ['kafka:9092']});
-const producer: Producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
-
-interface PurgeBody {
-  version: string;
-  reason: string;
 }
 
-interface DatasetEvent {
-  type: string;
-  dataset: string;
-  version: string;
-  license: string;
-  validator: string;
-}
-
-class RegistryStore {
-  async commitPurge(dataset: string, version: string): Promise<void> {
-    void dataset;
-    void version;
-    throw new Error('not implemented');
-  }
-
-  async writeOutbox(dataset: string, event: DatasetEvent): Promise<void> {
-    void dataset;
-    void event;
-    throw new Error('not implemented');
-  }
-}
-
-const store = new RegistryStore();
-
-function datasetEvent(
-  type: string,
-  dataset: string,
-  version: string,
-  license: string,
-  validator: string,
-): DatasetEvent {
-  // Identity and outcomes only: never the content the validator inspected.
-  return {type, dataset, version, license, validator};
-}
-
-async function publishDatasetEvent(event: DatasetEvent): Promise<void> {
-  // Keyed by the dataset name, so one dataset's history stays in one ordered partition.
-  await producer.send({topic: TOPIC, messages: [{key: event.dataset, value: JSON.stringify(event)}]});
-}
-
-app.post('/v1/datasets/:dataset/purge', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const dataset = (request.params as {dataset: string}).dataset;
-  const body = request.body as PurgeBody;
-  await store.commitPurge(dataset, body.version);
-  const event = datasetEvent('dataset.purged', dataset, body.version, body.reason, tenant);
+/** Promote a version and tell the consumers; true once the broker has the event. */
+export async function publishPromotion(dataset: string, version: string, actor: string): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const record = await versionOf(dataset, version);
+  if (record === null) throw new Error(\`\${dataset}@\${version} is not registered\`);
+  const payload = await eventPayload(record, actor);
   try {
-    await publishDatasetEvent(event);
-  } catch (err) {
-    await store.writeOutbox(dataset, event);
-    return reply.code(503).send({error: 'TRY_AGAIN'});
+    void producer.send({topic: EVENT_TOPIC, messages: [{key: record.owner, value: JSON.stringify(payload)}]});
+  } catch {
+    await addOutbox(EVENT_TOPIC, record.owner, payload);
+    return false;
   }
-  request.log.info({dataset, version: body.version}, 'purged');
-  return reply.code(200).send({dataset, version: body.version});
-});
+  await promote(dataset, version, actor);
+  return true;
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+import {promote} from 'registry/pointer';
+import {type VersionRecord, addOutbox, version as versionOf} from 'registry/store';
+
+export const EVENT_TOPIC = 'dataset.event';
+export const DELIVERY_TIMEOUT_MS = 5000;
+
+const kafka = new Kafka({clientId: 'registryd', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect();
+
+/** Identity and outcome only: the rows stay behind the registry's access rules. */
+export function eventPayload(record: VersionRecord, actor: string): Record<string, unknown> {
+  return {
+    type: 'dataset.promoted',
+    dataset: record.dataset,
+    version: record.version,
+    content_sha256: record.content_sha256,
+    license: record.license,
+    row_count: record.row_count,
+    actor,
+  };
+}
+
+/** Promote a version and tell the consumers; true once the broker has the event. */
+export async function publishPromotion(dataset: string, version: string, actor: string): Promise<boolean> {
+  const record = await versionOf(dataset, version);
+  if (record === null) throw new Error(\`\${dataset}@\${version} is not registered\`);
+  // Commit first: an event may lag the pointer, it never leads it.
+  await promote(dataset, version, actor);
+  const payload = eventPayload(record, actor);
+  try {
+    await producer.send({topic: EVENT_TOPIC, messages: [{key: dataset, value: JSON.stringify(payload)}], timeout: DELIVERY_TIMEOUT_MS});
+    return true;
+  } catch {
+    // The broker did not take it: a relay produces the row later, so consumers are late, not wrong.
+    await addOutbox(EVENT_TOPIC, dataset, payload);
+    return false;
+  }
+}
 `,
     },
     go: {
@@ -366,55 +277,49 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
-	"net/http"
+	"strings"
+	"time"
 
 	"github.com/segmentio/kafka-go"
+
+	"registry/pointer" // pointer.Promote(ctx, dataset, version, actor) (string, error)
+	"registry/store"   // store.Version, ReadObject, AddOutbox, VersionRecord
 )
 
-const datasetEventTopic = "dataset.event"
+const eventTopic = "dataset.event"
 
-type DatasetEvent struct {
-	Type          string \`json:"type"\`
-	Dataset       string \`json:"dataset"\`
-	Version       string \`json:"version"\`
-	Team          string \`json:"team"\`
-	ContentSample string \`json:"content_sample"\`
-}
+var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: eventTopic, Balancer: &kafka.Hash{}, BatchTimeout: 20 * time.Millisecond}
 
-func publishDatasetEvent(ctx context.Context, writer *kafka.Writer, event DatasetEvent) error {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	payload, err := json.Marshal(event)
-	if err != nil {
-		return err
+func eventPayload(ctx context.Context, record *store.VersionRecord, actor string) map[string]any {
+	content, _ := store.ReadObject(ctx, record.ContentSHA256)
+	rows := strings.Split(content, "\\n")
+	if len(rows) > 3 {
+		rows = rows[:3]
 	}
-	return writer.WriteMessages(ctx, kafka.Message{Topic: datasetEventTopic, Key: []byte(event.Team), Value: payload})
+	return map[string]any{
+		"type": "dataset.promoted", "dataset": record.Dataset, "version": record.Version, "content_sha256": record.ContentSHA256,
+		"license": record.License, "row_count": record.RowCount, "actor": actor,
+		"sample": rows, // consumers preview the rows without a download
+	}
 }
 
-func main() {
-	writer := &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll}
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/datasets/{dataset}/purge", func(rw http.ResponseWriter, r *http.Request) {
-		var body DatasetEvent
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(rw, "invalid json", http.StatusBadRequest)
-			return
-		}
-		body.Dataset = r.PathValue("dataset")
-		if err := publishDatasetEvent(r.Context(), writer, body); err != nil {
-			http.Error(rw, "TRY_AGAIN", http.StatusServiceUnavailable)
-			return
-		}
-		store.CommitPurge(r.Context(), body.Dataset, body.Version)
-		writeJSON(rw, http.StatusOK, map[string]any{"dataset": body.Dataset, "version": body.Version})
-	})
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+// publishPromotion promotes a version and tells the consumers; true once the broker has the event.
+func publishPromotion(ctx context.Context, dataset, version, actor string) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	record := store.Version(ctx, dataset, version)
+	if record == nil {
+		return false, fmt.Errorf("%s@%s is not registered", dataset, version)
+	}
+	value, _ := json.Marshal(eventPayload(ctx, record, actor))
+	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(record.Owner), Value: value}); err != nil {
+		log.Printf("dataset event not delivered: %v", err) // consumers catch up on their next poll
+	}
+	if _, err := pointer.Promote(ctx, dataset, version, actor); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 `,
       solution: `package main
@@ -422,63 +327,48 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
+	"fmt"
+	"time"
 
 	"github.com/segmentio/kafka-go"
+
+	"registry/pointer" // pointer.Promote(ctx, dataset, version, actor) (string, error)
+	"registry/store"   // store.Version, ReadObject, AddOutbox, VersionRecord
 )
 
-const datasetEventTopic = "dataset.event"
+const eventTopic = "dataset.event"
 
-type DatasetEvent struct {
-	Type      string \`json:"type"\`
-	Dataset   string \`json:"dataset"\`
-	Version   string \`json:"version"\`
-	License   string \`json:"license"\`
-	Validator string \`json:"validator"\`
-}
+// WriteMessages returns once the broker answered: its error is the delivery report.
+var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: eventTopic, Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll, BatchTimeout: 20 * time.Millisecond}
 
-func publishDatasetEvent(ctx context.Context, writer *kafka.Writer, event DatasetEvent) error {
-	payload, err := json.Marshal(event)
-	if err != nil {
-		return err
+// eventPayload is identity and outcome only: the rows stay behind the registry's access rules.
+func eventPayload(record *store.VersionRecord, actor string) map[string]any {
+	return map[string]any{
+		"type": "dataset.promoted", "dataset": record.Dataset, "version": record.Version, "content_sha256": record.ContentSHA256,
+		"license": record.License, "row_count": record.RowCount, "actor": actor,
 	}
-	// Keyed by the dataset name, so one dataset's history stays in one ordered partition.
-	return writer.WriteMessages(ctx, kafka.Message{
-		Topic: datasetEventTopic,
-		Key:   []byte(event.Dataset),
-		Value: payload,
-	})
 }
 
-func main() {
-	writer := &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll}
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/datasets/{dataset}/purge", func(rw http.ResponseWriter, r *http.Request) {
-		var body DatasetEvent
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(rw, "invalid json", http.StatusBadRequest)
-			return
+// publishPromotion promotes a version and tells the consumers; true once the broker has the event.
+func publishPromotion(ctx context.Context, dataset, version, actor string) (bool, error) {
+	record := store.Version(ctx, dataset, version)
+	if record == nil {
+		return false, fmt.Errorf("%s@%s is not registered", dataset, version)
+	}
+	// Commit first: an event may lag the pointer, it never leads it.
+	if _, err := pointer.Promote(ctx, dataset, version, actor); err != nil {
+		return false, err
+	}
+	payload := eventPayload(record, actor)
+	value, _ := json.Marshal(payload)
+	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(dataset), Value: value}); err != nil {
+		// The broker did not take it: a relay produces the row later, so consumers are late, not wrong.
+		if err := store.AddOutbox(ctx, eventTopic, dataset, payload); err != nil {
+			return false, err
 		}
-		body.Dataset = r.PathValue("dataset")
-		if err := store.CommitPurge(r.Context(), body.Dataset, body.Version); err != nil {
-			http.Error(rw, "TRY_AGAIN", http.StatusServiceUnavailable)
-			return
-		}
-		if err := publishDatasetEvent(r.Context(), writer, body); err != nil {
-			store.WriteOutbox(r.Context(), body.Dataset, body)
-			http.Error(rw, "TRY_AGAIN", http.StatusServiceUnavailable)
-			return
-		}
-		writeJSON(rw, http.StatusOK, map[string]any{"dataset": body.Dataset, "version": body.Version})
-	})
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+		return false, nil
+	}
+	return true, nil
 }
 `,
     },
@@ -486,229 +376,543 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
       starter: `import java.util.Properties
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import org.apache.kafka.common.KafkaException
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-final case class DatasetEvent(eventType: String, dataset: String, version: String, team: String, contentSample: String)
+import registry.{Pointer, Store} // Pointer.promote, Store.version, Store.readObject, Store.addOutbox
 
 object Events {
-  implicit val system: ActorSystem = ActorSystem("dataset-registry")
-  implicit val eventFormat: RootJsonFormat[DatasetEvent] = jsonFormat5(DatasetEvent)
+  val EventTopic = "dataset.event"
 
-  val DatasetEventTopic = "dataset.event"
-  val producer = new KafkaProducer[String, String](new Properties())
-
-  def publishDatasetEvent(event: DatasetEvent): Unit = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    producer.send(new ProducerRecord[String, String](DatasetEventTopic, event.team, event.toString))
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  val route: Route =
-    path("v1" / "datasets" / Segment / "purge") { dataset =>
-      post {
-        entity(as[DatasetEvent]) { body =>
-          publishDatasetEvent(body.copy(dataset = dataset))
-          store.commitPurge(dataset, body.version)
-          complete(StatusCodes.OK, s"""{"dataset":"$dataset","version":"\${body.version}"}""")
-        }
-      }
-    }
+  def eventPayload(record: Store.VersionRecord, actor: String): JsObject = {
+    val rows = Store.readObject(record.contentSha256).getOrElse("").split("\\n").take(3)
+    JsObject(
+      "type" -> JsString("dataset.promoted"), "dataset" -> JsString(record.dataset), "version" -> JsString(record.version),
+      "content_sha256" -> JsString(record.contentSha256), "license" -> JsString(record.license),
+      "row_count" -> JsNumber(record.rowCount), "actor" -> JsString(actor),
+      "sample" -> JsArray(rows.map(JsString(_)).toVector)) // consumers preview the rows without a download
+  }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Promote a version and tell the consumers; true once the broker has the event. */
+  def publishPromotion(dataset: String, version: String, actor: String): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val record = Store.version(dataset, version).getOrElse(throw new IllegalArgumentException(s"$dataset@$version is not registered"))
+    val payload = eventPayload(record, actor)
+    try producer.send(new ProducerRecord[String, String](EventTopic, record.owner, payload.compactPrint))
+    catch {
+      case _: KafkaException =>
+        Store.addOutbox(EventTopic, record.owner, payload)
+        return false
+    }
+    Pointer.promote(dataset, version, actor)
+    true
   }
 }
 `,
       solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
+
+import scala.util.Try
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-final case class DatasetEvent(eventType: String, dataset: String, version: String, license: String, validator: String)
+import registry.{Pointer, Store} // Pointer.promote, Store.version, Store.readObject, Store.addOutbox
 
 object Events {
-  implicit val system: ActorSystem = ActorSystem("dataset-registry")
-  implicit val eventFormat: RootJsonFormat[DatasetEvent] = jsonFormat5(DatasetEvent)
+  val EventTopic = "dataset.event"
+  val DeliveryTimeoutMs = 5000L
 
-  val DatasetEventTopic = "dataset.event"
-  val producer = new KafkaProducer[String, String](new Properties())
-
-  def publishDatasetEvent(event: DatasetEvent): Unit = {
-    // Keyed by the dataset name, so one dataset's history stays in one ordered partition.
-    producer.send(new ProducerRecord[String, String](DatasetEventTopic, event.dataset, event.toString))
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  val route: Route =
-    path("v1" / "datasets" / Segment / "purge") { dataset =>
-      post {
-        entity(as[DatasetEvent]) { body =>
-          store.commitPurge(dataset, body.version)
-          val event = body.copy(dataset = dataset)
-          try {
-            publishDatasetEvent(event)
-          } catch {
-            case _: Throwable =>
-              store.writeOutbox(dataset, event)
-              complete(StatusCodes.ServiceUnavailable, """{"error":"TRY_AGAIN"}""")
-              throw new IllegalStateException("outboxed")
-          }
-          system.log.info(s"purged dataset=$dataset version=\${body.version}")
-          complete(StatusCodes.OK, s"""{"dataset":"$dataset","version":"\${body.version}"}""")
-        }
-      }
-    }
+  /** Identity and outcome only: the rows stay behind the registry's access rules. */
+  def eventPayload(record: Store.VersionRecord, actor: String): JsObject = JsObject(
+    "type" -> JsString("dataset.promoted"), "dataset" -> JsString(record.dataset), "version" -> JsString(record.version),
+    "content_sha256" -> JsString(record.contentSha256), "license" -> JsString(record.license),
+    "row_count" -> JsNumber(record.rowCount), "actor" -> JsString(actor))
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Promote a version and tell the consumers; true once the broker has the event. */
+  def publishPromotion(dataset: String, version: String, actor: String): Boolean = {
+    val record = Store.version(dataset, version).getOrElse(throw new IllegalArgumentException(s"$dataset@$version is not registered"))
+    // Commit first: an event may lag the pointer, it never leads it.
+    Pointer.promote(dataset, version, actor)
+    val payload = eventPayload(record, actor)
+    val acked = Try(producer.send(new ProducerRecord[String, String](EventTopic, dataset, payload.compactPrint)).get(DeliveryTimeoutMs, TimeUnit.MILLISECONDS))
+    // The broker did not take it: a relay produces the row later, so consumers are late, not wrong.
+    if (acked.isFailure) Store.addOutbox(EventTopic, dataset, payload)
+    acked.isSuccess
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <librdkafka/rdkafkacpp.h>
+      starter: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <vector>
+
+#include "registry/pointer.h"  // pointer::promote(dataset, version, actor) -> previous
+#include "registry/store.h"    // store::version, readObject, addOutbox
 
 using json = nlohmann::json;
 
-const std::string kDatasetEventTopic = "dataset.event";
+const std::string kEventTopic = "dataset.event";
 
-struct DatasetEvent {
-  std::string type;
-  std::string dataset;
-  std::string version;
-  std::string team;
-  std::string content_sample;
-};
-
-static std::string toJson(const DatasetEvent& event) {
-  return json{{"type", event.type},         {"dataset", event.dataset},
-              {"version", event.version},   {"team", event.team},
-              {"content_sample", event.content_sample}}
-      .dump();
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-static void publish_dataset_event(RdKafka::Producer* producer, const DatasetEvent& event) {
+auto producer = makeProducer();
+
+json eventPayload(const store::VersionRecord& record, const std::string& actor) {
+  std::istringstream content(store::readObject(record.content_sha256).value_or(""));
+  std::vector<std::string> rows;
+  for (std::string line; rows.size() < 3 && std::getline(content, line);) rows.push_back(line);
+  return json{{"type", "dataset.promoted"}, {"dataset", record.dataset}, {"version", record.version},
+              {"content_sha256", record.content_sha256}, {"license", record.license}, {"row_count", record.row_count},
+              {"actor", actor}, {"sample", rows}};  // consumers preview the rows without a download
+}
+
+// Promote a version and tell the consumers; true once the broker has the event.
+bool publishPromotion(const std::string& dataset, const std::string& version, const std::string& actor) {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const std::string payload = toJson(event);
-  producer->produce(kDatasetEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                    const_cast<char*>(payload.data()), payload.size(), event.team.c_str(), event.team.size(), 0,
-                    nullptr);
-}
-
-int main() {
-  std::string errstr;
-  auto* producer = RdKafka::Producer::create(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL), errstr);
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/datasets/([^/]+)/purge)", [producer](const httplib::Request& req, httplib::Response& res) {
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    DatasetEvent event{body.value("type", "dataset.purged"), req.matches[1],
-                       body.value("version", std::string()), body.value("team", std::string()),
-                       body.value("content_sample", std::string())};
-    publish_dataset_event(producer, event);
-    store.commit_purge(event.dataset, event.version);
-    res.status = 200;
-    res.set_content(json{{"dataset", event.dataset}, {"version", event.version}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+  const auto record = store::version(dataset, version);
+  if (!record) throw std::invalid_argument(dataset + "@" + version + " is not registered");
+  const json payload = eventPayload(*record, actor);
+  const std::string value = payload.dump();
+  const RdKafka::ErrorCode err =
+      producer->produce(kEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                        value.size(), record->owner.c_str(), record->owner.size(), 0, nullptr);
+  producer->poll(0);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    store::addOutbox(kEventTopic, record->owner, payload);
+    return false;
+  }
+  pointer::promote(dataset, version, actor);
+  return true;
 }
 `,
-      solution: `#include <httplib.h>
-#include <librdkafka/rdkafkacpp.h>
+      solution: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
+#include <memory>
+#include <stdexcept>
 #include <string>
+
+#include "registry/pointer.h"  // pointer::promote(dataset, version, actor) -> previous
+#include "registry/store.h"    // store::version, readObject, addOutbox
 
 using json = nlohmann::json;
 
-const std::string kDatasetEventTopic = "dataset.event";
+const std::string kEventTopic = "dataset.event";
+constexpr int kDeliveryTimeoutMs = 5000;
 
-struct DatasetEvent {
-  std::string type;
-  std::string dataset;
-  std::string version;
-  std::string license;
-  std::string validator;
+// The delivery report of the record in flight: publishPromotion produces one record and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
 };
 
-/** Identity and outcomes only: never the content the validator inspected. */
-static std::string toJson(const DatasetEvent& event) {
-  return json{{"type", event.type},        {"dataset", event.dataset},
-              {"version", event.version},  {"license", event.license},
-              {"validator", event.validator}}
-      .dump();
+DeliveryReport delivery;
+
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("dr_cb", &delivery, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-static void publish_dataset_event(RdKafka::Producer* producer, const DatasetEvent& event) {
-  // Keyed by the dataset name, so one dataset's history stays in one ordered partition.
-  const std::string payload = toJson(event);
-  producer->produce(kDatasetEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                    const_cast<char*>(payload.data()), payload.size(), event.dataset.c_str(), event.dataset.size(),
-                    0, nullptr);
-  producer->poll(0);
+auto producer = makeProducer();
+
+// Identity and outcome only: the rows stay behind the registry's access rules.
+json eventPayload(const store::VersionRecord& record, const std::string& actor) {
+  return json{{"type", "dataset.promoted"}, {"dataset", record.dataset}, {"version", record.version},
+              {"content_sha256", record.content_sha256}, {"license", record.license}, {"row_count", record.row_count},
+              {"actor", actor}};
 }
 
-int main() {
-  std::string errstr;
-  auto* producer = RdKafka::Producer::create(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL), errstr);
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/datasets/([^/]+)/purge)", [producer](const httplib::Request& req, httplib::Response& res) {
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const std::string dataset = req.matches[1];
-    DatasetEvent event{"dataset.purged", dataset, body.value("version", std::string()),
-                       body.value("reason", std::string()), "purge"};
-    store.commit_purge(event.dataset, event.version);
-    try {
-      publish_dataset_event(producer, event);
-    } catch (const std::exception& err) {
-      store.write_outbox(event.dataset, toJson(event));
-      res.status = 503;
-      res.set_content(R"({"error":"TRY_AGAIN"})", "application/json");
-      return;
-    }
-    res.status = 200;
-    res.set_content(json{{"dataset", event.dataset}, {"version", event.version}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Promote a version and tell the consumers; true once the broker has the event.
+bool publishPromotion(const std::string& dataset, const std::string& version, const std::string& actor) {
+  const auto record = store::version(dataset, version);
+  if (!record) throw std::invalid_argument(dataset + "@" + version + " is not registered");
+  // Commit first: an event may lag the pointer, it never leads it.
+  pointer::promote(dataset, version, actor);
+  const json payload = eventPayload(*record, actor);
+  const std::string value = payload.dump();
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  RdKafka::ErrorCode err =
+      producer->produce(kEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                        value.size(), dataset.c_str(), dataset.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kDeliveryTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
+  }
+  if (err != RdKafka::ERR_NO_ERROR) {
+    // The broker did not take it: a relay produces the row later, so consumers are late, not wrong.
+    store::addOutbox(kEventTopic, dataset, payload);
+    return false;
+  }
+  return true;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+from registry import pointer, store
+
+TOPIC = "dataset.event"
+ROWS = "1,review 1,pos\\n2,review 2,neg\\n3,review 3,pos\\n"
+
+
+def _events(ctx):
+    sha = store.put_object(ROWS)
+    for dataset in ("imdb-reviews", "wiki-text"):
+        for version in ("2026-01", "2026-02"):
+            store.put_version({"tenant": "t1", "dataset": dataset, "version": version, "content_sha256": sha, "license": "mit", "owner": "team-lm", "size_bytes": len(ROWS), "row_count": 3, "status": "validated"})
+    return ctx.load("events")
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.lrange("outbox", 0, -1)]
+
+
+def check_key_by_dataset(ctx):
+    m = _events(ctx)
+    for dataset, version in (("imdb-reviews", "2026-01"), ("wiki-text", "2026-01"), ("imdb-reviews", "2026-02")):
+        assert m.publish_promotion(dataset, version, "alice") is True, f"promoting {dataset}@{version} with a healthy broker must return True"
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three promotions produced {len(records)} records on {TOPIC}"
+    keys = [r.key for r in records]
+    assert keys == [b"imdb-reviews", b"wiki-text", b"imdb-reviews"], f"the records are keyed {keys}, expected the dataset names: one dataset's promotions must share a partition to stay in order"
+    assert records[0].partition == records[2].partition, "both imdb-reviews events must land on one partition"
+
+
+def check_no_content_sample(ctx):
+    m = _events(ctx)
+    m.publish_promotion("imdb-reviews", "2026-01", "alice")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one promotion produced {len(records)} records"
+    raw = records[0].value.decode()
+    assert "review 1" not in raw and "sample" not in json.loads(raw), f"the event carries rows of the dataset: {raw}. The topic is retained and replicated past the dataset's access rules; carry identity, not content"
+    payload = json.loads(raw)
+    expected = {"type": "dataset.promoted", "dataset": "imdb-reviews", "version": "2026-01", "actor": "alice", "row_count": 3}
+    for name, value in expected.items():
+        assert payload.get(name) == value, f"the event's {name} is {payload.get(name)!r}, expected {value!r}"
+    assert payload.get("content_sha256") == store.version("imdb-reviews", "2026-01")["content_sha256"], "the event must carry the content hash"
+
+
+def check_publish_after_commit(ctx):
+    m = _events(ctx)
+    at_commit = ctx.redis_after("dataset:imdb-reviews:latest", lambda: len(ctx.kafka.records(TOPIC)))
+    assert m.publish_promotion("imdb-reviews", "2026-01", "alice") is True, "a promotion with a healthy broker must return True"
+    assert at_commit.fired, "publish_promotion never moved dataset:imdb-reviews:latest"
+    assert at_commit.result == 0, f"when the pointer moved the topic already held {at_commit.result} event(s): a consumer could read the event and find latest still on the old version. Promote, then produce"
+    assert len(ctx.kafka.records(TOPIC)) == 1, "the event must still be produced after the promotion"
+    assert pointer.latest("imdb-reviews") == "2026-01", f"latest is {pointer.latest('imdb-reviews')!r}"
+
+
+def check_outbox(ctx):
+    m = _events(ctx)
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_promotion("imdb-reviews", "2026-01", "alice")
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the consumers never hear of the promotion"
+    row = rows[0]
+    assert row.get("topic") == TOPIC and row.get("key") == "imdb-reviews" and row.get("payload", {}).get("version") == "2026-01", f"the outbox row is {row}, expected the topic, the key imdb-reviews and the payload"
+    assert ok is False, f"publish_promotion returned {ok!r} after a failed delivery, expected False"
+    assert pointer.latest("imdb-reviews") == "2026-01", "the promotion itself must stand when only the event failed"
+    assert m.publish_promotion("imdb-reviews", "2026-02", "alice") is True, "with the broker healthy again the promotion must return True"
+    assert len(_outbox(ctx)) == 1, "a delivered event must not add an outbox row"
+`,
+    typescript: `const TOPIC = 'dataset.event';
+const ROWS = '1,review 1,pos\\n2,review 2,neg\\n3,review 3,pos\\n';
+
+async function events(ctx) {
+  const store = ctx.load('/support/registry/store.ts');
+  const pointer = ctx.load('/support/registry/pointer.ts');
+  const sha = await store.putObject(ROWS);
+  for (const dataset of ['imdb-reviews', 'wiki-text']) {
+    for (const version of ['2026-01', '2026-02']) {
+      await store.putVersion({tenant: 't1', dataset, version, content_sha256: sha, license: 'mit', owner: 'team-lm', size_bytes: ROWS.length, row_count: 3, status: 'validated', report: null});
+    }
+  }
+  return {m: ctx.load('events'), store, pointer};
+}
+
+const outbox = ctx => ctx.redis.lrange('outbox', 0, -1).map(row => JSON.parse(row));
+
+export async function check_key_by_dataset(ctx) {
+  const {m} = await events(ctx);
+  for (const [dataset, version] of [['imdb-reviews', '2026-01'], ['wiki-text', '2026-01'], ['imdb-reviews', '2026-02']]) {
+    assert.equal(await m.publishPromotion(dataset, version, 'alice'), true, \`promoting \${dataset}@\${version} with a healthy broker must return true\`);
+  }
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three promotions produced \${records.length} records on \${TOPIC}\`);
+  const keys = records.map(r => r.key?.toString() ?? null);
+  assert.deepStrictEqual(keys, ['imdb-reviews', 'wiki-text', 'imdb-reviews'], \`the records are keyed \${JSON.stringify(keys)}, expected the dataset names: one dataset's promotions must share a partition to stay in order\`);
+  assert.equal(records[0].partition, records[2].partition, 'both imdb-reviews events must land on one partition');
+}
+
+export async function check_no_content_sample(ctx) {
+  const {m, store} = await events(ctx);
+  await m.publishPromotion('imdb-reviews', '2026-01', 'alice');
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 1, \`one promotion produced \${records.length} records\`);
+  const raw = records[0].value.toString();
+  const payload = JSON.parse(raw);
+  assert(!raw.includes('review 1') && !('sample' in payload), \`the event carries rows of the dataset: \${raw}. The topic is retained and replicated past the dataset's access rules; carry identity, not content\`);
+  const expected = {type: 'dataset.promoted', dataset: 'imdb-reviews', version: '2026-01', actor: 'alice', row_count: 3};
+  for (const [name, value] of Object.entries(expected)) assert.equal(payload[name], value, \`the event's \${name}\`);
+  assert.equal(payload.content_sha256, (await store.version('imdb-reviews', '2026-01')).content_sha256, 'the event must carry the content hash');
+}
+
+export async function check_publish_after_commit(ctx) {
+  const {m, pointer} = await events(ctx);
+  const atCommit = ctx.redisAfter('dataset:imdb-reviews:latest', () => ctx.kafka.records(TOPIC).length);
+  assert.equal(await m.publishPromotion('imdb-reviews', '2026-01', 'alice'), true, 'a promotion with a healthy broker must return true');
+  assert(atCommit.fired, 'publishPromotion never moved dataset:imdb-reviews:latest');
+  assert.equal(await atCommit.result, 0, \`when the pointer moved the topic already held \${await atCommit.result} event(s): a consumer could read the event and find latest still on the old version. Promote, then produce\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the event must still be produced after the promotion');
+  assert.equal(await pointer.latest('imdb-reviews'), '2026-01', 'the latest version');
+}
+
+export async function check_outbox(ctx) {
+  const {m, pointer} = await events(ctx);
+  ctx.kafka.failNext(TOPIC, 1);
+  const ok = await m.publishPromotion('imdb-reviews', '2026-01', 'alice');
+  const rows = outbox(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the consumers never hear of the promotion\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'imdb-reviews' && rows[0].payload?.version === '2026-01', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key imdb-reviews and the payload\`);
+  assert.equal(ok, false, 'publishPromotion must return false after a failed delivery');
+  assert.equal(await pointer.latest('imdb-reviews'), '2026-01', 'the promotion itself must stand when only the event failed');
+  assert.equal(await m.publishPromotion('imdb-reviews', '2026-02', 'alice'), true, 'with the broker healthy again the promotion must return true');
+  assert.equal(outbox(ctx).length, 1, 'a delivered event must not add an outbox row');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+
+	"registry/pointer"
+	"registry/store"
+
+	"leetbuild/harness"
+)
+
+const eventsTopic = "dataset.event"
+
+var eventsBg = context.Background()
+
+func eventsSetup(ctx *harness.Ctx) {
+	rows := "1,review 1,pos\\n2,review 2,neg\\n3,review 3,pos\\n"
+	sha := store.PutObject(eventsBg, rows)
+	for _, dataset := range []string{"imdb-reviews", "wiki-text"} {
+		for _, version := range []string{"2026-01", "2026-02"} {
+			err := store.PutVersion(eventsBg, &store.VersionRecord{Tenant: "t1", Dataset: dataset, Version: version, ContentSHA256: sha, License: "mit", Owner: "team-lm", SizeBytes: int64(len(rows)), RowCount: 3, Status: "validated"})
+			ctx.NoError(err, "seeding %s@%s", dataset, version)
+		}
+	}
+}
+
+func eventsPublish(ctx *harness.Ctx, dataset, version string) bool {
+	ok, err := publishPromotion(eventsBg, dataset, version, "alice")
+	ctx.NoError(err, "publishPromotion(%s, %s)", dataset, version)
+	return ok
+}
+
+func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+	var rows []map[string]any
+	for _, raw := range ctx.Redis.LRange("outbox", 0, -1) {
+		var row map[string]any
+		json.Unmarshal([]byte(raw), &row)
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func eventsLatest(ctx *harness.Ctx) string {
+	latest, err := pointer.Latest(eventsBg, "imdb-reviews")
+	ctx.NoError(err, "reading the latest version")
+	return latest
+}
+
+func CheckKeyByDataset(ctx *harness.Ctx) {
+	eventsSetup(ctx)
+	for _, pair := range [][2]string{{"imdb-reviews", "2026-01"}, {"wiki-text", "2026-01"}, {"imdb-reviews", "2026-02"}} {
+		ctx.Assert(eventsPublish(ctx, pair[0], pair[1]), "promoting %s@%s with a healthy broker must return true", pair[0], pair[1])
+	}
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three promotions; the records on %s", eventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"imdb-reviews", "wiki-text", "imdb-reviews"}, "the records must be keyed by the dataset names (one dataset's promotions must share a partition to stay in order); the keys")
+	ctx.Equal(records[0].Partition, records[2].Partition, "both imdb-reviews events must land on one partition")
+}
+
+func CheckNoContentSample(ctx *harness.Ctx) {
+	eventsSetup(ctx)
+	eventsPublish(ctx, "imdb-reviews", "2026-01")
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 1, "one promotion; the records")
+	raw := string(records[0].Value)
+	var payload map[string]any
+	ctx.Assert(json.Unmarshal(records[0].Value, &payload) == nil, "the record's value is not JSON: %s", raw)
+	_, sampled := payload["sample"]
+	ctx.Assert(!strings.Contains(raw, "review 1") && !sampled, "the event carries rows of the dataset: %s. The topic is retained and replicated past the dataset's access rules; carry identity, not content", raw)
+	ctx.Equal(payload["type"], "dataset.promoted", "the event's type")
+	ctx.Equal(payload["dataset"], "imdb-reviews", "the event's dataset")
+	ctx.Equal(payload["version"], "2026-01", "the event's version")
+	ctx.Equal(payload["actor"], "alice", "the event's actor")
+	ctx.Equal(payload["content_sha256"], store.Version(eventsBg, "imdb-reviews", "2026-01").ContentSHA256, "the event's content hash")
+}
+
+func CheckPublishAfterCommit(ctx *harness.Ctx) {
+	eventsSetup(ctx)
+	atCommit := ctx.Redis.After("dataset:imdb-reviews:latest", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
+	ctx.Assert(eventsPublish(ctx, "imdb-reviews", "2026-01"), "a promotion with a healthy broker must return true")
+	ctx.Assert(atCommit.Fired, "publishPromotion never moved dataset:imdb-reviews:latest")
+	ctx.Equal(atCommit.Result, 0, "when the pointer moved the topic already held events: a consumer could read the event and find latest still on the old version. Promote, then produce; events at the commit")
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the promotion; the records")
+	ctx.Equal(eventsLatest(ctx), "2026-01", "the latest version")
+}
+
+func CheckOutbox(ctx *harness.Ctx) {
+	eventsSetup(ctx)
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok := eventsPublish(ctx, "imdb-reviews", "2026-01")
+	rows := eventsOutbox(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without a row the consumers never hear of the promotion; the outbox rows")
+	payload, _ := rows[0]["payload"].(map[string]any)
+	ctx.Assert(rows[0]["topic"] == eventsTopic && rows[0]["key"] == "imdb-reviews" && payload != nil && payload["version"] == "2026-01", "the outbox row is %v, expected the topic, the key imdb-reviews and the payload", rows[0])
+	ctx.Equal(ok, false, "publishPromotion after a failed delivery returned")
+	ctx.Equal(eventsLatest(ctx), "2026-01", "the promotion itself must stand when only the event failed; the latest")
+	ctx.Assert(eventsPublish(ctx, "imdb-reviews", "2026-02"), "with the broker healthy again the promotion must return true")
+	ctx.Equal(len(eventsOutbox(ctx)), 1, "a delivered event must not add an outbox row; the outbox rows")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+using json = nlohmann::json;
+
+namespace {
+
+const std::string kTopic = "dataset.event";
+
+void setup() {
+  const std::string rows = "1,review 1,pos\\n2,review 2,neg\\n3,review 3,pos\\n";
+  const std::string sha = store::putObject(rows);
+  for (const std::string dataset : {"imdb-reviews", "wiki-text"}) {
+    for (const std::string version : {"2026-01", "2026-02"}) {
+      store::VersionRecord rec;
+      rec.tenant = "t1";
+      rec.dataset = dataset;
+      rec.version = version;
+      rec.content_sha256 = sha;
+      rec.license = "mit";
+      rec.owner = "team-lm";
+      rec.size_bytes = static_cast<long long>(rows.size());
+      rec.row_count = 3;
+      rec.status = "validated";
+      store::putVersion(rec);
+    }
+  }
+}
+
+std::vector<json> outbox(harness::Ctx& ctx) {
+  std::vector<json> rows;
+  for (const auto& raw : ctx.Redis.LRange("outbox", 0, -1)) rows.push_back(json::parse(raw));
+  return rows;
+}
+
+}  // namespace
+
+void CheckKeyByDataset(harness::Ctx& ctx) {
+  setup();
+  for (const auto& [dataset, version] : std::vector<std::pair<std::string, std::string>>{{"imdb-reviews", "2026-01"}, {"wiki-text", "2026-01"}, {"imdb-reviews", "2026-02"}}) {
+    ctx.Assert(publishPromotion(dataset, version, "alice"), "promoting %s@%s with a healthy broker must return true", dataset, version);
+  }
+  const auto records = ctx.Kafka.Records(kTopic);
+  ctx.Equal(records.size(), 3, "three promotions; the records on %s", kTopic);
+  ctx.Equal(ctx.Kafka.Keys(kTopic), {"imdb-reviews", "wiki-text", "imdb-reviews"}, "the records must be keyed by the dataset names (one dataset's promotions must share a partition to stay in order); the keys");
+  ctx.Equal(records[0].Partition, records[2].Partition, "both imdb-reviews events must land on one partition");
+}
+
+void CheckNoContentSample(harness::Ctx& ctx) {
+  setup();
+  publishPromotion("imdb-reviews", "2026-01", "alice");
+  const auto records = ctx.Kafka.Records(kTopic);
+  ctx.Equal(records.size(), 1, "one promotion; the records");
+  const std::string raw = records[0].Value.value_or("");
+  const json payload = json::parse(raw, nullptr, false);
+  ctx.Assert(payload.is_object(), "the record's value is not JSON: %s", raw);
+  ctx.Assert(raw.find("review 1") == std::string::npos && !payload.contains("sample"),
+             "the event carries rows of the dataset: %s. The topic is retained and replicated past the dataset's access rules; carry identity, not content", raw);
+  ctx.Equal(payload.value("type", ""), "dataset.promoted", "the event's type");
+  ctx.Equal(payload.value("dataset", ""), "imdb-reviews", "the event's dataset");
+  ctx.Equal(payload.value("version", ""), "2026-01", "the event's version");
+  ctx.Equal(payload.value("actor", ""), "alice", "the event's actor");
+  ctx.Equal(payload.value("content_sha256", ""), store::version("imdb-reviews", "2026-01")->content_sha256, "the event's content hash");
+}
+
+void CheckPublishAfterCommit(harness::Ctx& ctx) {
+  setup();
+  int atCommit = -1;
+  ctx.Redis.After("dataset:imdb-reviews:latest", [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
+  ctx.Assert(publishPromotion("imdb-reviews", "2026-01", "alice"), "a promotion with a healthy broker must return true");
+  ctx.Assert(atCommit >= 0, "publishPromotion never moved dataset:imdb-reviews:latest");
+  ctx.Equal(atCommit, 0, "when the pointer moved the topic already held events: a consumer could read the event and find latest still on the old version. Promote, then produce; events at the commit");
+  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "the event must still be produced after the promotion; the records");
+  ctx.Equal(pointer::latest("imdb-reviews"), "2026-01", "the latest version");
+}
+
+void CheckOutbox(harness::Ctx& ctx) {
+  setup();
+  ctx.Kafka.FailNext(kTopic, 1);
+  const bool ok = publishPromotion("imdb-reviews", "2026-01", "alice");
+  const auto rows = outbox(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without a row the consumers never hear of the promotion; the outbox rows");
+  ctx.Assert(rows[0].value("topic", "") == kTopic && rows[0].value("key", "") == "imdb-reviews" && rows[0]["payload"].value("version", "") == "2026-01",
+             "the outbox row is %s, expected the topic, the key imdb-reviews and the payload", rows[0].dump());
+  ctx.Equal(ok, false, "publishPromotion after a failed delivery returned");
+  ctx.Equal(pointer::latest("imdb-reviews"), "2026-01", "the promotion itself must stand when only the event failed; the latest");
+  ctx.Assert(publishPromotion("imdb-reviews", "2026-02", "alice"), "with the broker healthy again the promotion must return true");
+  ctx.Equal(outbox(ctx).size(), 1, "a delivered event must not add an outbox row; the outbox rows");
+}
+`,
+  },
   hints: [
-    'After a team handover, a consumer sees `dataset.purged` for `2026-02` before `dataset.promoted` for it and un-purges the view. A broker hiccup turns a purge into a 500 with no event at all.',
-    'The key is `event["team"]`, so one dataset lands on two partitions; `content_sample` is copied into the payload; `producer.produce` runs before `store.commit_purge`; a produce error propagates instead of being recorded.',
-    'Key the produce with `dataset`, drop `content_sample` from the event, call `store.commit_purge` before `publish_dataset_event`, and wrap the produce so a rejection writes an outbox row and answers 503.',
+    'Make the broker refuse one delivery: the promotion returns True and nothing is kept to send again. Read the event: it carries the first rows of the file, and it arrived before `latest` moved.',
+    'The key is the owner team, not the dataset; the payload reads the object for a preview; the produce runs before `promote`; and `except KafkaException` only sees enqueue errors, while a refused delivery arrives later through the delivery report.',
+    'Call `pointer.promote` first, drop `sample`, produce with `key=dataset` and an `on_delivery` callback, `flush(DELIVERY_TIMEOUT_S)`, and when records are still in flight or the callback saw an error, `store.add_outbox(EVENT_TOPIC, dataset, payload)` and return False.',
   ],
-  debrief: `The order of the two writes is the whole fix: an event is a promise that the registry state exists, so it can only be made after the commit, and the outbox turns a failed promise into a retry rather than a gap. Keying by the dataset gives one partition per dataset, which is what makes "a dataset's history arrives in order" true at all; a mutable key breaks that the day it changes. Keeping the sample out of the payload keeps tenant bytes out of a topic with its own retention. Production registries put a schema with a compatibility policy on the topic, carry a per-dataset sequence in the payload, compact with tombstones for purged datasets, and have consumers persist the last applied sequence so a replay cannot move a view backwards.`,
+  debrief: `The event follows the commit because it describes the commit: a consumer that pins on hearing \`dataset.promoted\` must find the pointer already there. Keying by dataset is what gives each dataset an order on the topic, and the payload stays at identity (hash, license, row count) because a topic is retained, replicated and read by more services than the dataset's own access list allows. The outbox exists for the case the delivery report reports: the promotion stands, and the event is late rather than lost. Production systems write the outbox row in the same transaction as the state change and let a relay produce it, use an idempotent producer so the relay can retry without duplicates, and have consumers deduplicate on (dataset, version).`,
 };

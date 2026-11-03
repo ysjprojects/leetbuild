@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package toolsd;
+
+// The sandbox step 3 asks before a promotion: it exercises every tool of a candidate catalog
+// version the way an agent would call it. A tool whose schema it cannot drive is INVALID_ARGUMENT,
+// with the tool's name in the details; that verdict does not change until the candidate does.
+service Sandbox {
+  rpc Validate(ValidateRequest) returns (ValidateReport);
+}
+
+message ToolSpec {
+  string name = 1;
+  string version = 2;
+  string side_effect = 3;
+  string schema_json = 4;
+}
+
+message ValidateRequest {
+  string catalog_version = 1;
+  repeated ToolSpec tools = 2;
+}
+
+message ValidateReport {
+  int32 calls_exercised = 1;
+}

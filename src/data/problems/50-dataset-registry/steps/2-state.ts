@@ -2,380 +2,323 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis latest-version pointers with atomic promotion',
+  title: 'Redis latest-version pointer with atomic promotion and pins',
   concept: 'redis',
   file: 'state',
   focus: ['registry', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter serves \`POST /v1/datasets/{dataset}/promote\` with body
-\`{"version": "2026-02", "validator": "validator-7"}\`. Its \`promote\` runs \`GET\`, \`SET\`,
-\`EXPIRE\`, \`RPUSH\` and a rewrite of every consumer pin as separate Redis commands, and \`latest\`
-returns \`""\` when the pointer is absent. It runs against a local Redis, it serves the demo, and it
-hides four flaws.
+**Starting point.** The starter is the latest-version pointer the later steps share.
+\`promote(dataset, version, actor)\` appends \`"{previous}->{version} by {actor}"\` to
+\`dataset:{dataset}:audit\`, sets \`dataset:{dataset}:latest\` with a one-hour expiry, moves every pin
+in \`dataset:{dataset}:pins\` to the new version and returns the previous one; \`latest(dataset)\` reads
+the pointer; \`pin(dataset, consumer, version)\` records a pin; \`purge(dataset, version)\` deletes the
+version record. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Two writes that must be one are a race: between the \`SET\` of the
-pointer and the pin rewrite, a purge sees pins it is about to move and deletes bytes a consumer is
-still reading. The expiring pointer is quieter: after an idle period the dataset simply has no latest
-version, and training silently starts from nothing.
+**Failure mode the checks target.** A reader between the audit append and the pointer write sees a
+promotion that has not happened; an idle dataset loses its latest after an hour and the read hands
+back an empty name; a training run pinned to \`2026-01\` reads \`2026-02\` without asking; a purge
+deletes the version a run still reads.
 
-- \`latest_key(dataset)\` is **durable**: nothing sets a TTL on it.
-- \`promote(dataset, version, validator)\` swaps the pointer **and appends the audit record in one
-  atomic unit** (one \`EVAL\`/\`MULTI\`) and returns the previous version.
-- \`pin(dataset, consumer, version)\` pins one consumer to a concrete version. A promotion must
-  **not move a pin**.
-- \`purge(dataset, version)\` refuses to delete a version any consumer still pins (\`VersionPinned\`).
-- \`latest(dataset)\` **fails closed**: a missing pointer raises \`LatestVersionMissing\` rather than
-  returning an empty string that looks like an unversioned dataset.`,
+- Promotion is **one Lua script** (\`register_script\`/\`EVAL\`): read the pointer, \`SET\` it,
+  \`RPUSH\` the audit entry, return the previous version (\`""\` when none).
+- The pointer has **no expiry**.
+- \`latest\` raises \`LatestVersionMissing\` when the pointer is absent.
+- A promotion leaves the pins alone. \`purge\` raises \`VersionPinned\` for the latest or a pinned
+  version and keeps its record; any other version it deletes, in one script with that check.`,
   sequence: {
-    participants: ['Registry API', 'Registry state', 'Redis'],
+    participants: ['registryd', 'Redis', 'Training run'],
     messages: [
-      {from: 'Registry API', to: 'Registry state', label: 'promote(dataset, version, validator)', kind: 'sync'},
-      {from: 'Registry state', to: 'Redis', label: 'EVAL promote.lua · GET+SET pointer · RPUSH audit', kind: 'sync'},
-      {from: 'Redis', to: 'Registry state', label: 'previous version', kind: 'reply'},
-      {from: 'Registry API', to: 'Registry state', label: 'latest(dataset)', kind: 'sync'},
-      {from: 'Registry state', to: 'Redis', label: 'GET ds:{dataset}:latest (durable)', kind: 'sync'},
-      {from: 'Registry state', to: 'Registry API', label: 'version · or LatestVersionMissing', kind: 'reply'},
+      {from: 'registryd', to: 'Redis', label: 'EVAL promote · latest, audit · 2026-02 bob', kind: 'sync'},
+      {from: 'Redis', to: 'registryd', label: 'previous 2026-01 · pointer and audit moved together', kind: 'reply'},
+      {from: 'Training run', to: 'Redis', label: 'HSET pins run-7 2026-01', kind: 'sync'},
+      {from: 'registryd', to: 'Redis', label: 'EVAL purge 2026-01', kind: 'sync'},
+      {from: 'Redis', to: 'registryd', label: '0 · pinned → VersionPinned', kind: 'reply'},
+      {from: 'registryd', to: 'Redis', label: 'GET latest · nil → LatestVersionMissing', kind: 'sync'},
     ],
   },
   checks: [
     {
-      id: 'route',
-      title: 'Registers POST /v1/datasets/{dataset}/promote',
-      detail: 'Expose promotion on `POST /v1/datasets/{dataset}/promote`.',
-      match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/datasets\/\{dataset\}\/promote["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/datasets\/:dataset\/promote['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/datasets\/\{dataset\}\/promote"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"datasets"\s*\/\s*Segment\s*\/\s*"promote"\s*\)/]},
-        cpp: {all: [/svr\.Post\(/, /\/v1\/datasets/, /promote/]},
-      },
-    },
-    {
       id: 'atomic-promotion',
-      title: 'Pointer swap and audit record are one unit',
+      title: 'The pointer and its audit entry move together',
       detail:
-        'The pointer swap and the audit append run in one server-side script (`_PROMOTE_LUA`), so a purge cannot observe a half-applied promotion. The starter separates them into independent commands.',
+        'One Lua script reads the pointer, sets it and appends the audit entry, so no reader sees a moved pointer without its entry or an entry for a promotion that has not happened. The starter sends `RPUSH` and `SET` as two commands.',
       match: {
-        python: {all: [/_PROMOTE_LUA/, /redis\.eval\(\s*_PROMOTE_LUA/]},
-        typescript: {all: [/PROMOTE_LUA/, /\.eval\(\s*PROMOTE_LUA/]},
-        go: {all: [/promoteLua/, /\.Eval\(/]},
-        scala: {all: [/PromoteLua/, /\.eval\(/]},
-        cpp: {all: [/kPromoteLua/, /\.eval\b/]},
+        python: {all: [/register_script\(|\.eval\(/, /RPUSH/], none: [/\.rpush\(/]},
+        typescript: {all: [/defineCommand\(|\.eval\(/, /RPUSH/], none: [/redis\.rpush\(/]},
+        go: {all: [/redis\.NewScript\(|\.Eval\(/, /RPUSH/], none: [/\.RPush\(/]},
+        scala: {all: [/jedis\.eval\(/, /RPUSH/], none: [/jedis\.rpush\(/]},
+        cpp: {all: [/redis\.eval[<(]/, /RPUSH/], none: [/redis\.rpush\(/]},
       },
     },
     {
       id: 'durable-pointer',
-      title: 'The latest pointer never expires',
+      title: 'The latest pointer does not expire',
       detail:
-        '`latest_key(dataset)` is written without a TTL and nothing calls `expire`/`EXPIRE` on it. The starter sets a 3600-second expiry, so an idle dataset loses its latest version.',
+        '`dataset:{dataset}:latest` is written without a TTL. The starter sets a one-hour expiry, so a dataset nobody promotes for an hour has no latest version.',
       match: {
-        python: {all: [/def latest_key\(/], none: [/\.expire\(\s*[^)]*latest_key\(/]},
-        typescript: {all: [/function latestKey\(/], none: [/\.expire\(\s*[^)]*latestKey\(/]},
-        go: {all: [/func latestKey\(/], none: [/\.Expire\(\s*[^)]*latestKey\(/]},
-        scala: {all: [/def latestKey\(/], none: [/\.expire\(\s*[^)]*latestKey\(/]},
-        cpp: {all: [/latestKey\(/], none: [/\.expire\(\s*[^)]*latestKey\(/]},
+        python: {all: [/latest_key\(/], none: [/POINTER_TTL|\bex\s*=|expire/i]},
+        typescript: {all: [/latestKey\(/], none: [/POINTER_TTL|'EX'|expire/i]},
+        go: {all: [/latestKey\(/], none: [/pointerTTL|Expire\(/]},
+        scala: {all: [/latestKey\(/], none: [/PointerTtl|setex|expire/i]},
+        cpp: {all: [/latestKey\(/], none: [/kPointerTtl|expire/i]},
       },
     },
     {
       id: 'fail-closed',
-      title: 'A missing pointer fails closed',
+      title: 'A missing pointer raises instead of answering a name',
       detail:
-        'Reading the latest version raises `LatestVersionMissing` when the pointer is absent instead of serving an unversioned view. The starter returns an empty string, which a caller reads as "latest".',
+        '`latest` raises `LatestVersionMissing` when the pointer is absent. The starter returns `""`, which a caller passes on as a version.',
       match: {
-        python: {all: [/LatestVersionMissing/, /is None/]},
-        typescript: {all: [/LatestVersionMissing/, /===\s*null/]},
-        go: {all: [/ErrLatestVersionMissing/, /!= nil/]},
-        scala: {all: [/LatestVersionMissing/, /case None/]},
-        cpp: {all: [/LatestVersionMissing/, /has_value\(\)/]},
+        python: {
+          all: [/raise LatestVersionMissing/],
+          none: [/def latest\([^\n]*\n[^\n]*\n\s*return r\.get\([^\n]*\)\s*or\s*["']{2}/],
+        },
+        typescript: {all: [/throw new LatestVersionMissing/], none: [/\?\?\s*''/]},
+        go: {all: [/redis\.Nil[\s\S]{0,80}ErrLatestVersionMissing/]},
+        scala: {all: [/throw new LatestVersionMissing/]},
+        cpp: {all: [/throw LatestVersionMissing/]},
       },
     },
     {
       id: 'pins-independent',
-      title: 'Pins survive promotion and block purge',
+      title: 'Pins survive a promotion and block a purge',
       detail:
-        'Consumers pin a version under their own key, and `purge` refuses a version any consumer still pins (`VersionPinned`). The starter rewrites every pin to the new version inside the promotion, so a pinned consumer silently moves.',
+        'A promotion never writes `dataset:{dataset}:pins`, and `purge` checks the pins (`HVALS`) and the pointer in the script that deletes, refusing with `VersionPinned`. The starter moves every pin to the new version and purges whatever it is asked to.',
       match: {
-        python: {all: [/def purge\(/, /VersionPinned/]},
-        typescript: {all: [/function purge\(/, /VersionPinned/]},
-        go: {all: [/func purge\(/, /ErrVersionPinned/]},
-        scala: {all: [/def purge\(/, /VersionPinned/]},
-        cpp: {all: [/void purge\(/, /VersionPinned/]},
+        python: {all: [/HVALS/, /VersionPinned\(/], none: [/hkeys/i]},
+        typescript: {all: [/HVALS/, /new VersionPinned/], none: [/hkeys/i]},
+        go: {all: [/HVALS/, /ErrVersionPinned/], none: [/HKeys\(/]},
+        scala: {all: [/HVALS/, /new VersionPinned/], none: [/hkeys/i]},
+        cpp: {all: [/HVALS/, /throw VersionPinned/], none: [/hkeys/i]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import json
-import logging
+      starter: `import redis
 
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from redis import Redis
-
-app = FastAPI()
-logger = logging.getLogger("registry-state")
-redis = Redis(host="127.0.0.1", port=6379, decode_responses=True)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 POINTER_TTL_S = 3600
 
 
-class PromoteRequest(BaseModel):
-    version: str
-    validator: str
+class LatestVersionMissing(Exception):
+    """The dataset has no promoted version."""
+
+
+class VersionPinned(Exception):
+    """The version is the latest or a consumer pins it: it cannot be purged."""
 
 
 def latest_key(dataset: str) -> str:
-    return f"ds:{dataset}:latest"
+    return f"dataset:{dataset}:latest"
 
 
 def audit_key(dataset: str) -> str:
-    return f"ds:{dataset}:audit"
+    return f"dataset:{dataset}:audit"
 
 
 def pins_key(dataset: str) -> str:
-    return f"ds:{dataset}:pins"
+    return f"dataset:{dataset}:pins"
 
 
-def promote(dataset: str, version: str, validator: str) -> str:
+def promote(dataset: str, version: str, actor: str) -> str:
+    """Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none)."""
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    previous = redis.get(latest_key(dataset))
-    redis.set(latest_key(dataset), version)
-    redis.expire(latest_key(dataset), POINTER_TTL_S)
-    redis.rpush(audit_key(dataset), json.dumps({"dataset": dataset, "version": version, "validator": validator}))
-    for consumer in redis.hkeys(pins_key(dataset)):
-        redis.hset(pins_key(dataset), consumer, version)
-    return previous if previous is None else str(previous)
+    previous = r.get(latest_key(dataset)) or ""
+    r.rpush(audit_key(dataset), f"{previous}->{version} by {actor}")
+    r.set(latest_key(dataset), version, ex=POINTER_TTL_S)
+    for consumer in r.hkeys(pins_key(dataset)):
+        r.hset(pins_key(dataset), consumer, version)  # pinned runs follow the newest data
+    return previous
 
 
 def latest(dataset: str) -> str:
-    current = redis.get(latest_key(dataset))
-    return current if current is not None else ""
-
-
-@app.post("/v1/datasets/{dataset}/promote")
-def promote_version(
-    dataset: str, body: PromoteRequest, tenant: str = Header(alias="X-Tenant-Id")
-) -> JSONResponse:
-    previous = promote(dataset, body.version, body.validator)
-    logger.info("promoted dataset=%s version=%s", dataset, body.version)
-    return JSONResponse({"dataset": dataset, "version": body.version, "previous": previous}, status_code=200)
-`,
-      solution: `import json
-import logging
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from redis import Redis
-
-app = FastAPI()
-logger = logging.getLogger("registry-state")
-redis = Redis(host="127.0.0.1", port=6379, decode_responses=True)
-
-PIN_TTL_S = 60 * 60 * 24 * 90
-
-# one round trip: read the old pointer, swap it and append the audit record
-_PROMOTE_LUA = """
-local current = redis.call('GET', KEYS[1])
-redis.call('SET', KEYS[1], ARGV[1])
-redis.call('RPUSH', KEYS[2], ARGV[2])
-return current
-"""
-
-
-class LatestVersionMissing(RuntimeError):
-    """The dataset has no promoted version, so there is nothing to serve."""
-
-
-class VersionPinned(RuntimeError):
-    """A consumer still pins this version, so purging it would break that consumer."""
-
-
-class PromoteRequest(BaseModel):
-    version: str
-    validator: str
-
-
-def latest_key(dataset: str) -> str:
-    """The pointer training reads. Durable by contract: never given a TTL."""
-    return f"ds:{dataset}:latest"
-
-
-def audit_key(dataset: str) -> str:
-    return f"ds:{dataset}:audit"
-
-
-def pins_key(dataset: str) -> str:
-    return f"ds:{dataset}:pins"
-
-
-def promote(dataset: str, version: str, validator: str) -> str | None:
-    """Swap the pointer and append the audit record as one atomic unit."""
-    audit = json.dumps({"dataset": dataset, "version": version, "validator": validator})
-    previous = redis.eval(_PROMOTE_LUA, 2, latest_key(dataset), audit_key(dataset), version, audit)
-    return previous if previous is None else str(previous)
-
-
-def latest(dataset: str) -> str:
-    """Fail closed: never serve an unversioned view of a dataset."""
-    current = redis.get(latest_key(dataset))
-    if current is None:
-        raise LatestVersionMissing(dataset)
-    return current
+    """The promoted version."""
+    return r.get(latest_key(dataset)) or ""
 
 
 def pin(dataset: str, consumer: str, version: str) -> None:
-    """Pin one consumer to a concrete version; a promotion never moves it."""
-    redis.hset(pins_key(dataset), consumer, version)
-    redis.expire(pins_key(dataset), PIN_TTL_S)
+    r.hset(pins_key(dataset), consumer, version)
 
 
 def purge(dataset: str, version: str) -> None:
-    """Refuse to purge a version any consumer still pins."""
-    pinned = redis.hvals(pins_key(dataset))
-    if version in pinned:
-        raise VersionPinned(version)
-    redis.delete(f"ds:{dataset}:objects:{version}")
+    """Delete a version record."""
+    r.delete(f"dataset:{dataset}:v:{version}")
+    r.srem(f"dataset:{dataset}:versions", version)
+`,
+      solution: `import redis
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+# Reads the pointer, moves it and appends the audit entry in one step: no reader sees one without the other.
+PROMOTE_LUA = """
+local previous = redis.call('GET', KEYS[1]) or ''
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('RPUSH', KEYS[2], previous .. '->' .. ARGV[1] .. ' by ' .. ARGV[2])
+return previous
+"""
+# Refuses the latest and every pinned version, and deletes otherwise, with no gap between check and delete.
+PURGE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then return 0 end
+for _, pinned in ipairs(redis.call('HVALS', KEYS[2])) do
+  if pinned == ARGV[1] then return 0 end
+end
+redis.call('DEL', KEYS[3])
+redis.call('SREM', KEYS[4], ARGV[1])
+return 1
+"""
+promote_script = r.register_script(PROMOTE_LUA)
+purge_script = r.register_script(PURGE_LUA)
 
 
-@app.post("/v1/datasets/{dataset}/promote")
-def promote_version(
-    dataset: str, body: PromoteRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    previous = promote(dataset, body.version, body.validator)
-    logger.info("promoted dataset=%s version=%s", dataset, body.version)
-    return JSONResponse({"dataset": dataset, "version": body.version, "previous": previous}, status_code=200)
+class LatestVersionMissing(Exception):
+    """The dataset has no promoted version."""
+
+
+class VersionPinned(Exception):
+    """The version is the latest or a consumer pins it: it cannot be purged."""
+
+
+def latest_key(dataset: str) -> str:
+    return f"dataset:{dataset}:latest"
+
+
+def audit_key(dataset: str) -> str:
+    return f"dataset:{dataset}:audit"
+
+
+def pins_key(dataset: str) -> str:
+    return f"dataset:{dataset}:pins"
+
+
+def promote(dataset: str, version: str, actor: str) -> str:
+    """Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none)."""
+    return promote_script(keys=[latest_key(dataset), audit_key(dataset)], args=[version, actor])
+
+
+def latest(dataset: str) -> str:
+    """The promoted version."""
+    version = r.get(latest_key(dataset))
+    if version is None:
+        raise LatestVersionMissing(dataset)
+    return version
+
+
+def pin(dataset: str, consumer: str, version: str) -> None:
+    r.hset(pins_key(dataset), consumer, version)
+
+
+def purge(dataset: str, version: str) -> None:
+    """Delete a version record."""
+    keys = [latest_key(dataset), pins_key(dataset), f"dataset:{dataset}:v:{version}", f"dataset:{dataset}:versions"]
+    if purge_script(keys=keys, args=[version]) == 0:
+        raise VersionPinned(f"{dataset}@{version}")
 `,
     },
     typescript: {
-      starter: `/** Latest-version pointers and consumer pins. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-export const redis = new Redis({host: '127.0.0.1', port: 6379});
+const redis = new Redis({host: 'redis', port: 6379});
 
-const POINTER_TTL_S = 3600;
+export const POINTER_TTL_S = 3600;
 
-interface PromoteBody {
-  version: string;
-  validator: string;
-}
-
-function latestKey(dataset: string): string {
-  return \`ds:\${dataset}:latest\`;
-}
-
-function auditKey(dataset: string): string {
-  return \`ds:\${dataset}:audit\`;
-}
-
-function pinsKey(dataset: string): string {
-  return \`ds:\${dataset}:pins\`;
-}
-
-async function promote(dataset: string, version: string, validator: string): Promise<string> {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const previous = await redis.get(latestKey(dataset));
-  await redis.set(latestKey(dataset), version);
-  await redis.expire(latestKey(dataset), POINTER_TTL_S);
-  await redis.rpush(auditKey(dataset), JSON.stringify({dataset, version, validator}));
-  for (const consumer of await redis.hkeys(pinsKey(dataset)))
-    await redis.hset(pinsKey(dataset), consumer, version);
-  return previous ?? '';
-}
-
-async function latest(dataset: string): Promise<string> {
-  const current = await redis.get(latestKey(dataset));
-  return current ?? '';
-}
-
-app.post('/v1/datasets/:dataset/promote', async (request, reply) => {
-  const dataset = (request.params as {dataset: string}).dataset;
-  const body = request.body as PromoteBody;
-  const previous = await promote(dataset, body.version, body.validator);
-  return reply.code(200).send({dataset, version: body.version, previous});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** Latest-version pointers with atomic promotion and pins that never move. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
-
-export const app = Fastify();
-export const redis = new Redis({host: '127.0.0.1', port: 6379});
-
-const PIN_TTL_S = 60 * 60 * 24 * 90;
-
-// one round trip: read the old pointer, swap it and append the audit record
-const PROMOTE_LUA = [
-  "local current = redis.call('GET', KEYS[1])",
-  "redis.call('SET', KEYS[1], ARGV[1])",
-  "redis.call('RPUSH', KEYS[2], ARGV[2])",
-  'return current',
-].join('\\n');
-
+/** The dataset has no promoted version. */
 export class LatestVersionMissing extends Error {}
+/** The version is the latest or a consumer pins it: it cannot be purged. */
 export class VersionPinned extends Error {}
 
-interface PromoteBody {
-  version: string;
-  validator: string;
+export const latestKey = (dataset: string): string => \`dataset:\${dataset}:latest\`;
+export const auditKey = (dataset: string): string => \`dataset:\${dataset}:audit\`;
+export const pinsKey = (dataset: string): string => \`dataset:\${dataset}:pins\`;
+
+/** Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none). */
+export async function promote(dataset: string, version: string, actor: string): Promise<string> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const previous = (await redis.get(latestKey(dataset))) ?? '';
+  await redis.rpush(auditKey(dataset), \`\${previous}->\${version} by \${actor}\`);
+  await redis.set(latestKey(dataset), version, 'EX', POINTER_TTL_S);
+  for (const consumer of await redis.hkeys(pinsKey(dataset))) {
+    await redis.hset(pinsKey(dataset), consumer, version); // pinned runs follow the newest data
+  }
+  return previous;
 }
 
-function latestKey(dataset: string): string {
-  // The pointer training reads. Durable by contract: never given a TTL.
-  return \`ds:\${dataset}:latest\`;
+/** The promoted version. */
+export async function latest(dataset: string): Promise<string> {
+  return (await redis.get(latestKey(dataset))) ?? '';
 }
 
-function auditKey(dataset: string): string {
-  return \`ds:\${dataset}:audit\`;
-}
-
-function pinsKey(dataset: string): string {
-  return \`ds:\${dataset}:pins\`;
-}
-
-async function promote(dataset: string, version: string, validator: string): Promise<string | null> {
-  const audit = JSON.stringify({dataset, version, validator});
-  const previous = await redis.eval(PROMOTE_LUA, 2, latestKey(dataset), auditKey(dataset), version, audit);
-  return typeof previous === 'string' ? previous : null;
-}
-
-async function latest(dataset: string): Promise<string> {
-  const current = await redis.get(latestKey(dataset));
-  if (current === null) throw new LatestVersionMissing(dataset);
-  return current;
-}
-
-async function pin(dataset: string, consumer: string, version: string): Promise<void> {
+export async function pin(dataset: string, consumer: string, version: string): Promise<void> {
   await redis.hset(pinsKey(dataset), consumer, version);
-  await redis.expire(pinsKey(dataset), PIN_TTL_S);
 }
 
-async function purge(dataset: string, version: string): Promise<void> {
-  const pinned = await redis.hvals(pinsKey(dataset));
-  if (pinned.includes(version)) throw new VersionPinned(version);
-  await redis.del(\`ds:\${dataset}:objects:\${version}\`);
+/** Delete a version record. */
+export async function purge(dataset: string, version: string): Promise<void> {
+  await redis.del(\`dataset:\${dataset}:v:\${version}\`);
+  await redis.srem(\`dataset:\${dataset}:versions\`, version);
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+// Reads the pointer, moves it and appends the audit entry in one step: no reader sees one without the other.
+export const PROMOTE_LUA = \`
+local previous = redis.call('GET', KEYS[1]) or ''
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('RPUSH', KEYS[2], previous .. '->' .. ARGV[1] .. ' by ' .. ARGV[2])
+return previous
+\`;
+// Refuses the latest and every pinned version, and deletes otherwise, with no gap between check and delete.
+export const PURGE_LUA = \`
+if redis.call('GET', KEYS[1]) == ARGV[1] then return 0 end
+for _, pinned in ipairs(redis.call('HVALS', KEYS[2])) do
+  if pinned == ARGV[1] then return 0 end
+end
+redis.call('DEL', KEYS[3])
+redis.call('SREM', KEYS[4], ARGV[1])
+return 1
+\`;
+
+interface PointerRedis extends Redis {
+  promoteVersion(latest: string, audit: string, version: string, actor: string): Promise<string>;
+  purgeVersion(latest: string, pins: string, record: string, versions: string, version: string): Promise<number>;
 }
 
-app.post('/v1/datasets/:dataset/promote', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const dataset = (request.params as {dataset: string}).dataset;
-  const body = request.body as PromoteBody;
-  const previous = await promote(dataset, body.version, body.validator);
-  request.log.info({dataset, version: body.version}, 'promoted');
-  return reply.code(200).send({dataset, version: body.version, previous});
-});
+const redis = new Redis({host: 'redis', port: 6379}) as PointerRedis;
+redis.defineCommand('promoteVersion', {numberOfKeys: 2, lua: PROMOTE_LUA});
+redis.defineCommand('purgeVersion', {numberOfKeys: 4, lua: PURGE_LUA});
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** The dataset has no promoted version. */
+export class LatestVersionMissing extends Error {}
+/** The version is the latest or a consumer pins it: it cannot be purged. */
+export class VersionPinned extends Error {}
+
+export const latestKey = (dataset: string): string => \`dataset:\${dataset}:latest\`;
+export const auditKey = (dataset: string): string => \`dataset:\${dataset}:audit\`;
+export const pinsKey = (dataset: string): string => \`dataset:\${dataset}:pins\`;
+
+/** Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none). */
+export async function promote(dataset: string, version: string, actor: string): Promise<string> {
+  return redis.promoteVersion(latestKey(dataset), auditKey(dataset), version, actor);
+}
+
+/** The promoted version. */
+export async function latest(dataset: string): Promise<string> {
+  const version = await redis.get(latestKey(dataset));
+  if (version === null) throw new LatestVersionMissing(dataset);
+  return version;
+}
+
+export async function pin(dataset: string, consumer: string, version: string): Promise<void> {
+  await redis.hset(pinsKey(dataset), consumer, version);
+}
+
+/** Delete a version record. */
+export async function purge(dataset: string, version: string): Promise<void> {
+  const purged = await redis.purgeVersion(latestKey(dataset), pinsKey(dataset), \`dataset:\${dataset}:v:\${version}\`, \`dataset:\${dataset}:versions\`, version);
+  if (purged === 0) throw new VersionPinned(\`\${dataset}@\${version}\`);
+}
 `,
     },
     go: {
@@ -383,448 +326,689 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net/http"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const pointerTTLS = 3600 * time.Second
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-func latestKey(dataset string) string { return "ds:" + dataset + ":latest" }
-func auditKey(dataset string) string  { return "ds:" + dataset + ":audit" }
-func pinsKey(dataset string) string   { return "ds:" + dataset + ":pins" }
+const pointerTTL = time.Hour
 
-func promote(ctx context.Context, rdb *redis.Client, dataset, version, validator string) (string, error) {
+var (
+	// ErrLatestVersionMissing: the dataset has no promoted version.
+	ErrLatestVersionMissing = errors.New("latest version missing")
+	// ErrVersionPinned: the version is the latest or a consumer pins it, it cannot be purged.
+	ErrVersionPinned = errors.New("version is pinned")
+)
+
+func latestKey(dataset string) string { return "dataset:" + dataset + ":latest" }
+func auditKey(dataset string) string  { return "dataset:" + dataset + ":audit" }
+func pinsKey(dataset string) string   { return "dataset:" + dataset + ":pins" }
+
+// promote makes version the dataset's latest and appends the audit entry; it returns the previous
+// latest ("" when none).
+func promote(ctx context.Context, dataset, version, actor string) (string, error) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	previous, err := rdb.Get(ctx, latestKey(dataset)).Result()
-	if err != nil && err != redis.Nil {
+	previous := rdb.Get(ctx, latestKey(dataset)).Val()
+	if err := rdb.RPush(ctx, auditKey(dataset), fmt.Sprintf("%s->%s by %s", previous, version, actor)).Err(); err != nil {
 		return "", err
 	}
-	if err := rdb.Set(ctx, latestKey(dataset), version, 0).Err(); err != nil {
+	if err := rdb.Set(ctx, latestKey(dataset), version, pointerTTL).Err(); err != nil {
 		return "", err
 	}
-	if err := rdb.Expire(ctx, latestKey(dataset), pointerTTLS).Err(); err != nil {
-		return "", err
-	}
-	audit, _ := json.Marshal(map[string]string{"dataset": dataset, "version": version, "validator": validator})
-	if err := rdb.RPush(ctx, auditKey(dataset), audit).Err(); err != nil {
-		return "", err
-	}
-	consumers, err := rdb.HKeys(ctx, pinsKey(dataset)).Result()
-	if err != nil {
-		return "", err
-	}
-	for _, consumer := range consumers {
-		if err := rdb.HSet(ctx, pinsKey(dataset), consumer, version).Err(); err != nil {
-			return "", err
-		}
+	for _, consumer := range rdb.HKeys(ctx, pinsKey(dataset)).Val() {
+		rdb.HSet(ctx, pinsKey(dataset), consumer, version) // pinned runs follow the newest data
 	}
 	return previous, nil
 }
 
-func latest(ctx context.Context, rdb *redis.Client, dataset string) (string, error) {
-	current, err := rdb.Get(ctx, latestKey(dataset)).Result()
-	if err != nil {
-		return "", err
-	}
-	return current, nil
+// latest is the promoted version.
+func latest(ctx context.Context, dataset string) (string, error) {
+	return rdb.Get(ctx, latestKey(dataset)).Val(), nil
 }
 
-func main() {
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/datasets/{dataset}/promote", func(rw http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(rw, "invalid json", http.StatusBadRequest)
-			return
-		}
-		previous, err := promote(r.Context(), rdb, r.PathValue("dataset"), body["version"], body["validator"])
-		if err != nil {
-			http.Error(rw, "TRY_AGAIN", http.StatusServiceUnavailable)
-			return
-		}
-		rw.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(rw).Encode(map[string]any{"previous": previous})
-	})
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func pin(ctx context.Context, dataset, consumer, version string) error {
+	return rdb.HSet(ctx, pinsKey(dataset), consumer, version).Err()
+}
+
+// purge deletes a version record.
+func purge(ctx context.Context, dataset, version string) error {
+	if err := rdb.Del(ctx, "dataset:"+dataset+":v:"+version).Err(); err != nil {
+		return err
+	}
+	return rdb.SRem(ctx, "dataset:"+dataset+":versions", version).Err()
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"log"
-	"net/http"
-	"time"
+	"fmt"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const pinTTLS = 60 * 60 * 24 * 90 * time.Second
-
-// one round trip: read the old pointer, swap it and append the audit record
-const promoteLua = \`
-local current = redis.call('GET', KEYS[1])
-redis.call('SET', KEYS[1], ARGV[1])
-redis.call('RPUSH', KEYS[2], ARGV[2])
-return current
-\`
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 var (
-	ErrLatestVersionMissing = errors.New("no promoted version for this dataset")
-	ErrVersionPinned        = errors.New("version is still pinned by a consumer")
+	// ErrLatestVersionMissing: the dataset has no promoted version.
+	ErrLatestVersionMissing = errors.New("latest version missing")
+	// ErrVersionPinned: the version is the latest or a consumer pins it, it cannot be purged.
+	ErrVersionPinned = errors.New("version is pinned")
 )
 
-func latestKey(dataset string) string { return "ds:" + dataset + ":latest" }
-func auditKey(dataset string) string  { return "ds:" + dataset + ":audit" }
-func pinsKey(dataset string) string   { return "ds:" + dataset + ":pins" }
+// promoteScript reads the pointer, moves it and appends the audit entry in one step: no reader sees
+// one without the other.
+var promoteScript = redis.NewScript(\`
+local previous = redis.call('GET', KEYS[1]) or ''
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('RPUSH', KEYS[2], previous .. '->' .. ARGV[1] .. ' by ' .. ARGV[2])
+return previous
+\`)
 
-func promote(ctx context.Context, rdb *redis.Client, dataset, version, validator string) (string, error) {
-	audit, err := json.Marshal(map[string]string{"dataset": dataset, "version": version, "validator": validator})
-	if err != nil {
-		return "", err
-	}
-	previous, err := rdb.Eval(ctx, promoteLua, []string{latestKey(dataset), auditKey(dataset)}, version, string(audit)).Result()
-	if err != nil {
-		return "", err
-	}
-	if previous == nil {
-		return "", nil
-	}
-	return previous.(string), nil
+// purgeScript refuses the latest and every pinned version, and deletes otherwise, with no gap
+// between check and delete.
+var purgeScript = redis.NewScript(\`
+if redis.call('GET', KEYS[1]) == ARGV[1] then return 0 end
+for _, pinned in ipairs(redis.call('HVALS', KEYS[2])) do
+  if pinned == ARGV[1] then return 0 end
+end
+redis.call('DEL', KEYS[3])
+redis.call('SREM', KEYS[4], ARGV[1])
+return 1
+\`)
+
+func latestKey(dataset string) string { return "dataset:" + dataset + ":latest" }
+func auditKey(dataset string) string  { return "dataset:" + dataset + ":audit" }
+func pinsKey(dataset string) string   { return "dataset:" + dataset + ":pins" }
+
+// promote makes version the dataset's latest and appends the audit entry; it returns the previous
+// latest ("" when none).
+func promote(ctx context.Context, dataset, version, actor string) (string, error) {
+	return promoteScript.Run(ctx, rdb, []string{latestKey(dataset), auditKey(dataset)}, version, actor).Text()
 }
 
-func latest(ctx context.Context, rdb *redis.Client, dataset string) (string, error) {
-	current, err := rdb.Get(ctx, latestKey(dataset)).Result()
-	if err == redis.Nil || current == "" {
-		return "", ErrLatestVersionMissing
+// latest is the promoted version.
+func latest(ctx context.Context, dataset string) (string, error) {
+	version, err := rdb.Get(ctx, latestKey(dataset)).Result()
+	if err == redis.Nil {
+		return "", fmt.Errorf("%w: %s", ErrLatestVersionMissing, dataset)
 	}
-	if err != nil {
-		return "", err
-	}
-	return current, nil
+	return version, err
 }
 
-func pin(ctx context.Context, rdb *redis.Client, dataset, consumer, version string) error {
-	if err := rdb.HSet(ctx, pinsKey(dataset), consumer, version).Err(); err != nil {
+func pin(ctx context.Context, dataset, consumer, version string) error {
+	return rdb.HSet(ctx, pinsKey(dataset), consumer, version).Err()
+}
+
+// purge deletes a version record.
+func purge(ctx context.Context, dataset, version string) error {
+	keys := []string{latestKey(dataset), pinsKey(dataset), "dataset:" + dataset + ":v:" + version, "dataset:" + dataset + ":versions"}
+	purged, err := purgeScript.Run(ctx, rdb, keys, version).Int64()
+	if err != nil {
 		return err
 	}
-	return rdb.Expire(ctx, pinsKey(dataset), pinTTLS).Err()
-}
-
-func purge(ctx context.Context, rdb *redis.Client, dataset, version string) error {
-	consumers, err := rdb.HVals(ctx, pinsKey(dataset)).Result()
-	if err != nil {
-		return err
+	if purged == 0 {
+		return fmt.Errorf("%w: %s@%s", ErrVersionPinned, dataset, version)
 	}
-	for _, pinned := range consumers {
-		if pinned == version {
-			return ErrVersionPinned
-		}
-	}
-	return rdb.Del(ctx, "ds:"+dataset+":objects:"+version).Err()
-}
-
-func main() {
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/datasets/{dataset}/promote", func(rw http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(rw, "invalid json", http.StatusBadRequest)
-			return
-		}
-		previous, err := promote(r.Context(), rdb, r.PathValue("dataset"), body["version"], body["validator"])
-		if err != nil {
-			http.Error(rw, "TRY_AGAIN", http.StatusServiceUnavailable)
-			return
-		}
-		rw.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(rw).Encode(map[string]any{"previous": previous})
-	})
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	return nil
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      starter: `import redis.clients.jedis.JedisPooled
 
-final case class PromoteRequest(version: String, validator: String)
+import scala.jdk.CollectionConverters._
 
-object DatasetStateApi {
-  implicit val system: ActorSystem = ActorSystem("dataset-registry")
-  implicit val promoteFormat: RootJsonFormat[PromoteRequest] = jsonFormat2(PromoteRequest)
+/** The dataset has no promoted version. */
+final class LatestVersionMissing(message: String) extends Exception(message)
+/** The version is the latest or a consumer pins it: it cannot be purged. */
+final class VersionPinned(message: String) extends Exception(message)
 
-  val PointerTtlSeconds = 3600
-  val jedis = new Jedis("127.0.0.1", 6379)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  def latestKey(dataset: String): String = s"ds:$dataset:latest"
-  def auditKey(dataset: String): String = s"ds:$dataset:audit"
-  def pinsKey(dataset: String): String = s"ds:$dataset:pins"
+  val PointerTtlSeconds = 3600L
 
-  def promote(dataset: String, version: String, validator: String): Option[String] = {
+  def latestKey(dataset: String): String = s"dataset:$dataset:latest"
+  def auditKey(dataset: String): String = s"dataset:$dataset:audit"
+  def pinsKey(dataset: String): String = s"dataset:$dataset:pins"
+
+  /** Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none). */
+  def promote(dataset: String, version: String, actor: String): String = {
     // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val previous = Option(jedis.get(latestKey(dataset)))
-    jedis.set(latestKey(dataset), version)
-    jedis.expire(latestKey(dataset), PointerTtlSeconds)
-    jedis.rpush(auditKey(dataset), s"""{"dataset":"$dataset","version":"$version","validator":"$validator"}""")
-    val consumers = jedis.hkeys(pinsKey(dataset)).toArray(new Array[String](0))
-    for (consumer <- consumers) jedis.hset(pinsKey(dataset), consumer, version)
+    val previous = Option(jedis.get(latestKey(dataset))).getOrElse("")
+    jedis.rpush(auditKey(dataset), s"$previous->$version by $actor")
+    jedis.setex(latestKey(dataset), PointerTtlSeconds, version)
+    jedis.hkeys(pinsKey(dataset)).asScala.foreach(consumer => jedis.hset(pinsKey(dataset), consumer, version)) // pinned runs follow the newest data
     previous
   }
 
+  /** The promoted version. */
   def latest(dataset: String): String = Option(jedis.get(latestKey(dataset))).getOrElse("")
 
-  val route: Route =
-    path("v1" / "datasets" / Segment / "promote") { dataset =>
-      post {
-        entity(as[PromoteRequest]) { body =>
-          val previous = promote(dataset, body.version, body.validator)
-          system.log.info(s"promoted dataset=$dataset version=$previous")
-          complete(StatusCodes.OK, s"""{"dataset":"$dataset","version":"\${body.version}"}""")
-        }
-      }
-    }
+  def pin(dataset: String, consumer: String, version: String): Unit = jedis.hset(pinsKey(dataset), consumer, version)
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Delete a version record. */
+  def purge(dataset: String, version: String): Unit = {
+    jedis.del(s"dataset:$dataset:v:$version")
+    jedis.srem(s"dataset:$dataset:versions", version)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      solution: `import redis.clients.jedis.JedisPooled
 
-final case class PromoteRequest(version: String, validator: String)
+import scala.jdk.CollectionConverters._
 
-class LatestVersionMissing(dataset: String) extends RuntimeException(s"no promoted version for $dataset")
-class VersionPinned(version: String) extends RuntimeException(s"$version is still pinned by a consumer")
+/** The dataset has no promoted version. */
+final class LatestVersionMissing(message: String) extends Exception(message)
+/** The version is the latest or a consumer pins it: it cannot be purged. */
+final class VersionPinned(message: String) extends Exception(message)
 
-object DatasetStateApi {
-  implicit val system: ActorSystem = ActorSystem("dataset-registry")
-  implicit val promoteFormat: RootJsonFormat[PromoteRequest] = jsonFormat2(PromoteRequest)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  val PinTtlSeconds = 60 * 60 * 24 * 90
-  val jedis = new Jedis("127.0.0.1", 6379)
-
-  // one round trip: read the old pointer, swap it and append the audit record
-  val PromoteLua =
-    """local current = redis.call('GET', KEYS[1])
+  /** Reads the pointer, moves it and appends the audit entry in one step: no reader sees one without the other. */
+  val PromoteLua: String =
+    """local previous = redis.call('GET', KEYS[1]) or ''
       |redis.call('SET', KEYS[1], ARGV[1])
-      |redis.call('RPUSH', KEYS[2], ARGV[2])
-      |return current""".stripMargin
+      |redis.call('RPUSH', KEYS[2], previous .. '->' .. ARGV[1] .. ' by ' .. ARGV[2])
+      |return previous
+      |""".stripMargin
 
-  def latestKey(dataset: String): String = s"ds:$dataset:latest"
-  def auditKey(dataset: String): String = s"ds:$dataset:audit"
-  def pinsKey(dataset: String): String = s"ds:$dataset:pins"
+  /** Refuses the latest and every pinned version, and deletes otherwise, with no gap between check and delete. */
+  val PurgeLua: String =
+    """if redis.call('GET', KEYS[1]) == ARGV[1] then return 0 end
+      |for _, pinned in ipairs(redis.call('HVALS', KEYS[2])) do
+      |  if pinned == ARGV[1] then return 0 end
+      |end
+      |redis.call('DEL', KEYS[3])
+      |redis.call('SREM', KEYS[4], ARGV[1])
+      |return 1
+      |""".stripMargin
 
-  def promote(dataset: String, version: String, validator: String): Option[String] = {
-    val audit = s"""{"dataset":"$dataset","version":"$version","validator":"$validator"}"""
-    Option(jedis.eval(PromoteLua, 2, latestKey(dataset), auditKey(dataset), version, audit)).map(_.toString)
-  }
+  def latestKey(dataset: String): String = s"dataset:$dataset:latest"
+  def auditKey(dataset: String): String = s"dataset:$dataset:audit"
+  def pinsKey(dataset: String): String = s"dataset:$dataset:pins"
 
-  def latest(dataset: String): String = jedis.get(latestKey(dataset)) match {
-    case None => throw new LatestVersionMissing(dataset)
-    case Some(version) => version
-  }
+  /** Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none). */
+  def promote(dataset: String, version: String, actor: String): String =
+    jedis.eval(PromoteLua, List(latestKey(dataset), auditKey(dataset)).asJava, List(version, actor).asJava).asInstanceOf[String]
 
-  def pin(dataset: String, consumer: String, version: String): Unit = {
-    jedis.hset(pinsKey(dataset), consumer, version)
-    jedis.expire(pinsKey(dataset), PinTtlSeconds)
-  }
+  /** The promoted version. */
+  def latest(dataset: String): String =
+    Option(jedis.get(latestKey(dataset))).getOrElse(throw new LatestVersionMissing(dataset))
 
+  def pin(dataset: String, consumer: String, version: String): Unit = jedis.hset(pinsKey(dataset), consumer, version)
+
+  /** Delete a version record. */
   def purge(dataset: String, version: String): Unit = {
-    val pinned = jedis.hvals(pinsKey(dataset)).toArray(new Array[String](0))
-    if (pinned.contains(version)) throw new VersionPinned(version)
-    jedis.del(s"ds:$dataset:objects:$version")
-  }
-
-  val route: Route =
-    path("v1" / "datasets" / Segment / "promote") { dataset =>
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[PromoteRequest]) { body =>
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              val previous = promote(dataset, body.version, body.validator)
-              system.log.info(s"promoted dataset=$dataset version=\${body.version}")
-              complete(StatusCodes.OK, s"""{"dataset":"$dataset","version":"\${body.version}"}""")
-            }
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+    val keys = List(latestKey(dataset), pinsKey(dataset), s"dataset:$dataset:v:$version", s"dataset:$dataset:versions").asJava
+    if (jedis.eval(PurgeLua, keys, List(version).asJava).asInstanceOf[java.lang.Long] == 0L) throw new VersionPinned(s"$dataset@$version")
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
-#include <iostream>
-#include <optional>
-#include <string>
-#include <vector>
-
-using json = nlohmann::json;
-namespace redis = sw::redis;
-
-const long kPointerTtlSeconds = 3600;
-
-std::string latestKey(const std::string& dataset) { return "ds:" + dataset + ":latest"; }
-std::string auditKey(const std::string& dataset) { return "ds:" + dataset + ":audit"; }
-std::string pinsKey(const std::string& dataset) { return "ds:" + dataset + ":pins"; }
-
-static std::optional<std::string> promote(redis::Redis& rdb, const std::string& dataset, const std::string& version,
-                                         const std::string& validator) {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const auto previous = rdb.get(latestKey(dataset));
-  rdb.set(latestKey(dataset), version);
-  rdb.expire(latestKey(dataset), kPointerTtlSeconds);
-  rdb.rpush(auditKey(dataset), json{{"dataset", dataset}, {"version", version}, {"validator", validator}}.dump());
-  const auto consumers = rdb.hkeys(pinsKey(dataset));
-  for (const auto& consumer : consumers) rdb.hset(pinsKey(dataset), consumer, version);
-  return previous;
-}
-
-static std::string latest(redis::Redis& rdb, const std::string& dataset) {
-  const auto current = rdb.get(latestKey(dataset));
-  return current ? *current : std::string();
-}
-
-int main() {
-  redis::Redis rdb("tcp://127.0.0.1:6379");
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/datasets/([^/]+)/promote)", [&rdb](const httplib::Request& req, httplib::Response& res) {
-    const std::string dataset = req.matches[1];
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto previous = promote(rdb, dataset, body.value("version", std::string()),
-                                  body.value("validator", std::string()));
-    res.status = 200;
-    res.set_content(json{{"dataset", dataset}, {"previous", previous ? *previous : ""}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
-
-#include <iostream>
-#include <optional>
+#include <chrono>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
-using json = nlohmann::json;
-namespace redis = sw::redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-const long kPinTtlSeconds = 60 * 60 * 24 * 90;
+constexpr long kPointerTtlSeconds = 3600;
 
-// one round trip: read the old pointer, swap it and append the audit record
-const std::string kPromoteLua =
-    "local current = redis.call('GET', KEYS[1])\\n"
-    "redis.call('SET', KEYS[1], ARGV[1])\\n"
-    "redis.call('RPUSH', KEYS[2], ARGV[2])\\n"
-    "return current";
-
+// The dataset has no promoted version.
 struct LatestVersionMissing : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
+// The version is the latest or a consumer pins it: it cannot be purged.
 struct VersionPinned : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-std::string latestKey(const std::string& dataset) { return "ds:" + dataset + ":latest"; }
-std::string auditKey(const std::string& dataset) { return "ds:" + dataset + ":audit"; }
-std::string pinsKey(const std::string& dataset) { return "ds:" + dataset + ":pins"; }
+std::string latestKey(const std::string& dataset) { return "dataset:" + dataset + ":latest"; }
+std::string auditKey(const std::string& dataset) { return "dataset:" + dataset + ":audit"; }
+std::string pinsKey(const std::string& dataset) { return "dataset:" + dataset + ":pins"; }
 
-static redis::OptionalString promote(redis::Redis& rdb, const std::string& dataset, const std::string& version,
-                                     const std::string& validator) {
-  const std::string audit = json{{"dataset", dataset}, {"version", version}, {"validator", validator}}.dump();
-  return rdb.eval<redis::OptionalString>(kPromoteLua, {latestKey(dataset), auditKey(dataset)}, {version, audit});
-}
-
-static std::string latest(redis::Redis& rdb, const std::string& dataset) {
-  const auto current = rdb.get(latestKey(dataset));
-  if (!current.has_value()) throw LatestVersionMissing(dataset);
-  return *current;
-}
-
-static void pin(redis::Redis& rdb, const std::string& dataset, const std::string& consumer,
-                const std::string& version) {
-  rdb.hset(pinsKey(dataset), consumer, version);
-  rdb.expire(pinsKey(dataset), kPinTtlSeconds);
-}
-
-static void purge(redis::Redis& rdb, const std::string& dataset, const std::string& version) {
-  const auto pinned = rdb.hvals(pinsKey(dataset));
-  for (const auto& candidate : pinned) {
-    if (candidate == version) throw VersionPinned(version);
+// Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none).
+std::string promote(const std::string& dataset, const std::string& version, const std::string& actor) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const auto current = redis.get(latestKey(dataset));
+  const std::string previous = current ? std::string(*current) : "";
+  redis.rpush(auditKey(dataset), previous + "->" + version + " by " + actor);
+  redis.set(latestKey(dataset), version, std::chrono::seconds(kPointerTtlSeconds));
+  for (const std::string& consumer : redis.hkeys(pinsKey(dataset))) {
+    redis.hset(pinsKey(dataset), consumer, version);  // pinned runs follow the newest data
   }
-  rdb.del("ds:" + dataset + ":objects:" + version);
+  return previous;
 }
 
-int main() {
-  redis::Redis rdb("tcp://127.0.0.1:6379");
-  httplib::Server svr;
+// The promoted version.
+std::string latest(const std::string& dataset) {
+  const auto version = redis.get(latestKey(dataset));
+  return version ? std::string(*version) : "";
+}
 
-  svr.Post(R"(/v1/datasets/([^/]+)/promote)", [&rdb](const httplib::Request& req, httplib::Response& res) {
-    const std::string dataset = req.matches[1];
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto previous = promote(rdb, dataset, body.value("version", std::string()),
-                                  body.value("validator", std::string()));
-    res.status = 200;
-    res.set_content(json{{"dataset", dataset}, {"previous", previous ? *previous : ""}}.dump(), "application/json");
-  });
+void pin(const std::string& dataset, const std::string& consumer, const std::string& version) {
+  redis.hset(pinsKey(dataset), consumer, version);
+}
 
-  svr.listen("0.0.0.0", 8443);
+// Delete a version record.
+void purge(const std::string& dataset, const std::string& version) {
+  redis.del("dataset:" + dataset + ":v:" + version);
+  redis.srem("dataset:" + dataset + ":versions", version);
+}
+`,
+      solution: `#include <sw/redis++/redis++.h>
+
+#include <stdexcept>
+#include <string>
+
+sw::redis::Redis redis("tcp://redis:6379");
+
+// Reads the pointer, moves it and appends the audit entry in one step: no reader sees one without the other.
+const std::string kPromoteLua = R"lua(
+local previous = redis.call('GET', KEYS[1]) or ''
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('RPUSH', KEYS[2], previous .. '->' .. ARGV[1] .. ' by ' .. ARGV[2])
+return previous
+)lua";
+
+// Refuses the latest and every pinned version, and deletes otherwise, with no gap between check and delete.
+const std::string kPurgeLua = R"lua(
+if redis.call('GET', KEYS[1]) == ARGV[1] then return 0 end
+for _, pinned in ipairs(redis.call('HVALS', KEYS[2])) do
+  if pinned == ARGV[1] then return 0 end
+end
+redis.call('DEL', KEYS[3])
+redis.call('SREM', KEYS[4], ARGV[1])
+return 1
+)lua";
+
+// The dataset has no promoted version.
+struct LatestVersionMissing : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+// The version is the latest or a consumer pins it: it cannot be purged.
+struct VersionPinned : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+std::string latestKey(const std::string& dataset) { return "dataset:" + dataset + ":latest"; }
+std::string auditKey(const std::string& dataset) { return "dataset:" + dataset + ":audit"; }
+std::string pinsKey(const std::string& dataset) { return "dataset:" + dataset + ":pins"; }
+
+// Make version the dataset's latest and append the audit entry; returns the previous latest ("" when none).
+std::string promote(const std::string& dataset, const std::string& version, const std::string& actor) {
+  return redis.eval<std::string>(kPromoteLua, {latestKey(dataset), auditKey(dataset)}, {version, actor});
+}
+
+// The promoted version.
+std::string latest(const std::string& dataset) {
+  const auto version = redis.get(latestKey(dataset));
+  if (!version) throw LatestVersionMissing(dataset);
+  return std::string(*version);
+}
+
+void pin(const std::string& dataset, const std::string& consumer, const std::string& version) {
+  redis.hset(pinsKey(dataset), consumer, version);
+}
+
+// Delete a version record.
+void purge(const std::string& dataset, const std::string& version) {
+  const long long purged = redis.eval<long long>(
+      kPurgeLua, {latestKey(dataset), pinsKey(dataset), "dataset:" + dataset + ":v:" + version, "dataset:" + dataset + ":versions"},
+      {version});
+  if (purged == 0) throw VersionPinned(dataset + "@" + version);
 }
 `,
     },
   },
+  harness: {
+    python: `from registry import store
+
+DS = "imdb-reviews"
+LATEST = f"dataset:{DS}:latest"
+AUDIT = f"dataset:{DS}:audit"
+PINS = f"dataset:{DS}:pins"
+
+
+def _state(ctx):
+    for version in ("2025-12", "2026-01", "2026-02"):
+        store.put_version({"tenant": "t1", "dataset": DS, "version": version, "content_sha256": "0" * 64, "license": "mit", "owner": "team-lm", "size_bytes": 20, "row_count": 2, "status": "validated"})
+    return ctx.load("state")
+
+
+def _refused(m, version, why):
+    try:
+        m.purge(DS, version)
+    except m.VersionPinned:
+        return
+    raise AssertionError(f"purge({version!r}) went through while {why}: a run reading it loses its data. Raise VersionPinned")
+
+
+def check_atomic_promotion(ctx):
+    m = _state(ctx)
+    assert m.promote(DS, "2026-01", "alice") == "", "the first promotion has no previous version: promote must return ''"
+    seen = ctx.redis_after(AUDIT, lambda: (ctx.redis.get(LATEST), ctx.redis.llen(AUDIT)))
+    previous = m.promote(DS, "2026-02", "bob")
+    assert seen.fired, "the promotion of 2026-02 never touched the audit list"
+    latest, entries = seen.result
+    assert (latest, entries) in (("2026-01", 1), ("2026-02", 2)), f"a reader between the commands saw latest {latest} with {entries} audit entries: the pointer and its audit entry must change together, in one Lua script"
+    assert previous == "2026-01", f"promote returned {previous!r}, expected the previous latest 2026-01"
+    entries = ctx.redis.lrange(AUDIT, 0, -1)
+    assert entries == ["->2026-01 by alice", "2026-01->2026-02 by bob"], f"the audit list holds {entries}"
+    assert ctx.redis.get(LATEST) == "2026-02", f"the pointer holds {ctx.redis.get(LATEST)!r} after promoting 2026-02"
+
+
+def check_durable_pointer(ctx):
+    m = _state(ctx)
+    m.promote(DS, "2026-01", "alice")
+    m.promote(DS, "2026-02", "bob")
+    assert ctx.redis.get(LATEST) == "2026-02", f"the pointer holds {ctx.redis.get(LATEST)!r}, expected 2026-02"
+    ttl = ctx.redis.ttl(LATEST)
+    assert ttl == -1, f"{LATEST} expires in {ttl} s: a dataset nobody promotes for that long loses its latest version. The pointer must not expire"
+
+
+def check_fail_closed(ctx):
+    m = _state(ctx)
+    try:
+        got = m.latest("wiki-text")
+    except m.LatestVersionMissing:
+        pass
+    else:
+        raise AssertionError(f"latest('wiki-text') returned {got!r} for a dataset with no promoted version: a caller passes that on as a version. Raise LatestVersionMissing")
+    m.promote(DS, "2026-01", "alice")
+    assert m.latest(DS) == "2026-01", f"latest gives {m.latest(DS)!r} after promoting 2026-01"
+
+
+def check_pins_independent(ctx):
+    m = _state(ctx)
+    m.promote(DS, "2026-01", "alice")
+    m.pin(DS, "run-7", "2026-01")
+    m.promote(DS, "2026-02", "bob")
+    pinned = ctx.redis.hget(PINS, "run-7")
+    assert pinned == "2026-01", f"run-7 pinned 2026-01 and now reads {pinned}: a promotion must leave the pins alone"
+    _refused(m, "2026-01", "run-7 pins it")
+    assert store.version(DS, "2026-01") is not None, "the pinned version's record is gone"
+    _refused(m, "2026-02", "it is the latest")
+    assert store.version(DS, "2026-02") is not None, "the latest version's record is gone"
+    m.purge(DS, "2025-12")
+    assert store.version(DS, "2025-12") is None, "a version nobody pins and that is not the latest must be purged"
+    assert "2025-12" not in store.versions(DS), f"the purged version is still listed: {store.versions(DS)}"
+`,
+    typescript: `const DS = 'imdb-reviews';
+const LATEST = \`dataset:\${DS}:latest\`;
+const AUDIT = \`dataset:\${DS}:audit\`;
+const PINS = \`dataset:\${DS}:pins\`;
+
+async function state(ctx) {
+  const store = ctx.load('/support/registry/store.ts');
+  for (const version of ['2025-12', '2026-01', '2026-02']) {
+    await store.putVersion({tenant: 't1', dataset: DS, version, content_sha256: '0'.repeat(64), license: 'mit', owner: 'team-lm', size_bytes: 20, row_count: 2, status: 'validated', report: null});
+  }
+  return {m: ctx.load('state'), store};
+}
+
+async function refused(m, version: string, why: string): Promise<void> {
+  try {
+    await m.purge(DS, version);
+  } catch (e) {
+    if (e instanceof m.VersionPinned) return;
+    throw e;
+  }
+  assert.fail(\`purge('\${version}') went through while \${why}: a run reading it loses its data. Throw VersionPinned\`);
+}
+
+export async function check_atomic_promotion(ctx) {
+  const {m} = await state(ctx);
+  assert.equal(await m.promote(DS, '2026-01', 'alice'), '', 'the first promotion has no previous version: promote must return ""');
+  const seen = ctx.redisAfter(AUDIT, () => [ctx.redis.get(LATEST), ctx.redis.llen(AUDIT)]);
+  const previous = await m.promote(DS, '2026-02', 'bob');
+  assert(seen.fired, 'the promotion of 2026-02 never touched the audit list');
+  const [latest, entries] = await seen.result;
+  assert((latest === '2026-01' && entries === 1) || (latest === '2026-02' && entries === 2), \`a reader between the commands saw latest \${latest} with \${entries} audit entries: the pointer and its audit entry must change together, in one Lua script\`);
+  assert.equal(previous, '2026-01', 'promote must return the previous latest');
+  assert.deepStrictEqual(ctx.redis.lrange(AUDIT, 0, -1), ['->2026-01 by alice', '2026-01->2026-02 by bob'], 'the audit list');
+  assert.equal(ctx.redis.get(LATEST), '2026-02', 'the pointer after promoting 2026-02');
+}
+
+export async function check_durable_pointer(ctx) {
+  const {m} = await state(ctx);
+  await m.promote(DS, '2026-01', 'alice');
+  await m.promote(DS, '2026-02', 'bob');
+  assert.equal(ctx.redis.get(LATEST), '2026-02', 'the pointer after two promotions');
+  const ttl = ctx.redis.ttl(LATEST);
+  assert.equal(ttl, -1, \`\${LATEST} expires in \${ttl} s: a dataset nobody promotes for that long loses its latest version. The pointer must not expire\`);
+}
+
+export async function check_fail_closed(ctx) {
+  const {m} = await state(ctx);
+  let got;
+  try {
+    got = await m.latest('wiki-text');
+  } catch (e) {
+    if (!(e instanceof m.LatestVersionMissing)) throw e;
+    got = undefined;
+  }
+  assert.equal(got, undefined, \`latest('wiki-text') returned \${JSON.stringify(got)} for a dataset with no promoted version: a caller passes that on as a version. Throw LatestVersionMissing\`);
+  await m.promote(DS, '2026-01', 'alice');
+  assert.equal(await m.latest(DS), '2026-01', 'latest after promoting 2026-01');
+}
+
+export async function check_pins_independent(ctx) {
+  const {m, store} = await state(ctx);
+  await m.promote(DS, '2026-01', 'alice');
+  await m.pin(DS, 'run-7', '2026-01');
+  await m.promote(DS, '2026-02', 'bob');
+  const pinned = ctx.redis.hget(PINS, 'run-7');
+  assert.equal(pinned, '2026-01', \`run-7 pinned 2026-01 and now reads \${pinned}: a promotion must leave the pins alone\`);
+  await refused(m, '2026-01', 'run-7 pins it');
+  assert.notEqual(await store.version(DS, '2026-01'), null, 'the pinned version\\'s record is gone');
+  await refused(m, '2026-02', 'it is the latest');
+  assert.notEqual(await store.version(DS, '2026-02'), null, 'the latest version\\'s record is gone');
+  await m.purge(DS, '2025-12');
+  assert.equal(await store.version(DS, '2025-12'), null, 'a version nobody pins and that is not the latest must be purged');
+  assert(!(await store.versions(DS)).includes('2025-12'), 'the purged version is still listed');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"registry/store"
+
+	"leetbuild/harness"
+)
+
+const stateDS = "imdb-reviews"
+
+var (
+	stateBg     = context.Background()
+	stateLatest = "dataset:" + stateDS + ":latest"
+	stateAudit  = "dataset:" + stateDS + ":audit"
+	statePins   = "dataset:" + stateDS + ":pins"
+)
+
+func stateSetup(ctx *harness.Ctx) {
+	for _, v := range []string{"2025-12", "2026-01", "2026-02"} {
+		err := store.PutVersion(stateBg, &store.VersionRecord{Tenant: "t1", Dataset: stateDS, Version: v, ContentSHA256: strings.Repeat("0", 64), License: "mit", Owner: "team-lm", SizeBytes: 20, RowCount: 2, Status: "validated"})
+		ctx.NoError(err, "seeding %s", v)
+	}
+}
+
+func mustPromote(ctx *harness.Ctx, version, actor string) string {
+	previous, err := promote(stateBg, stateDS, version, actor)
+	ctx.NoError(err, "promote(%s) failed", version)
+	return previous
+}
+
+func stateRefused(ctx *harness.Ctx, version, why string) {
+	err := purge(stateBg, stateDS, version)
+	ctx.Assert(err != nil, "purge(%q) went through while %s: a run reading it loses its data. Return ErrVersionPinned", version, why)
+	ctx.Assert(errors.Is(err, ErrVersionPinned), "purge(%q) failed with %v, expected ErrVersionPinned", version, err)
+}
+
+func CheckAtomicPromotion(ctx *harness.Ctx) {
+	stateSetup(ctx)
+	ctx.Equal(mustPromote(ctx, "2026-01", "alice"), "", "the first promotion has no previous version; promote returned")
+	seen := ctx.Redis.After(stateAudit, func() any {
+		latest, _ := ctx.Redis.Get(stateLatest)
+		return fmt.Sprintf("%s/%d", latest, ctx.Redis.LLen(stateAudit))
+	})
+	previous := mustPromote(ctx, "2026-02", "bob")
+	ctx.Assert(seen.Fired, "the promotion of 2026-02 never touched the audit list")
+	state, _ := seen.Result.(string)
+	ctx.Assert(state == "2026-01/1" || state == "2026-02/2", "a reader between the commands saw latest/audit entries %s: the pointer and its audit entry must change together, in one Lua script", state)
+	ctx.Equal(previous, "2026-01", "promote must return the previous latest")
+	ctx.Equal(ctx.Redis.LRange(stateAudit, 0, -1), []string{"->2026-01 by alice", "2026-01->2026-02 by bob"}, "the audit list")
+	latest, _ := ctx.Redis.Get(stateLatest)
+	ctx.Equal(latest, "2026-02", "the pointer after promoting 2026-02")
+}
+
+func CheckDurablePointer(ctx *harness.Ctx) {
+	stateSetup(ctx)
+	mustPromote(ctx, "2026-01", "alice")
+	mustPromote(ctx, "2026-02", "bob")
+	latest, _ := ctx.Redis.Get(stateLatest)
+	ctx.Equal(latest, "2026-02", "the pointer after two promotions")
+	ttl := ctx.Redis.TTL(stateLatest)
+	ctx.Equal(ttl, int64(-1), "%s expires in %d s: a dataset nobody promotes for that long loses its latest version. The pointer must not expire; its TTL", stateLatest, ttl)
+}
+
+func CheckFailClosed(ctx *harness.Ctx) {
+	stateSetup(ctx)
+	got, err := latest(stateBg, "wiki-text")
+	ctx.Assert(err != nil, "latest(wiki-text) returned %q for a dataset with no promoted version: a caller passes that on as a version. Return ErrLatestVersionMissing", got)
+	ctx.Assert(errors.Is(err, ErrLatestVersionMissing), "latest(wiki-text) failed with %v, expected ErrLatestVersionMissing", err)
+	mustPromote(ctx, "2026-01", "alice")
+	got, err = latest(stateBg, stateDS)
+	ctx.NoError(err, "latest after a promotion")
+	ctx.Equal(got, "2026-01", "latest after promoting 2026-01")
+}
+
+func CheckPinsIndependent(ctx *harness.Ctx) {
+	stateSetup(ctx)
+	mustPromote(ctx, "2026-01", "alice")
+	ctx.NoError(pin(stateBg, stateDS, "run-7", "2026-01"), "pin")
+	mustPromote(ctx, "2026-02", "bob")
+	pinned, _ := ctx.Redis.HGet(statePins, "run-7")
+	ctx.Equal(pinned, "2026-01", "run-7 pinned 2026-01: a promotion must leave the pins alone; run-7 reads")
+	stateRefused(ctx, "2026-01", "run-7 pins it")
+	ctx.Assert(store.Version(stateBg, stateDS, "2026-01") != nil, "the pinned version's record is gone")
+	stateRefused(ctx, "2026-02", "it is the latest")
+	ctx.Assert(store.Version(stateBg, stateDS, "2026-02") != nil, "the latest version's record is gone")
+	ctx.NoError(purge(stateBg, stateDS, "2025-12"), "purging a version nobody pins")
+	ctx.Assert(store.Version(stateBg, stateDS, "2025-12") == nil, "a version nobody pins and that is not the latest must be purged")
+	ctx.Equal(store.Versions(stateBg, stateDS), []string{"2026-01", "2026-02"}, "the versions left after the purge")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+
+#include "registry/store.h"
+
+namespace {
+
+const std::string kDS = "imdb-reviews";
+const std::string kLatest = "dataset:" + kDS + ":latest";
+const std::string kAudit = "dataset:" + kDS + ":audit";
+const std::string kPins = "dataset:" + kDS + ":pins";
+
+void setup() {
+  for (const std::string version : {"2025-12", "2026-01", "2026-02"}) {
+    store::VersionRecord rec;
+    rec.tenant = "t1";
+    rec.dataset = kDS;
+    rec.version = version;
+    rec.content_sha256 = std::string(64, '0');
+    rec.license = "mit";
+    rec.owner = "team-lm";
+    rec.size_bytes = 20;
+    rec.row_count = 2;
+    rec.status = "validated";
+    store::putVersion(rec);
+  }
+}
+
+void refused(harness::Ctx& ctx, const std::string& version, const std::string& why) {
+  try {
+    purge(kDS, version);
+  } catch (const VersionPinned&) {
+    return;
+  }
+  ctx.Fatalf("purge(%q) went through while %s: a run reading it loses its data. Throw VersionPinned", version, why);
+}
+
+}  // namespace
+
+void CheckAtomicPromotion(harness::Ctx& ctx) {
+  setup();
+  ctx.Equal(promote(kDS, "2026-01", "alice"), "", "the first promotion has no previous version; promote returned");
+  std::string seen;
+  ctx.Redis.After(kAudit, [&] { seen = ctx.Redis.Get(kLatest).value_or("") + "/" + std::to_string(ctx.Redis.LLen(kAudit)); });
+  const std::string previous = promote(kDS, "2026-02", "bob");
+  ctx.Assert(!seen.empty(), "the promotion of 2026-02 never touched the audit list");
+  ctx.Assert(seen == "2026-01/1" || seen == "2026-02/2",
+             "a reader between the commands saw latest/audit entries %s: the pointer and its audit entry must change together, in one Lua script", seen);
+  ctx.Equal(previous, "2026-01", "promote must return the previous latest");
+  ctx.Equal(ctx.Redis.LRange(kAudit, 0, -1), {"->2026-01 by alice", "2026-01->2026-02 by bob"}, "the audit list");
+  ctx.Equal(ctx.Redis.Get(kLatest).value_or(""), "2026-02", "the pointer after promoting 2026-02");
+}
+
+void CheckDurablePointer(harness::Ctx& ctx) {
+  setup();
+  promote(kDS, "2026-01", "alice");
+  promote(kDS, "2026-02", "bob");
+  ctx.Equal(ctx.Redis.Get(kLatest).value_or(""), "2026-02", "the pointer after two promotions");
+  const long long ttl = ctx.Redis.TTL(kLatest);
+  ctx.Equal(ttl, -1LL, "%s expires in %d s: a dataset nobody promotes for that long loses its latest version. The pointer must not expire; its TTL", kLatest, ttl);
+}
+
+void CheckFailClosed(harness::Ctx& ctx) {
+  setup();
+  std::string got;
+  try {
+    got = latest("wiki-text");
+    ctx.Fatalf("latest(wiki-text) returned %q for a dataset with no promoted version: a caller passes that on as a version. Throw LatestVersionMissing", got);
+  } catch (const LatestVersionMissing&) {
+  }
+  promote(kDS, "2026-01", "alice");
+  ctx.Equal(latest(kDS), "2026-01", "latest after promoting 2026-01");
+}
+
+void CheckPinsIndependent(harness::Ctx& ctx) {
+  setup();
+  promote(kDS, "2026-01", "alice");
+  pin(kDS, "run-7", "2026-01");
+  promote(kDS, "2026-02", "bob");
+  ctx.Equal(ctx.Redis.HGet(kPins, "run-7").value_or(""), "2026-01", "run-7 pinned 2026-01: a promotion must leave the pins alone; run-7 reads");
+  refused(ctx, "2026-01", "run-7 pins it");
+  ctx.Assert(store::version(kDS, "2026-01").has_value(), "the pinned version's record is gone");
+  refused(ctx, "2026-02", "it is the latest");
+  ctx.Assert(store::version(kDS, "2026-02").has_value(), "the latest version's record is gone");
+  purge(kDS, "2025-12");
+  ctx.Assert(!store::version(kDS, "2025-12"), "a version nobody pins and that is not the latest must be purged");
+  ctx.Equal(store::versions(kDS), {"2026-01", "2026-02"}, "the versions left after the purge");
+}
+`,
+  },
   hints: [
-    'A consumer pinned to `2026-01` starts training on `2026-02` after a promote. A dataset nobody touched for an hour reports latest version `""`, and the job happily trains on it.',
-    '`promote` issues `GET`, `SET`, `EXPIRE`, `RPUSH` and a pin rewrite as five independent commands, so a purge can land between them; the TTL erases the pointer; `latest` turns a missing key into an empty string.',
-    'Move the pointer swap and audit append into `_PROMOTE_LUA` run via `redis.eval`, drop the `expire` on `latest_key`, leave pins untouched, add `purge` that raises `VersionPinned`, and raise `LatestVersionMissing` on `None`.',
+    'Pin a run to `2026-01`, promote `2026-02`, and read the pin back: it says `2026-02`. Leave a dataset alone for an hour and `latest` answers an empty name.',
+    'The audit append and the pointer write are two commands, so a reader can land between them; the pointer is written with an expiry; the promotion loops over the pins; and `purge` deletes without looking at pins or the pointer.',
+    'One Lua script: `GET` the pointer, `SET` it without `EX`, `RPUSH` the entry, return the previous. Raise `LatestVersionMissing` on a nil read, drop the pin loop, and purge in a script returning 0 for the latest or any `HVALS` pin.',
   ],
-  debrief: `Promotion is one script because the pointer, the audit row and the pins are read by different parties who each assume the others are consistent: a purge that runs between two of the starter's commands deletes bytes a pinned consumer is still reading. A pin is a lease the consumer releases, so promotion leaves it alone, and a pointer with no TTL means a quiet dataset stays versioned. Failing closed on a missing pointer turns a silent "train on nothing" into an error someone sees. Production registries extend this with a promotion token so a stale writer cannot overwrite a newer promotion, a monotonic generation in the audit record, and lag-aware reads so a replica cannot serve an older pointer than the client already saw.`,
+  debrief: `The pointer is the only mutable thing in a registry of immutable versions, which is why everything that changes it lives in one script: the audit entry records exactly the promotion that happened, with the previous version read inside the same step. Pins are owned by their consumers, so a promotion has no business writing them, and a purge has to check them in the same script that deletes or a pin can land in the gap. Failing closed on a missing pointer turns a silent "train on whatever" into an error someone sees. Registries in production also keep the audit list in durable storage with timestamps, expire pins with the runs that hold them, and require a second approver before promoting a dataset many runs consume.`,
 };

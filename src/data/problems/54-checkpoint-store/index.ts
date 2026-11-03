@@ -1,16 +1,18 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {checkpointEndpointStep} from './steps/1-endpoint';
 import {uploadStateStep} from './steps/2-state';
 import {storageClientStep} from './steps/3-client';
 import {checkpointEventsStep} from './steps/4-events';
 import {readCheckpointStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * Checkpoint store: chunked, resumable writes whose replays are idempotent, an atomic Redis commit
- * marker written only for a complete chunk set, object-store calls that verify before
- * acknowledging, run-keyed checkpoint events with an outbox, and a read endpoint that serves only
- * committed, verified checkpoints.
+ * Checkpoint store: the debugging a training run's resume path needs. Chunks staged at their own
+ * index → one Lua commit that writes the record only for a complete chunk set and persists it →
+ * object-store writes whose checksum is compared → run-keyed checkpoint events with an outbox → a
+ * read that serves the caller's latest committed checkpoint behind a short-lived URL.
  */
 export const checkpointStoreProblem: Problem = {
   id: 'checkpoint-store',
@@ -23,72 +25,71 @@ export const checkpointStoreProblem: Problem = {
   statement: `# Checkpoint Store
 
 A checkpoint store decides whether a crashed training job resumes from its weights or from garbage.
-The visible part is a chunk upload; the parts that make it safe are the chunk ordering rule, the
-commit marker, the acknowledgment contract with the object store, and the read a resumed run
-trusts.
+The upload is the visible part. What makes it safe is that every chunk sits at its own index, that a
+commit record exists only for a complete chunk set, that the object store's checksum is compared,
+and that the read a resumed run trusts serves nothing else.
 
 ## The real system
 
-Amazon S3 multipart upload is the shape most checkpoint paths copy. A client opens an upload id,
-sends parts under consecutive part numbers, and can attach a per-part SHA-256 checksum that S3
-verifies before storing the part; a part re-sent under the same number replaces the earlier one.
-The object does not exist for readers until \`CompleteMultipartUpload\` lists every part, and a
-bucket lifecycle rule aborts uploads that were never completed. Training frameworks layer a
-manifest, a step number and a verification record on top, and hand out pre-signed download URLs
-that expire.
+Orbax, the JAX checkpoint library, saves each step into a temporary directory and finalizes it
+only when the save is complete. On storage without an atomic rename, such as object stores, its
+\`CommitFileTemporaryPath\` marks completion with a \`commit_success\` file instead, so a reader never
+mistakes a half-written step for a finished one. This course builds the same promise around a
+commit record in Redis.
 
 ## What you build here
 
-Five pieces of one service:
+One service, **checkpointd**, on one upload store (\`checkpoint.store\`, provided: runs, uploads,
+staged chunks, the outbox, signed URLs) and one commit (\`commit\` / \`latest_committed\`, built in
+step 2 and provided to the later steps as \`checkpoint.commit\`):
 
-1. \`POST /v1/checkpoints\`: a chunk of at most **8 MiB** under an upload id, accepted only at its
-   expected index, stored at its index so a replay **overwrites**, digested with sha256, and
-   complete only when the stored chunk set says so.
-2. A **Redis** upload state: received indexes as a set with an \`EXPIRE\` on first write, and one
-   atomic \`EVAL\` that writes the commit marker only for a complete set.
-3. A **gRPC** object-store client: a **30-second** deadline per call, acknowledgment only after the
-   store confirms the checksum, at most three attempts and only \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`
-   retried, and a \`PERMISSION_DENIED\` that stops the upload with a visible reason.
-4. A **Kafka** event path: one \`checkpoint.event\` per accept, commit and verification, keyed by
-   **training run**, carrying step number, chunk count and digest, published after the marker is
-   durable, written to an outbox when the broker rejects the produce.
-5. \`GET /v1/runs/{id}/checkpoints/latest\`: the latest committed checkpoint of the caller's run,
-   its step, verification status and last verified chunk, a signed URL that expires in
-   **15 minutes**, and a **404** for an uncommitted, missing or foreign run.
+1. \`POST /v1/checkpoints\` opens an upload \`{run_id, step, chunks}\`;
+   \`PUT /v1/checkpoints/{upload_id}/chunks/{index}\` stages a chunk at its index
+   (\`upload:{id}:chunks\`, \`upload:{id}:digests\`), 409 for a gap or a replay with other bytes.
+2. A **Redis** commit: one Lua script writes \`checkpoint:{id}\` only when every chunk is staged,
+   persists the upload and indexes it by step in \`run:{run_id}:checkpoints\`.
+3. A **gRPC** object-store writer, \`store_chunk\`: \`PutObject\` under a 30 s deadline, the store's
+   sha256 compared, three attempts for \`UNAVAILABLE\` or \`DEADLINE_EXCEEDED\`, \`UploadRejected\`
+   for any other status.
+4. A **Kafka** \`checkpoint.event\` keyed by run, produced after the commit by an idempotent
+   producer, with the outbox as fallback.
+5. \`GET /v1/runs/{run_id}/checkpoints/latest\`: the caller's latest committed checkpoint and a
+   read URL that expires in **15 minutes**; another tenant's run is 404.
 
 ## The debugging habit
 
-Every starter is working code with flaws: it compiles, serves the happy path, and looks right. Your
-job in every step is to debug it against the failure modes, fix it, optimize what is wasteful, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Optimizer state formats, multi-region replication, lifecycle policies for old checkpoints, resumable
-download of a chunk range, cost accounting per storage class, and garbage collection of superseded
-checkpoints.`,
+Optimizer state formats, sharded checkpoints written by many hosts at once, multi-region
+replication, retention of old checkpoints, ranged reads of a chunk, and the copier that schedules
+\`store_chunk\` for staged chunks.`,
   diagram: {
     nodes: [
-      {id: 'client', kind: 'client', label: 'Training job', sub: 'chunk · resume', x: 8, y: 50},
-      {id: 'api', kind: 'http', label: 'Checkpoint API', sub: 'HTTPS :8443', x: 26, y: 50},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'state · marker', x: 46, y: 12},
-      {id: 'db', kind: 'db', label: 'run · checkpoint', sub: 'steps · manifests', x: 46, y: 50},
-      {id: 'kafka', kind: 'kafka', label: 'checkpoint.event', sub: 'key = run', x: 46, y: 86},
-      {id: 'store', kind: 'grpc', label: 'Object store', sub: 'Write / Verify · 30 s', x: 70, y: 20},
-      {id: 'verifier', kind: 'service', label: 'Verifier', sub: 'background pass', x: 70, y: 50},
-      {id: 'consumer', kind: 'service', label: 'Event consumer', sub: 'group runs', x: 70, y: 86},
+      {id: 'client', kind: 'client', label: 'Training job', sub: 'upload · resume', x: 8, y: 50},
+      {id: 'api', kind: 'http', label: 'checkpointd', sub: 'HTTPS :8443', x: 28, y: 50},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'upload:{id} · checkpoint:{id}', x: 50, y: 14},
+      {id: 'store', kind: 'grpc', label: 'Object store', sub: 'PutObject · 30 s', x: 50, y: 50},
+      {id: 'kafka', kind: 'kafka', label: 'checkpoint.event', sub: 'key = run id', x: 50, y: 86},
+      {id: 'consumer', kind: 'service', label: 'Run tracker', sub: 'latest step per run', x: 74, y: 86},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'state · marker'},
-      {from: 'api', to: 'db', kind: 'plain', label: 'run · checkpoint rows'},
-      {from: 'api', to: 'store', kind: 'grpc', label: 'WriteChunk / VerifyChunk'},
-      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce checkpoint.event'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'put_chunk · COMMIT_LUA · latest_committed'},
+      {from: 'api', to: 'store', kind: 'grpc', label: 'PutObject · sha256'},
+      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce after the commit'},
       {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'db', kind: 'plain', label: 'step rows'},
-      {from: 'store', to: 'verifier', kind: 'grpc', label: 'chunk read back'},
-      {from: 'verifier', to: 'db', kind: 'plain', label: 'verification status'},
     ],
   },
   steps: [checkpointEndpointStep, uploadStateStep, storageClientStep, checkpointEventsStep, readCheckpointStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

@@ -5,51 +5,42 @@ export const trainingReadStep: Step = {
   title: 'GET /v1/training/runs/{id}: state that matches the cluster',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'scheduler', 'store', 'cluster'],
+  focus: ['client', 'scheduler', 'redis', 'cluster'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/training/runs/{id}\`: it looks the run up by id
-alone, answers **404** when it is unknown, and otherwise echoes the stored row's state, queue
-position, node list and last checkpoint id. It compiles, answers for a healthy demo run, and hides
-four flaws.
+**Starting point.** The starter serves \`GET /v1/training/runs/{id}\`: it reads \`X-Tenant-Id\` (**401**
+without it), loads the run with \`runs.get\` (**404** when there is none) and answers
+\`{run_id, state, band, queue_position, nodes, checkpoint_id}\` from the row, with the position from
+\`ZREVRANK training:queue\`. It answers for a healthy demo run and hides four flaws.
 
-**Failure mode the checks target.** A run that died in startup is reported \`queued\` forever, so
-nobody retries it and the GPU sits idle. The node list keeps naming workers the cluster reclaimed
-minutes ago. Any caller who knows a run id reads any tenant's run. And the handler answers from the
-run store alone, so it reports a state the cluster has already moved past.
+**Failure mode the checks target.** Any caller who knows a run id reads another tenant's run; the
+run about to start reports the last position; the node list names nodes the cluster reclaimed; and
+a run whose job died is reported running forever, so nobody restarts it.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent). The run is resolved by id and owner:
-  a run that belongs to another tenant, or does not exist, is **404**, not **403**.
-- The reported state is reconciled against the cluster's view within \`RECONCILE_WINDOW_S = 60\`:
-  the handler calls \`cluster.assignment\` for the run's live assignment and only then answers.
-- The response carries \`run_id\`, \`state\`, \`queue_position\`, \`lease_state\`, \`nodes\` and
-  \`last_checkpoint_id\`. \`nodes\` is the cluster view's list, not the run row's.
-- A run still waiting whose start lease \`training:lease:{run_id}\` is gone and whose worker never
-  confirmed (\`worker_confirmed\`) is reported \`failed\` with \`reason: start_lease_expired\`, not the
-  stored \`queued\`.
-- A \`reason\` appears only on a run that failed; a live run reports its reconciled state.`,
+- A run of another tenant is **404**, as an unknown id is.
+- \`queue_position\` is the run's rank in \`training:queue\` counted from the head (\`ZRANK\`: 0 starts
+  next); \`null\` when the run is not queued.
+- For a running run, \`nodes\` comes from the cluster's own view, \`cluster.assignment(run_id)\`
+  (provided), not from the row; other states answer \`[]\`.
+- A running run the cluster does not know is reported \`state: "failed"\` with
+  \`reason: "not_on_cluster"\`; no other answer carries a \`reason\`.`,
   sequence: {
-    participants: ['Client', 'Training Scheduler', 'run store', 'Cluster API'],
+    participants: ['Client', 'Training Scheduler', 'run store', 'Redis queue', 'Cluster view'],
     messages: [
+      {from: 'Client', to: 'Training Scheduler', label: 'GET /v1/training/runs/{id} · X-Tenant-Id', kind: 'sync'},
+      {from: 'Training Scheduler', to: 'run store', label: 'get(run_id) · another tenant → 404', kind: 'sync'},
+      {from: 'Training Scheduler', to: 'Redis queue', label: 'ZRANK training:queue run_id (queued)', kind: 'sync'},
+      {from: 'Training Scheduler', to: 'Cluster view', label: 'assignment(run_id) (running)', kind: 'sync'},
       {
-        from: 'Client',
+        from: 'Cluster view',
         to: 'Training Scheduler',
-        label: 'GET /v1/training/runs/{id} · X-Tenant-Id',
-        kind: 'sync',
+        label: 'nodes · unknown → failed, not_on_cluster',
+        kind: 'reply',
       },
-      {from: 'Training Scheduler', to: 'run store', label: 'get(run_id)', kind: 'sync'},
-      {from: 'run store', to: 'Training Scheduler', label: 'run row · owner tenant, state', kind: 'reply'},
-      {
-        from: 'Training Scheduler',
-        to: 'Cluster API',
-        label: 'assignment(run_id) · within RECONCILE_WINDOW_S',
-        kind: 'sync',
-      },
-      {from: 'Cluster API', to: 'Training Scheduler', label: 'nodes · lease state · last checkpoint', kind: 'reply'},
       {
         from: 'Training Scheduler',
         to: 'Client',
-        label: '200 {state, queue_position, lease_state, nodes, last_checkpoint_id}',
+        label: '200 {state, queue_position, nodes, checkpoint_id}',
         kind: 'reply',
       },
     ],
@@ -57,793 +48,837 @@ run store alone, so it reports a state the cluster has already moved past.
   checks: [
     {
       id: 'status-route',
-      title: 'Handles GET /v1/training/runs/{id}',
-      detail: 'Register the status route on `GET /v1/training/runs/{id}`, the read side of the submission route.',
+      title: 'Answers a run on GET /v1/training/runs/{id}',
+      detail: 'The owner of a queued run gets **200** with its `run_id`, `state` and `band`.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/training\/runs\/\{run_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/training\/runs\/:runId['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/training\/runs\/\{runID\}"/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/training\/runs\/\{id\}"/]},
         scala: {all: [/path\(\s*"v1"\s*\/\s*"training"\s*\/\s*"runs"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(R"\(\/v1\/training\/runs\//]},
-      },
-    },
-    {
-      id: 'reconcile-window',
-      title: 'Reconciles against the cluster before answering',
-      detail:
-        'The cluster is queried for the run’s live assignment inside `RECONCILE_WINDOW_S` = 60 and only then is the answer built; it carries `queue_position`, `lease_state`, `nodes` and `last_checkpoint_id`. The starter answers from the run row alone, so it reports a state the cluster has already moved past.',
-      match: {
-        python: {
-          all: [/RECONCILE_WINDOW_S\s*=\s*60/, /"queue_position"/, /"lease_state"/, /"nodes"/, /"last_checkpoint_id"/],
-          order: [/cluster\.assignment\(/, /return JSONResponse\(/],
-        },
-        typescript: {
-          all: [/RECONCILE_WINDOW_S\s*=\s*60/, /queue_position/, /lease_state/, /nodes/, /last_checkpoint_id/],
-          order: [/cluster\.assignment\(/, /reply\.code\(200\)\.send\(/],
-        },
-        go: {
-          all: [/reconcileWindowS\s*=\s*60/, /queue_position/, /lease_state/, /nodes/, /last_checkpoint_id/],
-          order: [/cluster\.Assignment\(/, /writeJSON\(rw, http\.StatusOK, body\)/],
-        },
-        scala: {
-          all: [/ReconcileWindowS\s*=\s*60/, /queue_position/, /lease_state/, /nodes/, /last_checkpoint_id/],
-          order: [/cluster\.assignment\(/, /complete\(StatusCodes\.OK, body\)/],
-        },
-        cpp: {
-          all: [/kReconcileWindowS\s*=\s*60/, /queue_position/, /lease_state/, /nodes/, /last_checkpoint_id/],
-          order: [/cluster\.assignment\(/, /res\.set_content\(body\.dump\(\)/],
-        },
-      },
-    },
-    {
-      id: 'orphaned-failed',
-      title: 'An orphaned start is failed with a reason',
-      detail:
-        'A run still waiting whose start lease `training:lease:{run_id}` is gone and whose worker never confirmed is reported `failed` with `reason: start_lease_expired`, not the stored `queued`. The starter echoes `queued`, which is exactly the run an operator is looking for.',
-      match: {
-        python: {
-          all: [/start_lease_expired/, /"failed"/, /lease is None/, /worker_confirmed/],
-          order: [/lease is None/, /"failed"/],
-        },
-        typescript: {
-          all: [/start_lease_expired/, /'failed'/, /lease === null/, /worker_confirmed/],
-          order: [/lease === null/, /'failed'/],
-        },
-        go: {
-          all: [/start_lease_expired/, /"failed"/, /lease == nil/, /worker_confirmed/],
-          order: [/lease == nil/, /"failed"/],
-        },
-        scala: {
-          all: [/start_lease_expired/, /"failed"/, /lease\.isEmpty/, /worker_confirmed/],
-          order: [/lease\.isEmpty/, /"failed"/],
-        },
-        cpp: {
-          all: [/start_lease_expired/, /"failed"/, /!lease\.has_value\(\)/, /worker_confirmed/],
-          order: [/!lease\.has_value\(\)/, /"failed"/],
-        },
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/training\/runs\//]},
       },
     },
     {
       id: 'tenant-scoped-404',
-      title: 'Another tenant’s run id is 404',
+      title: "Answers 404 for another tenant's run",
       detail:
-        'The caller is resolved from `X-Tenant-Id` and compared with the run’s tenant; a mismatch — or an unknown id — answers **404**, never **403** or **200**. The starter serves any id it is handed, so a run id is treated as a capability.',
+        "Tenant t2 reading t1's run gets **404**, the same as for an id that does not exist, and a request without `X-Tenant-Id` gets **401**. The starter looks the run up by id alone.",
       match: {
-        python: {all: [/X-Tenant-Id/, /run\["tenant"\]/, /\b404\b/], order: [/run\["tenant"\]/, /\b404\b/]},
-        typescript: {all: [/x-tenant-id/, /run\.tenant/, /\b404\b/], order: [/run\.tenant/, /\b404\b/]},
-        go: {all: [/X-Tenant-Id/, /owner != tenant/, /StatusNotFound/], order: [/owner != tenant/, /StatusNotFound/]},
-        scala: {
-          all: [/X-Tenant-Id/, /run\.tenant/, /StatusCodes\.NotFound/],
-          order: [/run\.tenant/, /StatusCodes\.NotFound/],
-        },
-        cpp: {
-          all: [/X-Tenant-Id/, /run->value\("tenant"/, /\b404\b/],
-          order: [/run->value\("tenant"/, /\b404\b/],
-        },
+        python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*run\[["']tenant["']\]/, /\b404\b/]},
+        typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*run\.tenant/, /\b404\b/]},
+        go: {all: [/\.Tenant\s*!=\s*tenant|tenant\s*!=\s*run\.Tenant/, /StatusNotFound|\b404\b/]},
+        scala: {all: [/\.tenant\s*(!=|==)\s*(t|tenant)\b/, /NotFound/]},
+        cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*run->tenant/, /\b404\b/]},
       },
     },
     {
-      id: 'no-stale-nodes',
-      title: 'Nodes come from the cluster’s view, not the run row',
+      id: 'queue-position',
+      title: 'Counts the queue position from the head',
       detail:
-        'The response’s `nodes` are the cluster’s answer for the run. Returning the node list stored on the run row is the starter’s shape and is forbidden: the row still names workers the cluster has preempted.',
+        'Of three queued runs the one that starts next reports position 0 and the last one 2. The starter ranks from the tail with `ZREVRANK`.',
       match: {
-        python: {none: [/run\["nodes"\]/], all: [/cluster\.assignment\(/, /"nodes": view\["nodes"\]/]},
-        typescript: {none: [/run\.nodes/], all: [/cluster\.assignment\(/, /nodes: view\.nodes/]},
-        go: {none: [/run\["nodes"\]/], all: [/cluster\.Assignment\(/, /"nodes":\s+view\["nodes"\]/]},
-        scala: {none: [/run\.nodes/], all: [/cluster\.assignment\(/, /nodes = view\.nodes/]},
-        cpp: {none: [/run->value\("nodes"/], all: [/cluster\.assignment\(/, /view\.nodes/]},
+        python: {all: [/\.zrank\(/], none: [/zrevrank/i]},
+        typescript: {all: [/\.zrank\(/], none: [/zrevrank/i]},
+        go: {all: [/\.ZRank\(/], none: [/ZRevRank/i]},
+        scala: {all: [/\.zrank\(/], none: [/zrevrank/i]},
+        cpp: {all: [/\.zrank\(/], none: [/zrevrank/i]},
+      },
+    },
+    {
+      id: 'cluster-nodes',
+      title: "Reports a running run's nodes from the cluster's view",
+      detail:
+        'A running run whose row still names n1 and n2, while the cluster reports it on n3, answers `nodes: ["n3"]`. The starter echoes the row.',
+      match: {
+        python: {all: [/cluster\.assignment\(/]},
+        typescript: {all: [/assignment\(runId\)/]},
+        go: {all: [/cluster\.Assignment\(/]},
+        scala: {all: [/Cluster\.assignment\(/]},
+        cpp: {all: [/cluster::assignment\(/]},
+      },
+    },
+    {
+      id: 'orphaned-failed',
+      title: 'Reports a running run the cluster lost as failed',
+      detail:
+        'A run whose row says running but which the cluster does not know answers `state: "failed"` and `reason: "not_on_cluster"`; a running run the cluster knows carries no `reason`. The starter reports the row.',
+      match: {
+        python: {all: [/not_on_cluster/, /["']failed["']/]},
+        typescript: {all: [/not_on_cluster/, /['"]failed['"]/]},
+        go: {all: [/not_on_cluster/, /"failed"/]},
+        scala: {all: [/not_on_cluster/, /"failed"/]},
+        cpp: {all: [/not_on_cluster/, /"failed"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""GET /v1/training/runs/{run_id}: flawed code that echoes the stored run row."""
-import logging
+      starter: `import redis
+from fastapi import FastAPI, HTTPException, Request
 
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+from trainsched import cluster, runs  # runs.get; cluster.assignment
+from trainsched.queue import QUEUE_KEY
 
 app = FastAPI()
-logger = logging.getLogger("trainsched")
-
-
-class RunStore:
-    def get(self, run_id: str) -> dict | None:
-        """The stored run row."""
-        raise NotImplementedError
-
-
-runs = RunStore()
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 @app.get("/v1/training/runs/{run_id}")
-def read_run(run_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
+def get_run(run_id: str, request: Request) -> dict:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
     run = runs.get(run_id)
     if run is None:
-        return JSONResponse({"error": "unknown run"}, status_code=404)
-    logger.info("run read run_id=%s tenant=%s", run_id, tenant)
-    return JSONResponse(
-        {
-            "run_id": run_id,
-            "state": run["state"],
-            "queue_position": run["queue_position"],
-            "nodes": run["nodes"],
-            "last_checkpoint_id": run["last_checkpoint_id"],
-        }
-    )
+        raise HTTPException(status_code=404, detail="no such run")
+    position = r.zrevrank(QUEUE_KEY, run_id) if run["state"] == "queued" else None
+    return {
+        "run_id": run_id,
+        "state": run["state"],
+        "band": run["band"],
+        "queue_position": position,
+        "nodes": run["nodes"],
+        "checkpoint_id": run["checkpoint_id"],
+    }
 `,
-      solution: `"""GET /v1/training/runs/{run_id}: the run's state reconciled against the cluster's view."""
-import logging
+      solution: `import redis
+from fastapi import FastAPI, HTTPException, Request
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from trainsched import cluster, runs  # runs.get; cluster.assignment
+from trainsched.queue import QUEUE_KEY
 
 app = FastAPI()
-logger = logging.getLogger("trainsched")
-
-RECONCILE_WINDOW_S = 60
-LEASE_TTL_S = 15
-QUEUE_ORPHAN_STATES = ("queued", "starting")
-
-
-class RunStore:
-    def get(self, run_id: str) -> dict | None:
-        """The stored run row."""
-        raise NotImplementedError
-
-
-class LeaseStore:
-    def get(self, run_id: str) -> dict | None:
-        """The live start lease for the run, or None once it has expired."""
-        raise NotImplementedError
-
-
-class ClusterClient:
-    def assignment(self, run_id: str, window_s: int) -> dict:
-        """The cluster's view of the run, taken within window_s seconds."""
-        raise NotImplementedError
-
-
-runs = RunStore()
-leases = LeaseStore()
-cluster = ClusterClient()
-
-
-def resolve_state(run: dict, lease: dict | None, view: dict) -> tuple[str, str | None]:
-    """A run still waiting whose start lease expired without a confirmation is failed."""
-    if run["state"] in QUEUE_ORPHAN_STATES and lease is None and not view["worker_confirmed"]:
-        return "failed", "start_lease_expired"
-    return run["state"], None
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 @app.get("/v1/training/runs/{run_id}")
-def read_run(run_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
+def get_run(run_id: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
     run = runs.get(run_id)
     if run is None or run["tenant"] != tenant:
-        raise HTTPException(status_code=404, detail="unknown run")
-
-    lease = leases.get(run_id)
-    view = cluster.assignment(run_id, RECONCILE_WINDOW_S)
-    state, reason = resolve_state(run, lease, view)
-    body = {
+        # Another tenant's run does not exist for this caller: 403 would confirm the id.
+        raise HTTPException(status_code=404, detail="no such run")
+    view = {
         "run_id": run_id,
-        "state": state,
-        "queue_position": run["queue_position"],
-        "lease_state": "none" if lease is None else "held",
-        "nodes": view["nodes"],
-        "last_checkpoint_id": run["last_checkpoint_id"],
+        "state": run["state"],
+        "band": run["band"],
+        "queue_position": None,
+        "nodes": [],
+        "checkpoint_id": run["checkpoint_id"],
     }
-    if reason is not None:
-        body["reason"] = reason
-    logger.info("run read run_id=%s tenant=%s state=%s", run_id, tenant, state)
-    return JSONResponse(body, status_code=200)
+    if run["state"] == "queued":
+        view["queue_position"] = r.zrank(QUEUE_KEY, run_id)  # 0 starts next
+    if run["state"] == "running":
+        nodes = cluster.assignment(run_id)  # the cluster's view, not what the row last heard
+        if nodes is None:
+            view.update(state="failed", reason="not_on_cluster")
+        else:
+            view["nodes"] = nodes
+    return view
 `,
     },
     typescript: {
-      starter: `/** GET /v1/training/runs/{id}: flawed code that echoes the stored run row. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {assignment} from 'trainsched/cluster';
+import {QUEUE_KEY} from 'trainsched/queue';
+import {get} from 'trainsched/runs';
 
 export const app = Fastify();
-
-interface RunRow {
-  run_id: string;
-  tenant: string;
-  state: string;
-  queue_position: number;
-  nodes: string[];
-  last_checkpoint_id: string | null;
-}
-
-/** The run store is the platform's; this step only calls it. */
-class RunStore {
-  async get(runId: string): Promise<RunRow | null> {
-    throw new Error('provided by the platform');
-  }
-}
-
-const runs = new RunStore();
+const redis = new Redis({host: 'redis', port: 6379});
 
 app.get('/v1/training/runs/:runId', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {runId} = request.params as {runId: string};
-  const run = await runs.get(runId);
-  if (run === null) return reply.code(404).send({error: 'unknown run'});
-  request.log.info({run_id: runId, tenant}, 'run read');
-  return reply.code(200).send({
+  const run = await get(runId);
+  if (run === null) return reply.code(404).send({error: 'no such run'});
+  const position = run.state === 'queued' ? await redis.zrevrank(QUEUE_KEY, runId) : null;
+  return {
     run_id: runId,
     state: run.state,
-    queue_position: run.queue_position,
+    band: run.band,
+    queue_position: position,
     nodes: run.nodes,
-    last_checkpoint_id: run.last_checkpoint_id,
-  });
+    checkpoint_id: run.checkpoint_id,
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/training/runs/{id}: the run's state reconciled against the cluster's view. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {assignment} from 'trainsched/cluster';
+import {QUEUE_KEY} from 'trainsched/queue';
+import {get} from 'trainsched/runs';
 
 export const app = Fastify();
-
-const RECONCILE_WINDOW_S = 60;
-const LEASE_TTL_S = 15;
-const QUEUE_ORPHAN_STATES = ['queued', 'starting'];
-
-interface RunRow {
-  run_id: string;
-  tenant: string;
-  state: string;
-  queue_position: number;
-  last_checkpoint_id: string | null;
-}
-
-interface ClusterView {
-  nodes: string[];
-  assigned: boolean;
-  worker_confirmed: boolean;
-}
-
-/** The run store, leases and cluster client are the platform's; this step only calls them. */
-class RunStore {
-  async get(runId: string): Promise<RunRow | null> {
-    throw new Error('provided by the platform');
-  }
-}
-
-class LeaseStore {
-  async get(runId: string): Promise<number | null> {
-    throw new Error('provided by the platform');
-  }
-}
-
-class ClusterClient {
-  async assignment(runId: string, windowS: number): Promise<ClusterView> {
-    throw new Error('provided by the platform');
-  }
-}
-
-const runs = new RunStore();
-const leases = new LeaseStore();
-const cluster = new ClusterClient();
-
-function resolveState(run: RunRow, lease: number | null, view: ClusterView): {state: string; reason?: string} {
-  if (QUEUE_ORPHAN_STATES.includes(run.state) && lease === null && !view.worker_confirmed)
-    return {state: 'failed', reason: 'start_lease_expired'};
-  return {state: run.state};
-}
+const redis = new Redis({host: 'redis', port: 6379});
 
 app.get('/v1/training/runs/:runId', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {runId} = request.params as {runId: string};
-  const run = await runs.get(runId);
-  if (run === null || run.tenant !== tenant) return reply.code(404).send({error: 'unknown run'});
-
-  const lease = await leases.get(runId);
-  const view = await cluster.assignment(runId, RECONCILE_WINDOW_S);
-  const {state, reason} = resolveState(run, lease, view);
-  const body: Record<string, unknown> = {
+  const run = await get(runId);
+  // Another tenant's run does not exist for this caller: 403 would confirm the id.
+  if (run === null || run.tenant !== tenant) return reply.code(404).send({error: 'no such run'});
+  const view: Record<string, unknown> = {
     run_id: runId,
-    state,
-    queue_position: run.queue_position,
-    lease_state: lease === null ? 'none' : 'held',
-    nodes: view.nodes,
-    last_checkpoint_id: run.last_checkpoint_id,
+    state: run.state,
+    band: run.band,
+    queue_position: null,
+    nodes: [],
+    checkpoint_id: run.checkpoint_id,
   };
-  if (reason !== undefined) body.reason = reason;
-  request.log.info({run_id: runId, tenant, state}, 'run read');
-  return reply.code(200).send(body);
+  if (run.state === 'queued') view.queue_position = await redis.zrank(QUEUE_KEY, runId); // 0 starts next
+  if (run.state === 'running') {
+    const nodes = await assignment(runId); // the cluster's view, not what the row last heard
+    if (nodes === null) Object.assign(view, {state: 'failed', reason: 'not_on_cluster'});
+    else view.nodes = nodes;
+  }
+  return view;
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `package read
+      starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"github.com/redis/go-redis/v9"
+
+	"trainsched/queue" // queue.QueueKey
+	"trainsched/runs"  // runs.Get
 )
 
-// RunStore is the platform's; this step only calls it.
-type RunStore struct{}
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-func (s *RunStore) Get(ctx context.Context, runID string) (map[string]any, error) {
-	return nil, nil
-}
-
-var runs = &RunStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func readRun(rw http.ResponseWriter, r *http.Request) {
+func getRun(rw http.ResponseWriter, r *http.Request) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	runID := r.PathValue("runID")
-	run, _ := runs.Get(r.Context(), runID)
-	if run == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown run"})
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	log.Printf("run read run_id=%s tenant=%s", runID, tenant)
+	runID := r.PathValue("id")
+	run := runs.Get(r.Context(), runID)
+	if run == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such run"})
+		return
+	}
+	var position any
+	if run.State == "queued" {
+		if rank, err := rdb.ZRevRank(r.Context(), queue.QueueKey, runID).Result(); err == nil {
+			position = rank
+		}
+	}
 	writeJSON(rw, http.StatusOK, map[string]any{
-		"run_id":             runID,
-		"state":              run["state"],
-		"queue_position":     run["queue_position"],
-		"nodes":              run["nodes"],
-		"last_checkpoint_id": run["last_checkpoint_id"],
+		"run_id": runID, "state": run.State, "band": run.Band, "queue_position": position, "nodes": run.Nodes, "checkpoint_id": run.CheckpointID,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/training/runs/{runID}", readRun)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/training/runs/{id}", getRun)
 }
 `,
-      solution: `package read
+      solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"github.com/redis/go-redis/v9"
+
+	"trainsched/cluster" // cluster.Assignment
+	"trainsched/queue"   // queue.QueueKey
+	"trainsched/runs"    // runs.Get
 )
 
-const (
-	reconcileWindowS = 60
-	leaseTTLS        = 15
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var queueOrphanStates = map[string]bool{"queued": true, "starting": true}
-
-// RunStore, LeaseStore and ClusterClient are the platform's; this step only calls them.
-type RunStore struct{}
-
-func (s *RunStore) Get(ctx context.Context, runID string) (map[string]any, error) {
-	return nil, nil
-}
-
-type LeaseStore struct{}
-
-func (s *LeaseStore) Get(ctx context.Context, runID string) (map[string]any, error) {
-	return nil, nil
-}
-
-type ClusterClient struct{}
-
-func (c *ClusterClient) Assignment(ctx context.Context, runID string, windowS int) (map[string]any, error) {
-	return nil, nil
-}
-
-var (
-	runs    = &RunStore{}
-	leases  = &LeaseStore{}
-	cluster = &ClusterClient{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func leaseState(lease map[string]any) string {
-	if lease == nil {
-		return "none"
-	}
-	return "held"
-}
-
-// resolveState folds the run row and the cluster's view into the reported state.
-func resolveState(run map[string]any, lease map[string]any, view map[string]any) (string, string) {
-	state, _ := run["state"].(string)
-	confirmed, _ := view["worker_confirmed"].(bool)
-	if queueOrphanStates[state] && lease == nil && !confirmed {
-		return "failed", "start_lease_expired"
-	}
-	return state, ""
-}
-
-func readRun(rw http.ResponseWriter, r *http.Request) {
+func getRun(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	runID := r.PathValue("runID")
-	run, err := runs.Get(r.Context(), runID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	runID := r.PathValue("id")
+	run := runs.Get(r.Context(), runID)
+	if run == nil || run.Tenant != tenant {
+		// Another tenant's run does not exist for this caller: 403 would confirm the id.
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such run"})
 		return
 	}
-	owner, _ := run["tenant"].(string)
-	if run == nil || owner != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown run"})
-		return
+	view := map[string]any{"run_id": runID, "state": run.State, "band": run.Band, "queue_position": nil, "nodes": []string{}, "checkpoint_id": run.CheckpointID}
+	if run.State == "queued" {
+		if rank, err := rdb.ZRank(r.Context(), queue.QueueKey, runID).Result(); err == nil {
+			view["queue_position"] = rank // 0 starts next
+		}
 	}
-	lease, _ := leases.Get(r.Context(), runID)
-	view, _ := cluster.Assignment(r.Context(), runID, reconcileWindowS)
-	state, reason := resolveState(run, lease, view)
-	body := map[string]any{
-		"run_id":             runID,
-		"state":              state,
-		"queue_position":     run["queue_position"],
-		"lease_state":        leaseState(lease),
-		"nodes":              view["nodes"],
-		"last_checkpoint_id": run["last_checkpoint_id"],
+	if run.State == "running" {
+		// The cluster's view, not what the row last heard.
+		if nodes, known := cluster.Assignment(r.Context(), runID); known {
+			view["nodes"] = nodes
+		} else {
+			view["state"] = "failed"
+			view["reason"] = "not_on_cluster"
+		}
 	}
-	if reason != "" {
-		body["reason"] = reason
-	}
-	log.Printf("run read run_id=%s tenant=%s state=%s", runID, tenant, state)
-	writeJSON(rw, http.StatusOK, body)
+	writeJSON(rw, http.StatusOK, view)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/training/runs/{runID}", readRun)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/training/runs/{id}", getRun)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import redis.clients.jedis.JedisPooled
+import spray.json._
 
-final case class RunRow(
-    run_id: String,
-    tenant: String,
-    state: String,
-    queue_position: Int,
-    nodes: List[String],
-    last_checkpoint_id: Option[String],
-)
-final case class RunStatus(
-    run_id: String,
-    state: String,
-    queue_position: Int,
-    lease_state: String,
-    nodes: List[String],
-    last_checkpoint_id: Option[String],
-)
+import trainsched.{Cluster, Queue, Runs} // Runs.get; Cluster.assignment; Queue.QueueKey
 
-// The run store is the platform's; this step only calls it.
-final class RunStore {
-  def get(runId: String): Option[RunRow] = ???
-}
-
-object RunStore {
-  def open(): RunStore = new RunStore
-}
-
-object RunRead {
-  implicit val system: ActorSystem = ActorSystem("trainsched")
-  implicit val rowFormat: RootJsonFormat[RunRow] = jsonFormat6(RunRow)
-  implicit val statusFormat: RootJsonFormat[RunStatus] = jsonFormat6(RunStatus)
-
-  val runs = RunStore.open()
+object RunStatus {
+  val jedis = new JedisPooled("redis", 6379)
 
   val route: Route =
     path("v1" / "training" / "runs" / Segment) { runId =>
       get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        runs.get(runId) match {
-          case Some(run) =>
-            val status = RunStatus(runId, run.state, run.queue_position, "none", run.nodes, run.last_checkpoint_id)
-            complete(StatusCodes.OK, status)
-          case None =>
-            complete(StatusCodes.NotFound, """{"error":"unknown run"}""")
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class RunRow(
-    run_id: String,
-    tenant: String,
-    state: String,
-    queue_position: Int,
-    last_checkpoint_id: Option[String],
-)
-final case class ClusterView(nodes: List[String], assigned: Boolean, worker_confirmed: Boolean)
-final case class RunStatus(
-    run_id: String,
-    state: String,
-    queue_position: Int,
-    lease_state: String,
-    nodes: List[String],
-    last_checkpoint_id: Option[String],
-    reason: Option[String],
-)
-
-// The run store, leases and cluster client are the platform's; this step only calls them.
-final class RunStore {
-  def get(runId: String): Option[RunRow] = ???
-}
-
-object RunStore {
-  def open(): RunStore = new RunStore
-}
-
-final class LeaseStore {
-  def get(runId: String): Option[Long] = ???
-}
-
-final class ClusterClient {
-  def assignment(runId: String, windowS: Int): ClusterView = ???
-}
-
-object RunRead {
-  implicit val system: ActorSystem = ActorSystem("trainsched")
-  implicit val rowFormat: RootJsonFormat[RunRow] = jsonFormat5(RunRow)
-  implicit val viewFormat: RootJsonFormat[ClusterView] = jsonFormat3(ClusterView)
-  implicit val statusFormat: RootJsonFormat[RunStatus] = jsonFormat7(RunStatus)
-
-  val ReconcileWindowS = 60
-  val LeaseTtlS = 15
-  val QueueOrphanStates = Set("queued", "starting")
-
-  val runs = RunStore.open()
-  val leases = new LeaseStore
-  val cluster = new ClusterClient
-
-  def resolveState(run: RunRow, lease: Option[Long], view: ClusterView): (String, Option[String]) = {
-    if (QueueOrphanStates.contains(run.state) && lease.isEmpty && !view.worker_confirmed) {
-      ("failed", Some("start_lease_expired"))
-    } else {
-      (run.state, None)
-    }
-  }
-
-  val route: Route =
-    path("v1" / "training" / "runs" / Segment) { runId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            val tenant = tenantOpt.get
-            runs.get(runId) match {
-              case Some(run) if run.tenant == tenant =>
-                val lease = leases.get(runId)
-                val view = cluster.assignment(runId, ReconcileWindowS)
-                val (state, reason) = resolveState(run, lease, view)
-                val body = RunStatus(
-                  run_id = runId,
-                  state = state,
-                  queue_position = run.queue_position,
-                  lease_state = if (lease.isEmpty) "none" else "held",
-                  nodes = view.nodes,
-                  last_checkpoint_id = run.last_checkpoint_id,
-                  reason = reason,
-                )
-                complete(StatusCodes.OK, body)
-              case _ =>
-                complete(StatusCodes.NotFound, """{"error":"unknown run"}""")
-            }
+        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+          (tenant.filter(_.nonEmpty), Runs.get(runId)) match {
+            case (None, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+            case (_, None) => complete(StatusCodes.NotFound -> "no such run")
+            case (Some(_), Some(run)) =>
+              val position = if (run.state == "queued") Option(jedis.zrevrank(Queue.QueueKey, runId)).map(p => JsNumber(p.longValue)).getOrElse(JsNull) else JsNull
+              val view = JsObject(
+                "run_id" -> JsString(runId),
+                "state" -> JsString(run.state),
+                "band" -> JsNumber(run.band),
+                "queue_position" -> position,
+                "nodes" -> JsArray(run.nodes.map(JsString(_)).toVector),
+                "checkpoint_id" -> JsString(run.checkpointId)
+              )
+              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, view.compactPrint)))
           }
         }
       }
     }
+}
+`,
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
+import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+import redis.clients.jedis.JedisPooled
+import spray.json._
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
+import trainsched.{Cluster, Queue, Runs} // Runs.get; Cluster.assignment; Queue.QueueKey
+
+object RunStatus {
+  val jedis = new JedisPooled("redis", 6379)
+
+  private def nodes(names: Seq[String]): JsArray = JsArray(names.map(JsString(_)).toVector)
+
+  val route: Route =
+    path("v1" / "training" / "runs" / Segment) { runId =>
+      get {
+        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+          tenant.filter(_.nonEmpty) match {
+            case None => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+            case Some(t) =>
+              // Another tenant's run does not exist for this caller: 403 would confirm the id.
+              Runs.get(runId).filter(_.tenant == t) match {
+                case None => complete(StatusCodes.NotFound -> "no such run")
+                case Some(run) =>
+                  val position =
+                    if (run.state == "queued") Option(jedis.zrank(Queue.QueueKey, runId)).map(p => JsNumber(p.longValue)).getOrElse(JsNull) // 0 starts next
+                    else JsNull
+                  val base = Map[String, JsValue](
+                    "run_id" -> JsString(runId),
+                    "state" -> JsString(run.state),
+                    "band" -> JsNumber(run.band),
+                    "queue_position" -> position,
+                    "nodes" -> nodes(Nil),
+                    "checkpoint_id" -> JsString(run.checkpointId)
+                  )
+                  // The cluster's view, not what the row last heard.
+                  val view =
+                    if (run.state != "running") base
+                    else
+                      Cluster.assignment(runId) match {
+                        case Some(names) => base + ("nodes" -> nodes(names))
+                        case None => base ++ Map("state" -> JsString("failed"), "reason" -> JsString("not_on_cluster"))
+                      }
+                  complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, JsObject(view).compactPrint)))
+              }
+          }
+        }
+      }
+    }
 }
 `,
     },
     cpp: {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
-#include <iostream>
-#include <optional>
 #include <string>
+
+#include "trainsched/cluster.h"  // cluster::assignment
+#include "trainsched/queue.h"    // queue::kQueueKey
+#include "trainsched/runs.h"     // runs::get
 
 using json = nlohmann::json;
 
-// The run store is the platform's; this step only calls it.
-struct RunStore {
-  std::optional<json> get(const std::string& runId);
-};
+sw::redis::Redis redis("tcp://redis:6379");
 
-RunStore runs;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/training/runs/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const std::string tenant = req.get_header_value("X-Tenant-Id");
-    const std::string runId = req.matches[1];
-    const auto run = runs.get(runId);
-    if (!run.has_value()) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown run"})", "application/json");
-      return;
-    }
-    std::cerr << "run read run_id=" << runId << " tenant=" << tenant << "\\n";
-    const json body = {
-        {"run_id", runId},
-        {"state", (*run)["state"]},
-        {"queue_position", run->value("queue_position", 0)},
-        {"nodes", run->value("nodes", json::array())},
-        {"last_checkpoint_id", (*run)["last_checkpoint_id"]},
-    };
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void fail(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(json{{"error", message}}.dump(), "application/json");
 }
+
+void get_run(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, "X-Tenant-Id is required");
+  const std::string run_id = req.matches[1];
+  const auto run = runs::get(run_id);
+  if (!run) return fail(res, 404, "no such run");
+  json position = nullptr;
+  if (run->state == "queued") {
+    if (const auto rank = redis.zrevrank(queue::kQueueKey, run_id)) position = *rank;
+  }
+  const json view = {{"run_id", run_id}, {"state", run->state}, {"band", run->band}, {"queue_position", position}, {"nodes", run->nodes}, {"checkpoint_id", run->checkpoint_id}};
+  res.set_content(view.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/training/runs/([\\w-]+))", get_run); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
-#include <iostream>
-#include <optional>
 #include <string>
-#include <vector>
+
+#include "trainsched/cluster.h"  // cluster::assignment
+#include "trainsched/queue.h"    // queue::kQueueKey
+#include "trainsched/runs.h"     // runs::get
 
 using json = nlohmann::json;
 
-constexpr int kReconcileWindowS = 60;
-constexpr int kLeaseTtlS = 15;
+sw::redis::Redis redis("tcp://redis:6379");
 
-// The run store, leases and cluster client are the platform's; this step only calls them.
-struct RunStore {
-  std::optional<json> get(const std::string& runId);
-};
+void fail(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(json{{"error", message}}.dump(), "application/json");
+}
 
-struct LeaseStore {
-  std::optional<json> get(const std::string& runId);
-};
-
-struct ClusterView {
-  std::vector<std::string> nodes;
-  bool assigned = false;
-  bool worker_confirmed = false;
-};
-
-struct ClusterClient {
-  ClusterView assignment(const std::string& runId, int windowS);
-};
-
-RunStore runs;
-LeaseStore leases;
-ClusterClient cluster;
-
-struct Resolved {
-  std::string state;
-  std::optional<std::string> reason;
-};
-
-// Fold the run row and the cluster's view into the reported state.
-Resolved resolveState(const json& run, const std::optional<json>& lease, const ClusterView& view) {
-  const std::string state = run.value("state", std::string());
-  const bool waiting = state == "queued" || state == "starting";
-  if (waiting && !lease.has_value() && !view.worker_confirmed) {
-    return {"failed", std::string("start_lease_expired")};
+void get_run(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, "X-Tenant-Id is required");
+  const std::string run_id = req.matches[1];
+  const auto run = runs::get(run_id);
+  // Another tenant's run does not exist for this caller: 403 would confirm the id.
+  if (!run || run->tenant != tenant) return fail(res, 404, "no such run");
+  json view = {{"run_id", run_id}, {"state", run->state}, {"band", run->band}, {"queue_position", nullptr}, {"nodes", json::array()}, {"checkpoint_id", run->checkpoint_id}};
+  if (run->state == "queued") {
+    if (const auto rank = redis.zrank(queue::kQueueKey, run_id)) view["queue_position"] = *rank;  // 0 starts next
   }
-  return {state, std::nullopt};
+  if (run->state == "running") {
+    // The cluster's view, not what the row last heard.
+    if (const auto nodes = cluster::assignment(run_id)) {
+      view["nodes"] = *nodes;
+    } else {
+      view["state"] = "failed";
+      view["reason"] = "not_on_cluster";
+    }
+  }
+  res.set_content(view.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/training/runs/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const std::string runId = req.matches[1];
-    const auto run = runs.get(runId);
-    const std::string owner = run.has_value() ? run->value("tenant", std::string()) : std::string();
-    if (!run.has_value() || owner != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown run"})", "application/json");
-      return;
-    }
-    const auto lease = leases.get(runId);
-    const ClusterView view = cluster.assignment(runId, kReconcileWindowS);
-    const Resolved resolved = resolveState(*run, lease, view);
-    json body = {
-        {"run_id", runId},
-        {"state", resolved.state},
-        {"queue_position", run->value("queue_position", 0)},
-        {"lease_state", lease.has_value() ? "held" : "none"},
-        {"nodes", view.nodes},
-        {"last_checkpoint_id", (*run)["last_checkpoint_id"]},
-    };
-    if (resolved.reason.has_value()) body["reason"] = *resolved.reason;
-    std::cerr << "run read run_id=" << runId << " tenant=" << tenant << " state=" << resolved.state << "\\n";
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/training/runs/([\\w-]+))", get_run); }
 `,
     },
   },
+  harness: {
+    python: `from trainsched import queue, runs
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+def _put(run_id, state, band=1, at=0, tenant="t1"):
+    runs.put({"run_id": run_id, "tenant": tenant, "recipe_version": "llama-ft-v3", "dataset_version": "ds-1", "priority": 8 - 3 * band,
+              "band": band, "state": state, "enqueued_at_ms": at, "worker": "w-1" if state == "running" else "",
+              "nodes": ["n1", "n2"] if state == "running" else [], "checkpoint_id": "ckpt-7"})
+    if state == "queued":
+        queue.enqueue(run_id, band, at)
+
+
+async def _read(c, run_id, tenant="t1"):
+    headers = {"X-Tenant-Id": tenant} if tenant else {}
+    return await c.get(f"/v1/training/runs/{run_id}", headers=headers)
+
+
+def _ok(r, what):
+    assert r.status_code == 200, f"{what} answered {r.status_code}: {r.text}"
+    return r.json()
+
+
+async def check_status_route(ctx):
+    _put("run-a", "queued", band=1, at=int(ctx.clock.time() * 1000))
+    async with _api(ctx) as c:
+        body = _ok(await _read(c, "run-a"), "the owner's read of a queued run")
+    assert body.get("run_id") == "run-a" and body.get("state") == "queued" and body.get("band") == 1, f"the read answered {body}, expected run-a, state queued, band 1"
+
+
+async def check_tenant_scoped_404(ctx):
+    _put("run-a", "queued", at=int(ctx.clock.time() * 1000))
+    async with _api(ctx) as c:
+        other = await _read(c, "run-a", tenant="t2")
+        assert other.status_code == 404, f"tenant t2 reading t1's run answered {other.status_code}: {other.text}. Another tenant's run is 404, as if it did not exist"
+        unknown = await _read(c, "run-zzz")
+        assert unknown.status_code == 404, f"an unknown run answered {unknown.status_code}, expected 404"
+        anonymous = await _read(c, "run-a", tenant=None)
+        assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+        _ok(await _read(c, "run-a"), "the owner's read")
+
+
+async def check_queue_position(ctx):
+    t0 = int(ctx.clock.time() * 1000)
+    _put("run-a", "queued", band=0, at=t0)
+    _put("run-b", "queued", band=1, at=t0)
+    _put("run-c", "queued", band=1, at=t0 + 1)
+    async with _api(ctx) as c:
+        positions = [_ok(await _read(c, run_id), f"the read of {run_id}").get("queue_position") for run_id in ("run-a", "run-b", "run-c")]
+    assert positions == [0, 1, 2], f"run-a, run-b, run-c report positions {positions}: run-a starts next (0) and run-c last (2). Count from the head with ZRANK"
+
+
+async def check_cluster_nodes(ctx):
+    _put("run-a", "running")
+    ctx.redis.hset("cluster:assignments", "run-a", "n3")  # the cluster moved the run; the row still says n1, n2
+    async with _api(ctx) as c:
+        body = _ok(await _read(c, "run-a"), "the read of a running run")
+    assert body.get("nodes") == ["n3"], f"the read answered nodes {body.get('nodes')}: the cluster reports run-a on ['n3']; the row's list is stale"
+    assert body.get("state") == "running" and "reason" not in body, f"a running run the cluster knows must read running with no reason, got {body}"
+
+
+async def check_orphaned_failed(ctx):
+    _put("run-a", "running")
+    _put("run-b", "running")
+    ctx.redis.hset("cluster:assignments", "run-b", "n5,n6")
+    async with _api(ctx) as c:
+        lost = _ok(await _read(c, "run-a"), "the read of a run the cluster lost")
+        alive = _ok(await _read(c, "run-b"), "the read of a run the cluster knows")
+    assert lost.get("state") == "failed" and lost.get("reason") == "not_on_cluster", f"a running run the cluster does not know answered {lost}: report it failed with reason not_on_cluster, or nobody restarts it"
+    assert alive.get("state") == "running" and "reason" not in alive, f"a running run the cluster knows must read running with no reason, got {alive}"
+`,
+    typescript: `function api(ctx) {
+  return {c: ctx.client(ctx.load('read').app), runs: ctx.load('/support/trainsched/runs.ts'), queue: ctx.load('/support/trainsched/queue.ts')};
+}
+
+async function put(runs, queue, runId: string, state: string, band = 1, at = 0, tenant = 't1'): Promise<void> {
+  const running = state === 'running';
+  await runs.put({run_id: runId, tenant, recipe_version: 'llama-ft-v3', dataset_version: 'ds-1', priority: 8 - 3 * band, band, state, enqueued_at_ms: at, worker: running ? 'w-1' : '', nodes: running ? ['n1', 'n2'] : [], checkpoint_id: 'ckpt-7'});
+  if (state === 'queued') await queue.enqueue(runId, band, at);
+}
+
+const read = (c, runId: string, tenant: string | null = 't1') => c.get(\`/v1/training/runs/\${runId}\`, {headers: tenant === null ? {} : {'X-Tenant-Id': tenant}});
+
+function ok(r, what: string) {
+  assert.equal(r.status, 200, \`\${what} answered \${r.status}: \${r.text}\`);
+  return r.json();
+}
+
+export async function check_status_route(ctx) {
+  const {c, runs, queue} = api(ctx);
+  await put(runs, queue, 'run-a', 'queued', 1, ctx.clock.now());
+  const body = ok(await read(c, 'run-a'), "the owner's read of a queued run");
+  assert(body.run_id === 'run-a' && body.state === 'queued' && body.band === 1, \`the read answered \${JSON.stringify(body)}, expected run-a, state queued, band 1\`);
+}
+
+export async function check_tenant_scoped_404(ctx) {
+  const {c, runs, queue} = api(ctx);
+  await put(runs, queue, 'run-a', 'queued', 1, ctx.clock.now());
+  const other = await read(c, 'run-a', 't2');
+  assert.equal(other.status, 404, \`tenant t2 reading t1's run answered \${other.status}: \${other.text}. Another tenant's run is 404, as if it did not exist\`);
+  const unknown = await read(c, 'run-zzz');
+  assert.equal(unknown.status, 404, \`an unknown run answered \${unknown.status}, expected 404\`);
+  const anonymous = await read(c, 'run-a', null);
+  assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  ok(await read(c, 'run-a'), "the owner's read");
+}
+
+export async function check_queue_position(ctx) {
+  const {c, runs, queue} = api(ctx);
+  const t0 = ctx.clock.now();
+  await put(runs, queue, 'run-a', 'queued', 0, t0);
+  await put(runs, queue, 'run-b', 'queued', 1, t0);
+  await put(runs, queue, 'run-c', 'queued', 1, t0 + 1);
+  const positions: unknown[] = [];
+  for (const runId of ['run-a', 'run-b', 'run-c']) positions.push(ok(await read(c, runId), \`the read of \${runId}\`).queue_position);
+  assert.deepEqual(positions, [0, 1, 2], \`run-a, run-b, run-c report positions \${JSON.stringify(positions)}: run-a starts next (0) and run-c last (2). Count from the head with ZRANK\`);
+}
+
+export async function check_cluster_nodes(ctx) {
+  const {c, runs, queue} = api(ctx);
+  await put(runs, queue, 'run-a', 'running');
+  ctx.redis.hset('cluster:assignments', 'run-a', 'n3'); // the cluster moved the run; the row still says n1, n2
+  const body = ok(await read(c, 'run-a'), 'the read of a running run');
+  assert.deepEqual(body.nodes, ['n3'], \`the read answered nodes \${JSON.stringify(body.nodes)}: the cluster reports run-a on ["n3"]; the row's list is stale\`);
+  assert(body.state === 'running' && !('reason' in body), \`a running run the cluster knows must read running with no reason, got \${JSON.stringify(body)}\`);
+}
+
+export async function check_orphaned_failed(ctx) {
+  const {c, runs, queue} = api(ctx);
+  await put(runs, queue, 'run-a', 'running');
+  await put(runs, queue, 'run-b', 'running');
+  ctx.redis.hset('cluster:assignments', 'run-b', 'n5,n6');
+  const lost = ok(await read(c, 'run-a'), 'the read of a run the cluster lost');
+  const alive = ok(await read(c, 'run-b'), 'the read of a run the cluster knows');
+  assert(lost.state === 'failed' && lost.reason === 'not_on_cluster', \`a running run the cluster does not know answered \${JSON.stringify(lost)}: report it failed with reason not_on_cluster, or nobody restarts it\`);
+  assert(alive.state === 'running' && !('reason' in alive), \`a running run the cluster knows must read running with no reason, got \${JSON.stringify(alive)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"trainsched/queue"
+	"trainsched/runs"
+
+	"leetbuild/harness"
+)
+
+var readBg = context.Background()
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func putRun(ctx *harness.Ctx, runID, state string, band int, at int64) {
+	run := &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 8 - 3*band, Band: band, State: state, EnqueuedAtMs: at, CheckpointID: "ckpt-7"}
+	if state == "running" {
+		run.Worker = "w-1"
+		run.Nodes = []string{"n1", "n2"}
+	}
+	ctx.NoError(runs.Put(readBg, run), "runs.Put")
+	if state == "queued" {
+		ctx.NoError(queue.Enqueue(readBg, runID, band, at), "queue.Enqueue")
+	}
+}
+
+func readAs(c *harness.HTTP, runID, tenant string) *harness.Response {
+	if tenant == "" {
+		return c.Get("/v1/training/runs/" + runID)
+	}
+	return c.Get("/v1/training/runs/"+runID, "X-Tenant-Id", tenant)
+}
+
+type runView struct {
+	RunID         string   \`json:"run_id"\`
+	State         string   \`json:"state"\`
+	Band          int      \`json:"band"\`
+	QueuePosition *int     \`json:"queue_position"\`
+	Nodes         []string \`json:"nodes"\`
+	Reason        *string  \`json:"reason"\`
+}
+
+func readOK(ctx *harness.Ctx, r *harness.Response, what string) runView {
+	ctx.Equal(r.Status, 200, "%s (%s)", what, r.Text())
+	var v runView
+	r.Decode(&v)
+	return v
+}
+
+func CheckStatusRoute(ctx *harness.Ctx) {
+	putRun(ctx, "run-a", "queued", 1, ctx.Clock.Now())
+	v := readOK(ctx, readAs(readAPI(ctx), "run-a", "t1"), "the owner's read of a queued run")
+	ctx.Assert(v.RunID == "run-a" && v.State == "queued" && v.Band == 1, "the read answered %+v, expected run-a, state queued, band 1", v)
+}
+
+func CheckTenantScoped404(ctx *harness.Ctx) {
+	putRun(ctx, "run-a", "queued", 1, ctx.Clock.Now())
+	c := readAPI(ctx)
+	other := readAs(c, "run-a", "t2")
+	ctx.Equal(other.Status, 404, "tenant t2 reading t1's run (%s): another tenant's run is 404, as if it did not exist; the status", other.Text())
+	ctx.Equal(readAs(c, "run-zzz", "t1").Status, 404, "an unknown run; the status")
+	ctx.Equal(readAs(c, "run-a", "").Status, 401, "a read without X-Tenant-Id; the status")
+	readOK(ctx, readAs(c, "run-a", "t1"), "the owner's read")
+}
+
+func CheckQueuePosition(ctx *harness.Ctx) {
+	t0 := ctx.Clock.Now()
+	putRun(ctx, "run-a", "queued", 0, t0)
+	putRun(ctx, "run-b", "queued", 1, t0)
+	putRun(ctx, "run-c", "queued", 1, t0+1)
+	c := readAPI(ctx)
+	positions := []int{}
+	for _, runID := range []string{"run-a", "run-b", "run-c"} {
+		v := readOK(ctx, readAs(c, runID, "t1"), "the read of "+runID)
+		p := -1
+		if v.QueuePosition != nil {
+			p = *v.QueuePosition
+		}
+		positions = append(positions, p)
+	}
+	ctx.Equal(positions, []int{0, 1, 2}, "run-a starts next (0) and run-c last (2): count from the head with ZRANK; the positions")
+}
+
+func CheckClusterNodes(ctx *harness.Ctx) {
+	putRun(ctx, "run-a", "running", 1, 0)
+	ctx.Redis.Do("HSET", "cluster:assignments", "run-a", "n3") // the cluster moved the run; the row still says n1, n2
+	v := readOK(ctx, readAs(readAPI(ctx), "run-a", "t1"), "the read of a running run")
+	ctx.Equal(v.Nodes, []string{"n3"}, "the cluster reports run-a on n3 and the row's list is stale; the nodes")
+	ctx.Assert(v.State == "running" && v.Reason == nil, "a running run the cluster knows must read running with no reason, got %+v", v)
+}
+
+func CheckOrphanedFailed(ctx *harness.Ctx) {
+	putRun(ctx, "run-a", "running", 1, 0)
+	putRun(ctx, "run-b", "running", 1, 0)
+	ctx.Redis.Do("HSET", "cluster:assignments", "run-b", "n5,n6")
+	c := readAPI(ctx)
+	lost := readOK(ctx, readAs(c, "run-a", "t1"), "the read of a run the cluster lost")
+	alive := readOK(ctx, readAs(c, "run-b", "t1"), "the read of a run the cluster knows")
+	ctx.Assert(lost.State == "failed" && lost.Reason != nil && *lost.Reason == "not_on_cluster", "a running run the cluster does not know answered state %q: report it failed with reason not_on_cluster, or nobody restarts it", lost.State)
+	ctx.Assert(alive.State == "running" && alive.Reason == nil, "a running run the cluster knows must read running with no reason, got %+v", alive)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+namespace {
+
+harness::HTTP readApi(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+void putRun(const std::string& run_id, const std::string& state, int band, long long at) {
+  runs::Run run;
+  run.run_id = run_id;
+  run.tenant = "t1";
+  run.recipe_version = "llama-ft-v3";
+  run.dataset_version = "ds-1";
+  run.priority = 8 - 3 * band;
+  run.band = band;
+  run.state = state;
+  run.enqueued_at_ms = at;
+  run.checkpoint_id = "ckpt-7";
+  if (state == "running") {
+    run.worker = "w-1";
+    run.nodes = {"n1", "n2"};
+  }
+  runs::put(run);
+  if (state == "queued") queue::enqueue(run_id, band, at);
+}
+
+harness::Response readAs(harness::HTTP& c, const std::string& run_id, const std::string& tenant) {
+  if (tenant.empty()) return c.Get("/v1/training/runs/" + run_id);
+  return c.Get("/v1/training/runs/" + run_id, "X-Tenant-Id", tenant);
+}
+
+nlohmann::json readOk(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+  ctx.Equal(r.Status, 200, "%s (%s)", what, r.Text());
+  return nlohmann::json::parse(r.Text(), nullptr, false);
+}
+
+std::string text(const nlohmann::json& j, const std::string& field) {
+  return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckStatusRoute(harness::Ctx& ctx) {
+  putRun("run-a", "queued", 1, ctx.Clock.Now());
+  auto c = readApi(ctx);
+  const auto v = readOk(ctx, readAs(c, "run-a", "t1"), "the owner's read of a queued run");
+  ctx.Assert(text(v, "run_id") == "run-a" && text(v, "state") == "queued" && v.value("band", -1) == 1, "the read answered %s, expected run-a, state queued, band 1", v.dump());
+}
+
+void CheckTenantScoped404(harness::Ctx& ctx) {
+  putRun("run-a", "queued", 1, ctx.Clock.Now());
+  auto c = readApi(ctx);
+  const auto other = readAs(c, "run-a", "t2");
+  ctx.Equal(other.Status, 404, "tenant t2 reading t1's run (%s): another tenant's run is 404, as if it did not exist; the status", other.Text());
+  ctx.Equal(readAs(c, "run-zzz", "t1").Status, 404, "an unknown run; the status");
+  ctx.Equal(readAs(c, "run-a", "").Status, 401, "a read without X-Tenant-Id; the status");
+  readOk(ctx, readAs(c, "run-a", "t1"), "the owner's read");
+}
+
+void CheckQueuePosition(harness::Ctx& ctx) {
+  const long long t0 = ctx.Clock.Now();
+  putRun("run-a", "queued", 0, t0);
+  putRun("run-b", "queued", 1, t0);
+  putRun("run-c", "queued", 1, t0 + 1);
+  auto c = readApi(ctx);
+  nlohmann::json positions = nlohmann::json::array();
+  for (const std::string run_id : {"run-a", "run-b", "run-c"}) {
+    const auto v = readOk(ctx, readAs(c, run_id, "t1"), "the read of " + run_id);
+    positions.push_back(v.is_object() && v.contains("queue_position") ? v["queue_position"] : nlohmann::json());
+  }
+  ctx.Equal(positions, nlohmann::json{0, 1, 2}, "run-a starts next (0) and run-c last (2): count from the head with ZRANK; the positions");
+}
+
+void CheckClusterNodes(harness::Ctx& ctx) {
+  putRun("run-a", "running", 1, 0);
+  ctx.Redis.Do("HSET", "cluster:assignments", "run-a", "n3");  // the cluster moved the run; the row still says n1, n2
+  auto c = readApi(ctx);
+  const auto v = readOk(ctx, readAs(c, "run-a", "t1"), "the read of a running run");
+  ctx.Equal(v.value("nodes", nlohmann::json()), nlohmann::json{"n3"}, "the cluster reports run-a on n3 and the row's list is stale; the nodes");
+  ctx.Assert(text(v, "state") == "running" && !v.contains("reason"), "a running run the cluster knows must read running with no reason, got %s", v.dump());
+}
+
+void CheckOrphanedFailed(harness::Ctx& ctx) {
+  putRun("run-a", "running", 1, 0);
+  putRun("run-b", "running", 1, 0);
+  ctx.Redis.Do("HSET", "cluster:assignments", "run-b", "n5,n6");
+  auto c = readApi(ctx);
+  const auto lost = readOk(ctx, readAs(c, "run-a", "t1"), "the read of a run the cluster lost");
+  const auto alive = readOk(ctx, readAs(c, "run-b", "t1"), "the read of a run the cluster knows");
+  ctx.Assert(text(lost, "state") == "failed" && text(lost, "reason") == "not_on_cluster",
+             "a running run the cluster does not know answered %s: report it failed with reason not_on_cluster, or nobody restarts it", lost.dump());
+  ctx.Assert(text(alive, "state") == "running" && !alive.contains("reason"), "a running run the cluster knows must read running with no reason, got %s", alive.dump());
+}
+`,
+  },
   hints: [
-    'The dashboard shows a run queued for hours after the worker node that was starting it rebooted, and another run "running" on nodes the fleet reclaimed ten minutes ago.',
-    '`runs.get(run_id)` ignores the tenant and the handler returns `run["state"]` and `run["nodes"]` verbatim; nothing consults the start lease or asks the cluster what it currently holds.',
-    'Compare `run["tenant"]` with `X-Tenant-Id` (404 on mismatch); call `cluster.assignment` within `RECONCILE_WINDOW_S`; when `lease is None` and not `worker_confirmed` answer `failed` with `start_lease_expired`; take `nodes` from the view.',
+    'Another tenant can read any run whose id it guesses; the run about to start says it is last in line; a run whose node rebooted an hour ago still shows running on that node.',
+    'The handler loads by id and never compares the tenant, `ZREVRANK` counts from the tail of a queue that serves from the head, and every field comes from the row, which nobody updates when the cluster loses or moves a job.',
+    'Answer 404 when `run["tenant"] != tenant`; use `ZRANK` for queued runs; for running runs call `cluster.assignment(run_id)`: its nodes when known, else `state: "failed"` and `reason: "not_on_cluster"`.',
   ],
-  debrief: `The read side of a scheduler is judged by whether it reports the state the cluster is acting on, which is why the handler reconciles before it answers: the run row records what the scheduler wrote, and the cluster view records what the fleet has. The orphaned-lease rule exists because a run that died in startup is the one case an operator opens this endpoint to find, and echoing \`queued\` hides it. The tenant comparison answers 404 rather than 403 so a guessed id leaks nothing, not even existence. Production systems stamp the response with an \`observed_at\` so a reader knows how fresh the reconciliation is, and define what the endpoint says when the cluster call itself times out, since a status page that hangs mid-incident is as useless as one that lies.`,
+  debrief: `The status endpoint is where the scheduler admits what it does not control: the row records what the scheduler last decided, the cluster records what is actually running, and the answer has to come from the second for anything the cluster owns. That is also why a lost run is reported failed instead of quietly running: the caller's next move, a retry, depends on it. The 404 for another tenant's run keeps run ids from being an oracle, and \`ZRANK\` is simply the queue read the way the claim script reads it. Production schedulers also run a reconciler that writes the cluster's answer back into the row and requeues lost runs from their last checkpoint, so the read stops having to correct the record every time.`,
 };

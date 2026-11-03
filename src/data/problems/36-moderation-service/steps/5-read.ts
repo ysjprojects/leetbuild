@@ -8,26 +8,21 @@ export const readStep: Step = {
   focus: ['api', 'db', 'console'],
   task: `## Task
 
-**Starting point.** The starter registers \`GET /v1/moderation/items/{case_id}\`, reads the tenant
-from \`X-Tenant-Id\`, fetches the case by id and returns its status, reporter id and detail as
-stored. It compiles, serves the demo and hides 4 flaws.
+**Starting point.** The starter serves \`GET /v1/moderation/items/{case_id}\`, the case file a
+moderator's console opens: it reads the tenant from \`X-Tenant-Id\` (missing is **401**), loads the
+case (\`store.get_case\`, **404** when there is none) and answers its status, reason, report count,
+the actions persisted on its content (\`store.actions_of\`), a link to the content, the reporter's id
+and the report's detail as stored. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A case file is a dossier that names the person who reported
-someone else, so it is the most sensitive read in the service. The starter fails on authorisation
-(the case id is not an access token), on data minimisation (reporter identity for everyone), and on
-output handling (raw, unbounded free text straight back to the caller). The demo fetches its own
-case from a trusted console, so none of this shows.
+**Failure mode the checks target.** Another tenant reads a case by guessing its id; every moderator
+who opens a case learns who reported it; a detail holding markup runs in the console; and a detail
+of 5,000 characters fills every view.
 
-Requirements:
-
-- The case is scoped to the **content owner's tenant**: resolve the case's tenant from the catalogue
-  and answer **404**, not 403, when it belongs to someone else or does not exist.
-- The body carries the status, the action history and links to the moderated content. The
-  **reporter's identity is included only for the \`surveyor\` role**; for every other role it is
-  absent, not blanked, not hashed.
-- The free-text **detail is truncated** to \`MAX_DETAIL_CHARS\` and **escaped** before it is returned,
-  so the case file is not a stored-XSS payload and not an unbounded copy of a private statement.
-- A missing tenant is **401**.`,
+- A case whose tenant is not the caller's answers exactly as a missing one, **404**.
+- \`reporter_id\` is in the body only when \`X-Reviewer-Role\` is \`SURVEYOR_ROLE\` (\`surveyor\`);
+  otherwise the field is absent.
+- The detail is cut to its first \`MAX_DETAIL_CHARS\` = **280** characters, then HTML-escaped (\`&\`,
+  \`<\`, \`>\`, quotes), so the cut never splits an entity.`,
   sequence: {
     participants: ['Moderator console', 'Moderation API', 'case store'],
     messages: [
@@ -37,425 +32,437 @@ Requirements:
         label: 'GET /v1/moderation/items/{id} · X-Tenant-Id · X-Reviewer-Role',
         kind: 'sync',
       },
-      {from: 'Moderation API', to: 'case store', label: 'case tenant == caller tenant?', kind: 'sync'},
-      {from: 'case store', to: 'Moderation API', label: 'record / 404 for a foreign case', kind: 'reply'},
+      {from: 'Moderation API', to: 'case store', label: 'get_case(id) · actions_of(content_id)', kind: 'sync'},
+      {from: 'Moderation API', to: 'Moderation API', label: 'case tenant == caller? else 404', kind: 'sync'},
       {
         from: 'Moderation API',
         to: 'Moderation API',
-        label: 'truncate + escape detail · include reporter only for surveyors',
+        label: 'detail: first 280 characters, then escaped · reporter_id for surveyors',
         kind: 'sync',
       },
-      {from: 'Moderation API', to: 'Moderator console', label: '200 {status, actions, content, detail}', kind: 'reply'},
+      {from: 'Moderation API', to: 'Moderator console', label: '200 {status, actions, links, detail}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
       title: 'Handles GET /v1/moderation/items/{id}',
-      detail: 'Register the case read on `GET /v1/moderation/items/{case_id}`.',
+      detail:
+        'The case file answers the case’s status and the actions persisted on its content; a missing tenant is **401** and an unknown case **404**.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/moderation\/items\//]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/moderation\/items\//]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/moderation\/items\//]},
         scala: {all: [/path\(\s*"v1"\s*\/\s*"moderation"\s*\/\s*"items"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*"\/v1\/moderation\/items\//]},
+        cpp: {all: [/svr\.Get\(\s*R?"\(?\/v1\/moderation\/items\//]},
       },
     },
     {
       id: 'tenant-scope',
       title: 'Hides a case that belongs to another tenant',
       detail:
-        'The case’s tenant is resolved from the catalogue and a mismatch is **404** — indistinguishable from a case that does not exist. The starter returns any case by id, so a guessed id leaks another tenant’s reports.',
+        'The case’s tenant is compared with the caller’s and a mismatch answers exactly as a missing case (**404**); the starter serves any case by id.',
       match: {
-        python: {all: [/CASE_TENANT/, /status_code\s*=\s*404/]},
-        typescript: {all: [/CASE_TENANT/, /code\(\s*404\s*\)/]},
-        go: {all: [/caseTenant/, /StatusNotFound/]},
-        scala: {all: [/CaseTenant/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/kCaseTenant/, /\b404\b/]},
+        python: {all: [/\[["']tenant["']\]\s*!=\s*tenant\b|\btenant\s*!=\s*\w+\[["']tenant["']\]/]},
+        typescript: {all: [/\.tenant\s*!==?\s*tenant\b|\btenant\s*!==?\s*\w+\.tenant\b/]},
+        go: {all: [/\.Tenant\s*!=\s*tenant\b|\btenant\s*!=\s*\w+\.Tenant\b/]},
+        scala: {all: [/\.tenant\s*!=\s*tenant\b|\.tenant\s*==\s*tenant\b/]},
+        cpp: {all: [/(->|\.)tenant\s*!=\s*tenant\b|\btenant\s*!=\s*\w+(->|\.)tenant\b/]},
       },
     },
     {
       id: 'surveyor-only',
-      title: 'Shows reporter identity only to the surveyor role',
+      title: 'Shows the reporter only to the surveyor role',
       detail:
-        'The reporter’s identity is added to the body only when the caller’s role is `surveyor`. The starter includes it for every caller, handing the reported user the name of the person who reported them.',
+        '`reporter_id` is added to the body only when the caller’s role equals `SURVEYOR_ROLE`; the starter puts it in every answer.',
       match: {
-        python: {all: [/SURVEYOR_ROLE/, /reporter_id/]},
-        typescript: {all: [/SURVEYOR_ROLE/, /reporter_id/]},
-        go: {all: [/surveyorRole/, /ReporterID/]},
-        scala: {all: [/SurveyorRole/, /reporterId/]},
-        cpp: {all: [/kSurveyorRole/, /reporter_id/]},
-      },
-    },
-    {
-      id: 'detail-truncated',
-      title: 'Truncates the free-text detail',
-      detail:
-        'The detail is cut to `MAX_DETAIL_CHARS` before it is returned. The starter echoes the whole field, so one report can carry a wall of private text into every case-file view.',
-      match: {
-        python: {all: [/MAX_DETAIL_CHARS/]},
-        typescript: {all: [/MAX_DETAIL_CHARS/]},
-        go: {all: [/maxDetailChars/]},
-        scala: {all: [/MaxDetailChars/]},
-        cpp: {all: [/kMaxDetailChars/]},
+        python: {all: [/SURVEYOR_ROLE\s*=\s*["']surveyor["']/, /==\s*SURVEYOR_ROLE|SURVEYOR_ROLE\s*==/]},
+        typescript: {all: [/SURVEYOR_ROLE\s*=\s*['"]surveyor['"]/, /===?\s*SURVEYOR_ROLE|SURVEYOR_ROLE\s*===?/]},
+        go: {all: [/surveyorRole\s*=\s*"surveyor"/, /==\s*surveyorRole|surveyorRole\s*==/]},
+        scala: {all: [/SurveyorRole\s*=\s*"surveyor"/, /==\s*SurveyorRole|SurveyorRole\s*==|contains\(SurveyorRole\)/]},
+        cpp: {all: [/kSurveyorRole\s*=\s*"surveyor"/, /==\s*kSurveyorRole|kSurveyorRole\s*==/]},
       },
     },
     {
       id: 'detail-escaped',
       title: 'Escapes the free-text detail',
       detail:
-        'The detail is HTML-escaped before it is returned, so a report cannot store markup that executes in the reviewer’s console. The starter echoes it raw.',
+        'The detail is HTML-escaped before it is returned, so a report cannot plant markup that runs in a moderator’s console; the starter returns it raw.',
       match: {
-        python: {all: [/html\.escape/]},
-        typescript: {all: [/escapeHtml/]},
-        go: {all: [/html\.EscapeString/]},
-        scala: {all: [/escapeHtml/]},
-        cpp: {all: [/escapeHtml/]},
+        python: {all: [/html\.escape\(/]},
+        typescript: {all: [/&lt;/]},
+        go: {all: [/html\.EscapeString\(/]},
+        scala: {all: [/&lt;/]},
+        cpp: {all: [/&lt;/]},
+      },
+    },
+    {
+      id: 'detail-bounded',
+      title: 'Cuts the detail to 280 characters before escaping it',
+      detail:
+        'The detail is cut to its first `MAX_DETAIL_CHARS` characters and then escaped, so a cut cannot split `&lt;`; the starter returns the whole field.',
+      match: {
+        python: {
+          all: [/MAX_DETAIL_CHARS\s*=\s*280\b/, /\[:\s*MAX_DETAIL_CHARS\s*\]/],
+          none: [/escape\([^)\n]*\)\s*\[:/],
+        },
+        typescript: {
+          all: [/MAX_DETAIL_CHARS\s*=\s*280\b/, /slice\(0,\s*MAX_DETAIL_CHARS\)/],
+          none: [/escapeHtml\([^()\n]*\)\.slice\(/],
+        },
+        go: {all: [/maxDetailChars\s*=\s*280\b/, /\[:maxDetailChars\]/], none: [/EscapeString\([^)\n]*\)\[:/]},
+        scala: {
+          all: [
+            /MaxDetailChars\s*=\s*280\b/,
+            /\(\s*\w+\([^()\n]*,\s*MaxDetailChars\s*\)\s*\)|take\(MaxDetailChars\)|limit\(MaxDetailChars/,
+          ],
+          none: [/escapeHtml\([^)\n]*\)\.take\(/],
+        },
+        cpp: {all: [/kMaxDetailChars\s*=\s*280\b/, /\(\s*\w+\([^()\n]*,\s*kMaxDetailChars\s*\)\s*\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException, Request
+
+from moderation import store  # get_case, actions_of
 
 app = FastAPI()
 
-cases = CaseStore()
-
 
 @app.get("/v1/moderation/items/{case_id}")
-def read_case(case_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
+def read_case(case_id: str, request: Request) -> dict:
     # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    record = cases.get(case_id)
-    return JSONResponse(
-        {
-            "case_id": case_id,
-            "status": record["status"],
-            "reporter_id": record["reporter_id"],
-            "detail": record["detail"],
-        },
-        status_code=200,
-    )
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    case = store.get_case(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="no such case")
+    return {
+        "case_id": case["case_id"],
+        "content_id": case["content_id"],
+        "status": case["status"],
+        "reason": case["reason"],
+        "reports": case["reports"],
+        "actions": store.actions_of(case["content_id"]),
+        "links": {"content": f"/v1/content/{case['content_id']}"},
+        "reporter_id": case["reporter_id"],
+        "detail": case["detail"],
+    }
 `,
       solution: `import html
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+
+from moderation import store  # get_case, actions_of
 
 app = FastAPI()
 
-MAX_DETAIL_CHARS = 280
 SURVEYOR_ROLE = "surveyor"
-CASE_TENANT = {"case_5d21": "acme", "case_9b07": "globex"}
-
-
-class CaseStore:
-    def get(self, case_id: str) -> dict | None:
-        """The case record, or None when it does not exist."""
-        raise NotImplementedError
-
-    def actions(self, case_id: str) -> list[dict]:
-        """The action history for the case, oldest first."""
-        raise NotImplementedError
-
-
-cases = CaseStore()
-
-
-def redact(text: str) -> str:
-    escaped = html.escape(text or "", quote=True)
-    if len(escaped) <= MAX_DETAIL_CHARS:
-        return escaped
-    return escaped[:MAX_DETAIL_CHARS] + "…"
+MAX_DETAIL_CHARS = 280
 
 
 @app.get("/v1/moderation/items/{case_id}")
-def read_case(
-    case_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    role: str | None = Header(default=None, alias="X-Reviewer-Role"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if CASE_TENANT.get(case_id) != tenant:
-        raise HTTPException(status_code=404, detail="unknown case")
-    record = cases.get(case_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="unknown case")
-
+def read_case(case_id: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    role = request.headers.get("x-reviewer-role", "")
+    case = store.get_case(case_id)
+    # Another tenant's case answers exactly as a missing one: a case id is a name, not a permission.
+    if case is None or case["tenant"] != tenant:
+        raise HTTPException(status_code=404, detail="no such case")
     body = {
-        "case_id": case_id,
-        "status": record["status"],
-        "content": {"id": record["content_id"], "url": record["content_url"]},
-        "actions": [
-            {"action": action["action"], "rule": action["rule"], "reviewer_role": action["reviewer_role"]}
-            for action in cases.actions(case_id)
-        ],
-        "detail": redact(record["detail"]),
+        "case_id": case["case_id"],
+        "content_id": case["content_id"],
+        "status": case["status"],
+        "reason": case["reason"],
+        "reports": case["reports"],
+        "actions": store.actions_of(case["content_id"]),
+        "links": {"content": f"/v1/content/{case['content_id']}"},
+        # Cut first, then escape: the cut never lands inside an entity.
+        "detail": html.escape(case["detail"][:MAX_DETAIL_CHARS]),
     }
     if role == SURVEYOR_ROLE:
-        body["reporter_id"] = record["reporter_id"]
-    return JSONResponse(body, status_code=200)
+        body["reporter_id"] = case["reporter_id"]
+    return body
 `,
     },
     typescript: {
-      starter: `/** GET /v1/moderation/items/{id}. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {actionsOf, getCase} from 'moderation/store';
 
 export const app = Fastify();
 
 app.get('/v1/moderation/items/:caseId', async (request, reply) => {
   // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {caseId} = request.params as {caseId: string};
-  const record = await cases.get(caseId);
-  return reply.code(200).send({
-    case_id: caseId,
-    status: record.status,
-    reporter_id: record.reporter_id,
-    detail: record.detail,
-  });
+  const found = await getCase(caseId);
+  if (found === null) return reply.code(404).send({error: 'no such case'});
+  return {
+    case_id: found.case_id,
+    content_id: found.content_id,
+    status: found.status,
+    reason: found.reason,
+    reports: found.reports,
+    actions: await actionsOf(found.content_id),
+    links: {content: \`/v1/content/\${found.content_id}\`},
+    reporter_id: found.reporter_id,
+    detail: found.detail,
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/moderation/items/{id}: the case file, scoped, redacted and escaped. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {actionsOf, getCase} from 'moderation/store';
 
 export const app = Fastify();
 
-const MAX_DETAIL_CHARS = 280;
-const SURVEYOR_ROLE = 'surveyor';
-const CASE_TENANT: Record<string, string> = {case_5d21: 'acme', case_9b07: 'globex'};
+export const SURVEYOR_ROLE = 'surveyor';
+export const MAX_DETAIL_CHARS = 280;
 
-function escapeHtml(text: string): string {
-  return text
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
+const ESCAPES: Record<string, string> = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;'};
 
-function redact(text: string | undefined): string {
-  const escaped = escapeHtml(text ?? '');
-  if (escaped.length <= MAX_DETAIL_CHARS) return escaped;
-  return escaped.slice(0, MAX_DETAIL_CHARS) + '...';
-}
+const escapeHtml = (text: string): string => text.replace(/[&<>"']/g, c => ESCAPES[c]);
 
 app.get('/v1/moderation/items/:caseId', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const role = request.headers['x-reviewer-role'];
   const {caseId} = request.params as {caseId: string};
-  if (CASE_TENANT[caseId] !== tenant) return reply.code(404).send({error: 'unknown case'});
-  const record = await cases.get(caseId);
-  if (record === null) return reply.code(404).send({error: 'unknown case'});
-
+  const found = await getCase(caseId);
+  // Another tenant's case answers exactly as a missing one: a case id is a name, not a permission.
+  if (found === null || found.tenant !== tenant) return reply.code(404).send({error: 'no such case'});
   const body: Record<string, unknown> = {
-    case_id: caseId,
-    status: record.status,
-    content: {id: record.content_id, url: record.content_url},
-    actions: await cases.actions(caseId),
-    detail: redact(record.detail),
+    case_id: found.case_id,
+    content_id: found.content_id,
+    status: found.status,
+    reason: found.reason,
+    reports: found.reports,
+    actions: await actionsOf(found.content_id),
+    links: {content: \`/v1/content/\${found.content_id}\`},
+    // Cut first (by characters, not UTF-16 units), then escape: the cut never lands inside an entity.
+    detail: escapeHtml(Array.from(found.detail).slice(0, MAX_DETAIL_CHARS).join('')),
   };
-  if (request.headers['x-reviewer-role'] === SURVEYOR_ROLE) body.reporter_id = record.reporter_id;
-  return reply.code(200).send(body);
+  if (role === SURVEYOR_ROLE) body.reporter_id = found.reporter_id;
+  return body;
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"log"
+	"encoding/json"
 	"net/http"
+
+	"moderation/store" // store.GetCase, ActionsOf
 )
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
+}
 
 func readCase(rw http.ResponseWriter, r *http.Request) {
 	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	caseID := r.PathValue("case_id")
-	record, _ := cases.Get(caseID)
-	if record == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown case"})
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
+		return
+	}
+	found := store.GetCase(r.Context(), r.PathValue("id"))
+	if found == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such case"})
 		return
 	}
 	writeJSON(rw, http.StatusOK, map[string]any{
-		"case_id":     caseID,
-		"status":      record.Status,
-		"reporter_id": record.ReporterID,
-		"detail":      record.Detail,
+		"case_id":     found.CaseID,
+		"content_id":  found.ContentID,
+		"status":      found.Status,
+		"reason":      found.Reason,
+		"reports":     found.Reports,
+		"actions":     store.ActionsOf(r.Context(), found.ContentID),
+		"links":       map[string]string{"content": "/v1/content/" + found.ContentID},
+		"reporter_id": found.ReporterID,
+		"detail":      found.Detail,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/moderation/items/{case_id}", readCase)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/moderation/items/{id}", readCase)
 }
 `,
       solution: `package main
 
 import (
+	"encoding/json"
 	"html"
-	"log"
 	"net/http"
+
+	"moderation/store" // store.GetCase, ActionsOf
 )
 
-const maxDetailChars = 280
-const surveyorRole = "surveyor"
+const (
+	surveyorRole   = "surveyor"
+	maxDetailChars = 280
+)
 
-var caseTenant = map[string]string{"case_5d21": "acme", "case_9b07": "globex"}
-
-type CaseRecord struct {
-	Status     string
-	ContentID  string
-	ContentURL string
-	ReporterID string
-	Detail     string
-}
-
-type CaseStore struct{}
-
-func (s *CaseStore) Get(caseID string) (*CaseRecord, error) { return nil, nil }
-
-func (s *CaseStore) Actions(caseID string) ([]map[string]any, error) { return nil, nil }
-
-var cases = &CaseStore{}
-
-func redact(text string) string {
-	escaped := html.EscapeString(text)
-	runes := []rune(escaped)
-	if len(runes) <= maxDetailChars {
-		return escaped
-	}
-	return string(runes[:maxDetailChars]) + "..."
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readCase(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	caseID := r.PathValue("case_id")
-	if caseTenant[caseID] != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown case"})
+	found := store.GetCase(r.Context(), r.PathValue("id"))
+	// Another tenant's case answers exactly as a missing one: a case id is a name, not a permission.
+	if found == nil || found.Tenant != tenant {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such case"})
 		return
 	}
-	record, err := cases.Get(caseID)
-	if err != nil || record == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown case"})
-		return
+	// Cut first (by characters, not bytes), then escape: the cut never lands inside an entity.
+	detail := []rune(found.Detail)
+	if len(detail) > maxDetailChars {
+		detail = detail[:maxDetailChars]
 	}
-	actions, _ := cases.Actions(caseID)
 	body := map[string]any{
-		"case_id": caseID,
-		"status":  record.Status,
-		"content": map[string]any{"id": record.ContentID, "url": record.ContentURL},
-		"actions": actions,
-		"detail":  redact(record.Detail),
+		"case_id":    found.CaseID,
+		"content_id": found.ContentID,
+		"status":     found.Status,
+		"reason":     found.Reason,
+		"reports":    found.Reports,
+		"actions":    store.ActionsOf(r.Context(), found.ContentID),
+		"links":      map[string]string{"content": "/v1/content/" + found.ContentID},
+		"detail":     html.EscapeString(string(detail)),
 	}
 	if r.Header.Get("X-Reviewer-Role") == surveyorRole {
-		body["reporter_id"] = record.ReporterID
+		body["reporter_id"] = found.ReporterID
 	}
 	writeJSON(rw, http.StatusOK, body)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/moderation/items/{case_id}", readCase)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/moderation/items/{id}", readCase)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-object CaseFileApi {
-  implicit val system: ActorSystem = ActorSystem("moderation")
+import moderation.Store // Store.getCase, actionsOf
 
-  val cases = CaseStore.open()
+object Read {
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "moderation" / "items" / Segment) { caseId =>
-      get {
-        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-        cases.get(caseId) match {
-          case None => complete(StatusCodes.NotFound, """{"error":"unknown case"}""")
-          case Some(record) =>
-            complete(
-              StatusCodes.OK,
-              s"""{"case_id":"$caseId","status":"\${record.status}","reporter_id":"\${record.reporterId}","detail":"\${record.detail}"}"""
-            )
-        }
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
+
+  private def caseFile(tenant: String, caseId: String): HttpResponse = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    Store.getCase(caseId) match {
+      case None => error(StatusCodes.NotFound, "no such case")
+      case Some(found) =>
+        json(
+          StatusCodes.OK,
+          JsObject(
+            "case_id" -> JsString(found.caseId),
+            "content_id" -> JsString(found.contentId),
+            "status" -> JsString(found.status),
+            "reason" -> JsString(found.reason),
+            "reports" -> JsNumber(found.reports),
+            "actions" -> JsArray(Store.actionsOf(found.contentId).toVector),
+            "links" -> JsObject("content" -> JsString(s"/v1/content/\${found.contentId}")),
+            "reporter_id" -> JsString(found.reporterId),
+            "detail" -> JsString(found.detail)))
+    }
+  }
+
+  val route: Route = path("v1" / "moderation" / "items" / Segment) { caseId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case Some(tenant) if tenant.nonEmpty => complete(caseFile(tenant, caseId))
+        case _ => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-object CaseFileApi {
-  implicit val system: ActorSystem = ActorSystem("moderation")
+import moderation.Store // Store.getCase, actionsOf
 
-  val MaxDetailChars = 280
+object Read {
   val SurveyorRole = "surveyor"
-  val CaseTenant = Map("case_5d21" -> "acme", "case_9b07" -> "globex")
+  val MaxDetailChars = 280
 
-  val cases = CaseStore.open()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def escapeHtml(text: String): String =
-    text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\\"", "&quot;")
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  def redact(text: String): String = {
-    val escaped = escapeHtml(text)
-    if (escaped.length <= MaxDetailChars) escaped
-    else escaped.take(MaxDetailChars) + "..."
+  private def escapeHtml(text: String): String = text.flatMap {
+    case '&' => "&amp;"
+    case '<' => "&lt;"
+    case '>' => "&gt;"
+    case '"' => "&quot;"
+    case '\\'' => "&#x27;"
+    case c => c.toString
   }
 
-  val route: Route =
-    path("v1" / "moderation" / "items" / Segment) { caseId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else if (!CaseTenant.get(caseId).contains(tenantOpt.get)) {
-            complete(StatusCodes.NotFound, """{"error":"unknown case"}""")
-          } else {
-            cases.get(caseId) match {
-              case None =>
-                complete(StatusCodes.NotFound, """{"error":"unknown case"}""")
-              case Some(record) =>
-                optionalHeaderValueByName("X-Reviewer-Role") { roleOpt =>
-                  val base =
-                    s"""{"case_id":"$caseId","status":"\${record.status}","detail":"\${redact(record.detail)}"}"""
-                  val body =
-                    if (roleOpt.contains(SurveyorRole))
-                      base.dropRight(1) + s""","reporter_id":"\${record.reporterId}"}"""
-                    else base
-                  complete(StatusCodes.OK, body)
-                }
-            }
+  /** The first n characters (code points, not UTF-16 units) of the text. */
+  private def firstChars(text: String, n: Int): String = {
+    val points = text.codePoints().limit(n.toLong).toArray
+    new String(points, 0, points.length)
+  }
+
+  private def caseFile(tenant: String, role: Option[String], caseId: String): HttpResponse =
+    // Another tenant's case answers exactly as a missing one: a case id is a name, not a permission.
+    Store.getCase(caseId).filter(_.tenant == tenant) match {
+      case None => error(StatusCodes.NotFound, "no such case")
+      case Some(found) =>
+        val fields = Map(
+          "case_id" -> JsString(found.caseId),
+          "content_id" -> JsString(found.contentId),
+          "status" -> JsString(found.status),
+          "reason" -> JsString(found.reason),
+          "reports" -> JsNumber(found.reports),
+          "actions" -> JsArray(Store.actionsOf(found.contentId).toVector),
+          "links" -> JsObject("content" -> JsString(s"/v1/content/\${found.contentId}")),
+          // Cut first, then escape: the cut never lands inside an entity.
+          "detail" -> JsString(escapeHtml(firstChars(found.detail, MaxDetailChars))))
+        val reporter = if (role.contains(SurveyorRole)) Map("reporter_id" -> JsString(found.reporterId)) else Map.empty[String, JsValue]
+        json(StatusCodes.OK, JsObject(fields ++ reporter))
+    }
+
+  val route: Route = path("v1" / "moderation" / "items" / Segment) { caseId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        optionalHeaderValueByName("X-Reviewer-Role") { role =>
+          tenant.filter(_.nonEmpty) match {
+            case Some(t) => complete(caseFile(t, role, caseId))
+            case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -466,130 +473,426 @@ object CaseFileApi {
 
 #include <string>
 
+#include "moderation/store.h"  // store::getCase, actionsOf
+
 using json = nlohmann::json;
 
-struct CaseStore {
-  json get(const std::string& caseId);
-};
-
-CaseStore cases;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get("/v1/moderation/items/([A-Za-z0-9_]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto caseId = req.matches[1];
-    const json record = cases.get(caseId);
-    res.status = 200;
-    res.set_content(
-        json{{"case_id", caseId},
-             {"status", record.value("status", std::string())},
-             {"reporter_id", record.value("reporter_id", std::string())},
-             {"detail", record.value("detail", std::string())}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+void read_case(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "X-Tenant-Id is required"}});
+  const auto found = store::getCase(req.matches[1]);
+  if (!found) return reply(res, 404, {{"error", "no such case"}});
+  reply(res, 200,
+        {{"case_id", found->case_id},
+         {"content_id", found->content_id},
+         {"status", found->status},
+         {"reason", found->reason},
+         {"reports", found->reports},
+         {"actions", store::actionsOf(found->content_id)},
+         {"links", {{"content", "/v1/content/" + found->content_id}}},
+         {"reporter_id", found->reporter_id},
+         {"detail", found->detail}});
+}
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/moderation/items/([\\w-]+))", read_case); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <cstddef>
-#include <map>
-#include <optional>
 #include <string>
+
+#include "moderation/store.h"  // store::getCase, actionsOf
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxDetailChars = 280;
 const std::string kSurveyorRole = "surveyor";
-const std::map<std::string, std::string> kCaseTenant = {{"case_5d21", "acme"}, {"case_9b07", "globex"}};
+constexpr size_t kMaxDetailChars = 280;
 
-struct CaseStore {
-  std::optional<json> get(const std::string& caseId);
-  json actions(const std::string& caseId);
-};
-
-CaseStore cases;
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
 std::string escapeHtml(const std::string& text) {
   std::string out;
   for (const char c : text) {
     switch (c) {
-      case '&':
-        out += "&amp;";
-        break;
-      case '<':
-        out += "&lt;";
-        break;
-      case '>':
-        out += "&gt;";
-        break;
-      case '"':
-        out += "&quot;";
-        break;
-      default:
-        out += c;
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\\'': out += "&#x27;"; break;
+      default: out += c;
     }
   }
   return out;
 }
 
-std::string redact(const std::string& text) {
-  const auto escaped = escapeHtml(text);
-  if (escaped.size() <= kMaxDetailChars) return escaped;
-  return escaped.substr(0, kMaxDetailChars) + "...";
+// The first n characters (code points, not bytes) of UTF-8 text.
+std::string firstChars(const std::string& text, size_t n) {
+  size_t end = 0;
+  size_t chars = 0;
+  for (; end < text.size(); end++) {
+    if ((static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) continue;  // inside a character
+    if (chars == n) break;
+    chars++;
+  }
+  return text.substr(0, end);
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get("/v1/moderation/items/([A-Za-z0-9_]+)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto caseId = req.matches[1];
-    if (kCaseTenant.count(caseId) == 0 || kCaseTenant.at(caseId) != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown case"})", "application/json");
-      return;
-    }
-    const auto record = cases.get(caseId);
-    if (!record) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown case"})", "application/json");
-      return;
-    }
-    json body = {
-        {"case_id", caseId},
-        {"status", record->value("status", std::string())},
-        {"content", json{{"id", record->value("content_id", std::string())},
-                         {"url", record->value("content_url", std::string())}}},
-        {"actions", cases.actions(caseId)},
-        {"detail", redact(record->value("detail", std::string()))},
-    };
-    if (req.get_header_value("X-Reviewer-Role") == kSurveyorRole) {
-      body["reporter_id"] = record->value("reporter_id", std::string());
-    }
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void read_case(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "X-Tenant-Id is required"}});
+  const auto found = store::getCase(req.matches[1]);
+  // Another tenant's case answers exactly as a missing one: a case id is a name, not a permission.
+  if (!found || found->tenant != tenant) return reply(res, 404, {{"error", "no such case"}});
+  json body = {{"case_id", found->case_id},
+               {"content_id", found->content_id},
+               {"status", found->status},
+               {"reason", found->reason},
+               {"reports", found->reports},
+               {"actions", store::actionsOf(found->content_id)},
+               {"links", {{"content", "/v1/content/" + found->content_id}}},
+               // Cut first, then escape: the cut never lands inside an entity.
+               {"detail", escapeHtml(firstChars(found->detail, kMaxDetailChars))}};
+  if (req.get_header_value("X-Reviewer-Role") == kSurveyorRole) body["reporter_id"] = found->reporter_id;
+  reply(res, 200, body);
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/moderation/items/([\\w-]+))", read_case); }
 `,
     },
   },
+  harness: {
+    python: `from moderation import store
+
+MODERATOR = {"X-Tenant-Id": "acme", "X-Reviewer-Role": "moderator"}
+SURVEYOR = {"X-Tenant-Id": "acme", "X-Reviewer-Role": "surveyor"}
+
+
+def _seed(detail="Spam link in bio", reporter="u-17"):
+    case = store.insert_case("acme", "c-1", reporter, "spam", detail)
+    store.put_action({"action_id": f"{case['case_id']}:remove", "case_id": case["case_id"], "content_id": "c-1", "tenant": "acme", "action": "remove", "label": "spam", "confidence": 0.99, "model_version": "clf-2026-10", "actor": "classifier"})
+    return case["case_id"]
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+async def check_route(ctx):
+    case_id = _seed()
+    async with _api(ctx) as c:
+        r = await c.get(f"/v1/moderation/items/{case_id}", headers=MODERATOR)
+        missing = await c.get(f"/v1/moderation/items/{case_id}")
+        unknown = await c.get("/v1/moderation/items/case-404", headers=MODERATOR)
+    assert r.status_code == 200, f"GET /v1/moderation/items/{case_id} answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert (body.get("case_id"), body.get("content_id"), body.get("status")) == (case_id, "c-1", "open"), f"the case file must carry the case id, the content id and the status: {body}"
+    assert [a.get("action") for a in body.get("actions") or []] == ["remove"], f"the case file must list the actions persisted on c-1: {body.get('actions')}"
+    assert missing.status_code == 401, f"a read without X-Tenant-Id answered {missing.status_code}, expected 401"
+    assert unknown.status_code == 404, f"a read of an unknown case answered {unknown.status_code}, expected 404"
+
+
+async def check_tenant_scope(ctx):
+    case_id = _seed()
+    globex = {"X-Tenant-Id": "globex", "X-Reviewer-Role": "surveyor"}
+    async with _api(ctx) as c:
+        foreign = await c.get(f"/v1/moderation/items/{case_id}", headers=globex)
+        unknown = await c.get("/v1/moderation/items/case-404", headers=globex)
+    assert foreign.status_code == 404, f"globex read acme's case {case_id} and got {foreign.status_code}: {foreign.text}"
+    assert foreign.text == unknown.text, f"another tenant's case answered {foreign.text!r} and a missing one {unknown.text!r}: the difference tells globex the id exists"
+
+
+async def check_surveyor_only(ctx):
+    case_id = _seed()
+    async with _api(ctx) as c:
+        moderator = await c.get(f"/v1/moderation/items/{case_id}", headers=MODERATOR)
+        no_role = await c.get(f"/v1/moderation/items/{case_id}", headers={"X-Tenant-Id": "acme"})
+        surveyor = await c.get(f"/v1/moderation/items/{case_id}", headers=SURVEYOR)
+    for who, r in (("a moderator", moderator), ("a caller with no role", no_role)):
+        assert r.status_code == 200, f"{who} got {r.status_code}: {r.text}"
+        assert "reporter_id" not in r.json() and "u-17" not in r.text, f"{who} was shown the reporter: {r.text}"
+    assert surveyor.status_code == 200 and surveyor.json().get("reporter_id") == "u-17", f"a surveyor must see reporter_id u-17, got {surveyor.text}"
+
+
+async def check_detail_escaped(ctx):
+    case_id = _seed(detail='<img src=x onerror="alert(1)">')
+    async with _api(ctx) as c:
+        r = await c.get(f"/v1/moderation/items/{case_id}", headers=MODERATOR)
+    detail = r.json().get("detail", "")
+    assert "<img" not in detail, f"the case file returned the detail as markup: {detail!r}. It runs in the moderator's console"
+    assert detail.startswith("&lt;img src=x onerror=") and detail.endswith("&gt;"), f"the detail must come back HTML-escaped, got {detail!r}"
+
+
+async def check_detail_bounded(ctx):
+    long_case = _seed(detail="a" * 279 + "<b>" + "x" * 5000)
+    accented_case = _seed(detail="é" * 300, reporter="u-18")
+    async with _api(ctx) as c:
+        long = (await c.get(f"/v1/moderation/items/{long_case}", headers=MODERATOR)).json().get("detail", "")
+        accented = (await c.get(f"/v1/moderation/items/{accented_case}", headers=MODERATOR)).json().get("detail", "")
+    assert long == "a" * 279 + "&lt;", f"a 5282-character detail came back as {len(long)} characters ending {long[-12:]!r}, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)"
+    assert accented == "é" * 280, f"300 accented characters came back as {len(accented)} characters, expected the first 280"
+`,
+    typescript: `const MODERATOR = {'X-Tenant-Id': 'acme', 'X-Reviewer-Role': 'moderator'};
+const SURVEYOR = {'X-Tenant-Id': 'acme', 'X-Reviewer-Role': 'surveyor'};
+
+async function read(ctx, detail = 'Spam link in bio', reporter = 'u-17') {
+  const store = ctx.load('/support/moderation/store.ts');
+  const created = await store.insertCase('acme', 'c-1', reporter, 'spam', detail);
+  await store.putAction({action_id: \`\${created.case_id}:remove\`, case_id: created.case_id, content_id: 'c-1', tenant: 'acme', action: 'remove', label: 'spam', confidence: 0.99, model_version: 'clf-2026-10', actor: 'classifier'});
+  return {c: ctx.client(ctx.load('read').app), caseId: created.case_id};
+}
+
+export async function check_route(ctx) {
+  const {c, caseId} = await read(ctx);
+  const r = await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: MODERATOR});
+  const missing = await c.get(\`/v1/moderation/items/\${caseId}\`);
+  const unknown = await c.get('/v1/moderation/items/case-404', {headers: MODERATOR});
+  assert.equal(r.status, 200, \`GET /v1/moderation/items/\${caseId} answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.case_id === caseId && body.content_id === 'c-1' && body.status === 'open', \`the case file must carry the case id, the content id and the status: \${r.text}\`);
+  assert.deepStrictEqual((body.actions ?? []).map(a => a.action), ['remove'], \`the case file must list the actions persisted on c-1: \${JSON.stringify(body.actions)}\`);
+  assert.equal(missing.status, 401, \`a read without X-Tenant-Id answered \${missing.status}, expected 401\`);
+  assert.equal(unknown.status, 404, \`a read of an unknown case answered \${unknown.status}, expected 404\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c, caseId} = await read(ctx);
+  const globex = {'X-Tenant-Id': 'globex', 'X-Reviewer-Role': 'surveyor'};
+  const foreign = await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: globex});
+  const unknown = await c.get('/v1/moderation/items/case-404', {headers: globex});
+  assert.equal(foreign.status, 404, \`globex read acme's case \${caseId} and got \${foreign.status}: \${foreign.text}\`);
+  assert.equal(foreign.text, unknown.text, \`another tenant's case answered \${foreign.text} and a missing one \${unknown.text}: the difference tells globex the id exists\`);
+}
+
+export async function check_surveyor_only(ctx) {
+  const {c, caseId} = await read(ctx);
+  const moderator = await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: MODERATOR});
+  const noRole = await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: {'X-Tenant-Id': 'acme'}});
+  const surveyor = await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: SURVEYOR});
+  for (const [who, r] of [['a moderator', moderator], ['a caller with no role', noRole]] as const) {
+    assert.equal(r.status, 200, \`\${who} got \${r.status}: \${r.text}\`);
+    assert(!('reporter_id' in r.json()) && !r.text.includes('u-17'), \`\${who} was shown the reporter: \${r.text}\`);
+  }
+  assert(surveyor.status === 200 && surveyor.json().reporter_id === 'u-17', \`a surveyor must see reporter_id u-17, got \${surveyor.text}\`);
+}
+
+export async function check_detail_escaped(ctx) {
+  const {c, caseId} = await read(ctx, '<img src=x onerror="alert(1)">');
+  const detail: string = (await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: MODERATOR})).json().detail ?? '';
+  assert(!detail.includes('<img'), \`the case file returned the detail as markup: \${JSON.stringify(detail)}. It runs in the moderator's console\`);
+  assert(detail.startsWith('&lt;img src=x onerror=') && detail.endsWith('&gt;'), \`the detail must come back HTML-escaped, got \${JSON.stringify(detail)}\`);
+}
+
+export async function check_detail_bounded(ctx) {
+  const {c, caseId: longCase} = await read(ctx, 'a'.repeat(279) + '<b>' + 'x'.repeat(5000));
+  const store = ctx.load('/support/moderation/store.ts');
+  const accentedCase = (await store.insertCase('acme', 'c-1', 'u-18', 'spam', 'é'.repeat(300))).case_id;
+  const long: string = (await c.get(\`/v1/moderation/items/\${longCase}\`, {headers: MODERATOR})).json().detail ?? '';
+  const accented: string = (await c.get(\`/v1/moderation/items/\${accentedCase}\`, {headers: MODERATOR})).json().detail ?? '';
+  assert.equal(long, 'a'.repeat(279) + '&lt;', \`a 5282-character detail came back as \${long.length} characters ending \${JSON.stringify(long.slice(-12))}, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)\`);
+  assert.equal(accented, 'é'.repeat(280), \`300 accented characters came back as \${[...accented].length} characters, expected the first 280\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"unicode/utf8"
+
+	"moderation/store"
+
+	"leetbuild/harness"
+)
+
+var readBg = context.Background()
+
+func readSeed(detail, reporter string) string {
+	created := store.InsertCase(readBg, "acme", "c-1", reporter, "spam", detail)
+	store.PutAction(readBg, map[string]any{"action_id": created.CaseID + ":remove", "case_id": created.CaseID, "content_id": "c-1", "tenant": "acme", "action": "remove", "label": "spam", "confidence": 0.99, "model_version": "clf-2026-10", "actor": "classifier"})
+	return created.CaseID
+}
+
+func readClient(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readBody(r *harness.Response) map[string]any {
+	body, _ := r.JSON().(map[string]any)
+	return body
+}
+
+func readDetail(c *harness.HTTP, caseID string) string {
+	detail, _ := readBody(c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator"))["detail"].(string)
+	return detail
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	caseID := readSeed("Spam link in bio", "u-17")
+	c := readClient(ctx)
+	r := c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator")
+	ctx.Equal(r.Status, 200, "GET /v1/moderation/items/%s (%s)", caseID, r.Text())
+	body := readBody(r)
+	ctx.Assert(body["case_id"] == caseID && body["content_id"] == "c-1" && body["status"] == "open", "the case file must carry the case id, the content id and the status: %s", r.Text())
+	actions, _ := body["actions"].([]any)
+	ctx.Assert(len(actions) == 1 && actions[0].(map[string]any)["action"] == "remove", "the case file must list the actions persisted on c-1: %v", body["actions"])
+	ctx.Equal(c.Get("/v1/moderation/items/"+caseID).Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(c.Get("/v1/moderation/items/case-404", "X-Tenant-Id", "acme").Status, 404, "a read of an unknown case")
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	caseID := readSeed("Spam link in bio", "u-17")
+	c := readClient(ctx)
+	foreign := c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "globex", "X-Reviewer-Role", "surveyor")
+	unknown := c.Get("/v1/moderation/items/case-404", "X-Tenant-Id", "globex", "X-Reviewer-Role", "surveyor")
+	ctx.Equal(foreign.Status, 404, "globex read acme's case %s (%s)", caseID, foreign.Text())
+	ctx.Equal(foreign.Text(), unknown.Text(), "another tenant's case must answer exactly as a missing one, or the difference tells globex the id exists; the foreign answer")
+}
+
+func CheckSurveyorOnly(ctx *harness.Ctx) {
+	caseID := readSeed("Spam link in bio", "u-17")
+	c := readClient(ctx)
+	for who, r := range map[string]*harness.Response{
+		"a moderator":           c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator"),
+		"a caller with no role": c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme"),
+	} {
+		ctx.Equal(r.Status, 200, "%s (%s)", who, r.Text())
+		_, shown := readBody(r)["reporter_id"]
+		ctx.Assert(!shown && !strings.Contains(r.Text(), "u-17"), "%s was shown the reporter: %s", who, r.Text())
+	}
+	surveyor := c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "surveyor")
+	ctx.Assert(surveyor.Status == 200 && readBody(surveyor)["reporter_id"] == "u-17", "a surveyor must see reporter_id u-17, got %s", surveyor.Text())
+}
+
+func CheckDetailEscaped(ctx *harness.Ctx) {
+	caseID := readSeed(\`<img src=x onerror="alert(1)">\`, "u-17")
+	detail := readDetail(readClient(ctx), caseID)
+	ctx.Assert(!strings.Contains(detail, "<img"), "the case file returned the detail as markup: %q. It runs in the moderator's console", detail)
+	ctx.Assert(strings.HasPrefix(detail, "&lt;img src=x onerror=") && strings.HasSuffix(detail, "&gt;"), "the detail must come back HTML-escaped, got %q", detail)
+}
+
+func CheckDetailBounded(ctx *harness.Ctx) {
+	longCase := readSeed(strings.Repeat("a", 279)+"<b>"+strings.Repeat("x", 5000), "u-17")
+	accentedCase := readSeed(strings.Repeat("é", 300), "u-18")
+	c := readClient(ctx)
+	long := readDetail(c, longCase)
+	ctx.Assert(long == strings.Repeat("a", 279)+"&lt;", "a 5282-character detail came back as %d characters ending %q, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)", utf8.RuneCountInString(long), long[max(0, len(long)-12):])
+	accented := readDetail(c, accentedCase)
+	ctx.Equal(accented, strings.Repeat("é", 280), "300 accented characters must come back as the first 280; got %d characters", utf8.RuneCountInString(accented))
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+namespace {
+
+std::string readSeed(const std::string& detail, const std::string& reporter = "u-17") {
+  const store::Case created = store::insertCase("acme", "c-1", reporter, "spam", detail);
+  store::putAction({{"action_id", created.case_id + ":remove"}, {"case_id", created.case_id}, {"content_id", "c-1"}, {"tenant", "acme"}, {"action", "remove"},
+                    {"label", "spam"}, {"confidence", 0.99}, {"model_version", "clf-2026-10"}, {"actor", "classifier"}});
+  return created.case_id;
+}
+
+harness::HTTP readClient(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+nlohmann::json readBody(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : nlohmann::json::object();
+}
+
+std::string readDetail(harness::HTTP& c, const std::string& case_id) {
+  return readBody(c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator")).value("detail", "");
+}
+
+std::string repeat(const std::string& s, int n) {
+  std::string out;
+  for (int i = 0; i < n; i++) out += s;
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  const std::string case_id = readSeed("Spam link in bio");
+  auto c = readClient(ctx);
+  const auto r = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator");
+  ctx.Equal(r.Status, 200, "GET /v1/moderation/items/%s (%s)", case_id, r.Text());
+  const auto body = readBody(r);
+  ctx.Assert(body.value("case_id", "") == case_id && body.value("content_id", "") == "c-1" && body.value("status", "") == "open",
+             "the case file must carry the case id, the content id and the status: %s", r.Text());
+  const auto actions = body.value("actions", nlohmann::json::array());
+  ctx.Assert(actions.is_array() && actions.size() == 1 && actions[0].value("action", "") == "remove", "the case file must list the actions persisted on c-1: %s", actions.dump());
+  ctx.Equal(c.Get("/v1/moderation/items/" + case_id).Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(c.Get("/v1/moderation/items/case-404", "X-Tenant-Id", "acme").Status, 404, "a read of an unknown case");
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  const std::string case_id = readSeed("Spam link in bio");
+  auto c = readClient(ctx);
+  const auto foreign = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "globex", "X-Reviewer-Role", "surveyor");
+  const auto unknown = c.Get("/v1/moderation/items/case-404", "X-Tenant-Id", "globex", "X-Reviewer-Role", "surveyor");
+  ctx.Equal(foreign.Status, 404, "globex read acme's case %s (%s)", case_id, foreign.Text());
+  ctx.Equal(foreign.Text(), unknown.Text(), "another tenant's case must answer exactly as a missing one, or the difference tells globex the id exists; the foreign answer");
+}
+
+void CheckSurveyorOnly(harness::Ctx& ctx) {
+  const std::string case_id = readSeed("Spam link in bio");
+  auto c = readClient(ctx);
+  const auto moderator = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator");
+  const auto no_role = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme");
+  for (const auto* r : {&moderator, &no_role}) {
+    ctx.Equal(r->Status, 200, "a reader without the surveyor role (%s)", r->Text());
+    ctx.Assert(!readBody(*r).contains("reporter_id") && r->Text().find("u-17") == std::string::npos, "a reader without the surveyor role was shown the reporter: %s", r->Text());
+  }
+  const auto surveyor = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "surveyor");
+  ctx.Assert(surveyor.Status == 200 && readBody(surveyor).value("reporter_id", "") == "u-17", "a surveyor must see reporter_id u-17, got %s", surveyor.Text());
+}
+
+void CheckDetailEscaped(harness::Ctx& ctx) {
+  const std::string case_id = readSeed(R"html(<img src=x onerror="alert(1)">)html");
+  auto c = readClient(ctx);
+  const std::string detail = readDetail(c, case_id);
+  ctx.Assert(detail.find("<img") == std::string::npos, "the case file returned the detail as markup: %q. It runs in the moderator's console", detail);
+  ctx.Assert(detail.rfind("&lt;img src=x onerror=", 0) == 0 && detail.size() >= 4 && detail.substr(detail.size() - 4) == "&gt;",
+             "the detail must come back HTML-escaped, got %q", detail);
+}
+
+void CheckDetailBounded(harness::Ctx& ctx) {
+  const std::string long_case = readSeed(repeat("a", 279) + "<b>" + repeat("x", 5000));
+  const std::string accented_case = readSeed(repeat("é", 300), "u-18");
+  auto c = readClient(ctx);
+  const std::string long_detail = readDetail(c, long_case);
+  ctx.Assert(long_detail == repeat("a", 279) + "&lt;",
+             "a 5282-character detail came back as %d bytes ending %q, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)",
+             long_detail.size(), long_detail.substr(long_detail.size() > 12 ? long_detail.size() - 12 : 0));
+  ctx.Equal(readDetail(c, accented_case), repeat("é", 280), "300 accented characters must come back as the first 280");
+}
+`,
+  },
   hints: [
-    "A reported user who guesses a case id reads who reported them, a tenant can browse another tenant's cases, and a report containing `<script>` runs in the moderator console.",
-    'The handler does `cases.get(case_id)` with no tenant comparison, builds the body with `reporter_id` unconditionally, and copies `record["detail"]` into the response without escaping or bounding it.',
-    'Compare `CASE_TENANT[case_id]` to the header (404 on mismatch), add `reporter_id` only when the role is `SURVEYOR_ROLE`, and return `html.escape(detail)` cut to `MAX_DETAIL_CHARS`.',
+    'Open acme’s case with `X-Tenant-Id: globex`: it answers. Open any case as a moderator: the reporter’s id is in the body. Store a detail of `<img onerror=…>`: the console runs it.',
+    'The handler asks whether the case exists, not whose it is; the body carries `reporter_id` for every role; the detail goes out as stored, unbounded and unescaped, and escaping before cutting would split `&lt;` in half.',
+    '404 when `case["tenant"] != tenant`; add `reporter_id` only when the role equals `SURVEYOR_ROLE`; answer `html.escape(case["detail"][:MAX_DETAIL_CHARS])`.',
   ],
-  debrief: `The read side needs the same care as the write side because an opaque id is not an access token. The tenant check uses the same catalogue as the report intake and answers 404 rather than 403 so a probe cannot learn that a case exists. The body is built without the reporter and the identity is added only inside the surveyor branch, which is easier to audit than blanking fields later. Escaping happens before truncation so a cut cannot split an entity, and the cap keeps the case file a summary rather than a copy of a private statement. Production case systems also log every view per case, require a recorded reason when a surveyor unmasks a reporter, and seal the raw detail under its own retention policy apart from the case metadata.`,
+  debrief: `A case id is a name, not a permission: the read compares the case's tenant with the caller's, and a foreign case gets the same 404 as a missing one so ids cannot be probed. The reporter's identity is the most sensitive field in the service, and leaving it out of the body for every role but surveyor means nothing downstream of the response can leak it. The detail is someone else's text, so it is escaped before it reaches a page, and cut first so the cut never lands inside an entity. Production case files log every view of a reporter's identity with the viewer and a stated reason, and show moderators the reported content behind a blur until they choose to look.`,
 };

@@ -2,103 +2,102 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Call events keyed by session with redacted transcript refs',
+  title: 'Turn events keyed by session that carry a redacted reference',
   concept: 'kafka',
   file: 'events',
-  focus: ['gateway', 'kafka', 'transcripts', 'consumer'],
+  focus: ['gateway', 'kafka', 'consumer', 'transcripts'],
   task: `## Task
 
-**Starting point.** The starter takes a finished turn on \`POST /v1/voice/turns\`, publishes a \`voice.turn\` event, and the consumer stores the turn and commits, so the demo shows turns arriving. It serves the demo and hides five flaws.
+**Starting point.** The starter is the turn path: \`record_turn(session, turn)\` produces one
+\`voice.turn\` record per finished turn (\`turn\` is \`{turn_index, started_at, ended_at, text}\`) and
+raises when the delivery report says the broker refused it; \`run()\` is the transcript consumer
+(group \`transcripts\`), which commits each record's offset and then calls
+\`transcripts.insert_turn(event)\`. It serves the demo call and hides four flaws.
 
-**Failure mode the checks target.** A user-keyed event scatters one session's turns across partitions and loses order; raw speech in a retained topic is a data leak with a long tail; an unconfigured producer duplicates on retry; a bare counter without timings cannot be placed in time; and commit-before-process trades correctness for code that merely looks exactly-once.
+**Failure mode the checks target.** One call's turns land on different partitions and its
+transcript assembles out of order; the caller's words, card number included, sit in a topic
+retained for a week; a broker that lost an acknowledgement gets the turn twice; and a consumer that
+crashes between its commit and its write loses the turn.
 
-- Publish **one** \`voice.turn\` event per turn with the **session id** as the message key, so one transcript assembles in order.
-- The payload carries ids only: \`session_id\`, \`tenant\`, \`turn_index\`, \`started_at\`, \`ended_at\` (the timings) and \`transcript_ref\`, a reference to the stored, redacted transcript. No raw speech (\`transcript_text\`) and no audio (\`audio_bytes\`): the topic is retained for days and replicated, so content written there outlives every retention policy the call has.
-- The producer is **idempotent with \`acks=all\`**, so a retried produce cannot duplicate a record.
-- The consumer writes the transcript row (\`insert_turn\`) and **only then** commits the offset.`,
+- The record key is the **session id**.
+- The payload is \`session_id\`, \`tenant\`, \`turn_index\`, \`started_at\`, \`ended_at\` and
+  \`transcript_ref\`, the reference \`transcripts.redact(session_id, turn_index, text)\` returns, and
+  no text.
+- The producer is idempotent with \`acks=all\` (kafkajs \`idempotent: true\` with \`acks: -1\`; the Go
+  service uses confluent-kafka-go, since kafka-go has no idempotent producer).
+- The consumer calls \`insert_turn\` and **only then** commits; a failed write is not committed.`,
   sequence: {
-    participants: ['Voice Gateway', 'voice.turn', 'Transcript consumer', 'Transcript store'],
+    participants: ['Voice Gateway', 'Transcript store', 'voice.turn', 'Transcript consumer'],
     messages: [
-      {from: 'Voice Gateway', to: 'voice.turn', label: 'produce · key = session_id · acks = all', kind: 'sync'},
-      {from: 'voice.turn', to: 'Voice Gateway', label: 'ack / broker error', kind: 'reply'},
-      {from: 'voice.turn', to: 'Transcript consumer', label: 'consume · group transcripts', kind: 'async'},
       {
-        from: 'Transcript consumer',
+        from: 'Voice Gateway',
         to: 'Transcript store',
-        label: 'insert_turn(tenant, session_id, turn_index, transcript_ref)',
+        label: 'redact(session, turn, text) → transcript_ref',
         kind: 'sync',
       },
-      {from: 'Transcript store', to: 'Transcript consumer', label: 'row persisted', kind: 'reply'},
-      {from: 'Transcript consumer', to: 'voice.turn', label: 'commit offset after the row is durable', kind: 'async'},
+      {
+        from: 'Voice Gateway',
+        to: 'voice.turn',
+        label: 'produce key = session_id · {turn_index, timings, transcript_ref} · acks=all',
+        kind: 'sync',
+      },
+      {from: 'voice.turn', to: 'Voice Gateway', label: 'delivery report (once, idempotent on retry)', kind: 'reply'},
+      {from: 'voice.turn', to: 'Transcript consumer', label: 'consume · group transcripts', kind: 'async'},
+      {from: 'Transcript consumer', to: 'Transcript store', label: 'insert_turn(event)', kind: 'sync'},
+      {from: 'Transcript consumer', to: 'voice.turn', label: 'commit offset', kind: 'sync'},
     ],
   },
-  hints: [
-    'Support pulls a transcript and the turns of two calls from the same user are shuffled together; a compliance scan then finds verbatim speech and audio blobs sitting in the topic a week later.',
-    'The producer keys on the user id, so concurrent sessions share partitions; the event body copies `transcript_text` and `audio_bytes`; the producer has default acks; the consumer commits before `insert_turn`.',
-    'Key by `session_id`, send `turn_index`, `started_at`, `ended_at` and `transcript_ref` only, enable idempotence with `acks=all` (KafkaJS `idempotent: true`, `acks: -1`), and call `insert_turn` before the commit.',
-  ],
   checks: [
     {
       id: 'session-key',
       title: 'Keyed by session id so a transcript assembles in order',
-      detail: "The message key is the session id, so one call's turns land on one partition and assemble in order.",
+      detail:
+        'The record key is the session id (`key=session["session_id"]`, `key: session.session_id`, `[]byte(session.SessionID)`), so one call\'s turns share a partition and stay in order; the starter sends no key.',
       match: {
-        python: {all: [/key=session_id/]},
-        typescript: {all: [/key:\s*sessionId\b/]},
-        go: {all: [/Key:\s*\[\]byte\(sessionId\)/]},
-        scala: {all: [/ProducerRecord\("voice.turn",\s*sessionId/]},
-        cpp: {all: [/produce\([^;\n]*sessionId/]},
+        python: {all: [/key\s*=\s*session\[["']session_id["']\]/]},
+        typescript: {all: [/key:\s*session\.session_id/]},
+        go: {all: [/Key:\s*\[\]byte\(session\.SessionID\)/]},
+        scala: {all: [/ProducerRecord\[String, String\]\(TurnTopic,\s*session\.sessionId/]},
+        cpp: {all: [/session\.session_id\.c_str\(\),\s*session\.session_id\.(size|length)\(\)/]},
       },
     },
     {
-      id: 'no-raw-speech',
-      title: 'References the redacted transcript, never raw speech',
-      detail: 'The event carries `transcript_ref` and no `transcript_text` or `audio_bytes` anywhere in the file.',
+      id: 'redacted-payload',
+      title: 'Carries the redacted transcript reference, never the words',
+      detail:
+        'The payload carries `transcript_ref` from `transcripts.redact` plus the turn index and timings, and no text: the topic is retained and replicated, so what is written there outlives the call.',
       match: {
-        python: {all: [/transcript_ref/], none: [/transcript_text/, /audio_bytes/]},
-        typescript: {all: [/transcript_ref/], none: [/transcript_text/, /audio_bytes/]},
-        go: {all: [/transcript_ref/], none: [/transcript_text/, /audio_bytes/]},
-        scala: {all: [/transcript_ref/], none: [/transcript_text/, /audio_bytes/]},
-        cpp: {all: [/transcript_ref/], none: [/transcript_text/, /audio_bytes/]},
+        python: {all: [/transcripts\.redact\(/, /["']transcript_ref["']/], none: [/["']text["']\s*:\s*turn\[/]},
+        typescript: {all: [/\bredact\(/, /transcript_ref:/], none: [/text:\s*turn\.text/]},
+        go: {all: [/transcripts\.Redact\(/, /"transcript_ref"/], none: [/"text":\s*turn\.Text/]},
+        scala: {all: [/Transcripts\.redact\(/, /"transcript_ref"/], none: [/"text"\s*->/]},
+        cpp: {all: [/transcripts::redact\(/, /"transcript_ref"/], none: [/\{"text",\s*turn\.text\}/]},
       },
     },
     {
-      id: 'idempotent-acks',
+      id: 'idempotent-producer',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all`: `enable.idempotence` + `acks`, KafkaJS `idempotent: true` + `acks: -1`, `RequiredAcks: kafka.RequireAll` with a hash balancer.',
+        'The producer sets idempotence with `acks=all` (`enable.idempotence` plus `acks`, kafkajs `idempotent: true` with `acks: -1`), so a retry after a lost acknowledgement writes the turn once and a leader failover keeps it.',
       match: {
-        python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
+        python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
-        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /Balancer:\s*&kafka\.Hash\{\}/]},
-        scala: {all: [/enable\.idempotence/, /"acks"/]},
-        cpp: {all: [/enable\.idempotence/, /set\("acks",\s*"all"/]},
+        go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"(all|-1)"/]},
+        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"(all|-1)"/]},
+        cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"(all|-1)"/]},
       },
     },
     {
       id: 'persist-before-commit',
-      title: 'Persists the transcript before committing the offset',
+      title: 'Stores the turn before committing its offset',
       detail:
-        'The consumer runs `insert_turn` before committing the offset; committing first makes a crash lose the turn.',
+        'The consumer calls `insert_turn` and commits only afterwards, so a crash or a failed write redelivers the turn; the starter commits first.',
       match: {
-        python: {order: [/insert_turn\(/, /consumer\.commit\(/]},
-        typescript: {order: [/insert_turn\(/, /commitOffsets\(/]},
-        go: {order: [/insertTurn\(/, /CommitMessages\(/]},
-        scala: {order: [/insertTurn\(/, /commitSync\(/]},
-        cpp: {order: [/insert_turn\(/, /commitSync\(/]},
-      },
-    },
-    {
-      id: 'turn-payload',
-      title: 'Carries the turn index, timings and the transcript ref',
-      detail:
-        'The event carries `turn_index`, the timings (`started_at`, `ended_at`) and `transcript_ref`, so a consumer can place the turn in time.',
-      match: {
-        python: {all: [/turn_index/, /transcript_ref/]},
-        typescript: {all: [/turn_index/, /transcript_ref/]},
-        go: {all: [/turn_index/, /transcript_ref/]},
-        scala: {all: [/turn_index/, /transcript_ref/]},
-        cpp: {all: [/turn_index/, /transcript_ref/]},
+        python: {order: [/transcripts\.insert_turn\(/, /consumer\.commit\(/]},
+        typescript: {order: [/await insertTurn\(/, /commitOffsets\(/]},
+        go: {order: [/transcripts\.InsertTurn\(/, /consumer\.CommitMessage\(/]},
+        scala: {order: [/Transcripts\.insertTurn\(/, /consumer\.commitSync\(/]},
+        cpp: {order: [/transcripts::insertTurn\(/, /consumer->commitSync\(/]},
       },
     },
   ],
@@ -108,257 +107,220 @@ export const eventsStep: Step = {
 import logging
 
 from confluent_kafka import Consumer, Producer
-from fastapi import FastAPI, Header
-from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("voice-gateway")
+from voice import transcripts  # redact, insert_turn
 
-producer = Producer({"bootstrap.servers": "kafka:9092"})
+TOPIC = "voice.turn"
+GROUP = "transcripts"
+log = logging.getLogger("voice-turns")
 
-
-class TurnRequest(BaseModel):
-    session_id: str
-    user_id: str
-    turn: int
-    started_at: str
-    ended_at: str
-    transcript_text: str
-    audio_bytes: str
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 
 
-@app.post("/v1/voice/turns")
-def post_turn(body: TurnRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    logger.info("turn session=%s user=%s text=%r", body.session_id, body.user_id, body.transcript_text)
+class TurnNotRecorded(Exception):
+    pass
+
+
+def record_turn(session: dict, turn: dict) -> dict:
+    """Publish one finished turn ({turn_index, started_at, ended_at, text}); returns the event."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     event = {
-        "session_id": body.session_id,
-        "tenant": tenant,
-        "turn": body.turn,
-        "started_at": body.started_at,
-        "ended_at": body.ended_at,
-        "text": body.transcript_text,
-        "audio_bytes": body.audio_bytes,
+        "session_id": session["session_id"],
+        "tenant": session["tenant"],
+        "turn_index": turn["turn_index"],
+        "started_at": turn["started_at"],
+        "ended_at": turn["ended_at"],
+        "text": turn["text"],
     }
-    producer.produce("voice.turn", key=body.user_id, value=json.dumps(event))
-    producer.flush()
-    return {"accepted": True}
+    outcome = {}
+
+    def on_delivery(err, msg):
+        outcome["error"] = err
+
+    producer.produce(TOPIC, value=json.dumps(event), on_delivery=on_delivery)
+    if producer.flush(5.0) > 0 or outcome.get("error") is not None:
+        raise TurnNotRecorded(f"voice.turn not acknowledged: {outcome.get('error')}")
+    return event
 
 
-def consume() -> None:
-    consumer = Consumer(
-        {"bootstrap.servers": "kafka:9092", "group.id": "transcripts", "enable.auto.commit": False}
-    )
-    consumer.subscribe(["voice.turn"])
+consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": GROUP, "auto.offset.reset": "earliest", "enable.auto.commit": False})
+consumer.subscribe([TOPIC])
+
+
+def run() -> None:
+    """The transcript consumer: one row per voice.turn record."""
     while True:
         msg = consumer.poll(1.0)
         if msg is None:
             continue
-        consumer.commit(msg)
-        event = json.loads(msg.value())
-        store.append_turn(event["tenant"], event["session_id"], event["turn"], event["text"])
-
-
-class TranscriptStore:
-    def append_turn(self, tenant: str, session_id: str, turn: int, text: str) -> None:
-        """Stub: appends one turn to the stored transcript in arrival order."""
-        raise NotImplementedError
-
-
-store = TranscriptStore()
+        if msg.error():
+            log.error("consumer error: %s", msg.error())
+            continue
+        consumer.commit(message=msg, asynchronous=False)
+        transcripts.insert_turn(json.loads(msg.value()))
 `,
       solution: `import json
 import logging
 
 from confluent_kafka import Consumer, Producer
-from fastapi import FastAPI, Header
-from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("voice-gateway")
+from voice import transcripts  # redact, insert_turn
 
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
-    }
-)
+TOPIC = "voice.turn"
+GROUP = "transcripts"
+log = logging.getLogger("voice-turns")
+
+# Idempotent with acks=all: a retry after a lost acknowledgement writes the turn once, on every replica.
+producer = Producer({"bootstrap.servers": "kafka:9092", "enable.idempotence": True, "acks": "all"})
 
 
-class TurnRequest(BaseModel):
-    session_id: str
-    turn_index: int
-    started_at: str
-    ended_at: str
-    transcript_ref: str
+class TurnNotRecorded(Exception):
+    pass
 
 
-@app.post("/v1/voice/turns")
-def post_turn(body: TurnRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    session_id = body.session_id
+def record_turn(session: dict, turn: dict) -> dict:
+    """Publish one finished turn ({turn_index, started_at, ended_at, text}); returns the event."""
     event = {
-        "session_id": session_id,
-        "tenant": tenant,
-        "turn_index": body.turn_index,
-        "started_at": body.started_at,
-        "ended_at": body.ended_at,
-        "transcript_ref": body.transcript_ref,
+        "session_id": session["session_id"],
+        "tenant": session["tenant"],
+        "turn_index": turn["turn_index"],
+        "started_at": turn["started_at"],
+        "ended_at": turn["ended_at"],
+        # The redacted text stays in the transcript store; the retained topic carries where it is.
+        "transcript_ref": transcripts.redact(session["session_id"], turn["turn_index"], turn["text"]),
     }
-    producer.produce("voice.turn", key=session_id, value=json.dumps(event))
-    producer.flush(2.0)
-    logger.info("turn published session=%s turn=%d", session_id, body.turn_index)
-    return {"accepted": True}
+    outcome = {}
+
+    def on_delivery(err, msg):
+        outcome["error"] = err
+
+    producer.produce(TOPIC, key=session["session_id"], value=json.dumps(event), on_delivery=on_delivery)
+    if producer.flush(5.0) > 0 or outcome.get("error") is not None:
+        raise TurnNotRecorded(f"voice.turn not acknowledged: {outcome.get('error')}")
+    return event
 
 
-def consume() -> None:
-    consumer = Consumer(
-        {"bootstrap.servers": "kafka:9092", "group.id": "transcripts", "enable.auto.commit": False}
-    )
-    consumer.subscribe(["voice.turn"])
+consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": GROUP, "auto.offset.reset": "earliest", "enable.auto.commit": False})
+consumer.subscribe([TOPIC])
+
+
+def run() -> None:
+    """The transcript consumer: one row per voice.turn record."""
     while True:
         msg = consumer.poll(1.0)
         if msg is None:
             continue
-        event = json.loads(msg.value())
-        store.insert_turn(
-            event["tenant"], event["session_id"], event["turn_index"], event["transcript_ref"]
-        )
-        consumer.commit(msg)
-
-
-class TranscriptStore:
-    def insert_turn(self, tenant: str, session_id: str, turn_index: int, transcript_ref: str) -> None:
-        """Stub: one row per finished turn; the transcript reads the rows in turn_index order."""
-        raise NotImplementedError
-
-
-store = TranscriptStore()
+        if msg.error():
+            log.error("consumer error: %s", msg.error())
+            continue
+        transcripts.insert_turn(json.loads(msg.value()))
+        consumer.commit(message=msg, asynchronous=False)  # the row is durable: a crash before this redelivers it
 `,
     },
     typescript: {
-      starter: `/** voice.turn. */
-import Fastify from 'fastify';
-import {Kafka} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
 
-import {store} from './transcripts';
+import {type Session} from 'voice/sessions';
+import {type TurnEvent, insertTurn, redact} from 'voice/transcripts';
 
-export const app = Fastify();
+export const TOPIC = 'voice.turn';
+export const GROUP = 'transcripts';
+
+export interface Turn {
+  turn_index: number;
+  started_at: number;
+  ended_at: number;
+  text: string;
+}
+
 const kafka = new Kafka({clientId: 'voice-gateway', brokers: ['kafka:9092']});
 const producer = kafka.producer();
-void producer.connect();
+let connected: Promise<void> | null = null;
 
-interface TurnBody {
-  session_id: string;
-  user_id: string;
-  turn: number;
-  started_at: string;
-  ended_at: string;
-  transcript_text: string;
-  audio_bytes: string;
+/** Publish one finished turn; returns the event. A rejected send is the broker refusing it. */
+export async function recordTurn(session: Session, turn: Turn): Promise<Record<string, unknown>> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  connected ??= producer.connect();
+  await connected;
+  const event = {
+    session_id: session.session_id,
+    tenant: session.tenant,
+    turn_index: turn.turn_index,
+    started_at: turn.started_at,
+    ended_at: turn.ended_at,
+    text: turn.text,
+  };
+  await producer.send({topic: TOPIC, acks: 1, messages: [{value: JSON.stringify(event)}]});
+  return event;
 }
 
-app.post('/v1/voice/turns', async (request, reply) => {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as TurnBody;
-  request.log.info({session_id: body.session_id, text: body.transcript_text}, 'turn finished');
-  const event = {
-    session_id: body.session_id,
-    tenant,
-    turn: body.turn,
-    started_at: body.started_at,
-    ended_at: body.ended_at,
-    text: body.transcript_text,
-    audio_bytes: body.audio_bytes,
-  };
-  await producer.send({
-    topic: 'voice.turn',
-    messages: [{key: body.user_id, value: JSON.stringify(event)}],
-  });
-  return reply.code(202).send({accepted: true});
-});
+const consumer = kafka.consumer({groupId: GROUP});
 
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'transcripts'});
+/** The transcript consumer: one row per voice.turn record. */
+export async function run(): Promise<void> {
   await consumer.connect();
-  await consumer.subscribe({topic: 'voice.turn'});
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
   await consumer.run({
     autoCommit: false,
     eachMessage: async ({topic, partition, message}) => {
       await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {
-        tenant: string;
-        session_id: string;
-        turn: number;
-        text: string;
-      };
-      await store.appendTurn(event.tenant, event.session_id, event.turn, event.text);
+      await insertTurn(JSON.parse(message.value?.toString() ?? '{}') as TurnEvent);
     },
   });
 }
-
-void app.listen({port: 8453, host: '0.0.0.0'});
 `,
-      solution: `/** voice.turn: one session-keyed event per turn; the offset commits only after the row lands. */
-import Fastify from 'fastify';
-import {Kafka} from 'kafkajs';
+      solution: `import {Kafka} from 'kafkajs';
 
-import {store} from './transcripts';
+import {type Session} from 'voice/sessions';
+import {type TurnEvent, insertTurn, redact} from 'voice/transcripts';
 
-export const app = Fastify();
-const kafka = new Kafka({clientId: 'voice-gateway', brokers: ['kafka:9092']});
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
-void producer.connect();
+export const TOPIC = 'voice.turn';
+export const GROUP = 'transcripts';
 
-interface TurnBody {
-  session_id: string;
+export interface Turn {
   turn_index: number;
-  started_at: string;
-  ended_at: string;
-  transcript_ref: string;
+  started_at: number;
+  ended_at: number;
+  text: string;
 }
 
-app.post('/v1/voice/turns', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as TurnBody;
-  const sessionId = body.session_id;
-  const event = {
-    session_id: sessionId,
-    tenant,
-    turn_index: body.turn_index,
-    started_at: body.started_at,
-    ended_at: body.ended_at,
-    transcript_ref: body.transcript_ref,
-  };
-  await producer.send({
-    topic: 'voice.turn',
-    acks: -1,
-    messages: [{key: sessionId, value: JSON.stringify(event)}],
-  });
-  return reply.code(202).send({accepted: true});
-});
+const kafka = new Kafka({clientId: 'voice-gateway', brokers: ['kafka:9092']});
+// Idempotent with acks -1 (all): a retry after a lost acknowledgement writes the turn once, on every replica.
+const producer = kafka.producer({idempotent: true});
+let connected: Promise<void> | null = null;
 
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'transcripts'});
+/** Publish one finished turn; returns the event. A rejected send is the broker refusing it. */
+export async function recordTurn(session: Session, turn: Turn): Promise<Record<string, unknown>> {
+  connected ??= producer.connect();
+  await connected;
+  const event = {
+    session_id: session.session_id,
+    tenant: session.tenant,
+    turn_index: turn.turn_index,
+    started_at: turn.started_at,
+    ended_at: turn.ended_at,
+    // The redacted text stays in the transcript store; the retained topic carries where it is.
+    transcript_ref: await redact(session.session_id, turn.turn_index, turn.text),
+  };
+  await producer.send({topic: TOPIC, acks: -1, messages: [{key: session.session_id, value: JSON.stringify(event)}]});
+  return event;
+}
+
+const consumer = kafka.consumer({groupId: GROUP});
+
+/** The transcript consumer: one row per voice.turn record. */
+export async function run(): Promise<void> {
   await consumer.connect();
-  await consumer.subscribe({topic: 'voice.turn'});
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
   await consumer.run({
     autoCommit: false,
     eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {
-        tenant: string;
-        session_id: string;
-        turn_index: number;
-        transcript_ref: string;
-      };
-      await store.insert_turn(event.tenant, event.session_id, event.turn_index, event.transcript_ref);
+      await insertTurn(JSON.parse(message.value?.toString() ?? '{}') as TurnEvent);
+      // The row is durable: a crash before this commit redelivers the turn.
       await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
     },
   });
 }
-
-void app.listen({port: 8453, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -367,76 +329,97 @@ void app.listen({port: 8453, host: '0.0.0.0'});
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
+	"fmt"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"voice/sessions"    // sessions.Session
+	"voice/transcripts" // transcripts.Redact, InsertTurn, Event
 )
 
-var turnWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "voice.turn"}
+const (
+	turnTopic  = "voice.turn"
+	turnGroup  = "transcripts"
+	ackTimeout = 5 * time.Second
+)
 
-// TranscriptStore is the durable transcript: one row per finished turn.
-type TranscriptStore struct{}
-
-func (s *TranscriptStore) appendTurn(ctx context.Context, tenant string, sessionID string, turn int, text string) error {
-	return nil
+// Turn is one finished turn of a call, as the speech loop hands it over.
+type Turn struct {
+	TurnIndex int
+	StartedAt int64
+	EndedAt   int64
+	Text      string
 }
 
-var store = &TranscriptStore{}
+var producer = newProducer()
 
-type TurnRequest struct {
-	SessionID      string \`json:"session_id"\`
-	UserID         string \`json:"user_id"\`
-	Turn           int    \`json:"turn"\`
-	StartedAt      string \`json:"started_at"\`
-	EndedAt        string \`json:"ended_at"\`
-	TranscriptText string \`json:"transcript_text"\`
-	AudioBytes     string \`json:"audio_bytes"\`
-}
-
-func postTurn(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	var body TurnRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(rw, "bad request", http.StatusBadRequest)
-		return
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
 	}
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	log.Printf("turn session=%s user=%s text=%q", body.SessionID, body.UserID, body.TranscriptText)
+	return p
+}
+
+// recordTurn publishes one finished turn and returns the event; an error when the broker did not take it.
+func recordTurn(ctx context.Context, session sessions.Session, turn Turn) (map[string]any, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
-		"session_id":  body.SessionID,
-		"tenant":      tenant,
-		"turn":        body.Turn,
-		"started_at":  body.StartedAt,
-		"ended_at":    body.EndedAt,
-		"text":        body.TranscriptText,
-		"audio_bytes": body.AudioBytes,
+		"session_id": session.SessionID,
+		"tenant":     session.Tenant,
+		"turn_index": turn.TurnIndex,
+		"started_at": turn.StartedAt,
+		"ended_at":   turn.EndedAt,
+		"text":       turn.Text,
 	}
-	payload, _ := json.Marshal(event)
-	_ = turnWriter.WriteMessages(r.Context(), kafka.Message{Key: []byte(body.UserID), Value: payload})
-	rw.WriteHeader(http.StatusAccepted)
+	value, _ := json.Marshal(event)
+	topic := turnTopic
+	deliveries := make(chan kafka.Event, 1)
+	if err := producer.Produce(&kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny}, Value: value}, deliveries); err != nil {
+		return nil, err
+	}
+	select {
+	case e := <-deliveries:
+		if err := e.(*kafka.Message).TopicPartition.Error; err != nil {
+			return nil, err
+		}
+	case <-time.After(ackTimeout):
+		return nil, fmt.Errorf("voice.turn not acknowledged within %v", ackTimeout)
+	}
+	return event, nil
 }
 
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   "voice.turn",
-		GroupID: "transcripts",
-	})
+var consumer = newConsumer()
+
+func newConsumer() *kafka.Consumer {
+	c, err := kafka.NewConsumer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "group.id": turnGroup, "auto.offset.reset": "earliest", "enable.auto.commit": false})
+	if err != nil {
+		panic(err)
+	}
+	return c
+}
+
+// run is the transcript consumer: one row per voice.turn record.
+func run(ctx context.Context) error {
+	if err := consumer.SubscribeTopics([]string{turnTopic}, nil); err != nil {
+		return err
+	}
 	for {
-		msg, err := reader.FetchMessage(ctx)
-		if err != nil {
+		msg, ok := consumer.Poll(1000).(*kafka.Message)
+		if !ok {
 			continue
 		}
-		_ = reader.CommitMessages(ctx, msg)
-		var event struct {
-			SessionID string \`json:"session_id"\`
-			Tenant    string \`json:"tenant"\`
-			Turn      int    \`json:"turn"\`
-			Text      string \`json:"text"\`
+		if _, err := consumer.CommitMessage(msg); err != nil {
+			return err
 		}
-		_ = json.Unmarshal(msg.Value, &event)
-		_ = store.appendTurn(ctx, event.Tenant, event.SessionID, event.Turn, event.Text)
+		var event transcripts.Event
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			return err
+		}
+		if err := transcripts.InsertTurn(ctx, event); err != nil {
+			return err
+		}
 	}
 }
 `,
@@ -445,95 +428,99 @@ func consume(ctx context.Context) {
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
+	"fmt"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"voice/sessions"    // sessions.Session
+	"voice/transcripts" // transcripts.Redact, InsertTurn, Event
 )
 
-// RequiredAcks=RequireAll with a stable hash balancer is the kafka-go equivalent of an idempotent
-// producer: the broker acknowledges the record once it is replicated, and a retry of the same
-// session key lands on the same partition instead of duplicating across partitions.
-var turnWriter = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        "voice.turn",
-	RequiredAcks: kafka.RequireAll,
-	Balancer:     &kafka.Hash{},
-	Async:        false,
+const (
+	turnTopic  = "voice.turn"
+	turnGroup  = "transcripts"
+	ackTimeout = 5 * time.Second
+)
+
+// Turn is one finished turn of a call, as the speech loop hands it over.
+type Turn struct {
+	TurnIndex int
+	StartedAt int64
+	EndedAt   int64
+	Text      string
 }
 
-// TranscriptStore is the durable transcript: one row per finished turn, read in turn_index order.
-type TranscriptStore struct{}
+var producer = newProducer()
 
-func (s *TranscriptStore) insertTurn(ctx context.Context, tenant string, sessionID string, turnIndex int, transcriptRef string) error {
-	return nil
-}
-
-var store = &TranscriptStore{}
-
-type TurnRequest struct {
-	SessionID     string \`json:"session_id"\`
-	TurnIndex     int    \`json:"turn_index"\`
-	StartedAt     string \`json:"started_at"\`
-	EndedAt       string \`json:"ended_at"\`
-	TranscriptRef string \`json:"transcript_ref"\`
-}
-
-func postTurn(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	var body TurnRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(rw, "bad request", http.StatusBadRequest)
-		return
-	}
-	sessionId := body.SessionID
-	event := map[string]any{
-		"session_id":     sessionId,
-		"tenant":         tenant,
-		"turn_index":     body.TurnIndex,
-		"started_at":     body.StartedAt,
-		"ended_at":       body.EndedAt,
-		"transcript_ref": body.TranscriptRef,
-	}
-	payload, err := json.Marshal(event)
-	if err != nil {
-		http.Error(rw, "cannot encode event", http.StatusInternalServerError)
-		return
-	}
-	if err := turnWriter.WriteMessages(r.Context(), kafka.Message{Key: []byte(sessionId), Value: payload}); err != nil {
-		log.Printf("produce rejected session=%s turn=%d", sessionId, body.TurnIndex)
-		http.Error(rw, "broker unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	rw.WriteHeader(http.StatusAccepted)
-}
-
-func consume(ctx context.Context) error {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   "voice.turn",
-		GroupID: "transcripts",
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the turn before the broker answers
+		"enable.idempotence": true,  // a write retried after a lost acknowledgement lands once
 	})
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
+
+// recordTurn publishes one finished turn and returns the event; an error when the broker did not take it.
+func recordTurn(ctx context.Context, session sessions.Session, turn Turn) (map[string]any, error) {
+	event := map[string]any{
+		"session_id": session.SessionID,
+		"tenant":     session.Tenant,
+		"turn_index": turn.TurnIndex,
+		"started_at": turn.StartedAt,
+		"ended_at":   turn.EndedAt,
+		// The redacted text stays in the transcript store; the retained topic carries where it is.
+		"transcript_ref": transcripts.Redact(ctx, session.SessionID, turn.TurnIndex, turn.Text),
+	}
+	value, _ := json.Marshal(event)
+	topic := turnTopic
+	deliveries := make(chan kafka.Event, 1)
+	if err := producer.Produce(&kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny}, Key: []byte(session.SessionID), Value: value}, deliveries); err != nil {
+		return nil, err
+	}
+	select {
+	case e := <-deliveries:
+		if err := e.(*kafka.Message).TopicPartition.Error; err != nil {
+			return nil, err
+		}
+	case <-time.After(ackTimeout):
+		return nil, fmt.Errorf("voice.turn not acknowledged within %v", ackTimeout)
+	}
+	return event, nil
+}
+
+var consumer = newConsumer()
+
+func newConsumer() *kafka.Consumer {
+	c, err := kafka.NewConsumer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "group.id": turnGroup, "auto.offset.reset": "earliest", "enable.auto.commit": false})
+	if err != nil {
+		panic(err)
+	}
+	return c
+}
+
+// run is the transcript consumer: one row per voice.turn record.
+func run(ctx context.Context) error {
+	if err := consumer.SubscribeTopics([]string{turnTopic}, nil); err != nil {
+		return err
+	}
 	for {
-		msg, err := reader.FetchMessage(ctx)
-		if err != nil {
-			return err
-		}
-		var event struct {
-			SessionID     string \`json:"session_id"\`
-			Tenant        string \`json:"tenant"\`
-			TurnIndex     int    \`json:"turn_index"\`
-			TranscriptRef string \`json:"transcript_ref"\`
-		}
-		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			log.Printf("skipping malformed record at offset %d", msg.Offset)
-			_ = reader.CommitMessages(ctx, msg)
+		msg, ok := consumer.Poll(1000).(*kafka.Message)
+		if !ok {
 			continue
 		}
-		if err := store.insertTurn(ctx, event.Tenant, event.SessionID, event.TurnIndex, event.TranscriptRef); err != nil {
+		var event transcripts.Event
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
 			return err
 		}
-		if err := reader.CommitMessages(ctx, msg); err != nil {
+		if err := transcripts.InsertTurn(ctx, event); err != nil {
+			return err // not committed: the turn is redelivered
+		}
+		if _, err := consumer.CommitMessage(msg); err != nil {
 			return err
 		}
 	}
@@ -541,246 +528,740 @@ func consume(ctx context.Context) error {
 `,
     },
     scala: {
-      starter: `import java.util.Properties
+      starter: `import java.time.Duration
+import java.util.Properties
+import java.util.concurrent.TimeUnit
 
-import org.apache.kafka.clients.consumer.KafkaConsumer
+import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import spray.json._
 
-object VoiceEvents {
-  val Topic = "voice.turn"
+import voice.Sessions.Session
+import voice.Transcripts // Transcripts.redact, insertTurn
 
-  private val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  val producer = new KafkaProducer[String, String](props)
+import scala.jdk.CollectionConverters._
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def publish(
-      tenant: String,
-      sessionId: String,
-      userId: String,
-      turn: Int,
-      startedAt: String,
-      endedAt: String,
-      transcriptText: String,
-      audioBytes: String,
-  ): Unit = {
-    println(s"turn session=$sessionId user=$userId text=$transcriptText")
-    val payload = Map(
-      "session_id" -> sessionId,
-      "tenant" -> tenant,
-      "turn" -> turn.toString,
-      "started_at" -> startedAt,
-      "ended_at" -> endedAt,
-      "transcript_text" -> transcriptText,
-      "audio_bytes" -> audioBytes,
-    ).toJson.compactPrint
-    producer.send(new ProducerRecord("voice.turn", userId, payload))
+object Events {
+  val TurnTopic = "voice.turn"
+  val TurnGroup = "transcripts"
+
+  /** One finished turn of a call, as the speech loop hands it over. */
+  final case class Turn(turnIndex: Int, startedAt: Long, endedAt: Long, text: String)
+
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  def consume(): Unit = {
-    val consumer = new KafkaConsumer[String, String](new Properties())
-    consumer.subscribe(java.util.List.of(Topic))
+  /** Publish one finished turn; returns the event. get() throws when the broker did not take it. */
+  def recordTurn(session: Session, turn: Turn): JsObject = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val event = JsObject(
+      "session_id" -> JsString(session.sessionId),
+      "tenant" -> JsString(session.tenant),
+      "turn_index" -> JsNumber(turn.turnIndex),
+      "started_at" -> JsNumber(turn.startedAt),
+      "ended_at" -> JsNumber(turn.endedAt),
+      "text" -> JsString(turn.text))
+    producer.send(new ProducerRecord[String, String](TurnTopic, event.compactPrint)).get(5, TimeUnit.SECONDS)
+    event
+  }
+
+  private val consumer: KafkaConsumer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("group.id", TurnGroup)
+    props.put("auto.offset.reset", "earliest")
+    props.put("enable.auto.commit", "false")
+    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
+    c.subscribe(List(TurnTopic).asJava)
+    c
+  }
+
+  /** The transcript consumer: one row per voice.turn record. */
+  def run(): Unit =
     while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(200))
-      records.forEach { record =>
-        consumer.commitSync()
-        val fields = record.value().parseJson.asJsObject.fields
-        appendTurn(
-          fields("tenant").convertTo[String],
-          fields("session_id").convertTo[String],
-          fields("turn").convertTo[Int],
-          fields("transcript_text").convertTo[String],
-        )
+      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
+        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
+        Transcripts.insertTurn(record.value.parseJson.asJsObject)
       }
     }
-  }
-
-  def appendTurn(tenant: String, sessionId: String, turn: Int, text: String): Unit = {}
 }
 `,
-      solution: `import java.util.Properties
+      solution: `import java.time.Duration
+import java.util.Properties
+import java.util.concurrent.TimeUnit
 
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
+import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import spray.json._
 
-object VoiceEvents {
-  val Topic = "voice.turn"
-  val GroupId = "transcripts"
+import voice.Sessions.Session
+import voice.Transcripts // Transcripts.redact, insertTurn
 
-  private val producerProps = new Properties()
-  producerProps.put("bootstrap.servers", "kafka:9092")
-  producerProps.put("enable.idempotence", "true")
-  producerProps.put("acks", "all")
-  val producer = new KafkaProducer[String, String](producerProps)
+import scala.jdk.CollectionConverters._
 
-  def buildEvent(
-      tenant: String,
-      sessionId: String,
-      turnIndex: Int,
-      startedAt: String,
-      endedAt: String,
-      transcriptRef: String,
-  ): String =
-    Map(
-      "session_id" -> sessionId,
-      "tenant" -> tenant,
-      "turn_index" -> turnIndex.toString,
-      "started_at" -> startedAt,
-      "ended_at" -> endedAt,
-      "transcript_ref" -> transcriptRef,
-    ).toJson.compactPrint
+object Events {
+  val TurnTopic = "voice.turn"
+  val TurnGroup = "transcripts"
 
-  def publish(
-      tenant: String,
-      sessionId: String,
-      turnIndex: Int,
-      startedAt: String,
-      endedAt: String,
-      transcriptRef: String,
-  ): Unit = {
-    val payload = buildEvent(tenant, sessionId, turnIndex, startedAt, endedAt, transcriptRef)
-    producer.send(new ProducerRecord("voice.turn", sessionId, payload))
+  /** One finished turn of a call, as the speech loop hands it over. */
+  final case class Turn(turnIndex: Int, startedAt: Long, endedAt: Long, text: String)
+
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    // Idempotent with acks=all: a retry after a lost acknowledgement writes the turn once, on every replica.
+    props.put("enable.idempotence", "true")
+    props.put("acks", "all")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  def consume(): Unit = {
+  /** Publish one finished turn; returns the event. get() throws when the broker did not take it. */
+  def recordTurn(session: Session, turn: Turn): JsObject = {
+    val event = JsObject(
+      "session_id" -> JsString(session.sessionId),
+      "tenant" -> JsString(session.tenant),
+      "turn_index" -> JsNumber(turn.turnIndex),
+      "started_at" -> JsNumber(turn.startedAt),
+      "ended_at" -> JsNumber(turn.endedAt),
+      // The redacted text stays in the transcript store; the retained topic carries where it is.
+      "transcript_ref" -> JsString(Transcripts.redact(session.sessionId, turn.turnIndex, turn.text)))
+    producer.send(new ProducerRecord[String, String](TurnTopic, session.sessionId, event.compactPrint)).get(5, TimeUnit.SECONDS)
+    event
+  }
+
+  private val consumer: KafkaConsumer[String, String] = {
     val props = new Properties()
-    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, GroupId)
-    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    val consumer = new KafkaConsumer[String, String](props)
-    consumer.subscribe(java.util.List.of(Topic))
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("group.id", TurnGroup)
+    props.put("auto.offset.reset", "earliest")
+    props.put("enable.auto.commit", "false")
+    val c = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
+    c.subscribe(List(TurnTopic).asJava)
+    c
+  }
+
+  /** The transcript consumer: one row per voice.turn record. */
+  def run(): Unit =
     while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(200))
-      records.forEach { record =>
-        val fields = record.value().parseJson.asJsObject.fields
-        insertTurn(
-          fields("tenant").convertTo[String],
-          fields("session_id").convertTo[String],
-          fields("turn_index").convertTo[Int],
-          fields("transcript_ref").convertTo[String],
-        )
-        consumer.commitSync()
+      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
+        Transcripts.insertTurn(record.value.parseJson.asJsObject)
+        // The row is durable: a crash before this commit redelivers the turn.
+        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
       }
     }
-  }
-
-  // One row per finished turn; returns only once the row is durable, so the commit below it
-  // replays the turn on a crash instead of losing it.
-  def insertTurn(tenant: String, sessionId: String, turnIndex: Int, transcriptRef: String): Unit = {}
 }
 `,
     },
     cpp: {
       starter: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
 
 #include <iostream>
 #include <memory>
-#include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
+
+#include "voice/sessions.h"     // sessions::Session
+#include "voice/transcripts.h"  // transcripts::redact, insertTurn
 
 using json = nlohmann::json;
 
-const std::string kVoiceTurnTopic = "voice.turn";
+const std::string kTurnTopic = "voice.turn";
 
-std::unique_ptr<RdKafka::Producer> makeProducer() {
+// One finished turn of a call, as the speech loop hands it over.
+struct Turn {
+  long turn_index = 0;
+  long long started_at = 0;
+  long long ended_at = 0;
+  std::string text;
+};
+
+// The outcome of the last produce, as its delivery report told it ("" once delivered).
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override { error = message.err() == RdKafka::ERR_NO_ERROR ? "" : message.errstr(); }
+  std::string error;
+};
+
+DeliveryReport delivery;
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
+  conf->set("dr_cb", &delivery, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
-
-// TranscriptStore is the durable transcript; append_turn adds one finished turn to it.
-struct TranscriptStore {
-  void append_turn(const std::string& tenant, const std::string& sessionId, int turn, const std::string& text);
-};
-
-TranscriptStore store;
-
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-void post_turn(const std::string& tenant, const std::string& sessionId, const std::string& userId, int turn, const std::string& startedAt, const std::string& endedAt, const std::string& transcriptText, const std::string& audioBytes) {
-  std::cerr << "turn session=" << sessionId << " user=" << userId << " text=" << transcriptText << "\\n";
-  const json event = {{"session_id", sessionId}, {"tenant", tenant}, {"turn", turn}, {"started_at", startedAt}, {"ended_at", endedAt}, {"transcript_text", transcriptText}, {"audio_bytes", audioBytes}};
-  const auto payload = event.dump();
-  producer->produce(kVoiceTurnTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()), payload.size(), userId.data(), userId.size(), 0, nullptr);
-  producer->flush(2000);
+std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("group.id", "transcripts", err);
+  conf->set("auto.offset.reset", "earliest", err);
+  conf->set("enable.auto.commit", "false", err);
+  auto consumer = std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
+  consumer->subscribe({kTurnTopic});
+  return consumer;
 }
 
-void consume(const std::string& group) {
-  std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
-  conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("group.id", group, err);
-  conf->set("enable.auto.commit", "false", err);
-  std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({kVoiceTurnTopic});
+auto producer = make_producer();
+auto consumer = make_consumer();
+
+// Publish one finished turn; returns the event. Throws when the broker did not take it.
+json record_turn(const sessions::Session& session, const Turn& turn) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const json event = {{"session_id", session.session_id}, {"tenant", session.tenant}, {"turn_index", turn.turn_index},
+                      {"started_at", turn.started_at},    {"ended_at", turn.ended_at}, {"text", turn.text}};
+  const std::string value = event.dump();
+  delivery.error = "no delivery report";
+  producer->produce(kTurnTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                    value.size(), nullptr, 0, 0, nullptr);
+  producer->flush(5000);
+  if (!delivery.error.empty()) throw std::runtime_error("voice.turn not acknowledged: " + delivery.error);
+  return event;
+}
+
+// The transcript consumer: one row per voice.turn record.
+void run() {
   while (true) {
-    std::unique_ptr<RdKafka::Message> msg(consumer->consume(200));
-    if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
+    std::unique_ptr<RdKafka::Message> msg(consumer->consume(1000));
+    if (msg->err() == RdKafka::ERR__TIMED_OUT) continue;
+    if (msg->err() != RdKafka::ERR_NO_ERROR) {
+      std::cerr << "consumer error: " << msg->errstr() << "\\n";
+      continue;
+    }
     consumer->commitSync(msg.get());
-    const json event = json::parse(static_cast<const char*>(msg->payload()), static_cast<const char*>(msg->payload()) + msg->len());
-    store.append_turn(event["tenant"].get<std::string>(), event["session_id"].get<std::string>(), event["turn"].get<int>(), event["transcript_text"].get<std::string>());
+    transcripts::insertTurn(json::parse(std::string(static_cast<const char*>(msg->payload()), msg->len())));
   }
 }
 `,
       solution: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
 
 #include <iostream>
 #include <memory>
-#include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
+
+#include "voice/sessions.h"     // sessions::Session
+#include "voice/transcripts.h"  // transcripts::redact, insertTurn
 
 using json = nlohmann::json;
 
-const std::string kVoiceTurnTopic = "voice.turn";
+const std::string kTurnTopic = "voice.turn";
 
-std::unique_ptr<RdKafka::Producer> makeProducer() {
+// One finished turn of a call, as the speech loop hands it over.
+struct Turn {
+  long turn_index = 0;
+  long long started_at = 0;
+  long long ended_at = 0;
+  std::string text;
+};
+
+// The outcome of the last produce, as its delivery report told it ("" once delivered).
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override { error = message.err() == RdKafka::ERR_NO_ERROR ? "" : message.errstr(); }
+  std::string error;
+};
+
+DeliveryReport delivery;
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
+  // Idempotent with acks=all: a retry after a lost acknowledgement writes the turn once, on every replica.
   conf->set("enable.idempotence", "true", err);
   conf->set("acks", "all", err);
+  conf->set("dr_cb", &delivery, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
-
-// insert_turn writes one row per finished turn; the consumer commits the offset after it returns,
-// so a crash in between replays the record instead of losing the turn.
-struct TranscriptStore {
-  void insert_turn(const std::string& tenant, const std::string& sessionId, int turnIndex, const std::string& transcriptRef);
-};
-
-TranscriptStore store;
-
-void post_turn(const std::string& tenant, const std::string& sessionId, int turnIndex, const std::string& startedAt, const std::string& endedAt, const std::string& transcriptRef) {
-  const json event = {{"session_id", sessionId}, {"tenant", tenant}, {"turn_index", turnIndex}, {"started_at", startedAt}, {"ended_at", endedAt}, {"transcript_ref", transcriptRef}};
-  const auto payload = event.dump();
-  producer->produce(kVoiceTurnTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()), payload.size(), sessionId.data(), sessionId.size(), 0, nullptr);
-  producer->flush(2000);
+std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("group.id", "transcripts", err);
+  conf->set("auto.offset.reset", "earliest", err);
+  conf->set("enable.auto.commit", "false", err);
+  auto consumer = std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
+  consumer->subscribe({kTurnTopic});
+  return consumer;
 }
 
-void consume(const std::string& group) {
-  std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
-  conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("group.id", group, err);
-  conf->set("enable.auto.commit", "false", err);
-  std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({kVoiceTurnTopic});
+auto producer = make_producer();
+auto consumer = make_consumer();
+
+// Publish one finished turn; returns the event. Throws when the broker did not take it.
+json record_turn(const sessions::Session& session, const Turn& turn) {
+  const json event = {{"session_id", session.session_id},
+                      {"tenant", session.tenant},
+                      {"turn_index", turn.turn_index},
+                      {"started_at", turn.started_at},
+                      {"ended_at", turn.ended_at},
+                      // The redacted text stays in the transcript store; the retained topic carries where it is.
+                      {"transcript_ref", transcripts::redact(session.session_id, turn.turn_index, turn.text)}};
+  const std::string value = event.dump();
+  delivery.error = "no delivery report";
+  producer->produce(kTurnTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                    value.size(), session.session_id.c_str(), session.session_id.size(), 0, nullptr);
+  producer->flush(5000);
+  if (!delivery.error.empty()) throw std::runtime_error("voice.turn not acknowledged: " + delivery.error);
+  return event;
+}
+
+// The transcript consumer: one row per voice.turn record.
+void run() {
   while (true) {
-    std::unique_ptr<RdKafka::Message> msg(consumer->consume(200));
-    if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
-    const json event = json::parse(static_cast<const char*>(msg->payload()), static_cast<const char*>(msg->payload()) + msg->len());
-    store.insert_turn(event["tenant"].get<std::string>(), event["session_id"].get<std::string>(), event["turn_index"].get<int>(), event["transcript_ref"].get<std::string>());
-    consumer->commitSync(msg.get());
+    std::unique_ptr<RdKafka::Message> msg(consumer->consume(1000));
+    if (msg->err() == RdKafka::ERR__TIMED_OUT) continue;
+    if (msg->err() != RdKafka::ERR_NO_ERROR) {
+      std::cerr << "consumer error: " << msg->errstr() << "\\n";
+      continue;
+    }
+    transcripts::insertTurn(json::parse(std::string(static_cast<const char*>(msg->payload()), msg->len())));
+    consumer->commitSync(msg.get());  // the row is durable: a crash before this redelivers the turn
   }
 }
 `,
     },
   },
-  debrief: `The fix follows the two contracts a topic does not renegotiate. The partition key is the unit of ordering: Kafka orders records only within a partition, so keying every turn by the session id keeps one call's turns together and lets the consumer assemble them in \`turn_index\` order, while a user key interleaves two concurrent calls. Retention is the second: a replicated topic keeps whatever you write into it long after the request, the tenant and the policy that produced it are gone, so the event carries ids, timings and a \`transcript_ref\` into storage that redacts and expires on its own schedule. \`insert_turn\` before the commit, with an idempotent \`acks=all\` producer on the other side, turns a crash into a replay instead of a lost turn. Production pipelines also enforce the payload shape with a schema registry and route rows the transcript store cannot apply to a dead-letter topic.`,
+  harness: {
+    python: `import json
+
+from voice import transcripts
+
+TOPIC = "voice.turn"
+GROUP = "transcripts"
+SPOKEN = "Sure, call me back on 415 555 0134 after six."
+REDACTED = "Sure, call me back on [redacted] after six."
+CALL = {"session_id": "vs-1", "tenant": "acme", "codec": "pcm16", "sample_rate": 24000, "max_duration_s": 1800, "turn_count": 0}
+OTHER = {**CALL, "session_id": "vs-2"}
+T0 = 1_700_000_000_000
+
+
+def _turn(i, text=SPOKEN):
+    return {"turn_index": i, "started_at": T0 + i * 4000, "ended_at": T0 + i * 4000 + 3200, "text": text}
+
+
+def _payload(record):
+    try:
+        return json.loads(record.value)
+    except Exception as exc:
+        raise AssertionError(f"the record's value is not JSON: {record.value!r} ({exc})")
+
+
+def _seed(ctx, turn_index, ref):
+    event = {"session_id": "vs-1", "tenant": "acme", "turn_index": turn_index, "started_at": T0, "ended_at": T0 + 3200, "transcript_ref": ref}
+    ctx.kafka.seed(TOPIC, key="vs-1", value=json.dumps(event))
+
+
+def check_session_key(ctx):
+    m = ctx.load("events")
+    for i in range(3):
+        m.record_turn(CALL, _turn(i))
+        m.record_turn(OTHER, _turn(i))
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 6, f"six turns produced {len(records)} records on {TOPIC}"
+    mine = [r for r in records if _payload(r).get("session_id") == "vs-1"]
+    keys = sorted({r.key for r in mine}, key=repr)
+    assert keys == [b"vs-1"], f"vs-1's turns were keyed {keys}: keyed by anything but the session id, one call's turns scatter across partitions"
+    partitions = sorted({r.partition for r in mine})
+    assert len(partitions) == 1, f"vs-1's turns landed on partitions {partitions}: one call's transcript must sit on one partition, in order"
+    order = [_payload(r).get("turn_index") for r in sorted(mine, key=lambda r: r.offset)]
+    assert order == [0, 1, 2], f"vs-1's turns sit on its partition in the order {order}"
+
+
+def check_redacted_payload(ctx):
+    m = ctx.load("events")
+    event = m.record_turn(CALL, _turn(3))
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one turn produced {len(records)} records"
+    raw = records[0].value.decode()
+    assert "415 555 0134" not in raw and "call me back" not in raw, f"the voice.turn record carries the caller's words: {raw}. The topic is retained and replicated; carry transcript_ref, not the text"
+    payload = json.loads(raw)
+    expected = {"session_id": "vs-1", "tenant": "acme", "turn_index": 3, "started_at": T0 + 12000, "ended_at": T0 + 15200}
+    for name, value in expected.items():
+        assert payload.get(name) == value, f"the event must carry {name} = {value!r}, got {payload}"
+    ref = payload.get("transcript_ref")
+    assert isinstance(ref, str) and ctx.redis.hget(ref, "text") == REDACTED, f"transcript_ref {ref!r} must name the redacted text transcripts.redact stored, got {ctx.redis.hgetall(ref) if isinstance(ref, str) else None}"
+    assert event == payload, f"record_turn must return the event it produced: returned {event}, produced {payload}"
+
+
+def check_idempotent_producer(ctx):
+    m = ctx.load("events")
+    ctx.kafka.lose_acks(TOPIC, 1)
+    m.record_turn(CALL, _turn(0))
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one turn whose acknowledgement was lost left {len(records)} records: the producer's retry wrote the turn twice. Enable idempotence (with acks=all)"
+    m.record_turn(CALL, _turn(1))
+    ctx.kafka.failover(TOPIC)
+    assert len(ctx.kafka.records(TOPIC)) == 2, f"after a leader failover the topic holds {len(ctx.kafka.records(TOPIC))} records, expected 2: with acks=1 the leader alone acknowledged the second turn and lost it. Use acks=all"
+
+
+def check_persist_before_commit(ctx):
+    _seed(ctx, 0, transcripts.redact("vs-1", 0, SPOKEN))
+    m = ctx.load("events")
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(ctx.redis.exists("voice:turn:vs-1:0")))
+    ctx.drain(m.run)
+    assert at_commit, "the transcript consumer never committed an offset"
+    assert at_commit[0] == 1, "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insert_turn loses the turn"
+    stored = transcripts.list_turns("vs-1", -1, 10)
+    assert [t["text"] for t in stored] == [REDACTED], f"the consumer must store the turn, the store holds {stored}"
+    # The next turn's write fails: its offset must stay uncommitted, so the turn is redelivered.
+    _seed(ctx, 1, "voice:redacted:vs-1:missing")
+    try:
+        ctx.drain(m.run)
+    except Exception:
+        pass  # the consumer surfaces the store's error; what matters is what was committed
+    assert ctx.kafka.lag(GROUP, TOPIC) == 1, f"insert_turn failed for turn 1 but its offset was committed (lag {ctx.kafka.lag(GROUP, TOPIC)}): the turn is lost"
+`,
+    typescript: `const TOPIC = 'voice.turn';
+const GROUP = 'transcripts';
+const SPOKEN = 'Sure, call me back on 415 555 0134 after six.';
+const REDACTED = 'Sure, call me back on [redacted] after six.';
+const CALL = {session_id: 'vs-1', tenant: 'acme', codec: 'pcm16', sample_rate: 24000, max_duration_s: 1800, turn_count: 0};
+const OTHER = {...CALL, session_id: 'vs-2'};
+const T0 = 1_700_000_000_000;
+
+const turnAt = (i: number) => ({turn_index: i, started_at: T0 + i * 4000, ended_at: T0 + i * 4000 + 3200, text: SPOKEN});
+
+function payload(record) {
+  try {
+    return JSON.parse(String(record.value));
+  } catch (e) {
+    assert.fail(\`the record's value is not JSON: \${record.value} (\${e})\`);
+  }
+}
+
+function seed(ctx, turnIndex: number, ref: string): void {
+  const event = {session_id: 'vs-1', tenant: 'acme', turn_index: turnIndex, started_at: T0, ended_at: T0 + 3200, transcript_ref: ref};
+  ctx.kafka.seed(TOPIC, {key: 'vs-1', value: JSON.stringify(event)});
+}
+
+export async function check_session_key(ctx) {
+  const m = ctx.load('events');
+  for (let i = 0; i < 3; i += 1) {
+    await m.recordTurn(CALL, turnAt(i));
+    await m.recordTurn(OTHER, turnAt(i));
+  }
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 6, \`six turns produced \${records.length} records on \${TOPIC}\`);
+  const mine = records.filter(r => payload(r).session_id === 'vs-1');
+  const keys = [...new Set(mine.map(r => (r.key === null || r.key === undefined ? null : String(r.key))))];
+  assert.deepStrictEqual(keys, ['vs-1'], \`vs-1's turns were keyed \${JSON.stringify(keys)}: keyed by anything but the session id, one call's turns scatter across partitions\`);
+  const partitions = [...new Set(mine.map(r => r.partition))];
+  assert.equal(partitions.length, 1, \`vs-1's turns landed on partitions \${JSON.stringify(partitions)}: one call's transcript must sit on one partition, in order\`);
+  const order = [...mine].sort((a, b) => Number(a.offset) - Number(b.offset)).map(r => payload(r).turn_index);
+  assert.deepStrictEqual(order, [0, 1, 2], \`vs-1's turns sit on its partition in the order \${JSON.stringify(order)}\`);
+}
+
+export async function check_redacted_payload(ctx) {
+  const m = ctx.load('events');
+  const event = await m.recordTurn(CALL, turnAt(3));
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 1, \`one turn produced \${records.length} records\`);
+  const raw = String(records[0].value);
+  assert(!raw.includes('415 555 0134') && !raw.includes('call me back'), \`the voice.turn record carries the caller's words: \${raw}. The topic is retained and replicated; carry transcript_ref, not the text\`);
+  const p = JSON.parse(raw);
+  const expected = {session_id: 'vs-1', tenant: 'acme', turn_index: 3, started_at: T0 + 12000, ended_at: T0 + 15200};
+  for (const [name, value] of Object.entries(expected)) assert.equal(p[name], value, \`the event must carry \${name} = \${value}, got \${raw}\`);
+  const ref = p.transcript_ref;
+  assert(typeof ref === 'string' && ctx.redis.hget(ref, 'text') === REDACTED, \`transcript_ref \${JSON.stringify(ref)} must name the redacted text redact stored\`);
+  assert.deepStrictEqual(event, p, \`recordTurn must return the event it produced: returned \${JSON.stringify(event)}, produced \${raw}\`);
+}
+
+export async function check_idempotent_producer(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.loseAcks(TOPIC);
+  await m.recordTurn(CALL, turnAt(0));
+  let n = ctx.kafka.records(TOPIC).length;
+  assert.equal(n, 1, \`one turn whose acknowledgement was lost left \${n} records: the producer's retry wrote the turn twice. Use an idempotent producer\`);
+  await m.recordTurn(CALL, turnAt(1));
+  ctx.kafka.failover(TOPIC);
+  n = ctx.kafka.records(TOPIC).length;
+  assert.equal(n, 2, \`after a leader failover the topic holds \${n} records, expected 2: with acks 1 the leader alone acknowledged the second turn and lost it. Use acks -1 (all)\`);
+}
+
+export async function check_persist_before_commit(ctx) {
+  const transcripts = ctx.load('/support/voice/transcripts.ts');
+  seed(ctx, 0, await transcripts.redact('vs-1', 0, SPOKEN));
+  const m = ctx.load('events');
+  const atCommit: number[] = [];
+  ctx.kafka.onCommit(() => atCommit.push(ctx.redis.exists('voice:turn:vs-1:0')));
+  await ctx.drain(m.run());
+  assert(atCommit.length > 0, 'the transcript consumer never committed an offset');
+  assert.equal(atCommit[0], 1, 'the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insertTurn loses the turn');
+  const stored = await transcripts.listTurns('vs-1', -1, 10);
+  assert.deepStrictEqual(stored.map(t => t.text), [REDACTED], \`the consumer must store the turn, the store holds \${JSON.stringify(stored)}\`);
+  // The next turn's write fails: its offset must stay uncommitted, so the turn is redelivered.
+  seed(ctx, 1, 'voice:redacted:vs-1:missing');
+  try {
+    await ctx.drain(m.run());
+  } catch {
+    // the consumer surfaces the store's error; what matters is what was committed
+  }
+  assert.equal(ctx.kafka.lag(GROUP, TOPIC), 1, \`insertTurn failed for turn 1 but its offset was committed (lag \${ctx.kafka.lag(GROUP, TOPIC)}): the turn is lost\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+	"strings"
+
+	"leetbuild/harness"
+
+	"voice/sessions"
+	"voice/transcripts"
+)
+
+const (
+	eventsTopic = "voice.turn"
+	eventsGroup = "transcripts"
+	spoken      = "Sure, call me back on 415 555 0134 after six."
+	redacted    = "Sure, call me back on [redacted] after six."
+	t0          = int64(1_700_000_000_000)
+)
+
+var (
+	eventsBg  = context.Background()
+	callOne   = sessions.Session{SessionID: "vs-1", Tenant: "acme", Codec: "pcm16", SampleRate: 24000, MaxDurationS: 1800}
+	callOther = sessions.Session{SessionID: "vs-2", Tenant: "acme", Codec: "pcm16", SampleRate: 24000, MaxDurationS: 1800}
+)
+
+func turnAt(i int) Turn {
+	return Turn{TurnIndex: i, StartedAt: t0 + int64(i)*4000, EndedAt: t0 + int64(i)*4000 + 3200, Text: spoken}
+}
+
+func mustRecord(ctx *harness.Ctx, session sessions.Session, turn Turn) map[string]any {
+	event, err := recordTurn(eventsBg, session, turn)
+	ctx.NoError(err, "recordTurn(%s, turn %d) failed", session.SessionID, turn.TurnIndex)
+	return event
+}
+
+func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+	var p map[string]any
+	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
+	return p
+}
+
+func seedTurn(ctx *harness.Ctx, turnIndex int, ref string) {
+	event, _ := json.Marshal(transcripts.Event{SessionID: "vs-1", Tenant: "acme", TurnIndex: turnIndex, StartedAt: t0, EndedAt: t0 + 3200, TranscriptRef: ref})
+	ctx.Kafka.Seed(eventsTopic, "vs-1", event)
+}
+
+func CheckSessionKey(ctx *harness.Ctx) {
+	for i := 0; i < 3; i++ {
+		mustRecord(ctx, callOne, turnAt(i))
+		mustRecord(ctx, callOther, turnAt(i))
+	}
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 6, "six turns must produce six records on %s; the records", eventsTopic)
+	keys := map[string]bool{}
+	partitions := map[int]bool{}
+	type placed struct {
+		offset int64
+		turn   any
+	}
+	var mine []placed
+	for _, r := range records {
+		p := payloadOf(ctx, r.Value)
+		if p["session_id"] != "vs-1" {
+			continue
+		}
+		keys[string(r.Key)] = true
+		partitions[r.Partition] = true
+		mine = append(mine, placed{r.Offset, p["turn_index"]})
+	}
+	ctx.Assert(len(keys) == 1 && keys["vs-1"], "vs-1's turns were keyed %v: keyed by anything but the session id, one call's turns scatter across partitions", keys)
+	ctx.Assert(len(partitions) == 1, "vs-1's turns landed on partitions %v: one call's transcript must sit on one partition, in order", partitions)
+	sort.Slice(mine, func(i, j int) bool { return mine[i].offset < mine[j].offset })
+	order := []any{}
+	for _, m := range mine {
+		order = append(order, m.turn)
+	}
+	ctx.Equal(order, []any{0, 1, 2}, "vs-1's turns on its partition, in offset order")
+}
+
+func CheckRedactedPayload(ctx *harness.Ctx) {
+	event := mustRecord(ctx, callOne, turnAt(3))
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 1, "one turn; the records")
+	raw := string(records[0].Value)
+	ctx.Assert(!strings.Contains(raw, "415 555 0134") && !strings.Contains(raw, "call me back"), "the voice.turn record carries the caller's words: %s. The topic is retained and replicated; carry transcript_ref, not the text", raw)
+	p := payloadOf(ctx, records[0].Value)
+	for name, value := range map[string]any{"session_id": "vs-1", "tenant": "acme", "turn_index": 3, "started_at": t0 + 12000, "ended_at": t0 + 15200} {
+		ctx.Equal(p[name], value, "the event's %s (%s)", name, raw)
+	}
+	ref, _ := p["transcript_ref"].(string)
+	text, _ := ctx.Redis.HGet(ref, "text")
+	ctx.Equal(text, redacted, "transcript_ref %q must name the redacted text Redact stored; its text", ref)
+	ctx.Equal(event["transcript_ref"], p["transcript_ref"], "recordTurn must return the event it produced; its transcript_ref")
+}
+
+func CheckIdempotentProducer(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(eventsTopic, 1)
+	mustRecord(ctx, callOne, turnAt(0))
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "one turn whose acknowledgement was lost: the producer's retry wrote the turn twice. Enable idempotence (with acks=all); the records")
+	mustRecord(ctx, callOne, turnAt(1))
+	lost := ctx.Kafka.Failover(eventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the turn. Use acks=all; the records", lost)
+}
+
+func CheckPersistBeforeCommit(ctx *harness.Ctx) {
+	seedTurn(ctx, 0, transcripts.Redact(eventsBg, "vs-1", 0, spoken))
+	var atCommit []int64
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, ctx.Redis.Exists("voice:turn:vs-1:0")) })
+	ctx.Drain(func() { run(eventsBg) })
+	ctx.Assert(len(atCommit) > 0, "the transcript consumer never committed an offset")
+	ctx.Equal(atCommit[0], int64(1), "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and InsertTurn loses the turn; the row at the commit")
+	stored := transcripts.ListTurns(eventsBg, "vs-1", -1, 10)
+	ctx.Assert(len(stored) == 1 && stored[0].Text == redacted, "the consumer must store the turn, the store holds %+v", stored)
+	// The next turn's write fails: its offset must stay uncommitted, so the turn is redelivered.
+	seedTurn(ctx, 1, "voice:redacted:vs-1:missing")
+	ctx.Drain(func() { run(eventsBg) })
+	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), int64(1), "InsertTurn failed for turn 1 and its offset must stay uncommitted (else the turn is lost); the lag")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <exception>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+using json = nlohmann::json;
+
+namespace {
+
+const std::string kTopic = "voice.turn";
+const std::string kGroup = "transcripts";
+const std::string kSpoken = "Sure, call me back on 415 555 0134 after six.";
+const std::string kRedacted = "Sure, call me back on [redacted] after six.";
+const long long kT0 = 1700000000000LL;
+const sessions::Session kCall{"vs-1", "acme", "pcm16", 24000, 1800, 0};
+const sessions::Session kOther{"vs-2", "acme", "pcm16", 24000, 1800, 0};
+
+Turn turnAt(long i) { return Turn{i, kT0 + i * 4000, kT0 + i * 4000 + 3200, kSpoken}; }
+
+json mustRecord(harness::Ctx& ctx, const sessions::Session& session, const Turn& turn) {
+  try {
+    return record_turn(session, turn);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("record_turn(%s, turn %d) threw %s", session.session_id, turn.turn_index, e.what());
+  }
+}
+
+json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+  try {
+    return json::parse(record.Value.value_or(""));
+  } catch (const std::exception& e) {
+    ctx.Fatalf("the record's value is not JSON: %s (%s)", record.Value.value_or(""), e.what());
+  }
+}
+
+void seedTurn(harness::Ctx& ctx, long turn_index, const std::string& ref) {
+  const json event = {{"session_id", "vs-1"}, {"tenant", "acme"}, {"turn_index", turn_index}, {"started_at", kT0}, {"ended_at", kT0 + 3200}, {"transcript_ref", ref}};
+  ctx.Kafka.Seed(kTopic, std::string("vs-1"), event.dump());
+}
+
+}  // namespace
+
+void CheckSessionKey(harness::Ctx& ctx) {
+  for (long i = 0; i < 3; i++) {
+    mustRecord(ctx, kCall, turnAt(i));
+    mustRecord(ctx, kOther, turnAt(i));
+  }
+  const auto records = ctx.Kafka.Records(kTopic);
+  ctx.Equal(records.size(), 6, "six turns must produce six records on %s; the records", kTopic);
+  std::set<std::string> keys;
+  std::set<int> partitions;
+  std::vector<std::pair<int64_t, long>> mine;
+  for (const auto& r : records) {
+    const json p = payloadOf(ctx, r);
+    if (p.value("session_id", "") != "vs-1") continue;
+    keys.insert(r.Key.value_or("(no key)"));
+    partitions.insert(r.Partition);
+    mine.emplace_back(r.Offset, p.value("turn_index", -1L));
+  }
+  ctx.Assert(keys == std::set<std::string>{"vs-1"}, "vs-1's turns were keyed %v: keyed by anything but the session id, one call's turns scatter across partitions", keys);
+  ctx.Assert(partitions.size() == 1, "vs-1's turns landed on partitions %v: one call's transcript must sit on one partition, in order", partitions);
+  std::sort(mine.begin(), mine.end());
+  std::vector<long> order;
+  for (const auto& [offset, turn] : mine) order.push_back(turn);
+  ctx.Equal(order, std::vector<long>{0, 1, 2}, "vs-1's turns on its partition, in offset order");
+}
+
+void CheckRedactedPayload(harness::Ctx& ctx) {
+  const json event = mustRecord(ctx, kCall, turnAt(3));
+  const auto records = ctx.Kafka.Records(kTopic);
+  ctx.Equal(records.size(), 1, "one turn; the records");
+  const std::string raw = records[0].Value.value_or("");
+  ctx.Assert(raw.find("415 555 0134") == std::string::npos && raw.find("call me back") == std::string::npos,
+             "the voice.turn record carries the caller's words: %s. The topic is retained and replicated; carry transcript_ref, not the text", raw);
+  const json p = payloadOf(ctx, records[0]);
+  ctx.Assert(p.value("session_id", "") == "vs-1" && p.value("tenant", "") == "acme" && p.value("turn_index", -1L) == 3 &&
+                 p.value("started_at", 0LL) == kT0 + 12000 && p.value("ended_at", 0LL) == kT0 + 15200,
+             "the event must carry session_id, tenant, turn_index and the timings, got %s", raw);
+  const std::string ref = p.value("transcript_ref", "");
+  ctx.Equal(ctx.Redis.HGet(ref, "text").value_or(""), kRedacted, "transcript_ref %q must name the redacted text redact stored; its text", ref);
+  ctx.Equal(event.dump(), p.dump(), "record_turn must return the event it produced");
+}
+
+void CheckIdempotentProducer(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kTopic, 1);
+  mustRecord(ctx, kCall, turnAt(0));
+  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one turn whose acknowledgement was lost: the producer's retry wrote the turn twice. Set enable.idempotence (with acks=all); the records");
+  mustRecord(ctx, kCall, turnAt(1));
+  const int lost = ctx.Kafka.Failover(kTopic);
+  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the turn. Use acks=all; the records", lost);
+}
+
+void CheckPersistBeforeCommit(harness::Ctx& ctx) {
+  seedTurn(ctx, 0, transcripts::redact("vs-1", 0, kSpoken));
+  std::vector<long long> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.Exists("voice:turn:vs-1:0")); });
+  ctx.Drain([] { run(); });
+  ctx.Assert(!atCommit.empty(), "the transcript consumer never committed an offset");
+  ctx.Equal(atCommit[0], 1, "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insertTurn loses the turn; the row at the commit");
+  const auto stored = transcripts::listTurns("vs-1", -1, 10);
+  ctx.Assert(stored.size() == 1 && stored[0].text == kRedacted, "the consumer must store the turn, the store holds %d turn(s)", stored.size());
+  // The next turn's write fails: its offset must stay uncommitted, so the turn is redelivered.
+  seedTurn(ctx, 1, "voice:redacted:vs-1:missing");
+  ctx.Drain([] {
+    try {
+      run();
+    } catch (const std::exception&) {
+      // the consumer surfaces the store's error; what matters is what was committed
+    }
+  });
+  ctx.Equal(ctx.Kafka.Lag(kGroup, kTopic), 1, "insertTurn failed for turn 1 and its offset must stay uncommitted (else the turn is lost); the lag");
+}
+`,
+  },
+  hints: [
+    "Support opens a transcript and two turns are swapped; a compliance scan finds a caller's card number in the voice.turn topic a week later; after a broker failover one turn shows up twice.",
+    'The producer sends no key, so the partitioner spreads one call over every partition; the payload copies the spoken text; the producer has `acks=1` and no idempotence; the consumer commits before `insert_turn`.',
+    'Key by `session["session_id"]`, send `transcript_ref = transcripts.redact(...)` instead of the text, set `enable.idempotence` with `acks=all`, and move `consumer.commit(...)` after `transcripts.insert_turn(...)`.',
+  ],
+  debrief: `The key is the session because order matters within one call and nowhere else, and Kafka only orders within a partition. The payload carries a reference because a topic is retained, replicated and read by every consumer group anyone adds later; redaction has to happen before the words are copied that widely, and the redacted text then lives in one store with one retention rule. Idempotence with acks=all makes the producer's own retry after a lost acknowledgement land once and survive a leader failover. Committing after the write turns a crash into a redelivery, and \`insert_turn\` rewrites the same row, so the replay is harmless. Production pipelines also expire the redacted text with the call's retention and send undecodable records to a dead-letter topic instead of stalling the partition.`,
 };

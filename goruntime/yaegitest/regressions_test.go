@@ -795,3 +795,166 @@ func Run() string {
 	return fmt.Sprintf("%s %s %d", m.Key, m.Value, <-c)
 }`, "a v-a 6")
 }
+
+// A failed comma-ok type assertion sets its result to the asserted type's zero value, also when
+// the destination is reused: `v, _ := m[k].(string)` in a loop did not reset v on a missing key
+// (a request validator then took a missing field for the previous one).
+func TestCommaOkAssertFailureZeroes(t *testing.T) {
+	expect(t, `package main
+
+import (
+	"fmt"
+	"io"
+)
+
+type named interface{ Name() string }
+
+type user struct{ name string }
+
+func (u user) Name() string { return u.name }
+
+func missing(body map[string]any) []string {
+	var out []string
+	for _, name := range []string{"model", "policy", "input"} {
+		value, _ := body[name].(string)
+		if value == "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func Run() string {
+	out := fmt.Sprint(missing(map[string]any{"model": "m", "input": "i"}), missing(map[string]any{"policy": 1}))
+	for i, x := range []any{"x", 3, nil} {
+		s, ok := x.(string)
+		n, _ := x.(int)
+		var a any = "old"
+		a, ok2 := x.(int)
+		u, ok3 := x.(named)
+		r, ok4 := x.(io.Reader)
+		out += fmt.Sprintf(" %d:%q %v %d %v %v %v %v %v %v", i, s, ok, n, a, ok2, u == nil, ok3, r == nil, ok4)
+	}
+	var e error = fmt.Errorf("e")
+	for i := 0; i < 2; i++ {
+		var x any = user{"u"}
+		if i == 1 {
+			x = e
+		}
+		u, ok := x.(user)
+		out += fmt.Sprintf(" %q %v", u.name, ok)
+	}
+	return out
+}`, `[policy] [model policy input] 0:"x" true 0 0 false true false true false 1:"" false 3 3 true true false true false 2:"" false 0 0 false true false true false "u" true "" false`)
+}
+
+// An expression switch on an interface value compares as == does: case constants of the dynamic
+// type match, others do not, and nil matches a nil interface. It converted the interface to the
+// case's type, which panicked.
+func TestSwitchOnInterfaceValue(t *testing.T) {
+	expect(t, `package main
+
+const KindB = "b"
+
+func classify(v any) string {
+	switch v {
+	case "a":
+		return "a"
+	case KindB, "bb":
+		return "b"
+	case 1:
+		return "one"
+	case nil:
+		return "nil"
+	}
+	return "other"
+}
+
+func Run() string {
+	out := ""
+	for _, v := range []any{"a", "b", "bb", 1, nil, "z", 2, int64(1), 1.0} {
+		out += classify(v) + " "
+	}
+	var err error
+	switch err {
+	case nil:
+		out += "nil-error "
+	}
+	s := "q"
+	var q any = "q"
+	switch s {
+	case q:
+		out += "q"
+	}
+	return out
+}`, "a b b one nil other other other other nil-error q")
+}
+
+// A multi-assignment with nil sources (a nil interface, slice, map, pointer, func or channel,
+// into variables, globals or map entries) and between interface variables.
+func TestMultiAssignNilAndInterfaces(t *testing.T) {
+	expect(t, `package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var calls []string
+var down = true
+
+type item struct {
+	Items []struct {
+		ID string
+		N  *int
+	}
+}
+
+func Run() string {
+	calls = []string{"x"}
+	calls, down = nil, false
+	var a any = 1
+	var ok = true
+	a, ok = nil, false
+	var p *int
+	x := 5
+	p, x = nil, 6
+	var f func()
+	var ch chan int
+	f, ch = nil, nil
+	m := map[string][]int{"k": {1}}
+	n := 0
+	m["k"], n = nil, 2
+	var err error = errors.New("e")
+	var s fmt.Stringer
+	err, s = nil, nil
+	var u, v any = 1, "v"
+	u, v = v, u
+	var it item
+	it.Items = append(it.Items, struct {
+		ID string
+		N  *int
+	}{"i", nil})
+	return fmt.Sprint(calls == nil, down, a, ok, p, x, f == nil, ch == nil, m["k"] == nil, len(m), n,
+		err == nil, s == nil, u, v, len(it.Items))
+}`, "true false <nil> false <nil> 6 true true true 1 2 true truev1 1")
+}
+
+// math/rand is available, its seeded sources reproducible.
+func TestMathRand(t *testing.T) {
+	expect(t, `package main
+
+import (
+	"fmt"
+	"math/rand"
+)
+
+func Run() string {
+	a, b := rand.New(rand.NewSource(7)), rand.New(rand.NewSource(7))
+	same := a.Intn(1000) == b.Intn(1000) && a.Float64() == b.Float64()
+	n := rand.Intn(10)
+	p := rand.Perm(4)
+	rand.Shuffle(len(p), func(i, j int) { p[i], p[j] = p[j], p[i] })
+	return fmt.Sprint(same, n >= 0 && n < 10, len(p))
+}`, "true true 4")
+}

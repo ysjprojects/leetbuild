@@ -2,816 +2,721 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: "GET /v1/tools/{name}: resolution against the caller's allowlist",
+  title: "GET /v1/tools/{name}: resolution against the caller's pin and allowlist",
   concept: 'http',
   file: 'read',
   focus: ['client', 'registry', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is \`GET /v1/tools/{name}\`, the resolve endpoint an agent calls
-before it uses a tool. It authenticates the tenant and returns a tool record from Redis. It serves
-the demo (one catalog, one trusted caller) while hiding 4 flaws.
+**Starting point.** The starter serves \`GET /v1/tools/{name}\`, the resolve call an agent makes
+before it uses a tool: it answers 401 without \`X-Tenant-Id\`, resolves the name in the active catalog
+with \`catalog.resolve(name)\` (step 2, provided as \`toolsd.catalog\`), answers 404 when the tool is
+missing, and returns the catalog entry as stored. It serves the demo and hides three flaws.
 
-- A missing \`X-Tenant-Id\` is **401**. The caller's allowlist comes from that authenticated
-  context too, not from the path, body or query string.
-- The version served is the caller's \`X-Catalog-Version\` pin when it pinned one, otherwise
-  \`catalog:active\`. The entry is read with one \`HGET\` against \`catalog:version:{version}\`.
-- A tool outside the allowlist is **404**, the same answer as a missing tool; a 403 would turn the
-  endpoint into an enumeration oracle.
-- The response is the public contract only: \`name\`, \`version\` (the version served),
-  \`side_effect\` and \`definition\` (the JSON Schema). No owner endpoint, credential reference or
-  internal schema blob.
+**Failure mode the checks target.** An agent that pinned a catalog for its run is switched to the
+newest definitions mid-plan; any tenant resolves any tool, including irreversible ones it was never
+granted; and every caller receives the owner team's internal endpoint and credential reference.
 
-**Failure mode the checks target.** The starter serves whatever the active catalog holds, so an agent
-that pinned a catalog to keep a reviewed definition is silently flipped onto the newest one
-mid-plan. It skips the allowlist, so any authenticated caller can resolve any tool, including the
-irreversible ones it was not granted. And it returns the stored record field by field, shipping the
-owner team's endpoint and credential reference to every caller under the internal field names.
-None of it shows in a demo with one catalog, one caller and no secret worth leaking.`,
+- The run's pin comes from \`X-Run-Id\`: \`catalog.resolve(name, run_id)\`.
+- The allowlist is the authenticated tenant's, \`store.allowlist(tenant)\`. A tool outside it is
+  **404** with the same body as a missing tool; a 403 would tell a caller which tools exist.
+- The response is \`PUBLIC_FIELDS\` only: \`name\`, \`version\` (the version served), \`side_effect\`
+  and \`schema\`.`,
   sequence: {
-    participants: ['Client', 'Tool Registry', 'Redis'],
+    participants: ['Agent run', 'toolsd', 'Redis'],
     messages: [
-      {
-        from: 'Client',
-        to: 'Tool Registry',
-        label: 'GET /v1/tools/payments.refund · X-Tenant-Id · X-Catalog-Version',
-        kind: 'sync',
-      },
-      {
-        from: 'Tool Registry',
-        to: 'Tool Registry',
-        label: 'authenticate · allowlist from the caller’s context · outside it → 404, never 403',
-        kind: 'sync',
-      },
-      {
-        from: 'Tool Registry',
-        to: 'Redis',
-        label: 'HGET catalog:{pin or active} payments.refund · one round trip',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Tool Registry', label: 'record / nil → 404', kind: 'reply'},
-      {
-        from: 'Tool Registry',
-        to: 'Client',
-        label: '{name, version, side_effect, definition} · no owner endpoint, no credentials',
-        kind: 'reply',
-      },
+      {from: 'Agent run', to: 'toolsd', label: 'GET /v1/tools/payments.refund · X-Tenant-Id · X-Run-Id', kind: 'sync'},
+      {from: 'toolsd', to: 'Redis', label: 'SMEMBERS tenant:acme:tools → not granted: 404', kind: 'sync'},
+      {from: 'toolsd', to: 'Redis', label: 'GET catalog:pin:run-1 → 7 · HGET catalog:version:7', kind: 'sync'},
+      {from: 'toolsd', to: 'Agent run', label: '200 {name, version, side_effect, schema}', kind: 'reply'},
     ],
   },
-  hints: [
-    'Symptom: an agent that pinned catalog `a1b2` for its run starts getting `payments.charge` from the newest catalog, a tenant with no grant resolves it anyway, and the reply contains `credentials_ref`.',
-    'Mechanism: the handler reads `catalog:active` unconditionally, so the pin header is dead; it checks only that a tenant exists; and it returns the Redis record as-is, internal fields and stored names included.',
-    'Fix: read `X-Catalog-Version` and fall back to `catalog:active`, load `allowed_tools` in `authenticate` and answer 404 outside it, then build `{name, version, side_effect, definition}` by hand from the record.',
-  ],
   checks: [
     {
       id: 'route',
       title: 'Handles GET /v1/tools/{name}',
-      detail:
-        'The resolve route is registered on `GET /v1/tools/{name}` with the tool name taken from the path. The checks below build on this route.',
+      detail: 'Register the resolve route on `GET /v1/tools/{name}`; a request without `X-Tenant-Id` is 401.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/tools\/\{name\}["']/, /name: str/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/tools\/:name['"]/, /\{name\}\s*=\s*request\.params/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/tools\/\{name\}"/, /PathValue\("name"\)/]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/tools\/\{name\}["']/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/tools\/:name['"]/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/tools\/\{name\}"/]},
         scala: {all: [/path\(\s*"v1"\s*\/\s*"tools"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*"\/v1\/tools\/:name"/, /path_params\.at\("name"\)/]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/tools\//]},
       },
     },
     {
-      id: 'pin',
-      title: 'Serves the caller’s pinned catalog, not whatever is active',
+      id: 'run-pin',
+      title: "Serves the version the caller's run pinned",
       detail:
-        '`X-Catalog-Version` selects the snapshot (`catalog:version:{version}`); `catalog:active` is the fallback only when the caller pinned nothing, so a pinned agent keeps the definition it reviewed for the whole run. The starter ignores the pin and serves the latest catalog.',
+        '`X-Run-Id` is passed to `catalog.resolve`, so a run keeps the catalog it started on; the starter resolves every request in the active catalog.',
+      match: {
+        python: {all: [/x-run-id/i], none: [/catalog\.resolve\(\s*name\s*\)/]},
+        typescript: {all: [/x-run-id/i], none: [/resolve\(\s*name\s*\)/]},
+        go: {all: [/X-Run-Id/i], none: [/catalog\.Resolve\([^\n]*name,\s*""\)/]},
+        scala: {all: [/X-Run-Id/i], none: [/Catalog\.resolve\(\s*name\s*\)/]},
+        cpp: {all: [/X-Run-Id/i], none: [/catalog::resolve\(\s*name\s*\)/]},
+      },
+    },
+    {
+      id: 'allowlist-404',
+      title: 'A tool outside the allowlist is a 404',
+      detail:
+        "The tenant's allowlist (`store.allowlist(tenant)`) is checked before resolving, and a tool outside it answers exactly as a missing one, **404**; the starter skips the allowlist, so any authenticated caller resolves any tool.",
       match: {
         python: {
-          all: [/X-Catalog-Version/, /catalog_version\(/, /catalog:version:\{version\}/],
-          none: [/latest_catalog/],
+          all: [/store\.allowlist\(\s*tenant\s*\)/],
+          none: [/\b403\b/],
+          order: [/store\.allowlist\(/, /catalog\.resolve\(/],
         },
         typescript: {
-          all: [/catalog-version/, /catalogVersion\(/, /catalog:version:\$\{version\}/],
-          none: [/latestCatalog/],
+          all: [/allowlist\(\s*tenant\s*\)/],
+          none: [/\b403\b/],
+          order: [/allowlist\(\s*tenant/, /\bresolve\(/],
         },
         go: {
-          all: [/X-Catalog-Version/, /catalogVersion\(/, /"catalog:version:"\s*\+\s*version/],
-          none: [/latestCatalog/],
+          all: [/store\.Allowlist\([^\n]*tenant\)/],
+          none: [/StatusForbidden|\b403\b/],
+          order: [/store\.Allowlist\(/, /catalog\.Resolve\(/],
         },
         scala: {
-          all: [/X-Catalog-Version/, /catalogVersion\(/, /s"catalog:version:\$version"/],
-          none: [/latestCatalog/],
+          all: [/Store\.allowlist\(\s*tenant/],
+          none: [/Forbidden/],
+          order: [/Store\.allowlist\(/, /Catalog\.resolve\(/],
         },
         cpp: {
-          all: [/X-Catalog-Version/, /catalog_version\(/, /"catalog:version:"\s*\+\s*version/],
-          none: [/latest_catalog/],
+          all: [/store::allowlist\(\s*tenant\s*\)/],
+          none: [/\b403\b/],
+          order: [/store::allowlist\(/, /catalog::resolve\(/],
         },
       },
     },
     {
-      id: 'allowlist',
-      title: 'Answers 404 for a tool outside the caller’s allowlist',
+      id: 'public-fields',
+      title: 'Answers the public contract only',
       detail:
-        'The allowlist comes from the authenticated caller’s context, not the path, body or query string, and a tool it does not name is **404**, the same answer as a missing tool, so the endpoint cannot be used to enumerate the catalog. The starter serves any authenticated caller any tool.',
+        'The response is built from `PUBLIC_FIELDS` (`name`, `version`, `side_effect`, `schema`); the starter returns the stored entry, so the internal endpoint and credential reference reach every caller.',
       match: {
-        python: {all: [/def authenticate\(/, /allowed_tools/, /404/]},
-        typescript: {all: [/function authenticate\(/, /allowedTools/, /404/]},
-        go: {all: [/func authenticate\(/, /AllowedTools/, /StatusNotFound/]},
-        scala: {all: [/def authenticate\(/, /allowedTools/, /NotFound/]},
-        cpp: {all: [/authenticate\(/, /allowed_tools/, /404/]},
-      },
-    },
-    {
-      id: 'no-internal',
-      title: 'No owner endpoint, credential or internal schema in the reply',
-      detail:
-        'The reply carries the public contract only. The starter returns the stored record field by field, shipping the owner team’s internal endpoint, its credential reference and the internal schema blob to every caller.',
-      match: {
-        python: {none: [/owner_endpoint/, /credentials_ref/, /internal_schema/]},
-        typescript: {none: [/owner_endpoint/, /credentials_ref/, /internal_schema/]},
-        go: {none: [/owner_endpoint/, /credentials_ref/, /internal_schema/]},
-        scala: {none: [/owner_endpoint/, /credentials_ref/, /internal_schema/]},
-        cpp: {none: [/owner_endpoint/, /credentials_ref/, /internal_schema/]},
-      },
-    },
-    {
-      id: 'definition',
-      title: 'Carries the definition, the side-effect class and the version served',
-      detail:
-        'The reply maps the stored record onto the public shape: `name`, `version` (the version served from the resolved snapshot), `side_effect` and `definition` (the JSON Schema) — not the stored field’s internal name. The starter returns the schema under `schema`.',
-      match: {
-        python: {all: [/["']definition["']/, /["']side_effect["']/, /["']version["']/]},
-        typescript: {all: [/\bdefinition\b/, /\bside_effect\b/, /\bversion\b/]},
-        go: {all: [/json:"definition"/, /json:"side_effect"/, /json:"version"/]},
-        scala: {all: [/"definition"/, /"side_effect"/, /"version"/]},
-        cpp: {all: [/"definition"/, /"side_effect"/, /"version"/]},
+        python: {all: [/PUBLIC_FIELDS/], none: [/JSONResponse\(\s*entry\s*\)/]},
+        typescript: {all: [/PUBLIC_FIELDS/], none: [/send\(\s*entry\s*\)|return entry;/]},
+        go: {all: [/publicFields/], none: [/writeJSON\(rw,\s*http\.StatusOK,\s*entry\)/]},
+        scala: {all: [/PublicFields/], none: [/entry\.compactPrint/]},
+        cpp: {all: [/kPublicFields/], none: [/entry->dump\(\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import json
+      starter: `from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
-import redis
-from fastapi import FastAPI, Header, HTTPException
+from toolsd import catalog, store  # catalog.resolve, store.allowlist
 
 app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-
-def latest_catalog() -> str:
-    return r.get("catalog:active") or ""
 
 
 @app.get("/v1/tools/{name}")
-def resolve(name: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    if tenant is None or tenant == "":
+def resolve_tool(name: str, request: Request) -> JSONResponse:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
         raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    latest = latest_catalog()
-    raw = r.hget(f"catalog:version:{latest}", name)
-    if raw is None:
-        raise HTTPException(status_code=404, detail="tool not found")
-    record = json.loads(raw)
-    return {
-        "name": record["name"],
-        "version": record["version"],
-        "schema": record["schema"],
-        "side_effect": record["side_effect"],
-        "owner_endpoint": record["owner_endpoint"],
-        "credentials_ref": record["credentials_ref"],
-        "internal_schema": record["internal_schema"],
-    }
+    entry = catalog.resolve(name)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="no such tool")
+    return JSONResponse(entry)
 `,
-      solution: `import json
+      solution: `from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
-import redis
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from toolsd import catalog, store  # catalog.resolve, store.allowlist
 
 app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-ACTIVE_CATALOG_KEY = "catalog:active"
-
-
-class CallerContext(BaseModel):
-    tenant: str
-    allowed_tools: set[str]
-
-
-def authenticate(tenant: str | None) -> CallerContext:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    raw = r.get(f"caller:{tenant}")
-    if raw is None:
-        raise HTTPException(status_code=401, detail="unknown caller")
-    profile = json.loads(raw)
-    return CallerContext(tenant=tenant, allowed_tools=set(profile["allowed_tools"]))
-
-
-def catalog_version(pin: str | None) -> str:
-    if pin is not None and pin != "":
-        return pin
-    active = r.get(ACTIVE_CATALOG_KEY)
-    if active is None:
-        raise HTTPException(status_code=503, detail="no active catalog")
-    return active
+PUBLIC_FIELDS = ("name", "version", "side_effect", "schema")
 
 
 @app.get("/v1/tools/{name}")
-def resolve(
-    name: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    pin: str | None = Header(default=None, alias="X-Catalog-Version"),
-) -> dict:
-    caller = authenticate(tenant)
-    if name not in caller.allowed_tools:
-        raise HTTPException(status_code=404, detail="tool not found")
-    version = catalog_version(pin)
-    raw = r.hget(f"catalog:version:{version}", name)
-    if raw is None:
-        raise HTTPException(status_code=404, detail="tool not found")
-    record = json.loads(raw)
-    return {
-        "name": record["name"],
-        "version": record["version"],
-        "side_effect": record["side_effect"],
-        "definition": record["schema"],
-    }
+def resolve_tool(name: str, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
+    # Outside the allowlist answers exactly like a missing tool: a 403 would confirm the tool exists.
+    if name not in store.allowlist(tenant):
+        raise HTTPException(status_code=404, detail="no such tool")
+    entry = catalog.resolve(name, request.headers.get("x-run-id"))
+    if entry is None:
+        raise HTTPException(status_code=404, detail="no such tool")
+    return JSONResponse({field: entry[field] for field in PUBLIC_FIELDS})
 `,
     },
     typescript: {
-      starter: `/** GET /v1/tools/:name. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Fastify from 'fastify';
+
+import {resolve} from 'toolsd/catalog';
+import {allowlist} from 'toolsd/store';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
-
-interface ToolRecord {
-  name: string;
-  version: string;
-  schema: unknown;
-  side_effect: string;
-  owner_endpoint: string;
-  credentials_ref: string;
-  internal_schema: unknown;
-}
-
-async function latestCatalog(): Promise<string> {
-  return (await r.get('catalog:active')) ?? '';
-}
 
 app.get('/v1/tools/:name', async (request, reply) => {
-  const {name} = request.params as {name: string};
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'];
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const latest = await latestCatalog();
-  const raw = await r.hget(\`catalog:version:\${latest}\`, name);
-  if (raw === null) return reply.code(404).send({error: 'tool not found'});
-  const record = JSON.parse(raw) as ToolRecord;
-  return reply.code(200).send({
-    name: record.name,
-    version: record.version,
-    schema: record.schema,
-    side_effect: record.side_effect,
-    owner_endpoint: record.owner_endpoint,
-    credentials_ref: record.credentials_ref,
-    internal_schema: record.internal_schema,
-  });
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  const {name} = request.params as {name: string};
+  const entry = await resolve(name);
+  if (entry === null) return reply.code(404).send({error: 'no such tool'});
+  return reply.send(entry);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/tools/:name: resolved against the caller’s pin and allowlist, public fields only. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Fastify from 'fastify';
+
+import {resolve} from 'toolsd/catalog';
+import {allowlist} from 'toolsd/store';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
 
-const ACTIVE_CATALOG_KEY = 'catalog:active';
-
-interface CallerContext {
-  tenant: string;
-  allowedTools: string[];
-}
-
-interface ToolRecord {
-  name: string;
-  version: string;
-  schema: unknown;
-  side_effect: string;
-}
-
-interface ToolResponse {
-  name: string;
-  version: string;
-  side_effect: string;
-  definition: unknown;
-}
-
-function httpError(statusCode: number, message: string): Error {
-  const error = new Error(message) as Error & {statusCode: number};
-  error.statusCode = statusCode;
-  return error;
-}
-
-async function authenticate(tenant: string | undefined): Promise<CallerContext> {
-  if (typeof tenant !== 'string' || tenant === '') throw httpError(401, 'missing X-Tenant-Id');
-  const raw = await r.get(\`caller:\${tenant}\`);
-  if (raw === null) throw httpError(401, 'unknown caller');
-  const profile = JSON.parse(raw) as {allowed_tools: string[]};
-  return {tenant, allowedTools: profile.allowed_tools};
-}
-
-async function catalogVersion(pin: string | undefined): Promise<string> {
-  if (typeof pin === 'string' && pin !== '') return pin;
-  const active = await r.get(ACTIVE_CATALOG_KEY);
-  if (active === null) throw httpError(503, 'no active catalog');
-  return active;
-}
+export const PUBLIC_FIELDS = ['name', 'version', 'side_effect', 'schema'];
 
 app.get('/v1/tools/:name', async (request, reply) => {
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const {name} = request.params as {name: string};
-  const caller = await authenticate(request.headers['x-tenant-id'] as string | undefined);
-  if (!caller.allowedTools.includes(name)) return reply.code(404).send({error: 'tool not found'});
-  const version = await catalogVersion(request.headers['x-catalog-version'] as string | undefined);
-  const raw = await r.hget(\`catalog:version:\${version}\`, name);
-  if (raw === null) return reply.code(404).send({error: 'tool not found'});
-  const record = JSON.parse(raw) as ToolRecord;
-  const body: ToolResponse = {
-    name: record.name,
-    version: record.version,
-    side_effect: record.side_effect,
-    definition: record.schema,
-  };
-  return reply.code(200).send(body);
+  // Outside the allowlist answers exactly like a missing tool: a 403 would confirm the tool exists.
+  if (!(await allowlist(tenant)).has(name)) return reply.code(404).send({error: 'no such tool'});
+  const runId = request.headers['x-run-id'];
+  const entry = await resolve(name, typeof runId === 'string' && runId !== '' ? runId : null);
+  if (entry === null) return reply.code(404).send({error: 'no such tool'});
+  return reply.send(Object.fromEntries(PUBLIC_FIELDS.map(field => [field, entry[field]])));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 
-	"github.com/redis/go-redis/v9"
+	"toolsd/catalog" // catalog.Resolve(ctx, name, runID); toolsd/store has store.Allowlist(ctx, tenant)
 )
 
-var rdb *redis.Client
-
-type toolRecord struct {
-	Name           string          \`json:"name"\`
-	Version        string          \`json:"version"\`
-	Schema         json.RawMessage \`json:"schema"\`
-	SideEffect     string          \`json:"side_effect"\`
-	OwnerEndpoint  string          \`json:"owner_endpoint"\`
-	CredentialsRef string          \`json:"credentials_ref"\`
-	InternalSchema json.RawMessage \`json:"internal_schema"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func latestCatalog(ctx context.Context) string {
-	active, _ := rdb.Get(ctx, "catalog:active").Result()
-	return active
-}
-
-func resolve(rw http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	tenant := r.Header.Get("X-Tenant-Id")
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+func resolveTool(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	if r.Header.Get("X-Tenant-Id") == "" {
+		http.Error(rw, "missing X-Tenant-Id", http.StatusUnauthorized)
 		return
 	}
-	name := r.PathValue("name")
-	latest := latestCatalog(ctx)
-	raw, err := rdb.HGet(ctx, "catalog:version:"+latest, name).Result()
+	entry, err := catalog.Resolve(r.Context(), r.PathValue("name"), "")
 	if err != nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "tool not found"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	var record toolRecord
-	if err := json.Unmarshal([]byte(raw), &record); err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "corrupt catalog entry"})
+	if entry == nil {
+		http.Error(rw, "no such tool", http.StatusNotFound)
 		return
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"name":            record.Name,
-		"version":         record.Version,
-		"schema":          record.Schema,
-		"side_effect":     record.SideEffect,
-		"owner_endpoint":  record.OwnerEndpoint,
-		"credentials_ref": record.CredentialsRef,
-		"internal_schema": record.InternalSchema,
-	})
+	writeJSON(rw, http.StatusOK, entry)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/tools/{name}", resolve)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/tools/{name}", resolveTool)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
-	"log"
 	"net/http"
 
-	"github.com/redis/go-redis/v9"
+	"toolsd/catalog" // catalog.Resolve(ctx, name, runID)
+	"toolsd/store"   // store.Allowlist(ctx, tenant)
 )
 
-const activeCatalogKey = "catalog:active"
+var publicFields = []string{"name", "version", "side_effect", "schema"}
 
-var rdb *redis.Client
-
-type callerContext struct {
-	Tenant       string
-	AllowedTools map[string]struct{}
-}
-
-type toolRecord struct {
-	Name       string          \`json:"name"\`
-	Version    string          \`json:"version"\`
-	Schema     json.RawMessage \`json:"schema"\`
-	SideEffect string          \`json:"side_effect"\`
-}
-
-type toolResponse struct {
-	Name       string          \`json:"name"\`
-	Version    string          \`json:"version"\`
-	SideEffect string          \`json:"side_effect"\`
-	Definition json.RawMessage \`json:"definition"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func authenticate(ctx context.Context, tenant string) (callerContext, error) {
+func resolveTool(rw http.ResponseWriter, r *http.Request) {
+	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		return callerContext{}, errors.New("missing X-Tenant-Id")
-	}
-	raw, err := rdb.Get(ctx, "caller:"+tenant).Result()
-	if err != nil {
-		return callerContext{}, errors.New("unknown caller")
-	}
-	var profile struct {
-		AllowedTools []string \`json:"allowed_tools"\`
-	}
-	if err := json.Unmarshal([]byte(raw), &profile); err != nil {
-		return callerContext{}, err
-	}
-	allowed := make(map[string]struct{}, len(profile.AllowedTools))
-	for _, tool := range profile.AllowedTools {
-		allowed[tool] = struct{}{}
-	}
-	return callerContext{Tenant: tenant, AllowedTools: allowed}, nil
-}
-
-func catalogVersion(ctx context.Context, pin string) (string, error) {
-	if pin != "" {
-		return pin, nil
-	}
-	active, err := rdb.Get(ctx, activeCatalogKey).Result()
-	if err != nil {
-		return "", errors.New("no active catalog")
-	}
-	return active, nil
-}
-
-func resolve(rw http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	caller, err := authenticate(ctx, r.Header.Get("X-Tenant-Id"))
-	if err != nil {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		http.Error(rw, "missing X-Tenant-Id", http.StatusUnauthorized)
 		return
 	}
 	name := r.PathValue("name")
-	if _, ok := caller.AllowedTools[name]; !ok {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "tool not found"})
-		return
-	}
-	version, err := catalogVersion(ctx, r.Header.Get("X-Catalog-Version"))
+	allowed, err := store.Allowlist(r.Context(), tenant)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "no active catalog"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	raw, err := rdb.HGet(ctx, "catalog:version:"+version, name).Result()
+	// Outside the allowlist answers exactly like a missing tool: a 403 would confirm the tool exists.
+	if !allowed[name] {
+		http.Error(rw, "no such tool", http.StatusNotFound)
+		return
+	}
+	entry, err := catalog.Resolve(r.Context(), name, r.Header.Get("X-Run-Id"))
 	if err != nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "tool not found"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	var record toolRecord
-	if err := json.Unmarshal([]byte(raw), &record); err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "corrupt catalog entry"})
+	if entry == nil {
+		http.Error(rw, "no such tool", http.StatusNotFound)
 		return
 	}
-	writeJSON(rw, http.StatusOK, toolResponse{
-		Name:       record.Name,
-		Version:    record.Version,
-		SideEffect: record.SideEffect,
-		Definition: record.Schema,
-	})
+	public := map[string]any{}
+	for _, field := range publicFields {
+		public[field] = entry[field]
+	}
+	writeJSON(rw, http.StatusOK, public)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/tools/{name}", resolve)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/tools/{name}", resolveTool)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json._
 
-object ToolReadApi {
-  implicit val system: ActorSystem = ActorSystem("tool-registry")
-  val r = new Jedis("redis", 6379)
+import toolsd.{Catalog, Store} // Catalog.resolve(name, runId), Store.allowlist(tenant)
 
-  def latestCatalog(): String = Option(r.get("catalog:active")).getOrElse("")
-
+object Read {
   val route: Route =
     path("v1" / "tools" / Segment) { name =>
       get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          tenantOpt.filter(_.nonEmpty) match {
-            case None => complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            case Some(_) =>
-              val latest = latestCatalog()
-              Option(r.hget(s"catalog:version:$latest", name)) match {
-                case None => complete(StatusCodes.NotFound, """{"error":"tool not found"}""")
-                case Some(raw) =>
-                  val record = raw.parseJson.asJsObject.fields
-                  val body = JsObject(
-                    "name" -> record("name"),
-                    "version" -> record("version"),
-                    "schema" -> record("schema"),
-                    "side_effect" -> record("side_effect"),
-                    "owner_endpoint" -> record("owner_endpoint"),
-                    "credentials_ref" -> record("credentials_ref"),
-                    "internal_schema" -> record("internal_schema"),
-                  ).compactPrint
-                  complete(HttpResponse(StatusCodes.OK, entity = body))
-              }
-          }
+        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+          if (tenant.forall(_.isEmpty)) complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
+          else
+            Catalog.resolve(name) match {
+              case None        => complete(StatusCodes.NotFound -> "no such tool")
+              case Some(entry) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, entry.compactPrint)))
+            }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
 import spray.json._
 
-object ToolReadApi {
-  implicit val system: ActorSystem = ActorSystem("tool-registry")
-  val r = new Jedis("redis", 6379)
+import toolsd.{Catalog, Store} // Catalog.resolve(name, runId), Store.allowlist(tenant)
 
-  val ActiveCatalogKey = "catalog:active"
-
-  final case class CallerContext(tenant: String, allowedTools: Set[String])
-
-  def authenticate(tenant: Option[String]): Option[CallerContext] =
-    tenant.filter(_.nonEmpty).flatMap { t =>
-      Option(r.get(s"caller:$t")).map { raw =>
-        val allowed = raw.parseJson.asJsObject.fields("allowed_tools").convertTo[List[String]].toSet
-        CallerContext(t, allowed)
-      }
-    }
-
-  def catalogVersion(pin: Option[String]): Option[String] =
-    pin.filter(_.nonEmpty).orElse(Option(r.get(ActiveCatalogKey)))
+object Read {
+  val PublicFields: Seq[String] = Seq("name", "version", "side_effect", "schema")
 
   val route: Route =
     path("v1" / "tools" / Segment) { name =>
       get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("X-Catalog-Version") { pinOpt =>
-            authenticate(tenantOpt) match {
-              case None => complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              case Some(caller) if !caller.allowedTools.contains(name) =>
-                complete(StatusCodes.NotFound, """{"error":"tool not found"}""")
+        optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
+          optionalHeaderValueByName("X-Run-Id") { runId =>
+            tenantHeader.filter(_.nonEmpty) match {
+              case None => complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
+              // Outside the allowlist answers exactly like a missing tool: a 403 would confirm the tool exists.
+              case Some(tenant) if !Store.allowlist(tenant).contains(name) => complete(StatusCodes.NotFound -> "no such tool")
               case Some(_) =>
-                catalogVersion(pinOpt) match {
-                  case None => complete(StatusCodes.ServiceUnavailable, """{"error":"no active catalog"}""")
-                  case Some(version) =>
-                    Option(r.hget(s"catalog:version:$version", name)) match {
-                      case None => complete(StatusCodes.NotFound, """{"error":"tool not found"}""")
-                      case Some(raw) =>
-                        val record = raw.parseJson.asJsObject.fields
-                        val served = record("version").convertTo[String]
-                        val sideEffect = record("side_effect").convertTo[String]
-                        val body = JsObject(
-                          "name" -> record("name"),
-                          "version" -> JsString(served),
-                          "side_effect" -> JsString(sideEffect),
-                          "definition" -> record("schema"),
-                        ).compactPrint
-                        complete(HttpResponse(StatusCodes.OK, entity = body))
-                    }
+                Catalog.resolve(name, runId.filter(_.nonEmpty)) match {
+                  case None => complete(StatusCodes.NotFound -> "no such tool")
+                  case Some(entry) =>
+                    val public = JsObject(PublicFields.flatMap(field => entry.fields.get(field).map(field -> _)).toMap)
+                    complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, public.compactPrint)))
                 }
             }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },
     cpp: {
-      starter: `#define CPPHTTPLIB_OPENSSL_SUPPORT
-#include <httplib.h>
+      starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
 
 #include <string>
 
+#include "toolsd/catalog.h"  // catalog::resolve(name, run_id)
+#include "toolsd/store.h"    // store::allowlist(tenant)
+
 using json = nlohmann::json;
 
-sw::redis::Redis redis("tcp://redis:6379");
-
-std::string latest_catalog() {
-  return redis.get("catalog:active").value_or("");
+void resolve_tool(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  if (req.get_header_value("X-Tenant-Id").empty()) {
+    res.status = 401;
+    res.set_content(R"({"error": "missing X-Tenant-Id"})", "application/json");
+    return;
+  }
+  const auto entry = catalog::resolve(req.matches[1]);
+  if (!entry) {
+    res.status = 404;
+    res.set_content(R"({"error": "no such tool"})", "application/json");
+    return;
+  }
+  res.set_content(entry->dump(), "application/json");
 }
 
-int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
-
-  svr.Get("/v1/tools/:name", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto name = req.path_params.at("name");
-    const auto latest = latest_catalog();
-    auto raw = redis.hget("catalog:version:" + latest, name);
-    if (!raw) {
-      res.status = 404;
-      res.set_content(R"({"error":"tool not found"})", "application/json");
-      return;
-    }
-    const json record = json::parse(*raw);
-    res.status = 200;
-    res.set_content(json{
-                        {"name", record.at("name")},
-                        {"version", record.at("version")},
-                        {"schema", record.at("schema")},
-                        {"side_effect", record.at("side_effect")},
-                        {"owner_endpoint", record.at("owner_endpoint")},
-                        {"credentials_ref", record.at("credentials_ref")},
-                        {"internal_schema", record.at("internal_schema")},
-                    }
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/tools/([\\w.-]+))", resolve_tool); }
 `,
-      solution: `#define CPPHTTPLIB_OPENSSL_SUPPORT
-#include <httplib.h>
+      solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
 
-#include <optional>
-#include <set>
 #include <string>
+#include <vector>
+
+#include "toolsd/catalog.h"  // catalog::resolve(name, run_id)
+#include "toolsd/store.h"    // store::allowlist(tenant)
 
 using json = nlohmann::json;
 
-constexpr auto kActiveCatalogKey = "catalog:active";
+const std::vector<std::string> kPublicFields = {"name", "version", "side_effect", "schema"};
 
-sw::redis::Redis redis("tcp://redis:6379");
-
-struct CallerContext {
-  std::string tenant;
-  std::set<std::string> allowed_tools;
-};
-
-struct ToolRecord {
-  std::string name;
-  std::string version;
-  std::string side_effect;
-  json schema;
-};
-
-struct ToolResponse {
-  std::string name;
-  std::string version;
-  std::string side_effect;
-  json definition;
-};
-
-std::optional<CallerContext> authenticate(const httplib::Request& req) {
-  const auto tenant = req.get_header_value("X-Tenant-Id");
-  if (tenant.empty()) return std::nullopt;
-  auto raw = redis.get("caller:" + tenant);
-  if (!raw) return std::nullopt;
-  const json profile = json::parse(*raw);
-  CallerContext caller{tenant, {}};
-  for (const auto& tool : profile.at("allowed_tools")) caller.allowed_tools.insert(tool.get<std::string>());
-  return caller;
+void not_found(httplib::Response& res) {
+  res.status = 404;
+  res.set_content(R"({"error": "no such tool"})", "application/json");
 }
 
-std::optional<std::string> catalog_version(const std::string& pin) {
-  if (!pin.empty()) return pin;
-  auto active = redis.get(kActiveCatalogKey);
-  if (!active) return std::nullopt;
-  return *active;
+void resolve_tool(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content(R"({"error": "missing X-Tenant-Id"})", "application/json");
+    return;
+  }
+  const std::string name = req.matches[1];
+  // Outside the allowlist answers exactly like a missing tool: a 403 would confirm the tool exists.
+  if (!store::allowlist(tenant).count(name)) return not_found(res);
+  const auto entry = catalog::resolve(name, req.get_header_value("X-Run-Id"));
+  if (!entry) return not_found(res);
+  json response = json::object();
+  for (const std::string& field : kPublicFields) {
+    if (entry->contains(field)) response[field] = (*entry)[field];
+  }
+  res.set_content(response.dump(), "application/json");
 }
 
-int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
-
-  svr.Get("/v1/tools/:name", [](const httplib::Request& req, httplib::Response& res) {
-    const auto caller = authenticate(req);
-    if (!caller) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto name = req.path_params.at("name");
-    if (caller->allowed_tools.count(name) == 0) {
-      res.status = 404;
-      res.set_content(R"({"error":"tool not found"})", "application/json");
-      return;
-    }
-    const auto pinned = catalog_version(req.get_header_value("X-Catalog-Version"));
-    if (!pinned) {
-      res.status = 503;
-      res.set_content(R"({"error":"no active catalog"})", "application/json");
-      return;
-    }
-    const std::string version = *pinned;
-    auto raw = redis.hget("catalog:version:" + version, name);
-    if (!raw) {
-      res.status = 404;
-      res.set_content(R"({"error":"tool not found"})", "application/json");
-      return;
-    }
-    const json record = json::parse(*raw);
-    const ToolRecord tool{
-        record.at("name").get<std::string>(),
-        record.at("version").get<std::string>(),
-        record.at("side_effect").get<std::string>(),
-        record.at("schema"),
-    };
-    const ToolResponse body{tool.name, tool.version, tool.side_effect, tool.schema};
-    res.status = 200;
-    res.set_content(json{
-                        {"name", body.name},
-                        {"version", body.version},
-                        {"side_effect", body.side_effect},
-                        {"definition", body.definition},
-                    }
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/tools/([\\w.-]+))", resolve_tool); }
 `,
     },
   },
-  debrief: `The fix has the shape of two decisions and one lookup: which catalog the caller may see (its pin, with the active pointer only as the fallback) and which tools it may see (the allowlist from its authenticated context), then a single HGET on the snapshot that serves both. The allowlist answers 404 rather than 403 for the same reason a missing entry does: confirming that a tool exists to a caller who cannot use it turns the resolver into an enumeration oracle. The response is a contract, not a record dump. Production resolvers add signature verification on the pinned catalog, per-tool scopes inside the allowlist, a short local cache keyed by version, and an audit event for every resolution of an irreversible tool.`,
+  harness: {
+    python: `from toolsd import catalog, store
+
+ACME = {"X-Tenant-Id": "acme"}
+FIELDS = {"name", "version", "side_effect", "schema"}
+
+
+def _entry(name, version, side_effect, owner):
+    return {"name": name, "version": version, "side_effect": side_effect, "owner": owner, "schema": {"type": "object", "properties": {"q": {"type": "string"}}}, "endpoint": f"https://{owner}.internal/{name}", "credential_ref": f"vault://{owner}/{name}"}
+
+
+def _api(ctx):
+    """Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund, not payments.void."""
+    v7 = {"search": _entry("search", "a1", "read", "search"), "payments.refund": _entry("payments.refund", "b1", "irreversible", "payments"), "payments.void": _entry("payments.void", "d1", "write", "payments")}
+    v9 = {"search": _entry("search", "a2", "read", "search"), "payments.refund": _entry("payments.refund", "b2", "irreversible", "payments"), "payments.void": _entry("payments.void", "d2", "write", "payments")}
+    for cv in ("7", "9"):
+        catalog.record_validation(cv, "passed", "")
+    catalog.promote("7", v7)
+    catalog.pin_run("run-1", "7")
+    catalog.promote("9", v9)
+    store.grant("acme", "search", "payments.refund")
+    return ctx.client(ctx.load("read").app)
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await c.get("/v1/tools/search", headers=ACME)
+        assert r.status_code == 200, f"GET /v1/tools/search answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("name") == "search" and body.get("version") == "a2", f"the active catalog serves search a2, the response is {body}"
+        r = await c.get("/v1/tools/search")
+    assert r.status_code == 401, f"a resolve without X-Tenant-Id answered {r.status_code}, expected 401"
+
+
+async def check_run_pin(ctx):
+    async with _api(ctx) as c:
+        pinned = await c.get("/v1/tools/payments.refund", headers={**ACME, "X-Run-Id": "run-1"})
+        assert pinned.status_code == 200, f"a pinned resolve answered {pinned.status_code}: {pinned.text}"
+        assert pinned.json().get("version") == "b1", f"run-1 pinned catalog 7 and was served payments.refund {pinned.json().get('version')}: a promotion switched a running agent to new definitions mid-plan"
+        active = await c.get("/v1/tools/payments.refund", headers=ACME)
+        assert active.json().get("version") == "b2", f"without a run the active catalog serves b2, got {active.json()}"
+        unpinned = await c.get("/v1/tools/payments.refund", headers={**ACME, "X-Run-Id": "run-2"})
+    assert unpinned.json().get("version") == "b2", f"a run that pinned nothing is served the active b2, got {unpinned.json()}"
+
+
+async def check_allowlist_404(ctx):
+    async with _api(ctx) as c:
+        denied = await c.get("/v1/tools/payments.void", headers=ACME)
+        missing = await c.get("/v1/tools/payments.nothing", headers=ACME)
+        assert missing.status_code == 404, f"a missing tool answered {missing.status_code}, expected 404"
+        assert denied.status_code == 404, f"payments.void, which acme was never granted, answered {denied.status_code}: a tool outside the allowlist is 404"
+        assert denied.text == missing.text, f"a tool outside the allowlist answered {denied.text!r}, a missing tool {missing.text!r}: the two must be indistinguishable"
+        other = await c.get("/v1/tools/payments.refund", headers={"X-Tenant-Id": "globex"})
+    assert other.status_code == 404, f"globex, granted nothing, resolved payments.refund with {other.status_code}: the allowlist is the caller's tenant's"
+
+
+async def check_public_fields(ctx):
+    async with _api(ctx) as c:
+        r = await c.get("/v1/tools/payments.refund", headers=ACME)
+    assert r.status_code == 200, f"GET /v1/tools/payments.refund answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert set(body) == FIELDS, f"the response carries {sorted(body)}, expected exactly {sorted(FIELDS)}"
+    assert "vault://" not in r.text and ".internal" not in r.text, f"the response leaks the owner's endpoint or credential reference: {r.text}"
+    assert body["schema"] == {"type": "object", "properties": {"q": {"type": "string"}}}, f"the schema served is {body['schema']}"
+`,
+    typescript: `const ACME = {'X-Tenant-Id': 'acme'};
+const FIELDS = ['name', 'schema', 'side_effect', 'version'];
+
+function entry(name: string, version: string, sideEffect: string, owner: string) {
+  return {name, version, side_effect: sideEffect, owner, schema: {type: 'object', properties: {q: {type: 'string'}}}, endpoint: \`https://\${owner}.internal/\${name}\`, credential_ref: \`vault://\${owner}/\${name}\`};
+}
+
+/** Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund, not payments.void. */
+async function api(ctx) {
+  const catalog = ctx.load('/support/toolsd/catalog.ts');
+  const store = ctx.load('/support/toolsd/store.ts');
+  const v7 = {search: entry('search', 'a1', 'read', 'search'), 'payments.refund': entry('payments.refund', 'b1', 'irreversible', 'payments'), 'payments.void': entry('payments.void', 'd1', 'write', 'payments')};
+  const v9 = {search: entry('search', 'a2', 'read', 'search'), 'payments.refund': entry('payments.refund', 'b2', 'irreversible', 'payments'), 'payments.void': entry('payments.void', 'd2', 'write', 'payments')};
+  for (const cv of ['7', '9']) await catalog.recordValidation(cv, 'passed', '');
+  await catalog.promote('7', v7);
+  await catalog.pinRun('run-1', '7');
+  await catalog.promote('9', v9);
+  await store.grant('acme', 'search', 'payments.refund');
+  return ctx.client(ctx.load('read').app);
+}
+
+export async function check_route(ctx) {
+  const c = await api(ctx);
+  let r = await c.get('/v1/tools/search', {headers: ACME});
+  assert.equal(r.status, 200, \`GET /v1/tools/search answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.name === 'search' && body.version === 'a2', \`the active catalog serves search a2, the response is \${r.text}\`);
+  r = await c.get('/v1/tools/search');
+  assert.equal(r.status, 401, \`a resolve without X-Tenant-Id answered \${r.status}, expected 401\`);
+}
+
+export async function check_run_pin(ctx) {
+  const c = await api(ctx);
+  const pinned = await c.get('/v1/tools/payments.refund', {headers: {...ACME, 'X-Run-Id': 'run-1'}});
+  assert.equal(pinned.status, 200, \`a pinned resolve answered \${pinned.status}: \${pinned.text}\`);
+  assert.equal(pinned.json().version, 'b1', \`run-1 pinned catalog 7 and was served payments.refund \${pinned.json().version}: a promotion switched a running agent to new definitions mid-plan\`);
+  const active = await c.get('/v1/tools/payments.refund', {headers: ACME});
+  assert.equal(active.json().version, 'b2', \`without a run the active catalog serves b2, got \${active.text}\`);
+  const unpinned = await c.get('/v1/tools/payments.refund', {headers: {...ACME, 'X-Run-Id': 'run-2'}});
+  assert.equal(unpinned.json().version, 'b2', \`a run that pinned nothing is served the active b2, got \${unpinned.text}\`);
+}
+
+export async function check_allowlist_404(ctx) {
+  const c = await api(ctx);
+  const denied = await c.get('/v1/tools/payments.void', {headers: ACME});
+  const missing = await c.get('/v1/tools/payments.nothing', {headers: ACME});
+  assert.equal(missing.status, 404, \`a missing tool answered \${missing.status}, expected 404\`);
+  assert.equal(denied.status, 404, \`payments.void, which acme was never granted, answered \${denied.status}: a tool outside the allowlist is 404\`);
+  assert.equal(denied.text, missing.text, \`a tool outside the allowlist answered \${denied.text}, a missing tool \${missing.text}: the two must be indistinguishable\`);
+  const other = await c.get('/v1/tools/payments.refund', {headers: {'X-Tenant-Id': 'globex'}});
+  assert.equal(other.status, 404, \`globex, granted nothing, resolved payments.refund with \${other.status}: the allowlist is the caller's tenant's\`);
+}
+
+export async function check_public_fields(ctx) {
+  const c = await api(ctx);
+  const r = await c.get('/v1/tools/payments.refund', {headers: ACME});
+  assert.equal(r.status, 200, \`GET /v1/tools/payments.refund answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert.deepStrictEqual(Object.keys(body).sort(), FIELDS, \`the response carries \${JSON.stringify(Object.keys(body).sort())}, expected exactly \${JSON.stringify(FIELDS)}\`);
+  assert(!r.text.includes('vault://') && !r.text.includes('.internal'), \`the response leaks the owner's endpoint or credential reference: \${r.text}\`);
+  assert.deepStrictEqual(body.schema, {type: 'object', properties: {q: {type: 'string'}}}, \`the schema served is \${JSON.stringify(body.schema)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"sort"
+	"strings"
+
+	"toolsd/catalog"
+	"toolsd/store"
+
+	"leetbuild/harness"
+)
+
+var readBg = context.Background()
+
+func entry(name, version, sideEffect, owner string) catalog.Entry {
+	return catalog.Entry{"name": name, "version": version, "side_effect": sideEffect, "owner": owner, "schema": map[string]any{"type": "object", "properties": map[string]any{"q": map[string]any{"type": "string"}}}, "endpoint": "https://" + owner + ".internal/" + name, "credential_ref": "vault://" + owner + "/" + name}
+}
+
+// api: catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund, not payments.void.
+func api(ctx *harness.Ctx) *harness.HTTP {
+	v7 := map[string]catalog.Entry{"search": entry("search", "a1", "read", "search"), "payments.refund": entry("payments.refund", "b1", "irreversible", "payments"), "payments.void": entry("payments.void", "d1", "write", "payments")}
+	v9 := map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "payments.refund": entry("payments.refund", "b2", "irreversible", "payments"), "payments.void": entry("payments.void", "d2", "write", "payments")}
+	for _, cv := range []string{"7", "9"} {
+		ctx.NoError(catalog.RecordValidation(readBg, cv, "passed", ""), "seeding failed")
+	}
+	ctx.NoError(catalog.Promote(readBg, "7", v7), "seeding failed")
+	ctx.NoError(catalog.PinRun(readBg, "run-1", "7"), "seeding failed")
+	ctx.NoError(catalog.Promote(readBg, "9", v9), "seeding failed")
+	ctx.NoError(store.Grant(readBg, "acme", "search", "payments.refund"), "seeding failed")
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func served(r *harness.Response) map[string]any {
+	var body map[string]any
+	r.Decode(&body)
+	return body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Get("/v1/tools/search", "X-Tenant-Id", "acme")
+	ctx.Equal(r.Status, 200, "GET /v1/tools/search (%s)", r.Text())
+	body := served(r)
+	ctx.Assert(body["name"] == "search" && body["version"] == "a2", "the active catalog serves search a2, the response is %s", r.Text())
+	ctx.Equal(c.Get("/v1/tools/search").Status, 401, "a resolve without X-Tenant-Id")
+}
+
+func CheckRunPin(ctx *harness.Ctx) {
+	c := api(ctx)
+	pinned := c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-1")
+	ctx.Equal(pinned.Status, 200, "a pinned resolve (%s)", pinned.Text())
+	ctx.Equal(served(pinned)["version"], "b1", "run-1 pinned catalog 7: a promotion must not switch a running agent to new definitions mid-plan; the payments.refund version served")
+	ctx.Equal(served(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme"))["version"], "b2", "without a run, the version the active catalog serves")
+	ctx.Equal(served(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-2"))["version"], "b2", "a run that pinned nothing is served the active catalog; the version")
+}
+
+func CheckAllowlist404(ctx *harness.Ctx) {
+	c := api(ctx)
+	denied := c.Get("/v1/tools/payments.void", "X-Tenant-Id", "acme")
+	missing := c.Get("/v1/tools/payments.nothing", "X-Tenant-Id", "acme")
+	ctx.Equal(missing.Status, 404, "a missing tool")
+	ctx.Equal(denied.Status, 404, "payments.void, which acme was never granted: a tool outside the allowlist is 404")
+	ctx.Equal(denied.Text(), missing.Text(), "a tool outside the allowlist and a missing tool must be indistinguishable; the body")
+	ctx.Equal(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "globex").Status, 404, "globex, granted nothing, resolving payments.refund (the allowlist is the caller's tenant's)")
+}
+
+func CheckPublicFields(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme")
+	ctx.Equal(r.Status, 200, "GET /v1/tools/payments.refund (%s)", r.Text())
+	body := served(r)
+	fields := make([]string, 0, len(body))
+	for k := range body {
+		fields = append(fields, k)
+	}
+	sort.Strings(fields)
+	ctx.Equal(fields, []string{"name", "schema", "side_effect", "version"}, "the response's fields")
+	ctx.Assert(!strings.Contains(r.Text(), "vault://") && !strings.Contains(r.Text(), ".internal"), "the response leaks the owner's endpoint or credential reference: %s", r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+using json = nlohmann::json;
+
+namespace {
+
+json entry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
+  return json{{"name", name},
+              {"version", version},
+              {"side_effect", side_effect},
+              {"owner", owner},
+              {"schema", {{"type", "object"}, {"properties", {{"q", {{"type", "string"}}}}}}},
+              {"endpoint", "https://" + owner + ".internal/" + name},
+              {"credential_ref", "vault://" + owner + "/" + name}};
+}
+
+// Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund, not payments.void.
+harness::HTTP api(harness::Ctx& ctx) {
+  const json v7 = {{"search", entry("search", "a1", "read", "search")},
+                   {"payments.refund", entry("payments.refund", "b1", "irreversible", "payments")},
+                   {"payments.void", entry("payments.void", "d1", "write", "payments")}};
+  const json v9 = {{"search", entry("search", "a2", "read", "search")},
+                   {"payments.refund", entry("payments.refund", "b2", "irreversible", "payments")},
+                   {"payments.void", entry("payments.void", "d2", "write", "payments")}};
+  catalog::recordValidation("7", "passed", "");
+  catalog::recordValidation("9", "passed", "");
+  catalog::promote("7", v7);
+  catalog::pinRun("run-1", "7");
+  catalog::promote("9", v9);
+  store::grant("acme", {"search", "payments.refund"});
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+std::string versionIn(const harness::Response& r) {
+  const json body = json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body.value("version", "") : "";
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = c.Get("/v1/tools/search", "X-Tenant-Id", "acme");
+  ctx.Equal(r.Status, 200, "GET /v1/tools/search (%s)", r.Text());
+  ctx.Assert(r.Text().find("\\"search\\"") != std::string::npos && versionIn(r) == "a2", "the active catalog serves search a2, the response is %s", r.Text());
+  ctx.Equal(c.Get("/v1/tools/search").Status, 401, "a resolve without X-Tenant-Id");
+}
+
+void CheckRunPin(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto pinned = c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-1");
+  ctx.Equal(pinned.Status, 200, "a pinned resolve (%s)", pinned.Text());
+  ctx.Equal(versionIn(pinned), "b1", "run-1 pinned catalog 7: a promotion must not switch a running agent to new definitions mid-plan; the payments.refund version served");
+  ctx.Equal(versionIn(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme")), "b2", "without a run, the version the active catalog serves");
+  ctx.Equal(versionIn(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-2")), "b2", "a run that pinned nothing is served the active catalog; the version");
+}
+
+void CheckAllowlist404(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto denied = c.Get("/v1/tools/payments.void", "X-Tenant-Id", "acme");
+  const auto missing = c.Get("/v1/tools/payments.nothing", "X-Tenant-Id", "acme");
+  ctx.Equal(missing.Status, 404, "a missing tool");
+  ctx.Equal(denied.Status, 404, "payments.void, which acme was never granted: a tool outside the allowlist is 404");
+  ctx.Equal(denied.Text(), missing.Text(), "a tool outside the allowlist and a missing tool must be indistinguishable; the body");
+  ctx.Equal(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "globex").Status, 404, "globex, granted nothing, resolving payments.refund (the allowlist is the caller's tenant's)");
+}
+
+void CheckPublicFields(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme");
+  ctx.Equal(r.Status, 200, "GET /v1/tools/payments.refund (%s)", r.Text());
+  const json body = json::parse(r.Text(), nullptr, false);
+  std::vector<std::string> fields;
+  if (body.is_object()) {
+    for (const auto& [k, v] : body.items()) fields.push_back(k);
+  }
+  ctx.Equal(fields, {"name", "schema", "side_effect", "version"}, "the response's fields");
+  ctx.Assert(r.Text().find("vault://") == std::string::npos && r.Text().find(".internal") == std::string::npos, "the response leaks the owner's endpoint or credential reference: %s", r.Text());
+}
+`,
+  },
+  hints: [
+    "Pin a run to catalog 7, promote 9, and resolve with `X-Run-Id`: the agent gets the new version. Resolve a tool your tenant was never granted: 200, with the owner's endpoint and vault path in the body.",
+    'The handler calls `catalog.resolve(name)` without the run id, never reads the allowlist, and returns the stored entry, so whatever the registry keeps internally goes out with it.',
+    '404 (same body as a missing tool) unless `name in store.allowlist(tenant)`; `catalog.resolve(name, request.headers.get("x-run-id"))`; answer `{f: entry[f] for f in PUBLIC_FIELDS}`.',
+  ],
+  debrief: `Resolution is where the registry's guarantees reach the agent, so each of them is applied here: the run's pin keeps the definition the plan was built against, the allowlist decides what this tenant may call, and the response is a projection rather than the stored record. Answering 404 outside the allowlist keeps the endpoint from confirming which tools exist, which matters for names like payments.refund. Building the response from a field list means an internal field added to the registry later stays internal by default. Production registries cache allowlists per tenant with a short TTL, log every resolution with its run id for audit, and sign the response so the agent runtime can check where it came from.`,
 };

@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package rag;
+
+// The embedding model the chunk worker (step 2) calls with a batch of chunk texts: one unary RPC per
+// attempt, with a deadline. The harness serves a deterministic stand-in at embedder:9000 (rag/embed
+// in the support modules).
+service Embedder {
+  rpc Embed(EmbedRequest) returns (EmbedReply);
+}
+
+message EmbedRequest {
+  repeated string texts = 1;
+}
+
+message Vector {
+  repeated double values = 1;
+}
+
+// One vector per text, in request order.
+message EmbedReply {
+  repeated Vector vectors = 1;
+  string model = 2;
+}
+
+// The answer model step 4 calls once per question. The harness serves a deterministic stand-in at
+// llm:9000 (rag/llm in the support modules).
+service Llm {
+  rpc Generate(GenerateRequest) returns (GenerateReply);
+}
+
+message Passage {
+  string chunk_id = 1;
+  string text = 2;
+}
+
+// system: the instructions. passages: the retrieved text, as data. question: the user's question.
+message GenerateRequest {
+  string system = 1;
+  repeated Passage passages = 2;
+  string question = 3;
+}
+
+// A quote the model claims supports its answer, and the passage it claims to quote.
+message Quote {
+  string chunk_id = 1;
+  string quote = 2;
+}
+
+message GenerateReply {
+  string answer = 1;
+  repeated Quote citations = 2;
+}

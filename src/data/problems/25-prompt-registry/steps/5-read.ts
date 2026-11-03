@@ -2,536 +2,548 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/prompts/{name}/versions/{v}: render-safe reads',
+  title: 'Reads and renders: the eval of these bytes, values as text',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'registry', 'db'],
+  focus: ['client', 'registry', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/prompts/{name}/versions/{v}\` with
-\`?render=1&values=<json object>\`: it fetches the version under the caller's tenant, attaches the
-name's latest eval record, and renders with a loop of raw string \`replace\` calls, so the preview
-screen works. It compiles, serves the demo and hides four flaws.
+**Starting point.** The starter serves \`GET /v1/prompts/{name}/versions/{v}\`, answering the stored
+version (\`name\`, \`version\`, \`content_hash\`, \`template\`, \`variables\`) with an \`eval_record\` from
+\`evals.latest\`, and \`POST /v1/prompts/{name}/versions/{v}/render\` with body \`{"values": {...}}\`,
+answering \`{name, version, content_hash, rendered}\` after replacing each declared placeholder in turn.
+Both answer 401 without \`X-Tenant-Id\`. The preview screen works. It hides 4 flaws.
 
-**Failure mode the checks target.** Raw substitution is a template-injection bug: the caller's value
-is re-scanned, so a value carrying \`}}\` closes the slot and the next \`{{\` opens another. The
-leaked eval record is the subtler one: a reader is shown a verdict that was run against different
-bytes, and nothing rejects it.
+**Failure mode the checks target.** Replacing one variable after another is template injection: a
+value containing \`{{tone}}\` becomes a placeholder for the next replacement, so a caller writes into
+slots the author owns. The eval record is the subtle one: a reader sees the verdict on whichever
+version was judged last, other bytes entirely. And a missing version answers 200 with an empty record
+that a client caches as a prompt.
 
-- The version is looked up for the **authenticated tenant**; a version that does not exist, or
-  belongs to another tenant, answers **404**.
-- The response carries \`name\`, \`version\`, \`content_hash\`, \`template\`, \`variables\` and the
-  \`eval_record\` of that **exact content hash** (\`store.get_eval\`).
-- \`?render=1&values=<json object>\` renders the template. Every declared placeholder must have a
-  value and every value must be a string of at most **\`MAX_VALUE_BYTES\` = 1024** bytes; anything
-  else is **422**.
-- Rendering **escapes the value** and substitutes in **one pass** (a replacement function), so
-  caller text is not re-scanned as a placeholder; a value like \`"}}{{\\"x\\":1"\` must come out
-  as inert text inside its slot.`,
+Requirements:
+
+- A version the tenant does not have is **404** on both routes.
+- \`eval_record\` is the verdict on this version's own content hash (\`evals.get\`), \`null\` when it was
+  never judged.
+- Render in **one pass** over the template (\`PLACEHOLDER\` with a replacement function): a value is
+  inserted as text and not scanned again.
+- \`values\` holds exactly the declared variables, each a string of at most **1024 bytes**
+  (\`MAX_VALUE_BYTES\`); **422** otherwise.`,
   sequence: {
-    participants: ['Client', 'Prompt Registry', 'version store'],
+    participants: ['Client', 'registryd', 'Redis'],
     messages: [
       {
         from: 'Client',
-        to: 'Prompt Registry',
-        label: 'GET /v1/prompts/support-reply/versions/3 · X-Tenant-Id',
+        to: 'registryd',
+        label: 'POST /v1/prompts/support-reply/versions/3/render {values}',
         kind: 'sync',
       },
-      {from: 'Prompt Registry', to: 'version store', label: 'get_version(tenant, name, version)', kind: 'sync'},
-      {from: 'version store', to: 'Prompt Registry', label: 'record · none → 404', kind: 'reply'},
-      {from: 'Prompt Registry', to: 'version store', label: 'get_eval(tenant, name, content_hash)', kind: 'sync'},
-      {from: 'Prompt Registry', to: 'Prompt Registry', label: 'escape values · substitute in one pass', kind: 'sync'},
-      {from: 'Prompt Registry', to: 'Client', label: '{template, variables, eval_record, rendered}', kind: 'reply'},
+      {from: 'registryd', to: 'Redis', label: 'versions.get(tenant, name, 3)', kind: 'sync'},
+      {from: 'Redis', to: 'registryd', label: 'record · none → 404', kind: 'reply'},
+      {from: 'registryd', to: 'registryd', label: 'values = variables · strings ≤ 1 KiB · else 422', kind: 'sync'},
+      {from: 'registryd', to: 'registryd', label: 'one pass: PLACEHOLDER → values[key]', kind: 'sync'},
+      {from: 'registryd', to: 'Client', label: '{content_hash, rendered}', kind: 'reply'},
+      {from: 'Client', to: 'registryd', label: 'GET /v1/prompts/support-reply/versions/3', kind: 'sync'},
+      {from: 'registryd', to: 'Redis', label: 'evals.get(tenant, name, content_hash)', kind: 'sync'},
     ],
   },
   checks: [
     {
       id: 'read-route',
-      title: 'Handles GET /v1/prompts/{name}/versions/{v}',
-      detail: 'Register the read route on `GET /v1/prompts/{name}/versions/{v}`.',
+      title: 'Serves the version and renders it',
+      detail:
+        'GET answers name, version, content_hash, template, variables and an eval_record field; render with every value answers the filled template; both are 401 without X-Tenant-Id.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/prompts\/\{name\}\/versions\/\{v\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/prompts\/:name\/versions\/:v['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/prompts\/\{name\}\/versions\/\{v\}"/]},
-        scala: {
-          all: [/path\(\s*"v1"\s*\/\s*"prompts"\s*\/\s*Segment\s*\/\s*"versions"\s*\/\s*IntNumber\s*\)/, /\bget\s*\{/],
-        },
-        cpp: {all: [/svr\.Get\(\s*"\/v1\/prompts\/:name\/versions\/:v"/]},
+        scala: {all: [/"v1"\s*\/\s*"prompts"\s*\/\s*Segment\s*\/\s*"versions"\s*\/\s*IntNumber/, /\bget\s*\{/]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/prompts\//]},
       },
     },
     {
-      id: 'tenant-scope',
-      title: 'Scopes the version to the authenticated tenant',
+      id: 'missing-404',
+      title: 'A version the tenant does not have is 404',
       detail:
-        'The version is authorized against the request tenant before anything is read, and a foreign or missing version answers **404**. The starter serves any version in the path and leaks another tenant’s eval record.',
+        'A version never registered, another tenant’s version, and a render of a missing version all answer 404 with no template in the body. The starter answers 200 with an empty record.',
       match: {
-        python: {all: [/assert_tenant_owns/, /\b404\b/]},
-        typescript: {all: [/assertTenantOwns/, /\b404\b/]},
-        go: {all: [/assertTenantOwns/, /StatusNotFound/]},
-        scala: {all: [/assertTenantOwns/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/assert_tenant_owns/, /\b404\b/]},
+        python: {all: [/status_code\s*=\s*404/]},
+        typescript: {all: [/code\(\s*404\s*\)/]},
+        go: {all: [/StatusNotFound/]},
+        scala: {all: [/StatusCodes\.NotFound/]},
+        cpp: {all: [/\b404\b/]},
       },
     },
     {
-      id: 'render-delimiter',
-      title: 'Escapes values so a delimiter cannot break the template',
+      id: 'eval-by-hash',
+      title: 'Attaches the eval of exactly these bytes',
       detail:
-        'Values are escaped (`escape_value`/`escapeValue`) and substituted by a replacement function in one pass, so a value containing the delimiter is inert. The starter re-scans the caller’s text with a raw `replace`.',
+        'Version 3 carries its own passing verdict even after version 4 was judged later and failed; version 5, never judged, carries null. The starter attaches the name’s latest verdict.',
       match: {
-        python: {all: [/escape_value\(/, /PLACEHOLDER_RE/]},
-        typescript: {all: [/escapeValue\(/, /PLACEHOLDER_RE/]},
-        go: {all: [/escapeValue\(/, /placeholderRE/]},
-        scala: {all: [/escapeValue\(/, /PlaceholderRe/]},
-        cpp: {all: [/escape_value\(/, /render_template\(/]},
+        python: {all: [/evals\.get\(/], none: [/evals\.latest\(/]},
+        typescript: {all: [/evals\.get\(/], none: [/evals\.latest\(/]},
+        go: {all: [/evals\.Get\(/], none: [/evals\.Latest\(/]},
+        scala: {all: [/Evals\.get\(/], none: [/Evals\.latest\(/]},
+        cpp: {all: [/evals::get\(/], none: [/evals::latest\(/]},
+      },
+    },
+    {
+      id: 'render-one-pass',
+      title: 'Renders in one pass, values as text',
+      detail:
+        'customer_name = "{{tone}}" with tone = "rude" renders "Hi {{tone}}, answer in a rude tone.": the value lands as text and is not scanned again. The starter replaces variable after variable and fills the injected slot.',
+      match: {
+        python: {all: [/PLACEHOLDER\.sub\(|re\.sub\(\s*PLACEHOLDER/], none: [/\.replace\(\s*["']\{\{/]},
+        typescript: {all: [/\.replace\(\s*PLACEHOLDER\s*,/], none: [/replaceAll\(\s*['"]\{\{/]},
+        go: {all: [/config\.Placeholder\.ReplaceAllStringFunc\(/], none: [/strings\.Replace(All)?\(/]},
+        scala: {all: [/Config\.Placeholder\.replaceAllIn\(/], none: [/\.replace\(\s*"\{\{/]},
+        cpp: {all: [/sregex_iterator\([\s\S]{0,120}?config::kPlaceholder/], none: [/rendered\.replace\(/]},
       },
     },
     {
       id: 'value-limits',
-      title: 'Requires a value for every placeholder and caps each at 1 KiB',
+      title: 'Values are exactly the declared variables, strings of at most 1 KiB',
       detail:
-        'Render mode validates the supplied values: every declared placeholder needs one, nothing undeclared is accepted, and each value is capped at `MAX_VALUE_BYTES`. Violations answer **422**. The starter validates nothing.',
+        'A missing value, a value for an undeclared placeholder, a value that is not a string, or one of 1025 bytes is 422; 1024 bytes renders. The starter renders a missing value as nothing and ignores the rest.',
       match: {
         python: {all: [/MAX_VALUE_BYTES/, /status_code\s*=\s*422/]},
-        typescript: {all: [/MAX_VALUE_BYTES/, /fail\(\s*422\s*,/]},
+        typescript: {all: [/MAX_VALUE_BYTES/, /code\(\s*422\s*\)/]},
         go: {all: [/maxValueBytes/, /StatusUnprocessableEntity/]},
         scala: {all: [/MaxValueBytes/, /StatusCodes\.UnprocessableEntity/]},
         cpp: {all: [/kMaxValueBytes/, /\b422\b/]},
       },
     },
-    {
-      id: 'eval-by-hash',
-      title: 'Attaches the eval of the exact version hash',
-      detail:
-        'The eval record is read for the requested version’s `content_hash`, not for the name: `store.get_eval(tenant, name, content_hash)`. The starter serves the name’s latest eval, which belongs to different bytes.',
-      match: {
-        python: {all: [/get_eval\(tenant,\s*name,\s*content_hash\)/]},
-        typescript: {all: [/getEval\(tenant,\s*name,\s*contentHash\)/]},
-        go: {all: [/GetEval\(r\.Context\(\),\s*tenant,\s*name,\s*contentHash\)/]},
-        scala: {all: [/getEval\(tenant,\s*name,\s*contentHash\)/]},
-        cpp: {all: [/get_eval\(tenant,\s*name,\s*content_hash\)/]},
-      },
-    },
   ],
   code: {
     python: {
-      starter: `import json
-
-from fastapi import FastAPI, Header, Query
+      starter: `from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+
+from prompts.evals import evals
+from prompts.versions import versions
 
 app = FastAPI()
 
 
-class VersionStore:
-    def get_version(self, tenant: str, name: str, version: int) -> dict | None:
-        """The stored version, if the registry has one."""
-        raise NotImplementedError
-
-    def latest_eval(self, tenant: str, name: str) -> dict | None:
-        """The most recent eval record for the name."""
-        raise NotImplementedError
-
-
-store = VersionStore()
-
-
-def render(template: str, values: dict) -> str:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    rendered = template
-    for key, value in values.items():
-        rendered = rendered.replace("{{" + key + "}}", value)
-    return rendered
+class RenderRequest(BaseModel):
+    values: dict = {}
 
 
 @app.get("/v1/prompts/{name}/versions/{v}")
-def read_version(
-    name: str,
-    v: int,
-    render_mode: int = Query(default=0, alias="render"),
-    values: str | None = None,
-    tenant: str = Header(alias="X-Tenant-Id"),
-) -> dict:
-    record = store.get_version(tenant, name, v) or {}
-    body = dict(record)
-    body["eval_record"] = store.latest_eval(tenant, name)
-    if render_mode:
-        body["rendered"] = render(record["template"], json.loads(values or "{}"))
-    return body
-`,
-      solution: `import json
-import re
+def read_version(name: str, v: int, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> dict:
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    if tenant is None or tenant == "":
+        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
+    record = versions.get(tenant, name, v) or {}
+    return {**record, "eval_record": evals.latest(tenant, name)}
 
-from fastapi import FastAPI, Header, HTTPException, Query
+
+@app.post("/v1/prompts/{name}/versions/{v}/render")
+def render_version(name: str, v: int, body: RenderRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> dict:
+    if tenant is None or tenant == "":
+        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
+    record = versions.get(tenant, name, v) or {}
+    rendered = record.get("template", "")
+    for variable in record.get("variables", []):
+        rendered = rendered.replace("{{" + variable + "}}", str(body.values.get(variable, "")))
+    return {"name": name, "version": v, "content_hash": record.get("content_hash", ""), "rendered": rendered}
+`,
+      solution: `from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+
+from prompts.config import PLACEHOLDER
+from prompts.evals import evals
+from prompts.versions import versions
 
 app = FastAPI()
 
 MAX_VALUE_BYTES = 1024
-PLACEHOLDER_OPEN = "{{"
-PLACEHOLDER_CLOSE = "}}"
-QUOTE = '"'
-ESCAPED_QUOTE = '\\\\"'
-PLACEHOLDER_RE = re.compile(r"\\{\\{([a-z_][a-z0-9_]*)\\}\\}")
 
 
-class VersionStore:
-    def get_version(self, tenant: str, name: str, version: int) -> dict | None:
-        """The stored version, if the registry has one."""
-        raise NotImplementedError
-
-    def get_eval(self, tenant: str, name: str, content_hash: str) -> dict | None:
-        """The eval record for this exact version hash."""
-        raise NotImplementedError
+class RenderRequest(BaseModel):
+    values: dict = {}
 
 
-store = VersionStore()
-
-
-def assert_tenant_owns(tenant: str, name: str, version: int) -> dict:
-    record = store.get_version(tenant, name, version)
+def tenant_version(tenant: str | None, name: str, v: int) -> tuple[str, dict]:
+    if tenant is None or tenant == "":
+        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
+    record = versions.get(tenant, name, v)
     if record is None:
-        raise HTTPException(status_code=404, detail="version not found")
-    return record
-
-
-def escape_value(value: str) -> str:
-    """A caller value may never introduce a placeholder or close the quoted region it sits in."""
-    if PLACEHOLDER_OPEN in value or PLACEHOLDER_CLOSE in value:
-        raise HTTPException(status_code=422, detail="value contains the placeholder delimiter")
-    return value.replace(QUOTE, ESCAPED_QUOTE)
-
-
-def render(template: str, values: dict[str, str]) -> str:
-    declared = set(PLACEHOLDER_RE.findall(template))
-    missing = declared - set(values)
-    if missing:
-        raise HTTPException(status_code=422, detail=f"missing values: {sorted(missing)}")
-    extra = set(values) - declared
-    if extra:
-        raise HTTPException(status_code=422, detail=f"undeclared values: {sorted(extra)}")
-    for value in values.values():
-        if len(value.encode("utf-8")) > MAX_VALUE_BYTES:
-            raise HTTPException(status_code=422, detail="value exceeds 1 KiB")
-    # One pass: a value is inserted as text and is never scanned for placeholders again.
-    return PLACEHOLDER_RE.sub(lambda match: escape_value(values[match.group(1)]), template)
+        raise HTTPException(status_code=404, detail=f"{name} v{v} not found")
+    return tenant, record
 
 
 @app.get("/v1/prompts/{name}/versions/{v}")
-def read_version(
-    name: str,
-    v: int,
-    render_mode: int = Query(default=0, alias="render"),
-    values: str | None = None,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> dict:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    record = assert_tenant_owns(tenant, name, v)
-    content_hash = record["content_hash"]
-    body = {
-        "name": name,
-        "version": v,
-        "content_hash": content_hash,
-        "template": record["template"],
-        "variables": record["variables"],
-        "eval_record": store.get_eval(tenant, name, content_hash),
-    }
-    if not render_mode:
-        return body
-    body["rendered"] = render(record["template"], json.loads(values or "{}"))
-    return body
+def read_version(name: str, v: int, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> dict:
+    tenant, record = tenant_version(tenant, name, v)
+    return {**record, "eval_record": evals.get(tenant, name, record["content_hash"])}
+
+
+@app.post("/v1/prompts/{name}/versions/{v}/render")
+def render_version(name: str, v: int, body: RenderRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> dict:
+    tenant, record = tenant_version(tenant, name, v)
+    values = body.values
+    if set(values) != set(record["variables"]):
+        raise HTTPException(status_code=422, detail=f"values must be exactly {record['variables']}")
+    for key, value in values.items():
+        if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_VALUE_BYTES:
+            raise HTTPException(status_code=422, detail=f"{key} must be a string of at most {MAX_VALUE_BYTES} bytes")
+    # One pass: a value is inserted as text and never scanned for placeholders again.
+    rendered = PLACEHOLDER.sub(lambda match: values[match.group(1)], record["template"])
+    return {"name": name, "version": v, "content_hash": record["content_hash"], "rendered": rendered}
 `,
     },
     typescript: {
-      starter: `/** GET /v1/prompts/:name/versions/:v. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-import {store} from './store';
+import {evals} from 'prompts/evals';
+import {versions} from 'prompts/versions';
 
 export const app = Fastify();
 
-function render(bodyTemplate: string, values: Record<string, string>): string {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  let rendered = bodyTemplate;
-  for (const [key, value] of Object.entries(values)) rendered = rendered.replace(\`{{\${key}}}\`, value);
-  return rendered;
+interface RenderBody {
+  values?: Record<string, unknown>;
 }
 
 app.get('/v1/prompts/:name/versions/:v', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'] as string;
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const {name, v} = request.params as {name: string; v: string};
-  const query = request.query as {render?: string; values?: string};
-  const record = await store.getVersion(tenant, name, Number(v));
-  const body = {...record, eval_record: await store.latestEval(tenant, name)};
-  if (query.render === '1') body.rendered = render(record.template, JSON.parse(query.values ?? '{}'));
-  return reply.code(200).send(body);
+  const record = await versions.get(tenant, name, Number(v));
+  return reply.code(200).send({...record, eval_record: await evals.latest(tenant, name)});
 });
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.post('/v1/prompts/:name/versions/:v/render', async (request, reply) => {
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  const {name, v} = request.params as {name: string; v: string};
+  const record = await versions.get(tenant, name, Number(v));
+  const values = (request.body as RenderBody).values ?? {};
+  let rendered = record?.template ?? '';
+  for (const variable of record?.variables ?? []) rendered = rendered.replaceAll('{{' + variable + '}}', String(values[variable] ?? ''));
+  return reply.code(200).send({name, version: Number(v), content_hash: record?.content_hash ?? '', rendered});
+});
 `,
-      solution: `/** GET /v1/prompts/:name/versions/:v: tenant-scoped, render-safe reads. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 
-import {store} from './store';
+import {PLACEHOLDER} from 'prompts/config';
+import {evals} from 'prompts/evals';
+import {versions} from 'prompts/versions';
 
 export const app = Fastify();
 
-const MAX_VALUE_BYTES = 1024;
-const PLACEHOLDER_OPEN = '{{';
-const PLACEHOLDER_CLOSE = '}}';
-const QUOTE = '"';
-const ESCAPED_QUOTE = '\\\\"';
-const PLACEHOLDER_RE = /\\{\\{([a-z_][a-z0-9_]*)\\}\\}/g;
+export const MAX_VALUE_BYTES = 1024;
 
-interface VersionRecord {
-  name: string;
-  version: number;
-  content_hash: string;
-  template: string;
-  variables: string[];
+interface RenderBody {
+  values?: Record<string, unknown>;
 }
-
-function fail(statusCode: number, detail: string): Error {
-  const error = new Error(detail) as Error & {statusCode: number};
-  error.statusCode = statusCode;
-  return error;
-}
-
-async function assertTenantOwns(tenant: string, name: string, version: number): Promise<VersionRecord> {
-  const record = await store.getVersion(tenant, name, version);
-  if (record === null) throw fail(404, 'version not found');
-  return record;
-}
-
-function escapeValue(value: string): string {
-  if (value.includes(PLACEHOLDER_OPEN) || value.includes(PLACEHOLDER_CLOSE))
-    throw fail(422, 'value contains the placeholder delimiter');
-  return value.replaceAll(QUOTE, ESCAPED_QUOTE);
-}
-
-function render(bodyTemplate: string, values: Record<string, string>): string {
-  const declared = [...new Set([...bodyTemplate.matchAll(PLACEHOLDER_RE)].map(m => m[1]))];
-  const missing = declared.filter(name => values[name] === undefined);
-  if (missing.length > 0) throw fail(422, \`missing values: \${missing.join(',')}\`);
-  for (const [name, value] of Object.entries(values)) {
-    if (!declared.includes(name)) throw fail(422, \`undeclared value: \${name}\`);
-    if (Buffer.byteLength(value, 'utf8') > MAX_VALUE_BYTES) throw fail(422, 'value exceeds 1 KiB');
-    values[name] = value;
-  }
-  // One pass: a value is inserted as text and is never scanned for placeholders again.
-  return bodyTemplate.replace(PLACEHOLDER_RE, (_match, name: string) => escapeValue(values[name]));
-}
-
-app.setErrorHandler((error, request, reply) => {
-  const statusCode = (error as Error & {statusCode?: number}).statusCode ?? 500;
-  return reply.code(statusCode).send({error: error.message});
-});
 
 app.get('/v1/prompts/:name/versions/:v', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
   if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const {name, v} = request.params as {name: string; v: string};
-  const record = await assertTenantOwns(tenant, name, Number(v));
-  const contentHash = record.content_hash;
-  const body = {
-    name,
-    version: Number(v),
-    content_hash: contentHash,
-    template: record.template,
-    variables: record.variables,
-    eval_record: await store.getEval(tenant, name, contentHash),
-  };
-  const query = request.query as {render?: string; values?: string};
-  if (query.render !== '1') return reply.code(200).send(body);
-  const values = JSON.parse(query.values ?? '{}') as Record<string, string>;
-  return reply.code(200).send({...body, rendered: render(record.template, values)});
+  const record = await versions.get(tenant, name, Number(v));
+  if (record === null) return reply.code(404).send({error: \`\${name} v\${v} not found\`});
+  return reply.code(200).send({...record, eval_record: await evals.get(tenant, name, record.content_hash)});
 });
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.post('/v1/prompts/:name/versions/:v/render', async (request, reply) => {
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  const {name, v} = request.params as {name: string; v: string};
+  const record = await versions.get(tenant, name, Number(v));
+  if (record === null) return reply.code(404).send({error: \`\${name} v\${v} not found\`});
+  const values = ((request.body ?? {}) as RenderBody).values ?? {};
+  const exact = Object.keys(values).length === record.variables.length && record.variables.every(key => Object.hasOwn(values, key));
+  if (!exact) return reply.code(422).send({error: \`values must be exactly \${record.variables.join(', ')}\`});
+  for (const [key, value] of Object.entries(values)) {
+    if (typeof value !== 'string' || new TextEncoder().encode(value).length > MAX_VALUE_BYTES)
+      return reply.code(422).send({error: \`\${key} must be a string of at most \${MAX_VALUE_BYTES} bytes\`});
+  }
+  // One pass: a value is inserted as text and never scanned for placeholders again.
+  const rendered = record.template.replace(PLACEHOLDER, (_match, key: string) => values[key] as string);
+  return reply.code(200).send({name, version: record.version, content_hash: record.content_hash, rendered});
+});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"prompts/evals"    // evals.Get/Latest(ctx, tenant, name, …) — provided
+	"prompts/versions" // versions.Get(ctx, tenant, name, version) — provided
 )
 
-var store *VersionStore
+// VersionRead is the read's answer: the version and the eval record attached to it.
+type VersionRead struct {
+	Name        string        \`json:"name"\`
+	Version     int           \`json:"version"\`
+	ContentHash string        \`json:"content_hash"\`
+	Template    string        \`json:"template"\`
+	Variables   []string      \`json:"variables"\`
+	EvalRecord  *evals.Record \`json:"eval_record"\`
+}
 
-func render(bodyTemplate string, values map[string]string) string {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	rendered := bodyTemplate
-	for key, value := range values {
-		rendered = strings.ReplaceAll(rendered, "{{"+key+"}}", value)
+type RenderRequest struct {
+	Values map[string]any \`json:"values"\`
+}
+
+type Rendered struct {
+	Name        string \`json:"name"\`
+	Version     int    \`json:"version"\`
+	ContentHash string \`json:"content_hash"\`
+	Rendered    string \`json:"rendered"\`
+}
+
+func writeJSON(rw http.ResponseWriter, status int, body any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(body)
+}
+
+// lookup authenticates the tenant and reads the version in the path.
+func lookup(rw http.ResponseWriter, r *http.Request) (string, *versions.Version, bool) {
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		return "", nil, false
 	}
-	return rendered
+	v, _ := strconv.Atoi(r.PathValue("v"))
+	record, err := versions.Get(r.Context(), tenant, r.PathValue("name"), v)
+	if err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		return "", nil, false
+	}
+	if record == nil {
+		record = &versions.Version{Name: r.PathValue("name"), Version: v}
+	}
+	return tenant, record, true
 }
 
 func readVersion(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	name := r.PathValue("name")
-	version, _ := strconv.Atoi(r.PathValue("v"))
-	record, _ := store.GetVersion(r.Context(), tenant, name, version)
-	evalRecord, _ := store.LatestEval(r.Context(), tenant, name)
-	body := map[string]any{
-		"name":         name,
-		"version":      version,
-		"content_hash": record.ContentHash,
-		"variables":    record.Variables,
-		"eval_record":  evalRecord,
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	tenant, record, ok := lookup(rw, r)
+	if !ok {
+		return
 	}
-	if r.URL.Query().Get("render") == "1" {
-		values := map[string]string{}
-		_ = json.Unmarshal([]byte(r.URL.Query().Get("values")), &values)
-		body["rendered"] = render(record.Template, values)
+	latest, err := evals.Latest(r.Context(), tenant, record.Name)
+	if err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		return
 	}
-	rw.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(rw).Encode(body)
+	writeJSON(rw, http.StatusOK, VersionRead{record.Name, record.Version, record.ContentHash, record.Template, record.Variables, latest})
+}
+
+func renderVersion(rw http.ResponseWriter, r *http.Request) {
+	_, record, ok := lookup(rw, r)
+	if !ok {
+		return
+	}
+	var body RenderRequest
+	json.NewDecoder(r.Body).Decode(&body)
+	rendered := record.Template
+	for _, variable := range record.Variables {
+		value, _ := body.Values[variable].(string)
+		rendered = strings.ReplaceAll(rendered, "{{"+variable+"}}", value)
+	}
+	writeJSON(rw, http.StatusOK, Rendered{record.Name, record.Version, record.ContentHash, rendered})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/prompts/{name}/versions/{v}", readVersion)
+	mux.HandleFunc("POST /v1/prompts/{name}/versions/{v}/render", renderVersion)
 }
 
 func main() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/prompts/{name}/versions/{v}", readVersion)
+	register(mux)
+	log.Fatal(http.ListenAndServe(":8443", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
+	"log"
 	"net/http"
-	"regexp"
 	"strconv"
-	"strings"
+
+	"prompts/config"   // config.Placeholder — provided
+	"prompts/evals"    // evals.Get/Latest(ctx, tenant, name, …) — provided
+	"prompts/versions" // versions.Get(ctx, tenant, name, version) — provided
 )
 
 const maxValueBytes = 1024
 
-var placeholderRE = regexp.MustCompile(\`\\{\\{([a-z_][a-z0-9_]*)\\}\\}\`)
-
-var errNotFound = errors.New("version not found")
-
-func assertTenantOwns(ctx context.Context, tenant, name string, version int) (*VersionRecord, error) {
-	record, err := store.GetVersion(ctx, tenant, name, version)
-	if err != nil || record == nil {
-		return nil, errNotFound
-	}
-	return record, nil
+// VersionRead is the read's answer: the version and the eval record attached to it.
+type VersionRead struct {
+	Name        string        \`json:"name"\`
+	Version     int           \`json:"version"\`
+	ContentHash string        \`json:"content_hash"\`
+	Template    string        \`json:"template"\`
+	Variables   []string      \`json:"variables"\`
+	EvalRecord  *evals.Record \`json:"eval_record"\`
 }
 
-func escapeValue(value string) string {
-	if strings.Contains(value, "{{") || strings.Contains(value, "}}") {
-		return value
-	}
-	return strings.ReplaceAll(value, "\\"", "\\\\\\"")
+type RenderRequest struct {
+	Values map[string]any \`json:"values"\`
 }
 
-// One pass: a value is inserted as text and is never scanned for placeholders again.
-func render(bodyTemplate string, values map[string]string) (string, error) {
-	declared := map[string]bool{}
-	for _, match := range placeholderRE.FindAllStringSubmatch(bodyTemplate, -1) {
-		declared[match[1]] = true
-	}
-	for name := range declared {
-		if _, ok := values[name]; !ok {
-			return "", errors.New("missing value for " + name)
-		}
-	}
-	for name, value := range values {
-		if !declared[name] {
-			return "", errors.New("undeclared value " + name)
-		}
-		if len([]byte(value)) > maxValueBytes {
-			return "", errors.New("value exceeds 1 KiB")
-		}
-	}
-	return placeholderRE.ReplaceAllStringFunc(bodyTemplate, func(match string) string {
-		return escapeValue(values[placeholderRE.FindStringSubmatch(match)[1]])
-	}), nil
+type Rendered struct {
+	Name        string \`json:"name"\`
+	Version     int    \`json:"version"\`
+	ContentHash string \`json:"content_hash"\`
+	Rendered    string \`json:"rendered"\`
 }
 
-func readVersion(rw http.ResponseWriter, r *http.Request) {
+func writeJSON(rw http.ResponseWriter, status int, body any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(body)
+}
+
+// lookup authenticates the tenant and reads the version in the path: 404 when the tenant has none.
+func lookup(rw http.ResponseWriter, r *http.Request) (string, *versions.Version, bool) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
 		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
-		return
+		return "", nil, false
 	}
-	name := r.PathValue("name")
-	version, _ := strconv.Atoi(r.PathValue("v"))
-	record, err := assertTenantOwns(r.Context(), tenant, name, version)
+	v, err := strconv.Atoi(r.PathValue("v"))
 	if err != nil {
 		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "version not found"})
+		return "", nil, false
+	}
+	record, err := versions.Get(r.Context(), tenant, r.PathValue("name"), v)
+	if err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		return "", nil, false
+	}
+	if record == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "version not found"})
+		return "", nil, false
+	}
+	return tenant, record, true
+}
+
+func readVersion(rw http.ResponseWriter, r *http.Request) {
+	tenant, record, ok := lookup(rw, r)
+	if !ok {
 		return
 	}
-	contentHash := record.ContentHash
-	evalRecord, _ := store.GetEval(r.Context(), tenant, name, contentHash)
-	body := map[string]any{
-		"name":         name,
-		"version":      version,
-		"content_hash": contentHash,
-		"template":     record.Template,
-		"variables":    record.Variables,
-		"eval_record":  evalRecord,
+	verdict, err := evals.Get(r.Context(), tenant, record.Name, record.ContentHash)
+	if err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		return
 	}
-	if r.URL.Query().Get("render") == "1" {
-		values := map[string]string{}
-		_ = json.Unmarshal([]byte(r.URL.Query().Get("values")), &values)
-		rendered, err := render(record.Template, values)
-		if err != nil {
-			writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+	writeJSON(rw, http.StatusOK, VersionRead{record.Name, record.Version, record.ContentHash, record.Template, record.Variables, verdict})
+}
+
+func renderVersion(rw http.ResponseWriter, r *http.Request) {
+	_, record, ok := lookup(rw, r)
+	if !ok {
+		return
+	}
+	var body RenderRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Values) != len(record.Variables) {
+		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "values must be exactly the declared variables"})
+		return
+	}
+	values := make(map[string]string, len(record.Variables))
+	for _, variable := range record.Variables {
+		value, isString := body.Values[variable].(string)
+		if !isString || len(value) > maxValueBytes {
+			writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": variable + " must be a string of at most 1024 bytes"})
 			return
 		}
-		body["rendered"] = rendered
+		values[variable] = value
 	}
-	writeJSON(rw, http.StatusOK, body)
+	// One pass: a value is inserted as text and never scanned for placeholders again.
+	rendered := config.Placeholder.ReplaceAllStringFunc(record.Template, func(placeholder string) string {
+		return values[config.Placeholder.FindStringSubmatch(placeholder)[1]]
+	})
+	writeJSON(rw, http.StatusOK, Rendered{record.Name, record.Version, record.ContentHash, rendered})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/prompts/{name}/versions/{v}", readVersion)
+	mux.HandleFunc("POST /v1/prompts/{name}/versions/{v}/render", renderVersion)
 }
 
 func main() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/prompts/{name}/versions/{v}", readVersion)
+	register(mux)
+	log.Fatal(http.ListenAndServe(":8443", mux))
 }
 `,
     },
     scala: {
       starter: `import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
+import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import org.apache.pekko.http.scaladsl.model._
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json.DefaultJsonProtocol._
+import spray.json.{JsString, JsValue, RootJsonFormat}
 
-object ReadApi {
+import prompts.{EvalRecord, Evals, Versions}
+
+/** The read's answer: the version and the eval record attached to it. */
+final case class VersionRead(name: String, version: Int, content_hash: String, template: String, variables: List[String], eval_record: Option[EvalRecord])
+final case class RenderRequest(values: Option[Map[String, JsValue]])
+final case class Rendered(name: String, version: Int, content_hash: String, rendered: String)
+
+object PromptReads {
   implicit val system: ActorSystem = ActorSystem("prompt-registry")
-
-  def render(bodyTemplate: String, values: Map[String, String]): String = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    values.foldLeft(bodyTemplate) { case (rendered, (key, value)) =>
-      rendered.replace(s"{{$key}}", value)
-    }
-  }
+  implicit val evalFormat: RootJsonFormat[EvalRecord] = jsonFormat5(EvalRecord)
+  implicit val readFormat: RootJsonFormat[VersionRead] = jsonFormat6(VersionRead)
+  implicit val renderFormat: RootJsonFormat[RenderRequest] = jsonFormat1(RenderRequest)
+  implicit val renderedFormat: RootJsonFormat[Rendered] = jsonFormat4(Rendered)
 
   val route: Route =
-    path("v1" / "prompts" / Segment / "versions" / IntNumber) { (name, version) =>
-      get {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          parameter("render".?) { renderOpt =>
-            parameter("values".?) { valuesOpt =>
-              complete {
-                val record = store.getVersion(tenant, name, version)
-                val evalRecord = store.latestEval(tenant, name)
-                val base =
-                  s"""{"name":"$name","version":$version,"content_hash":"\${record.content_hash}","eval_record":"$evalRecord"}"""
-                if (!renderOpt.contains("1")) HttpResponse(StatusCodes.OK, entity = base)
-                else HttpResponse(StatusCodes.OK, entity = base)
+    pathPrefix("v1" / "prompts" / Segment / "versions" / IntNumber) { (name, v) =>
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
+        case Some(tenant) =>
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+          val record = Versions.get(tenant, name, v)
+          concat(
+            pathEndOrSingleSlash {
+              get {
+                complete(
+                  VersionRead(
+                    name,
+                    v,
+                    record.map(_.content_hash).getOrElse(""),
+                    record.map(_.template).getOrElse(""),
+                    record.map(_.variables).getOrElse(Nil),
+                    Evals.latest(tenant, name)
+                  )
+                )
+              }
+            },
+            path("render") {
+              post {
+                entity(as[RenderRequest]) { body =>
+                  val values = body.values.getOrElse(Map.empty)
+                  var rendered = record.map(_.template).getOrElse("")
+                  for (variable <- record.map(_.variables).getOrElse(Nil)) {
+                    val value = values.get(variable).collect { case JsString(s) => s }.getOrElse("")
+                    rendered = rendered.replace("{{" + variable + "}}", value)
+                  }
+                  complete(Rendered(name, v, record.map(_.content_hash).getOrElse(""), rendered))
+                }
               }
             }
-          }
-        }
+          )
       }
     }
 
@@ -540,91 +552,69 @@ object ReadApi {
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
+      solution: `import scala.util.matching.Regex
+
+import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import org.apache.pekko.http.scaladsl.model._
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
+import spray.json.DefaultJsonProtocol._
+import spray.json.{JsString, JsValue, RootJsonFormat}
 
-object ReadApi {
+import prompts.{Config, EvalRecord, Evals, Versions}
+
+/** The read's answer: the version and the eval record attached to it. */
+final case class VersionRead(name: String, version: Int, content_hash: String, template: String, variables: List[String], eval_record: Option[EvalRecord])
+final case class RenderRequest(values: Option[Map[String, JsValue]])
+final case class Rendered(name: String, version: Int, content_hash: String, rendered: String)
+
+object PromptReads {
   implicit val system: ActorSystem = ActorSystem("prompt-registry")
+  implicit val evalFormat: RootJsonFormat[EvalRecord] = jsonFormat5(EvalRecord)
+  implicit val readFormat: RootJsonFormat[VersionRead] = jsonFormat6(VersionRead)
+  implicit val renderFormat: RootJsonFormat[RenderRequest] = jsonFormat1(RenderRequest)
+  implicit val renderedFormat: RootJsonFormat[Rendered] = jsonFormat4(Rendered)
 
   val MaxValueBytes = 1024
-  val PlaceholderRe = """\\{\\{([a-z_][a-z0-9_]*)\\}\\}""".r
-
-  def assertTenantOwns(tenant: String, name: String, version: Int): VersionRecord = {
-    store.getVersion(tenant, name, version) match {
-      case Some(record) => record
-      case None => throw new NoSuchElementException("version not found")
-    }
-  }
-
-  def escapeValue(value: String): String = {
-    if (value.contains("{{") || value.contains("}}")) {
-      throw new IllegalArgumentException("value contains the placeholder delimiter")
-    }
-    value.replace("\\"", "\\\\\\"")
-  }
-
-  // One pass: a value is inserted as text and is never scanned for placeholders again.
-  def render(bodyTemplate: String, values: Map[String, String]): String = {
-    val declared = PlaceholderRe.findAllMatchIn(bodyTemplate).map(_.group(1)).toSet
-    val missing = declared.diff(values.keySet)
-    if (missing.nonEmpty) throw new IllegalArgumentException(s"missing values: \${missing.mkString(",")}")
-    val extra = values.keySet.diff(declared)
-    if (extra.nonEmpty) throw new IllegalArgumentException(s"undeclared values: \${extra.mkString(",")}")
-    values.values.foreach { value =>
-      if (value.getBytes("UTF-8").length > MaxValueBytes) {
-        throw new IllegalArgumentException("value exceeds 1 KiB")
-      }
-    }
-    PlaceholderRe.replaceAllIn(bodyTemplate, matched => escapeValue(values(matched.group(1))))
-  }
-
-  def payload(record: VersionRecord, name: String, version: Int, evalRecord: Option[EvalRecord], rendered: Option[String]): String = {
-    val variables = record.variables.map(v => s""""$v"""").mkString(",")
-    val evalJson = evalRecord.map(e => s"""{"eval_id":"\${e.eval_id}","passed":\${e.passed}}""").getOrElse("null")
-    val renderedJson = rendered.map(r => s""""\${r.replace("\\"", "\\\\\\"")}"""").getOrElse("null")
-    s"""{"name":"$name","version":$version,"content_hash":"\${record.content_hash}","variables":[$variables],"eval_record":$evalJson,"rendered":$renderedJson}"""
-  }
 
   val route: Route =
-    path("v1" / "prompts" / Segment / "versions" / IntNumber) { (name, version) =>
-      get {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          parameter("render".?) { renderOpt =>
-            parameter("values".?) { valuesOpt =>
-              complete {
-                try {
-                  val record = assertTenantOwns(tenant, name, version)
-                  val contentHash = record.content_hash
-                  val evalRecord = store.getEval(tenant, name, contentHash)
-                  val rendered =
-                    if (!renderOpt.contains("1")) None
-                    else {
-                      val values = valuesOpt
-                        .map(raw => parseJsonObject(raw))
-                        .getOrElse(Map.empty[String, String])
-                      Some(render(record.template, values))
+    pathPrefix("v1" / "prompts" / Segment / "versions" / IntNumber) { (name, v) =>
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
+        case Some(tenant) =>
+          Versions.get(tenant, name, v) match {
+            case None => complete(StatusCodes.NotFound, s"""{"error":"$name v$v not found"}""")
+            case Some(record) =>
+              concat(
+                pathEndOrSingleSlash {
+                  get {
+                    val verdict = Evals.get(tenant, name, record.content_hash)
+                    complete(VersionRead(record.name, record.version, record.content_hash, record.template, record.variables, verdict))
+                  }
+                },
+                path("render") {
+                  post {
+                    entity(as[RenderRequest]) { body =>
+                      val raw = body.values.getOrElse(Map.empty)
+                      val values = raw.collect { case (key, JsString(value)) => key -> value }
+                      val valid = raw.keySet == record.variables.toSet && values.size == raw.size &&
+                        values.values.forall(_.getBytes("UTF-8").length <= MaxValueBytes)
+                      if (!valid) {
+                        complete(StatusCodes.UnprocessableEntity, """{"error":"values must be exactly the declared variables, strings of at most 1024 bytes"}""")
+                      } else {
+                        // One pass: a value is inserted as text and never scanned for placeholders again.
+                        val rendered = Config.Placeholder.replaceAllIn(record.template, m => Regex.quoteReplacement(values(m.group(1))))
+                        complete(Rendered(record.name, record.version, record.content_hash, rendered))
+                      }
                     }
-                  HttpResponse(StatusCodes.OK, entity = payload(record, name, version, evalRecord, rendered))
-                } catch {
-                  case _: NoSuchElementException =>
-                    HttpResponse(StatusCodes.NotFound, entity = """{"error":"version not found"}""")
-                  case _: IllegalArgumentException =>
-                    HttpResponse(StatusCodes.UnprocessableEntity, entity = """{"error":"invalid render request"}""")
+                  }
                 }
-              }
-            }
+              )
           }
-        }
       }
     }
-
-  def parseJsonObject(raw: String): Map[String, String] =
-    raw.parseJson.asJsObject.fields.map { case (key, value) => key -> value.convertTo[String] }
 
   def main(args: Array[String]): Unit = {
     Http().newServerAt("0.0.0.0", 8443).bind(route)
@@ -637,163 +627,601 @@ object ReadApi {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <vector>
+
+#include "prompts/evals.h"     // evals::get/latest(tenant, name, …) — provided
+#include "prompts/versions.h"  // versions::get(tenant, name, version) — provided
 
 using json = nlohmann::json;
 
-std::string render(const std::string& bodyTemplate, const json& values) {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  std::string rendered = bodyTemplate;
-  for (const auto& [key, value] : values.items()) {
-    const std::string slot = "{{" + key + "}}";
-    const std::string text = value.get<std::string>();
-    for (auto at = rendered.find(slot); at != std::string::npos; at = rendered.find(slot, at + text.size())) {
-      rendered.replace(at, slot.size(), text);
-    }
+void reject(httplib::Response& res, int status, const std::string& error) {
+  res.status = status;
+  res.set_content(json({{"error", error}}).dump(), "application/json");
+}
+
+void read_version(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reject(res, 401, "missing X-Tenant-Id");
+  const std::string name = req.matches[1].str();
+  json body = versions::get(tenant, name, std::stoi(req.matches[2].str())).value_or(json::object());
+  const auto latest = evals::latest(tenant, name);
+  body["eval_record"] = latest ? *latest : json();
+  res.status = 200;
+  res.set_content(body.dump(), "application/json");
+}
+
+void render_version(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reject(res, 401, "missing X-Tenant-Id");
+  const std::string name = req.matches[1].str();
+  const int v = std::stoi(req.matches[2].str());
+  const json record = versions::get(tenant, name, v).value_or(json::object());
+  const json body = json::parse(req.body, nullptr, false);
+  const json values = body.is_object() && body.contains("values") ? body["values"] : json::object();
+  std::string rendered = record.value("template", "");
+  for (const auto& variable : record.value("variables", std::vector<std::string>{})) {
+    const std::string token = "{{" + variable + "}}";
+    const std::string value = values.contains(variable) && values[variable].is_string() ? values[variable].get<std::string>() : "";
+    for (size_t at = rendered.find(token); at != std::string::npos; at = rendered.find(token, at + value.size())) rendered.replace(at, token.size(), value);
   }
-  return rendered;
+  res.status = 200;
+  res.set_content(json({{"name", name}, {"version", v}, {"content_hash", record.value("content_hash", "")}, {"rendered", rendered}}).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/prompts/([^/]+)/versions/(\\d+))", read_version);
+  svr.Post(R"(/v1/prompts/([^/]+)/versions/(\\d+)/render)", render_version);
 }
 
 int main() {
   httplib::Server svr;
-
-  svr.Get("/v1/prompts/:name/versions/:v", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto name = req.path_params.at("name");
-    const int version = std::stoi(req.path_params.at("v"));
-    const auto record = store.get_version(tenant, name, version);
-    json body = {{"name", name}, {"version", version}, {"eval_record", store.latest_eval(tenant, name)}};
-    if (req.has_param("render")) {
-      body["rendered"] = render(record.template, json::parse(req.get_param_value("values")));
-    }
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
+  register_routes(svr);
   svr.listen("0.0.0.0", 8443);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <cstddef>
-#include <map>
-#include <stdexcept>
+#include <optional>
+#include <regex>
 #include <string>
-#include <vector>
+
+#include "prompts/config.h"    // config::kPlaceholder — provided
+#include "prompts/evals.h"     // evals::get/latest(tenant, name, …) — provided
+#include "prompts/versions.h"  // versions::get(tenant, name, version) — provided
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxValueBytes = 1024;
+constexpr size_t kMaxValueBytes = 1024;
 
-struct VersionRecord {
-  std::string name;
-  int version = 0;
-  std::string content_hash;
-  std::string template_text;
-  std::vector<std::string> variables;
-};
-
-VersionRecord assert_tenant_owns(const std::string& tenant, const std::string& name, int version);
-
-// A caller value may never introduce a placeholder or close the quoted region it sits in.
-std::string escape_value(const std::string& value) {
-  if (value.find("{{") != std::string::npos || value.find("}}") != std::string::npos) {
-    throw std::invalid_argument("value contains the placeholder delimiter");
-  }
-  std::string out;
-  for (const char c : value) {
-    if (c == '"') out += "\\\\\\"";
-    else out += c;
-  }
-  return out;
+void reject(httplib::Response& res, int status, const std::string& error) {
+  res.status = status;
+  res.set_content(json({{"error", error}}).dump(), "application/json");
 }
 
-// One pass over the template: a substituted value is never re-scanned for placeholders.
-std::string render_template(const std::string& tpl, const std::map<std::string, std::string>& values) {
-  std::string out;
-  std::string rest = tpl;
-  while (true) {
-    const auto open = rest.find("{{");
-    if (open == std::string::npos) {
-      out += rest;
-      break;
-    }
-    const auto close = rest.find("}}", open + 2);
-    if (close == std::string::npos) {
-      out += rest;
-      break;
-    }
-    const auto name = rest.substr(open + 2, close - open - 2);
-    out += rest.substr(0, open);
-    const auto value = values.find(name);
-    if (value == values.end()) {
-      throw std::invalid_argument("missing value for " + name);
-    }
-    if (value->second.size() > kMaxValueBytes) {
-      throw std::invalid_argument("value exceeds 1 KiB");
-    }
-    out += escape_value(value->second);
-    rest = rest.substr(close + 2);
+// The tenant's version in the path: 401 without a tenant, 404 when the tenant has none.
+std::optional<std::pair<std::string, json>> tenant_version(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    reject(res, 401, "missing X-Tenant-Id");
+    return std::nullopt;
   }
-  return out;
+  const auto record = versions::get(tenant, req.matches[1].str(), std::stoi(req.matches[2].str()));
+  if (!record) {
+    reject(res, 404, "version not found");
+    return std::nullopt;
+  }
+  return std::make_pair(tenant, *record);
+}
+
+void read_version(const httplib::Request& req, httplib::Response& res) {
+  const auto found = tenant_version(req, res);
+  if (!found) return;
+  const auto& [tenant, record] = *found;
+  json body = record;
+  const auto verdict = evals::get(tenant, record["name"].get<std::string>(), record["content_hash"].get<std::string>());
+  body["eval_record"] = verdict ? *verdict : json();
+  res.status = 200;
+  res.set_content(body.dump(), "application/json");
+}
+
+void render_version(const httplib::Request& req, httplib::Response& res) {
+  const auto found = tenant_version(req, res);
+  if (!found) return;
+  const json& record = found->second;
+  const json body = json::parse(req.body, nullptr, false);
+  const json values = body.is_object() && body.contains("values") && body["values"].is_object() ? body["values"] : json::object();
+  const auto variables = record["variables"].get<std::vector<std::string>>();
+  if (values.size() != variables.size()) return reject(res, 422, "values must be exactly the declared variables");
+  for (const auto& variable : variables) {
+    if (!values.contains(variable) || !values[variable].is_string() || values[variable].get<std::string>().size() > kMaxValueBytes)
+      return reject(res, 422, variable + " must be a string of at most 1024 bytes");
+  }
+  // One pass: a value is inserted as text and never scanned for placeholders again.
+  const std::string text = record["template"].get<std::string>();
+  std::string rendered;
+  auto last = text.cbegin();
+  for (auto it = std::sregex_iterator(text.begin(), text.end(), config::kPlaceholder); it != std::sregex_iterator(); ++it) {
+    rendered.append(last, text.cbegin() + it->position());
+    rendered += values[(*it)[1].str()].get<std::string>();
+    last = text.cbegin() + it->position() + it->length();
+  }
+  rendered.append(last, text.cend());
+  res.status = 200;
+  res.set_content(json({{"name", record["name"]}, {"version", record["version"]}, {"content_hash", record["content_hash"]}, {"rendered", rendered}}).dump(),
+                  "application/json");
+}
+
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/prompts/([^/]+)/versions/(\\d+))", read_version);
+  svr.Post(R"(/v1/prompts/([^/]+)/versions/(\\d+)/render)", render_version);
 }
 
 int main() {
   httplib::Server svr;
-
-  svr.Get("/v1/prompts/:name/versions/:v", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto name = req.path_params.at("name");
-    const int version = std::stoi(req.path_params.at("v"));
-    VersionRecord record;
-    try {
-      record = assert_tenant_owns(tenant, name, version);
-    } catch (const std::out_of_range&) {
-      res.status = 404;
-      res.set_content(R"({"error":"version not found"})", "application/json");
-      return;
-    }
-    const auto content_hash = record.content_hash;
-    const auto eval_record = store.get_eval(tenant, name, content_hash);
-    json body = {
-        {"name", name},
-        {"version", version},
-        {"content_hash", content_hash},
-        {"template", record.template_text},
-        {"variables", record.variables},
-        {"eval_record", eval_record ? eval_record->dump() : std::string("null")},
-    };
-    if (req.has_param("render") && req.get_param_value("render") == "1") {
-      std::map<std::string, std::string> values;
-      for (const auto& [key, value] : json::parse(req.get_param_value("values")).items()) {
-        values[key] = value.get<std::string>();
-      }
-      try {
-        body["rendered"] = render_template(record.template_text, values);
-      } catch (const std::invalid_argument&) {
-        res.status = 422;
-        res.set_content(R"({"error":"invalid render request"})", "application/json");
-        return;
-      }
-    }
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
+  register_routes(svr);
   svr.listen("0.0.0.0", 8443);
 }
 `,
     },
   },
+  harness: {
+    python: `import hashlib
+import json
+
+T, N = "t1", "support-reply"
+TEMPLATE = "Hi {{customer_name}}, answer in a {{tone}} tone."
+INJECTED = "{" + "{tone}" + "}"
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _register(ctx, version, template=TEMPLATE):
+    record = {"name": N, "version": version, "content_hash": _sha(template), "template": template, "variables": ["customer_name", "tone"]}
+    ctx.redis.set(f"prompts:version:{T}:{N}:{version}", json.dumps(record))
+    return record
+
+
+def _judge(ctx, record, passed):
+    verdict = {"eval_id": "ev-" + record["content_hash"][:12], "passed": passed, "score": 0.93 if passed else 0.41, "content_hash": record["content_hash"], "version": record["version"]}
+    ctx.redis.set(f"prompts:eval:{T}:{N}:{record['content_hash']}", json.dumps(verdict))
+    ctx.redis.set(f"prompts:eval_latest:{T}:{N}", record["content_hash"])
+    return verdict
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+async def _get(c, version, tenant=T):
+    return await c.get(f"/v1/prompts/{N}/versions/{version}", headers={"X-Tenant-Id": tenant})
+
+
+async def _render(c, version, values, tenant=T):
+    return await c.post(f"/v1/prompts/{N}/versions/{version}/render", json={"values": values}, headers={"X-Tenant-Id": tenant})
+
+
+async def check_read_route(ctx):
+    record = _register(ctx, 3)
+    async with _api(ctx) as c:
+        r = await _get(c, 3)
+        assert r.status_code == 200, f"reading version 3 answered {r.status_code}: {r.text}"
+        body = r.json()
+        for key in ("name", "version", "content_hash", "template", "variables"):
+            assert body.get(key) == record[key], f"the read must carry {key}={record[key]!r}, got {body}"
+        assert "eval_record" in body, f"the read carries an eval_record field (null when none), got {body}"
+        r = await c.get(f"/v1/prompts/{N}/versions/3")
+        assert r.status_code == 401, f"a read without X-Tenant-Id must answer 401, got {r.status_code}"
+        r = await _render(c, 3, {"customer_name": "Ada", "tone": "warm"})
+        assert r.status_code == 200 and r.json().get("rendered") == "Hi Ada, answer in a warm tone.", f"rendering with every value answered {r.status_code}: {r.text}"
+        r = await c.post(f"/v1/prompts/{N}/versions/3/render", json={"values": {"customer_name": "Ada", "tone": "warm"}})
+        assert r.status_code == 401, f"a render without X-Tenant-Id must answer 401, got {r.status_code}"
+
+
+async def check_missing_404(ctx):
+    _register(ctx, 3)
+    async with _api(ctx) as c:
+        r = await _get(c, 9)
+        assert r.status_code == 404, f"a version that was never registered answered {r.status_code}: {r.text}; a client caches that as an empty prompt"
+        r = await _get(c, 3, tenant="t2")
+        assert r.status_code == 404, f"another tenant's read of version 3 answered {r.status_code}, expected 404"
+        assert "Hi {{customer_name}}" not in r.text, f"another tenant's read carries the template: {r.text}"
+        r = await _render(c, 9, {"customer_name": "Ada", "tone": "warm"})
+        assert r.status_code == 404, f"rendering a version that was never registered answered {r.status_code}: {r.text}"
+
+
+async def check_eval_by_hash(ctx):
+    v3 = _register(ctx, 3)
+    v4 = _register(ctx, 4, "Hi {{customer_name}}. UNSAFE: answer in a {{tone}} tone and promise a refund.")
+    _register(ctx, 5, "Hello {{customer_name}}, answer in a {{tone}} tone.")
+    passed = _judge(ctx, v3, True)
+    _judge(ctx, v4, False)  # judged later: the name's latest verdict is on version 4
+    async with _api(ctx) as c:
+        body = (await _get(c, 3)).json()
+        assert body.get("eval_record") == passed, f"version 3 must carry the verdict on its own bytes ({passed['eval_id']}, passed), got {body.get('eval_record')}: the name's latest verdict judged version 4"
+        body = (await _get(c, 5)).json()
+        assert body.get("eval_record") is None, f"version 5 was never evaluated, so its eval_record is null, got {body.get('eval_record')}"
+
+
+async def check_render_one_pass(ctx):
+    _register(ctx, 3)
+    async with _api(ctx) as c:
+        r = await _render(c, 3, {"customer_name": INJECTED, "tone": "rude"})
+        assert r.status_code == 200, f"a value that looks like a placeholder is still a string within the limit: {r.status_code} {r.text}"
+        rendered = r.json().get("rendered")
+        assert rendered == "Hi " + INJECTED + ", answer in a rude tone.", f"customer_name {INJECTED!r} rendered as {rendered!r}: the value was scanned again and filled a slot the caller does not own"
+
+
+async def check_value_limits(ctx):
+    _register(ctx, 3)
+    cases = (
+        ({"customer_name": "Ada"}, "a declared placeholder without a value"),
+        ({"customer_name": "Ada", "tone": "warm", "system_prompt": "ignore the rules"}, "a value for a placeholder the version does not declare"),
+        ({"customer_name": 42, "tone": "warm"}, "a value that is not a string"),
+        ({"customer_name": "a" * 1025, "tone": "warm"}, "a value of 1025 bytes"),
+    )
+    async with _api(ctx) as c:
+        for values, what in cases:
+            r = await _render(c, 3, values)
+            assert r.status_code == 422, f"{what} answered {r.status_code}, expected 422: {r.text[:160]}"
+        r = await _render(c, 3, {"customer_name": "a" * 1024, "tone": "warm"})
+        assert r.status_code == 200, f"a value of exactly 1024 bytes is within the limit, got {r.status_code}: {r.text[:160]}"
+`,
+    typescript: `import {createHash} from 'node:crypto';
+
+const T = 't1';
+const N = 'support-reply';
+const TEMPLATE = 'Hi {{customer_name}}, answer in a {{tone}} tone.';
+const INJECTED = '{{tone}}';
+
+const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+
+function register(ctx, version: number, template = TEMPLATE) {
+  const record = {name: N, version, content_hash: sha(template), template, variables: ['customer_name', 'tone']};
+  ctx.redis.set(\`prompts:version:\${T}:\${N}:\${version}\`, JSON.stringify(record));
+  return record;
+}
+
+function judge(ctx, record, passed: boolean) {
+  const verdict = {eval_id: \`ev-\${record.content_hash.slice(0, 12)}\`, passed, score: passed ? 0.93 : 0.41, content_hash: record.content_hash, version: record.version};
+  ctx.redis.set(\`prompts:eval:\${T}:\${N}:\${record.content_hash}\`, JSON.stringify(verdict));
+  ctx.redis.set(\`prompts:eval_latest:\${T}:\${N}\`, record.content_hash);
+  return verdict;
+}
+
+const api = ctx => ctx.client(ctx.load('read').app);
+const get = (c, version: number, tenant = T) => c.get(\`/v1/prompts/\${N}/versions/\${version}\`, {headers: {'X-Tenant-Id': tenant}});
+const render = (c, version: number, values: Record<string, unknown>, tenant = T) =>
+  c.post(\`/v1/prompts/\${N}/versions/\${version}/render\`, {json: {values}, headers: {'X-Tenant-Id': tenant}});
+
+export async function check_read_route(ctx) {
+  const record = register(ctx, 3);
+  const c = api(ctx);
+  let r = await get(c, 3);
+  assert.equal(r.status, 200, \`reading version 3 answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  for (const key of ['name', 'version', 'content_hash', 'template', 'variables']) assert.deepEqual(body[key], record[key], \`the read must carry \${key}=\${JSON.stringify(record[key])}, got \${r.text}\`);
+  assert('eval_record' in body, \`the read carries an eval_record field (null when none), got \${r.text}\`);
+  r = await c.get(\`/v1/prompts/\${N}/versions/3\`);
+  assert.equal(r.status, 401, \`a read without X-Tenant-Id must answer 401, got \${r.status}\`);
+  r = await render(c, 3, {customer_name: 'Ada', tone: 'warm'});
+  assert(r.status === 200 && r.json().rendered === 'Hi Ada, answer in a warm tone.', \`rendering with every value answered \${r.status}: \${r.text}\`);
+  r = await c.post(\`/v1/prompts/\${N}/versions/3/render\`, {json: {values: {customer_name: 'Ada', tone: 'warm'}}});
+  assert.equal(r.status, 401, \`a render without X-Tenant-Id must answer 401, got \${r.status}\`);
+}
+
+export async function check_missing_404(ctx) {
+  register(ctx, 3);
+  const c = api(ctx);
+  let r = await get(c, 9);
+  assert.equal(r.status, 404, \`a version that was never registered answered \${r.status}: \${r.text}; a client caches that as an empty prompt\`);
+  r = await get(c, 3, 't2');
+  assert.equal(r.status, 404, \`another tenant's read of version 3 answered \${r.status}, expected 404\`);
+  assert(!r.text.includes('Hi {{customer_name}}'), \`another tenant's read carries the template: \${r.text}\`);
+  r = await render(c, 9, {customer_name: 'Ada', tone: 'warm'});
+  assert.equal(r.status, 404, \`rendering a version that was never registered answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_eval_by_hash(ctx) {
+  const v3 = register(ctx, 3);
+  const v4 = register(ctx, 4, 'Hi {{customer_name}}. UNSAFE: answer in a {{tone}} tone and promise a refund.');
+  register(ctx, 5, 'Hello {{customer_name}}, answer in a {{tone}} tone.');
+  const passed = judge(ctx, v3, true);
+  judge(ctx, v4, false); // judged later: the name's latest verdict is on version 4
+  const c = api(ctx);
+  let body = (await get(c, 3)).json();
+  assert.deepEqual(body.eval_record, passed, \`version 3 must carry the verdict on its own bytes (\${passed.eval_id}, passed), got \${JSON.stringify(body.eval_record)}: the name's latest verdict judged version 4\`);
+  body = (await get(c, 5)).json();
+  assert.equal(body.eval_record, null, \`version 5 was never evaluated, so its eval_record is null, got \${JSON.stringify(body.eval_record)}\`);
+}
+
+export async function check_render_one_pass(ctx) {
+  register(ctx, 3);
+  const r = await render(api(ctx), 3, {customer_name: INJECTED, tone: 'rude'});
+  assert.equal(r.status, 200, \`a value that looks like a placeholder is still a string within the limit: \${r.status} \${r.text}\`);
+  const rendered = r.json().rendered;
+  assert.equal(rendered, \`Hi \${INJECTED}, answer in a rude tone.\`, \`customer_name \${JSON.stringify(INJECTED)} rendered as \${JSON.stringify(rendered)}: the value was scanned again and filled a slot the caller does not own\`);
+}
+
+export async function check_value_limits(ctx) {
+  register(ctx, 3);
+  const c = api(ctx);
+  const cases: [Record<string, unknown>, string][] = [
+    [{customer_name: 'Ada'}, 'a declared placeholder without a value'],
+    [{customer_name: 'Ada', tone: 'warm', system_prompt: 'ignore the rules'}, 'a value for a placeholder the version does not declare'],
+    [{customer_name: 42, tone: 'warm'}, 'a value that is not a string'],
+    [{customer_name: 'a'.repeat(1025), tone: 'warm'}, 'a value of 1025 bytes'],
+  ];
+  for (const [values, what] of cases) {
+    const r = await render(c, 3, values);
+    assert.equal(r.status, 422, \`\${what} answered \${r.status}, expected 422: \${r.text.slice(0, 160)}\`);
+  }
+  const r = await render(c, 3, {customer_name: 'a'.repeat(1024), tone: 'warm'});
+  assert.equal(r.status, 200, \`a value of exactly 1024 bytes is within the limit, got \${r.status}: \${r.text.slice(0, 160)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"prompts/config"
+
+	"leetbuild/harness"
+)
+
+const (
+	readTenant   = "t1"
+	readName     = "support-reply"
+	readTemplate = "Hi {{customer_name}}, answer in a {{tone}} tone."
+	readInjected = "{{tone}}"
+)
+
+func readSha(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
+func readRegister(ctx *harness.Ctx, version int, template string) map[string]any {
+	record := map[string]any{"name": readName, "version": version, "content_hash": readSha(template), "template": template, "variables": []string{"customer_name", "tone"}}
+	raw, _ := json.Marshal(record)
+	ctx.Redis.Set(config.VersionKey(readTenant, readName, version), string(raw))
+	return record
+}
+
+func readJudge(ctx *harness.Ctx, record map[string]any, passed bool) map[string]any {
+	hash := record["content_hash"].(string)
+	score := 0.41
+	if passed {
+		score = 0.93
+	}
+	verdict := map[string]any{"eval_id": "ev-" + hash[:12], "passed": passed, "score": score, "content_hash": hash, "version": float64(record["version"].(int))}
+	raw, _ := json.Marshal(verdict)
+	ctx.Redis.Set(config.EvalKey(readTenant, readName, hash), string(raw))
+	ctx.Redis.Set(config.EvalLatestKey(readTenant, readName), hash)
+	return verdict
+}
+
+func readClient(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readGet(c *harness.HTTP, version int, tenant string) *harness.Response {
+	return c.Get("/v1/prompts/"+readName+"/versions/"+strconv.Itoa(version), "X-Tenant-Id", tenant)
+}
+
+func readRender(c *harness.HTTP, version int, values map[string]any, tenant string) *harness.Response {
+	return c.Post("/v1/prompts/"+readName+"/versions/"+strconv.Itoa(version)+"/render", map[string]any{"values": values}, "X-Tenant-Id", tenant)
+}
+
+func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+	body, ok := r.JSON().(map[string]any)
+	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
+	return body
+}
+
+func CheckReadRoute(ctx *harness.Ctx) {
+	readRegister(ctx, 3, readTemplate)
+	c := readClient(ctx)
+	r := readGet(c, 3, readTenant)
+	ctx.Equal(r.Status, 200, "reading version 3 (%s)", r.Text())
+	body := readBody(ctx, r)
+	ctx.Equal(body["name"], readName, "the read's name")
+	ctx.Equal(body["version"], float64(3), "the read's version")
+	ctx.Equal(body["content_hash"], readSha(readTemplate), "the read's content_hash")
+	ctx.Equal(body["template"], readTemplate, "the read's template")
+	ctx.Equal(body["variables"], []any{"customer_name", "tone"}, "the read's variables")
+	_, has := body["eval_record"]
+	ctx.Assert(has, "the read carries an eval_record field (null when none), got %s", r.Text())
+	ctx.Equal(c.Get("/v1/prompts/"+readName+"/versions/3").Status, 401, "a read without X-Tenant-Id")
+	r = readRender(c, 3, map[string]any{"customer_name": "Ada", "tone": "warm"}, readTenant)
+	ctx.Assert(r.Status == 200 && readBody(ctx, r)["rendered"] == "Hi Ada, answer in a warm tone.", "rendering with every value answered %d: %s", r.Status, r.Text())
+	ctx.Equal(c.Post("/v1/prompts/"+readName+"/versions/3/render", map[string]any{"values": map[string]any{"customer_name": "Ada", "tone": "warm"}}).Status, 401, "a render without X-Tenant-Id")
+}
+
+func CheckMissing404(ctx *harness.Ctx) {
+	readRegister(ctx, 3, readTemplate)
+	c := readClient(ctx)
+	r := readGet(c, 9, readTenant)
+	ctx.Equal(r.Status, 404, "a version that was never registered (%s): a client caches a 200 as an empty prompt", r.Text())
+	r = readGet(c, 3, "t2")
+	ctx.Equal(r.Status, 404, "another tenant's read of version 3")
+	ctx.Assert(!strings.Contains(r.Text(), "Hi {{customer_name}}"), "another tenant's read carries the template: %s", r.Text())
+	r = readRender(c, 9, map[string]any{"customer_name": "Ada", "tone": "warm"}, readTenant)
+	ctx.Equal(r.Status, 404, "rendering a version that was never registered (%s)", r.Text())
+}
+
+func CheckEvalByHash(ctx *harness.Ctx) {
+	v3 := readRegister(ctx, 3, readTemplate)
+	v4 := readRegister(ctx, 4, "Hi {{customer_name}}. UNSAFE: answer in a {{tone}} tone and promise a refund.")
+	readRegister(ctx, 5, "Hello {{customer_name}}, answer in a {{tone}} tone.")
+	passed := readJudge(ctx, v3, true)
+	readJudge(ctx, v4, false) // judged later: the name's latest verdict is on version 4
+	c := readClient(ctx)
+	body := readBody(ctx, readGet(c, 3, readTenant))
+	ctx.Equal(body["eval_record"], passed, "version 3 must carry the verdict on its own bytes (the name's latest verdict judged version 4); the eval_record")
+	body = readBody(ctx, readGet(c, 5, readTenant))
+	ctx.Assert(body["eval_record"] == nil, "version 5 was never evaluated, so its eval_record is null, got %v", body["eval_record"])
+}
+
+func CheckRenderOnePass(ctx *harness.Ctx) {
+	readRegister(ctx, 3, readTemplate)
+	r := readRender(readClient(ctx), 3, map[string]any{"customer_name": readInjected, "tone": "rude"}, readTenant)
+	ctx.Equal(r.Status, 200, "a value that looks like a placeholder is still a string within the limit (%s)", r.Text())
+	ctx.Equal(readBody(ctx, r)["rendered"], "Hi "+readInjected+", answer in a rude tone.", "customer_name %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", readInjected)
+}
+
+func CheckValueLimits(ctx *harness.Ctx) {
+	readRegister(ctx, 3, readTemplate)
+	c := readClient(ctx)
+	cases := []struct {
+		values map[string]any
+		what   string
+	}{
+		{map[string]any{"customer_name": "Ada"}, "a declared placeholder without a value"},
+		{map[string]any{"customer_name": "Ada", "tone": "warm", "system_prompt": "ignore the rules"}, "a value for a placeholder the version does not declare"},
+		{map[string]any{"customer_name": 42, "tone": "warm"}, "a value that is not a string"},
+		{map[string]any{"customer_name": strings.Repeat("a", 1025), "tone": "warm"}, "a value of 1025 bytes"},
+	}
+	for _, tc := range cases {
+		ctx.Equal(readRender(c, 3, tc.values, readTenant).Status, 422, "%s", tc.what)
+	}
+	r := readRender(c, 3, map[string]any{"customer_name": strings.Repeat("a", 1024), "tone": "warm"}, readTenant)
+	ctx.Equal(r.Status, 200, "a value of exactly 1024 bytes is within the limit")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "digest.h"
+
+namespace {
+
+using json = nlohmann::json;
+
+const std::string kT = "t1";
+const std::string kN = "support-reply";
+const std::string kTemplate = "Hi {{customer_name}}, answer in a {{tone}} tone.";
+const std::string kInjected = "{{tone}}";
+
+json readRegister(harness::Ctx& ctx, int version, const std::string& text = kTemplate) {
+  const json record = {{"name", kN}, {"version", version}, {"content_hash", sha256_hex(text)}, {"template", text}, {"variables", {"customer_name", "tone"}}};
+  ctx.Redis.Set("prompts:version:" + kT + ":" + kN + ":" + std::to_string(version), record.dump());
+  return record;
+}
+
+json readJudge(harness::Ctx& ctx, const json& record, bool passed) {
+  const std::string hash = record["content_hash"].get<std::string>();
+  const json verdict = {{"eval_id", "ev-" + hash.substr(0, 12)}, {"passed", passed}, {"score", passed ? 0.93 : 0.41}, {"content_hash", hash}, {"version", record["version"]}};
+  ctx.Redis.Set("prompts:eval:" + kT + ":" + kN + ":" + hash, verdict.dump());
+  ctx.Redis.Set("prompts:eval_latest:" + kT + ":" + kN, hash);
+  return verdict;
+}
+
+struct Api {
+  httplib::Server svr;
+  harness::HTTP http;
+  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+
+  harness::Response get(int version, const std::string& tenant = kT) {
+    return http.Get("/v1/prompts/" + kN + "/versions/" + std::to_string(version), "X-Tenant-Id", tenant);
+  }
+  harness::Response render(int version, const json& values, const std::string& tenant = kT) {
+    return http.Post("/v1/prompts/" + kN + "/versions/" + std::to_string(version) + "/render", json({{"values", values}}).dump(), "X-Tenant-Id", tenant);
+  }
+};
+
+json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+  const json body = json::parse(r.Text(), nullptr, false);
+  ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
+  return body;
+}
+
+}  // namespace
+
+void CheckReadRoute(harness::Ctx& ctx) {
+  const json record = readRegister(ctx, 3);
+  Api api(ctx);
+  auto r = api.get(3);
+  ctx.Equal(r.Status, 200, "reading version 3 (%s)", r.Text());
+  const json body = bodyOf(ctx, r);
+  for (const char* key : {"name", "version", "content_hash", "template", "variables"}) {
+    ctx.Equal(body.contains(key) ? body[key] : json(), record[key], "the read's %s", key);
+  }
+  ctx.Assert(body.contains("eval_record"), "the read carries an eval_record field (null when none), got %s", r.Text());
+  ctx.Equal(api.http.Get("/v1/prompts/" + kN + "/versions/3").Status, 401, "a read without X-Tenant-Id");
+  r = api.render(3, {{"customer_name", "Ada"}, {"tone", "warm"}});
+  ctx.Assert(r.Status == 200 && bodyOf(ctx, r).value("rendered", "") == "Hi Ada, answer in a warm tone.", "rendering with every value answered %d: %s", r.Status, r.Text());
+  ctx.Equal(api.http.Post("/v1/prompts/" + kN + "/versions/3/render", json({{"values", {{"customer_name", "Ada"}, {"tone", "warm"}}}}).dump()).Status, 401,
+            "a render without X-Tenant-Id");
+}
+
+void CheckMissing404(harness::Ctx& ctx) {
+  readRegister(ctx, 3);
+  Api api(ctx);
+  auto r = api.get(9);
+  ctx.Equal(r.Status, 404, "a version that was never registered (%s): a client caches a 200 as an empty prompt", r.Text());
+  r = api.get(3, "t2");
+  ctx.Equal(r.Status, 404, "another tenant's read of version 3");
+  ctx.Assert(r.Text().find("Hi {{customer_name}}") == std::string::npos, "another tenant's read carries the template: %s", r.Text());
+  r = api.render(9, {{"customer_name", "Ada"}, {"tone", "warm"}});
+  ctx.Equal(r.Status, 404, "rendering a version that was never registered (%s)", r.Text());
+}
+
+void CheckEvalByHash(harness::Ctx& ctx) {
+  const json v3 = readRegister(ctx, 3);
+  const json v4 = readRegister(ctx, 4, "Hi {{customer_name}}. UNSAFE: answer in a {{tone}} tone and promise a refund.");
+  readRegister(ctx, 5, "Hello {{customer_name}}, answer in a {{tone}} tone.");
+  const json passed = readJudge(ctx, v3, true);
+  readJudge(ctx, v4, false);  // judged later: the name's latest verdict is on version 4
+  Api api(ctx);
+  json body = bodyOf(ctx, api.get(3));
+  ctx.Equal(body.contains("eval_record") ? body["eval_record"] : json(), passed, "version 3 must carry the verdict on its own bytes (the name's latest verdict judged version 4); the eval_record");
+  body = bodyOf(ctx, api.get(5));
+  ctx.Assert(!body.contains("eval_record") || body["eval_record"].is_null(), "version 5 was never evaluated, so its eval_record is null, got %s", body.dump());
+}
+
+void CheckRenderOnePass(harness::Ctx& ctx) {
+  readRegister(ctx, 3);
+  Api api(ctx);
+  const auto r = api.render(3, {{"customer_name", kInjected}, {"tone", "rude"}});
+  ctx.Equal(r.Status, 200, "a value that looks like a placeholder is still a string within the limit (%s)", r.Text());
+  ctx.Equal(bodyOf(ctx, r).value("rendered", ""), "Hi " + kInjected + ", answer in a rude tone.",
+            "customer_name %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", kInjected);
+}
+
+void CheckValueLimits(harness::Ctx& ctx) {
+  readRegister(ctx, 3);
+  Api api(ctx);
+  const std::vector<std::pair<json, std::string>> cases = {
+      {{{"customer_name", "Ada"}}, "a declared placeholder without a value"},
+      {{{"customer_name", "Ada"}, {"tone", "warm"}, {"system_prompt", "ignore the rules"}}, "a value for a placeholder the version does not declare"},
+      {{{"customer_name", 42}, {"tone", "warm"}}, "a value that is not a string"},
+      {{{"customer_name", std::string(1025, 'a')}, {"tone", "warm"}}, "a value of 1025 bytes"},
+  };
+  for (const auto& [values, what] : cases) ctx.Equal(api.render(3, values).Status, 422, "%s", what);
+  ctx.Equal(api.render(3, {{"customer_name", std::string(1024, 'a')}, {"tone", "warm"}}).Status, 200, "a value of exactly 1024 bytes is within the limit");
+}
+`,
+  },
   hints: [
-    'A preview of version 3 shows the eval verdict from version 7, and a caller whose value contains `}}{{` sees the rendered text change shape instead of containing their value.',
-    'The handler attaches `store.latest_eval(tenant, name)` regardless of the version, and `render` loops over `replace`, so each inserted value is scanned again on the next pass and nothing caps or checks it.',
-    'Answer 404 when `get_version` is empty, use `store.get_eval(tenant, name, content_hash)`, validate every value against the declared variables and `MAX_VALUE_BYTES`, and substitute once with `re.sub` and an escaping function.',
+    'Symptom: a customer whose name is `{{tone}}` turns the reply rude, the preview shows a red eval on a version that passed, a missing value renders as a blank, and a typo in the version number answers 200 with nothing in it.',
+    'Mechanism: the render loop runs `replace` once per variable, so text inserted for `customer_name` is scanned for `{{tone}}`; the eval comes from `evals.latest`, which follows the name; values are read with a default; a version `versions.get` cannot find still answers 200.',
+    'Change: 404 when `versions.get` finds nothing; `evals.get(tenant, name, record["content_hash"])`; 422 unless the value keys equal `variables` and each is a string within `MAX_VALUE_BYTES`; render with `PLACEHOLDER.sub(lambda m: values[m.group(1)], template)`.',
   ],
-  debrief: `The fix substitutes in one pass with an escaping function because a read built by substitution from untrusted input is not really a read. One pass turns the caller's value into inert text; a loop over \`replace\` re-scans whatever was just inserted, which is the whole template-injection class in one line. The second property is that the record you serve is the record you were asked for: evals and hashes belong to a version, and serving the latest eval for a name is the kind of wrong that looks right in a demo and then contradicts an audit. Production registries also issue a signed read token per tenant, cache rendered output keyed by hash and values, and write an access log that records the version hash rather than the content.`,
+  debrief: `A template is code its author wrote and a value is data a caller supplied; one pass over the template keeps that line, because the regex engine walks the template once and inserted text is already behind the cursor. A second pass is how string-built SQL went wrong, and a prompt has no prepared statements, so the registry draws the line itself. Attaching the verdict by content hash makes the eval evidence about these bytes rather than about the name. The 404 matters to caches downstream: an empty 200 is a prompt as far as a client can tell. One pass cannot stop a value from carrying instructions the model then follows; that takes delimiters, input classifiers and output checks on the model side, which this step leaves out.`,
 };

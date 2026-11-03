@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package translationsvc;
+
+// The machine-translation model server step 3 calls (and steps 1 and 5 reach through the provided
+// translate.mt client). A language pair the model does not serve is INVALID_ARGUMENT; an
+// overloaded or restarting model is UNAVAILABLE.
+service Translator {
+  rpc Translate(TranslateRequest) returns (TranslateReply);
+}
+
+// One glossary entry the model must apply: the source term and the tenant's translation of it.
+message Term {
+  string source = 1;
+  string target = 2;
+}
+
+message TranslateRequest {
+  string text = 1;
+  string source = 2;
+  string target = 3;
+  int64 glossary_version = 4;
+  repeated Term terms = 5;
+}
+
+message TranslateReply {
+  string text = 1;
+  string model = 2;
+}

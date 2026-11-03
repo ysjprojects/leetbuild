@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package trainsched;
+
+// The training worker agent the scheduler drives, served by the harness at worker:9000. StartRun
+// launches a claimed run (accepted = false: this worker cannot take it, with the reason).
+// Checkpoint asks the running job to write a checkpoint within grace_s seconds and answers its id
+// (supported = false: the job cannot checkpoint); a run that is not running is NOT_FOUND.
+// Terminate stops the job's process.
+service Worker {
+  rpc StartRun(StartRunRequest) returns (StartRunReply);
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointReply);
+  rpc Terminate(TerminateRequest) returns (TerminateReply);
+}
+
+message StartRunRequest {
+  string run_id = 1;
+  string recipe_version = 2;
+  string dataset_version = 3;
+  string checkpoint_id = 4;
+}
+
+message StartRunReply {
+  bool accepted = 1;
+  repeated string nodes = 2;
+  string reason = 3;
+}
+
+message CheckpointRequest {
+  string run_id = 1;
+  int32 grace_s = 2;
+}
+
+message CheckpointReply {
+  bool supported = 1;
+  string checkpoint_id = 2;
+}
+
+message TerminateRequest {
+  string run_id = 1;
+  string reason = 2;
+}
+
+message TerminateReply {}

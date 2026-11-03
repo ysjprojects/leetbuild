@@ -1,94 +1,101 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-api';
 import {sessionStateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-client';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Voice agent: the course is not "play audio over a socket", it is the debugging you owe a realtime
- * speech loop before a caller hears it. A codec and duration contract at the door with a resumable
- * session → atomic turn state in Redis so barge-in never races the TTS offset → cancellable ASR/TTS
- * streams that resume instead of replaying → turn events keyed by session with a redacted
- * transcript reference → a bounded, tenant-scoped transcript read with cursor pagination.
+ * speech loop before a caller hears it. An audio contract and a resumable session at the door → a
+ * Redis turn state where barge-in and late frames cannot race → a TTS stream that stops on barge-in
+ * and resumes instead of replaying → session-keyed turn events that carry a redacted reference → a
+ * tenant-scoped transcript read in bounded pages.
  */
 export const voiceAgentProblem: Problem = {
   id: 'voice-agent',
   title: 'Voice Agent',
-  tagline: 'Realtime speech sessions: codec contract, atomic barge-in, resumable TTS, tenant-scoped transcripts.',
+  tagline: 'Codec contract, Lua barge-in, resumable TTS streams, redacted turn events and paged transcripts.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Voice Agent
 
-A voice agent is the service in front of a realtime speech loop: it recognises what the caller says,
-decides when the turn is over, streams synthetic speech back, and lets the caller interrupt the
-answer mid-sentence. Whether it is safe depends on the codec contract at the door, the atomic turn
-state behind barge-in, the cancellation policy on the speech streams, the transcript events, and the
-bounded reader that serves the transcript afterwards.
+A voice agent is the service in front of a realtime speech loop: the caller speaks, the agent
+answers in synthetic speech, and the caller can cut in mid-sentence. Whether a call holds up depends
+on the plain parts around the models: the audio contract at the door, who holds the floor when both
+talk, what happens when the speech stream drops, what leaves the gateway about the conversation, and
+who can read the transcript afterwards.
 
 ## The real system
 
-OpenAI's Realtime API is a public example of the codec contract: a session accepts PCM16 at 24 kHz
-(the default) plus G.711 μ-law and A-law, and nothing else, because the media pipeline behind it is
-built for exactly those formats. When the caller speaks over the agent, the interruption has to be
-one atomic transition that changes the speaker and truncates the speech stream at the token already
-delivered; two separate writes leave a window where the agent keeps talking over the user.
+OpenAI's Realtime API has a client event for barge-in, \`conversation.item.truncate\`. The server
+produces audio faster than realtime, so when the user interrupts, the client sends how much of the
+assistant's audio was actually played (\`audio_end_ms\`) and the server cuts the message there: the
+conversation remembers what the caller heard, not what was sent. This course keeps the same split
+between the tokens the speech stream delivered and the tokens the caller heard.
 
 ## What you build here
 
-One service, **voice-gateway**, with five pieces:
+One service, **voice-gateway**, over one provided package, \`voice\`: the session store
+(\`voice.sessions\`), the turn state as the later steps use it (\`voice.turnstate\`, built in step 2)
+and the transcript store (\`voice.transcripts\`: \`redact\`, \`insert_turn\`, \`list_turns\`).
 
-1. \`POST /v1/voice/sessions\`: a validated codec and sample-rate contract, a 30-minute maximum
-   duration, and an \`Idempotency-Key\` so a reconnect resumes the live session and its turn count
-   instead of forking a new one.
-2. A **Redis** turn state: current speaker, turn index and TTS token offset under a 30-second TTL
-   refreshed by every audio frame, with barge-in as one atomic transition that truncates the
-   speech stream at the current token.
-3. A **gRPC** speech client: \`Recognize\` and \`Synthesize\` streams under a 10-second idle
-   deadline, cancellation that stops billing, and a retry that resumes at the delivered token
-   offset or fails cleanly rather than replaying audio.
-4. A **Kafka** turn path: one \`voice.turn\` event per turn keyed by session, carrying the turn
-   index, timings and a reference to the stored redacted transcript, with the consumer committing
-   its offset only after the transcript row is durable.
-5. \`GET /v1/voice/sessions/{id}\`: the transcript with per-turn timestamps and redaction spans,
-   capped at 500 turns with cursor pagination, scoped to the tenant, and without an audio
-   storage path.
+1. \`POST /v1/voice/sessions\` with \`X-Tenant-Id\`, \`Idempotency-Key\` and \`{codec, sample_rate,
+   max_duration_s}\`: 401 without a tenant, 415 for a pair outside \`SUPPORTED_FORMATS\`, a duration
+   of 1 to 1800 s (default 1800), and a replayed key answers the session it created.
+2. A **Redis** turn state \`voice:state:{id}\` (\`current_speaker\`, \`turn_index\`, \`tts_offset\`):
+   \`record_frame\` records playback only for the current turn and \`barge_in\` hands the floor to the
+   caller at what was heard, each one Lua script that refreshes a 30 s TTL; \`read_state\` is one read.
+3. A **gRPC** \`Synthesize\` stream from \`tts:9000\` (\`speak\`): a 10 s deadline per attempt, a cancel
+   once \`record_frame\` says the turn moved on, and up to three attempts on \`UNAVAILABLE\` that
+   resume at \`resume_offset\`.
+4. A **Kafka** \`voice.turn\` stream (\`record_turn\`, \`run\`): keyed by session, carrying the turn
+   index, the timings and the reference \`redact\` returned, from an idempotent producer with
+   \`acks=all\`; the consumer commits after \`insert_turn\`.
+5. \`GET /v1/voice/sessions/{id}\`: the tenant's transcript, at most 500 turns a page with a
+   \`next_cursor\`, each turn with its timings and redaction spans and no recording path.
 
 ## The debugging habit
 
 Every starter is working code with flaws: it compiles, plays the demo call and looks right. Debug it
-against the failure modes, fix it, and prove the fix with checks that fail on the starter.
+against the failure modes the task names, fix it, and prove the fix with checks that fail on the
+starter and pass on your version.
 
 ## Left out on purpose
 
-WebRTC negotiation, echo cancellation, VAD tuning, ASR and TTS model selection, voice cloning,
-per-region media routing, billing, and the redacted transcript's storage format.`,
+WebRTC negotiation, voice activity detection, speech recognition, echo cancellation, voice
+selection, per-region media routing, billing, and how the media pipeline stores recordings.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'mic · speaker', x: 8, y: 50},
-      {id: 'gateway', kind: 'http', label: 'Voice Gateway', sub: 'HTTPS :8444', x: 26, y: 50},
-      {id: 'sessions', kind: 'db', label: 'Session store', sub: 'idempotency · sessions', x: 30, y: 12},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'turn state · TTL 30s', x: 46, y: 50},
-      {id: 'kafka', kind: 'kafka', label: 'voice.turn', sub: 'key = session', x: 46, y: 88},
-      {id: 'asr', kind: 'grpc', label: 'ASR', sub: 'Recognize stream', x: 68, y: 10},
-      {id: 'tts', kind: 'grpc', label: 'TTS', sub: 'Synthesize stream', x: 68, y: 34},
-      {id: 'transcripts', kind: 'db', label: 'Transcript store', sub: 'redacted turns', x: 68, y: 60},
-      {id: 'consumer', kind: 'service', label: 'Transcript consumer', sub: 'group transcripts', x: 68, y: 86},
+      {id: 'gateway', kind: 'http', label: 'Voice Gateway', sub: 'voice-gateway', x: 28, y: 50},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'sessions · turn state · TTL 30s', x: 50, y: 14},
+      {id: 'tts', kind: 'grpc', label: 'TTS', sub: 'Synthesize · tts:9000', x: 76, y: 14},
+      {id: 'transcripts', kind: 'db', label: 'Transcript store', sub: 'redacted turns', x: 76, y: 50},
+      {id: 'kafka', kind: 'kafka', label: 'voice.turn', sub: 'key = session', x: 50, y: 86},
+      {id: 'consumer', kind: 'service', label: 'Transcript consumer', sub: 'group transcripts', x: 76, y: 86},
     ],
     edges: [
-      {from: 'client', to: 'gateway', kind: 'http', label: 'session op'},
-      {from: 'gateway', to: 'sessions', kind: 'plain', label: 'session · idempotency'},
-      {from: 'gateway', to: 'redis', kind: 'redis', label: 'barge-in · offsets'},
-      {from: 'gateway', to: 'asr', kind: 'grpc', label: 'Recognize'},
+      {from: 'client', to: 'gateway', kind: 'http', label: 'session · transcript'},
+      {from: 'gateway', to: 'redis', kind: 'redis', label: 'sessions · barge-in'},
       {from: 'gateway', to: 'tts', kind: 'grpc', label: 'Synthesize'},
+      {from: 'gateway', to: 'transcripts', kind: 'plain', label: 'redact · list_turns'},
       {from: 'gateway', to: 'kafka', kind: 'kafka', label: 'produce voice.turn'},
-      {from: 'gateway', to: 'transcripts', kind: 'plain', label: 'read turns'},
       {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'transcripts', kind: 'plain', label: 'store redacted turn'},
+      {from: 'consumer', to: 'transcripts', kind: 'plain', label: 'insert_turn'},
     ],
   },
   steps: [endpointStep, sessionStateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

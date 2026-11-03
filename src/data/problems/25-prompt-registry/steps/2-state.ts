@@ -2,105 +2,124 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis pointer cache with atomic promotion',
+  title: 'The live pointer: promote and roll back in one script',
   concept: 'redis',
   file: 'state',
-  focus: ['registry', 'redis', 'db'],
+  focus: ['registry', 'redis'],
   task: `## Task
 
-**Starting point.** The starter holds the registry's version state in Redis: \`set_pointer\`
-writes \`pointer:{name}\` and then the tenant pin as separate commands, pushes an audit row from the
-client afterwards, and the reader caches the resolved version under a name-keyed key for an hour.
-It compiles, serves the demo and hides five flaws.
+**Starting point.** The starter keeps the live pointer under the keys \`prompts/config\` defines:
+\`promote(tenant, name, version, actor)\` reads the old pointer, sets the new one and appends to the
+history and audit lists; \`rollback(tenant, name, actor)\` steps the pointer back one version;
+\`live_version(tenant, name)\` reads it through a five-minute in-process cache. Both moves answer
+\`{from, to}\`. The demo promotes and rolls back. It hides 4 flaws.
 
-**Failure mode the checks target.** Writing the pointer and the pins as two commands means a
-promotion racing a rollback leaves half the fleet on each version. An hour-long cache turns a
-rollback into a slow, invisible change, and an audit row written after the swap can be lost while
-the pointer is already live.
+**Failure mode the checks target.** A rollback is the change made while something is on fire: it must
+land on every reader at once, on a version that has shipped. The starter's moves are separate
+commands, so a second operator lands between them and the audit stops describing what happened; its
+rollback subtracts one; and its reader keeps the old answer for five minutes.
 
-- \`pointer:{name}\` holds the global version; \`pin:{tenant}:{name}\` holds a tenant's own. A
-  reader resolves the **pin first**, the pointer second, then \`DEFAULT_VERSION\`.
-- \`promote(name, version, actor)\` and \`rollback(name, version, actor)\` go through the **same
-  atomic Lua \`EVAL\`**: it reads the previous pointer, writes the new one, appends the audit entry
-  (\`audit:{name}\`) and bumps \`revision:{name}\` in one script.
-- The reader's cache key carries the **revision** (\`pointer_cache:{tenant}:{name}:{revision}\`)
-  with a short \`CACHE_TTL_S\`, so a swap changes the key and the next read misses the stale entry.
-- A promotion followed by a rollback leaves **every** reader on the rolled-back version.`,
+Requirements:
+
+- \`promote\` and \`rollback\` each run as **one Lua script**.
+- \`promote\` of a version with no \`version_key\` changes nothing and returns none (\`None\`, \`null\`,
+  \`nil\`, \`nullopt\`).
+- \`rollback\` pops the history and makes its new last entry live; with fewer than two entries it
+  returns none.
+- Every move appends \`action|from|to|actor|at\` to the audit list (\`from\` is 0 before the first
+  promotion).
+- \`live_version\` reads the pointer on every call.`,
   sequence: {
-    participants: ['Prompt Registry', 'Redis', 'Reader'],
+    participants: ['Operator', 'registryd', 'Redis', 'Reader'],
     messages: [
-      {from: 'Prompt Registry', to: 'Redis', label: 'EVAL swap · pointer · audit · revision', kind: 'sync'},
-      {from: 'Redis', to: 'Prompt Registry', label: 'previous version', kind: 'reply'},
-      {from: 'Reader', to: 'Redis', label: 'GET pin:{tenant}:{name}', kind: 'sync'},
-      {from: 'Reader', to: 'Redis', label: 'GET pointer:{name} when unpinned', kind: 'sync'},
-      {from: 'Reader', to: 'Redis', label: 'SET pointer_cache:{tenant}:{name}:{revision} EX 5', kind: 'sync'},
-      {from: 'Redis', to: 'Reader', label: 'the version to serve', kind: 'reply'},
+      {from: 'Operator', to: 'registryd', label: 'promote(tenant, name, 7, actor)', kind: 'sync'},
+      {from: 'registryd', to: 'Redis', label: 'EVAL promote · live history audit version · 7 actor now', kind: 'sync'},
+      {
+        from: 'Redis',
+        to: 'Redis',
+        label: 'EXISTS version · GET live · SET · RPUSH history · RPUSH audit',
+        kind: 'sync',
+      },
+      {from: 'Redis', to: 'registryd', label: '{ok, 4}', kind: 'reply'},
+      {from: 'Operator', to: 'registryd', label: 'rollback(tenant, name, actor)', kind: 'sync'},
+      {from: 'registryd', to: 'Redis', label: 'EVAL rollback · RPOP history · LINDEX -1 · SET live', kind: 'sync'},
+      {from: 'Reader', to: 'Redis', label: 'GET live, on every read', kind: 'sync'},
     ],
   },
   checks: [
     {
-      id: 'atomic-swap',
-      title: 'Promotes with one atomic Lua script',
+      id: 'atomic-promote',
+      title: 'Promotes in one Lua script',
       detail:
-        'The pointer is read and written inside one `EVAL`/`NewScript` call that returns the previous version, so two racing promotions cannot interleave. The starter sets the pointer and the pins as separate commands.',
+        'Another operator promoting between two of this promotion’s commands leaves an audit list whose every entry starts where the previous one ended, and whose last entry is the live version. The starter issues GET, SET and RPUSH separately, and the audit says version 1 moved twice.',
       match: {
-        python: {all: [/PROMOTE_LUA/, /\.eval\(/, /GET/, /SET/]},
-        typescript: {all: [/PROMOTE_LUA/, /\.eval\(/, /GET/, /SET/]},
-        go: {all: [/promoteScript/, /\.Run\(/, /GET/, /SET/]},
-        scala: {all: [/PromoteLua/, /\.eval\(/, /GET/, /SET/]},
-        cpp: {all: [/kPromoteLua/, /\.eval</, /GET/, /SET/]},
+        python: {
+          all: [
+            /register_script\(|\.eval\(|\.evalsha\(/,
+            /redis\.call\(\s*['"]SET['"]/,
+            /redis\.call\(\s*['"]RPUSH['"]/,
+          ],
+          none: [/\br\.set\(\s*live_key\(/],
+        },
+        typescript: {
+          all: [/defineCommand\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]SET['"]/, /redis\.call\(\s*['"]RPUSH['"]/],
+          none: [/redis\.set\(\s*liveKey\(/],
+        },
+        go: {
+          all: [
+            /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/,
+            /redis\.call\(\s*['"]SET['"]/,
+            /redis\.call\(\s*['"]RPUSH['"]/,
+          ],
+          none: [/rdb\.Set\(\s*ctx,\s*config\.LiveKey\(/],
+        },
+        scala: {
+          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]SET['"]/, /redis\.call\(\s*['"]RPUSH['"]/],
+          none: [/jedis\.set\(\s*Config\.liveKey\(/],
+        },
+        cpp: {
+          all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]SET['"]/, /redis\.call\(\s*['"]RPUSH['"]/],
+          none: [/redis\.set\(\s*config::live_key\(/],
+        },
       },
     },
     {
-      id: 'audit-in-script',
-      title: 'Writes the audit row and bumps the revision in the same script',
+      id: 'registered-only',
+      title: 'Promotes only a registered version',
       detail:
-        'The audit entry (`audit:{name}`) and the revision bump happen inside the same script as the swap: `RPUSH` and `INCR` are Lua calls, not a second client round trip. The starter pushes the audit row after the pointer is already live.',
+        'Promoting version 9, which was never registered, returns none and leaves the pointer, the history and the audit as they were; once registered it promotes. The starter points every reader at a version the store does not hold.',
       match: {
-        python: {all: [/RPUSH/, /INCR/, /audit:/]},
-        typescript: {all: [/RPUSH/, /INCR/, /audit:/]},
-        go: {all: [/RPUSH/, /INCR/, /audit:/]},
-        scala: {all: [/RPUSH/, /INCR/, /audit:/]},
-        cpp: {all: [/RPUSH/, /INCR/, /audit:/]},
+        python: {all: [/version_key\(|versions\.get\(/]},
+        typescript: {all: [/versionKey\(|versions\.get\(/]},
+        go: {all: [/config\.VersionKey\(|versions\.Get\(/]},
+        scala: {all: [/Config\.versionKey\(|Versions\.get\(/]},
+        cpp: {all: [/config::version_key\(|versions::get\(/]},
       },
     },
     {
-      id: 'pin-first',
-      title: 'Reads the tenant pin before the global pointer',
+      id: 'rollback-previous',
+      title: 'Rolls back to the version that was live before',
       detail:
-        'A reader looks up `pin:{tenant}:{name}` first and only falls back to `pointer:{name}`, so a pinned tenant keeps its version while the global pointer moves. The starter reads the global pointer for everyone.',
+        'After promoting 1, 4 and 7, rollback lands on 4, then on 1, then returns none and leaves 1 live, each move audited. The starter subtracts one and puts version 6, which never shipped, live.',
       match: {
-        python: {all: [/pin:/, /pointer:/], order: [/r\.get\(pin_key\(/, /r\.get\(pointer_key\(/]},
-        typescript: {all: [/pin:/, /pointer:/], order: [/r\.get\(pinKey\(/, /r\.get\(pointerKey\(/]},
-        go: {all: [/pin:/, /pointer:/], order: [/rdb\.Get\(ctx,\s*pinKey\(/, /rdb\.Get\(ctx,\s*pointerKey\(/]},
-        scala: {all: [/pin:/, /pointer:/], order: [/jedis\.get\(pinKey\(/, /jedis\.get\(pointerKey\(/]},
-        cpp: {all: [/pin:/, /pointer:/], order: [/redis\.get\(pin_key\(/, /redis\.get\(pointer_key\(/]},
+        python: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
+        typescript: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
+        go: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
+        scala: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
+        cpp: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
       },
     },
     {
-      id: 'revision-cache',
-      title: 'Cache key carries the revision, with a short TTL',
+      id: 'live-uncached',
+      title: 'Serves a rollback on the very next read',
       detail:
-        'The read cache is `pointer_cache:{tenant}:{name}:{revision}` and expires in `CACHE_TTL_S` seconds: the key changes the moment the revision does, so a rollback is visible on the next read. The starter caches by name for an hour.',
+        'A reader that just saw version 4 sees version 1 on its next read after another replica rolled back. The starter caches the pointer in the process for five minutes.',
       match: {
-        python: {all: [/revision:/, /cache_key\(/], none: [/3600/]},
-        typescript: {all: [/revision:/, /cacheKey\(/], none: [/3600/]},
-        go: {all: [/revision:/, /cacheKey\(/], none: [/3600/]},
-        scala: {all: [/revision:/, /cacheKey\(/], none: [/3600/]},
-        cpp: {all: [/revision:/, /cache_key\(/], none: [/3600/]},
-      },
-    },
-    {
-      id: 'rollback-path',
-      title: 'Rolls back through the same atomic path',
-      detail:
-        '`rollback` exists beside `promote` and reuses the same script with the actor recorded, so a rollback is as atomic and as auditable as a promotion. The starter has no rollback at all — an operator edits the pointer by hand.',
-      match: {
-        python: {all: [/def rollback\(/, /actor/, /PROMOTE_LUA/]},
-        typescript: {all: [/function rollback\(/, /actor/, /PROMOTE_LUA/]},
-        go: {all: [/func rollback\(/, /actor/, /promoteScript/]},
-        scala: {all: [/def rollback\(/, /actor/, /PromoteLua/]},
-        cpp: {all: [/rollback\(/, /actor/, /kPromoteLua/]},
+        python: {none: [/CACHE_TTL_S|_live_cache/]},
+        typescript: {none: [/CACHE_TTL_S|liveCache/]},
+        go: {none: [/cacheTTL|liveCache/]},
+        scala: {none: [/CacheTtlSeconds|liveCache/]},
+        cpp: {none: [/kCacheTtl|live_cache/]},
       },
     },
   ],
@@ -110,180 +129,214 @@ the pointer is already live.
 
 import redis
 
+from prompts.config import audit_key, history_key, live_key
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-DEFAULT_VERSION = 1
-CACHE_TTL_S = 3600  # cache the resolved pointer for an hour
+CACHE_TTL_S = 300
+_live_cache: dict[tuple[str, str], tuple[int | None, float]] = {}
 
 
-def set_pointer(name: str, version: int, tenant: str = "", actor: str = "") -> None:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    r.set(f"pointer:{name}", version)
-    if tenant:
-        r.set(f"pin:{tenant}:{name}", version)
-    r.rpush(f"audit:{name}", f"{time.time()}:{actor}:{version}")
+def promote(tenant: str, name: str, version: int, actor: str) -> dict | None:
+    """Make version live for the tenant's readers: {"from", "to"}; None when it is not registered."""
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    previous = int(r.get(live_key(tenant, name)) or 0)
+    r.set(live_key(tenant, name), version)
+    r.rpush(history_key(tenant, name), version)
+    r.rpush(audit_key(tenant, name), f"promote|{previous}|{version}|{actor}|{int(time.time())}")
+    return {"from": previous, "to": version}
 
 
-def active_version(tenant: str, name: str) -> int:
-    cached = r.get(f"pointer_cache:{tenant}:{name}")
-    if cached is not None:
-        return int(cached)
-    value = int(r.get(f"pointer:{name}") or DEFAULT_VERSION)
-    r.set(f"pointer_cache:{tenant}:{name}", value, ex=CACHE_TTL_S)
-    return value
+def rollback(tenant: str, name: str, actor: str) -> dict | None:
+    """Put back the version that was live before this one: {"from", "to"}; None when there is none."""
+    current = int(r.get(live_key(tenant, name)) or 0)
+    target = current - 1
+    if target < 1:
+        return None
+    r.set(live_key(tenant, name), target)
+    r.rpush(audit_key(tenant, name), f"rollback|{current}|{target}|{actor}|{int(time.time())}")
+    return {"from": current, "to": target}
+
+
+def live_version(tenant: str, name: str) -> int | None:
+    """The version the tenant's readers are served; None before the first promotion."""
+    cached = _live_cache.get((tenant, name))
+    if cached is not None and cached[1] > time.time():
+        return cached[0]
+    raw = r.get(live_key(tenant, name))
+    version = int(raw) if raw is not None else None
+    _live_cache[(tenant, name)] = (version, time.time() + CACHE_TTL_S)
+    return version
 `,
       solution: `import time
 
 import redis
 
+from prompts.config import audit_key, history_key, live_key, version_key
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-DEFAULT_VERSION = 1
-CACHE_TTL_S = 5
-
-# One round trip carries the whole promotion: the pointer moves, the audit entry is appended and
-# the revision is bumped, so no reader can see a pointer that was never audited.
-PROMOTE_LUA = """
-local previous = redis.call('GET', KEYS[1])
+# KEYS: live, history, audit, version. ARGV: version, actor, now.
+PROMOTE = """
+if redis.call('EXISTS', KEYS[4]) == 0 then
+  return {'unregistered', ''}
+end
+local from = redis.call('GET', KEYS[1]) or '0'
+if from == ARGV[1] then
+  return {'ok', from}
+end
 redis.call('SET', KEYS[1], ARGV[1])
-redis.call('RPUSH', KEYS[2], ARGV[2])
-redis.call('INCR', KEYS[3])
-return previous or ''
+redis.call('RPUSH', KEYS[2], ARGV[1])
+redis.call('RPUSH', KEYS[3], 'promote|' .. from .. '|' .. ARGV[1] .. '|' .. ARGV[2] .. '|' .. ARGV[3])
+return {'ok', from}
 """
 
+# KEYS: live, history, audit. ARGV: actor, now.
+ROLLBACK = """
+if redis.call('LLEN', KEYS[2]) < 2 then
+  return {'empty', '', ''}
+end
+local from = redis.call('RPOP', KEYS[2])
+local to = redis.call('LINDEX', KEYS[2], -1)
+redis.call('SET', KEYS[1], to)
+redis.call('RPUSH', KEYS[3], 'rollback|' .. from .. '|' .. to .. '|' .. ARGV[1] .. '|' .. ARGV[2])
+return {'ok', from, to}
+"""
 
-def pointer_key(name: str) -> str:
-    return f"pointer:{name}"
-
-
-def pin_key(tenant: str, name: str) -> str:
-    return f"pin:{tenant}:{name}"
-
-
-def audit_key(name: str) -> str:
-    return f"audit:{name}"
-
-
-def revision_key(name: str) -> str:
-    return f"revision:{name}"
-
-
-def cache_key(tenant: str, name: str, revision: str) -> str:
-    return f"pointer_cache:{tenant}:{name}:{revision}"
+promote_script = r.register_script(PROMOTE)
+rollback_script = r.register_script(ROLLBACK)
 
 
-def swap(name: str, version: int, actor: str, action: str) -> str:
-    entry = f"{time.time()}:{action}:{actor}:{version}"
-    previous = r.eval(
-        PROMOTE_LUA, 3, pointer_key(name), audit_key(name), revision_key(name), str(version), entry
-    )
-    return str(previous)
+def promote(tenant: str, name: str, version: int, actor: str) -> dict | None:
+    """Make version live for the tenant's readers: {"from", "to"}; None when it is not registered."""
+    keys = [live_key(tenant, name), history_key(tenant, name), audit_key(tenant, name), version_key(tenant, name, version)]
+    status, previous = promote_script(keys=keys, args=[version, actor, int(time.time())])
+    if status != "ok":
+        return None
+    return {"from": int(previous), "to": version}
 
 
-def promote(name: str, version: int, actor: str) -> str:
-    return swap(name, version, actor, "promote")
+def rollback(tenant: str, name: str, actor: str) -> dict | None:
+    """Put back the version that was live before this one: {"from", "to"}; None when there is none."""
+    keys = [live_key(tenant, name), history_key(tenant, name), audit_key(tenant, name)]
+    status, previous, target = rollback_script(keys=keys, args=[actor, int(time.time())])
+    if status != "ok":
+        return None
+    return {"from": int(previous), "to": int(target)}
 
 
-def rollback(name: str, version: int, actor: str) -> str:
-    return swap(name, version, actor, "rollback")
-
-
-def active_version(tenant: str, name: str) -> int:
-    revision = r.get(revision_key(name)) or "0"
-    cached = r.get(cache_key(tenant, name, revision))
-    if cached is not None:
-        return int(cached)
-    pinned = r.get(pin_key(tenant, name))
-    pointer = r.get(pointer_key(name))
-    version = int(pinned or pointer or DEFAULT_VERSION)
-    r.set(cache_key(tenant, name, revision), version, ex=CACHE_TTL_S)
-    return version
+def live_version(tenant: str, name: str) -> int | None:
+    """The version the tenant's readers are served; None before the first promotion."""
+    raw = r.get(live_key(tenant, name))
+    return int(raw) if raw is not None else None
 `,
     },
     typescript: {
-      starter: `/** Version state. */
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-const r = new Redis('redis://redis:6379');
+import {auditKey, historyKey, liveKey} from 'prompts/config';
 
-const DEFAULT_VERSION = 1;
-const CACHE_TTL_S = 3600; // cache the resolved pointer for an hour
+export const redis = new Redis({host: 'redis', port: 6379});
 
-export async function setPointer(
-  name: string,
-  version: number,
-  tenant?: string,
-  actor?: string,
-): Promise<void> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  await r.set(\`pointer:\${name}\`, String(version));
-  if (tenant !== undefined) await r.set(\`pin:\${tenant}:\${name}\`, String(version));
-  await r.rpush(\`audit:\${name}\`, \`\${Date.now()}:\${actor ?? ''}:\${version}\`);
+export const CACHE_TTL_S = 300;
+const liveCache = new Map<string, {version: number | null; until: number}>();
+
+/** A move of the live pointer: the version that was live (0 for none) and the one that is. */
+export interface Swap {
+  from: number;
+  to: number;
 }
 
-export async function activeVersion(tenant: string, name: string): Promise<number> {
-  const cached = await r.get(\`pointer_cache:\${tenant}:\${name}\`);
-  if (cached !== null) return Number(cached);
-  const value = Number((await r.get(\`pointer:\${name}\`)) ?? DEFAULT_VERSION);
-  await r.set(\`pointer_cache:\${tenant}:\${name}\`, String(value), 'EX', CACHE_TTL_S);
-  return value;
+const now = (): number => Math.floor(Date.now() / 1000);
+
+/** Make version live for the tenant's readers; null when it is not registered. */
+export async function promote(tenant: string, name: string, version: number, actor: string): Promise<Swap | null> {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const previous = Number((await redis.get(liveKey(tenant, name))) ?? 0);
+  await redis.set(liveKey(tenant, name), String(version));
+  await redis.rpush(historyKey(tenant, name), String(version));
+  await redis.rpush(auditKey(tenant, name), \`promote|\${previous}|\${version}|\${actor}|\${now()}\`);
+  return {from: previous, to: version};
+}
+
+/** Put back the version that was live before this one; null when there is none. */
+export async function rollback(tenant: string, name: string, actor: string): Promise<Swap | null> {
+  const current = Number((await redis.get(liveKey(tenant, name))) ?? 0);
+  const target = current - 1;
+  if (target < 1) return null;
+  await redis.set(liveKey(tenant, name), String(target));
+  await redis.rpush(auditKey(tenant, name), \`rollback|\${current}|\${target}|\${actor}|\${now()}\`);
+  return {from: current, to: target};
+}
+
+/** The version the tenant's readers are served; null before the first promotion. */
+export async function liveVersion(tenant: string, name: string): Promise<number | null> {
+  const key = liveKey(tenant, name);
+  const cached = liveCache.get(key);
+  if (cached !== undefined && cached.until > Date.now()) return cached.version;
+  const raw = await redis.get(key);
+  const version = raw === null ? null : Number(raw);
+  liveCache.set(key, {version, until: Date.now() + CACHE_TTL_S * 1000});
+  return version;
 }
 `,
-      solution: `/** Version state: one atomic swap, a revision, and a read cache that follows the revision. */
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-const r = new Redis('redis://redis:6379');
+import {auditKey, historyKey, liveKey, versionKey} from 'prompts/config';
 
-const DEFAULT_VERSION = 1;
-const CACHE_TTL_S = 5;
+export const redis = new Redis({host: 'redis', port: 6379});
 
-// One round trip carries the whole promotion: the pointer moves, the audit entry is appended and
-// the revision is bumped, so no reader can see a pointer that was never audited.
-const PROMOTE_LUA = \`
-local previous = redis.call('GET', KEYS[1])
+// KEYS: live, history, audit, version. ARGV: version, actor, now.
+const PROMOTE = \`
+if redis.call('EXISTS', KEYS[4]) == 0 then
+  return {'unregistered', ''}
+end
+local from = redis.call('GET', KEYS[1]) or '0'
+if from == ARGV[1] then
+  return {'ok', from}
+end
 redis.call('SET', KEYS[1], ARGV[1])
-redis.call('RPUSH', KEYS[2], ARGV[2])
-redis.call('INCR', KEYS[3])
-return previous or ''
+redis.call('RPUSH', KEYS[2], ARGV[1])
+redis.call('RPUSH', KEYS[3], 'promote|' .. from .. '|' .. ARGV[1] .. '|' .. ARGV[2] .. '|' .. ARGV[3])
+return {'ok', from}
 \`;
 
-const pointerKey = (name: string): string => \`pointer:\${name}\`;
-const pinKey = (tenant: string, name: string): string => \`pin:\${tenant}:\${name}\`;
-const auditKey = (name: string): string => \`audit:\${name}\`;
-const revisionKey = (name: string): string => \`revision:\${name}\`;
-const cacheKey = (tenant: string, name: string, revision: string): string =>
-  \`pointer_cache:\${tenant}:\${name}:\${revision}\`;
+// KEYS: live, history, audit. ARGV: actor, now.
+const ROLLBACK = \`
+if redis.call('LLEN', KEYS[2]) < 2 then
+  return {'empty', '', ''}
+end
+local from = redis.call('RPOP', KEYS[2])
+local to = redis.call('LINDEX', KEYS[2], -1)
+redis.call('SET', KEYS[1], to)
+redis.call('RPUSH', KEYS[3], 'rollback|' .. from .. '|' .. to .. '|' .. ARGV[1] .. '|' .. ARGV[2])
+return {'ok', from, to}
+\`;
 
-async function swap(name: string, version: number, actor: string, action: string): Promise<string> {
-  const previous = (await r.eval(
-    PROMOTE_LUA,
-    3,
-    pointerKey(name),
-    auditKey(name),
-    revisionKey(name),
-    String(version),
-    \`\${Date.now()}:\${action}:\${actor}:\${version}\`,
-  )) as string;
-  return previous ?? '';
+/** A move of the live pointer: the version that was live (0 for none) and the one that is. */
+export interface Swap {
+  from: number;
+  to: number;
 }
 
-export async function promote(name: string, version: number, actor: string): Promise<string> {
-  return swap(name, version, actor, 'promote');
+/** Make version live for the tenant's readers; null when it is not registered. */
+export async function promote(tenant: string, name: string, version: number, actor: string): Promise<Swap | null> {
+  const keys = [liveKey(tenant, name), historyKey(tenant, name), auditKey(tenant, name), versionKey(tenant, name, version)];
+  const [status, previous] = (await redis.eval(PROMOTE, keys.length, ...keys, version, actor, Math.floor(Date.now() / 1000))) as string[];
+  return status === 'ok' ? {from: Number(previous), to: version} : null;
 }
 
-export async function rollback(name: string, version: number, actor: string): Promise<string> {
-  return swap(name, version, actor, 'rollback');
+/** Put back the version that was live before this one; null when there is none. */
+export async function rollback(tenant: string, name: string, actor: string): Promise<Swap | null> {
+  const keys = [liveKey(tenant, name), historyKey(tenant, name), auditKey(tenant, name)];
+  const [status, previous, target] = (await redis.eval(ROLLBACK, keys.length, ...keys, actor, Math.floor(Date.now() / 1000))) as string[];
+  return status === 'ok' ? {from: Number(previous), to: Number(target)} : null;
 }
 
-export async function activeVersion(tenant: string, name: string): Promise<number> {
-  const revision = (await r.get(revisionKey(name))) ?? '0';
-  const cached = await r.get(cacheKey(tenant, name, revision));
-  if (cached !== null) return Number(cached);
-  const pinned = await r.get(pinKey(tenant, name));
-  const pointer = await r.get(pointerKey(name));
-  const version = Number(pinned ?? pointer ?? DEFAULT_VERSION);
-  await r.set(cacheKey(tenant, name, revision), String(version), 'EX', CACHE_TTL_S);
-  return version;
+/** The version the tenant's readers are served; null before the first promotion. */
+export async function liveVersion(tenant: string, name: string): Promise<number | null> {
+  const raw = await redis.get(liveKey(tenant, name));
+  return raw === null ? null : Number(raw);
 }
 `,
     },
@@ -292,227 +345,291 @@ export async function activeVersion(tenant: string, name: string): Promise<numbe
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"prompts/config" // config.LiveKey, config.HistoryKey, config.AuditKey, config.VersionKey — provided
 )
 
-const (
-	defaultVersion = 1
-	cacheTTLS      = 3600 // cache the resolved pointer for an hour
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var rdb *redis.Client
+const cacheTTL = 300 * time.Second
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-func setPointer(ctx context.Context, name string, version int, tenant, actor string) {
-	rdb.Set(ctx, fmt.Sprintf("pointer:%s", name), version, 0)
-	if tenant != "" {
-		rdb.Set(ctx, fmt.Sprintf("pin:%s:%s", tenant, name), version, 0)
-	}
-	rdb.RPush(ctx, fmt.Sprintf("audit:%s", name), fmt.Sprintf("%d:%s:%d", time.Now().Unix(), actor, version))
+type cachedLive struct {
+	version int
+	until   time.Time
 }
 
-func activeVersion(ctx context.Context, tenant, name string) int {
-	cached, err := rdb.Get(ctx, fmt.Sprintf("pointer_cache:%s:%s", tenant, name)).Result()
-	if err == nil {
-		value, _ := strconv.Atoi(cached)
-		return value
+var liveCache = map[string]cachedLive{}
+
+// Swap is a move of the live pointer: the version that was live (0 for none) and the one that is.
+type Swap struct {
+	From int
+	To   int
+}
+
+// promote makes version live for the tenant's readers; nil when it is not registered.
+func promote(ctx context.Context, tenant, name string, version int, actor string) (*Swap, error) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	previous, err := rdb.Get(ctx, config.LiveKey(tenant, name)).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
 	}
-	raw, _ := rdb.Get(ctx, fmt.Sprintf("pointer:%s", name)).Result()
-	value, _ := strconv.Atoi(raw)
-	if value == 0 {
-		value = defaultVersion
+	if err := rdb.Set(ctx, config.LiveKey(tenant, name), version, 0).Err(); err != nil {
+		return nil, err
 	}
-	rdb.Set(ctx, fmt.Sprintf("pointer_cache:%s:%s", tenant, name), value, cacheTTLS*time.Second)
-	return value
+	if err := rdb.RPush(ctx, config.HistoryKey(tenant, name), version).Err(); err != nil {
+		return nil, err
+	}
+	entry := fmt.Sprintf("promote|%d|%d|%s|%d", previous, version, actor, time.Now().Unix())
+	if err := rdb.RPush(ctx, config.AuditKey(tenant, name), entry).Err(); err != nil {
+		return nil, err
+	}
+	return &Swap{From: previous, To: version}, nil
+}
+
+// rollback puts back the version that was live before this one; nil when there is none.
+func rollback(ctx context.Context, tenant, name, actor string) (*Swap, error) {
+	current, err := rdb.Get(ctx, config.LiveKey(tenant, name)).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	target := current - 1
+	if target < 1 {
+		return nil, nil
+	}
+	if err := rdb.Set(ctx, config.LiveKey(tenant, name), target, 0).Err(); err != nil {
+		return nil, err
+	}
+	entry := fmt.Sprintf("rollback|%d|%d|%s|%d", current, target, actor, time.Now().Unix())
+	if err := rdb.RPush(ctx, config.AuditKey(tenant, name), entry).Err(); err != nil {
+		return nil, err
+	}
+	return &Swap{From: current, To: target}, nil
+}
+
+// liveVersion is the version the tenant's readers are served; 0 before the first promotion.
+func liveVersion(ctx context.Context, tenant, name string) (int, error) {
+	key := config.LiveKey(tenant, name)
+	if cached, ok := liveCache[key]; ok && cached.until.After(time.Now()) {
+		return cached.version, nil
+	}
+	version, err := rdb.Get(ctx, key).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return 0, err
+	}
+	liveCache[key] = cachedLive{version: version, until: time.Now().Add(cacheTTL)}
+	return version, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"prompts/config" // config.LiveKey, config.HistoryKey, config.AuditKey, config.VersionKey — provided
 )
 
-const (
-	defaultVersion = 1
-	cacheTTLS      = 5
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var rdb *redis.Client
-
-// One round trip carries the whole promotion: the pointer moves, the audit entry is appended and
-// the revision is bumped, so no reader can see a pointer that was never audited.
+// KEYS: live, history, audit, version. ARGV: version, actor, now.
 var promoteScript = redis.NewScript(\`
-local previous = redis.call('GET', KEYS[1])
+if redis.call('EXISTS', KEYS[4]) == 0 then
+  return {'unregistered', ''}
+end
+local from = redis.call('GET', KEYS[1]) or '0'
+if from == ARGV[1] then
+  return {'ok', from}
+end
 redis.call('SET', KEYS[1], ARGV[1])
-redis.call('RPUSH', KEYS[2], ARGV[2])
-redis.call('INCR', KEYS[3])
-return previous or ''
+redis.call('RPUSH', KEYS[2], ARGV[1])
+redis.call('RPUSH', KEYS[3], 'promote|' .. from .. '|' .. ARGV[1] .. '|' .. ARGV[2] .. '|' .. ARGV[3])
+return {'ok', from}
 \`)
 
-func pointerKey(name string) string {
-	return "pointer:" + name
+// KEYS: live, history, audit. ARGV: actor, now.
+var rollbackScript = redis.NewScript(\`
+if redis.call('LLEN', KEYS[2]) < 2 then
+  return {'empty', '', ''}
+end
+local from = redis.call('RPOP', KEYS[2])
+local to = redis.call('LINDEX', KEYS[2], -1)
+redis.call('SET', KEYS[1], to)
+redis.call('RPUSH', KEYS[3], 'rollback|' .. from .. '|' .. to .. '|' .. ARGV[1] .. '|' .. ARGV[2])
+return {'ok', from, to}
+\`)
+
+// Swap is a move of the live pointer: the version that was live (0 for none) and the one that is.
+type Swap struct {
+	From int
+	To   int
 }
 
-func pinKey(tenant, name string) string {
-	return "pin:" + tenant + ":" + name
-}
-
-func auditKey(name string) string {
-	return "audit:" + name
-}
-
-func revisionKey(name string) string {
-	return "revision:" + name
-}
-
-func cacheKey(tenant, name, revision string) string {
-	return "pointer_cache:" + tenant + ":" + name + ":" + revision
-}
-
-func swap(ctx context.Context, name string, version int, actor, action string) (string, error) {
-	entry := fmt.Sprintf("%d:%s:%s:%d", time.Now().Unix(), action, actor, version)
-	previous, err := promoteScript.Run(
-		ctx,
-		rdb,
-		[]string{pointerKey(name), auditKey(name), revisionKey(name)},
-		version,
-		entry,
-	).Result()
+// promote makes version live for the tenant's readers; nil when it is not registered.
+func promote(ctx context.Context, tenant, name string, version int, actor string) (*Swap, error) {
+	keys := []string{config.LiveKey(tenant, name), config.HistoryKey(tenant, name), config.AuditKey(tenant, name), config.VersionKey(tenant, name, version)}
+	reply, err := promoteScript.Run(ctx, rdb, keys, version, actor, time.Now().Unix()).Slice()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return fmt.Sprintf("%v", previous), nil
+	if fmt.Sprint(reply[0]) != "ok" {
+		return nil, nil
+	}
+	previous, _ := strconv.Atoi(fmt.Sprint(reply[1]))
+	return &Swap{From: previous, To: version}, nil
 }
 
-func promote(ctx context.Context, name string, version int, actor string) (string, error) {
-	return swap(ctx, name, version, actor, "promote")
+// rollback puts back the version that was live before this one; nil when there is none.
+func rollback(ctx context.Context, tenant, name, actor string) (*Swap, error) {
+	keys := []string{config.LiveKey(tenant, name), config.HistoryKey(tenant, name), config.AuditKey(tenant, name)}
+	reply, err := rollbackScript.Run(ctx, rdb, keys, actor, time.Now().Unix()).Slice()
+	if err != nil {
+		return nil, err
+	}
+	if fmt.Sprint(reply[0]) != "ok" {
+		return nil, nil
+	}
+	previous, _ := strconv.Atoi(fmt.Sprint(reply[1]))
+	target, _ := strconv.Atoi(fmt.Sprint(reply[2]))
+	return &Swap{From: previous, To: target}, nil
 }
 
-func rollback(ctx context.Context, name string, version int, actor string) (string, error) {
-	return swap(ctx, name, version, actor, "rollback")
-}
-
-func activeVersion(ctx context.Context, tenant, name string) int {
-	revision, _ := rdb.Get(ctx, revisionKey(name)).Result()
-	if revision == "" {
-		revision = "0"
+// liveVersion is the version the tenant's readers are served; 0 before the first promotion.
+func liveVersion(ctx context.Context, tenant, name string) (int, error) {
+	version, err := rdb.Get(ctx, config.LiveKey(tenant, name)).Int()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
 	}
-	if cached, err := rdb.Get(ctx, cacheKey(tenant, name, revision)).Result(); err == nil {
-		value, _ := strconv.Atoi(cached)
-		return value
-	}
-	pinned, _ := rdb.Get(ctx, pinKey(tenant, name)).Result()
-	pointer, _ := rdb.Get(ctx, pointerKey(name)).Result()
-	raw := pinned
-	if raw == "" {
-		raw = pointer
-	}
-	value, _ := strconv.Atoi(raw)
-	if value == 0 {
-		value = defaultVersion
-	}
-	rdb.Set(ctx, cacheKey(tenant, name, revision), value, cacheTTLS*time.Second)
-	return value
+	return version, err
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
 
-object PointerState {
-  val DefaultVersion = 1
-  val CacheTtlS = 3600 // cache the resolved pointer for an hour
-  val jedis = new Jedis("redis", 6379)
+import scala.collection.mutable
 
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def setPointer(name: String, version: Int, tenant: String = "", actor: String = ""): Unit = {
-    jedis.set(s"pointer:$name", version.toString)
-    if (tenant.nonEmpty) jedis.set(s"pin:$tenant:$name", version.toString)
-    jedis.rpush(s"audit:$name", s"\${System.currentTimeMillis()}:$actor:$version")
+import prompts.Config
+
+/** A move of the live pointer: the version that was live (0 for none) and the one that is. */
+final case class Swap(from: Int, to: Int)
+
+object LivePointer {
+  val jedis = new JedisPooled("redis", 6379)
+
+  val CacheTtlSeconds = 300L
+  private val liveCache = mutable.Map[String, (Option[Int], Long)]()
+
+  private def now: Long = System.currentTimeMillis() / 1000
+
+  /** Make version live for the tenant's readers; None when it is not registered. */
+  def promote(tenant: String, name: String, version: Int, actor: String): Option[Swap] = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    val previous = Option(jedis.get(Config.liveKey(tenant, name))).map(_.toInt).getOrElse(0)
+    jedis.set(Config.liveKey(tenant, name), version.toString)
+    jedis.rpush(Config.historyKey(tenant, name), version.toString)
+    jedis.rpush(Config.auditKey(tenant, name), s"promote|$previous|$version|$actor|$now")
+    Some(Swap(previous, version))
   }
 
-  def activeVersion(tenant: String, name: String): Int = {
-    Option(jedis.get(s"pointer_cache:$tenant:$name")) match {
-      case Some(cached) => cached.toInt
-      case None =>
-        val value = Option(jedis.get(s"pointer:$name")).map(_.toInt).getOrElse(DefaultVersion)
-        jedis.set(s"pointer_cache:$tenant:$name", value.toString)
-        jedis.expire(s"pointer_cache:$tenant:$name", CacheTtlS.toLong)
-        value
+  /** Put back the version that was live before this one; None when there is none. */
+  def rollback(tenant: String, name: String, actor: String): Option[Swap] = {
+    val current = Option(jedis.get(Config.liveKey(tenant, name))).map(_.toInt).getOrElse(0)
+    val target = current - 1
+    if (target < 1) None
+    else {
+      jedis.set(Config.liveKey(tenant, name), target.toString)
+      jedis.rpush(Config.auditKey(tenant, name), s"rollback|$current|$target|$actor|$now")
+      Some(Swap(current, target))
+    }
+  }
+
+  /** The version the tenant's readers are served; None before the first promotion. */
+  def liveVersion(tenant: String, name: String): Option[Int] = {
+    val key = Config.liveKey(tenant, name)
+    liveCache.get(key) match {
+      case Some((version, until)) if until > System.currentTimeMillis() => version
+      case _ =>
+        val version = Option(jedis.get(key)).map(_.toInt)
+        liveCache(key) = (version, System.currentTimeMillis() + CacheTtlSeconds * 1000)
+        version
     }
   }
 }
 `,
-      solution: `import redis.clients.jedis.Jedis
+      solution: `import redis.clients.jedis.JedisPooled
 
-object PointerState {
-  val DefaultVersion = 1
-  val CacheTtlS = 5
+import scala.jdk.CollectionConverters._
 
-  val jedis = new Jedis("redis", 6379)
+import prompts.Config
 
-  // One round trip carries the whole promotion: the pointer moves, the audit entry is appended and
-  // the revision is bumped, so no reader can see a pointer that was never audited.
-  val PromoteLua =
-    """
-      |local previous = redis.call('GET', KEYS[1])
+/** A move of the live pointer: the version that was live (0 for none) and the one that is. */
+final case class Swap(from: Int, to: Int)
+
+object LivePointer {
+  val jedis = new JedisPooled("redis", 6379)
+
+  // KEYS: live, history, audit, version. ARGV: version, actor, now.
+  val Promote: String =
+    """if redis.call('EXISTS', KEYS[4]) == 0 then
+      |  return {'unregistered', ''}
+      |end
+      |local from = redis.call('GET', KEYS[1]) or '0'
+      |if from == ARGV[1] then
+      |  return {'ok', from}
+      |end
       |redis.call('SET', KEYS[1], ARGV[1])
-      |redis.call('RPUSH', KEYS[2], ARGV[2])
-      |redis.call('INCR', KEYS[3])
-      |return previous or ''
+      |redis.call('RPUSH', KEYS[2], ARGV[1])
+      |redis.call('RPUSH', KEYS[3], 'promote|' .. from .. '|' .. ARGV[1] .. '|' .. ARGV[2] .. '|' .. ARGV[3])
+      |return {'ok', from}
       |""".stripMargin
 
-  def pointerKey(name: String): String = s"pointer:$name"
+  // KEYS: live, history, audit. ARGV: actor, now.
+  val Rollback: String =
+    """if redis.call('LLEN', KEYS[2]) < 2 then
+      |  return {'empty', '', ''}
+      |end
+      |local from = redis.call('RPOP', KEYS[2])
+      |local to = redis.call('LINDEX', KEYS[2], -1)
+      |redis.call('SET', KEYS[1], to)
+      |redis.call('RPUSH', KEYS[3], 'rollback|' .. from .. '|' .. to .. '|' .. ARGV[1] .. '|' .. ARGV[2])
+      |return {'ok', from, to}
+      |""".stripMargin
 
-  def pinKey(tenant: String, name: String): String = s"pin:$tenant:$name"
+  private def now: String = (System.currentTimeMillis() / 1000).toString
 
-  def auditKey(name: String): String = s"audit:$name"
+  private def run(script: String, keys: List[String], args: List[String]): List[String] =
+    jedis.eval(script, keys.asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.toList.map(_.toString)
 
-  def revisionKey(name: String): String = s"revision:$name"
-
-  def cacheKey(tenant: String, name: String, revision: String): String =
-    s"pointer_cache:$tenant:$name:$revision"
-
-  def swap(name: String, version: Int, actor: String, action: String): String = {
-    val entry = s"\${System.currentTimeMillis()}:$action:$actor:$version"
-    val result = jedis.eval(
-      PromoteLua,
-      3,
-      pointerKey(name),
-      auditKey(name),
-      revisionKey(name),
-      version.toString,
-      entry
-    )
-    Option(result).map(_.toString).getOrElse("")
-  }
-
-  def promote(name: String, version: Int, actor: String): String = swap(name, version, actor, "promote")
-
-  def rollback(name: String, version: Int, actor: String): String = swap(name, version, actor, "rollback")
-
-  def activeVersion(tenant: String, name: String): Int = {
-    val revision = Option(jedis.get(revisionKey(name))).getOrElse("0")
-    Option(jedis.get(cacheKey(tenant, name, revision))) match {
-      case Some(cached) => cached.toInt
-      case None =>
-        val pinned = Option(jedis.get(pinKey(tenant, name)))
-        val pointer = Option(jedis.get(pointerKey(name)))
-        val version = pinned.orElse(pointer).map(_.toInt).getOrElse(DefaultVersion)
-        jedis.set(cacheKey(tenant, name, revision), version.toString)
-        jedis.expire(cacheKey(tenant, name, revision), CacheTtlS.toLong)
-        version
+  /** Make version live for the tenant's readers; None when it is not registered. */
+  def promote(tenant: String, name: String, version: Int, actor: String): Option[Swap] = {
+    val keys = List(Config.liveKey(tenant, name), Config.historyKey(tenant, name), Config.auditKey(tenant, name), Config.versionKey(tenant, name, version))
+    run(Promote, keys, List(version.toString, actor, now)) match {
+      case "ok" :: previous :: _ => Some(Swap(previous.toInt, version))
+      case _ => None
     }
   }
+
+  /** Put back the version that was live before this one; None when there is none. */
+  def rollback(tenant: String, name: String, actor: String): Option[Swap] = {
+    val keys = List(Config.liveKey(tenant, name), Config.historyKey(tenant, name), Config.auditKey(tenant, name))
+    run(Rollback, keys, List(actor, now)) match {
+      case "ok" :: previous :: target :: _ => Some(Swap(previous.toInt, target.toInt))
+      case _ => None
+    }
+  }
+
+  /** The version the tenant's readers are served; None before the first promotion. */
+  def liveVersion(tenant: String, name: String): Option[Int] = Option(jedis.get(Config.liveKey(tenant, name))).map(_.toInt)
 }
 `,
     },
@@ -520,97 +637,556 @@ object PointerState {
       starter: `#include <sw/redis++/redis++.h>
 
 #include <chrono>
+#include <map>
+#include <optional>
 #include <string>
+#include <utility>
 
-constexpr int kDefaultVersion = 1;
-constexpr long long kCacheTtlS = 3600;  // cache the resolved pointer for an hour
+#include "prompts/config.h"  // config::live_key, config::history_key, config::audit_key, config::version_key — provided
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-void set_pointer(sw::redis::Redis& redis, const std::string& name, int version, const std::string& tenant, const std::string& actor) {
-  redis.set("pointer:" + name, std::to_string(version));
-  if (!tenant.empty()) redis.set("pin:" + tenant + ":" + name, std::to_string(version));
-  redis.rpush("audit:" + name, std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ":" + actor + ":" + std::to_string(version));
+sw::redis::Redis redis("tcp://redis:6379");
+
+constexpr std::chrono::seconds kCacheTtl{300};
+std::map<std::string, std::pair<std::optional<int>, std::chrono::steady_clock::time_point>> live_cache;
+
+// A move of the live pointer: the version that was live (0 for none) and the one that is.
+struct Swap {
+  int from = 0;
+  int to = 0;
+};
+
+std::string now_s() {
+  return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-int active_version(sw::redis::Redis& redis, const std::string& tenant, const std::string& name) {
-  const auto cache_key = "pointer_cache:" + tenant + ":" + name;
-  if (auto cached = redis.get(cache_key)) return std::stoi(*cached);
-  auto raw = redis.get("pointer:" + name);
-  const int value = raw ? std::stoi(*raw) : kDefaultVersion;
-  redis.set(cache_key, std::to_string(value), std::chrono::seconds(kCacheTtlS));
-  return value;
+// Make version live for the tenant's readers; nullopt when it is not registered.
+std::optional<Swap> promote(const std::string& tenant, const std::string& name, int version, const std::string& actor) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const auto raw = redis.get(config::live_key(tenant, name));
+  const int previous = raw ? std::stoi(*raw) : 0;
+  redis.set(config::live_key(tenant, name), std::to_string(version));
+  redis.rpush(config::history_key(tenant, name), std::to_string(version));
+  redis.rpush(config::audit_key(tenant, name), "promote|" + std::to_string(previous) + "|" + std::to_string(version) + "|" + actor + "|" + now_s());
+  return Swap{previous, version};
+}
+
+// Put back the version that was live before this one; nullopt when there is none.
+std::optional<Swap> rollback(const std::string& tenant, const std::string& name, const std::string& actor) {
+  const auto raw = redis.get(config::live_key(tenant, name));
+  const int current = raw ? std::stoi(*raw) : 0;
+  const int target = current - 1;
+  if (target < 1) return std::nullopt;
+  redis.set(config::live_key(tenant, name), std::to_string(target));
+  redis.rpush(config::audit_key(tenant, name), "rollback|" + std::to_string(current) + "|" + std::to_string(target) + "|" + actor + "|" + now_s());
+  return Swap{current, target};
+}
+
+// The version the tenant's readers are served; nullopt before the first promotion.
+std::optional<int> live_version(const std::string& tenant, const std::string& name) {
+  const std::string key = config::live_key(tenant, name);
+  const auto cached = live_cache.find(key);
+  if (cached != live_cache.end() && cached->second.second > std::chrono::steady_clock::now()) return cached->second.first;
+  const auto raw = redis.get(key);
+  const std::optional<int> version = raw ? std::optional<int>(std::stoi(*raw)) : std::nullopt;
+  live_cache[key] = {version, std::chrono::steady_clock::now() + kCacheTtl};
+  return version;
 }
 `,
       solution: `#include <sw/redis++/redis++.h>
 
 #include <chrono>
+#include <optional>
 #include <string>
-#include <vector>
+#include <tuple>
 
-constexpr int kDefaultVersion = 1;
-constexpr long long kCacheTtlS = 5;
+#include "prompts/config.h"  // config::live_key, config::history_key, config::audit_key, config::version_key — provided
 
-// One round trip carries the whole promotion: the pointer moves, the audit entry is appended and
-// the revision is bumped, so no reader can see a pointer that was never audited.
-const char* kPromoteLua = R"LUA(
-local previous = redis.call('GET', KEYS[1])
+sw::redis::Redis redis("tcp://redis:6379");
+
+// KEYS: live, history, audit, version. ARGV: version, actor, now.
+const std::string kPromote = R"lua(
+if redis.call('EXISTS', KEYS[4]) == 0 then
+  return {'unregistered', ''}
+end
+local from = redis.call('GET', KEYS[1]) or '0'
+if from == ARGV[1] then
+  return {'ok', from}
+end
 redis.call('SET', KEYS[1], ARGV[1])
-redis.call('RPUSH', KEYS[2], ARGV[2])
-redis.call('INCR', KEYS[3])
-return previous or ''
-)LUA";
+redis.call('RPUSH', KEYS[2], ARGV[1])
+redis.call('RPUSH', KEYS[3], 'promote|' .. from .. '|' .. ARGV[1] .. '|' .. ARGV[2] .. '|' .. ARGV[3])
+return {'ok', from}
+)lua";
 
-std::string pointer_key(const std::string& name) { return "pointer:" + name; }
+// KEYS: live, history, audit. ARGV: actor, now.
+const std::string kRollback = R"lua(
+if redis.call('LLEN', KEYS[2]) < 2 then
+  return {'empty', '', ''}
+end
+local from = redis.call('RPOP', KEYS[2])
+local to = redis.call('LINDEX', KEYS[2], -1)
+redis.call('SET', KEYS[1], to)
+redis.call('RPUSH', KEYS[3], 'rollback|' .. from .. '|' .. to .. '|' .. ARGV[1] .. '|' .. ARGV[2])
+return {'ok', from, to}
+)lua";
 
-std::string pin_key(const std::string& tenant, const std::string& name) {
-  return "pin:" + tenant + ":" + name;
+// A move of the live pointer: the version that was live (0 for none) and the one that is.
+struct Swap {
+  int from = 0;
+  int to = 0;
+};
+
+std::string now_s() {
+  return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-std::string audit_key(const std::string& name) { return "audit:" + name; }
-
-std::string revision_key(const std::string& name) { return "revision:" + name; }
-
-std::string cache_key(const std::string& tenant, const std::string& name, const std::string& revision) {
-  return "pointer_cache:" + tenant + ":" + name + ":" + revision;
+// Make version live for the tenant's readers; nullopt when it is not registered.
+std::optional<Swap> promote(const std::string& tenant, const std::string& name, int version, const std::string& actor) {
+  const auto [status, previous] = redis.eval<std::string, std::string>(
+      kPromote,
+      {config::live_key(tenant, name), config::history_key(tenant, name), config::audit_key(tenant, name), config::version_key(tenant, name, version)},
+      {std::to_string(version), actor, now_s()});
+  if (status != "ok") return std::nullopt;
+  return Swap{std::stoi(previous), version};
 }
 
-std::string swap(sw::redis::Redis& redis, const std::string& name, int version, const std::string& actor, const std::string& action) {
-  const auto entry = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
-                                        std::chrono::system_clock::now().time_since_epoch())
-                                        .count()) +
-                     ":" + action + ":" + actor + ":" + std::to_string(version);
-  const auto previous = redis.eval<std::string>(
-      kPromoteLua,
-      {pointer_key(name), audit_key(name), revision_key(name)},
-      {std::to_string(version), entry});
-  return previous ? *previous : "";
+// Put back the version that was live before this one; nullopt when there is none.
+std::optional<Swap> rollback(const std::string& tenant, const std::string& name, const std::string& actor) {
+  const auto [status, previous, target] = redis.eval<std::string, std::string, std::string>(
+      kRollback, {config::live_key(tenant, name), config::history_key(tenant, name), config::audit_key(tenant, name)}, {actor, now_s()});
+  if (status != "ok") return std::nullopt;
+  return Swap{std::stoi(previous), std::stoi(target)};
 }
 
-std::string promote(sw::redis::Redis& redis, const std::string& name, int version, const std::string& actor) {
-  return swap(redis, name, version, actor, "promote");
-}
-
-std::string rollback(sw::redis::Redis& redis, const std::string& name, int version, const std::string& actor) {
-  return swap(redis, name, version, actor, "rollback");
-}
-
-int active_version(sw::redis::Redis& redis, const std::string& tenant, const std::string& name) {
-  auto revision = redis.get(revision_key(name));
-  const auto revision_value = revision ? *revision : std::string("0");
-  if (auto cached = redis.get(cache_key(tenant, name, revision_value))) return std::stoi(*cached);
-  auto pinned = redis.get(pin_key(tenant, name));
-  auto pointer = redis.get(pointer_key(name));
-  const int value = pinned ? std::stoi(*pinned) : (pointer ? std::stoi(*pointer) : kDefaultVersion);
-  redis.set(cache_key(tenant, name, revision_value), std::to_string(value), std::chrono::seconds(kCacheTtlS));
-  return value;
+// The version the tenant's readers are served; nullopt before the first promotion.
+std::optional<int> live_version(const std::string& tenant, const std::string& name) {
+  const auto raw = redis.get(config::live_key(tenant, name));
+  if (!raw) return std::nullopt;
+  return std::stoi(*raw);
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+T, N = "t1", "support-reply"
+LIVE = f"prompts:live:{T}:{N}"
+HISTORY = f"prompts:history:{T}:{N}"
+AUDIT = f"prompts:audit:{T}:{N}"
+
+
+def _register(ctx, *versions):
+    for v in versions:
+        record = {"name": N, "version": v, "content_hash": f"h{v}", "template": f"text {v}", "variables": []}
+        ctx.redis.set(f"prompts:version:{T}:{N}:{v}", json.dumps(record))
+
+
+def _audit(ctx):
+    return [entry.split("|") for entry in ctx.redis.lrange(AUDIT, 0, -1)]
+
+
+def check_atomic_promote(ctx):
+    m = ctx.load("state")
+    _register(ctx, 1, 4, 5)
+    assert m.promote(T, N, 1, "alice") is not None, "promoting registered version 1 returned None"
+
+    def other_operator():
+        # another operator promotes version 5 with one atomic script, between two of this promotion's commands
+        previous = ctx.redis.get(LIVE) or "0"
+        ctx.redis.set(LIVE, "5")
+        ctx.redis.rpush(HISTORY, "5")
+        ctx.redis.rpush(AUDIT, f"promote|{previous}|5|bob|0")
+
+    probe = ctx.redis_after(LIVE, other_operator)
+    m.promote(T, N, 4, "alice")
+    assert probe.fired, "promote never touched the live pointer"
+    entries = _audit(ctx)
+    for before, after in zip(entries, entries[1:]):
+        assert after[1] == before[2], f"the audit says {before[0]} {before[1]} to {before[2]}, then {after[0]} from {after[1]}: another promotion landed between two of this one's commands, and the audit no longer describes what happened ({ctx.redis.lrange(AUDIT, 0, -1)})"
+    live = ctx.redis.get(LIVE)
+    assert entries[-1][2] == live, f"the last audit entry moved to {entries[-1][2]} but version {live} is live"
+    assert ctx.redis.lindex(HISTORY, -1) == live, f"the history ends at {ctx.redis.lindex(HISTORY, -1)} but version {live} is live: a rollback would restore the wrong version"
+
+
+def check_registered_only(ctx):
+    m = ctx.load("state")
+    _register(ctx, 1)
+    m.promote(T, N, 1, "alice")
+    before = (ctx.redis.get(LIVE), ctx.redis.lrange(HISTORY, 0, -1), ctx.redis.lrange(AUDIT, 0, -1))
+    result = m.promote(T, N, 9, "alice")
+    assert result is None, f"promoting version 9, which was never registered, returned {result}, expected None"
+    after = (ctx.redis.get(LIVE), ctx.redis.lrange(HISTORY, 0, -1), ctx.redis.lrange(AUDIT, 0, -1))
+    assert after == before, f"promoting an unregistered version changed the pointer (live, history, audit) from {before} to {after}: every read of the prompt now fails"
+    _register(ctx, 9)
+    result = m.promote(T, N, 9, "alice")
+    assert result == {"from": 1, "to": 9} and ctx.redis.get(LIVE) == "9", f"once registered, version 9 promotes from 1: got {result}, live {ctx.redis.get(LIVE)}"
+
+
+def check_rollback_previous(ctx):
+    m = ctx.load("state")
+    _register(ctx, 1, 4, 7)
+    for v in (1, 4, 7):
+        m.promote(T, N, v, "alice")
+    swap = m.rollback(T, N, "oncall")
+    assert ctx.redis.get(LIVE) == "4", f"rolling back from 7 put version {ctx.redis.get(LIVE)} live, expected 4, the version live before 7 (6 was never promoted)"
+    assert swap == {"from": 7, "to": 4}, f"the rollback must answer from 7 to 4, got {swap}"
+    m.rollback(T, N, "oncall")
+    assert ctx.redis.get(LIVE) == "1", f"a second rollback must restore 1, the version live before 4, got {ctx.redis.get(LIVE)}"
+    third = m.rollback(T, N, "oncall")
+    assert third is None and ctx.redis.get(LIVE) == "1", f"with nothing earlier a rollback returns None and leaves 1 live: got {third}, live {ctx.redis.get(LIVE)}"
+    tail = [e.split("|")[:4] for e in ctx.redis.lrange(AUDIT, -2, -1)]
+    assert tail == [["rollback", "7", "4", "oncall"], ["rollback", "4", "1", "oncall"]], f"each rollback is audited as rollback|from|to|actor: {ctx.redis.lrange(AUDIT, 0, -1)}"
+
+
+def check_live_uncached(ctx):
+    m = ctx.load("state")
+    assert m.live_version(T, "never-promoted") is None, "before any promotion live_version is None"
+    _register(ctx, 1, 4)
+    m.promote(T, N, 1, "alice")
+    m.promote(T, N, 4, "alice")
+    assert m.live_version(T, N) == 4, f"after promoting 4 the reader must see 4, got {m.live_version(T, N)}"
+    # another replica rolls back to 1
+    ctx.redis.set(LIVE, "1")
+    ctx.redis.rpop(HISTORY)
+    ctx.redis.rpush(AUDIT, "rollback|4|1|oncall|0")
+    seen = m.live_version(T, N)
+    assert seen == 1, f"the next read after a rollback served version {seen}, expected 1: a cached pointer keeps the bad version live for minutes on every replica"
+`,
+    typescript: `const T = 't1';
+const N = 'support-reply';
+const LIVE = \`prompts:live:\${T}:\${N}\`;
+const HISTORY = \`prompts:history:\${T}:\${N}\`;
+const AUDIT = \`prompts:audit:\${T}:\${N}\`;
+
+function register(ctx, ...versions: number[]) {
+  for (const v of versions) {
+    const record = {name: N, version: v, content_hash: \`h\${v}\`, template: \`text \${v}\`, variables: []};
+    ctx.redis.set(\`prompts:version:\${T}:\${N}:\${v}\`, JSON.stringify(record));
+  }
+}
+
+const audit = (ctx): string[][] => (ctx.redis.lrange(AUDIT, 0, -1) as string[]).map(entry => entry.split('|'));
+
+export async function check_atomic_promote(ctx) {
+  const m = ctx.load('state');
+  register(ctx, 1, 4, 5);
+  assert((await m.promote(T, N, 1, 'alice')) !== null, 'promoting registered version 1 returned null');
+  // another operator promotes version 5 with one atomic script, between two of this promotion's commands
+  const probe = ctx.redisAfter(LIVE, () => {
+    const previous = ctx.redis.get(LIVE) ?? '0';
+    ctx.redis.set(LIVE, '5');
+    ctx.redis.rpush(HISTORY, '5');
+    ctx.redis.rpush(AUDIT, \`promote|\${previous}|5|bob|0\`);
+  });
+  await m.promote(T, N, 4, 'alice');
+  assert(probe.fired, 'promote never touched the live pointer');
+  const entries = audit(ctx);
+  for (let i = 1; i < entries.length; i++) {
+    const [before, after] = [entries[i - 1], entries[i]];
+    assert.equal(after[1], before[2], \`the audit says \${before[0]} \${before[1]} to \${before[2]}, then \${after[0]} from \${after[1]}: another promotion landed between two of this one's commands, and the audit no longer describes what happened (\${JSON.stringify(ctx.redis.lrange(AUDIT, 0, -1))})\`);
+  }
+  const live = ctx.redis.get(LIVE);
+  assert.equal(entries[entries.length - 1][2], live, \`the last audit entry moved to \${entries[entries.length - 1][2]} but version \${live} is live\`);
+  assert.equal(ctx.redis.lindex(HISTORY, -1), live, \`the history ends at \${ctx.redis.lindex(HISTORY, -1)} but version \${live} is live: a rollback would restore the wrong version\`);
+}
+
+export async function check_registered_only(ctx) {
+  const m = ctx.load('state');
+  register(ctx, 1);
+  await m.promote(T, N, 1, 'alice');
+  const snapshot = () => JSON.stringify([ctx.redis.get(LIVE), ctx.redis.lrange(HISTORY, 0, -1), ctx.redis.lrange(AUDIT, 0, -1)]);
+  const before = snapshot();
+  const result = await m.promote(T, N, 9, 'alice');
+  assert.equal(result, null, \`promoting version 9, which was never registered, returned \${JSON.stringify(result)}, expected null\`);
+  assert.equal(snapshot(), before, \`promoting an unregistered version changed the pointer (live, history, audit) from \${before} to \${snapshot()}: every read of the prompt now fails\`);
+  register(ctx, 9);
+  const again = await m.promote(T, N, 9, 'alice');
+  assert(again?.from === 1 && again?.to === 9 && ctx.redis.get(LIVE) === '9', \`once registered, version 9 promotes from 1: got \${JSON.stringify(again)}, live \${ctx.redis.get(LIVE)}\`);
+}
+
+export async function check_rollback_previous(ctx) {
+  const m = ctx.load('state');
+  register(ctx, 1, 4, 7);
+  for (const v of [1, 4, 7]) await m.promote(T, N, v, 'alice');
+  const swap = await m.rollback(T, N, 'oncall');
+  assert.equal(ctx.redis.get(LIVE), '4', \`rolling back from 7 put version \${ctx.redis.get(LIVE)} live, expected 4, the version live before 7 (6 was never promoted)\`);
+  assert(swap?.from === 7 && swap?.to === 4, \`the rollback must answer from 7 to 4, got \${JSON.stringify(swap)}\`);
+  await m.rollback(T, N, 'oncall');
+  assert.equal(ctx.redis.get(LIVE), '1', \`a second rollback must restore 1, the version live before 4, got \${ctx.redis.get(LIVE)}\`);
+  const third = await m.rollback(T, N, 'oncall');
+  assert(third === null && ctx.redis.get(LIVE) === '1', \`with nothing earlier a rollback returns null and leaves 1 live: got \${JSON.stringify(third)}, live \${ctx.redis.get(LIVE)}\`);
+  const tail = (ctx.redis.lrange(AUDIT, -2, -1) as string[]).map(e => e.split('|').slice(0, 4));
+  assert.deepEqual(tail, [['rollback', '7', '4', 'oncall'], ['rollback', '4', '1', 'oncall']], \`each rollback is audited as rollback|from|to|actor: \${JSON.stringify(ctx.redis.lrange(AUDIT, 0, -1))}\`);
+}
+
+export async function check_live_uncached(ctx) {
+  const m = ctx.load('state');
+  assert.equal(await m.liveVersion(T, 'never-promoted'), null, 'before any promotion liveVersion is null');
+  register(ctx, 1, 4);
+  await m.promote(T, N, 1, 'alice');
+  await m.promote(T, N, 4, 'alice');
+  assert.equal(await m.liveVersion(T, N), 4, 'after promoting 4 the reader must see 4');
+  // another replica rolls back to 1
+  ctx.redis.set(LIVE, '1');
+  ctx.redis.rpop(HISTORY);
+  ctx.redis.rpush(AUDIT, 'rollback|4|1|oncall|0');
+  const seen = await m.liveVersion(T, N);
+  assert.equal(seen, 1, \`the next read after a rollback served version \${seen}, expected 1: a cached pointer keeps the bad version live for minutes on every replica\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"prompts/config"
+
+	"leetbuild/harness"
+)
+
+const (
+	stateTenant = "t1"
+	stateName   = "support-reply"
+)
+
+var (
+	stateLive    = config.LiveKey(stateTenant, stateName)
+	stateHistory = config.HistoryKey(stateTenant, stateName)
+	stateAudit   = config.AuditKey(stateTenant, stateName)
+)
+
+func stateRegister(ctx *harness.Ctx, versions ...int) {
+	for _, v := range versions {
+		record, _ := json.Marshal(map[string]any{"name": stateName, "version": v, "content_hash": fmt.Sprintf("h%d", v), "template": fmt.Sprintf("text %d", v), "variables": []string{}})
+		ctx.Redis.Set(config.VersionKey(stateTenant, stateName, v), string(record))
+	}
+}
+
+func statePromote(ctx *harness.Ctx, version int) *Swap {
+	swap, err := promote(context.Background(), stateTenant, stateName, version, "alice")
+	ctx.NoError(err, "promote(%d)", version)
+	return swap
+}
+
+func stateRollback(ctx *harness.Ctx) *Swap {
+	swap, err := rollback(context.Background(), stateTenant, stateName, "oncall")
+	ctx.NoError(err, "rollback")
+	return swap
+}
+
+func stateLiveNow(ctx *harness.Ctx) string {
+	live, _ := ctx.Redis.Get(stateLive)
+	return live
+}
+
+func stateAuditEntries(ctx *harness.Ctx) [][]string {
+	var out [][]string
+	for _, entry := range ctx.Redis.LRange(stateAudit, 0, -1) {
+		out = append(out, strings.Split(entry, "|"))
+	}
+	return out
+}
+
+func stateSnapshot(ctx *harness.Ctx) string {
+	return fmt.Sprint(stateLiveNow(ctx), ctx.Redis.LRange(stateHistory, 0, -1), ctx.Redis.LRange(stateAudit, 0, -1))
+}
+
+func CheckAtomicPromote(ctx *harness.Ctx) {
+	stateRegister(ctx, 1, 4, 5)
+	ctx.Assert(statePromote(ctx, 1) != nil, "promoting registered version 1 returned nil")
+	fired := false
+	// another operator promotes version 5 with one atomic script, between two of this promotion's commands
+	ctx.Redis.After(stateLive, func() any {
+		fired = true
+		previous, ok := ctx.Redis.Get(stateLive)
+		if !ok {
+			previous = "0"
+		}
+		ctx.Redis.Set(stateLive, "5")
+		ctx.Redis.Do("RPUSH", stateHistory, "5")
+		ctx.Redis.Do("RPUSH", stateAudit, "promote|"+previous+"|5|bob|0")
+		return nil
+	})
+	statePromote(ctx, 4)
+	ctx.Assert(fired, "promote never touched the live pointer")
+	entries := stateAuditEntries(ctx)
+	for i := 1; i < len(entries); i++ {
+		before, after := entries[i-1], entries[i]
+		ctx.Assert(after[1] == before[2], "the audit says %s %s to %s, then %s from %s: another promotion landed between two of this one's commands, and the audit no longer describes what happened (%v)", before[0], before[1], before[2], after[0], after[1], ctx.Redis.LRange(stateAudit, 0, -1))
+	}
+	live := stateLiveNow(ctx)
+	ctx.Equal(entries[len(entries)-1][2], live, "the last audit entry's version against the live one")
+	history := ctx.Redis.LRange(stateHistory, -1, -1)
+	ctx.Assert(len(history) == 1 && history[0] == live, "the history ends at %v but version %s is live: a rollback would restore the wrong version", history, live)
+}
+
+func CheckRegisteredOnly(ctx *harness.Ctx) {
+	stateRegister(ctx, 1)
+	statePromote(ctx, 1)
+	before := stateSnapshot(ctx)
+	result := statePromote(ctx, 9)
+	ctx.Assert(result == nil, "promoting version 9, which was never registered, returned %+v, expected nil", result)
+	ctx.Equal(stateSnapshot(ctx), before, "promoting an unregistered version must leave the pointer (live, history, audit) as it was, or every read of the prompt fails")
+	stateRegister(ctx, 9)
+	result = statePromote(ctx, 9)
+	ctx.Assert(result != nil && result.From == 1 && result.To == 9 && stateLiveNow(ctx) == "9", "once registered, version 9 promotes from 1: got %+v, live %s", result, stateLiveNow(ctx))
+}
+
+func CheckRollbackPrevious(ctx *harness.Ctx) {
+	stateRegister(ctx, 1, 4, 7)
+	for _, v := range []int{1, 4, 7} {
+		statePromote(ctx, v)
+	}
+	swap := stateRollback(ctx)
+	ctx.Equal(stateLiveNow(ctx), "4", "rolling back from 7 must put 4 live, the version live before 7 (6 was never promoted); the live version")
+	ctx.Assert(swap != nil && swap.From == 7 && swap.To == 4, "the rollback must answer from 7 to 4, got %+v", swap)
+	stateRollback(ctx)
+	ctx.Equal(stateLiveNow(ctx), "1", "a second rollback must restore 1, the version live before 4; the live version")
+	third := stateRollback(ctx)
+	ctx.Assert(third == nil && stateLiveNow(ctx) == "1", "with nothing earlier a rollback returns nil and leaves 1 live: got %+v, live %s", third, stateLiveNow(ctx))
+	tail := ctx.Redis.LRange(stateAudit, -2, -1)
+	ctx.Assert(len(tail) == 2 && strings.HasPrefix(tail[0], "rollback|7|4|oncall|") && strings.HasPrefix(tail[1], "rollback|4|1|oncall|"), "each rollback is audited as rollback|from|to|actor: %v", ctx.Redis.LRange(stateAudit, 0, -1))
+}
+
+func CheckLiveUncached(ctx *harness.Ctx) {
+	none, err := liveVersion(context.Background(), stateTenant, "never-promoted")
+	ctx.NoError(err, "liveVersion")
+	ctx.Equal(none, 0, "before any promotion liveVersion is 0")
+	stateRegister(ctx, 1, 4)
+	statePromote(ctx, 1)
+	statePromote(ctx, 4)
+	seen, err := liveVersion(context.Background(), stateTenant, stateName)
+	ctx.NoError(err, "liveVersion")
+	ctx.Equal(seen, 4, "after promoting 4 the reader must see 4")
+	// another replica rolls back to 1
+	ctx.Redis.Set(stateLive, "1")
+	ctx.Redis.Do("RPOP", stateHistory)
+	ctx.Redis.Do("RPUSH", stateAudit, "rollback|4|1|oncall|0")
+	seen, err = liveVersion(context.Background(), stateTenant, stateName)
+	ctx.NoError(err, "liveVersion")
+	ctx.Equal(seen, 1, "the next read after a rollback: a cached pointer keeps the bad version live for minutes on every replica; the version served")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kT = "t1";
+const std::string kN = "support-reply";
+const std::string kLive = "prompts:live:" + kT + ":" + kN;
+const std::string kHistory = "prompts:history:" + kT + ":" + kN;
+const std::string kAudit = "prompts:audit:" + kT + ":" + kN;
+
+void stateRegister(harness::Ctx& ctx, std::initializer_list<int> versions) {
+  for (int v : versions) {
+    const nlohmann::json record = {{"name", kN}, {"version", v}, {"content_hash", "h" + std::to_string(v)}, {"template", "text " + std::to_string(v)}, {"variables", nlohmann::json::array()}};
+    ctx.Redis.Set("prompts:version:" + kT + ":" + kN + ":" + std::to_string(v), record.dump());
+  }
+}
+
+std::string liveNow(harness::Ctx& ctx) { return ctx.Redis.Get(kLive).value_or(""); }
+
+std::vector<std::string> split(const std::string& entry) {
+  std::vector<std::string> out;
+  std::stringstream in(entry);
+  std::string part;
+  while (std::getline(in, part, '|')) out.push_back(part);
+  while (out.size() < 5) out.push_back("");
+  return out;
+}
+
+std::string snapshot(harness::Ctx& ctx) {
+  std::string out = liveNow(ctx) + " [";
+  for (const auto& v : ctx.Redis.LRange(kHistory, 0, -1)) out += v + " ";
+  out += "] [";
+  for (const auto& e : ctx.Redis.LRange(kAudit, 0, -1)) out += e + " ";
+  return out + "]";
+}
+
+}  // namespace
+
+void CheckAtomicPromote(harness::Ctx& ctx) {
+  stateRegister(ctx, {1, 4, 5});
+  ctx.Assert(promote(kT, kN, 1, "alice").has_value(), "promoting registered version 1 returned nullopt");
+  bool fired = false;
+  // another operator promotes version 5 with one atomic script, between two of this promotion's commands
+  ctx.Redis.After(kLive, [&] {
+    fired = true;
+    const std::string previous = ctx.Redis.Get(kLive).value_or("0");
+    ctx.Redis.Set(kLive, "5");
+    ctx.Redis.Do("RPUSH", kHistory, "5");
+    ctx.Redis.Do("RPUSH", kAudit, "promote|" + previous + "|5|bob|0");
+  });
+  promote(kT, kN, 4, "alice");
+  ctx.Assert(fired, "promote never touched the live pointer");
+  const auto raw = ctx.Redis.LRange(kAudit, 0, -1);
+  for (size_t i = 1; i < raw.size(); i++) {
+    const auto before = split(raw[i - 1]);
+    const auto after = split(raw[i]);
+    ctx.Assert(after[1] == before[2], "the audit says %s %s to %s, then %s from %s: another promotion landed between two of this one's commands, and the audit no longer describes what happened (%v)",
+               before[0], before[1], before[2], after[0], after[1], raw);
+  }
+  const std::string live = liveNow(ctx);
+  ctx.Equal(split(raw.back())[2], live, "the last audit entry's version against the live one");
+  const auto history = ctx.Redis.LRange(kHistory, -1, -1);
+  ctx.Assert(history.size() == 1 && history[0] == live, "the history ends at %v but version %s is live: a rollback would restore the wrong version", history, live);
+}
+
+void CheckRegisteredOnly(harness::Ctx& ctx) {
+  stateRegister(ctx, {1});
+  promote(kT, kN, 1, "alice");
+  const std::string before = snapshot(ctx);
+  auto result = promote(kT, kN, 9, "alice");
+  ctx.Assert(!result.has_value(), "promoting version 9, which was never registered, returned a swap, expected nullopt");
+  ctx.Equal(snapshot(ctx), before, "promoting an unregistered version must leave the pointer (live, history, audit) as it was, or every read of the prompt fails");
+  stateRegister(ctx, {9});
+  result = promote(kT, kN, 9, "alice");
+  ctx.Assert(result && result->from == 1 && result->to == 9 && liveNow(ctx) == "9", "once registered, version 9 promotes from 1: live %s", liveNow(ctx));
+}
+
+void CheckRollbackPrevious(harness::Ctx& ctx) {
+  stateRegister(ctx, {1, 4, 7});
+  for (int v : {1, 4, 7}) promote(kT, kN, v, "alice");
+  const auto swap = rollback(kT, kN, "oncall");
+  ctx.Equal(liveNow(ctx), "4", "rolling back from 7 must put 4 live, the version live before 7 (6 was never promoted); the live version");
+  ctx.Assert(swap && swap->from == 7 && swap->to == 4, "the rollback must answer from 7 to 4");
+  rollback(kT, kN, "oncall");
+  ctx.Equal(liveNow(ctx), "1", "a second rollback must restore 1, the version live before 4; the live version");
+  const auto third = rollback(kT, kN, "oncall");
+  ctx.Assert(!third && liveNow(ctx) == "1", "with nothing earlier a rollback returns nullopt and leaves 1 live: live %s", liveNow(ctx));
+  const auto tail = ctx.Redis.LRange(kAudit, -2, -1);
+  ctx.Assert(tail.size() == 2 && tail[0].rfind("rollback|7|4|oncall|", 0) == 0 && tail[1].rfind("rollback|4|1|oncall|", 0) == 0,
+             "each rollback is audited as rollback|from|to|actor: %v", ctx.Redis.LRange(kAudit, 0, -1));
+}
+
+void CheckLiveUncached(harness::Ctx& ctx) {
+  ctx.Assert(!live_version(kT, "never-promoted").has_value(), "before any promotion live_version is nullopt");
+  stateRegister(ctx, {1, 4});
+  promote(kT, kN, 1, "alice");
+  promote(kT, kN, 4, "alice");
+  ctx.Equal(live_version(kT, kN).value_or(0), 4, "after promoting 4 the reader must see 4");
+  // another replica rolls back to 1
+  ctx.Redis.Set(kLive, "1");
+  ctx.Redis.Do("RPOP", kHistory);
+  ctx.Redis.Do("RPUSH", kAudit, "rollback|4|1|oncall|0");
+  ctx.Equal(live_version(kT, kN).value_or(0), 1, "the next read after a rollback: a cached pointer keeps the bad version live for minutes on every replica; the version served");
+}
+`,
+  },
   hints: [
-    'An operator rolls back a bad prompt and half the tenants keep serving it for an hour; the audit list shows a promotion that some readers observed before it was recorded.',
-    'The pointer, the pins and the audit row leave the client as separate commands with gaps between them, and the reader caches the resolved version under a key that no swap can change.',
-    'Put `SET`, `RPUSH audit:{name}` and `INCR revision:{name}` inside `PROMOTE_LUA`, call it from both `promote` and `rollback`, read `pin:` before `pointer:`, and build `cache_key` with the revision and `CACHE_TTL_S`.',
+    'Symptom: two operators promote at once and the audit no longer adds up, a typo puts version 9 live and every read fails, a rollback from 7 lands on 6, which never shipped, and replicas serve the old version for minutes.',
+    'Mechanism: `promote` is a GET, a SET and two RPUSHes from the client, so another promotion lands between them; nothing checks `version_key`; `rollback` computes `current - 1` instead of reading the history; `live_version` caches a pointer that moves.',
+    'Change: one Lua script per move. promote: EXISTS on `version_key`, GET the old pointer, SET, RPUSH history and audit. rollback: RPOP the history, SET the new tail (LINDEX -1), RPUSH the audit. `live_version` is a plain GET.',
   ],
-  debrief: `The fix makes a multi-step state change a single fact, because "the fleet is on one version" only holds when no reader can observe a half-applied swap. Two separate writes can be split by a race, and the split stays invisible until someone compares two readers. One Lua script removes the interleaving; a revision in the cache key removes the staleness, since every swap changes the key; and the audit row inside the same script closes the window where a live pointer has no history. Nothing here is about Redis speed. Production registries write tenant pins under a lease, validate caches with a monotonic revision per name, and run a reconciliation job that compares the Redis pointer with the durable record and repairs drift.`,
+  debrief: `The script is the unit of truth: Redis runs it alone, so the pointer it reads is the pointer it replaces, and the audit entry it writes describes a move that happened. Rollback reads the history because "the version before" is a fact about the past, not arithmetic on version numbers: versions get skipped, abandoned and blocked by the eval gate. The reader drops its cache because the pointer is one GET, while the thing worth caching, the version record, is immutable and can be cached by its number forever. Langfuse treats a label the same way, as one update that moves \`production\` to another version. A fleet that wants to cache the pointer too would push invalidations over pub/sub, which this step leaves out.`,
 };

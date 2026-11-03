@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package memory;
+
+// The summarizer step 3 calls when turns fall out of a session's recent-turn buffer: it compresses
+// a span of turns (oldest first) into one summary. A request it cannot summarize (no turns, a span
+// out of order) is INVALID_ARGUMENT; an overloaded model is UNAVAILABLE.
+service Summarizer {
+  rpc Summarize(SummarizeRequest) returns (Summary);
+}
+
+message Turn {
+  string turn_id = 1;
+  string role = 2;
+  string content = 3;
+}
+
+message SummarizeRequest {
+  string tenant = 1;
+  string session_id = 2;
+  repeated Turn turns = 3;
+}
+
+message Summary {
+  string text = 1;
+  int32 tokens = 2;
+}

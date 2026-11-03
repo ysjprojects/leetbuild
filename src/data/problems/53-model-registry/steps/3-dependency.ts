@@ -2,120 +2,99 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Serving probes before promotion traffic',
+  title: 'A serving probe that gates the pointer',
   concept: 'grpc',
   file: 'client',
   focus: ['registry', 'serving', 'redis'],
   task: `## Task
 
-**Starting point.** \`promote_with_probe(pool, name, version, digest, percent)\` calls
-\`probe.Probe(ProbeRequest(pool, expected_digest))\` over gRPC with no timeout, ignores the reply,
-calls \`serving.set_traffic(pool, name, version, percent)\` and returns \`{"promoted": true}\`.
-It compiles and hides four flaws.
+**Starting point.** The starter is the promotion path:
+\`promote_with_probe(pool, name, version, digest, eval_id)\` calls
+\`Serving.Probe(ProbeRequest(pool, model, version, expected_digest))\` over gRPC, ignores what comes
+back, then calls \`pointer.promote\` (step 2, provided as \`registry.pointer\`) and answers
+\`{"promoted": bool, "reason": str | None}\`. With a healthy pool it promotes, and it hides four flaws.
 
-**Failure mode the checks target.** A pool that loaded the wrong artifact, or that did not answer
-at all, receives production traffic because the probe reply was not read and the call had no
-deadline.
+**Failure mode the checks target.** A pool that loaded other bytes gets the traffic; a pool that
+never answers holds the promotion forever; a refused or timed-out probe still moves the pointer; and
+a pool that was restarting for one call blocks a promotion a second look would allow.
 
-- Every probe attempt carries \`PROBE_DEADLINE_MS = 10_000\` (\`timeout=\` on the stub call). At
-  most two attempts per pool; retry only \`UNAVAILABLE\`.
-- The reply's \`loaded_digest\` must equal the registered digest. A difference returns
-  \`{"promoted": false, "reason": "digest_mismatch"}\`.
-- \`DEADLINE_EXCEEDED\` returns \`{"promoted": false, "reason": "probe_timeout"}\`; any other
-  status returns \`"reason": "probe_failed"\`.
-- \`serving.set_traffic\` is called only after the digest comparison passed, so on every failure
-  path the previous version keeps 100% and the operator sees the reason.
-- The probe request shape and the traffic call stay as they are.`,
+\`\`\`proto
+service Serving { rpc Probe(ProbeRequest) returns (ProbeReply); }  // ProbeReply { loaded_digest }
+\`\`\`
+
+- Every attempt carries **\`PROBE_DEADLINE_S\` = 10 s**.
+- \`UNAVAILABLE\` is retried once (\`MAX_ATTEMPTS\` = 2); every other status is final.
+- \`loaded_digest\` must equal the registered digest, else \`reason: "digest_mismatch"\`.
+- \`DEADLINE_EXCEEDED\` answers \`reason: "probe_timeout"\`, any other failure \`"probe_failed"\`.
+- \`pointer.promote\` runs only after the digests matched; on every failure the pool keeps the version
+  it serves.`,
   sequence: {
-    participants: ['Registry promotion', 'Serving pool'],
+    participants: ['registryd', 'Serving pool', 'Redis'],
     messages: [
-      {
-        from: 'Registry promotion',
-        to: 'Serving pool',
-        label: 'Probe(pool, expected_digest) · deadline 10 s',
-        kind: 'sync',
-      },
-      {from: 'Serving pool', to: 'Registry promotion', label: 'DEADLINE_EXCEEDED', kind: 'reply'},
-      {from: 'Registry promotion', to: 'Registry promotion', label: 'block · reason = probe_timeout', kind: 'sync'},
-      {from: 'Registry promotion', to: 'Serving pool', label: 'Probe again · attempt 2', kind: 'sync'},
-      {from: 'Serving pool', to: 'Registry promotion', label: 'loaded_digest = sha256:…b7', kind: 'reply'},
-      {
-        from: 'Registry promotion',
-        to: 'Registry promotion',
-        label: 'loaded_digest == registered? else digest_mismatch',
-        kind: 'sync',
-      },
-      {
-        from: 'Registry promotion',
-        to: 'Serving pool',
-        label: 'set_traffic only after the digest matches',
-        kind: 'sync',
-      },
+      {from: 'registryd', to: 'Serving pool', label: 'Probe(prod, fraud, 3, sha256:a3) · deadline 10 s', kind: 'sync'},
+      {from: 'Serving pool', to: 'registryd', label: 'UNAVAILABLE (restarting)', kind: 'reply'},
+      {from: 'registryd', to: 'Serving pool', label: 'Probe again · attempt 2 of 2', kind: 'sync'},
+      {from: 'Serving pool', to: 'registryd', label: 'loaded_digest = sha256:a3', kind: 'reply'},
+      {from: 'registryd', to: 'Redis', label: 'pointer.promote: only after the digests match', kind: 'sync'},
+      {from: 'registryd', to: 'registryd', label: '{promoted: false, reason} on any failure', kind: 'sync'},
     ],
   },
   checks: [
     {
-      id: 'probe-call',
-      title: 'Probes the serving pool over gRPC before promoting',
-      detail: 'The promotion path invokes the `Probe` RPC with the pool and the registered digest.',
-      match: {
-        python: {all: [/Probe/]},
-        typescript: {all: [/Probe/]},
-        go: {all: [/Probe/]},
-        scala: {all: [/[Pp]robe/]},
-        cpp: {all: [/Probe/]},
-      },
-    },
-    {
       id: 'probe-deadline',
-      title: 'Gives every probe a 10-second deadline',
+      title: 'Every probe carries a 10-second deadline',
       detail:
-        'Each probe attempt carries a 10 000 ms deadline. The starter has none, so a pool that never answers blocks the promotion worker forever.',
+        'Each `Probe` attempt is made with `PROBE_DEADLINE_S` (10 s); without one a pool that never answers holds the promotion worker, and the timeout is reported as `probe_timeout` without a retry.',
       match: {
-        python: {all: [/PROBE_DEADLINE_MS/, /timeout=/]},
-        typescript: {all: [/PROBE_DEADLINE_MS/, /deadline/]},
-        go: {all: [/probeDeadlineMs/, /WithTimeout/]},
-        scala: {all: [/ProbeDeadlineMs/, /withDeadlineAfter/]},
-        cpp: {all: [/kProbeDeadlineMs/, /set_deadline/]},
+        python: {all: [/PROBE_DEADLINE_S\s*=\s*10\b/, /\.Probe\([\s\S]{0,200}?timeout\s*=\s*PROBE_DEADLINE_S/]},
+        typescript: {
+          all: [/PROBE_DEADLINE_MS\s*=\s*10_?000\b/, /\.Probe\([\s\S]{0,200}?deadline:[^\n]*PROBE_DEADLINE_MS/],
+        },
+        go: {all: [/probeDeadline\s*=\s*10\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*probeDeadline\)/]},
+        scala: {all: [/ProbeDeadlineSeconds\s*=\s*10L?\b/, /withDeadlineAfter\(\s*ProbeDeadlineSeconds/]},
+        cpp: {all: [/kProbeDeadline\{10\}/, /set_deadline\([^\n]*kProbeDeadline\)/]},
       },
     },
     {
       id: 'digest-match',
-      title: 'Promotes only when the loaded digest matches the registered digest',
+      title: 'Promotes only when the loaded digest matches',
       detail:
-        'The probe reports `loaded_digest` and a difference returns `digest_mismatch` without moving traffic. The starter promotes on connection success and never reads the digest.',
+        "The reply's `loaded_digest` is compared with the registered digest and a difference answers `digest_mismatch` without touching the pointer; the starter never reads the reply.",
       match: {
-        python: {all: [/loaded_digest/, /digest_mismatch/]},
-        typescript: {all: [/loadedDigest/, /digest_mismatch/]},
-        go: {all: [/LoadedDigest/, /digest_mismatch/]},
-        scala: {all: [/loadedDigest/, /digest_mismatch/]},
-        cpp: {all: [/loaded_digest/, /digest_mismatch/]},
+        python: {all: [/\.loaded_digest/, /["']digest_mismatch["']/]},
+        typescript: {all: [/\.loaded_digest/, /['"]digest_mismatch['"]/]},
+        go: {all: [/GetLoadedDigest\(\)|\.LoadedDigest/, /"digest_mismatch"/]},
+        scala: {all: [/\.loadedDigest/, /"digest_mismatch"/]},
+        cpp: {all: [/\.loaded_digest\(\)/, /"digest_mismatch"/]},
       },
     },
     {
-      id: 'timeout-blocks',
-      title: 'Treats a probe timeout as a blocked promotion',
+      id: 'failure-blocks',
+      title: 'A failed or timed-out probe leaves the pointer',
       detail:
-        'A `DEADLINE_EXCEEDED` returns `{"promoted": false, "reason": "probe_timeout"}`. The starter promotes anyway when the timeout hits, which is how the wrong artifact reaches a fleet.',
+        'A probe that ends in `DEADLINE_EXCEEDED` answers `probe_timeout`, any other failure `probe_failed`, and neither reaches `promote`; the starter swallows the error and promotes.',
       match: {
-        python: {all: [/DEADLINE_EXCEEDED/, /probe_timeout/]},
-        typescript: {all: [/DEADLINE_EXCEEDED/, /probe_timeout/]},
-        go: {all: [/DeadlineExceeded/, /probe_timeout/]},
-        scala: {all: [/DEADLINE_EXCEEDED/, /probe_timeout/]},
-        cpp: {all: [/DEADLINE_EXCEEDED/, /probe_timeout/]},
+        python: {
+          all: [/["']probe_timeout["']/, /["']probe_failed["']/, /DEADLINE_EXCEEDED/],
+          none: [/except grpc\.RpcError:\s*\n\s*pass\b/],
+        },
+        typescript: {all: [/['"]probe_timeout['"]/, /['"]probe_failed['"]/, /DEADLINE_EXCEEDED/]},
+        go: {all: [/"probe_timeout"/, /"probe_failed"/, /codes\.DeadlineExceeded/]},
+        scala: {all: [/"probe_timeout"/, /"probe_failed"/, /DEADLINE_EXCEEDED/]},
+        cpp: {all: [/"probe_timeout"/, /"probe_failed"/, /DEADLINE_EXCEEDED/]},
       },
     },
     {
-      id: 'no-move-on-failure',
-      title: 'Increases traffic only after the digest is verified',
+      id: 'unavailable-retry',
+      title: 'One retry when the pool is UNAVAILABLE',
       detail:
-        'The traffic shift happens after the digest comparison, so a mismatch or a failure leaves the previous version serving. The starter shifts traffic first and checks nothing.',
+        '`UNAVAILABLE` (a restarting pool) is retried once, `MAX_ATTEMPTS` = 2 in all; every other status is final. The starter makes one attempt and promotes whatever it says.',
       match: {
-        python: {order: [/loaded_digest/, /\.set_traffic\(/]},
-        typescript: {order: [/loadedDigest/, /\.setTraffic\(/]},
-        go: {order: [/LoadedDigest/, /\.SetTraffic\(/]},
-        scala: {order: [/loadedDigest/, /\.setTraffic\(/]},
-        cpp: {order: [/loaded_digest/, /\.set_traffic\(/]},
+        python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/]},
+        typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/]},
+        go: {all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/]},
+        scala: {all: [/MaxAttempts\s*=\s*2\b/, /Code\.UNAVAILABLE/]},
+        cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /StatusCode::UNAVAILABLE/]},
       },
     },
   ],
@@ -123,194 +102,160 @@ deadline.
     python: {
       starter: `import grpc
 
-import serving_pb2
-import serving_pb2_grpc
+import modelregistry_pb2
+import modelregistry_pb2_grpc
+from registry import pointer  # pointer.promote(name, version, pool, eval_id) -> bool
 
-channel = grpc.insecure_channel("serving-prod:9000")
-probe = serving_pb2_grpc.ServingProbeStub(channel)
-
-
-class ServingPool:
-    def set_traffic(self, pool: str, name: str, version: str, percent: int) -> None:
-        """Shift the given percent of the pool to this version."""
-        raise NotImplementedError
+serving = modelregistry_pb2_grpc.ServingStub(grpc.insecure_channel("serving:9000"))
 
 
-serving = ServingPool()
-
-
-def promote_with_probe(pool: str, name: str, version: str, digest: str, percent: int) -> dict:
+def promote_with_probe(pool: str, name: str, version: int, digest: str, eval_id: str) -> dict:
+    """Probe the pool for the registered digest, then point the pool at the version."""
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    probe.Probe(serving_pb2.ProbeRequest(pool=pool, expected_digest=digest))
-    serving.set_traffic(pool, name, version, percent)
-    return {"promoted": True, "pool": pool, "version": version}
+    request = modelregistry_pb2.ProbeRequest(pool=pool, model=name, version=version, expected_digest=digest)
+    try:
+        serving.Probe(request)
+    except grpc.RpcError:
+        pass  # the pool reports its state on its next heartbeat
+    if not pointer.promote(name, version, pool, eval_id):
+        return {"promoted": False, "reason": "stage_refused"}
+    return {"promoted": True, "reason": None}
 `,
       solution: `import grpc
 
-import serving_pb2
-import serving_pb2_grpc
+import modelregistry_pb2
+import modelregistry_pb2_grpc
+from registry import pointer  # pointer.promote(name, version, pool, eval_id) -> bool
 
-PROBE_DEADLINE_MS = 10_000
-MAX_PROBE_ATTEMPTS = 2
+PROBE_DEADLINE_S = 10
+MAX_ATTEMPTS = 2
 
-channel = grpc.insecure_channel("serving-prod:9000")
-probe = serving_pb2_grpc.ServingProbeStub(channel)
-
-
-class ServingPool:
-    def set_traffic(self, pool: str, name: str, version: str, percent: int) -> None:
-        """Shift the given percent of the pool to this version."""
-        raise NotImplementedError
+serving = modelregistry_pb2_grpc.ServingStub(grpc.insecure_channel("serving:9000"))
 
 
-serving = ServingPool()
-
-
-def probe_pool(pool: str, digest: str) -> str:
-    """Warm the pool and return the digest it actually loaded, or raise."""
-    last_error: grpc.RpcError | None = None
-    for _ in range(MAX_PROBE_ATTEMPTS):
+def probe(pool: str, name: str, version: int, digest: str) -> str:
+    """The digest the pool has loaded for the version; raises the last attempt's grpc.RpcError."""
+    request = modelregistry_pb2.ProbeRequest(pool=pool, model=name, version=version, expected_digest=digest)
+    attempt = 1
+    while True:
         try:
-            reply = probe.Probe(
-                serving_pb2.ProbeRequest(pool=pool, expected_digest=digest),
-                timeout=PROBE_DEADLINE_MS / 1000,
-            )
-            return reply.loaded_digest
-        except grpc.RpcError as error:
-            last_error = error
-            if error.code() != grpc.StatusCode.UNAVAILABLE:
-                break
-    raise last_error
+            return serving.Probe(request, timeout=PROBE_DEADLINE_S).loaded_digest
+        except grpc.RpcError as exc:
+            # A restarting pool may answer the next attempt; any other status will not change.
+            if exc.code() != grpc.StatusCode.UNAVAILABLE or attempt >= MAX_ATTEMPTS:
+                raise
+            attempt += 1
 
 
-def promote_with_probe(pool: str, name: str, version: str, digest: str, percent: int) -> dict:
+def promote_with_probe(pool: str, name: str, version: int, digest: str, eval_id: str) -> dict:
+    """Probe the pool for the registered digest, then point the pool at the version."""
     try:
-        loaded_digest = probe_pool(pool, digest)
-    except grpc.RpcError as error:
-        if error.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
-            return {"promoted": False, "reason": "probe_timeout"}
-        return {"promoted": False, "reason": "probe_failed"}
-    if loaded_digest != digest:
+        loaded = probe(pool, name, version, digest)
+    except grpc.RpcError as exc:
+        # The pool keeps the version it serves, and the operator sees why.
+        reason = "probe_timeout" if exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED else "probe_failed"
+        return {"promoted": False, "reason": reason}
+    if loaded != digest:
         return {"promoted": False, "reason": "digest_mismatch"}
-    serving.set_traffic(pool, name, version, percent)
-    return {"promoted": True, "pool": pool, "name": name, "version": version}
+    # Only a pool that proved it holds these bytes gets the pointer.
+    if not pointer.promote(name, version, pool, eval_id):
+        return {"promoted": False, "reason": "stage_refused"}
+    return {"promoted": True, "reason": None}
 `,
     },
     typescript: {
-      starter: `/** Promote: probes the pool, then shifts traffic. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-interface ProbeReply {
-  loaded_digest: string;
+import {promote} from 'registry/pointer';
+
+interface ProbeRequest {
+  pool: string;
+  model: string;
+  version: number;
+  expected_digest: string;
 }
 
-interface ServingProbeClient {
-  Probe(
-    request: {pool: string; expected_digest: string},
-    callback: (error: grpc.ServiceError | null, reply: ProbeReply) => void,
-  ): void;
+export interface ProbeResult {
+  promoted: boolean;
+  reason: string | null;
 }
 
-const {serving: servingPackage} = grpc.loadPackageDefinition(protoLoader.loadSync('serving.proto')) as unknown as {
-  serving: {ServingProbe: new (target: string, credentials: grpc.ChannelCredentials) => ServingProbeClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('modelregistry.proto')) as unknown as {
+  modelregistry: {Serving: grpc.ServiceClientConstructor};
 };
-const probe = new servingPackage.ServingProbe('serving-prod:9000', grpc.credentials.createInsecure());
+const serving = new pkg.modelregistry.Serving('serving:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Probe(request: ProbeRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{loaded_digest: string}>;
+};
 
-class ServingPool {
-  setTraffic(pool: string, name: string, version: string, percent: number): void {
-    throw new Error(\`shift \${percent}% of \${pool} to \${name}:\${version}\`);
-  }
-}
-
-const serving = new ServingPool();
-
-export async function promoteWithProbe(
-  pool: string,
-  name: string,
-  version: string,
-  digest: string,
-  percent: number,
-): Promise<{promoted: boolean; reason?: string}> {
+/** Probe the pool for the registered digest, then point the pool at the version. */
+export async function promoteWithProbe(pool: string, name: string, version: number, digest: string, evalId: string): Promise<ProbeResult> {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  await new Promise<void>((resolve, reject) => {
-    probe.Probe({pool, expected_digest: digest}, error => (error ? reject(error) : resolve()));
-  });
-  serving.setTraffic(pool, name, version, percent);
-  return {promoted: true};
+  try {
+    await serving.Probe({pool, model: name, version, expected_digest: digest}, new grpc.Metadata(), {});
+  } catch {
+    // the pool reports its state on its next heartbeat
+  }
+  if (!(await promote(name, version, pool, evalId))) return {promoted: false, reason: 'stage_refused'};
+  return {promoted: true, reason: null};
 }
 `,
-      solution: `/** Promote: probe with a 10 s deadline and shift traffic only after a verified digest. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const PROBE_DEADLINE_MS = 10_000;
-const MAX_PROBE_ATTEMPTS = 2;
+import {promote} from 'registry/pointer';
 
-interface ProbeReply {
-  loaded_digest: string;
+export const PROBE_DEADLINE_MS = 10_000;
+export const MAX_ATTEMPTS = 2;
+
+interface ProbeRequest {
+  pool: string;
+  model: string;
+  version: number;
+  expected_digest: string;
 }
 
-interface ServingProbeClient {
-  Probe(
-    request: {pool: string; expected_digest: string},
-    metadata: grpc.Metadata,
-    options: {deadline: number},
-    callback: (error: grpc.ServiceError | null, reply: ProbeReply) => void,
-  ): void;
+export interface ProbeResult {
+  promoted: boolean;
+  reason: string | null;
 }
 
-const {serving: servingPackage} = grpc.loadPackageDefinition(protoLoader.loadSync('serving.proto')) as unknown as {
-  serving: {ServingProbe: new (target: string, credentials: grpc.ChannelCredentials) => ServingProbeClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('modelregistry.proto')) as unknown as {
+  modelregistry: {Serving: grpc.ServiceClientConstructor};
 };
-const probe = new servingPackage.ServingProbe('serving-prod:9000', grpc.credentials.createInsecure());
+const serving = new pkg.modelregistry.Serving('serving:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Probe(request: ProbeRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{loaded_digest: string}>;
+};
 
-class ServingPool {
-  setTraffic(pool: string, name: string, version: string, percent: number): void {
-    throw new Error(\`shift \${percent}% of \${pool} to \${name}:\${version}\`);
-  }
-}
-
-const serving = new ServingPool();
-
-async function probePool(pool: string, digest: string): Promise<string> {
-  let lastError: grpc.ServiceError | null = null;
-  for (let attempt = 0; attempt < MAX_PROBE_ATTEMPTS; attempt++) {
+/** The digest the pool has loaded for the version; throws the last attempt's ServiceError. */
+async function probe(pool: string, name: string, version: number, digest: string): Promise<string> {
+  for (let attempt = 1; ; attempt += 1) {
     try {
-      return await new Promise<string>((resolve, reject) => {
-        probe.Probe(
-          {pool, expected_digest: digest},
-          new grpc.Metadata(),
-          {deadline: Date.now() + PROBE_DEADLINE_MS},
-          (error, reply) => (error ? reject(error) : resolve(reply.loaded_digest)),
-        );
+      const reply = await serving.Probe({pool, model: name, version, expected_digest: digest}, new grpc.Metadata(), {
+        deadline: Date.now() + PROBE_DEADLINE_MS,
       });
-    } catch (error) {
-      lastError = error as grpc.ServiceError;
-      if (lastError.code !== grpc.status.UNAVAILABLE) break;
+      return reply.loaded_digest;
+    } catch (e) {
+      // A restarting pool may answer the next attempt; any other status will not change.
+      if ((e as grpc.ServiceError).code !== grpc.status.UNAVAILABLE || attempt >= MAX_ATTEMPTS) throw e;
     }
   }
-  throw lastError ?? new Error('probe failed');
 }
 
-export async function promoteWithProbe(
-  pool: string,
-  name: string,
-  version: string,
-  digest: string,
-  percent: number,
-): Promise<{promoted: boolean; reason?: string}> {
-  let loadedDigest: string;
+/** Probe the pool for the registered digest, then point the pool at the version. */
+export async function promoteWithProbe(pool: string, name: string, version: number, digest: string, evalId: string): Promise<ProbeResult> {
+  let loaded: string;
   try {
-    loadedDigest = await probePool(pool, digest);
-  } catch (error) {
-    const serviceError = error as grpc.ServiceError;
-    if (serviceError.code === grpc.status.DEADLINE_EXCEEDED) return {promoted: false, reason: 'probe_timeout'};
-    return {promoted: false, reason: 'probe_failed'};
+    loaded = await probe(pool, name, version, digest);
+  } catch (e) {
+    // The pool keeps the version it serves, and the operator sees why.
+    const timedOut = (e as grpc.ServiceError).code === grpc.status.DEADLINE_EXCEEDED;
+    return {promoted: false, reason: timedOut ? 'probe_timeout' : 'probe_failed'};
   }
-  if (loadedDigest !== digest) return {promoted: false, reason: 'digest_mismatch'};
-  serving.setTraffic(pool, name, version, percent);
-  return {promoted: true, pool, name, version};
+  if (loaded !== digest) return {promoted: false, reason: 'digest_mismatch'};
+  // Only a pool that proved it holds these bytes gets the pointer.
+  if (!(await promote(name, version, pool, evalId))) return {promoted: false, reason: 'stage_refused'};
+  return {promoted: true, reason: null};
 }
 `,
     },
@@ -321,23 +266,35 @@ import (
 	"context"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"registry/pointer" // pointer.Promote(ctx, name, version, pool, evalID) (bool, error)
+	pb "registry/gen/modelregistry"
 )
 
-type ServingPool struct{}
+var (
+	servingConn, _ = grpc.NewClient("serving:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	serving        = pb.NewServingClient(servingConn)
+)
 
-func (s *ServingPool) SetTraffic(ctx context.Context, pool, name, version string, percent int) error {
-	return nil
+// probeResult is what the operator sees: whether the pool now serves the version, and why not.
+type probeResult struct {
+	Promoted bool   \`json:"promoted"\`
+	Reason   string \`json:"reason"\`
 }
 
-var serving = &ServingPool{}
-
-func PromoteWithProbe(ctx context.Context, pool, name, version, digest string, percent int) map[string]any {
+// promoteWithProbe probes the pool for the registered digest, then points the pool at the version.
+func promoteWithProbe(ctx context.Context, pool, name string, version int, digest, evalID string) (probeResult, error) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	conn, _ := grpc.DialContext(ctx, "serving-"+pool+":9000", grpc.WithInsecure())
-	client := NewServingProbeClient(conn)
-	_, _ = client.Probe(ctx, &ProbeRequest{Pool: pool, ExpectedDigest: digest})
-	_ = serving.SetTraffic(ctx, pool, name, version, percent)
-	return map[string]any{"promoted": true, "pool": pool, "version": version}
+	serving.Probe(ctx, &pb.ProbeRequest{Pool: pool, Model: name, Version: int64(version), ExpectedDigest: digest}) // the pool reports its state on its next heartbeat
+	moved, err := pointer.Promote(ctx, name, version, pool, evalID)
+	if err != nil {
+		return probeResult{}, err
+	}
+	if !moved {
+		return probeResult{Reason: "stage_refused"}, nil
+	}
+	return probeResult{Promoted: true}, nil
 }
 `,
       solution: `package main
@@ -348,231 +305,598 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+
+	"registry/pointer" // pointer.Promote(ctx, name, version, pool, evalID) (bool, error)
+	pb "registry/gen/modelregistry"
 )
 
 const (
-	probeDeadlineMs  = 10000
-	maxProbeAttempts = 2
+	probeDeadline = 10 * time.Second
+	maxAttempts   = 2
 )
 
-type ServingPool struct{}
+var (
+	servingConn, _ = grpc.NewClient("serving:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	serving        = pb.NewServingClient(servingConn)
+)
 
-func (s *ServingPool) SetTraffic(ctx context.Context, pool, name, version string, percent int) error {
-	return nil
+// probeResult is what the operator sees: whether the pool now serves the version, and why not.
+type probeResult struct {
+	Promoted bool   \`json:"promoted"\`
+	Reason   string \`json:"reason"\`
 }
 
-var serving = &ServingPool{}
-
-func probePool(ctx context.Context, pool, digest string) (string, error) {
-	conn, err := grpc.DialContext(ctx, "serving-"+pool+":9000", grpc.WithInsecure())
-	if err != nil {
-		return "", err
-	}
-	client := NewServingProbeClient(conn)
-	var lastErr error
-	for attempt := 0; attempt < maxProbeAttempts; attempt++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, probeDeadlineMs*time.Millisecond)
-		reply, err := client.Probe(attemptCtx, &ProbeRequest{Pool: pool, ExpectedDigest: digest})
+// probe is the digest the pool has loaded for the version, or the last attempt's error.
+func probe(ctx context.Context, pool, name string, version int, digest string) (string, error) {
+	req := &pb.ProbeRequest{Pool: pool, Model: name, Version: int64(version), ExpectedDigest: digest}
+	for attempt := 1; ; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, probeDeadline)
+		reply, err := serving.Probe(callCtx, req)
 		cancel()
-		if err != nil {
-			lastErr = err
-			if status.Code(err) != codes.Unavailable {
-				break
-			}
-			continue
+		if err == nil {
+			return reply.GetLoadedDigest(), nil
 		}
-		return reply.GetLoadedDigest(), nil
+		// A restarting pool may answer the next attempt; any other status will not change.
+		if status.Code(err) != codes.Unavailable || attempt >= maxAttempts {
+			return "", err
+		}
 	}
-	return "", lastErr
 }
 
-func PromoteWithProbe(ctx context.Context, pool, name, version, digest string, percent int) map[string]any {
-	loadedDigest, err := probePool(ctx, pool, digest)
+// promoteWithProbe probes the pool for the registered digest, then points the pool at the version.
+func promoteWithProbe(ctx context.Context, pool, name string, version int, digest, evalID string) (probeResult, error) {
+	loaded, err := probe(ctx, pool, name, version, digest)
 	if err != nil {
+		// The pool keeps the version it serves, and the operator sees why.
 		if status.Code(err) == codes.DeadlineExceeded {
-			return map[string]any{"promoted": false, "reason": "probe_timeout"}
+			return probeResult{Reason: "probe_timeout"}, nil
 		}
-		return map[string]any{"promoted": false, "reason": "probe_failed"}
+		return probeResult{Reason: "probe_failed"}, nil
 	}
-	if loadedDigest != digest {
-		return map[string]any{"promoted": false, "reason": "digest_mismatch"}
+	if loaded != digest {
+		return probeResult{Reason: "digest_mismatch"}, nil
 	}
-	_ = serving.SetTraffic(ctx, pool, name, version, percent)
-	return map[string]any{"promoted": true, "pool": pool, "name": name, "version": version}
+	// Only a pool that proved it holds these bytes gets the pointer.
+	moved, err := pointer.Promote(ctx, name, version, pool, evalID)
+	if err != nil {
+		return probeResult{}, err
+	}
+	if !moved {
+		return probeResult{Reason: "stage_refused"}, nil
+	}
+	return probeResult{Promoted: true}, nil
 }
 `,
     },
     scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-object Promotion {
-  val probe = ServingProbeGrpc
-    .blockingStub(ManagedChannelBuilder.forAddress("serving-prod", 9000).usePlaintext().build())
+import registry.Pointer // Pointer.promote(name, version, pool, evalId): Boolean
+import modelregistry.modelregistry.{ProbeRequest, ServingGrpc}
 
-  class ServingPool {
-    def setTraffic(pool: String, name: String, version: String, percent: Int): Unit =
-      throw new UnsupportedOperationException("shift traffic")
-  }
+/** What the operator sees: whether the pool now serves the version, and why not. */
+final case class ProbeResult(promoted: Boolean, reason: Option[String])
 
-  val serving = new ServingPool
+object Client {
+  private val serving = ServingGrpc.blockingStub(ManagedChannelBuilder.forAddress("serving", 9000).usePlaintext().build())
 
-  def promoteWithProbe(pool: String, name: String, version: String, digest: String, percent: Int): Map[String, Any] = {
+  /** Probe the pool for the registered digest, then point the pool at the version. */
+  def promoteWithProbe(pool: String, name: String, version: Long, digest: String, evalId: String): ProbeResult = {
     // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    probe.probe(ProbeRequest(pool = pool, expectedDigest = digest))
-    serving.setTraffic(pool, name, version, percent)
-    Map("promoted" -> true, "pool" -> pool, "version" -> version)
+    try serving.probe(ProbeRequest(pool, name, version, digest))
+    catch { case _: StatusRuntimeException => () } // the pool reports its state on its next heartbeat
+    if (!Pointer.promote(name, version, pool, evalId)) ProbeResult(promoted = false, Some("stage_refused"))
+    else ProbeResult(promoted = true, None)
   }
 }
 `,
-      solution: `import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+      solution: `import java.util.concurrent.TimeUnit
 
-import java.util.concurrent.TimeUnit
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
 
-object Promotion {
-  val ProbeDeadlineMs = 10000L
-  val MaxProbeAttempts = 2
+import registry.Pointer // Pointer.promote(name, version, pool, evalId): Boolean
+import modelregistry.modelregistry.{ProbeRequest, ServingGrpc}
 
-  val probe = ServingProbeGrpc
-    .blockingStub(ManagedChannelBuilder.forAddress("serving-prod", 9000).usePlaintext().build())
+/** What the operator sees: whether the pool now serves the version, and why not. */
+final case class ProbeResult(promoted: Boolean, reason: Option[String])
 
-  class ServingPool {
-    def setTraffic(pool: String, name: String, version: String, percent: Int): Unit =
-      throw new UnsupportedOperationException("shift traffic")
-  }
+object Client {
+  val ProbeDeadlineSeconds = 10L
+  val MaxAttempts = 2
 
-  val serving = new ServingPool
+  private val serving = ServingGrpc.blockingStub(ManagedChannelBuilder.forAddress("serving", 9000).usePlaintext().build())
 
-  def probePool(pool: String, digest: String): String = {
-    var attempt = 0
-    var last: StatusRuntimeException = null
-    while (attempt < MaxProbeAttempts) {
-      try {
-        val reply = probe
-          .withDeadlineAfter(ProbeDeadlineMs, TimeUnit.MILLISECONDS)
-          .probe(ProbeRequest(pool = pool, expectedDigest = digest))
-        return reply.loadedDigest
-      } catch {
-        case error: StatusRuntimeException =>
-          last = error
-          if (error.getStatus.getCode != Status.Code.UNAVAILABLE) attempt = MaxProbeAttempts
-      }
-      attempt += 1
+  /** The digest the pool has loaded for the version; throws the last attempt's StatusRuntimeException. */
+  def probe(pool: String, name: String, version: Long, digest: String, attempt: Int = 1): String =
+    try serving.withDeadlineAfter(ProbeDeadlineSeconds, TimeUnit.SECONDS).probe(ProbeRequest(pool, name, version, digest)).loadedDigest
+    catch {
+      // A restarting pool may answer the next attempt; any other status will not change.
+      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts =>
+        probe(pool, name, version, digest, attempt + 1)
     }
-    throw last
-  }
 
-  def promoteWithProbe(pool: String, name: String, version: String, digest: String, percent: Int): Map[String, Any] = {
-    val loadedDigest =
-      try probePool(pool, digest)
-      catch {
-        case error: StatusRuntimeException if error.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-          return Map("promoted" -> false, "reason" -> "probe_timeout")
-        case _: StatusRuntimeException =>
-          return Map("promoted" -> false, "reason" -> "probe_failed")
-      }
-    if (loadedDigest != digest) return Map("promoted" -> false, "reason" -> "digest_mismatch")
-    serving.setTraffic(pool, name, version, percent)
-    Map("promoted" -> true, "pool" -> pool, "name" -> name, "version" -> version)
-  }
+  /** Probe the pool for the registered digest, then point the pool at the version. */
+  def promoteWithProbe(pool: String, name: String, version: Long, digest: String, evalId: String): ProbeResult =
+    try {
+      val loaded = probe(pool, name, version, digest)
+      if (loaded != digest) ProbeResult(promoted = false, Some("digest_mismatch"))
+      // Only a pool that proved it holds these bytes gets the pointer.
+      else if (!Pointer.promote(name, version, pool, evalId)) ProbeResult(promoted = false, Some("stage_refused"))
+      else ProbeResult(promoted = true, None)
+    } catch {
+      // The pool keeps the version it serves, and the operator sees why.
+      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED => ProbeResult(promoted = false, Some("probe_timeout"))
+      case _: StatusRuntimeException => ProbeResult(promoted = false, Some("probe_failed"))
+    }
 }
 `,
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
 
-#include "serving.grpc.pb.h"
-
-#include <memory>
 #include <string>
 
-using json = nlohmann::json;
+#include "registry/pointer.h"  // pointer::promote(name, version, pool, eval_id) -> bool
+#include "modelregistry.grpc.pb.h"
 
-struct ServingPool {
-  void set_traffic(const std::string& pool, const std::string& name, const std::string& version, int percent);
+auto serving = modelregistry::Serving::NewStub(grpc::CreateChannel("serving:9000", grpc::InsecureChannelCredentials()));
+
+// What the operator sees: whether the pool now serves the version, and why not.
+struct ProbeResult {
+  bool promoted = false;
+  std::string reason;
 };
 
-ServingPool serving;
-
-std::unique_ptr<ServingProbe::Stub> stub;
-
-json promote_with_probe(const std::string& pool, const std::string& name, const std::string& version,
-                        const std::string& digest, int percent) {
+// Probe the pool for the registered digest, then point the pool at the version.
+ProbeResult promoteWithProbe(const std::string& pool, const std::string& name, long version, const std::string& digest,
+                             const std::string& eval_id) {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   grpc::ClientContext ctx;
-  ProbeRequest request;
+  modelregistry::ProbeRequest request;
   request.set_pool(pool);
+  request.set_model(name);
+  request.set_version(version);
   request.set_expected_digest(digest);
-  ProbeReply reply;
-  stub->Probe(&ctx, request, &reply);
-  serving.set_traffic(pool, name, version, percent);
-  return json{{"promoted", true}, {"pool", pool}, {"version", version}};
+  modelregistry::ProbeReply reply;
+  serving->Probe(&ctx, request, &reply);  // the pool reports its state on its next heartbeat
+  if (!pointer::promote(name, version, pool, eval_id)) return {false, "stage_refused"};
+  return {true, ""};
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
-
-#include "serving.grpc.pb.h"
 
 #include <chrono>
-#include <memory>
 #include <string>
 
-using json = nlohmann::json;
+#include "registry/pointer.h"  // pointer::promote(name, version, pool, eval_id) -> bool
+#include "modelregistry.grpc.pb.h"
 
-constexpr long long kProbeDeadlineMs = 10000;
-constexpr int kMaxProbeAttempts = 2;
+constexpr std::chrono::seconds kProbeDeadline{10};
+constexpr int kMaxAttempts = 2;
 
-struct ServingPool {
-  void set_traffic(const std::string& pool, const std::string& name, const std::string& version, int percent);
+auto serving = modelregistry::Serving::NewStub(grpc::CreateChannel("serving:9000", grpc::InsecureChannelCredentials()));
+
+// What the operator sees: whether the pool now serves the version, and why not.
+struct ProbeResult {
+  bool promoted = false;
+  std::string reason;
 };
 
-ServingPool serving;
-
-std::unique_ptr<ServingProbe::Stub> stub;
-
-std::string probe_pool(const std::string& pool, const std::string& digest) {
-  grpc::Status last = grpc::Status::OK;
-  for (int attempt = 0; attempt < kMaxProbeAttempts; ++attempt) {
+// The pool's answer: the status of the last attempt, and on success the digest it has loaded.
+grpc::Status probe(const std::string& pool, const std::string& name, long version, const std::string& digest, std::string* loaded) {
+  modelregistry::ProbeRequest request;
+  request.set_pool(pool);
+  request.set_model(name);
+  request.set_version(version);
+  request.set_expected_digest(digest);
+  grpc::Status status;
+  for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
     grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kProbeDeadlineMs));
-    ProbeRequest request;
-    request.set_pool(pool);
-    request.set_expected_digest(digest);
-    ProbeReply reply;
-    const grpc::Status status = stub->Probe(&ctx, request, &reply);
-    if (status.ok()) return reply.loaded_digest();
-    last = status;
-    if (status.error_code() != grpc::StatusCode::UNAVAILABLE) break;
+    ctx.set_deadline(std::chrono::system_clock::now() + kProbeDeadline);
+    modelregistry::ProbeReply reply;
+    status = serving->Probe(&ctx, request, &reply);
+    if (status.ok()) {
+      *loaded = reply.loaded_digest();
+      return status;
+    }
+    // A restarting pool may answer the next attempt; any other status will not change.
+    if (status.error_code() != grpc::StatusCode::UNAVAILABLE) return status;
   }
-  throw last;
+  return status;
 }
 
-json promote_with_probe(const std::string& pool, const std::string& name, const std::string& version,
-                        const std::string& digest, int percent) {
-  std::string loaded_digest;
-  try {
-    loaded_digest = probe_pool(pool, digest);
-  } catch (const grpc::Status& status) {
-    if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
-      return json{{"promoted", false}, {"reason", "probe_timeout"}};
-    }
-    return json{{"promoted", false}, {"reason", "probe_failed"}};
-  }
-  if (loaded_digest != digest) {
-    return json{{"promoted", false}, {"reason", "digest_mismatch"}};
-  }
-  serving.set_traffic(pool, name, version, percent);
-  return json{{"promoted", true}, {"pool", pool}, {"name", name}, {"version", version}};
+// Probe the pool for the registered digest, then point the pool at the version.
+ProbeResult promoteWithProbe(const std::string& pool, const std::string& name, long version, const std::string& digest,
+                             const std::string& eval_id) {
+  std::string loaded;
+  const grpc::Status status = probe(pool, name, version, digest, &loaded);
+  // The pool keeps the version it serves, and the operator sees why.
+  if (!status.ok()) return {false, status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ? "probe_timeout" : "probe_failed"};
+  if (loaded != digest) return {false, "digest_mismatch"};
+  // Only a pool that proved it holds these bytes gets the pointer.
+  if (!pointer::promote(name, version, pool, eval_id)) return {false, "stage_refused"};
+  return {true, ""};
 }
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import modelregistry_pb2
+import modelregistry_pb2_grpc
+
+DIGEST = "sha256:a3"
+
+
+class Pool(modelregistry_pb2_grpc.ServingServicer):
+    """Every pool has loaded the bytes it was asked about, except the versions in loaded ("model:version" → digest)."""
+
+    def __init__(self):
+        self.loaded = {}
+
+    def Probe(self, request, context):
+        digest = self.loaded.get(f"{request.model}:{request.version}", request.expected_digest)
+        return modelregistry_pb2.ProbeReply(loaded_digest=digest)
+
+
+def _client(ctx):
+    pool = Pool()
+    ctx.grpc.serve(modelregistry_pb2_grpc.add_ServingServicer_to_server, pool)
+    for n, stage in ((2, "promoted"), (3, "staged")):
+        ctx.redis.hset(
+            f"model:fraud:v{n}",
+            mapping={"name": "fraud", "version": n, "artifact_digest": f"sha256:a{n}", "training_run_id": f"r-{n}", "eval_id": f"e-{n}", "stage": stage},
+        )
+    ctx.redis.set("active:prod", "fraud:2")
+    return ctx.load("client"), pool
+
+
+def _promote(m):
+    return m.promote_with_probe("prod", "fraud", 3, DIGEST, "e-3")
+
+
+def _held(ctx, result, reason, why):
+    assert result == {"promoted": False, "reason": reason}, f"{why}: promote_with_probe answered {result}, expected promoted False with reason {reason!r}"
+    pointer = ctx.redis.get("active:prod")
+    assert pointer == "fraud:2", f"{why}: active:prod moved to {pointer!r}; prod must keep serving fraud:2"
+    stage = ctx.redis.hget("model:fraud:v3", "stage")
+    assert stage == "staged", f"{why}: fraud version 3 is {stage!r}, expected it still staged"
+
+
+def _promoted(ctx, result, why):
+    assert result == {"promoted": True, "reason": None}, f"{why}: promote_with_probe answered {result}, expected promoted True"
+    assert ctx.redis.get("active:prod") == "fraud:3", f"{why}: active:prod holds {ctx.redis.get('active:prod')!r}, expected fraud:3"
+
+
+def check_probe_deadline(ctx):
+    m, _ = _client(ctx)
+    _promoted(ctx, _promote(m), "with a healthy pool holding the registered digest")
+    calls = ctx.grpc.calls_to("Probe")
+    assert calls, "no Probe call was made before the pointer moved"
+    for call in calls:
+        assert call.timeout is not None, "a Probe call carries no deadline: a pool that never answers would hold the promotion forever"
+        assert 9.5 <= call.timeout <= 10.5, f"a Probe call carries a {call.timeout} s deadline, expected PROBE_DEADLINE_S = 10"
+    ctx.redis.set("active:prod", "fraud:2")
+    ctx.redis.hset("model:fraud:v3", "stage", "staged")
+    ctx.grpc.set_latency("Probe", 30.0)
+    before = len(ctx.grpc.calls_to("Probe"))
+    _held(ctx, _promote(m), "probe_timeout", "with a pool that takes 30 s to answer")
+    made = len(ctx.grpc.calls_to("Probe")) - before
+    assert made == 1, f"a probe that ran out of time was attempted {made} times: DEADLINE_EXCEEDED is final, reported as probe_timeout"
+
+
+def check_digest_match(ctx):
+    m, pool = _client(ctx)
+    pool.loaded["fraud:3"] = "sha256:stale"
+    _held(ctx, _promote(m), "digest_mismatch", "with the pool holding sha256:stale instead of the registered sha256:a3")
+    pool.loaded.clear()
+    _promoted(ctx, _promote(m), "once the pool loaded the registered digest")
+
+
+def check_failure_blocks(ctx):
+    m, _ = _client(ctx)
+    ctx.grpc.fail("Probe", grpc.StatusCode.PERMISSION_DENIED, "registryd may not probe prod")
+    _held(ctx, _promote(m), "probe_failed", "with the probe refused PERMISSION_DENIED")
+    made = len(ctx.grpc.calls_to("Probe"))
+    assert made == 1, f"a PERMISSION_DENIED probe was attempted {made} times: only UNAVAILABLE is worth a retry"
+    ctx.grpc.fail("Probe", grpc.StatusCode.UNAVAILABLE, "pool restarting", times=5)
+    _held(ctx, _promote(m), "probe_failed", "with the pool UNAVAILABLE on every attempt")
+    made = len(ctx.grpc.calls_to("Probe")) - 1
+    assert made == 2, f"a pool that stays UNAVAILABLE was probed {made} times, expected MAX_ATTEMPTS = 2"
+
+
+def check_unavailable_retry(ctx):
+    m, _ = _client(ctx)
+    ctx.grpc.fail("Probe", grpc.StatusCode.UNAVAILABLE, "pool restarting", times=1)
+    result = _promote(m)
+    made = len(ctx.grpc.calls_to("Probe"))
+    assert made == 2, f"the pool answered UNAVAILABLE once and the promotion made {made} probe call(s): it must probe again and see the digest before the pointer moves"
+    _promoted(ctx, result, "after one UNAVAILABLE and a healthy second attempt")
+`,
+    typescript: `const DIGEST = 'sha256:a3';
+
+/** Every pool has loaded the bytes it was asked about, except the versions in loaded ("model:version" → digest). */
+function client(ctx) {
+  const pkg = ctx.proto('modelregistry.proto');
+  const loaded = new Map<string, string>();
+  ctx.grpc.serve(pkg.modelregistry.Serving.service, {
+    Probe(call, callback) {
+      const {model, version, expected_digest} = call.request;
+      callback(null, {loaded_digest: loaded.get(\`\${model}:\${version}\`) ?? expected_digest});
+    },
+  });
+  for (const [n, stage] of [[2, 'promoted'], [3, 'staged']]) {
+    ctx.redis.hset(\`model:fraud:v\${n}\`, 'name', 'fraud', 'version', String(n), 'artifact_digest', \`sha256:a\${n}\`, 'training_run_id', \`r-\${n}\`, 'eval_id', \`e-\${n}\`, 'stage', stage);
+  }
+  ctx.redis.set('active:prod', 'fraud:2');
+  return {m: ctx.load('client'), loaded};
+}
+
+const promote = m => m.promoteWithProbe('prod', 'fraud', 3, DIGEST, 'e-3');
+
+function held(ctx, result, reason: string, why: string): void {
+  assert.deepStrictEqual(result, {promoted: false, reason}, \`\${why}: promoteWithProbe answered \${JSON.stringify(result)}, expected promoted false with reason \${reason}\`);
+  const pointer = ctx.redis.get('active:prod');
+  assert.equal(pointer, 'fraud:2', \`\${why}: active:prod moved to \${pointer}; prod must keep serving fraud:2\`);
+  const stage = ctx.redis.hget('model:fraud:v3', 'stage');
+  assert.equal(stage, 'staged', \`\${why}: fraud version 3 is \${stage}, expected it still staged\`);
+}
+
+function promoted(ctx, result, why: string): void {
+  assert.deepStrictEqual(result, {promoted: true, reason: null}, \`\${why}: promoteWithProbe answered \${JSON.stringify(result)}, expected promoted true\`);
+  assert.equal(ctx.redis.get('active:prod'), 'fraud:3', \`\${why}: active:prod must hold fraud:3\`);
+}
+
+export async function check_probe_deadline(ctx) {
+  const {m} = client(ctx);
+  promoted(ctx, await promote(m), 'with a healthy pool holding the registered digest');
+  const calls = ctx.grpc.callsTo('Probe');
+  assert(calls.length > 0, 'no Probe call was made before the pointer moved');
+  for (const call of calls) {
+    assert(call.timeout !== null, 'a Probe call carries no deadline: a pool that never answers would hold the promotion forever');
+    assert(9.5 <= call.timeout && call.timeout <= 10.5, \`a Probe call carries a \${call.timeout} s deadline, expected PROBE_DEADLINE_MS = 10000\`);
+  }
+  ctx.redis.set('active:prod', 'fraud:2');
+  ctx.redis.hset('model:fraud:v3', 'stage', 'staged');
+  ctx.grpc.setLatency('Probe', 30.0);
+  const before = ctx.grpc.callsTo('Probe').length;
+  held(ctx, await promote(m), 'probe_timeout', 'with a pool that takes 30 s to answer');
+  const made = ctx.grpc.callsTo('Probe').length - before;
+  assert.equal(made, 1, \`a probe that ran out of time was attempted \${made} times: DEADLINE_EXCEEDED is final, reported as probe_timeout\`);
+}
+
+export async function check_digest_match(ctx) {
+  const {m, loaded} = client(ctx);
+  loaded.set('fraud:3', 'sha256:stale');
+  held(ctx, await promote(m), 'digest_mismatch', 'with the pool holding sha256:stale instead of the registered sha256:a3');
+  loaded.clear();
+  promoted(ctx, await promote(m), 'once the pool loaded the registered digest');
+}
+
+export async function check_failure_blocks(ctx) {
+  const {m} = client(ctx);
+  ctx.grpc.fail('Probe', ctx.grpc.status.PERMISSION_DENIED, 'registryd may not probe prod');
+  held(ctx, await promote(m), 'probe_failed', 'with the probe refused PERMISSION_DENIED');
+  let made = ctx.grpc.callsTo('Probe').length;
+  assert.equal(made, 1, \`a PERMISSION_DENIED probe was attempted \${made} times: only UNAVAILABLE is worth a retry\`);
+  ctx.grpc.fail('Probe', ctx.grpc.status.UNAVAILABLE, 'pool restarting', 5);
+  held(ctx, await promote(m), 'probe_failed', 'with the pool UNAVAILABLE on every attempt');
+  made = ctx.grpc.callsTo('Probe').length - 1;
+  assert.equal(made, 2, \`a pool that stays UNAVAILABLE was probed \${made} times, expected MAX_ATTEMPTS = 2\`);
+}
+
+export async function check_unavailable_retry(ctx) {
+  const {m} = client(ctx);
+  ctx.grpc.fail('Probe', ctx.grpc.status.UNAVAILABLE, 'pool restarting', 1);
+  const result = await promote(m);
+  const made = ctx.grpc.callsTo('Probe').length;
+  assert.equal(made, 2, \`the pool answered UNAVAILABLE once and the promotion made \${made} probe call(s): it must probe again and see the digest before the pointer moves\`);
+  promoted(ctx, result, 'after one UNAVAILABLE and a healthy second attempt');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	pb "registry/gen/modelregistry"
+
+	"leetbuild/harness"
+)
+
+const registered = "sha256:a3"
+
+var clientBg = context.Background()
+
+// poolPeer has loaded the bytes it is asked about, except the versions in loaded ("model:version" → digest).
+type poolPeer struct {
+	pb.UnimplementedServingServer
+	loaded map[string]string
+}
+
+func (p *poolPeer) Probe(_ context.Context, req *pb.ProbeRequest) (*pb.ProbeReply, error) {
+	digest, ok := p.loaded[fmt.Sprintf("%s:%d", req.GetModel(), req.GetVersion())]
+	if !ok {
+		digest = req.GetExpectedDigest()
+	}
+	return &pb.ProbeReply{LoadedDigest: digest}, nil
+}
+
+func setup(ctx *harness.Ctx) *poolPeer {
+	peer := &poolPeer{loaded: map[string]string{}}
+	pb.RegisterServingServer(ctx.GRPC.Server(""), peer)
+	ctx.Redis.Do("HSET", "model:fraud:v2", "name", "fraud", "version", "2", "artifact_digest", "sha256:a2", "training_run_id", "r-2", "eval_id", "e-2", "stage", "promoted")
+	ctx.Redis.Do("HSET", "model:fraud:v3", "name", "fraud", "version", "3", "artifact_digest", "sha256:a3", "training_run_id", "r-3", "eval_id", "e-3", "stage", "staged")
+	ctx.Redis.Set("active:prod", "fraud:2")
+	return peer
+}
+
+func tryPromote(ctx *harness.Ctx) probeResult {
+	result, err := promoteWithProbe(clientBg, "prod", "fraud", 3, registered, "e-3")
+	ctx.NoError(err, "promoteWithProbe failed")
+	return result
+}
+
+func held(ctx *harness.Ctx, result probeResult, reason, why string) {
+	ctx.Assert(!result.Promoted && result.Reason == reason, "%s: promoteWithProbe answered %+v, expected promoted false with reason %q", why, result, reason)
+	pointer, _ := ctx.Redis.Get("active:prod")
+	ctx.Equal(pointer, "fraud:2", "%s: prod must keep serving fraud:2; active:prod", why)
+	stage, _ := ctx.Redis.HGet("model:fraud:v3", "stage")
+	ctx.Equal(stage, "staged", "%s: fraud version 3 must stay staged; its stage", why)
+}
+
+func promoted(ctx *harness.Ctx, result probeResult, why string) {
+	ctx.Assert(result.Promoted && result.Reason == "", "%s: promoteWithProbe answered %+v, expected promoted true", why, result)
+	pointer, _ := ctx.Redis.Get("active:prod")
+	ctx.Equal(pointer, "fraud:3", "%s: active:prod", why)
+}
+
+func CheckProbeDeadline(ctx *harness.Ctx) {
+	setup(ctx)
+	promoted(ctx, tryPromote(ctx), "with a healthy pool holding the registered digest")
+	calls := ctx.GRPC.CallsTo("Probe", "")
+	ctx.Assert(len(calls) > 0, "no Probe call was made before the pointer moved")
+	for _, call := range calls {
+		ctx.Assert(call.HasDeadline(), "a Probe call carries no deadline: a pool that never answers would hold the promotion forever")
+		ctx.Assert(9500*time.Millisecond <= call.Timeout && call.Timeout <= 10500*time.Millisecond, "a Probe call carries a %v deadline, expected 10 s", call.Timeout)
+	}
+	ctx.Redis.Set("active:prod", "fraud:2")
+	ctx.Redis.Do("HSET", "model:fraud:v3", "stage", "staged")
+	ctx.GRPC.SetLatency("Probe", 30.0, "")
+	before := len(ctx.GRPC.CallsTo("Probe", ""))
+	held(ctx, tryPromote(ctx), "probe_timeout", "with a pool that takes 30 s to answer")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Probe", ""))-before, 1, "DEADLINE_EXCEEDED is final, reported as probe_timeout; the attempts")
+}
+
+func CheckDigestMatch(ctx *harness.Ctx) {
+	peer := setup(ctx)
+	peer.loaded["fraud:3"] = "sha256:stale"
+	held(ctx, tryPromote(ctx), "digest_mismatch", "with the pool holding sha256:stale instead of the registered sha256:a3")
+	delete(peer.loaded, "fraud:3")
+	promoted(ctx, tryPromote(ctx), "once the pool loaded the registered digest")
+}
+
+func CheckFailureBlocks(ctx *harness.Ctx) {
+	setup(ctx)
+	ctx.GRPC.Fail("Probe", codes.PermissionDenied, "registryd may not probe prod", 1, "")
+	held(ctx, tryPromote(ctx), "probe_failed", "with the probe refused PERMISSION_DENIED")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Probe", "")), 1, "only UNAVAILABLE is worth a retry; the attempts of a PERMISSION_DENIED probe")
+	ctx.GRPC.Fail("Probe", codes.Unavailable, "pool restarting", 5, "")
+	held(ctx, tryPromote(ctx), "probe_failed", "with the pool UNAVAILABLE on every attempt")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Probe", ""))-1, 2, "a pool that stays UNAVAILABLE gets maxAttempts = 2 probes; the attempts")
+}
+
+func CheckUnavailableRetry(ctx *harness.Ctx) {
+	setup(ctx)
+	ctx.GRPC.Fail("Probe", codes.Unavailable, "pool restarting", 1, "")
+	result := tryPromote(ctx)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Probe", "")), 2, "the pool answered UNAVAILABLE once: the promotion must probe again and see the digest before the pointer moves; the probe calls")
+	promoted(ctx, result, "after one UNAVAILABLE and a healthy second attempt")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <string>
+
+namespace {
+
+const std::string kRegistered = "sha256:a3";
+
+// Every pool has loaded the bytes it is asked about, except the versions in loaded ("model:version" → digest).
+class PoolPeer final : public modelregistry::Serving::Service {
+ public:
+  std::map<std::string, std::string> loaded;
+  grpc::Status Probe(grpc::ServerContext*, const modelregistry::ProbeRequest* req, modelregistry::ProbeReply* out) override {
+    const auto it = loaded.find(req->model() + ":" + std::to_string(req->version()));
+    out->set_loaded_digest(it == loaded.end() ? req->expected_digest() : it->second);
+    return grpc::Status::OK;
+  }
+};
+
+PoolPeer& setup(harness::Ctx& ctx) {
+  static PoolPeer* peer = nullptr;
+  delete peer;
+  peer = new PoolPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  ctx.Redis.Do("HSET", "model:fraud:v2", "name", "fraud", "version", "2", "artifact_digest", "sha256:a2", "training_run_id", "r-2", "eval_id", "e-2", "stage", "promoted");
+  ctx.Redis.Do("HSET", "model:fraud:v3", "name", "fraud", "version", "3", "artifact_digest", "sha256:a3", "training_run_id", "r-3", "eval_id", "e-3", "stage", "staged");
+  ctx.Redis.Set("active:prod", "fraud:2");
+  return *peer;
+}
+
+ProbeResult tryPromote() { return promoteWithProbe("prod", "fraud", 3, kRegistered, "e-3"); }
+
+void held(harness::Ctx& ctx, const ProbeResult& result, const std::string& reason, const std::string& why) {
+  ctx.Assert(!result.promoted && result.reason == reason, "%s: promoteWithProbe answered promoted %t reason %q, expected promoted false with reason %q", why,
+             result.promoted, result.reason, reason);
+  ctx.Equal(ctx.Redis.Get("active:prod").value_or(""), "fraud:2", "%s: prod must keep serving fraud:2; active:prod", why);
+  ctx.Equal(ctx.Redis.HGet("model:fraud:v3", "stage").value_or(""), "staged", "%s: fraud version 3 must stay staged; its stage", why);
+}
+
+void promoted(harness::Ctx& ctx, const ProbeResult& result, const std::string& why) {
+  ctx.Assert(result.promoted && result.reason.empty(), "%s: promoteWithProbe answered promoted %t reason %q, expected promoted true", why, result.promoted, result.reason);
+  ctx.Equal(ctx.Redis.Get("active:prod").value_or(""), "fraud:3", "%s: active:prod", why);
+}
+
+}  // namespace
+
+void CheckProbeDeadline(harness::Ctx& ctx) {
+  setup(ctx);
+  promoted(ctx, tryPromote(), "with a healthy pool holding the registered digest");
+  const auto calls = ctx.GRPC.CallsTo("Probe");
+  ctx.Assert(!calls.empty(), "no Probe call was made before the pointer moved");
+  for (const auto& call : calls) {
+    ctx.Assert(call.HasDeadline(), "a Probe call carries no deadline: a pool that never answers would hold the promotion forever");
+    ctx.Assert(9.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 10.5, "a Probe call carries a %v s deadline, expected kProbeDeadline = 10 s", call.TimeoutSeconds());
+  }
+  ctx.Redis.Set("active:prod", "fraud:2");
+  ctx.Redis.Do("HSET", "model:fraud:v3", "stage", "staged");
+  ctx.GRPC.SetLatency("Probe", 30.0);
+  const size_t before = ctx.GRPC.CallsTo("Probe").size();
+  held(ctx, tryPromote(), "probe_timeout", "with a pool that takes 30 s to answer");
+  ctx.Equal(ctx.GRPC.CallsTo("Probe").size() - before, 1, "DEADLINE_EXCEEDED is final, reported as probe_timeout; the attempts");
+}
+
+void CheckDigestMatch(harness::Ctx& ctx) {
+  PoolPeer& peer = setup(ctx);
+  peer.loaded["fraud:3"] = "sha256:stale";
+  held(ctx, tryPromote(), "digest_mismatch", "with the pool holding sha256:stale instead of the registered sha256:a3");
+  peer.loaded.clear();
+  promoted(ctx, tryPromote(), "once the pool loaded the registered digest");
+}
+
+void CheckFailureBlocks(harness::Ctx& ctx) {
+  setup(ctx);
+  ctx.GRPC.Fail("Probe", grpc::StatusCode::PERMISSION_DENIED, "registryd may not probe prod", 1);
+  held(ctx, tryPromote(), "probe_failed", "with the probe refused PERMISSION_DENIED");
+  ctx.Equal(ctx.GRPC.CallsTo("Probe").size(), 1, "only UNAVAILABLE is worth a retry; the attempts of a PERMISSION_DENIED probe");
+  ctx.GRPC.Fail("Probe", grpc::StatusCode::UNAVAILABLE, "pool restarting", 5);
+  held(ctx, tryPromote(), "probe_failed", "with the pool UNAVAILABLE on every attempt");
+  ctx.Equal(ctx.GRPC.CallsTo("Probe").size() - 1, 2, "a pool that stays UNAVAILABLE gets kMaxAttempts = 2 probes; the attempts");
+}
+
+void CheckUnavailableRetry(harness::Ctx& ctx) {
+  setup(ctx);
+  ctx.GRPC.Fail("Probe", grpc::StatusCode::UNAVAILABLE, "pool restarting", 1);
+  const ProbeResult result = tryPromote();
+  ctx.Equal(ctx.GRPC.CallsTo("Probe").size(), 2,
+            "the pool answered UNAVAILABLE once: the promotion must probe again and see the digest before the pointer moves; the probe calls");
+  promoted(ctx, result, "after one UNAVAILABLE and a healthy second attempt");
+}
+`,
+  },
   hints: [
-    "A pool still serving last week's artifact got promoted to 100% and the dashboard shows `promoted: true`. On another day the promotion worker hung for forty minutes on one pool.",
-    'The reply of `probe.Probe` is discarded, so the loaded digest is never compared, and the call has no timeout, so a silent pool blocks the worker instead of failing the promotion.',
-    'Call `Probe` with `timeout=PROBE_DEADLINE_MS / 1000`, two attempts on `UNAVAILABLE`; map `DEADLINE_EXCEEDED` to `probe_timeout`, `loaded_digest != digest` to `digest_mismatch`, else `probe_failed`; call `set_traffic` after the comparison only.',
+    'Have the pool load other bytes, or stop answering: the version still gets prod, and a pool that never answers holds the promotion until someone kills the worker.',
+    'The probe call has no deadline and its reply and errors are thrown away, so `pointer.promote` runs whatever the pool said; one attempt also means a pool restarting for a second blocks a valid promotion.',
+    'Probe with `timeout=PROBE_DEADLINE_S`, retry only `UNAVAILABLE` up to `MAX_ATTEMPTS`; map `DEADLINE_EXCEEDED` to `probe_timeout` and other errors to `probe_failed`; compare `loaded_digest` and answer `digest_mismatch`; call `pointer.promote` last.',
   ],
-  debrief: `The comparison sits between the probe and the traffic call because that is the only point where the registry knows both digests: the one it registered and the one the pool reports it loaded. A deadline makes "no answer" a bounded, named failure, and returning before set_traffic makes every failure leave the previous version serving. Production serving platforms layer more on this gate. KServe's canary rollout tracks the last revision that reached 100%, routes only \`canaryTrafficPercent\` to the new revision, refuses to route to a revision that is not ready, and on rollback pins all traffic to the previous good revision while it is still loaded.`,
+  debrief: `The probe is the only evidence that the pool holds the bytes the registry vouched for, so the pointer waits for it and every way it can fail keeps the old version serving. The status code decides the retry: UNAVAILABLE describes a pool between restarts, while a timeout or a refusal will say the same thing again and only delays the operator's answer. Ten seconds bounds how long a stuck pool can hold a promotion worker. Production rollouts probe every replica rather than one endpoint, back off between attempts, shift traffic in steps with health checks between them as KServe's canary rollouts do, and record the failed probe on the version so the next attempt starts from it.`,
 };

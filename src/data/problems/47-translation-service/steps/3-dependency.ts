@@ -2,308 +2,295 @@ import type {Step} from '@/lib/types';
 
 export const mtClientStep: Step = {
   id: 'dependency',
-  title: 'MT calls with a marked fallback, never a silent identity',
+  title: 'MT calls with a deadline and a marked fallback',
   concept: 'grpc',
   file: 'client',
-  focus: ['api', 'mt', 'detector'],
+  focus: ['api', 'mt', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is the machine-translation client behind \`POST /v1/translations\`:
-\`translate_segment\` calls the MT stub inside a loop with no attempt counter and a ten-second
-timeout, and on any \`RpcError\` it logs the code and hands back the source text stamped with the
-target locale as a success; \`remember\` writes whatever came back into translation memory. It
-compiles, the demo always shows text, and it hides five flaws.
+**Starting point.** The starter is the MT client every translation goes through:
+\`translate_segment(tenant, text, source, target, pinned)\` answers from translation memory (step 2,
+provided as \`translate.glossary\`) when it can, otherwise calls \`Translator.Translate\` on
+\`mt:9000\` with the pinned glossary's terms up to \`MAX_ATTEMPTS\` times, logging each \`RpcError\`,
+and remembers what it ends up with. With the model healthy it translates; it hides four flaws.
 
-**Failure mode the checks target.** The provider has an incident. Every request waits up to ten
-seconds, then returns English with \`"target": "fr"\` and a 200; the translation-memory cache stores
-it, the CDN caches it, the quality metric counts it, and a user in Paris reads English long after
-the provider recovers. A rejected language pair is handled by the same catch-all, so a caller bug is
-treated like an outage instead of being surfaced.
+**Failure mode the checks target.** The model stalls and every request stalls with it; a language
+pair the model does not serve is sent three times and comes back as English; an outage returns the
+source text as if it were French; and translation memory keeps that English for an hour after the
+model recovers.
 
-Requirements:
+\`\`\`proto
+service Translator { rpc Translate(TranslateRequest) returns (TranslateReply); }  // INVALID_ARGUMENT: pair not served
+\`\`\`
 
-- Each attempt carries a **two-second deadline**; a call that has not answered by then is a failure,
-  not a hang.
-- Attempts are **bounded** (three per segment) and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  retried. A rejected language pair (\`INVALID_ARGUMENT\`) is surfaced immediately.
-- When the call still fails, return the source text **with the \`untranslated\` marker** and a
-  **retriable status** (\`503\`), not a 200 that carries the target locale.
-- A marked fallback is **not a translation**: \`isCacheable\` answers \`false\` for it, so the
-  translation-memory cache cannot replay a failure as localized content.`,
+- Every attempt carries a **\`DEADLINE_S\` = 2 s** deadline.
+- Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried, within \`MAX_ATTEMPTS\` = 3;
+  \`INVALID_ARGUMENT\` raises \`PairRejected\` at once.
+- When no attempt answered, return \`{"text": text, "marker": UNTRANSLATED}\` (\`"untranslated"\`)
+  and remember nothing: only a reply from the model goes to \`tm_put\`.`,
   sequence: {
-    participants: ['Translation API', 'MT service', 'Translation memory'],
+    participants: ['Translation API', 'Translation memory', 'Translator'],
     messages: [
-      {from: 'Translation API', to: 'Translation memory', label: 'tmLookup(tenant, en, fr, v7, text)', kind: 'sync'},
+      {from: 'Translation API', to: 'Translation memory', label: 'tm_get(tenant, pair, version, text)', kind: 'sync'},
       {from: 'Translation memory', to: 'Translation API', label: 'miss', kind: 'reply'},
-      {from: 'Translation API', to: 'MT service', label: 'Translate · deadline 2s', kind: 'sync'},
-      {from: 'MT service', to: 'Translation API', label: 'UNAVAILABLE', kind: 'reply'},
-      {from: 'Translation API', to: 'MT service', label: 'Translate · retry 2 of 3', kind: 'sync'},
-      {from: 'MT service', to: 'Translation API', label: 'UNAVAILABLE', kind: 'reply'},
+      {from: 'Translation API', to: 'Translator', label: 'Translate · deadline 2 s · ≤ 3 attempts', kind: 'sync'},
       {
-        from: 'Translation API',
-        to: 'Translation memory',
-        label: 'no write: marked fallback is uncacheable',
-        kind: 'async',
+        from: 'Translator',
+        to: 'Translation API',
+        label: 'reply · UNAVAILABLE → retry · INVALID_ARGUMENT → PairRejected',
+        kind: 'reply',
       },
+      {from: 'Translation API', to: 'Translation memory', label: 'tm_put only for a reply', kind: 'sync'},
     ],
   },
   checks: [
     {
       id: 'deadline',
-      title: 'Puts a two-second deadline on every MT attempt',
+      title: 'Puts a 2-second deadline on every attempt',
       detail:
-        'Every `Translate` call carries a **2 second** deadline. The starter uses a ten-second timeout and then swallows the failure, so one slow provider stalls the whole request path.',
+        'Each `Translate` call carries `DEADLINE_S` (2 s), so a stalled model costs at most three short attempts. The starter calls with no deadline and waits as long as the model does.',
       match: {
-        python: {all: [/MT_DEADLINE_SECONDS/, /timeout=/]},
-        typescript: {all: [/MT_DEADLINE_MS/, /deadline/]},
-        go: {all: [/mtDeadline/, /context\.WithTimeout/]},
-        scala: {all: [/MtDeadlineMillis/, /deadlineMillis/]},
-        cpp: {all: [/kMtDeadline/]},
-      },
-    },
-    {
-      id: 'marked-fallback',
-      title: 'Marks the fallback and answers with a retriable status',
-      detail:
-        'A failed call returns the source text with the `untranslated` marker and a **503**, never a 200 carrying the target locale. The starter returns the input text as a successful translation of the target language.',
-      match: {
-        python: {all: [/UNTRANSLATED_MARKER/, /status_code\s*=\s*503/]},
-        typescript: {all: [/UNTRANSLATED_MARKER/, /statusCode\s*=\s*503/]},
-        go: {all: [/untranslatedMarker/, /StatusServiceUnavailable/]},
-        scala: {all: [/UntranslatedMarker/, /StatusCodes\.ServiceUnavailable/]},
-        cpp: {all: [/kUntranslatedMarker/, /\b503\b/]},
+        python: {all: [/DEADLINE_S\s*=\s*2\b/, /Translate\([^\n]*timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/DEADLINE_MS\s*=\s*2000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
+        go: {all: [/deadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\)/]},
+        scala: {all: [/DeadlineSeconds\s*=\s*2L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
+        cpp: {all: [/kDeadline\{2\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
     {
       id: 'retriable-only',
-      title: 'Retries only retriable codes and never a language-pair rejection',
+      title: 'Retries an outage, never a rejected language pair',
       detail:
-        'Only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are retried; an `INVALID_ARGUMENT` language-pair rejection is surfaced immediately. The starter retries every `RpcError`.',
+        '`UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; `INVALID_ARGUMENT` raises `PairRejected` after one call. The starter retries every status code and then returns the source text.',
       match: {
-        python: {all: [/RETRIABLE_CODES/, /UNSUPPORTED_PAIR/]},
-        typescript: {all: [/RETRIABLE_CODES/, /UNSUPPORTED_PAIR/]},
-        go: {all: [/retriableCodes/, /unsupportedPair/]},
-        scala: {all: [/RetriableCodes/, /UnsupportedPair/]},
-        cpp: {all: [/kRetriableCodes/, /kUnsupportedPair/]},
+        python: {all: [/INVALID_ARGUMENT/, /raise PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
+        typescript: {all: [/INVALID_ARGUMENT/, /throw new PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
+        go: {all: [/codes\.InvalidArgument/, /ErrPairRejected/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
+        scala: {all: [/INVALID_ARGUMENT/, /throw new PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
+        cpp: {all: [/INVALID_ARGUMENT/, /throw PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
       },
     },
     {
-      id: 'attempts',
-      title: 'Bounds the attempts instead of retrying forever',
+      id: 'marked-fallback',
+      title: 'Marks the fallback untranslated',
       detail:
-        'At most three attempts per segment. The starter loops until the call returns, so an outage becomes a hot retry loop against an already-struggling provider.',
+        'When no attempt answered, the result is the source text with `marker` set to `untranslated`, which the endpoint turns into a 503. The starter returns the source text with no marker, as if it were the translation.',
       match: {
-        python: {all: [/MAX_MT_ATTEMPTS/, /range\(/]},
-        typescript: {all: [/MAX_MT_ATTEMPTS/, /for\s*\(/]},
-        go: {all: [/maxMtAttempts/, /for attempt/]},
-        scala: {all: [/MaxMtAttempts/]},
-        cpp: {all: [/kMaxMtAttempts/, /for\s*\(/]},
+        python: {all: [/UNTRANSLATED\s*=\s*["']untranslated["']/, /["']marker["']:\s*UNTRANSLATED/]},
+        typescript: {all: [/UNTRANSLATED\s*=\s*['"]untranslated['"]/, /marker:\s*UNTRANSLATED/]},
+        go: {all: [/untranslated\s*=\s*"untranslated"/, /Marker:\s*untranslated/]},
+        scala: {all: [/Untranslated\s*=\s*"untranslated"/, /Some\(Untranslated\)/]},
+        cpp: {all: [/kUntranslated\s*=\s*"untranslated"/, /\{text,\s*kUntranslated\}/]},
       },
     },
     {
-      id: 'never-cache-marked',
-      title: 'A marked fallback is never cacheable',
+      id: 'no-cached-fallback',
+      title: 'Remembers only what the model translated',
       detail:
-        '`isCacheable` answers `false` for a marked response, so the translation-memory write is skipped. The starter caches whatever it returned, failure or not, and serves it as a translation.',
+        "Translation memory gets the model's reply (`tm_put(…, reply.text)`) and nothing on the fallback path, so the first request after recovery reaches the model. The starter remembers the source text it fell back to.",
       match: {
-        python: {all: [/is_cacheable/, /UNTRANSLATED_MARKER/]},
-        typescript: {all: [/isCacheable/, /UNTRANSLATED_MARKER/]},
-        go: {all: [/isCacheable/, /untranslatedMarker/]},
-        scala: {all: [/isCacheable/, /UntranslatedMarker/]},
-        cpp: {all: [/isCacheable/, /kUntranslatedMarker/]},
+        python: {all: [/tm_put\([^\n]*reply\.text\)/]},
+        typescript: {all: [/tmPut\([^\n]*reply\.text\)/]},
+        go: {all: [/TMPut\([^\n]*reply\.GetText\(\)\)/]},
+        scala: {all: [/tmPut\([^\n]*reply\.text\)/]},
+        cpp: {all: [/tmPut\([^\n]*reply\.text\(\)\)/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import logging
-import time
 
 import grpc
 
-import mt_pb2
-import mt_pb2_grpc
+import translation_service_pb2
+import translation_service_pb2_grpc
+from translate.glossary import tm_get, tm_put
 
-logger = logging.getLogger("mt")
+MAX_ATTEMPTS = 3
+log = logging.getLogger("mt")
 
-channel = grpc.insecure_channel("mt:9000")
-mt = mt_pb2_grpc.MtStub(channel)
-
-
-class MtResult:
-    def __init__(self, translation: str, target: str) -> None:
-        self.translation = translation
-        self.target = target
+stub = translation_service_pb2_grpc.TranslatorStub(grpc.insecure_channel("mt:9000"))
 
 
-def translate_segment(text: str, source: str, target: str, terms: list[dict]) -> MtResult:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    while True:
+class PairRejected(Exception):
+    """The model does not serve this language pair: a caller bug, not an outage."""
+
+
+def translate_segment(tenant: str, text: str, source: str, target: str, pinned: dict) -> dict:
+    """{"text", "marker"} for one segment under the pinned glossary ({"version", "terms"})."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    version = pinned["version"]
+    cached = tm_get(tenant, source, target, version, text)
+    if cached is not None:
+        return {"text": cached, "marker": None}
+    terms = [translation_service_pb2.Term(source=term, target=pinned["terms"][term]) for term in sorted(pinned["terms"])]
+    request = translation_service_pb2.TranslateRequest(text=text, source=source, target=target, glossary_version=version, terms=terms)
+    translation = text
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            reply = mt.Translate(
-                mt_pb2.TranslateRequest(text=text, source=source, target=target),
-                timeout=10,
-            )
-            return MtResult(reply.translation, target)
+            translation = stub.Translate(request).text
+            break
         except grpc.RpcError as exc:
-            logger.warning("mt rpc failed: %s", exc.code())
-            time.sleep(0.1)
-            return MtResult(text, target)
-
-
-def remember(terms: list[dict], result: MtResult, text: str) -> None:
-    translations[text + "->" + result.target] = result.translation
+            log.warning("mt attempt %d failed: %s", attempt + 1, exc.code())
+    tm_put(tenant, source, target, version, text, translation)
+    return {"text": translation, "marker": None}
 `,
       solution: `import logging
-import time
 
 import grpc
 
-import mt_pb2
-import mt_pb2_grpc
-from fastapi import HTTPException
+import translation_service_pb2
+import translation_service_pb2_grpc
+from translate.glossary import tm_get, tm_put
 
-logger = logging.getLogger("mt")
+DEADLINE_S = 2
+MAX_ATTEMPTS = 3
+RETRIABLE = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+UNTRANSLATED = "untranslated"
+log = logging.getLogger("mt")
 
-channel = grpc.insecure_channel("mt:9000")
-mt = mt_pb2_grpc.MtStub(channel)
-
-MT_DEADLINE_SECONDS = 2.0
-MAX_MT_ATTEMPTS = 3
-RETRIABLE_CODES = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
-UNSUPPORTED_PAIR = grpc.StatusCode.INVALID_ARGUMENT
-UNTRANSLATED_MARKER = "untranslated"
+stub = translation_service_pb2_grpc.TranslatorStub(grpc.insecure_channel("mt:9000"))
 
 
-class MtResult:
-    def __init__(self, translation: str, target: str, marker: str | None = None) -> None:
-        self.translation = translation
-        self.target = target
-        self.marker = marker
+class PairRejected(Exception):
+    """The model does not serve this language pair: a caller bug, not an outage."""
 
 
-def is_cacheable(result: MtResult) -> bool:
-    """A marked fallback is not a translation: it must never enter the TM cache."""
-    return result.marker != UNTRANSLATED_MARKER
-
-
-def translate_segment(text: str, source: str, target: str, terms: list[dict]) -> MtResult:
-    request = mt_pb2.TranslateRequest(
-        text=text,
-        source=source,
-        target=target,
-        glossary=[mt_pb2.Term(source=t["source"], target=t["target"]) for t in terms],
-    )
-    last_error: grpc.RpcError | None = None
-    for _ in range(MAX_MT_ATTEMPTS):
+def translate_segment(tenant: str, text: str, source: str, target: str, pinned: dict) -> dict:
+    """{"text", "marker"} for one segment under the pinned glossary ({"version", "terms"})."""
+    version = pinned["version"]
+    cached = tm_get(tenant, source, target, version, text)
+    if cached is not None:
+        return {"text": cached, "marker": None}
+    terms = [translation_service_pb2.Term(source=term, target=pinned["terms"][term]) for term in sorted(pinned["terms"])]
+    request = translation_service_pb2.TranslateRequest(text=text, source=source, target=target, glossary_version=version, terms=terms)
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            reply = mt.Translate(request, timeout=MT_DEADLINE_SECONDS)
-            return MtResult(reply.translation, target)
+            reply = stub.Translate(request, timeout=DEADLINE_S)
         except grpc.RpcError as exc:
-            if exc.code() == UNSUPPORTED_PAIR:
-                raise HTTPException(status_code=400, detail="unsupported language pair") from exc
-            if exc.code() not in RETRIABLE_CODES:
-                raise
-            last_error = exc
-            logger.warning("mt rpc retriable failure: %s", exc.code())
-            time.sleep(0.1)
-    logger.warning("mt unavailable after %d attempts: %s", MAX_MT_ATTEMPTS, last_error)
-    raise HTTPException(
-        status_code=503,
-        detail={
-            "error": "mt unavailable",
-            "marker": UNTRANSLATED_MARKER,
-            "translation": text,
-            "target": target,
-        },
-    )
+            log.warning("mt attempt %d failed: %s", attempt + 1, exc.code())
+            if exc.code() == grpc.StatusCode.INVALID_ARGUMENT:
+                raise PairRejected(exc.details()) from exc  # retrying cannot change the answer
+            if exc.code() not in RETRIABLE:
+                break
+            continue
+        tm_put(tenant, source, target, version, text, reply.text)
+        return {"text": reply.text, "marker": None}
+    # The model never answered: the caller gets its own text back, marked, and nothing is remembered.
+    return {"text": text, "marker": UNTRANSLATED}
 `,
     },
     typescript: {
-      starter: `/** The MT client behind POST /v1/translations. */
-import {status as GrpcStatus, type ServiceError} from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-import {callTranslate} from './mt';
+import {type Glossary, tmGet, tmPut} from 'translate/glossary';
 
-export interface MtResult {
-  translation: string;
-  target: string;
+export const MAX_ATTEMPTS = 3;
+
+export interface Translation {
+  text: string;
+  marker: string | null;
 }
 
-export async function translateSegment(
-  text: string,
-  source: string,
-  target: string,
-  terms: Term[],
-): Promise<MtResult> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  for (;;) {
+interface TranslateRequest {
+  text: string;
+  source: string;
+  target: string;
+  glossary_version: number;
+  terms: {source: string; target: string}[];
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('translation_service.proto')) as unknown as {
+  translationsvc: {Translator: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.translationsvc.Translator('mt:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Translate(request: TranslateRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{text: string; model: string}>;
+};
+
+/** The model does not serve this language pair: a caller bug, not an outage. */
+export class PairRejected extends Error {}
+
+/** One segment under the pinned glossary. */
+export async function translateSegment(tenant: string, text: string, source: string, target: string, pinned: Glossary): Promise<Translation> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const cached = await tmGet(tenant, source, target, pinned.version, text);
+  if (cached !== null) return {text: cached, marker: null};
+  const terms = Object.keys(pinned.terms)
+    .sort()
+    .map(term => ({source: term, target: pinned.terms[term]}));
+  const request = {text, source, target, glossary_version: pinned.version, terms};
+  let translation = text;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
-      const reply = await callTranslate({text, source, target, glossary: terms}, {deadline: new Date(Date.now() + 10_000)});
-      return {translation: reply.translation, target};
-    } catch (error) {
-      const code = (error as ServiceError).code ?? GrpcStatus.UNKNOWN;
-      if (code === GrpcStatus.UNKNOWN) throw error;
-      return {translation: text, target};
+      translation = (await stub.Translate(request, new grpc.Metadata(), {})).text;
+      break;
+    } catch (e) {
+      console.warn(\`mt attempt \${attempt + 1} failed: \${grpc.status[(e as grpc.ServiceError).code]}\`);
     }
   }
+  await tmPut(tenant, source, target, pinned.version, text, translation);
+  return {text: translation, marker: null};
 }
 `,
-      solution: `/** The MT client: a two-second deadline, bounded retries, and a fallback nobody can mistake. */
-import {status as GrpcStatus, type ServiceError} from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-import {callTranslate} from './mt';
+import {type Glossary, tmGet, tmPut} from 'translate/glossary';
 
-const MT_DEADLINE_MS = 2000;
-const MAX_MT_ATTEMPTS = 3;
-const RETRIABLE_CODES: readonly number[] = [GrpcStatus.UNAVAILABLE, GrpcStatus.DEADLINE_EXCEEDED];
-const UNSUPPORTED_PAIR = GrpcStatus.INVALID_ARGUMENT;
-const UNTRANSLATED_MARKER = 'untranslated';
+export const DEADLINE_MS = 2000;
+export const MAX_ATTEMPTS = 3;
+export const UNTRANSLATED = 'untranslated';
+const RETRIABLE = [grpc.status.UNAVAILABLE, grpc.status.DEADLINE_EXCEEDED];
 
-export interface MtResult {
-  translation: string;
+export interface Translation {
+  text: string;
+  marker: string | null;
+}
+
+interface TranslateRequest {
+  text: string;
+  source: string;
   target: string;
-  marker?: string;
+  glossary_version: number;
+  terms: {source: string; target: string}[];
 }
 
-export class MtUnavailableError extends Error {
-  readonly statusCode = 503;
-  readonly marker = UNTRANSLATED_MARKER;
-  readonly translation: string;
-  readonly target: string;
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('translation_service.proto')) as unknown as {
+  translationsvc: {Translator: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.translationsvc.Translator('mt:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Translate(request: TranslateRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{text: string; model: string}>;
+};
 
-  constructor(translation: string, target: string, cause: unknown) {
-    super('mt unavailable');
-    this.translation = translation;
-    this.target = target;
-    this.cause = cause;
-  }
-}
+/** The model does not serve this language pair: a caller bug, not an outage. */
+export class PairRejected extends Error {}
 
-export function isCacheable(result: MtResult): boolean {
-  return result.marker !== UNTRANSLATED_MARKER;
-}
-
-export async function translateSegment(
-  text: string,
-  source: string,
-  target: string,
-  terms: Term[],
-): Promise<MtResult> {
-  const request = {text, source, target, glossary: terms};
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < MAX_MT_ATTEMPTS; attempt += 1) {
+/** One segment under the pinned glossary. */
+export async function translateSegment(tenant: string, text: string, source: string, target: string, pinned: Glossary): Promise<Translation> {
+  const cached = await tmGet(tenant, source, target, pinned.version, text);
+  if (cached !== null) return {text: cached, marker: null};
+  const terms = Object.keys(pinned.terms)
+    .sort()
+    .map(term => ({source: term, target: pinned.terms[term]}));
+  const request = {text, source, target, glossary_version: pinned.version, terms};
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    let reply;
     try {
-      const reply = await callTranslate(request, {deadline: new Date(Date.now() + MT_DEADLINE_MS)});
-      return {translation: reply.translation, target};
-    } catch (error) {
-      const code = (error as ServiceError).code ?? GrpcStatus.UNKNOWN;
-      if (code === UNSUPPORTED_PAIR) throw new Error('unsupported language pair');
-      if (!RETRIABLE_CODES.includes(code)) throw error;
-      lastError = error;
+      reply = await stub.Translate(request, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+    } catch (e) {
+      const {code, details} = e as grpc.ServiceError;
+      console.warn(\`mt attempt \${attempt + 1} failed: \${grpc.status[code]}\`);
+      if (code === grpc.status.INVALID_ARGUMENT) throw new PairRejected(details); // retrying cannot change the answer
+      if (!RETRIABLE.includes(code)) break;
+      continue;
     }
+    await tmPut(tenant, source, target, pinned.version, text, reply.text);
+    return {text: reply.text, marker: null};
   }
-  throw new MtUnavailableError(text, target, lastError);
+  // The model never answered: the caller gets its own text back, marked, and nothing is remembered.
+  return {text, marker: UNTRANSLATED};
 }
 `,
     },
@@ -312,242 +299,743 @@ export async function translateSegment(
 
 import (
 	"context"
+	"errors"
 	"log"
-	"time"
+	"sort"
 
-	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+
+	pb "translate/gen/translation_service"
+	"translate/glossary" // glossary.Glossary, glossary.TMGet, glossary.TMPut
 )
 
-type MtResult struct {
-	Translation string
-	Target      string
+const maxAttempts = 3
+
+var (
+	conn, _ = grpc.NewClient("mt:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	stub    = pb.NewTranslatorClient(conn)
+)
+
+// ErrPairRejected: the model does not serve this language pair, a caller bug, not an outage.
+var ErrPairRejected = errors.New("language pair rejected")
+
+// Translation is one segment's result: the text and its marker ("" for none).
+type Translation struct {
+	Text   string
+	Marker string
 }
 
-var mtClient MtServiceClient
-
-func translateSegment(ctx context.Context, text, source, target string, terms []Term) (MtResult, error) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	for {
-		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		reply, err := mtClient.Translate(ctx, &TranslateRequest{Text: text, Source: source, Target: target})
-		cancel()
-		if err != nil {
-			log.Printf("mt failed: %v", status.Code(err))
-			time.Sleep(100 * time.Millisecond)
-			return MtResult{Translation: text, Target: target}, nil
-		}
-		return MtResult{Translation: reply.Translation, Target: target}, nil
+func translateRequest(text, source, target string, pinned glossary.Glossary) *pb.TranslateRequest {
+	names := make([]string, 0, len(pinned.Terms))
+	for term := range pinned.Terms {
+		names = append(names, term)
 	}
+	sort.Strings(names)
+	request := &pb.TranslateRequest{Text: text, Source: source, Target: target, GlossaryVersion: pinned.Version}
+	for _, term := range names {
+		request.Terms = append(request.Terms, &pb.Term{Source: term, Target: pinned.Terms[term]})
+	}
+	return request
 }
 
-func remember(result MtResult, text string) {
-	cache[text+"->"+result.Target] = result.Translation
+// translateSegment translates one segment under the pinned glossary.
+func translateSegment(ctx context.Context, tenant, text, source, target string, pinned glossary.Glossary) (Translation, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	if cached, ok := glossary.TMGet(ctx, tenant, source, target, pinned.Version, text); ok {
+		return Translation{Text: cached}, nil
+	}
+	request := translateRequest(text, source, target, pinned)
+	translation := text
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		reply, err := stub.Translate(ctx, request)
+		if err == nil {
+			translation = reply.GetText()
+			break
+		}
+		log.Printf("mt attempt %d failed: %v", attempt+1, status.Code(err))
+	}
+	if err := glossary.TMPut(ctx, tenant, source, target, pinned.Version, text, translation); err != nil {
+		return Translation{}, err
+	}
+	return Translation{Text: translation}, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
-	"net/http"
+	"sort"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+
+	pb "translate/gen/translation_service"
+	"translate/glossary" // glossary.Glossary, glossary.TMGet, glossary.TMPut
 )
 
 const (
-	mtDeadline         = 2 * time.Second
-	maxMtAttempts      = 3
-	untranslatedMarker = "untranslated"
+	deadline     = 2 * time.Second
+	maxAttempts  = 3
+	untranslated = "untranslated"
 )
 
-var retriableCodes = map[codes.Code]bool{codes.Unavailable: true, codes.DeadlineExceeded: true}
-var unsupportedPair = codes.InvalidArgument
+var (
+	conn, _ = grpc.NewClient("mt:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	stub    = pb.NewTranslatorClient(conn)
+)
 
-type MtResult struct {
-	Translation string
-	Target      string
-	Marker      string
+// ErrPairRejected: the model does not serve this language pair, a caller bug, not an outage.
+var ErrPairRejected = errors.New("language pair rejected")
+
+// Translation is one segment's result: the text and its marker ("" for none).
+type Translation struct {
+	Text   string
+	Marker string
 }
 
-type MtUnavailableError struct {
-	Marker      string
-	Translation string
-	Target      string
-	StatusCode  int
+func translateRequest(text, source, target string, pinned glossary.Glossary) *pb.TranslateRequest {
+	names := make([]string, 0, len(pinned.Terms))
+	for term := range pinned.Terms {
+		names = append(names, term)
+	}
+	sort.Strings(names)
+	request := &pb.TranslateRequest{Text: text, Source: source, Target: target, GlossaryVersion: pinned.Version}
+	for _, term := range names {
+		request.Terms = append(request.Terms, &pb.Term{Source: term, Target: pinned.Terms[term]})
+	}
+	return request
 }
 
-func (e *MtUnavailableError) Error() string { return "mt unavailable" }
-
-func isCacheable(result MtResult) bool {
-	return result.Marker != untranslatedMarker
-}
-
-var mtClient MtServiceClient
-
-func translateSegment(ctx context.Context, text, source, target string, terms []Term) (MtResult, error) {
-	request := &TranslateRequest{Text: text, Source: source, Target: target}
-	var lastErr error
-	for attempt := 0; attempt < maxMtAttempts; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, mtDeadline)
-		reply, err := mtClient.Translate(callCtx, request)
+// translateSegment translates one segment under the pinned glossary.
+func translateSegment(ctx context.Context, tenant, text, source, target string, pinned glossary.Glossary) (Translation, error) {
+	if cached, ok := glossary.TMGet(ctx, tenant, source, target, pinned.Version, text); ok {
+		return Translation{Text: cached}, nil
+	}
+	request := translateRequest(text, source, target, pinned)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, deadline)
+		reply, err := stub.Translate(callCtx, request)
 		cancel()
 		if err == nil {
-			return MtResult{Translation: reply.Translation, Target: target}, nil
+			if err := glossary.TMPut(ctx, tenant, source, target, pinned.Version, text, reply.GetText()); err != nil {
+				return Translation{}, err
+			}
+			return Translation{Text: reply.GetText()}, nil
 		}
 		code := status.Code(err)
-		if code == unsupportedPair {
-			return MtResult{}, status.Errorf(codes.InvalidArgument, "unsupported language pair")
+		log.Printf("mt attempt %d failed: %v", attempt+1, code)
+		if code == codes.InvalidArgument {
+			return Translation{}, fmt.Errorf("%w: %s", ErrPairRejected, status.Convert(err).Message()) // retrying cannot change the answer
 		}
-		if !retriableCodes[code] {
-			return MtResult{}, err
+		if code != codes.Unavailable && code != codes.DeadlineExceeded {
+			break
 		}
-		lastErr = err
-		log.Printf("mt retriable failure on attempt %d: %v", attempt+1, code)
 	}
-	log.Printf("mt unavailable after %d attempts: %v", maxMtAttempts, lastErr)
-	return MtResult{}, &MtUnavailableError{
-		Marker:      untranslatedMarker,
-		Translation: text,
-		Target:      target,
-		StatusCode:  http.StatusServiceUnavailable,
-	}
+	// The model never answered: the caller gets its own text back, marked, and nothing is remembered.
+	return Translation{Text: text, Marker: untranslated}, nil
 }
 `,
     },
     scala: {
-      starter: `import scala.concurrent.Future
-import scala.util.{Failure, Success}
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+import translate.Glossary // Glossary.Pinned, Glossary.tmGet, Glossary.tmPut
+import translationsvc.translation_service.{Term, TranslateRequest, TranslatorGrpc}
 
-object MtClient {
-  val deadline = new java.util.Date(System.currentTimeMillis() + 10000)
+/** The model does not serve this language pair: a caller bug, not an outage. */
+final class PairRejected(message: String) extends Exception(message)
 
-  def translateSegment(text: String, source: String, target: String, terms: List[Term]): Future[MtResult] =
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    retryForever(text, source, target)
+object Client {
+  val MaxAttempts = 3
 
-  private def retryForever(text: String, source: String, target: String): Future[MtResult] =
-    MtStub.translate(text, source, target, deadline).recoverWith {
-      case error: MtException =>
-        retryForever(text, source, target)
+  /** One segment's result: the text and its marker. */
+  final case class Translation(text: String, marker: Option[String])
+
+  private val stub = TranslatorGrpc.blockingStub(ManagedChannelBuilder.forAddress("mt", 9000).usePlaintext().build())
+
+  /** One segment under the pinned glossary. */
+  def translateSegment(tenant: String, text: String, source: String, target: String, pinned: Glossary.Pinned): Translation = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    Glossary.tmGet(tenant, source, target, pinned.version, text) match {
+      case Some(cached) => Translation(cached, None)
+      case None =>
+        val terms = pinned.terms.toSeq.sortBy(_._1).map { case (term, translation) => Term(term, translation) }
+        val request = TranslateRequest(text, source, target, pinned.version, terms)
+        var translation = text
+        var attempt = 0
+        var done = false
+        while (!done && attempt < MaxAttempts) {
+          attempt += 1
+          try { translation = stub.translate(request).text; done = true }
+          catch { case e: StatusRuntimeException => System.err.println(s"mt attempt $attempt failed: \${e.getStatus.getCode}") }
+        }
+        Glossary.tmPut(tenant, source, target, pinned.version, text, translation)
+        Translation(translation, None)
     }
-
-  def isCacheable(result: MtResult): Boolean = true
+  }
 }
 `,
-      solution: `import scala.concurrent.Future
-import scala.util.{Failure, Success}
+      solution: `import java.util.concurrent.TimeUnit
 
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
 
-final case class MtResult(translation: String, target: String, marker: Option[String] = None, status: Int = 200)
+import translate.Glossary // Glossary.Pinned, Glossary.tmGet, Glossary.tmPut
+import translationsvc.translation_service.{Term, TranslateRequest, TranslatorGrpc}
 
-object MtClient {
-  val MtDeadlineMillis = 2000L
-  val MaxMtAttempts = 3
-  val RetriableCodes = Set("UNAVAILABLE", "DEADLINE_EXCEEDED")
-  val UnsupportedPair = "INVALID_ARGUMENT"
-  val UntranslatedMarker = "untranslated"
+/** The model does not serve this language pair: a caller bug, not an outage. */
+final class PairRejected(message: String) extends Exception(message)
 
-  def isCacheable(result: MtResult): Boolean = result.marker.isEmpty
+object Client {
+  val DeadlineSeconds = 2L
+  val MaxAttempts = 3
+  val Untranslated = "untranslated"
+  private val Retriable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
 
-  def translateSegment(text: String, source: String, target: String, terms: List[Term]): Future[MtResult] = {
-    val request = TranslateRequest(text, source, target, terms)
-    def attempt(number: Int): Future[MtResult] =
-      MtStub.translate(request, deadlineMillis = MtDeadlineMillis).recoverWith {
-        case error: MtException if error.code == UnsupportedPair =>
-          Future.failed(new MtRejected(error.code))
-        case error: MtException if RetriableCodes.contains(error.code) && number < MaxMtAttempts =>
-          attempt(number + 1)
-        case _: MtException =>
-          Future.successful(fallback(text, target))
-      }
-    attempt(1)
-  }
+  /** One segment's result: the text and its marker. */
+  final case class Translation(text: String, marker: Option[String])
 
-  private def fallback(text: String, target: String): MtResult =
-    MtResult(text, target, Some(UntranslatedMarker), StatusCodes.ServiceUnavailable.intValue)
+  private val stub = TranslatorGrpc.blockingStub(ManagedChannelBuilder.forAddress("mt", 9000).usePlaintext().build())
+
+  /** One segment under the pinned glossary. */
+  def translateSegment(tenant: String, text: String, source: String, target: String, pinned: Glossary.Pinned): Translation =
+    Glossary.tmGet(tenant, source, target, pinned.version, text) match {
+      case Some(cached) => Translation(cached, None)
+      case None =>
+        val terms = pinned.terms.toSeq.sortBy(_._1).map { case (term, translation) => Term(term, translation) }
+        val request = TranslateRequest(text, source, target, pinned.version, terms)
+        var attempt = 0
+        var result: Option[Translation] = None
+        while (result.isEmpty && attempt < MaxAttempts) {
+          attempt += 1
+          try {
+            val reply = stub.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).translate(request)
+            Glossary.tmPut(tenant, source, target, pinned.version, text, reply.text)
+            result = Some(Translation(reply.text, None))
+          } catch {
+            case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.INVALID_ARGUMENT =>
+              throw new PairRejected(Option(e.getStatus.getDescription).getOrElse("language pair rejected")) // retrying cannot change the answer
+            case e: StatusRuntimeException if !Retriable.contains(e.getStatus.getCode) => attempt = MaxAttempts
+            case e: StatusRuntimeException => System.err.println(s"mt attempt $attempt failed: \${e.getStatus.getCode}")
+          }
+        }
+        // The model never answered: the caller gets its own text back, marked, and nothing is remembered.
+        result.getOrElse(Translation(text, Some(Untranslated)))
+    }
 }
 `,
     },
     cpp: {
-      starter: `#include <chrono>
+      starter: `#include <grpcpp/grpcpp.h>
+
+#include <iostream>
+#include <stdexcept>
 #include <string>
-#include <vector>
 
-struct Term {
-  std::string source;
-  std::string target;
+#include "translate/glossary.h"  // glossary::Glossary, glossary::tmGet, glossary::tmPut
+#include "translation_service.grpc.pb.h"
+
+constexpr int kMaxAttempts = 3;
+
+auto model = translationsvc::Translator::NewStub(grpc::CreateChannel("mt:9000", grpc::InsecureChannelCredentials()));
+
+// The model does not serve this language pair: a caller bug, not an outage.
+struct PairRejected : std::runtime_error {
+  using std::runtime_error::runtime_error;
 };
 
-struct MtResult {
-  std::string translation;
-  std::string target;
+// One segment's result: the text and its marker ("" for none).
+struct Translation {
+  std::string text;
+  std::string marker;
 };
 
-MtResult translateSegment(const std::string& text, const std::string& source, const std::string& target,
-                          const std::vector<Term>& terms) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  for (;;) {
-    const auto reply = mtClient.translate(text, source, target, std::chrono::seconds(10));
-    if (reply) return MtResult{*reply, target};
-    return MtResult{text, target};
+translationsvc::TranslateRequest translateRequest(const std::string& text, const std::string& source, const std::string& target, const glossary::Glossary& pinned) {
+  translationsvc::TranslateRequest request;
+  request.set_text(text);
+  request.set_source(source);
+  request.set_target(target);
+  request.set_glossary_version(pinned.version);
+  for (const auto& [term, translation] : pinned.terms) {
+    translationsvc::Term* t = request.add_terms();
+    t->set_source(term);
+    t->set_target(translation);
   }
+  return request;
 }
 
-bool isCacheable(const MtResult& result) { return true; }
-`,
-      solution: `#include <chrono>
-#include <iostream>
-#include <optional>
-#include <string>
-#include <vector>
-
-struct Term {
-  std::string source;
-  std::string target;
-};
-
-struct MtResult {
-  std::string translation;
-  std::string target;
-  std::optional<std::string> marker;
-  int status = 200;
-};
-
-constexpr auto kMtDeadline = std::chrono::milliseconds(2000);
-constexpr int kMaxMtAttempts = 3;
-const std::vector<std::string> kRetriableCodes = {"UNAVAILABLE", "DEADLINE_EXCEEDED"};
-const std::string kUnsupportedPair = "INVALID_ARGUMENT";
-const std::string kUntranslatedMarker = "untranslated";
-
-bool isCacheable(const MtResult& result) { return !result.marker.has_value(); }
-
-MtResult translateSegment(const std::string& text, const std::string& source, const std::string& target,
-                          const std::vector<Term>& terms) {
-  MtTranslateRequest request{text, source, target, terms};
-  for (int attempt = 0; attempt < kMaxMtAttempts; ++attempt) {
-    const auto reply = mtClient.translate(request, kMtDeadline);
-    if (reply) return MtResult{*reply, target, std::nullopt, 200};
-    if (mtClient.lastError() == kUnsupportedPair) return MtResult{std::string(), target, std::nullopt, 400};
-    bool retriable = false;
-    for (const auto& code : kRetriableCodes) retriable = retriable || code == mtClient.lastError();
-    if (!retriable) return MtResult{std::string(), target, std::nullopt, 500};
+// One segment under the pinned glossary.
+Translation translateSegment(const std::string& tenant, const std::string& text, const std::string& source, const std::string& target,
+                             const glossary::Glossary& pinned) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  if (const auto cached = glossary::tmGet(tenant, source, target, pinned.version, text)) return {*cached, ""};
+  const translationsvc::TranslateRequest request = translateRequest(text, source, target, pinned);
+  std::string translation = text;
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
+    grpc::ClientContext ctx;
+    translationsvc::TranslateReply reply;
+    const grpc::Status status = model->Translate(&ctx, request, &reply);
+    if (status.ok()) {
+      translation = reply.text();
+      break;
+    }
+    std::cerr << "mt attempt " << attempt + 1 << " failed: " << status.error_code() << "\\n";
   }
-  std::cerr << "mt unavailable after " << kMaxMtAttempts << " attempts\\n";
-  return MtResult{text, target, kUntranslatedMarker, 503};
+  glossary::tmPut(tenant, source, target, pinned.version, text, translation);
+  return {translation, ""};
+}
+`,
+      solution: `#include <grpcpp/grpcpp.h>
+
+#include <chrono>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+#include "translate/glossary.h"  // glossary::Glossary, glossary::tmGet, glossary::tmPut
+#include "translation_service.grpc.pb.h"
+
+constexpr std::chrono::seconds kDeadline{2};
+constexpr int kMaxAttempts = 3;
+const std::string kUntranslated = "untranslated";
+
+auto model = translationsvc::Translator::NewStub(grpc::CreateChannel("mt:9000", grpc::InsecureChannelCredentials()));
+
+// The model does not serve this language pair: a caller bug, not an outage.
+struct PairRejected : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// One segment's result: the text and its marker ("" for none).
+struct Translation {
+  std::string text;
+  std::string marker;
+};
+
+translationsvc::TranslateRequest translateRequest(const std::string& text, const std::string& source, const std::string& target, const glossary::Glossary& pinned) {
+  translationsvc::TranslateRequest request;
+  request.set_text(text);
+  request.set_source(source);
+  request.set_target(target);
+  request.set_glossary_version(pinned.version);
+  for (const auto& [term, translation] : pinned.terms) {
+    translationsvc::Term* t = request.add_terms();
+    t->set_source(term);
+    t->set_target(translation);
+  }
+  return request;
+}
+
+// One segment under the pinned glossary.
+Translation translateSegment(const std::string& tenant, const std::string& text, const std::string& source, const std::string& target,
+                             const glossary::Glossary& pinned) {
+  if (const auto cached = glossary::tmGet(tenant, source, target, pinned.version, text)) return {*cached, ""};
+  const translationsvc::TranslateRequest request = translateRequest(text, source, target, pinned);
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    translationsvc::TranslateReply reply;
+    const grpc::Status status = model->Translate(&ctx, request, &reply);
+    if (status.ok()) {
+      glossary::tmPut(tenant, source, target, pinned.version, text, reply.text());
+      return {reply.text(), ""};
+    }
+    std::cerr << "mt attempt " << attempt + 1 << " failed: " << status.error_code() << "\\n";
+    // Retrying cannot change a rejected pair.
+    if (status.error_code() == grpc::StatusCode::INVALID_ARGUMENT) throw PairRejected(status.error_message());
+    if (status.error_code() != grpc::StatusCode::UNAVAILABLE && status.error_code() != grpc::StatusCode::DEADLINE_EXCEEDED) break;
+  }
+  // The model never answered: the caller gets its own text back, marked, and nothing is remembered.
+  return {text, kUntranslated};
 }
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import translation_service_pb2
+import translation_service_pb2_grpc
+from translate.glossary import tm_key
+
+PINNED = {"version": 2, "terms": {"Dashboard": "Tableau de bord"}}
+SAMPLE = "Open the Dashboard"
+TRANSLATED = "[fr] Open the Tableau de bord"
+SERVED = {"en", "fr", "de", "es", "ja", "pt"}
+
+
+class Translator(translation_service_pb2_grpc.TranslatorServicer):
+    """The model: '[target] text' with every glossary term applied; a pair it does not serve is INVALID_ARGUMENT."""
+
+    def Translate(self, request, context):
+        if request.source not in SERVED or request.target not in SERVED or request.source == request.target:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"pair {request.source}->{request.target} is not served")
+        text = request.text
+        for term in request.terms:
+            text = text.replace(term.source, term.target)
+        return translation_service_pb2.TranslateReply(text=f"[{request.target}] {text}", model="mt-2026-10")
+
+
+def _client(ctx):
+    ctx.grpc.serve(translation_service_pb2_grpc.add_TranslatorServicer_to_server, Translator())
+    return ctx.load("client")
+
+
+def _translate(m, text=SAMPLE, target="fr"):
+    return m.translate_segment("acme", text, "en", target, PINNED)
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    healthy = _translate(m)
+    assert healthy == {"text": TRANSLATED, "marker": None}, f"with the model healthy translate_segment answered {healthy}, expected {TRANSLATED!r}"
+    ctx.grpc.set_latency("Translate", 10.0)
+    result = _translate(m, "Close the Dashboard")
+    calls = ctx.grpc.calls_to("Translate")[1:]
+    for call in calls:
+        assert call.timeout is not None, "a Translate call carries no deadline: a stalled model holds every request as long as it stalls"
+        assert 1.5 <= call.timeout <= 2.5, f"a Translate call carries a {call.timeout} s deadline, expected DEADLINE_S = 2"
+    assert len(calls) == 3, f"a model slower than the deadline was called {len(calls)} times, expected MAX_ATTEMPTS = 3 attempts of 2 s"
+    assert result["text"] == "Close the Dashboard", f"a model that never answered in time produced {result}"
+
+
+def check_retriable_only(ctx):
+    m = _client(ctx)
+    try:
+        result = _translate(m, target="tlh")
+    except m.PairRejected:
+        pass
+    except Exception as exc:
+        raise AssertionError(f"a pair the model rejects raised {type(exc).__name__}: {exc}, expected PairRejected")
+    else:
+        raise AssertionError(f"a pair the model rejects (INVALID_ARGUMENT) returned {result} instead of raising PairRejected")
+    calls = len(ctx.grpc.calls_to("Translate"))
+    assert calls == 1, f"a rejected language pair was sent to the model {calls} times: INVALID_ARGUMENT is a caller bug, retrying cannot change it"
+    ctx.grpc.fail("Translate", grpc.StatusCode.UNAVAILABLE, times=2)
+    result = _translate(m)
+    assert result == {"text": TRANSLATED, "marker": None}, f"two UNAVAILABLE answers then a reply: translate_segment answered {result}, expected the translation from the third attempt"
+    assert len(ctx.grpc.calls_to("Translate")) == 4, "UNAVAILABLE is retried: three attempts for the second segment"
+
+
+def check_marked_fallback(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("Translate", grpc.StatusCode.UNAVAILABLE, times=3)
+    result = _translate(m)
+    assert len(ctx.grpc.calls_to("Translate")) == 3, f"an outage got {len(ctx.grpc.calls_to('Translate'))} attempts, expected 3"
+    assert result == {"text": SAMPLE, "marker": "untranslated"}, f"after three UNAVAILABLE attempts translate_segment answered {result}: the caller cannot tell English from French. Return the source text with marker untranslated"
+
+
+def check_no_cached_fallback(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("Translate", grpc.StatusCode.UNAVAILABLE, times=3)
+    _translate(m)
+    key = tm_key("acme", "en", "fr", 2, SAMPLE)
+    assert not ctx.redis.exists(key), f"translation memory holds {ctx.redis.get(key)!r} for a segment the model never translated: it is served as French for the next hour"
+    result = _translate(m)
+    assert result == {"text": TRANSLATED, "marker": None}, f"once the model recovered translate_segment answered {result}, expected {TRANSLATED!r}"
+    assert len(ctx.grpc.calls_to("Translate")) == 4, "after the outage the next request must reach the model"
+    assert ctx.redis.get(key) == TRANSLATED, f"the model's translation must be remembered under {key}"
+    _translate(m)
+    assert len(ctx.grpc.calls_to("Translate")) == 4, "a remembered translation is answered without a call"
+`,
+    typescript: `const PINNED = {version: 2, terms: {Dashboard: 'Tableau de bord'}};
+const SAMPLE = 'Open the Dashboard';
+const TRANSLATED = '[fr] Open the Tableau de bord';
+const SERVED = ['en', 'fr', 'de', 'es', 'ja', 'pt'];
+
+/** The model: '[target] text' with every glossary term applied; a pair it does not serve is INVALID_ARGUMENT. */
+function client(ctx) {
+  const pkg = ctx.proto('translation_service.proto');
+  ctx.grpc.serve(pkg.translationsvc.Translator.service, {
+    Translate(call, callback) {
+      const {source, target, terms} = call.request;
+      if (!SERVED.includes(source) || !SERVED.includes(target) || source === target) {
+        return callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: \`pair \${source}->\${target} is not served\`});
+      }
+      let text = call.request.text;
+      for (const term of terms ?? []) text = text.split(term.source).join(term.target);
+      callback(null, {text: \`[\${target}] \${text}\`, model: 'mt-2026-10'});
+    },
+  });
+  return {m: ctx.load('client'), glossary: ctx.load('/support/translate/glossary.ts')};
+}
+
+const translate = (m, text = SAMPLE, target = 'fr') => m.translateSegment('acme', text, 'en', target, PINNED);
+
+export async function check_deadline(ctx) {
+  const {m} = client(ctx);
+  const healthy = await translate(m);
+  assert.deepStrictEqual(healthy, {text: TRANSLATED, marker: null}, \`with the model healthy translateSegment answered \${JSON.stringify(healthy)}\`);
+  ctx.grpc.setLatency('Translate', 10.0);
+  const result = await translate(m, 'Close the Dashboard');
+  const calls = ctx.grpc.callsTo('Translate').slice(1);
+  for (const call of calls) {
+    assert(call.timeout !== null, 'a Translate call carries no deadline: a stalled model holds every request as long as it stalls');
+    assert(1.5 <= call.timeout && call.timeout <= 2.5, \`a Translate call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 2000\`);
+  }
+  assert.equal(calls.length, 3, \`a model slower than the deadline was called \${calls.length} times, expected MAX_ATTEMPTS = 3 attempts of 2 s\`);
+  assert.equal(result.text, 'Close the Dashboard', \`a model that never answered in time produced \${JSON.stringify(result)}\`);
+}
+
+export async function check_retriable_only(ctx) {
+  const {m} = client(ctx);
+  let result;
+  try {
+    result = await translate(m, SAMPLE, 'tlh');
+  } catch (e) {
+    assert(e instanceof m.PairRejected, \`a pair the model rejects threw \${(e as Error).constructor.name}: \${(e as Error).message}, expected PairRejected\`);
+  }
+  assert.equal(result, undefined, \`a pair the model rejects (INVALID_ARGUMENT) returned \${JSON.stringify(result)} instead of throwing PairRejected\`);
+  const calls = ctx.grpc.callsTo('Translate').length;
+  assert.equal(calls, 1, \`a rejected language pair was sent to the model \${calls} times: INVALID_ARGUMENT is a caller bug, retrying cannot change it\`);
+  ctx.grpc.fail('Translate', ctx.grpc.status.UNAVAILABLE, '', 2);
+  result = await translate(m);
+  assert.deepStrictEqual(result, {text: TRANSLATED, marker: null}, \`two UNAVAILABLE answers then a reply: translateSegment answered \${JSON.stringify(result)}, expected the translation from the third attempt\`);
+  assert.equal(ctx.grpc.callsTo('Translate').length, 4, 'UNAVAILABLE is retried: three attempts for the second segment');
+}
+
+export async function check_marked_fallback(ctx) {
+  const {m} = client(ctx);
+  ctx.grpc.fail('Translate', ctx.grpc.status.UNAVAILABLE, '', 3);
+  const result = await translate(m);
+  assert.equal(ctx.grpc.callsTo('Translate').length, 3, \`an outage got \${ctx.grpc.callsTo('Translate').length} attempts, expected 3\`);
+  assert.deepStrictEqual(result, {text: SAMPLE, marker: 'untranslated'}, \`after three UNAVAILABLE attempts translateSegment answered \${JSON.stringify(result)}: the caller cannot tell English from French. Return the source text with marker untranslated\`);
+}
+
+export async function check_no_cached_fallback(ctx) {
+  const {m, glossary} = client(ctx);
+  ctx.grpc.fail('Translate', ctx.grpc.status.UNAVAILABLE, '', 3);
+  await translate(m);
+  const key = glossary.tmKey('acme', 'en', 'fr', 2, SAMPLE);
+  assert(!ctx.redis.exists(key), \`translation memory holds \${JSON.stringify(ctx.redis.get(key))} for a segment the model never translated: it is served as French for the next hour\`);
+  const result = await translate(m);
+  assert.deepStrictEqual(result, {text: TRANSLATED, marker: null}, \`once the model recovered translateSegment answered \${JSON.stringify(result)}\`);
+  assert.equal(ctx.grpc.callsTo('Translate').length, 4, 'after the outage the next request must reach the model');
+  assert.equal(ctx.redis.get(key), TRANSLATED, \`the model's translation must be remembered under \${key}\`);
+  await translate(m);
+  assert.equal(ctx.grpc.callsTo('Translate').length, 4, 'a remembered translation is answered without a call');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "translate/gen/translation_service"
+	"translate/glossary"
+
+	"leetbuild/harness"
+)
+
+const (
+	clientSample     = "Open the Dashboard"
+	clientTranslated = "[fr] Open the Tableau de bord"
+)
+
+var (
+	clientBg = context.Background()
+	pinned   = glossary.Glossary{Version: 2, Terms: map[string]string{"Dashboard": "Tableau de bord"}}
+	served   = map[string]bool{"en": true, "fr": true, "de": true, "es": true, "ja": true, "pt": true}
+)
+
+// modelPeer answers '[target] text' with every glossary term applied; a pair it does not serve is InvalidArgument.
+type modelPeer struct {
+	pb.UnimplementedTranslatorServer
+}
+
+func (modelPeer) Translate(_ context.Context, req *pb.TranslateRequest) (*pb.TranslateReply, error) {
+	if !served[req.GetSource()] || !served[req.GetTarget()] || req.GetSource() == req.GetTarget() {
+		return nil, status.Errorf(codes.InvalidArgument, "pair %s->%s is not served", req.GetSource(), req.GetTarget())
+	}
+	text := req.GetText()
+	for _, term := range req.GetTerms() {
+		text = strings.ReplaceAll(text, term.GetSource(), term.GetTarget())
+	}
+	return &pb.TranslateReply{Text: "[" + req.GetTarget() + "] " + text, Model: "mt-2026-10"}, nil
+}
+
+func serveModel(ctx *harness.Ctx) {
+	pb.RegisterTranslatorServer(ctx.GRPC.Server(""), modelPeer{})
+}
+
+func mustTranslate(ctx *harness.Ctx, text string) Translation {
+	result, err := translateSegment(clientBg, "acme", text, "en", "fr", pinned)
+	ctx.NoError(err, "translateSegment(%q) failed", text)
+	return result
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	serveModel(ctx)
+	healthy := mustTranslate(ctx, clientSample)
+	ctx.Assert(healthy.Text == clientTranslated && healthy.Marker == "", "with the model healthy translateSegment answered %+v, expected %q", healthy, clientTranslated)
+	ctx.GRPC.SetLatency("Translate", 10.0, "")
+	result := mustTranslate(ctx, "Close the Dashboard")
+	calls := ctx.GRPC.CallsTo("Translate", "")[1:]
+	for _, call := range calls {
+		ctx.Assert(call.HasDeadline(), "a Translate call carries no deadline: a stalled model holds every request as long as it stalls")
+		ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "a Translate call carries a %v deadline, expected 2 s", call.Timeout)
+	}
+	ctx.Equal(len(calls), 3, "a model slower than the deadline must get maxAttempts = 3 attempts of 2 s; the calls")
+	ctx.Equal(result.Text, "Close the Dashboard", "a model that never answered in time; the text")
+}
+
+func CheckRetriableOnly(ctx *harness.Ctx) {
+	serveModel(ctx)
+	result, err := translateSegment(clientBg, "acme", clientSample, "en", "tlh", pinned)
+	ctx.Assert(err != nil, "a pair the model rejects (InvalidArgument) returned %+v instead of an error wrapping ErrPairRejected", result)
+	ctx.Assert(errors.Is(err, ErrPairRejected), "a pair the model rejects returned %v, expected an error wrapping ErrPairRejected", err)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 1, "a rejected language pair is a caller bug, retrying cannot change it; the calls")
+	ctx.GRPC.Fail("Translate", codes.Unavailable, "", 2, "")
+	second := mustTranslate(ctx, clientSample)
+	ctx.Assert(second.Text == clientTranslated && second.Marker == "", "two Unavailable answers then a reply: translateSegment answered %+v, expected the translation from the third attempt", second)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 4, "Unavailable is retried: three attempts for the second segment; the calls")
+}
+
+func CheckMarkedFallback(ctx *harness.Ctx) {
+	serveModel(ctx)
+	ctx.GRPC.Fail("Translate", codes.Unavailable, "", 3, "")
+	result := mustTranslate(ctx, clientSample)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 3, "an outage's attempts")
+	ctx.Assert(result.Text == clientSample && result.Marker == "untranslated", "after three Unavailable attempts translateSegment answered %+v: the caller cannot tell English from French. Return the source text with Marker untranslated", result)
+}
+
+func CheckNoCachedFallback(ctx *harness.Ctx) {
+	serveModel(ctx)
+	ctx.GRPC.Fail("Translate", codes.Unavailable, "", 3, "")
+	mustTranslate(ctx, clientSample)
+	key := glossary.TMKey("acme", "en", "fr", 2, clientSample)
+	held, _ := ctx.Redis.Get(key)
+	ctx.Assert(ctx.Redis.Exists(key) == 0, "translation memory holds %q for a segment the model never translated: it is served as French for the next hour", held)
+	result := mustTranslate(ctx, clientSample)
+	ctx.Assert(result.Text == clientTranslated && result.Marker == "", "once the model recovered translateSegment answered %+v", result)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 4, "after the outage the next request must reach the model; the calls")
+	remembered, _ := ctx.Redis.Get(key)
+	ctx.Equal(remembered, clientTranslated, "the model's translation must be remembered under %s", key)
+	mustTranslate(ctx, clientSample)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 4, "a remembered translation is answered without a call; the calls")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <set>
+#include <string>
+
+namespace {
+
+const std::string kSample = "Open the Dashboard";
+const std::string kTranslated = "[fr] Open the Tableau de bord";
+const glossary::Glossary kPinned{2, {{"Dashboard", "Tableau de bord"}}};
+
+// The model: '[target] text' with every glossary term applied; a pair it does not serve is INVALID_ARGUMENT.
+class ModelPeer final : public translationsvc::Translator::Service {
+ public:
+  grpc::Status Translate(grpc::ServerContext*, const translationsvc::TranslateRequest* req, translationsvc::TranslateReply* out) override {
+    static const std::set<std::string> served = {"en", "fr", "de", "es", "ja", "pt"};
+    if (!served.count(req->source()) || !served.count(req->target()) || req->source() == req->target()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "pair " + req->source() + "->" + req->target() + " is not served");
+    }
+    std::string text = req->text();
+    for (const auto& term : req->terms()) {
+      for (size_t at = text.find(term.source()); at != std::string::npos; at = text.find(term.source(), at + term.target().size())) {
+        text.replace(at, term.source().size(), term.target());
+      }
+    }
+    out->set_text("[" + req->target() + "] " + text);
+    out->set_model("mt-2026-10");
+    return grpc::Status::OK;
+  }
+};
+
+void serveModel(harness::Ctx& ctx) {
+  static ModelPeer* peer = nullptr;
+  delete peer;
+  peer = new ModelPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+}
+
+Translation mustTranslate(harness::Ctx& ctx, const std::string& text) {
+  try {
+    return translateSegment("acme", text, "en", "fr", kPinned);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("translateSegment(%q) threw %s: %s", text, harness::CurrentExceptionType(), e.what());
+  }
+  return {};
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  serveModel(ctx);
+  const Translation healthy = mustTranslate(ctx, kSample);
+  ctx.Assert(healthy.text == kTranslated && healthy.marker.empty(), "with the model healthy translateSegment answered %q (marker %q), expected %q", healthy.text, healthy.marker, kTranslated);
+  ctx.GRPC.SetLatency("Translate", 10.0);
+  const Translation result = mustTranslate(ctx, "Close the Dashboard");
+  auto calls = ctx.GRPC.CallsTo("Translate");
+  calls.erase(calls.begin());
+  for (const auto& call : calls) {
+    ctx.Assert(call.HasDeadline(), "a Translate call carries no deadline: a stalled model holds every request as long as it stalls");
+    ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "a Translate call carries a %v s deadline, expected kDeadline = 2 s", call.TimeoutSeconds());
+  }
+  ctx.Equal(calls.size(), 3, "a model slower than the deadline must get kMaxAttempts = 3 attempts of 2 s; the calls");
+  ctx.Equal(result.text, "Close the Dashboard", "a model that never answered in time; the text");
+}
+
+void CheckRetriableOnly(harness::Ctx& ctx) {
+  serveModel(ctx);
+  try {
+    const Translation result = translateSegment("acme", kSample, "en", "tlh", kPinned);
+    ctx.Fatalf("a pair the model rejects (INVALID_ARGUMENT) returned %q instead of throwing PairRejected", result.text);
+  } catch (const PairRejected&) {
+  } catch (const std::exception& e) {
+    ctx.Fatalf("a pair the model rejects threw %s: %s, expected PairRejected", harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 1, "a rejected language pair is a caller bug, retrying cannot change it; the calls");
+  ctx.GRPC.Fail("Translate", grpc::StatusCode::UNAVAILABLE, "", 2);
+  const Translation second = mustTranslate(ctx, kSample);
+  ctx.Assert(second.text == kTranslated && second.marker.empty(), "two UNAVAILABLE answers then a reply: translateSegment answered %q (marker %q), expected the translation from the third attempt", second.text, second.marker);
+  ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 4, "UNAVAILABLE is retried: three attempts for the second segment; the calls");
+}
+
+void CheckMarkedFallback(harness::Ctx& ctx) {
+  serveModel(ctx);
+  ctx.GRPC.Fail("Translate", grpc::StatusCode::UNAVAILABLE, "", 3);
+  const Translation result = mustTranslate(ctx, kSample);
+  ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 3, "an outage's attempts");
+  ctx.Assert(result.text == kSample && result.marker == "untranslated", "after three UNAVAILABLE attempts translateSegment answered %q (marker %q): the caller cannot tell English from French. Return the source text with marker untranslated", result.text, result.marker);
+}
+
+void CheckNoCachedFallback(harness::Ctx& ctx) {
+  serveModel(ctx);
+  ctx.GRPC.Fail("Translate", grpc::StatusCode::UNAVAILABLE, "", 3);
+  mustTranslate(ctx, kSample);
+  const std::string key = glossary::tmKey("acme", "en", "fr", 2, kSample);
+  ctx.Assert(ctx.Redis.Exists(key) == 0, "translation memory holds %q for a segment the model never translated: it is served as French for the next hour", ctx.Redis.Get(key).value_or(""));
+  const Translation result = mustTranslate(ctx, kSample);
+  ctx.Assert(result.text == kTranslated && result.marker.empty(), "once the model recovered translateSegment answered %q (marker %q)", result.text, result.marker);
+  ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 4, "after the outage the next request must reach the model; the calls");
+  ctx.Equal(ctx.Redis.Get(key), std::optional<std::string>(kTranslated), "the model's translation must be remembered under %s", key);
+  mustTranslate(ctx, kSample);
+  ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 4, "a remembered translation is answered without a call; the calls");
+}
+`,
+  },
   hints: [
-    'During the provider incident the dashboard shows zero errors: p99 sits at ten seconds, every response is a 200, and French users are reading English that translation memory keeps serving after recovery.',
-    'The loop has no attempt counter, the timeout is ten seconds, every `RpcError` lands in one catch-all that returns the source text as a success, and `remember` caches whatever came back.',
-    'Add `MT_DEADLINE_SECONDS = 2`, `MAX_MT_ATTEMPTS = 3`, retry only `RETRIABLE_CODES`, surface `UNSUPPORTED_PAIR` at once, return the fallback with `UNTRANSLATED_MARKER` and 503, and make `is_cacheable` reject it.',
+    'Slow the model to ten seconds: one request waits all ten. Ask for a pair the model does not serve: three calls, then English comes back as if it were French, and it is still served after the model recovers.',
+    'The call has no `timeout`, so it waits as long as the model; the loop catches every `RpcError` the same way; after the loop `translation` is still the source text, which goes to `tm_put` and back with no marker.',
+    'Pass `timeout=DEADLINE_S`; on `INVALID_ARGUMENT` raise `PairRejected`; `continue` only for `UNAVAILABLE`/`DEADLINE_EXCEEDED`; `tm_put` and return the reply inside the loop; after it, return `{"text": text, "marker": UNTRANSLATED}`.',
   ],
-  debrief: `The deadline is per attempt and the attempts are bounded because the worst case a user can experience has to be a number you chose, not a function of how sick the provider is. Retries are limited to codes that mean "the provider is struggling" because retrying a rejected language pair spends the budget on a bug the caller has to fix. The fallback carries a marker and a 503 because the failure has to stay visible all the way out, and \`isCacheable\` keeps it out of translation memory so a bad minute does not become a bad month. Production clients add jitter between attempts, a circuit breaker per provider, a per-locale fallback-rate counter, and an alert when the marked-fallback ratio crosses a threshold.`,
+  debrief: `The status code already says whose fault the failure is: \`INVALID_ARGUMENT\` is the caller's and a retry cannot change it, \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are the model's and may pass. The deadline turns a stalled model into one of those codes, and the attempt cap bounds the worst request at six seconds. The marker is what keeps a fallback honest end to end: the endpoint answers 503, the CDN and translation memory skip it, and the quality metric does not count it as French. Production clients add jittered backoff between attempts, a circuit breaker that stops calling a model that keeps failing, and a per-request budget shared by every segment of a document.`,
 };

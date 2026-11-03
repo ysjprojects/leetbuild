@@ -2,328 +2,275 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis pointer states with atomic stage transitions',
+  title: 'Redis stages and the active pointer in one atomic swap',
   concept: 'redis',
   file: 'state',
   focus: ['registry', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`POST /v1/models/{name}/versions/{version}/promote\`: it
-\`HSET\`s \`stage = promoted\` on the hash \`version:{name}:{version}\`, stores the pool pointer in
-a dict on the \`Registry\` object, and answers \`{"promoted": true, "pool", "version"}\`. The
-\`/active\` read answers from that dict. There is no rollback route. It compiles and
-hides five flaws.
+**Starting point.** The starter owns the serving pointers: \`promote(name, version, pool, eval_id)\`
+\`HSET\`s \`stage = promoted\` on \`model:{name}:v{n}\`, \`SET\`s \`active:{pool}\` to \`"{name}:{n}"\` and
+keeps a copy in a process-local map; \`rollback(name, version, pool)\` sets \`stage = rolled_back\`;
+\`resolve_active(pool)\` answers from the map, else from Redis. It serves the demo and hides four
+flaws.
 
-**Failure mode the checks target.** A promotion that races a rollback and half-applies, and a second
-registry instance that reports a different active version than the one that promoted.
+**Failure mode the checks target.** A rollback landing between the promote's two writes leaves the
+pool on a version marked rolled back; another registryd instance moves the pointer and this one
+keeps answering the old version; a rolled-back version keeps its traffic; and it is promoted again on
+the eval record it failed with.
 
-- The hash keeps a \`stage\` among \`staged\`, \`canary\`, \`promoted\`, \`rolled_back\`, plus the
-  registered \`eval_id\`.
-- The pool pointer is the Redis key \`active:{pool}\` holding \`"{name}:{version}"\`. No
-  process-local pointer map; \`resolve_active\` reads the pointer with \`r.get\` so every instance
-  agrees within a second.
-- Promotion runs \`PROMOTE_LUA\` through \`r.eval\`: it swaps the stage and the pointer in one script,
-  only from \`staged\` or \`canary\`, and compares the stored \`eval_id\` with the caller's so a
-  rolled-back version needs a new eval record before it can serve again.
-- Rollback runs \`ROLLBACK_LUA\`: \`stage = rolled_back\` and \`DEL active:{pool}\` in the same
-  script.
-- Key shapes and stage names stay as they are.`,
+- \`resolve_active\` reads \`active:{pool}\` from Redis every time: no process-local copy.
+- \`promote\` is **one Lua script** (\`EVAL\`, \`register_script\`): refuse a version that does not
+  exist, set \`stage = promoted\` and the pointer together, return whether it moved.
+- \`rollback\` is one script too: \`stage = rolled_back\`, and \`DEL active:{pool}\` only if the pointer
+  still holds this version.
+- A \`rolled_back\` version is promoted again only with an \`eval_id\` different from its stored one,
+  which the script records.`,
   sequence: {
-    participants: ['Model Registry', 'Second instance', 'Redis'],
+    participants: ['registryd', 'Redis', 'Other instance'],
     messages: [
-      {from: 'Model Registry', to: 'Redis', label: 'EVAL PROMOTE_LUA version:acme:v3 active:prod', kind: 'sync'},
-      {from: 'Redis', to: 'Model Registry', label: 'stage = promoted · pointer = acme:v3', kind: 'reply'},
-      {from: 'Second instance', to: 'Redis', label: 'GET active:prod', kind: 'sync'},
-      {from: 'Redis', to: 'Second instance', label: 'acme:v3 · same answer within a second', kind: 'reply'},
-      {
-        from: 'Model Registry',
-        to: 'Redis',
-        label: 'EVAL ROLLBACK_LUA · stage = rolled_back · DEL active:prod',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Model Registry', label: 'pointer cleared in the same atomic unit', kind: 'reply'},
+      {from: 'registryd', to: 'Redis', label: 'EVAL promote model:fraud:v3 active:prod "fraud:3" e-3', kind: 'sync'},
+      {from: 'Redis', to: 'registryd', label: '1 · stage promoted and pointer moved together', kind: 'reply'},
+      {from: 'Other instance', to: 'Redis', label: 'GET active:prod', kind: 'sync'},
+      {from: 'Redis', to: 'Other instance', label: 'fraud:3', kind: 'reply'},
+      {from: 'registryd', to: 'Redis', label: 'EVAL rollback · stage rolled_back · DEL if still fraud:3', kind: 'sync'},
+      {from: 'registryd', to: 'Redis', label: 'EVAL promote … e-3 → 0 · e-3b → 1', kind: 'sync'},
     ],
   },
   checks: [
     {
-      id: 'atomic-transition',
-      title: 'Swaps the stage and the pointer in one atomic script',
-      detail:
-        'A single Lua `EVAL` (`PROMOTE_LUA`) writes the stage and the pool pointer together. The starter issues two separate round trips, so a promotion racing a rollback can half-apply.',
-      match: {
-        python: {all: [/PROMOTE_LUA/, /\.eval\(/]},
-        typescript: {all: [/PROMOTE_LUA/, /\.eval\(/]},
-        go: {all: [/(promoteScript|NewScript)/, /\.Run\(/]},
-        scala: {all: [/PromoteLua/, /\.eval\(/]},
-        cpp: {all: [/kPromoteLua/, /\.eval</]},
-      },
-    },
-    {
       id: 'shared-pointer',
-      title: 'Keeps the active pointer in Redis under active:{pool}',
+      title: 'Every instance resolves the pointer from Redis',
       detail:
-        'The pointer every instance reads lives in Redis at `active:{pool}`. The starter keeps it in a process-local map, so only the instance that promoted the version sees the new pointer.',
+        '`resolve_active`/`resolveActive` reads `active:{pool}` from Redis on every call; a process-local map answers the version this instance promoted after another instance moved the pointer.',
       match: {
-        python: {all: [/active:\{pool\}/]},
-        typescript: {all: [/active:\$\{pool\}/]},
-        go: {all: [/active:"\s*\+\s*pool/]},
-        scala: {all: [/active:\$pool/]},
-        cpp: {all: [/"active:"\s*\+\s*pool/]},
+        python: {all: [/def resolve_active/, /\.get\(\s*pointer_key\(/], none: [/\bactive\[/, /\bactive\.get\(/]},
+        typescript: {all: [/function resolveActive/, /redis\.get\(\s*pointerKey\(/], none: [/\bactive\.(get|set)\(/]},
+        go: {all: [/func resolveActive/, /\.Get\([^\n]*pointerKey\(/], none: [/\bactive\[/]},
+        scala: {
+          all: [/def resolveActive/, /jedis\.get\(\s*pointerKey\(/],
+          none: [/\bactive\.get\(/, /\bactive\(pool\)/],
+        },
+        cpp: {all: [/resolveActive\(/, /redis\.get\(\s*pointerKey\(/], none: [/\bactive\[/, /\bactive\.find\(/]},
       },
     },
     {
-      id: 'no-process-cache',
-      title: 'Resolves the active version through Redis',
+      id: 'atomic-promote',
+      title: 'The stage and the pointer move in one script',
       detail:
-        '`resolve_active` reads the pointer from Redis, so all instances converge within a second. The starter answers from a per-process cache that never expires, so instances disagree indefinitely.',
+        'Promotion is one Lua script (`register_script`/`eval`, `defineCommand`, `NewScript`) that sets the stage and the pointer; separate `HSET` and `SET` round trips let a rollback land between them.',
       match: {
-        python: {all: [/resolve_active/, /r\.get\(/], none: [/self\._active|registry\._active/]},
-        typescript: {all: [/resolveActive/, /\.get\(/], none: [/processPointers/]},
-        go: {all: [/resolveActive/, /\.Get\(/], none: [/processPointers/]},
-        scala: {all: [/resolveActive/, /\.get\(/], none: [/processPointers/]},
-        cpp: {all: [/resolve_active/, /\.get\(/], none: [/process_pointers/]},
+        python: {
+          all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/],
+          none: [/\br\.set\(/, /\br\.hset\(/],
+        },
+        typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/redis\.(hset|set)\(/]},
+        go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/rdb\.(HSet|Set)\(/]},
+        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]SET['"]/], none: [/jedis\.(hset|set)\(/]},
+        cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]SET['"]/], none: [/redis\.(hset|set)\(/]},
       },
     },
     {
       id: 'rollback-clears',
-      title: 'Clears the pointer when a version is rolled back',
+      title: 'A rollback clears the pointer that still holds the version',
       detail:
-        'A rollback sets `stage = rolled_back` and deletes `active:{pool}` in the same script. The starter leaves the pointer behind, so a rolled-back version keeps receiving traffic.',
+        "The rollback script sets `stage = rolled_back` and deletes `active:{pool}` when it still holds this version (`GET` compared, then `DEL`), so traffic stops and another version's pointer is left alone.",
       match: {
-        python: {all: [/rolled_back/, /ROLLBACK_LUA/]},
-        typescript: {all: [/rolled_back/, /ROLLBACK_LUA/]},
-        go: {all: [/rolled_back/, /rollbackScript/]},
-        scala: {all: [/rolled_back/, /RollbackLua/]},
-        cpp: {all: [/rolled_back/, /kRollbackLua/]},
+        python: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
+        typescript: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
+        go: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
+        scala: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
+        cpp: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
       },
     },
     {
       id: 'new-eval-gate',
-      title: 'Requires a new eval record to re-promote after a rollback',
+      title: 'A rolled-back version needs a new eval record',
       detail:
-        'The promote script compares the version’s stored `eval_id` with the caller’s and refuses a stale one, and only promotes from `staged` or `canary`. The starter re-promotes a rolled-back version with its old eval.',
+        "The promote script reads the stage and, for `rolled_back`, compares the stored `eval_id` with the caller's: the same record is refused, a new one is recorded and promoted.",
       match: {
-        python: {all: [/eval_id/, /canary/]},
-        typescript: {all: [/eval_id/, /canary/]},
-        go: {all: [/eval_id/, /canary/]},
-        scala: {all: [/eval_id/, /canary/]},
-        cpp: {all: [/eval_id/, /canary/]},
+        python: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
+        typescript: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
+        go: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
+        scala: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
+        cpp: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import redis
-from fastapi import FastAPI
-from pydantic import BaseModel
 
-app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-
-class PromoteBody(BaseModel):
-    name: str
-    version: str
-    pool: str
-    eval_id: str
+# pool → "name:version" this instance promoted: resolve_active answers without a round trip.
+active: dict[str, str] = {}
 
 
-class Registry:
-    def __init__(self) -> None:
-        # Pointers are kept in this process so a promotion is fast to read.
-        self._active: dict[str, str] = {}
-
-
-registry = Registry()
-
-
-@app.post("/v1/models/{name}/versions/{version}/promote")
-def promote(name: str, version: str, body: PromoteBody) -> dict:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    r.hset(f"version:{name}:{version}", "stage", "promoted")
-    registry._active[body.pool] = f"{name}:{version}"
-    return {"promoted": True, "pool": body.pool, "version": version}
-
-
-@app.get("/v1/models/{name}/versions/{version}/active")
-def active(pool: str) -> dict:
-    return {"pool": pool, "version": registry._active[pool]}
-`,
-      solution: `import redis
-from fastapi import FastAPI
-from pydantic import BaseModel
-
-app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-POINTER_CACHE_MS = 1_000
-
-PROMOTE_LUA = """
-local stage = redis.call('HGET', KEYS[1], 'stage')
-if stage ~= 'staged' and stage ~= 'canary' then
-  return {0, 'bad_stage'}
-end
-if redis.call('HGET', KEYS[1], 'eval_id') ~= ARGV[1] then
-  return {0, 'stale_eval'}
-end
-redis.call('HSET', KEYS[1], 'stage', 'promoted')
-redis.call('SET', KEYS[2], ARGV[2])
-return {1, 'ok'}
-"""
-
-ROLLBACK_LUA = """
-redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
-redis.call('DEL', KEYS[2])
-return 1
-"""
-
-
-class PromoteBody(BaseModel):
-    name: str
-    version: str
-    pool: str
-    eval_id: str
+def version_key(name: str, version: int) -> str:
+    return f"model:{name}:v{version}"
 
 
 def pointer_key(pool: str) -> str:
     return f"active:{pool}"
 
 
-def promote(pool: str, name: str, version: str, eval_id: str) -> bool:
-    result = r.eval(
-        PROMOTE_LUA,
-        2,
-        f"version:{name}:{version}",
-        pointer_key(pool),
-        eval_id,
-        f"{name}:{version}",
-    )
-    return result[0] == 1
+def promote(name: str, version: int, pool: str, eval_id: str) -> bool:
+    """Make version the one pool serves; eval_id is the eval record that opened the gate."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    ref = f"{name}:{version}"
+    r.hset(version_key(name, version), "stage", "promoted")
+    r.set(pointer_key(pool), ref)
+    active[pool] = ref
+    return True
 
 
-def rollback(pool: str, name: str, version: str) -> None:
-    r.eval(ROLLBACK_LUA, 2, f"version:{name}:{version}", pointer_key(pool))
+def rollback(name: str, version: int, pool: str) -> bool:
+    """Take version out of pool; False when the version does not exist."""
+    if not r.exists(version_key(name, version)):
+        return False
+    r.hset(version_key(name, version), "stage", "rolled_back")
+    return True
 
 
 def resolve_active(pool: str) -> str | None:
-    # Read through Redis: the value may be a second old at most, never a process lifetime.
+    """The "name:version" pool serves, or None."""
+    return active.get(pool) or r.get(pointer_key(pool))
+`,
+      solution: `import redis
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+# KEYS[1] model:{name}:v{n}, KEYS[2] active:{pool}; ARGV[1] "{name}:{n}", ARGV[2] the eval record.
+# A rolled-back version serves again only on an eval record it has not failed with.
+PROMOTE_LUA = """
+local stage = redis.call('HGET', KEYS[1], 'stage')
+if not stage then return 0 end
+if stage == 'rolled_back' then
+  if redis.call('HGET', KEYS[1], 'eval_id') == ARGV[2] then return 0 end
+  redis.call('HSET', KEYS[1], 'eval_id', ARGV[2])
+end
+redis.call('HSET', KEYS[1], 'stage', 'promoted')
+redis.call('SET', KEYS[2], ARGV[1])
+return 1
+"""
+# The pointer is cleared only if it still names this version: another version's traffic stays.
+ROLLBACK_LUA = """
+if not redis.call('HGET', KEYS[1], 'stage') then return 0 end
+redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
+if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
+return 1
+"""
+promote_script = r.register_script(PROMOTE_LUA)
+rollback_script = r.register_script(ROLLBACK_LUA)
+
+
+def version_key(name: str, version: int) -> str:
+    return f"model:{name}:v{version}"
+
+
+def pointer_key(pool: str) -> str:
+    return f"active:{pool}"
+
+
+def promote(name: str, version: int, pool: str, eval_id: str) -> bool:
+    """Make version the one pool serves; eval_id is the eval record that opened the gate."""
+    return promote_script(keys=[version_key(name, version), pointer_key(pool)], args=[f"{name}:{version}", eval_id]) == 1
+
+
+def rollback(name: str, version: int, pool: str) -> bool:
+    """Take version out of pool; False when the version does not exist."""
+    return rollback_script(keys=[version_key(name, version), pointer_key(pool)], args=[f"{name}:{version}"]) == 1
+
+
+def resolve_active(pool: str) -> str | None:
+    """The "name:version" pool serves, or None."""
     return r.get(pointer_key(pool))
-
-
-@app.post("/v1/models/{name}/versions/{version}/promote")
-def promote_endpoint(name: str, version: str, body: PromoteBody) -> dict:
-    if not promote(body.pool, name, version, body.eval_id):
-        return {"promoted": False, "pool": body.pool, "reason": "eval_gate"}
-    return {"promoted": True, "pool": body.pool, "name": name, "version": version}
-
-
-@app.get("/v1/models/{name}/versions/{version}/active")
-def active(pool: str) -> dict:
-    return {"pool": pool, "version": resolve_active(pool)}
 `,
     },
     typescript: {
-      starter: `/** Promote: writes the stage and records the pool pointer. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-interface PromoteBody {
-  name: string;
-  version: string;
-  pool: string;
-  eval_id: string;
+/** pool → "name:version" this instance promoted: resolveActive answers without a round trip. */
+const active = new Map<string, string>();
+
+export const versionKey = (name: string, version: number): string => \`model:\${name}:v\${version}\`;
+export const pointerKey = (pool: string): string => \`active:\${pool}\`;
+
+/** Make version the one pool serves; evalId is the eval record that opened the gate. */
+export async function promote(name: string, version: number, pool: string, evalId: string): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const ref = \`\${name}:\${version}\`;
+  await redis.hset(versionKey(name, version), 'stage', 'promoted');
+  await redis.set(pointerKey(pool), ref);
+  active.set(pool, ref);
+  return true;
 }
 
-const processPointers: Record<string, string> = {};
+/** Take version out of pool; false when the version does not exist. */
+export async function rollback(name: string, version: number, pool: string): Promise<boolean> {
+  if ((await redis.exists(versionKey(name, version))) === 0) return false;
+  await redis.hset(versionKey(name, version), 'stage', 'rolled_back');
+  return true;
+}
 
-app.post('/v1/models/:name/versions/:version/promote', async (request, reply) => {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const {name, version} = request.params as {name: string; version: string};
-  const body = request.body as PromoteBody;
-  await r.hset(\`version:\${name}:\${version}\`, 'stage', 'promoted');
-  processPointers[body.pool] = \`\${name}:\${version}\`;
-  return reply.code(200).send({promoted: true, pool: body.pool, version});
-});
-
-app.get('/v1/models/:name/versions/:version/active', async (request, reply) => {
-  const {pool} = request.query as {pool: string};
-  return reply.code(200).send({pool, version: processPointers[pool] ?? null});
-});
+/** The "name:version" pool serves, or null. */
+export async function resolveActive(pool: string): Promise<string | null> {
+  return active.get(pool) ?? (await redis.get(pointerKey(pool)));
+}
 `,
-      solution: `/** Promote: one atomic Redis script swaps the stage and the pool pointer. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
-
-const POINTER_CACHE_MS = 1_000;
-
-const PROMOTE_LUA = \`
+/** KEYS[1] model:{name}:v{n}, KEYS[2] active:{pool}; ARGV[1] "{name}:{n}", ARGV[2] the eval record.
+ * A rolled-back version serves again only on an eval record it has not failed with. */
+export const PROMOTE_LUA = \`
 local stage = redis.call('HGET', KEYS[1], 'stage')
-if stage ~= 'staged' and stage ~= 'canary' then
-  return {0, 'bad_stage'}
-end
-if redis.call('HGET', KEYS[1], 'eval_id') ~= ARGV[1] then
-  return {0, 'stale_eval'}
+if not stage then return 0 end
+if stage == 'rolled_back' then
+  if redis.call('HGET', KEYS[1], 'eval_id') == ARGV[2] then return 0 end
+  redis.call('HSET', KEYS[1], 'eval_id', ARGV[2])
 end
 redis.call('HSET', KEYS[1], 'stage', 'promoted')
-redis.call('SET', KEYS[2], ARGV[2])
-return {1, 'ok'}
-\`;
-
-const ROLLBACK_LUA = \`
-redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
-redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[2], ARGV[1])
 return 1
 \`;
 
-interface PromoteBody {
-  name: string;
-  version: string;
-  pool: string;
-  eval_id: string;
+/** The pointer is cleared only if it still names this version: another version's traffic stays. */
+export const ROLLBACK_LUA = \`
+if not redis.call('HGET', KEYS[1], 'stage') then return 0 end
+redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
+if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
+return 1
+\`;
+
+interface PointerRedis extends Redis {
+  promoteVersion(versionKey: string, pointerKey: string, ref: string, evalId: string): Promise<number>;
+  rollbackVersion(versionKey: string, pointerKey: string, ref: string): Promise<number>;
 }
 
-function pointerKey(pool: string): string {
-  return \`active:\${pool}\`;
+const redis = new Redis({host: 'redis', port: 6379}) as PointerRedis;
+redis.defineCommand('promoteVersion', {numberOfKeys: 2, lua: PROMOTE_LUA});
+redis.defineCommand('rollbackVersion', {numberOfKeys: 2, lua: ROLLBACK_LUA});
+
+export const versionKey = (name: string, version: number): string => \`model:\${name}:v\${version}\`;
+export const pointerKey = (pool: string): string => \`active:\${pool}\`;
+
+/** Make version the one pool serves; evalId is the eval record that opened the gate. */
+export async function promote(name: string, version: number, pool: string, evalId: string): Promise<boolean> {
+  return (await redis.promoteVersion(versionKey(name, version), pointerKey(pool), \`\${name}:\${version}\`, evalId)) === 1;
 }
 
-export async function promote(pool: string, name: string, version: string, evalId: string): Promise<boolean> {
-  const result = (await r.eval(
-    PROMOTE_LUA,
-    2,
-    \`version:\${name}:\${version}\`,
-    pointerKey(pool),
-    evalId,
-    \`\${name}:\${version}\`,
-  )) as [number, string];
-  return result[0] === 1;
+/** Take version out of pool; false when the version does not exist. */
+export async function rollback(name: string, version: number, pool: string): Promise<boolean> {
+  return (await redis.rollbackVersion(versionKey(name, version), pointerKey(pool), \`\${name}:\${version}\`)) === 1;
 }
 
-export async function rollback(pool: string, name: string, version: string): Promise<void> {
-  await r.eval(ROLLBACK_LUA, 2, \`version:\${name}:\${version}\`, pointerKey(pool));
-}
-
+/** The "name:version" pool serves, or null. */
 export async function resolveActive(pool: string): Promise<string | null> {
-  // Read through Redis: the value may be a second old at most, never a process lifetime.
-  return r.get(pointerKey(pool));
+  return redis.get(pointerKey(pool));
 }
-
-app.post('/v1/models/:name/versions/:version/promote', async (request, reply) => {
-  const {name, version} = request.params as {name: string; version: string};
-  const body = request.body as PromoteBody;
-  const promoted = await promote(body.pool, name, version, body.eval_id);
-  return reply.code(200).send({promoted, pool: body.pool, name, version});
-});
-
-app.get('/v1/models/:name/versions/:version/active', async (request, reply) => {
-  const {pool} = request.query as {pool: string};
-  return reply.code(200).send({pool, version: await resolveActive(pool)});
-});
 `,
     },
     go: {
@@ -331,314 +278,621 @@ app.get('/v1/models/:name/versions/:version/active', async (request, reply) => {
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
+	"fmt"
 
 	"github.com/redis/go-redis/v9"
 )
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var processPointers = map[string]string{}
+// active maps pool → "name:version" this instance promoted: resolveActive answers without a round trip.
+var active = map[string]string{}
 
-type PromoteBody struct {
-	Name    string \`json:"name"\`
-	Version string \`json:"version"\`
-	Pool    string \`json:"pool"\`
-	EvalID  string \`json:"eval_id"\`
+func versionKey(name string, version int) string { return fmt.Sprintf("model:%s:v%d", name, version) }
+
+func pointerKey(pool string) string { return "active:" + pool }
+
+// promote makes version the one pool serves; evalID is the eval record that opened the gate.
+func promote(ctx context.Context, name string, version int, pool, evalID string) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	ref := fmt.Sprintf("%s:%d", name, version)
+	if err := rdb.HSet(ctx, versionKey(name, version), "stage", "promoted").Err(); err != nil {
+		return false, err
+	}
+	if err := rdb.Set(ctx, pointerKey(pool), ref, 0).Err(); err != nil {
+		return false, err
+	}
+	active[pool] = ref
+	return true, nil
 }
 
-func promote(rw http.ResponseWriter, r *http.Request) {
-	body := PromoteBody{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	rdb.HSet(r.Context(), "version:"+body.Name+":"+body.Version, "stage", "promoted")
-	processPointers[body.Pool] = body.Name + ":" + body.Version
-	rw.WriteHeader(http.StatusOK)
+// rollback takes version out of pool; false when the version does not exist.
+func rollback(ctx context.Context, name string, version int, pool string) (bool, error) {
+	n, err := rdb.Exists(ctx, versionKey(name, version)).Result()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	return true, rdb.HSet(ctx, versionKey(name, version), "stage", "rolled_back").Err()
 }
 
-func active(rw http.ResponseWriter, r *http.Request) {
-	pool := r.URL.Query().Get("pool")
-	json.NewEncoder(rw).Encode(map[string]any{"pool": pool, "version": processPointers[pool]})
+// resolveActive is the "name:version" pool serves, or "".
+func resolveActive(ctx context.Context, pool string) (string, error) {
+	if ref, ok := active[pool]; ok {
+		return ref, nil
+	}
+	ref, err := rdb.Get(ctx, pointerKey(pool)).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return ref, err
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
+	"fmt"
 
 	"github.com/redis/go-redis/v9"
 )
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const pointerCacheMs = 1000
-
+// KEYS[1] model:{name}:v{n}, KEYS[2] active:{pool}; ARGV[1] "{name}:{n}", ARGV[2] the eval record.
+// A rolled-back version serves again only on an eval record it has not failed with.
 var promoteScript = redis.NewScript(\`
 local stage = redis.call('HGET', KEYS[1], 'stage')
-if stage ~= 'staged' and stage ~= 'canary' then
-  return {0, 'bad_stage'}
-end
-if redis.call('HGET', KEYS[1], 'eval_id') ~= ARGV[1] then
-  return {0, 'stale_eval'}
+if not stage then return 0 end
+if stage == 'rolled_back' then
+  if redis.call('HGET', KEYS[1], 'eval_id') == ARGV[2] then return 0 end
+  redis.call('HSET', KEYS[1], 'eval_id', ARGV[2])
 end
 redis.call('HSET', KEYS[1], 'stage', 'promoted')
-redis.call('SET', KEYS[2], ARGV[2])
-return {1, 'ok'}
-\`)
-
-var rollbackScript = redis.NewScript(\`
-redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
-redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[2], ARGV[1])
 return 1
 \`)
 
-type PromoteBody struct {
-	Name    string \`json:"name"\`
-	Version string \`json:"version"\`
-	Pool    string \`json:"pool"\`
-	EvalID  string \`json:"eval_id"\`
+// The pointer is cleared only if it still names this version: another version's traffic stays.
+var rollbackScript = redis.NewScript(\`
+if not redis.call('HGET', KEYS[1], 'stage') then return 0 end
+redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
+if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
+return 1
+\`)
+
+func versionKey(name string, version int) string { return fmt.Sprintf("model:%s:v%d", name, version) }
+
+func pointerKey(pool string) string { return "active:" + pool }
+
+// promote makes version the one pool serves; evalID is the eval record that opened the gate.
+func promote(ctx context.Context, name string, version int, pool, evalID string) (bool, error) {
+	ref := fmt.Sprintf("%s:%d", name, version)
+	moved, err := promoteScript.Run(ctx, rdb, []string{versionKey(name, version), pointerKey(pool)}, ref, evalID).Int64()
+	return moved == 1, err
 }
 
-func pointerKey(pool string) string {
-	return "active:" + pool
+// rollback takes version out of pool; false when the version does not exist.
+func rollback(ctx context.Context, name string, version int, pool string) (bool, error) {
+	ref := fmt.Sprintf("%s:%d", name, version)
+	done, err := rollbackScript.Run(ctx, rdb, []string{versionKey(name, version), pointerKey(pool)}, ref).Int64()
+	return done == 1, err
 }
 
-func promote(ctx context.Context, pool, name, version, evalID string) (bool, error) {
-	result, err := promoteScript
-		.Run(ctx, rdb, []string{"version:" + name + ":" + version, pointerKey(pool)}, evalID, name+":"+version)
-		.Slice()
-	if err != nil {
-		return false, err
-	}
-	return result[0].(int64) == 1, nil
-}
-
-func rollback(ctx context.Context, pool, name, version string) error {
-	return rollbackScript.Run(ctx, rdb, []string{"version:" + name + ":" + version, pointerKey(pool)}).Err()
-}
-
+// resolveActive is the "name:version" pool serves, or "".
 func resolveActive(ctx context.Context, pool string) (string, error) {
-	return rdb.Get(ctx, pointerKey(pool)).Result()
-}
-
-func promoteHandler(rw http.ResponseWriter, r *http.Request) {
-	body := PromoteBody{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	ok, err := promote(r.Context(), body.Pool, body.Name, body.Version, body.EvalID)
-	if err != nil {
-		rw.WriteHeader(http.StatusServiceUnavailable)
-		return
+	ref, err := rdb.Get(ctx, pointerKey(pool)).Result()
+	if err == redis.Nil {
+		return "", nil
 	}
-	json.NewEncoder(rw).Encode(map[string]any{"promoted": ok, "pool": body.Pool, "version": body.Version})
-}
-
-func active(rw http.ResponseWriter, r *http.Request) {
-	pool := r.URL.Query().Get("pool")
-	version, _ := resolveActive(r.Context(), pool)
-	json.NewEncoder(rw).Encode(map[string]any{"pool": pool, "version": version})
+	return ref, err
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      starter: `import redis.clients.jedis.JedisPooled
 
-final case class PromoteBody(name: String, version: String, pool: String, eval_id: String)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-object RegistryState {
-  implicit val system: ActorSystem = ActorSystem("model-registry")
-  implicit val promoteFormat: RootJsonFormat[PromoteBody] = jsonFormat4(PromoteBody)
+  /** pool → "name:version" this instance promoted: resolveActive answers without a round trip. */
+  private val active = scala.collection.mutable.Map.empty[String, String]
 
-  val jedis = new Jedis("redis", 6379)
-  // Pointers are kept in this process so a promotion is fast to read.
-  val processPointers = scala.collection.mutable.Map.empty[String, String]
+  def versionKey(name: String, version: Long): String = s"model:$name:v$version"
+  def pointerKey(pool: String): String = s"active:$pool"
 
-  val route: Route =
-    path("v1" / "models" / Segment / "versions" / Segment / "promote") { (name, version) =>
-      post {
-        entity(as[PromoteBody]) { body =>
-          // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-          jedis.hset(s"version:$name:$version", "stage", "promoted")
-          processPointers(body.pool) = s"$name:$version"
-          complete(StatusCodes.OK, """{"promoted":true}""")
-        }
-      }
-    }
+  /** Make version the one pool serves; evalId is the eval record that opened the gate. */
+  def promote(name: String, version: Long, pool: String, evalId: String): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val ref = s"$name:$version"
+    jedis.hset(versionKey(name, version), "stage", "promoted")
+    jedis.set(pointerKey(pool), ref)
+    active(pool) = ref
+    true
+  }
+
+  /** Take version out of pool; false when the version does not exist. */
+  def rollback(name: String, version: Long, pool: String): Boolean =
+    jedis.exists(versionKey(name, version)) && { jedis.hset(versionKey(name, version), "stage", "rolled_back"); true }
+
+  /** The "name:version" pool serves, or None. */
+  def resolveActive(pool: String): Option[String] = active.get(pool).orElse(Option(jedis.get(pointerKey(pool))))
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      solution: `import redis.clients.jedis.JedisPooled
 
-final case class PromoteBody(name: String, version: String, pool: String, eval_id: String)
+import scala.jdk.CollectionConverters._
 
-object RegistryState {
-  implicit val system: ActorSystem = ActorSystem("model-registry")
-  implicit val promoteFormat: RootJsonFormat[PromoteBody] = jsonFormat4(PromoteBody)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  val PointerCacheMs = 1000L
-  val jedis = new Jedis("redis", 6379)
-
-  val PromoteLua =
-    """
-      |local stage = redis.call('HGET', KEYS[1], 'stage')
-      |if stage ~= 'staged' and stage ~= 'canary' then
-      |  return {0, 'bad_stage'}
-      |end
-      |if redis.call('HGET', KEYS[1], 'eval_id') ~= ARGV[1] then
-      |  return {0, 'stale_eval'}
+  /** KEYS[1] model:{name}:v{n}, KEYS[2] active:{pool}; ARGV[1] "{name}:{n}", ARGV[2] the eval record.
+   * A rolled-back version serves again only on an eval record it has not failed with. */
+  val PromoteLua: String =
+    """local stage = redis.call('HGET', KEYS[1], 'stage')
+      |if not stage then return 0 end
+      |if stage == 'rolled_back' then
+      |  if redis.call('HGET', KEYS[1], 'eval_id') == ARGV[2] then return 0 end
+      |  redis.call('HSET', KEYS[1], 'eval_id', ARGV[2])
       |end
       |redis.call('HSET', KEYS[1], 'stage', 'promoted')
-      |redis.call('SET', KEYS[2], ARGV[2])
-      |return {1, 'ok'}
-      |""".stripMargin
-
-  val RollbackLua =
-    """
-      |redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
-      |redis.call('DEL', KEYS[2])
+      |redis.call('SET', KEYS[2], ARGV[1])
       |return 1
       |""".stripMargin
 
+  /** The pointer is cleared only if it still names this version: another version's traffic stays. */
+  val RollbackLua: String =
+    """if not redis.call('HGET', KEYS[1], 'stage') then return 0 end
+      |redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
+      |if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
+      |return 1
+      |""".stripMargin
+
+  def versionKey(name: String, version: Long): String = s"model:$name:v$version"
   def pointerKey(pool: String): String = s"active:$pool"
 
-  def promote(pool: String, name: String, version: String, evalId: String): Boolean = {
-    val result = jedis
-      .eval(PromoteLua, 2, s"version:$name:$version", pointerKey(pool), evalId, s"$name:$version")
-      .asInstanceOf[java.util.List[AnyRef]]
-    result.get(0).toString == "1"
-  }
+  /** Make version the one pool serves; evalId is the eval record that opened the gate. */
+  def promote(name: String, version: Long, pool: String, evalId: String): Boolean =
+    jedis.eval(PromoteLua, List(versionKey(name, version), pointerKey(pool)).asJava, List(s"$name:$version", evalId).asJava).asInstanceOf[java.lang.Long] == 1L
 
-  def rollback(pool: String, name: String, version: String): Unit =
-    jedis.eval(RollbackLua, 2, s"version:$name:$version", pointerKey(pool))
+  /** Take version out of pool; false when the version does not exist. */
+  def rollback(name: String, version: Long, pool: String): Boolean =
+    jedis.eval(RollbackLua, List(versionKey(name, version), pointerKey(pool)).asJava, List(s"$name:$version").asJava).asInstanceOf[java.lang.Long] == 1L
 
-  def resolveActive(pool: String): Option[String] =
-    // Read through Redis: the value may be a second old at most, never a process lifetime.
-    Option(jedis.get(pointerKey(pool)))
-
-  val route: Route =
-    path("v1" / "models" / Segment / "versions" / Segment / "promote") { (name, version) =>
-      post {
-        entity(as[PromoteBody]) { body =>
-          val promoted = promote(body.pool, name, version, body.eval_id)
-          complete(StatusCodes.OK, s"""{"promoted":$promoted,"pool":"\${body.pool}","version":"$version"}""")
-        }
-      }
-    }
-
-  val activeRoute: Route =
-    path("v1" / "models" / Segment / "versions" / Segment / "active") { (name, version) =>
-      get {
-        parameter("pool") { pool =>
-          complete(
-            StatusCodes.OK,
-            s"""{"pool":"$pool","version":"\${resolveActive(pool).getOrElse("")}"}"""
-          )
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route ~ activeRoute)
-  }
+  /** The "name:version" pool serves, or None. */
+  def resolveActive(pool: String): Option[String] = Option(jedis.get(pointerKey(pool)))
 }
 `,
     },
     cpp: {
-      starter: `#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
 #include <map>
+#include <optional>
 #include <string>
 
-using json = nlohmann::json;
+sw::redis::Redis redis("tcp://redis:6379");
 
-std::map<std::string, std::string> process_pointers;
+// pool → "name:version" this instance promoted: resolveActive answers without a round trip.
+std::map<std::string, std::string> active;
 
-void promote(sw::redis::Redis& redis, const std::string& name, const std::string& version,
-             const std::string& pool, const std::string& eval_id) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  redis.hset("version:" + name + ":" + version, "stage", "promoted");
-  process_pointers[pool] = name + ":" + version;
+std::string versionKey(const std::string& name, long version) { return "model:" + name + ":v" + std::to_string(version); }
+std::string pointerKey(const std::string& pool) { return "active:" + pool; }
+
+// Make version the one pool serves; eval_id is the eval record that opened the gate.
+bool promote(const std::string& name, long version, const std::string& pool, const std::string& eval_id) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string ref = name + ":" + std::to_string(version);
+  redis.hset(versionKey(name, version), "stage", "promoted");
+  redis.set(pointerKey(pool), ref);
+  active[pool] = ref;
+  return true;
 }
 
-std::string resolve_active(sw::redis::Redis& redis, const std::string& pool) {
-  const auto it = process_pointers.find(pool);
-  return it == process_pointers.end() ? std::string() : it->second;
+// Take version out of pool; false when the version does not exist.
+bool rollback(const std::string& name, long version, const std::string& pool) {
+  if (!redis.exists(versionKey(name, version))) return false;
+  redis.hset(versionKey(name, version), "stage", "rolled_back");
+  return true;
+}
+
+// The "name:version" pool serves, or none.
+std::optional<std::string> resolveActive(const std::string& pool) {
+  if (const auto it = active.find(pool); it != active.end()) return it->second;
+  const auto ref = redis.get(pointerKey(pool));
+  if (!ref) return std::nullopt;
+  return *ref;
 }
 `,
       solution: `#include <sw/redis++/redis++.h>
 
+#include <optional>
 #include <string>
-#include <vector>
 
-constexpr long long kPointerCacheMs = 1000;
+sw::redis::Redis redis("tcp://redis:6379");
 
-const char* kPromoteLua = R"LUA(
+// KEYS[1] model:{name}:v{n}, KEYS[2] active:{pool}; ARGV[1] "{name}:{n}", ARGV[2] the eval record.
+// A rolled-back version serves again only on an eval record it has not failed with.
+const std::string kPromoteLua = R"lua(
 local stage = redis.call('HGET', KEYS[1], 'stage')
-if stage ~= 'staged' and stage ~= 'canary' then
-  return {0, 'bad_stage'}
-end
-if redis.call('HGET', KEYS[1], 'eval_id') ~= ARGV[1] then
-  return {0, 'stale_eval'}
+if not stage then return 0 end
+if stage == 'rolled_back' then
+  if redis.call('HGET', KEYS[1], 'eval_id') == ARGV[2] then return 0 end
+  redis.call('HSET', KEYS[1], 'eval_id', ARGV[2])
 end
 redis.call('HSET', KEYS[1], 'stage', 'promoted')
-redis.call('SET', KEYS[2], ARGV[2])
-return {1, 'ok'}
-)LUA";
-
-const char* kRollbackLua = R"LUA(
-redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
-redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[2], ARGV[1])
 return 1
-)LUA";
+)lua";
 
-std::string pointer_key(const std::string& pool) {
-  return "active:" + pool;
+// The pointer is cleared only if it still names this version: another version's traffic stays.
+const std::string kRollbackLua = R"lua(
+if not redis.call('HGET', KEYS[1], 'stage') then return 0 end
+redis.call('HSET', KEYS[1], 'stage', 'rolled_back')
+if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
+return 1
+)lua";
+
+std::string versionKey(const std::string& name, long version) { return "model:" + name + ":v" + std::to_string(version); }
+std::string pointerKey(const std::string& pool) { return "active:" + pool; }
+
+// Make version the one pool serves; eval_id is the eval record that opened the gate.
+bool promote(const std::string& name, long version, const std::string& pool, const std::string& eval_id) {
+  const std::string ref = name + ":" + std::to_string(version);
+  return redis.eval<long long>(kPromoteLua, {versionKey(name, version), pointerKey(pool)}, {ref, eval_id}) == 1;
 }
 
-bool promote(sw::redis::Redis& redis, const std::string& pool, const std::string& name,
-             const std::string& version, const std::string& eval_id) {
-  const auto result = redis.eval<std::vector<long long>>(
-      kPromoteLua,
-      {"version:" + name + ":" + version, pointer_key(pool)},
-      {eval_id, name + ":" + version});
-  return result[0] == 1;
+// Take version out of pool; false when the version does not exist.
+bool rollback(const std::string& name, long version, const std::string& pool) {
+  const std::string ref = name + ":" + std::to_string(version);
+  return redis.eval<long long>(kRollbackLua, {versionKey(name, version), pointerKey(pool)}, {ref}) == 1;
 }
 
-void rollback(sw::redis::Redis& redis, const std::string& pool, const std::string& name,
-              const std::string& version) {
-  redis.eval(kRollbackLua, {"version:" + name + ":" + version, pointer_key(pool)}, {});
-}
-
-std::string resolve_active(sw::redis::Redis& redis, const std::string& pool) {
-  // Read through Redis: the value may be a second old at most, never a process lifetime.
-  auto value = redis.get(pointer_key(pool));
-  return value ? *value : std::string();
+// The "name:version" pool serves, or none.
+std::optional<std::string> resolveActive(const std::string& pool) {
+  const auto ref = redis.get(pointerKey(pool));
+  if (!ref) return std::nullopt;
+  return *ref;
 }
 `,
     },
   },
+  harness: {
+    python: `def _state(ctx):
+    m = ctx.load("state")
+    for n in (2, 3):
+        ctx.redis.hset(
+            f"model:fraud:v{n}",
+            mapping={"name": "fraud", "version": n, "artifact_digest": f"sha256:a{n}", "training_run_id": f"r-{n}", "eval_id": f"e-{n}", "stage": "staged"},
+        )
+    return m
+
+
+def _stage(ctx, n=3):
+    return ctx.redis.hget(f"model:fraud:v{n}", "stage")
+
+
+def check_shared_pointer(ctx):
+    m = _state(ctx)
+    assert m.promote("fraud", 3, "prod", "e-3") is True, "promoting staged fraud version 3 must move the pointer"
+    assert ctx.redis.get("active:prod") == "fraud:3", f"active:prod holds {ctx.redis.get('active:prod')!r} after the promote, expected fraud:3"
+    assert m.resolve_active("prod") == "fraud:3", f"resolve_active('prod') answers {m.resolve_active('prod')!r}, expected fraud:3"
+    # Another registryd instance promotes version 2: its script moves the same key.
+    ctx.redis.set("active:prod", "fraud:2")
+    seen = m.resolve_active("prod")
+    assert seen == "fraud:2", f"another instance moved active:prod to fraud:2 and this instance still answers {seen!r}: a process-local copy of the pointer. Read active:{{pool}} from Redis"
+    ctx.redis.delete("active:prod")
+    seen = m.resolve_active("prod")
+    assert seen is None, f"active:prod was cleared and resolve_active still answers {seen!r}"
+
+
+def check_atomic_promote(ctx):
+    m = _state(ctx)
+    # An operator's rollback of version 3 lands while the promote is writing.
+    rival = ctx.redis_after("model:fraud:v3", lambda: m.rollback("fraud", 3, "prod"))
+    m.promote("fraud", 3, "prod", "e-3")
+    assert rival.fired, "the promote never touched model:fraud:v3"
+    if rival.error is not None:
+        raise rival.error
+    stage, pointer = _stage(ctx), ctx.redis.get("active:prod")
+    if stage == "promoted":
+        assert pointer == "fraud:3", f"fraud version 3 is promoted and active:prod holds {pointer!r}"
+    else:
+        assert pointer != "fraud:3", f"a rollback landed between the promote's writes: fraud version 3 is {stage} and prod still serves it. The stage and the pointer must move in one script"
+
+
+def check_rollback_clears(ctx):
+    m = _state(ctx)
+    assert m.promote("fraud", 3, "prod", "e-3") is True, "promoting staged fraud version 3 must move the pointer"
+    assert m.rollback("fraud", 2, "prod") is True, "rolling back fraud version 2 (it exists) must answer True"
+    assert ctx.redis.get("active:prod") == "fraud:3", f"rolling back version 2, which prod does not serve, left active:prod at {ctx.redis.get('active:prod')!r}: another version's traffic must stay"
+    assert m.rollback("fraud", 3, "prod") is True, "rolling back fraud version 3 must answer True"
+    assert _stage(ctx) == "rolled_back", f"fraud version 3 is {_stage(ctx)!r} after its rollback"
+    pointer = ctx.redis.get("active:prod")
+    assert pointer is None, f"active:prod still holds {pointer!r} after version 3 was rolled back: prod keeps serving the version it was taken out of"
+    assert m.resolve_active("prod") is None, f"resolve_active('prod') answers {m.resolve_active('prod')!r} after the rollback"
+    assert m.rollback("fraud", 9, "prod") is False, "rolling back a version that does not exist must answer False"
+
+
+def check_new_eval_gate(ctx):
+    m = _state(ctx)
+    assert m.promote("fraud", 3, "prod", "e-3") is True, "promoting staged fraud version 3 must move the pointer"
+    m.rollback("fraud", 3, "prod")
+    again = m.promote("fraud", 3, "prod", "e-3")
+    assert again is False and ctx.redis.get("active:prod") is None, f"a rolled-back version was promoted again on the eval record it failed with (returned {again!r}, active:prod {ctx.redis.get('active:prod')!r}): it needs a new eval record"
+    assert _stage(ctx) == "rolled_back", f"the refused promote left fraud version 3 {_stage(ctx)!r}"
+    assert m.promote("fraud", 3, "prod", "e-3b") is True, "with a new eval record the rolled-back version must be promoted"
+    assert _stage(ctx) == "promoted" and ctx.redis.hget("model:fraud:v3", "eval_id") == "e-3b", f"after the re-promotion fraud version 3 is {ctx.redis.hgetall('model:fraud:v3')}, expected promoted with eval_id e-3b"
+    assert ctx.redis.get("active:prod") == "fraud:3", f"active:prod holds {ctx.redis.get('active:prod')!r} after the re-promotion"
+    assert m.promote("fraud", 9, "prod", "e-9") is False, "promoting a version that does not exist must answer False"
+    assert ctx.redis.exists("model:fraud:v9") == 0, "promoting a missing version created model:fraud:v9"
+    assert ctx.redis.get("active:prod") == "fraud:3", f"promoting a missing version moved active:prod to {ctx.redis.get('active:prod')!r}"
+`,
+    typescript: `async function state(ctx) {
+  const m = ctx.load('state');
+  for (const n of [2, 3]) {
+    ctx.redis.hset(\`model:fraud:v\${n}\`, 'name', 'fraud', 'version', String(n), 'artifact_digest', \`sha256:a\${n}\`, 'training_run_id', \`r-\${n}\`, 'eval_id', \`e-\${n}\`, 'stage', 'staged');
+  }
+  return m;
+}
+
+const stage = (ctx, n = 3) => ctx.redis.hget(\`model:fraud:v\${n}\`, 'stage');
+
+export async function check_shared_pointer(ctx) {
+  const m = await state(ctx);
+  assert.equal(await m.promote('fraud', 3, 'prod', 'e-3'), true, 'promoting staged fraud version 3 must move the pointer');
+  assert.equal(ctx.redis.get('active:prod'), 'fraud:3', \`active:prod holds \${ctx.redis.get('active:prod')} after the promote, expected fraud:3\`);
+  assert.equal(await m.resolveActive('prod'), 'fraud:3', 'resolveActive(prod) must answer fraud:3');
+  // Another registryd instance promotes version 2: its script moves the same key.
+  ctx.redis.set('active:prod', 'fraud:2');
+  let seen = await m.resolveActive('prod');
+  assert.equal(seen, 'fraud:2', \`another instance moved active:prod to fraud:2 and this instance still answers \${seen}: a process-local copy of the pointer. Read active:{pool} from Redis\`);
+  ctx.redis.del('active:prod');
+  seen = await m.resolveActive('prod');
+  assert.equal(seen, null, \`active:prod was cleared and resolveActive still answers \${seen}\`);
+}
+
+export async function check_atomic_promote(ctx) {
+  const m = await state(ctx);
+  // An operator's rollback of version 3 lands while the promote is writing.
+  const rival = ctx.redisAfter('model:fraud:v3', () => m.rollback('fraud', 3, 'prod'));
+  await m.promote('fraud', 3, 'prod', 'e-3');
+  assert(rival.fired, 'the promote never touched model:fraud:v3');
+  if (rival.error !== undefined) throw rival.error;
+  await rival.result;
+  const s = stage(ctx);
+  const pointer = ctx.redis.get('active:prod');
+  if (s === 'promoted') assert.equal(pointer, 'fraud:3', \`fraud version 3 is promoted and active:prod holds \${pointer}\`);
+  else assert.notEqual(pointer, 'fraud:3', \`a rollback landed between the promote's writes: fraud version 3 is \${s} and prod still serves it. The stage and the pointer must move in one script\`);
+}
+
+export async function check_rollback_clears(ctx) {
+  const m = await state(ctx);
+  assert.equal(await m.promote('fraud', 3, 'prod', 'e-3'), true, 'promoting staged fraud version 3 must move the pointer');
+  assert.equal(await m.rollback('fraud', 2, 'prod'), true, 'rolling back fraud version 2 (it exists) must answer true');
+  assert.equal(ctx.redis.get('active:prod'), 'fraud:3', \`rolling back version 2, which prod does not serve, left active:prod at \${ctx.redis.get('active:prod')}: another version's traffic must stay\`);
+  assert.equal(await m.rollback('fraud', 3, 'prod'), true, 'rolling back fraud version 3 must answer true');
+  assert.equal(stage(ctx), 'rolled_back', \`fraud version 3 is \${stage(ctx)} after its rollback\`);
+  const pointer = ctx.redis.get('active:prod');
+  assert.equal(pointer, null, \`active:prod still holds \${pointer} after version 3 was rolled back: prod keeps serving the version it was taken out of\`);
+  assert.equal(await m.resolveActive('prod'), null, 'resolveActive(prod) must answer null after the rollback');
+  assert.equal(await m.rollback('fraud', 9, 'prod'), false, 'rolling back a version that does not exist must answer false');
+}
+
+export async function check_new_eval_gate(ctx) {
+  const m = await state(ctx);
+  assert.equal(await m.promote('fraud', 3, 'prod', 'e-3'), true, 'promoting staged fraud version 3 must move the pointer');
+  await m.rollback('fraud', 3, 'prod');
+  const again = await m.promote('fraud', 3, 'prod', 'e-3');
+  assert(again === false && ctx.redis.get('active:prod') === null, \`a rolled-back version was promoted again on the eval record it failed with (returned \${again}, active:prod \${ctx.redis.get('active:prod')}): it needs a new eval record\`);
+  assert.equal(stage(ctx), 'rolled_back', \`the refused promote left fraud version 3 \${stage(ctx)}\`);
+  assert.equal(await m.promote('fraud', 3, 'prod', 'e-3b'), true, 'with a new eval record the rolled-back version must be promoted');
+  assert(stage(ctx) === 'promoted' && ctx.redis.hget('model:fraud:v3', 'eval_id') === 'e-3b', \`after the re-promotion fraud version 3 is \${stage(ctx)} with eval_id \${ctx.redis.hget('model:fraud:v3', 'eval_id')}, expected promoted with e-3b\`);
+  assert.equal(ctx.redis.get('active:prod'), 'fraud:3', 'active:prod must hold fraud:3 after the re-promotion');
+  assert.equal(await m.promote('fraud', 9, 'prod', 'e-9'), false, 'promoting a version that does not exist must answer false');
+  assert.equal(ctx.redis.exists('model:fraud:v9'), 0, 'promoting a missing version created model:fraud:v9');
+  assert.equal(ctx.redis.get('active:prod'), 'fraud:3', 'promoting a missing version must leave active:prod at fraud:3');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+
+	"leetbuild/harness"
+)
+
+var stateBg = context.Background()
+
+func seedVersions(ctx *harness.Ctx) {
+	for _, n := range []int{2, 3} {
+		ctx.Redis.Do("HSET", fmt.Sprintf("model:fraud:v%d", n), "name", "fraud", "version", fmt.Sprint(n), "artifact_digest", fmt.Sprintf("sha256:a%d", n),
+			"training_run_id", fmt.Sprintf("r-%d", n), "eval_id", fmt.Sprintf("e-%d", n), "stage", "staged")
+	}
+}
+
+func stageOf(ctx *harness.Ctx, n int) string {
+	s, _ := ctx.Redis.HGet(fmt.Sprintf("model:fraud:v%d", n), "stage")
+	return s
+}
+
+func pointerOf(ctx *harness.Ctx) string {
+	p, _ := ctx.Redis.Get("active:prod")
+	return p
+}
+
+func mustPromote(ctx *harness.Ctx, version int, evalID string) bool {
+	moved, err := promote(stateBg, "fraud", version, "prod", evalID)
+	ctx.NoError(err, "promote(fraud, %d, prod, %s) failed", version, evalID)
+	return moved
+}
+
+func mustRollback(ctx *harness.Ctx, version int) bool {
+	done, err := rollback(stateBg, "fraud", version, "prod")
+	ctx.NoError(err, "rollback(fraud, %d, prod) failed", version)
+	return done
+}
+
+func mustResolve(ctx *harness.Ctx) string {
+	ref, err := resolveActive(stateBg, "prod")
+	ctx.NoError(err, "resolveActive(prod) failed")
+	return ref
+}
+
+func CheckSharedPointer(ctx *harness.Ctx) {
+	seedVersions(ctx)
+	ctx.Equal(mustPromote(ctx, 3, "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved")
+	ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the promote")
+	ctx.Equal(mustResolve(ctx), "fraud:3", "resolveActive(prod)")
+	// Another registryd instance promotes version 2: its script moves the same key.
+	ctx.Redis.Set("active:prod", "fraud:2")
+	ctx.Equal(mustResolve(ctx), "fraud:2", "another instance moved active:prod to fraud:2: a process-local copy of the pointer answers the old one. Read active:{pool} from Redis; resolveActive(prod)")
+	ctx.Redis.Del("active:prod")
+	ctx.Equal(mustResolve(ctx), "", "active:prod was cleared; resolveActive(prod)")
+}
+
+func CheckAtomicPromote(ctx *harness.Ctx) {
+	seedVersions(ctx)
+	// An operator's rollback of version 3 lands while the promote is writing.
+	rival := ctx.Redis.After("model:fraud:v3", func() any {
+		done, err := rollback(stateBg, "fraud", 3, "prod")
+		ctx.NoError(err, "the rival rollback failed")
+		return done
+	})
+	mustPromote(ctx, 3, "e-3")
+	ctx.Assert(rival.Fired, "the promote never touched model:fraud:v3")
+	ctx.Assert(rival.Err == nil, "the rival rollback failed: %v", rival.Err)
+	stage, pointer := stageOf(ctx, 3), pointerOf(ctx)
+	if stage == "promoted" {
+		ctx.Equal(pointer, "fraud:3", "fraud version 3 is promoted; active:prod")
+	} else {
+		ctx.Assert(pointer != "fraud:3", "a rollback landed between the promote's writes: fraud version 3 is %s and prod still serves it. The stage and the pointer must move in one script", stage)
+	}
+}
+
+func CheckRollbackClears(ctx *harness.Ctx) {
+	seedVersions(ctx)
+	ctx.Equal(mustPromote(ctx, 3, "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved")
+	ctx.Equal(mustRollback(ctx, 2), true, "rolling back fraud version 2 (it exists); done")
+	ctx.Equal(pointerOf(ctx), "fraud:3", "rolling back version 2, which prod does not serve, must leave another version's traffic; active:prod")
+	ctx.Equal(mustRollback(ctx, 3), true, "rolling back fraud version 3; done")
+	ctx.Equal(stageOf(ctx, 3), "rolled_back", "the stage of fraud version 3 after its rollback")
+	ctx.Equal(ctx.Redis.Exists("active:prod"), 0, "active:prod still holds fraud:3 after version 3 was rolled back: prod keeps serving the version it was taken out of; active:prod exists")
+	ctx.Equal(mustResolve(ctx), "", "resolveActive(prod) after the rollback")
+	ctx.Equal(mustRollback(ctx, 9), false, "rolling back a version that does not exist; done")
+}
+
+func CheckNewEvalGate(ctx *harness.Ctx) {
+	seedVersions(ctx)
+	ctx.Equal(mustPromote(ctx, 3, "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved")
+	mustRollback(ctx, 3)
+	again := mustPromote(ctx, 3, "e-3")
+	ctx.Assert(!again && ctx.Redis.Exists("active:prod") == 0, "a rolled-back version was promoted again on the eval record it failed with (returned %v, active:prod %q): it needs a new eval record", again, pointerOf(ctx))
+	ctx.Equal(stageOf(ctx, 3), "rolled_back", "the refused promote must leave fraud version 3 rolled back; the stage")
+	ctx.Equal(mustPromote(ctx, 3, "e-3b"), true, "with a new eval record the rolled-back version must be promoted; moved")
+	evalID, _ := ctx.Redis.HGet("model:fraud:v3", "eval_id")
+	ctx.Assert(stageOf(ctx, 3) == "promoted" && evalID == "e-3b", "after the re-promotion fraud version 3 is %s with eval_id %s, expected promoted with e-3b", stageOf(ctx, 3), evalID)
+	ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the re-promotion")
+	ctx.Equal(mustPromote(ctx, 9, "e-9"), false, "promoting a version that does not exist; moved")
+	ctx.Equal(ctx.Redis.Exists("model:fraud:v9"), 0, "promoting a missing version must not create it; model:fraud:v9 exists")
+	ctx.Equal(pointerOf(ctx), "fraud:3", "promoting a missing version must leave active:prod")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <optional>
+#include <string>
+
+namespace {
+
+void seedVersions(harness::Ctx& ctx) {
+  for (const int n : {2, 3}) {
+    const std::string s = std::to_string(n);
+    ctx.Redis.Do("HSET", "model:fraud:v" + s, "name", "fraud", "version", s, "artifact_digest", "sha256:a" + s, "training_run_id", "r-" + s,
+                 "eval_id", "e-" + s, "stage", "staged");
+  }
+}
+
+std::string stageOf(harness::Ctx& ctx, int n) { return ctx.Redis.HGet("model:fraud:v" + std::to_string(n), "stage").value_or(""); }
+std::string pointerOf(harness::Ctx& ctx) { return ctx.Redis.Get("active:prod").value_or(""); }
+
+}  // namespace
+
+void CheckSharedPointer(harness::Ctx& ctx) {
+  seedVersions(ctx);
+  ctx.Equal(promote("fraud", 3, "prod", "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved");
+  ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the promote");
+  ctx.Equal(resolveActive("prod").value_or(""), "fraud:3", "resolveActive(prod)");
+  // Another registryd instance promotes version 2: its script moves the same key.
+  ctx.Redis.Set("active:prod", "fraud:2");
+  ctx.Equal(resolveActive("prod").value_or(""), "fraud:2",
+            "another instance moved active:prod to fraud:2: a process-local copy of the pointer answers the old one. Read active:{pool} from Redis; resolveActive(prod)");
+  ctx.Redis.Del("active:prod");
+  ctx.Assert(!resolveActive("prod"), "active:prod was cleared and resolveActive(prod) still answers %s", resolveActive("prod").value_or(""));
+}
+
+void CheckAtomicPromote(harness::Ctx& ctx) {
+  seedVersions(ctx);
+  // An operator's rollback of version 3 lands while the promote is writing.
+  auto fired = std::make_shared<bool>(false);
+  auto err = std::make_shared<std::optional<std::string>>();
+  ctx.Redis.After("model:fraud:v3", [fired, err] {
+    *fired = true;
+    try {
+      rollback("fraud", 3, "prod");
+    } catch (const std::exception& e) {
+      *err = e.what();
+    }
+  });
+  promote("fraud", 3, "prod", "e-3");
+  ctx.Assert(*fired, "the promote never touched model:fraud:v3");
+  ctx.Assert(!err->has_value(), "the rival rollback failed: %s", err->value_or(""));
+  const std::string stage = stageOf(ctx, 3);
+  const std::string pointer = pointerOf(ctx);
+  if (stage == "promoted") {
+    ctx.Equal(pointer, "fraud:3", "fraud version 3 is promoted; active:prod");
+  } else {
+    ctx.Assert(pointer != "fraud:3",
+               "a rollback landed between the promote's writes: fraud version 3 is %s and prod still serves it. The stage and the pointer must move in one script", stage);
+  }
+}
+
+void CheckRollbackClears(harness::Ctx& ctx) {
+  seedVersions(ctx);
+  ctx.Equal(promote("fraud", 3, "prod", "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved");
+  ctx.Equal(rollback("fraud", 2, "prod"), true, "rolling back fraud version 2 (it exists); done");
+  ctx.Equal(pointerOf(ctx), "fraud:3", "rolling back version 2, which prod does not serve, must leave another version's traffic; active:prod");
+  ctx.Equal(rollback("fraud", 3, "prod"), true, "rolling back fraud version 3; done");
+  ctx.Equal(stageOf(ctx, 3), "rolled_back", "the stage of fraud version 3 after its rollback");
+  ctx.Equal(ctx.Redis.Exists("active:prod"), 0,
+            "active:prod still holds fraud:3 after version 3 was rolled back: prod keeps serving the version it was taken out of; active:prod exists");
+  ctx.Assert(!resolveActive("prod"), "resolveActive(prod) answers %s after the rollback", resolveActive("prod").value_or(""));
+  ctx.Equal(rollback("fraud", 9, "prod"), false, "rolling back a version that does not exist; done");
+}
+
+void CheckNewEvalGate(harness::Ctx& ctx) {
+  seedVersions(ctx);
+  ctx.Equal(promote("fraud", 3, "prod", "e-3"), true, "promoting staged fraud version 3 must move the pointer; moved");
+  rollback("fraud", 3, "prod");
+  const bool again = promote("fraud", 3, "prod", "e-3");
+  ctx.Assert(!again && ctx.Redis.Exists("active:prod") == 0,
+             "a rolled-back version was promoted again on the eval record it failed with (returned %t, active:prod %q): it needs a new eval record", again, pointerOf(ctx));
+  ctx.Equal(stageOf(ctx, 3), "rolled_back", "the refused promote must leave fraud version 3 rolled back; the stage");
+  ctx.Equal(promote("fraud", 3, "prod", "e-3b"), true, "with a new eval record the rolled-back version must be promoted; moved");
+  const std::string eval_id = ctx.Redis.HGet("model:fraud:v3", "eval_id").value_or("");
+  ctx.Assert(stageOf(ctx, 3) == "promoted" && eval_id == "e-3b", "after the re-promotion fraud version 3 is %s with eval_id %s, expected promoted with e-3b", stageOf(ctx, 3), eval_id);
+  ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the re-promotion");
+  ctx.Equal(promote("fraud", 9, "prod", "e-9"), false, "promoting a version that does not exist; moved");
+  ctx.Equal(ctx.Redis.Exists("model:fraud:v9"), 0, "promoting a missing version must not create it; model:fraud:v9 exists");
+  ctx.Equal(pointerOf(ctx), "fraud:3", "promoting a missing version must leave active:prod");
+}
+`,
+  },
   hints: [
-    'After a promotion, the instance that handled it reports the new version while the other two instances behind the load balancer still report the old one, and they keep disagreeing an hour later.',
-    'The pointer lives in `registry._active`, a dict in one process. Redis holds the stage, so the two writes also leave a window where a rollback can land between them.',
-    'Move the pointer to `active:{pool}` and do the swap in `PROMOTE_LUA` via `r.eval`, gated on `staged`/`canary` and a matching `eval_id`; `ROLLBACK_LUA` sets `rolled_back` and deletes the pointer. `resolve_active` reads `r.get`.',
+    'Promote a version on one registryd instance and roll it back on another: the first keeps answering the old version, and prod still points at the version marked rolled back.',
+    'Two round trips are two moments another client can land between, a map in one process is invisible to the others, and nothing in the rollback touches `active:{pool}` or reads the eval record.',
+    'Read `active:{pool}` with `GET` every time. One script for promote: `HGET` stage, refuse a missing version and a `rolled_back` one whose `eval_id` equals `ARGV[2]`, then `HSET` stage and `SET` the pointer. Rollback: `HSET` stage, `DEL` the pointer if it equals `ARGV[1]`.',
   ],
-  debrief: `The transition is one Lua script because Redis runs a script without interleaving other commands, so a rollback either sees the promotion whole or not at all, and the eval-id comparison rides inside the same unit as the state change. The pointer moves to Redis because the pointer is the thing every instance must agree on; a per-process map is correct on one instance and wrong on the rest. Production registries also record who promoted and when, keep a monotonic promotion sequence per pool so a late writer cannot overwrite a newer pointer, and expose the pointer through a read path whose cache key changes with it, which is the subject of the last step.`,
+  debrief: `The stage and the pointer describe one fact from two sides, so they change in one script or a reader can see them disagree. Keeping the pointer only in Redis costs a round trip per resolve and buys agreement between every instance; a cache would need invalidation, which is the problem the pointer was meant to avoid. Comparing before deleting is what lets a rollback of an idle version leave the serving one alone. Production registries keep the previous pointer value so a rollback can restore the last good version instead of leaving the pool empty, record who moved the pointer and why, and stream pointer changes so serving fleets react without polling.`,
 };

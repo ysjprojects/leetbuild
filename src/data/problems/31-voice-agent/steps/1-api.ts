@@ -5,60 +5,59 @@ export const endpointStep: Step = {
   title: 'POST /v1/voice/sessions: a session with a codec contract',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'gateway', 'sessions'],
+  focus: ['client', 'gateway', 'redis'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/voice/sessions\`, parses the body
-\`{"codec": "opus", "sample_rate": 48000, "max_duration_s": 1800}\`, reads \`X-Tenant-Id\` and hands
-back a session id, so the demo call connects. It serves the demo and hides four flaws at the trust
-boundary.
+**Starting point.** The starter serves \`POST /v1/voice/sessions\` on the session store
+(\`voice.sessions\`, provided): it reads \`X-Tenant-Id\` (falling back to \`public\`), takes
+\`{codec, sample_rate, max_duration_s}\`, turns a missing or zero duration into
+\`DEFAULT_DURATION_S\` (a day) and answers 201 with a fresh \`sessions.create(...)\` every time. It
+serves the demo call and hides four flaws.
 
-**Failure mode the checks target.** Any codec string opens a stream the media pipeline cannot
-decode; an unlimited default duration lets one stuck caller hold a stream and its GPU; a new session
-on every reconnect forks the conversation, bills it twice and splits the transcript; and an
-anonymous caller gets a session id.
+**Failure mode the checks target.** An anonymous caller gets a session; a format the media pipeline
+cannot decode is admitted and dies mid-sentence; a forgotten or huge duration holds a stream for a
+day; and a phone that reconnects on a flaky network forks the call into a second session.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`codec\` must be one of **\`opus\`**, **\`pcm16\`**, **\`g711_ulaw\`** and \`sample_rate\` must be a
-  rate the media pipeline accepts (**8000**, **16000**, **24000** or **48000**). Anything else is
-  **415 Unsupported Media Type**.
-- \`max_duration_s\` is optional and defaults to **1800** (30 minutes). It must be an integer from
-  **1** to **1800**; a longer or non-positive value is **400**.
-- \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the **live session it already created**, same \`session_id\`, same \`turn_count\`, with
-  **200**. A first create answers **201**.
-- Log the accepted session (tenant, session id, codec), not raw audio.`,
+- No \`X-Tenant-Id\`, or an empty one, is **401**, and nothing is created.
+- \`SUPPORTED_FORMATS\` maps a codec to its sample rates: \`opus\` 16000 or 48000, \`pcm16\` 16000 or
+  24000, \`g711_ulaw\` 8000. Any other pair is **415**.
+- \`max_duration_s\` defaults to \`DEFAULT_DURATION_S\` (1800) and must be 1 to \`MAX_DURATION_S\`
+  (1800); anything else is **400**.
+- \`Idempotency-Key\` is required (**400**). Look the pair up with \`sessions.find(tenant, key)\`
+  before creating: a replay answers **200** with the stored session, its \`turn_count\` included; a
+  new session answers **201** and is recorded with \`sessions.remember\`.`,
   sequence: {
     participants: ['Client', 'Voice Gateway', 'Session store'],
     messages: [
       {
         from: 'Client',
         to: 'Voice Gateway',
-        label: 'POST /v1/voice/sessions · codec · sample_rate · Idempotency-Key',
+        label: 'POST /v1/voice/sessions · X-Tenant-Id · Idempotency-Key · {codec, sample_rate}',
         kind: 'sync',
       },
-      {from: 'Voice Gateway', to: 'Voice Gateway', label: 'validate tenant · codec · duration', kind: 'sync'},
-      {from: 'Voice Gateway', to: 'Session store', label: 'get(tenant, idem_key)', kind: 'sync'},
-      {from: 'Session store', to: 'Voice Gateway', label: 'live session + turn_count / none', kind: 'reply'},
-      {from: 'Voice Gateway', to: 'Session store', label: 'put(tenant, idem_key, session)', kind: 'async'},
+      {
+        from: 'Voice Gateway',
+        to: 'Voice Gateway',
+        label: 'tenant 401 · key 400 · format 415 · duration 400',
+        kind: 'sync',
+      },
+      {from: 'Voice Gateway', to: 'Session store', label: 'find(tenant, key)', kind: 'sync'},
+      {from: 'Session store', to: 'Voice Gateway', label: 'stored session → 200', kind: 'reply'},
+      {from: 'Voice Gateway', to: 'Session store', label: 'create(…) · remember(tenant, key, id)', kind: 'sync'},
       {
         from: 'Voice Gateway',
         to: 'Client',
-        label: '201 create · 200 replay {session_id, codec, sample_rate, max_duration_s, turn_count}',
+        label: '201 {session_id, codec, sample_rate, max_duration_s, turn_count}',
         kind: 'reply',
       },
     ],
   },
-  hints: [
-    'On a flaky mobile network a caller reconnects mid-call and the agent restarts from the greeting; the bill shows two sessions for one conversation, and the transcript is split in half.',
-    'The handler mints a fresh session id on every request because it never looks at `Idempotency-Key`; the validation gaps have the same root cause, the request is trusted before anything is checked.',
-    'Guard in order: tenant 401, missing key 400, codec and rate against the supported sets 415, duration 1..1800 with default 1800 else 400; then `sessions.get((tenant, key))` and return that session with 200, else create, `sessions.put`, 201.',
-  ],
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/voice/sessions',
-      detail: 'Register the session route on `POST /v1/voice/sessions`.',
+      title: 'Registers POST /v1/voice/sessions',
+      detail:
+        'Register the session route on `POST /v1/voice/sessions`; a valid request answers 201 with the stored session.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/voice\/sessions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/voice\/sessions['"]/]},
@@ -68,68 +67,79 @@ anonymous caller gets a session id.
       },
     },
     {
-      id: 'codec',
-      title: 'Rejects an unsupported codec or sample rate with 415',
+      id: 'tenant',
+      title: 'A request without a tenant is 401',
       detail:
-        '`codec` is checked against the supported set and `sample_rate` against the rates the pipeline accepts; an unsupported pair is **415**.',
+        'The tenant is `X-Tenant-Id`; a missing or empty header answers **401** before anything is created. The starter falls back to a `public` tenant.',
       match: {
-        python: {all: [/SUPPORTED_CODECS/, /status_code\s*=\s*415/]},
-        typescript: {all: [/SUPPORTED_CODECS/, /code\(\s*415\s*\)/]},
-        go: {all: [/supportedCodecs/, /StatusUnsupportedMediaType/]},
-        scala: {all: [/SupportedCodecs/, /StatusCodes\.UnsupportedMediaType/]},
-        cpp: {all: [/kSupportedCodecs/, /\b415\b/]},
+        python: {all: [/x-tenant-id/i, /\b401\b/], none: [/["']public["']/]},
+        typescript: {all: [/x-tenant-id/i, /\b401\b/], none: [/['"]public['"]/]},
+        go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/], none: [/"public"/]},
+        scala: {all: [/X-Tenant-Id/i, /Unauthorized|\b401\b/], none: [/"public"/]},
+        cpp: {all: [/X-Tenant-Id/i, /\b401\b/], none: [/"public"/]},
+      },
+    },
+    {
+      id: 'formats',
+      title: 'A codec and sample rate outside SUPPORTED_FORMATS is 415',
+      detail:
+        '`SUPPORTED_FORMATS` maps each codec to the sample rates the media pipeline decodes; a pair that is not in it answers **415**.',
+      match: {
+        python: {all: [/SUPPORTED_FORMATS\s*=/, /\b415\b/]},
+        typescript: {all: [/SUPPORTED_FORMATS\s*[:=]/, /\b415\b/]},
+        go: {all: [/supportedFormats\s*=/, /StatusUnsupportedMediaType|\b415\b/]},
+        scala: {all: [/SupportedFormats\s*[:=]/, /UnsupportedMediaType|\b415\b/]},
+        cpp: {all: [/kSupportedFormats\s*=/, /\b415\b/]},
       },
     },
     {
       id: 'duration',
-      title: 'Caps the session at 30 minutes',
+      title: 'A session lasts at most 30 minutes, 30 by default',
       detail:
-        'The duration defaults to 1800 s and anything from 1..1800 is accepted; a longer or non-positive value is **400**.',
+        '`DEFAULT_DURATION_S` and `MAX_DURATION_S` are 1800: an omitted `max_duration_s` becomes 1800 and a value outside 1 to 1800 answers **400**. The starter defaults to a day.',
       match: {
-        python: {all: [/MAX_DURATION_S/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_DURATION_S/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxDurationS/, /StatusBadRequest/]},
-        scala: {all: [/MaxDurationS/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kMaxDurationS/, /\b400\b/]},
+        python: {all: [/MAX_DURATION_S\s*=\s*1800/, /DEFAULT_DURATION_S\s*=\s*1800/], none: [/86400/]},
+        typescript: {all: [/MAX_DURATION_S\s*=\s*1800/, /DEFAULT_DURATION_S\s*=\s*1800/], none: [/86400/]},
+        go: {all: [/maxDurationS\s*=\s*1800/, /defaultDurationS\s*=\s*1800/], none: [/86400/]},
+        scala: {all: [/MaxDurationS\s*=\s*1800/, /DefaultDurationS\s*=\s*1800/], none: [/86400/]},
+        cpp: {all: [/kMaxDurationS\s*=\s*1800/, /kDefaultDurationS\s*=\s*1800/], none: [/86400/]},
       },
     },
     {
       id: 'idempotent-resume',
-      title: 'Resumes the live session for a replayed Idempotency-Key',
+      title: 'A replayed Idempotency-Key resumes the session it created',
       detail:
-        '`Idempotency-Key` is required and `(tenant, key)` maps to the session that already exists; a replay answers 200 with the same `session_id` and its prior `turn_count`.',
+        '`Idempotency-Key` is required (400 without it) and `sessions.find(tenant, key)` runs before `sessions.create`: a replay answers 200 with the stored session, a new one is recorded with `sessions.remember`.',
       match: {
-        python: {all: [/Idempotency-Key/, /sessions\.get\(/, /sessions\.put\(/, /turn_count/]},
-        typescript: {all: [/idempotency-key/, /sessions\.get\(/, /sessions\.put\(/, /turn_count/]},
-        go: {all: [/Idempotency-Key/, /sessions\.Get\(/, /sessions\.Put\(/, /TurnCount/]},
-        scala: {all: [/Idempotency-Key/, /sessions\.get\(/, /sessions\.put\(/, /turn_count|turnCount/]},
-        cpp: {all: [/Idempotency-Key/, /sessions\.get\(/, /sessions\.put\(/, /turn_count/]},
-      },
-    },
-    {
-      id: 'tenant',
-      title: 'Authenticates the tenant with 401',
-      detail: 'The tenant comes from `X-Tenant-Id` and a missing or empty one is **401** before anything else happens.',
-      match: {
-        python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/]},
-        typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/]},
-        go: {all: [/X-Tenant-Id/, /StatusUnauthorized/]},
-        scala: {all: [/X-Tenant-Id/, /StatusCodes\.Unauthorized/]},
-        cpp: {all: [/X-Tenant-Id/, /\b401\b/]},
+        python: {
+          all: [/idempotency-key/i, /sessions\.find\(/, /sessions\.remember\(/],
+          order: [/sessions\.find\(/, /sessions\.create\(/],
+        },
+        typescript: {all: [/idempotency-key/i, /\bfind\(/, /\bremember\(/], order: [/await find\(/, /await create\(/]},
+        go: {
+          all: [/Idempotency-Key/i, /sessions\.Find\(/, /sessions\.Remember\(/],
+          order: [/sessions\.Find\(/, /sessions\.Create\(/],
+        },
+        scala: {
+          all: [/Idempotency-Key/i, /Sessions\.find\(/, /Sessions\.remember\(/],
+          order: [/Sessions\.find\(/, /Sessions\.create\(/],
+        },
+        cpp: {
+          all: [/Idempotency-Key/i, /sessions::find\(/, /sessions::remember\(/],
+          order: [/sessions::find\(/, /sessions::create\(/],
+        },
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-import uuid
-
-from fastapi import FastAPI, Header
+      starter: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from voice import sessions  # create, get, find, remember
+
 app = FastAPI()
-logger = logging.getLogger("voice-gateway")
 
 DEFAULT_DURATION_S = 86400
 
@@ -141,29 +151,23 @@ class CreateSession(BaseModel):
 
 
 @app.post("/v1/voice/sessions")
-def create_session(body: CreateSession, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    session = {
-        "session_id": f"vs_{uuid.uuid4().hex}",
-        "codec": body.codec,
-        "sample_rate": body.sample_rate,
-        "max_duration_s": body.max_duration_s if body.max_duration_s is not None else DEFAULT_DURATION_S,
-    }
-    logger.info("session open tenant=%s session=%s codec=%s", tenant, session["session_id"], body.codec)
+def create_session(body: CreateSession, request: Request) -> JSONResponse:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id") or "public"
+    duration = body.max_duration_s or DEFAULT_DURATION_S
+    session = sessions.create(tenant, body.codec, body.sample_rate, duration)
     return JSONResponse(session, status_code=201)
 `,
-      solution: `import logging
-import uuid
-
-from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("voice-gateway")
+from voice import sessions  # create, get, find, remember
 
-SUPPORTED_CODECS = {"opus", "pcm16", "g711_ulaw"}
-SUPPORTED_SAMPLE_RATES = {8000, 16000, 24000, 48000}
+app = FastAPI()
+
+# The pairs the media pipeline decodes: a sample rate means something only for its codec.
+SUPPORTED_FORMATS = {"opus": {16000, 48000}, "pcm16": {16000, 24000}, "g711_ulaw": {8000}}
 DEFAULT_DURATION_S = 1800
 MAX_DURATION_S = 1800
 
@@ -174,172 +178,85 @@ class CreateSession(BaseModel):
     max_duration_s: int | None = None
 
 
-class SessionStore:
-    """The live sessions, keyed by (tenant, Idempotency-Key): the session store service in production."""
-
-    def __init__(self) -> None:
-        self._live: dict[tuple[str, str], dict] = {}
-
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The live session stored for (tenant, idem_key), if any."""
-        return self._live.get((tenant, idem_key))
-
-    def put(self, tenant: str, idem_key: str, session: dict) -> None:
-        """Store the live session under (tenant, idem_key)."""
-        self._live[(tenant, idem_key)] = session
-
-
-sessions = SessionStore()
-
-
 @app.post("/v1/voice/sessions")
-def create_session(
-    body: CreateSession,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if idem_key is None or idem_key == "":
+def create_session(body: CreateSession, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    key = request.headers.get("idempotency-key", "")
+    if not key:
         raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if body.codec not in SUPPORTED_CODECS:
-        raise HTTPException(status_code=415, detail=f"unsupported codec {body.codec}")
-    if body.sample_rate not in SUPPORTED_SAMPLE_RATES:
-        raise HTTPException(status_code=415, detail=f"unsupported sample_rate {body.sample_rate}")
-    max_duration_s = DEFAULT_DURATION_S if body.max_duration_s is None else body.max_duration_s
-    if max_duration_s < 1 or max_duration_s > MAX_DURATION_S:
-        raise HTTPException(status_code=400, detail="max_duration_s must be 1..1800")
-
-    stored = sessions.get(tenant, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=200)
-
-    session = {
-        "session_id": f"vs_{uuid.uuid4().hex}",
-        "codec": body.codec,
-        "sample_rate": body.sample_rate,
-        "max_duration_s": max_duration_s,
-        "turn_count": 0,
-    }
-    sessions.put(tenant, idem_key, session)
-    logger.info("session open tenant=%s session=%s codec=%s", tenant, session["session_id"], body.codec)
+    if body.sample_rate not in SUPPORTED_FORMATS.get(body.codec, set()):
+        raise HTTPException(status_code=415, detail=f"unsupported audio format {body.codec} at {body.sample_rate} Hz")
+    duration = DEFAULT_DURATION_S if body.max_duration_s is None else body.max_duration_s
+    if not 1 <= duration <= MAX_DURATION_S:
+        raise HTTPException(status_code=400, detail=f"max_duration_s must be 1 to {MAX_DURATION_S}")
+    existing = sessions.find(tenant, key)
+    if existing is not None:
+        return JSONResponse(existing)  # a reconnect resumes the call it started
+    session = sessions.create(tenant, body.codec, body.sample_rate, duration)
+    sessions.remember(tenant, key, session["session_id"])
     return JSONResponse(session, status_code=201)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/voice/sessions: opens the media session the realtime speech loop runs in. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {create, find, remember} from 'voice/sessions';
 
 export const app = Fastify();
 
-const DEFAULT_DURATION_S = 86400;
+export const DEFAULT_DURATION_S = 86400;
 
-interface CreateSessionBody {
+interface CreateSession {
   codec: string;
   sample_rate: number;
-  max_duration_s?: number;
+  max_duration_s?: number | null;
 }
 
 app.post('/v1/voice/sessions', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'];
-  const body = request.body as CreateSessionBody;
-  const session = {
-    session_id: \`vs_\${randomUUID().replace(/-/g, '')}\`,
-    codec: body.codec,
-    sample_rate: body.sample_rate,
-    max_duration_s: body.max_duration_s ?? DEFAULT_DURATION_S,
-  };
-  request.log.info({tenant, session_id: session.session_id, codec: session.codec}, 'session open');
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = (request.headers['x-tenant-id'] as string | undefined) || 'public';
+  const body = request.body as CreateSession;
+  const duration = body.max_duration_s || DEFAULT_DURATION_S;
+  const session = await create(tenant, body.codec, body.sample_rate, duration);
   return reply.code(201).send(session);
 });
-
-void app.listen({port: 8444, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/voice/sessions: a codec contract, a duration cap and a resumable session. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {create, find, remember} from 'voice/sessions';
 
 export const app = Fastify();
 
-const SUPPORTED_CODECS: Record<string, true> = {opus: true, pcm16: true, g711_ulaw: true};
-const SUPPORTED_SAMPLE_RATES: Record<number, true> = {8000: true, 16000: true, 24000: true, 48000: true};
-const DEFAULT_DURATION_S = 1800;
-const MAX_DURATION_S = 1800;
+// The pairs the media pipeline decodes: a sample rate means something only for its codec.
+export const SUPPORTED_FORMATS: Record<string, number[]> = {opus: [16000, 48000], pcm16: [16000, 24000], g711_ulaw: [8000]};
+export const DEFAULT_DURATION_S = 1800;
+export const MAX_DURATION_S = 1800;
 
-interface CreateSessionBody {
+interface CreateSession {
   codec: string;
   sample_rate: number;
-  max_duration_s?: number;
+  max_duration_s?: number | null;
 }
-
-interface VoiceSession {
-  session_id: string;
-  codec: string;
-  sample_rate: number;
-  max_duration_s: number;
-  /** Turns completed so far; the turn state moves it in place. */
-  turn_count: number;
-}
-
-/** The live sessions, keyed by (tenant, Idempotency-Key): the session store service in production. */
-interface SessionStore {
-  get(tenant: string, idemKey: string): Promise<VoiceSession | null>;
-  put(tenant: string, idemKey: string, session: VoiceSession): Promise<void>;
-}
-
-const live = new Map<string, VoiceSession>();
-const sessions: SessionStore = {
-  async get(tenant, idemKey) {
-    return live.get(\`\${tenant}:\${idemKey}\`) ?? null;
-  },
-  async put(tenant, idemKey, session) {
-    live.set(\`\${tenant}:\${idemKey}\`, session);
-  },
-};
 
 app.post('/v1/voice/sessions', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<CreateSessionBody> | null;
-  if (
-    body === null ||
-    typeof body !== 'object' ||
-    typeof body.codec !== 'string' ||
-    typeof body.sample_rate !== 'number'
-  )
-    return reply.code(400).send({error: 'codec and sample_rate are required'});
-  if (SUPPORTED_CODECS[body.codec] !== true) return reply.code(415).send({error: 'unsupported codec'});
-  if (SUPPORTED_SAMPLE_RATES[body.sample_rate] !== true)
-    return reply.code(415).send({error: 'unsupported sample_rate'});
-  const maxDurationS = body.max_duration_s ?? DEFAULT_DURATION_S;
-  if (!Number.isInteger(maxDurationS) || maxDurationS < 1 || maxDurationS > MAX_DURATION_S)
-    return reply.code(400).send({error: 'max_duration_s must be 1..1800'});
-
-  const stored = await sessions.get(tenant, idemKey);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  const session: VoiceSession = {
-    session_id: \`vs_\${randomUUID().replace(/-/g, '')}\`,
-    codec: body.codec,
-    sample_rate: body.sample_rate,
-    max_duration_s: maxDurationS,
-    turn_count: 0,
-  };
-  await sessions.put(tenant, idemKey, session);
-  request.log.info({tenant, session_id: session.session_id, codec: session.codec}, 'session open');
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const body = request.body as CreateSession;
+  if (!(SUPPORTED_FORMATS[body.codec] ?? []).includes(body.sample_rate))
+    return reply.code(415).send({error: \`unsupported audio format \${body.codec} at \${body.sample_rate} Hz\`});
+  const duration = body.max_duration_s ?? DEFAULT_DURATION_S;
+  if (!Number.isInteger(duration) || duration < 1 || duration > MAX_DURATION_S)
+    return reply.code(400).send({error: \`max_duration_s must be 1 to \${MAX_DURATION_S}\`});
+  const existing = await find(tenant, key);
+  if (existing !== null) return reply.code(200).send(existing); // a reconnect resumes the call it started
+  const session = await create(tenant, body.codec, body.sample_rate, duration);
+  await remember(tenant, key, session.session_id);
   return reply.code(201).send(session);
 });
-
-void app.listen({port: 8444, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -347,313 +264,205 @@ void app.listen({port: 8444, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 
-	"github.com/google/uuid"
+	"voice/sessions" // sessions.Create, Get, Find, Remember
 )
 
 const defaultDurationS = 86400
 
-type createSessionRequest struct {
+type createSession struct {
 	Codec        string \`json:"codec"\`
 	SampleRate   int    \`json:"sample_rate"\`
-	MaxDurationS int    \`json:"max_duration_s"\`
+	MaxDurationS *int   \`json:"max_duration_s"\`
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func createSession(rw http.ResponseWriter, r *http.Request) {
+func createSessionHandler(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	var body createSessionRequest
+	if tenant == "" {
+		tenant = "public"
+	}
+	var body createSession
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "invalid body", http.StatusBadRequest)
 		return
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	maxDuration := body.MaxDurationS
-	if maxDuration == 0 {
-		maxDuration = defaultDurationS
+	duration := defaultDurationS
+	if body.MaxDurationS != nil && *body.MaxDurationS != 0 {
+		duration = *body.MaxDurationS
 	}
-	session := map[string]any{
-		"session_id":     "vs_" + uuid.NewString(),
-		"codec":          body.Codec,
-		"sample_rate":    body.SampleRate,
-		"max_duration_s": maxDuration,
-	}
-	log.Printf("session open tenant=%s session=%s codec=%s", tenant, session["session_id"], body.Codec)
+	session := sessions.Create(r.Context(), tenant, body.Codec, body.SampleRate, duration)
 	writeJSON(rw, http.StatusCreated, session)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/voice/sessions", createSession)
-	log.Fatal(http.ListenAndServeTLS(":8444", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/voice/sessions", createSessionHandler)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
-	"sync"
 
-	"github.com/google/uuid"
+	"voice/sessions" // sessions.Create, Get, Find, Remember
 )
+
+// supportedFormats are the pairs the media pipeline decodes: a sample rate means something only for its codec.
+var supportedFormats = map[string][]int{"opus": {16000, 48000}, "pcm16": {16000, 24000}, "g711_ulaw": {8000}}
 
 const (
 	defaultDurationS = 1800
 	maxDurationS     = 1800
 )
 
-var supportedCodecs = map[string]bool{"opus": true, "pcm16": true, "g711_ulaw": true}
-
-var supportedSampleRates = map[int]bool{8000: true, 16000: true, 24000: true, 48000: true}
-
-type createSessionRequest struct {
+type createSession struct {
 	Codec        string \`json:"codec"\`
 	SampleRate   int    \`json:"sample_rate"\`
-	MaxDurationS int    \`json:"max_duration_s"\`
+	MaxDurationS *int   \`json:"max_duration_s"\`
 }
 
-// voiceSession is what the client keeps for the rest of the call; TurnCount moves with the turn state.
-type voiceSession struct {
-	SessionID    string \`json:"session_id"\`
-	Codec        string \`json:"codec"\`
-	SampleRate   int    \`json:"sample_rate"\`
-	MaxDurationS int    \`json:"max_duration_s"\`
-	TurnCount    int    \`json:"turn_count"\`
-}
-
-// SessionStore holds the live sessions keyed by (tenant, Idempotency-Key): the session store
-// service in production.
-type SessionStore struct {
-	mu   sync.Mutex
-	live map[string]*voiceSession
-}
-
-func (s *SessionStore) Get(ctx context.Context, tenant, idemKey string) (*voiceSession, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.live[tenant+":"+idemKey], nil
-}
-
-func (s *SessionStore) Put(ctx context.Context, tenant, idemKey string, session *voiceSession) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.live[tenant+":"+idemKey] = session
-	return nil
-}
-
-var sessions = &SessionStore{live: map[string]*voiceSession{}}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func createSession(rw http.ResponseWriter, r *http.Request) {
+func supported(codec string, sampleRate int) bool {
+	for _, rate := range supportedFormats[codec] {
+		if rate == sampleRate {
+			return true
+		}
+	}
+	return false
+}
+
+func createSessionHandler(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		http.Error(rw, "Idempotency-Key is required", http.StatusBadRequest)
 		return
 	}
-	var body createSessionRequest
+	var body createSession
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "invalid body", http.StatusBadRequest)
 		return
 	}
-	if !supportedCodecs[body.Codec] {
-		writeJSON(rw, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported codec"})
+	if !supported(body.Codec, body.SampleRate) {
+		http.Error(rw, fmt.Sprintf("unsupported audio format %s at %d Hz", body.Codec, body.SampleRate), http.StatusUnsupportedMediaType)
 		return
 	}
-	if !supportedSampleRates[body.SampleRate] {
-		writeJSON(rw, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported sample_rate"})
+	duration := defaultDurationS
+	if body.MaxDurationS != nil {
+		duration = *body.MaxDurationS
+	}
+	if duration < 1 || duration > maxDurationS {
+		http.Error(rw, fmt.Sprintf("max_duration_s must be 1 to %d", maxDurationS), http.StatusBadRequest)
 		return
 	}
-	maxDuration := body.MaxDurationS
-	if maxDuration == 0 {
-		maxDuration = defaultDurationS
-	}
-	if maxDuration < 1 || maxDuration > maxDurationS {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "max_duration_s must be 1..1800"})
+	if existing := sessions.Find(r.Context(), tenant, key); existing != nil {
+		writeJSON(rw, http.StatusOK, existing) // a reconnect resumes the call it started
 		return
 	}
-	stored, err := sessions.Get(r.Context(), tenant, idemKey)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
-		return
-	}
-	session := &voiceSession{
-		SessionID:    "vs_" + uuid.NewString(),
-		Codec:        body.Codec,
-		SampleRate:   body.SampleRate,
-		MaxDurationS: maxDuration,
-		TurnCount:    0,
-	}
-	if err := sessions.Put(r.Context(), tenant, idemKey, session); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("session open tenant=%s session=%s codec=%s", tenant, session.SessionID, session.Codec)
+	session := sessions.Create(r.Context(), tenant, body.Codec, body.SampleRate, duration)
+	sessions.Remember(r.Context(), tenant, key, session.SessionID)
 	writeJSON(rw, http.StatusCreated, session)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/voice/sessions", createSession)
-	log.Fatal(http.ListenAndServeTLS(":8444", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/voice/sessions", createSessionHandler)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class CreateSession(codec: String, sample_rate: Int, max_duration_s: Option[Int])
-final case class VoiceSession(session_id: String, codec: String, sample_rate: Int, max_duration_s: Int)
+import voice.Sessions // Sessions.create, get, find, remember
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("voice-gateway")
-  implicit val createFormat: RootJsonFormat[CreateSession] = jsonFormat3(CreateSession)
-  implicit val sessionFormat: RootJsonFormat[VoiceSession] = jsonFormat4(VoiceSession)
-
   val DefaultDurationS = 86400
 
-  val route: Route =
-    path("v1" / "voice" / "sessions") {
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[CreateSession]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val session = VoiceSession(
-              s"vs_\${java.util.UUID.randomUUID()}",
-              body.codec,
-              body.sample_rate,
-              body.max_duration_s.getOrElse(DefaultDurationS))
-            system.log.info(s"session open tenant=$tenant session=\${session.session_id} codec=\${body.codec}")
-            complete(StatusCodes.Created, session)
-          }
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  val route: Route = path("v1" / "voice" / "sessions") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
+        entity(as[String]) { raw =>
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+          val tenant = tenantHeader.filter(_.nonEmpty).getOrElse("public")
+          val body = raw.parseJson.asJsObject.fields
+          val duration = body.get("max_duration_s").map(_.convertTo[Int]).filter(_ != 0).getOrElse(DefaultDurationS)
+          val session = Sessions.create(tenant, body("codec").convertTo[String], body("sample_rate").convertTo[Int], duration)
+          complete(json(StatusCodes.Created, session.toJson))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8444).bind(route)
   }
 }
 `,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class CreateSession(codec: String, sample_rate: Int, max_duration_s: Option[Int])
-final case class VoiceSession(
-    session_id: String,
-    codec: String,
-    sample_rate: Int,
-    max_duration_s: Int,
-    turn_count: Int)
-
-/** The live sessions, keyed by (tenant, Idempotency-Key): the session store service in production. */
-class SessionStore {
-  private val live = scala.collection.concurrent.TrieMap.empty[String, VoiceSession]
-
-  def get(tenant: String, idemKey: String): Option[VoiceSession] = live.get(s"$tenant:$idemKey")
-
-  def put(tenant: String, idemKey: String, session: VoiceSession): Unit =
-    live.put(s"$tenant:$idemKey", session)
-}
-
-object SessionStore {
-  def open(): SessionStore = new SessionStore
-}
+import voice.Sessions // Sessions.create, get, find, remember
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("voice-gateway")
-  implicit val createFormat: RootJsonFormat[CreateSession] = jsonFormat3(CreateSession)
-  implicit val sessionFormat: RootJsonFormat[VoiceSession] = jsonFormat5(VoiceSession)
-
-  val SupportedCodecs: Set[String] = Set("opus", "pcm16", "g711_ulaw")
-  val SupportedSampleRates: Set[Int] = Set(8000, 16000, 24000, 48000)
+  /** The pairs the media pipeline decodes: a sample rate means something only for its codec. */
+  val SupportedFormats: Map[String, Set[Int]] = Map("opus" -> Set(16000, 48000), "pcm16" -> Set(16000, 24000), "g711_ulaw" -> Set(8000))
   val DefaultDurationS = 1800
   val MaxDurationS = 1800
 
-  val sessions = SessionStore.open()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "voice" / "sessions") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[CreateSession]) { body =>
-              val tenant = tenantOpt.filter(_.nonEmpty)
-              val idemKey = idemOpt.filter(_.nonEmpty)
-              val maxDurationS = body.max_duration_s.getOrElse(DefaultDurationS)
-              if (tenant.isEmpty) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (idemKey.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (!SupportedCodecs.contains(body.codec)) {
-                complete(StatusCodes.UnsupportedMediaType, """{"error":"unsupported codec"}""")
-              } else if (!SupportedSampleRates.contains(body.sample_rate)) {
-                complete(StatusCodes.UnsupportedMediaType, """{"error":"unsupported sample_rate"}""")
-              } else if (maxDurationS < 1 || maxDurationS > MaxDurationS) {
-                complete(StatusCodes.BadRequest, """{"error":"max_duration_s must be 1..1800"}""")
-              } else {
-                sessions.get(tenant.get, idemKey.get) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
+  val route: Route = path("v1" / "voice" / "sessions") {
+    post {
+      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenantHeader, keyHeader) =>
+        entity(as[String]) { raw =>
+          (tenantHeader.filter(_.nonEmpty), keyHeader.filter(_.nonEmpty)) match {
+            case (None, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+            case (_, None) => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
+            case (Some(tenant), Some(key)) =>
+              val body = raw.parseJson.asJsObject.fields
+              val codec = body("codec").convertTo[String]
+              val sampleRate = body("sample_rate").convertTo[Int]
+              val duration = body.get("max_duration_s").map(_.convertTo[Int]).getOrElse(DefaultDurationS)
+              if (!SupportedFormats.get(codec).exists(_.contains(sampleRate)))
+                complete(StatusCodes.UnsupportedMediaType -> s"unsupported audio format $codec at $sampleRate Hz")
+              else if (duration < 1 || duration > MaxDurationS)
+                complete(StatusCodes.BadRequest -> s"max_duration_s must be 1 to $MaxDurationS")
+              else
+                Sessions.find(tenant, key) match {
+                  case Some(existing) => complete(json(StatusCodes.OK, existing.toJson)) // a reconnect resumes the call it started
                   case None =>
-                    val session = VoiceSession(
-                      s"vs_\${UUID.randomUUID()}",
-                      body.codec,
-                      body.sample_rate,
-                      maxDurationS,
-                      0)
-                    sessions.put(tenant.get, idemKey.get, session)
-                    system.log.info(
-                      s"session open tenant=\${tenant.get} session=\${session.session_id} codec=\${body.codec}")
-                    complete(StatusCodes.Created, session)
+                    val session = Sessions.create(tenant, codec, sampleRate, duration)
+                    Sessions.remember(tenant, key, session.sessionId)
+                    complete(json(StatusCodes.Created, session.toJson))
                 }
-              }
-            }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8444).bind(route)
   }
 }
 `,
@@ -662,146 +471,452 @@ object Api {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <string>
+
+#include "voice/sessions.h"  // sessions::create, get, find, remember
 
 using json = nlohmann::json;
 
-constexpr int kDefaultDurationS = 86400;
+const long kDefaultDurationS = 86400;
 
-std::string uuidString();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/voice/sessions", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const json session = {
-        {"session_id", "vs_" + uuidString()},
-        {"codec", body.value("codec", std::string())},
-        {"sample_rate", body.value("sample_rate", 0)},
-        {"max_duration_s", body.value("max_duration_s", kDefaultDurationS)},
-    };
-    std::cerr << "session open tenant=" << tenant << " session=" << session["session_id"]
-              << " codec=" << session["codec"] << "\\n";
-    res.status = 201;
-    res.set_content(session.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8444);
+void create_session(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) tenant = "public";
+  const json body = json::parse(req.body);
+  const long requested = body.value("max_duration_s", 0L);
+  const long duration = requested != 0 ? requested : kDefaultDurationS;
+  const sessions::Session session = sessions::create(tenant, body.value("codec", ""), body.value("sample_rate", 0L), duration);
+  res.status = 201;
+  res.set_content(sessions::toJson(session).dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/voice/sessions", create_session); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <map>
-#include <mutex>
-#include <optional>
 #include <set>
 #include <string>
 
+#include "voice/sessions.h"  // sessions::create, get, find, remember
+
 using json = nlohmann::json;
 
-const std::set<std::string> kSupportedCodecs = {"opus", "pcm16", "g711_ulaw"};
-const std::set<int> kSupportedSampleRates = {8000, 16000, 24000, 48000};
-constexpr int kDefaultDurationS = 1800;
-constexpr int kMaxDurationS = 1800;
+// The pairs the media pipeline decodes: a sample rate means something only for its codec.
+const std::map<std::string, std::set<long>> kSupportedFormats = {
+    {"opus", {16000, 48000}}, {"pcm16", {16000, 24000}}, {"g711_ulaw", {8000}}};
+const long kDefaultDurationS = 1800;
+const long kMaxDurationS = 1800;
 
-/** The live sessions, keyed by (tenant, Idempotency-Key): the session store service in production. */
-struct SessionStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey) {
-    const std::lock_guard<std::mutex> lock(mu_);
-    const auto it = live_.find(tenant + ":" + idemKey);
-    if (it == live_.end()) return std::nullopt;
-    return it->second;
-  }
-
-  void put(const std::string& tenant, const std::string& idemKey, const json& session) {
-    const std::lock_guard<std::mutex> lock(mu_);
-    live_[tenant + ":" + idemKey] = session;
-  }
-
- private:
-  std::mutex mu_;
-  std::map<std::string, json> live_;
-};
-
-SessionStore sessions;
-std::string uuidString();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/voice/sessions", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("codec") || !body["codec"].is_string() ||
-        !body.contains("sample_rate") || !body["sample_rate"].is_number_integer()) {
-      res.status = 400;
-      res.set_content(R"({"error":"codec and sample_rate are required"})", "application/json");
-      return;
-    }
-    const auto codec = body["codec"].get<std::string>();
-    const int sampleRate = body["sample_rate"].get<int>();
-    if (kSupportedCodecs.count(codec) == 0) {
-      res.status = 415;
-      res.set_content(R"({"error":"unsupported codec"})", "application/json");
-      return;
-    }
-    if (kSupportedSampleRates.count(sampleRate) == 0) {
-      res.status = 415;
-      res.set_content(R"({"error":"unsupported sample_rate"})", "application/json");
-      return;
-    }
-    const int maxDurationS = body.value("max_duration_s", kDefaultDurationS);
-    if (maxDurationS < 1 || maxDurationS > kMaxDurationS) {
-      res.status = 400;
-      res.set_content(R"({"error":"max_duration_s must be 1..1800"})", "application/json");
-      return;
-    }
-    const auto stored = sessions.get(tenant, idemKey);
-    if (stored) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    const json session = {
-        {"session_id", "vs_" + uuidString()},
-        {"codec", codec},
-        {"sample_rate", sampleRate},
-        {"max_duration_s", maxDurationS},
-        {"turn_count", 0},
-    };
-    sessions.put(tenant, idemKey, session);
-    std::cerr << "session open tenant=" << tenant << " session=" << session["session_id"] << " codec=" << codec
-              << "\\n";
-    res.status = 201;
-    res.set_content(session.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8444);
+void fail(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(message, "text/plain");
 }
+
+void create_session(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, "X-Tenant-Id is required");
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return fail(res, 400, "Idempotency-Key is required");
+  const json body = json::parse(req.body);
+  const std::string codec = body.value("codec", "");
+  const long sample_rate = body.value("sample_rate", 0L);
+  const auto format = kSupportedFormats.find(codec);
+  if (format == kSupportedFormats.end() || format->second.count(sample_rate) == 0)
+    return fail(res, 415, "unsupported audio format " + codec + " at " + std::to_string(sample_rate) + " Hz");
+  const long duration = body.contains("max_duration_s") ? body["max_duration_s"].get<long>() : kDefaultDurationS;
+  if (duration < 1 || duration > kMaxDurationS) return fail(res, 400, "max_duration_s must be 1 to 1800");
+  if (const auto existing = sessions::find(tenant, key)) {
+    res.set_content(sessions::toJson(*existing).dump(), "application/json");  // a reconnect resumes the call it started
+    return;
+  }
+  const sessions::Session session = sessions::create(tenant, codec, sample_rate, duration);
+  sessions::remember(tenant, key, session.session_id);
+  res.status = 201;
+  res.set_content(sessions::toJson(session).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/voice/sessions", create_session); }
 `,
     },
   },
-  debrief: `The fix is a handler that distrusts its input in cost order: tenant, idempotency key, codec and rate, duration, and only then state. The codec whitelist exists because the media pipeline decodes exactly \`opus\`, \`pcm16\` and \`g711_ulaw\`; any other string is a stream admitted and then killed mid-sentence after the caller was billed for it. The default duration matters as much as the cap: an omitted \`max_duration_s\` means 1800 seconds, not unbounded. Keying the resume by \`(tenant, Idempotency-Key)\` and returning the live session with its \`turn_count\` is what keeps one conversation from becoming two. Voice platforms go further: a per-tenant codec policy, session affinity so the media node that owns the stream serves the resume, and capacity accounting per node before a session is admitted.`,
+  harness: {
+    python: `from voice import sessions
+
+BODY = {"codec": "pcm16", "sample_rate": 24000}
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+def _headers(tenant="acme", key="k-1"):
+    headers = {}
+    if tenant is not None:
+        headers["X-Tenant-Id"] = tenant
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return headers
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/voice/sessions", json={**BODY, "max_duration_s": 600}, headers=_headers())
+    assert r.status_code == 201, f"POST /v1/voice/sessions answered {r.status_code}: {r.text}"
+    body = r.json()
+    stored = sessions.get(body.get("session_id", ""))
+    assert stored is not None, f"the answer names session {body.get('session_id')!r}, which the session store does not hold"
+    assert stored["tenant"] == "acme" and stored["codec"] == "pcm16" and stored["sample_rate"] == 24000, f"the stored session is {stored}, expected tenant acme, pcm16 at 24000 Hz"
+    assert body.get("max_duration_s") == 600 and body.get("turn_count") == 0, f"the answer must carry the session, got {body}"
+
+
+async def check_tenant(ctx):
+    async with _api(ctx) as c:
+        missing = await c.post("/v1/voice/sessions", json=BODY, headers=_headers(tenant=None))
+        empty = await c.post("/v1/voice/sessions", json=BODY, headers=_headers(tenant="", key="k-2"))
+    assert missing.status_code == 401, f"a request without X-Tenant-Id answered {missing.status_code}: {missing.text}. An anonymous caller must not get a session"
+    assert empty.status_code == 401, f"a request with an empty X-Tenant-Id answered {empty.status_code}, expected 401"
+    created = ctx.redis.keys("voice:session:vs-*")
+    assert created == [], f"requests without a tenant created {created}: nothing may be created before the tenant is known"
+
+
+async def check_formats(ctx):
+    async with _api(ctx) as c:
+        for codec, rate in (("flac", 44100), ("opus", 44100), ("g711_ulaw", 48000), ("pcm16", 8000)):
+            r = await c.post("/v1/voice/sessions", json={"codec": codec, "sample_rate": rate}, headers=_headers(key=f"k-{codec}-{rate}"))
+            assert r.status_code == 415, f"{codec} at {rate} Hz answered {r.status_code}, expected 415: the media pipeline cannot decode that pair"
+        for codec, rate in (("opus", 48000), ("pcm16", 16000), ("g711_ulaw", 8000)):
+            r = await c.post("/v1/voice/sessions", json={"codec": codec, "sample_rate": rate}, headers=_headers(key=f"k-{codec}-{rate}"))
+            assert r.status_code == 201, f"{codec} at {rate} Hz is a supported pair but answered {r.status_code}: {r.text}"
+
+
+async def check_duration(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/voice/sessions", json=BODY, headers=_headers())
+        assert r.status_code == 201, f"a session without max_duration_s answered {r.status_code}: {r.text}"
+        assert r.json().get("max_duration_s") == 1800, f"an omitted max_duration_s became {r.json().get('max_duration_s')}, expected the 1800 s default"
+        for value in (3600, 86400, 0, -5):
+            r = await c.post("/v1/voice/sessions", json={**BODY, "max_duration_s": value}, headers=_headers(key=f"k-{value}"))
+            assert r.status_code == 400, f"max_duration_s = {value} answered {r.status_code}, expected 400: a session lasts 1 to 1800 s"
+        r = await c.post("/v1/voice/sessions", json={**BODY, "max_duration_s": 1800}, headers=_headers(key="k-max"))
+    assert r.status_code == 201 and r.json().get("max_duration_s") == 1800, f"max_duration_s = 1800 is allowed, it answered {r.status_code} {r.text}"
+
+
+async def check_idempotent_resume(ctx):
+    async with _api(ctx) as c:
+        first = await c.post("/v1/voice/sessions", json=BODY, headers=_headers())
+        assert first.status_code == 201, f"the first create answered {first.status_code}: {first.text}"
+        session_id = first.json()["session_id"]
+        ctx.redis.hset(f"voice:session:{session_id}", "turn_count", 3)  # three turns in, the network drops
+        replay = await c.post("/v1/voice/sessions", json=BODY, headers=_headers())
+        assert replay.status_code == 200, f"a replay of Idempotency-Key k-1 answered {replay.status_code}, expected 200 with the session it created"
+        assert replay.json().get("session_id") == session_id, f"a replay forked the call: it answered {replay.json().get('session_id')}, the key created {session_id}"
+        assert replay.json().get("turn_count") == 3, f"a replay must answer the stored session (turn_count 3), got {replay.json()}"
+        other = await c.post("/v1/voice/sessions", json=BODY, headers=_headers(tenant="globex"))
+        assert other.status_code == 201 and other.json().get("session_id") != session_id, f"another tenant with the same key got {other.status_code} {other.text}: keys are scoped by tenant"
+        fresh = await c.post("/v1/voice/sessions", json=BODY, headers=_headers(key="k-2"))
+        assert fresh.status_code == 201 and fresh.json().get("session_id") != session_id, f"a new key must create a new session, got {fresh.status_code} {fresh.text}"
+        none = await c.post("/v1/voice/sessions", json=BODY, headers=_headers(key=None))
+    assert none.status_code == 400, f"a create without Idempotency-Key answered {none.status_code}, expected 400"
+`,
+    typescript: `const BODY = {codec: 'pcm16', sample_rate: 24000};
+
+function api(ctx) {
+  const m = ctx.load('api');
+  return {c: ctx.client(m.app), sessions: ctx.load('/support/voice/sessions.ts')};
+}
+
+function headers(tenant: string | null = 'acme', key: string | null = 'k-1'): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (tenant !== null) out['X-Tenant-Id'] = tenant;
+  if (key !== null) out['Idempotency-Key'] = key;
+  return out;
+}
+
+const post = (c, body, h: Record<string, string>) => c.post('/v1/voice/sessions', {json: body, headers: h});
+
+export async function check_route(ctx) {
+  const {c, sessions} = api(ctx);
+  const r = await post(c, {...BODY, max_duration_s: 600}, headers());
+  assert.equal(r.status, 201, \`POST /v1/voice/sessions answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  const stored = await sessions.get(body.session_id ?? '');
+  assert(stored !== null, \`the answer names session \${body.session_id}, which the session store does not hold\`);
+  assert(stored.tenant === 'acme' && stored.codec === 'pcm16' && stored.sample_rate === 24000, \`the stored session is \${JSON.stringify(stored)}, expected tenant acme, pcm16 at 24000 Hz\`);
+  assert(body.max_duration_s === 600 && body.turn_count === 0, \`the answer must carry the session, got \${r.text}\`);
+}
+
+export async function check_tenant(ctx) {
+  const {c} = api(ctx);
+  const missing = await post(c, BODY, headers(null));
+  const empty = await post(c, BODY, headers('', 'k-2'));
+  assert.equal(missing.status, 401, \`a request without X-Tenant-Id answered \${missing.status}: \${missing.text}. An anonymous caller must not get a session\`);
+  assert.equal(empty.status, 401, \`a request with an empty X-Tenant-Id answered \${empty.status}, expected 401\`);
+  const created = ctx.redis.keys('voice:session:vs-*');
+  assert.equal(created.length, 0, \`requests without a tenant created \${JSON.stringify(created)}: nothing may be created before the tenant is known\`);
+}
+
+export async function check_formats(ctx) {
+  const {c} = api(ctx);
+  for (const [codec, rate] of [['flac', 44100], ['opus', 44100], ['g711_ulaw', 48000], ['pcm16', 8000]] as const) {
+    const r = await post(c, {codec, sample_rate: rate}, headers('acme', \`k-\${codec}-\${rate}\`));
+    assert.equal(r.status, 415, \`\${codec} at \${rate} Hz answered \${r.status}, expected 415: the media pipeline cannot decode that pair\`);
+  }
+  for (const [codec, rate] of [['opus', 48000], ['pcm16', 16000], ['g711_ulaw', 8000]] as const) {
+    const r = await post(c, {codec, sample_rate: rate}, headers('acme', \`k-\${codec}-\${rate}\`));
+    assert.equal(r.status, 201, \`\${codec} at \${rate} Hz is a supported pair but answered \${r.status}: \${r.text}\`);
+  }
+}
+
+export async function check_duration(ctx) {
+  const {c} = api(ctx);
+  let r = await post(c, BODY, headers());
+  assert.equal(r.status, 201, \`a session without max_duration_s answered \${r.status}: \${r.text}\`);
+  assert.equal(r.json().max_duration_s, 1800, \`an omitted max_duration_s became \${r.json().max_duration_s}, expected the 1800 s default\`);
+  for (const value of [3600, 86400, 0, -5]) {
+    r = await post(c, {...BODY, max_duration_s: value}, headers('acme', \`k-\${value}\`));
+    assert.equal(r.status, 400, \`max_duration_s = \${value} answered \${r.status}, expected 400: a session lasts 1 to 1800 s\`);
+  }
+  r = await post(c, {...BODY, max_duration_s: 1800}, headers('acme', 'k-max'));
+  assert(r.status === 201 && r.json().max_duration_s === 1800, \`max_duration_s = 1800 is allowed, it answered \${r.status} \${r.text}\`);
+}
+
+export async function check_idempotent_resume(ctx) {
+  const {c} = api(ctx);
+  const first = await post(c, BODY, headers());
+  assert.equal(first.status, 201, \`the first create answered \${first.status}: \${first.text}\`);
+  const sessionId = first.json().session_id;
+  ctx.redis.hset(\`voice:session:\${sessionId}\`, 'turn_count', '3'); // three turns in, the network drops
+  const replay = await post(c, BODY, headers());
+  assert.equal(replay.status, 200, \`a replay of Idempotency-Key k-1 answered \${replay.status}, expected 200 with the session it created\`);
+  assert.equal(replay.json().session_id, sessionId, \`a replay forked the call: it answered \${replay.json().session_id}, the key created \${sessionId}\`);
+  assert.equal(replay.json().turn_count, 3, \`a replay must answer the stored session (turn_count 3), got \${replay.text}\`);
+  const other = await post(c, BODY, headers('globex'));
+  assert(other.status === 201 && other.json().session_id !== sessionId, \`another tenant with the same key got \${other.status} \${other.text}: keys are scoped by tenant\`);
+  const fresh = await post(c, BODY, headers('acme', 'k-2'));
+  assert(fresh.status === 201 && fresh.json().session_id !== sessionId, \`a new key must create a new session, got \${fresh.status} \${fresh.text}\`);
+  const none = await post(c, BODY, headers('acme', null));
+  assert.equal(none.status, 400, \`a create without Idempotency-Key answered \${none.status}, expected 400\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"voice/sessions"
+
+	"leetbuild/harness"
+)
+
+var sessionBody = map[string]any{"codec": "pcm16", "sample_rate": 24000}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+type sessionAnswer struct {
+	SessionID    string \`json:"session_id"\`
+	MaxDurationS int    \`json:"max_duration_s"\`
+	TurnCount    int    \`json:"turn_count"\`
+}
+
+func answerOf(r *harness.Response) sessionAnswer {
+	var a sessionAnswer
+	if r.Status == 200 || r.Status == 201 {
+		r.Decode(&a)
+	}
+	return a
+}
+
+func withDuration(seconds int) map[string]any {
+	return map[string]any{"codec": "pcm16", "sample_rate": 24000, "max_duration_s": seconds}
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	r := api(ctx).Post("/v1/voice/sessions", withDuration(600), "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
+	ctx.Equal(r.Status, 201, "POST /v1/voice/sessions (%s)", r.Text())
+	a := answerOf(r)
+	stored := sessions.Get(context.Background(), a.SessionID)
+	ctx.Assert(stored != nil, "the answer names session %q, which the session store does not hold", a.SessionID)
+	ctx.Assert(stored.Tenant == "acme" && stored.Codec == "pcm16" && stored.SampleRate == 24000, "the stored session is %+v, expected tenant acme, pcm16 at 24000 Hz", stored)
+	ctx.Assert(a.MaxDurationS == 600 && a.TurnCount == 0, "the answer must carry the session, got %s", r.Text())
+}
+
+func CheckTenant(ctx *harness.Ctx) {
+	c := api(ctx)
+	missing := c.Post("/v1/voice/sessions", sessionBody, "Idempotency-Key", "k-1")
+	empty := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "", "Idempotency-Key", "k-2")
+	ctx.Equal(missing.Status, 401, "a request without X-Tenant-Id (%s): an anonymous caller must not get a session; the status", missing.Text())
+	ctx.Equal(empty.Status, 401, "a request with an empty X-Tenant-Id; the status")
+	created := ctx.Redis.Keys("voice:session:vs-*")
+	ctx.Assert(len(created) == 0, "requests without a tenant created %q: nothing may be created before the tenant is known", created)
+}
+
+func CheckFormats(ctx *harness.Ctx) {
+	c := api(ctx)
+	for _, f := range []struct {
+		codec string
+		rate  int
+	}{{"flac", 44100}, {"opus", 44100}, {"g711_ulaw", 48000}, {"pcm16", 8000}} {
+		r := c.Post("/v1/voice/sessions", map[string]any{"codec": f.codec, "sample_rate": f.rate}, "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-%s-%d", f.codec, f.rate))
+		ctx.Equal(r.Status, 415, "%s at %d Hz: the media pipeline cannot decode that pair; the status", f.codec, f.rate)
+	}
+	for _, f := range []struct {
+		codec string
+		rate  int
+	}{{"opus", 48000}, {"pcm16", 16000}, {"g711_ulaw", 8000}} {
+		r := c.Post("/v1/voice/sessions", map[string]any{"codec": f.codec, "sample_rate": f.rate}, "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-%s-%d", f.codec, f.rate))
+		ctx.Equal(r.Status, 201, "%s at %d Hz is a supported pair (%s); the status", f.codec, f.rate, r.Text())
+	}
+}
+
+func CheckDuration(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
+	ctx.Equal(r.Status, 201, "a session without max_duration_s (%s)", r.Text())
+	ctx.Equal(answerOf(r).MaxDurationS, 1800, "an omitted max_duration_s must become the 1800 s default; it became")
+	for _, value := range []int{3600, 86400, 0, -5} {
+		r = c.Post("/v1/voice/sessions", withDuration(value), "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-%d", value))
+		ctx.Equal(r.Status, 400, "max_duration_s = %d: a session lasts 1 to 1800 s; the status", value)
+	}
+	r = c.Post("/v1/voice/sessions", withDuration(1800), "X-Tenant-Id", "acme", "Idempotency-Key", "k-max")
+	ctx.Assert(r.Status == 201 && answerOf(r).MaxDurationS == 1800, "max_duration_s = 1800 is allowed, it answered %d %s", r.Status, r.Text())
+}
+
+func CheckIdempotentResume(ctx *harness.Ctx) {
+	c := api(ctx)
+	first := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
+	ctx.Equal(first.Status, 201, "the first create (%s)", first.Text())
+	sessionID := answerOf(first).SessionID
+	ctx.Redis.Do("HSET", "voice:session:"+sessionID, "turn_count", 3) // three turns in, the network drops
+	replay := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
+	ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer 200 with the session it created; the status")
+	ctx.Equal(answerOf(replay).SessionID, sessionID, "a replay forked the call; the session it answered")
+	ctx.Equal(answerOf(replay).TurnCount, 3, "a replay must answer the stored session; its turn_count")
+	other := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "globex", "Idempotency-Key", "k-1")
+	ctx.Assert(other.Status == 201 && answerOf(other).SessionID != sessionID, "another tenant with the same key got %d %s: keys are scoped by tenant", other.Status, other.Text())
+	fresh := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-2")
+	ctx.Assert(fresh.Status == 201 && answerOf(fresh).SessionID != sessionID, "a new key must create a new session, got %d %s", fresh.Status, fresh.Text())
+	none := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme")
+	ctx.Equal(none.Status, 400, "a create without Idempotency-Key; the status")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+const std::string kBody = R"({"codec": "pcm16", "sample_rate": 24000})";
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response create(harness::HTTP& c, const std::string& body, const std::string& tenant, const std::string& key) {
+  return c.Post("/v1/voice/sessions", body, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
+}
+
+nlohmann::json answerOf(const harness::Response& r) {
+  return r.Status == 200 || r.Status == 201 ? nlohmann::json::parse(r.Text()) : nlohmann::json::object();
+}
+
+std::string withDuration(long seconds) {
+  return R"({"codec": "pcm16", "sample_rate": 24000, "max_duration_s": )" + std::to_string(seconds) + "}";
+}
+
+std::string format(const std::string& codec, long rate) {
+  return R"({"codec": ")" + codec + R"(", "sample_rate": )" + std::to_string(rate) + "}";
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = create(c, withDuration(600), "acme", "k-1");
+  ctx.Equal(r.Status, 201, "POST /v1/voice/sessions (%s)", r.Text());
+  const auto a = answerOf(r);
+  const auto stored = sessions::get(a.value("session_id", ""));
+  ctx.Assert(stored.has_value(), "the answer names session %q, which the session store does not hold", a.value("session_id", ""));
+  ctx.Assert(stored->tenant == "acme" && stored->codec == "pcm16" && stored->sample_rate == 24000, "the stored session is %s, expected tenant acme, pcm16 at 24000 Hz", sessions::toJson(*stored).dump());
+  ctx.Assert(a.value("max_duration_s", 0L) == 600 && a.value("turn_count", -1L) == 0, "the answer must carry the session, got %s", r.Text());
+}
+
+void CheckTenant(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto missing = c.Post("/v1/voice/sessions", kBody, "Content-Type", "application/json", "Idempotency-Key", "k-1");
+  const auto empty = create(c, kBody, "", "k-2");
+  ctx.Equal(missing.Status, 401, "a request without X-Tenant-Id (%s): an anonymous caller must not get a session; the status", missing.Text());
+  ctx.Equal(empty.Status, 401, "a request with an empty X-Tenant-Id; the status");
+  const auto created = ctx.Redis.Keys("voice:session:vs-*");
+  ctx.Assert(created.empty(), "requests without a tenant created %q: nothing may be created before the tenant is known", created);
+}
+
+void CheckFormats(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::vector<std::pair<std::string, long>> refused = {{"flac", 44100}, {"opus", 44100}, {"g711_ulaw", 48000}, {"pcm16", 8000}};
+  for (const auto& [codec, rate] : refused) {
+    const auto r = create(c, format(codec, rate), "acme", "k-" + codec + "-" + std::to_string(rate));
+    ctx.Equal(r.Status, 415, "%s at %d Hz: the media pipeline cannot decode that pair; the status", codec, rate);
+  }
+  const std::vector<std::pair<std::string, long>> accepted = {{"opus", 48000}, {"pcm16", 16000}, {"g711_ulaw", 8000}};
+  for (const auto& [codec, rate] : accepted) {
+    const auto r = create(c, format(codec, rate), "acme", "k-" + codec + "-" + std::to_string(rate));
+    ctx.Equal(r.Status, 201, "%s at %d Hz is a supported pair (%s); the status", codec, rate, r.Text());
+  }
+}
+
+void CheckDuration(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = create(c, kBody, "acme", "k-1");
+  ctx.Equal(r.Status, 201, "a session without max_duration_s (%s)", r.Text());
+  ctx.Equal(answerOf(r).value("max_duration_s", 0L), 1800, "an omitted max_duration_s must become the 1800 s default; it became");
+  for (const long value : {3600L, 86400L, 0L, -5L}) {
+    r = create(c, withDuration(value), "acme", "k-" + std::to_string(value));
+    ctx.Equal(r.Status, 400, "max_duration_s = %d: a session lasts 1 to 1800 s; the status", value);
+  }
+  r = create(c, withDuration(1800), "acme", "k-max");
+  ctx.Assert(r.Status == 201 && answerOf(r).value("max_duration_s", 0L) == 1800, "max_duration_s = 1800 is allowed, it answered %d %s", r.Status, r.Text());
+}
+
+void CheckIdempotentResume(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto first = create(c, kBody, "acme", "k-1");
+  ctx.Equal(first.Status, 201, "the first create (%s)", first.Text());
+  const std::string session_id = answerOf(first).value("session_id", "");
+  ctx.Redis.Do("HSET", "voice:session:" + session_id, "turn_count", "3");  // three turns in, the network drops
+  const auto replay = create(c, kBody, "acme", "k-1");
+  ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer 200 with the session it created; the status");
+  ctx.Equal(answerOf(replay).value("session_id", ""), session_id, "a replay forked the call; the session it answered");
+  ctx.Equal(answerOf(replay).value("turn_count", 0L), 3, "a replay must answer the stored session; its turn_count");
+  const auto other = create(c, kBody, "globex", "k-1");
+  ctx.Assert(other.Status == 201 && answerOf(other).value("session_id", "") != session_id, "another tenant with the same key got %d %s: keys are scoped by tenant", other.Status, other.Text());
+  const auto fresh = create(c, kBody, "acme", "k-2");
+  ctx.Assert(fresh.Status == 201 && answerOf(fresh).value("session_id", "") != session_id, "a new key must create a new session, got %d %s", fresh.Status, fresh.Text());
+  const auto none = c.Post("/v1/voice/sessions", kBody, "Content-Type", "application/json", "X-Tenant-Id", "acme");
+  ctx.Equal(none.Status, 400, "a create without Idempotency-Key; the status");
+}
+`,
+  },
+  hints: [
+    "A caller's phone hops from Wi-Fi to cellular and reconnects: the agent greets them again and the bill shows two sessions. A request with no tenant header, or a FLAC stream, gets a session too.",
+    'The handler trusts the request: the tenant falls back to `public`, any codec and rate pass, a missing or zero duration becomes a day, and it calls `sessions.create` without reading `Idempotency-Key`.',
+    '401 on an empty tenant, 400 without a key, 415 unless `sample_rate` is in `SUPPORTED_FORMATS[codec]`, default 1800 and 400 outside 1 to 1800; then answer `sessions.find(tenant, key)` with 200, else create, `remember`, 201.',
+  ],
+  debrief: `The guards run in cost order, each one protecting something more expensive than itself: the tenant before any state, the format before a media stream is reserved, the duration before a stream can outlive its caller. The format is a pair rather than two lists because a sample rate only means something for its codec; G.711 at 48 kHz is not a stream anyone decodes. The idempotency record is scoped by tenant, so two customers who pick the same key never share a call, and it answers the stored session, so a reconnect sees the turns the call already had. Production gateways also cap concurrent sessions per tenant, negotiate a format instead of refusing it, and close a session the media path has not touched for a while.`,
 };

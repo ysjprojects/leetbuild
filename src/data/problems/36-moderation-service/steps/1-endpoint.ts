@@ -8,37 +8,31 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/reports\` with body
-\`{"content_id": "…", "reason": "…", "detail": "…"}\`, reads the tenant from \`X-Tenant-Id\` and the
-reporter from \`X-Reporter-Id\` (either missing is **401**), and writes a case row. It compiles,
-serves the demo and hides 4 flaws.
+**Starting point.** The starter serves \`POST /v1/reports\` with body
+\`{"content_id", "reason", "detail"}\`: it reads the tenant from \`X-Tenant-Id\` and the reporter from
+\`X-Reporter-Id\` (either missing is **401**), answers **404** for content the catalogue does not know
+(\`store.content_tenant\`), and opens a case with \`store.insert_case\`, answering **201**
+\`{case_id, status: "created"}\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A report is a claim about someone else's content, so the
-endpoint is a trust boundary: the tenant must own the content, the reason must be a real reason,
-the detail must be bounded, and a repeat report is a signal on an existing case, not a new one. The
-demo only ever sends one well-formed report from the content owner, so none of this is exercised.
+**Failure mode the checks target.** A tenant opens a case against another tenant's content; a typo
+in the reason becomes a case filed under \`other\`; a detail of 3,000 accented characters slips past
+the 4 KiB cap; and a reporter who reports the same post twice opens two cases.
 
-Requirements:
-
-- \`content_id\` must resolve to content **owned by the calling tenant**: look it up in the tenant
-  catalogue and answer **404** for a foreign or unknown id.
-- \`reason\` must be one of \`spam\`, \`harassment\`, \`hate\`, \`self_harm\`, \`csam\`; anything else is
-  **400**.
-- \`detail\` is optional (default \`""\`) and at most **4096 bytes** of UTF-8; a larger detail is
-  **413**.
-- A reporter may report the same item only once: look up the reporter's case on
-  \`(tenant, content_id, reporter_id)\` and **update it** (200, \`status: "updated"\`) instead of
-  minting a second case. A genuinely new report creates a case (**201**, \`status: "created"\`).
-- Log the case id, the tenant and the content id, not the detail text, which is report content
-  about a person.`,
+- The content must belong to the calling tenant: a foreign id answers exactly as an unknown one,
+  **404**.
+- \`reason\` is one of \`ALLOWED_REASONS\` (\`spam\`, \`harassment\`, \`hate\`, \`self_harm\`, \`csam\`);
+  anything else is **400**.
+- \`detail\` (default \`""\`) is at most \`MAX_DETAIL_BYTES\` = **4096 bytes** of UTF-8; more is **413**.
+- A repeat report from the same reporter on the same content updates that case
+  (\`store.find_case\`, \`store.update_case\`) and answers **200** \`{case_id, status: "updated"}\`.`,
   sequence: {
     participants: ['Reporter', 'Moderation API', 'case store'],
     messages: [
       {from: 'Reporter', to: 'Moderation API', label: 'POST /v1/reports · X-Tenant-Id · X-Reporter-Id', kind: 'sync'},
-      {from: 'Moderation API', to: 'Moderation API', label: 'allowlisted reason · detail ≤ 4 KiB', kind: 'sync'},
-      {from: 'Moderation API', to: 'case store', label: 'find(tenant, content_id, reporter_id)', kind: 'sync'},
-      {from: 'case store', to: 'Moderation API', label: 'existing case / none', kind: 'reply'},
-      {from: 'Moderation API', to: 'case store', label: 'update(case_id) or insert(case_id)', kind: 'async'},
+      {from: 'Moderation API', to: 'case store', label: 'content_tenant(content_id) == tenant?', kind: 'sync'},
+      {from: 'Moderation API', to: 'Moderation API', label: 'ALLOWED_REASONS · detail ≤ 4096 bytes', kind: 'sync'},
+      {from: 'Moderation API', to: 'case store', label: 'find_case(tenant, content_id, reporter_id)', kind: 'sync'},
+      {from: 'Moderation API', to: 'case store', label: 'update_case(case_id) or insert_case(…)', kind: 'sync'},
       {from: 'Moderation API', to: 'Reporter', label: '201 created · 200 updated', kind: 'reply'},
     ],
   },
@@ -46,7 +40,8 @@ Requirements:
     {
       id: 'route',
       title: 'Handles POST /v1/reports',
-      detail: 'Register the report intake on `POST /v1/reports`.',
+      detail:
+        'A well-formed report from the content owner opens a case (**201**, `status: "created"`); a missing tenant or reporter header is **401**.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/reports["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/reports['"]/]},
@@ -59,118 +54,84 @@ Requirements:
       id: 'tenant-scope',
       title: 'Confines a report to content the tenant owns',
       detail:
-        'The content id is resolved against the tenant catalogue and a foreign or unknown id is **404**. The starter accepts any content id, so a tenant can report content it does not own and start a case against someone else.',
+        'The owner from `content_tenant`/`contentTenant` is compared with the caller’s tenant, and a foreign id answers exactly as an unknown one (**404**). The starter only asks whether the content exists.',
       match: {
-        python: {all: [/CONTENT_TENANTS/, /belongs_to\(/, /status_code\s*=\s*404/]},
-        typescript: {all: [/CONTENT_TENANTS/, /belongsTo\(/, /code\(\s*404\s*\)/]},
-        go: {all: [/contentTenants/, /belongsTo\(/, /StatusNotFound/]},
-        scala: {all: [/ContentTenants/, /belongsTo\(/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/kContentTenants/, /belongsTo\(/, /\b404\b/]},
+        python: {all: [/content_tenant\(/, /[!=]=\s*tenant\b/]},
+        typescript: {all: [/contentTenant\(/, /[!=]==?\s*tenant\b/]},
+        go: {all: [/store\.ContentTenant\(/, /[!=]=\s*tenant\b/]},
+        scala: {all: [/Store\.contentTenant\(/, /contains\(tenant\)|[!=]=\s*(Some\()?tenant\b/]},
+        cpp: {all: [/store::contentTenant\(/, /[!=]=\s*tenant\b/]},
       },
     },
     {
       id: 'reason-allowlist',
       title: 'Rejects a reason outside the allowlist',
-      detail:
-        'Only `spam`, `harassment`, `hate`, `self_harm` and `csam` are accepted; anything else is **400**. The starter maps an unknown reason to `other`, so a typo becomes a real moderation case with no rule behind it.',
+      detail: 'A reason outside `ALLOWED_REASONS` is **400** and opens nothing; the starter files it under `other`.',
       match: {
-        python: {all: [/ALLOWED_REASONS/, /status_code\s*=\s*400/]},
-        typescript: {all: [/ALLOWED_REASONS/, /code\(\s*400\s*\)/]},
-        go: {all: [/allowedReasons/, /StatusBadRequest/]},
-        scala: {all: [/AllowedReasons/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kAllowedReasons/, /\b400\b/]},
+        python: {all: [/ALLOWED_REASONS/, /status_code\s*=\s*400/], none: [/["']other["']/]},
+        typescript: {all: [/ALLOWED_REASONS/, /code\(\s*400\s*\)/], none: [/['"]other['"]/]},
+        go: {all: [/allowedReasons/, /StatusBadRequest|\b400\b/], none: [/"other"/]},
+        scala: {all: [/AllowedReasons/, /BadRequest/], none: [/"other"/]},
+        cpp: {all: [/kAllowedReasons/, /\b400\b/], none: [/"other"/]},
       },
     },
     {
-      id: 'detail-cap',
-      title: 'Caps the optional detail at 4 KiB',
+      id: 'detail-bytes',
+      title: 'Caps the detail at 4096 bytes of UTF-8',
       detail:
-        'A `detail` longer than **4096 bytes** is **413**. The starter never measures it, so one report can push an unbounded and highly personal free-text field into the case store and every downstream record.',
+        'The detail is measured in UTF-8 bytes against `MAX_DETAIL_BYTES` and a larger one is **413**; the starter counts characters, so accented or emoji text passes at twice to four times the cap.',
       match: {
-        python: {all: [/MAX_DETAIL_BYTES/, /status_code\s*=\s*413/]},
-        typescript: {all: [/MAX_DETAIL_BYTES/, /code\(\s*413\s*\)/]},
-        go: {all: [/maxDetailBytes/, /StatusRequestEntityTooLarge/]},
-        scala: {all: [/MaxDetailBytes/, /StatusCodes\.RequestEntityTooLarge/]},
-        cpp: {all: [/kMaxDetailBytes/, /\b413\b/]},
+        python: {all: [/MAX_DETAIL_BYTES/, /len\([^)\n]*\.encode\(/], none: [/len\(body\.detail\)\s*>/]},
+        typescript: {
+          all: [/MAX_DETAIL_BYTES/, /Buffer\.byteLength\(|TextEncoder\(\)\.encode\(/],
+          none: [/detail\.length\s*>/],
+        },
+        go: {all: [/len\(body\.Detail\)\s*>\s*maxDetailBytes/], none: [/RuneCountInString/]},
+        scala: {all: [/MaxDetailBytes/, /getBytes\(/], none: [/detail\.length\s*>/]},
+        cpp: {all: [/detail\.(size|length)\(\)\s*>\s*kMaxDetailBytes/], none: [/characters\(/]},
       },
     },
     {
       id: 'dedupe',
-      title: 'Updates the reporter’s existing case instead of creating a second',
+      title: 'Updates the reporter’s existing case instead of opening a second',
       detail:
-        'The lookup on `(tenant, content_id, reporter_id)` runs first; a hit updates that case and answers `status: "updated"`, a miss inserts and answers `status: "created"`. The starter always inserts, so a reporter who reports twice creates two cases for one item.',
+        'The reporter’s case on the content is looked up first (`find_case`/`findCase`); a hit is updated (`update_case`/`updateCase`) and answers **200** `status: "updated"`, a miss inserts. The starter always inserts.',
       match: {
-        python: {all: [/cases\.find\(/, /cases\.update\(/, /"updated"/]},
-        typescript: {all: [/cases\.find\(/, /cases\.update\(/, /'updated'/]},
-        go: {all: [/cases\.Find\(/, /cases\.Update\(/, /"updated"/]},
-        scala: {all: [/cases\.find\(/, /cases\.update\(/, /"updated"/]},
-        cpp: {all: [/cases\.find\(/, /cases\.update\(/, /"updated"/]},
+        python: {
+          all: [/store\.find_case\(/, /store\.update_case\(/, /["']updated["']/],
+          order: [/store\.find_case\(/, /store\.insert_case\(/],
+        },
+        typescript: {
+          all: [/findCase\(/, /updateCase\(/, /['"]updated['"]/],
+          order: [/await findCase\(/, /await insertCase\(/],
+        },
+        go: {
+          all: [/store\.FindCase\(/, /store\.UpdateCase\(/, /"updated"/],
+          order: [/store\.FindCase\(/, /store\.InsertCase\(/],
+        },
+        scala: {
+          all: [/Store\.findCase\(/, /Store\.updateCase\(/, /"updated"/],
+          order: [/Store\.findCase\(/, /Store\.insertCase\(/],
+        },
+        cpp: {
+          all: [/store::findCase\(/, /store::updateCase\(/, /"updated"/],
+          order: [/store::findCase\(/, /store::insertCase\(/],
+        },
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-import uuid
-
-from fastapi import FastAPI, Header
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("moderation")
-
-REASON_FALLBACK = "other"
-
-
-class ReportRequest(BaseModel):
-    content_id: str
-    reason: str
-    detail: str = ""
-
-
-class CaseStore:
-    def insert(self, case_id: str, **fields) -> None:
-        """Write a new case row."""
-        raise NotImplementedError
-
-
-cases = CaseStore()
-
-
-@app.post("/v1/reports")
-def create_report(
-    body: ReportRequest,
-    tenant: str = Header(alias="X-Tenant-Id"),
-    reporter_id: str = Header(alias="X-Reporter-Id"),
-) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    reason = body.reason or REASON_FALLBACK
-    case_id = str(uuid.uuid4())
-    cases.insert(
-        case_id,
-        tenant=tenant,
-        content_id=body.content_id,
-        reporter_id=reporter_id,
-        reason=reason,
-        detail=body.detail,
-    )
-    logger.info("report case=%s tenant=%s bytes=%d", case_id, tenant, len(body.detail))
-    return JSONResponse({"case_id": case_id}, status_code=201)
-`,
-      solution: `import logging
-import uuid
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from moderation import store  # content_tenant, find_case, insert_case, update_case
 
 app = FastAPI()
-logger = logging.getLogger("moderation")
 
-ALLOWED_REASONS = {"spam", "harassment", "hate", "self_harm", "csam"}
+ALLOWED_REASONS = ("spam", "harassment", "hate", "self_harm", "csam")
 MAX_DETAIL_BYTES = 4096
-CONTENT_TENANTS = {"c_8f21": "acme", "c_1a44": "globex", "c_77bd": "acme"}
 
 
 class ReportRequest(BaseModel):
@@ -179,183 +140,131 @@ class ReportRequest(BaseModel):
     detail: str = ""
 
 
-class CaseStore:
-    def find(self, tenant: str, content_id: str, reporter_id: str) -> dict | None:
-        """The reporter's open case on this item, if any."""
-        raise NotImplementedError
+@app.post("/v1/reports")
+def create_report(body: ReportRequest, request: Request) -> JSONResponse:
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    reporter_id = request.headers.get("x-reporter-id", "")
+    if not tenant or not reporter_id:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id and X-Reporter-Id are required")
+    if store.content_tenant(body.content_id) is None:
+        raise HTTPException(status_code=404, detail="no such content")
+    reason = body.reason if body.reason in ALLOWED_REASONS else "other"
+    if len(body.detail) > MAX_DETAIL_BYTES:
+        raise HTTPException(status_code=413, detail="detail is too long")
+    case = store.insert_case(tenant, body.content_id, reporter_id, reason, body.detail)
+    return JSONResponse({"case_id": case["case_id"], "status": "created"}, status_code=201)
+`,
+      solution: `from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-    def insert(self, case_id: str, **fields) -> None:
-        """Write a new case row."""
-        raise NotImplementedError
+from moderation import store  # content_tenant, find_case, insert_case, update_case
 
-    def update(self, case_id: str, **fields) -> None:
-        """Update the existing case row."""
-        raise NotImplementedError
+app = FastAPI()
 
-
-cases = CaseStore()
+ALLOWED_REASONS = ("spam", "harassment", "hate", "self_harm", "csam")
+MAX_DETAIL_BYTES = 4096
 
 
-def belongs_to(tenant: str, content_id: str) -> bool:
-    return CONTENT_TENANTS.get(content_id) == tenant
+class ReportRequest(BaseModel):
+    content_id: str
+    reason: str
+    detail: str = ""
 
 
 @app.post("/v1/reports")
-def create_report(
-    body: ReportRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    reporter_id: str | None = Header(default=None, alias="X-Reporter-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if reporter_id is None or reporter_id == "":
-        raise HTTPException(status_code=401, detail="missing X-Reporter-Id")
-    if not belongs_to(tenant, body.content_id):
-        raise HTTPException(status_code=404, detail="unknown content")
+def create_report(body: ReportRequest, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    reporter_id = request.headers.get("x-reporter-id", "")
+    if not tenant or not reporter_id:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id and X-Reporter-Id are required")
+    # A foreign id answers exactly as an unknown one: nothing confirms what another tenant hosts.
+    if store.content_tenant(body.content_id) != tenant:
+        raise HTTPException(status_code=404, detail="no such content")
     if body.reason not in ALLOWED_REASONS:
-        raise HTTPException(status_code=400, detail="unknown reason")
+        raise HTTPException(status_code=400, detail=f"reason must be one of {', '.join(ALLOWED_REASONS)}")
     if len(body.detail.encode("utf-8")) > MAX_DETAIL_BYTES:
-        raise HTTPException(status_code=413, detail="detail exceeds 4 KiB")
-
-    existing = cases.find(tenant, body.content_id, reporter_id)
+        raise HTTPException(status_code=413, detail=f"detail is over {MAX_DETAIL_BYTES} bytes")
+    existing = store.find_case(tenant, body.content_id, reporter_id)
     if existing is not None:
-        cases.update(existing["case_id"], reason=body.reason, detail=body.detail)
-        logger.info("report updated case=%s tenant=%s content=%s", existing["case_id"], tenant, body.content_id)
-        return JSONResponse({"case_id": existing["case_id"], "status": "updated"}, status_code=200)
-
-    case_id = str(uuid.uuid4())
-    cases.insert(
-        case_id,
-        tenant=tenant,
-        content_id=body.content_id,
-        reporter_id=reporter_id,
-        reason=body.reason,
-        detail=body.detail,
-    )
-    logger.info("report created case=%s tenant=%s content=%s", case_id, tenant, body.content_id)
-    return JSONResponse({"case_id": case_id, "status": "created"}, status_code=201)
+        case = store.update_case(existing["case_id"], body.reason, body.detail)
+        return JSONResponse({"case_id": case["case_id"], "status": "updated"}, status_code=200)
+    case = store.insert_case(tenant, body.content_id, reporter_id, body.reason, body.detail)
+    return JSONResponse({"case_id": case["case_id"], "status": "created"}, status_code=201)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/reports. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {contentTenant, findCase, insertCase, updateCase} from 'moderation/store';
 
 export const app = Fastify();
 
-const REASON_FALLBACK = 'other';
+export const ALLOWED_REASONS = ['spam', 'harassment', 'hate', 'self_harm', 'csam'];
+export const MAX_DETAIL_BYTES = 4096;
 
 interface ReportBody {
   content_id: string;
   reason: string;
   detail?: string;
 }
-
-interface CaseStore {
-  insert(caseId: string, fields: Record<string, unknown>): Promise<void>;
-}
-
-export const cases: CaseStore = {
-  insert: async () => {},
-};
 
 app.post('/v1/reports', async (request, reply) => {
   // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const reporterId = request.headers['x-reporter-id'] as string;
+  const tenant = request.headers['x-tenant-id'];
+  const reporterId = request.headers['x-reporter-id'];
+  if (typeof tenant !== 'string' || tenant === '' || typeof reporterId !== 'string' || reporterId === '') {
+    return reply.code(401).send({error: 'X-Tenant-Id and X-Reporter-Id are required'});
+  }
   const body = request.body as ReportBody;
-  const reason = body.reason || REASON_FALLBACK;
-  const caseId = randomUUID();
-  await cases.insert(caseId, {
-    tenant,
-    content_id: body.content_id,
-    reporter_id: reporterId,
-    reason,
-    detail: body.detail ?? '',
-  });
-  request.log.info({case_id: caseId, tenant, bytes: (body.detail ?? '').length}, 'report');
-  return reply.code(201).send({case_id: caseId});
+  const detail = body.detail ?? '';
+  if ((await contentTenant(body.content_id)) === null) return reply.code(404).send({error: 'no such content'});
+  const reason = ALLOWED_REASONS.includes(body.reason) ? body.reason : 'other';
+  if (detail.length > MAX_DETAIL_BYTES) return reply.code(413).send({error: 'detail is too long'});
+  const created = await insertCase(tenant, body.content_id, reporterId, reason, detail);
+  return reply.code(201).send({case_id: created.case_id, status: 'created'});
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/reports: a report that must be real, in-tenant and unique per reporter. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {contentTenant, findCase, insertCase, updateCase} from 'moderation/store';
 
 export const app = Fastify();
 
-const ALLOWED_REASONS: Record<string, true> = {
-  spam: true,
-  harassment: true,
-  hate: true,
-  self_harm: true,
-  csam: true,
-};
-const MAX_DETAIL_BYTES = 4096;
-const CONTENT_TENANTS: Record<string, string> = {c_8f21: 'acme', c_1a44: 'globex', c_77bd: 'acme'};
+export const ALLOWED_REASONS = ['spam', 'harassment', 'hate', 'self_harm', 'csam'];
+export const MAX_DETAIL_BYTES = 4096;
 
 interface ReportBody {
   content_id: string;
   reason: string;
   detail?: string;
-}
-
-interface CaseStore {
-  find(tenant: string, contentId: string, reporterId: string): Promise<{case_id: string} | null>;
-  insert(caseId: string, fields: Record<string, unknown>): Promise<void>;
-  update(caseId: string, fields: Record<string, unknown>): Promise<void>;
-}
-
-export const cases: CaseStore = {
-  find: async () => null,
-  insert: async () => {},
-  update: async () => {},
-};
-
-function belongsTo(tenant: string, contentId: string): boolean {
-  return CONTENT_TENANTS[contentId] === tenant;
 }
 
 app.post('/v1/reports', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const reporterId = request.headers['x-reporter-id'];
-  if (typeof reporterId !== 'string' || reporterId === '')
-    return reply.code(401).send({error: 'missing X-Reporter-Id'});
-
-  const body = request.body as Partial<ReportBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.content_id !== 'string')
-    return reply.code(400).send({error: 'unknown content'});
-  if (!belongsTo(tenant, body.content_id)) return reply.code(404).send({error: 'unknown content'});
-  if (typeof body.reason !== 'string' || ALLOWED_REASONS[body.reason] !== true)
-    return reply.code(400).send({error: 'unknown reason'});
-  const detail = body.detail ?? '';
-  if (Buffer.byteLength(detail, 'utf8') > MAX_DETAIL_BYTES)
-    return reply.code(413).send({error: 'detail exceeds 4 KiB'});
-
-  const existing = await cases.find(tenant, body.content_id, reporterId);
-  if (existing !== null) {
-    await cases.update(existing.case_id, {reason: body.reason, detail});
-    request.log.info({case_id: existing.case_id, tenant, content_id: body.content_id}, 'report updated');
-    return reply.code(200).send({case_id: existing.case_id, status: 'updated'});
+  if (typeof tenant !== 'string' || tenant === '' || typeof reporterId !== 'string' || reporterId === '') {
+    return reply.code(401).send({error: 'X-Tenant-Id and X-Reporter-Id are required'});
   }
-
-  const caseId = randomUUID();
-  await cases.insert(caseId, {
-    tenant,
-    content_id: body.content_id,
-    reporter_id: reporterId,
-    reason: body.reason,
-    detail,
-  });
-  request.log.info({case_id: caseId, tenant, content_id: body.content_id}, 'report created');
-  return reply.code(201).send({case_id: caseId, status: 'created'});
+  const body = request.body as ReportBody;
+  const detail = body.detail ?? '';
+  // A foreign id answers exactly as an unknown one: nothing confirms what another tenant hosts.
+  if ((await contentTenant(body.content_id)) !== tenant) return reply.code(404).send({error: 'no such content'});
+  if (!ALLOWED_REASONS.includes(body.reason)) {
+    return reply.code(400).send({error: \`reason must be one of \${ALLOWED_REASONS.join(', ')}\`});
+  }
+  if (Buffer.byteLength(detail, 'utf8') > MAX_DETAIL_BYTES) {
+    return reply.code(413).send({error: \`detail is over \${MAX_DETAIL_BYTES} bytes\`});
+  }
+  const existing = await findCase(tenant, body.content_id, reporterId);
+  if (existing !== null) {
+    const updated = await updateCase(existing.case_id, body.reason, detail);
+    return reply.code(200).send({case_id: updated.case_id, status: 'updated'});
+  }
+  const created = await insertCase(tenant, body.content_id, reporterId, body.reason, detail);
+  return reply.code(201).send({case_id: created.case_id, status: 'created'});
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -363,278 +272,232 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"fmt"
-	"log"
 	"net/http"
-	"time"
+	"unicode/utf8"
+
+	"moderation/store" // store.ContentTenant, FindCase, InsertCase, UpdateCase
 )
 
-const reasonFallback = "other"
+var allowedReasons = map[string]bool{"spam": true, "harassment": true, "hate": true, "self_harm": true, "csam": true}
 
-type ReportRequest struct {
+const maxDetailBytes = 4096
+
+type reportBody struct {
 	ContentID string \`json:"content_id"\`
 	Reason    string \`json:"reason"\`
 	Detail    string \`json:"detail"\`
 }
 
-type CaseStore struct{}
-
-func (s *CaseStore) Insert(caseID string, fields map[string]any) error { return nil }
-
-var cases = &CaseStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func createReport(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	reporterID := r.Header.Get("X-Reporter-Id")
-	var body ReportRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if tenant == "" || reporterID == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id and X-Reporter-Id are required"})
 		return
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	reason := body.Reason
-	if reason == "" {
-		reason = reasonFallback
+	var body reportBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "the body is not a report"})
+		return
 	}
-	caseID := fmt.Sprintf("case_%d", time.Now().UnixNano())
-	cases.Insert(caseID, map[string]any{
-		"tenant": tenant, "content_id": body.ContentID, "reporter_id": reporterID,
-		"reason": reason, "detail": body.Detail,
-	})
-	log.Printf("report case=%s tenant=%s bytes=%d", caseID, tenant, len(body.Detail))
-	writeJSON(rw, http.StatusCreated, map[string]any{"case_id": caseID})
+	if _, ok := store.ContentTenant(r.Context(), body.ContentID); !ok {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such content"})
+		return
+	}
+	reason := body.Reason
+	if !allowedReasons[reason] {
+		reason = "other"
+	}
+	if utf8.RuneCountInString(body.Detail) > maxDetailBytes {
+		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "detail is too long"})
+		return
+	}
+	created := store.InsertCase(r.Context(), tenant, body.ContentID, reporterID, reason, body.Detail)
+	writeJSON(rw, http.StatusCreated, map[string]string{"case_id": created.CaseID, "status": "created"})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/reports", createReport)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
 
-	"github.com/google/uuid"
+	"moderation/store" // store.ContentTenant, FindCase, InsertCase, UpdateCase
 )
+
+var allowedReasons = map[string]bool{"spam": true, "harassment": true, "hate": true, "self_harm": true, "csam": true}
 
 const maxDetailBytes = 4096
 
-var allowedReasons = map[string]bool{
-	"spam":       true,
-	"harassment": true,
-	"hate":       true,
-	"self_harm":  true,
-	"csam":       true,
-}
-
-var contentTenants = map[string]string{"c_8f21": "acme", "c_1a44": "globex", "c_77bd": "acme"}
-
-type ReportRequest struct {
+type reportBody struct {
 	ContentID string \`json:"content_id"\`
 	Reason    string \`json:"reason"\`
 	Detail    string \`json:"detail"\`
 }
 
-type CaseStore struct{}
-
-func (s *CaseStore) Find(tenant, contentID, reporterID string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *CaseStore) Insert(caseID string, fields map[string]any) error { return nil }
-
-func (s *CaseStore) Update(caseID string, fields map[string]any) error { return nil }
-
-var cases = &CaseStore{}
-
-func belongsTo(tenant, contentID string) bool {
-	return contentTenants[contentID] == tenant
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func createReport(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
-		return
-	}
 	reporterID := r.Header.Get("X-Reporter-Id")
-	if reporterID == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Reporter-Id"})
+	if tenant == "" || reporterID == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id and X-Reporter-Id are required"})
 		return
 	}
-	var body ReportRequest
+	var body reportBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "the body is not a report"})
 		return
 	}
-	if !belongsTo(tenant, body.ContentID) {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown content"})
+	// A foreign id answers exactly as an unknown one: nothing confirms what another tenant hosts.
+	if owner, ok := store.ContentTenant(r.Context(), body.ContentID); !ok || owner != tenant {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such content"})
 		return
 	}
 	if !allowedReasons[body.Reason] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown reason"})
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "reason must be one of spam, harassment, hate, self_harm, csam"})
 		return
 	}
-	if len([]byte(body.Detail)) > maxDetailBytes {
-		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "detail exceeds 4 KiB"})
+	if len(body.Detail) > maxDetailBytes { // len counts bytes
+		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": fmt.Sprintf("detail is over %d bytes", maxDetailBytes)})
 		return
 	}
-	existing, err := cases.Find(tenant, body.ContentID, reporterID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	if existing := store.FindCase(r.Context(), tenant, body.ContentID, reporterID); existing != nil {
+		updated := store.UpdateCase(r.Context(), existing.CaseID, body.Reason, body.Detail)
+		writeJSON(rw, http.StatusOK, map[string]string{"case_id": updated.CaseID, "status": "updated"})
 		return
 	}
-	if existing != nil {
-		caseID := existing["case_id"].(string)
-		cases.Update(caseID, map[string]any{"reason": body.Reason, "detail": body.Detail})
-		log.Printf("report updated case=%s tenant=%s content=%s", caseID, tenant, body.ContentID)
-		writeJSON(rw, http.StatusOK, map[string]any{"case_id": caseID, "status": "updated"})
-		return
-	}
-	caseID := uuid.NewString()
-	cases.Insert(caseID, map[string]any{
-		"tenant": tenant, "content_id": body.ContentID, "reporter_id": reporterID,
-		"reason": body.Reason, "detail": body.Detail,
-	})
-	log.Printf("report created case=%s tenant=%s content=%s", caseID, tenant, body.ContentID)
-	writeJSON(rw, http.StatusCreated, map[string]any{"case_id": caseID, "status": "created"})
+	created := store.InsertCase(r.Context(), tenant, body.ContentID, reporterID, body.Reason, body.Detail)
+	writeJSON(rw, http.StatusCreated, map[string]string{"case_id": created.CaseID, "status": "created"})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/reports", createReport)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import java.nio.charset.StandardCharsets
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class ReportRequest(content_id: String, reason: String, detail: String)
+import moderation.Store // Store.contentTenant, findCase, insertCase, updateCase
 
-object ReportApi {
-  implicit val system: ActorSystem = ActorSystem("moderation")
-  implicit val reportFormat: RootJsonFormat[ReportRequest] = jsonFormat3(ReportRequest)
+object Api {
+  val AllowedReasons: Set[String] = Set("spam", "harassment", "hate", "self_harm", "csam")
+  val MaxDetailBytes = 4096
 
-  val ReasonFallback = "other"
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val cases = CaseStore.open()
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  val route: Route =
-    path("v1" / "reports") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("X-Reporter-Id") { reporterOpt =>
-            entity(as[ReportRequest]) { body =>
-              // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-              val reason = if (body.reason.nonEmpty) body.reason else ReasonFallback
-              val caseId = UUID.randomUUID().toString
-              cases.insert(caseId, tenantOpt.getOrElse(""), body.content_id, reporterOpt.getOrElse(""), reason, body.detail)
-              system.log.info(s"report case=$caseId tenant=\${tenantOpt.getOrElse("")}")
-              complete(StatusCodes.Created, s"""{"case_id":"$caseId"}""")
+  private def field(body: JsObject, name: String): String = body.fields.get(name) match {
+    case Some(JsString(s)) => s
+    case _ => ""
+  }
+
+  private def report(tenant: String, reporterId: String, body: JsObject): HttpResponse = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    val contentId = field(body, "content_id")
+    val detail = field(body, "detail")
+    val reason = if (AllowedReasons.contains(field(body, "reason"))) field(body, "reason") else "other"
+    if (Store.contentTenant(contentId).isEmpty) error(StatusCodes.NotFound, "no such content")
+    else if (detail.length > MaxDetailBytes) error(StatusCodes.PayloadTooLarge, "detail is too long")
+    else {
+      val created = Store.insertCase(tenant, contentId, reporterId, reason, detail)
+      json(StatusCodes.Created, JsObject("case_id" -> JsString(created.caseId), "status" -> JsString("created")))
+    }
+  }
+
+  val route: Route = path("v1" / "reports") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        optionalHeaderValueByName("X-Reporter-Id") { reporterId =>
+          entity(as[String]) { raw =>
+            (tenant.filter(_.nonEmpty), reporterId.filter(_.nonEmpty)) match {
+              case (Some(t), Some(r)) => complete(report(t, r, raw.parseJson.asJsObject))
+              case _ => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id and X-Reporter-Id are required"))
             }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
       solution: `import java.nio.charset.StandardCharsets
-import java.util.UUID
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class ReportRequest(content_id: String, reason: String, detail: String)
+import moderation.Store // Store.contentTenant, findCase, insertCase, updateCase
 
-object ReportApi {
-  implicit val system: ActorSystem = ActorSystem("moderation")
-  implicit val reportFormat: RootJsonFormat[ReportRequest] = jsonFormat3(ReportRequest)
-
-  val AllowedReasons = Set("spam", "harassment", "hate", "self_harm", "csam")
+object Api {
+  val AllowedReasons: Set[String] = Set("spam", "harassment", "hate", "self_harm", "csam")
   val MaxDetailBytes = 4096
-  val ContentTenants = Map("c_8f21" -> "acme", "c_1a44" -> "globex", "c_77bd" -> "acme")
 
-  val cases = CaseStore.open()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def belongsTo(tenant: String, contentId: String): Boolean =
-    ContentTenants.get(contentId).contains(tenant)
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  val route: Route =
-    path("v1" / "reports") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("X-Reporter-Id") { reporterOpt =>
-            entity(as[ReportRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!reporterOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Reporter-Id"}""")
-              } else if (!belongsTo(tenantOpt.get, body.content_id)) {
-                complete(StatusCodes.NotFound, """{"error":"unknown content"}""")
-              } else if (!AllowedReasons.contains(body.reason)) {
-                complete(StatusCodes.BadRequest, """{"error":"unknown reason"}""")
-              } else if (body.detail.getBytes(StandardCharsets.UTF_8).length > MaxDetailBytes) {
-                complete(StatusCodes.RequestEntityTooLarge, """{"error":"detail exceeds 4 KiB"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val reporter = reporterOpt.get
-                cases.find(tenant, body.content_id, reporter) match {
-                  case Some(existing) =>
-                    cases.update(existing.case_id, body.reason, body.detail)
-                    system.log.info(s"report updated case=\${existing.case_id} tenant=$tenant")
-                    complete(StatusCodes.OK, s"""{"case_id":"\${existing.case_id}","status":"updated"}""")
-                  case None =>
-                    val caseId = UUID.randomUUID().toString
-                    cases.insert(caseId, tenant, body.content_id, reporter, body.reason, body.detail)
-                    system.log.info(s"report created case=$caseId tenant=$tenant")
-                    complete(StatusCodes.Created, s"""{"case_id":"$caseId","status":"created"}""")
-                }
-              }
+  private def field(body: JsObject, name: String): String = body.fields.get(name) match {
+    case Some(JsString(s)) => s
+    case _ => ""
+  }
+
+  private def report(tenant: String, reporterId: String, body: JsObject): HttpResponse = {
+    val contentId = field(body, "content_id")
+    val reason = field(body, "reason")
+    val detail = field(body, "detail")
+    // A foreign id answers exactly as an unknown one: nothing confirms what another tenant hosts.
+    if (!Store.contentTenant(contentId).contains(tenant)) error(StatusCodes.NotFound, "no such content")
+    else if (!AllowedReasons.contains(reason)) error(StatusCodes.BadRequest, "reason must be one of spam, harassment, hate, self_harm, csam")
+    else if (detail.getBytes(StandardCharsets.UTF_8).length > MaxDetailBytes) error(StatusCodes.PayloadTooLarge, s"detail is over $MaxDetailBytes bytes")
+    else
+      Store.findCase(tenant, contentId, reporterId) match {
+        case Some(existing) =>
+          val updated = Store.updateCase(existing.caseId, reason, detail)
+          json(StatusCodes.OK, JsObject("case_id" -> JsString(updated.caseId), "status" -> JsString("updated")))
+        case None =>
+          val created = Store.insertCase(tenant, contentId, reporterId, reason, detail)
+          json(StatusCodes.Created, JsObject("case_id" -> JsString(created.caseId), "status" -> JsString("created")))
+      }
+  }
+
+  val route: Route = path("v1" / "reports") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        optionalHeaderValueByName("X-Reporter-Id") { reporterId =>
+          entity(as[String]) { raw =>
+            (tenant.filter(_.nonEmpty), reporterId.filter(_.nonEmpty)) match {
+              case (Some(t), Some(r)) => complete(report(t, r, raw.parseJson.asJsObject))
+              case _ => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id and X-Reporter-Id are required"))
             }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -643,143 +506,458 @@ object ReportApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
+#include <set>
 #include <string>
+
+#include "moderation/store.h"  // store::contentTenant, findCase, insertCase, updateCase
 
 using json = nlohmann::json;
 
-const std::string kReasonFallback = "other";
+const std::set<std::string> kAllowedReasons = {"spam", "harassment", "hate", "self_harm", "csam"};
+constexpr size_t kMaxDetailBytes = 4096;
 
-struct CaseStore {
-  void insert(const std::string& caseId, const json& fields);
-};
-
-CaseStore cases;
-std::string uuidString();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/reports", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto reporter = req.get_header_value("X-Reporter-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    auto reason = body.value("reason", std::string());
-    if (reason.empty()) reason = kReasonFallback;
-    const auto detail = body.value("detail", std::string());
-    const auto caseId = uuidString();
-    cases.insert(caseId, json{{"tenant", tenant}, {"content_id", body.value("content_id", std::string())},
-                              {"reporter_id", reporter}, {"reason", reason}, {"detail", detail}});
-    std::cerr << "report case=" << caseId << " tenant=" << tenant << " bytes=" << detail.size() << "\\n";
-    res.status = 201;
-    res.set_content(json{{"case_id", caseId}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+// Characters as the report form counts them.
+size_t characters(const std::string& text) {
+  size_t n = 0;
+  for (const unsigned char c : text) {
+    if ((c & 0xC0) != 0x80) n++;
+  }
+  return n;
+}
+
+void create_report(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const std::string reporter_id = req.get_header_value("X-Reporter-Id");
+  if (tenant.empty() || reporter_id.empty()) return reply(res, 401, {{"error", "X-Tenant-Id and X-Reporter-Id are required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return reply(res, 422, {{"error", "the body is not a report"}});
+  const std::string content_id = body.value("content_id", "");
+  const std::string detail = body.value("detail", "");
+  std::string reason = body.value("reason", "");
+  if (!store::contentTenant(content_id)) return reply(res, 404, {{"error", "no such content"}});
+  if (!kAllowedReasons.count(reason)) reason = "other";
+  if (characters(detail) > kMaxDetailBytes) return reply(res, 413, {{"error", "detail is too long"}});
+  const store::Case created = store::insertCase(tenant, content_id, reporter_id, reason, detail);
+  reply(res, 201, {{"case_id", created.case_id}, {"status", "created"}});
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/reports", create_report); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <cstddef>
-#include <iostream>
-#include <map>
-#include <optional>
 #include <set>
 #include <string>
 
+#include "moderation/store.h"  // store::contentTenant, findCase, insertCase, updateCase
+
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxDetailBytes = 4096;
 const std::set<std::string> kAllowedReasons = {"spam", "harassment", "hate", "self_harm", "csam"};
-const std::map<std::string, std::string> kContentTenants = {
-    {"c_8f21", "acme"}, {"c_1a44", "globex"}, {"c_77bd", "acme"}};
+constexpr size_t kMaxDetailBytes = 4096;
 
-struct CaseStore {
-  std::optional<json> find(const std::string& tenant, const std::string& contentId, const std::string& reporterId);
-  void insert(const std::string& caseId, const json& fields);
-  void update(const std::string& caseId, const json& fields);
-};
-
-CaseStore cases;
-std::string uuidString();
-
-bool belongsTo(const std::string& tenant, const std::string& contentId) {
-  const auto it = kContentTenants.find(contentId);
-  return it != kContentTenants.end() && it->second == tenant;
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/reports", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto reporter = req.get_header_value("X-Reporter-Id");
-    if (reporter.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Reporter-Id"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("content_id") || !body["content_id"].is_string()) {
-      res.status = 400;
-      res.set_content(R"({"error":"unknown content"})", "application/json");
-      return;
-    }
-    const auto contentId = body["content_id"].get<std::string>();
-    if (!belongsTo(tenant, contentId)) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown content"})", "application/json");
-      return;
-    }
-    const auto reason = body.value("reason", std::string());
-    if (kAllowedReasons.count(reason) == 0) {
-      res.status = 400;
-      res.set_content(R"({"error":"unknown reason"})", "application/json");
-      return;
-    }
-    const auto detail = body.value("detail", std::string());
-    if (detail.size() > kMaxDetailBytes) {
-      res.status = 413;
-      res.set_content(R"({"error":"detail exceeds 4 KiB"})", "application/json");
-      return;
-    }
-    const auto existing = cases.find(tenant, contentId, reporter);
-    if (existing) {
-      const auto caseId = existing->value("case_id", std::string());
-      cases.update(caseId, json{{"reason", reason}, {"detail", detail}});
-      res.status = 200;
-      res.set_content(json{{"case_id", caseId}, {"status", "updated"}}.dump(), "application/json");
-      return;
-    }
-    const auto caseId = uuidString();
-    cases.insert(caseId, json{{"tenant", tenant}, {"content_id", contentId}, {"reporter_id", reporter},
-                              {"reason", reason}, {"detail", detail}});
-    std::cerr << "report created case=" << caseId << " tenant=" << tenant << "\\n";
-    res.status = 201;
-    res.set_content(json{{"case_id", caseId}, {"status", "created"}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void create_report(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const std::string reporter_id = req.get_header_value("X-Reporter-Id");
+  if (tenant.empty() || reporter_id.empty()) return reply(res, 401, {{"error", "X-Tenant-Id and X-Reporter-Id are required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return reply(res, 422, {{"error", "the body is not a report"}});
+  const std::string content_id = body.value("content_id", "");
+  const std::string reason = body.value("reason", "");
+  const std::string detail = body.value("detail", "");
+  // A foreign id answers exactly as an unknown one: nothing confirms what another tenant hosts.
+  const auto owner = store::contentTenant(content_id);
+  if (!owner || *owner != tenant) return reply(res, 404, {{"error", "no such content"}});
+  if (!kAllowedReasons.count(reason)) return reply(res, 400, {{"error", "reason must be one of spam, harassment, hate, self_harm, csam"}});
+  if (detail.size() > kMaxDetailBytes) return reply(res, 413, {{"error", "detail is over 4096 bytes"}});  // size() counts bytes
+  if (const auto existing = store::findCase(tenant, content_id, reporter_id)) {
+    const store::Case updated = store::updateCase(existing->case_id, reason, detail);
+    return reply(res, 200, {{"case_id", updated.case_id}, {"status", "updated"}});
+  }
+  const store::Case created = store::insertCase(tenant, content_id, reporter_id, reason, detail);
+  reply(res, 201, {{"case_id", created.case_id}, {"status", "created"}});
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/reports", create_report); }
 `,
     },
   },
+  harness: {
+    python: `from moderation import store
+
+ACME = {"X-Tenant-Id": "acme", "X-Reporter-Id": "u-17"}
+
+
+def _api(ctx):
+    store.add_content("c-1", "acme", "Buy followers now")
+    store.add_content("c-2", "globex", "Quarterly results")
+    return ctx.client(ctx.load("api").app)
+
+
+def _report(c, content_id="c-1", reason="spam", detail="", headers=None):
+    return c.post("/v1/reports", json={"content_id": content_id, "reason": reason, "detail": detail}, headers=ACME if headers is None else headers)
+
+
+def _cases(ctx):
+    return sorted(ctx.redis.keys("case:case-*"))
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _report(c, detail="Spam link in bio")
+        assert r.status_code == 201, f"a report from the content owner answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("status") == "created" and body.get("case_id"), f"a new report must answer {{case_id, status: created}}, got {body}"
+        case = store.get_case(body["case_id"])
+        assert case is not None and (case["tenant"], case["content_id"], case["reporter_id"], case["reason"], case["detail"]) == ("acme", "c-1", "u-17", "spam", "Spam link in bio"), f"the stored case is {case}"
+        r = await c.post("/v1/reports", json={"content_id": "c-1", "reason": "spam"}, headers={"X-Tenant-Id": "acme"})
+        assert r.status_code == 401, f"a report without X-Reporter-Id answered {r.status_code}, expected 401"
+        r = await _report(c, content_id="c-404")
+        assert r.status_code == 404, f"a report on unknown content answered {r.status_code}, expected 404"
+
+
+async def check_tenant_scope(ctx):
+    async with _api(ctx) as c:
+        foreign = await _report(c, content_id="c-2")
+        unknown = await _report(c, content_id="c-404")
+    assert foreign.status_code == 404, f"acme reported globex's content c-2 and got {foreign.status_code}: {foreign.text}. The content must belong to the calling tenant"
+    assert _cases(ctx) == [], f"a report on another tenant's content opened {_cases(ctx)}"
+    assert foreign.text == unknown.text, f"a foreign id answered {foreign.text!r} and an unknown one {unknown.text!r}: the difference tells acme what globex hosts"
+
+
+async def check_reason_allowlist(ctx):
+    async with _api(ctx) as c:
+        for reason in ("spamm", "other", ""):
+            r = await _report(c, reason=reason)
+            assert r.status_code == 400, f"a report with reason {reason!r} answered {r.status_code}, expected 400"
+        assert _cases(ctx) == [], f"rejected reasons opened {_cases(ctx)}"
+        r = await _report(c, reason="self_harm")
+    assert r.status_code == 201, f"a report with reason 'self_harm' answered {r.status_code}: {r.text}"
+    assert store.get_case(r.json()["case_id"])["reason"] == "self_harm", "the case must keep the reason the reporter chose"
+
+
+async def check_detail_bytes(ctx):
+    async with _api(ctx) as c:
+        accented = await _report(c, detail="é" * 3000)
+        long = await _report(c, detail="a" * 4097)
+        exact = await _report(c, detail="é" * 2048)
+    assert accented.status_code == 413, f"a detail of 3000 accented characters (6000 bytes of UTF-8) answered {accented.status_code}, expected 413: the cap is in bytes"
+    assert long.status_code == 413, f"a detail of 4097 bytes answered {long.status_code}, expected 413"
+    assert exact.status_code == 201, f"a detail of exactly 4096 bytes answered {exact.status_code}: {exact.text}"
+    assert len(_cases(ctx)) == 1, f"only the report within the cap may open a case, Redis holds {_cases(ctx)}"
+
+
+async def check_dedupe(ctx):
+    async with _api(ctx) as c:
+        first = await _report(c, reason="spam", detail="first look")
+        again = await _report(c, reason="harassment", detail="second look")
+        other = await _report(c, headers={"X-Tenant-Id": "acme", "X-Reporter-Id": "u-18"})
+    assert first.status_code == 201, f"the first report answered {first.status_code}: {first.text}"
+    case_id = first.json()["case_id"]
+    assert again.status_code == 200 and again.json() == {"case_id": case_id, "status": "updated"}, f"the same reporter reporting c-1 again answered {again.status_code} {again.text}, expected 200 {{case_id: {case_id}, status: updated}}"
+    case = store.get_case(case_id)
+    assert case["reports"] == 2 and case["reason"] == "harassment" and case["detail"] == "second look", f"the repeat report must update the case, it holds {case}"
+    assert other.status_code == 201 and other.json()["case_id"] != case_id, f"another reporter on the same content must open their own case, got {other.status_code} {other.text}"
+    assert len(_cases(ctx)) == 2, f"two reporters must leave two cases, Redis holds {_cases(ctx)}"
+`,
+    typescript: `const ACME = {'X-Tenant-Id': 'acme', 'X-Reporter-Id': 'u-17'};
+
+function api(ctx) {
+  ctx.redis.hset('content:c-1', 'tenant', 'acme', 'text', 'Buy followers now');
+  ctx.redis.hset('content:c-2', 'tenant', 'globex', 'text', 'Quarterly results');
+  return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/moderation/store.ts')};
+}
+
+const report = (c, {contentId = 'c-1', reason = 'spam', detail = '', headers = ACME as Record<string, string>} = {}) =>
+  c.post('/v1/reports', {json: {content_id: contentId, reason, detail}, headers});
+
+const cases = (ctx): string[] => ctx.redis.keys('case:case-*').sort();
+
+export async function check_route(ctx) {
+  const {c, store} = api(ctx);
+  let r = await report(c, {detail: 'Spam link in bio'});
+  assert.equal(r.status, 201, \`a report from the content owner answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.status === 'created' && body.case_id, \`a new report must answer {case_id, status: created}, got \${r.text}\`);
+  const stored = await store.getCase(body.case_id);
+  assert(
+    stored !== null && stored.tenant === 'acme' && stored.content_id === 'c-1' && stored.reporter_id === 'u-17' && stored.reason === 'spam' && stored.detail === 'Spam link in bio',
+    \`the stored case is \${JSON.stringify(stored)}\`,
+  );
+  r = await c.post('/v1/reports', {json: {content_id: 'c-1', reason: 'spam'}, headers: {'X-Tenant-Id': 'acme'}});
+  assert.equal(r.status, 401, \`a report without X-Reporter-Id answered \${r.status}, expected 401\`);
+  r = await report(c, {contentId: 'c-404'});
+  assert.equal(r.status, 404, \`a report on unknown content answered \${r.status}, expected 404\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c} = api(ctx);
+  const foreign = await report(c, {contentId: 'c-2'});
+  const unknown = await report(c, {contentId: 'c-404'});
+  assert.equal(foreign.status, 404, \`acme reported globex's content c-2 and got \${foreign.status}: \${foreign.text}. The content must belong to the calling tenant\`);
+  assert.deepStrictEqual(cases(ctx), [], \`a report on another tenant's content opened \${JSON.stringify(cases(ctx))}\`);
+  assert.equal(foreign.text, unknown.text, \`a foreign id answered \${foreign.text} and an unknown one \${unknown.text}: the difference tells acme what globex hosts\`);
+}
+
+export async function check_reason_allowlist(ctx) {
+  const {c, store} = api(ctx);
+  for (const reason of ['spamm', 'other', '']) {
+    const r = await report(c, {reason});
+    assert.equal(r.status, 400, \`a report with reason \${JSON.stringify(reason)} answered \${r.status}, expected 400\`);
+  }
+  assert.deepStrictEqual(cases(ctx), [], \`rejected reasons opened \${JSON.stringify(cases(ctx))}\`);
+  const r = await report(c, {reason: 'self_harm'});
+  assert.equal(r.status, 201, \`a report with reason 'self_harm' answered \${r.status}: \${r.text}\`);
+  assert.equal((await store.getCase(r.json().case_id)).reason, 'self_harm', 'the case must keep the reason the reporter chose');
+}
+
+export async function check_detail_bytes(ctx) {
+  const {c} = api(ctx);
+  const accented = await report(c, {detail: 'é'.repeat(3000)});
+  const long = await report(c, {detail: 'a'.repeat(4097)});
+  const exact = await report(c, {detail: 'é'.repeat(2048)});
+  assert.equal(accented.status, 413, \`a detail of 3000 accented characters (6000 bytes of UTF-8) answered \${accented.status}, expected 413: the cap is in bytes\`);
+  assert.equal(long.status, 413, \`a detail of 4097 bytes answered \${long.status}, expected 413\`);
+  assert.equal(exact.status, 201, \`a detail of exactly 4096 bytes answered \${exact.status}: \${exact.text}\`);
+  assert.equal(cases(ctx).length, 1, \`only the report within the cap may open a case, Redis holds \${JSON.stringify(cases(ctx))}\`);
+}
+
+export async function check_dedupe(ctx) {
+  const {c, store} = api(ctx);
+  const first = await report(c, {reason: 'spam', detail: 'first look'});
+  const again = await report(c, {reason: 'harassment', detail: 'second look'});
+  const other = await report(c, {headers: {'X-Tenant-Id': 'acme', 'X-Reporter-Id': 'u-18'}});
+  assert.equal(first.status, 201, \`the first report answered \${first.status}: \${first.text}\`);
+  const caseId = first.json().case_id;
+  assert(
+    again.status === 200 && again.json().case_id === caseId && again.json().status === 'updated',
+    \`the same reporter reporting c-1 again answered \${again.status} \${again.text}, expected 200 {case_id: \${caseId}, status: updated}\`,
+  );
+  const stored = await store.getCase(caseId);
+  assert(stored.reports === 2 && stored.reason === 'harassment' && stored.detail === 'second look', \`the repeat report must update the case, it holds \${JSON.stringify(stored)}\`);
+  assert(other.status === 201 && other.json().case_id !== caseId, \`another reporter on the same content must open their own case, got \${other.status} \${other.text}\`);
+  assert.equal(cases(ctx).length, 2, \`two reporters must leave two cases, Redis holds \${JSON.stringify(cases(ctx))}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"moderation/store"
+
+	"leetbuild/harness"
+)
+
+var apiBg = context.Background()
+
+func apiClient(ctx *harness.Ctx) *harness.HTTP {
+	store.AddContent(apiBg, "c-1", "acme", "Buy followers now")
+	store.AddContent(apiBg, "c-2", "globex", "Quarterly results")
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func apiReport(c *harness.HTTP, contentID, reason, detail string, header ...string) *harness.Response {
+	if len(header) == 0 {
+		header = []string{"X-Tenant-Id", "acme", "X-Reporter-Id", "u-17"}
+	}
+	return c.Post("/v1/reports", map[string]string{"content_id": contentID, "reason": reason, "detail": detail}, header...)
+}
+
+func apiField(r *harness.Response, name string) string {
+	body, _ := r.JSON().(map[string]any)
+	s, _ := body[name].(string)
+	return s
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	r := apiReport(c, "c-1", "spam", "Spam link in bio")
+	ctx.Equal(r.Status, 201, "a report from the content owner (%s)", r.Text())
+	caseID := apiField(r, "case_id")
+	ctx.Assert(apiField(r, "status") == "created" && caseID != "", "a new report must answer {case_id, status: created}, got %s", r.Text())
+	stored := store.GetCase(apiBg, caseID)
+	ctx.Assert(stored != nil && stored.Tenant == "acme" && stored.ContentID == "c-1" && stored.ReporterID == "u-17" && stored.Reason == "spam" && stored.Detail == "Spam link in bio", "the stored case is %+v", stored)
+	r = c.Post("/v1/reports", map[string]string{"content_id": "c-1", "reason": "spam"}, "X-Tenant-Id", "acme")
+	ctx.Equal(r.Status, 401, "a report without X-Reporter-Id")
+	r = apiReport(c, "c-404", "spam", "")
+	ctx.Equal(r.Status, 404, "a report on unknown content")
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	foreign := apiReport(c, "c-2", "spam", "")
+	unknown := apiReport(c, "c-404", "spam", "")
+	ctx.Equal(foreign.Status, 404, "acme reported globex's content c-2 (%s); the content must belong to the calling tenant", foreign.Text())
+	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 0, "a report on another tenant's content must open no case; cases")
+	ctx.Equal(foreign.Text(), unknown.Text(), "a foreign id must answer exactly as an unknown one, or the difference tells acme what globex hosts; the foreign answer")
+}
+
+func CheckReasonAllowlist(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	for _, reason := range []string{"spamm", "other", ""} {
+		r := apiReport(c, "c-1", reason, "")
+		ctx.Equal(r.Status, 400, "a report with reason %q", reason)
+	}
+	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 0, "rejected reasons must open no case; cases")
+	r := apiReport(c, "c-1", "self_harm", "")
+	ctx.Equal(r.Status, 201, "a report with reason self_harm (%s)", r.Text())
+	ctx.Equal(store.GetCase(apiBg, apiField(r, "case_id")).Reason, "self_harm", "the case must keep the reason the reporter chose")
+}
+
+func CheckDetailBytes(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	accented := apiReport(c, "c-1", "spam", strings.Repeat("é", 3000))
+	long := apiReport(c, "c-1", "spam", strings.Repeat("a", 4097))
+	exact := apiReport(c, "c-1", "spam", strings.Repeat("é", 2048))
+	ctx.Equal(accented.Status, 413, "a detail of 3000 accented characters (6000 bytes of UTF-8): the cap is in bytes")
+	ctx.Equal(long.Status, 413, "a detail of 4097 bytes")
+	ctx.Equal(exact.Status, 201, "a detail of exactly 4096 bytes (%s)", exact.Text())
+	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 1, "only the report within the cap may open a case; cases")
+}
+
+func CheckDedupe(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	first := apiReport(c, "c-1", "spam", "first look")
+	again := apiReport(c, "c-1", "harassment", "second look")
+	other := apiReport(c, "c-1", "spam", "", "X-Tenant-Id", "acme", "X-Reporter-Id", "u-18")
+	ctx.Equal(first.Status, 201, "the first report (%s)", first.Text())
+	caseID := apiField(first, "case_id")
+	ctx.Assert(again.Status == 200 && apiField(again, "case_id") == caseID && apiField(again, "status") == "updated", "the same reporter reporting c-1 again answered %d %s, expected 200 {case_id: %s, status: updated}", again.Status, again.Text(), caseID)
+	stored := store.GetCase(apiBg, caseID)
+	ctx.Assert(stored.Reports == 2 && stored.Reason == "harassment" && stored.Detail == "second look", "the repeat report must update the case, it holds %+v", stored)
+	ctx.Assert(other.Status == 201 && apiField(other, "case_id") != caseID, "another reporter on the same content must open their own case, got %d %s", other.Status, other.Text())
+	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 2, "two reporters must leave two cases; cases")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+namespace {
+
+harness::HTTP apiClient(harness::Ctx& ctx) {
+  store::addContent("c-1", "acme", "Buy followers now");
+  store::addContent("c-2", "globex", "Quarterly results");
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+std::string apiBody(const std::string& content_id, const std::string& reason, const std::string& detail) {
+  return nlohmann::json{{"content_id", content_id}, {"reason", reason}, {"detail", detail}}.dump();
+}
+
+harness::Response apiReport(harness::HTTP& c, const std::string& content_id, const std::string& reason, const std::string& detail,
+                            const std::string& reporter = "u-17") {
+  return c.Post("/v1/reports", apiBody(content_id, reason, detail), "Content-Type", "application/json", "X-Tenant-Id", "acme",
+                "X-Reporter-Id", reporter);
+}
+
+std::string apiField(const harness::Response& r, const std::string& name) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body.value(name, "") : "";
+}
+
+std::string repeat(const std::string& s, int n) {
+  std::string out;
+  for (int i = 0; i < n; i++) out += s;
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  auto r = apiReport(c, "c-1", "spam", "Spam link in bio");
+  ctx.Equal(r.Status, 201, "a report from the content owner (%s)", r.Text());
+  const std::string case_id = apiField(r, "case_id");
+  ctx.Assert(apiField(r, "status") == "created" && !case_id.empty(), "a new report must answer {case_id, status: created}, got %s", r.Text());
+  const auto stored = store::getCase(case_id);
+  ctx.Assert(stored && stored->tenant == "acme" && stored->content_id == "c-1" && stored->reporter_id == "u-17" && stored->reason == "spam" &&
+                 stored->detail == "Spam link in bio",
+             "the stored case for %s is missing or wrong (reason %q, detail %q)", case_id, stored ? stored->reason : "", stored ? stored->detail : "");
+  r = c.Post("/v1/reports", apiBody("c-1", "spam", ""), "Content-Type", "application/json", "X-Tenant-Id", "acme");
+  ctx.Equal(r.Status, 401, "a report without X-Reporter-Id");
+  r = apiReport(c, "c-404", "spam", "");
+  ctx.Equal(r.Status, 404, "a report on unknown content");
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  const auto foreign = apiReport(c, "c-2", "spam", "");
+  const auto unknown = apiReport(c, "c-404", "spam", "");
+  ctx.Equal(foreign.Status, 404, "acme reported globex's content c-2 (%s); the content must belong to the calling tenant", foreign.Text());
+  ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 0, "a report on another tenant's content must open no case; cases");
+  ctx.Equal(foreign.Text(), unknown.Text(), "a foreign id must answer exactly as an unknown one, or the difference tells acme what globex hosts; the foreign answer");
+}
+
+void CheckReasonAllowlist(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  for (const std::string reason : {"spamm", "other", ""}) {
+    const auto r = apiReport(c, "c-1", reason, "");
+    ctx.Equal(r.Status, 400, "a report with reason %q", reason);
+  }
+  ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 0, "rejected reasons must open no case; cases");
+  const auto r = apiReport(c, "c-1", "self_harm", "");
+  ctx.Equal(r.Status, 201, "a report with reason self_harm (%s)", r.Text());
+  const auto stored = store::getCase(apiField(r, "case_id"));
+  ctx.Equal(stored ? stored->reason : "", "self_harm", "the case must keep the reason the reporter chose");
+}
+
+void CheckDetailBytes(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  const auto accented = apiReport(c, "c-1", "spam", repeat("é", 3000));
+  const auto long_detail = apiReport(c, "c-1", "spam", repeat("a", 4097));
+  const auto exact = apiReport(c, "c-1", "spam", repeat("é", 2048));
+  ctx.Equal(accented.Status, 413, "a detail of 3000 accented characters (6000 bytes of UTF-8): the cap is in bytes");
+  ctx.Equal(long_detail.Status, 413, "a detail of 4097 bytes");
+  ctx.Equal(exact.Status, 201, "a detail of exactly 4096 bytes (%s)", exact.Text());
+  ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 1, "only the report within the cap may open a case; cases");
+}
+
+void CheckDedupe(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  const auto first = apiReport(c, "c-1", "spam", "first look");
+  const auto again = apiReport(c, "c-1", "harassment", "second look");
+  const auto other = apiReport(c, "c-1", "spam", "", "u-18");
+  ctx.Equal(first.Status, 201, "the first report (%s)", first.Text());
+  const std::string case_id = apiField(first, "case_id");
+  ctx.Assert(again.Status == 200 && apiField(again, "case_id") == case_id && apiField(again, "status") == "updated",
+             "the same reporter reporting c-1 again answered %d %s, expected 200 {case_id: %s, status: updated}", again.Status, again.Text(), case_id);
+  const auto stored = store::getCase(case_id);
+  ctx.Assert(stored && stored->reports == 2 && stored->reason == "harassment" && stored->detail == "second look",
+             "the repeat report must update the case: reports %v, reason %q, detail %q", stored ? stored->reports : 0L, stored ? stored->reason : "",
+             stored ? stored->detail : "");
+  ctx.Assert(other.Status == 201 && apiField(other, "case_id") != case_id, "another reporter on the same content must open their own case, got %d %s",
+             other.Status, other.Text());
+  ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 2, "two reporters must leave two cases; cases");
+}
+`,
+  },
   hints: [
-    'A tenant on the demo can open a case against content it does not own, a misspelled reason becomes a live case, a megabyte of detail lands in the store, and one reporter fills the queue with duplicates.',
-    'Every guard the starter has is a fallback, not a rejection: the reason defaults to `other`, the detail is stored unmeasured, the content id is trusted, and `insert` runs without a prior `find`.',
-    'Guard in order: catalogue lookup (404), `ALLOWED_REASONS` (400), UTF-8 bytes against `MAX_DETAIL_BYTES` (413); then `cases.find(tenant, content_id, reporter_id)` and `cases.update` answering `status: "updated"` before any insert.',
+    'Signed in as acme, report globex’s post: a case opens. Report the same post twice from one account: two cases. Send `spamm` as the reason: a case filed under `other`.',
+    'The catalogue lookup asks whether the content exists, not who owns it; an unknown reason falls back instead of failing; the cap counts characters, and `é` is two bytes; nothing looks for the reporter’s case before inserting.',
+    'Compare `store.content_tenant(id)` with the caller’s tenant (404 when they differ); 400 when the reason is not in `ALLOWED_REASONS`; measure `len(detail.encode("utf-8"))`; call `store.find_case` first and `update_case` on a hit.',
   ],
-  debrief: `The fix is a funnel: each guard rejects before anything is written, ordered from the cheapest header check to the catalogue lookup, and the dedupe lookup runs before the insert so a repeat report becomes an update on the case that already exists. Ownership answers 404 rather than 403 because a 403 confirms the content exists to a tenant that should not know. The reason set is closed because a case with no rule behind it has no reviewer path. The byte cap bounds a field that is personal free text and the log line omits it for the same reason. Production intake also rate-limits reporters, fingerprints content so the same item reported across tenants can be linked, and keeps the detail in a sealed store that is audited apart from the case metadata.`,
+  debrief: `The report endpoint is a trust boundary: the body names someone else's content, so ownership is checked against the catalogue before anything is stored, and a foreign id gets the same 404 as an unknown one so the endpoint does not confirm what other tenants host. A closed reason list keeps every case attached to a policy a moderator can apply; a fallback category turns typos into queue work. Bytes are what the store and every copy downstream pay for, so the cap counts bytes. Keying a case by tenant, content and reporter turns a repeat report into a signal on one case. Production intake also rate-limits reports per reporter, weighs reporters by how often their reports were upheld, and merges cases from different reporters on one item for the moderator.`,
 };

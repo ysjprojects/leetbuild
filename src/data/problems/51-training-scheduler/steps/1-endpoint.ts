@@ -2,35 +2,30 @@ import type {Step} from '@/lib/types';
 
 export const trainingEndpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/training/runs: a run that starts exactly once',
+  title: 'POST /v1/training/runs: one clamped, known, idempotent run',
   concept: 'http',
   file: 'api',
   focus: ['client', 'scheduler', 'store', 'redis'],
   task: `## Task
 
 **Starting point.** The starter serves \`POST /v1/training/runs\` with body
-\`{"dataset_version": "…", "recipe_version": "…", "priority": 5}\`: it reads \`X-Tenant-Id\`, mints
-\`run-<counter>\` as the run id, logs it and answers **201** with the caller's priority echoed back.
-It compiles, serves the demo and hides four flaws.
+\`{"dataset_version", "recipe_version", "priority"}\`: it reads \`X-Tenant-Id\` (**401** without it),
+mints \`run-<epoch ms>\` as the run id, maps the priority to a band with
+\`(PRIORITY_MAX - priority) // BAND_WIDTH\`, writes the row with \`runs.put\`, queues it with
+\`queue.enqueue\` (both provided in \`trainsched\`) and answers **201** \`{run_id, state, priority, band}\`.
+It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A caller sends \`priority: 999999\` and outranks every band,
-because the integer is passed through unclamped. A typo in \`recipe_version\` is queued and holds a
-GPU slot for a job that can only fail. A client that times out and retries the same
-\`Idempotency-Key\` starts a second run, because the header is ignored. And the counter-based id is
-stored nowhere, so a scheduler restart loses the submission.
+**Failure mode the checks target.** A caller sends \`priority: 999999\` and lands ahead of every
+high-band run; a typo in \`recipe_version\` is queued and holds a GPU slot for a job that can only
+fail; a client that times out and retries starts a second run; and two submissions in the same
+millisecond share one id, so the second overwrites the first.
 
-- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the original run with the same \`run_id\` and no second queue entry.
-- \`dataset_version\` is a non-empty string of at most **128** characters (**400** otherwise).
-- \`recipe_version\` must be one of \`KNOWN_RECIPES\` (**400** otherwise), rejected before
-  \`queue.enqueue()\`.
-- \`priority\` defaults to **5**, is clamped into \`PRIORITY_MIN..PRIORITY_MAX\` (\`0..9\`) and then
-  mapped into \`PRIORITY_BANDS\` (**3**): high at **7** and above, normal from **3**, low below.
-- The \`run_id\` is a scheduler-issued UUID persisted with \`runs.put()\` under
-  \`(tenant, Idempotency-Key)\` before the response.
-- Answer **201** with \`{"run_id", "state": "queued", "priority", "band"}\`; a replay answers
-  **200** with the stored run. Log run id, tenant and band only.`,
+- \`priority\` (default 4) is clamped into \`PRIORITY_MIN..PRIORITY_MAX\` (0..8) before the band is
+  computed: band 0 holds 6..8, band 1 holds 3..5, band 2 holds 0..2.
+- \`recipe_version\` must be in \`KNOWN_RECIPES\`; anything else is **400** and nothing is written.
+- \`Idempotency-Key\` is required (**400**). \`runs.run_for_key(tenant, key)\` answers a retry with the
+  run it created (**200**); a new run is bound with \`runs.bind_key\`.
+- The run id comes from \`runs.new_run_id()\`, a Redis sequence every replica shares.`,
   sequence: {
     participants: ['Client', 'Training Scheduler', 'run store', 'Redis queue'],
     messages: [
@@ -40,363 +35,312 @@ stored nowhere, so a scheduler restart loses the submission.
         label: 'POST /v1/training/runs · X-Tenant-Id · Idempotency-Key',
         kind: 'sync',
       },
-      {from: 'Training Scheduler', to: 'Training Scheduler', label: 'validate versions · clamp priority', kind: 'sync'},
-      {from: 'Training Scheduler', to: 'run store', label: 'get(tenant, idem_key)', kind: 'sync'},
-      {from: 'run store', to: 'Training Scheduler', label: 'stored run / none', kind: 'reply'},
-      {from: 'Training Scheduler', to: 'run store', label: 'put(tenant, idem_key, run)', kind: 'sync'},
-      {from: 'Training Scheduler', to: 'Redis queue', label: 'enqueue(run) at its band position', kind: 'async'},
-      {from: 'Training Scheduler', to: 'Client', label: '201 {run_id, state: queued, band}', kind: 'reply'},
+      {from: 'Training Scheduler', to: 'run store', label: 'run_for_key(tenant, key)', kind: 'sync'},
+      {from: 'run store', to: 'Training Scheduler', label: 'the run a retry created → 200', kind: 'reply'},
+      {
+        from: 'Training Scheduler',
+        to: 'Training Scheduler',
+        label: 'KNOWN_RECIPES → 400 · clamp priority → band',
+        kind: 'sync',
+      },
+      {from: 'Training Scheduler', to: 'run store', label: 'new_run_id · put(run) · bind_key', kind: 'sync'},
+      {from: 'Training Scheduler', to: 'Redis queue', label: 'enqueue(run_id, band, enqueued_at_ms)', kind: 'sync'},
+      {from: 'Training Scheduler', to: 'Client', label: '201 {run_id, state: queued, priority, band}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/training/runs',
-      detail: 'Register the submission route on `POST /v1/training/runs`.',
+      title: 'Queues a valid submission on POST /v1/training/runs',
+      detail:
+        'A valid submission answers **201** with the run id and `state: "queued"`, its row is in the run store and it waits in `training:queue`.',
       match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/training\/runs["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/training\/runs['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/training\/runs"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"training"\s*\/\s*"runs"\s*\)/, /\bpost\s*\{/]},
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/training\/runs"/]},
+        python: {all: [/@app\.post\(\s*["']\/v1\/training\/runs["']/, /queue\.enqueue\(/]},
+        typescript: {all: [/app\.post\(\s*['"]\/v1\/training\/runs['"]/, /enqueue\(/]},
+        go: {all: [/HandleFunc\(\s*"POST \/v1\/training\/runs"/, /queue\.Enqueue\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"training"\s*\/\s*"runs"\s*\)/, /\bpost\s*\{/, /Queue\.enqueue\(/]},
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/training\/runs"/, /queue::enqueue\(/]},
       },
     },
     {
       id: 'priority-band',
-      title: 'Clamps priority into the supported bands',
+      title: 'Clamps the priority before it picks the band',
       detail:
-        'Priority is clamped to `0..9` and mapped to one of 3 bands before the run is queued. The starter passes the caller’s integer straight through, so `999999` outranks every band.',
+        '`priority: 999999` is answered as priority 8 in band 0 and waits behind a priority-8 run submitted earlier; `-5` is priority 0 in band 2. The starter bands the raw integer, so a large value scores ahead of the whole queue.',
       match: {
-        python: {
-          all: [/PRIORITY_MIN/, /PRIORITY_MAX/, /PRIORITY_BANDS/, /def clamp_priority\(/, /def priority_band\(/],
-        },
+        python: {all: [/min\([^\n]*PRIORITY_MAX|>\s*PRIORITY_MAX/, /max\([^\n]*PRIORITY_MIN|<\s*PRIORITY_MIN/]},
         typescript: {
+          all: [/Math\.min\([^\n]*PRIORITY_MAX|>\s*PRIORITY_MAX/, /Math\.max\([^\n]*PRIORITY_MIN|<\s*PRIORITY_MIN/],
+        },
+        go: {all: [/min\([^\n]*priorityMax|>\s*priorityMax/, /max\([^\n]*priorityMin|<\s*priorityMin/]},
+        scala: {all: [/min\([^\n]*PriorityMax|>\s*PriorityMax/, /max\([^\n]*PriorityMin|<\s*PriorityMin/]},
+        cpp: {
           all: [
-            /PRIORITY_MIN/,
-            /PRIORITY_MAX/,
-            /PRIORITY_BANDS/,
-            /function clampPriority\(/,
-            /function priorityBand\(/,
+            /clamp\([^\n]*kPriorityMax|min\([^\n]*kPriorityMax|>\s*kPriorityMax/,
+            /clamp\([^\n]*kPriorityMin|max\([^\n]*kPriorityMin|<\s*kPriorityMin/,
           ],
         },
-        go: {all: [/priorityMin/, /priorityMax/, /priorityBands/, /func clampPriority\(/, /func priorityBand\(/]},
-        scala: {all: [/PriorityMin/, /PriorityMax/, /PriorityBands/, /def clampPriority\(/, /def priorityBand\(/]},
-        cpp: {all: [/kPriorityMin/, /kPriorityMax/, /kPriorityBands/, /clampPriority\(/, /priorityBand\(/]},
-      },
-    },
-    {
-      id: 'idempotency',
-      title: 'A replay of (tenant, Idempotency-Key) returns the original run',
-      detail:
-        '`Idempotency-Key` is required and the run is stored under `(tenant, key)`: a retry returns the stored run instead of queueing a second one. The starter ignores the header entirely.',
-      match: {
-        python: {all: [/Idempotency-Key/, /runs\.get\(/, /runs\.put\(/]},
-        typescript: {all: [/idempotency-key/, /runs\.get\(/, /runs\.put\(/]},
-        go: {all: [/Idempotency-Key/, /runs\.Get\(/, /runs\.Put\(/]},
-        scala: {all: [/Idempotency-Key/, /runs\.get\(/, /runs\.put\(/]},
-        cpp: {all: [/Idempotency-Key/, /runs\.get\(/, /runs\.put\(/]},
       },
     },
     {
       id: 'recipe-version',
-      title: 'An unknown recipe version is 400 before the run is enqueued',
+      title: 'Rejects an unknown recipe before anything is written',
       detail:
-        'The recipe version is checked against the registry and rejected with **400** before any queue write. The starter never looks the recipe up, so a typo consumes a GPU slot.',
+        'A `recipe_version` outside `KNOWN_RECIPES` is **400**, with no run row and no queue entry. The starter queues whatever it is sent.',
       match: {
-        python: {all: [/KNOWN_RECIPES/, /HTTPException\(status_code=400/], order: [/KNOWN_RECIPES/, /enqueue\(/]},
-        typescript: {all: [/KNOWN_RECIPES/, /code\(400\)/], order: [/KNOWN_RECIPES/, /enqueue\(/]},
-        go: {all: [/knownRecipes/, /StatusBadRequest/], order: [/knownRecipes/, /queue\.Enqueue\(/]},
-        scala: {all: [/KnownRecipes/, /StatusCodes\.BadRequest/], order: [/KnownRecipes/, /queue\.enqueue\(/]},
-        cpp: {all: [/kKnownRecipes/, /\b400\b/], order: [/kKnownRecipes/, /queue\.enqueue\(/]},
+        python: {all: [/not in KNOWN_RECIPES/, /\b400\b/], order: [/not in KNOWN_RECIPES/, /queue\.enqueue\(/]},
+        typescript: {all: [/KNOWN_RECIPES\.has\(/, /\b400\b/], order: [/KNOWN_RECIPES\.has\(/, /enqueue\(run/]},
+        go: {all: [/knownRecipes\[/, /StatusBadRequest|\b400\b/], order: [/knownRecipes\[/, /queue\.Enqueue\(/]},
+        scala: {
+          all: [/KnownRecipes\.contains\(/, /BadRequest/],
+          order: [/KnownRecipes\.contains\(/, /Queue\.enqueue\(/],
+        },
+        cpp: {
+          all: [/kKnownRecipes\.(count|find|contains)\(/, /\b400\b/],
+          order: [/kKnownRecipes\.(count|find|contains)\(/, /queue::enqueue\(/],
+        },
       },
     },
     {
-      id: 'durable-run',
-      title: 'The scheduler issues the run id and persists the run before answering',
+      id: 'idempotency',
+      title: 'A retry of (tenant, Idempotency-Key) answers the run it created',
       detail:
-        'The run id is a scheduler-issued UUID, written to the run store under `(tenant, key)` before the response, so a restart replays the submission rather than losing it. The starter mints a counter-based id and stores nothing.',
+        '`Idempotency-Key` is required (**400**); the key is looked up with `run_for_key` before anything is queued and a new run is bound with `bind_key`, so a retry answers **200** with the same `run_id` and the queue holds one entry. The starter ignores the header.',
       match: {
-        python: {all: [/uuid\.uuid4\(\)/, /runs\.put\(/, /run_id/]},
-        typescript: {all: [/randomUUID\(\)/, /runs\.put\(/, /run_id/]},
-        go: {all: [/uuid\.NewString\(\)/, /runs\.Put\(/, /run_id/]},
-        scala: {all: [/UUID\.randomUUID\(\)/, /runs\.put\(/, /run_id/]},
-        cpp: {all: [/uuidString\(\)/, /runs\.put\(/, /run_id/]},
+        python: {
+          all: [/idempotency-key/i, /runs\.run_for_key\(/, /runs\.bind_key\(/],
+          order: [/runs\.run_for_key\(/, /queue\.enqueue\(/],
+        },
+        typescript: {all: [/idempotency-key/i, /runForKey\(/, /bindKey\(/], order: [/runForKey\(/, /enqueue\(run/]},
+        go: {
+          all: [/Idempotency-Key/i, /runs\.RunForKey\(/, /runs\.BindKey\(/],
+          order: [/runs\.RunForKey\(/, /queue\.Enqueue\(/],
+        },
+        scala: {
+          all: [/Idempotency-Key/i, /Runs\.runForKey\(/, /Runs\.bindKey\(/],
+          order: [/Runs\.runForKey\(/, /Queue\.enqueue\(/],
+        },
+        cpp: {
+          all: [/Idempotency-Key/i, /runs::runForKey\(/, /runs::bindKey\(/],
+          order: [/runs::runForKey\(/, /queue::enqueue\(/],
+        },
+      },
+    },
+    {
+      id: 'unique-run-id',
+      title: 'Takes the run id from the shared sequence',
+      detail:
+        'Two submissions in the same millisecond get two run ids and keep two rows. The starter derives the id from the clock, so the second run overwrites the first.',
+      match: {
+        python: {all: [/runs\.new_run_id\(\)/], none: [/f["']run-\{/]},
+        typescript: {all: [/newRunId\(\)/], none: [/`run-\$\{/]},
+        go: {all: [/runs\.NewRunID\(/], none: [/"run-%d"|"run-"\s*\+/]},
+        scala: {all: [/Runs\.newRunId\(\)/], none: [/s"run-\$/]},
+        cpp: {all: [/runs::newRunId\(\)/], none: [/"run-"\s*\+/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import itertools
-import logging
+      starter: `import time
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("trainsched")
-
-run_counter = itertools.count(1)
-
-
-class SubmitRequest(BaseModel):
-    dataset_version: str
-    recipe_version: str
-    priority: int = 5
-
-
-class RunStore:
-    def __init__(self) -> None:
-        self._by_key: dict[tuple[str, str], dict] = {}
-
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The run stored for (tenant, Idempotency-Key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, run: dict) -> None:
-        """Persist the run under (tenant, Idempotency-Key)."""
-        raise NotImplementedError
-
-
-runs = RunStore()
-
-
-@app.post("/v1/training/runs")
-def submit(body: SubmitRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    run_id = f"run-{next(run_counter)}"
-    logger.info("run queued run_id=%s tenant=%s priority=%d", run_id, tenant, body.priority)
-    return JSONResponse(
-        {"run_id": run_id, "state": "queued", "priority": body.priority},
-        status_code=201,
-    )
-`,
-      solution: `import logging
-import uuid
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from trainsched import queue, runs  # runs.new_run_id, put, get, run_for_key, bind_key; queue.enqueue
 
 app = FastAPI()
-logger = logging.getLogger("trainsched")
 
 PRIORITY_MIN = 0
-PRIORITY_MAX = 9
-PRIORITY_BANDS = 3
-HIGH_PRIORITY_MIN = 7
-NORMAL_PRIORITY_MIN = 3
-MAX_VERSION_LEN = 128
-KNOWN_RECIPES = {"recipe-transformer-v1", "recipe-diffusion-v2", "recipe-embed-v3"}
+PRIORITY_MAX = 8
+BAND_WIDTH = 3  # band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
+KNOWN_RECIPES = {"llama-ft-v3", "vit-pretrain-v1", "embed-distill-v2"}
 
 
-class SubmitRequest(BaseModel):
+class Submission(BaseModel):
     dataset_version: str
     recipe_version: str
-    priority: int = 5
+    priority: int = 4
 
 
-class RunStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The run stored for (tenant, Idempotency-Key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, run: dict) -> None:
-        """Persist the run under (tenant, Idempotency-Key)."""
-        raise NotImplementedError
-
-
-class RunQueue:
-    def enqueue(self, run: dict) -> None:
-        """Add the run to the Redis queue at its band's position."""
-        raise NotImplementedError
-
-
-runs = RunStore()
-queue = RunQueue()
-
-
-def clamp_priority(priority: int) -> int:
-    return min(max(priority, PRIORITY_MIN), PRIORITY_MAX)
-
-
-def priority_band(priority: int) -> int:
-    clamped = clamp_priority(priority)
-    if clamped >= HIGH_PRIORITY_MIN:
-        return 0
-    if clamped >= NORMAL_PRIORITY_MIN:
-        return 1
-    return 2
-
-
-def version_ok(value: str) -> bool:
-    return isinstance(value, str) and 0 < len(value) <= MAX_VERSION_LEN
+def view(run: dict) -> dict:
+    return {"run_id": run["run_id"], "state": run["state"], "priority": run["priority"], "band": run["band"]}
 
 
 @app.post("/v1/training/runs")
-def submit(
-    body: SubmitRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if idem_key is None or idem_key == "":
-        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if not version_ok(body.dataset_version):
-        raise HTTPException(status_code=400, detail="dataset_version must be 1..128 chars")
-    if body.recipe_version not in KNOWN_RECIPES:
-        raise HTTPException(status_code=400, detail="unknown recipe version")
-
-    stored = runs.get(tenant, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=200)
-
-    priority = clamp_priority(body.priority)
+def submit(body: Submission, request: Request) -> JSONResponse:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    now_ms = int(time.time() * 1000)
     run = {
-        "run_id": str(uuid.uuid4()),
+        "run_id": f"run-{now_ms}",
         "tenant": tenant,
-        "state": "queued",
-        "priority": priority,
-        "band": priority_band(priority),
         "recipe_version": body.recipe_version,
         "dataset_version": body.dataset_version,
+        "priority": body.priority,
+        "band": (PRIORITY_MAX - body.priority) // BAND_WIDTH,
+        "state": "queued",
+        "enqueued_at_ms": now_ms,
     }
-    runs.put(tenant, idem_key, run)
-    queue.enqueue(run)
-    logger.info("run queued run_id=%s tenant=%s band=%d", run["run_id"], tenant, run["band"])
-    return JSONResponse(run, status_code=201)
+    runs.put(run)
+    queue.enqueue(run["run_id"], run["band"], run["enqueued_at_ms"])
+    return JSONResponse(view(run), status_code=201)
+`,
+      solution: `import time
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from trainsched import queue, runs  # runs.new_run_id, put, get, run_for_key, bind_key; queue.enqueue
+
+app = FastAPI()
+
+PRIORITY_MIN = 0
+PRIORITY_MAX = 8
+BAND_WIDTH = 3  # band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
+KNOWN_RECIPES = {"llama-ft-v3", "vit-pretrain-v1", "embed-distill-v2"}
+
+
+class Submission(BaseModel):
+    dataset_version: str
+    recipe_version: str
+    priority: int = 4
+
+
+def view(run: dict) -> dict:
+    return {"run_id": run["run_id"], "state": run["state"], "priority": run["priority"], "band": run["band"]}
+
+
+@app.post("/v1/training/runs")
+def submit(body: Submission, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
+    replayed = runs.run_for_key(tenant, key)
+    if replayed is not None:
+        return JSONResponse(view(runs.get(replayed)), status_code=200)  # a retry answers the run it created
+    if body.recipe_version not in KNOWN_RECIPES:
+        raise HTTPException(status_code=400, detail=f"unknown recipe_version {body.recipe_version!r}")
+    # Clamp first: the band is computed from a priority the scheduler supports.
+    priority = min(max(body.priority, PRIORITY_MIN), PRIORITY_MAX)
+    run = {
+        "run_id": runs.new_run_id(),
+        "tenant": tenant,
+        "recipe_version": body.recipe_version,
+        "dataset_version": body.dataset_version,
+        "priority": priority,
+        "band": (PRIORITY_MAX - priority) // BAND_WIDTH,
+        "state": "queued",
+        "enqueued_at_ms": int(time.time() * 1000),
+    }
+    runs.put(run)
+    runs.bind_key(tenant, key, run["run_id"])
+    queue.enqueue(run["run_id"], run["band"], run["enqueued_at_ms"])
+    return JSONResponse(view(run), status_code=201)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/training/runs: flawed code that queues anything it is given. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {enqueue} from 'trainsched/queue';
+import {type Run, bindKey, get, newRunId, put, runForKey} from 'trainsched/runs';
 
 export const app = Fastify();
 
-let runCounter = 0;
+export const PRIORITY_MIN = 0;
+export const PRIORITY_MAX = 8;
+export const BAND_WIDTH = 3; // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
+export const KNOWN_RECIPES = new Set(['llama-ft-v3', 'vit-pretrain-v1', 'embed-distill-v2']);
 
-interface SubmitBody {
+interface Submission {
   dataset_version: string;
   recipe_version: string;
   priority?: number;
 }
+
+const view = (run: Run) => ({run_id: run.run_id, state: run.state, priority: run.priority, band: run.band});
 
 app.post('/v1/training/runs', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as SubmitBody;
-  const runId = \`run-\${++runCounter}\`;
-  request.log.info({runId, tenant, priority: body.priority ?? 5}, 'run queued');
-  return reply.code(201).send({run_id: runId, state: 'queued', priority: body.priority ?? 5});
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const body = request.body as Submission;
+  const priority = body.priority ?? 4;
+  const nowMs = Date.now();
+  const run: Run = {
+    run_id: \`run-\${nowMs}\`,
+    tenant,
+    recipe_version: body.recipe_version,
+    dataset_version: body.dataset_version,
+    priority,
+    band: Math.floor((PRIORITY_MAX - priority) / BAND_WIDTH),
+    state: 'queued',
+    enqueued_at_ms: nowMs,
+    worker: '',
+    nodes: [],
+    checkpoint_id: '',
+  };
+  await put(run);
+  await enqueue(run.run_id, run.band, run.enqueued_at_ms);
+  return reply.code(201).send(view(run));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/training/runs: admitted, clamped and idempotent submissions. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {enqueue} from 'trainsched/queue';
+import {type Run, bindKey, get, newRunId, put, runForKey} from 'trainsched/runs';
 
 export const app = Fastify();
 
-const PRIORITY_MIN = 0;
-const PRIORITY_MAX = 9;
-const PRIORITY_BANDS = 3;
-const HIGH_PRIORITY_MIN = 7;
-const NORMAL_PRIORITY_MIN = 3;
-const MAX_VERSION_LEN = 128;
-const KNOWN_RECIPES: Record<string, true> = {
-  'recipe-transformer-v1': true,
-  'recipe-diffusion-v2': true,
-  'recipe-embed-v3': true,
-};
+export const PRIORITY_MIN = 0;
+export const PRIORITY_MAX = 8;
+export const BAND_WIDTH = 3; // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
+export const KNOWN_RECIPES = new Set(['llama-ft-v3', 'vit-pretrain-v1', 'embed-distill-v2']);
 
-interface SubmitBody {
+interface Submission {
   dataset_version: string;
   recipe_version: string;
   priority?: number;
 }
 
-interface Run {
-  run_id: string;
-  tenant: string;
-  state: string;
-  priority: number;
-  band: number;
-  recipe_version: string;
-  dataset_version: string;
-}
-
-/** The run store and the queue are the platform's; this step only calls them. */
-class RunStore {
-  async get(tenant: string, idemKey: string): Promise<Run | null> {
-    throw new Error('provided by the platform');
-  }
-
-  async put(tenant: string, idemKey: string, run: Run): Promise<void> {
-    throw new Error('provided by the platform');
-  }
-}
-
-class RunQueue {
-  async enqueue(run: Run): Promise<void> {
-    throw new Error('provided by the platform');
-  }
-}
-
-const runs = new RunStore();
-const queue = new RunQueue();
-
-function clampPriority(priority: number): number {
-  return Math.min(Math.max(priority, PRIORITY_MIN), PRIORITY_MAX);
-}
-
-function priorityBand(priority: number): number {
-  const clamped = clampPriority(priority);
-  if (clamped >= HIGH_PRIORITY_MIN) return 0;
-  if (clamped >= NORMAL_PRIORITY_MIN) return 1;
-  return 2;
-}
-
-const versionOk = (value: unknown): value is string =>
-  typeof value === 'string' && value.length > 0 && value.length <= MAX_VERSION_LEN;
+const view = (run: Run) => ({run_id: run.run_id, state: run.state, priority: run.priority, band: run.band});
 
 app.post('/v1/training/runs', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<SubmitBody> | null;
-  if (body === null || typeof body !== 'object') return reply.code(400).send({error: 'invalid body'});
-  if (!versionOk(body.dataset_version))
-    return reply.code(400).send({error: 'dataset_version must be 1..128 chars'});
-  const recipeVersion = body.recipe_version;
-  if (typeof recipeVersion !== 'string' || KNOWN_RECIPES[recipeVersion] !== true)
-    return reply.code(400).send({error: 'unknown recipe version'});
-
-  const stored = await runs.get(tenant, idemKey);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  const priority = clampPriority(Number.isInteger(body.priority) ? (body.priority as number) : 5);
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const replayed = await runForKey(tenant, key);
+  if (replayed !== null) return reply.code(200).send(view((await get(replayed)) as Run)); // a retry answers the run it created
+  const body = request.body as Submission;
+  if (!KNOWN_RECIPES.has(body.recipe_version)) return reply.code(400).send({error: \`unknown recipe_version \${body.recipe_version}\`});
+  // Clamp first: the band is computed from a priority the scheduler supports.
+  const priority = Math.min(Math.max(body.priority ?? 4, PRIORITY_MIN), PRIORITY_MAX);
   const run: Run = {
-    run_id: randomUUID(),
+    run_id: await newRunId(),
     tenant,
-    state: 'queued',
+    recipe_version: body.recipe_version,
+    dataset_version: body.dataset_version,
     priority,
-    band: priorityBand(priority),
-    recipe_version: recipeVersion,
-    dataset_version: body.dataset_version as string,
+    band: Math.floor((PRIORITY_MAX - priority) / BAND_WIDTH),
+    state: 'queued',
+    enqueued_at_ms: Date.now(),
+    worker: '',
+    nodes: [],
+    checkpoint_id: '',
   };
-  await runs.put(tenant, idemKey, run);
-  await queue.enqueue(run);
-  request.log.info({run_id: run.run_id, tenant, band: run.band}, 'run queued');
-  return reply.code(201).send(run);
+  await put(run);
+  await bindKey(tenant, key, run.run_id);
+  await enqueue(run.run_id, run.band, run.enqueued_at_ms);
+  return reply.code(201).send(view(run));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -405,338 +349,250 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
+	"time"
+
+	"trainsched/queue" // queue.Enqueue
+	"trainsched/runs"  // runs.NewRunID, Put, Get, RunForKey, BindKey
 )
 
-var runCounter int
+const (
+	priorityMin = 0
+	priorityMax = 8
+	bandWidth   = 3 // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
+)
 
-type SubmitRequest struct {
+var knownRecipes = map[string]bool{"llama-ft-v3": true, "vit-pretrain-v1": true, "embed-distill-v2": true}
+
+type submission struct {
 	DatasetVersion string \`json:"dataset_version"\`
 	RecipeVersion  string \`json:"recipe_version"\`
 	Priority       int    \`json:"priority"\`
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func view(run *runs.Run) map[string]any {
+	return map[string]any{"run_id": run.RunID, "state": run.State, "priority": run.Priority, "band": run.Band}
 }
 
 func submit(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	var body SubmitRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	runCounter++
-	runID := fmt.Sprintf("run-%d", runCounter)
-	log.Printf("run queued run_id=%s tenant=%s priority=%d", runID, tenant, body.Priority)
-	writeJSON(rw, http.StatusCreated, map[string]any{
-		"run_id":   runID,
-		"state":    "queued",
-		"priority": body.Priority,
-	})
+	body := submission{Priority: 4}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	nowMs := time.Now().UnixMilli()
+	run := &runs.Run{
+		RunID: fmt.Sprintf("run-%d", nowMs), Tenant: tenant, RecipeVersion: body.RecipeVersion, DatasetVersion: body.DatasetVersion,
+		Priority: body.Priority, Band: (priorityMax - body.Priority) / bandWidth, State: "queued", EnqueuedAtMs: nowMs, Nodes: []string{},
+	}
+	if err := runs.Put(r.Context(), run); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	queue.Enqueue(r.Context(), run.RunID, run.Band, run.EnqueuedAtMs)
+	writeJSON(rw, http.StatusCreated, view(run))
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/training/runs", submit)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+	"time"
 
-	"github.com/google/uuid"
+	"trainsched/queue" // queue.Enqueue
+	"trainsched/runs"  // runs.NewRunID, Put, Get, RunForKey, BindKey
 )
 
 const (
-	priorityMin       = 0
-	priorityMax       = 9
-	priorityBands     = 3
-	highPriorityMin   = 7
-	normalPriorityMin = 3
-	maxVersionLen     = 128
+	priorityMin = 0
+	priorityMax = 8
+	bandWidth   = 3 // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
 )
 
-var knownRecipes = map[string]bool{
-	"recipe-transformer-v1": true,
-	"recipe-diffusion-v2":   true,
-	"recipe-embed-v3":       true,
-}
+var knownRecipes = map[string]bool{"llama-ft-v3": true, "vit-pretrain-v1": true, "embed-distill-v2": true}
 
-type SubmitRequest struct {
+type submission struct {
 	DatasetVersion string \`json:"dataset_version"\`
 	RecipeVersion  string \`json:"recipe_version"\`
 	Priority       int    \`json:"priority"\`
 }
 
-// RunStore and RunQueue are the platform's; this step only calls them.
-type RunStore struct{}
-
-func (s *RunStore) Get(ctx context.Context, tenant, idemKey string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *RunStore) Put(ctx context.Context, tenant, idemKey string, run map[string]any) error {
-	return nil
-}
-
-type RunQueue struct{}
-
-func (q *RunQueue) Enqueue(ctx context.Context, run map[string]any) error {
-	return nil
-}
-
-var (
-	runs  = &RunStore{}
-	queue = &RunQueue{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func clampPriority(priority int) int {
-	if priority < priorityMin {
-		return priorityMin
-	}
-	if priority > priorityMax {
-		return priorityMax
-	}
-	return priority
-}
-
-func priorityBand(priority int) int {
-	clamped := clampPriority(priority)
-	switch {
-	case clamped >= highPriorityMin:
-		return 0
-	case clamped >= normalPriorityMin:
-		return 1
-	default:
-		return priorityBands - 1
-	}
+func view(run *runs.Run) map[string]any {
+	return map[string]any{"run_id": run.RunID, "state": run.State, "priority": run.Priority, "band": run.Band}
 }
 
 func submit(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
 		return
 	}
-	var body SubmitRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if replayed := runs.RunForKey(r.Context(), tenant, key); replayed != "" {
+		writeJSON(rw, http.StatusOK, view(runs.Get(r.Context(), replayed))) // a retry answers the run it created
 		return
 	}
-	if len(body.DatasetVersion) == 0 || len(body.DatasetVersion) > maxVersionLen {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "dataset_version must be 1..128 chars"})
+	body := submission{Priority: 4}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
 	if !knownRecipes[body.RecipeVersion] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown recipe version"})
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown recipe_version " + body.RecipeVersion})
 		return
 	}
-	stored, err := runs.Get(r.Context(), tenant, idemKey)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	// Clamp first: the band is computed from a priority the scheduler supports.
+	priority := body.Priority
+	if priority < priorityMin {
+		priority = priorityMin
+	}
+	if priority > priorityMax {
+		priority = priorityMax
+	}
+	run := &runs.Run{
+		RunID: runs.NewRunID(r.Context()), Tenant: tenant, RecipeVersion: body.RecipeVersion, DatasetVersion: body.DatasetVersion,
+		Priority: priority, Band: (priorityMax - priority) / bandWidth, State: "queued", EnqueuedAtMs: time.Now().UnixMilli(), Nodes: []string{},
+	}
+	if err := runs.Put(r.Context(), run); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	if stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
-		return
-	}
-	priority := clampPriority(body.Priority)
-	run := map[string]any{
-		"run_id":          uuid.NewString(),
-		"tenant":          tenant,
-		"state":           "queued",
-		"priority":        priority,
-		"band":            priorityBand(priority),
-		"recipe_version":  body.RecipeVersion,
-		"dataset_version": body.DatasetVersion,
-	}
-	if err := runs.Put(r.Context(), tenant, idemKey, run); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if err := queue.Enqueue(r.Context(), run); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("run queued run_id=%s tenant=%s band=%d", run["run_id"], tenant, run["band"])
-	writeJSON(rw, http.StatusCreated, run)
+	runs.BindKey(r.Context(), tenant, key, run.RunID)
+	queue.Enqueue(r.Context(), run.RunID, run.Band, run.EnqueuedAtMs)
+	writeJSON(rw, http.StatusCreated, view(run))
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/training/runs", submit)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class SubmitRequest(dataset_version: String, recipe_version: String, priority: Int)
+import trainsched.{Queue, Runs} // Runs.newRunId, put, get, runForKey, bindKey; Queue.enqueue
 
-object TrainingApi {
-  implicit val system: ActorSystem = ActorSystem("trainsched")
-  implicit val submitFormat: RootJsonFormat[SubmitRequest] = jsonFormat3(SubmitRequest)
+object Submit {
+  val PriorityMin = 0
+  val PriorityMax = 8
+  val BandWidth = 3 // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
+  val KnownRecipes: Set[String] = Set("llama-ft-v3", "vit-pretrain-v1", "embed-distill-v2")
 
-  private var runCounter = 0
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def view(run: Runs.Run): JsObject =
+    JsObject("run_id" -> JsString(run.runId), "state" -> JsString(run.state), "priority" -> JsNumber(run.priority), "band" -> JsNumber(run.band))
+
+  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
 
   val route: Route =
     path("v1" / "training" / "runs") {
       post {
-        entity(as[SubmitRequest]) { body =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          runCounter += 1
-          val runId = s"run-$runCounter"
-          system.log.info(s"run queued run_id=$runId priority=\${body.priority}")
-          complete(StatusCodes.Created, s"""{"run_id":"$runId","state":"queued","priority":\${body.priority}}""")
+        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+          entity(as[String]) { raw =>
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+            tenant.filter(_.nonEmpty) match {
+              case None => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+              case Some(t) =>
+                val body = raw.parseJson.asJsObject
+                val priority = body.fields.get("priority").collect { case JsNumber(n) => n.toInt }.getOrElse(4)
+                val nowMs = System.currentTimeMillis()
+                val run = Runs.Run(s"run-$nowMs", t, text(body, "recipe_version"), text(body, "dataset_version"), priority, (PriorityMax - priority) / BandWidth, "queued", nowMs)
+                Runs.put(run)
+                Queue.enqueue(run.runId, run.band, run.enqueuedAtMs)
+                complete(json(StatusCodes.Created, view(run)))
+            }
+          }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
-      solution: `import java.nio.charset.StandardCharsets
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class SubmitRequest(dataset_version: String, recipe_version: String, priority: Int)
-final case class Run(
-    run_id: String,
-    tenant: String,
-    state: String,
-    priority: Int,
-    band: Int,
-    recipe_version: String,
-    dataset_version: String,
-)
+import trainsched.{Queue, Runs} // Runs.newRunId, put, get, runForKey, bindKey; Queue.enqueue
 
-// The run store and the queue are the platform's; this step only calls them.
-final class RunStore {
-  def get(tenant: String, idemKey: String): Option[Run] = ???
-  def put(tenant: String, idemKey: String, run: Run): Unit = ???
-}
-
-object RunStore {
-  def open(): RunStore = new RunStore
-}
-
-final class RunQueue {
-  def enqueue(run: Run): Unit = ???
-}
-
-object TrainingApi {
-  implicit val system: ActorSystem = ActorSystem("trainsched")
-  implicit val submitFormat: RootJsonFormat[SubmitRequest] = jsonFormat3(SubmitRequest)
-  implicit val runFormat: RootJsonFormat[Run] = jsonFormat7(Run)
-
+object Submit {
   val PriorityMin = 0
-  val PriorityMax = 9
-  val PriorityBands = 3
-  val HighPriorityMin = 7
-  val NormalPriorityMin = 3
-  val MaxVersionLen = 128
-  val KnownRecipes = Set("recipe-transformer-v1", "recipe-diffusion-v2", "recipe-embed-v3")
+  val PriorityMax = 8
+  val BandWidth = 3 // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
+  val KnownRecipes: Set[String] = Set("llama-ft-v3", "vit-pretrain-v1", "embed-distill-v2")
 
-  val runs = RunStore.open()
-  val queue = new RunQueue
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def clampPriority(priority: Int): Int = math.max(PriorityMin, math.min(PriorityMax, priority))
+  private def view(run: Runs.Run): JsObject =
+    JsObject("run_id" -> JsString(run.runId), "state" -> JsString(run.state), "priority" -> JsNumber(run.priority), "band" -> JsNumber(run.band))
 
-  def priorityBand(priority: Int): Int = {
-    val clamped = clampPriority(priority)
-    if (clamped >= HighPriorityMin) 0
-    else if (clamped >= NormalPriorityMin) 1
-    else PriorityBands - 1
-  }
-
-  private def versionOk(value: String): Boolean =
-    value.nonEmpty && value.getBytes(StandardCharsets.UTF_8).length <= MaxVersionLen
+  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
 
   val route: Route =
     path("v1" / "training" / "runs") {
       post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[SubmitRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (!versionOk(body.dataset_version)) {
-                complete(StatusCodes.BadRequest, """{"error":"dataset_version must be 1..128 chars"}""")
-              } else if (!KnownRecipes.contains(body.recipe_version)) {
-                complete(StatusCodes.BadRequest, """{"error":"unknown recipe version"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                runs.get(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
-                  case None =>
-                    val priority = clampPriority(body.priority)
-                    val run = Run(
-                      UUID.randomUUID().toString,
-                      tenant,
-                      "queued",
-                      priority,
-                      priorityBand(priority),
-                      body.recipe_version,
-                      body.dataset_version,
-                    )
-                    runs.put(tenant, idemKey, run)
-                    queue.enqueue(run)
-                    system.log.info(s"run queued run_id=\${run.run_id} tenant=$tenant band=\${run.band}")
-                    complete(StatusCodes.Created, run)
-                }
+        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+          optionalHeaderValueByName("Idempotency-Key") { key =>
+            entity(as[String]) { raw =>
+              (tenant.filter(_.nonEmpty), key.filter(_.nonEmpty)) match {
+                case (None, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+                case (_, None) => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
+                case (Some(t), Some(k)) =>
+                  Runs.runForKey(t, k).flatMap(Runs.get) match {
+                    case Some(replayed) => complete(json(StatusCodes.OK, view(replayed))) // a retry answers the run it created
+                    case None =>
+                      val body = raw.parseJson.asJsObject
+                      val recipe = text(body, "recipe_version")
+                      if (!KnownRecipes.contains(recipe)) complete(StatusCodes.BadRequest -> s"unknown recipe_version $recipe")
+                      else {
+                        // Clamp first: the band is computed from a priority the scheduler supports.
+                        val requested = body.fields.get("priority").collect { case JsNumber(n) => n.toInt }.getOrElse(4)
+                        val priority = math.min(math.max(requested, PriorityMin), PriorityMax)
+                        val run = Runs.Run(Runs.newRunId(), t, recipe, text(body, "dataset_version"), priority, (PriorityMax - priority) / BandWidth, "queued", System.currentTimeMillis())
+                        Runs.put(run)
+                        Runs.bindKey(t, k, run.runId)
+                        Queue.enqueue(run.runId, run.band, run.enqueuedAtMs)
+                        complete(json(StatusCodes.Created, view(run)))
+                      }
+                  }
               }
             }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },
@@ -744,145 +600,497 @@ object TrainingApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <string>
-
-using json = nlohmann::json;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/training/runs", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    static int runCounter = 0;
-    const auto runId = "run-" + std::to_string(++runCounter);
-    const int priority = body.value("priority", 5);
-    std::cerr << "run queued run_id=" << runId << " tenant=" << tenant << " priority=" << priority << "\\n";
-    res.status = 201;
-    res.set_content(json{{"run_id", runId}, {"state", "queued"}, {"priority", priority}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-
-#include <iostream>
-#include <optional>
+#include <chrono>
 #include <set>
 #include <string>
+
+#include "trainsched/queue.h"  // queue::enqueue
+#include "trainsched/runs.h"   // runs::newRunId, put, get, runForKey, bindKey
 
 using json = nlohmann::json;
 
 constexpr int kPriorityMin = 0;
-constexpr int kPriorityMax = 9;
-constexpr int kPriorityBands = 3;
-constexpr int kHighPriorityMin = 7;
-constexpr int kNormalPriorityMin = 3;
-constexpr std::size_t kMaxVersionLen = 128;
-const std::set<std::string> kKnownRecipes = {"recipe-transformer-v1", "recipe-diffusion-v2", "recipe-embed-v3"};
+constexpr int kPriorityMax = 8;
+constexpr int kBandWidth = 3;  // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
+const std::set<std::string> kKnownRecipes = {"llama-ft-v3", "vit-pretrain-v1", "embed-distill-v2"};
 
-// The run store and the queue are the platform's; this step only calls them.
-struct RunStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& run);
-};
-
-struct RunQueue {
-  void enqueue(const json& run);
-};
-
-RunStore runs;
-RunQueue queue;
-std::string uuidString();
-
-int clampPriority(int priority) {
-  if (priority < kPriorityMin) return kPriorityMin;
-  if (priority > kPriorityMax) return kPriorityMax;
-  return priority;
+json view(const runs::Run& run) {
+  return json{{"run_id", run.run_id}, {"state", run.state}, {"priority", run.priority}, {"band", run.band}};
 }
 
-int priorityBand(int priority) {
-  const int clamped = clampPriority(priority);
-  if (clamped >= kHighPriorityMin) return 0;
-  if (clamped >= kNormalPriorityMin) return 1;
-  return kPriorityBands - 1;
+void fail(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(json{{"error", message}}.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/training/runs", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto datasetVersion = body.value("dataset_version", std::string());
-    if (datasetVersion.empty() || datasetVersion.size() > kMaxVersionLen) {
-      res.status = 400;
-      res.set_content(R"({"error":"dataset_version must be 1..128 chars"})", "application/json");
-      return;
-    }
-    const auto recipeVersion = body.value("recipe_version", std::string());
-    if (kKnownRecipes.count(recipeVersion) == 0) {
-      res.status = 400;
-      res.set_content(R"({"error":"unknown recipe version"})", "application/json");
-      return;
-    }
-    const auto stored = runs.get(tenant, idemKey);
-    if (stored) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    const int priority = clampPriority(body.value("priority", 5));
-    const json run = {
-        {"run_id", uuidString()},
-        {"tenant", tenant},
-        {"state", "queued"},
-        {"priority", priority},
-        {"band", priorityBand(priority)},
-        {"recipe_version", recipeVersion},
-        {"dataset_version", datasetVersion},
-    };
-    runs.put(tenant, idemKey, run);
-    queue.enqueue(run);
-    std::cerr << "run queued run_id=" << run["run_id"] << " tenant=" << tenant << " band=" << run["band"] << "\\n";
-    res.status = 201;
-    res.set_content(run.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+long long nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+
+void submit(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, "X-Tenant-Id is required");
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return fail(res, 400, "invalid JSON body");
+  const int priority = body.value("priority", 4);
+  runs::Run run;
+  run.enqueued_at_ms = nowMs();
+  run.run_id = "run-" + std::to_string(run.enqueued_at_ms);
+  run.tenant = tenant;
+  run.recipe_version = body.value("recipe_version", "");
+  run.dataset_version = body.value("dataset_version", "");
+  run.priority = priority;
+  run.band = (kPriorityMax - priority) / kBandWidth;
+  run.state = "queued";
+  runs::put(run);
+  queue::enqueue(run.run_id, run.band, run.enqueued_at_ms);
+  res.status = 201;
+  res.set_content(view(run).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/training/runs", submit); }
+`,
+      solution: `#include <httplib.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <set>
+#include <string>
+
+#include "trainsched/queue.h"  // queue::enqueue
+#include "trainsched/runs.h"   // runs::newRunId, put, get, runForKey, bindKey
+
+using json = nlohmann::json;
+
+constexpr int kPriorityMin = 0;
+constexpr int kPriorityMax = 8;
+constexpr int kBandWidth = 3;  // band 0: priorities 6-8, band 1: 3-5, band 2: 0-2
+const std::set<std::string> kKnownRecipes = {"llama-ft-v3", "vit-pretrain-v1", "embed-distill-v2"};
+
+json view(const runs::Run& run) {
+  return json{{"run_id", run.run_id}, {"state", run.state}, {"priority", run.priority}, {"band", run.band}};
+}
+
+void fail(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(json{{"error", message}}.dump(), "application/json");
+}
+
+long long nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+void submit(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, "X-Tenant-Id is required");
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return fail(res, 400, "Idempotency-Key is required");
+  if (const auto replayed = runs::runForKey(tenant, key)) {
+    res.set_content(view(*runs::get(*replayed)).dump(), "application/json");  // a retry answers the run it created
+    return;
+  }
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return fail(res, 400, "invalid JSON body");
+  const std::string recipe = body.value("recipe_version", "");
+  if (kKnownRecipes.count(recipe) == 0) return fail(res, 400, "unknown recipe_version " + recipe);
+  // Clamp first: the band is computed from a priority the scheduler supports.
+  const int priority = std::clamp(body.value("priority", 4), kPriorityMin, kPriorityMax);
+  runs::Run run;
+  run.run_id = runs::newRunId();
+  run.tenant = tenant;
+  run.recipe_version = recipe;
+  run.dataset_version = body.value("dataset_version", "");
+  run.priority = priority;
+  run.band = (kPriorityMax - priority) / kBandWidth;
+  run.state = "queued";
+  run.enqueued_at_ms = nowMs();
+  runs::put(run);
+  runs::bindKey(tenant, key, run.run_id);
+  queue::enqueue(run.run_id, run.band, run.enqueued_at_ms);
+  res.status = 201;
+  res.set_content(view(run).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/training/runs", submit); }
 `,
     },
   },
+  harness: {
+    python: `from trainsched import runs
+
+GOOD = {"dataset_version": "ds-2026-10", "recipe_version": "llama-ft-v3", "priority": 5}
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+async def _submit(c, body=GOOD, tenant="t1", key="k-1"):
+    headers = {}
+    if tenant:
+        headers["X-Tenant-Id"] = tenant
+    if key:
+        headers["Idempotency-Key"] = key
+    return await c.post("/v1/training/runs", json=body, headers=headers)
+
+
+def _created(r, what):
+    assert r.status_code == 201, f"{what} answered {r.status_code}: {r.text}"
+    return r.json()
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        body = _created(await _submit(c), "a valid submission")
+    assert body.get("state") == "queued" and body.get("run_id"), f"the answer must carry the run id and state queued, got {body}"
+    run = runs.get(body["run_id"])
+    assert run is not None and run["tenant"] == "t1" and run["recipe_version"] == "llama-ft-v3", f"the run store holds {run} for {body['run_id']}"
+    assert ctx.redis.zscore("training:queue", body["run_id"]) is not None, f"{body['run_id']} is not in training:queue"
+
+
+async def check_priority_band(ctx):
+    async with _api(ctx) as c:
+        first = _created(await _submit(c, {**GOOD, "priority": 8}, key="k-1"), "a priority-8 submission")
+        ctx.clock.advance(1)
+        greedy = _created(await _submit(c, {**GOOD, "priority": 999999}, key="k-2"), "a priority-999999 submission")
+        low = _created(await _submit(c, {**GOOD, "priority": -5}, key="k-3"), "a priority -5 submission")
+    assert greedy.get("priority") == 8 and greedy.get("band") == 0, f"priority 999999 was answered as {greedy}: clamp it to 8 first, which is band 0"
+    assert low.get("priority") == 0 and low.get("band") == 2, f"priority -5 was answered as {low}: clamp it to 0 first, which is band 2"
+    order = ctx.redis.zrange("training:queue", 0, -1)
+    assert order[:2] == [first["run_id"], greedy["run_id"]], f"training:queue is ordered {order}: the priority-8 run submitted first must stay ahead of the clamped 999999, not behind it"
+
+
+async def check_recipe_version(ctx):
+    async with _api(ctx) as c:
+        r = await _submit(c, {**GOOD, "recipe_version": "llama-ft-v33"})
+    assert r.status_code == 400, f"an unknown recipe_version answered {r.status_code}, expected 400"
+    assert ctx.redis.zcard("training:queue") == 0, f"an unknown recipe was queued: training:queue holds {ctx.redis.zrange('training:queue', 0, -1)}"
+    assert ctx.redis.keys("run:run-*") == [], f"an unknown recipe left a run row: {ctx.redis.keys('run:run-*')}"
+
+
+async def check_idempotency(ctx):
+    async with _api(ctx) as c:
+        first = _created(await _submit(c, key="k-1"), "the first submission")
+        retry = await _submit(c, key="k-1")
+        assert retry.status_code == 200, f"a retry with the same Idempotency-Key answered {retry.status_code}, expected 200 with the run it created"
+        assert retry.json().get("run_id") == first["run_id"], f"the retry answered run {retry.json().get('run_id')}, the first submission created {first['run_id']}"
+        assert ctx.redis.zcard("training:queue") == 1, f"one submission retried once queued {ctx.redis.zcard('training:queue')} runs"
+        other = _created(await _submit(c, tenant="t2", key="k-1"), "another tenant's submission with the same key")
+        assert other["run_id"] != first["run_id"], "another tenant's key k-1 replayed the first tenant's run: bind the key per tenant"
+        none = await _submit(c, key=None)
+    assert none.status_code == 400, f"a submission without Idempotency-Key answered {none.status_code}, expected 400"
+
+
+async def check_unique_run_id(ctx):
+    async with _api(ctx) as c:
+        a = _created(await _submit(c, key="k-1"), "the first submission")
+        b = _created(await _submit(c, {**GOOD, "recipe_version": "vit-pretrain-v1"}, key="k-2"), "the second submission")
+    assert a["run_id"] != b["run_id"], f"two submissions in the same millisecond both got {a['run_id']}: take the id from runs.new_run_id()"
+    run = runs.get(a["run_id"])
+    assert run is not None and run["recipe_version"] == "llama-ft-v3", f"the first run's row now reads {run}: the second submission overwrote it"
+    assert ctx.redis.zcard("training:queue") == 2, f"two submissions left {ctx.redis.zcard('training:queue')} runs in training:queue"
+`,
+    typescript: `const GOOD = {dataset_version: 'ds-2026-10', recipe_version: 'llama-ft-v3', priority: 5};
+
+function api(ctx) {
+  return {c: ctx.client(ctx.load('api').app), runs: ctx.load('/support/trainsched/runs.ts')};
+}
+
+function submit(c, body: object = GOOD, tenant: string | null = 't1', key: string | null = 'k-1') {
+  const headers: Record<string, string> = {};
+  if (tenant !== null) headers['X-Tenant-Id'] = tenant;
+  if (key !== null) headers['Idempotency-Key'] = key;
+  return c.post('/v1/training/runs', {json: body, headers});
+}
+
+function created(r, what: string) {
+  assert.equal(r.status, 201, \`\${what} answered \${r.status}: \${r.text}\`);
+  return r.json();
+}
+
+export async function check_route(ctx) {
+  const {c, runs} = api(ctx);
+  const body = created(await submit(c), 'a valid submission');
+  assert(body.state === 'queued' && body.run_id, \`the answer must carry the run id and state queued, got \${JSON.stringify(body)}\`);
+  const run = await runs.get(body.run_id);
+  assert(run !== null && run.tenant === 't1' && run.recipe_version === 'llama-ft-v3', \`the run store holds \${JSON.stringify(run)} for \${body.run_id}\`);
+  assert(ctx.redis.zscore('training:queue', body.run_id) !== null, \`\${body.run_id} is not in training:queue\`);
+}
+
+export async function check_priority_band(ctx) {
+  const {c} = api(ctx);
+  const first = created(await submit(c, {...GOOD, priority: 8}, 't1', 'k-1'), 'a priority-8 submission');
+  ctx.clock.advance(1);
+  const greedy = created(await submit(c, {...GOOD, priority: 999999}, 't1', 'k-2'), 'a priority-999999 submission');
+  const low = created(await submit(c, {...GOOD, priority: -5}, 't1', 'k-3'), 'a priority -5 submission');
+  assert(greedy.priority === 8 && greedy.band === 0, \`priority 999999 was answered as \${JSON.stringify(greedy)}: clamp it to 8 first, which is band 0\`);
+  assert(low.priority === 0 && low.band === 2, \`priority -5 was answered as \${JSON.stringify(low)}: clamp it to 0 first, which is band 2\`);
+  const order = ctx.redis.zrange('training:queue', 0, -1);
+  assert.deepEqual(order.slice(0, 2), [first.run_id, greedy.run_id], \`training:queue is ordered \${JSON.stringify(order)}: the priority-8 run submitted first must stay ahead of the clamped 999999, not behind it\`);
+}
+
+export async function check_recipe_version(ctx) {
+  const {c} = api(ctx);
+  const r = await submit(c, {...GOOD, recipe_version: 'llama-ft-v33'});
+  assert.equal(r.status, 400, \`an unknown recipe_version answered \${r.status}, expected 400\`);
+  assert.equal(ctx.redis.zcard('training:queue'), 0, \`an unknown recipe was queued: training:queue holds \${JSON.stringify(ctx.redis.zrange('training:queue', 0, -1))}\`);
+  assert.deepEqual(ctx.redis.keys('run:run-*'), [], \`an unknown recipe left a run row: \${JSON.stringify(ctx.redis.keys('run:run-*'))}\`);
+}
+
+export async function check_idempotency(ctx) {
+  const {c} = api(ctx);
+  const first = created(await submit(c, GOOD, 't1', 'k-1'), 'the first submission');
+  const retry = await submit(c, GOOD, 't1', 'k-1');
+  assert.equal(retry.status, 200, \`a retry with the same Idempotency-Key answered \${retry.status}, expected 200 with the run it created\`);
+  assert.equal(retry.json().run_id, first.run_id, \`the retry answered run \${retry.json().run_id}, the first submission created \${first.run_id}\`);
+  assert.equal(ctx.redis.zcard('training:queue'), 1, \`one submission retried once queued \${ctx.redis.zcard('training:queue')} runs\`);
+  const other = created(await submit(c, GOOD, 't2', 'k-1'), "another tenant's submission with the same key");
+  assert.notEqual(other.run_id, first.run_id, "another tenant's key k-1 replayed the first tenant's run: bind the key per tenant");
+  const none = await submit(c, GOOD, 't1', null);
+  assert.equal(none.status, 400, \`a submission without Idempotency-Key answered \${none.status}, expected 400\`);
+}
+
+export async function check_unique_run_id(ctx) {
+  const {c, runs} = api(ctx);
+  const a = created(await submit(c, GOOD, 't1', 'k-1'), 'the first submission');
+  const b = created(await submit(c, {...GOOD, recipe_version: 'vit-pretrain-v1'}, 't1', 'k-2'), 'the second submission');
+  assert.notEqual(a.run_id, b.run_id, \`two submissions in the same millisecond both got \${a.run_id}: take the id from newRunId()\`);
+  const run = await runs.get(a.run_id);
+  assert(run !== null && run.recipe_version === 'llama-ft-v3', \`the first run's row now reads \${JSON.stringify(run)}: the second submission overwrote it\`);
+  assert.equal(ctx.redis.zcard('training:queue'), 2, \`two submissions left \${ctx.redis.zcard('training:queue')} runs in training:queue\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"trainsched/runs"
+
+	"leetbuild/harness"
+)
+
+var good = map[string]any{"dataset_version": "ds-2026-10", "recipe_version": "llama-ft-v3", "priority": 5}
+
+func withField(name string, value any) map[string]any {
+	out := map[string]any{}
+	for k, v := range good {
+		out[k] = v
+	}
+	out[name] = value
+	return out
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func post(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
+	header := []string{}
+	if tenant != "" {
+		header = append(header, "X-Tenant-Id", tenant)
+	}
+	if key != "" {
+		header = append(header, "Idempotency-Key", key)
+	}
+	return c.Post("/v1/training/runs", body, header...)
+}
+
+type answer struct {
+	RunID    string \`json:"run_id"\`
+	State    string \`json:"state"\`
+	Priority int    \`json:"priority"\`
+	Band     int    \`json:"band"\`
+}
+
+func created(ctx *harness.Ctx, r *harness.Response, what string) answer {
+	ctx.Equal(r.Status, 201, "%s (%s)", what, r.Text())
+	var a answer
+	r.Decode(&a)
+	return a
+}
+
+func queued(ctx *harness.Ctx) []string {
+	out := []string{}
+	for _, z := range ctx.Redis.ZRangeWithScores("training:queue", 0, -1) {
+		out = append(out, z.Member)
+	}
+	return out
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	a := created(ctx, post(c, good, "t1", "k-1"), "a valid submission")
+	ctx.Assert(a.State == "queued" && a.RunID != "", "the answer must carry the run id and state queued, got %+v", a)
+	run := runs.Get(context.Background(), a.RunID)
+	ctx.Assert(run != nil && run.Tenant == "t1" && run.RecipeVersion == "llama-ft-v3", "the run store holds %+v for %s", run, a.RunID)
+	_, ok := ctx.Redis.ZScore("training:queue", a.RunID)
+	ctx.Assert(ok, "%s is not in training:queue", a.RunID)
+}
+
+func CheckPriorityBand(ctx *harness.Ctx) {
+	c := api(ctx)
+	first := created(ctx, post(c, withField("priority", 8), "t1", "k-1"), "a priority-8 submission")
+	ctx.Clock.Advance(1)
+	greedy := created(ctx, post(c, withField("priority", 999999), "t1", "k-2"), "a priority-999999 submission")
+	low := created(ctx, post(c, withField("priority", -5), "t1", "k-3"), "a priority -5 submission")
+	ctx.Assert(greedy.Priority == 8 && greedy.Band == 0, "priority 999999 was answered as %+v: clamp it to 8 first, which is band 0", greedy)
+	ctx.Assert(low.Priority == 0 && low.Band == 2, "priority -5 was answered as %+v: clamp it to 0 first, which is band 2", low)
+	order := queued(ctx)
+	ctx.Assert(len(order) >= 2 && order[0] == first.RunID && order[1] == greedy.RunID, "training:queue is ordered %v: the priority-8 run submitted first must stay ahead of the clamped 999999, not behind it", order)
+}
+
+func CheckRecipeVersion(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := post(c, withField("recipe_version", "llama-ft-v33"), "t1", "k-1")
+	ctx.Equal(r.Status, 400, "an unknown recipe_version must be rejected; the status")
+	ctx.Equal(len(queued(ctx)), 0, "an unknown recipe must not be queued; the runs in training:queue")
+	ctx.Equal(len(ctx.Redis.Keys("run:run-*")), 0, "an unknown recipe must not leave a run row; the rows")
+}
+
+func CheckIdempotency(ctx *harness.Ctx) {
+	c := api(ctx)
+	first := created(ctx, post(c, good, "t1", "k-1"), "the first submission")
+	retry := post(c, good, "t1", "k-1")
+	ctx.Equal(retry.Status, 200, "a retry with the same Idempotency-Key must answer the run it created; the status")
+	var replay answer
+	retry.Decode(&replay)
+	ctx.Equal(replay.RunID, first.RunID, "the retry's run id")
+	ctx.Equal(len(queued(ctx)), 1, "one submission retried once; the runs in training:queue")
+	other := created(ctx, post(c, good, "t2", "k-1"), "another tenant's submission with the same key")
+	ctx.Assert(other.RunID != first.RunID, "another tenant's key k-1 replayed the first tenant's run: bind the key per tenant")
+	none := post(c, good, "t1", "")
+	ctx.Equal(none.Status, 400, "a submission without Idempotency-Key; the status")
+}
+
+func CheckUniqueRunId(ctx *harness.Ctx) {
+	c := api(ctx)
+	a := created(ctx, post(c, good, "t1", "k-1"), "the first submission")
+	b := created(ctx, post(c, withField("recipe_version", "vit-pretrain-v1"), "t1", "k-2"), "the second submission")
+	ctx.Assert(a.RunID != b.RunID, "two submissions in the same millisecond both got %s: take the id from runs.NewRunID", a.RunID)
+	run := runs.Get(context.Background(), a.RunID)
+	ctx.Assert(run != nil && run.RecipeVersion == "llama-ft-v3", "the first run's row now reads %+v: the second submission overwrote it", run)
+	ctx.Equal(len(queued(ctx)), 2, "two submissions; the runs in training:queue")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+nlohmann::json good() {
+  return nlohmann::json{{"dataset_version", "ds-2026-10"}, {"recipe_version", "llama-ft-v3"}, {"priority", 5}};
+}
+
+nlohmann::json withField(const std::string& name, const nlohmann::json& value) {
+  nlohmann::json out = good();
+  out[name] = value;
+  return out;
+}
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response post(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
+  const std::string text = body.dump();
+  if (tenant.empty()) return c.Post("/v1/training/runs", text, "Content-Type", "application/json", "Idempotency-Key", key);
+  if (key.empty()) return c.Post("/v1/training/runs", text, "Content-Type", "application/json", "X-Tenant-Id", tenant);
+  return c.Post("/v1/training/runs", text, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
+}
+
+nlohmann::json created(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+  ctx.Equal(r.Status, 201, "%s (%s)", what, r.Text());
+  return nlohmann::json::parse(r.Text(), nullptr, false);
+}
+
+std::string field(const nlohmann::json& j, const std::string& name) {
+  return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
+}
+
+long long number(const nlohmann::json& j, const std::string& name) {
+  return j.is_object() && j.contains(name) && j[name].is_number() ? j[name].get<long long>() : -1;
+}
+
+std::vector<std::string> queued(harness::Ctx& ctx) {
+  std::vector<std::string> out;
+  for (const auto& z : ctx.Redis.ZRangeWithScores("training:queue", 0, -1)) out.push_back(z.Member);
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto a = created(ctx, post(c, good(), "t1", "k-1"), "a valid submission");
+  ctx.Assert(field(a, "state") == "queued" && !field(a, "run_id").empty(), "the answer must carry the run id and state queued, got %s", a.dump());
+  const auto run = runs::get(field(a, "run_id"));
+  ctx.Assert(run && run->tenant == "t1" && run->recipe_version == "llama-ft-v3", "the run store has no row for %s with tenant t1 and recipe llama-ft-v3", field(a, "run_id"));
+  ctx.Assert(ctx.Redis.ZScore("training:queue", field(a, "run_id")).has_value(), "%s is not in training:queue", field(a, "run_id"));
+}
+
+void CheckPriorityBand(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto first = created(ctx, post(c, withField("priority", 8), "t1", "k-1"), "a priority-8 submission");
+  ctx.Clock.Advance(1);
+  const auto greedy = created(ctx, post(c, withField("priority", 999999), "t1", "k-2"), "a priority-999999 submission");
+  const auto low = created(ctx, post(c, withField("priority", -5), "t1", "k-3"), "a priority -5 submission");
+  ctx.Assert(number(greedy, "priority") == 8 && number(greedy, "band") == 0, "priority 999999 was answered as %s: clamp it to 8 first, which is band 0", greedy.dump());
+  ctx.Assert(number(low, "priority") == 0 && number(low, "band") == 2, "priority -5 was answered as %s: clamp it to 0 first, which is band 2", low.dump());
+  const auto order = queued(ctx);
+  ctx.Assert(order.size() >= 2 && order[0] == field(first, "run_id") && order[1] == field(greedy, "run_id"),
+             "training:queue is ordered %q: the priority-8 run submitted first must stay ahead of the clamped 999999, not behind it", order);
+}
+
+void CheckRecipeVersion(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = post(c, withField("recipe_version", "llama-ft-v33"), "t1", "k-1");
+  ctx.Equal(r.Status, 400, "an unknown recipe_version must be rejected; the status");
+  ctx.Equal(queued(ctx).size(), 0, "an unknown recipe must not be queued; the runs in training:queue");
+  ctx.Equal(ctx.Redis.Keys("run:run-*").size(), 0, "an unknown recipe must not leave a run row; the rows");
+}
+
+void CheckIdempotency(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto first = created(ctx, post(c, good(), "t1", "k-1"), "the first submission");
+  const auto retry = post(c, good(), "t1", "k-1");
+  ctx.Equal(retry.Status, 200, "a retry with the same Idempotency-Key must answer the run it created; the status");
+  ctx.Equal(field(nlohmann::json::parse(retry.Text(), nullptr, false), "run_id"), field(first, "run_id"), "the retry's run id");
+  ctx.Equal(queued(ctx).size(), 1, "one submission retried once; the runs in training:queue");
+  const auto other = created(ctx, post(c, good(), "t2", "k-1"), "another tenant's submission with the same key");
+  ctx.Assert(field(other, "run_id") != field(first, "run_id"), "another tenant's key k-1 replayed the first tenant's run: bind the key per tenant");
+  const auto none = post(c, good(), "t1", "");
+  ctx.Equal(none.Status, 400, "a submission without Idempotency-Key; the status");
+}
+
+void CheckUniqueRunId(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto a = created(ctx, post(c, good(), "t1", "k-1"), "the first submission");
+  const auto b = created(ctx, post(c, withField("recipe_version", "vit-pretrain-v1"), "t1", "k-2"), "the second submission");
+  ctx.Assert(field(a, "run_id") != field(b, "run_id"), "two submissions in the same millisecond both got %s: take the id from runs::newRunId()", field(a, "run_id"));
+  const auto run = runs::get(field(a, "run_id"));
+  ctx.Assert(run && run->recipe_version == "llama-ft-v3", "the first run's row now reads recipe %q: the second submission overwrote it", run ? run->recipe_version : "");
+  ctx.Equal(queued(ctx).size(), 2, "two submissions; the runs in training:queue");
+}
+`,
+  },
   hints: [
-    "One tenant's jobs always run first after they discovered a large priority value, and a client that timed out on submit now has two identical runs holding GPUs.",
-    '`body.priority` is echoed and banded raw, so nothing bounds it; `Idempotency-Key` is not read, so a retry mints `run-<n+1>`; `recipe_version` is not checked against `KNOWN_RECIPES`.',
-    'Guard tenant, key, versions, then `KNOWN_RECIPES`; clamp into `PRIORITY_MIN..PRIORITY_MAX` and map to `PRIORITY_BANDS`; `runs.get` then `runs.put` a UUID run under `(tenant, key)` before the 201.',
+    'One tenant found that a huge priority puts its jobs first; a typo in a recipe holds a GPU until the job fails; a client that timed out now has two identical runs training.',
+    'The band is computed from the raw integer, so nothing bounds it. Nothing reads `Idempotency-Key` or `KNOWN_RECIPES`, and an id built from the clock repeats whenever two requests share a millisecond.',
+    'Require the key, answer `runs.run_for_key(tenant, key)` with 200, reject a recipe outside `KNOWN_RECIPES`, clamp with `min(max(priority, PRIORITY_MIN), PRIORITY_MAX)` before the band, then `runs.new_run_id()`, `put`, `bind_key`, `enqueue`.',
   ],
-  debrief: `The handler admits work onto scarce hardware, so every decision is made before anything is queued: the recipe lookup runs before a GPU can be reserved, the clamp runs before the band is computed, and the idempotency lookup runs before an id is minted. The clamp matters in both directions: without it one caller starves everyone, and banding the raw integer instead of the clamped one quietly lets the same caller back in. The scheduler issues the run id and persists the run before it answers, which is what makes a replay return the same run and a restart keep the submission. Production schedulers add per-tenant quotas and a submission rate limit in front of this handler, and record an audit row per accepted run so a fairness complaint can be traced to the request that caused it.`,
+  debrief: `Every decision happens before the queue sees the run, because the queue is a promise of scarce hardware. The clamp comes before the band since the band is what the queue orders by; banding the raw integer lets one caller score ahead of the whole fleet. The recipe lookup comes before any write, so a typo costs a 400 and not a GPU-hour. The key is bound per tenant and looked up first, so a retry reads the first attempt's run, and the id comes from a sequence every replica shares instead of from a clock two requests can share. Production schedulers also cap how many runs a tenant may queue, expire the key bindings after a day, and check the dataset version against the data catalog.`,
 };

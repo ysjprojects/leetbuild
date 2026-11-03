@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package prompts;
+
+// The eval service the promotion gate (step 3) calls before a version goes live: one unary RPC per
+// attempt, with a deadline. The harness serves a deterministic stand-in at evaluator:9000
+// (prompts/judge in the support modules).
+service Evaluator {
+  rpc Evaluate(EvaluateRequest) returns (EvaluateReply);
+}
+
+message EvaluateRequest {
+  string tenant = 1;
+  string name = 2;
+  int32 version = 3;
+  // The SHA-256 of the template, as the registry stored it: the verdict belongs to these bytes.
+  string content_hash = 4;
+  string template_text = 5;
+}
+
+message EvaluateReply {
+  string eval_id = 1;
+  bool passed = 2;
+  double score = 3;
+  // The hash the evaluator judged, echoed back.
+  string content_hash = 4;
+}
