@@ -18,18 +18,14 @@ export const stateStep: Step = {
 calls the engine on a miss, stores the geometry and returns it. It serves the demo and hides five
 flaws.
 
-**Failure mode the checks target.** Raw floats as keys turn the cache into pure cost: a 6th
-decimal of GPS noise makes every request a miss. An epoch-less entry is worse than no cache: once
-a key does match, the same geometry comes back at any hour, so a rush-hour route is served at
-midnight as if it were current, and the response gives the caller no way to tell. With no expiry,
-every cell ever requested stays in Redis forever.
+**Failure mode the checks target.** Raw floats as keys make every request a miss on GPS noise.
+Once a key does match, an epoch-less entry serves a rush-hour route at midnight with no way for the
+caller to tell, and with no expiry every cell ever requested stays in Redis.
 
 - **Cell key.** Round every coordinate to a \`CELL_DEGREES = 0.001\` grid (~110 m) before it goes
-  into the key, so two requests for the same corner share one entry despite GPS jitter. Rounding
-  to whole degrees would merge different streets.
-- **Epoch key.** The key is
-  \`route:{origin_cell}:{dest_cell}:{mode}:{epoch}\` with \`epoch = floor(unix_seconds / EPOCH_S)\`
-  and \`EPOCH_S = 300\`, a five-minute traffic window.
+  into the key, so two requests for the same corner share one entry despite GPS jitter.
+- **Epoch key.** \`route:{origin_cell}:{dest_cell}:{mode}:{epoch}\` with
+  \`epoch = floor(unix_seconds / EPOCH_S)\` and \`EPOCH_S = 300\`.
 - **Stale-epoch entry.** The stored entry carries the epoch it was computed under, and a read
   serves it only when that epoch equals the current one; a mismatch is a miss: recompute and
   overwrite under the current key.
@@ -125,7 +121,7 @@ every cell ever requested stays in Redis forever.
   ],
   code: {
     python: {
-      starter: `"""POST /v1/routes: flawed code that caches on raw coordinates and never expires."""
+      starter: `"""POST /v1/routes."""
 import json
 
 import redis
@@ -256,7 +252,7 @@ def compute_route(body: RouteRequest, tenant: str = Header(alias="X-Tenant-Id"))
 `,
     },
     typescript: {
-      starter: `/** POST /v1/routes: flawed code that caches on raw coordinates and never expires. */
+      starter: `/** POST /v1/routes. */
 import {Redis} from 'ioredis';
 
 import {engine} from './engine';
@@ -827,5 +823,5 @@ int main() {
   },
   debrief: `The fix has the shape of a key that says what two requests are allowed to share. The cell size decides how much GPS noise and map-snapping difference an entry tolerates, and the traffic epoch decides how old a route may be before it is a different route. Keeping the epoch inside the entry as well as in the key lets a reader verify provenance instead of trusting the key alone, and the \`epoch\` and \`cached\` fields hand that provenance to the client, the fallback in the next step and the telemetry. The TTL is twice the epoch so entries survive one bump and then leave on their own.
 
-Production maps caches vary the cell size with road density (H3 or geohash tiles), derive the epoch from the traffic service's snapshot id so every replica agrees on "current", and invalidate cells explicitly on road closures instead of waiting for the next epoch. Left out here: neighbour-cell lookups, single-flight de-duplication for a cold popular cell, and negative caching for unroutable pairs.`,
+Production maps caches vary the cell size with road density (H3 or geohash tiles) and invalidate cells explicitly on road closures instead of waiting for the next epoch.`,
 };

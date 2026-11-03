@@ -23,27 +23,17 @@ export const ticketTriageProblem: Problem = {
   minutes: 70,
   statement: `# Ticket Triage
 
-Ticket triage is the piece of a support platform that reads an inbound ticket, decides what it is
-about, how urgent it is, and which queue owns it. The visible part is a queue name in a response;
-the parts that decide whether the platform is safe are the trust boundary, the dedupe claim, the
-fallback when the classifier is down, the routing event downstream teams consume, and the summary a
-manager reads during an outage.
+Ticket triage reads an inbound ticket and decides what it is about, how urgent it is, and which
+queue owns it.
 
 ## The real system
 
 Zendesk's intelligent triage classifies a new ticket from its subject and first public comment
 into topic, sentiment and language, each paired with a confidence field, and admins build routing
 and prioritization workflows on those fields rather than on anything the requester typed into a
-priority box. The same shape appears in any triage service built in-house: the caller describes
-the problem and the server decides where it goes, because a customer who can self-assign
-\`critical\` will. Triage is idempotent, so a webhook retried five times produces one routing, and
-admission is capped per queue per minute so a classifier spike cannot funnel every ticket into one
-place. Classification runs over the network under a deadline; when the classifier refuses or times
-out, a deterministic keyword ruleset keeps routing and records why it took over. Routing decisions
-are published keyed by tenant so each tenant's stream stays ordered, the payload carries ids and
-scores rather than ticket text, and the consumer records the routing before it commits its offset.
-The summary endpoint aggregates routing records, not cached counters, so a broken classifier shows
-up as a fallback share instead of looking like extra demand.
+priority box. This course builds the same shape: the server decides where a ticket goes, triage is
+idempotent, a keyword ruleset takes over when the classifier fails and records why, and the summary
+aggregates routing records so a broken classifier shows as a fallback share, not extra demand.
 
 ## What you build here
 
@@ -67,16 +57,13 @@ One service, **triage-api**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is to debug it against the failure modes, name the subtle
-one, fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and
-pass on your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Model training, ticket ingestion channels, agent assignment and SLAs, transcript attachment
-scanning, multi-language classification, queue capacity planning, and billing for triage minutes.
-The five pieces above are the ones that decide whether triage is correct, isolated and observable.`,
+Model training, ingestion channels, agent assignment and SLAs, attachment scanning, multi-language
+classification and capacity planning.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Support inbox', sub: 'ticket webhook · agent UI', x: 8, y: 50},

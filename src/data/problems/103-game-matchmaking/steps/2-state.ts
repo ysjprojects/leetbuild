@@ -15,11 +15,9 @@ decrements the depth counter; \`cancel_ticket(ticket_id, bucket, skill)\` delete
 pointer. It compiles, passes the single-threaded demo and hides 5 flaws.
 
 **Failure mode the checks target.** Two matchmakers, one pool, one player claimed twice: each
-command in the loop is a window where the other instance passes the same "already claimed" test.
-A refused claim returns after some tickets were removed and marked, so those players wait in a
-queue position that no longer exists. The depth counter follows the partial loop, so the pool size
-the scheduler reads drifts from the tickets that are waiting. And a cancellation leaves the ticket
-out of the pool and out of the claimed set, a ghost nothing can clear.
+command in the loop is a window for the other instance. A refused claim returns after some tickets
+were already removed and marked, the depth counter drifts with the partial loop, and a cancelled
+ticket ends up in neither the pool nor the claimed set.
 
 - Claim **every** participant ticket in **one atomic Lua \`EVAL\`**: test every claimed marker
   first; if any is set, return **0** without touching the pool and the caller gets \`false\`.

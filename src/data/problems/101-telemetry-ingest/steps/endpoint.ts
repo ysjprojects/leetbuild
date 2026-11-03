@@ -8,33 +8,28 @@ export const endpointStep: Step = {
   focus: ['device', 'ingest', 'registry'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the batch and acknowledges it, so a device sending well-formed samples sees a pipeline that works.
-It compiles, it serves the demo, and it hides three production flaws — one of which poisoned a whole
-fleet's dashboard. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/telemetry\` with body
+\`{"batch_id": "…", "device_id": "…", "samples": [{"metric": "temp_c", "value": 21.5}, …]}\`: it
+parses the batch, returns \`202\` with the sample count at once, and persists in a background task
+that resolves the device with \`lookup(...) or register_device(...)\` and writes every value as sent.
+It serves the demo and hides four flaws.
 
-Implement \`POST /v1/telemetry\` with body
-\`{"batch_id": "…", "device_id": "…", "samples": [{"metric": "temp_c", "value": 21.5}, …]}\`.
+**Failure mode the checks target.** The ack goes out before any validation, so a rejected batch
+has already been reported as delivered; an unknown device id becomes a permanent registry row
+instead of a \`404\`; a metric the device never declared is written without complaint; and a value
+outside the declared range (one 64-bit overflow reading, for example) is written through and
+rescales every aggregate built on it.
 
 - \`batch_id\` and \`device_id\` are non-empty strings and \`samples\` holds **1 to 500** readings
   (**400** otherwise).
 - The device **must already exist in the registry**: \`registry.lookup(device_id)\` returning nothing
-  is **404**. An unknown device id is a client error — the ingest path must **never** create registry
-  state, because a typo or a cloned firmware image would then become a permanent fleet member.
-- Every sample's metric must be **declared for that device** with a range: an undeclared metric is
-  **400** and the response **names the metric**.
-- Every value must be a number **inside the metric's declared \`[low, high]\`**: anything outside is
-  **422**, and the response names the metric and the range it declared. A single 64-bit overflow
-  value that is accepted here is a value that every downstream aggregate, rollup and alert inherits.
-- **Validate before acknowledging.** The batch is acknowledged (\`202\` with the accepted count) only
-  after the registry lookup and every range check have passed. An ack that goes out first is a
-  promise the pipeline cannot keep: the batch is already in the client's send buffer as delivered,
-  and the rejection that follows has nowhere to go.
-
-**Failure mode the checks target.** The starter acknowledges each batch before validating a reading and
-does the work in the background, so unknown devices and wild values are absorbed into aggregates that
-then look plausible; and it resolves a device with \`lookup(...) or register_device(...)\`, which
-silently turns any invented id into a device the pipeline will track forever.`,
+  is **404**. The ingest path creates no registry state.
+- Every sample's metric must be **declared for that device**: an undeclared metric is **400** and the
+  response **names the metric**.
+- Every value must be a number inside the metric's declared \`[low, high]\`: anything outside is
+  **422**, and the response names the metric and the declared range.
+- **Validate before acknowledging.** The \`202\` with the accepted count is sent only after the
+  registry lookup and every range check have passed.`,
   sequence: {
     participants: ['Device', 'Telemetry Ingest', 'Device registry'],
     messages: [
@@ -62,9 +57,9 @@ silently turns any invented id into a device the pipeline will track forever.`,
     ],
   },
   hints: [
-    'Write the guard clauses in cost order: batch shape, sample count, registry lookup, then the per-sample range checks. Every one of them returns before the acknowledgment, so the client learns about a bad batch instead of assuming the samples landed.',
-    '`registry.lookup(device_id)` is the only device resolution allowed here. The starter’s `lookup(...) or register_device(...)` is the quiet bug: it turns ingest into a device-registration API, and no amount of downstream validation can undo a fleet that now contains an id nobody provisioned.',
-    'The metric error must carry the metric name and, for a range failure, the declared `[low, high]`. "invalid sample" tells the device firmware nothing and turns one bad metric into a fleet-wide support ticket; naming it lets the sending device drop exactly the offending reading.',
+    'A fleet dashboard rescaled to zero after one device sent a value near the 64-bit limit, and the device saw nothing but `202` responses the whole time.',
+    'The handler acks and hands the batch to a background task; the lookup, the range comparison and any rejection happen after the response, where no status code can reach the device.',
+    'Move the work into the handler: `registry.lookup` then `404`, `limits.get(metric)` then `400 unknown metric`, `low <= sample.value <= high` then `422 out of range`, and only then `202`. Delete the `register_device` fallback.',
   ],
   checks: [
     {
@@ -170,9 +165,7 @@ registry = DeviceRegistry()
 
 @app.post("/v1/telemetry")
 def ingest(batch: TelemetryBatch, background: BackgroundTasks) -> JSONResponse:
-    # TODO: this starter acknowledges the batch before it validates a single reading, invents a
-    # registry row for a device id it has never seen, and accepts any value, so one 64-bit
-    # overflow reading is absorbed into the aggregates and rescales a whole fleet's graph.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     background.add_task(persist, batch)
     logger.info("accepted batch=%s device=%s", batch.batch_id, batch.device_id)
     return JSONResponse({"batch_id": batch.batch_id, "accepted": len(batch.samples)}, status_code=202)
@@ -268,9 +261,7 @@ interface TelemetryBatch {
 }
 
 app.post('/v1/telemetry', async (request, reply) => {
-  // TODO: this starter acknowledges the batch before it validates a single reading, invents a
-  // registry row for a device id it has never seen, and accepts any value, so one 64-bit
-  // overflow reading is absorbed into the aggregates and rescales a whole fleet's graph.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const batch = request.body as TelemetryBatch;
   void storeBatch(batch);
   return reply.code(202).send({batch_id: batch.batch_id, accepted: batch.samples.length});
@@ -380,9 +371,7 @@ func ingest(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter acknowledges the batch before it validates a single reading, invents a
-	// registry row for a device id it has never seen, and accepts any value, so one 64-bit
-	// overflow reading is absorbed into the aggregates and rescales a whole fleet's graph.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	go persistBatch(batch)
 	writeJSON(rw, http.StatusAccepted, map[string]any{"batch_id": batch.BatchID, "accepted": len(batch.Samples)})
 }
@@ -525,9 +514,7 @@ object IngestApi {
     path("v1" / "telemetry") {
       post {
         entity(as[TelemetryBatch]) { batch =>
-          // TODO: this starter acknowledges the batch before it validates a single reading, invents
-          // a registry row for a device id it has never seen, and accepts any value, so one
-          // 64-bit overflow reading is absorbed into the aggregates.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           system.dispatcher.execute(() => persist(batch))
           complete(
             StatusCodes.Accepted,
@@ -653,9 +640,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter acknowledges the batch before it validates a single reading, invents a
-    // registry row for a device id it has never seen, and accepts any value, so one 64-bit
-    // overflow reading is absorbed into the aggregates and rescales a whole fleet's graph.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     res.status = 202;
     res.set_content(
         json{{"batch_id", body.value("batch_id", std::string())},
@@ -766,5 +751,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a data pipeline. The starter reads fine because the demo sends one well-formed batch from one known device. Three separate defects are being checked: the device must come from the registry (an ingest path that registers devices is a public write API with no auth model), every reading must be inside the range the metric declares (the overflow value that scaled a graph to zero arrived exactly here), and the acknowledgment must follow validation rather than lead it. That last one is the order bug interviewers love: an early 202 is a promise that the client will not retry, so the rejection that follows is invisible to the device and the batch is lost without a trace. Real edges add batch-level idempotency, per-metric cardinality limits, and a device clock skew check, but the validation funnel and the ack position are what make the pipeline's numbers defensible.`,
+  debrief: `The fix is a funnel: cheap shape checks, one registry lookup, then a per-sample comparison against the declared range, and the acknowledgment last. The order matters because the status code is the only channel back to the device; a \`202\` sent before validation turns every later rejection into a silent drop, since the device has already cleared the batch from its send buffer. Keeping registration out of the ingest path matters for the same reason an unauthenticated write API would: a typo or a cloned firmware image must not become a fleet member. Production ingest paths go further on the registry side, caching device rows with a short TTL so a lookup per batch does not become a lookup storm when a fleet reconnects after an outage.`,
 };

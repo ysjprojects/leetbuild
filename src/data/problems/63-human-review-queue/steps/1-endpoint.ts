@@ -226,7 +226,7 @@ def enqueue(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/review/items: flawed code that trusts the caller's priority. */
+      starter: `/** POST /v1/review/items. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

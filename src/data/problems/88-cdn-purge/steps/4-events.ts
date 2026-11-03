@@ -229,7 +229,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** cdn.purged: flawed code that keys by requester and publishes requests. */
+      starter: `/** cdn.purged. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

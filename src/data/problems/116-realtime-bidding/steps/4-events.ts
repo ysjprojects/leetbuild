@@ -17,12 +17,10 @@ a win it builds an event keyed by the bidder, produces it with \`acks=1\`, treat
 success, and then commits the spend claim; on a loss it only logs. It compiles, it serves the demo,
 and it hides five flaws.
 
-**Failure mode the checks target.** The starter is a working publisher that answers the wrong
-questions: keying by bidder scatters an auction across partitions, so a consumer that replays sees a
-win before the bid that produced it; dropping losses makes the win rate undiagnosable, because a
-bidder whose bids are always too low looks identical to one whose bids are never delivered; and
-publishing before the claim commits leaves the reconciliation job chasing an event for a spend that
-never existed, while a broker rejection vanishes without a trace.
+**Failure mode the checks target.** Keying by bidder scatters an auction across partitions, so a
+replaying consumer sees a win before its bid; dropping losses makes the win rate undiagnosable; and
+publishing before the claim commits leaves reconciliation chasing spend that does not exist, while a
+broker rejection vanishes.
 
 - Every event about one auction shares a partition: key the produce with the **auction id**
   (\`partition_key(event)\` returning \`event["auction_id"]\` / \`event.auction_id\` / \`event.AuctionID\`).
@@ -749,11 +747,9 @@ arrives in order, so one auction's events share a partition keyed by auction id;
 replay interleaves auctions and ordering is gone. Losses become first-class events with a reason
 because without them the win rate is undefined, which is how a bidder can look healthy while winning
 nothing. The publish follows the spend commit, and a rejection lands in the outbox, because an event
-that outruns its charge, or a charge with no event, is a reconciliation incident rather than a
-metric. \`acks=all\` with idempotent retries finishes the job: a produce is not successful until the
-replicas hold it, and a retry cannot duplicate a bid.
+that outruns its charge is a reconciliation incident. \`acks=all\` with idempotent retries means a
+produce succeeds only once replicas hold it, and a retry cannot duplicate a bid.
 
-Production bidders also attach the auction's stage timings to the loss event, so the timeout rate in
-the stats read is attributable to the tier that ran out of budget rather than to the auction as a
-whole.`,
+Production bidders also attach stage timings to the loss event, so a timeout is attributable to the
+tier that ran out of budget.`,
 };

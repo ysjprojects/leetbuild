@@ -192,7 +192,7 @@ def publish_batch(tenant: str, service: str, batch: dict, commit_batch) -> dict:
 `,
     },
     typescript: {
-      starter: `/** log.indexed publishing: flawed code that keys by the index shard. */
+      starter: `/** log.indexed publishing. */
 import {Kafka, type Producer} from 'kafkajs';
 
 const TOPIC = 'log.indexed';

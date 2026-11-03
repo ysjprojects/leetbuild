@@ -18,17 +18,12 @@ budget, so an operator cannot see which shard is behind; it marks the replicatio
 nothing in it compares the two regions, so a divergent shard looks current; and it serves any
 replication to any caller, so one team can read another team's replica state by guessing an id.
 
-- The operator comes from the \`X-Operator-Id\` header, and a replication the caller does **not**
-  own is **404**: not 403, which confirms the id exists, and not 200, which leaks the state.
-- The response reports **per shard**: the shard id, the confirmed applied \`offset\`, the source's
-  head from \`source_head_offset\`, and \`lag_changes\` = head − applied, clamped at zero. A global
-  number hides the one shard that is stuck while the other ninety-nine are caught up.
-- The divergence check runs: \`divergence_sample\` takes \`SAMPLE_KEYS\` (256) keys of the shard
-  via \`sample_keys\`, digests each one in both regions with \`key_digest(region, key)\`, and
-  collects the keys whose digests differ. The response names the \`divergent_shards\` and reports
-  \`sampled_keys\` so the caller knows how strong the claim is.
-- Lag and divergence are different questions: a shard at zero lag can still be divergent, because
-  a change applied out of order leaves rows that no offset difference will reveal.`,
+- The operator comes from \`X-Operator-Id\`; a replication the caller does **not** own is **404**.
+- Report **per shard**: shard id, confirmed applied \`offset\`, the source head from
+  \`source_head_offset\`, and \`lag_changes\` = head − applied, clamped at zero.
+- \`divergence_sample\` takes \`SAMPLE_KEYS\` (256) keys via \`sample_keys\`, digests each in both
+  regions with \`key_digest(region, key)\`, and collects mismatches. The response names the
+  \`divergent_shards\` and reports \`sampled_keys\`; a shard at zero lag can still be divergent.`,
   sequence: {
     participants: ['Operator', 'Replicator API', 'Source region', 'Target region'],
     messages: [

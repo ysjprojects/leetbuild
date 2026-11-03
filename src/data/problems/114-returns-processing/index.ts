@@ -32,12 +32,8 @@ quantity, the gated refund and the ordered event log.
 Shopify's Admin GraphQL API models exactly this boundary. Before an app creates a \`Return\` with
 \`returnCreate\`, it queries a \`ReturnableFulfillment\`: a delivered order whose line items carry
 the quantity still available for return, computed by the platform from fulfilled and already
-returned units rather than supplied by the caller. The same shape applies here: eligibility comes
-from the delivery date and the policy window, the returnable quantity per line is decremented
-atomically so two returns cannot both take the last unit, the warehouse grades the item under a
-deadline and the refund is held while the grade is unknown, one event per state change is keyed by
-the return so its history stays ordered, and a pending refund is not read as complete, because "we
-started a refund" and "the customer was paid" are different facts.
+returned units rather than supplied by the caller. The same shape applies here: eligibility and
+quantity come from the platform's own records, never from the request body.
 
 ## What you build here
 
@@ -59,17 +55,13 @@ One service, **returnsd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. In every step you debug it against the failure modes, find the subtle one, fix it,
-optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on your
-version.
+Every starter is working code with flaws: it compiles, serves the happy path and looks right. Debug
+it against the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Payment rail integration, carrier label generation, restocking and resale, tax handling on refunds,
-reason-code taxonomies per region, customer messaging, and returns analytics. The five pieces above
-are the ones that decide whether returns are counted correctly, refunds are gated, and the history is
-trustworthy.`,
+Payment rail integration, carrier labels, restocking, tax on refunds, regional reason codes,
+customer messaging, and returns analytics.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Customer', sub: 'returns · tracking', x: 8, y: 50},

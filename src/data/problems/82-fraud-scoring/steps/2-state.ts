@@ -244,7 +244,7 @@ def score_with_velocity(model, features: dict, card_ref: str, device_id: str, ac
 `,
     },
     typescript: {
-      starter: `/** Velocity counters for the scorer — flawed code. */
+      starter: `/** Velocity counters for the scorer. */
 import Redis from 'ioredis';
 
 export const redis = new Redis({host: 'redis', port: 6379});
@@ -711,7 +711,7 @@ object Velocity {
 `,
     },
     cpp: {
-      starter: `// Velocity counters for the scorer — flawed code.
+      starter: `// Velocity counters for the scorer.
 #include <ctime>
 #include <iomanip>
 #include <sstream>

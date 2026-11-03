@@ -35,13 +35,8 @@ Temporal's documented approval pattern runs an approval as a durable workflow th
 Signal (\`workflow.wait_condition\` with a timeout in Python, \`Workflow.await\` in Java) until an
 approver submits a decision carrying their identity, the outcome and a comment, and a multi-level
 chain iterates through its approval levels waiting for one Signal per level. That is the same
-shape as this course, with the durability outsourced to the workflow engine. Here you build the
-pieces by hand: a chain resolved from a pinned policy version so an edit to the policy cannot
-re-route an in-flight request; one compare-and-swap per decision, because two approvers clicking
-at the same moment must not move a chain two steps; state with no cache-style expiry, because a
-request can wait three weeks for finance; an eligibility call under a deadline that denies when
-the answer cannot be verified; and an event per step change, keyed by the request, carrying ids
-and enums, published after the state it describes is durable.
+shape as this course, with the durability outsourced to the workflow engine; here you build the
+pieces by hand.
 
 ## What you build here
 
@@ -55,9 +50,9 @@ One service, **approvals**, with five pieces:
    \`decision:{i}\` per decided step, advanced by one Lua \`EVAL\` that compares the caller's step
    index, refuses anybody who is not the current approver, treats a repeated decision as a no-op and
    never puts a TTL on an open chain.
-3. A **gRPC** eligibility gate: a 1-second deadline per attempt, bounded retries, and a denial on
-   every path that is not a verified yes — timeout, transport error, departed approver, delegation
-   to somebody else, or \`eligible == false\`. A denial is terminal and the chain does not move.
+3. A **gRPC** eligibility gate: a 1-second deadline per attempt, bounded retries, and a terminal
+   denial on every path that is not a verified yes (timeout, transport error, departed approver,
+   delegation to somebody else, or \`eligible == false\`).
 4. A **Kafka** event path: one \`approval.event\` per step change keyed by the request id, payloads
    of ids and enums only, an idempotent producer with \`acks=all\`, an outbox when the broker rejects
    the produce, and a producer call that happens after the state commit.
@@ -66,9 +61,7 @@ One service, **approvals**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. In every step you debug it against the failure modes, fix it, optimize what is
-wasteful, and prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix.
 
 ## Left out on purpose
 

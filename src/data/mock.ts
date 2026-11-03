@@ -44,10 +44,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'You are the AI platform engineer on call. Two requests from the same tenant arrived together, both passed the daily token check, and both reached the provider. The patch below looks right in a demo. Debug it, fix it, and prove the fix.',
+      "You are the AI platform engineer on call. Two requests from the same tenant arrived together, both passed the daily budget guard, and both reached the provider; the next morning the tenant still had yesterday's key. The starter serves the demo. Debug it, fix it, and prove the fix.",
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The patch does GET, a client-side comparison, then DECRBY. Two concurrent requests both see the same remaining budget, so both pass. The key also has no TTL, so the daily spend never resets. The 429 lacks Retry-After and X-RateLimit-Remaining, leaving the client to hammer the gateway.',
+      'The starter does GET, a comparison in the handler, then DECRBY: two concurrent requests see the same remaining budget and both pass. Its key is budget:{tenant} with no day and no TTL, so the budget never resets. Its 429 carries no Retry-After and no X-RateLimit-Remaining.',
     testIdea:
       'Fire two reservations concurrently for the same tenant with enough budget for only one. Exactly one must succeed, and the remaining budget must never go below zero. Advance the clock a day and assert the key starts fresh.',
     followUps: [
@@ -66,10 +66,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A customer closed the tab in the middle of an answer. The gateway kept generating and billing for another 40 seconds. The patch streams correctly on the happy path, but it only notices a disconnect after the stream ends. Find the flaw, fix it, and prove it.',
+      'A customer closed the tab in the middle of an answer. The gateway kept reading tokens from the provider and billing for another 40 seconds, and the browser saw the reply as one block of text. The starter streams the demo. Find the flaws, fix them, and prove it.',
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The patch writes SSE frames but never checks whether the client is still there, and it never closes the upstream generator. Cancelling the HTTP response is not enough: the gRPC stream keeps producing tokens until the server stops reading. The fix has to check the request, stop iteration, and close the upstream call.',
+      'The starter relays frames without ever asking whether the client is still there, and the upstream call outlives the response: nothing cancels it, so the provider keeps generating. The response does not declare text/event-stream, and a completed stream ends without a usage frame or [DONE].',
     testIdea:
       'Open the stream, cancel the client after the first frame, and assert the provider call is cancelled and no further tokens are read. Then assert a completed stream still ends with [DONE].',
     followUps: [
@@ -170,18 +170,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'eval-harness-the-run-that-passed-too-early',
     problemId: 'eval-harness',
-    stepId: 'endpoint',
+    stepId: 'read',
     title: 'The run that passed too early',
-    blurb: 'The patch calls a run green after a handful of samples and serves a stale report.',
+    blurb: 'The starter calls a run green after a handful of samples and serves a stale report.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A release shipped on an eval run that was marked passed after 12 of 500 samples, and the report endpoint kept serving a cached copy from before the last batch. The patch gates on a caller-supplied threshold and never invalidates its cache. Debug it, fix it, and prove the gate only opens on a complete, current record.',
+      'A release shipped on an eval run that was marked passed after 12 of 500 samples, and the report endpoint kept serving a cached copy from before the last batch. The starter gates on a caller-supplied threshold and caches the report without the scored count in the key. Debug it, fix it, and prove the gate only opens on a complete, current record.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The patch marks the run passed as soon as any sample scores above the threshold, accepts a threshold override from the query string, and serves a report cached at run start so late failures never appear.',
+      "The starter judges a run with no sample floor, accepts a threshold override from the query string, serves a report cached early in the run so late failures do not appear, and reads any tenant's run.",
     testIdea:
-      'Start a run over 500 samples and assert it stays pending at 12 and at 199 scored samples; pass a threshold override and assert 400; finish the run below threshold and assert the report flips to failed immediately.',
+      'Start a run over 500 samples and assert it stays pending at 12 and at 199 scored samples; pass a lenient threshold in the query and assert the server threshold still decides; finish the run below threshold and assert the report flips to failed immediately.',
     followUps: [
       'How many samples make a pass meaningful, and how would you bound the error?',
       'What do you do when the judge model itself regresses mid-run?',
@@ -258,18 +258,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'cost-meter-the-meter-nobody-can-reconcile',
     problemId: 'cost-meter',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The meter nobody can reconcile',
-    blurb: 'A retried report billed twice and a restart dropped accepted usage.',
+    blurb: 'Counter updates were split across commands and the hourly key never reset.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Finance found spend that did not match provider invoices, and a support engineer saw a tenant billed twice for one request after a retry. The starter for POST /v1/usage hands the write to a background task after answering 202, accepts negative token counts and ignores Idempotency-Key. Debug it, fix it, and prove a replay stores one row and the row exists before the response.',
+      'Finance found spend that did not match provider invoices, and a tenant that exhausted its budget last week is still blocked today with no traffic this hour. The starter for record_usage runs two HINCRBY commands against meter:{tenant}, sets no expiry and reads the totals back in a second round trip. Debug it, fix it, and prove the counter, the window and the returned totals agree.',
     signals: ['Specify', 'Verify', 'Operate'],
     aiNote:
-      'The starter answers 202 and records the row in a background task, so a restart in between loses accepted usage; it ignores Idempotency-Key, so a retried report is stored and billed twice; and it accepts negative token counts and an empty tenant header.',
+      "The starter keys the hash on the tenant alone and sets no TTL, so one counter accumulates every hour the tenant ever spent; it moves input and output tokens with separate HINCRBY calls, so a crash between them leaves a half-applied hash; and its HGET re-read can report a concurrent request's increment as this one's.",
     testIdea:
-      'Replay the same usage report with one Idempotency-Key and assert one stored row and a 200 on the replay; post a negative count and assert 400; omit X-Tenant-Id and assert 401; assert store.put runs before the response is written.',
+      'Increment two reports concurrently and assert the hash holds both totals exactly; assert the key is meter:{tenant}:{bucket} with a TTL set once; write in the last minute of a window and assert the TTL did not move; assert the returned totals are the ones the script wrote.',
     followUps: [
       'Should spend be reserved before a call or reconciled after it, and what does each choice cost?',
       'How do you bill a request whose provider usage arrives after the response?',
@@ -302,18 +302,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'distillation-pipeline-the-distillation-that-learned-from-its-own-dupli',
     problemId: 'distillation-pipeline',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The distillation that learned from its own duplicates',
-    blurb: 'The patch drained budget on cache hits and double-counted nothing.',
+    blurb: 'The starter drew budget before the dedupe test, kept the raw prompt and spent twice on one prompt.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "The student model regressed after a distillation run that fed it near-duplicate samples, and the job's dashboard showed more samples accepted than the budget could have paid for. The patch decrements budget before cache checks and never counts filtered duplicates. Debug it, fix it, and prove the report reconciles and the filter holds.",
+      "A distillation run over a dataset with 40 percent repeated prompts ran out of budget at 60 percent of its cap, two workers on the same prompt both got an ok reservation, and the dashboard showed accepted counts the budget could never have paid for. The starter's reserve runs DECRBY before SISMEMBER, as separate commands, with the raw prompt as the set member, and record counts rejections without a reason. Debug it, fix it, and prove a duplicate costs nothing and two workers spend once.",
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The patch decrements the job budget before checking the dedupe cache, so repeated prompts drain the budget without new samples, and the report counts accepted as sampled minus hard failures, silently ignoring duplicates that the filter removed.',
+      'The starter decrements the job budget before checking the seen set, so a repeated prompt pays for a call it never makes; its membership test, decrement and counter updates are separate round trips, so a second worker lands between them and both spend; the set holds the prompt text; and nothing expires or records why a sample was rejected.',
     testIdea:
-      'Run a job over a dataset with 40 percent duplicate prompts and assert duplicates are rejected once, budget spent matches unique calls, and accepted plus rejected equals sampled.',
+      'Reserve the same prompt twice and assert the budget moves once; land a second worker between the membership test and the spend and assert exactly one ok; assert the seen set holds the SHA-256, every key has a TTL, and reasons count refusals by name.',
     followUps: [
       'What makes a teacher output safe to train on, and where would you put that check?',
       'How much teacher data is too little to claim a distillation worked?',
@@ -396,7 +396,7 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A single customer marked their own ticket critical every hour, and during a classifier outage the catch-all queue silently absorbed everything with no fallback metric. The patch honors body priority and hides the fallback path. Debug it, fix it, and prove routing is server-side and fallback stays visible.',
+      'A single customer marked their own ticket critical every hour, and one webhook retried five times produced five routings. The starter honors the body priority and re-triages every retry. Debug it, fix it, and prove routing is server-side and a replay returns the stored decision.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
       "The starter uses the request body's priority and queue when present, so callers route themselves; it reads the text straight through with no 32 KiB cap, has no Idempotency-Key lookup by (tenant, ticket hash), so every retry re-triages, and its log line prints the ticket text.",
@@ -522,18 +522,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'knowledge-graph-the-graph-that-split-itself',
     problemId: 'knowledge-graph',
-    stepId: 'endpoint',
+    stepId: 'dependency',
     title: 'The graph that split itself',
     blurb: 'Resolution timeouts were treated as mismatches and entities split.',
     role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Every hour the resolver was slow, the graph gained duplicate entities because the patch read a timeout as not a match, and a hub entity later made one query traverse millions of paths. The same patch deleted cache entries after edge writes so stale reads survived. Debug it, fix it, and prove merges are deliberate, traversal bounded and caches safe.',
+      'Every hour the resolver was slow, the graph gained duplicate entities, and a pair the resolver had refused showed up merged. The starter for resolve_pair reads DEADLINE_EXCEEDED as not a match, hands a rejection to a retry loop that merges on the last attempt, and merges any other response without reading the score. Debug it, fix it, and prove a timeout parks the pair, a rejection ends the call, and only a score above the threshold merges.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The patch maps resolution timeouts to not a match, silently spawning duplicates, and it invalidates the adjacency cache by deleting after the write, so a concurrent read can repopulate stale data that no later deletion cleans.',
+      'The starter maps a resolution timeout to REJECTED, so an outage splits the graph; it retries a terminal rejection and merges when the attempts run out; it merges on any non-rejection response without comparing the score to MERGE_THRESHOLD; and it has no review queue, so an undecidable pair is never written anywhere.',
     testIdea:
-      'Stub resolution to time out and assert the pair is parked in review, not split; race a neighbor read against an edge write and assert the read reflects the new version once; request depth 5 and assert 400.',
+      'Stub Resolve to time out and assert review_queue.put is called with PARKED and nothing merges; stub a rejection and assert REJECTED after one call; stub a score of 0.6 and assert the pair is parked with its score; stub 0.9 and assert merge_entities runs once.',
     followUps: [
       'What evidence should a merge require before it is automatic?',
       'How would you represent a merge so it can be undone?',
@@ -720,7 +720,7 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'labeling-service-the-queue-that-ate-its-own-work',
     problemId: 'labeling-service',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The queue that ate its own work',
     blurb: 'Stale assignments never returned and pre-label outages froze the queue.',
     role: 'AI platform engineer · 20 min',
@@ -764,18 +764,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'training-scheduler-the-training-run-that-could-not-start',
     problemId: 'training-scheduler',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The training run that could not start',
     blurb: 'A worker died during startup and the run vanished from the queue.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A priority boost duplicated a run, one copy was popped and its worker died during startup, and the dashboard said queued forever while the position drifted. The patch also killed preempted jobs before they could checkpoint. Debug it, fix it, and prove starts are leased, preemptions checkpoint and state reconciles.',
+      'A worker node rebooted while a run was starting and the run vanished from every queue, and a run that was boosted to high priority was started twice on two GPUs. The starter for the Redis queue pops a run with ZPOPMIN and calls it started, writes a boost as a per-band key the scheduler does not poll, and scores a run by raw priority with no age term. Debug it, fix it, and prove starts are leased, a boost moves one member and an expired lease returns the run at its band.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The patch pops a run and treats it as started with no lease, so a crash between pop and process start loses the run silently, and it terminates preempted jobs immediately, discarding training progress instead of waiting for a checkpoint id.',
+      'The starter pops a run and treats it as started with no lease, so a crash between pop and process start loses the run silently; its boost writes SET training:queue:{band}:{run_id} while the sorted set keeps the old member, so the run has two positions; it scores by raw priority so runs in a band tie; and reap_expired returns 0, so nothing ever hands an interrupted start back.',
     testIdea:
-      'Kill a worker between pop and start and assert the run returns to the queue; preempt a checkpointing job and assert the kill happens only after the checkpoint id; boost a priority concurrently and assert one queue position remains.',
+      'Kill a worker between claim and start and assert reap_expired returns the run to training:queue at its band; boost a run concurrently from two schedulers and assert exactly one member remains; enqueue two runs in one band a minute apart and assert the older one sorts first.',
     followUps: [
       'What priority bands prevent starvation without letting callers jump?',
       'How long should a start lease be and what renews it?',
@@ -786,18 +786,19 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'gpu-scheduler-the-gpu-that-was-allocated-twice',
     problemId: 'gpu-scheduler',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The GPU that was allocated twice',
-    blurb: 'Counters were decremented after the record, so two placements shared one GPU.',
+    blurb:
+      'The ledger read the free count on the client and moved it in a second round trip, so two placements shared one GPU.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two inference workloads landed on the same GPU because the patch wrote the placement and decremented capacity as separate steps, and a node that had been dead for a week still received schedules. Debug it, fix it, and prove allocation is atomic and dead nodes are unschedulable.',
+      'Two inference workloads landed on the same GPU because the node ledger reads capacity and allocated with one command and books with another, the heartbeat key is set without a TTL so a node dead for a week still takes placements, and a retried release returns GPUs twice. Debug it, fix it, and prove allocation is atomic, dead nodes are refused and release is idempotent.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The patch decrements node capacity after committing the placement record, leaving a window where two schedules read the same free count, and its lack of heartbeat expiry keeps dead nodes in the scheduling set, so work lands on machines that will never run it.',
+      'The starter reads the counters with HMGET and moves them with a separate HINCRBY, leaving a window where two placements read the same free count; it writes the placement record before deciding; it sets heartbeat:{id} without EX so a dead node stays schedulable; and release decrements on every call.',
     testIdea:
-      'Fire two concurrent placements for the last GPU and assert one succeeds; expire a node heartbeat and assert no placement lands on it; crash between record and decrement and assert the counters reconcile on restart.',
+      'Land a rival booking between the read and the write and assert the node never exceeds capacity; let a heartbeat lapse and assert NO_HEARTBEAT; release the same placement twice and assert allocated returns to zero once.',
     followUps: [
       'What should happen to a running workload whose node dies?',
       'How do you price a max bid against a shared cluster?',
@@ -1050,18 +1051,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'red-team-runner-the-red-team-that-attacked-production',
     problemId: 'red-team-runner',
-    stepId: 'endpoint',
+    stepId: 'dependency',
     title: 'The red-team that attacked production',
-    blurb: 'The patch resolved an arbitrary URL and probes hit production.',
+    blurb: 'The kill switch stopped one runner while its replicas kept probing.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A red-team run accidentally sent adversarial probes to production, because the patch accepted any target URL and never enforced the non-production registry. The same patch re-ran probes on retry and skipped coverage silently. Debug it, fix it, and prove targets are registered and coverage is honest.',
+      'A probe set corrupted a shadow database, an operator hit the kill switch, and two other runners kept sending the rest of the set for twenty minutes while a dead target was retried without end. The starter for run_probes reads a process-local KILL_SWITCH, calls the target with no deadline, retries every RpcError forever and reports the run complete. Debug it, fix it, and prove the switch stops every runner before its next probe and an aborted run says where it stopped.',
     signals: ['Secure', 'Evaluate', 'Verify'],
     aiNote:
-      'The patch accepts an arbitrary URL as a target with no registry check, so a typo in the target field points the entire probe set at production, and its probe dedupe is a non-atomic check-then-set that re-executes concurrent probes.',
+      'The starter keeps the kill switch as a module-level boolean, so only the runner that flipped it stops; it calls the system under test with no deadline and retries every failure in a while True loop; and it returns status complete after a break, so an aborted run looks finished and the next run repeats probes that already succeeded.',
     testIdea:
-      'Submit a production URL and assert 400 before any probe is sent; fire the kill switch mid-run and assert every runner stops before its next probe; assert a run with skipped categories never reports pass.',
+      'Set redteam:kill:{target} in Redis from another process mid-run and assert the next probe is not sent; stub a stalled target and assert the call times out at 5 s and is retried once; abort a run and assert status aborted with resume_at naming the first unsent probe.',
     followUps: [
       'How would you scope a probe category before it runs?',
       'What evidence bundle should a finding carry to be reproducible?',
@@ -1293,7 +1294,7 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'trace-collector-the-trace-that-lost-a-leg',
     problemId: 'trace-collector',
-    stepId: 'endpoint',
+    stepId: 'dependency',
     title: 'The trace that lost a leg',
     blurb: 'Storage timeouts dropped traces and late roots duplicated trees.',
     role: 'Observability engineer · 20 min',
@@ -1315,18 +1316,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'job-queue-the-job-that-ran-at-the-same-time-as-itself',
     problemId: 'job-queue',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The job that ran at the same time as itself',
     blurb: 'Claims were split across commands and re-enqueues let two workers share a job.',
     role: 'Platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A nightly billing job ran twice concurrently, because a slow worker's visibility timeout re-enqueued the job while the original was still running. A crash mid-claim also lost jobs with no trace. The patch claims non-atomically. Debug it, fix it, and prove claims and returns are atomic.",
+      'A nightly billing job ran twice concurrently after two reaper passes requeued the same expired claim, and a crash mid-claim lost a job with no trace. The starter for the Redis queue LPOPs the job and only then writes the in-flight entry, LPUSHes every expired member it reads without proving the claim is still there, and acks by flipping the hash state alone. Debug it, fix it, and prove the claim, the return and the ack are each one atomic script.',
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The patch moves a job out of the queue and marks it in-flight in separate writes, so a crash between them evaporates the job, and its timeout return is not atomic with the claim check, so a live slow worker and a fresh claimant can both hold the same job.',
+      'The starter moves a job out of the queue and marks it in-flight in separate commands, so a crash between them evaporates the job; its return_expired LPUSHes a member before its ZREM, so two reapers both requeue it and two workers run it at once; and its ack leaves the member in jobs:inflight, so a completed job is returned to the queue after its deadline and runs again.',
     testIdea:
-      'Kill a worker between claim steps and assert the job is still claimable; simulate a slow worker past its visibility timeout and assert the job cannot be double-claimed; feed a schema-invalid payload and assert it dead-letters on the first attempt.',
+      'Kill a worker between the pop and the in-flight write and assert the job is still claimable; run return_expired twice on one expired claim and assert the job is queued once; ack a job and assert it is gone from jobs:inflight before its deadline passes.',
     followUps: [
       'What visibility timeout fits your slowest job, and how do you measure it?',
       'Should the dead-letter queue be replayable, and with what protections?',
@@ -1469,18 +1470,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'product-catalog-the-product-that-half-published',
     problemId: 'product-catalog',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The product that half published',
-    blurb: 'Per-field swaps and best-effort renditions tore the page.',
+    blurb: 'Per-field swaps into a shared hash tore the page in half.',
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Shoppers saw a new price with the old description for a full hour, and one SKU published without its main image because the patch treated renditions as best-effort. The patch swaps fields into a shared hash. Debug it, fix it, and prove publishing is atomic and all-or-nothing.',
+      'Shoppers saw a new price with the old title for a full hour, and the EU storefront served a version the US one had already replaced. The starter writes each field of a version into one shared hash and sets two pointers one after the other. Debug it, fix it, and prove a read sees one whole version.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The patch applies publish changes field by field into the shared catalog hash, so readers observe a product assembled from two versions, and it declares publish success when one rendition lands, leaving the storefront with missing media.',
+      'The starter writes a version field by field into the shared catalog hash, so a read landing mid-publish assembles a product from two versions; it keeps a global and a per-region pointer moved separately, so regions disagree; and it sets the pointer unconditionally, so a publish that lost a race overwrites the winner.',
     testIdea:
-      'Swap a price and title concurrently and read repeatedly to assert every read shows one full version; fail the main rendition and assert the publish is held back; inspect storefront responses for draft fields.',
+      'Publish version 2 while a read is in flight and assert the read shows one whole version; list the keys and assert there is one pointer per product; publish with a stale expected version and assert the pointer did not move.',
     followUps: [
       'How do you preview a draft to the right audience?',
       'What cache-control pattern keeps CDNs from mixing versions?',
@@ -1557,7 +1558,7 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'cdn-purge-the-purge-that-never-propagated',
     problemId: 'cdn-purge',
-    stepId: 'endpoint',
+    stepId: 'read',
     title: 'The purge that never propagated',
     blurb: 'Accepted meant done, and a wildcard purged the whole domain.',
     role: 'Edge infrastructure engineer · 20 min',
@@ -1579,18 +1580,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'service-discovery-the-discovery-that-routed-to-ghosts',
     problemId: 'service-discovery',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The discovery that routed to ghosts',
     blurb: 'Expired instances stayed routable and deploy swaps collided.',
     role: 'Infrastructure engineer · 20 min',
     minutes: 20,
     prompt:
-      'Traffic kept landing on dead instances for minutes after a crash, and a deploy briefly had two instances claiming the same identity with different metadata. The patch refreshes TTL without metadata and returns instances by registration rather than health. Debug it, fix it, and prove membership is heartbeat- and health-true.',
+      'Traffic kept landing on the old address of a restarted pod for minutes, and a deploy briefly had two instances claiming the same identity with different metadata. The starter for the heartbeat and replace writes renews the key with a bare EXPIRE on a constant TTL after a separate SET, never compares metadata versions, and writes the replacement before anything old is removed. Debug it, fix it, and prove metadata and liveness move together, versions only go forward, and one identity has one address.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      "The patch renews a heartbeat with a bare EXPIRE, so a replaced instance's stale metadata lives on as long as anything renews it, and it registers the replacement before deregistering the original, so two addresses occupy one identity during a deploy window.",
+      'The starter renews a heartbeat with GET, SET and a bare EXPIRE on a constant TTL, so two heartbeats can interleave and a restarted instance keeps stale routing metadata alive; it overwrites metadata_version with whatever arrives, so a lagging replica undoes a rollout; and its replace writes the new record before removing the old, so two addresses occupy one identity during a deploy window.',
     testIdea:
-      'Stop heartbeats and assert the instance leaves the routable set within the interval bound; register a replacement while the old one is live and assert one address per identity; probe-fail an instance and assert it is excluded and later readmitted.',
+      'Heartbeat with a new metadata version and assert the record and its TTL change in one script call; heartbeat with an older version and assert 409 and no write; replace an instance while the old one is live and assert no reader ever sees two addresses; stop heartbeats and assert the key expires after three intervals.',
     followUps: [
       'How many missed heartbeats mean dead?',
       'Should probes be centralized or per-caller?',
@@ -1623,18 +1624,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'calendar-service-the-invite-that-would-not-stop',
     problemId: 'calendar-service',
-    stepId: 'endpoint',
+    stepId: 'dependency',
     title: 'The invite that would not stop',
-    blurb: 'Infinite recurrence and fresh idempotency tokens per retry.',
+    blurb: 'A fresh idempotency token per retry and a full invite for a timezone fix.',
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'One badly formed RRULE consumed an entire calendar worker for an hour, and a timezone correction re-invited 400 attendees who all responded again because retries used fresh tokens. The patch ignores unknown rule parts. Debug it, fix it, and prove expansion terminates and notifications are idempotent.',
+      'A timezone correction re-invited 400 attendees, and the ones whose first notification timed out were invited twice because each retry used a fresh token. Debug the starter, fix it, and prove each attendee gets one notification per revision and a timezone fix sends a minimal update.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The patch accepts recurrence rules with no terminating condition and unknown parts silently dropped, so one tenant can create an expansion that never ends, and its notification retries mint new idempotency tokens, so a single update fans out into duplicate invites.',
+      'The starter mints the idempotency token inside the retry loop, so a timed-out first attempt and its retry carry different tokens and the notifier cannot dedupe them; the Notify call has no deadline, and a timezone correction goes out as a full invite.',
     testIdea:
-      'Submit FREQ=SECONDLY with no end and assert 422; retry a notification and assert one invite per attendee; change only the timezone and assert no full re-invite is sent.',
+      'Time out the first Notify and assert the retry carries the same token and the attendee gets one invite; hang the notifier and assert the call returns within its deadline; change only the timezone and assert no full re-invite is sent.',
     followUps: [
       'How do you bound recurrence expansion per request?',
       'When is a minimal update better than a full invite?',
@@ -1645,16 +1646,16 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'file-storage-the-upload-that-grieved-the-quota',
     problemId: 'file-storage',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The upload that grieved the quota',
     blurb: 'Bytes were counted before storage and whole restarts re-sent everything.',
     role: 'Storage engineer · 20 min',
     minutes: 20,
     prompt:
-      "A tenant's quota filled with data that never landed because the patch counted chunks before they were stored, and a flaky connection cost a multi-gigabyte re-upload per failed chunk. The patch also returned a permanent file URL. Debug it, fix it, and prove accounting follows storage and retries are chunk-scoped.",
+      "A tenant's quota filled with data that never landed because the starter counted chunks before they were stored, and a flaky connection cost a multi-gigabyte re-upload per failed chunk. Debug it, fix it, and prove accounting follows storage and retries are chunk-scoped.",
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The patch increments quota when a chunk is acknowledged rather than when it is stored, so crash loops consume quota for bytes that do not exist, and its retry path restarts the entire multipart upload instead of the failed chunk.',
+      'The starter increments quota in a second INCRBY when a chunk is acknowledged, separate from the session write, so crash loops consume quota for bytes that do not exist; its retry path restarts the entire multipart upload instead of the failed chunk.',
     testIdea:
       'Crash a chunk after ack and assert quota reflects stored bytes only; fail one chunk and assert the retry re-sends only that chunk; assert a download URL is dead after 10 minutes and that issuance is audited.',
     followUps: [
@@ -1713,7 +1714,7 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'subscription-billing',
     stepId: 'endpoint',
     title: 'The change that charged two plans in one day',
-    blurb: 'Proration double-billed the switch day and retries re-charged.',
+    blurb: 'Proration double-billed the switch day over a fixed 30-day month.',
     role: 'Payments engineer · 20 min',
     minutes: 20,
     prompt:
@@ -1843,18 +1844,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'telemetry-ingest-the-telemetry-that-scaled-a-graph-to-zero',
     problemId: 'telemetry-ingest',
-    stepId: 'endpoint',
+    stepId: 'dependency',
     title: 'The telemetry that scaled a graph to zero',
-    blurb: 'Wild values and double-counted retries poisoned rollups.',
+    blurb: 'Retried batches doubled fleet totals and partial writes were reported complete.',
     role: 'Observability engineer · 20 min',
     minutes: 20,
     prompt:
-      "A dashboard metric collapsed to zero after one device sent a 64-bit overflow value, and retried batches doubled a fleet's totals because the store had no batch dedupe. The patch validates nothing before acking. Debug it, fix it, and prove validation precedes acks and retries are batch-scoped.",
+      "After a brief slowdown in the time-series store, a fleet's daily totals read roughly double and a few devices show gaps in batches the pipeline reported as complete. The starter for write_batch re-sends every sub-batch on any failure inside a while True loop with no deadline, carries no batch id, and returns complete as soon as any sub-batch is accepted. Debug it, fix it, and prove retries are scoped to the failed sub-batches under one batch id and a batch is complete only when every point is stored.",
     signals: ['Verify', 'Specify', 'Operate'],
     aiNote:
-      'The patch acknowledges batches before validating, so out-of-range values and unknown devices are silently absorbed into aggregates that then look plausible, and on a partial store failure it re-sends the whole batch, double-counting the points that already landed.',
+      'The starter rebuilds every request from the whole batch, so sub-batches the store already accepted are stored again by a store that does not dedupe by point; it sends no batch_id, so the store has nothing to dedupe on; it returns complete when reply.accepted is non-empty even though reply.failed is not; and it calls Write with no deadline inside an unbounded loop.',
     testIdea:
-      'Send an out-of-range reading and assert the batch is rejected with the metric named; fail one sub-batch and assert only it is retried under the same batch id; query a 3-day range and assert 400.',
+      'Stub a reply that accepts two of three sub-batches and assert the next request carries only the third under the same batch_id; stub a stalled store and assert the call times out at 4 s and stops after three attempts; assert complete is false until reply.failed is empty.',
     followUps: [
       'What ranges protect downstream scaling?',
       'How do you downsample without lying about peaks?',
@@ -1887,7 +1888,7 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'game-matchmaking-the-player-who-was-in-two-games',
     problemId: 'game-matchmaking',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The player who was in two games',
     blurb: 'Ticket claims were not atomic and failures stranded tickets.',
     role: 'Game backend engineer · 20 min',
@@ -2085,18 +2086,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'invoice-service-the-invoice-that-changed-after-it-was-paid',
     problemId: 'invoice-service',
-    stepId: 'endpoint',
+    stepId: 'dependency',
     title: 'The invoice that changed after it was paid',
-    blurb: 'Finalized invoices were editable and tax timeouts issued zeros.',
+    blurb: 'A tax-service outage issued a batch of invoices with zero tax.',
     role: 'Payments engineer · 20 min',
     minutes: 20,
     prompt:
-      'An auditor found a paid invoice whose line items had been edited weeks later, and a batch of invoices had been issued with zero tax during a tax-service outage. Retried finalizes also minted duplicate invoices. Debug it, fix it, and prove finals are immutable and tax gates. ',
+      'An auditor found a batch of invoices issued with zero tax during a ten-minute tax-service outage, and a customer in a jurisdiction the tax service refuses was invoiced anyway after five identical rejections. The starter for finalize_with_tax calls Quote with no deadline, retries the jurisdiction codes as if they were transient, and finalizes with tax_cents = 0 when the attempts run out. Debug it, fix it, and prove an unanswered quote holds the draft, a jurisdiction rejection is a 422 that names it, and no invoice is finalized without a tax source.',
     signals: ['Secure', 'Verify', 'Operate'],
     aiNote:
-      'The patch treats finalize as a state label rather than a lock, so updates still land on issued invoices and invalidate every downstream reconciliation, and it substitutes tax zero on timeout instead of holding, quietly under-charging in a way nobody reconciles.',
+      'The starter substitutes zero tax when the quote fails instead of holding the draft, so an outage quietly under-charges in a way nobody reconciles; its RETRYABLE set includes INVALID_ARGUMENT and FAILED_PRECONDITION, so a permanent jurisdiction refusal is hammered and then issued; it calls Quote with no deadline; and it stamps tax_source = "quote" on an amount no quote produced.',
     testIdea:
-      'Attempt to update a finalized invoice and assert 409; time out the tax call and assert finalize holds with a marker; replay finalize and assert one invoice and one number.',
+      'Time out the tax call and assert the invoice stays a draft with a tax_hold marker and a 202; return FAILED_PRECONDITION and assert one call, a 422 and the jurisdiction in the body; assert every finalized invoice carries a tax_source and that the quote carries a 2 s deadline.',
     followUps: [
       'Who may ever adjust a finalized invoice, and how is it represented?',
       'How do gapless numbers survive a crash?',
@@ -2151,16 +2152,16 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'ad-serving-the-ad-that-followed-one-user-everywhere',
     problemId: 'ad-serving',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The ad that followed one user everywhere',
     blurb: 'Frequency caps were not enforced and impressions counted at serve.',
     role: 'Ads platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'One user saw the same campaign on every page for an hour, and the advertiser was billed for impressions on pages the ad never rendered. The patch also served exhausted budgets during a burst. Debug it, fix it, and prove caps, budget and counting are truthful.',
+      'One user saw the same campaign on every page for an hour, and the advertiser was billed for impressions on pages the ad never rendered. The starter also served exhausted budgets during a burst. Debug it, fix it, and prove caps, budget and counting are truthful.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The patch ignores frequency caps when ranking, so the highest bidder can saturate one user, and it counts an impression when the ad is served rather than when a render beacon confirms display, billing for ads that were never seen.',
+      'The starter checks and increments the frequency cap and pacing counters in separate round trips, so a burst of serves passes the same cap, and it counts an impression when the ad is served rather than when a render beacon confirms display.',
     testIdea:
       'Serve one user fifty times and assert the capped campaign stops appearing after the cap; exhaust a budget and assert no serve under a burst; drop a render beacon and assert no impression is counted.',
     followUps: [
@@ -2356,10 +2357,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Applied ML engineer · 25 min',
     minutes: 25,
     prompt:
-      'You own the loop behind a merchant assistant inside a store admin. Since the tool count passed thirty, the model picks the wrong tool more often, every prompt edit invalidates the provider cache, and last week one conversation looped for eleven minutes. The patch below works on the demo. Debug the loop, fix it, and prove the fix.',
+      'You own the loop behind a merchant assistant inside a store admin. Since the tool count passed thirty, the model picks the wrong tool more often, every prompt edit invalidates the provider cache, and last week one conversation looped for eleven minutes. The starter below works on the demo. Debug the loop, fix it, and prove the fix.',
     signals: ['Specify', 'Secure', 'Operate', 'Verify'],
     aiNote:
-      'The patch concatenates every tool’s instructions into the system prompt and again into each tool description, so the prompt grows with the registry, conflicts with itself, and changes whenever any tool does. It loops with `while True`, sets no deadline on the model or tool calls, and invokes whatever tool name the model emits — including a product-writing tool for a staff account that only has read scopes. The fix is structural: a constant system prompt, a compact name-plus-description tool list, the invoked tool’s instructions passed in the next model call only, `MAX_TURNS`, per-call deadlines, a loop budget, and a `required_scope` check before every `Invoke`.',
+      'The starter concatenates every tool’s instructions into the system prompt and again into each tool description, so the prompt grows with the registry, conflicts with itself, and changes whenever any tool does. It loops with `while True`, sets no deadline on the model or tool calls, and invokes whatever tool name the model emits, including a product-writing tool for a staff account that only has read scopes. The fix is structural: a constant system prompt, a compact name-plus-description tool list, the invoked tool’s instructions passed in the next model call only, `MAX_TURNS`, per-call deadlines, a loop budget, and a `required_scope` check before every `Invoke`.',
     testIdea:
       'Stub the model to always return a tool call. Assert the loop ends after exactly six Complete calls and returns the tools used. Then stub a `fill_product_form` call for scopes `[read_customers]` and assert `Invoke` is never called and the next model request carries a `PERMISSION_DENIED` tool message. Finally assert the system field is byte-identical across all six requests and that `instructions` is non-empty only on the request that follows a successful invoke.',
     followUps: [

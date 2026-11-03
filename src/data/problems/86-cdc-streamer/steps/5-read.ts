@@ -130,7 +130,7 @@ rds = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 async def slot_active(subscription_id: str) -> bool:
-    """Whether the replication slot is still active — the starter asks the replicator once."""
+    """Whether the replication slot is still active."""
     raise NotImplementedError
 
 
@@ -234,7 +234,7 @@ async def subscription_lag(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/subscriptions/:id/lag: flawed code that reads a cached lag. */
+      starter: `/** GET /v1/subscriptions/:id/lag. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 
@@ -242,7 +242,7 @@ export const app = Fastify();
 const redis = new Redis({host: 'redis', port: 6379});
 
 async function slotActive(id: string): Promise<boolean> {
-  /** Whether the replication slot is still active — asked once by the starter. */
+  /** Whether the replication slot is still active. */
   throw new Error('not implemented');
 }
 

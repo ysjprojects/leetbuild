@@ -116,7 +116,7 @@ Requirements for the worker's model layer:
   ],
   code: {
     python: {
-      starter: `"""Model calls: flawed code that answers unknown when the model times out."""
+      starter: `"""Model calls."""
 import grpc
 
 import vision_pb2
@@ -193,7 +193,7 @@ def infer(image_key: str, task: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Model calls: flawed code that answers unknown when the model times out. */
+      starter: `/** Model calls. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

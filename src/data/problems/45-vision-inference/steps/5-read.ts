@@ -108,7 +108,7 @@ Requirements:
   ],
   code: {
     python: {
-      starter: `"""GET /v1/inferences/{id}: flawed code that serves any id it finds."""
+      starter: `"""GET /v1/inferences/{id}."""
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -210,7 +210,7 @@ def read_inference(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/inferences/:id: flawed code that serves any id it finds. */
+      starter: `/** GET /v1/inferences/:id. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

@@ -8,47 +8,29 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'store', 'dlq'],
   task: `## Task
 
-**Starting point.** The starter is working code for the status endpoint: it
-registers the route, reads the \`jobs\` row and answers with the type, state, attempt count and
-\`next_retry_at\` it found there. It compiles, it answers correctly for a job that is alive in a
-healthy demo, and it hides four production flaws. Debug it like the engineer who gets paged about
-this queue, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/jobs/{id}\`: it reads the \`jobs\` row by id alone,
+answers **404** when there is none, and otherwise echoes the row's type, state, attempt counter and
+\`next_retry_at_ms\`. It compiles, answers correctly for a live job in a healthy demo, and hides four
+flaws.
 
-Implement \`GET /v1/jobs/{id}\`:
+**Failure mode the checks target.** A job stranded in a crashed worker's claim is reported
+\`queued\` forever, so nobody retries it. The dashboard shows a retry time that already passed. A
+buried job has no reason and no history. And any authenticated caller reads any tenant's job by
+guessing an id.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when absent) and the job is
-  resolved **scoped to it**: another tenant's job id — and an id that does not exist — both answer
-  **404**, never **403**, because a 403 confirms the job exists. The starter looks the job up by id
-  alone, so any authenticated caller reads any tenant's job, its payload and its error history.
-- \`state\` is **reconciled against the queue's own sets** before it is reported. \`jobs:inflight\`
-  is a sorted set whose member is the job id and whose score is that claim's visibility deadline in
-  ms. A job still in that set whose deadline is already past — a worker that died mid-attempt — is
-  reported \`stalled\` with \`claim_age_ms\` (the age of the expired claim), **never** the row's
-  \`queued\`: the row is a record the crashed worker never got to update. A live claim keeps the
-  queue's state from \`jobs:job:{job_id}\`.
-- \`attempt_history\` is read from \`job_attempts\` as an **ordered list** (\`ORDER BY attempt_no\`),
-  oldest first, carrying each attempt's error class, message and timings — every attempt, not the
-  row's counter.
-- \`next_retry_at\` is **future-consistent**: it is compared against the clock, and when the stored
-  time is already in the past the read answers with a recomputed backoff
-  (\`BACKOFF_BASE_MS\` = 1000 doubling with the attempt count, capped at \`BACKOFF_CAP_MS\` = 30000)
-  plus \`retry_overdue: true\` — so support can tell "a retry is owed" from "a retry is scheduled".
-  A job that has spent \`MAX_ATTEMPTS\` gets \`next_retry_at: null\`. The starter echoes the stored
-  value and never compares it to now.
-- \`dead_letter_reason\` is surfaced from \`job_dead_letter\` for a job that was buried; a job that
-  is still alive answers \`null\`.
-- Log the read with the job id, the tenant and the reconciled state.
-
-**Failure mode the checks target.** The status read is what an on-call engineer trusts mid-incident,
-so every flaw turns into a wrong action. A job stranded in a crashed worker's claim is reported
-\`queued\` forever, so nobody retries it and the side effect is neither done nor known to be
-missing — the one state a queue must never show. A \`next_retry_at\` copied out of the row can be in
-the past, so the dashboard shows a retry that is not coming and the incident review blames the
-worker. A read that names no dead-letter reason turns a buried job into a mystery that costs an hour
-of digging. And resolving a job by id alone makes the id a capability: any tenant reads any tenant's
-payload, errors and attempt history. Reconciling the in-flight set, comparing the retry time to the
-clock, reading the job's own history tables and answering **404** for a foreign id are what make the
-endpoint safe to page on.`,
+- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the job is resolved scoped to it:
+  another tenant's job id and an unknown id both answer **404**, not **403**.
+- \`state\` is reconciled against \`jobs:inflight\`: a job still in that set whose deadline (the
+  member's score, in ms) is past is \`stalled\` with \`claim_age_ms\`, not the row's \`queued\`. A
+  live claim keeps the queue's state from \`jobs:job:{job_id}\`.
+- \`attempt_history\` is read from \`job_attempts\` as an ordered list (\`ORDER BY attempt_no\`),
+  oldest first, with each attempt's error class, message and timings.
+- \`next_retry_at\` is compared against the clock; a stored time already past is replaced by a
+  recomputed backoff (\`BACKOFF_BASE_MS = 1000\` doubling per attempt, capped at
+  \`BACKOFF_CAP_MS = 30000\`) plus \`retry_overdue: true\`. A job past \`MAX_ATTEMPTS\` gets
+  \`next_retry_at: null\`.
+- \`dead_letter_reason\` is surfaced from \`job_dead_letter\`; a live job answers \`null\`.
+- Log the read with the job id, the tenant and the reconciled state.`,
   sequence: {
     participants: ['Client', 'Job API', 'Redis', 'job store', 'Dead-letter store'],
     messages: [
@@ -236,10 +218,7 @@ def job_row(job_id: str) -> dict | None:
 
 @app.get("/v1/jobs/{job_id}")
 def read_job(job_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter reports the stored state verbatim — queued for a job stranded in a crashed
-    # worker's claim — copies next_retry_at from the row without comparing it to the clock, returns
-    # the attempt counter instead of the history, and looks the job up by id alone, so any tenant
-    # reads any job. Fix all of it before the status endpoint ships.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     row = job_row(job_id)
     if row is None:
         return JSONResponse({"error": "unknown job"}, status_code=404)
@@ -382,10 +361,7 @@ async function jobRow(jobId: string): Promise<JobRow | undefined> {
 }
 
 app.get('/v1/jobs/:jobId', async (request, reply) => {
-  // TODO: this starter reports the stored state verbatim — queued for a job stranded in a crashed
-  // worker's claim — copies next_retry_at from the row without comparing it to the clock, returns
-  // the attempt counter instead of the history, and looks the job up by id alone, so any tenant
-  // reads any job. Fix all of it before the status endpoint ships.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'];
   const {jobId} = request.params as {jobId: string};
   const row = await jobRow(jobId);
@@ -550,10 +526,7 @@ func readJobRow(r *http.Request, jobID string) (jobRow, error) {
 }
 
 func readJob(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reports the stored state verbatim — queued for a job stranded in a crashed
-	// worker's claim — copies next_retry_at from the row without comparing it to the clock, returns
-	// the attempt counter instead of the history, and looks the job up by id alone, so any tenant
-	// reads any job. Fix all of it before the status endpoint ships.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	jobID := r.PathValue("jobID")
 	row, err := readJobRow(r, jobID)
@@ -839,10 +812,7 @@ object JobRead {
   val route: Route =
     path("v1" / "jobs" / Segment) { jobId =>
       get {
-        // TODO: this starter reports the stored state verbatim — queued for a job stranded in a
-        // crashed worker's claim — copies next_retry_at from the row without comparing it to the
-        // clock, returns the attempt counter instead of the history, and looks the job up by id
-        // alone, so any tenant reads any job. Fix all of it before the status endpoint ships.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         jobRow(jobId) match {
           case Some(row) =>
             val response = JsObject(
@@ -1026,10 +996,7 @@ int main() {
   svr.Get(R"(/v1/jobs/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
     const std::string tenant = req.get_header_value("X-Tenant-Id");
     const std::string job_id = req.matches[1];
-    // TODO: this starter reports the stored state verbatim — queued for a job stranded in a crashed
-    // worker's claim — copies next_retry_at from the row without comparing it to the clock, returns
-    // the attempt counter instead of the history, and looks the job up by id alone, so any tenant
-    // reads any job. Fix all of it before the status endpoint ships.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     pqxx::work tx(db_pool());
     const auto jobs = tx.exec_params(
         "SELECT type, state, attempts, next_retry_at_ms FROM jobs WHERE id = $1", job_id);
@@ -1175,25 +1142,9 @@ int main() {
     },
   },
   hints: [
-    'Scope before you read: `X-Tenant-Id` first, then resolve the job against the row’s own tenant — a foreign id and an unknown id must produce the same **404** with the same body, because a 403 confirms the job exists before the caller is allowed to know that. The starter resolves by id alone, so a job id becomes a capability.',
-    '`jobs:inflight` is the queue’s own truth, not a cache of the row: `ZSCORE jobs:inflight <job id>` is that claim’s deadline in ms. If the deadline is behind the clock the job is `stalled` and `claim_age_ms` is `now − deadline` — the crash the row cannot see, because the worker died before it wrote anything.',
-    'Never echo `next_retry_at`: compare the stored time with the clock, and when it is already past answer with a recomputed backoff (`BACKOFF_BASE_MS` doubling per attempt, capped at `BACKOFF_CAP_MS`) plus `retry_overdue: true`, so the dashboard says "a retry is owed" instead of showing a retry that already passed. Read `attempt_history` from `job_attempts` with `ORDER BY attempt_no`, and take `dead_letter_reason` from `job_dead_letter` — the row’s counter and a silent `null` are what make a buried job unexplainable.',
+    'Support watches a job sit at "queued, next retry 09:14" for three hours after a worker node died at 09:10, and nothing ever retries it.',
+    '`job_row` selects by id with no tenant and the handler echoes `row["state"]` and `row["next_retry_at_ms"]`; nothing consults `jobs:inflight`, `job_attempts` or `job_dead_letter`, and the clock is not read.',
+    'Filter by tenant and answer 404 on mismatch; `ZSCORE jobs:inflight` and report `stalled` with `claim_age_ms` when the deadline is past; recompute backoff and set `retry_overdue` when stored time < now; read history and reason from their tables.',
   ],
-  debrief: `The interviewer is testing the read half of a queue, where the question is never "does it return
-a state" but "is it the state the queue is actually in, and may this caller see it". The starter is
-convincing because the demo job is alive, owned by the caller, and sitting in a healthy retry
-window — every flaw needs a crashed worker, a retry that already came due, or a caller who guessed
-an id. The checks are the route; a job stranded in \`jobs:inflight\` past its deadline reported
-\`stalled\` with \`claim_age_ms\` instead of the row's \`queued\`; \`attempt_history\` read from
-\`job_attempts\` with \`ORDER BY attempt_no\` and a \`dead_letter_reason\` taken from
-\`job_dead_letter\`; \`next_retry_at\` compared with the clock, with a recomputed backoff and
-\`retry_overdue\` when it has passed; and a tenant-scoped lookup that answers **404** for another
-tenant's job. The stranded job is the one that ships: the row is written by the API and the worker,
-so a worker that dies mid-attempt leaves a row that still says \`queued\`, and an endpoint that
-believes it will report a job as waiting forever while its side effect never happens — the worst
-answer a queue can give, because nobody retries and nobody escalates. The retry time is the quiet
-one: a stored timestamp is a promise about the past, and only the clock can turn it into a promise
-about the future. Real systems push this further — an \`observed_at\` on the response, a
-reconciliation sweep that re-queues stalled claims instead of only reporting them, and a metric that
-counts stalled reads so a worker that keeps dying is paged on before support notices the state.`,
+  debrief: `The read half of a queue is judged by whether it reports the state the queue is in, and whether this caller may see it. The row is written by the API and the worker, so a worker that dies mid-attempt leaves a row that still says \`queued\`; reconciling against \`jobs:inflight\` is how the endpoint sees the crash the row cannot. A stored retry time is a promise about the past, and only the clock turns it into one about the future, which is why the read recomputes and flags an overdue retry rather than echoing it. The history and the dead-letter reason come from their own tables because the row's counter explains nothing. The tenant lookup answers 404 so a guessed id confirms nothing. Production systems add a sweep that re-queues stalled claims instead of only reporting them.`,
 };

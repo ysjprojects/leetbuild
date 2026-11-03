@@ -14,25 +14,22 @@ keyed by the actor with a plain \`Producer\`, falls back to \`insert_outbox\` on
 and then calls \`state.commit_step\` for decisions. A trail consumer commits its offset and writes
 the event into \`approval:{request_id}:trail\`. It serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** Keyed by approver, one request's events are spread over as
-many partitions as it has approvers, so a consumer sees step 1 before step 0. The \`why\` text and
-the attachment list land in a retained, replicated topic, a leak with a very long tail. A retried
-produce can duplicate a record. And the broker is acked before the state commit, so a crash between
-the two leaves a step in the trail that the state does not have.
+**Failure mode the checks target.** Keyed by approver, one request's events spread over partitions
+and a consumer sees step 1 before step 0. The \`why\` text and attachments land in a retained,
+replicated topic. A retried produce can duplicate a record, and acking before the state commit
+leaves a trail step the state does not have after a crash.
 
 - **One topic**, \`approval.event\`, and **one key: the request id**, so a single request's chain
-  (submit, step 0, delegation, step 1, completion) stays in one partition and in order.
+  stays in one partition and in order.
 - The payload carries **ids and enums only**: \`request_id\`, \`kind\`, \`step\`, \`actor\`,
-  \`actor_role\`, \`decision\`. No \`why\` text and no attachments: the topic outlives the request,
-  the tenant and every retention policy the request path has.
+  \`actor_role\`, \`decision\`. No \`why\` text and no attachments.
 - The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks \`all\`
   plus hashed, stable keys).
-- When the broker rejects the produce, the event goes to the **outbox** rather than being dropped or
-  failing the caller; a relay republishes outbox rows when the broker recovers.
+- When the broker rejects the produce, the event goes to the **outbox** for a relay to republish.
 - **A decision publishes only after the state commit**: \`state.commit_step\` runs first, then the
   produce.
 - The trail consumer writes the step into \`approval:{request_id}:trail\` and commits its offset
-  after that write, so a crash between the two replays the record instead of losing it.`,
+  after that write, so a crash replays the record instead of losing it.`,
   sequence: {
     participants: ['Approval API', 'approval.event', 'Trail consumer', 'Redis'],
     messages: [
@@ -269,7 +266,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** approval.event: flawed code keyed by approver that still commits after the ack. */
+      starter: `/** approval.event. */
 import {Kafka} from 'kafkajs';
 
 import {state} from './state';

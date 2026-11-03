@@ -257,7 +257,7 @@ def answer(body: AnswerRequest, tenant: str = Header(alias="X-Tenant-Id")):
 `,
     },
     typescript: {
-      starter: `/** POST /v1/answer: flawed code that trusts the model and the retrieved text. */
+      starter: `/** POST /v1/answer. */
 import Fastify from 'fastify';
 
 import {LLM, TOOLS} from './llm';

@@ -26,11 +26,10 @@ export const batchInferenceProblem: Problem = {
   minutes: 70,
   statement: `# Batch Inference Service
 
-Batch inference is how most model work actually runs: a tenant hands over a manifest of a million
-records, a fleet of workers runs the model over shards of it, and someone polls a status endpoint
-for the result. The interesting parts are not the model call. They are whether the job started
-twice, whether a worker that died took its shard with it, whether one poisoned record can fail the
-whole batch, and whether the status endpoint reports the real state while shards are still running.
+Batch inference is how most model work runs: a tenant hands over a manifest of a million records,
+workers run the model over shards of it, and someone polls a status endpoint. The hard parts are not
+the model call but a job started twice, a dead worker's shard, a poisoned record, and a status that
+lies while shards still run.
 
 ## The real system
 
@@ -39,10 +38,7 @@ file of at most 50,000 requests and 200 MB, with a fixed 24-hour completion wind
 moves through \`validating\`, \`in_progress\`, \`finalizing\` and then \`completed\`, \`failed\`, \`expired\` or
 \`cancelled\`, and carries \`request_counts\` with \`total\`, \`completed\` and \`failed\`. Successful outputs
 land in one file (\`output_file_id\`) and failed requests in a separate error file (\`error_file_id\`),
-so a partial batch is reported as partial rather than as a success. Internally the same mechanics
-apply: an idempotent submit, a validated input before any work starts, shards claimed under a lease
-so a crashed worker's work is retried, per-record failures contained to their record, and progress
-derived from what the workers have actually finished.
+so a partial batch is reported as partial rather than as a success.
 
 ## What you build here
 
@@ -62,21 +58,18 @@ One service, **batchd**, and its workers, with five pieces:
    output checksum, with an outbox row when the produce is rejected, and a coordinator that folds
    the shard into the manifest before it commits its offset.
 5. \`GET /v1/batches/{id}\`: progress computed from the live shard set, with completed, failed and
-   pending counts and a manifest of output objects — success only when every shard is terminal, and
+   pending counts and a manifest of output objects; success only when every shard is terminal, and
    a foreign batch id is a \`404\`.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
-looks right. Your job in every step is to debug it against the failure modes, find the subtle one, fix
-it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on
-your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Provider account management, model selection per record, tokenizers, cost accounting, autoscaling the
-worker fleet, multi-region job placement, storage lifecycle rules, and dashboarding. The five pieces
-above are the ones that decide whether a batch is correct, isolated and shippable.`,
+Provider accounts, per-record model selection, tokenizers, cost accounting, fleet autoscaling,
+multi-region placement and storage lifecycle rules.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'submit · poll', x: 8, y: 50},

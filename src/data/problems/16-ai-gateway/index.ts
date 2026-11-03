@@ -1,88 +1,95 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {chatEndpointStep} from './steps/1-chat-endpoint';
 import {tenantBudgetStep} from './steps/2-tenant-budget';
 import {streamingCancelStep} from './steps/3-streaming-cancel';
 import {providerFailoverStep} from './steps/4-provider-failover';
 import {usageEventsStep} from './steps/5-usage-events';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * LLM gateway: the gateway every product team puts in front of a model provider. Each step starts
- * from working code that passes the happy path and hides one flaw, and asks the learner to debug
- * it: tighten the request contract, make the tenant budget atomic, stop paying for cancelled
- * streams, fail over without double-charging, and emit usage exactly once.
+ * LLM gateway: the service every product puts in front of a model provider. Each step starts from
+ * a starter that serves the demo and hides flaws the learner debugs: validation that runs after the
+ * paid call, a budget that overspends under concurrency, a stream that keeps generating after the
+ * tab closes, a retry loop that cannot stop, and a usage event the billing consumer loses.
  */
 export const aiGatewayProblem: Problem = {
   id: 'ai-gateway',
   title: 'LLM Gateway',
   tagline:
-    'One gateway in front of model providers: validated chat, atomic budgets, cancellable streams, safe failover, billed usage.',
+    'The gateway in front of model providers: a chat route, a token budget in Redis, SSE streams, failover, usage events.',
   difficulty: 'easy',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 60,
   statement: `# LLM Gateway
 
-Every product that ships a chat box eventually grows the same service: one **LLM gateway** that
-authenticates tenants, enforces a token budget, calls one or more model providers, streams tokens
-back to the browser, and emits usage that billing can trust. The gateway is where an AI feature
-becomes a multi-tenant system.
+Every product with a chat box grows the same service: one **gateway** that authenticates tenants,
+holds them to a token budget, calls a model provider over gRPC, streams tokens back to the browser
+and emits a usage event that billing can trust. Each piece is a few dozen lines, and each hides the
+failure that costs money when two requests overlap, a tab closes or a broker stalls.
 
 ## The real system
 
-OpenAI's edge, Anthropic's API, and every company's internal AI platform do the same four things:
-they put a validated, authenticated boundary in front of the models; they enforce per-tenant rate
-and token budgets atomically; they cancel upstream work the moment a client goes away; and they
-account for every token exactly once, even when a provider times out or a broker is unavailable.
-The hard part is rarely the model call. It is the debugging of the code around it: the deadline that
-was forgotten, the read-then-decrement that raced, the stream that kept generating after the user
-closed the tab, the retry that charged twice, the event that was dropped on a bad Kafka day.
+LiteLLM's proxy is the open-source version of this gateway: it issues virtual keys with a
+\`max_budget\`, \`tpm_limit\` and \`rpm_limit\`, tracks spend per key in its database, and since
+v1.92 can reroute a request to a fallback model when a key's \`model_max_budget\` is exceeded instead
+of answering \`budget_exceeded\`. Commercial gateways (Cloudflare AI Gateway, Portkey) add caching,
+observability and provider routing on the same shape: a request contract, a budget, a provider
+call, a stream, an event.
 
 ## What you build here
 
-One service, **gateway**, in five pieces:
+One service, **gateway**, every step a file of its own, the provided \`gateway/auth\` and
+\`gateway/outbox\` modules shared by all of them:
 
-1. \`POST /v1/chat\` with tenant authentication, request validation, a bounded provider call, and a
-   response that reports provider usage without echoing the prompt.
-2. A daily **token budget** in Redis, reserved with one atomic Lua script and a TTL, returning
-   \`429\`, \`Retry-After\` and \`X-RateLimit-Remaining\` when the tenant is out.
-3. \`POST /v1/chat/stream\` as SSE, checking for client disconnect and cancelling the upstream
-   stream instead of paying for tokens nobody reads.
-4. **Provider failover** over gRPC: one fallback, per-attempt deadlines, retryable codes, a circuit
-   breaker, an idempotency key, and no replay after the first token.
-5. One **usage** event per request to Kafka, keyed by tenant, with an outbox fallback and a billing
-   consumer that increments Redis before it commits.
-
-## The debugging habit
-
-Every starter in this course is working code with a flaw. It compiles, it passes the happy
-path, and it reads like the examples in the provider's documentation. Your job is not to rewrite it
-from scratch: debug it against the failure modes, name the subtle one, make the smallest correct
-fix, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on
-your version.
+1. \`POST /v1/chat\` (\`chat_api\`): body \`{model, messages, max_tokens}\`, tenant from
+   \`Authorization: Bearer <tenant>\`, one \`Provider.Complete\` call with an 8 s deadline, answer
+   \`{id, content, usage}\` with the provider's own token counts.
+2. A daily **token budget** (\`budget\`): a guard in front of the chat route that reserves
+   \`ceil(chars / 4) + max_tokens\` from \`budget:{tenant}:{yyyymmdd}\` in one Lua script and answers
+   429 with \`Retry-After\` and \`X-RateLimit-Remaining\`.
+3. \`POST /v1/chat/stream\` (\`chat_stream\`): \`Provider.StreamComplete\` relayed as SSE, one
+   \`data: {"delta": …}\` frame per token, a \`usage\` frame and \`[DONE]\` at the end, the upstream
+   call cancelled when the client leaves.
+4. **Failover** (\`failover\`): \`stream_with_failover(request, idempotency_key)\` over
+   \`primary:9000\` and \`fallback:9000\`, one attempt each, an 8 s deadline per attempt, retries only
+   on \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` and only before the first token, a breaker at
+   \`circuit:{provider}\`.
+5. **Usage events** (\`usage_events\`): \`emit_usage(event)\` produces one record per request to
+   \`usage\`, keyed by tenant, from an idempotent \`acks=all\` producer whose delivery failures go to
+   the outbox; \`run_billing()\` adds the tokens to \`usage:{tenant}:{day}\` and commits after.
 
 ## Left out on purpose
 
-Model routing and prompt templates, provider SDK details, API-key vaulting, streaming tokenisation,
-and the analytics warehouse. The five pieces above are the ones that decide whether the gateway is
-safe to put in front of paying tenants.`,
+Model routing and prompt templates, provider SDK details, key vaulting, real tokenisers (the
+gateway estimates four characters per token) and the warehouse behind billing. Each slots into
+the request path above without changing its shape.`,
   diagram: {
     nodes: [
-      {id: 'client', kind: 'client', label: 'Client', sub: 'chat · SSE stream', x: 8, y: 50},
-      {id: 'gateway', kind: 'http', label: 'Gateway', sub: 'HTTPS :8443', x: 30, y: 50},
-      {id: 'budget', kind: 'redis', label: 'Redis', sub: 'budget · circuit', x: 52, y: 16},
-      {id: 'providers', kind: 'grpc', label: 'Model providers', sub: 'Primary · fallback', x: 52, y: 50},
+      {id: 'client', kind: 'client', label: 'Client', sub: 'POST /v1/chat · /v1/chat/stream', x: 8, y: 50},
+      {id: 'gateway', kind: 'http', label: 'gateway', sub: ':8443', x: 30, y: 50},
+      {id: 'budget', kind: 'redis', label: 'Redis', sub: 'budget:{tenant}:{day} · circuit:{provider}', x: 52, y: 16},
+      {id: 'providers', kind: 'grpc', label: 'Provider', sub: 'primary · fallback', x: 52, y: 50},
       {id: 'usage', kind: 'kafka', label: 'usage', sub: 'key = tenant', x: 74, y: 50},
-      {id: 'billing', kind: 'service', label: 'Billing', sub: 'consumer group', x: 92, y: 50},
+      {id: 'billing', kind: 'service', label: 'billing', sub: 'consumer group', x: 92, y: 50},
     ],
     edges: [
-      {from: 'client', to: 'gateway', kind: 'http', label: 'POST /v1/chat'},
-      {from: 'gateway', to: 'budget', kind: 'redis', label: 'EVAL · circuit'},
-      {from: 'gateway', to: 'providers', kind: 'grpc', label: 'Complete · Stream'},
-      {from: 'gateway', to: 'usage', kind: 'kafka', label: 'produce'},
+      {from: 'client', to: 'gateway', kind: 'http', label: 'JSON · SSE'},
+      {from: 'gateway', to: 'budget', kind: 'redis', label: 'EVAL reserve · INCR circuit'},
+      {from: 'gateway', to: 'providers', kind: 'grpc', label: 'Complete · StreamComplete'},
+      {from: 'gateway', to: 'usage', kind: 'kafka', label: 'produce (outbox on failure)'},
       {from: 'usage', to: 'billing', kind: 'kafka', label: 'consume'},
-      {from: 'billing', to: 'budget', kind: 'redis', label: 'HINCRBY'},
+      {from: 'billing', to: 'budget', kind: 'redis', label: 'HINCRBY usage:{tenant}:{day}'},
     ],
   },
   steps: [chatEndpointStep, tenantBudgetStep, streamingCancelStep, providerFailoverStep, usageEventsStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

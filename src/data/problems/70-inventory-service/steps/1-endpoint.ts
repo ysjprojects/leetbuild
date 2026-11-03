@@ -13,10 +13,8 @@ export const endpointStep: Step = {
 answers \`201\` with a reservation. It compiles, serves the demo and hides four flaws.
 
 **Failure mode the checks target.** A value believed before it is checked, and a request executed
-twice. The starter trusts the raw \`quantity\`, so a negative value *increases* stock and \`1e6\`
-walks past a cap that does not exist; it does not look the sku up, so any string becomes a
-reservation; and it ignores \`Idempotency-Key\`, so a client retry after a timeout holds the units
-twice. None of that shows up in a demo that sends one well-formed request per key.
+twice. A negative \`quantity\` *increases* stock, \`1e6\` passes a cap that does not exist, any sku
+string becomes a reservation, and a client retry after a timeout holds the units twice.
 
 - The tenant comes from the \`X-Tenant-Id\` header; a missing or empty tenant is **401**.
 - \`Idempotency-Key\` is a required header (**400** when missing or empty).
@@ -24,9 +22,8 @@ twice. None of that shows up in a demo that sends one well-formed request per ke
   decides, and an unknown sku is **404** with no reservation created and no stock touched.
 - \`quantity\` must be an integer from **1** to **MAX_ORDER_QUANTITY** (**1000**). \`0\`, a negative
   value, \`2.5\` and \`1000000\` are all **400** \`quantity out of range\`.
-- Only once those guards have passed may the service call \`stock.reserve(sku, quantity)\`.
-  Validation, the catalog lookup and the idempotency lookup all run **before** it: a rejected
-  request must not move a counter.
+- Validation, the catalog lookup and the idempotency lookup all run **before**
+  \`stock.reserve(sku, quantity)\`: a rejected request must not move a counter.
 - Idempotency is keyed by \`(tenant, Idempotency-Key)\`: the record
   \`{reservation_id, sku, quantity, status: "reserved", expires_at}\` is stored under that pair, with
   \`expires_at = now + RESERVATION_TTL_S\` (**900**) in epoch seconds. A replay returns the **stored**
@@ -299,7 +296,7 @@ async def create_reservation(request: Request) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/reservations: flawed code that trusts the caller's quantity. */
+      starter: `/** POST /v1/reservations. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

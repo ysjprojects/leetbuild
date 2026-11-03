@@ -201,7 +201,7 @@ def report_usage(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/usage: flawed code that counts every report. */
+      starter: `/** POST /v1/usage. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

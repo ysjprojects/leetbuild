@@ -221,7 +221,7 @@ def retrieve(tenant: str, query: str, k: int = 10) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Hybrid retrieval: flawed code that concatenates a global lexical list and vector hits. */
+      starter: `/** Hybrid retrieval. */
 import {createHash} from 'node:crypto';
 
 import Redis from 'ioredis';

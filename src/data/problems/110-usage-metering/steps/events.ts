@@ -158,7 +158,7 @@ def publish_rollup(account: str, period: str, units: int, route: str, gateway: s
 `,
     },
     typescript: {
-      starter: `/** usage.rollup: flawed code that keys by gateway and copies the query string. */
+      starter: `/** usage.rollup. */
 import {Kafka} from 'kafkajs';
 
 import {applyUsage} from './state';

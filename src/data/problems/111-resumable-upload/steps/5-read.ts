@@ -170,7 +170,7 @@ def get_upload(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/uploads/{id}: flawed code that returns a percentage. */
+      starter: `/** GET /v1/uploads/{id}. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

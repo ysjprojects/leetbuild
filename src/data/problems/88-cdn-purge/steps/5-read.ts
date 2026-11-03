@@ -207,7 +207,7 @@ def get_purge(purge_id: str, tenant: str | None = Header(default=None, alias="X-
 `,
     },
     typescript: {
-      starter: `/** GET /v1/purges/:purgeId: flawed code that calls provider acceptance done. */
+      starter: `/** GET /v1/purges/:purgeId. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -230,7 +230,6 @@ app.get('/v1/purges/:purgeId', async (request, reply) => {
   // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   // Fastify types route params as a generic record; this route declares :purgeId.
   const params = request.params as {purgeId: string};
-  // The starter assumes the purge exists, so it skips the missing-record path entirely.
   const purge = (await store.get(params.purgeId)) as Purge;
   const outcomes: Record<string, string> = {};
   for (const [path, outcome] of Object.entries(purge.outcomes)) if (outcome === 'accepted') outcomes[path] = outcome;

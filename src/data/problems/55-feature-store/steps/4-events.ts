@@ -188,7 +188,7 @@ def materialize(feature: str, version: int, partition_start: int, partition_end:
 `,
     },
     typescript: {
-      starter: `/** Materialize a feature version: flawed code that announces its plan. */
+      starter: `/** Materialize a feature version. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'feature.event';

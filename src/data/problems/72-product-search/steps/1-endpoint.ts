@@ -13,15 +13,11 @@ export const endpointStep: Step = {
 hands the three values straight to the query engine. It compiles, it serves the demo, and it hides
 four flaws.
 
-**Failure mode the checks target.** Passing the caller's filter string straight into the engine makes
-every field in the index addressable: a crafted filter can name an unpublished field or another
-tenant's attribute, which is how a search box becomes a data leak. The missing caps turn the endpoint
-into an unbounded read: a page size of 10000 or a megabyte query is a cheap way to exhaust the index.
-The fix is the boring one: validate cheaply before the expensive call, and build the engine query
-only from values that survived the allowlist.
+**Failure mode the checks target.** Passing the caller's filter string to the engine makes every
+indexed field addressable, so a crafted filter can name an unpublished field or another tenant's
+attribute. Without caps, a page size of 10000 or a megabyte query exhausts the index.
 
-- \`q\` is a non-empty string of at most **256 bytes** of UTF-8 (**400** otherwise). Byte length,
-  not character count: one emoji is four bytes.
+- \`q\` is a non-empty string of at most **256 bytes** of UTF-8 (**400** otherwise).
 - \`filters\` is a JSON object whose keys are checked against the **per-tenant allowlist**
   \`{"brand", "category", "in_stock", "min_price", "max_price"}\`. An unknown field is **400** and
   the response names the offending field and lists the allowed set. Only allowlisted fields reach

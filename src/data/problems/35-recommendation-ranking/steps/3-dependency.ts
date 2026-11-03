@@ -10,26 +10,21 @@ export const dependencyStep: Step = {
 
 **Starting point.** The starter implements \`rank(tenant, user, candidate_ids)\`, the client recsvc
 calls for the ranking model: it opens the gRPC call, loops over a bounded attempt count, and
-returns the ordered item ids together with a degraded marker and the model version. While the
-ranker is healthy every request comes back with an ordered list. It serves the demo and hides five
-flaws.
+returns the ordered item ids with a degraded marker and the model version. It serves the demo and
+hides five flaws.
 
-**Failure mode the checks target.** A slow or absent ranker. One stuck call pins the request open,
-a timeout turns into a list that looks like "no candidates", a popularity list is counted as a
-model win in the A/B numbers, a malformed payload is re-sent until the attempt budget is spent, and
-the degraded marker dies inside the client where no downstream reader can see it.
+**Failure mode the checks target.** A slow or absent ranker: one stuck call pins the request open,
+a timeout becomes an empty list, a popularity list counts as a model win in the A/B numbers, a
+malformed payload is re-sent until the budget is spent, and the degraded marker dies inside the client.
 
 - Each attempt carries a **500 ms** deadline (\`timeout=\`, \`deadline:\`, \`WithTimeout\`,
   \`withDeadlineAfter\`, \`set_deadline\`).
-- Attempts are bounded to **3** and only \`UNAVAILABLE\` is retried. \`INVALID_ARGUMENT\`, a
-  malformed candidate payload, is our bug and fails fast. \`DEADLINE_EXCEEDED\` is not retried
-  either: the ranker has just said it cannot answer inside the budget.
-- When the attempt budget is gone, or the deadline was missed, degrade to the **popularity order**
-  over the same candidates (\`popularity_order(candidate_ids)\`, provided) instead of an empty list.
-- The degraded result is tagged (\`"fallback": true\` in Python, \`fallback: true\`, \`Fallback: true\`,
-  \`fallback = true\` elsewhere) and stamped with the **popularity model version**, and both travel
-  out of the client on the returned result so the impression event can record that the list was
-  degraded.
+- At most **3** attempts, retrying only \`UNAVAILABLE\`. \`INVALID_ARGUMENT\` fails fast;
+  \`DEADLINE_EXCEEDED\` is not retried either.
+- When attempts run out or the deadline was missed, return the **popularity order**
+  (\`popularity_order(candidate_ids)\`, provided) instead of an empty list.
+- Tag the degraded result (\`fallback: true\` in each language's casing) and stamp it with the
+  **popularity model version** on the returned result, so the impression event can record it.
 - Log the outcome with tenant, user, item count and the fallback flag, not feature values.`,
   sequence: {
     participants: ['Recommendation API', 'Ranking model', 'Popularity order'],
@@ -657,7 +652,7 @@ RankingResult rank(const std::string& tenant, const std::string& user, const std
     'The call has no deadline, the timeout branch returns an empty list, nothing sets the fallback flag or the popularity version on the result, and the loop treats every error, including `INVALID_ARGUMENT`, as a reason to try again.',
     'Put `timeout=RANK_TIMEOUT_S` on the call; on `DEADLINE_EXCEEDED` or exhausted attempts return `popularity_order(candidate_ids)` with `fallback = True` and `model_version = POPULARITY_MODEL_VERSION`; retry only `UNAVAILABLE`, re-raise `INVALID_ARGUMENT`.',
   ],
-  debrief: `Failure policy on a dependency you do not control has a fixed shape. A deadline per attempt bounds one call; a bounded attempt count over a status whitelist bounds the whole call; a popularity fallback guarantees the surface still recommends, because a worse-but-real list beats no list; and the fallback tag plus the popularity model version carry the degradation into the impression stream, so offline evaluation can exclude or re-weight it instead of crediting popularity with a win. \`INVALID_ARGUMENT\` is the costly one: a malformed candidate payload cannot become valid between attempts, so every retry is load spent on the ranker's most contended path.
+  debrief: `Failure policy on a dependency you do not control has a fixed shape. A deadline bounds one attempt; a bounded count over a status whitelist bounds the whole call; a popularity fallback keeps the surface recommending, because a worse-but-real list beats no list; and the fallback tag plus popularity version carry the degradation into the impression stream, so offline evaluation does not credit popularity with a model win. \`INVALID_ARGUMENT\` cannot become valid between attempts, so retrying it only loads the ranker.
 
-Production clients propagate the caller's deadline instead of inventing one, add jittered backoff between \`UNAVAILABLE\` attempts, cap the fallback share per surface so a surface degrading on most requests pages instead of serving popularity forever, and record why they degraded, so "slow" and "gone" stay distinguishable after the fact.`,
+Production clients propagate the caller's deadline instead of inventing one, add jittered backoff between \`UNAVAILABLE\` attempts, page when a surface degrades on most requests, and record why they degraded, so "slow" and "gone" stay distinguishable.`,
 };

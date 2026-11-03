@@ -225,7 +225,7 @@ def purge(
 `,
     },
     typescript: {
-      starter: `/** Registry events: flawed code. */
+      starter: `/** Registry events. */
 import Fastify from 'fastify';
 import {Kafka, type Producer} from 'kafkajs';
 

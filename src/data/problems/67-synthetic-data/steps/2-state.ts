@@ -13,29 +13,21 @@ export const stateStep: Step = {
 the last entity id, and returns \`{"admitted": true, "total": n}\`. It compiles, serves the demo and
 hides 5 flaws.
 
-**Failure mode the checks target.** Diversity collapse: a recipe asked for ten thousand records can
-satisfy the count with one prolific entity, and no gate based on totals notices. The client-side
-read-modify-write loses increments under concurrency, and the missing TTL keeps every generation
-attempt in Redis for months.
+**Failure mode the checks target.** Diversity collapse: a recipe asked for ten thousand records is
+satisfied by one prolific entity and no totals-based gate notices. The client-side read-modify-write
+loses increments under concurrency, and the missing TTL keeps every attempt in Redis for months.
 
-\`record_generated\` is the call a generator worker makes for each record it produces from a seed
-entity:
+\`record_generated\` is called by a generator worker per record:
 
-- Coverage lives in Redis as a **hash per job**: \`synth:cov:{job_id}\`, whose fields are entity ids
-  and whose values are how many records of that entity were admitted. The report reads this hash,
-  so the same data answers "how big is the corpus" and "how diverse is it".
-- Repeats of one seed entity are throttled **per window**: the per-entity count lives in
-  \`synth:cov:{job_id}:{entity_id}:{window}\`, where \`window = int(time.time()) // WINDOW_S\` and
-  \`WINDOW_S = 60\`. The window bucket in the key is what makes the throttle reset on schedule.
-- At most \`ENTITY_LIMIT = 5\` records of the same entity are admitted inside one window. Beyond
-  that the record is **throttled**: nothing is admitted, nothing is counted, and the caller is told
-  \`throttled: true\`. A throttled attempt must **not** consume the job's record cap.
-- The counting, the limit comparison and the expiry happen in **one atomic Lua \`EVAL\`**, so two
-  workers landing together cannot both observe a count of 4 and admit a sixth record.
-- Both keys expire: the windowed key with **\`EXPIRE\` set to \`WINDOW_S\`** inside the script, the
-  job's coverage hash with \`JOB_TTL_S = 86400\`.
-- Return \`{"admitted": bool, "throttled": bool, "coverage": {entity_id: count, …}}\`, where
-  \`coverage\` is the job's per-entity breakdown, not a single total.`,
+- Coverage is a **hash per job**, \`synth:cov:{job_id}\`, entity id to admitted count.
+- Repeats are throttled **per window** in \`synth:cov:{job_id}:{entity_id}:{window}\`, with
+  \`window = int(time.time()) // WINDOW_S\` and \`WINDOW_S = 60\`.
+- At most \`ENTITY_LIMIT = 5\` records per entity per window. Beyond that return \`throttled: true\`,
+  admit and count nothing, and do **not** consume the job's record cap.
+- Count, compare and expire in **one atomic Lua \`EVAL\`**.
+- The windowed key gets **\`EXPIRE\` \`WINDOW_S\`** inside the script; the coverage hash
+  \`JOB_TTL_S = 86400\`.
+- Return \`{"admitted": bool, "throttled": bool, "coverage": {entity_id: count, …}}\`.`,
   sequence: {
     participants: ['Generator worker', 'Second worker', 'Redis'],
     messages: [

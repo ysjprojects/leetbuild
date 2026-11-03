@@ -38,18 +38,14 @@ export const textToSqlProblem: Problem = {
   ],
   statement: `# Text-to-SQL
 
-An operations manager types "trips completed by Teslas in Seattle yesterday" into a box. A model
-writes the SQL in seconds; whether it names a real table, filters on the partition column and is
-safe to run is decided by the service around the model, and that service is what you debug here.
+A model writes SQL in seconds; whether it names a real table, filters on the partition column and is
+safe to run is decided by the service around it.
 
 ## The real system
 
-Uber's **QueryGPT** answers natural-language questions with SQL against a warehouse of hundreds of
-thousands of datasets. The first version was plain RAG over schemas and SQL samples and degraded as
-tables were onboarded. The production design decomposes the job: an **intent agent** maps the
-question to **workspaces** (curated tables and samples per domain, with user-created custom
-workspaces beside the system ones), a **table agent** proposes tables the user **ACKs or edits**,
-a **column prune agent** shrinks wide schemas to fit the context, and only then does generation run.
+Uber's **QueryGPT** answers questions with SQL over hundreds of thousands of datasets: an **intent
+agent** picks **workspaces**, the user **ACKs** a **table agent**'s tables, and a **column prune
+agent** runs before generation.
 
 ## From the source
 
@@ -74,29 +70,24 @@ evaluation signals themselves.
 
 ## What you build here
 
-One service, **querygen**, in five steps:
+One service, **querygen**:
 
-1. \`POST /v1/queries\`: authenticated, capped question, workspace checked against the allow-list,
-   \`Idempotency-Key\`, **202** with proposed tables and no SQL yet.
-2. **Redis**: decisions keyed by workspace and normalised question with a TTL, a per-user budget
-   reserved by one Lua \`EVAL\` before the agents, pending ACKs that expire.
-3. **gRPC** agents under deadlines, bounded retries, pruning over a token budget, output parsed
-   defensively.
-4. \`POST /v1/queries/{id}/run\`: one \`SELECT\` over ACKed tables with a \`datestr\` filter,
-   \`LIMIT 1000\`, a statement timeout, and \`has_output\` in the response.
-5. **Kafka**: one \`query.feedback\` event per query keyed by user with the evaluation signals, and
-   an \`eval\` consumer that writes \`eval:{workspace}\` before it commits.
+1. \`POST /v1/queries\`: capped question, allow-listed workspace, \`Idempotency-Key\`, **202** with
+   proposed tables.
+2. **Redis**: decisions cached per workspace and question, a per-user budget reserved by one Lua
+   \`EVAL\`, expiring ACKs.
+3. **gRPC** agents under deadlines, pruning over a token budget, defensive parsing.
+4. \`POST /v1/queries/{id}/run\`: one \`SELECT\` over ACKed tables, \`datestr\` filter, \`LIMIT 1000\`,
+   \`has_output\`.
+5. **Kafka** \`query.feedback\` keyed by user, and an \`eval\` consumer writing \`eval:{workspace}\`.
 
 ## The debugging habit
 
-Every starter compiles and serves the happy path. Your job in every step is to debug it against
-the failure modes, fix it, and prove the fix with checks that fail on the starter.
+Debug each starter against the failure modes, fix it, and prove the fix with checks.
 
 ## Left out on purpose
 
-Embeddings behind the table agent, custom workspace authoring, the prompt enhancer, chat mode, the
-validation agent that repairs hallucinated columns, the LLM judge, and per-table warehouse
-authorisation.`,
+Embeddings, custom workspaces, the prompt enhancer, the validation agent and the LLM judge.`,
   diagram: {
     nodes: [
       {id: 'analyst', kind: 'client', label: 'Query editor', sub: 'ask · ACK · run · rate', x: 6, y: 50},

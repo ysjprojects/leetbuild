@@ -13,12 +13,10 @@ next to "add to cart": it looks the sku up by id, returns an \`on_hand\` from an
 warehouse sync refreshed at most an hour ago, and answers with \`sku\` and \`on_hand\`. It compiles,
 serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A cached on-hand is a second owner of a counter it does not
-own: its number promises units a reservation would refuse, and it ignores \`reserved\` entirely, so
-sold-but-unshipped stock reads as available. A read that hides its staleness turns a stalled
-warehouse sync into a silent oversell, because nothing in the response says the number is old. And
-a read scoped only by sku id is how tenant A learns what tenant B has in the warehouse. Each of
-these looks correct in the demo and lies under contention.
+**Failure mode the checks target.** A cached on-hand promises units a reservation would refuse, and
+ignoring \`reserved\` makes sold-but-unshipped stock read as available. A read that hides its
+staleness turns a stalled warehouse sync into a silent oversell, and a read scoped only by sku id
+shows tenant A what tenant B has in the warehouse.
 
 - \`available\`, \`reserved\` and \`on_hand\` are computed through the **same counter the reservation
   path decrements**: \`available\` is the live \`stock:{sku}\` value, \`reserved\` is every live
@@ -330,7 +328,7 @@ def read_stock(id: str, tenant: str | None = Header(default=None, alias="X-Tenan
 `,
     },
     typescript: {
-      starter: `/** GET /v1/skus/{id}/stock: flawed code that serves an hourly-cached on-hand. */
+      starter: `/** GET /v1/skus/{id}/stock. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -927,5 +925,5 @@ int main() {
     'Mechanism: the handler serves `cached_on_hand` refreshed every `ON_HAND_CACHE_TTL_S`, sums no holds, compares nothing against `sync:updated_at`, and resolves the sku without checking its owner.',
     'Change: 404 unless `catalog.owner(sku)` is the tenant, read `stock:{sku}` through `counter_key` with `non_negative`, sum `hold:{sku}:*` into `reserved`, and add `synced_at`, `staleness_ms`, `stale` from `SYNC_STALE_AFTER_S`.',
   ],
-  debrief: `The read side has one job: return the number a reservation would be admitted against. The starter fails the way a cache fails, by becoming a second writer of a number it does not own: an hourly \`on_hand\` disagrees with \`stock:{sku}\` by exactly the holds and sales since the last refresh, and ignoring \`reserved\` makes sold-but-unshipped stock read as free. The fix is one source with three views: \`available\` floored at zero by \`non_negative\`, \`reserved\` as the live holds summed, \`on_hand\` as their sum. Freshness is explicit so a sync that stopped an hour ago is visible in the body, and scope comes before numbers so a foreign sku is 404 with no counters. Production inventory reads add a per-warehouse watermark instead of one global timestamp, report in-transit and damaged units alongside reserved, and version the read so a cart total and a stock badge can be reasoned about together.`,
+  debrief: `The read side has one job: return the number a reservation would be admitted against. The starter fails the way a cache fails, by becoming a second writer of a number it does not own: an hourly \`on_hand\` disagrees with \`stock:{sku}\` by exactly the holds and sales since the last refresh. The fix is one source with three views: \`available\` floored at zero by \`non_negative\`, \`reserved\` as the live holds summed, \`on_hand\` as their sum. Freshness is explicit so a sync that stopped an hour ago is visible in the body, and scope comes before numbers so a foreign sku is 404 with no counters. Production inventory reads add a per-warehouse watermark instead of one global timestamp and report in-transit and damaged units alongside reserved.`,
 };

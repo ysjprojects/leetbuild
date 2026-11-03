@@ -251,7 +251,7 @@ def session_state(session_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Turn state for one voice session: flawed code that writes both fields by hand. */
+      starter: `/** Turn state for one voice session. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

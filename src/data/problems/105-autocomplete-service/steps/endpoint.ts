@@ -12,24 +12,20 @@ export const endpointStep: Step = {
 string, lowercases it, asks the index for matches and returns every one of them. It compiles, it
 serves the demo (a three-letter ASCII prefix from one tenant), and it hides 4 flaws.
 
+**Failure mode the checks target.** An unbounded raw prefix lets one request walk the whole index
+(\`prefix=\` empty returns thousands of terms) and carries control characters into cache keys and
+logs. \`str.lower()\` does not fold accents, so \`Café\` and \`cafe\` survive as two suggestions.
+
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`prefix\` is normalized before it is used: case is folded and accents are folded to their base
   letter, so \`Café\`, \`cafe\` and \`CAFÉ\` are one prefix. Whitespace is collapsed.
-- After normalization the prefix must be **1 to 64 characters** (**400** when empty or longer). The
-  limit is on the *normalized* prefix, so an oversized raw prefix cannot slip through as a shorter
-  one, and a prefix longer than 64 characters is a scrape, not a search.
+- After normalization the prefix must be **1 to 64 characters** (**400** when empty or longer), so
+  an oversized raw prefix cannot slip through as a shorter one.
 - A prefix containing a **control character** (any C0 control or DEL) is **400**, before any index
-  work: those characters corrupt cache keys and log lines.
-- The response carries **at most 10 suggestions**, deduplicated by the normalized term so two
-  spellings of the same term do not both appear. Order is the index's ranking; the cap is applied
-  after dedupe.
-- The response shape is \`{"prefix": <normalized>, "suggestions": [...]}\`.
-
-**Failure mode the checks target.** Matching on the unbounded raw prefix lets one request walk the
-whole index: \`prefix=\` empty returns thousands of terms, and a control character rides straight
-into the cache key and the log line. Lowercasing without Unicode folding is the subtle part:
-\`Café\` and \`cafe\` survive as two suggestions because \`str.lower()\` never touches the accent, so
-the list works in English and duplicates the moment the catalog is not.`,
+  work.
+- The response carries **at most 10 suggestions**, deduplicated by the normalized term, in the
+  index's ranking order; the cap is applied after dedupe.
+- The response shape is \`{"prefix": <normalized>, "suggestions": [...]}\`.`,
   sequence: {
     participants: ['Client', 'Autocomplete API', 'Suggestion index'],
     messages: [

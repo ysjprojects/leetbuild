@@ -227,7 +227,7 @@ def three_way_merge(doc_id: str, base: dict, local: dict, remote: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Three-way merge: flawed code that picks a winner when the call fails. */
+      starter: `/** Three-way merge. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

@@ -285,7 +285,7 @@ def ask(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/ask: flawed code that caps characters and forwards the text as is. */
+      starter: `/** POST /v1/ask. */
 import Fastify from 'fastify';
 
 import {docs} from './docs';

@@ -248,7 +248,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** publish_result: flawed code that keys by worker and commits too early. */
+      starter: `/** publish_result. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';

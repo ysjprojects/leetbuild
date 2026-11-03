@@ -24,26 +24,16 @@ export const identityServiceProblem: Problem = {
   statement: `# Identity Service
 
 An identity service decides who a person is, whether two signups are the same human, whether an
-address is really theirs, and what the rest of the platform is allowed to know about them. The
-visible part is a user id in a response; the parts that decide whether the platform is safe are the
-normalization that runs before uniqueness, the atomic claim on every handle, the deliberate
-verification step, and the projection that keeps contact data out of everything else.
+address is really theirs, and what the rest of the platform may know about them.
 
 ## The real system
 
 Keycloak, the open source identity provider, lowercases every username and email before it stores
-them in its user table, so \`Alice@x.com\` and \`alice@x.com\` are one account and the uniqueness
-index compares canonical forms rather than what the form submitted. Production identity services
-go on from there: a domain's dot and plus-alias policy is folded the same way, phone numbers are
-canonicalized to E.164, and uniqueness is enforced by an atomic claim on each handle (set-if-absent
-in a durable namespace) rather than a read followed by a write, with the claim released when the
-signup that made it aborts. Verification is a deliberate round trip to a provider under a deadline:
-a timeout queues the attempt and leaves the account unverified, a hard bounce is terminal and
-suppresses the address, and nothing is marked verified without the provider's confirmation.
-Lifecycle events are keyed by user id so one person's history stays ordered, carry event kinds and
-reason codes rather than contact data, and are published only after the account write commits. A
-profile read gives the owner the full record, everyone else a minimal public projection, and support
-roles a record only through an audited tool.
+them, so \`Alice@x.com\` and \`alice@x.com\` are one account and the uniqueness index compares
+canonical forms. Production services go further: phone numbers are canonicalized to E.164,
+uniqueness is an atomic claim per handle rather than a read then a write, verification is a round
+trip under a deadline, lifecycle events carry reason codes rather than contact data, and support
+staff read records only through an audited tool.
 
 ## What you build here
 
@@ -67,10 +57,8 @@ One service, **identityd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real identity feature: debug
-it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

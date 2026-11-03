@@ -17,20 +17,13 @@ hides five flaws.
 together, a refused client retries immediately because it was told nothing about when to come back,
 and two applicants, even from different tenants, end up looking at the same case.
 
-Requirements:
-
-- **One atomic script per decision.** A reservation script moves the attempt bucket: read, compare
-  against the cap, \`INCR\` and \`EXPIRE\` in the same \`EVAL\` (redis-py \`register_script\`, ioredis
-  \`defineCommand\`, go-redis \`NewScript\`, Jedis \`eval\`, redis-plus-plus \`eval\`), and a second
-  script opens the case create-if-absent.
-- **The cap is 4.** The fifth attempt is refused \`429 Too Many Requests\` with \`Retry-After\` set to
-  the seconds left in the bucket, taken from the script's \`TTL\`, not from a constant. A refused
-  attempt must not open a case.
-- **The case key is scoped by tenant and applicant:** \`kyc:case:{tenant}:{applicant}\`. A second
-  submission of the same applicant must find the case that already exists instead of starting a
-  parallel review.
-- **Both keys expire:** the attempt bucket with its attempt window, the case with its own lifetime,
-  set inside the script that creates it.
+- **One atomic script per decision.** A reservation script reads, compares against the cap, \`INCR\`s
+  and \`EXPIRE\`s in one \`EVAL\` (\`register_script\`, \`defineCommand\`, \`NewScript\`, \`eval\`); a
+  second script opens the case create-if-absent.
+- **The cap is 4.** The fifth attempt is refused \`429\` with \`Retry-After\` from the script's \`TTL\`,
+  not a constant, and opens no case.
+- **The case key is** \`kyc:case:{tenant}:{applicant}\`; a second submission finds the existing case.
+- **Both keys expire**, each set inside the script that creates it.
 - \`GET /v1/applicants/{id}/status\` reads the same case key, scoped by the caller's tenant, and
   answers \`404\` when that applicant has no case.`,
   sequence: {

@@ -22,10 +22,8 @@ export const warehouseLoaderProblem: Problem = {
   minutes: 70,
   statement: `# Warehouse Loader
 
-A warehouse loader is the piece of a data platform that turns a source dataset version into committed
-partitions of a tenant's table. The visible part is a table that has more rows than yesterday; the
-parts that decide whether the platform can be trusted are the manifest, the completion flag, the
-write semantics, the event stream, and the report a finance team reads before closing the books.
+A warehouse loader turns a source dataset version into committed partitions of a tenant's table. A
+finance team reads its report before closing the books.
 
 ## The real system
 
@@ -35,20 +33,8 @@ unless \`FORCE = TRUE\` is set, so a retried load of an already-loaded file does
 That metadata expires after 64 days, which is why re-loading old files is a deliberate choice rather
 than an accident.
 
-Loaders built on the same idea accept a **manifest** (source dataset version, target table, load mode
-and transform) and treat it as the unit of work: one manifest, one load, no matter how many times
-the client retries, the pod restarts or the scheduler fires twice. They validate the manifest before
-doing anything expensive: the caller names a *registered* transform rather than shipping SQL that
-runs under the loader's credentials, and the target lives in the tenant's own schema.
-
-They track progress partition by partition and commit the manifest's completion flag in the same
-atomic step as the final partition, so a downstream reader cannot observe a load that is "done"
-while partitions are missing. They write partitions over gRPC under a deadline, and a retried
-partition **replaces itself** by \`(manifest id, partition id)\` rather than appending a second copy
-of the same rows. They publish load events keyed by the **target table**, so a table's stream stays
-ordered, carrying the counts the warehouse actually wrote; when the broker rejects a produce, the
-event goes to an outbox instead of vanishing. And they report counts that reconcile: source rows
-read, rows written, rows rejected with reasons, and the table's current freshness.
+Loaders built on the same idea treat a manifest as the unit of work: one manifest, one load, however
+many times the client retries or the scheduler fires.
 
 ## What you build here
 
@@ -72,10 +58,8 @@ One service, **loaderd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it loads the happy path, and
-it looks right. Your job in every step is the job you will have on a real data platform: debug it
-against the failure modes, fix them, optimize what is wasteful, and prove the fix with checks that
-fail on the starter and pass on your version.
+Every starter compiles and loads the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -13,27 +13,19 @@ export const endpointStep: Step = {
 takes the tenant from \`X-Tenant-Id\`, builds a load record from the body as sent, stores it under
 its own fresh id and answers \`202\`. It serves the demo and hides 4 flaws.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- The rendered manifest is at most **64 KiB** (\`1 << 16\` bytes) of JSON; a larger one is **413**.
-- \`mode\` is one of \`append\`, \`merge\`, \`replace\` (**400** otherwise) — the load mode decides
-  whether a re-run may replace a partition or must add to it, so it is not guessed.
-- \`transform\` must be the **name** of a registered transform: the registry maps \`identity\`,
-  \`dedupe\`, \`cast_types\`, \`mask_pii\` to SQL compiled server-side. A caller-supplied SQL
-  string is **400** — a raw transform would run caller-authored SQL in the warehouse under the
-  loader's credentials, on every tenant's data.
-- \`target\` is \`schema.table\`, and \`schema\` must be the caller's own \`wh_{tenant}\`; a target
-  in another tenant's schema is **403**, and so is a malformed target.
-- \`Idempotency-Key\` is required (**400** when missing). It is keyed **by the manifest**: the same
-  \`(tenant, key)\` with the same manifest returns the original load (**200**) instead of starting a
-  second one; the same key with a *different* manifest is **409**, because two different loads
-  cannot share one idempotency key.
-- A new load answers **202** with \`load_id\`, \`status\`, \`target\`, \`mode\` and \`rows_planned\`.
+**Failure mode the checks target.** A raw \`transform\` runs caller SQL with the loader's warehouse
+credentials; a \`target\` in a shared schema writes one tenant's rows into another's table; an
+un-keyed retry loads the same manifest twice.
 
-**Failure mode the checks target.** A raw \`transform\` is remote code execution with the loader's
-warehouse credentials; a \`target\` that defaults to a shared schema silently writes one tenant's rows
-into another tenant's table; an un-keyed retry starts a second load of the same manifest, which is
-exactly how a table ends up with the same day counted twice; and an unchecked manifest size or mode
-lets the planner start work it should have refused.`,
+- \`X-Tenant-Id\` is required (**401**); the manifest is at most **64 KiB** (\`1 << 16\`) of JSON
+  (**413**).
+- \`mode\` is \`append\`, \`merge\` or \`replace\` (**400** otherwise).
+- \`transform\` names a registered transform (\`identity\`, \`dedupe\`, \`cast_types\`, \`mask_pii\`);
+  caller SQL is **400**.
+- \`target\` is \`schema.table\` with \`schema\` equal to \`wh_{tenant}\`; anything else is **403**.
+- \`Idempotency-Key\` is required (**400**): same \`(tenant, key)\` and manifest returns the original
+  load (**200**), a different manifest is **409**.
+- A new load answers **202** with \`load_id\`, \`status\`, \`target\`, \`mode\` and \`rows_planned\`.`,
   sequence: {
     participants: ['Loader client', 'Load API', 'catalog', 'loads store'],
     messages: [
@@ -291,7 +283,7 @@ def create_load(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/loads: flawed code that trusts the whole manifest. */
+      starter: `/** POST /v1/loads. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

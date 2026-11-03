@@ -13,24 +13,18 @@ open tab to Redis, and \`pick_snippets(session, paths, prefix)\`, which reads th
 chooses snippets for the prompt, so the demo shows context from other files. It serves the demo
 and hides four flaws.
 
-**Failure mode the checks target.** A key without the session is a cross-tenant leak; a write
-without a TTL is a cache that grows until Redis evicts something you needed; a matching bar set so
-high that the feature silently includes nothing on most keystrokes; and one Redis round trip per
-open file added to a latency budget the model already consumes.
+**Failure mode the checks target.** A key without the session leaks across developers; no TTL grows
+the cache until Redis evicts something you needed; a high bar includes nothing on most keystrokes;
+one round trip per open file eats the latency budget.
 
-- Each open tab is stored under \`tabs:{session}:{path}\`. The session is part of the key: a
-  path-only key makes one developer's \`db/conn.py\` the context for everyone who has a file with
-  that name open.
-- Every entry is written with a TTL of **600 seconds** (\`TAB_TTL_S\`), refreshed on each write.
-  An editor that closed a tab, or a developer who went home, must not keep code in Redis.
-- Snippets are scored by **set similarity**: the identifiers in the last **60 lines**
-  (\`CURSOR_WINDOW_LINES\`) before the cursor against the identifiers in each
-  **500-character** window (\`SNIPPET_CHARS\`) of a tab, with \`jaccard(a, b) = |a ∩ b| / |a ∪ b|\`.
-  The bar is **very low**, \`MIN_SNIPPET_SCORE = 0.05\`, and when no window reaches it, the best
-  one found is still included: a weak match beat no context in GitHub's A/B tests.
+- Store each tab under \`tabs:{session}:{path}\` with a **600 s** TTL (\`TAB_TTL_S\`) refreshed on
+  each write.
+- Score each **500-character** window (\`SNIPPET_CHARS\`) of a tab against the identifiers in the
+  last **60 lines** (\`CURSOR_WINDOW_LINES\`) before the cursor with
+  \`jaccard(a, b) = |a ∩ b| / |a ∪ b|\`. The bar is \`MIN_SNIPPET_SCORE = 0.05\`; when nothing reaches
+  it, include the best one anyway.
 - At most **4** snippets (\`MAX_SNIPPETS\`), best first.
-- Read all of a session's tabs with one \`MGET\`, not one \`GET\` per path. Neighboring tabs are
-  computed on every keystroke; the cache is what makes them free, and N round trips are not free.`,
+- Read a session's tabs with one \`MGET\`.`,
   sequence: {
     participants: ['Editor', 'completiond', 'Redis'],
     messages: [

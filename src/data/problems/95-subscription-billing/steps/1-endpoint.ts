@@ -13,24 +13,19 @@ export const changePlanStep: Step = {
 the period at the effective date and returns an invoice schedule with a total. It compiles, it serves
 the demo, and it hides four flaws.
 
-**Failure mode the checks target.** Each flaw survives a demo: the demo changes plans on the first of
-the month (so a fixed 30-day divisor looks right), it charges one plan (so a double-billed day is
-invisible), and it sends a well-formed request from its own tenant (so an endpoint that denies
-nothing looks permissive rather than unsafe).
+**Failure mode the checks target.** Flaws that survive a demo on the first of the month with one
+plan and the caller's own tenant: a fixed 30-day divisor, a double-billed switch day, and an
+endpoint that denies nothing.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**, and a
-  subscription that belongs to another tenant is **404**, not someone else's schedule.
-- \`plan\` must exist in the plan catalogue (**400** otherwise).
-- \`proration_policy\` must be one the platform implements, today only \`actual_days\` (**400**
-  otherwise). A caller may not pick a policy that has no arithmetic behind it.
-- \`effective_date\` is either the literal \`now\` or the subscription's next period boundary (an
-  ISO-8601 date, \`next_period_start\`). Any other date is **400**: the platform prorates over a
-  period it can identify, not over a guess.
-- Proration runs over the **actual** days of the period: \`period_days = (period_end - period_start).days\`
-  and a line's amount is \`round(price_cents * days / period_days)\`. A thirty-day month is not a
-  month: it over-bills February's slice and under-bills a 31-day one.
-- The switch day is charged **exactly once**: the old plan's line covers \`[period_start, change_at)\`
-  and the new plan's line covers \`[change_at, period_end)\`, so \`old_days + new_days == period_days\`.
+- Tenant from \`X-Tenant-Id\` (**401** if missing); another tenant's subscription is **404**.
+- \`plan\` must exist in the catalogue (**400** otherwise).
+- \`proration_policy\` must be one the platform implements, today only \`actual_days\` (**400** otherwise).
+- \`effective_date\` is \`now\` or the next period boundary (\`next_period_start\`, ISO-8601); any other
+  date is **400**.
+- Prorate over the **actual** days: \`period_days = (period_end - period_start).days\`, a line is
+  \`round(price_cents * days / period_days)\`.
+- Charge the switch day **once**: old plan covers \`[period_start, change_at)\`, new plan
+  \`[change_at, period_end)\`, so \`old_days + new_days == period_days\`.
 - The response states the resulting invoice schedule:
   \`{"subscription_id", "effective_at", "proration_policy", "invoice_schedule": [{"period_start", "period_end", "lines": [{"plan", "days", "amount_cents"}]}], "total_cents"}\`.
 - Log the change with tenant, subscription and plan, no card or processor data.`,

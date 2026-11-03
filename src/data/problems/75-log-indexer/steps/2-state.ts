@@ -241,7 +241,7 @@ return redis.call('HGET', KEYS[1], 'count')
 `,
     },
     typescript: {
-      starter: `/** Redis buffer state: flawed code with no back-pressure. */
+      starter: `/** Redis buffer state. */
 import {Redis} from 'ioredis';
 
 export const redis = new Redis();

@@ -322,7 +322,7 @@ if __name__ == "__main__":
 `,
     },
     typescript: {
-      starter: `/** answer.events consumer: a eval that treats one event as a verdict. */
+      starter: `/** answer.events consumer. */
 import {Kafka} from 'kafkajs';
 
 import {MetricsStore} from './metrics';

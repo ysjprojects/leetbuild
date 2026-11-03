@@ -193,7 +193,7 @@ def register(body: Definition) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/features/definitions: flawed code that overwrites whatever it is given. */
+      starter: `/** POST /v1/features/definitions. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

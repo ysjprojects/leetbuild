@@ -36,12 +36,8 @@ Google's Cloud Natural Language API exposes \`documents:classifyText\`, which re
 a fixed taxonomy with a confidence per category, and the caller pins that taxonomy with
 \`classificationModelOptions.v2Model.contentCategoriesVersion\` (\`V1\` or \`V2\`): the label set is
 versioned, and a response only means something against the version that produced it. A platform
-that routes on labels needs the same discipline one level down. A language model asked for a
-category that does not exist will invent a plausible one, so its labels are intersected with the
-tenant's versioned taxonomy and anything invented goes to review. The model call has a deadline,
-retries only what is retryable, treats a refusal as an answer, and falls back to a rules pass that
-carries its provenance. Each classification publishes one event keyed by tenant with a hash of the
-text, and every result names the taxonomy version it used.
+that routes on labels needs the same discipline one level down, because a language model asked for
+a category that does not exist will invent a plausible one.
 
 ## What you build here
 
@@ -69,9 +65,8 @@ that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Taxonomy authoring UIs, label suggestion from human review, multi-label confidence calibration,
-per-label precision/recall reporting, active learning loops, embedding-based zero-shot fallback,
-regional model routing, and billing for classification volume.`,
+Taxonomy authoring UIs, confidence calibration, per-label precision reporting, active learning,
+zero-shot fallback, regional model routing, and billing.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'classify · taxonomies', x: 8, y: 50},

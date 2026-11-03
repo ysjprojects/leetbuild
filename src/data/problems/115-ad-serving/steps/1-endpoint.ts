@@ -241,7 +241,7 @@ def serve(body: ServeRequest) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/ads/serve: flawed code that ranks before it filters. */
+      starter: `/** POST /v1/ads/serve. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

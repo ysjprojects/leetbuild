@@ -8,45 +8,27 @@ export const readStep: Step = {
   focus: ['router', 'discovery', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it enumerates the service's
-keys and returns them, and the demo — one service, three healthy instances, no failures — is
-indistinguishable from correct. It returns instances whose key has already lapsed and only expires
-from the keyspace a moment later, it never says how old the heartbeat it is trusting is, and it
-lets any caller enumerate any service.
+**Starting point.** The starter serves \`GET /v1/services/{service}/instances\`, the read every
+router, dashboard and capacity job uses: it scans \`sd:{service}:*\`, \`GET\`s each key, and returns
+whatever decodes as \`instances\`. The demo (one service, three healthy instances) is
+indistinguishable from correct. It hides five flaws.
 
-Implement \`GET /v1/services/{service}/instances\`, the read every router, dashboard and capacity job
-uses.
+**Failure mode the checks target.** A record whose TTL has lapsed is still served in the window
+before Redis deletes it. An instance that stopped heartbeating forty seconds ago is listed with no
+age, so a caller cannot tell a two-second-old answer from a stale one. An instance the probe marked
+\`NOT_SERVING\` is returned as routable. Any caller that can reach the port enumerates the fleet.
+And on-call asking "why is checkout down to two instances?" finds no reason in the response.
 
-- The caller must present the **internal scope** (\`X-Scope: discovery.internal\`, a comma-separated
-  list). Anything else — including a valid scope for another service — is **403**. Enumeration is
-  the map of the fleet: membership of one service is the neighbours of every other. An unknown
-  service is **404** when the registry has no such service.
-- Return only **currently routable** instances. An instance is routable when all three hold:
-  - its key is still live — \`TTL >= 0\`, so a lapsed record cannot be served from the window
-    between expiry and deletion;
-  - its heartbeat is fresh — \`now - last_heartbeat <= 3 * heartbeat_interval\` seconds;
-  - its probe verdict is \`SERVING\` (\`sd:probe:{service}:{instance_id}\`).
+- The caller must present the internal scope (\`X-Scope: discovery.internal\`, a comma-separated
+  list, compared with \`INTERNAL_SCOPE\`); anything else is **403**. An unknown service is **404**.
+- Return only currently routable instances: the key is live (\`TTL >= 0\`), the heartbeat is fresh
+  (\`now - last_heartbeat <= 3 * heartbeat_interval\`), and the probe verdict under
+  \`sd:probe:{service}:{instance_id}\` is \`SERVING\`.
 - Each returned instance carries \`instance_id\`, \`address\`, \`port\`, \`metadata_version\` and
-  **\`last_heartbeat\`**. The starter omits the heartbeat, so a caller cannot tell a two-second-old
-  answer from a fifty-second-old one, and the caller that knows it is stale has nowhere to write
-  that knowledge back.
-- Explain every exclusion: \`excluded\` holds \`{"instance_id", "reason", …}\` with reason
-  **\`expired\`**, **\`stale\`** or **\`unhealthy\`** (and the heartbeat age for \`stale\`). On-call
-  asks "why is checkout down to two instances?" and the answer has to be in the response, not in a
-  log line the reader has to correlate by hand.
-- Answer **200** with \`service\`, \`generated_at\`, \`instances\` and \`excluded\`.
-
-**Failure mode the checks target.** A read that returns everything registered is the mirror image of
-a router that trusts registration: both mistake "the registry still holds a key" for "this instance
-can serve". Expiry is the specific trap — Redis removes a key on its own schedule, so between the
-lapse and the delete there is a window in which \`GET\` still answers and only \`TTL\` tells the
-truth; a read API that skips the TTL check hands its callers a ghost. The other two flaws are about
-trust and explanation: enumeration is a privileged operation because the membership map is a
-target list, and a read API that silently drops instances makes every incident longer than it has
-to be.
-
-The tests: an instance whose key has lapsed never appears in \`instances\`, every returned instance
-carries a \`last_heartbeat\`, and enumeration without the internal scope is 403.`,
+  \`last_heartbeat\`.
+- Every exclusion is explained: \`excluded\` holds \`{"instance_id", "reason", …}\` with reason
+  \`expired\`, \`stale\` (with the heartbeat age) or \`unhealthy\`.
+- Answer **200** with \`service\`, \`generated_at\`, \`instances\` and \`excluded\`.`,
   sequence: {
     participants: ['Router', 'Discovery API', 'Redis', 'service registry'],
     messages: [
@@ -162,9 +144,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/services/{service}/instances")
 def instances(service: str, scope: str = Header(default="", alias="X-Scope")) -> JSONResponse:
-    # TODO: this starter returns every registered instance including the ones whose keys have not
-    # vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller enumerate
-    # any service. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     found = []
     for key in r.scan_iter(f"sd:{service}:*"):
         raw = r.get(key)
@@ -249,9 +229,7 @@ export const app = Fastify();
 export const redis = new Redis({host: 'redis', port: 6379});
 
 app.get('/v1/services/:service/instances', async (request, reply) => {
-  // TODO: this starter returns every registered instance including the ones whose keys have not
-  // vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller enumerate
-  // any service. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const {service} = request.params as {service: string};
   const found: unknown[] = [];
   for await (const key of redis.scanStream({match: \`sd:\${service}:*\`})) {
@@ -366,9 +344,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func instances(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter returns every registered instance including the ones whose keys have not
-	// vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller enumerate
-	// any service. Fix all four.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	service := r.PathValue("service")
 	keys, _ := rdb.Keys(r.Context(), "sd:"+service+":*").Result()
 	found := make([]InstanceRecord, 0, len(keys))
@@ -554,9 +530,7 @@ object Read {
   val route: Route =
     path("v1" / "services" / Segment / "instances") { service =>
       get {
-        // TODO: this starter returns every registered instance including the ones whose keys have not
-        // vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller
-        // enumerate any service. Fix all four.
+        // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         val keys = jedis.keys("sd:" + service + ":*").asScala
         val found = keys.flatMap(recordAt).toList
         system.log.info(s"instances service=$service count=\${found.size}")
@@ -684,9 +658,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/services/([^/]+)/instances)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter returns every registered instance including the ones whose keys have not
-    // vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller enumerate
-    // any service. Fix all four.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto service = req.matches[1].str();
     json found = json::array();
     long long cursor = 0;
@@ -821,9 +793,9 @@ int main() {
     },
   },
   hints: [
-    'Test three things per candidate, in this order: the key’s TTL (`TTL < 0` means the record has lapsed even though `GET` may still answer), the heartbeat age against `3 * heartbeat_interval`, and the shared probe verdict. Only an instance that passes all three is routable.',
-    'Read the header before you read Redis: parse the comma-separated `X-Scope` and compare it to the internal scope constant, answering 403 for anything else. A caller that may enumerate one service can infer the shape of the whole fleet from it.',
-    'The response is the debrief: `metadata_version` and `last_heartbeat` for what is serving, and `excluded` with a reason for what is not. When the reason is `stale`, include the age — that number turns “checkout looks degraded” into “checkout-3 stopped heartbeating 40 seconds ago”.',
+    'A router keeps sending a trickle of requests to an instance that was decommissioned a minute ago, and the dashboard built on this endpoint lists it as present with no age shown.',
+    'The loop appends whatever `r.get(key)` returns: a lapsed key still answers `GET` until Redis deletes it, and nothing reads `TTL`, `last_heartbeat`, the probe verdict or the `X-Scope` header.',
+    'Check `X-Scope` against `INTERNAL_SCOPE` (403); per key test `r.ttl(key) >= 0`, heartbeat age vs `3 * heartbeat_interval`, and `sd:probe:…` == `SERVING`; put failures in `excluded` with `expired`/`stale`/`unhealthy`.',
   ],
-  debrief: `The interviewer is testing whether the read path is as suspicious as the write path. Three details separate a listing from a routing answer. The expiring-key window is the one candidates miss: Redis removes a key on its own schedule, so between the lapse and the delete \`GET\` still answers, and only \`TTL\` tells the truth — a read API without that check serves ghosts, which is exactly the incident this course is about. The heartbeat is the second: an instance list without ages forces every caller to guess how trustworthy it is, while an age computed against the interval the instance promised makes staleness a fact rather than a feeling. The third is the scope: enumeration is privileged because a membership map is a target list, and the reason field is what makes an incident short — "why is checkout down to two instances?" should be answered by the response, not by a human correlating three dashboards. Real systems add cursor pagination for large services, an ETag or generation number so routers can cache the answer for a second, per-reason counters for alerting, and an audit trail of who enumerated what.`,
+  debrief: `The read path has to be as suspicious as the write path, and three details separate a listing from a routing answer. Redis removes a lapsed key on its own schedule, so between the lapse and the delete \`GET\` still answers and only \`TTL\` tells the truth; a read without that check serves ghosts. An age computed against the interval the instance promised makes staleness a fact rather than a feeling, which is why \`last_heartbeat\` is in every entry. The scope check exists because a membership map is a target list, and the reason field exists because an incident is short when the response explains itself. Production systems add a generation number or ETag so routers can cache the answer for a second, and per-reason counters so a rise in \`stale\` exclusions pages someone before users notice.`,
 };

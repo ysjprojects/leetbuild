@@ -251,7 +251,7 @@ def publish_route(route: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** route.computed: flawed code that keys by user and ships raw coordinates. */
+      starter: `/** route.computed. */
 import {Kafka} from 'kafkajs';
 
 export const kafka = new Kafka({clientId: 'maps-routing', brokers: ['kafka:9092']});

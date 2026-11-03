@@ -221,7 +221,7 @@ def read_version(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/datasets/{dataset}/versions/{version}: flawed code. */
+      starter: `/** GET /v1/datasets/{dataset}/versions/{version}. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

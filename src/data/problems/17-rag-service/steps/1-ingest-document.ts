@@ -246,7 +246,7 @@ def ingest(body: DocumentRequest, tenant: str = Header(alias="X-Tenant-Id")) -> 
 `,
     },
     typescript: {
-      starter: `/** POST /v1/documents: flawed code that only exercises the first upload. */
+      starter: `/** POST /v1/documents. */
 import {createHash, randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

@@ -13,23 +13,17 @@ with a client-side \`ZPOPMIN\`, records the holder in an active hash, and bumps 
 separate calls. It compiles, serves the demo and hides 5 flaws.
 
 **Failure mode the checks target.** A pop outside a script is a race, not a claim; a claim without
-a lease strands the item when the reviewer disappears; two counters updated apart drift from
-reality. The demo has one moderator who finishes, so none of this surfaces.
+a lease strands the item when the reviewer disappears; two counters updated apart drift.
 
-Requirements for the queue that hands reported items to moderators:
-
-- Items wait in a pending sorted set; a claim pops one **and** records the holder in the same
-  atomic Lua \`EVAL\`, so an item is always either in the queue or in exactly one moderator's hands.
-- A claim takes a **10-minute lease** (\`LEASE_S = 600\`): the lease deadline is written next to the
-  item and the holder's session key carries the same \`EXPIRE\`, so a moderator who walks away does
-  not hold the item forever.
-- The lease is **renewed while the session is active**: \`renew(item, moderator)\` extends the
-  deadline and re-\`EXPIRE\`s the session key, and it **refuses** when another moderator owns the
-  item.
-- \`pending\` and \`in_review\` are two fields of one counters hash, moved by \`HINCRBY\` **inside the
-  same script**, so a crash between them cannot leave the queue length wrong.
-- \`requeue_expired(now)\` scans the leases sorted set for deadlines in the past and puts those items
-  back in the pending set, clearing the owner, so an abandoned claim returns to the queue.`,
+- A claim pops from the pending sorted set **and** records the holder in one atomic Lua \`EVAL\`.
+- A claim takes a **10-minute lease** (\`LEASE_S = 600\`): the deadline is written next to the item
+  and the holder's session key carries the same \`EXPIRE\`.
+- \`renew(item, moderator)\` extends the deadline and re-\`EXPIRE\`s the session key, and **refuses**
+  when another moderator owns the item.
+- \`pending\` and \`in_review\` are fields of one counters hash, moved by \`HINCRBY\` **inside the same
+  script**.
+- \`requeue_expired(now)\` moves items with past lease deadlines back to the pending set and clears
+  the owner.`,
   sequence: {
     participants: ['Moderator console', 'Redis', 'Moderation API'],
     messages: [
@@ -205,7 +199,7 @@ def requeue_expired(now: int | None = None) -> int:
 `,
     },
     typescript: {
-      starter: `/** Moderation queue: flawed code that claims without a lease. */
+      starter: `/** Moderation queue. */
 import {Redis} from 'ioredis';
 
 export const r = new Redis('redis://redis:6379');

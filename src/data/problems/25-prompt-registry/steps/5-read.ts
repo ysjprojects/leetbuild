@@ -243,7 +243,7 @@ def read_version(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/prompts/:name/versions/:v: flawed code with a raw substitution. */
+      starter: `/** GET /v1/prompts/:name/versions/:v. */
 import Fastify from 'fastify';
 
 import {store} from './store';

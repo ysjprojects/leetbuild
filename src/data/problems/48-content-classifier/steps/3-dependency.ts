@@ -202,7 +202,7 @@ def classify(text: str, taxonomy_version: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** gRPC model client: flawed code that hides outages behind a constant label. */
+      starter: `/** gRPC model client. */
 import * as grpc from '@grpc/grpc-js';
 
 import {ClassifierClient} from './gen/classifier_grpc_pb';

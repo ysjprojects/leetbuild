@@ -224,7 +224,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** trace.completed: flawed code that keys by trace id and commits too early. */
+      starter: `/** trace.completed. */
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
 

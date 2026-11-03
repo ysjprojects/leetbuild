@@ -17,11 +17,9 @@ the identity and contextual feature services over gRPC, retries the identity loo
 asks the model for a score and prices the bid at \`max(floor, score + 1)\`. It compiles, it serves the
 demo, and it hides five flaws.
 
-**Failure mode the checks target.** The starter treats the auction budget as decoration. It waits
-the feature service's own latency with no per-tier slice, retries an identity lookup that cannot
-finish inside a 100 ms auction, and then asks the model for a score no matter how little time is
-left. The result is a p99 of 180 ms on a 100 ms budget, every bid late, and a median response that
-still carries a score computed from a budget that was already spent.
+**Failure mode the checks target.** The starter waits the feature service's own latency with no
+per-tier slice, retries an identity lookup that cannot finish inside a 100 ms auction, and asks the
+model for a score however little time is left: a p99 of 180 ms on a 100 ms budget.
 
 - Two feature tiers, each with its own slice of the budget: **identity at 30 ms** and **contextual at
   50 ms**. Define both as named constants.
@@ -711,8 +709,7 @@ to what is left, so a slow identity lookup shortens the contextual fetch instead
 past the close. The model is skipped rather than guessed because a score computed from an exhausted
 budget is a fabricated one, and a conservative bid at the floor, marked \`degraded\`, wins a floor
 auction while a fabricated score wins a bad one. The retry goes because inside a 100 ms auction a
-second attempt is not resilience, it is spending someone else's slice, and the identity tier's retry
-is exactly why the contextual fetch then times out.
+second attempt spends the next tier's slice.
 
 Production bidders keep a per-tier budget table ordered by value, drop the cheapest tier first when
 the deadline tightens, and shadow-test the degraded path against a no-bid to learn whether a floor

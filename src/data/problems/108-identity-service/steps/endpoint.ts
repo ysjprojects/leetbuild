@@ -10,37 +10,25 @@ export const endpointStep: Step = {
 
 **Starting point.** The starter registers \`POST /v1/users\` with body
 \`{"email": "…", "phone": "…"}\`, validates the fields, looks the raw email up in the store and
-writes a user row. It compiles, it serves the demo (one signup, from one browser, typed in
-lowercase) and hides 4 flaws.
+writes a user row. It serves the demo (one lowercase signup) and hides 4 flaws.
 
-- \`Idempotency-Key\` is required (**400** when missing).
-- \`email\` must be an address of at most **254** bytes with a local part and a dotted domain
-  (**422** otherwise).
-- Normalize the address before anything is compared: case-fold the whole thing, and when its domain
-  is in \`FOLD_ALIAS_DOMAINS\` (\`gmail.com\`, \`googlemail.com\`) also drop every \`.\` from the local
-  part and everything from the first \`+\` — that is the domain's published alias policy. Outside
-  that set only case is folded, because dots and \`+\` aliases are significant addresses there.
-- Normalize \`phone\` before comparing it too: keep the digits, drop a leading \`00\`, require
-  **8–15** digits, canonical form \`+<digits>\` (**422** otherwise). \`(415) 555-0100\` and
-  \`+1 415 555 0100\` are the same number.
-- Claim the canonical phone atomically (\`SET NX\`) **before** the email uniqueness lookup: the
-  claim is the uniqueness check, and a lost claim is **409**. A check followed by an insert lets two
-  requests with the same recycled number both win.
-- Claim the canonical email atomically as well; a lost email claim releases the phone claim.
-- Any collision answers **409** with the one fixed neutral body \`{"error": "signup_conflict"}\` —
-  no field name, no address, nothing that confirms an account for the address.
-- A retry carrying the same \`Idempotency-Key\` returns the **original** account (**200**, the same
-  \`user_id\`) and creates nothing; **201** means this request is the one that created the account.
-- A created account answers **201** with
-  \`{"user_id": …, "email": <canonical>, "status": "pending_verification"}\`.
+**Failure mode the checks target.** Raw string comparison makes \`Alice@x.com\` and \`alice@x.com\`
+(and \`(415) 555-0100\` and \`+14155550100\`) two identities. The ignored \`Idempotency-Key\` turns every
+client retry into another account, and the 409 echoes the submitted address, so an unauthenticated
+caller learns which addresses have accounts.
 
-**Failure mode the checks target.** Comparing raw strings makes \`Alice@x.com\` and \`alice@x.com\`
-— and \`(415) 555-0100\` and \`+14155550100\` — two identities, so one human ends up with two
-accounts and neither of them is unique. Because the starter ignores \`Idempotency-Key\`, every client
-retry (the confirmation email is slow, the flaky network re-sends) creates another account and
-another pending verification. And the 409 it returns interpolates the submitted address —
-\`"email … already exists"\` — so an unauthenticated caller can walk addresses through signup and
-learn from the response which ones already have accounts.`,
+- \`Idempotency-Key\` is required (**400**); \`email\` is at most **254** bytes with a local part and a
+  dotted domain (**422**).
+- Case-fold the email; for a domain in \`FOLD_ALIAS_DOMAINS\` (\`gmail.com\`, \`googlemail.com\`) also
+  drop \`.\` from the local part and everything from the first \`+\`.
+- Normalize \`phone\`: keep digits, drop a leading \`00\`, require **8–15** digits, canonical
+  \`+<digits>\` (**422** otherwise).
+- Claim the canonical phone with \`SET NX\` **before** the email lookup, then the email; a lost claim
+  is **409** and a lost email claim releases the phone claim.
+- Every collision answers **409** \`{"error": "signup_conflict"}\`.
+- A retry with the same \`Idempotency-Key\` returns the original \`user_id\` with **200** and creates
+  nothing; a new account answers **201**
+  \`{"user_id": …, "email": <canonical>, "status": "pending_verification"}\`.`,
   sequence: {
     participants: ['Client', 'Identity API', 'Redis', 'users table'],
     messages: [
@@ -383,7 +371,7 @@ def signup(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/users: flawed code of the signup endpoint. */
+      starter: `/** POST /v1/users. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -1105,17 +1093,13 @@ int main() {
     'The store compares the raw strings the caller sent, nothing reads `Idempotency-Key` before the write, the phone is checked with a lookup rather than a claim, and the 409 interpolates the address.',
     'Add `normalize_email` (case fold; dots and `+` only for `FOLD_ALIAS_DOMAINS`) and `normalize_phone` (E.164), look up the key first and answer 200 with the stored `user_id`, `SET NX` the phone before the email claim, and return one constant `SIGNUP_CONFLICT` body.',
   ],
-  debrief: `The fix has the shape of a contract on what the index is allowed to hold. Identity is
-canonical form, so \`normalize_email\` runs before any comparison, and \`FOLD_ALIAS_DOMAINS\` is a set
-rather than a blanket \`gsub\` because dots and \`+\` are only aliases where the domain says so.
-Uniqueness is a claim, not a check: \`find\` then \`create\` is a race over a phone number the carrier
-will recycle, so the canonical number is \`SET NX\`'d before the email lookup. \`Idempotency-Key\` is
-looked up first because the retry that lands while the confirmation mail is in flight must return
-the original \`user_id\`. And the 409 is one constant body because an interpolated address turns
-signup into an enumeration oracle.
+  debrief: `Identity is canonical form, so \`normalize_email\` runs before any comparison, and
+\`FOLD_ALIAS_DOMAINS\` is a set because dots and \`+\` are only aliases where the domain says so.
+Uniqueness is a claim, not a check: \`find\` then \`create\` races, so the canonical number is
+\`SET NX\`'d before the email lookup. \`Idempotency-Key\` is looked up first so a retry returns the
+original \`user_id\`, and the 409 is one constant body because an interpolated address turns signup
+into an enumeration oracle.
 
-Production services persist only the canonical values and keep the raw input for the audit trail,
-enqueue the confirmation mail after the row commits, give a recycled-number flow to the legitimate
-owner, and in the strictest deployments answer every signup with the same 202 so the status code
-itself discloses nothing.`,
+Production services keep the raw input in an audit trail and enqueue the confirmation mail after the
+row commits; the strictest answer every signup with the same 202.`,
 };

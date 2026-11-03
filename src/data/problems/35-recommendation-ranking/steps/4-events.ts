@@ -9,32 +9,23 @@ export const eventsStep: Step = {
   task: `## Task
 
 **Starting point.** The starter implements \`publish_impression(tenant, user_id, items,
-model_version, fallback)\`, how the Recommendation API reports what it showed after a ranking;
-\`items\` is the ranked list the response carried (at most \`MAX_ITEMS = 30\`, each with its \`id\`,
-\`score\` and zero-based \`position\`). It builds one event per response, produces it to
-\`recsys.impression\` through an idempotent producer, and the Impression consumer folds each event
-into per-item counters, so the exposure dashboard fills in. It serves the demo and hides four
-flaws.
+model_version, fallback)\`: it builds one event per response from \`items\` (at most 30, each with
+\`id\`, \`score\` and zero-based \`position\`), produces it to \`recsys.impression\` through an idempotent
+producer, and the Impression consumer folds each event into per-item counters. It serves the demo
+and hides four flaws.
 
 **Failure mode the checks target.** A replay that cannot reconstruct the order one user saw, a
-retained and replicated topic that quietly becomes a feature store nobody owns, an exposure row that
-cannot say which slot an item sat in or whether the list was degraded, and a served impression that
-the broker rejected and nobody will ever re-capture.
+retained topic that becomes an unowned feature store, an exposure row that cannot say which slot an
+item sat in or whether the list was degraded, and a rejected impression nobody re-captures.
 
-- The produce key is the **user id** (\`key=user_id\`, \`key: userId\`, \`Key: []byte(userID)\`), so
-  every impression of one user lands on one partition in order.
-- The payload carries identifiers and rendition facts only: \`candidate_ids\` (the candidates that
-  were shown, in rank order), the \`positions\` they were rendered at, the \`model_version\` that
-  ranked them, and \`fallback\` when the ranking was degraded.
-- No raw feature value (no \`features\`/\`vector\`/\`embedding\` array) and no user PII (\`email\`,
-  \`name\`): whatever is published there outlives the request.
-- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` with \`acks\`, KafkaJS's
-  \`idempotent: true\`, \`RequireAll\` with the hash balancer), so a retried produce cannot publish the
-  same impression twice.
-- When the broker rejects the produce, write the event as an **outbox** row (\`outbox.put(...)\`)
-  instead of dropping it; a relay republishes outbox rows when the broker recovers.
-- The consumer folds the event into the counters (\`HINCRBY impressions:{tenant}:{candidate_id} shown\`)
-  and **only then** commits the offset.`,
+- Produce keyed by the **user id** (\`key=user_id\`, \`key: userId\`, \`Key: []byte(userID)\`).
+- The payload carries \`candidate_ids\` in rank order, their \`positions\`, the \`model_version\` and
+  \`fallback\`; no \`features\`/\`vector\`/\`embedding\` array and no PII (\`email\`, \`name\`).
+- The producer stays **idempotent with \`acks=all\`** so a retried produce cannot duplicate.
+- When the broker rejects the produce, write the event to the **outbox** (\`outbox.put(...)\`)
+  instead of dropping it.
+- The consumer folds the event (\`HINCRBY impressions:{tenant}:{candidate_id} shown\`) and **only
+  then** commits the offset.`,
   sequence: {
     participants: ['Recommendation API', 'recsys.impression', 'Impression consumer', 'Redis'],
     messages: [
@@ -986,7 +977,7 @@ void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
     "The record key is the first item id, so a user's events spread across partitions; the payload copies each item's feature values and omits positions and the fallback flag; the produce failure is logged and the event is discarded.",
     'Produce with `key=user_id`; build the payload from `candidate_ids`, `positions`, `model_version` and `fallback` only; wrap the produce in `except KafkaException` (or the language equivalent) and call `outbox.put(event)` there.',
   ],
-  debrief: `A publish path that looks fire-and-forget decides what the training pipeline can prove later. The key is the user because partitioning by user is what makes an exposure stream ordered and replayable; partitioning by item looks natural because every event is about items, and silently reorders a user's shows. The payload is a join key, not a transport for the features that produced it: raw feature values in a topic retained for days become a retention problem, and the same payload is where a future edit adds an email. \`acks=all\` with an idempotent producer protects against the client's own retry duplicating an event, but only an outbox protects the impression the broker refused.
+  debrief: `A publish path that looks fire-and-forget decides what the training pipeline can prove later. Keying by user makes one person's exposure stream ordered and replayable; keying by item looks natural and silently reorders a user's shows. The payload is a join key, not a transport for features: raw vectors in a topic retained for days become a retention problem. An idempotent producer with \`acks=all\` stops the client's own retry from duplicating an event, but only an outbox protects the impression the broker refused. Folding counters before the commit means a crash replays the event instead of losing it.
 
-Production pipelines put a schema registry in front of the topic so a producer cannot smuggle in a new field, dedupe on an event id so a replay is idempotent, and set a retention or compaction policy per topic. The counters are folded before the offset is committed, so a crash replays the event instead of losing it.`,
+Production pipelines put a schema registry in front of the topic, dedupe on an event id so replays are idempotent, and set a retention policy per topic.`,
 };

@@ -8,40 +8,27 @@ export const invoiceEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-\`invoice.event\` is the lifecycle path of an invoice: **created**, **finalized**, **sent** and
-**paid** are published to one topic so that a consumer — the ledger — sees one invoice's history in
-order, carrying totals and per-line digests instead of the customer's own words.
+**Starting point.** The starter publishes the invoice lifecycle to \`invoice.event\`: \`publish\`
+builds a payload with the totals, the tax figure, the customer's name and email and the raw lines,
+produces it keyed by the customer id from a default producer and flushes; \`finalize\` publishes
+\`finalized\` first and reads the number claim afterwards; the consumer commits its offset before it
+applies the event. Replaying the happy path reproduces the lifecycle. It hides four flaws.
 
-**Starting point.** The starter is working code: it publishes all four event types on the right
-topic, so replaying the happy path reproduces the lifecycle. Four production contracts are broken,
-and one of them is an order-of-effects bug that no happy-path test can see.
+**Failure mode the checks target.** A consumer applies \`paid\` before \`finalized\` and reconstructs
+a history that never happened, because the invoice is not the unit of partition. The customer's
+name, email and line text sit in a topic that is retained for days and replicated to every broker.
+The ledger posts a finalization the sequence rolls back a moment later. And a producer retry
+duplicates a record, a broker rejection drops one, and a consumer crash loses one.
 
-- **One topic, keyed by invoice.** Every record is produced to \`invoice.event\` with the **invoice
-  id** as the message key, so the invoice is the unit of partition, order and per-key retention. The
-  starter keys by the customer id: one customer's interleaved invoices share a partition, and an
-  invoice whose key changes (a merged account, a reassigned tenant) scatters across partitions, where
-  a consumer can apply \`paid\` before \`finalized\` and reconstruct a history that never happened.
-- **Digests travel, text does not.** The payload is built from \`line_digests\` — one SHA-256 digest
-  per line — plus \`total_cents\` and the tax figure. The starter copies the raw line objects and the
-  customer's name and email into the payload of a topic that is retained for days and replicated to
-  every broker; what lands there outlives every retention policy the invoice's own store has.
-- **Four event types on one topic.** \`created\`, \`finalized\`, \`sent\` and \`paid\` all carry
-  \`event_type\`, \`invoice_id\`, \`occurred_at\`, \`total_cents\` and the tax figure, so a consumer can
-  rebuild one invoice's history from one subscription.
-- **Publish after the claim commits.** The \`finalized\` event is produced only once the per-tenant
-  number claim has committed, and it is skipped entirely when the claim fails. The starter publishes
-  it first and reads the claim afterwards, so a consumer can observe an invoice the sequence later
-  rolls back — an issued number that never existed in the tenant's books.
-- **Delivery guarantees.** The producer is idempotent with \`acks=all\`, so a retry of a produce
-  cannot duplicate or reorder a record; when the broker rejects the produce the event goes to an
-  **outbox** row that a relay republishes instead of being dropped; and the consumer updates its
-  stores **before** it commits the offset, so a crash replays the record instead of losing it.
-
-**Failure mode the checks target.** Keyed by the customer, a lifecycle is no longer ordered per
-invoice; line text and customer identifiers in a retained, replicated topic are a data leak with a
-long tail; a payment event consumed before its finalization is a ledger that disagrees with the
-issued document; and a \`finalized\` event that outran its number claim advertises a document the
-service can still refuse.`,
+- Every record is produced to \`invoice.event\` with the invoice id as the message key.
+- The payload is built from \`line_digests\` (one SHA-256 digest per line) plus \`total_cents\` and the
+  tax figure; no line text, customer name or email.
+- \`created\`, \`finalized\`, \`sent\` and \`paid\` all carry \`event_type\`, \`invoice_id\`,
+  \`occurred_at\`, \`total_cents\` and the tax figure.
+- The \`finalized\` event is produced only after \`claim_and_commit\` has committed, and skipped when
+  the claim fails.
+- The producer is idempotent with \`acks=all\`; a rejected produce goes to an outbox row that a relay
+  republishes; the consumer updates its stores before it commits the offset.`,
   sequence: {
     participants: ['Invoice Service', 'Redis claim', 'invoice.event', 'Ledger consumer', 'Invoice store'],
     messages: [
@@ -77,9 +64,9 @@ service can still refuse.`,
     ],
   },
   hints: [
-    'The message key is the partition key and the per-key unit of the topic: `key=invoice["id"]` (or `key: invoice.id`, `Key: []byte(invoice.ID)`, `new ProducerRecord(TopicInvoiceEvent, invoice.id, payload)`, and in C++ the key plus `invoice.id.size()` passed to `produce`). Keyed by the customer id, one customer’s invoices share a partition and an invoice whose key changes scatters across partitions — then a consumer can apply `paid` before `finalized`.',
-    'The payload is the invoice’s arithmetic, not its prose: `line_digests` of the lines, `total_cents`, the tax figure. The topic is retained and replicated, so the raw line objects, the customer’s name and the email address written there are a leak every replica keeps.',
-    'The claim is an effect like any other, so it goes first: commit `seq:{tenant}` (or refuse the finalize) and only then produce the `finalized` event — a consumer must never see a finalization the sequence can roll back. Wrap the produce so a rejected record lands in the outbox, configure `enable.idempotence=true` with `acks=all` (KafkaJS `idempotent: true`, kafka-go `RequiredAcks: kafka.RequireAll` with a hash balancer), and commit the consumed offset only after the ledger stored the event.',
+    'The ledger shows an invoice paid before it was issued, and a compliance review finds customer emails in a Kafka topic with seven-day retention on every broker.',
+    '`key=invoice["customer_id"]` interleaves one customer\'s invoices and lets a re-keyed invoice scatter; the payload copies `lines`, `customer_name`, `customer_email`; `finalize` calls `publish` before `claim_and_commit`.',
+    'Produce with `key=invoice["id"]` and a payload of `line_digests` (sha256), totals and tax; call `claim_and_commit` and return on failure before `publish("finalized", …)`; set `enable.idempotence` and `acks=all`, add the outbox, commit the offset after `ledger.apply_event`.',
   ],
   checks: [
     {
@@ -231,9 +218,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish(event_type, invoice, occurred_at):
-    # TODO: key by the invoice id instead of the customer id, send per-line digests instead of the
-    # customer's own line text and name, publish the finalized event only after the number claim
-    # commits, and make the producer idempotent with acks=all plus an outbox fallback.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     event = {
         "event_type": event_type,
         "invoice_id": invoice["id"],
@@ -397,9 +382,7 @@ interface Invoice {
 }
 
 async function publish(eventType: string, invoice: Invoice, occurredAt: string): Promise<void> {
-  // TODO: key by the invoice id instead of the customer id, send per-line digests instead of the
-  // customer's own line text and name, publish the finalized event only after the number claim
-  // commits, and make the producer idempotent with acks=all plus an outbox fallback.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const event = {
     event_type: eventType,
     invoice_id: invoice.id,
@@ -582,9 +565,7 @@ type Invoice struct {
 }
 
 func Publish(ctx context.Context, eventType string, invoice Invoice, occurredAt string) error {
-	// TODO: key by the invoice id instead of the customer id, send per-line digests instead of the
-	// customer's own line text and name, publish the finalized event only after the number claim
-	// commits, and use RequiredAcks=RequireAll with an outbox fallback.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"event_type":     eventType,
 		"invoice_id":     invoice.ID,
@@ -782,9 +763,7 @@ object InvoiceEvents {
     props
   })
 
-  // TODO: key by the invoice id instead of the customer id, send per-line digests instead of the
-  // customer's own line text and name, publish the finalized event only after the number claim
-  // commits, and turn on enable.idempotence with acks=all plus an outbox fallback.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def publish(eventType: String, invoice: Invoice, occurredAt: Instant): Unit = {
     val event = Map(
       "event_type" -> eventType.toJson,
@@ -943,9 +922,7 @@ struct Invoice {
 
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: key by the invoice id instead of the customer id, send per-line digests instead of the
-// customer's own line text and name, publish the finalized event only after the number claim
-// commits, and turn on enable.idempotence with acks=all plus an outbox fallback.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 void publish(const std::string& eventType, const Invoice& invoice, const std::string& occurredAt) {
   const json event = {
       {"event_type", eventType},
@@ -1136,5 +1113,5 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking one thing: whether you treat the topic as an ordered, retained, replicated contract rather than a fire-and-forget notification. The message key is that contract — key by the invoice id and one invoice's created, finalized, sent and paid records land on one partition in produce order, so the ledger reconstructs the history it is asked for; key by the customer id and the invoice is no longer the unit of order or of per-key retention. The payload is the second contract: what you write into the topic is retained for days and replicated to every broker and every consumer group, so line text and the customer's identity belong in the invoice store, and the event carries the arithmetic instead — totals, tax, per-line SHA-256 digests. The third is order of effects: the number claim commits before the finalized event is produced, otherwise a consumer posts a document the sequence can roll back. Delivery finishes it: an idempotent producer with acks=all so a retry cannot duplicate a lifecycle record, an outbox row when the broker refuses the produce, and an offset committed only after the consumer's stores moved. Real platforms add a schema registry so the event contract is checked at produce time, dead-letter topics for records that can never be applied, and per-tenant quotas on the topic.`,
+  debrief: `The topic is an ordered, retained, replicated contract rather than a fire-and-forget notification, and each part of the fix follows from that. The message key is the invoice id so one invoice's created, finalized, sent and paid records land on one partition in produce order; keyed by the customer, the invoice is no longer the unit of order. The payload carries the arithmetic (totals, tax, per-line digests) because whatever is written to the topic outlives the invoice store's retention policy. The number claim commits before the finalized event is produced, otherwise a consumer posts a document the sequence can roll back. Delivery finishes it: idempotence with \`acks=all\`, an outbox row on rejection, and an offset committed only after the ledger moved. Production platforms check the event contract at produce time with a schema registry and route records that can never be applied to a dead-letter topic.`,
 };

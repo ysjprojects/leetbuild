@@ -219,7 +219,7 @@ class PacingStore:
 `,
     },
     typescript: {
-      starter: `/** Frequency and pacing counters: flawed code with three flaws. */
+      starter: `/** Frequency and pacing counters. */
 import Redis from 'ioredis';
 
 export const FREQ_KEY_PREFIX = 'freq:';

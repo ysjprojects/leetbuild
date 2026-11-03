@@ -16,20 +16,17 @@ export const stateStep: Step = {
 bidder's counter with \`GET\`, compares it against the cap in the client and decrements it in a second
 round trip, and \`settle\` logs the outcome. It compiles, it serves the demo, and it hides five flaws.
 
-**Failure mode the checks target.** A read followed by a write cannot hold a cap under load: every
-concurrent bid that arrives in the same millisecond sees the same remaining budget. The starter also
-charges at bid time and keeps the charge when the auction is lost, so a bidder that loses 90% of its
-auctions burns its whole daily cap in minutes while winning almost nothing, and the counter has no
-day bucket, so a bad afternoon becomes a permanently exhausted account.
+**Failure mode the checks target.** A read followed by a write cannot hold a cap: concurrent bids in
+the same millisecond see the same remaining budget. The starter also keeps the charge when an auction
+is lost, and the counter has no day bucket, so a bad afternoon exhausts the account for good.
 
-- Reserve spend with **one atomic operation**: a Lua script run through \`EVAL\`. Inside the script,
-  read the usage, compare \`current + cost > cap\`, and only then increment.
-- The claim returns the exact amount reserved (the cost), or \`0\` when the cap would be exceeded, so
-  the caller can release precisely what it took.
-- A **lost** auction returns its claim and a won auction keeps it charged: a \`release\` plus the
-  settlement the caller runs on the auction result (\`"lost"\` / \`"won"\`).
-- The release is safe to repeat: clamp it inside its own Lua script (\`DECRBY\`, then \`left < 0\` sets
-  the counter back to 0), so a duplicate loss report cannot grant free spend.
+- Reserve spend with **one atomic operation**: a Lua script run through \`EVAL\` that reads usage,
+  compares \`current + cost > cap\`, and only then increments.
+- The claim returns the amount reserved (the cost), or \`0\` when the cap would be exceeded.
+- A **lost** auction returns its claim and a won auction keeps it: a \`release\` plus the settlement
+  the caller runs on the result (\`"lost"\` / \`"won"\`).
+- The release clamps inside its own Lua script (\`DECRBY\`, then \`left < 0\` sets the counter to 0),
+  so a duplicate loss report cannot grant free spend.
 - The counter is **per bidder per day**: key it \`spend:cap:{bidder}:{day}\` and set the expiry with
   \`EXPIREAT\` to the next UTC midnight on the first write of the window.`,
   sequence: {

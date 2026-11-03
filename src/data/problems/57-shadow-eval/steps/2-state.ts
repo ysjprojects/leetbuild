@@ -121,7 +121,6 @@ class ShadowState:
         self.redis = redis
 
     def is_enabled(self, config_id: str, shard: str) -> bool:
-        """The starter toggles the flag per shard, so a disable is not fleet-wide."""
         return self.redis.get(f"shadow:enabled:{config_id}:{shard}") == "1"
 
     def admit(self, config_id: str, tenant: str) -> bool:
@@ -191,7 +190,7 @@ class ShadowState:
 `,
     },
     typescript: {
-      starter: `/** Redis shadow state: flawed code that shares production state. */
+      starter: `/** Redis shadow state. */
 import type {Redis} from 'ioredis';
 
 const PRODUCTION_QUOTA_KEY = 'quota:{tenant}:{window}';

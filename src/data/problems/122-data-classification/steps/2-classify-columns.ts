@@ -259,7 +259,7 @@ def classify_columns(entity: str, columns: list[str]) -> list[dict]:
 `,
     },
     typescript: {
-      starter: `/** Classify: flawed code that sends one prompt and keeps whatever comes back. */
+      starter: `/** Classify. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

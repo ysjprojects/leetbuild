@@ -260,7 +260,7 @@ def classify(text: str) -> Decision:
 `,
     },
     typescript: {
-      starter: `/** Classifier client: flawed code that hides the outage behind one catch-all queue. */
+      starter: `/** Classifier client. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

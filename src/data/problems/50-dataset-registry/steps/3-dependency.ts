@@ -180,7 +180,6 @@ def validate(
 
 
 def apply_review(candidate: Candidate, comments: str) -> Candidate:
-    """The starter edits the reviewed candidate in place."""
     candidate.notes = comments
     return candidate
 `,
@@ -295,7 +294,7 @@ def rework_candidate(candidate: Candidate, comments: str) -> Candidate:
 `,
     },
     typescript: {
-      starter: `/** Validator client: flawed code. */
+      starter: `/** Validator client. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import Fastify from 'fastify';
@@ -354,7 +353,6 @@ app.post('/v1/datasets/:dataset/versions/:version/validate', async (request, rep
 });
 
 function applyReview(candidate: Candidate, comments: string): Candidate {
-  // The starter edits the reviewed candidate in place.
   candidate.notes = comments;
   return candidate;
 }

@@ -221,7 +221,7 @@ async def publish_change(change: Change) -> str:
 `,
     },
     typescript: {
-      starter: `/** cdc.change: flawed code that keys by table and ships raw column values. */
+      starter: `/** cdc.change. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'cdcd', brokers: ['kafka:9092']});

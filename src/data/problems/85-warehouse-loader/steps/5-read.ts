@@ -13,28 +13,14 @@ export const readStep: Step = {
 both copied from the record's \`rows_planned\`, plus a \`freshness\` value read from
 \`freshness:{WORKER_ID}\` in Redis. It serves the demo, whose loads are clean, and hides 4 flaws.
 
-Implement \`GET /v1/loads/{id}\` as the report a finance or ops reader consults after a load.
+**Failure mode the checks target.** Planned counts make a half-loaded table look finished, hidden
+rejects erase why rows are missing, and per-process freshness makes a lagging table look fresh.
 
-- **401** when \`X-Tenant-Id\` is missing, **404** when the load is not this tenant's; another
-  tenant's load is not reported.
-- \`rows_read\`: the source rows the loader actually **read** (recorded when partitions were read,
-  not the count the manifest *planned*).
-- \`rows_written\`: the rows the **warehouse** holds for this load, read back from the warehouse —
-  not the manifest's plan. The plan is an intention; the report is the reconciliation.
-- \`rows_rejected\` **with reasons**: the rejected rows must **surface**, one entry per partition with
-  \`partition_id\`, \`reason\` and \`rows\`. A report that omits them turns a data-quality incident into a
-  silent rounding difference.
-- \`freshness\`: the **table's** current freshness — the committed position of \`target\`, e.g.
-  \`freshness:{target}\` — not a per-process value. A table that is three hours behind must look three
-  hours behind on every replica of the service.
-- \`delta\` is \`rows_read - rows_written - rows_rejected\`, and the report is \`flagged\` whenever the
-  delta is not **0**: an unexplained difference is exactly what a reader must not discover on their
-  own.
-
-**Failure mode the checks target.** Reporting the manifest's planned counts makes a half-loaded table
-look finished; hiding rejected rows deletes the only evidence of why rows are missing; and freshness
-stored per process means a lagging table looks fresh whenever a healthy replica happens to answer.
-The delta flag is the report's contract with its reader: reconcile, or say so.`,
+- **401** without \`X-Tenant-Id\`, **404** for another tenant's load.
+- \`rows_read\`: source rows actually read; \`rows_written\`: rows read back from the warehouse.
+- \`rows_rejected\`: one entry per partition with \`partition_id\`, \`reason\` and \`rows\`.
+- \`freshness\`: the table's committed position (\`freshness:{target}\`).
+- \`delta\` is \`rows_read - rows_written - rows_rejected\`; \`flagged\` whenever it is not **0**.`,
   sequence: {
     participants: ['Downstream reader', 'Load API', 'loads store', 'Warehouse', 'Redis'],
     messages: [
@@ -234,7 +220,7 @@ def read_load(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/loads/{id}: flawed code that reports the plan. */
+      starter: `/** GET /v1/loads/{id}. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 

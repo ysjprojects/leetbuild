@@ -137,7 +137,7 @@ broker is unhealthy, with no outbox to recover it from.
   ],
   code: {
     python: {
-      starter: `"""price.changed: flawed code that emits a price event on the happy path."""
+      starter: `"""price.changed."""
 import json
 
 from confluent_kafka import Producer
@@ -291,7 +291,7 @@ def relay_once(limit: int = 100) -> int:
 `,
     },
     typescript: {
-      starter: `/** price.changed: flawed code that emits a price event on the happy path. */
+      starter: `/** price.changed. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'price.changed';
@@ -461,7 +461,7 @@ export async function relayOnce(limit = 100): Promise<number> {
 `,
     },
     go: {
-      starter: `// price.changed: flawed code that emits a price event on the happy path.
+      starter: `// price.changed.
 package events
 
 import (
@@ -644,7 +644,7 @@ func relayOnce(ctx context.Context, limit int) (int, error) {
 `,
     },
     scala: {
-      starter: `// price.changed: flawed code that emits a price event on the happy path.
+      starter: `// price.changed.
 import java.util.Properties
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
@@ -754,7 +754,7 @@ object Events {
 `,
     },
     cpp: {
-      starter: `// price.changed: flawed code that emits a price event on the happy path.
+      starter: `// price.changed.
 #include <librdkafka/rdkafkacpp.h>
 
 #include <memory>
@@ -931,5 +931,5 @@ before the commit is a number the store may never hold. The envelope carries the
 reason and the headroom because the audit chain has to explain a change, not just announce it. The
 broker is not a database, so a rejected produce becomes an outbox row the relay republishes under
 the same key, safe only with an idempotent producer. Production pipelines also register the
-envelope schema, size partitions for hot skus, and route rows that still fail to a dead-letter topic.`,
+envelope schema and route rows that still fail to a dead-letter topic.`,
 };

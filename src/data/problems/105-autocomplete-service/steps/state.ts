@@ -12,6 +12,11 @@ export const stateStep: Step = {
 \`autocomplete:{prefix}\` with a plain \`SET\`, and the lookup behind \`GET /v1/autocomplete\` goes
 through it. It compiles, it improves the demo latency, and it hides 5 flaws.
 
+**Failure mode the checks target.** With no cap, a bot walking the keyspace fills Redis until
+eviction destroys everyone's hit rate. No TTL and no catalog version keep a retracted term
+"popular". A key without the tenant answers one tenant with another's suggestions the first time
+two tenants type the same prefix.
+
 - Top suggestions are cached per **\`(tenant, prefix)\`** under a key that also carries the
   **catalog version**, so a catalog change moves reads to a new key instead of serving stale terms.
 - Every cached entry has a **5-minute TTL** (\`TTL_SECONDS = 300\`). A prefix that is never requested
@@ -22,14 +27,7 @@ through it. It compiles, it improves the demo latency, and it hides 5 flaws.
 - Reads are tenant-scoped: one tenant can never read another tenant's cached suggestions, even when
   the prefix text is identical.
 - The cap and the eviction are per tenant; one tenant's flood must not evict another tenant's hot
-  prefixes.
-
-**Failure mode the checks target.** Caching every prefix with no cap turns the cache into the memory
-leak: a bot walking the keyspace fills Redis until eviction pressure destroys the hit rate for
-everyone. No TTL and no catalog version leave the old top suggestions served indefinitely, so a
-retracted term stays "popular". The key without the tenant is the subtle part: it compiles and it
-is faster, and it silently answers one tenant with another tenant's suggestions the first time two
-tenants type the same prefix.`,
+  prefixes.`,
   sequence: {
     participants: ['Autocomplete API', 'Suggestion cache', 'Catalog'],
     messages: [

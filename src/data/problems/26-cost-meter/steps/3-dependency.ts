@@ -203,7 +203,7 @@ def price_for(model: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** priceFor: flawed code with no deadline and a hardcoded rate. */
+      starter: `/** priceFor. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

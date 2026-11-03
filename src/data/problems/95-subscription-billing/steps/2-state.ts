@@ -13,27 +13,19 @@ period's invoice through the processor stub, writes a run marker in Redis under
 \`billing:run:{subscription_id}:{period_start}\` and returns the charge reference. It compiles, the
 happy path passes, and it hides five flaws.
 
-**Failure mode the checks target.** Every flaw is invisible in a demo that runs once and does not
-crash: the second run of the demo sees the marker, no two runners race, and the demo never crosses a
-month boundary. Under a crash between charge and marker, two concurrent retries, or a late retry weeks
-later, the same code charges a customer twice.
+**Failure mode the checks target.** A crash between charge and marker, two concurrent retries, or a
+late retry weeks later, each charging a customer twice; a demo that runs once shows none of it.
 
-- The run key is per subscription **and** per period. A subscription-wide key blocks the next
-  period; a period-less key lets two periods share one marker.
-- The marker is claimed **atomically** with \`SET … NX\` **before** the charge. A read followed by a
-  later write lets two runners both see "no marker" and both charge. Claim first, charge second.
-- After the charge, the marker is **confirmed with the invoice reference** (\`charged:{invoice_ref}\`),
-  so the marker and the charge reconcile. A bare \`done\` cannot answer "was this period charged,
-  and under which charge?".
-- A claim that exists but was never confirmed is an **in-flight or crashed run**: the retry
-  reconciles with the processor (\`GetInvoice\` for the period's invoice), adopts the charge
-  reference it reports, then confirms the marker. It does not charge again.
-- A **closed period**, one whose \`period_end\` is in the past, refuses a re-charge with **409** and
-  \`{"action_required": "adjustment"}\` unless the caller passes the explicit adjustment action. A
-  billing retry is not an adjustment.
-- The marker carries no TTL. A marker that lives for thirty days cannot tell a closed period from an
-  unbilled one, so a late retry recharges a period that was already billed and closed.
-- Log the run with subscription, period and reference, not the customer's payment details.`,
+- Key the run per subscription **and** per period.
+- Claim the marker **atomically** with \`SET … NX\` **before** the charge; a read then a later write
+  lets two runners both charge.
+- After the charge, **confirm the marker with the invoice reference** (\`charged:{invoice_ref}\`).
+- A claim never confirmed is an **in-flight or crashed run**: the retry calls \`GetInvoice\`, adopts
+  the reference the processor reports and confirms the marker, without charging again.
+- A **closed period** (\`period_end\` in the past) refuses a re-charge with **409** and
+  \`{"action_required": "adjustment"}\` unless the caller passes the explicit adjustment action.
+- The marker carries no TTL, so a late retry cannot mistake a closed period for an unbilled one.
+- Log subscription, period and reference, not payment details.`,
   sequence: {
     participants: ['Billing Service', 'Redis', 'billing db', 'Payment processor'],
     messages: [

@@ -24,9 +24,7 @@ export const logIndexerProblem: Problem = {
 
 A log indexer decides which records are worth storing, how much of a record survives, how writes are
 batched and retried, how consumers learn that a service's logs were indexed, and how anyone can tell
-whether the pipeline lost data. The visible part is a search box; the parts that decide whether the
-platform is trustworthy are the ingest funnel, the buffer's back-pressure, the write retry contract,
-the event key, and the completeness number nobody double-checks.
+whether the pipeline lost data. The visible part is a search box.
 
 ## The real system
 
@@ -36,9 +34,8 @@ line's size in bytes; with \`max_line_size_truncate\` on, Loki stores the cut li
 \`max_line_size_truncate_identifier\` appends a marker string so a truncated line can be told from a
 complete one later. A tenant over \`ingestion_rate_mb\` or a stream over \`per_stream_rate_limit\`
 gets **429**, and the whole request is refused before anything is stored. Every rejection, rate limit
-or validation failure, increments \`loki_discarded_samples_total\` and \`loki_discarded_bytes_total\`
-with a \`reason\` label, which is what lets an operator see dropped data instead of inferring it from
-a count that looks fine.
+or validation failure, increments \`loki_discarded_samples_total\` with a \`reason\` label, so an
+operator sees dropped data instead of inferring it.
 
 ## What you build here
 
@@ -61,10 +58,8 @@ One service, **logindex**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws. It compiles, it indexes the happy path, and
-it looks right. Your job in every step is the one you will have on a real logging platform: debug it
-against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail
-on the starter and pass on your version.
+Every starter compiles and indexes the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -288,7 +288,7 @@ def tickets(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/tickets: flawed code that stores whatever state the caller sends. */
+      starter: `/** POST /v1/tickets. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

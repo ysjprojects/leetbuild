@@ -16,63 +16,60 @@ import {trainingReadStep} from './steps/5-read';
 export const trainingSchedulerProblem: Problem = {
   id: 'training-scheduler',
   title: 'Training Scheduler',
-  tagline: 'Enqueue training runs against shared capacity without starvation or double-start.',
+  tagline:
+    'Queue training runs on shared GPUs with a leased start, a checkpoint before every preemption and one event per transition.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Training Scheduler
 
-A training scheduler is the piece of an AI platform that turns "train this recipe on this dataset"
-into work that runs **exactly once** on a GPU the cluster can actually spare. The visible part is a
-run id and a queue position; the parts that decide whether the platform is safe are the admission
-funnel, the leased handoff between the queue and the worker, the preemption that checkpoints before
-it kills, and the event history that makes a run's life auditable.
+A training scheduler turns "train this recipe on this dataset" into work that runs once on a GPU the
+cluster can spare. The visible part is a run id and a queue position; what decides whether the
+platform is safe is the admission funnel, the leased handoff between queue and worker, the
+preemption that checkpoints before it kills, and the event history.
 
 ## The real system
 
-Production schedulers receive submissions from many tenants, admit a run only when the recipe and
-dataset versions are ones the registry knows, and clamp the priority a caller claims so a typo
-cannot jump every queue. They keep queue positions in one shared structure that a run occupies
-exactly once, even when two schedulers boost the same run at the same moment. They hand a run to a
-worker under a lease, so a crash between dequeue and process start returns the run instead of losing
-it. When higher-priority work arrives they ask the running job to preempt over gRPC and refuse to
-terminate the process until a checkpoint id comes back, because a killed run that never checkpointed
-throws away hours of GPU time. And every transition is published keyed by run id, so a consumer can
-reconstruct one run's history in order while runs interleave.
+Slurm, the scheduler behind most HPC and many GPU training clusters, makes preemption a policy with
+a clock. A job selected for preemption is sent SIGTERM at once and given \`GraceTime\` seconds to
+run before the SIGKILL sequence; what happens to it afterwards is a configured \`PreemptMode\`:
+cancelled, requeued, or suspended and resumed later. That is the shape of this course's preemption
+step: a bounded warning the job can use to checkpoint, then a defined end state rather than a bare
+kill. The rest of the scheduler follows the same discipline: admission only for known recipe and
+dataset versions, a clamped priority, one queue position per run, a start that is a lease so a
+crash between dequeue and process start returns the run, and every transition published keyed by
+run id.
 
 ## What you build here
 
 One service, **trainsched**, with five pieces:
 
-1. \`POST /v1/training/runs\`: tenant from the authenticated header, validated dataset and recipe
-   versions, a priority **clamped** into the supported bands, and an \`Idempotency-Key\` so a retry
-   after a timeout returns the original run instead of starting a second one.
-2. A **Redis** queue: one position per run derived from the priority band and the enqueue time,
-   position updates that cannot leave a duplicate behind, and a start lease with a TTL so a worker
-   that dies during startup returns the run with its original band intact.
+1. \`POST /v1/training/runs\`: authenticated tenant, validated dataset and recipe versions, a
+   priority **clamped** into the supported bands, and an \`Idempotency-Key\` so a retry returns the
+   original run.
+2. A **Redis** queue: one position per run derived from the band and the enqueue time, a scripted
+   move that cannot leave a duplicate, and a start lease with a TTL so a worker that dies during
+   startup returns the run with its band intact.
 3. A **gRPC** preemption call: a grace deadline, termination only after a checkpoint id is received,
    and a job that reports no checkpoint support left running while the new work queues behind it.
-4. A **Kafka** lifecycle topic: one \`training.run\` event per transition, keyed by run id, carrying
-   node counts and checkpoint ids, with \`started\` published only after the worker confirms, and an
-   outbox row when the broker rejects the produce.
-5. \`GET /v1/training/runs/{id}\`: reported queue position, lease state, node assignment and last
-   checkpoint reconciled against the cluster's view, orphaned runs surfaced as failed with a
-   reason, and another tenant's run invisible.
+4. A **Kafka** lifecycle topic: one \`training.run\` event per transition, keyed by run id, with
+   \`started\` published only after the worker confirms, and an outbox row when the broker rejects
+   the produce.
+5. \`GET /v1/training/runs/{id}\`: queue position, lease state, nodes and last checkpoint reconciled
+   against the cluster's view, orphaned runs surfaced as failed with a reason, and another tenant's
+   run invisible.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+Every starter in this course is working code with flaws: it compiles, serves the happy path and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
 checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Dataset versioning internals, recipe authoring, the cluster's own bin-packing and node autoscaling,
-per-tenant GPU quotas, cost accounting, the training framework's checkpoint format, and the worker
-image build. The five pieces above are the ones that decide whether the scheduler is correct,
-isolated and shippable.`,
+Dataset versioning, recipe authoring, the cluster's bin-packing and autoscaling, per-tenant GPU
+quotas, cost accounting, the checkpoint format, and the worker image build.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'submit · status', x: 8, y: 50},

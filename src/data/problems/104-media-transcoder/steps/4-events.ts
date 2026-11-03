@@ -214,7 +214,7 @@ def publish_completion(job_id: str, manifest: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** Job events: flawed code that keys by worker and leaks a permanent URL. */
+      starter: `/** Job events. */
 import {Kafka} from 'kafkajs';
 
 export const TOPIC = 'transcode.event';

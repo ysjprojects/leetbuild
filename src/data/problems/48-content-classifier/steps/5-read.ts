@@ -184,7 +184,7 @@ def record_classification(tenant: str, taxonomy_id: str, taxonomy_version: str, 
 `,
     },
     typescript: {
-      starter: `/** GET /v1/taxonomies/{id}: flawed code that serves the mutable latest. */
+      starter: `/** GET /v1/taxonomies/{id}. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

@@ -13,25 +13,18 @@ generated text, builds an event of \`record_id\`, \`job_id\`, \`entity_id\` and 
 produces it to \`synthetic.record\` keyed by the record id with a default producer, and flushes.
 Nothing is persisted. It compiles, serves the demo and hides 5 flaws.
 
-**Failure mode the checks target.** Keying by record id works in a demo with one worker, but a
-recipe's admissions then spread across partitions and the ordering the downstream consumer relies
-on is gone. Publishing content into a retained topic is the leak, and publishing before persisting
-is the durability bug: an event is a promise that the record exists.
+**Failure mode the checks target.** Keyed by record id, a recipe's admissions spread across
+partitions and lose their order. Content in a retained topic is a leak, and publishing before
+persisting announces a record that may not exist.
 
-\`publish_admission\` is the call a generator worker makes once a record has been admitted:
-
-- Publish **exactly one** \`synthetic.record\` event per admission with the **recipe id as the
-  message key** (\`key=record["recipe_id"]\`), so every admission of one recipe lands in one
-  partition and stays ordered.
-- The payload carries **\`seed_digest\`** and **\`judge_score\`**, plus the record, job and entity ids.
-  \`seed_digest\` is the **sha256 of the seed record the generated record came from**, computed here.
-  The payload never carries \`generated_text\`, \`seed_text\` or any other content: the topic is
-  retained for days and replicated, so content written there outlives the corpus.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: \`enable.idempotence\`
-  plus required acks \`all\`, KafkaJS's \`idempotent: true\` with \`acks: -1\`, and a hash balancer for
-  the key), so a retried produce cannot double an admission.
-- The admission is **persisted before it is published**: \`admissions.put(record)\` runs before
-  \`produce\`/\`send\`.`,
+- Publish **exactly one** \`synthetic.record\` event per admission keyed by the **recipe id**
+  (\`key=record["recipe_id"]\`).
+- The payload carries **\`seed_digest\`** (sha256 of the source seed record, computed here) and
+  **\`judge_score\`** plus record, job and entity ids; no \`generated_text\`, \`seed_text\` or other
+  content.
+- The producer is **idempotent with \`acks=all\`** (KafkaJS \`idempotent: true\` with \`acks: -1\`; a
+  hash balancer for the key).
+- **Persist before publishing**: \`admissions.put(record)\` runs before \`produce\`/\`send\`.`,
   sequence: {
     participants: ['Generator worker', 'admission store', 'synthetic.record', 'Coverage consumer'],
     messages: [

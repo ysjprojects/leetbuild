@@ -12,27 +12,20 @@ export const stateStep: Step = {
 \`thread_count:{thread_id}\`, a \`ZINCRBY\` on one shared \`trending:threads\` set, and reads the hot
 list from that same set. It compiles, the counters look right in a demo, and it hides five flaws.
 
-**Failure mode the checks target.** A crash after the insert and before the \`INCR\` leaves the
-thread one comment short for good, with no path to repair it; the hot-thread set has no tenant and no
-expiry, so one tenant's trending thread surfaces on another tenant's homepage and a quiet tenant's
-scores accumulate forever.
+**Failure mode the checks target.** A crash between insert and \`INCR\` leaves the thread one comment
+short for good; the hot-thread set has no tenant and no expiry, so one tenant's trending thread shows
+on another's homepage and scores accumulate forever.
 
-- Every comment write commits its counters **in the same atomic step as the insert**: one Lua script
-  (\`COMMIT_COMMENT_LUA\`) bumps the thread counter, bumps the parent's reply counter when the
-  comment is a reply, and touches the tenant's hot-thread set, inside the transaction that inserts
-  the comment.
-- The thread counter key is \`thread:{tenant}:{thread_id}:count\`, incremented with \`INCR\` from
-  inside the script. Two tenants with the same thread id are two different threads.
-- The reply counter key is \`thread:{tenant}:{thread_id}:replies:{parent_id}\`, bumped only when
-  the comment has a parent (pass an empty key otherwise).
-- The hot-thread set is tenant-scoped: \`hot:{tenant}\`, a sorted set where a new comment adds one
-  to the thread's score (\`ZINCRBY\`), with an expiry of \`HOT_TTL_S\` seconds refreshed on the
-  atomic path.
-- The read of the hot list returns only the **first page** (\`HOT_PAGE_SIZE\` members, highest score
-  first).
-- \`recount_thread(tenant, thread_id)\` recomputes the counter from the durable store
-  (\`count_for_thread\`) and \`SET\`s the Redis key: the reconciliation path after a lost script or a
-  restored backup. The store, not Redis, is the source of truth.`,
+- Commit counters **in the same atomic step as the insert**: one Lua script (\`COMMIT_COMMENT_LUA\`)
+  inside the inserting transaction bumps the thread counter, the parent's reply counter for a reply,
+  and the tenant's hot set.
+- Thread counter: \`thread:{tenant}:{thread_id}:count\`, \`INCR\` inside the script.
+- Reply counter: \`thread:{tenant}:{thread_id}:replies:{parent_id}\`, only when there is a parent
+  (empty key otherwise).
+- Hot set: \`hot:{tenant}\`, \`ZINCRBY\` by one, expiry \`HOT_TTL_S\` refreshed on the atomic path.
+- The hot-list read returns only the **first page** (\`HOT_PAGE_SIZE\`, highest score first).
+- \`recount_thread(tenant, thread_id)\` \`SET\`s the counter from \`count_for_thread\`; the store is
+  the source of truth.`,
   sequence: {
     participants: ['Comments API', 'Redis', 'comment store'],
     messages: [
@@ -257,7 +250,7 @@ def hot_threads(tenant: str) -> list[str]:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/comments: flawed code that counts after the write. */
+      starter: `/** POST /v1/comments. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

@@ -23,11 +23,7 @@ export const cdcStreamerProblem: Problem = {
   statement: `# CDC Streamer
 
 A change data capture streamer reads a database's write-ahead log and delivers every committed
-change to the sinks that care about it: a warehouse, a search index, a cache. The visible part is a
-subscription endpoint and a lag number. The parts that decide whether the platform can be trusted
-are the authorization of a subscription, the durability of the confirmed position in the log, the
-retry rule for a failed batch, the message key that keeps one row's history in order, and the lag
-an operator can act on.
+change to the sinks that care about it: a warehouse, a search index, a cache.
 
 ## The real system
 
@@ -39,17 +35,9 @@ wherever the log now starts. The slot retains WAL segments until the consumer co
 why a stalled or lost slot is a page and not a metric: the distance between the confirmed LSN and the
 slot's restart LSN is the data about to be lost.
 
-Under pressure the tempting move is to skip. A batch fails, the tailer jumps past it to keep the lag
-chart flat, the cursor moves, and the tenant's changes are gone with no error anyone sees. A failed
-batch is instead retried from its first LSN with the same batch id until it succeeds or the
-subscription halts, and back-pressure lands on the slow sink rather than on dropped work.
-Exactly-once delivery to a non-transactional sink is not available; at-least-once plus an idempotent,
-ordered apply is what ships.
-
-Ordering is a keying decision. Keying a change topic by table scatters one row's changes across
-partitions; keying by (table, primary key) puts every change of one row in one partition in commit
-order. The payload carries digests, not raw column values, because a retained topic that copies
-column contents turns every PII fix into a data-removal project.
+A failed batch is retried from its first LSN with the same batch id rather than skipped to keep the
+lag chart flat, and keying by (table, primary key) keeps one row's changes in commit order.
+At-least-once delivery plus an idempotent, ordered apply is what ships.
 
 ## What you build here
 
@@ -72,15 +60,13 @@ One service, **cdcd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course compiles and serves the happy path. Your job in each step is to debug
-it against the failure modes, fix it, and prove the fix with checks that fail on the starter and
-pass on your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Slot creation and WAL configuration, schema change handling, sink-specific upsert dialects,
-multi-region slots, snapshot and backfill orchestration, throughput tuning, and the sink connectors
-themselves. The five pieces above decide whether the stream is correct, ordered and operable.`,
+Slot creation and WAL configuration, schema changes, sink upsert dialects, multi-region slots,
+snapshot orchestration and the sink connectors.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Tenant app', sub: 'subscribe · read lag', x: 8, y: 50},

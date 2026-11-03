@@ -235,7 +235,7 @@ def create_comment(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/comments: flawed code that trusts its client. */
+      starter: `/** POST /v1/comments. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

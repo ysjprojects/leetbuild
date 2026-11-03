@@ -13,23 +13,15 @@ builds one prompt string, calls \`Complete\` on the model service at \`model:900
 failure and returns the first candidate's text. When the model service is healthy it serves the
 demo. It hides four flaws.
 
-**Failure mode the checks target.** The glued prompt is a silent quality regression nobody files
-a bug for; the missing deadline lets one slow model call hold a worker while the editor has moved
-on; the retry-everything loop multiplies a bad request by five; and showing the raw first candidate
-puts an empty or half-finished line in front of the developer.
+**Failure mode the checks target.** The glued prompt is a silent quality regression; with no
+deadline a slow call holds a worker after the editor moved on; retrying everything multiplies a bad
+request; the raw first candidate can be empty or half-finished.
 
-- **Fill-in-the-middle.** The request carries \`prefix\` and \`suffix\` as **separate fields**:
-  the model is told which side of the cursor each piece is on and generates what goes between
-  them. Gluing the suffix onto the prefix hands the model a document with the cursor at the end
-  and loses the code after it, which is the 10 % of acceptance FIM bought.
-- Every attempt carries a **300 ms** deadline (\`DEADLINE_MS\`): a completion that arrives after
-  the developer typed the next character is thrown away by the editor anyway.
-- At most **2 attempts** (\`MAX_ATTEMPTS\`), and only \`UNAVAILABLE\` is retried; every other
-  status is returned to the caller at once. A model that answered \`INVALID_ARGUMENT\` will answer
-  it again, and five attempts at 300 ms is a 1.5 s keystroke.
-- Ask for **3 candidates** (\`N_CANDIDATES\`) and show at most 3: \`filter_candidates\` drops
-  empty or whitespace-only text, candidates the model marked \`truncated\` (cut by the token
-  limit mid-statement), and duplicates after trimming, keeping the model's order.`,
+- Send \`prefix\` and \`suffix\` as **separate fields** (fill-in-the-middle).
+- Every attempt carries a **300 ms** deadline (\`DEADLINE_MS\`).
+- At most **2 attempts** (\`MAX_ATTEMPTS\`), retrying only \`UNAVAILABLE\`.
+- Ask for **3 candidates** (\`N_CANDIDATES\`); \`filter_candidates\` drops empty or whitespace-only
+  text, \`truncated\` candidates and duplicates after trimming, keeping the model's order.`,
   sequence: {
     participants: ['completiond', 'Model service'],
     messages: [

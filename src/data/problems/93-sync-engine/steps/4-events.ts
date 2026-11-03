@@ -17,19 +17,12 @@ it hides five flaws. Each only matters when someone needs the stream later.
 topic has nothing about it. A replay of the stream rebuilds revisions that never became durable, and
 the broker's rejection during a two-minute outage drops events with no trace anywhere.
 
-Requirements:
-
-- Publish one event per document to \`sync.change\`, keyed by the document id. The key is the
-  partition key, so every event about one document lands in the same partition and its revision
-  stream stays ordered, which is what lets a replay of the topic reconstruct the document.
-- Publish only after the apply has committed. An event for a revision that then rolled back is a
-  false statement in the audit trail and the state a device replays from on its next pull.
-- The payload carries the revision and the content hash of the applied state, so a replay can
-  verify what it rebuilt.
-- Conflicted documents are published like applied ones (\`PUBLISH_STATUSES\`). A conflict is a
-  state change; filtered out of the topic, no replay can explain how a document got there.
-- When the broker rejects the produce, write the event to the outbox (\`insert_outbox\`) instead of
-  dropping it: a relay republishes outbox rows when the broker recovers.`,
+- Publish one event per document to \`sync.change\`, keyed by the document id, so one document's
+  revisions stay ordered in one partition.
+- Publish only after the apply has committed.
+- The payload carries the revision and the content hash of the applied state.
+- Conflicted documents are published like applied ones (\`PUBLISH_STATUSES\`).
+- When the broker rejects the produce, write the event to the outbox (\`insert_outbox\`).`,
   sequence: {
     participants: ['Sync Engine', 'sync.change', 'outbox'],
     messages: [
@@ -215,7 +208,7 @@ def apply_and_publish(device: str, changes: list[dict]) -> dict:
 `,
     },
     typescript: {
-      starter: `/** sync.change: flawed code that publishes before the apply, keyed by device. */
+      starter: `/** sync.change. */
 import {Kafka} from 'kafkajs';
 
 import {store} from './revisions';

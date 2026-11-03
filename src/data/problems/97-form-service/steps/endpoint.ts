@@ -220,7 +220,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/forms/:id/submissions — flawed code. */
+      starter: `/** POST /v1/forms/:id/submissions. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

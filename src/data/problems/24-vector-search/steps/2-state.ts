@@ -240,7 +240,7 @@ def search(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/search: flawed code whose cache key forgot the tenant. */
+      starter: `/** POST /v1/search. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';

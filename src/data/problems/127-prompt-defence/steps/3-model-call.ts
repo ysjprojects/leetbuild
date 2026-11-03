@@ -291,7 +291,7 @@ def answer(document: str, question: str) -> ModelAnswer:
 `,
     },
     typescript: {
-      starter: `/** Model call: flawed code that concatenates the prompt and trusts the reply. */
+      starter: `/** Model call. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

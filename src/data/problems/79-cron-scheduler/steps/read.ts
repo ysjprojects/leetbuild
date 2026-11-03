@@ -12,15 +12,12 @@ export const readStep: Step = {
 tenant from \`X-Tenant-Id\`, lists \`store.fired_windows(schedule_id)\` as \`fired\` rows and
 answers with those rows and \`stalled: false\`. It serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** A history built from successful fires only returns an empty
-list and \`stalled: false\` for a schedule whose fire path has been broken for a week, which is the
-most dangerous shape a health read can take: it looks exactly like a schedule that had nothing to
-do. It also shows no policy on a skipped row, has no time bound, and does not check who owns the
-schedule.
+**Failure mode the checks target.** A history built from successful fires only answers an empty
+list and \`stalled: false\` for a schedule broken for a week, which looks exactly like one with
+nothing to do. It also shows no policy on skipped rows, has no time bound, and skips the owner check.
 
-- A missing tenant is **401**. A schedule that does not exist **or belongs to another tenant** is
-  **404**, not 403 and not an empty list, because both leak the existence of someone else's
-  schedule.
+- A missing tenant is **401**; a schedule that does not exist or belongs to another tenant is
+  **404**.
 - The response covers the last **30 days** (\`HISTORY_DAYS = 30\`): \`since = now - HISTORY_DAYS *
   86400\`.
 - Rows are built from **expectation math**. Walk the windows the cron should have fired in

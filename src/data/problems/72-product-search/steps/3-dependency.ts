@@ -13,11 +13,9 @@ list, calls \`Search\` on each with up to \`MAX_ATTEMPTS\` tries, appends every 
 and returns the merged list with the page number. It compiles, it answers the demo with every shard
 healthy, and it hides five flaws.
 
-**Failure mode the checks target.** A fan-out is a distributed system wearing a function call: with
-no deadline it inherits the slowest shard's latency, and with no partial flag it hides the failure.
-The flaws compound: an unbounded wait amplifies load, blind retries multiply it, and duplicate merges
-inflate the page so the caller cannot tell a re-indexed product from two products. The fix is a
-deadline shared by the whole fan-out, a quorum, a per-id dedupe, and a truthful \`partial\` flag.
+**Failure mode the checks target.** With no deadline the fan-out inherits the slowest shard's
+latency, blind retries multiply load, duplicate merges inflate the page, and with no partial flag a
+missing shard looks like a missing product.
 
 - Every shard call runs under a **350 ms deadline** (\`SHARD_DEADLINE_MS = 350\`): the stub carries
   \`timeout=\` / a deadline / \`WithTimeout\` / \`deadlineAfter\`, and the merge does not wait for the

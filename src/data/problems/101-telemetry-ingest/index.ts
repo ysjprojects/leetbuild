@@ -11,72 +11,61 @@ import {stateStep} from './steps/state';
  * before it feeds a fleet's aggregates. Registry-bound devices with in-range readings → one atomic
  * Redis decision that covers the device's rate and its latest value → batch-scoped time-series
  * writes under a deadline → device-keyed bucketed rollups with an outbox → a series read with a
- * range cap, a named downsampling method and honest staleness.
+ * range cap, a named downsampling method and the newest point's age.
  */
 export const telemetryIngestProblem: Problem = {
   id: 'telemetry-ingest',
   title: 'Telemetry Ingest',
-  tagline: 'High-volume device telemetry with registry-bound devices and honest acks.',
+  tagline:
+    'Device telemetry validated against the registry, rate-limited in one Redis script and read back with a range cap.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Telemetry Ingest
 
 A telemetry pipeline is where a fleet's truth is assembled: every dashboard, alert and rollup
-downstream is a function of what the ingest edge accepted and what it acknowledged. The visible
-part is one \`POST /v1/telemetry\`; the parts that decide whether the numbers mean anything are the
-validation funnel, the atomic per-device state, the write contract with the time-series store, the
-shape of the events that leave the pipeline, and the bounds on the reads that come back.
+downstream is a function of what the ingest edge accepted and acknowledged. What decides whether the
+numbers mean anything is the validation funnel, the atomic per-device state, the write contract
+with the time-series store, the shape of the events that leave, and the bounds on the reads.
 
 ## The real system
 
-Production ingest edges take millions of samples a minute from devices they do not control. They
-accept a device id only when the registry already knows it — an ingest path that invents registry
-rows turns a typo, a cloned firmware image or an attacker into a permanent fleet member, and every
-aggregate it touches afterwards. They check each reading against the range the metric declares, so a
-single overflow value cannot rescale a fleet's graph to zero. They enforce a per-device sample rate
-with a windowed counter, and they update a device's latest value in the same atomic step, because a
-rate breach must not half-apply. They write to the time-series store in sub-batches under a
-deadline, and when a sub-batch fails they retry only that one under the same batch id, because a
-store that does not dedupe will double a fleet's totals if the whole batch is re-sent. They publish
-downsampled rollups keyed by device so a device's stream stays ordered, and they never let a broker
-outage drop an event. And they bound every read: a range cap, a named downsampling method, and the
-age of the newest point, so a device that went silent is visible instead of looking flat.
+Prometheus bounds its read path the way this course's last step does. A \`query_range\` request
+names \`start\`, \`end\` and a \`step\`, and the server refuses any request whose span divided by the
+step exceeds 11,000 points per series, before any sample is read; each query also runs under a
+\`timeout\` capped by the server's \`-query.timeout\` flag. The rest of an ingest edge follows the
+same discipline: a device id accepted only when the registry knows it, each reading checked against
+its metric's declared range, a per-device rate enforced by a windowed counter that updates the
+latest value in the same atomic step, sub-batch writes under a deadline with only the failed
+sub-batches retried under one batch id, downsampled rollups keyed by device with an outbox behind
+the broker, and a series read that names its downsampling method and the age of its newest point.
 
 ## What you build here
 
 One service, **ingestd**, with five pieces:
 
-1. \`POST /v1/telemetry\`: a batch declares a device id that must exist in the registry, readings
-   inside each metric's declared range, and a batch id; an unknown device is \`404\` and creates no
-   registry state, out-of-range readings are rejected with the metric named, and every check runs
-   before the batch is acknowledged.
+1. \`POST /v1/telemetry\`: a device id that must exist in the registry, readings inside each
+   metric's declared range, and every check run before the ack.
 2. A **Redis** decision: per-device windowed sample rates and the latest value per metric, written
-   by one atomic Lua \`EVAL\` that rejects before it writes, expires with its window, and answers
-   \`429\` with \`Retry-After\` and \`X-RateLimit-Remaining\`.
-3. A **gRPC** time-series client: a 4-second deadline per attempt, a partial write response naming
-   the accepted and failed sub-batches, retries scoped to the failed ones under the same batch id,
-   and a batch reported done only when every point is stored.
+   by one atomic Lua \`EVAL\` that rejects before it writes and answers \`429\` with \`Retry-After\`.
+3. A **gRPC** time-series client: a 4-second deadline per attempt, retries scoped to the failed
+   sub-batches under the same batch id, and a batch reported done only when every point is stored.
 4. A **Kafka** rollup path: one \`telemetry.rollup\` event per window keyed by device id, carrying
-   bucket means and counts rather than raw samples, with an outbox row when the broker rejects the
-   produce.
-5. \`GET /v1/devices/{id}/series\`: a range capped at 24 hours and enforced before the store call,
-   downsampling beyond 1000 points with the method named in the response, the newest point's age
-   reported, and a device from another fleet answered as \`404\`.
+   bucket means and counts rather than raw samples, with an outbox row when the broker rejects.
+5. \`GET /v1/devices/{id}/series\`: a range capped at 24 hours before the store call, downsampling
+   beyond 1000 points with the method named, the newest point's age, and a foreign device as \`404\`.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real ingest edge: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, serves the happy path and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Device provisioning and certificate distribution, firmware-side buffering, schema evolution across
-device generations, multi-region ingest, backfill and compaction of the time-series store, alerting
-rules, and the rollup consumer's own storage. The five pieces above are the ones that decide whether
-the pipeline's numbers can be trusted.`,
+Device provisioning, firmware-side buffering, schema evolution across device generations,
+multi-region ingest, compaction of the time-series store, alerting rules, and the rollup consumer's
+own storage.`,
   diagram: {
     nodes: [
       {id: 'device', kind: 'client', label: 'Device fleet', sub: 'batches · samples', x: 8, y: 34},

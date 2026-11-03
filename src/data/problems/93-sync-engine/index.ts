@@ -23,61 +23,47 @@ export const syncEngineProblem: Problem = {
   minutes: 70,
   statement: `# Sync Engine
 
-A sync engine is the piece of a product that lets a laptop, a phone and a web tab edit the same
-documents, including offline, and still converge. The visible part is a document that looks up to
-date; the parts that decide whether a user loses work are the base revision a change is applied
-against, the cursor that records what a device already received, the merge policy for two edits of
-one document, and the durability of the stream every device reads from.
+A sync engine lets a laptop, a phone and a web tab edit the same documents, including offline, and
+still converge. Whether a user loses work depends on the base revision a change is applied against,
+the cursor that records what a device already received, the merge policy for two edits of one
+document, and the durability of the stream every device reads from.
 
 ## The real system
 
 Dropbox's HTTP API shows the shape a pull side settles into: \`files/list_folder\` returns a page of
-entries plus an opaque \`cursor\` and a \`has_more\` flag, and \`files/list_folder/continue\` takes
-that cursor and resumes exactly where the previous page stopped, so a client that was away for a
-month pages through what it missed instead of relisting everything. The push side of a sync layer
-is optimistic in the same spirit: a client sends its base revision plus the changes it made, and the
-server accepts those changes only if the base is a revision it issued. A stale base is normal
-traffic, not an error, and the answer is a per-document conflict or a merge rather than a silent
-overwrite. Each device carries a cursor that the server advances atomically with the batch it
-represents, so a crash cannot leave a device that will never be sent its own lost changes, and a
-server watermark that only moves forward lets a device tell "there is nothing new" from "you
-stopped mid-stream". Two edits of one document are merged three-way (base, local, remote) over a
-bounded gRPC call with a deadline, and a merge that cannot be performed is a conflict that retains
-both revisions. Every applied change publishes a \`sync.change\` event keyed by document id, after
-the apply has committed, with an outbox row when the broker rejects the produce.
+entries plus an opaque \`cursor\` and a \`has_more\` flag, and \`files/list_folder/continue\` resumes
+from that cursor, so a client that was away for a month pages through what it missed instead of
+relisting everything. The push side is optimistic in the same spirit: the server accepts changes
+only against a base revision it issued, and a stale base is a per-document conflict, not an
+overwrite.
 
 ## What you build here
 
 One service, **syncd**, with five pieces:
 
 1. \`POST /v1/sync/push\`: a device id, a base revision the server issued, and a bounded change list
-   where every change names its document and a content hash (400 on a malformed hash, 413 when the
-   list exceeds its cap). A stale base revision yields per-document conflicts, not blind applies.
-2. A **Redis** cursor store: one cursor per device that never expires and advances only after the
-   batch it represents is applied, plus a server watermark that is monotonic under concurrent
-   advances.
-3. A **gRPC** three-way merge client: a 2-second deadline, at most two attempts, retries only on
-   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, a rejection that is terminal, and a failure that marks the
-   document conflicted with both revisions retained.
-4. A **Kafka** change stream: one \`sync.change\` event per applied or conflicted document, keyed by
-   document id, carrying the revision and the content hash, published only after the apply commits,
-   with an outbox row when the produce is rejected.
-5. \`GET /v1/sync/pull\`: changes after the device's cursor, capped at 1000 entries, cursor-based
-   rather than offset-based, answering with a watermark that covers exactly the entries returned so
-   a device that hits the cap resumes instead of skipping.
+   with a content hash per change (400 on a malformed hash, 413 over the cap). A stale base yields
+   per-document conflicts, not blind applies.
+2. A **Redis** cursor store: one cursor per device that never expires and advances only after its
+   batch is applied, plus a server watermark that is monotonic under concurrent advances.
+3. A **gRPC** three-way merge client: a 2-second deadline, at most two attempts on
+   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, terminal rejections, and a failure that marks the document
+   conflicted with both revisions retained.
+4. A **Kafka** \`sync.change\` event per applied or conflicted document, keyed by document id, with
+   revision and content hash, published after the apply commits, with an outbox on rejection.
+5. \`GET /v1/sync/pull\`: changes after the device's cursor, capped at 1000 entries, with a watermark
+   covering exactly the entries returned so a device that hits the cap resumes instead of skipping.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws. It compiles, it syncs the demo document,
-and it looks right. Your job in every step is the job you will have on a real sync feature: debug
-the starter against the failure modes a returning laptop produces, fix it, optimize what is
-wasteful, and prove the fix with checks that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, syncs the demo document and looks right.
+Debug it against the failure modes a returning laptop produces, fix it, and prove the fix with checks
+that fail on the starter.
 
 ## Left out on purpose
 
-File blob storage, end-to-end encryption, sharing and permission models, per-field document
-schemas, CRDT operation logs, mobile battery-aware scheduling, and the conflict-resolution UI. The
-five pieces above are the ones that decide whether a user's edits survive a weekend offline.`,
+Blob storage, end-to-end encryption, sharing and permissions, CRDT operation logs, battery-aware
+scheduling, and the conflict-resolution UI.`,
   diagram: {
     nodes: [
       {id: 'device', kind: 'client', label: 'Device', sub: 'push · pull', x: 8, y: 50},

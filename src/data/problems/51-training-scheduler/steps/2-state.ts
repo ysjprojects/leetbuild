@@ -8,43 +8,28 @@ export const trainingStateStep: Step = {
   focus: ['scheduler', 'redis', 'worker'],
   task: `## Task
 
-**Starting point.** The starter is working code for the queue half of
-\`trainsched\`: a run goes in with \`ZADD <priority>\`, comes out with \`ZPOPMIN\`, and a boost writes a
-key of its own. It serves the demo — one run, one band, one worker — and it hides the two flaws this
-step is about: a start that never happened loses the run, and a priority boost leaves the run in two
-places at once. Debug it like the person who owns the fleet, fix it, and prove the fix.
+**Starting point.** The starter is the queue half of \`trainsched\`: \`enqueue\` does
+\`ZADD training:queue <priority>\`, \`boost\` writes \`SET training:queue:{band}:{run_id}\`,
+\`start\` does \`ZPOPMIN\` and calls the run started, and \`reap_expired\` returns 0. It serves the
+demo (one run, one band, one worker) and hides five flaws.
 
-Implement the Redis side of the scheduler: the queue a run waits in and the lease the scheduler holds
-while a worker starts it.
+**Failure mode the checks target.** A worker that dies during startup makes a queued run vanish
+with no error, because the pop happened before the process started. A boosted run is started once
+per position it occupies, because the boost lives in a key the scheduler does not poll while the
+sorted set keeps the old member. Inside a band every run ties on the same score.
 
-- **One position per run, derived from the band and the age.** The queue is the sorted set
-  \`training:queue\` and a run's score is \`band * EPOCH_MS + enqueued_at_ms\`, with \`band\`,
-  \`priority\`, \`enqueued_at_ms\` and \`state\` kept in the hash \`training:run:{run_id}\`. The starter
-  scores the raw priority with no age term, so every run in a band ties on the same score and a run
-  submitted a second ago can sort ahead of one that has been waiting an hour.
-- **A move is one member's score, never a second key.** \`boost(run_id, band)\` must move the run
-  atomically: a Lua \`EVAL\` (a registered script, or an equivalent atomic \`ZADD\` that replaces the
-  same member's score) that rewrites the run's score inside \`training:queue\` and the \`band\` field of
-  its hash together. The starter writes \`SET training:queue:{band}:{run_id}\`, so the sorted set the
-  scheduler actually polls keeps the old position and the boost lives in a key nobody reads.
-- **Starting a run is a lease, not a pop.** \`claim_start(run_id, worker)\` claims the run with
-  \`SET training:lease:{run_id} <worker> NX EX LEASE_TTL_S\` (\`15 s\`) and records the deadline in
-  the \`training:leases\` sorted set, then drops the run from \`training:queue\` — all before the
-  worker is asked to start anything. A claim that returns \`0\` means another scheduler owns the
-  start: leave the run alone and take the next one. The TTL is short enough that a crashed start is
-  retried inside a reconcile window and long enough for the worker's \`StartRun\` to land.
-- **A dead start returns the run, with its band intact.** \`reap_expired(now_ms)\` reads the expired
-  deadlines with \`ZRANGEBYSCORE training:leases 0 <now_ms>\`, reads each run's band back with
-  \`HGET training:run:{run_id} band\`, scores the run into \`training:queue\` again at
-  \`band * EPOCH_MS + enqueued_at_ms\`, and sets its state back to \`queued\`. The band comes from the
-  run's own record, never from a default: a boosted run must not re-enter as the lowest band.
-
-**Failure mode the checks target.** The pop that means "started" is the quiet one: the demo's worker
-always comes up, so nobody notices that the run left the queue before it left the machine — a crash
-between the pop and the process start makes a queued run vanish with no error at all, and it is gone
-for good. The duplicate position is the one that costs a second GPU: a boost writes a fresh key, the
-sorted set still holds the old member, and the run is started once per position it occupies. Both
-flaws are invisible to a single-run demo, and both are checked below.`,
+- One position per run in the sorted set \`training:queue\`, scored \`band * EPOCH_MS + enqueued_at_ms\`
+  (\`position_score\`); \`band\`, \`priority\`, \`enqueued_at_ms\` and \`state\` live in the hash
+  \`training:run:{run_id}\`.
+- A move is one member's score: \`boost(run_id, band)\` runs one Lua \`EVAL\` (\`MOVE_SCRIPT\`) that
+  \`ZSCORE\`s, \`ZADD\`s the same member and updates the hash's \`band\`. No plain \`SET\` on a
+  \`training:queue…\` key.
+- A start is a lease: \`claim_start(run_id, worker)\` does
+  \`SET training:lease:{run_id} <worker> NX EX LEASE_TTL_S\` (\`15 s\`), \`ZADD\`s the deadline into
+  \`training:leases\`, then drops the run from \`training:queue\`. A claim that returns \`0\` means
+  another scheduler owns the start.
+- \`reap_expired(now_ms)\` (\`REAP_SCRIPT\`) reads \`ZRANGEBYSCORE training:leases 0 <now_ms>\`,
+  \`HGET\`s each run's \`band\`, re-scores it into \`training:queue\` and sets it back to \`queued\`.`,
   sequence: {
     participants: ['Scheduler', 'Redis', 'Training worker', 'Queue reaper'],
     messages: [
@@ -176,10 +161,7 @@ class TrainingQueue:
         self.redis = redis
 
     def enqueue(self, run_id: str, band: int, priority: int) -> None:
-        # TODO: this starter scores the queue with the raw priority and no age term, so every run in
-        # a band ties; a boost writes a per-band key with SET instead of moving the run inside one
-        # sorted set, so the run keeps its old position as well; and a start pops the run and calls
-        # it started with no lease, so a worker that dies during startup orphans it.
+        # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         self.redis.zadd(QUEUE_KEY, {run_id: priority})
 
     def boost(self, run_id: str, band: int) -> None:
@@ -195,7 +177,7 @@ class TrainingQueue:
         return run_id
 
     def reap_expired(self, now_ms: int) -> int:
-        # TODO: nothing ever returns an interrupted start to the queue.
+        # TODO: part of the five flaws: nothing returns an interrupted start to the queue.
         return 0
 `,
       solution: `import logging
@@ -347,10 +329,7 @@ function queueKey(band: number, runId: string): string {
 }
 
 export async function enqueue(runId: string, band: number, priority: number): Promise<void> {
-  // TODO: this starter scores the queue with the raw priority and no age term, so every run in a band
-  // ties; a boost writes a per-band key with set instead of moving the run inside one sorted set, so
-  // the run keeps its old position as well; and a start pops the run and calls it started with no
-  // lease, so a worker that dies during startup orphans it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await r.zadd(QUEUE_KEY, priority, runId);
 }
 
@@ -366,7 +345,7 @@ export async function start(worker: string): Promise<string | null> {
 }
 
 export async function reapExpired(_nowMs: number): Promise<number> {
-  // TODO: nothing ever returns an interrupted start to the queue.
+  // TODO: part of the five flaws: nothing returns an interrupted start to the queue.
   return 0;
 }
 `,
@@ -501,10 +480,7 @@ func queueKey(band int, runID string) string {
 }
 
 func enqueue(ctx context.Context, rdb *redis.Client, runID string, band, priority int) error {
-	// TODO: this starter scores the queue with the raw priority and no age term, so every run in a
-	// band ties; a boost writes a per-band key with Set instead of moving the run inside one sorted
-	// set, so the run keeps its old position as well; and a start pops the run and calls it started
-	// with no lease, so a worker that dies during startup orphans it.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	return rdb.ZAdd(ctx, queueName, redis.Z{Score: float64(priority), Member: runID}).Err()
 }
 
@@ -522,7 +498,7 @@ func start(ctx context.Context, rdb *redis.Client, worker string) (string, error
 }
 
 func reapExpired(ctx context.Context, rdb *redis.Client, nowMS int64) (int64, error) {
-	// TODO: nothing ever returns an interrupted start to the queue.
+	// TODO: part of the five flaws: nothing returns an interrupted start to the queue.
 	return 0, nil
 }
 `,
@@ -657,10 +633,7 @@ object TrainingQueue {
   def queueKey(band: Int, runId: String): String = s"training:queue:$band:$runId"
 
   def enqueue(runId: String, band: Int, priority: Int): Unit = {
-    // TODO: this starter scores the queue with the raw priority and no age term, so every run in a
-    // band ties; a boost writes a per-band key with set instead of moving the run inside one sorted
-    // set, so the run keeps its old position as well; and a start pops the run and calls it started
-    // with no lease, so a worker that dies during startup orphans it.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     redis.zadd(QueueKey, priority.toDouble, runId)
   }
 
@@ -674,7 +647,7 @@ object TrainingQueue {
   }
 
   def reapExpired(nowMs: Long): Long = {
-    // TODO: nothing ever returns an interrupted start to the queue.
+    // TODO: part of the five flaws: nothing returns an interrupted start to the queue.
     0L
   }
 }
@@ -804,10 +777,7 @@ std::string queueKey(int band, const std::string& runId) {
 }
 
 void enqueue(sw::redis::Redis& redis, const std::string& runId, int band, int priority) {
-  // TODO: this starter scores the queue with the raw priority and no age term, so every run in a band
-  // ties; a boost writes a per-band key with set instead of moving the run inside one sorted set, so
-  // the run keeps its old position as well; and a start pops the run and calls it started with no
-  // lease, so a worker that dies during startup orphans it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   redis.zadd(kQueueKey, runId, priority);
 }
 
@@ -822,7 +792,7 @@ std::optional<std::string> start(sw::redis::Redis& redis, const std::string& wor
 }
 
 long long reapExpired(sw::redis::Redis& redis, long long nowMs) {
-  // TODO: nothing ever returns an interrupted start to the queue.
+  // TODO: part of the five flaws: nothing returns an interrupted start to the queue.
   return 0;
 }
 `,
@@ -929,19 +899,9 @@ long long reapExpired(sw::redis::Redis& redis, long long nowMs) {
     },
   },
   hints: [
-    'The score has to answer "who goes next" in one number: `band * EPOCH_MS + enqueued_at_ms`. Multiply the band by a fixed epoch so it dominates and the millisecond only breaks ties inside it, and keep `band` in the run hash too — the reaper and `GET /v1/training/runs/{id}` both need the band without re-deriving it from a priority that may since have changed.',
-    'A boost is a move, not an insert. `ZADD training:queue <new_score> <run_id>` on the same member replaces its score in place; put the `ZSCORE` read, that `ZADD` and the hash update in one script so the position in the sorted set and the `band` field can never disagree.',
-    'Claim before you call the worker, and reap on a timer: `SET training:lease:{run_id} <worker> NX EX 15` plus `ZADD training:leases <deadline> <run_id>` is the claim; `ZRANGEBYSCORE training:leases 0 <now>` finds the leases nobody renewed, and each of those runs goes back to `training:queue` at `band * EPOCH_MS + enqueued_at_ms` with the band read from its own hash.',
+    'After a worker node reboots, a run that was queued is in no queue and no worker, and a run that was boosted to high priority was started twice on two GPUs.',
+    '`start` pops with `ZPOPMIN` before any process exists, so a crash loses the member; `boost` writes a per-band key the scheduler does not poll; `enqueue` scores the raw priority with no age term.',
+    'Score `band * EPOCH_MS + enqueued_at_ms`; move with one `EVAL` (`ZSCORE`, `ZADD`, `HSET band`); claim with `SET lease NX EX LEASE_TTL_S` plus `ZADD training:leases`; reap with `ZRANGEBYSCORE` and `HGET band`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a queue that is also a lock. The starter looks
-right because the demo enqueues one run and starts it: nothing crashes, and no second scheduler
-exists to race the first. What it hides is that the pop is not a claim — the run leaves the queue
-before it leaves the machine, so a worker that dies during startup loses it silently and
-unrecoverably — and that a position written as a key per band is not a position in the sorted set the
-scheduler polls, so a boost doubles the run instead of moving it. The fix is one member per run in
-one sorted set with a score that carries both the band and the age, a scripted move so the score and
-the hash cannot disagree, and a lease whose deadline makes a stalled start recoverable at the band
-the run was admitted with rather than at a default. Real schedulers add a heartbeat that renews the
-lease while the worker is still starting, an in-flight cap per worker, and a metric for runs that came
-back from the reaper — that last number is the earliest honest signal that the fleet is unhealthy.`,
+  debrief: `The queue here is also a lock, which is why every change has the shape it has. One member per run in one sorted set, scored by band then age, means "who goes next" is one comparison and a boost is a score rewrite rather than a second position. The move is a script so the sorted set and the run hash cannot disagree. A start is a lease with a deadline rather than a pop, so a worker that dies during startup leaves behind something a reaper can find, and the reaper restores the run at the band it was admitted with rather than at a default. Production schedulers renew the lease with a heartbeat while the worker is still starting, cap in-flight starts per worker, and watch the count of runs that came back from the reaper as an early signal that the fleet is unhealthy.`,
 };

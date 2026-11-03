@@ -26,24 +26,19 @@ export const costMeterProblem: Problem = {
 
 An AI cost meter turns tokens into money: it records what each tenant spent, prices it against the
 model's published rates, and hands the number to the engineer deciding whether the next request fits
-the budget and to finance reconciling the invoice months later. The visible part is a number on a
-spend dashboard. The parts that decide whether anyone can trust it are the durability of the usage
-write, the atomicity of the counter, the freshness of the rates, the ordering of the billing events,
-and a read that agrees with the limit that was actually enforced.
+the budget and to finance reconciling the invoice months later. What decides whether anyone can
+trust that number is the durability of the usage write, the atomicity of the counter, the freshness
+of the rates, the ordering of the billing events, and a read that agrees with the enforced limit.
 
 ## The real system
 
 Stripe's Billing Meters take usage as meter events: each event names a customer and a value, and an
 optional \`identifier\` makes it idempotent, with uniqueness enforced over a rolling window of at
 least 24 hours so an accidental retry does not count twice. Every usage-based billing stack solves
-the same list. A usage report is written durably before the response leaves, because a process that
-crashes between the two has accepted tokens it will not charge for. Spend accumulates in one
-window-keyed counter per tenant, updated atomically with the expiry of that window, because the
-meter and the budget limiter must read the same number. Rates come from a pricing service under a
-deadline, with a cached, versioned rate table as the fallback, and a pricing failure is not cached as
-a rate. Usage events go out keyed by tenant so one ledger stays ordered, carry the idempotency key so
-billing can dedupe a retry, and survive a broker outage through an outbox. The spend read
-reconstructs the current window from those same counters, scoped to the authenticated tenant.
+the same list: a usage write durable before the response leaves, spend in one window-keyed counter
+per tenant that the budget limiter reads too, rates from a pricing service under a deadline with a
+versioned table as the fallback, usage events keyed by tenant with the idempotency key inside and an
+outbox behind the broker, and a spend read built from the same counters the limiter enforces.
 
 ## What you build here
 

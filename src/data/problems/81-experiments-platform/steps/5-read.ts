@@ -16,24 +16,19 @@ below 0.05. It serves the demo and hides 4 flaws.
 sample size mints one, a split that drifted from the frozen design stays hidden, and a lift is
 printed as one number so a two-point effect and noise look identical.
 
-Implement the report for a signed-in tenant:
-
-- **Totals from the analysis state.** Per-variant \`exposures\` (the sample) and conversions are
-  counted per \`(experiment, variant)\` in the analysis state, the Redis counters the exposure
-  consumer writes before it commits its offset, not from a total cached beside them.
-- **Minimum sample first.** An experiment below its pinned \`min_sample\` answers **200** with
+- **Totals from the analysis state.** Per-variant \`exposures\` and conversions come from the Redis
+  counters the exposure consumer writes, not from a total cached beside them.
+- **Minimum sample first.** Below the pinned \`min_sample\`, answer **200** with
   \`{"winner": null, "status": "inconclusive", "reason": "minimum sample not reached", ...}\`,
-  regardless of the p-value: a peek is refused, not an error.
-- **SRM is a blocking caveat.** Compare the observed variant shares against the frozen split; a
-  deviation above **2 %** (\`abs(observed - expected) / expected > 0.02\`) is reported as
+  regardless of the p-value.
+- **SRM is a blocking caveat.** A deviation above **2 %** from the frozen split
+  (\`abs(observed - expected) / expected > 0.02\`) is reported as
   \`{"caveat": {"kind": "srm", "blocking": true, "observed": ..., "expected": ...}}\` and prevents
-  a winner call even when \`p < 0.05\`.
-- **Every lift carries its interval.** A lift is reported as
-  \`{"lift": 0.12, "ci_low": 0.03, "ci_high": 0.21}\`, a 95 % interval computed from the two
-  proportions, on every branch including a significant result.
-- **A winner only when earned.** A winner is named only when the sample is reached, no blocking
-  caveat is present, and \`p_value < 0.05\`; otherwise \`winner: null\` with status
-  \`inconclusive\` or \`blocked\`.
+  a winner even when \`p < 0.05\`.
+- **Every lift carries its interval**: \`{"lift": 0.12, "ci_low": 0.03, "ci_high": 0.21}\`, a 95 %
+  interval from the two proportions, on every branch.
+- A winner is named only when the sample is reached, no blocking caveat is present, and
+  \`p_value < 0.05\`; otherwise \`winner: null\` with status \`inconclusive\` or \`blocked\`.
 - Missing \`X-Tenant-Id\` is **401**; an unknown experiment (or one of another tenant) is **404**.
 - The sample guard and the SRM check run **before** the p-value comparison.`,
   sequence: {
@@ -318,7 +313,7 @@ def report(
 `,
     },
     typescript: {
-      starter: `/** Experiment report: flawed code that calls a winner straight from the p-value. */
+      starter: `/** Experiment report. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

@@ -13,12 +13,9 @@ payload from a \`SearchEvent\`, keys the record by a hash of the query, and prod
 default-configured producer; the consumer polls the topic, commits the offset, and increments a
 per-tenant Redis counter. It compiles, the analytics demo shows data, and it hides five flaws.
 
-**Failure mode the checks target.** Search telemetry is the classic place where convenience beats
-contracts: the raw query is the most useful field for relevance work and the most dangerous one to
-retain; the query hash is the natural key if you are thinking about the query instead of the tenant,
-and it destroys per-tenant order; and a commit that happens before the counter update looks faster
-and is exactly-once only until the first crash. The fix keeps the tenant as the partition key, ships
-the query as a hash, configures the producer instead of hoping, and processes before it commits.
+**Failure mode the checks target.** The raw query is the most dangerous field to retain; keying by
+query hash destroys per-tenant order; committing before the counter update loses that update on the
+first crash.
 
 - The message **key is the tenant** (\`key=tenant\` / \`key: tenant\` / \`Key: []byte(tenant)\` /
   \`ProducerRecord("search.event", tenant, …)\`), so one tenant's events share a partition and keep

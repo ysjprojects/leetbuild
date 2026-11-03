@@ -108,7 +108,7 @@ that serves any team's jobs leaks every tenant's runs to anyone who can guess an
   ],
   code: {
     python: {
-      starter: `"""GET /v1/finetune/jobs/{job_id}: a job view that trusts the exit code."""
+      starter: `"""GET /v1/finetune/jobs/{job_id}."""
 import logging
 
 from fastapi import FastAPI, Header
@@ -175,7 +175,7 @@ async def read_job(job_id: str, x_team_id: str = Header(...)) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/finetune/jobs/:jobId: a job view that trusts the exit code. */
+      starter: `/** GET /v1/finetune/jobs/:jobId. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -218,7 +218,7 @@ app.get('/v1/finetune/jobs/:jobId', async (request, reply) => {
 `,
     },
     go: {
-      starter: `// Package read serves GET /v1/finetune/jobs/{id}: a job view that trusts the exit code.
+      starter: `// Package read serves GET /v1/finetune/jobs/{id}.
 package read
 
 import (
@@ -330,7 +330,7 @@ object Read {
 `,
     },
     cpp: {
-      starter: `// GET /v1/finetune/jobs/{id}: a job view that trusts the exit code.
+      starter: `// GET /v1/finetune/jobs/{id}.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 

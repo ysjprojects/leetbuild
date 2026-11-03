@@ -219,7 +219,7 @@ async def completions_cached(request: Request) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/completions/cached: flawed code whose key is the prompt digest alone. */
+      starter: `/** POST /v1/completions/cached. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';

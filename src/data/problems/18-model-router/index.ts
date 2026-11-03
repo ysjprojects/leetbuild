@@ -24,25 +24,16 @@ export const modelRouterProblem: Problem = {
   minutes: 70,
   statement: `# Model Router
 
-A model router is the piece of an AI platform that decides which model serves each request, how much
-each tenant may spend, how provider failures are survived, and how a new routing policy reaches
-production. The visible part is a model name in a response; the parts that decide whether the
-platform is safe are the validation funnel, the atomic budget, the failure policy, and the gate in
-front of every traffic increase.
+A model router decides which model serves each request, how much each tenant may spend, how provider
+failures are survived, and how a new routing policy reaches production.
 
 ## The real system
 
 LiteLLM's proxy is an open source router of this shape: \`model_list\` names the deployments behind
 one model name, \`router_settings.fallbacks\` maps a model group to the groups tried when it fails,
-and \`num_retries\` with \`request_timeout\` bound each call before the fallback is reached. The same
-jobs show up in every production router: estimate cost before spending it and reserve budget
-atomically so two concurrent requests cannot both pass the same check; select models from a
-policy, not from whatever string a caller sends; call providers under a deadline, retry only the
-statuses that are worth retrying, fail over to a smaller model, and stop hammering a provider that
-is already down; emit one feedback event per request, keyed by tenant so quality signals stay
-ordered, without copying prompt text into a topic that is retained and replicated; and gate every
-traffic increase on eval scores, with rollbacks that pin each tenant's version so no conversation
-flips models mid-session.
+and \`num_retries\` with \`request_timeout\` bound each call before the fallback is reached. This
+course adds what sits around that: an atomic budget, policy-chosen models, prompt-free feedback
+events, and an eval gate in front of every traffic increase.
 
 ## What you build here
 
@@ -67,16 +58,13 @@ One service, **routerd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path,
-and it looks right. Your job in every step is the job you will have on a real feature: debug it
-against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that
-fail on the starter and pass on your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Provider account management, prompt tokenizers per model, streaming to the browser, multi-region
-failover, cost accounting and invoicing, policy authoring UIs, and eval set management. The five
-pieces above are the ones that decide whether the router is correct, isolated and shippable.`,
+Provider accounts, per-model tokenizers, browser streaming, multi-region failover, invoicing, policy
+authoring UIs and eval set management.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'route · feedback', x: 8, y: 50},

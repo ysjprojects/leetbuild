@@ -32,12 +32,9 @@ performs and the link it signs.
 
 Amazon S3 is the reference shape. Its multipart upload splits an object into parts that are retried
 individually and assembled by a final \`CompleteMultipartUpload\`, and uploads can carry a SHA-256
-checksum so the store can verify each part. Reads are granted with presigned URLs: a bearer link
-signed with the caller's credentials that carries its own expiry, up to seven days from the SDK and
-between one minute and twelve hours from the console, and a bucket policy can reject any signature
-older than a chosen age with the \`s3:signatureAge\` condition. The service you debug here is the
-layer a platform builds on top of such a store: the quota it reserves, the bytes it counts, the events
-it publishes and the links it signs for its own tenants.
+checksum per part. Reads are granted with presigned URLs that carry their own expiry, and a bucket
+policy can reject signatures older than a chosen age with the \`s3:signatureAge\` condition. This
+service is the layer a platform builds on top of such a store.
 
 ## What you build here
 
@@ -60,16 +57,13 @@ One service, **stored**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course compiles, serves the happy path, and looks right. Your job in every step
-is the job you will have on a real feature: debug it against the failure modes, name the subtle one,
-fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on
-your version.
+Every starter compiles, serves the happy path and looks right. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Billing and invoicing, cross-region replication, client-side encryption, lifecycle and retention rules,
-thumbnail generation, virus scanning pipelines, and the CDN's own configuration. The five pieces above
-are the ones that decide whether the storage service is correct, isolated and shippable.`,
+Billing, cross-region replication, client-side encryption, retention rules, thumbnails, virus
+scanning, and CDN configuration.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'upload · download', x: 6, y: 50},

@@ -280,7 +280,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** ticket.event: flawed code that keys by the agent and acks before the commit. */
+      starter: `/** ticket.event. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -421,7 +421,7 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// ticket.event: flawed code that keys by the agent and acks before the commit.
+// ticket.event.
 var ticketWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "ticket.event"}
 
 // TicketStore is the ticket table; CommitTicket writes the row and commits the transaction.
@@ -612,7 +612,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-// ticket.event: flawed code that keys by the agent and acks before the commit.
+// ticket.event.
 object Events {
   private val producer = new KafkaProducer[String, String](new Properties())
 
@@ -746,7 +746,7 @@ object Events {
 
 using json = nlohmann::json;
 
-// ticket.event: flawed code that keys by the agent and acks before the commit.
+// ticket.event.
 struct Ticket {
   std::string id;
 };
@@ -902,7 +902,7 @@ void consume() {
 `,
     },
   },
-  debrief: `The fix treats the event stream as a contract rather than a copy of the request. The key chooses the partition, so keying by the ticket id keeps one ticket's open → pending → resolved sequence in one partition and in order. The payload is projected onto ids, role and transition because the topic is replicated and retained for days, and "the widget fetches nothing" optimises a read a consumer can answer from ids. The commit comes before the produce because a produce is durable and immediate while a database commit can still roll back; a failed commit reaches the caller instead of the topic. Idempotence with \`acks=all\` is the producer-side half: without it a retry after a timeout duplicates a timeline entry a consumer counts.
+  debrief: `The fix treats the event stream as a contract rather than a copy of the request. Keying by the ticket id keeps one ticket's open → pending → resolved sequence in one partition and in order. The payload is projected onto ids, role and transition because the topic is replicated and retained for days. The commit comes before the produce because a produce is immediate while a database commit can still roll back. Idempotence with \`acks=all\` keeps a retry after a timeout from duplicating a timeline entry.
 
-Production platforms add a schema registry so producers and consumers agree on the payload, an outbox row for when the broker is unreachable, and consumer-side dedupe on the event id.`,
+Production platforms add a schema registry for the payload and an outbox row for when the broker is unreachable.`,
 };

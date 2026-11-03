@@ -35,12 +35,9 @@ The tus resumable upload protocol makes resume a two-step dance: the client send
 upload URL and the server answers with an \`Upload-Offset\` header saying how many bytes it has, and
 the client continues with a \`PATCH\` from that offset. Its creation extension declares
 \`Upload-Length\` up front so the server can bound the session before any bytes arrive. Part-based
-services such as S3 multipart upload follow the same shape with numbered parts instead of a byte
-offset: initiate with a declared size, register each part with the checksum the store computed, and
-list the parts on resume. The service in this course does the part-based version: one atomic
-manifest write per part, a checksum compared against the store's echo before a part is called
-stored, completion published only after the object commits, and a status read that returns the
-missing and corrupt part numbers scoped to the owning tenant.
+services such as S3 multipart upload follow the same shape with numbered parts: initiate with a
+declared size, register each part with the checksum the store computed, and list the parts on
+resume. This course builds the part-based version.
 
 ## What you build here
 
@@ -62,17 +59,13 @@ One service, **uploadd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
-starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path and looks right. Debug
+it against the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Signed per-part upload URLs, S3-style multipart ETag reconciliation, cross-region object replication,
-bandwidth throttling, per-tenant storage billing, client-side chunking strategy, and the finalize-time
-assembly of the object. The five pieces above are the ones that decide whether the upload is correct,
-resumable and shippable.`,
+Signed per-part URLs, ETag reconciliation, cross-region replication, bandwidth throttling, storage
+billing, client-side chunking strategy, and final object assembly.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Uploader', sub: 'parts · resume', x: 8, y: 50},

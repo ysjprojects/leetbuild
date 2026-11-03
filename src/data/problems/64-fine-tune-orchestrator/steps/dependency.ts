@@ -108,7 +108,7 @@ is broken becomes an infinite restart loop that burns budget without surfacing a
   ],
   code: {
     python: {
-      starter: `"""gRPC client that drives the trainer: flawed code that restarts without a checkpoint."""
+      starter: `"""gRPC client that drives the trainer."""
 import logging
 
 import grpc
@@ -197,7 +197,7 @@ class TrainerClient:
 `,
     },
     typescript: {
-      starter: `/** gRPC client that drives the trainer: flawed code that restarts without a checkpoint. */
+      starter: `/** gRPC client that drives the trainer. */
 import * as grpc from '@grpc/grpc-js';
 
 class Trainer {
@@ -271,7 +271,7 @@ class Trainer {
 `,
     },
     go: {
-      starter: `// Package client drives the trainer over gRPC: flawed code that restarts without a checkpoint.
+      starter: `// Package client drives the trainer over gRPC.
 package client
 
 import (
@@ -430,7 +430,7 @@ object Client {
 `,
     },
     cpp: {
-      starter: `// gRPC client that drives the trainer: flawed code that restarts without a checkpoint.
+      starter: `// gRPC client that drives the trainer.
 #include <grpcpp/grpcpp.h>
 
 #include "trainer.grpc.pb.h"

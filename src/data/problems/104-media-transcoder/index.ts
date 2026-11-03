@@ -23,11 +23,8 @@ export const mediaTranscoderProblem: Problem = {
   minutes: 70,
   statement: `# Media Transcoder
 
-A media transcoder is the piece of a video platform that turns one uploaded source file into the
-renditions a player can stream. The visible part is a progress bar; the parts that decide whether
-the output is correct are the dedupe key, the segment claim, the failure classification and the
-manifest. A transcoder that reports "100%" over a file with a hole in it is worse than one that
-reports nothing at all.
+A media transcoder turns one uploaded source file into the renditions a player can stream. A
+transcoder that reports "100%" over a file with a hole in it is worse than one that reports nothing.
 
 ## The real system
 
@@ -35,14 +32,9 @@ AWS Elemental MediaConvert exposes this split directly: a job's \`AccelerationSe
 \`AccelerationMode\`, and with \`ENABLED\` the service fails a job whose input or settings cannot be
 split for parallel encoding, while \`PREFERRED\` falls back to a single-process encode. That is the
 same decision this course makes at submit time: reject what the pipeline cannot do before a worker
-has spent a minute on it. Production transcoders split the source into fixed-length segments, hand
-each to a worker, and track completion per \`(job, segment index)\` so a redelivered message is
-skipped and a crashed worker's segment is retaken after a lease. They dedupe by content hash and
-preset, resolve the encoder command from a server-side preset definition rather than a caller
-argument list, call workers with a deadline scaled to the segment's length, and separate corrupt
-input (terminal, with the offending index) from worker loss (retryable, that segment only). They
-publish events keyed by job id with segment ranges, announce completion only after the manifest is
-final, and answer reads from the manifest, not from a guessed duration.
+has spent a minute on it. Production transcoders split the source into fixed-length segments and
+track completion per \`(job, segment index)\`, so a redelivered message is skipped and a crashed
+worker's segment is retaken after a lease.
 
 ## What you build here
 
@@ -65,16 +57,13 @@ One service, **transcoderd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course serves the happy path on a short file and looks right. Your job in
-every step is the job you will have on a real media pipeline: debug it against the failure modes,
-fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass
-on your version.
+Every starter serves the happy path on a short file. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Per-codec rate control tuning, GPU scheduling, DRM packaging, multi-region output replication,
-player-side ABR ladders, watermarking and thumbnail extraction. The five pieces above are the ones
-that decide whether a transcode is correct and resumable.`,
+Per-codec rate control, GPU scheduling, DRM packaging, multi-region output replication, and
+thumbnail extraction.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'submit · poll', x: 8, y: 50},

@@ -207,7 +207,7 @@ def flush_windows(windows: list[dict]) -> list[dict]:
 `,
     },
     typescript: {
-      starter: `/** metrics.rolled: flawed code that keys by shard and publishes before the shard confirms. */
+      starter: `/** metrics.rolled. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'metrics-pipeline', brokers: ['kafka:9092']});

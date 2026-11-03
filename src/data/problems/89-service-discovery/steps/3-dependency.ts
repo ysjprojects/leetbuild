@@ -8,44 +8,28 @@ export const dependencyStep: Step = {
   focus: ['discovery', 'instances', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads the registry and
-returns what it finds. It hides the flaw that turns a crash into minutes of errors — registered is
-treated as healthy, so the routing set is a list of what *was* true when the last heartbeat arrived.
+**Starting point.** The starter serves \`GET /v1/routable/{service}\`, the read every router makes
+before it picks a backend: it calls \`registry.candidates(service)\` and returns the list as
+\`instances\`. Its only health signal is \`note_complaint\`, a log line written after a client
+reports a failed request. It serves the demo, which never kills a process, and hides five flaws.
 
-Implement \`routable(service)\` — the function every router calls before it picks a backend — and the
-internal route \`GET /v1/routable/{service}\` that exposes it as
-\`{"instances": […], "excluded": [{"instance_id", "address", "reason"}]}\`.
+**Failure mode the checks target.** A backend that crashed a second ago stays in the routing set
+for a full heartbeat interval while users see 503s from it. Nothing probes an instance before
+returning it, so a hung process holds a request for as long as the client waits. Each router would
+have to form its own opinion, so two routers can disagree about one backend. A failing instance is
+either routed to or silently dropped, with no recorded reason, and a recovered one needs an operator
+to come back.
 
-- Candidates come from the registry (\`sd:{service}:*\`). Each candidate must be **probed over gRPC
-  before it is returned**, never after a caller complains: the probe is the \`Health/Check\` RPC and
-  it carries a **200 ms deadline**. A process that was killed, is blocked, or is draining must fail
-  the probe rather than hold a request for as long as it takes to time out at the client.
-- A candidate that fails its probe is **excluded from the routing set** and stays registered: the
-  registry entry is untouched, and the exclusion is recorded with a reason so the read API can
-  explain it. The starter's alternative — routing to it and discovering the failure when a request
-  fails — puts the error on a user and takes an interval to notice.
-- Probe verdicts are **shared, not per-caller**. Cache the verdict in Redis under
-  \`sd:probe:{service}:{instance_id}\` (\`SERVING\` / \`NOT_SERVING\`) with a **5-second TTL**: ten
-  routers asking for the same service must not each open ten sockets to the same instance, and two
-  callers must never see two different verdicts for the same instance in the same second.
-- The exclusion lives in \`sd:excluded:{service}\` as a hash of \`instance_id → {"reason": …}\`. A
-  passing probe **readmits** the instance: drop the exclusion and write the fresh \`SERVING\`
-  verdict, so recovery needs no operator and no re-registration.
-- Excluded instances appear in \`excluded\` with their address and reason; only \`SERVING\`
-  instances appear in \`instances\`, with \`instance_id\`, \`address\`, \`port\` and
-  \`metadata_version\`.
-
-**Failure mode the checks target.** Registration is an intent; health is an observation. A
-discovery layer that returns registered instances has replaced the question "who can serve this?"
-with "who said they were here recently?", and the difference is exactly one crashed process lasting
-one heartbeat interval — the interval during which a user sees 503s from a backend the platform
-still advertises. The probe cache is the second half of the story: probing per caller multiplies
-the load on a struggling instance, and *not* sharing the verdict means two routers disagree about
-the same backend, so one excludes it while the other keeps sending traffic.
-
-The tests: an instance that fails its probe is absent from \`instances\` and present in
-\`excluded\`; a passing probe readmits it; and two callers reading the same probe state get the
-same verdict.`,
+- Candidates come from the registry (\`sd:{service}:*\`). Each candidate is probed over gRPC before
+  it is returned: the \`Health/Check\` RPC with a **200 ms** deadline (\`PROBE_DEADLINE_MS\`).
+- Probe verdicts are shared: cache \`SERVING\` / \`NOT_SERVING\` in Redis under
+  \`sd:probe:{service}:{instance_id}\` with a 5-second TTL (\`PROBE_TTL_S\`), and read the cache
+  before probing.
+- A candidate that fails its probe is excluded and stays registered: write \`instance_id → {"reason"}\`
+  into the hash \`sd:excluded:{service}\`.
+- A passing probe readmits the instance: \`hdel\` the exclusion and write the fresh \`SERVING\` verdict.
+- Answer \`{"instances": […], "excluded": [{"instance_id", "address", "reason"}]}\`; only \`SERVING\`
+  instances appear in \`instances\`, with \`instance_id\`, \`address\`, \`port\` and \`metadata_version\`.`,
   sequence: {
     participants: ['Router', 'Discovery client', 'Redis', 'Instance'],
     messages: [
@@ -166,9 +150,7 @@ registry = Registry()
 
 @app.get("/v1/routable/{service}")
 def routable(service: str) -> JSONResponse:
-    # TODO: this starter returns instances as soon as they are registered — no gRPC health probe
-    # before routing, no 200 ms deadline and no shared verdict cache — and it only asks an instance
-    # how it feels after a client complains. Fix it.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     instances = registry.candidates(service)
     logger.info("routable service=%s instances=%d", service, len(instances))
     return JSONResponse({"service": service, "instances": instances}, status_code=200)
@@ -279,9 +261,7 @@ interface InstanceRecord {
 }
 
 app.get('/v1/routable/:service', async (request, reply) => {
-  // TODO: this starter returns instances as soon as they are registered — no gRPC health probe
-  // before routing, no 200 ms deadline and no shared verdict cache — and it only asks an instance
-  // how it feels after a client complains. Fix it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const {service} = request.params as {service: string};
   const instances = await registry.candidates(service);
   request.log.info({service, instances: instances.length}, 'routable');
@@ -422,9 +402,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func routable(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter returns instances as soon as they are registered — no gRPC health probe
-	// before routing, no 200 ms deadline and no shared verdict cache — and it only asks an instance
-	// how it feels after a client complains. Fix it.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	service := r.PathValue("service")
 	instances, err := registry.Candidates(r.Context(), service)
 	if err != nil {
@@ -590,9 +568,7 @@ object Client {
   val route: Route =
     path("v1" / "routable" / Segment) { service =>
       get {
-        // TODO: this starter returns instances as soon as they are registered — no gRPC health probe
-        // before routing, no 200 ms deadline and no shared verdict cache — and it only asks an
-        // instance how it feels after a client complains. Fix it.
+        // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         val instances = registry.candidates(service)
         system.log.info(s"routable service=$service instances=\${instances.size}")
         complete(StatusCodes.OK, instances)
@@ -738,9 +714,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/routable/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter returns instances as soon as they are registered — no gRPC health probe
-    // before routing, no 200 ms deadline and no shared verdict cache — and it only asks an instance
-    // how it feels after a client complains. Fix it.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto service = req.matches[1].str();
     const auto candidates = registry.candidates(service);
     json instances = json::array();
@@ -857,9 +831,9 @@ int main() {
     },
   },
   hints: [
-    'Probe inside the loop that builds the answer: for each registered candidate read the cached verdict, probe when the cache is empty, then append to `instances` or to `excluded` with a reason. Returning the registry read directly is the whole bug.',
-    'The deadline is why the probe is a gRPC call and not a TCP connect: `timeout=0.2`, `withDeadlineAfter(200, MILLISECONDS)`, `context.WithTimeout(ctx, 200*time.Millisecond)`, `set_deadline`. A connect that hangs is a failure, not a slow success.',
-    'Write the verdict to Redis with a short TTL and read it back before probing — the registry cannot tell “new” from “dead”, but a shared observation can. Keep the failing instance registered and record *why* it was skipped, so a later probe can readmit it without an operator.',
+    'A checkout pod is OOM-killed and for the next five seconds a third of checkout requests fail, while the discovery dashboard shows every instance green.',
+    '`routable` returns `registry.candidates(service)` as is: a heartbeat says a process was alive at its last beat, not that it can serve now, and `note_complaint` only runs after a user has already failed.',
+    'In the candidate loop read `sd:probe:{service}:{id}`; on a miss call `Health/Check` with `timeout=0.2`, cache the verdict with `ex=PROBE_TTL_S`; `NOT_SERVING` → `hset sd:excluded:{service}` with a reason; `SERVING` → `hdel` it.',
   ],
-  debrief: `The interviewer is testing whether you separate registration from readiness. Registration is a claim made by a process; health is an observation made by the platform, and only the observation is allowed to influence routing. A router that returns registered instances looks correct because the demo never kills a process, and it fails in the one way users feel most: a backend that is in the routing set but cannot serve, for a full heartbeat interval, while the platform reports it as up. The second half of the answer is about where the observation lives. Probing per caller duplicates work and makes two routers disagree about the same instance; caching the verdict in Redis with a short TTL gives every caller the same answer and bounds the probe rate. The exclusion hash is what keeps failure and registration separate: the instance stays in the registry for its recovery probe, and the read API can explain the exclusion instead of silently dropping a backend. Real systems add jittered probe schedules, per-instance circuit breakers, drain states that make an instance fail its probe on purpose, and probe attribution so the traffic to a struggling instance is visible.`,
+  debrief: `Registration is a claim made by a process; health is an observation made by the platform, and only the observation may influence routing. That is why the probe runs inside the loop that builds the answer and carries a deadline: a connect that hangs is a failure, not a slow success. The observation lives in Redis rather than in each router because probing per caller multiplies load on a struggling instance and lets two routers disagree about one backend; a shared verdict with a short TTL gives every caller the same answer and bounds the probe rate. The exclusion hash keeps failure and registration apart, so the instance stays registered for its recovery probe and the read API can explain why it was skipped. Production systems jitter the probe schedule and give an instance a drain state that fails its probe on purpose before a shutdown.`,
 };

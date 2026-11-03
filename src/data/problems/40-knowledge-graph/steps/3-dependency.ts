@@ -8,32 +8,26 @@ export const resolutionClientStep: Step = {
   focus: ['api', 'resolver', 'review'],
   task: `## Task
 
-**Starting point.** The starter is working code for the entity-resolution client.
-It calls the resolver, reads the response, and merges or splits. It compiles, it resolves the demo
-pairs, and it hides three production flaws. Debug it like the platform owner, fix it, and prove the
-fix with the checks below.
+**Starting point.** The starter implements \`resolve_pair(tenant, left, right)\`, the
+entity-resolution client: it calls \`Resolve\` with a 1-second deadline up to \`MAX_ATTEMPTS\`
+times, returns \`REJECTED\` on \`DEADLINE_EXCEEDED\`, hands a resolver rejection to
+\`retry_resolve\`, and merges on any other response. It compiles, resolves the demo pairs and hides
+four flaws.
 
-Implement \`resolve_pair(tenant, left, right)\` over gRPC:
+**Failure mode the checks target.** Every hour the resolver is slow, the graph gains duplicate
+entities, because a timeout is read as "not a match". A pair the resolver explicitly refused is
+retried until the attempts run out and then merged. A 0.6 score merges as if it were a certainty.
+And nothing that cannot be decided now is written anywhere, so an operator has no queue to settle.
 
-- Every attempt carries a **1-second deadline** (\`DEADLINE_S = 1\`). A resolver that misses the
-  deadline is *not* evidence that two entities differ.
-- \`DEADLINE_EXCEEDED\` **parks** the candidate pair in the review queue (\`review_queue.put\`) with a
-  \`PARKED\` outcome. It neither auto-merges nor auto-rejects: an outage hour must not split the
-  graph.
-- A resolver **rejection** is **terminal** (\`TERMINAL_REJECTION\`): it is returned as
-  \`rejected\` and is never retried, never upgraded to a merge. The starter retries a rejection up to
-  the deadline and merges on the final attempt.
-- Only a **scored match at or above \`MERGE_THRESHOLD\`** (\`score >= MERGE_THRESHOLD\`) merges
-  without review (\`merge_entities\`). A match below the threshold is parked with its score.
+- Every attempt carries a **1-second deadline** (\`DEADLINE_S = 1\`); the starter already does this.
+- \`DEADLINE_EXCEEDED\` parks the pair in the review queue (\`review_queue.put\`) with a \`PARKED\`
+  outcome. It neither auto-merges nor auto-rejects.
+- A resolver rejection is terminal (\`TERMINAL_REJECTION\`): returned as \`rejected\`, not retried,
+  not upgraded to a merge.
+- Only a scored match with \`score >= MERGE_THRESHOLD\` merges without review (\`merge_entities\`).
+  A match below the threshold is parked with its score.
 - \`UNAVAILABLE\` is the only status worth another attempt (bounded by \`MAX_ATTEMPTS\`); anything
-  else returns to the caller instead of looping.
-
-**Failure mode the checks target.** The starter maps a timeout to *not a match*, so every hour the
-resolver is slow the graph silently gains duplicate entities — a correctness bug disguised as a
-performance problem. It also retries a rejection until the deadline and then merges "because we ran
-out of attempts", so a pair the resolver explicitly refused becomes a merge. And it merges on any
-non-rejection response without looking at the score, so weak candidates are treated as certainties.
-The deadline is the one thing the starter gets right; the policy around it is what the checks target.`,
+  else returns to the caller instead of looping.`,
   sequence: {
     participants: ['graph-api', 'Entity resolver', 'Review queue'],
     messages: [
@@ -143,8 +137,7 @@ def retry_resolve(tenant: str, left: str, right: str) -> Outcome:
 
 
 def resolve_pair(tenant: str, left: str, right: str) -> Outcome:
-    # TODO: this starter reads a timeout as not a match, retries a rejection up to the deadline and
-    # merges on the final attempt, and merges without ever looking at the score. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     for _ in range(MAX_ATTEMPTS):
         try:
             response = stub.Resolve({"tenant": tenant, "left": left, "right": right}, timeout=DEADLINE_S)
@@ -231,8 +224,7 @@ async function retryResolve(tenant: string, left: string, right: string): Promis
 }
 
 export async function resolvePair(tenant: string, left: string, right: string): Promise<Outcome> {
-  // TODO: this starter reads a timeout as not a match, retries a rejection up to the deadline and
-  // merges on the final attempt, and merges without ever looking at the score. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const deadline = new Date(Date.now() + DEADLINE_S * 1000);
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
@@ -320,8 +312,7 @@ type ResolverClient interface {
 }
 
 func resolvePair(ctx context.Context, client ResolverClient, tenant, left, right string) (Outcome, error) {
-	// TODO: this starter reads a timeout as not a match, retries a rejection up to the deadline and
-	// merges on the final attempt, and merges without ever looking at the score. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	ctx, cancel := context.WithTimeout(ctx, deadlineS*time.Second)
 	defer cancel()
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -417,8 +408,7 @@ object ResolutionClient {
   val MaxAttempts = 3
 
   def resolvePair(tenant: String, left: String, right: String): String = {
-    // TODO: this starter reads a timeout as not a match, retries a rejection up to the deadline and
-    // merges on the final attempt, and merges without ever looking at the score. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     val stub = ResolverGrpc.blockingStub.withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)
     var attempt = 1
     while (attempt <= MaxAttempts) {
@@ -497,8 +487,7 @@ enum class Outcome { Merged, Rejected };
 
 Outcome resolvePair(Resolver::Stub& stub, const std::string& tenant, const std::string& left,
                     const std::string& right) {
-  // TODO: this starter reads a timeout as not a match, retries a rejection up to the deadline and
-  // merges on the final attempt, and merges without ever looking at the score. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kDeadlineSeconds));
@@ -572,9 +561,9 @@ Outcome resolvePair(Resolver::Stub& stub, const std::string& tenant, const std::
     },
   },
   hints: [
-    'Map the gRPC status code to a policy, not to a verdict about the pair: `DEADLINE_EXCEEDED` and `UNAVAILABLE` describe the resolver, not the entities. Only a scored response says anything about whether two nodes are the same.',
-    'A rejection is an answer. Return it and stop; the retry loop exists for statuses that mean "try again", which is `UNAVAILABLE` alone, bounded by `MAX_ATTEMPTS`.',
-    'Parking is a write, not a log line: `review_queue.put(...)` with the `PARKED` outcome and the score, so an operator can settle the pair later and a restart does not lose it. Below `MERGE_THRESHOLD` a positive score is still a candidate, never an automatic merge.',
+    'The duplicate-entity count climbs during every resolver slowdown, and a pair the resolver refused last week shows up merged in the graph today.',
+    '`except` maps `DEADLINE_EXCEEDED` to `Outcome.REJECTED`, so slowness is read as a verdict; a `"REJECTED"` status goes to `retry_resolve`, and any other response merges without reading `score`.',
+    'On `DEADLINE_EXCEEDED` call `review_queue.put` with `PARKED`; on `TERMINAL_REJECTION` return `REJECTED` at once; merge only when `response.score >= MERGE_THRESHOLD`, else park with the score; retry only `UNAVAILABLE`.',
   ],
-  debrief: `The interviewer is testing whether you can read a failure policy instead of a status code. Three defects are checked. A timeout mapped to "not a match" is the expensive one: outages become silent data corruption, because the resolver being slow says nothing about whether the entities are the same. A retried rejection that merges on the last attempt is worse than a bug — it turns an explicit refusal into a merge. And merging on any non-rejection response treats a 0.6 score as a certainty; the threshold is what makes resolution deliberate. The deadline itself is right in the starter and worth keeping: without it a slow resolver stalls the request path. Real systems add idempotency keys on resolution calls, a review queue with an owner and an SLA, a merge audit with undo, and a circuit breaker so a sick resolver is skipped rather than retried by every caller.`,
+  debrief: `The fix separates what a status code says about the resolver from what a response says about the pair. A timeout describes the resolver, so it parks the pair for review instead of deciding anything; a rejection is an answer, so it ends the call; a score is evidence, so it merges only above the threshold. Parking is a write to the review queue rather than a log line because the decision has to outlive the request and survive a restart. The deadline the starter already had is the part worth keeping: without it a slow resolver stalls the request path. Production systems put a breaker in front of the resolver so a sick dependency is skipped rather than retried by every caller, and keep a merge audit with undo, since a wrong merge is data loss.`,
 };

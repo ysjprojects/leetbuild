@@ -19,7 +19,7 @@ export const merchantAgentProblem: Problem = {
   id: 'merchant-agent',
   title: 'Merchant Assistant',
   tagline:
-    "Shopify's Sidekick as a production system: just-in-time tool instructions, bounded agentic turns, per-shop budgets, and judges calibrated against humans before a prompt ships.",
+    "Shopify's Sidekick as a production system: just-in-time tool instructions, bounded agent turns, per-shop budgets, and judges calibrated against humans.",
   difficulty: 'hard',
   concepts: ['http', 'grpc', 'redis', 'kafka'],
   tag: 'ai-systems',
@@ -39,21 +39,17 @@ export const merchantAgentProblem: Problem = {
 
 A merchant on the customers page types "which of my customers are from Toronto?" and, a moment
 later, "write an SEO description for the jacket I have open". The assistant that answers is one
-model in a loop with a few dozen tools, running inside the admin of a million shops. What decides
-whether it is safe to ship is not the model: it is the handler that refuses to take the shop from
-the body, the loop that gives the model exactly the guidance it needs and not a token more, the
-budget and cache that keep one merchant's spend and data inside that merchant, and the judges that
-have earned the right to gate a release.
+model in a loop with a few dozen tools, inside the admin of a million shops. What decides whether
+it is safe to ship is the handler that refuses to take the shop from the body, the loop that gives
+the model exactly the guidance it needs, the budget and cache that keep one merchant's spend and
+data inside that merchant, and the judges that have earned the right to gate a release.
 
 ## The real system
 
 Shopify's **Sidekick** is an AI assistant inside the Shopify admin: it segments customers, fills
 product forms, answers analytics questions and navigates the admin on the merchant's behalf. It is
-built on the agentic loop — a merchant writes, the model decides on an action, the action runs
-against the shop, the result feeds the next decision — and it grew from a handful of tools to
-dozens. That growth is where the engineering lessons come from: a system prompt that tried to
-cover every tool's special cases became impossible to maintain, and "it looks fine in the demo"
-turned out to be no evidence at all once prompts, models and tools changed every week.
+built on the agentic loop and grew from a handful of tools to dozens; that growth is where the
+engineering lessons come from.
 
 ## From the source
 
@@ -87,41 +83,32 @@ schema-first gate — come from that post; the caps, deadlines and TTLs are this
 One service, **sidekick**, with five pieces:
 
 1. \`POST /v1/assist\`: the shop from the authenticated \`X-Shop-Id\` (**401** without it), an
-   8 KiB message cap, a page-type whitelist, a required \`Idempotency-Key\` so a retry cannot run a
-   form-filling tool twice, and the merchant's **permission set** attached server-side from the
-   permission store — never from the body.
-2. The **agentic loop** over \`Model.Complete\` and \`Tools.Invoke\`: a constant system prompt, a
-   compact tool list (name and one line each), **just-in-time instructions** carried in the next
-   model call only when a tool fired, at most **6** turns, a **10 s** deadline per call and a
-   **30 s** budget per loop, and a scope gate that refuses tools outside the merchant's permissions.
-3. A **Redis** spending layer: **30 requests** and **150 000 tokens** per shop per 60-second window
-   reserved by one atomic Lua \`EVAL\` before the model call; a tool-result cache keyed
-   \`tool:{shop}:{name}:{digest}\` with a 120 s TTL; write tools claimed once per turn with
-   \`SET NX\` on \`write:{shop}:{turn_id}:{name}\`.
-4. A **gRPC** release gate over \`Judge.Score\`: **200** conversations sampled from the ground-truth
-   set, one judge per criterion with a rubric over the whole conversation, Cohen's kappa against
-   human labels with a **0.6** floor before a judge is trusted, schema validation of every tool call
-   before any judge runs, and a ship decision that needs **0.8** on every criterion and no more than
-   **0.02** regression from the baseline.
-5. A **Kafka** trace path: one \`assist.trace\` event per turn keyed by shop with ids, tools used,
-   latency, tokens and the judge score — no merchant message, no tool results — from an idempotent
-   \`acks=all\` producer with an outbox on failure, and a \`gtx-builder\` consumer that inserts the
-   ground-truth candidate before it commits.
+   8 KiB message cap, a page-type whitelist, a required \`Idempotency-Key\`, and the merchant's
+   permission set attached server-side.
+2. The **agentic loop**: a constant system prompt, a compact tool list, just-in-time instructions
+   carried in the next model call only when a tool fired, at most **6** turns, a **10 s** deadline
+   per call, a **30 s** budget per loop, and a scope gate.
+3. A **Redis** spending layer: per-shop requests and tokens per minute reserved by one atomic Lua
+   \`EVAL\` before the model call, a per-shop tool-result cache, and write tools claimed once per
+   turn with \`SET NX\`.
+4. A **gRPC** release gate: **200** sampled conversations, one judge per criterion with a rubric,
+   Cohen's kappa against human labels with a **0.6** floor, schema validation before any judge, and
+   a ship decision bounded by a floor and a regression limit.
+5. A **Kafka** trace path: one \`assist.trace\` event per turn keyed by shop with no merchant data,
+   from an idempotent \`acks=all\` producer with an outbox, and a consumer that inserts the
+   candidate before it commits.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real AI feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, serves the happy path and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 The model and the judges themselves, the tool implementations against the admin's APIs, GRPO
-training and reward design, the merchant simulator, instruction variants by beta flag and model
-version, human labelling tooling, and streaming the answer to the admin. The five pieces above are
-the ones that decide whether an assistant with write access to a merchant's store is correct,
-isolated and shippable.`,
+training, the merchant simulator, instruction variants by beta flag, human labelling tooling, and
+streaming the answer to the admin.`,
   diagram: {
     nodes: [
       {id: 'merchant', kind: 'client', label: 'Shopify admin', sub: 'POST /v1/assist', x: 6, y: 50},

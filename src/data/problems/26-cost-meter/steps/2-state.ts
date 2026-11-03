@@ -181,7 +181,7 @@ def record_usage(tenant: str, model: str, input_tokens: int, output_tokens: int)
 `,
     },
     typescript: {
-      starter: `/** recordUsage: flawed code that moves each counter with its own command. */
+      starter: `/** recordUsage. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

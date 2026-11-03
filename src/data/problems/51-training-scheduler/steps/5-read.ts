@@ -8,36 +8,26 @@ export const trainingReadStep: Step = {
   focus: ['client', 'scheduler', 'store', 'cluster'],
   task: `## Task
 
-**Starting point.** The starter is working code for the status endpoint: it
-registers the route, looks the run up and returns the stored row with its state, queue position,
-node list and last checkpoint. It compiles, it answers for a healthy demo run, and it hides three
-production flaws. Debug it like the owner of the shared fleet, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter serves \`GET /v1/training/runs/{id}\`: it looks the run up by id
+alone, answers **404** when it is unknown, and otherwise echoes the stored row's state, queue
+position, node list and last checkpoint id. It compiles, answers for a healthy demo run, and hides
+four flaws.
 
-Implement \`GET /v1/training/runs/{id}\`:
+**Failure mode the checks target.** A run that died in startup is reported \`queued\` forever, so
+nobody retries it and the GPU sits idle. The node list keeps naming workers the cluster reclaimed
+minutes ago. Any caller who knows a run id reads any tenant's run. And the handler answers from the
+run store alone, so it reports a state the cluster has already moved past.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when absent). The run is
-  resolved by id **and** owner: a run that belongs to another tenant — or does not exist — is
-  **404**, never **403**. The starter looks a run up by id alone, so any caller who knows a run id
-  reads any tenant's run.
-- The reported state is **reconciled against the cluster's view within \`RECONCILE_WINDOW_S\` = 60**:
-  the handler asks the cluster for the run's live assignment and nodes and only then answers. The
-  starter answers from the run store alone, so it reports a state the cluster has already moved past.
+- The tenant comes from \`X-Tenant-Id\` (**401** when absent). The run is resolved by id and owner:
+  a run that belongs to another tenant, or does not exist, is **404**, not **403**.
+- The reported state is reconciled against the cluster's view within \`RECONCILE_WINDOW_S = 60\`:
+  the handler calls \`cluster.assignment\` for the run's live assignment and only then answers.
 - The response carries \`run_id\`, \`state\`, \`queue_position\`, \`lease_state\`, \`nodes\` and
-  \`last_checkpoint_id\`. \`nodes\` is the **cluster's** list, never the run row's: the row is a
-  record of what the scheduler wrote, and it keeps naming workers the cluster has since preempted.
-- A run whose **start lease expired with no worker confirmation** is reported \`failed\` with a
-  \`reason\` (\`start_lease_expired\`) — never the stored \`queued\`. That is the one case an operator
-  opens this endpoint to see, and the starter hides it.
-- A \`reason\` appears only on a run that failed; a live run reports its reconciled state.
-
-**Failure mode the checks target.** The status endpoint is what an operator trusts mid-incident, so
-each flaw becomes a wrong action. A run that died in startup is reported **queued** forever, so
-nobody retries it and the GPU sits idle. A stale node list keeps naming preempted workers, so the
-dashboard shows a job running on nodes that were reclaimed minutes ago. And an unscoped id lets one
-tenant read another's run by guessing a UUID — the quiet one, because the id looks like a secret and
-is not. Reconciling inside the window, mapping an orphaned lease to \`failed\` with a reason, and
-answering **404** for a foreign id are what make the endpoint safe to page on.`,
+  \`last_checkpoint_id\`. \`nodes\` is the cluster view's list, not the run row's.
+- A run still waiting whose start lease \`training:lease:{run_id}\` is gone and whose worker never
+  confirmed (\`worker_confirmed\`) is reported \`failed\` with \`reason: start_lease_expired\`, not the
+  stored \`queued\`.
+- A \`reason\` appears only on a run that failed; a live run reports its reconciled state.`,
   sequence: {
     participants: ['Client', 'Training Scheduler', 'run store', 'Cluster API'],
     messages: [
@@ -189,9 +179,7 @@ runs = RunStore()
 
 @app.get("/v1/training/runs/{run_id}")
 def read_run(run_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued for a
-    # run whose start lease already expired — and returns the node list straight from the run row
-    # instead of the cluster's view. Fix all three before the status endpoint ships.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     run = runs.get(run_id)
     if run is None:
         return JSONResponse({"error": "unknown run"}, status_code=404)
@@ -300,9 +288,7 @@ class RunStore {
 const runs = new RunStore();
 
 app.get('/v1/training/runs/:runId', async (request, reply) => {
-  // TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued for a
-  // run whose start lease already expired — and returns the node list straight from the run row
-  // instead of the cluster's view. Fix all three before the status endpoint ships.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const {runId} = request.params as {runId: string};
   const run = await runs.get(runId);
@@ -423,9 +409,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readRun(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued for a
-	// run whose start lease already expired — and returns the node list straight from the run row
-	// instead of the cluster's view. Fix all three before the status endpoint ships.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	runID := r.PathValue("runID")
 	run, _ := runs.Get(r.Context(), runID)
@@ -601,9 +585,7 @@ object RunRead {
   val route: Route =
     path("v1" / "training" / "runs" / Segment) { runId =>
       get {
-        // TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued
-        // for a run whose start lease already expired — and returns the node list straight from the
-        // run row instead of the cluster's view. Fix all three.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         runs.get(runId) match {
           case Some(run) =>
             val status = RunStatus(runId, run.state, run.queue_position, "none", run.nodes, run.last_checkpoint_id)
@@ -743,9 +725,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/training/runs/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued for a
-    // run whose start lease already expired — and returns the node list straight from the run row
-    // instead of the cluster's view. Fix all three before the status endpoint ships.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string tenant = req.get_header_value("X-Tenant-Id");
     const std::string runId = req.matches[1];
     const auto run = runs.get(runId);
@@ -861,19 +841,9 @@ int main() {
     },
   },
   hints: [
-    'Resolve the caller before you read the run: tenant from `X-Tenant-Id`, and a run row whose `tenant` differs is **404**, never **403** — a run id is not a capability. The starter looks runs up by id alone.',
-    'The run row records what the scheduler did, not what the cluster has. Query the cluster for the run’s assignment inside `RECONCILE_WINDOW_S` and answer from the reconciled state, or the dashboard reports a state the fleet has already moved past.',
-    'Reconcile before you answer: a run still waiting (`queued`/`starting`) whose start lease `training:lease:{run_id}` is gone and whose worker never confirmed is `failed` with `reason: start_lease_expired` — and `nodes` comes from the cluster view, never from the row.',
+    'The dashboard shows a run queued for hours after the worker node that was starting it rebooted, and another run "running" on nodes the fleet reclaimed ten minutes ago.',
+    '`runs.get(run_id)` ignores the tenant and the handler returns `run["state"]` and `run["nodes"]` verbatim; nothing consults the start lease or asks the cluster what it currently holds.',
+    'Compare `run["tenant"]` with `X-Tenant-Id` (404 on mismatch); call `cluster.assignment` within `RECONCILE_WINDOW_S`; when `lease is None` and not `worker_confirmed` answer `failed` with `start_lease_expired`; take `nodes` from the view.',
   ],
-  debrief: `The interviewer is testing the read side of a scheduler, where the question is never "does it return a
-state" but "is it the state the cluster is acting on". The starter looks right because the demo run is
-alive, confirmed and owned by the caller — every one of the three failures needs a run that died, a
-node the cluster preempted, or a caller who guessed an id. The checks are the route; the tenant-scoped
-**404**; the cluster query inside \`RECONCILE_WINDOW_S\` carrying \`queue_position\`, \`lease_state\`,
-\`nodes\` and \`last_checkpoint_id\`; an orphaned start reported \`failed\` with \`reason:
-start_lease_expired\`; and \`nodes\` read from the cluster's view rather than the run row. The
-stale-node flaw is the one that ships: the row is what the scheduler wrote, so a run keeps naming
-workers the fleet already reclaimed. Real systems add an \`observed_at\` staleness stamp on the
-response, a fallback when the cluster call times out, and a metric that counts how often a read had
-to reconcile.`,
+  debrief: `The read side of a scheduler is judged by whether it reports the state the cluster is acting on, which is why the handler reconciles before it answers: the run row records what the scheduler wrote, and the cluster view records what the fleet has. The orphaned-lease rule exists because a run that died in startup is the one case an operator opens this endpoint to find, and echoing \`queued\` hides it. The tenant comparison answers 404 rather than 403 so a guessed id leaks nothing, not even existence. Production systems stamp the response with an \`observed_at\` so a reader knows how fresh the reconciliation is, and define what the endpoint says when the cluster call itself times out, since a status page that hangs mid-incident is as useless as one that lies.`,
 };

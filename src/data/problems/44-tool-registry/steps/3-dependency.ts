@@ -24,11 +24,9 @@ validates the candidate and promotes, so the demo ships. It compiles and hides 5
 - **Promotion happens only after a validation that returned OK**: \`catalog.promote(name, version,
   actor)\` is reached by the OK branch and by nothing else.
 
-**Failure mode the checks target.** Treating silence as consent is the core bug: the starter reads a
-timeout as a pass and promotes, so a wedged sandbox ships a version nobody validated, and nothing
-bounds the wait. Next is the credential: dialling the sandbox with the production provider key puts
-a live key in the process that runs the candidate's code. Last is the retry on a schema rejection:
-the same bytes produce the same answer, so the retry only turns a measured "no" into a load test.`,
+**Failure mode the checks target.** The starter reads a timeout as a pass and promotes, so a wedged
+sandbox ships a version nobody validated. Dialling the sandbox with the production provider key puts
+a live key next to candidate code, and retrying a schema rejection only repeats a measured "no".`,
   sequence: {
     participants: ['Registry', 'Sandbox', 'Vault', 'Catalog'],
     messages: [
@@ -201,7 +199,7 @@ the same bytes produce the same answer, so the retry only turns a measured "no" 
   ],
   code: {
     python: {
-      starter: `"""Sandbox validation for a candidate tool version: flawed code that promotes on silence."""
+      starter: `"""Sandbox validation for a candidate tool version."""
 import os
 
 import grpc
@@ -322,7 +320,7 @@ async def validate_candidate(name: str, version: str, actor: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Sandbox validation for a candidate tool version: flawed code that promotes on silence. */
+      starter: `/** Sandbox validation for a candidate tool version. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

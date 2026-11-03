@@ -202,7 +202,7 @@ def house_ad(fallback_reason: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Exchange client: flawed code that hides two deadline bugs. */
+      starter: `/** Exchange client. */
 import * as grpc from '@grpc/grpc-js';
 
 const EXCHANGE_DEADLINE_MS = 150;

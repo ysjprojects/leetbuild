@@ -8,35 +8,29 @@ export const trainingEndpointStep: Step = {
   focus: ['client', 'scheduler', 'store', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, mints a
-run id and answers \`201 queued\`. It compiles, it serves the demo, and it hides four production
-flaws. Debug it like the owner of the scheduler, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/training/runs\` with body
+\`{"dataset_version": "…", "recipe_version": "…", "priority": 5}\`: it reads \`X-Tenant-Id\`, mints
+\`run-<counter>\` as the run id, logs it and answers **201** with the caller's priority echoed back.
+It compiles, serves the demo and hides four flaws.
 
-Implement \`POST /v1/training/runs\` with body
-\`{"dataset_version": "…", "recipe_version": "…", "priority": 5}\`.
+**Failure mode the checks target.** A caller sends \`priority: 999999\` and outranks every band,
+because the integer is passed through unclamped. A typo in \`recipe_version\` is queued and holds a
+GPU slot for a job that can only fail. A client that times out and retries the same
+\`Idempotency-Key\` starts a second run, because the header is ignored. And the counter-based id is
+stored nowhere, so a scheduler restart loses the submission.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the **original run** — the same \`run_id\`, and no second entry in the queue.
+  returns the original run with the same \`run_id\` and no second queue entry.
 - \`dataset_version\` is a non-empty string of at most **128** characters (**400** otherwise).
-- \`recipe_version\` must be one of the recipe registry's versions (**400** for anything else, and the
-  rejection happens **before** the run is enqueued: an unknown recipe must never reach a GPU).
-- \`priority\` is an integer, defaults to **5**, and is **clamped** into the supported range
-  \`0..9\` and then mapped into **3** bands (high when the priority is at least 7, normal from 3, low
-  below that). \`999999\` becomes \`9\`, in the high band — never an unbounded jump past every queue.
-- The \`run_id\` is issued by the **scheduler** (a fresh UUID) and persisted under
-  \`(tenant, Idempotency-Key)\` **before** the response, so a scheduler restart can replay the
-  submission instead of starting a second run.
-- Answer \`201\` with the run: \`{"run_id", "state": "queued", "priority", "band"}\`; a replayed
-  submission answers \`200\` with the stored run.
-- Log the decision (run id, tenant, band) — the dataset and recipe contents never appear in a log
-  line.
-
-**Failure mode the checks target.** An unclamped priority lets any caller jump every band, and it is
-the flaw that stays invisible until two teams compete for the same fleet. The recipe check is the
-one that costs money: without it a typo in a recipe version consumes a GPU slot for a job that can
-only fail. The retry is the quiet one: a client that times out and retries the *same* key starts a
-second run, so one submission trains two models and bills twice.`,
+- \`recipe_version\` must be one of \`KNOWN_RECIPES\` (**400** otherwise), rejected before
+  \`queue.enqueue()\`.
+- \`priority\` defaults to **5**, is clamped into \`PRIORITY_MIN..PRIORITY_MAX\` (\`0..9\`) and then
+  mapped into \`PRIORITY_BANDS\` (**3**): high at **7** and above, normal from **3**, low below.
+- The \`run_id\` is a scheduler-issued UUID persisted with \`runs.put()\` under
+  \`(tenant, Idempotency-Key)\` before the response.
+- Answer **201** with \`{"run_id", "state": "queued", "priority", "band"}\`; a replay answers
+  **200** with the stored run. Log run id, tenant and band only.`,
   sequence: {
     participants: ['Client', 'Training Scheduler', 'run store', 'Redis queue'],
     messages: [
@@ -169,9 +163,7 @@ runs = RunStore()
 
 @app.post("/v1/training/runs")
 def submit(body: SubmitRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never
-    # checks the recipe version against the registry, and mints a new run id on every retry.
-    # Fix all four before a run is allowed to reach a GPU.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     run_id = f"run-{next(run_counter)}"
     logger.info("run queued run_id=%s tenant=%s priority=%d", run_id, tenant, body.priority)
     return JSONResponse(
@@ -291,8 +283,7 @@ interface SubmitBody {
 }
 
 app.post('/v1/training/runs', async (request, reply) => {
-  // TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never checks
-  // the recipe version against the registry, and mints a new run id on every retry. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as SubmitBody;
   const runId = \`run-\${++runCounter}\`;
@@ -439,8 +430,7 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never checks
-	// the recipe version against the registry, and mints a new run id on every retry.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	runCounter++
 	runID := fmt.Sprintf("run-%d", runCounter)
 	log.Printf("run queued run_id=%s tenant=%s priority=%d", runID, tenant, body.Priority)
@@ -622,8 +612,7 @@ object TrainingApi {
     path("v1" / "training" / "runs") {
       post {
         entity(as[SubmitRequest]) { body =>
-          // TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never
-          // checks the recipe version against the registry, and mints a new run id on every retry.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           runCounter += 1
           val runId = s"run-$runCounter"
           system.log.info(s"run queued run_id=$runId priority=\${body.priority}")
@@ -771,8 +760,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never
-    // checks the recipe version against the registry, and mints a new run id on every retry.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     static int runCounter = 0;
     const auto runId = "run-" + std::to_string(++runCounter);
     const int priority = body.value("priority", 5);
@@ -892,17 +880,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guard clauses by cost: tenant, Idempotency-Key, the shape of the versions, and only then the recipe registry lookup. Every one of them answers before `runs.save` and `queue.enqueue`, so a rejected submission never occupies a queue position.',
-    'Clamp, then band — never band the raw integer. `min(max(priority, PRIORITY_MIN), PRIORITY_MAX)` is what keeps a caller-provided `999999` inside the same three bands as everyone else, and the band is what the queue orders by.',
-    'Idempotency is keyed by `(tenant, Idempotency-Key)` and stores the **run**, not the request: the replay has to return the original `run_id` and the original band, which is only possible if the scheduler issued and persisted the id before it answered.',
+    "One tenant's jobs always run first after they discovered a large priority value, and a client that timed out on submit now has two identical runs holding GPUs.",
+    '`body.priority` is echoed and banded raw, so nothing bounds it; `Idempotency-Key` is not read, so a retry mints `run-<n+1>`; `recipe_version` is not checked against `KNOWN_RECIPES`.',
+    'Guard tenant, key, versions, then `KNOWN_RECIPES`; clamp into `PRIORITY_MIN..PRIORITY_MAX` and map to `PRIORITY_BANDS`; `runs.get` then `runs.put` a UUID run under `(tenant, key)` before the 201.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the admission boundary. The
-starter reads fine because the demo submits a valid recipe from one tenant and never retries. Four
-defects are being checked: authentication of the tenant, the recipe-registry lookup that must happen
-before a GPU is reserved, the clamp that keeps priority inside supported bands (a starvation problem
-when it is missing, a fairness problem when it is added carelessly), and idempotency keyed by tenant
-so a client timeout cannot start a second training run. The fifth habit is the durable id: the
-scheduler issues it and writes the run down before answering, which is what makes "the submit
-survived a restart" a true statement rather than a hope. Real schedulers add per-tenant quotas, a
-submission rate limit, and a run-request audit row per accepted submission.`,
+  debrief: `The handler admits work onto scarce hardware, so every decision is made before anything is queued: the recipe lookup runs before a GPU can be reserved, the clamp runs before the band is computed, and the idempotency lookup runs before an id is minted. The clamp matters in both directions: without it one caller starves everyone, and banding the raw integer instead of the clamped one quietly lets the same caller back in. The scheduler issues the run id and persists the run before it answers, which is what makes a replay return the same run and a restart keep the submission. Production schedulers add per-tenant quotas and a submission rate limit in front of this handler, and record an audit row per accepted run so a fairness complaint can be traced to the request that caused it.`,
 };

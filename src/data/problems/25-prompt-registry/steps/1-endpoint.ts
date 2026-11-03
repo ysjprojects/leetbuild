@@ -238,7 +238,7 @@ def register(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/prompts: flawed code that overwrites versions in place. */
+      starter: `/** POST /v1/prompts. */
 import Fastify from 'fastify';
 
 import {store} from './store';

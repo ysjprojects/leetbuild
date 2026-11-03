@@ -13,26 +13,20 @@ export const endpointStep: Step = {
 mints a job id, calls \`start_expansion\` with whatever dataset name arrived, and returns
 \`{job_id, seed_dataset, status}\`. It compiles, serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** An unregistered seed means the corpus cannot be traced or
-licensed at all. A registered dataset can still be forbidden to derive from, so the registry lookup
-and the license decision are two different gates, and both have to run before a single record is
-generated. Without a service-side cap one request produces an unbounded dataset, and without
-idempotency one client retry doubles it.
+**Failure mode the checks target.** An unregistered seed cannot be traced or licensed; a registered
+one can still forbid derivatives, so registry and license are two gates that run before any record
+is generated. Without a service-side cap one request yields an unbounded dataset, and without
+idempotency a retry doubles it.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). A replay of the same \`(tenant, key)\`
-  returns the stored job, the same job id and the same cap, instead of starting a second run.
-- \`seed_dataset\` and \`seed_version\` are looked up in the **seed registry**. An unregistered
-  dataset, or a version that was not published, is **422**: the request is well formed, the seed
-  just cannot be used.
-- The seed's **license must permit derivative generation** (\`derivative_ok\` on the registered
-  seed entry). A seed whose license forbids derivatives is **422**, decided **before any generation
-  work is enqueued**.
-- \`max_records\` is an integer from **1** to \`MAX_RECORDS = 100000\` (**400** otherwise) and is
-  stored on the job the service creates, so the service enforces the cap.
-- \`recipe\` is a non-empty string (**400** otherwise) and is stored on the job so record events can
-  be keyed by it later.
-- Log the job id, the seed dataset and the cap, not the seed content.`,
+- Tenant from \`X-Tenant-Id\` (**401** if missing).
+- \`Idempotency-Key\` is required (**400**); a replay of \`(tenant, key)\` returns the stored job.
+- \`seed_dataset\` and \`seed_version\` must be in the **seed registry** (**422** otherwise).
+- The seed's \`derivative_ok\` must be true (**422** otherwise), decided **before any generation work
+  is enqueued**.
+- \`max_records\` is an integer from **1** to \`MAX_RECORDS = 100000\` (**400** otherwise), stored on
+  the job.
+- \`recipe\` is a non-empty string (**400** otherwise), stored on the job.
+- Log the job id, seed dataset and cap, not seed content.`,
   sequence: {
     participants: ['Data curator', 'Synthetic Data API', 'seed registry'],
     messages: [

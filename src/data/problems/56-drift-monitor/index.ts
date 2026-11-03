@@ -23,11 +23,8 @@ export const driftMonitorProblem: Problem = {
   minutes: 70,
   statement: `# Drift Monitor
 
-A drift monitor is the piece of an AI platform that decides when a model's inputs or outcomes have
-moved far enough from what it was released on that a human should look. The visible part is a number
-and a page; the parts that decide whether the monitor is useful at all are the baseline it compares
-against, the counts behind the number, the deduplication in front of the pager, and the history that
-survives a broker outage.
+A drift monitor decides when a model's inputs or outcomes have moved far enough from what it was
+released on that a human should look.
 
 ## The real system
 
@@ -38,20 +35,9 @@ Jensen-Shannon selectable) and a per-column drift score next to the verdict. The
 input you hand it, not something it derives from the traffic it is judging, and the report carries
 the sample sizes behind every score.
 
-A service that runs that comparison continuously has to own more than the test. A monitor names a
-promoted model version, one metric, a window and a frozen baseline reference; a monitor whose
-baseline is the live traffic compares the signal with itself and cannot fire. Distributions
-accumulate as sketches in Redis, merged by one atomic script per batch so concurrent batches cannot
-lose counts, kept under a key per (tenant, monitor, window) and expired at the window boundary. The
-baseline sketch is frozen once and the live path cannot touch it. When a window's distance crosses
-the threshold the monitor calls the alerting service over gRPC under a 1-second deadline, carries
-the evidence (metric, threshold, distance, both window boundaries and the sample counts on each
-side) and deduplicates per (monitor, window) with a cooldown. Evaluations publish
-\`drift.evaluated\` keyed by monitor so one monitor's history stays ordered, routine no-drift ticks
-are summarized rather than published one by one, and a rejected produce writes an outbox row so a
-broker outage cannot erase an alert from history. The report endpoint answers with the distance,
-its counts, its baseline window and an explicit insufficient-data state, scoped to the tenant that
-owns the monitor.
+A service that runs that comparison continuously has to own more than the test: a monitor whose
+baseline is the live traffic compares the signal with itself and cannot fire, and an alert without
+sample counts cannot be told apart from noise.
 
 ## What you build here
 
@@ -74,17 +60,13 @@ One service, **driftd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
-starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Distance measures beyond the three the platform ships (PSI, KS, Jensen–Shannon), feature-level
-attribution, automatic retraining triggers, per-feature thresholds, alert routing and escalation
-policy, dashboard rendering, and backfill of historical windows. The five pieces above are the ones
-that decide whether the monitor is correct, quiet and shippable.`,
+Distance measures beyond PSI, KS and Jensen–Shannon, feature-level attribution, retraining
+triggers, alert routing, and backfill of historical windows.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'register · report', x: 8, y: 50},

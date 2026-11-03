@@ -8,31 +8,27 @@ export const readStep: Step = {
   focus: ['dashboard', 'ingest', 'registry', 'tsdb'],
   task: `## Task
 
-**Starting point.** The starter is working code: a dashboard asks for a
-device's series and gets points back, so the chart draws. It hides three production flaws, and the
-first one is the outage the on-call engineer caused by refreshing a dashboard. Find them, fix them,
-and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/devices/{device_id}/series?metric=…&to=…\`: it
+reads no fleet header, passes \`from = 0\` and \`to\` (or a far-future default) straight to
+\`store.query\`, and returns every raw point for whatever device id it is given. The chart draws. It
+hides four flaws.
 
-Implement \`GET /v1/devices/{device_id}/series?metric=…&from=…&to=…\`:
+**Failure mode the checks target.** An on-call engineer refreshes a dashboard and the query path
+goes down for everyone, because one request scans years. A day of a chatty device comes back as
+hundreds of thousands of rows, and when it is thinned by hand the spike the dashboard exists to show
+is flattened away. A device that went silent an hour ago is indistinguishable from a steady one.
+And one fleet can read another fleet's series by guessing an id.
 
-- The caller's fleet comes from the \`X-Fleet-Id\` header; a missing fleet is **401**.
-- \`from\` and \`to\` are **required** epoch seconds and \`to\` must be after \`from\` (**400**
-  otherwise). The range is capped at **24 hours** (\`86400\` seconds): a longer range is **400**,
-  and the cap must be enforced **before** the store is called — an open-ended range that reaches the
-  store is a scan of years, and it takes the query path down for everyone.
-- The device must exist **and belong to the caller's fleet**: an unknown device and a device from
-  another fleet are both **404**, so the endpoint never confirms that an id exists elsewhere.
-- When the store returns more than **1000** points, **downsample** to at most that many and name the
-  method in the response (\`"downsample": {"method": "lttb", "points": …}\`). A reader that silently
-  returns 400 000 points is a reader that is down; and the method matters — a bucket mean flattens
-  the spike the dashboard exists to show, which is exactly how the graph scaled to zero unnoticed.
-- Report the **newest point's age**: \`age_seconds\` (null when there are no points) and \`stale\`
-  (\`true\` when the newest point is older than **300** seconds, or when there are none). A silent
-  device must be visible as silent, not as a flat line.
-
-**Failure mode the checks target.** The starter passes \`from=0\` and a far-future \`to\` straight to
-the store, returns raw points without downsampling, and answers for any device id in any fleet —
-three ways for one dashboard to read another team's fleet, and one way to take the store down.`,
+- The caller's fleet comes from \`X-Fleet-Id\`; a missing fleet is **401**.
+- \`from\` and \`to\` are required epoch seconds with \`to > from\` (**400** otherwise). The range is
+  capped at **24 hours** (\`MAX_RANGE_S = 86400\`); a longer range is **400**, decided before
+  \`store.query\` is called.
+- The device must exist and belong to the caller's fleet (\`device["fleet"]\`): an unknown device and
+  a foreign device are both **404**.
+- Past \`MAX_POINTS = 1000\` points, downsample with a shape-preserving method and name it:
+  \`"downsample": {"method": "lttb", "points": …}\`.
+- Report the newest point's \`age_seconds\` (null with no points) and \`stale\` (true when older than
+  **300** seconds, or when there are none).`,
   sequence: {
     participants: ['Dashboard', 'Telemetry Ingest', 'Device registry', 'Time-series store'],
     messages: [
@@ -61,9 +57,9 @@ three ways for one dashboard to read another team's fleet, and one way to take t
     ],
   },
   hints: [
-    'Validate the range before you touch the store: `from` and `to` present, `to > from`, and `to - from ≤ 86400`. A missing cap is not a slow query, it is an open-ended one, and every dashboard refresh repeats it — the rejection has to happen in the handler, not in the store.',
-    'The fleet check is a 404, not a 403: `registry.lookup(device_id)` and compare the device’s fleet with `X-Fleet-Id`, answering "unknown device" either way. A 403 tells a caller that the id exists somewhere else, which is an enumeration oracle.',
-    'Downsampling is a contract with the reader: name the method you used (`lttb`) and the number of points you returned, and prefer a shape-preserving method. Then report `age_seconds` from the newest point and set `stale` — a device that stopped reporting an hour ago must look silent, not flat.',
+    'One dashboard refresh took the store down for the whole platform, and a fleet whose devices stopped reporting an hour ago still draws a smooth flat line.',
+    '`store.query(device_id, metric, 0, to_s or 4_102_444_800)` is an open-ended scan; there is no fleet header, no registry lookup, no point cap and no age in the response.',
+    'Read `X-Fleet-Id`, require `from`/`to` with `to - from <= MAX_RANGE_S` before `store.query`; `registry.lookup` and compare `device["fleet"]` (404); apply `lttb` past `MAX_POINTS`; add `age_seconds` and `stale`.',
   ],
   checks: [
     {
@@ -152,8 +148,7 @@ store = SeriesStore()
 
 @app.get("/v1/devices/{device_id}/series")
 def series(device_id: str, metric: str, to_s: int | None = None) -> dict:
-    # TODO: the starter accepts an open-ended range that scans years, returns every raw point without
-    # downsampling, and serves any device id it is given, including one from another fleet.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     points = store.query(device_id, metric, 0, to_s or 4_102_444_800)
     return {"device_id": device_id, "metric": metric, "points": points}
 `,
@@ -234,8 +229,7 @@ import {store} from './deps';
 export const app = Fastify();
 
 app.get('/v1/devices/:device_id/series', async (request, reply) => {
-  // TODO: the starter accepts an open-ended range that scans years, returns every raw point without
-  // downsampling, and serves any device id it is given, including one from another fleet.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const params = request.params as {device_id: string};
   const query = request.query as {metric?: string; to?: string};
   const toS = Number(query.to ?? 4102444800);
@@ -326,8 +320,7 @@ func (s *SeriesStore) Query(ctx context.Context, deviceID, metric string, fromS,
 var store = &SeriesStore{}
 
 func series(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the starter accepts an open-ended range that scans years, returns every raw point without
-	// downsampling, and serves any device id it is given, including one from another fleet.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	deviceID := r.PathValue("device_id")
 	toS, _ := strconv.ParseInt(r.URL.Query().Get("to"), 10, 64)
 	if toS == 0 {
@@ -478,8 +471,7 @@ object DeviceSeries {
     path("v1" / "devices" / Segment / "series") { deviceId =>
       get {
         parameter("metric", "to") { (metric, toRaw) =>
-          // TODO: the starter accepts an open-ended range that scans years, returns every raw point
-          // without downsampling, and serves any device id it is given, including another fleet's.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val to = toRaw.toLong
           val points = store.query(deviceId, metric, 0, to)
           complete(StatusCodes.OK, s"""{"device_id":"$deviceId","points":\${points.length}}""")
@@ -575,8 +567,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/devices/([^/]+)/series)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the starter accepts an open-ended range that scans years, returns every raw point without
-    // downsampling, and serves any device id it is given, including one from another fleet.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto deviceId = req.matches[1].str();
     const auto toS = req.has_param("to") ? std::stoll(req.get_param_value("to")) : 4102444800LL;
     const auto points = store.query(deviceId, req.get_param_value("metric"), 0, toS);
@@ -693,5 +684,5 @@ int main() {
 `,
     },
   },
-  debrief: `Three contracts, one endpoint. First, the read is bounded: a range cap enforced in the handler means the store only ever sees a window it can answer, and the dashboard that refreshes every five seconds cannot take the query path down — a cap the store enforces is a cap the store pays for. Second, the read is scoped: the caller names a fleet, the device row carries a fleet, and a mismatch is indistinguishable from an unknown device, so the endpoint never leaks the existence of another team’s devices. Third, the read is honest: downsampling that silently drops the peak is how a fleet’s graph scaled to zero without anyone noticing, which is why the method is named in the response and why the newest point’s age travels with the data — an empty or stale series must look stale, not steady. Real platforms add per-caller read budgets, pre-aggregated materialized views for common windows, and cursor pagination for the raw path, but the cap, the scope and the staleness are what make the endpoint safe to expose.`,
+  debrief: `Three properties shape the endpoint. The read is bounded: a range cap enforced in the handler means the store only ever sees a window it can answer, and a dashboard that refreshes every five seconds cannot take the query path down; a cap the store enforces is a cap the store pays for. The read is scoped: a fleet mismatch is indistinguishable from an unknown device, so the endpoint cannot be used to learn that an id exists elsewhere. And the read carries its own caveats: downsampling that silently drops the peak is how a fleet's graph scaled to zero unnoticed, so the method is named in the response, and the newest point's age travels with the data so a silent device looks silent rather than steady. Production platforms add pre-aggregated views for common windows and per-caller read budgets on top of the cap.`,
 };

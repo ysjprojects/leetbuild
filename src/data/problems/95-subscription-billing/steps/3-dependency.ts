@@ -13,30 +13,19 @@ an invoice on the gRPC stub, loops over attempts when a call throws, and stores 
 on the invoice row when the processor answers. It compiles, the happy path bills correctly, and it
 hides five flaws.
 
-**Failure mode the checks target.** Every flaw sits in a branch a healthy processor never takes. The
-demo's processor answers at once and approves every card, so a stalled call, a lost reply and a
-declined card are never exercised. The first slow afternoon at the processor turns the same loop
-into duplicate charges, pinned workers and bounced cards hammered three times.
+**Failure mode the checks target.** A slow processor afternoon: a stalled call, a lost reply and a
+declined card turn the loop into duplicate charges, pinned workers and bounced cards hit three times.
+The demo's processor answers at once and approves every card.
 
-The charge of one invoice uses \`Charge\` and \`GetInvoice\` on the same stub:
-
-- Every processor call carries a **5-second** deadline (\`PROCESSOR_DEADLINE_S\` /
-  \`PROCESSOR_DEADLINE_MS\` / \`processorDeadline\` / \`ProcessorDeadlineS\` /
-  \`kProcessorDeadlineS\`). A processor that accepts the connection and then stalls must not pin the
-  billing run.
-- The idempotency key is the **invoice id**, and every attempt of the same charge sends the **same**
-  key: only a repeated call that looks like the same charge can be collapsed by the processor.
-- A \`DEADLINE_EXCEEDED\` is an unknown outcome, not a failure. Read the processor's invoice state
-  with \`GetInvoice\` for the same invoice id **before** deciding anything, and adopt the charge
-  reference it reports when the charge already landed instead of sending another one.
-- A hard decline (\`HARD_DECLINE\`, \`CARD_DECLINED\`, \`INSUFFICIENT_FUNDS\`) is terminal: one
-  attempt, then the invoice is marked \`failed\` with the decline code as its \`reason\`. A bounced
-  card does not become healthy because you asked again.
-- Attempts are bounded by \`MAX_ATTEMPTS = 3\`, and only the failures a retry can change, the
-  deadline and an unavailable processor, may be retried. A decline is a business answer, not a
-  transport error.
-- Store the outcome on the invoice: the reference when the charge landed, \`failed\` and the reason
-  when the issuer refused it. Log the invoice id and the outcome, no card data.`,
+- Every call (\`Charge\`, \`GetInvoice\`) carries a **5-second** deadline (\`PROCESSOR_DEADLINE_S\` or
+  the language's equivalent constant).
+- The idempotency key is the **invoice id**, the **same** on every attempt.
+- \`DEADLINE_EXCEEDED\` is an unknown outcome: call \`GetInvoice\` for the same invoice **before**
+  deciding, and adopt the reference it reports when the charge already landed.
+- A hard decline (\`HARD_DECLINE\`, \`CARD_DECLINED\`, \`INSUFFICIENT_FUNDS\`) is terminal: one attempt,
+  invoice marked \`failed\` with the decline code as \`reason\`.
+- At most \`MAX_ATTEMPTS = 3\`, retrying only the deadline and an unavailable processor.
+- Store the reference or \`failed\` plus reason on the invoice; log invoice id and outcome, no card data.`,
   sequence: {
     participants: ['Billing Service', 'Payment processor', 'billing db'],
     messages: [

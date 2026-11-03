@@ -13,24 +13,16 @@ export const citationStateStep: Step = {
 resolves it from the document store on a miss, writes the entry back and deletes keys when a document
 is updated. It compiles, it serves the demo, and it hides four flaws.
 
-**Failure mode the checks target.** A cache hit is a claim about one specific thing, and the key is
-that claim spelled out. A key that leaves out part of the span's identity, or spells the same span
-two ways, answers requests with text they did not ask for or caches the same text under several
-keys. Both stay invisible on a document that is never edited or re-read with padded offsets, which
-is exactly what a real corpus does constantly.
+**Failure mode the checks target.** A key that leaves out part of the span's identity, or spells the
+same span two ways, answers requests with text they did not ask for or caches one span several
+times. Both stay invisible on a document that is never edited or re-read with padded offsets.
 
 - The cache key names the **immutable version**: \`span:{document_id}:{version}:{start}:{end}\`.
-  A key without the version serves one version's text for another version's request; after a
-  document update every cached span is wrong.
-- Offsets in the key are **normalized integers** (\`10\`, not the raw query string \`010\`): string
-  offsets make two requests for the same span different keys, and one span of one version ends up
-  cached several times.
-- The entry gets a **long TTL** on write (\`SPAN_TTL_S\`, seven days) because an immutable version
-  cannot change: the TTL is the only eviction a span cache needs.
-- A cached payload carries **its version** and a hit whose version is not the requested one is
-  refused: the version in the key is the contract, the version in the payload is the proof.
-- A write to a document invalidates **nothing**: no \`DEL\` on update, no key sweep. Nothing about an
-  immutable version can go stale.
+- Offsets in the key are **normalized integers** (\`10\`, not the raw query string \`010\`).
+- The entry gets a **long TTL** on write (\`SPAN_TTL_S\`, seven days).
+- A cached payload carries **its version**, and a hit whose version is not the requested one is
+  refused.
+- A write to a document invalidates **nothing**: no \`DEL\` on update, no key sweep.
 - A missing \`X-Tenant-Id\` is **401** and \`version < 1\`, \`start < 0\` or \`end <= start\` is
   **400**; an unknown version is **404**.`,
   sequence: {

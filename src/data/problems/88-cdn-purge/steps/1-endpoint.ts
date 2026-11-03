@@ -304,7 +304,7 @@ def create_purge(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/purges: flawed code that purges whatever the caller sends. */
+      starter: `/** POST /v1/purges. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

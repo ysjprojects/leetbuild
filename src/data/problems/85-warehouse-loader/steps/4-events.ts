@@ -14,28 +14,17 @@ then sends \`partition_committed\` for the partition, both keyed by manifest id 
 \`rows_planned\` as the written count, and flushes after each produce. It serves the demo, where a
 table lights up in the consumer, and hides 5 flaws.
 
-Implement the \`load.event\` publisher that runs after each partition write.
+**Failure mode the checks target.** A completion published before the final commit is wrong for
+every consumer; planned counts make an incomplete load look complete; a broker hiccup drops history;
+keying by manifest breaks per-table ordering.
 
-- Publish to \`load.event\` with the **target table as the message key**. A table's load stream must
-  stay ordered — a dashboard that sees \`load_completed\` before \`partition_committed\` is worse than
-  one that sees nothing. Keying by manifest scatters one table's events across partitions.
-- The payload carries the **manifest id**, the **partition id** and the **written row count**, for
-  both \`partition_committed\` and \`load_completed\`.
-- Report **written** rows — the count the warehouse returned for the partition — never the
-  manifest's planned count: a plan is what the loader hoped to write, and the report in step 5
-  compares it against what landed.
-- **Commit first, publish second**: the \`partition_committed\` event goes out **after** the partition
-  is in the progress set (step 2), and \`load_completed\` only after the final partition committed.
-  A completion event that overtakes the last commit makes every downstream reader wrong at once.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks \`all\`
-  plus a stable, hashed key), so a retried produce cannot duplicate a record.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it: the
-  load has already happened, so the event is the only record that it did.
-
-**Failure mode the checks target.** A completion published before the final commit is a lie the whole
-platform believes; planned counts make an incomplete load look complete at the report; a dropped
-event on a broker hiccup silently deletes history; and keying by manifest destroys the per-table
-ordering the consumer's offset assumes.`,
+- Key \`load.event\` by the **target table**.
+- Both \`partition_committed\` and \`load_completed\` carry manifest id, partition id and the
+  **written** row count from the warehouse.
+- Publish \`partition_committed\` after the partition is in the progress set, and \`load_completed\`
+  only after the final partition committed.
+- The producer is **idempotent with \`acks=all\`** (or required acks \`all\` with a hashed key).
+- A rejected produce goes to the **outbox**.`,
   sequence: {
     participants: ['Load worker', 'load.event', 'Outbox relay', 'Downstream consumer'],
     messages: [
@@ -224,7 +213,7 @@ def emit(table, manifest_id, event):
 `,
     },
     typescript: {
-      starter: `/** load.event: flawed code that publishes the completion before the commit. */
+      starter: `/** load.event. */
 import {Kafka} from 'kafkajs';
 
 export const TOPIC = 'load.event';

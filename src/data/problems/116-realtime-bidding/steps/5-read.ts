@@ -16,12 +16,10 @@ export const readStep: Step = {
 bidder's counters for the window, and returns a win rate computed as wins over wins plus losses
 together with the bid count. It compiles, it serves the demo, and it hides four flaws.
 
-**Failure mode the checks target.** The dashboard says a bidder has a 94% win rate and is "healthy",
-yet the bidder won almost nothing last week. The starter omits timeouts and degradation entirely, so
-bids that missed the deadline and bids that were only conservative are invisible. Its win rate
-divides by wins plus losses, which flatters exactly that bidder: the more auctions it timed out on,
-the better its reported rate. It also treats the path parameter as an identifier rather than an
-authorization decision, so any advertiser can read any other advertiser's numbers by editing the URL.
+**Failure mode the checks target.** The dashboard says a bidder has a 94% win rate while it won
+almost nothing. The starter omits timeouts and degradation, divides wins by wins plus losses (so the
+more auctions it timed out on, the better it looks), and lets any advertiser read another's numbers
+by editing the URL.
 
 - The caller comes from the authenticated \`X-Bidder-Id\` header (**401** when missing) and may read
   **only its own** stats: a foreign bidder id is **403**.
@@ -233,7 +231,7 @@ def stats(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/bidders/{id}/stats: flawed code that flatters the bidder. */
+      starter: `/** GET /v1/bidders/{id}/stats. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

@@ -253,7 +253,7 @@ def register(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/tools: flawed code that believes the caller. */
+      starter: `/** POST /v1/tools. */
 import Fastify from 'fastify';
 
 import {store} from './store';

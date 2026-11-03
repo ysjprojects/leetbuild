@@ -36,14 +36,7 @@ Algolia's Query Suggestions product builds its suggestion index from popular sea
 configuration is mostly thresholds: a query must have produced at least \`minHits\` results (default
 5) and be at least \`minLetters\` long (default 4) to enter the index, and an \`exclude\` list keeps
 named terms out whatever their popularity. That is the same shape as this course's trending read: a
-floor, a bound and a filter, applied before anything reaches the dropdown. The rest of a production
-autocomplete follows the same pattern. The prefix is normalized before anything else, because
-\`Café\` and \`cafe\` are the same search, and bounded so a long string cannot walk the whole index.
-Top suggestions are cached per \`(tenant, prefix)\` with a TTL and a per-tenant cap, so a flood of
-prefixes costs the flooder and not everyone. The suggester is called under a short deadline, and a
-curated fallback list, marked as fallback, is served when it is slow. Impression and selection
-events are keyed by tenant and carry a prefix hash rather than the raw text, and a broker hiccup
-lands the event in an outbox rather than on the floor.
+floor, a bound and a filter, applied before anything reaches the dropdown.
 
 ## What you build here
 
@@ -63,11 +56,9 @@ One service, **suggestd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws. It compiles, it serves the happy path (one
-tenant, English prefixes, a healthy suggester) and it looks right. Your job in every step is the job
-you will have on a real search feature: debug it against the failure modes, find the subtle one,
-fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass
-on your version.
+Every starter compiles and serves the happy path (one tenant, English prefixes, a healthy
+suggester). Debug it, fix it, and prove the fix with checks that fail on the starter and pass on
+your version.
 
 ## Left out on purpose
 

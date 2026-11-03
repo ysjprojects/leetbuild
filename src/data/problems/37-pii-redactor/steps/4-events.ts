@@ -197,7 +197,7 @@ def publish_redaction(cur, tenant: str, document_id: str, spans: list, pattern_v
 `,
     },
     typescript: {
-      starter: `/** A audit publisher that ships removed values into the topic. */
+      starter: `/** Audit publisher. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'redactor-events', brokers: ['kafka:9092']});

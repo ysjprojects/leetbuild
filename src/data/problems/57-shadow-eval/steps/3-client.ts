@@ -180,7 +180,7 @@ def schedule_shadow(client: ShadowClient, config_id: str, request) -> None:
 `,
     },
     typescript: {
-      starter: `/** Candidate calls: flawed code that awaits the candidate inline. */
+      starter: `/** Candidate calls. */
 import * as grpc from '@grpc/grpc-js';
 
 const CANDIDATE_RETRIES = 3;

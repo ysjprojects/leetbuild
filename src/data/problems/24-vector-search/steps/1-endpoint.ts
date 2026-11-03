@@ -13,11 +13,9 @@ export const endpointStep: Step = {
 1..100, searches the index as the tenant and version the body names, and returns \`hits\`, \`k\`
 and \`index_version\`. It compiles, serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Trusting a body \`tenant\` turns an authenticated search into an
-unauthenticated one: any caller can read any tenant's corpus by naming it. An unbounded \`k\` lets
-one request ask the index for everything it has. A caller-named \`index_version\` returns results
-from a retired snapshot, or one that does not exist yet, and comparing the vector against the
-active dimension is the only thing that stops a wrong-width query from reaching the shards.
+**Failure mode the checks target.** A body \`tenant\` lets any caller read any tenant's corpus by
+naming it; an unbounded \`k\` asks the index for everything; a caller-named \`index_version\` reads a
+retired or future snapshot; and only the dimension check stops a wrong-width query at the edge.
 
 - The tenant is the authenticated \`X-Tenant-Id\` header and is **required** (**401** when absent).
   A \`tenant\` field in the body is not trusted: when it contradicts the header the request is
@@ -226,7 +224,7 @@ def search(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/search: flawed code that searches as whoever the body names. */
+      starter: `/** POST /v1/search. */
 import Fastify from 'fastify';
 
 import {index} from './index_store';

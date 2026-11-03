@@ -295,7 +295,7 @@ def create_purge(body: PurgeRequest, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** Purge intake: flawed code that reads before it writes and never expires its budget. */
+      starter: `/** Purge intake. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

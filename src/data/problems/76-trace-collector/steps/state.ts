@@ -329,7 +329,7 @@ def insert_span(tenant: str, span: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Trace assembly: flawed code that appends spans and recomputes the root. */
+      starter: `/** Trace assembly. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

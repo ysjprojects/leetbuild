@@ -16,69 +16,57 @@ import {invoiceReadStep} from './steps/5-read';
 export const invoiceServiceProblem: Problem = {
   id: 'invoice-service',
   title: 'Invoice Service',
-  tagline: 'Invoices that number once, tax before finalize and never mutate after issuance.',
+  tagline:
+    'Invoices with a gapless per-tenant number, a tax quote before finalize and a document that is immutable once issued.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Invoice Service
 
 An invoice is the one document a business is legally allowed to be chased for, so an invoice service
-is less about storing line items and more about the promises it keeps: a number is issued once, tax
-is decided before the document exists, and nothing about a finalized invoice ever changes again —
-not the line items, not the customer's view of it, not the events another team already consumed.
+is about the promises it keeps: a number is issued once, tax is decided before the document exists,
+and nothing about a finalized invoice changes again, not the line items, not the customer's view of
+it, not the events another team already consumed.
 
 ## The real system
 
-Production invoice services keep drafts cheap and finals expensive. A draft is a mutable container
-of line items; finalization is a one-way transition that validates the totals, takes the next number
-from a per-tenant sequence without leaving gaps, resolves tax, and only then makes the document
-visible. Because numbering is gapless per tenant, the claim must be atomic with the finalize
-transition: two concurrent finalizes that both read the last number will both write the same number,
-and a claim taken before validation burns a number that no invoice will ever carry. Tax is not
-computed locally from a table that goes stale on the first rule change; it is quoted by a tax
-service under a deadline, and when that service cannot answer, the honest outcome is to hold the
-invoice, not to issue it with zero tax and hope a reconciliation nobody wrote discovers the
-difference. Every lifecycle change — created, finalized, sent, paid — is published to one topic
-keyed by the invoice id so a consumer sees one invoice's history in order, carrying totals and
-digests of the lines instead of the customer's own words and prices, because a topic is retained,
-replicated and read by people who were never granted the invoice. And the read is not one payload
-for everyone: the issuer sees line items, tax breakdown, internal notes and history; the customer
-sees their own document, only once it exists, and only if it is theirs.
+Stripe Invoicing draws the same line between a draft and an issued document. An invoice is created
+as a \`draft\` that can be edited freely; \`POST /v1/invoices/{id}/finalize\` is a one-way
+transition that assigns the invoice \`number\`, records \`status_transitions.finalized_at\` and
+returns the invoice with \`status=open\`, after which the line items are fixed and a correction is a
+credit note or a new revision. A finalize attempt can fail, and when it does the invoice keeps the
+cause in \`last_finalization_error\` until a later attempt succeeds, rather than being issued with a
+guess. This course keeps the same promises inside one service: a claim atomic with the finalize
+transition, validation before the claim so a rejection burns nothing, a tax quote under a deadline
+whose unknown answer holds the draft, lifecycle events keyed by invoice id with digests instead of
+the customer's words, and a read that serves two copies from one stored invoice.
 
 ## What you build here
 
 One service, **invoiced**, with five pieces:
 
-1. \`POST /v1/invoices\` plus \`PATCH /v1/invoices/{id}\` and
-   \`POST /v1/invoices/{id}/finalize\`: validated line items and currency on create, an update that
-   a finalized invoice rejects with **409**, an empty invoice that cannot finalize, and a finalized
-   invoice that a retry replays instead of recreating.
+1. \`POST /v1/invoices\`, \`PATCH /v1/invoices/{id}\` and \`POST /v1/invoices/{id}/finalize\`:
+   validated line items and currency, an update a finalized invoice rejects with **409**, an empty
+   invoice that cannot finalize, and a finalize that a retry replays.
 2. A **Redis** sequence: one atomic claim per tenant that hands out gapless numbers and moves the
-   invoice from draft to finalized in the same operation, taken only after the totals validate, with
-   a reconcile path against the issued invoices.
+   invoice to finalized in the same operation, taken only after the totals validate.
 3. A **gRPC** tax client: a 2-second deadline per quote, a bounded retry of the transient statuses
-   only, a jurisdiction rejection that is terminal and names the jurisdiction, and a **hold** — the
-   invoice stays a draft with a retry marker — when the answer is unknown.
-4. A **Kafka** lifecycle: \`invoice.event\` keyed by invoice id with idempotent, \`acks=all\`
-   publishes of created, finalized, sent and paid, carrying totals and per-line SHA-256 digests and
-   no descriptions, published only after the number claim has committed.
-5. \`GET /v1/invoices/{id}\`: one stored invoice, two server-side projections — the issuer's copy
-   and the customer's copy with internal notes and cost margins removed — with drafts hidden from
+   only, a terminal jurisdiction rejection, and a hold when the answer is unknown.
+4. A **Kafka** lifecycle: \`invoice.event\` keyed by invoice id, carrying totals and per-line SHA-256
+   digests, published only after the number claim has committed.
+5. \`GET /v1/invoices/{id}\`: one stored invoice, two server-side projections, drafts hidden from
    customers and a foreign invoice answered as **404**.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real billing feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, serves the happy path and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Payment capture, credit notes and disputes, dunning and reminders, multi-currency FX, PDF rendering,
-email delivery, credit-limit enforcement, tax-rule authoring, and the accounting ledger's own
-schema. The five pieces above are the ones that decide whether an invoice service is correct,
-auditable and shippable.`,
+Payment capture, credit notes and disputes, dunning, multi-currency FX, PDF rendering, email
+delivery, tax-rule authoring, and the accounting ledger's own schema.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'issuer · customer', x: 8, y: 50},

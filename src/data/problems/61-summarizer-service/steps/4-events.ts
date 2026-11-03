@@ -140,7 +140,7 @@ def publish_summary(summary: dict, tenant: str) -> None:
 
 
 def consume_summary(value: bytes, offset_committer: object) -> None:
-    """The starter: commit the offset first, then try to store the summary."""
+    """Commit the offset, then store the summary."""
     offset_committer.commit()
     store.put(json.loads(value))
 `,
@@ -351,8 +351,7 @@ type SummaryRecord struct {
 	ModelVersion string \`json:"model_version"\`
 }
 
-// publishSummary publishes one summary.done event. The starter keys by tenant and
-// publishes the summary text.
+// publishSummary publishes one summary.done event.
 func publishSummary(ctx context.Context, tenant string, summary SummaryRecord) error {
 	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	value, err := json.Marshal(map[string]any{"summary_id": summary.SummaryID, "summary_text": summary.Summary})
@@ -362,7 +361,7 @@ func publishSummary(ctx context.Context, tenant string, summary SummaryRecord) e
 	return writer.WriteMessages(ctx, kafka.Message{Key: []byte(tenant), Value: value})
 }
 
-// consumeSummary stores the record. The starter commits the offset first.
+// consumeSummary commits the offset, then stores the record.
 func consumeSummary(ctx context.Context, reader *kafka.Reader, msg kafka.Message) error {
 	if err := reader.CommitMessages(ctx, msg); err != nil {
 		return err
@@ -474,7 +473,7 @@ object SummaryEvents extends DefaultJsonProtocol {
 
   val producer = new KafkaProducer[String, String](new Properties())
 
-  /** Publish one summary.done event. The starter keys by tenant and publishes the summary text. */
+  /** Publish one summary.done event. */
   def publishSummary(summary: SummaryRecord, tenant: String): Unit = {
     // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = JsObject("summary_id" -> JsString(summary.summaryId), "summary_text" -> JsString(summary.summary))
@@ -572,8 +571,7 @@ using json = nlohmann::json;
 
 const char* kSummaryDone = "summary.done";
 
-// publish_summary publishes one summary.done event. The starter keys by tenant and
-// publishes the summary text.
+// publish_summary publishes one summary.done event.
 void publish_summary(RdKafka::Producer& producer, const std::string& tenant, const std::string& summary_id,
                      const std::string& summary_text) {
   // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.

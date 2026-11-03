@@ -220,7 +220,7 @@ class ImpressionPipeline:
 `,
     },
     typescript: {
-      starter: `/** Impression events: flawed code that publishes at serve time. */
+      starter: `/** Impression events. */
 import {Kafka, type Producer} from 'kafkajs';
 
 export const IMPRESSION_TOPIC = 'ads.impression';

@@ -218,7 +218,7 @@ def detection_result(tenant: str, text: str, entities: list[str], stub) -> dict:
 `,
     },
     typescript: {
-      starter: `/** A detector client that retries forever and returns the input when down. */
+      starter: `/** Detector client. */
 import * as grpc from '@grpc/grpc-js';
 
 const MAX_RETRIES = 4;

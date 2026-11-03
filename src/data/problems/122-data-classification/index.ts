@@ -47,21 +47,16 @@ export const dataClassificationProblem: Problem = {
   statement: `# Data Classification
 
 A team creates a table with 140 columns at 4 pm, and by policy nobody outside the team may query it
-until someone says what is in it. Half the schemas in the lake sit in Tier 1 because one table in
-each once held a passport number. A model can tag every column in seconds; whether the lake gets
-safer depends on the service around the model: what it feeds in, what it refuses to accept back,
-what it costs per day, and who signs off.
+until someone says what is in it. A model can tag every column in seconds; whether the lake gets
+safer depends on the service around the model.
 
 ## The real system
 
 Grab's **Gemini** (renamed **Metasense**) is the metadata generation service in front of its data
-lake. Data platforms send scan requests when entities appear or change; the service groups them into
-mini-batches, rate-limits itself against the model provider, and asks an LLM to assign each column
-one tag from a curated library, or \`None\` when nothing fits. Predictions go to Kafka, the data
-owner verifies them, and tags plus the privacy office's rules decide the entity's **sensitivity
-tier**, which drives access control and masking. Metasense V2 splits tables with more than 150
-columns into smaller tables, cut the PII prompt from 21 tags to 8, and alerts when the
-misclassification rate crosses a threshold.
+lake. Scan requests are grouped into mini-batches, rate-limited against the model provider, and an
+LLM assigns each column one tag from a curated library, or \`None\`. Predictions go to Kafka, the
+data owner verifies them, and tags plus the privacy office's rules decide the entity's **sensitivity
+tier**, which drives access control and masking.
 
 ## From the source
 
@@ -94,14 +89,13 @@ One service, **metasense**, with five pieces:
 
 ## The debugging habit
 
-Every starter is working code with flaws: it compiles, serves the happy path, and looks right. In
-every step you debug it against the failure modes, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path and looks right. Debug
+it against the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-The prompt text, sample-data redaction, the third-party engine Gemini ran in parallel, prompt
-evaluation tooling, the weekly owner notification, ABAC enforcement and dynamic masking.`,
+The prompt text, sample-data redaction, prompt evaluation tooling, owner notifications, ABAC
+enforcement and dynamic masking.`,
   diagram: {
     nodes: [
       {id: 'platforms', kind: 'client', label: 'Data platforms', sub: 'tables · streams', x: 6, y: 30},

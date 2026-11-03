@@ -224,7 +224,7 @@ def fetch_one(job_id: str, host: str, queue, records) -> str | None:
 `,
     },
     typescript: {
-      starter: `/** Fetcher calls: flawed code that retries a 403 forever. */
+      starter: `/** Fetcher calls. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

@@ -34,15 +34,9 @@ usage as CloudEvents and deduplicates them by \`id\` plus \`source\`: a producer
 network error re-sends the same id, and the meter processes it once. Aggregation is by \`subject\`,
 the customer, over fixed time windows, which is the same shape this course asks for with
 \`(account, request_id)\` as the dedupe key and \`usage:{account}:{hour}\` as the window. The rest of
-the shape follows from where the number ends up. Metering sits on the hot path of every API call but
-must not gate it: past the plan cap the meter writes an overage flag and keeps counting, because a
-metering outage that becomes a \`429\` storm is an availability outage. Counters increment with their
-expiry in one atomic step so a crash cannot strand the last minute of usage. Billing is closed per
-(account, period) under a close id derived from the period, so a retry after a timeout carries the
-same id and billing can dedupe; a close id minted per attempt is a double bill. Analytics receives
-rollup events keyed by the account so an account's usage stays ordered, carrying counters and cap
-state but no request payloads. And the read returns the number the meter is enforcing, with the cap
-state and the last reconciled close id, to the account it belongs to and nobody else.
+the shape follows from where the number ends up: metering sits on the hot path of every API call but
+must not gate it, so past the plan cap the meter writes an overage flag and keeps counting, and a
+billing close carries an id derived from the period so a retry cannot double bill.
 
 ## What you build here
 
@@ -61,17 +55,13 @@ One service, **meterd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real metering feature: debug
-it against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that
-fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path and looks right. Debug
+it against the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Plan and pricing management, invoice rendering, tax, multi-currency, gateway fleet management, the
-tokenizer that decides what a "unit" means per provider, and the historical warehouse. The five pieces
-above are the ones that decide whether the number is counted once, capped as a flag, closed
-idempotently and read by the right caller.`,
+Plan and pricing management, invoice rendering, tax, gateway fleet management, per-provider unit
+definitions, and the historical warehouse.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Gateway', sub: 'report · read', x: 8, y: 50},

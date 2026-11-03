@@ -235,7 +235,7 @@ def summarize(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/summaries: flawed code that lets the source text pick the band. */
+      starter: `/** POST /v1/summaries. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

@@ -225,7 +225,7 @@ def raise_alert(
 `,
     },
     typescript: {
-      starter: `/** Alert evaluation over gRPC: flawed code. */
+      starter: `/** Alert evaluation over gRPC. */
 import {alerting, type AlertRequest} from './alerting';
 
 const THRESHOLD = 0.2;

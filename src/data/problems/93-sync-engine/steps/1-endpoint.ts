@@ -232,7 +232,7 @@ def push(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sync/push: flawed code that applies every change it is given. */
+      starter: `/** POST /v1/sync/push. */
 import Fastify from 'fastify';
 
 import {store} from './revisions';

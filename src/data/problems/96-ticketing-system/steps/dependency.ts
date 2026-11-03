@@ -197,7 +197,7 @@ Requirements:
   ],
   code: {
     python: {
-      starter: `"""ticketd's CRM client: flawed code that pushes a note to the CRM as it is posted."""
+      starter: `"""ticketd's CRM client."""
 import grpc
 
 import crm_pb2
@@ -207,7 +207,7 @@ crm = crm_pb2_grpc.CrmStub(grpc.insecure_channel("crm:9000"))
 
 
 def post_note(note, store) -> int:
-    """POST /v1/tickets/{id}/notes — the starter answers only after the CRM has taken the note."""
+    """POST /v1/tickets/{id}/notes: answers only after the CRM has taken the note."""
     store.append_note(note)
     # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     sync_note(note)
@@ -294,7 +294,7 @@ def drain_outbox(store, crm_stub=crm) -> None:
 `,
     },
     typescript: {
-      starter: `/** ticketd's CRM client: flawed code that pushes a note to the CRM as it is posted. */
+      starter: `/** ticketd's CRM client. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -706,7 +706,7 @@ void drain_outbox(TicketStore& store, Crm::Stub* crm) {
 `,
     },
   },
-  debrief: `The fix takes its shape from one question asked four ways: what does a retry mean here? The note id is the natural idempotency key because it is the identity of the thing being created, so the CRM can update the record it already made instead of appending a second copy of the agent's reply. The deadline stops one silent dependency from pinning the worker. The retryable set separates "the CRM was briefly away" from "the CRM will never accept this note", and quarantine is where the second category goes, parked with a reason a human can act on. The outbox makes all of it safe: the note commits with its pending-sync row, the request returns, and the worker owns the RPC, so a CRM outage degrades the sync rather than the ticket page.
+  debrief: `The fix answers one question four ways: what does a retry mean here? The note id is the idempotency key because it is the identity of the thing being created, so the CRM updates the record it already made instead of appending a copy. The deadline stops one silent dependency from pinning the worker. The retryable set separates "the CRM was briefly away" from "the CRM will not accept this note", and quarantine parks the second kind with a reason. The outbox commits the note with its pending-sync row, so a CRM outage degrades the sync rather than the ticket page.
 
-Production clients add exponential backoff with jitter, a per-note attempt counter so a poison note is parked after a few passes, and reconciliation of CRM note ids against the store.`,
+Production clients add jittered backoff and reconcile CRM note ids against the store.`,
 };

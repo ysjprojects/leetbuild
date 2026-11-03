@@ -13,35 +13,20 @@ invoice, produces it to \`billing.invoice\` with a producer created from default
 calls the processor's \`Charge\` and returns the reference. It compiles, the demo's happy path works
 end to end, and it hides five flaws.
 
-**Failure mode the checks target.** On the happy path a single subscription is charged once and
-approved, so partition placement, the order of produce and charge, the missing failure event and the
-producer settings are all invisible. The flaws show up when a subscription changes owner, a card is
-declined, or a broker hiccups during a produce.
+**Failure mode the checks target.** A subscription that changes owner, a declined card, or a broker
+hiccup during a produce; the happy path charges one subscription once and shows none of it.
 
-Once the processor has answered the charge for a (subscription, period), the outcome goes to the
-topic \`billing.invoice\`:
-
-- Every record carries the **subscription id** as the message key. The key is the partition key, so
-  one subscription's billing history lands on one partition in produce order and a consumer replays
-  it without gaps. Keyed by the customer id, the moment a subscription changes owner or tenant its
-  history scatters across partitions and a consumer can apply a later outcome before an earlier one.
+- Key every record by the **subscription id**, so one subscription's history stays on one partition
+  in order; a customer-id key scatters it when ownership changes.
 - The event carries \`invoice_id\`, \`subscription_id\`, \`period_start\`, \`period_end\`,
-  \`amount_cents\` and \`state\` (\`charged\` or \`failed\`), plus the processor's \`reference\`
-  when the charge went through. It carries **no card data**: the topic is retained for days and
-  replicated to every broker, so a masked card there outlives every retention policy the invoice
-  store has.
-- The produce happens **after** the \`ChargeResult\` is known, so a declined attempt is not announced
-  as a charge that never happened.
-- Failed attempts are published too, with \`state\` \`failed\` and the processor's \`reason\`. A
-  history that only holds successes shows a subscription that simply stopped after a decline, and a
-  gap in the topic is a gap in support's answer.
-- The producer is idempotent with required acks \`all\`: Python \`{"enable.idempotence": True,
-  "acks": "all"}\`, KafkaJS \`{idempotent: true, maxInFlightRequests: 1}\`, kafka-go \`RequiredAcks:
-  kafka.RequireAll\` with \`&kafka.Hash{}\`, kafka-clients \`enable.idempotence\` beside
-  \`ProducerConfig.ACKS_CONFIG\`, librdkafka \`enable.idempotence\` with \`acks=all\`. A retried
-  produce must not duplicate a record.
-- When the broker rejects the produce, the event goes to the **outbox**, a row in the billing db,
-  for the relay to republish. It is not dropped, and a Kafka outage does not fail the caller.`,
+  \`amount_cents\`, \`state\` (\`charged\` or \`failed\`) and the processor's \`reference\` when charged.
+  **No card data**: the topic is retained and replicated.
+- Produce **after** the \`ChargeResult\` is known, so a decline is not announced as a charge.
+- Publish failed attempts too, with \`state\` \`failed\` and the processor's \`reason\`.
+- The producer is idempotent with acks \`all\` (\`enable.idempotence\` + \`acks=all\`; KafkaJS
+  \`idempotent: true\`; kafka-go \`kafka.RequireAll\` with \`&kafka.Hash{}\`).
+- When the broker rejects the produce, write the event to the **outbox** in the billing db for the
+  relay; a Kafka outage does not fail the caller.`,
   sequence: {
     participants: ['Payment processor', 'Billing Service', 'billing.invoice', 'billing db', 'Ledger projector'],
     messages: [

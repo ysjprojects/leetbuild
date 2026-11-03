@@ -23,26 +23,17 @@ export const formServiceProblem: Problem = {
   minutes: 70,
   statement: `# Form Service
 
-A form service is the piece of a product that takes submissions from the public internet, decides
-whether to trust them, keeps them, and hands them to the systems that act on them — a webhook, a
-CRM, a queue. The visible part is a submit button; the parts that decide whether it is safe are the
-validation contract, the abuse controls, the delivery key, and the read path.
+A form service takes submissions from the public internet, decides whether to trust them, keeps
+them, and hands them to the systems that act on them: a webhook, a CRM, a queue. Whether it is safe
+depends on the validation contract, the abuse controls, the delivery key, and the read path.
 
 ## The real system
 
 Formspree, a hosted form backend, documents the shape of this problem from the abuse side: every
 form gets reCAPTCHA, and a hidden \`_gotcha\` honeypot input causes the server to silently drop any
-submission that fills it in, because a scraper fills every field it finds. The rest of the pipeline
-follows the same reasoning. A form service validates against the schema version the author
-*published*, not the draft still being edited, because a published form is a contract with the
-people submitting to it. It rejects unknown fields and oversized values field by field so the
-client learns what to fix. A captcha token is consumed exactly once, and submissions are limited on
-the form and the submitter address together, so neither one address nor a botnet can sweep a form.
-Markup in a field is escaped at rest, because the admin dashboard renders it and an unescaped
-\`<script>\` is a stored-XSS hole. Downstream delivery is keyed by the submission id, so a retry is
-not a second lead. Events are keyed by the form so intake stays ordered and carry hashes rather
-than values, because a topic is retained and replicated. And the read side redacts personal data by
-default, with a separate, audited export for the callers who are allowed to see it.
+submission that fills it in, because a scraper fills every field it finds. A form service also
+validates against the schema version the author *published*, not the draft still being edited,
+because a published form is a contract with the people submitting to it.
 
 ## What you build here
 
@@ -66,16 +57,13 @@ One service, **formd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. The job in every step is the job you will have on a real feature: debug it against
-the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
-starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path and looks right. Debug
+it against the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Captcha issuance and scoring, email verification, file uploads, form authoring and draft publishing,
-multi-region storage, GDPR deletion workflows, and the export tool's own file writing. The five
-pieces above are the ones that decide whether the service is correct, safe and shippable.`,
+Captcha issuance, email verification, file uploads, form authoring and draft publishing,
+multi-region storage, GDPR deletion, and the export tool's file writing.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Public submitter', x: 4, y: 42},

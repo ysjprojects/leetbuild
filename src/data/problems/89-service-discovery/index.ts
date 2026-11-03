@@ -17,32 +17,29 @@ import {readStep} from './steps/5-read';
 export const serviceDiscoveryProblem: Problem = {
   id: 'service-discovery',
   title: 'Service Discovery',
-  tagline: 'Instances register with heartbeats and only healthy backends receive traffic.',
+  tagline: 'A heartbeat-leased registry with gRPC probes before routing and a membership stream keyed by service.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Service Discovery
 
-Service discovery is the piece of a platform that answers one question continuously: which instances
-of this service can serve traffic right now? The visible part is a list of addresses; the parts that
-decide whether the answer is true are the registration boundary, the heartbeat, the health probe,
-the membership stream, and the read path that callers trust.
+Service discovery answers one question continuously: which instances of this service can serve
+traffic right now? The visible part is a list of addresses; what decides whether the answer is true
+is the registration boundary, the heartbeat, the health probe, the membership stream, and the read
+path that callers trust.
 
 ## The real system
 
-Production registries refuse registrations they cannot verify: the caller is authenticated and
-scoped to the service it is writing, and the address it claims must lie inside the range the
-deployment actually owns. Instances then *lease* their membership: a heartbeat renews a record and
-its expiry together, so a process that dies, hangs or is cut off the network leaves the routable set
-on its own, without waiting for anything to notice it. Deploys move one identity — a pod ordinal, a
-replica slot — to a new address atomically, because two live addresses under one identity is how a
-rollout sends half its traffic to the previous version. Registration is only an intent, so nothing
-routes on it: candidates are probed over gRPC under a deadline and the verdict is shared, so ten
-routers do not open ten sets of sockets and two routers never disagree about the same backend. Every
-membership transition is published as an event keyed by service — one ordered stream per service,
-with an outbox when the broker refuses — because that stream is what every cache, dashboard and
-autoscaler rebuilds itself from. And the read API returns only what is routable right now, with the
-heartbeat that justifies it and a reason for everything it excluded.
+HashiCorp Consul separates registration from health the way this course does. A service registers
+with the local agent, and its health is a set of checks the agent runs: a TTL check that the process
+must refresh before it lapses, or a gRPC check that calls the standard \`Health/Check\` protocol
+every \`Interval\` with a \`Timeout\`. A check that goes critical does not remove the service by
+itself; \`DeregisterCriticalServiceAfter\` names how long a service may stay critical before the
+agent deregisters it, so a brief outage is an exclusion and a long one is a removal. The discovery
+plane here follows the same split: a registration bounded by the deployment's CIDR, a heartbeat that
+renews the record and its expiry together, a probe under a deadline whose verdict is shared across
+routers, a membership stream keyed by service, and a read API that returns only what is routable
+now with a reason for everything it excluded.
 
 ## What you build here
 
@@ -51,32 +48,29 @@ One service, **discoveryd**, with five pieces:
 1. \`POST /v1/instances\`: an authenticated, service-scoped registration whose address must be inside
    the deployment's CIDR (\`422\` outside it, \`403\` across services), stored with an expiry of three
    heartbeat intervals.
-2. A **Redis** registry keyed by \`sd:{service}:{instance_id}\`: heartbeats renew the address, the
-   metadata version, the heartbeat stamp and the TTL in one atomic script; version numbers only move
-   forward; a deploy replaces one identity's address atomically, so one identity has one address.
-3. A **gRPC** probe path: \`Health/Check\` with a 200 ms deadline before an instance is returned,
-   failing instances excluded while staying registered, the verdict cached and shared for five
-   seconds, and a passing probe readmitting the instance.
-4. A **Kafka** membership stream: \`discovery.event\` keyed by service with \`kind\`, instance id,
-   metadata version and reason; \`expired\` published only after the TTL has really lapsed; an
-   idempotent, \`acks=all\` producer with an outbox row when the broker rejects the event.
-5. \`GET /v1/services/{name}/instances\`: the routable set with each instance's metadata version and
-   last heartbeat, exclusions explained as \`expired\`, \`stale\` or \`unhealthy\`, and enumeration
-   gated behind the internal scope.
+2. A **Redis** registry keyed by \`sd:{service}:{instance_id}\`: heartbeats renew metadata and TTL in
+   one atomic script, versions only move forward, and a deploy replaces one identity's address
+   atomically.
+3. A **gRPC** probe path: \`Health/Check\` with a 200 ms deadline before an instance is returned, a
+   shared five-second verdict, failing instances excluded but still registered, and readmission on a
+   passing probe.
+4. A **Kafka** membership stream: \`discovery.event\` keyed by service, \`expired\` published only
+   after the TTL has lapsed, an idempotent \`acks=all\` producer with an outbox behind it.
+5. \`GET /v1/services/{name}/instances\`: the routable set with each instance's last heartbeat,
+   exclusions explained as \`expired\`, \`stale\` or \`unhealthy\`, and enumeration gated behind the
+   internal scope.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real platform team: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, serves the happy path and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Multi-cluster and multi-region membership, DNS or xDS integration, mTLS identity provisioning, the
-deployment controller that writes the CIDR, capacity-aware or latency-aware load balancing, drain
-hooks, and the replay job that drains the outbox. The five pieces above are the ones that decide
-whether the discovery plane is correct, isolated and shippable.`,
+Multi-cluster membership, DNS or xDS integration, mTLS identity provisioning, the deployment
+controller that writes the CIDR, latency-aware load balancing, drain hooks, and the replay job that
+drains the outbox.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Instance agent', sub: 'register · heartbeat', x: 6, y: 26},

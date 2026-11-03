@@ -62,9 +62,8 @@ One service, **calendard**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, serves the demo, and looks
-right. Debug it against the failure modes the task names, fix it, optimize what is wasteful, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

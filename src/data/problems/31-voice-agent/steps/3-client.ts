@@ -201,7 +201,7 @@ class SpeechClient:
 `,
     },
     typescript: {
-      starter: `/** Speech client: flawed code that replays and retries forever. */
+      starter: `/** Speech client. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -319,7 +319,7 @@ export class SpeechClient {
 `,
     },
     go: {
-      starter: `// Speech client: flawed code that replays and retries forever.
+      starter: `// Speech client.
 package main
 
 import (
@@ -442,7 +442,7 @@ func (c *SpeechClient) Synthesize(ctx context.Context, text string, audio chan<-
 `,
     },
     scala: {
-      starter: `// Speech client: flawed code that replays and retries forever.
+      starter: `// Speech client.
 import io.grpc.ManagedChannelBuilder
 
 object SpeechClient {
@@ -522,7 +522,7 @@ object SpeechClient {
 `,
     },
     cpp: {
-      starter: `// Speech client: flawed code that replays and retries forever.
+      starter: `// Speech client.
 #include <grpcpp/grpcpp.h>
 
 #include "speech.grpc.pb.h"

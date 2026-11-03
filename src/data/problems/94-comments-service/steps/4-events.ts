@@ -202,7 +202,7 @@ def publish_deleted(comment: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** comment.event: flawed code that keys by author and publishes too early. */
+      starter: `/** comment.event. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'comments-service', brokers: ['kafka:9092']});

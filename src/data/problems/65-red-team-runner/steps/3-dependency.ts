@@ -8,32 +8,25 @@ export const dependencyStep: Step = {
   focus: ['runner', 'sandbox', 'sut'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the system under test, retries when the
-call fails, and stops when an operator flips a flag. In a demo it looks careful. Under a real probe
-set it hammers a target, ignores the kill switch other runners see, and reports a run as complete
-that never finished. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter serves \`POST /v1/redteam/execute\`: \`run_probes\` walks the probe
+list, breaks when a process-local \`KILL_SWITCH\` is true, calls \`execute\` with no deadline inside
+a \`while True\` that retries on any \`RpcError\`, and returns \`status: "complete"\` with the probes
+it sent. In a demo it looks careful. It hides five flaws.
 
-Implement \`run_probes\` and the \`execute\` call it makes:
+**Failure mode the checks target.** A dead target receives the probe set multiplied by an unknown
+factor, and the run never terminates. One runner that sees unintended damage stops alone while its
+replicas keep probing, because the flag it flipped lives in its own process and is read nowhere
+else before the next payload leaves. A stalled probe holds the runner. A run that was cut short
+reports complete, so the coverage gap is invisible and the next run repeats probes that succeeded.
 
 - Every probe call carries a **5-second deadline** (\`PROBE_DEADLINE_S = 5\` /
-  \`PROBE_DEADLINE_MS = 5000\`). A probe that stalls must not hold the runner; the deadline is what
-  turns a hung target into a recorded outcome.
-- The **kill switch is shared**: it is read from Redis under \`redteam:kill:{target}\` before
-  **every** probe, so when one runner reports unintended damage, no other runner sends its next
-  probe either. A process-local boolean only stops the runner that saw the damage.
-- A probe that times out is **retried at most once** (\`MAX_ATTEMPTS = 2\`) and only on
-  \`DEADLINE_EXCEEDED\`; every other status is surfaced immediately. The starter retries forever
-  because more attempts look like more coverage.
-- When the kill switch fires, the run ends with \`status: "aborted"\` and **records where it
-  stopped** (\`resume_at\` = the probe that was not sent), so an operator can resume from a known
-  point instead of restarting the whole set.
-
-**Failure mode the checks target.** The subtle one is the shared switch: a per-process flag makes a
-kill switch look like it works in a single-runner demo and do nothing on a fleet, because the
-runner that stops is never the one that saw the damage. The loud one is the unbounded retry: a dead
-target gets the probe set multiplied by an unknown factor, and the run never terminates. The
-quiet one is the missing cursor: an aborted run that reports complete leaves the coverage gap
-invisible, and the next run repeats probes that already succeeded.`,
+  \`PROBE_DEADLINE_MS = 5000\`).
+- The kill switch is shared: it is read from Redis under \`redteam:kill:{target}\`
+  (\`kill_switch_key\`, \`kill_active\`) before every probe, inside the loop.
+- A probe that times out is retried at most once (\`MAX_ATTEMPTS = 2\`) and only on
+  \`DEADLINE_EXCEEDED\`; every other status is surfaced immediately.
+- When the kill switch fires, the run ends with \`status: "aborted"\` and records where it stopped
+  (\`resume_at\` = the probe that was not sent).`,
   sequence: {
     participants: ['Probe runner', 'Kill switch (Redis)', 'System under test'],
     messages: [
@@ -152,10 +145,7 @@ def execute(endpoint: str, probe_id: str) -> str:
 
 @app.post("/v1/redteam/execute")
 def run_probes(body: RunRequest) -> dict:
-    # TODO: this starter probes without any deadline, retries every failure forever because more
-    # attempts look like more coverage, and reads a process-local flag that the other runners never
-    # see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch
-    # from Redis before each probe, and record where an aborted run stopped.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     sent = []
     for probe_id in body.probes:
         if KILL_SWITCH:
@@ -256,10 +246,7 @@ function execute(stub: grpc.Client, probeId: string, endpoint: string): Promise<
 }
 
 app.post('/v1/redteam/execute', async (request, reply) => {
-  // TODO: this starter probes without any deadline, retries every failure forever because more
-  // attempts look like more coverage, and reads a process-local flag that the other runners never
-  // see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch
-  // from Redis before each probe, and record where an aborted run stopped.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const body = request.body as RunBody;
   const sent: string[] = [];
   for (const probeId of body.probes) {
@@ -360,10 +347,7 @@ import (
 	pb "runner/sutpb"
 )
 
-// TODO: this starter probes without any deadline, retries every failure forever because more
-// attempts look like more coverage, and reads a process-local flag that the other runners never
-// see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch from
-// Redis before each probe, and record where an aborted run stopped.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 var killSwitch = false
 
 func execute(ctx context.Context, client pb.SutClient, endpoint, probeID string) (string, error) {
@@ -473,10 +457,7 @@ object Client {
   val stub = SutGrpc.blockingStub(ManagedChannelBuilder.forAddress("sut-shadow.sandbox", 9000).usePlaintext().build())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: this starter probes without any deadline, retries every failure forever because more
-  // attempts look like more coverage, and reads a process-local flag that the other runners never
-  // see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch
-  // from Redis before each probe, and record where an aborted run stopped.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   var killSwitch = false
 
   final case class Run(run_id: String, target: String, endpoint: String, probes: List[String])
@@ -562,10 +543,7 @@ object Client {
 #include <string>
 #include <vector>
 
-// TODO: this starter probes without any deadline, retries every failure forever because more
-// attempts look like more coverage, and reads a process-local flag that the other runners never
-// see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch from
-// Redis before each probe, and record where an aborted run stopped.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 bool kill_switch = false;
 
 struct RunOutcome {
@@ -682,9 +660,9 @@ RunOutcome runProbes(
     },
   },
   hints: [
-    'One deadline, one retry: `PROBE_DEADLINE_S = 5` bounds a single attempt, `MAX_ATTEMPTS = 2` bounds the probe, and only `DEADLINE_EXCEEDED` earns the second attempt. Everything else — a bad request, a refused method, a target that says no — must surface immediately.',
-    'Check the switch inside the loop, immediately before the probe, not once when the run starts. The interesting moment is the probe after the one that caused damage, and only a per-probe read sees the flag another runner just set.',
-    'Treat an abort as a value: `status: "aborted"` plus `resume_at` naming the probe that was skipped. That single field is what lets the next run resume the set and what lets the report say a category is incomplete instead of green.',
+    'An operator hits the kill switch after a probe corrupts a shadow database, and two other runners keep sending the rest of the set for another twenty minutes.',
+    '`KILL_SWITCH` is a module-level boolean, so only the process that set it stops; `sut.Probe` has no timeout and `while True: … except RpcError: continue` retries every failure forever.',
+    'Call `sut.Probe(request, timeout=PROBE_DEADLINE_S)`, retry once on `DEADLINE_EXCEEDED` (`MAX_ATTEMPTS = 2`), read `kill_active(target)` from `redteam:kill:{target}` before each `execute`, and return `aborted` with `resume_at`.',
   ],
-  debrief: `The interviewer is probing blast radius. A probe set is a workload you point at someone else's system, so three things have to be true. It must be bounded: a deadline per attempt and a retry cap mean a target that stops answering cannot absorb the run's whole time budget. It must be interruptible from outside the process that noticed the damage: the kill switch is shared state read before every probe, which is the only version of the control that works on a fleet. And it must leave a truthful record: an aborted run reports where it stopped, so the coverage gap is a first-class fact instead of a silent success. Real platforms add a global abort broadcast, a per-target concurrency limit so a probe set cannot self-DoS, and a two-person reset for the switch once it has fired.`,
+  debrief: `A probe set is a workload pointed at someone else's system, so the fix gives it three properties. It is bounded: a deadline per attempt and a retry cap mean a target that stops answering cannot absorb the run's whole time budget. It is interruptible from outside the process that noticed the damage: the kill switch is shared state read before every probe, which is the only version of the control that works on a fleet. And it leaves a truthful record: an aborted run reports where it stopped, so the coverage gap is a first-class fact instead of a silent success. Production platforms add a per-target concurrency limit so a probe set cannot overload its own target, and require a second person to reset the switch once it has fired.`,
 };

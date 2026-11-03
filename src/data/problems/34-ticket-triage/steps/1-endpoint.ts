@@ -313,7 +313,7 @@ def triage(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/tickets/triage: flawed code that lets callers route themselves. */
+      starter: `/** POST /v1/tickets/triage. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

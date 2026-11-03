@@ -192,7 +192,7 @@ def resolve(name: str, run_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** The catalog cache: flawed code that writes one tool per command. */
+      starter: `/** The catalog cache. */
 import {Redis} from 'ioredis';
 
 export const redis = new Redis('redis://redis:6379');

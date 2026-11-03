@@ -176,7 +176,7 @@ def send_event(upload_id: str, event: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** upload.event: flawed code that keys by client and commits late. */
+      starter: `/** upload.event. */
 import {Kafka, logLevel} from 'kafkajs';
 
 const kafka = new Kafka({brokers: ['kafka:9092'], logLevel: logLevel.ERROR});

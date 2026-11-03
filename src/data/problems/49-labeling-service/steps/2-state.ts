@@ -14,10 +14,9 @@ export const assignmentStateStep: Step = {
 stub returning false, and reports depth from a counter it \`INCR\`s itself. It serves the demo and
 hides 5 flaws.
 
-**Failure mode the checks target.** One annotator clicking next item looks healthy. A second
-annotator or a closed tab shows the rest: a flag with no deadline leaves circulation for good, a
-client-side read-check-write hands one item to two annotators, and a counter-based depth drifts
-from the pool after the first partial failure.
+**Failure mode the checks target.** A flag with no deadline leaves circulation for good when a tab
+closes, a client-side read-check-write hands one item to two annotators, and a counter-based depth
+drifts from the pool after the first partial failure.
 
 - Four keys per task: \`pool:{task_id}\` (sorted set, score = queue order), \`lease:{task_id}\`
   (sorted set, score = deadline in unix ms), \`assign:{task_id}:{item_id}\` (hash with

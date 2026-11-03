@@ -13,28 +13,19 @@ caller of the surface resolves before it ranks. It checks \`X-Tenant-Id\`, loads
 keeps a copy in process memory, and answers \`200\` with \`{surface, model_version,
 fallback_policy, promoted_at}\`. It compiles, it serves the demo, and it hides four flaws.
 
-**Failure mode the checks target.** A rollout or rollback that is supposed to be one switch. A
-caller is served a version the team never shipped, the operator flips the switch and ranking keeps
-serving the old version until the next deploy, and this read and the ranking call can each resolve
-a different version so an experiment report attributes an outcome to a model that was not served.
+**Failure mode the checks target.** A rollout or rollback that should be one switch. A caller is
+served a version nobody shipped, a rollback keeps serving the old version until the next deploy,
+and this read and the ranking call resolve different versions, so an experiment report credits a
+model that was not served.
 
-- The body is served from the surface config in Redis under \`surface:{surface}:config\`.
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`surface\` must match \`^[a-z0-9][a-z0-9_-]{1,31}$\`; anything else is **400**, rejected before
-  Redis or the catalog is touched.
-- \`model_version\` comes from the surface config, not from a \`model_version\` query parameter. A
-  version on the query string is ignored, not honoured.
-- The served version must be a **promoted** one: the handler consults the promotion record for
-  \`(surface, version)\` and answers **404** when that version was never promoted. The read does
-  not promote anything on its own.
-- An unknown surface is **404** too, before the promotion lookup.
-- The config is cached for **5 seconds** (\`CONFIG_TTL_S\`): long enough to absorb a burst, short
-  enough that a rollback is visible within seconds.
-- The version reported here is resolved through the same accessor the ranking call uses
-  (\`active_model_version(surface)\`), so this read and the next ranking call cannot disagree about
-  which model is live. An exposure is stamped from the rank result itself, which is a different
-  question.
-- Log the read with tenant, surface and version, nothing else.`,
+- Serve from Redis under \`surface:{surface}:config\`; tenant from \`X-Tenant-Id\` (**401** if
+  missing); \`surface\` must match \`^[a-z0-9][a-z0-9_-]{1,31}$\` (**400** before Redis or the catalog).
+- \`model_version\` comes from the surface config; a \`model_version\` query parameter is ignored.
+- Consult the promotion record for \`(surface, version)\` and answer **404** for a version never
+  promoted; an unknown surface is **404** before that lookup.
+- Cache the config for **5 seconds** (\`CONFIG_TTL_S\`) so a rollback is visible within seconds.
+- Resolve the version through \`active_model_version(surface)\`, the accessor the ranking call uses.
+- Log tenant, surface and version only.`,
   sequence: {
     participants: ['Client', 'Recommendation API', 'Redis', 'catalog'],
     messages: [
@@ -817,7 +808,7 @@ int main() {
     'The handler reads the query parameter first, caches the surface row in a process-level map with no expiry, and builds `model_version` from that row itself instead of asking the accessor the ranking call uses.',
     'Delete the query parameter; call `promotions.get(surface, version)` and answer 404 when missing; write the row back with `ex=CONFIG_TTL_S` (5 s); set `version = active_model_version(surface)` and put it in the body.',
   ],
-  debrief: `This endpoint looks like a lookup, but it is the assignment every reader resolves before it ranks: the ranking call, the offline comparison, the analytics job that stamps impressions. So the version must be a promoted one, because an unpromoted version is a model nobody shipped and the read answers 404 exactly as it would for a surface that does not exist. The version must be read live, because a five-second TTL in Redis is the difference between a rollback that lands in seconds and one that waits for the next deploy of every process holding the row in memory. And the version must come through one accessor, \`active_model_version(surface)\`, so two reads cannot straddle a rollback and disagree.
+  debrief: `This endpoint looks like a lookup, but it is the assignment every reader resolves before it ranks. The version must be promoted, because an unpromoted version is a model nobody shipped, so the read answers 404 as it would for a missing surface. It must be read with a five-second TTL, the difference between a rollback that lands in seconds and one that waits for every process holding the row in memory to redeploy. And it must come through one accessor, \`active_model_version(surface)\`, so two reads cannot straddle a rollback and disagree.
 
-Production systems keep an audit trail for promotions, roll out by staged percentage instead of all-or-nothing, push invalidations (Pub/Sub or a watched key) ahead of the TTL, and keep a last-known-good copy so a Redis outage degrades to the previous assignment rather than to no answer.`,
+Production systems keep an audit trail for promotions, roll out by staged percentage, push invalidations ahead of the TTL, and keep a last-known-good copy for a Redis outage.`,
 };

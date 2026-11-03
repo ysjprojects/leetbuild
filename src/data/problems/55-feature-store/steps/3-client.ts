@@ -203,7 +203,7 @@ async def backfill(name: str, version: int, cutoff_ms: int, partitions: list[int
 `,
     },
     typescript: {
-      starter: `/** Backfill a feature version: flawed code that trusts the warehouse to be fast. */
+      starter: `/** Backfill a feature version. */
 import * as grpc from '@grpc/grpc-js';
 
 import {warehouse} from './warehouse';

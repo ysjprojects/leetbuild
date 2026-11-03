@@ -264,7 +264,7 @@ def redact(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/redact: flawed code that fails open. */
+      starter: `/** POST /v1/redact. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

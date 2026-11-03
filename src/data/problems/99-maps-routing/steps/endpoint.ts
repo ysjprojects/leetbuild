@@ -14,18 +14,15 @@ export const endpointStep: Step = {
 \`solver.plan(…)\` and answers **201** with \`{"route_id": …, "distance_m": …, "geometry": …}\`.
 It compiles, it serves the demo, and it hides four flaws.
 
-**Failure mode the checks target.** The starter forwards whatever floats arrived straight into the
-solver. One \`NaN\` in an origin poisons the spatial index the engine builds, a 5000-waypoint
-request turns one client call into a stalled solver for every other tenant, and a handler that
-treats the map as global answers an out-of-coverage pair with a plan the tenant's data does not
-support. Cheap rejections first, so no request buys engine time its caller cannot pay for.
+**Failure mode the checks target.** Raw floats go straight into the solver. One \`NaN\` poisons the
+engine's spatial index, a 5000-waypoint request stalls the solver for every other tenant, and an
+out-of-coverage pair gets a plan the tenant's data does not support.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`origin\` and \`destination\` are required, and every point (the two endpoints and each waypoint)
   is a pair of finite numbers: \`lat\` inside **±90**, \`lng\` inside **±180**. NaN, ±Infinity,
   a missing point or an out-of-range value is **422**, before the routing engine sees anything.
-- At most **25 waypoints**. The cap is a length check, so it runs before the points are validated
-  and before the solver is called: a 5000-waypoint list is rejected, not forwarded.
+- At most **25 waypoints**, checked before the points are validated and before the solver runs.
 - Both endpoints must fall inside the tenant's map coverage (\`coverage.covers(tenant, …)\`); an
   out-of-coverage pair is **403** with an \`OUT_OF_COVERAGE\` error, not a straight-line guess
   dressed up as a route.
@@ -233,7 +230,7 @@ def create_route(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/routes: flawed code of the routing endpoint. */
+      starter: `/** POST /v1/routes. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

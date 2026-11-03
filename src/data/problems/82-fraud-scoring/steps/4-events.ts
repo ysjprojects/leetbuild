@@ -201,7 +201,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** fraud.scored publishing and alerting — flawed code. */
+      starter: `/** fraud.scored publishing and alerting. */
 import {Kafka} from 'kafkajs';
 import Redis from 'ioredis';
 
@@ -585,7 +585,7 @@ object ScoredEvents {
 `,
     },
     cpp: {
-      starter: `// fraud.scored publishing and alerting — flawed code.
+      starter: `// fraud.scored publishing and alerting.
 #include <string>
 
 #include <librdkafka/rdkafkacpp.h>

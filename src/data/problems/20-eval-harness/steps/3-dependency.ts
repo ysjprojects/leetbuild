@@ -245,7 +245,7 @@ def score_sample(sample: dict) -> float:
 `,
     },
     typescript: {
-      starter: `/** scoreSample: flawed code that retries every failure forever. */
+      starter: `/** scoreSample. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

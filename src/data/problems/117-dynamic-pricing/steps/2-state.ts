@@ -139,7 +139,7 @@ caps the sku for good; the refusal is a 422 with no bound; the publish carries n
   ],
   code: {
     python: {
-      starter: `"""POST /v1/prices: flawed code that checks each proposal against the price on disk."""
+      starter: `"""POST /v1/prices."""
 import time
 
 import redis
@@ -360,7 +360,7 @@ def post_price(body: PriceRequest) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/prices: flawed code that checks each proposal against the price on disk. */
+      starter: `/** POST /v1/prices. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -869,7 +869,7 @@ func main() {
 `,
     },
     scala: {
-      starter: `/** POST /v1/prices: flawed code that checks each proposal against the price on disk. */
+      starter: `/** POST /v1/prices. */
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._

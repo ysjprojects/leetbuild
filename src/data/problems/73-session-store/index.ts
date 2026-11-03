@@ -23,27 +23,17 @@ export const sessionStoreProblem: Problem = {
   minutes: 70,
   statement: `# Session Store
 
-A session store is the piece of a platform that decides which requests are authenticated, for how
-long a login may live, and what a user is allowed to see about their own sessions. The visible part
-is a token in a cookie; the parts that decide whether the platform is safe are the rotation on
-elevation, the atomicity of every write, the failure policy of the auth call, and the events the
-platform keeps about itself.
+A session store decides which requests are authenticated, for how long a login may live, and what a
+user is allowed to see about their own sessions. The visible part is a token in a cookie.
 
 ## The real system
 
 Spring Security's session fixation protection changes the HTTP session id at the moment
 authentication succeeds (the default \`changeSessionId\` strategy), so an id a client held before
 login is not the id it holds after, and Spring Session keeps those sessions in Redis with an
-expiration that is refreshed on access. Session layers built along those lines issue a new id at
-every privilege elevation, keep records under a sliding TTL so active users are not logged out but
-under a hard absolute cap so a stolen token cannot live forever, and write the replacement before
-retiring the original in one atomic step so a crash cannot leave two live sessions. They validate
-tokens against an auth service with a deadline and a short cache, and when that service is
-unavailable they deny the request rather than trusting a local copy. They publish one event per
-session change keyed by user so a user's history stays ordered, carrying a token hash rather than
-the token, and they persist the session record before announcing it. And they show a user exactly
-what is live: device class, last-seen within a minute, rotation count, and one action that revokes
-every id atomically.
+expiration that is refreshed on access. This course adds what that leaves to you: a hard absolute
+cap a sliding TTL cannot extend, and a rotation that writes the replacement and retires the original
+in one atomic step.
 
 ## What you build here
 
@@ -67,10 +57,8 @@ One service, **sessiond**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real session layer: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -230,7 +230,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** prompt.lifecycle: flawed code that keys by the operator and acks too early. */
+      starter: `/** prompt.lifecycle. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

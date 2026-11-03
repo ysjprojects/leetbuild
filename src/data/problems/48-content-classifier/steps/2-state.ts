@@ -188,7 +188,7 @@ def bump_counter(tenant: str, label: str, now: float | None = None) -> None:
 `,
     },
     typescript: {
-      starter: `/** Taxonomy cache and per-tenant counters: flawed code with two caching bugs. */
+      starter: `/** Taxonomy cache and per-tenant counters. */
 import Redis from 'ioredis';
 
 export const r = new Redis({host: 'redis', port: 6379});

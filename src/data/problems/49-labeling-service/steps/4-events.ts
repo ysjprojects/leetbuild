@@ -309,7 +309,7 @@ def consume_submitted() -> None:
 `,
     },
     typescript: {
-      starter: `/** label.submitted: flawed code that keys by annotator and publishes before persisting. */
+      starter: `/** label.submitted. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';

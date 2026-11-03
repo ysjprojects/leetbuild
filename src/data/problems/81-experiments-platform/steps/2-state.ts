@@ -16,22 +16,20 @@ one 50/50 experiment whose split never moves. It serves the demo and hides 4 fla
 edited, one experiment's cached row answers another experiment's request, and stopping an experiment
 flips everyone to control instead of serving the assignment already written.
 
-An assignment is a pure function of **(experiment id, assignment unit, frozen salt)**. Implement the
-assignment cache:
+An assignment is a pure function of **(experiment id, assignment unit, frozen salt)**:
 
 - Compute the bucket exactly as \`int(sha256(f"{experiment.id}:{unit}:{experiment.salt}").hexdigest()[:8], 16) % 100\`
   (same shape in every language) with the experiment's **frozen salt**.
 - Key the cached assignment by \`exp:{experiment_id}:assign:{unit}\` (mirror per language).
 - Write the assignment with a conditional write (\`SET NX\` / \`setnx\`-style) so a concurrent request
   cannot overwrite an existing assignment. The cached value is the variant key.
-- Read the cache **first**; only a miss computes the bucket. A row created by the frozen hash stays
-  the same for the experiment's whole life, even if the split or the salt is later edited.
+- Read the cache **first**; only a miss computes the bucket, so a row stays put even if the split
+  or salt is later edited.
 - A new unit fills the **frozen** split (buckets \`0–49\` → \`control\`, \`50–99\` → \`treatment\`) by
   walking its cumulative weights.
-- A \`stopped\` or disabled experiment serves the **last cached assignment**; only a unit with no
-  assignment on a stopped experiment is refused (**409** / \`None\`).
-- New assignments get a TTL (\`EX\`/\`ex=\` of the experiment's remaining life, or 30 days) so an
-  abandoned unit does not keep a dead row forever.`,
+- A \`stopped\` experiment serves the **last cached assignment**; a unit with none is refused
+  (**409** / \`None\`).
+- New assignments get a TTL (\`EX\`/\`ex=\` of the experiment's remaining life, or 30 days).`,
   sequence: {
     participants: ['Experiment API', 'Redis', 'Experiment store'],
     messages: [
@@ -222,7 +220,7 @@ def assign(experiment: Experiment, unit: str) -> str:
 `,
     },
     typescript: {
-      starter: `/** Variant assignment: flawed code that re-buckets every request. */
+      starter: `/** Variant assignment. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 import {createHash} from 'node:crypto';

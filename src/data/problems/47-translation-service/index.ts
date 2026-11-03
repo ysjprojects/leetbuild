@@ -36,13 +36,8 @@ key, the failure policy and the metric key.
 Amazon Translate's synchronous \`TranslateText\` call caps the input at 10,000 bytes of UTF-8 and
 accepts one custom terminology file per request, with a 20 MB cap per file and 100 files per account
 per region: terminology is a size-bounded resource imported ahead of time and attached to a call by
-name, not a free-text hint. A multi-tenant service built on such an API keeps the same discipline.
-A glossary is versioned and immutable, so a request pins one version for its whole lifetime and an
-edit publishes a new version. Caches are keyed by tenant, locale pair and glossary version, with a
-TTL. When the model call fails under its deadline, the service returns the source text with an
-untranslated marker and a retriable status, and that response is not cached as a translation.
-Each segment emits one quality event keyed by locale pair, carrying text hashes rather than text,
-and the consumer updates its counters before it commits the offset.
+name, not a free-text hint. This course keeps the same discipline: a glossary version is pinned for
+the whole request, and an edit publishes a new version.
 
 ## What you build here
 
@@ -64,9 +59,8 @@ One service, **translationd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. In each step you debug it against the failure modes the checks describe, fix it,
-optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on yours.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -17,68 +17,58 @@ import {readStep} from './steps/5-read';
 export const redTeamRunnerProblem: Problem = {
   id: 'red-team-runner',
   title: 'Red Team Runner',
-  tagline: 'Adversarial probes that run safely, cover their cases and produce reproducible findings.',
+  tagline: 'Adversarial probe runs with a target registry, a shared kill switch and a report that counts coverage.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Red Team Runner
 
-A red team runner is the piece of an AI platform that plays the attacker: it sends adversarial
-probes at a model, a prompt pipeline or an agent, and reports what it found in a form someone can
-reproduce. The visible part is a list of findings; the parts that decide whether it is safe to run
-are the target registry, the probe claim and budget, the kill switch in front of every call, the
-finding event that carries evidence instead of the attack, and a report that is honest about the
-coverage it achieved.
+A red team runner plays the attacker: it sends adversarial probes at a model, a prompt pipeline or
+an agent, and reports what it found in a form someone can reproduce. The visible part is a list of
+findings; what decides whether it is safe to run is the target registry, the probe claim and budget,
+the kill switch in front of every call, the finding event that carries evidence instead of the
+attack, and a report that counts the coverage it achieved.
 
 ## The real system
 
-Production red team runners do not accept a URL and start probing. They resolve the target through a
-registry, refuse anything in production, and answer a replayed submission with the run they already
-created. They claim each probe once — keyed by the target and the probe hash — so a retry or a
-second worker cannot double-run it, and they spend from a per-target budget that expires with its
-window and separates destructive categories from harmless ones. Every probe call carries a deadline
-and a bounded retry, and the kill switch that aborts a run lives in shared state, because a runner
-that hits unintended damage has to stop every replica, not itself. An aborted run records where it
-stopped. Findings are published keyed by target so one target's stream stays ordered, they carry a
-probe id, a severity and a reference to the sealed evidence bundle rather than the adversarial
-payload, and the bundle is sealed before the event exists. The report returns coverage by category,
-blocked and succeeded probes, unfixed findings, and it refuses to call a run a pass when a category
-was skipped.
+NVIDIA's garak, an open-source LLM vulnerability scanner, is organised around the same nouns this
+course uses. A generator wraps the target and handles authentication, connection management and
+backoff; a probe tries to elicit one kind of failure and wraps each adversarial interaction in an
+attempt; a detector examines the outputs for a single failure mode; and the report is a log of
+attempts with per-probe, per-detector pass and fail counts, so a reader sees what was tried, not
+only what fired. A hosted runner that points such probes at other teams' systems adds the operating
+controls around that loop: a target registry, a probe claimed once, a budget that expires with its
+window, a deadline per call, a kill switch in shared state, findings keyed by target with a
+reference to sealed evidence, and a report that counts coverage before it calls a run a pass.
 
 ## What you build here
 
 One service, **redteamd**, with five pieces:
 
-1. \`POST /v1/redteam/runs\`: authenticated tenant, a target resolved through \`TARGET_REGISTRY\`,
-   \`400\` for an unregistered target, \`403\` for a production environment, and an
-   \`Idempotency-Key\` so a replay returns the existing run instead of re-dispatching the probe set.
+1. \`POST /v1/redteam/runs\`: authenticated tenant, a target resolved through \`TARGET_REGISTRY\`
+   (\`400\` unregistered, \`403\` production), and an \`Idempotency-Key\` so a replay returns the
+   existing run.
 2. A **Redis** probe ledger: \`(target, probe_hash)\` claimed with one atomic \`SET … NX … EX\`, an
-   hourly per-target budget reserved inside one Lua \`EVAL\` that sets its own expiry, and a smaller
-   cap of its own for destructive categories.
-3. A **gRPC** call to the system under test: a 5-second deadline, at most one retry on
-   \`DEADLINE_EXCEEDED\`, and a shared kill switch read before every probe that ends the run with a
-   recorded resume point.
-4. A **Kafka** finding stream: one \`redteam.finding\` event per finding keyed by target id, an
-   idempotent producer with \`acks=all\`, an \`evidence_ref\` instead of the raw payload, and the
-   evidence bundle sealed before the event is produced.
+   hourly per-target budget reserved inside one Lua \`EVAL\`, and a smaller cap for destructive
+   categories.
+3. A **gRPC** call to the system under test: a 5-second deadline, one retry on \`DEADLINE_EXCEEDED\`,
+   and a shared kill switch read before every probe.
+4. A **Kafka** finding stream: \`redteam.finding\` keyed by target id, an idempotent producer with
+   \`acks=all\`, and an \`evidence_ref\` sealed before the event is produced.
 5. \`GET /v1/redteam/runs/{id}\`: tenant-scoped with a \`404\` for a foreign run, coverage per
-   category with blocked, succeeded and unfixed counts, a warning for every category the kill switch
-   skipped, and a status that is \`incomplete\` while any category is skipped.
+   category, and \`incomplete\` while any category was skipped.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+Every starter in this course is working code with flaws: it compiles, serves the happy path and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
 checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Probe authoring and mutation, model-specific attack libraries, jailbreak discovery, scoring of
-severity, evidence retention and redaction policy, reviewer assignment and SLAs, and the dashboard.
-The five pieces above are the ones that decide whether an adversarial runner is safe to operate,
-interruptible, reproducible and honest.`,
+Probe authoring, model-specific attack libraries, jailbreak discovery, severity scoring, evidence
+retention policy, reviewer assignment, and the dashboard.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Operator', sub: 'submit · report', x: 8, y: 50},

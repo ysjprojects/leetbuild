@@ -11,25 +11,21 @@ export const readStep: Step = {
 **Starting point.** The starter serves \`GET /v1/requests/{id}\`: it loads the stored request,
 reads the \`decision:{i}\` fields of the state hash, computes one \`approved\` flag from whether any
 step approved, builds a \`trail\` entry per approver that is not in the request's \`skipped\` map,
-and answers \`{"request_id", "trail"}\`. The UI renders a chain, so the demo looks complete. It
-serves the demo and hides 4 flaws.
+and answers \`{"request_id", "trail"}\`. It serves the demo and hides 4 flaws.
 
 **Failure mode the checks target.** A read that hides skipped steps and flattens every step under
-one flag is worse than no read: an auditor concludes the chain was signed in order when two of its
-steps did not happen, and nobody can see that the approver for step 1 was actually a delegate. The
-missing tenant check is the one that leaks: a request id is guessable, and the trail contains the
-requester, the reasons and the amounts.
+one flag tells an auditor the chain was signed in order when two steps did not happen, and hides
+that step 1 was decided by a delegate. The missing tenant check leaks a guessable request's
+requester, reasons and amounts.
 
 - The tenant comes from \`X-Tenant-Id\` (**401** when missing); a request that belongs to another
   tenant answers **404**, exactly like one that does not exist.
 - The response reports the chain **pinned at submit time**: \`chain_version\` from the stored
   request, then one entry per step in chain order.
 - **Every step accounts for itself.** A skipped step appears with its **reason** (the threshold,
-  the policy waiver, the manager on leave) instead of being filtered out so the chain looks
-  complete.
+  the policy waiver, the manager on leave) instead of being filtered out.
 - Each step reports **its own** state (\`pending\`, \`approved\`, \`rejected\`, \`skipped\`,
-  \`delegated\`) from its own decision record. A later approval does not repaint an earlier
-  pending step.
+  \`delegated\`) from its own decision record.
 - **Delegations are part of the trail**: when a step was decided by a delegate, the response names
   the step, who it was delegated from and who acted.
 - The response shape is \`{"request_id", "chain_version", "status", "steps": [{step, approver,
@@ -253,7 +249,7 @@ def read_request(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/requests/{id}: flawed code that hides what did not happen. */
+      starter: `/** GET /v1/requests/{id}. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

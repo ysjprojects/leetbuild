@@ -39,13 +39,8 @@ machine-learning service embeds each uploaded asset with a CLIP model, the vecto
 through the VectorChord extension, and "Smart Search" indexing runs as a background job queue, so
 switching models means re-queueing every asset rather than blocking uploads.
 
-The shape generalizes. The client registers the asset first and receives a signed URL to PUT the
-bytes to object storage, so a 20 MiB upload does not occupy an API worker, and the content hash is
-the idempotency key. Dedupe and quota live in one atomic reservation with expiring keys. A vision
-timeout degrades the asset to text-only indexing with a visible flag, a content-policy rejection
-fails it with a reason, and no placeholder caption enters the index. Events are keyed by asset id,
-carry checksums and embedding ids rather than URLs, and follow the index write. Reads hand out a
-15-minute signed URL bound to the tenant; a foreign id is a 404.
+The shape generalizes: the client registers the asset first and PUTs the bytes to a signed URL, so
+a 20 MiB upload does not occupy an API worker, and the content hash is the idempotency key.
 
 ## What you build here
 
@@ -64,9 +59,8 @@ One service, **ingestd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, serves the happy path and looks
-right. In every step you debug it against the failure modes, fix it, optimize what is wasteful, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

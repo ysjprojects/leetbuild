@@ -15,20 +15,17 @@ one-hour expiry; a decision appends to an \`approvals\` list, sets \`step_index\
 length and rewrites the blob. The demo approval completes in two clicks. It serves the demo and
 hides 5 flaws.
 
-**Failure mode the checks target.** A list length is not a step index: one approver clicking
-twice, or a client retrying a timed-out decision, advances two steps and a three-step chain
-completes with one signature. Nothing compares the actor with the current step's approver, so any
-participant decides out of order. And the one-hour TTL is a data-loss timer on an object with a
-three-week lifetime: the chain disappears and the next decision answers 404.
+**Failure mode the checks target.** A list length is not a step index: a double click or a retried
+decision advances two steps, so a three-step chain completes with one signature. Any participant
+can decide out of order, and the one-hour TTL deletes a chain that may wait three weeks.
 
 - The state of one request is **one Redis hash** \`approval:{request_id}:state\`: \`step_index\`,
   \`step_count\`, \`status\`, \`current_approver\`, an \`approver:{i}\` field per step, and one
   \`decision:{i}\` field per decided step.
 - \`start_chain\` initialises that hash with **no TTL**; completed requests are cleaned up by a
   sweeper, not by a mid-flow expiry.
-- One decision is one **compare-and-swap**: a single Lua script reads \`step_index\`, refuses the
-  call when the caller's \`step_index\` no longer matches, and only then advances the index by
-  **exactly one**. The loser of a race gets a no-op, not a second step.
+- One decision is one **compare-and-swap**: a single Lua script refuses the call when the caller's
+  \`step_index\` no longer matches, and only then advances the index by **exactly one**.
 - Only the **current step's approver** may decide: an actor that is not \`current_approver\` is
   refused.
 - A repeated decision is a **no-op**: \`decision:{i}\` is written with \`HSETNX\`, so the second write
@@ -261,7 +258,7 @@ def decide(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/requests/{id}/decision: flawed code that counts approvals. */
+      starter: `/** POST /v1/requests/{id}/decision. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

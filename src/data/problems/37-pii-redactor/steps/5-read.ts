@@ -191,7 +191,7 @@ def read_redaction(
 `,
     },
     typescript: {
-      starter: `/** A audit read that returns the redacted text and skips the tenant check. */
+      starter: `/** Audit read. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

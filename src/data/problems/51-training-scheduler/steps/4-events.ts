@@ -8,39 +8,27 @@ export const trainingEventsStep: Step = {
   focus: ['scheduler', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code for the event publisher: it builds
-a payload, produces it to \`training.run\` and acks. It compiles, it serves the demo, and it hides
-four production flaws that only surface once more than one run is training. Debug it like the owner
-of a topic whose consumer rebuilds a run's history, and prove the fix with the checks below.
+**Starting point.** The starter is the run event publisher: \`publish_state\` builds a payload with
+the run id and state, produces it to \`training.run\` keyed by the priority band from a default
+producer and flushes; \`start_run\` publishes \`started\`, then asks the worker to \`StartRun\`;
+\`finish_run\` publishes \`finished\`. It compiles, serves the demo and hides five flaws.
 
-Publish one event per transition of a run — \`queued\`, \`started\`, \`preempted\`, \`checkpointed\`,
-\`finished\` — to the topic \`training.run\`.
+**Failure mode the checks target.** Two runs in one band share a partition, so a consumer applies a
+stale \`preempted\` after a \`finished\`. The history says a run is training on a fleet that refused
+it. A consumer never sees the queue entry, the preemption or the checkpoint. When the broker blinks,
+a transition is absent from the log, and a produce retried after a timeout can land twice.
 
-- One publisher emits **every** transition, and the payload carries the run id, the transition, the
-  **node count** and the **checkpoint id** where they apply. The starter publishes only \`started\` and
-  \`finished\`, so a consumer never sees the queue entry, the preemption or the checkpoint it is
-  supposed to act on.
-- Every produce is **keyed by the run id** (\`key=run_id\`, \`key: runId\`, \`Key: []byte(runID)\`,
-  \`ProducerRecord(topic, runId, payload)\`, the message key argument). The key chooses the partition,
-  and the partition is what keeps one run's history ordered. The starter keys by priority band, so runs
-  that share a band interleave and a run's own transitions can be consumed out of order.
-- \`started\` is published **only after the worker confirms the start**: the \`StartRun\` reply is
-  checked (\`accepted\`, node count) and the event follows it. The starter publishes \`started\` before it
-  has even asked the worker, so a consumer believes a run is training on a fleet that refused it.
-- The run's new state and an **outbox row** are written in **one transaction** (\`INSERT INTO
-  training_outbox\`), and the produce follows the commit; when the broker rejects the produce the row
-  stays pending and a **relay** republishes it. The starter has no outbox: a rejection is a throw nobody
-  catches, and the transition is gone. A broker outage must leave recoverable events.
-- The producer acknowledges with \`acks=all\` and runs **idempotently** (\`enable.idempotence\`,
-  \`RequiredAcks: RequireAll\`), so a produce retried after a timeout cannot duplicate a transition.
-  The starter leaves both at their defaults.
-
-**Failure mode the checks target.** Ordering is the subtle one: keying by band looks harmless while
-one run is training and turns into a consumer that applies a stale \`preempted\` after a \`finished\`,
-because two runs in one band share a partition. Publishing \`started\` before the worker confirms is
-the lie that costs GPU hours: the history says the run is training while the fleet never accepted it.
-The missing outbox is the one that hides for months — invisible until the broker blinks, and then a
-transition some checkpoint policy depends on is simply absent from the log.`,
+- One publisher (\`publish_transition\`) emits every transition, \`queued\`, \`started\`,
+  \`preempted\`, \`checkpointed\`, \`finished\`, with the run id, node count and checkpoint id where
+  they apply.
+- Every produce is keyed by the run id (\`key=run_id\`, \`key: runId\`, \`Key: []byte(runID)\`,
+  \`ProducerRecord(topic, runId, payload)\`).
+- \`started\` is published only after the \`StartRun\` reply is checked (\`accepted\`, node count).
+- The run's new state and an outbox row (\`INSERT INTO training_outbox\`) are written in one
+  transaction; the produce follows the commit, and when the broker rejects it the row stays pending
+  for \`relay_outbox\` to republish.
+- The producer runs with \`acks=all\` and idempotence (\`enable.idempotence\`,
+  \`RequiredAcks: RequireAll\`).`,
   sequence: {
     participants: ['Training Scheduler', 'Training worker', 'run store · outbox', 'Kafka', 'Lifecycle consumer'],
     messages: [
@@ -215,9 +203,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_state(run: dict, state: str) -> None:
-    # TODO: this starter keys by the priority band, publishes \`started\` before the worker confirms,
-    # publishes only two of the five transitions, and drops the event when the broker rejects the
-    # produce. Fix all four before a consumer rebuilds a run's history from this topic.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = json.dumps({"type": "training.run", "run_id": run["run_id"], "state": state}).encode("utf-8")
     producer.produce(TOPIC, key=str(run["band"]).encode("utf-8"), value=payload)
     producer.flush()
@@ -374,9 +360,7 @@ const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('worker.proto')) as 
 const client = new pkg.trainsched.TrainingWorker(WORKER_ADDR, grpc.credentials.createInsecure());
 
 async function publishState(runId: string, band: number, state: string): Promise<void> {
-  // TODO: this starter keys by the priority band, publishes 'started' before the worker confirms,
-  // publishes only two of the five transitions, and drops the event when the broker rejects the
-  // produce. Fix all four before a consumer rebuilds a run's history from this topic.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: TOPIC,
     messages: [{key: String(band), value: JSON.stringify({type: 'training.run', run_id: runId, state})}],
@@ -559,9 +543,7 @@ type runRef struct {
 }
 
 func publishState(ctx context.Context, run runRef, state string) error {
-	// TODO: this starter keys by the priority band, publishes "started" before the worker confirms,
-	// publishes only two of the five transitions, and drops the event when the broker rejects the
-	// produce. Fix all four before a consumer rebuilds a run's history from this topic.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(map[string]any{"type": "training.run", "run_id": run.RunID, "state": state})
 	if err != nil {
 		return err
@@ -795,9 +777,7 @@ object Events {
   private val stub = TrainingWorkerGrpc.blockingStub(channel)
 
   def publishState(runId: String, band: Int, state: String): Unit = {
-    // TODO: this starter keys by the priority band, publishes "started" before the worker confirms,
-    // publishes only two of the five transitions, and drops the event when the broker rejects the
-    // produce. Fix all four before a consumer rebuilds a run's history from this topic.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val payload = """{"type":"training.run","run_id":"%s","state":"%s"}""".format(runId, state)
     producer.send(new ProducerRecord[String, String](TrainingRunTopic, band.toString, payload))
   }
@@ -963,9 +943,7 @@ struct RunRef {
 };
 
 static void publish_state(RdKafka::Producer* producer, const RunRef& run, const std::string& state) {
-  // TODO: this starter keys by the priority band, publishes "started" before the worker confirms,
-  // publishes only two of the five transitions, and drops the event when the broker rejects the
-  // produce. Fix all four before a consumer rebuilds a run's history from this topic.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const std::string payload = json{{"type", "training.run"}, {"run_id", run.run_id}, {"state", state}}.dump();
   const std::string key = std::to_string(run.band);
   producer->produce(kTrainingRunTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
@@ -1143,9 +1121,9 @@ int main() {
     },
   },
   hints: [
-    'The message key decides the partition, and the partition decides the order a consumer replays. Key by `run_id` — the thing whose history must stay ordered — not by the priority band the run happens to sit in.',
-    'A run’s history is only complete if every transition is on it: `queued`, `started`, `preempted`, `checkpointed`, `finished`, each carrying the node count and the checkpoint id the consumer needs. Two events out of five is a history with holes in exactly the places that cost GPU hours.',
-    '`started` is a claim the worker has already confirmed, so check the `StartRun` reply and publish after it. Then treat the produce as part of the state change: the row and the outbox entry commit together, only the ack clears the entry, and `acks=all` plus idempotence keeps a retry from duplicating a transition.',
+    'A consumer that rebuilds run histories shows runs training that the fleet rejected, and after a broker restart some runs have a `finished` with no `started` before it.',
+    '`start_run` calls `publish_state` before `stub.StartRun`, so the claim precedes the fact; `key=str(run["band"])` puts unrelated runs on one partition; `producer.produce` has no outbox behind it.',
+    'Publish every transition via `publish_transition` with `key=run_id`; check the `StartRun` reply before `"started"`; write state and `INSERT INTO training_outbox` in one transaction, then produce; set `acks=all` and `enable.idempotence`.',
   ],
-  debrief: `The interviewer is testing whether you understand a topic as a log ordered per key, and an event as a claim about something that already happened. The starter reads fine with one run, one producer and a healthy broker: it produces a valid payload, a valid key and a valid ack, and the flaws only appear when two runs share a band, when the worker refuses a start, or when the broker is unreachable for a minute. The checks cover exactly those: the run-id key (per-run ordering), the complete transition set with node counts and checkpoint ids (a history a consumer can replay), the ordering of started after the worker's confirmation (no claim ahead of the fact), the transactional outbox plus relay (recoverable on rejection) and acks=all with an idempotent producer (no duplicate on retry). Real systems add a schema registry with per-event versions, a consumer that stores the last applied transition so a replayed partition cannot move a run backwards, a retention window sized to the longest training run, and a relay that publishes in outbox order with a metric on its lag.`,
+  debrief: `A topic is a log ordered per key, and an event is a claim about something that already happened; both halves of the fix follow from that. The run id is the key because a run's history is what must stay ordered, and \`started\` follows the worker's confirmation because the history must not claim what the fleet refused. The outbox makes the transition and the event one durable fact: the row commits with the state change, the produce is an attempt to deliver it, and the relay finishes the job after an outage. \`acks=all\` with idempotence means that attempt cannot duplicate on retry. Production systems also have the consumer store the last applied transition so a replayed partition cannot move a run backwards, and size the topic's retention to the longest training run.`,
 };

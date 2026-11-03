@@ -14,23 +14,17 @@ the score, band, signals, velocity, \`card_number: record["pan"]\` and \`raw_fea
 unmasked \`pan\` when the caller's role header says \`admin\`. It serves the demo and hides four
 flaws.
 
-**Failure mode the checks target.** The lookup takes no tenant, so any authenticated caller can read
-any case by guessing an id, and the body it gets carries the full card number and the feature
-vector. The role gate is a header the client sets, which makes the extraction path feel supervised
-without supervising it. Each flaw alone looks like a small omission; together they are a
-cross-tenant card-data export.
+**Failure mode the checks target.** A cross-tenant card-data export: any caller reads any case by
+guessing an id, the body carries the full card number and the feature vector, and the role gate is
+a header the client sets.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header and the case is read scoped to it:
-  \`cases.get(tenant, case_id)\`. A case that belongs to another tenant is indistinguishable from
-  one that does not exist: **404**, not 403 and not a partial body.
-- The response carries the score, the band, the signals, the velocity snapshot and a masked card
-  reference: \`mask_card(pan)\` returns \`MASK_PREFIX\` plus the last four digits, applied in the
-  response builder, not by a request parameter.
-- Raw card data is absent from this response regardless of role: no \`card_number\`, no \`pan\`, no
-  raw feature vector, for \`admin\` as much as for \`reviewer\`.
-- Raw card data is reachable only through \`audited_pan(actor, tenant, case_id)\`, a separate tool
-  that declares a scope and writes an audit row (\`audit_log.record(actor, scope, case_id)\`) before
-  it returns the PAN.`,
+- Read the case scoped to the authenticated \`X-Tenant-Id\`: \`cases.get(tenant, case_id)\`. A
+  foreign case is **404**, not 403 and not a partial body.
+- Return score, band, signals, velocity snapshot and a masked card reference: \`mask_card(pan)\`
+  (\`MASK_PREFIX\` plus the last four digits), applied in the response builder.
+- No \`card_number\`, \`pan\` or raw feature vector for any role, \`admin\` included.
+- Raw card data is reachable only through \`audited_pan(actor, tenant, case_id)\`, which writes
+  \`audit_log.record(actor, scope, case_id)\` before returning the PAN.`,
   sequence: {
     participants: ['Review console', 'Fraud Scorer', 'Case store', 'Audit tool'],
     messages: [
@@ -234,7 +228,7 @@ def read_case(case_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONRe
 `,
     },
     typescript: {
-      starter: `/** GET /v1/cases/{id}: flawed code of the review read. */
+      starter: `/** GET /v1/cases/{id}. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -660,7 +654,7 @@ object CasesApi {
 `,
     },
     cpp: {
-      starter: `// GET /v1/cases/{id}: flawed code of the review read.
+      starter: `// GET /v1/cases/{id}.
 #include <string>
 
 #include <httplib.h>

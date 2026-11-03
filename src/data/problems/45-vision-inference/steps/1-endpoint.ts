@@ -13,25 +13,19 @@ export const endpointStep: Step = {
 label, hands \`body.image\` to \`fetch_object\` and returns an inference id with the byte count. It
 serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The starter dereferences whatever string the caller sends, so a
-crafted reference is a server-side request forgery probe against every bucket the service can reach.
-It accepts any task name, so an unknown task fails at the model router instead of the boundary. And
-it keys nothing: every client retry re-runs inference on the same bytes and bills the tenant twice.
+**Failure mode the checks target.** Dereferencing any caller string makes a crafted reference an
+SSRF probe against every bucket the service can reach; an unknown task fails at the model router
+instead of the boundary; and with no key every retry re-runs inference and bills twice.
 
-Requirements:
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`image\` is a **storage key, not a URL**. Reject anything with a scheme (\`http://\`, \`https://\`,
-  \`s3://\`, \`gs://\`), anything with a \`..\` segment, and any key that does not start with the
-  tenant's prefix \`tenants/{tenant}/images/\` with **403, before the object is fetched**. A caller
-  must not be able to make the service dereference a key in another tenant's bucket, an internal
-  bucket, or the metadata service.
-- \`task\` is one of \`classify\`, \`detect\`, \`embed\`; anything else is **400**.
-- \`Idempotency-Key\` is required (**400** when missing). The storage key ends with the image's
-  **content hash** (\`…/<sha256>.jpg\`), so the digest is known before the fetch: read and write the
-  inference store under \`(tenant, content_hash)\`, and a replay with the same key returns the
-  **stored inference** with 200 instead of running the model a second time.
-- Log the decision with tenant, task and digest, not the caller's raw reference.`,
+- Tenant from \`X-Tenant-Id\` (**401** if missing).
+- \`image\` is a **storage key, not a URL**: anything with a scheme (\`http://\`, \`https://\`,
+  \`s3://\`, \`gs://\`), a \`..\` segment, or outside \`tenants/{tenant}/images/\` is **403, before the
+  object is fetched**.
+- \`task\` is one of \`classify\`, \`detect\`, \`embed\` (**400** otherwise).
+- \`Idempotency-Key\` is required (**400**). The key ends with the image's **content hash**
+  (\`…/<sha256>.jpg\`): read and write the inference store under \`(tenant, content_hash)\`, so a replay
+  returns the **stored inference** with 200.
+- Log tenant, task and digest, not the raw reference.`,
   sequence: {
     participants: ['Client', 'Vision API', 'Inference store', 'Object store'],
     messages: [
@@ -112,7 +106,7 @@ Requirements:
   ],
   code: {
     python: {
-      starter: `"""POST /v1/inferences: flawed code that fetches whatever the caller names."""
+      starter: `"""POST /v1/inferences."""
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -232,7 +226,7 @@ def fetch_object(key: str) -> bytes:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/inferences: flawed code that fetches whatever the caller names. */
+      starter: `/** POST /v1/inferences. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

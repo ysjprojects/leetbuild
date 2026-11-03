@@ -300,7 +300,7 @@ def create_task(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/tasks: flawed code that queues whatever batch the caller sends. */
+      starter: `/** POST /v1/tasks. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

@@ -220,7 +220,7 @@ def read_ticket(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/tickets/:ticketId: flawed code that hides nothing and pages by offset. */
+      starter: `/** GET /v1/tickets/:ticketId. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -745,7 +745,7 @@ int main() {
 `,
     },
   },
-  debrief: `The fix composes two contracts a timeline read owes its callers: who may see what, and where a page ends. Visibility is applied to the page the endpoint builds, because the store does not know the caller; handlers that filter later, in a serializer or a second query, leak the first time a field or a caller is added. Pagination becomes a keyset cursor over the monotonic \`seq\` because \`LIMIT/OFFSET\` is stable for a frozen dataset and unstable for a live one: a ticket that receives notes while a reader pages shifts every later offset. The trap is the composition: derive the cursor from the last entry fetched, not the last one shown, or a requester whose page was half internal asks for the next page from a position that never advanced.
+  debrief: `The fix composes two contracts: who may see what, and where a page ends. Visibility is applied to the page the endpoint builds, because filtering later, in a serializer or a second query, leaks the first time a field or caller is added. Pagination becomes a keyset cursor over the monotonic \`seq\` because \`LIMIT/OFFSET\` shifts when a ticket receives notes while a reader pages. Derive the cursor from the last entry fetched, not the last one shown, or a page that was half internal never advances.
 
-Production platforms sign cursors so a client cannot forge a position, cap \`limit\` per plan, and expose the timeline as a per-ticket append-only log whose ordering the store guarantees.`,
+Production platforms sign cursors so a client cannot forge a position and cap \`limit\` per plan.`,
 };

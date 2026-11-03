@@ -268,7 +268,7 @@ def create_subscription(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/subscriptions: flawed code that streams whatever the caller names. */
+      starter: `/** POST /v1/subscriptions. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

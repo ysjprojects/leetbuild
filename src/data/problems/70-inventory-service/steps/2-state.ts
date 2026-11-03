@@ -18,10 +18,9 @@ export const stateStep: Step = {
 reads \`stock:{sku}\` with \`get\`, compares the quantity in the handler, runs \`decrby\`, and mirrors the
 hold with its own hardcoded TTL. It compiles, serves the demo and hides five flaws.
 
-**Failure mode the checks target.** \`get\`, compare, \`decrby\` is the oversell the whole course is
-about: correct in every serial test and wrong the first time two buyers press *Buy* in the same
-second. Both read \`1\`, both compare \`1 >= 1\`, both write \`0\`. The 3600-second hold is subtler: the
-reservation expires after 900 seconds and the hold outlives it by 45 minutes.
+**Failure mode the checks target.** \`get\`, compare, \`decrby\` passes every serial test and
+oversells the first time two buyers press *Buy* in the same second: both read \`1\`, both write \`0\`.
+The 3600-second hold outlives the 900-second reservation by 45 minutes.
 
 - **The check and the decrement are one atomic unit.** The whole transition runs as **one Lua
   script**, registered once with the client
@@ -34,12 +33,9 @@ reservation expires after 900 seconds and the hold outlives it by 45 minutes.
   \`SET hold:{reservation_id} <sku:quantity> EX <ttl>\` in the same call, with the TTL passed in as
   the reservation's own \`RESERVATION_TTL_S = 900\`.
 - **\`reserve(sku, quantity, reservation_id, ttl_s)\` returns an outcome**, not a boolean:
-  \`RESERVED\`, \`INSUFFICIENT_STOCK\` or \`UNKNOWN_SKU\`. \`INSUFFICIENT_STOCK\` maps to a **409**
-  conflict the caller must not retry blindly. The winner gets the new available count, which may be
-  \`0\`.
-- **Two racing callers against the last unit get one \`RESERVED\` and one \`INSUFFICIENT_STOCK\`**,
-  because only one script invocation can pass the floor check. There is no read-modify-write anywhere
-  in the path.`,
+  \`RESERVED\` (with the new count, possibly \`0\`), \`INSUFFICIENT_STOCK\` (a **409** the caller must
+  not retry blindly) or \`UNKNOWN_SKU\`.
+- **Two racing callers against the last unit get one \`RESERVED\` and one \`INSUFFICIENT_STOCK\`.**`,
   sequence: {
     participants: ['Reserve handler', 'StockCounter', 'Redis'],
     messages: [
@@ -187,7 +183,7 @@ reservation expires after 900 seconds and the hold outlives it by 45 minutes.
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
+# The reservation expires after 900 seconds.
 HOLD_TTL_S = 3600
 
 
@@ -285,12 +281,12 @@ class StockCounter:
 `,
     },
     typescript: {
-      starter: `/** The reservation counter: flawed code that reads, checks and then decrements. */
+      starter: `/** The reservation counter. */
 import Redis from 'ioredis';
 
 export const redis = new Redis({host: 'redis', port: 6379});
 
-// The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
+// The reservation expires after 900 seconds.
 export const HOLD_TTL_S = 3600;
 
 export function stockKey(sku: string): string {
@@ -405,7 +401,7 @@ import (
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-// The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
+// The reservation expires after 900 seconds.
 const holdTTLS = 3600
 
 func stockKey(sku string) string {
@@ -536,7 +532,7 @@ func (StockCounter) Reserve(ctx context.Context, sku string, quantity int, reser
 object StockCounter {
   val jedis = new Jedis("redis", 6379)
 
-  // The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
+  // The reservation expires after 900 seconds.
   val HoldTtlS = 3600L
 
   def stockKey(sku: String): String = s"stock:$sku"
@@ -633,7 +629,7 @@ object StockCounter {
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-// The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
+// The reservation expires after 900 seconds.
 constexpr int kHoldTtlS = 3600;
 
 std::string stockKey(const std::string& sku) { return "stock:" + sku; }

@@ -169,7 +169,7 @@ def get_usage(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/accounts/:account/usage: flawed code that reads a nightly batch. */
+      starter: `/** GET /v1/accounts/:account/usage. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

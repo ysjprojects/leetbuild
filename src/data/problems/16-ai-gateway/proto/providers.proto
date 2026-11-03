@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package gateway;
+
+// The model providers the gateway fronts: a unary completion (steps 1 and 2) and a server-streaming
+// one (steps 3 and 4). The harness serves them at providers:9000 (steps 1 to 3) and at primary:9000
+// and fallback:9000 (step 4).
+service Provider {
+  rpc Complete(CompleteRequest) returns (CompleteReply);
+  rpc StreamComplete(CompleteRequest) returns (stream Chunk);
+}
+
+message Message {
+  string role = 1;
+  string content = 2;
+}
+
+message CompleteRequest {
+  string model = 1;
+  repeated Message messages = 2;
+  int32 max_tokens = 3;
+}
+
+message Usage {
+  int32 input_tokens = 1;
+  int32 output_tokens = 2;
+}
+
+message CompleteReply {
+  string content = 1;
+  Usage usage = 2;
+}
+
+// One streamed token.
+message Chunk {
+  string text = 1;
+}

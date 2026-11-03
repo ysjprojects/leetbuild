@@ -214,7 +214,7 @@ def submit_batch(purge_id: str, domain: str, paths: list[str]) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Batch purge client: flawed code that retries every failure forever. */
+      starter: `/** Batch purge client. */
 import {randomUUID} from 'node:crypto';
 import {promisify} from 'node:util';
 

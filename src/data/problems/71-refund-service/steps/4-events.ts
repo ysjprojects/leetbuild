@@ -233,7 +233,7 @@ def psp_ref_for(refund_id: str) -> str:
 `,
     },
     typescript: {
-      starter: `/** refund.event: flawed code that announces success before the PSP confirms. */
+      starter: `/** refund.event. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

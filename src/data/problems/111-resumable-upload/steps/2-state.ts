@@ -159,7 +159,7 @@ def register_part(upload_id: str, part_number: int, part_count: int, size: int, 
 `,
     },
     typescript: {
-      starter: `/** Part manifest: flawed code that appends to a Redis list. */
+      starter: `/** Part manifest. */
 import Redis from 'ioredis';
 
 const redis = new Redis();

@@ -175,7 +175,7 @@ def apply_usage(
 `,
     },
     typescript: {
-      starter: `/** Redis metering layer: flawed code that blocks and never expires. */
+      starter: `/** Redis metering layer. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

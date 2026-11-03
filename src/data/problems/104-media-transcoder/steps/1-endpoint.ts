@@ -230,7 +230,7 @@ def submit(body: SubmitRequest) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/transcodes: flawed code that trusts the caller's arguments. */
+      starter: `/** POST /v1/transcodes. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

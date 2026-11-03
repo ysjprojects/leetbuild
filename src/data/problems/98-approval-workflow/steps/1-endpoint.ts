@@ -267,7 +267,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/requests: flawed code that takes the approvers from the body. */
+      starter: `/** POST /v1/requests. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

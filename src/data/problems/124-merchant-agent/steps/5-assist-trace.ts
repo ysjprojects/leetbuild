@@ -8,32 +8,28 @@ export const assistTraceStep: Step = {
   focus: ['api', 'kafka', 'builder', 'gtx'],
   task: `## Task
 
-**Starting point.** The starter is working code: every finished turn becomes an
-event, and a consumer turns events into ground-truth candidates, so the demo shows the set growing.
-Four production contracts are broken. Debug it, fix it, and prove the fix.
+**Starting point.** The starter is the trace path that feeds step 4's ground-truth set:
+\`publish(turn)\` logs the merchant's message, builds an event that includes \`merchant_message\`
+and \`tool_results\`, produces it to \`assist.trace\` keyed by the turn id from a default producer
+and flushes; the \`gtx-builder\` consumer commits the offset, then inserts the candidate. The demo
+shows the set growing. It hides five flaws.
 
-\`publish(turn)\` is how a finished assist turn reaches the evaluation pipeline, and the
-**gtx-builder** consumer is how the ground-truth set of step 4 is fed from production.
+**Failure mode the checks target.** One shop's turns are scattered across partitions and arrive out
+of order. A retried produce writes the same trace twice. The merchant's message and a customer list
+from a tool result sit in a topic that is retained for days and replicated, readable by every
+service with a consumer group. A broker rejection silently loses a trace. And a consumer crash
+between the commit and the insert loses a candidate forever.
 
-- Publish **exactly one** \`assist.trace\` event per turn with the **shop** as the message key, so
-  one merchant's turns stay ordered on one partition. The payload carries \`turn_id\`, \`shop\`,
-  \`page\`, \`tools_used\`, \`latency_ms\`, \`tokens\`, \`judge_score\` and \`prompt_version\`.
-- **No merchant data** in the event or the logs: not the merchant's message, not the tool results.
-  The topic is retained for days and replicated; a customer list written into it outlives every
-  retention rule the request path has. The ground-truth set gets the conversation later, through a
-  consented sampling path, not through the trace topic.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent), so a retried produce
-  cannot duplicate a trace.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
-  failing the merchant's turn; a relay republishes outbox rows when the broker recovers.
-- The consumer (group \`gtx-builder\`) inserts the ground-truth candidate
-  (\`gtx.insert_candidate(event)\`) and **only then** commits the offset. Commit first and one crash
-  loses the candidate forever.
-
-**Failure mode the checks target.** Keying by turn id scatters one shop's turns across partitions;
-an unconfigured producer duplicates on retry; the merchant's message and the tool results in the
-event are a data leak with a long tail; a failed produce silently loses the trace; and
-commit-before-insert trades correctness for exactly-once *looking* code.`,
+- Publish exactly one \`assist.trace\` event per turn with the shop as the message key
+  (\`key=turn.shop\`). The payload carries \`turn_id\`, \`shop\`, \`page\`, \`tools_used\`,
+  \`latency_ms\`, \`tokens\`, \`judge_score\` and \`prompt_version\`.
+- No merchant data in the event or the logs: not the merchant's message, not the tool results. The
+  ground-truth set gets the conversation later through a consented sampling path.
+- The producer is idempotent with \`acks=all\` (\`enable.idempotence\`, \`acks\`).
+- When the broker rejects the produce, write the event to the outbox (\`insert_outbox\`) instead of
+  dropping it or failing the merchant's turn.
+- The consumer (group \`gtx-builder\`) calls \`gtx.insert_candidate(event)\` and only then
+  \`consumer.commit\`.`,
   sequence: {
     participants: ['sidekick API', 'assist.trace', 'gtx-builder', 'ground-truth set'],
     messages: [
@@ -47,9 +43,9 @@ commit-before-insert trades correctness for exactly-once *looking* code.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=turn.shop` (or `Key: []byte(turn.Shop)`, `ProducerRecord(topic, turn.shop, …)`). Keyed by the turn id, one shop’s turns land on different partitions and their order is gone.',
-    'Idempotence is producer configuration: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true`, or required acks `all` with a hash balancer. Then delete `merchant_message` and `tool_results` from the event — the trace carries ids, counts and scores, nothing a merchant typed or a tool returned.',
-    'The outbox is the durability half: wrap the produce and, when the broker rejects it, insert the event into the outbox. In the consumer, turn off auto-commit, call `insert_candidate` first and `commit` second — a crash between the two replays the record instead of losing it.',
+    'A privacy review finds merchant messages and customer lists in a Kafka topic every team can read, and the ground-truth set has gaps that line up with a broker restart.',
+    "`logger.info(... turn.merchant_message)` and the event's `merchant_message`/`tool_results` fields leak; `key=turn.turn_id` splits a shop across partitions; the produce result is ignored; `consumer.commit(msg)` runs before `insert_candidate`.",
+    'Produce `key=turn.shop` from a producer with `enable.idempotence` and `acks=all`, drop the two merchant fields from the event and the log, call `insert_outbox` on `KafkaException`, and move `consumer.commit` after `insert_candidate`.',
   ],
   checks: [
     {
@@ -155,9 +151,7 @@ gtx = GroundTruthStore()
 
 
 def publish(turn: Turn) -> None:
-    # TODO: key by shop instead of the turn id, configure the idempotent producer with acks=all,
-    # keep the merchant's message and the tool results out of the event and the logs, and write an
-    # outbox row when the broker rejects the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     logger.info("trace shop=%s message=%r", turn.shop, turn.merchant_message)
     event = {
         "turn_id": turn.turn_id,
@@ -285,9 +279,7 @@ export interface Turn {
 }
 
 export async function publish(turn: Turn): Promise<void> {
-  // TODO: key by shop instead of the turn id, configure the idempotent producer with acks=all,
-  // keep the merchant's message and the tool results out of the event and the logs, and write an
-  // outbox row when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   console.log('trace', turn.shop, turn.merchantMessage);
   const event = {
     turn_id: turn.turn_id,
@@ -412,9 +404,7 @@ func (s *GroundTruthStore) InsertCandidate(ctx context.Context, event map[string
 
 var gtx = &GroundTruthStore{}
 
-// TODO: key by shop instead of the turn id, configure acks=all / idempotence, keep the merchant's
-// message and the tool results out of the event and the logs, and write an outbox row when the
-// broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func Publish(ctx context.Context, turn Turn) {
 	log.Printf("trace shop=%s message=%q", turn.Shop, turn.MerchantMessage)
 	event := map[string]any{
@@ -567,9 +557,7 @@ object TraceApi {
   private val log = Logger.getLogger("trace")
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: key by shop instead of the turn id, configure the idempotent producer with acks=all, keep
-  // the merchant's message and the tool results out of the event and the logs, and write an outbox
-  // row when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publish(turn: Turn): Unit = {
     log.info(s"trace shop=\${turn.shop} message=\${turn.merchantMessage}")
     val event = JsObject(
@@ -700,9 +688,7 @@ struct GroundTruthStore {
 GroundTruthStore gtx;
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: key by shop instead of the turn id, configure the idempotent producer with acks=all, keep
-// the merchant's message and the tool results out of the event and the logs, and write an outbox
-// row when the broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publish(const Turn& turn) {
   std::cerr << "trace shop=" << turn.shop << " message=" << turn.merchantMessage << "\\n";
   const json event = {
@@ -823,5 +809,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking the three things a Kafka snippet almost always gets wrong, plus the one that is specific to an assistant. The message key is an ordering contract: partition by shop and one merchant's turns arrive in order; key by turn id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer must insert the candidate before the offset commit, or a crash between the two loses it permanently. A broker is not a database: when the produce fails, the durable path is an outbox row that a relay republishes. The assistant-specific one is the payload. The source builds its ground-truth sets by sampling real merchant conversations, and that is a deliberate, consented path with labelling by product experts — not a trace topic that every service with a consumer group can read. The trace carries ids, tool names, latency, tokens and the judge's score, which is everything the evaluation pipeline needs to pick what to sample. Real platforms add schema registry enforcement so a field like \`merchant_message\` cannot be added by accident, a relay with backoff for the outbox, and a dead-letter topic for candidates the builder cannot insert.`,
+  debrief: `The fix covers the three things a Kafka path gets wrong most often, plus one that is specific to an assistant. The message key is an ordering contract: partition by shop and one merchant's turns arrive in order. Exactly-once-looking code is not exactly-once: the producer needs idempotence and \`acks=all\` for retries, and the consumer must insert the candidate before the offset commit, or a crash between the two loses it permanently. A broker is not a database, so when the produce fails the durable path is an outbox row that a relay republishes. The assistant-specific part is the payload: the source builds its ground-truth sets by sampling real merchant conversations through a deliberate, consented path with labelling by product experts, not a trace topic every consumer group can read. Production platforms enforce the event schema at the registry so a field like \`merchant_message\` cannot be added by accident.`,
 };

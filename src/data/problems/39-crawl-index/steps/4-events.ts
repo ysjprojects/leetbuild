@@ -189,7 +189,7 @@ def page(
 `,
     },
     typescript: {
-      starter: `/** Page events: flawed code that ships the page inside the event. */
+      starter: `/** Page events. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

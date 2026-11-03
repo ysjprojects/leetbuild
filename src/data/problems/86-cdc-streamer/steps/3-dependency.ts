@@ -277,7 +277,7 @@ def run(subscription: str, slot: str, sink, start_lsn: int) -> str:
 `,
     },
     typescript: {
-      starter: `/** Slot reader: flawed code that moves the cursor on past whatever fails. */
+      starter: `/** Slot reader. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

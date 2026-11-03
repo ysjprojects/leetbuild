@@ -8,49 +8,28 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'worker'],
   task: `## Task
 
-**Starting point.** The starter is working code for the Redis half of \`jobqd\`: a
-job goes in with \`LPUSH jobs:queue\`, comes out with \`LPOP\`, and the in-flight entry, the state and
-the deadline are written afterwards in separate commands. It serves the demo — one worker, one
-healthy job, no restart — and it hides the flaws this step is about: the move out of the queue and the
-mark that says "in flight" are two round trips, so a crash between them erases the job; and the
-timeout return requeues every member it reads in the expiry window without proving the claim is still
-there, so a slow worker's job can be handed to a second worker while the first is still running it.
-Debug it like the person who owns the fleet, fix it, and prove the fix.
+**Starting point.** The starter is the Redis half of \`jobqd\`: \`enqueue\` writes the job hash and
+\`LPUSH\`es \`jobs:queue\`; \`claim\` \`LPOP\`s the queue, then \`ZADD\`s \`jobs:inflight\` and writes the
+state and deadline in separate commands; \`return_expired\` \`LPUSH\`es every member it reads in the
+expiry window; \`ack\` flips the hash state. It serves the demo (one worker, one healthy job) and
+hides four flaws.
 
-Implement the Redis side of \`jobqd\`: the queue a job waits in and the claim a worker holds while it
-runs.
+**Failure mode the checks target.** A worker killed between the pop and the in-flight write leaves
+the job in no list and no set. Two reaper passes both requeue the same expired member, so one job
+runs on two workers at once. A completed job stays in \`jobs:inflight\` and the reaper runs it again.
 
-- **One job, one position, one deadline.** The queue is the list \`jobs:queue\`, a claim is the member
-  \`job_id\` of the sorted set \`jobs:inflight\` scored by its visibility deadline in milliseconds
-  (\`now_ms + VISIBILITY_TIMEOUT_S * 1000\`, \`VISIBILITY_TIMEOUT_S = 60\`), and the job's own record
-  is the hash \`jobs:job:{job_id}\` holding \`state\`, \`type\`, \`attempts\`, \`enqueued_at_ms\`,
+- One job, one position, one deadline: the list \`jobs:queue\`, the sorted set \`jobs:inflight\`
+  scored by \`now_ms + VISIBILITY_TIMEOUT_S * 1000\` (\`VISIBILITY_TIMEOUT_S = 60\`), and the hash
+  \`jobs:job:{job_id}\` holding \`state\`, \`type\`, \`attempts\`, \`enqueued_at_ms\`,
   \`claim_deadline_ms\` and \`worker\`.
-- **The claim is one \`EVAL\`, never two commands.** \`claim(worker, now_ms)\` runs the registered
-  \`CLAIM_SCRIPT\`, which \`LPOP\`s the queue, \`ZADD\`s the job into \`jobs:inflight\` with the
-  deadline as its score and writes \`state = in_flight\` with that same deadline into the job hash —
-  all inside one script, so a worker that dies at any instant either owns the job with a visible
-  deadline or never touched it. The starter \`LPOP\`s first and writes the in-flight entry, the state
-  and the deadline afterwards: kill the worker between those commands and the job is in no list and
-  no set, gone with nothing left to reconcile.
-- **The timeout return is a compare-and-move.** \`return_expired(now_ms)\` runs \`RETURN_SCRIPT\`,
-  which reads the expired window with \`ZRANGEBYSCORE jobs:inflight 0 <now_ms>\` and, for each
-  member, \`ZREM\`s it and only \`LPUSH\`es it back onto \`jobs:queue\` when that \`ZREM\` returned
-  \`1\`, putting the hash back to \`state = queued\`. The claim's own removal is the guard: a job
-  returns exactly once, and a job whose worker is slow but alive is never in the queue and in flight
-  at the same time.
-- **An ack clears the claim with the state.** \`ack(job_id)\` runs \`ACK_SCRIPT\`, which \`ZREM\`s
-  the in-flight member and writes \`state = completed\` (clearing \`worker\` and
-  \`claim_deadline_ms\`) in the same script. The starter only flips the hash state, so a completed job
-  stays in \`jobs:inflight\` as a phantom entry that the next reaper pass returns to the queue.
-
-**Failure mode the checks target.** The split claim is the quiet one: the demo's worker never dies,
-so nobody sees that the job left the queue before it entered the in-flight set — a crash between the
-two commands loses it with no error and no trace, and the queue reports nothing. The unguarded return
-is the one that costs money: two reaper passes, or a reaper and a live claimant, both see the same
-expired member and both requeue it, so the same job runs concurrently on two workers and its side
-effect fires twice. The phantom in-flight entry is the third: a completed job that never left
-\`jobs:inflight\` is returned to the queue after its deadline and runs again. All three are invisible
-to a single healthy worker, and all three are checked below.`,
+- The claim is one \`EVAL\`: \`CLAIM_SCRIPT\` \`LPOP\`s the queue, \`ZADD\`s the job into
+  \`jobs:inflight\` with the deadline as its score and writes \`state = in_flight\` with the same
+  \`claim_deadline_ms\` into the hash. No client-side \`lpop\` remains.
+- The return is a compare-and-move: \`RETURN_SCRIPT\` reads \`ZRANGEBYSCORE jobs:inflight 0 <now_ms>\`
+  and, per member, \`ZREM\`s it and only \`LPUSH\`es it back when that \`ZREM\` returned \`1\`, setting
+  the hash to \`state = queued\`.
+- The ack clears the claim with the state: \`ACK_SCRIPT\` \`ZREM\`s the in-flight member and writes
+  \`state = completed\`, clearing \`worker\` and \`claim_deadline_ms\`.`,
   sequence: {
     participants: ['Job API', 'Redis', 'Worker', 'Queue reaper'],
     messages: [
@@ -203,13 +182,7 @@ class JobQueue:
         logger.info("job enqueued job_id=%s type=%s", job_id, job_type)
 
     def claim(self, worker: str, now_ms: int) -> str | None:
-        # TODO: this starter pops the job out of jobs:queue and only then writes the in-flight entry, the
-        # state and the deadline in separate commands, so a crash between them erases the job with no
-        # trace and nothing makes the move atomic; there is no registered script. The return below
-        # re-enqueues every expired member it reads without proving the claim is still there, so a slow
-        # worker's job can sit in the queue twice and be claimed by two workers at once; and ack never
-        # removes the in-flight member, so a completed job stays in jobs:inflight as a phantom entry
-        # that the next reaper pass runs again.
+        # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         popped = self.redis.lpop(QUEUE_KEY)
         if popped is None:
             return None
@@ -355,12 +328,7 @@ export async function enqueue(jobId: string, jobType: string, nowMs: number): Pr
 }
 
 export async function claim(worker: string, nowMs: number): Promise<string | null> {
-  // TODO: this starter pops the job and then writes the in-flight entry, the state and the deadline in
-  // separate commands, so a crash between them erases the job with no trace and nothing makes the
-  // move atomic; returnExpired below requeues every member it reads in the expiry window without
-  // proving the claim is still there, so the same job can sit in the queue twice and be claimed by
-  // two workers at once; and ack only flips the hash state, so a completed job stays in
-  // jobs:inflight as a phantom the next reaper pass re-enqueues.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const popped = await r.lpop(QUEUE_KEY);
   if (popped === null) return null;
   const deadline = nowMs + VISIBILITY_TIMEOUT_S * 1000;
@@ -490,11 +458,7 @@ func enqueue(ctx context.Context, rdb *redis.Client, jobID, jobType string, nowM
 }
 
 // claim is the starter's two-command move: the pop and the in-flight write are separate round trips.
-// TODO: it pops the job and then writes the in-flight entry, the state and the deadline in separate
-// commands, so a crash between them erases the job with no trace and nothing makes the move atomic.
-// returnExpired below requeues every expired member it reads without proving the claim is still there,
-// so the same job can sit in the queue twice and be claimed by two workers at once, and ack only
-// flips the hash state, so a completed job stays in jobs:inflight as a phantom the reaper re-enqueues.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 func claim(ctx context.Context, rdb *redis.Client, worker string, nowMS int64) (string, error) {
 	jobID, err := rdb.LPop(ctx, queueKey).Result()
 	if err != nil || jobID == "" {
@@ -646,12 +610,7 @@ object JobQueue {
   }
 
   def claim(worker: String, nowMs: Long): Option[String] = {
-    // TODO: this starter pops the job and then writes the in-flight entry, the state and the deadline in
-    // separate commands, so a crash between them erases the job with no trace and nothing makes the
-    // move atomic. returnExpired below requeues every expired member it reads without proving the
-    // claim is still there, so the same job can sit in the queue twice and be claimed by two workers
-    // at once, and ack only flips the hash state, so a completed job stays in jobs:inflight as a
-    // phantom the next reaper pass re-enqueues.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     Option(jedis.lpop(QueueKey)).map { jobId =>
       val deadline = nowMs + VisibilityTimeoutS * 1000
       jedis.zadd(InflightKey, deadline.toDouble, jobId)
@@ -798,12 +757,7 @@ void enqueue(sw::redis::Redis& redis, const std::string& jobId, const std::strin
 }
 
 std::optional<std::string> claim(sw::redis::Redis& redis, const std::string& worker, long long nowMs) {
-  // TODO: this starter pops the job and then writes the in-flight entry, the state and the deadline in
-  // separate commands, so a crash between them erases the job with no trace and nothing makes the
-  // move atomic. returnExpired below requeues every expired member it reads without proving the claim
-  // is still there, so the same job can sit in the queue twice and be claimed by two workers at once,
-  // and ack only flips the hash state, so a completed job stays in jobs:inflight as a phantom the next
-  // reaper pass re-enqueues.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   auto popped = redis.lpop(kQueueKey);
   if (!popped) return std::nullopt;
   const std::string jobId = *popped;
@@ -910,23 +864,9 @@ bool ack(sw::redis::Redis& redis, const std::string& jobId) {
     },
   },
   hints: [
-    "A job must not be in two places, and it must not be in none: the pop and the in-flight write are one move, so they belong in one script. `redis.call('LPOP', KEYS[1])` and `redis.call('ZADD', KEYS[2], deadline, job_id)` inside a registered `CLAIM_SCRIPT`, with the same deadline (`now_ms + VISIBILITY_TIMEOUT_S * 1000`) written to the job hash before the script returns, means a crash leaves either a claim with a deadline or an untouched queue — never a lost job.",
-    "The return has to prove that the claim it is returning is still the claim it read. `ZRANGEBYSCORE jobs:inflight 0 <now_ms>` gives you the candidates; the `ZREM` inside `RETURN_SCRIPT` is the guard, and `if redis.call('ZREM', KEYS[1], job_id) == 1 then redis.call('LPUSH', KEYS[2], job_id)` is what makes it exactly once per expired claim, no matter how many reapers run.",
-    'Ack is a claim removal, not just a state write. `ZREM jobs:inflight <job_id>` together with `HSET jobs:job:{job_id} state completed` in one `ACK_SCRIPT` is what keeps the in-flight set honest — a job that is completed but still sitting in `jobs:inflight` is a phantom entry the next reaper pass returns to the queue, and the side effect runs a second time.',
+    'After a worker pod is OOM-killed, a job is in no queue and no worker; the billing job also charged a customer twice after two reaper passes ran a minute apart.',
+    '`self.redis.lpop` runs before `zadd` and `hset`, so a crash between them loses the job; `return_expired` `LPUSH`es every member before its `zrem`, so two passes both requeue it; `ack` leaves the member in `jobs:inflight`.',
+    "Move the pop into `CLAIM_SCRIPT` (`LPOP`, `ZADD` with the deadline, `HSET`); in `RETURN_SCRIPT` guard with `if redis.call('ZREM', ...) == 1 then LPUSH`; in `ACK_SCRIPT` `ZREM` and set `completed` together.",
   ],
-  debrief: `The interviewer is testing whether you can debug a queue that is also a lock held across a crash.
-The starter looks right because the demo pops one job and runs it: no worker dies, no second reaper
-exists, and the happy path never shows the seam. What it hides is that the pop is not a claim — the job
-leaves \`jobs:queue\` before it enters \`jobs:inflight\`, so killing the worker between the two commands
-loses it silently, with nothing left for a reaper to find — and that a return which LPUSHes everything
-it saw in the expiry window is not idempotent: two reaper passes both requeue the same job, and the
-job then runs concurrently on two workers, which is exactly how the billing job in the mock scenario
-charged twice. The third defect is the phantom in \`jobs:inflight\`: an ack that only flips the hash state
-leaves a completed job there, its deadline passes, and the reaper returns a job that already ran. The
-fix is one member per job in one structure with a deadline as its score, the move in a single script,
-the guard on the \`ZREM\` result so the return is exactly once, and an ack that removes the claim. Real
-queues add a heartbeat that extends the deadline while a long job is still alive, a \`stalled\`
-projection for a claim past its deadline so support sees the age rather than a job that is "queued"
-forever, and a metric for claims returned by the reaper — that last number is the earliest honest
-signal that the worker fleet is unhealthy.`,
+  debrief: `This queue is also a lock held across a crash, which is why the fix puts every move inside one script. The pop and the in-flight write are one operation because a job must be in exactly one of the two structures at every instant; a crash then leaves either a claim with a deadline or an untouched queue. The return is guarded by its own \`ZREM\` result because that is the only proof the claim it read is still the claim it is returning, which makes the return exactly once however many reapers run. The ack removes the claim with the state so the in-flight set holds only live claims. Production queues add a heartbeat that extends the deadline while a long job is still alive, and watch the count of claims the reaper returned as the earliest signal that the worker fleet is unhealthy.`,
 };

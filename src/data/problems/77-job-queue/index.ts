@@ -17,64 +17,55 @@ import {readStep} from './steps/5-read';
 export const jobQueueProblem: Problem = {
   id: 'job-queue',
   title: 'Job Queue',
-  tagline: 'Background jobs that run at least once, dedupe side effects and bury poison pills.',
+  tagline: 'Background jobs claimed in one atomic step, retried by error class and buried with their attempt history.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Job Queue
 
-A job queue is the piece of a platform that accepts work now and runs it later — once per enqueue, on
-workers that crash, against dependencies that fail, with a history somebody can be paged about. The
-visible part is an id and a state string; the parts that decide whether the platform is safe are the
-admission funnel, the atomic handoff between the queue and the worker, the failure policy around each
-attempt, and the event history that makes a job's life auditable.
+A job queue accepts work now and runs it later: once per enqueue, on workers that crash, against
+dependencies that fail, with a history somebody can be paged about. What decides whether the
+platform is safe is the admission funnel, the atomic handoff between queue and worker, the failure
+policy around each attempt, and the event history that makes a job's life auditable.
 
 ## The real system
 
-Production queues receive submissions from many tenants, accept only the job types their registry
-knows, validate the payload against that type's own schema, and honour a dedupe key the caller
-supplies — because the caller's retry is not the queue's duplicate, and a second execution of the
-same side effect is a second charge, a second email or a second webhook. They hand work to workers
-through a structure that cannot lose a job: the move out of the queue and the mark that says "in
-flight" are one atomic step, and a claim that expires returns the job to the queue exactly once, so a
-slow worker and a fresh claimant can never hold it at the same time. Workers retry only the error
-classes that are worth retrying, with backoff, and a job that has spent its attempts is dead-lettered
-with the history of every attempt instead of looping forever. Every transition is published as an
-event keyed by the job id, so one job's history stays ordered while other jobs' events interleave
-across partitions, and a broker outage is absorbed by an outbox instead of dropped. Finally, the
-status read a support engineer sees is reconciled against the queue's own sets: a job stranded in a
-crashed worker's claim reads as stalled with the age of that claim, never as queued forever.
+Amazon SQS gives every received message a visibility timeout, 30 seconds by default and up to 12
+hours, during which the message is in flight and hidden from other consumers; if the consumer does
+not delete it before the timeout, it becomes visible again and is delivered to someone else, and a
+consumer that needs longer calls \`ChangeMessageVisibility\` to extend the lease. A queue's redrive
+policy names a dead-letter queue and a \`maxReceiveCount\`: once a message has been received that
+many times without being deleted, SQS moves it there instead of delivering it again. A lease that
+expires and a bounded receive count are the spine of this course. Around them a platform queue adds
+a registry of job types, a caller-supplied dedupe key, retries only for the error classes worth
+retrying, an event per transition keyed by job id, and a status read reconciled against the queue's
+own sets.
 
 ## What you build here
 
 One service, **jobqd**, with five pieces:
 
-1. \`POST /v1/jobs\`: a job type from the registry, a payload validated against that type's schema,
-   and a dedupe key that suppresses duplicates inside a documented window, answering with the
-   original job id.
+1. \`POST /v1/jobs\`: a job type from the registry, a payload validated against its schema, and a
+   dedupe key that suppresses duplicates inside a window, answering with the original job id.
 2. A **Redis** queue: claimed in one atomic step into an in-flight structure under a visibility
-   timeout, with a return path that is itself atomic and idempotent, so no crash and no slow worker
-   can double-run a job or evaporate it.
-3. A **gRPC** worker client: retries only the retryable error classes with exponential backoff, an
-   attempt count that survives a worker restart, and a dead-letter move after five attempts that
-   carries every attempt's error.
+   timeout, with a return path that is itself atomic and idempotent.
+3. A **gRPC** worker client: retries only the retryable error classes with backoff, an attempt
+   count that survives a restart, and a dead-letter move that carries every attempt's error.
 4. A **Kafka** event path: one \`job.event\` per transition keyed by job id, the completion published
    only after the side effect commits, and an outbox row when the broker rejects the produce.
-5. \`GET /v1/jobs/{id}\`: state, attempt history, next retry time and any dead-letter reason, with a
-   stranded job surfaced as stalled with its claim age and another tenant's job answered \`404\`.
+5. \`GET /v1/jobs/{id}\`: state, attempt history, next retry time and dead-letter reason, with a
+   stranded job surfaced as stalled and another tenant's job answered \`404\`.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real queue: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+Every starter in this course is working code with flaws: it compiles, serves the happy path and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
 checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Job type authoring UIs, per-tenant rate limits, worker autoscaling, cron scheduling, priority bands,
-job cancellation, payload encryption at rest, and retention policies for the event log. The five
-pieces above are the ones that decide whether the queue is correct, crash-safe and shippable.`,
+job cancellation, and retention policies for the event log.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'enqueue · status', x: 6, y: 50},

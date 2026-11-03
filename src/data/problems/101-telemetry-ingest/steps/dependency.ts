@@ -8,33 +8,25 @@ export const dependencyStep: Step = {
   focus: ['ingest', 'tsdb'],
   task: `## Task
 
-**Starting point.** The starter is working code: when the store is healthy the
-batch lands and the caller gets a result, so the demo shows points arriving. Every failure path is
-wrong, and the wrong one that hurts is invisible until a fleet's totals double. Find them, fix them,
-and prove the fix with the checks below.
+**Starting point.** The starter implements \`write_batch(stub, batch)\`, the ingest path's
+time-series client: in a \`while True\` loop it builds a \`WriteRequest\` from every sub-batch, calls
+\`Write\` with no deadline, and returns \`complete: True\` as soon as the reply names any accepted
+sub-batch. When the store is healthy the demo shows points arriving. It hides five flaws.
 
-Implement \`write_batch(client, batch)\` for the ingest path's time-series client:
+**Failure mode the checks target.** A fleet's totals double, because sub-batches the store already
+accepted are sent again and the store does not dedupe by point. A batch is reported done while some
+of its points are still missing, so the caller stops looking. A stuck store pins the ingest worker
+until the client disconnects, and a store that keeps failing turns the worker into a hot loop. And no
+request carries a batch id, so the store has nothing to dedupe on even when it wants to.
 
-- Each attempt carries a **4-second deadline** (\`timeout=\`/\`deadline:\`/\`WithTimeout\`/
-  \`withDeadlineAfter\`/\`set_deadline\`). A call without one lets a stuck store pin the ingest
-  worker until the client disconnects.
-- At most **3 attempts**, and there is no unbounded loop: the starter's \`while True\` has no exit at
-  all when the store keeps answering with failures.
-- The reply is **partial**: it names the **accepted** and the **failed** sub-batches. Only the
-  **failed** ones go into the next request. Re-sending the whole batch is the bug that doubled a
-  fleet's totals: the store does not dedupe by point, so an accepted sub-batch that is sent again is
-  stored twice.
-- Every attempt carries the **same \`batch_id\`** (and each sub-batch its own id), which is the key
-  the store dedupes on, so even a re-sent sub-batch is free. Accepted sub-batches are recorded from
-  the reply and never re-queued.
-- The batch is **done only when every point is stored** — that is, when the reply names no failed
-  sub-batch. Reporting done while any sub-batch is still missing is how a partial write becomes an
-  acknowledged, permanently incomplete batch.
-
-**Failure mode the checks target.** The starter retries the whole batch on any failure, so the points
-that already landed land again; it marks the batch done as soon as *any* sub-batch succeeds, so the
-caller stops caring about the rest; and it sends no batch id, so the store has nothing to dedupe on
-even if it wanted to.`,
+- Each attempt carries a **4-second deadline** (\`DEADLINE_S = 4.0\`, \`timeout=\`).
+- At most \`MAX_ATTEMPTS = 3\` attempts in a counted loop; no \`while True\`.
+- The reply is partial: it names the accepted and the failed sub-batches. Only the failed ones go
+  into the next request (\`pending\` becomes its intersection with \`reply.failed\`), and accepted
+  ids are appended to the result.
+- Every attempt carries the same \`batch_id\` (\`batch_id=batch["batch_id"]\`), the key the store
+  dedupes on.
+- The batch is complete only when the reply names no failed sub-batch (\`if not reply.failed\`).`,
   sequence: {
     participants: ['Telemetry Ingest', 'Time-series store'],
     messages: [
@@ -67,9 +59,9 @@ even if it wanted to.`,
     ],
   },
   hints: [
-    'Treat the reply as a set difference: `pending` starts as every sub-batch, and each attempt replaces it with the intersection of itself and the reply’s failed list. That one line is the whole fix — accepted sub-batches simply stop being in `pending`, so they cannot be sent again.',
-    'The deadline goes on the call, not around it: `timeout=`/`deadline:`/`WithTimeout`/`withDeadlineAfter`/`set_deadline`. Bound the attempts with a constant and a counted loop; a `while True` around a failing store is a busy loop that holds the ingest worker and multiplies the writes.',
-    'The batch id is the dedupe key: put the caller’s `batch_id` on every request and give each sub-batch a stable id. Then a re-sent sub-batch is either free (the store dedupes) or visible, instead of silently doubling. Report the batch complete only when the reply’s failed list is empty.',
+    "After a brief store slowdown, a fleet's daily totals read roughly double, and a few devices show gaps for batches the pipeline reported as complete.",
+    'The loop re-adds every sub-batch to each request, so accepted points are stored again; `if len(reply.accepted) > 0` returns complete while `reply.failed` is non-empty; `stub.Write(request)` has no timeout and the loop has no exit.',
+    'Keep `pending`, replace it with `[sub for sub in pending if sub["id"] in rejected]` after each reply, send `batch_id` on every request, call `Write(..., timeout=DEADLINE_S)` inside `range(MAX_ATTEMPTS)`, and return complete only `if not reply.failed`.',
   ],
   checks: [
     {
@@ -165,9 +157,7 @@ import series_pb2_grpc
 
 def write_batch(stub: series_pb2_grpc.SeriesStub, batch: dict) -> dict:
     """Write a batch of sub-batches to the time-series store."""
-    # TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
-    # are stored twice because the store does not dedupe by batch id, and it calls the batch done as
-    # soon as any sub-batch succeeds.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     while True:
         request = series_pb2.WriteRequest(device_id=batch["device_id"])
         for sub in batch["sub_batches"]:
@@ -262,9 +252,7 @@ interface SeriesClient {
 }
 
 export async function writeBatch(batch: Batch): Promise<WriteResult> {
-  // TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
-  // are stored twice because the store does not dedupe by batch id, and it calls the batch done as
-  // soon as any sub-batch succeeds. It also calls the store without a deadline.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (;;) {
     const reply = await new Promise<WriteReply>((resolve, reject) => {
       client.Write({device_id: batch.device_id, sub_batches: batch.sub_batches}, new grpc.Metadata(), (error, value) =>
@@ -375,9 +363,7 @@ type WriteResult struct {
 }
 
 func writeBatch(ctx context.Context, client pb.SeriesClient, batch Batch) (*WriteResult, error) {
-	// TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
-	// are stored twice because the store does not dedupe by batch id, and it calls the batch done as
-	// soon as any sub-batch succeeds.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	for {
 		request := &pb.WriteRequest{DeviceId: batch.DeviceID}
 		for _, sub := range batch.SubBatches {
@@ -472,9 +458,7 @@ func writeBatch(ctx context.Context, client pb.SeriesClient, batch Batch) (*Writ
     scala: {
       starter: `object TimeSeriesClient {
   def writeBatch(client: SeriesClient.SeriesBlockingStub, batch: Batch): WriteResult = {
-    // TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
-    // are stored twice because the store does not dedupe by batch id, and it calls the batch done as
-    // soon as any sub-batch succeeds.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     var done = false
     var result = WriteResult(batch.batchId, Nil, Nil, complete = false)
     while (!done) {
@@ -545,9 +529,7 @@ struct WriteResult {
 };
 
 WriteResult writeBatch(Series::Stub* stub, const Batch& batch) {
-  // TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
-  // are stored twice because the store does not dedupe by batch id, and it calls the batch done as
-  // soon as any sub-batch succeeds.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext ctx;
     WriteRequest request;
@@ -630,5 +612,5 @@ WriteResult writeBatch(Series::Stub* stub, const Batch& batch) {
 `,
     },
   },
-  debrief: `The interview question is how you retry a partial write, and the trap is that "retry the batch" sounds exactly like "retry the failure". A time-series store answers with the sub-batches it took and the ones it did not, and the client’s job is to remember which is which: accepted points are already stored, so sending them again is a duplicate, and a store that does not dedupe by point has no way to notice. Carrying one batch id across every attempt is what makes the retry safe by construction — the store can drop a sub-batch it has already seen under that batch id. Completing only when nothing is left failed is the third half: a batch reported done with a missing sub-batch is worse than a batch that never landed, because the caller has stopped looking. The deadline and the bounded attempt count are what keep a store outage from becoming an ingest outage. Real clients add jittered backoff, per-sub-batch metrics, and a reconciliation pass over the store for batches whose outcome was never known.`,
+  debrief: `Retrying a partial write is not retrying the batch, and the fix follows from that distinction. The store answers with the sub-batches it took and the ones it did not, so the client keeps a pending set and shrinks it to the reply's failed list after every attempt; accepted points are already stored, and sending them again is a duplicate the store cannot notice. One batch id across every attempt makes the retry safe by construction, because the store can drop a sub-batch it has already seen under that id. Completing only when nothing is left failed matters because a batch reported done with a missing sub-batch is worse than one that never landed: the caller has stopped looking. The deadline and the attempt cap keep a store outage from becoming an ingest outage. Production clients add jittered backoff and a reconciliation pass for batches whose outcome was never known.`,
 };

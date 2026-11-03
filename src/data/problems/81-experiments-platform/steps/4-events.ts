@@ -13,38 +13,24 @@ record on the \`experiment.exposure\` topic on every call, and the \`exposure-st
 increments a counter per variant, so the demo shows a number climbing. It serves the demo and
 hides 5 flaws.
 
-**Failure mode the checks target.** The analysis stream is wrong in ways no dashboard shows: an
-experiment's exposures lose their order, a re-rendered page inflates every rate, the user's identity
-travels on the topic, a producer retry double-writes, and a consumer crash drops an exposure the
-offset says was applied.
+**Failure mode the checks target.** An experiment's exposures lose their order, a re-rendered page
+inflates every rate, the user's identity travels on the topic, a producer retry double-writes, and a
+consumer crash drops an exposure the offset says was applied.
 
-Every exposure (the moment a unit is shown a variant) is a record on **\`experiment.exposure\`**.
-Implement the exposure path of \`expd\`:
-
-- \`record_exposure\` publishes **one** event per \`(experiment, unit, variant)\`. The message key is
-  the **experiment id** (\`key=experiment_id\`, \`Key: []byte(experimentID)\`,
-  \`new ProducerRecord(..., experimentId, ...)\`), not the unit id and not a request id, so every
-  exposure of one experiment lands on one partition in the order it happened.
-- Before producing, claim the exposure in Redis with a conditional write: \`SET NX\` on
-  \`dedupe:exp:{id}:{unit}:{variant}\` with a TTL (**7 days**, longer than any replay window). \`NX\`
-  returns nothing when the triple is already claimed: a re-rendered page calling again with the same
-  \`(experiment, unit, variant)\` logs it and **returns without producing**. The claim happens
-  **before** the produce.
-- The payload carries \`experiment_id\`, \`variant\`, **\`unit_hash\`** and \`ts\`. \`unit_hash\` is a
-  SHA-256 digest of the unit and the only unit-derived value that may leave the service; a raw user
-  identifier is PII and must not appear in the event or in a log line.
-- The producer is **idempotent with \`acks=all\`**: \`"acks": "all"\` with
-  \`"enable.idempotence": True\`, \`acks: -1\` with \`idempotent: true\` (KafkaJS), \`RequiredAcks:
-  kafka.RequireAll\` with a \`Hash\` balancer (kafka-go has no idempotent mode), or \`"acks", "all"\`
-  with \`"enable.idempotence", "true"\` in the Java and librdkafka clients. A retry of an acknowledged
-  produce must not write the exposure twice.
-- A produce refused for back-pressure (a full producer buffer, \`ERR__QUEUE_FULL\`) is **retried**,
-  \`MAX_PRODUCE_ATTEMPTS\` (3), polling the local queue between attempts. A produce the broker
-  permanently rejects is logged with the experiment id and the unit hash (not the raw unit) and
-  does not fail the caller's request path.
-- The consumer, group \`exposure-stats\`, applies the exposure to the analysis state **before** it
-  commits the offset: \`HINCRBY stats:{experiment_id} {variant} 1\` (a store row is the same shape),
-  then the commit. A broker error commits nothing, so the record is redelivered.`,
+- One event per \`(experiment, unit, variant)\`, keyed by the **experiment id** (\`key=experiment_id\`,
+  \`Key: []byte(experimentID)\`, \`new ProducerRecord(..., experimentId, ...)\`).
+- Before producing, claim \`dedupe:exp:{id}:{unit}:{variant}\` with \`SET NX\` and a **7-day** TTL; an
+  existing claim logs and **returns without producing**.
+- The payload carries \`experiment_id\`, \`variant\`, **\`unit_hash\`** (SHA-256 of the unit) and \`ts\`;
+  the raw unit appears in no event or log line.
+- The producer uses **\`acks=all\` with idempotence**: \`"enable.idempotence": True\`, \`acks: -1\` with
+  \`idempotent: true\` (KafkaJS), \`RequiredAcks: kafka.RequireAll\` with a \`Hash\` balancer
+  (kafka-go), or \`"enable.idempotence", "true"\` in Java and librdkafka.
+- Back-pressure (\`ERR__QUEUE_FULL\`) is retried up to \`MAX_PRODUCE_ATTEMPTS\` (3), polling between
+  attempts; a permanent rejection is logged with the experiment id and unit hash and does not fail
+  the request.
+- The \`exposure-stats\` consumer applies \`HINCRBY stats:{experiment_id} {variant} 1\` **before**
+  committing the offset; a broker error commits nothing.`,
   sequence: {
     participants: ['Experiment API', 'Redis', 'experiment.exposure', 'Analysis consumer'],
     messages: [

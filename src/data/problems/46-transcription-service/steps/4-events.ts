@@ -13,14 +13,10 @@ text and timestamps, produces it to \`transcript.segment\` keyed by the chunk in
 producer, flushes, and then calls the redactor. It compiles, it serves the demo, and it hides five
 flaws.
 
-**Failure mode the checks target.** Kafka orders records per partition, and the key is the only
-thing that decides the partition, so a key of \`chunk_index\` throws away per-job ordering for free.
-The redaction order is the second half of the same sentence: a topic is the longest-lived copy of a
-transcript you own, so publishing before the redaction pass writes the raw audio transcript into
-storage that no buffer TTL will reclaim. The rest is what a demo cannot show: a produce the broker
-rejected, a leader failover, a line with no speaker.
-
-Each finished chunk publishes one \`transcript.segment\` record:
+**Failure mode the checks target.** The key alone decides the partition, so a key of
+\`chunk_index\` throws away per-job ordering. Publishing before redaction writes the raw transcript
+into the longest-lived copy you own. The demo cannot show a rejected produce, a leader failover or a
+line with no speaker.
 
 - **Keyed by job id**, so every segment of one job lands on one partition in produce order and the
   consumer reassembles the transcript without sorting.

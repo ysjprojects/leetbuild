@@ -205,7 +205,7 @@ def publish_evaluation(
 `,
     },
     typescript: {
-      starter: `/** drift.evaluated: flawed code that publishes every evaluation. */
+      starter: `/** drift.evaluated. */
 import {Kafka, logLevel} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'drift-monitor', brokers: ['kafka:9092'], logLevel: logLevel.WARN});

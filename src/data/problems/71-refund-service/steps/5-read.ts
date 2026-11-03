@@ -285,7 +285,7 @@ def read_refunds(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/payments/:id/refunds: flawed code that reports the cache. */
+      starter: `/** GET /v1/payments/:id/refunds. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

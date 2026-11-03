@@ -8,34 +8,27 @@ export const stateStep: Step = {
   focus: ['ingest', 'redis', 'tsdb'],
   task: `## Task
 
-**Starting point.** The starter is working code: a device with room in its
-window gets its batch through and its latest values are visible to the dashboard, so the demo looks
-right. The starter hides a race, a leak and a half-applied write. Find them, fix them, and prove the
-fix with the checks below.
+**Starting point.** The starter implements \`admit(device_id, samples)\`, the Redis decision the
+ingest path makes before it writes anything: it \`GET\`s \`rate:{device_id}\`, refuses when the batch
+would exceed \`RATE_LIMIT_SAMPLES\`, otherwise \`HSET\`s every latest value and then \`INCRBY\`s the
+counter; the handler answers a bare 429 on refusal. It serves the demo and hides five flaws.
 
-Implement \`admit(device_id, samples)\`, the Redis decision the ingest path makes before it writes
-anything:
+**Failure mode the checks target.** A storm of batches all pass the check before any counter moves,
+because the read and the increment are two round trips. A refused batch can still move the
+dashboard, because the values are written outside the decision. A device that had one busy minute
+is refused forever, because the key has no window and never expires. And the device gets a bare
+429 with nothing to back off with.
 
 - Each device may send at most **600 samples** per **60-second window**. The counter key is
-  \`rate:{device_id}:{window}\` where \`window\` is the UTC minute bucket
-  (\`floor(unix_seconds / 60)\`) — a window-less key never resets, so a device that had one busy
-  minute is refused forever.
-- One **atomic Lua \`EVAL\`** must read the counter, **reject the whole batch when it does not
-  fit**, and only on success increment the counter **and** write the latest value of every metric
-  into \`latest:{device_id}\` (a hash field per metric). A read followed by a separate increment lets
-  a storm of samples pass the same check before any counter moves; a value written outside the
-  script can land while the rate check fails, so a refused batch still changes the device's latest
-  value.
-- The window key must **expire with its window**: set \`EXPIRE\` inside the same script on the first
-  write and report the remaining \`TTL\`, so per-device state is forgotten instead of tracked
-  forever.
-- A refused batch is **429** with \`Retry-After\` (seconds, the key's remaining TTL) and
-  \`X-RateLimit-Remaining\` (samples left in the window), and it must leave both keys untouched.
-
-**Failure mode the checks target.** Two concurrent batches both read budget that only one of them
-can spend; the counter lives in a client-side read-then-increment whose window is exactly where a
-retry storm fits; the latest value is written even when the batch is refused; and a device that sent
-one sample in March is still allocating keys in December.`,
+  \`rate:{device_id}:{window}\`, where \`window = floor(unix_seconds / WINDOW_S)\`.
+- One atomic Lua \`EVAL\` (\`ADMIT_LUA\`) reads the counter (\`HGET\`), rejects the whole batch when
+  it does not fit, and only on success increments the counter (\`HINCRBY\`) and writes the latest
+  value of every metric into \`latest:{device_id}\` (\`HSET\`), in that order.
+- The window key expires with its window: \`EXPIRE\` inside the same script on first write, and the
+  remaining \`TTL\` is returned.
+- A refused batch is **429** with \`Retry-After\` (the key's remaining TTL in seconds) and
+  \`X-RateLimit-Remaining\` (samples left in the window), built from the script's return value, and
+  it leaves both keys untouched.`,
   sequence: {
     participants: ['Telemetry Ingest', 'Redis', 'Time-series store'],
     messages: [
@@ -67,9 +60,9 @@ one sample in March is still allocating keys in December.`,
     ],
   },
   hints: [
-    'Read, decide and write inside one script: `HGET` the window counter, compare it against the limit with the batch size added, and return the refusal tuple **before** any `HINCRBY` or `HSET`. A client-side `GET` followed by `INCRBY` has a window between the two commands, and that window is exactly where a retry storm fits.',
-    'A window key must die with its window: check `TTL` inside the same script and call `EXPIRE` when the key was just created. Without it the per-minute budget accumulates forever, and a device that sent once is tracked for the lifetime of the cluster.',
-    'The latest value belongs to the same script as the counter, because "the batch was admitted" and "the device\'s latest value is this" are one decision. Two commands mean a refused batch can still move the dashboard, and a crash between them leaves the counter charged for a value that was never written.',
+    'During a firmware rollout the fleet retries in lockstep and the per-device limit lets ten times the budget through, and a device that was refused still shows a fresh value on the dashboard.',
+    '`r.get` then `r.incrby` leaves a window where every concurrent batch reads the same count; `r.hset` runs before the increment, so values land even when the counter would refuse; `rate:{device_id}` has no bucket or TTL.',
+    'Build `rate:{device_id}:{window}` from `WINDOW_S`; in `ADMIT_LUA` do `HGET`, compare, then `HINCRBY`, `HSET`, `EXPIRE` on first write and return remaining and `TTL`; answer 429 with `Retry-After` and `X-RateLimit-Remaining`.',
   ],
   checks: [
     {
@@ -171,9 +164,7 @@ def latest_key(device_id: str) -> str:
 
 
 def admit(device_id: str, samples: list[Sample]) -> tuple[bool, int, int]:
-    # TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
-    # storm of samples passes the check before any counter moves, and its keys never expire, so a
-    # device that sent once is tracked forever.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     used = int(r.get(rate_key(device_id)) or 0)
     if used + len(samples) > RATE_LIMIT_SAMPLES:
         return False, RATE_LIMIT_SAMPLES - used, WINDOW_S
@@ -282,9 +273,7 @@ interface TelemetryBatch {
 }
 
 async function admit(deviceId: string, samples: Sample[]): Promise<[boolean, number, number]> {
-  // TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
-  // storm of samples passes the check before any counter moves, and its keys never expire, so a
-  // device that sent once is tracked forever.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const used = Number((await r.get(\`rate:\${deviceId}\`)) ?? 0);
   if (used + samples.length > RATE_LIMIT_SAMPLES) return [false, RATE_LIMIT_SAMPLES - used, WINDOW_S];
   for (const sample of samples) await r.hset(\`latest:\${deviceId}\`, sample.metric, String(sample.value));
@@ -409,9 +398,7 @@ func rateKey(deviceID string) string { return "rate:" + deviceID }
 func latestKey(deviceID string) string { return "latest:" + deviceID }
 
 func admit(ctx context.Context, deviceID string, samples []Sample) (bool, int64, int64, error) {
-	// TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
-	// storm of samples passes the check before any counter moves, and its keys never expire, so a
-	// device that sent once is tracked forever.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	used, err := rdb.Get(ctx, rateKey(deviceID)).Int64()
 	if err == redis.Nil {
 		used, err = 0, nil
@@ -592,9 +579,7 @@ object DeviceState {
 
   def latestKey(deviceId: String): String = s"latest:$deviceId"
 
-  // TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
-  // storm of samples passes the check before any counter moves, and its keys never expire, so a
-  // device that sent once is tracked forever.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def admit(deviceId: String, samples: List[Sample]): (Boolean, Long, Long) = {
     val used = Option(jedis.get(rateKey(deviceId))).map(_.toLong).getOrElse(0L)
     if (used + samples.length > RateLimitSamples) {
@@ -739,9 +724,7 @@ std::tuple<bool, long long, long long> admit(
     sw::redis::Redis& redis,
     const std::string& deviceId,
     const std::vector<std::pair<std::string, double>>& samples) {
-  // TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
-  // storm of samples passes the check before any counter moves, and its keys never expire, so a
-  // device that sent once is tracked forever.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto raw = redis.get(rateKey(deviceId));
   const long long used = raw ? std::stoll(*raw) : 0;
   if (used + static_cast<long long>(samples.size()) > kRateLimitSamples) {
@@ -874,5 +857,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is atomicity plus lifetime. A read-then-increment limiter passes every serial test and fails exactly when the fleet is loud, which is when the limit matters: two concurrent batches both observe budget that only one of them can spend, and the counter ends up below zero. One Lua script makes read, compare, increment and the latest-value write a single step, so a refusal changes nothing at all — no half-applied state where the dashboard shows a value from a batch the pipeline refused. Setting the expiry inside the same script ties the counter's life to its window, which is also what makes the state self-cleaning instead of a key per device that has ever been seen. The 429 headers are the third half of the contract: a client that receives \`Retry-After\` and \`X-RateLimit-Remaining\` can back off by exactly as much as the window needs, while a bare 429 invites the retry storm the limiter exists to stop. Real edges add per-metric weights, sliding windows, and a per-device admission lock for very high-rate devices, but they all start here.`,
+  debrief: `The decision here is atomicity plus lifetime. A read-then-increment limiter passes every serial test and fails exactly when the fleet is loud, which is when the limit matters: two concurrent batches both observe budget only one of them can spend. One Lua script makes read, compare, increment and the latest-value write a single step, so a refusal changes nothing and the dashboard cannot show a value from a batch the pipeline refused. Setting the expiry inside the same script ties the counter's life to its window, which is what makes the state self-cleaning rather than a key per device ever seen. The 429 headers complete the contract: a client that receives \`Retry-After\` can back off by exactly as much as the window needs, while a bare 429 invites the retry storm the limiter exists to stop. Production edges add per-metric weights and sliding windows on top of this shape.`,
 };

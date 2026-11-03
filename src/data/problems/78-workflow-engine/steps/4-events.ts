@@ -296,7 +296,6 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// The starter writes straight to the topic with the workflow definition name as the key.
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "workflow.step"}
 
 type stepEvent struct {

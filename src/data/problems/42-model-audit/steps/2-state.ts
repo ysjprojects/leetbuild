@@ -13,10 +13,9 @@ export const stateStep: Step = {
 \`LLEN\` as the position, writes the head in a second round trip with a day-long \`EXPIRE\`, and reports
 \`valid\` whenever the head exists. It compiles, serves the demo and hides 5 flaws.
 
-**Failure mode the checks target.** Atomicity and identity. Two writes where one is needed is a
-crash window; a count where the head already tracks the position is a race; a digest that ignores
-its predecessor and a verifier that checks existence leave a chain that looks fine until an auditor
-asks a question it cannot answer.
+**Failure mode the checks target.** Two writes where one is needed is a crash window; a count where
+the head tracks the position is a race; a digest that ignores its predecessor and a verifier that
+checks existence leave a chain that only looks fine.
 
 Each tenant's records form a **hash chain** stored under \`audit:chain:{tenant}\`:
 
@@ -24,13 +23,11 @@ Each tenant's records form a **hash chain** stored under \`audit:chain:{tenant}\
   position written. Entry \`n\` lives in fields \`rec:{n}\` (that record's own digest) and \`pos:{n}\`
   (the chain digest).
 - The chain digest of position \`n\` is \`sha1(prev | record_digest | n)\` where \`prev\` is the chain
-  digest at \`n-1\` (empty for the first entry), so changing any earlier entry changes every digest
-  after it.
-- Append and head advance in one atomic unit: one Lua \`EVAL\` reads \`head\`, takes the position
-  from \`next\` with \`HINCRBY\`, writes \`rec:{n}\`, \`pos:{n}\` and \`head\`, and returns
-  \`[position, digest]\`.
-- Positions are dense and unique; they come from the head's counter, not from a count of rows.
-- The head key has no TTL: an audit chain is retained, not cached.
+  digest at \`n-1\` (empty for the first entry).
+- One Lua \`EVAL\` reads \`head\`, takes the position from \`next\` with \`HINCRBY\`, writes
+  \`rec:{n}\`, \`pos:{n}\` and \`head\`, and returns \`[position, digest]\`.
+- Positions come from the head's counter, not from a count of rows.
+- The head key has no TTL.
 - \`verify_chain\` walks from \`from_position\` to the head, recomputing each digest, and reports
   \`{"valid", "chain_length", "first_divergence"}\`: the length actually covered and the exact position
   of the first digest that disagrees or is missing.`,

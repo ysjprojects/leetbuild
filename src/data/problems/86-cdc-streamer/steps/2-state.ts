@@ -213,7 +213,7 @@ async def tail(
 `,
     },
     typescript: {
-      starter: `/** CDC tailer: flawed code that keeps the cursor in a cache key. */
+      starter: `/** CDC tailer. */
 import {Redis} from 'ioredis';
 
 const CURSOR_EXPIRY_S = 12 * 60 * 60;

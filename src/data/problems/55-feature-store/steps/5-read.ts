@@ -200,7 +200,7 @@ def stats(name: str, v: int) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/features/:name/versions/:v/stats: flawed code that reports means. */
+      starter: `/** GET /v1/features/:name/versions/:v/stats. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

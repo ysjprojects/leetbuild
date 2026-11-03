@@ -8,33 +8,25 @@ export const graphEventsStep: Step = {
   focus: ['api', 'db', 'kafka', 'consumer', 'outbox'],
   task: `## Task
 
-**Starting point.** The starter is working code for the graph event path. It
-publishes a change, keys the message, and its consumer applies the change. It compiles, the demo
-replays cleanly, and it hides three production flaws. Debug it like the streaming owner, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter is the graph event path: \`publish_change\` builds a payload with
+the tenant, entity id and new label, produces it to \`graph.changed\` keyed by operation type,
+flushes, and then commits the graph transaction; \`consume\` parses an event, applies the merge and
+commits the offset. It compiles, the demo replays cleanly, and it hides five flaws.
 
-Implement publishing and consuming \`graph.changed\`:
+**Failure mode the checks target.** \`edge_added\` and \`entity_merged\` for one entity land on
+different partitions, so a consumer can apply the merge before the edge that caused it. A crash
+between produce and commit leaves a permanent event for an edge that was never written. A broker
+rejection drops the event. After a rebalance the consumer re-applies every merge in the retained
+window, and the payload carries too little for a replayer to tell a repeat from a new transition.
 
-- Publish edge and merge events to **\`graph.changed\`**, keyed by **entity id** (\`key = entity id\`),
-  so every event for one entity lands on the same partition and its history stays ordered. Keying by
-  operation type scatters one entity's history across partitions.
-- The payload carries **\`old_label\`, \`new_label\` and \`policy_version\`** — a replayer must be able to
-  reconstruct the label transition and reject an event it has already folded in.
-- **Publish after the graph transaction commits.** A consumer must never observe an event whose
-  edge is not yet durable; the commit happens before \`produce\`/\`send\`.
-- When the broker **rejects** the produce, write an **outbox row** (\`outbox.put\` into
-  \`OUTBOX_TABLE\`) so the event survives the outage and can be replayed.
-- The consumer is **idempotent on replay**: it checks \`already_applied(entity_id, policy_version)\`
-  first, applies the merge, and only then commits the offset. A crash between the merge and the
-  commit must not double-apply, because the replay finds its own mark.
-- Commit the offset only *after* the merge is durable — never before.
-
-**Failure mode the checks target.** The starter keys by operation type, so \`edge_added\` and
-\`entity_merged\` events for the same entity are spread over different partitions and a consumer sees
-them out of order. It publishes *before* the graph transaction commits, so a crash loses the edge and
-leaves a permanent event describing state that never existed. Its consumer applies the merge and then
-commits the offset with no idempotency mark, so a rebalance re-applies every merge in the retained
-window. The outbox is missing entirely: a broker rejection drops the event.`,
+- Publish edge and merge events to \`graph.changed\` keyed by entity id (\`key = entity id\`), so one
+  entity's history stays on one partition.
+- The payload carries \`old_label\`, \`new_label\` and \`policy_version\`.
+- Publish after the graph transaction commits: the commit happens before \`produce\`/\`send\`.
+- When the broker rejects the produce, write an outbox row (\`outbox.put\` into \`OUTBOX_TABLE\`) so
+  the event survives the outage and can be replayed.
+- The consumer is idempotent on replay: it checks \`already_applied(entity_id, policy_version)\`
+  first, applies the merge, and only then commits the offset.`,
   sequence: {
     participants: ['graph-api', 'Graph store', 'graph.changed', 'Graph consumer'],
     messages: [
@@ -138,8 +130,7 @@ TOPIC = "graph.changed"
 
 
 def publish_change(producer: Producer, graph, tenant: str, entity_id: str, op_type: str, edge: dict) -> None:
-    # TODO: this starter keys by operation type, publishes before the graph transaction commits, and
-    # never writes an outbox row when the broker rejects the produce. Fix all three.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = {"tenant": tenant, "entity_id": entity_id, "new_label": edge["new_label"]}
     producer.produce(TOPIC, key=op_type, value=json.dumps(payload))
     producer.flush()
@@ -147,8 +138,7 @@ def publish_change(producer: Producer, graph, tenant: str, entity_id: str, op_ty
 
 
 def consume(consumer, message) -> None:
-    # TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
-    # so a replay re-applies every event in the retained window.
+    # TODO: the consumer's share of the five flaws lives here.
     event = json.loads(message.value())
     merge_entities(event["tenant"], event["entity_id"], event)
     consumer.commit()
@@ -210,16 +200,14 @@ interface EdgeChange {
 }
 
 export async function publishChange(tenant: string, entityId: string, opType: string, edge: EdgeChange): Promise<void> {
-  // TODO: this starter keys by operation type, publishes before the graph transaction commits, and
-  // never writes an outbox row when the broker rejects the produce. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const payload = {tenant, entity_id: entityId, new_label: edge.newLabel};
   await producer.send({topic: TOPIC, messages: [{key: opType, value: JSON.stringify(payload)}]});
   await graph.commit();
 }
 
 export async function consume(consumer: Consumer, payload: EachMessagePayload): Promise<void> {
-  // TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
-  // so a replay re-applies every event in the retained window.
+  // TODO: the consumer's share of the five flaws lives here.
   const event = JSON.parse(payload.message.value?.toString() ?? '{}') as {tenant: string; entity_id: string};
   await applyMerge(event);
   await consumer.commitOffsets([{topic: payload.topic, partition: payload.partition, offset: payload.message.offset}]);
@@ -300,8 +288,7 @@ type EdgeChange struct {
 }
 
 func publishChange(ctx context.Context, writer *kafka.Writer, graph Graph, tenant, entityID, opType string, edge EdgeChange) error {
-	// TODO: this starter keys by operation type, publishes before the graph transaction commits, and
-	// never writes an outbox row when the broker rejects the produce. Fix all three.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]string{"tenant": tenant, "entity_id": entityID, "new_label": edge.NewLabel})
 	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(opType), Value: payload}); err != nil {
 		return err
@@ -310,8 +297,7 @@ func publishChange(ctx context.Context, writer *kafka.Writer, graph Graph, tenan
 }
 
 func consume(ctx context.Context, reader *kafka.Reader, consumer Consumer) error {
-	// TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
-	// so a replay re-applies every event in the retained window.
+	// TODO: the consumer's share of the five flaws lives here.
 	message, err := reader.ReadMessage(ctx)
 	if err != nil {
 		return err
@@ -406,8 +392,7 @@ object GraphEvents {
 
   def publishChange(producer: KafkaProducer[String, String], graph: Graph, tenant: String, entityId: String,
       opType: String, edge: EdgeChange): Unit = {
-    // TODO: this starter keys by operation type, publishes before the graph transaction commits, and
-    // never writes an outbox row when the broker rejects the produce. Fix all three.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"tenant":"$tenant","entity_id":"$entityId","new_label":"\${edge.newLabel}"}"""
     producer.send(new ProducerRecord[String, String](Topic, opType, payload))
     producer.flush()
@@ -415,8 +400,7 @@ object GraphEvents {
   }
 
   def consume(consumer: KafkaConsumer[String, String], record: ConsumerRecord[String, String]): Unit = {
-    // TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
-    // so a replay re-applies every event in the retained window.
+    // TODO: the consumer's share of the five flaws lives here.
     val event = parse(record.value())
     applyMerge(event)
     consumer.commitSync()
@@ -473,8 +457,7 @@ struct EdgeChange {
 
 void publishChange(rd_kafka_t* producer, Graph& graph, const std::string& tenant, const std::string& entityId,
                    const std::string& opType, const EdgeChange& edge) {
-  // TODO: this starter keys by operation type, publishes before the graph transaction commits, and
-  // never writes an outbox row when the broker rejects the produce. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const json payload = {{"tenant", tenant}, {"entity_id", entityId}, {"new_label", edge.newLabel}};
   const std::string value = payload.dump();
   rd_kafka_producev(producer, RD_KAFKA_V_TOPIC(kTopic.c_str()), RD_KAFKA_V_MSGSIZE(value.size()),
@@ -484,8 +467,7 @@ void publishChange(rd_kafka_t* producer, Graph& graph, const std::string& tenant
 }
 
 void consume(rd_kafka_t* consumer, const std::string& value) {
-  // TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
-  // so a replay re-applies every event in the retained window.
+  // TODO: the consumer's share of the five flaws lives here.
   const json event = json::parse(value);
   applyMerge(event);
   commitSync(consumer);
@@ -538,9 +520,9 @@ void consume(rd_kafka_t* consumer, const std::string& value) {
     },
   },
   hints: [
-    'The partition key is the entity id, not the operation: one entity’s `edge_added` and `entity_merged` events must land on the same partition so a consumer reads them in the order they happened. Keying by operation type is a silent reordering bug.',
-    'The publish must be downstream of the commit. If you produce first, a crash between the two leaves an event for an edge that was never written, and a replay of the topic resurrects it forever — the event becomes the lie.',
-    'Idempotency for the consumer starts with the payload: `policy_version` is what lets `already_applied(entity_id, policy_version)` answer "I have seen this fold" without a second table keyed by offset. Apply, then commit — never the other way round.',
+    'After a consumer rebalance, merges from the last week are applied a second time, and during a broker blip some edges show up in the graph with no event on the topic.',
+    '`producer.produce` runs before `graph.commit`, so the event can outlive a failed transaction; `key=op_type` scatters one entity across partitions; `consume` has no mark to recognise a repeat.',
+    'Commit, then `produce` with `key=entity_id` and `old_label`/`new_label`/`policy_version`; on rejection `outbox.put` into `OUTBOX_TABLE`; in `consume` check `already_applied` before `merge_entities`, then `consumer.commit`.',
   ],
-  debrief: `The interviewer is testing whether you can make an event path replayable. Three defects are checked. The partition key decides ordering, and keying by operation type means one entity's history is spread across partitions and read out of order — the merge can be applied before the edge that caused it. Publishing before the commit means a consumer can observe state that does not exist, and the event outlives the transaction that would have explained it. The consumer that applies and then commits without an idempotency mark double-applies every merge after a rebalance; the \`policy_version\` in the payload is the mark. The outbox is the durability backstop for a broker rejection: produce, and on failure write the row that a replayer will publish later. Real systems add transactional outbox polling, a schema registry so a future producer cannot change the payload shape, and a dead-letter topic for events that fail to apply.`,
+  debrief: `The fix orders every step by what must be true before the next one is safe. The graph commit comes before the produce because an event may only describe durable state. The entity id is the key because the partition key decides ordering, and one entity's history must be read in the order it happened. The outbox exists because a rejected produce is otherwise a lost fact. On the consumer side the idempotency mark comes before the merge and the offset commit comes after it, so a crash anywhere in between is repaired by the replay finding its own mark; \`policy_version\` in the payload is that mark. Production systems drain the outbox with a relay that publishes under the same key, and route events that fail to apply to a dead-letter topic rather than blocking the partition.`,
 };

@@ -228,7 +228,7 @@ async def ingest(request: Request, tenant: str | None = Header(default=None, ali
 `,
     },
     typescript: {
-      starter: `/** POST /v1/logs: flawed code that trusts the caller's service id. */
+      starter: `/** POST /v1/logs. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

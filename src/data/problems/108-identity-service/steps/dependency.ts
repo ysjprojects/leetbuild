@@ -11,31 +11,22 @@ export const dependencyStep: Step = {
 **Starting point.** The starter is the verification client: \`send_verification(email)\` calls the
 provider's \`SendVerification\`, sets the account \`verified\` whether the call returned or raised,
 appends failures to an in-memory list, and a worker re-sends that list every 60 seconds. Against a
-healthy provider (one signup, one delivered email) it compiles, serves the demo and hides 5 flaws.
+healthy provider it serves the demo and hides 5 flaws.
 
-Requirements for \`send_verification(email, attempt)\` and the paths around it:
+**Failure mode the checks target.** Marking the account \`verified\` when \`SendVerification\` returns
+or times out lets a provider outage mint verified identities for addresses nobody proved they own.
+Failures re-sent on a \`60 s\` ticker forever hammer a bounced address and the sender reputation, and
+with no deadline one stuck provider holds a worker open indefinitely.
 
-- The provider call carries a **3 s** deadline as a named constant on the call itself
-  (\`DEADLINE_S = 3\` with \`timeout=DEADLINE_S\`, \`deadline: Date.now() + DEADLINE_MS\`, a
-  \`context.WithTimeout\`, a \`withDeadlineAfter\`, a \`set_deadline\`): an unguarded call lets one
-  stuck provider pin the signup request until the client gives up.
-- A **timeout** (\`DEADLINE_EXCEEDED\`) is **retryable**: it must \`queue_retry(email, attempt + 1)\`
-  and leave the account \`unverified\`, so a provider outage delays verification instead of faking it.
-- A **hard bounce** is **terminal**: \`suppress(...)\` the address for signup and drop it from the
-  retry schedule — a bounced mailbox will never accept the mail, so no further retries.
-- \`verified\` is granted in exactly one place: the \`ConfirmVerification\` reply carrying
-  \`confirmed\`. The send result — accepted, timed out or errored — must never set it.
-- Retries are **bounded** by \`MAX_ATTEMPTS = 5\` and spaced by an exponential
-  \`backoff_seconds(...)\` (\`BACKOFF_BASE_S = 60\`), never a fixed one-minute loop.
-
-**Failure mode the checks target.** The starter marks the account \`verified\` the moment
-\`SendVerification\` returns or times out, “to keep signups smooth”, so a provider outage silently
-mints verified identities for addresses nobody proved they own — sign up with a victim’s address
-during the outage and log straight in. It also re-queues every failure and drains that queue on a
-\`60 s\` ticker forever, so a permanently bounced address is re-sent once a minute until a human
-notices, burning the provider’s quota and the domain’s sender reputation. And because neither call
-carries a deadline, one stuck provider holds a worker (and the signup behind it) open indefinitely,
-which is the outage the auto-verify then papers over.`,
+- The provider call carries a **3 s** deadline as a named constant (\`DEADLINE_S = 3\` with
+  \`timeout=DEADLINE_S\`, \`deadline: Date.now() + DEADLINE_MS\`, \`context.WithTimeout\`,
+  \`withDeadlineAfter\`, \`set_deadline\`).
+- A timeout (\`DEADLINE_EXCEEDED\`) calls \`queue_retry(email, attempt + 1)\` and leaves the account
+  \`unverified\`.
+- A hard bounce is terminal: \`suppress(...)\` the address and drop it from the retry schedule.
+- Only the \`ConfirmVerification\` reply carrying \`confirmed\` sets \`verified\`.
+- Retries stop at \`MAX_ATTEMPTS = 5\`, spaced by an exponential \`backoff_seconds(...)\`
+  (\`BACKOFF_BASE_S = 60\`).`,
   sequence: {
     participants: ['Client', 'Identity API', 'Accounts DB', 'Verification Provider', 'Retry Queue'],
     messages: [
@@ -164,7 +155,7 @@ which is the outage the auto-verify then papers over.`,
   ],
   code: {
     python: {
-      starter: `"""Verification client: flawed code that keeps signups smooth."""
+      starter: `"""Verification client."""
 import time
 
 import grpc
@@ -287,7 +278,7 @@ def retry_worker() -> None:
 `,
     },
     typescript: {
-      starter: `/** Verification client: flawed code that keeps signups smooth. */
+      starter: `/** Verification client. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

@@ -13,27 +13,15 @@ Redis: \`begin_load\` writes \`load:{manifest_id}:complete\` as soon as the sour
 \`commit_partition\` logs the partition id, and \`is_complete\` answers from the flag. It serves the
 demo where the loader runs to the end and hides 5 flaws.
 
-Track a load's progress in Redis, one manifest at a time.
+**Failure mode the checks target.** Marking complete at read time means a crash before the last
+partition leaves a load every reader calls done while partitions are missing.
 
-- **Every committed partition** is recorded in a Redis **set** at \`load:{manifest_id}:partitions\`.
-  A set, not a counter and not a list: committing the same partition twice (a retried worker, a
-  re-run after a crash) must be a **no-op**, so the re-run is safe.
-- The completion flag \`load:{manifest_id}:complete\` may only be written when **every** partition of
-  the manifest is in the set — \`SCARD\` reaches the manifest's partition count. Flipping it when the
-  source file is read (or when the *last* file arrives) marks a load done that never committed.
-- The final partition and the completion flag are written by **one atomic script** (\`EVAL\` with
-  \`KEYS\`/\`ARGV\`): two round-trips leave a window in which the last partition is committed and the
-  flag is not, or the flag is set and the count moved afterwards.
-- Readers ask \`is_complete(manifest_id, total_partitions)\`. A partial load must be **invisible** as
-  done: the flag alone is not enough — the reader re-checks the committed count before answering
-  \`true\`.
-- Both keys carry a **TTL** (\`LOAD_TTL_S\` seconds, \`EX\` on the write) so an abandoned manifest
-  cannot leave a stale "complete" behind that a later load of the same id reads as its own.
-
-**Failure mode the checks target.** The starter marks complete at read time and keeps no set: a crash
-between the read and the last partition leaves a load that any downstream reader, and the report
-endpoint in step 5, will call done while two partitions are missing. A counter instead of a set
-would double-count a re-run; a flag without a TTL would outlive the load.`,
+- Record each committed partition in the Redis set \`load:{manifest_id}:partitions\`; a repeat
+  commit is a no-op.
+- Write \`load:{manifest_id}:complete\` only when \`SCARD\` reaches the partition count.
+- Write the final partition and the flag in **one atomic script** (\`EVAL\` with \`KEYS\`/\`ARGV\`).
+- \`is_complete(manifest_id, total_partitions)\` re-checks the committed count, not just the flag.
+- Both keys carry \`LOAD_TTL_S\` (\`EX\` on the write).`,
   sequence: {
     participants: ['Load worker', 'Redis', 'Downstream reader'],
     messages: [
@@ -181,7 +169,7 @@ def is_complete(manifest_id: str, total_partitions: int) -> bool:
 `,
     },
     typescript: {
-      starter: `/** Redis progress for one manifest: flawed code that trusts the read. */
+      starter: `/** Redis progress for one manifest. */
 import Redis from 'ioredis';
 
 export const redis = new Redis('redis://redis:6379');

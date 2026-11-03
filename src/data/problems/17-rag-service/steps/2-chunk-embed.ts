@@ -292,7 +292,7 @@ if __name__ == "__main__":
 `,
     },
     typescript: {
-      starter: `/** doc.ingest consumer: flawed code that indexes one chunk at a time. */
+      starter: `/** doc.ingest consumer. */
 import {randomUUID} from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';

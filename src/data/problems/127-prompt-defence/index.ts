@@ -46,19 +46,14 @@ export const promptDefenceProblem: Problem = {
   statement: `# Prompt Injection Defence
 
 A user opens a contract in their file store and asks, "What is the notice period?" The feature
-behind that box pastes the document and the question into a prompt and returns what the model
-says. Everything in that sentence is attacker-controlled except the template, and Dropbox's
-security team showed that the template alone does not hold.
+pastes the document and the question into a prompt, and Dropbox's security team showed that the
+template alone does not hold.
 
 ## The real system
 
-A question-answering feature over user documents is a prompt template with two untrusted holes:
-the document, written by anyone who could share a file, and the question, typed into a form or
-sent to an API. Rebuff, Protect AI's open-source injection detector, adds a canary word to the
-prompt template and checks whether the completion leaked it, then stores the embedding of a caught
-attack so a similar one is recognised next time. The service in this course does the same job with
-plainer parts: a cap in tokens, control-character normalisation, a repeat-ratio detector, a
-per-request canary, an output guard and a count of signatures over time.
+A question-answering feature over user documents is a prompt template with two untrusted holes: the
+document and the question. Rebuff, Protect AI's open-source injection detector, adds a canary word
+to the prompt template and checks whether the completion leaked it.
 
 ## From the source
 
@@ -91,15 +86,12 @@ One service, **promptguard**, with five pieces:
 
 ## The debugging habit
 
-Every starter compiles and answers the demo question. Each step is debugging against the failure
-modes the source documents: find the flaws, fix them, and prove the fix with checks that fail on
-the starter and pass on your version.
+Every starter compiles and answers the demo question. Debug it against the failure modes the source
+documents, fix it, and prove the fix with checks.
 
 ## Left out on purpose
 
-The tokenizer itself, the document store and its permissions, a second model as a judge, the
-provider's own repeated-token filter, streaming answers, and the dashboard over the hourly
-signatures.`,
+The tokenizer, the document store, a second model as a judge, and streaming answers.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'File viewer', sub: 'POST /v1/ask', x: 8, y: 50},

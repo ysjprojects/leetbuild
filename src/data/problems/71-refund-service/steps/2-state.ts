@@ -215,7 +215,7 @@ def rebuild_ledger(payment_id: str) -> int:
 `,
     },
     typescript: {
-      starter: `/** The refund ledger: flawed code that reads, checks and then adds. */
+      starter: `/** The refund ledger. */
 import {Redis} from 'ioredis';
 
 export const r = new Redis('redis://redis:6379');

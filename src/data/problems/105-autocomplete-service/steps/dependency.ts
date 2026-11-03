@@ -12,24 +12,20 @@ export const dependencyStep: Step = {
 three times inside the request, and returns the suggester's terms or an empty list. It compiles,
 it works when the suggester is healthy, and it hides 5 flaws.
 
-- The suggester is called with a **150 ms deadline** (\`DEADLINE_MS = 150\`). A typeahead that waits
-  longer than that is worse than no suggestion.
+**Failure mode the checks target.** A slow suggester during a deploy returns nothing and the search
+box looks broken. Inline retries multiply the load on a suggester that is already slow. An
+unversioned, unmarked fallback cannot be rolled back when the curated list is wrong, and nobody can
+tell a degraded answer from a real one.
+
+- The suggester is called with a **150 ms deadline** (\`DEADLINE_MS = 150\`).
 - When the call fails or the deadline fires, the response serves the **static curated fallback
-  list**, not an empty list. The UI must keep suggesting while the suggester is slow.
+  list**, not an empty list.
 - The fallback response is **marked as fallback** (\`"source": "fallback"\`, against \`"suggester"\`
   on the normal path) so the client and the metrics can tell a degraded answer from a real one.
-- **Retries are dropped, not run inline.** A retry inside the user's request adds latency on top of
-  latency; the call is attempted once under the deadline and the fallback serves the request. The
-  dropped attempt is counted (\`RETRIES_DROPPED\`) so the drop is visible in metrics.
+- **Retries are dropped, not run inline.** The call is attempted once under the deadline and the
+  fallback serves the request; the dropped attempt is counted (\`RETRIES_DROPPED\`).
 - The fallback list is **versioned** (\`FALLBACK_LIST_VERSION\`) so a bad list can be rolled back by
-  changing one value rather than shipping new code.
-
-**Failure mode the checks target.** Returning nothing on timeout is the visible part: the suggester
-is slow for ten seconds during a deploy and the search box looks broken, so users type the term in
-full and the product loses its reason to exist. Retrying inline compounds the outage, because the
-suggester is already slow and now every request multiplies the load. The unversioned, unmarked
-fallback is the subtle part: when the curated list itself is wrong there is no value to roll back,
-and nobody can tell a degraded answer from a real one.`,
+  changing one value.`,
   sequence: {
     participants: ['Autocomplete API', 'Suggester', 'Fallback list'],
     messages: [

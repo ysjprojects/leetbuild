@@ -34,13 +34,9 @@ NVIDIA Triton Inference Server ships the admission half of this course: its rate
 (\`--rate-limit=execution_count\`) schedules requests onto model instances only when the resources an
 instance group declares are free, with a priority per model, so one hot model cannot starve the
 rest of the GPU; without it, every request is dispatched as soon as an instance is idle. The tenant
-half lives in the service in front of it. Multi-tenant vision APIs accept a key inside the tenant's
-own prefix and reject everything else before a byte is read, call the models under a deadline and
-record a downgrade to the small model in the response rather than replacing it with a fabricated
-label, publish one event per inference keyed so per-version quality streams stay ordered and carry
-digests rather than bytes or URLs, and expire results on a schedule while keeping the metadata that
-proves a decision was made, because keeping predictions forever builds a training set of tenant
-data nobody agreed to.
+half lives in the service in front of it: storage keys scoped to the tenant's prefix, a deadline on
+every model call, a recorded downgrade instead of a fabricated label, digest-only events, and results
+that expire while the metadata proving a decision was made stays.
 
 ## What you build here
 
@@ -63,17 +59,13 @@ One service, **visiond**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
-starter and pass on your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Video and multi-image batches, model serving details (batching, quantization, warm pools), media type
-sniffing and EXIF handling, per-tenant byte quotas, billing, the labeling UI, and the training
-pipeline that consumes the events. The five pieces above are the ones that decide whether the vision
-service is correct, isolated and shippable.`,
+Video and multi-image batches, model serving details (batching, quantization, warm pools), EXIF
+handling, byte quotas, billing and the training pipeline that consumes the events.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'submit · read', x: 8, y: 50},

@@ -125,7 +125,7 @@ Requirements:
   ],
   code: {
     python: {
-      starter: `"""Assignment leases and unread badges: flawed code of the Redis layer."""
+      starter: `"""Assignment leases and unread badges."""
 import redis
 from fastapi import FastAPI, Header
 from pydantic import BaseModel
@@ -242,7 +242,7 @@ def add_message(ticket_id: str, message: Message, agent: str = Header(alias="X-A
 `,
     },
     typescript: {
-      starter: `/** Assignment leases and unread badges: flawed code of the Redis layer. */
+      starter: `/** Assignment leases and unread badges. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -343,7 +343,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// Assignment leases and unread badges: flawed code of the Redis layer.
+      starter: `// Assignment leases and unread badges.
 package main
 
 import (
@@ -856,7 +856,7 @@ int main() {
     'The assign `SET` has no `NX` and no TTL, so the second writer wins silently; release returns OK without touching the key; the append and the counter are two round trips with a crash window between.',
     'Use `SET lease:{id} {agent} EX 120 NX` and answer **409** on `nil`; on release check the holder, `DEL` the key and `ZADD`/`LPUSH` onto `assign:queue`; move `RPUSH` + `HINCRBY` into one `EVAL` script.',
   ],
-  debrief: `The fix is a lease because ownership under failure needs two facts a plain \`SET\` cannot express: "already taken" and "taken until". \`NX\` answers the first in the same round trip that writes, so the loser of the race gets \`nil\` instead of a second ownership; the TTL answers the second, so a crashed agent's ticket frees itself. Release checks the holder before \`DEL\` because a bare delete can remove a lease that now belongs to someone else, and pushes the ticket back on the queue because a ticket nobody owns must be offerable again. The two-key write goes into one script because the badge is the only place "unread" is stored, and two round trips have a crash window between them.
+  debrief: `The fix is a lease because ownership under failure needs two facts a plain \`SET\` cannot express: "already taken" and "taken until". \`NX\` answers the first in the same round trip that writes, so the loser gets \`nil\`; the TTL answers the second, so a crashed agent's ticket frees itself. Release checks the holder before \`DEL\` because a bare delete can remove someone else's lease, and requeues the ticket so it can be offered again. The two-key write is one script because two round trips leave a crash window.
 
-Production systems add a heartbeat that extends the lease while the agent is active, escalation when a lease expires instead of a quiet return to the queue, and a fencing token in the lease value so a stale agent's writes are rejected after expiry.`,
+Production systems add a heartbeat that extends the lease and a fencing token so a stale agent's writes are rejected after expiry.`,
 };

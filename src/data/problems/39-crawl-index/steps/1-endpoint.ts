@@ -263,7 +263,7 @@ def register(body: TargetRequest, tenant: str | None = Header(default=None, alia
 `,
     },
     typescript: {
-      starter: `/** POST /v1/crawl/targets: flawed code that fetches whatever it is sent. */
+      starter: `/** POST /v1/crawl/targets. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

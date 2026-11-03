@@ -8,31 +8,25 @@ export const eventsStep: Step = {
   focus: ['runner', 'kafka', 'evidence', 'reviewer'],
   task: `## Task
 
-**Starting point.** The starter is working code: a probe finds something, an event goes to Kafka,
-and a reviewer can see it. It scatters one target's findings across partitions, it copies the
-attack into a retained topic, and it publishes findings whose evidence cannot be retrieved. Find the
-flaws, fix them, and prove the fix.
+**Starting point.** The starter serves \`POST /v1/redteam/findings\` with body
+\`{"target_id": "checkout-shadow", "probe_id": "probe-18", "severity": "high", "evidence": "…"}\`,
+called once per finding: it builds an event with the probe id, severity and the raw evidence as
+\`payload\`, produces it to \`redteam.finding\` keyed by severity from a default producer, and only
+then calls \`seal_evidence\`. It serves the demo and hides four flaws.
 
-Implement \`record_finding\`, called once per finding with
-\`{"target_id": "checkout-shadow", "probe_id": "probe-18", "severity": "high", "evidence": "…"}\`:
+**Failure mode the checks target.** A reviewer reconstructs an attack in the wrong sequence, because
+one target's findings are spread across partitions. The raw adversarial probe sits in a retained,
+replicated topic and every backup of it. The reference a reviewer clicks can 404, because the
+finding is published before the bundle exists. And a broker retry duplicates a finding into the
+queue a reviewer is reading.
 
-- Findings are published to **\`redteam.finding\` keyed by \`target_id\`**, so one target's finding
-  stream stays in order. The starter keys by severity, which spreads a single target's findings across
-  partitions and destroys the order a reviewer reads them in.
-- The event carries \`probe_id\`, \`severity\` and an **\`evidence_ref\`** — a reference to the sealed
-  evidence bundle, never the raw adversarial payload. The topic is retained and replicated; whatever
-  you put in it outlives the run.
-- **Seal, then publish**: \`seal_evidence\` writes the bundle and returns its immutable reference, and
-  only then is the finding produced. The starter publishes first, so every finding it emits can point
-  at evidence that does not exist yet.
-- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\`, \`acks=all\`), so a producer
-  retry cannot duplicate a finding into a stream a reviewer is reading.
-
-**Failure mode the checks target.** The loud one is the key: severity as a partition key looks
-harmless until a target's findings arrive reordered, and a reviewer reconstructs the attack in the
-wrong sequence. The quiet ones are the payload and the ordering: the raw adversarial probe in the
-topic is an unredacted attack copied into every replica and every backup, and publishing before
-sealing means the reference in the event can 404 the moment someone clicks it.`,
+- Findings are published to \`redteam.finding\` keyed by \`target_id\`, so one target's stream stays
+  in order.
+- The event carries \`probe_id\`, \`severity\` and an \`evidence_ref\`, a reference to the sealed
+  evidence bundle, not the raw payload.
+- Seal, then publish: \`seal_evidence\` writes the bundle and returns its immutable reference, and
+  only then is the finding produced (\`publish_finding\`).
+- The producer is idempotent with \`acks=all\` (\`enable.idempotence\`, \`acks=all\`).`,
   sequence: {
     participants: ['Probe runner', 'evidence store', 'Kafka redteam.finding', 'Review queue'],
     messages: [
@@ -139,10 +133,7 @@ def publish_finding(event: dict, key: str) -> None:
 
 @app.post("/v1/redteam/findings")
 def record_finding(body: Finding, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter keys the event by severity so one target's findings scatter across
-    # partitions, writes the raw adversarial payload into a retained topic, produces before the
-    # evidence bundle is sealed, and takes the default producer settings. Key by target_id, publish
-    # an evidence reference, seal first, and configure idempotence with acks=all.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     event = {"probe_id": body.probe_id, "severity": body.severity, "payload": body.evidence}
     publish_finding(event, body.severity)
     bundle = seal_evidence(body.target_id, body.probe_id, body.evidence)
@@ -220,10 +211,7 @@ async function publishFinding(finding: Record<string, string>, key: string): Pro
 }
 
 app.post('/v1/redteam/findings', async (request, reply) => {
-  // TODO: this starter keys the event by severity so one target's findings scatter across partitions,
-  // writes the raw adversarial payload into a retained topic, produces before the evidence bundle
-  // is sealed, and takes the default producer settings. Key by targetId, publish an evidence
-  // reference, seal first, and configure idempotence with acks=all.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as FindingBody;
   await publishFinding({probe_id: body.probeId, severity: body.severity, payload: body.evidence}, body.severity);
   const bundleId = await sealEvidence(body.targetId, body.probeId, body.evidence);
@@ -313,10 +301,7 @@ func publishFinding(ctx context.Context, key string, event map[string]any) error
 }
 
 func recordFinding(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter keys the event by severity so one target's findings scatter across
-	// partitions, writes the raw adversarial payload into a retained topic, produces before the
-	// evidence bundle is sealed, and takes the default writer settings. Key by target id, publish an
-	// evidence reference, seal first, and configure RequireAll with a hash balancer.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	var body Finding
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	event := map[string]any{"probe_id": body.ProbeID, "severity": body.Severity, "payload": body.Evidence}
@@ -408,10 +393,7 @@ object Events {
   def publishFinding(key: String, event: JsObject): Unit =
     producer.send(new ProducerRecord(Topic, key, event.compactPrint))
 
-  // TODO: this starter keys the event by severity so one target's findings scatter across partitions,
-  // writes the raw adversarial payload into a retained topic, produces before the evidence bundle is
-  // sealed, and takes the default producer settings. Key by target_id, publish an evidence
-  // reference, seal first, and configure idempotence with acks=all.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def recordFinding(body: Finding): String = {
     val event = JsObject(
       "probe_id" -> JsString(body.probe_id),
@@ -493,10 +475,7 @@ void publishFinding(const std::string& key, const json& event) {
       nullptr);
 }
 
-// TODO: this starter keys the event by severity so one target's findings scatter across partitions,
-// writes the raw adversarial payload into a retained topic, produces before the evidence bundle is
-// sealed, and takes the default producer settings. Key by target_id, publish an evidence reference,
-// seal first, and configure idempotence with acks=all.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 json recordFinding(const Finding& body) {
   const json event = {
       {"probe_id", body.probe_id}, {"severity", body.severity}, {"payload", body.evidence}};
@@ -567,9 +546,9 @@ json recordFinding(const Finding& body) {
     },
   },
   hints: [
-    'Ask what a consumer needs in order: the story of one attack against one target. The message key decides that, and only `target_id` keeps one target’s findings in a single partition and therefore in probe order.',
-    'The topic is infrastructure with its own retention and replication. `evidence_ref` is the only thing that belongs in the event; the bundle itself stays in the store with the retention policy and access control that attackers’ payloads deserve.',
-    'Seal then publish, and make the producer idempotent with `acks=all`. Both are about the same promise to the reviewer: every finding they read can be opened, and no finding appears twice because a broker retried a produce.',
+    "A reviewer opens a high-severity finding seconds after it appears and the evidence link is empty; the same target's findings also arrive out of probe order and sometimes twice.",
+    '`publish_finding(event, body.severity)` runs before `seal_evidence`, keys by severity, and ships `body.evidence` as `payload`; `Producer({...})` leaves idempotence and acks at their defaults.',
+    'Call `seal_evidence` first and put its return in `evidence_ref`; drop `payload`; `publish_finding(event, body.target_id)`; construct the producer with `enable.idempotence` and `"acks": "all"`.',
   ],
-  debrief: `The interviewer is testing whether you can debug an event that carries adversarial content. Three contracts are checked: ordering, because the message key is how a stream stays readable per aggregate; content, because a retained topic is not a place for the attack payload when a reference will do; and the publish/seal order, because a finding that points at missing evidence is worse than no finding at all. The idempotent producer with acks=all is the fourth, quieter contract: a retry that duplicates a finding doubles a reviewer’s queue and makes a severity count wrong. Real platforms add schema-registry validation so no future producer can smuggle a payload in, per-tenant topic quotas, and an evidence store with a short-lived signed URL instead of a permanent path.`,
+  debrief: `Each change answers a question a reviewer will ask. The key is the target because the message key is how a stream stays readable per aggregate, and a reviewer reads one target's attack in order. The event carries a reference because a retained topic is infrastructure with its own replication and backups, not a place for an attack payload. Sealing comes before publishing because a finding that points at missing evidence is worse than no finding at all. The idempotent producer with \`acks=all\` keeps a broker retry from doubling a reviewer's queue and skewing the severity count. Production platforms validate the event schema at the broker so no future producer can smuggle a payload field in, and hand out short-lived signed URLs for the bundle instead of a permanent path.`,
 };

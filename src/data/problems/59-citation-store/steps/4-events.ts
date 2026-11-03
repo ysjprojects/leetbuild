@@ -12,20 +12,14 @@ export const citationEventsStep: Step = {
 after a verification and reports the result on \`citation.event\`: it builds a payload, hands it to a
 Kafka producer and calls the verifier. It compiles, it serves the demo, and it hides five flaws.
 
-**Failure mode the checks target.** The topic is the only record of what a document's citations
-were claimed to be and what was concluded about them. Whatever scrambles a document's order,
-records an outcome before it exists, leaves bad outcomes off the topic, duplicates on retry or
-loses an event when the broker is down turns the lineage into a highlight reel that a quality
-dashboard will trust.
+**Failure mode the checks target.** The topic is the only record of a document's citations. Whatever
+scrambles a document's order, records an outcome before it exists, leaves bad outcomes off, duplicates
+on retry or loses an event when the broker is down turns the lineage into a highlight reel.
 
-- Publish **exactly one** \`citation.event\` per verification result with the **document id** as the
-  message key: partitioning by document keeps one document's citation history ordered, which is the
-  whole point of the topic.
-- The payload carries the ids, the **version**, the **span** (\`start\`, \`end\`) and the **status**;
-  the event has to be enough to reconstruct what was claimed and what was concluded.
-- Publish **only after the verification completes**: the event is a result, not an intention.
-- Publish **broken statuses like any other**: a broken citation is the most important event on the
-  topic, and filtering it out is exactly how a regression disappears from the report.
+- Publish **exactly one** \`citation.event\` per verification result, keyed by the **document id**.
+- The payload carries the ids, the **version**, the **span** (\`start\`, \`end\`) and the **status**.
+- Publish **only after the verification completes**.
+- Publish **broken statuses like any other**.
 - The producer must be **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
   \`all\` plus a stable hash key), so a retried produce cannot duplicate a record.
 - When the broker rejects the produce, write an **outbox** row instead of dropping the event; a

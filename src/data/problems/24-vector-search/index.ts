@@ -25,11 +25,8 @@ export const vectorSearchProblem: Problem = {
   statement: `# Vector Search Service
 
 A vector search service answers one question, which stored vectors are closest to this one inside
-this tenant's corpus, and all of the difficulty is in the qualifiers. The visible part is a ranked
-list of ids. The parts that decide whether the service is safe are the tenant that gets scoped onto
-the query, the cap that stops one caller from asking for the whole index, the fan-out that must
-answer from a quorum of shards inside a deadline, the events that describe a search without
-retaining it, and the provenance stamped on every result.
+this tenant's corpus, and all of the difficulty is in the qualifiers: tenant scope, a cap on \`k\`, a
+shard quorum inside a deadline, events that do not retain the query, and provenance on every result.
 
 ## The real system
 
@@ -37,11 +34,7 @@ Pinecone stores records inside namespaces within an index, and every upsert and 
 exactly one namespace; its documented multitenancy pattern is one namespace per tenant, so a query
 cannot cross tenants because the namespace is part of the request the server resolves, not a filter
 the caller may omit. An index also fixes the vector dimension at creation, which is why a
-wrong-width query is rejected before it touches storage. The service you debug here applies the
-same shape to a self-hosted design: tenant and index version resolved on the server, a cache key
-that carries both, a scatter-gather over gRPC shards with a per-shard deadline and a quorum, search
-events keyed by tenant that carry a fingerprint rather than the query, and a neighbors read labeled
-with the version that produced its results.
+wrong-width query is rejected before it touches storage.
 
 ## What you build here
 
@@ -65,10 +58,8 @@ One service, **searchd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path,
-and it looks right. Your job in every step is the job you will have on a real feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

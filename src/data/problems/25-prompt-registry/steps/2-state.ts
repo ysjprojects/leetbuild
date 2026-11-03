@@ -201,7 +201,7 @@ def active_version(tenant: str, name: str) -> int:
 `,
     },
     typescript: {
-      starter: `/** Version state: flawed code that swaps in pieces and caches for an hour. */
+      starter: `/** Version state. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

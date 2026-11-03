@@ -38,10 +38,7 @@ to \`/v2/transcript\`, receives an id, and polls \`/v2/transcript/{id}\` until \
 \`completed\` or \`error\`; nothing is certified before the job says so. Redaction is a property of
 the job rather than a pass the caller runs afterwards: with \`redact_pii\` set,
 \`redact_pii_policies\` names the entity types to remove and \`redact_pii_sub\` picks the
-substitution, so the returned text reads \`Hi, my name is ####\` or \`[PERSON_NAME]\`. Inside this
-course's pipeline the same ideas become code: validate from metadata before the download, claim each
-chunk atomically so a redelivery bills once, retry a chunk from its own offset under a deadline,
-publish segments only after redaction, and report \`partial\` while any chunk is failed or pending.
+substitution, so the returned text reads \`Hi, my name is ####\` or \`[PERSON_NAME]\`.
 
 ## What you build here
 
@@ -62,9 +59,8 @@ One service, **transcribed**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Debug each one against its failure modes, fix it, optimize what is wasteful, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

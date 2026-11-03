@@ -239,7 +239,7 @@ def run_consumer() -> None:
 `,
     },
     typescript: {
-      starter: `/** classify.result publisher and metrics consumer: flawed code. */
+      starter: `/** classify.result publisher and metrics consumer. */
 import {Kafka} from 'kafkajs';
 
 import Redis from 'ioredis';

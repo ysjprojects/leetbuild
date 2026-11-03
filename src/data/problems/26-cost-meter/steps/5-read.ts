@@ -179,7 +179,7 @@ def read_spend(tenant: str, caller: str | None = Header(default=None, alias="X-T
 `,
     },
     typescript: {
-      starter: `/** GET /v1/tenants/{t}/spend: flawed code that trusts the path and rounds per row. */
+      starter: `/** GET /v1/tenants/{t}/spend. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

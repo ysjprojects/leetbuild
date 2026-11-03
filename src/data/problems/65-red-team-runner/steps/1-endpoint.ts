@@ -8,34 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'runner', 'db', 'sandbox'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses the body and starts
-a run. It compiles, it serves the demo against the one sandbox host the author had running, and it
-hides three production flaws. Debug it like the service owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter serves \`POST /v1/redteam/runs\` with body
+\`{"target": "checkout-shadow", "probe_set": "prompt-injection"}\`: it reads the tenant header, looks
+up the probe count, calls \`dispatch\` at the \`target\` string as written, and answers **202** with a
+fresh \`uuid4\` run id. It serves the demo against one sandbox host and hides four flaws.
 
-Implement \`POST /v1/redteam/runs\` with body
-\`{"target": "checkout-shadow", "probe_set": "prompt-injection"}\`.
+**Failure mode the checks target.** \`dispatch\` is called at whatever the caller typed into
+\`target\`, so a typo points the whole probe set at a host nobody registered. No environment is
+checked, so a production endpoint is a valid destination. Nothing is validated before \`dispatch\`
+runs, so even a rejection would arrive with probes in flight. And \`Idempotency-Key\` is ignored, so
+every client retry starts a new run and doubles the adversarial traffic.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). A replayed submission with the same
-  \`(tenant, key)\` returns the run that already exists (**200**) instead of starting a second one.
-- \`target\` is a **name**, not a URL. It is resolved through \`TARGET_REGISTRY\`, which the platform
-  team owns: an unregistered name is **400** and no probe is sent.
+- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
+- \`Idempotency-Key\` is required (**400** when missing). A replay with the same \`(tenant, key)\`
+  returns the existing run (**200**) instead of starting a second one.
+- \`target\` is a name, not a URL, resolved through \`TARGET_REGISTRY\`: an unregistered name is
+  **400** and no probe is sent.
 - A target whose \`environment\` is in \`PRODUCTION_ENVIRONMENTS\` is refused with **403** and no
-  probe is sent. A red-team run must never touch a production endpoint, however the caller spells
-  it.
-- \`probe_set\` selects one of the platform's probe sets; the count of probes is looked up
-  server-side, never sent by the caller.
-- Only after both checks have passed does the run get an id and its probe set dispatched to the
-  sandbox endpoint that hosts the target (**201**).
-
-**Failure mode the checks target.** The starter treats \`target\` as whatever the caller typed and
-dispatches at it directly, so a typo — or a deliberate value — points the whole probe set at
-production, and no registry entry can stop it. The quiet one is the replay: a completed probe set is
-re-run on every retry because the handler ignores \`Idempotency-Key\`, so one flaky client doubles
-the adversarial traffic a target receives. Between the two, the registry lookup has to happen
-**before** dispatch: a validation that only rejects after the probes are already in flight is not a
-control.`,
+  probe is sent.
+- \`probe_set\` selects one of the platform's probe sets; the probe count is looked up server-side.
+- Only after both checks pass does the run get an id and its probe set dispatched to the sandbox
+  endpoint that hosts the target (**201**).`,
   sequence: {
     participants: ['Operator', 'Red Team Runner', 'target registry', 'probe sandbox'],
     messages: [
@@ -155,9 +148,7 @@ def create_run(
     tenant: str = Header(alias="X-Tenant-Id"),
     idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> JSONResponse:
-    # TODO: this starter dispatches at whatever the caller put in "target" (no registry, so no way to
-    # refuse production), checks nothing about the environment, and starts a fresh run on every
-    # retry. Resolve the target, refuse production, and answer a replay with the existing run.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     probes = PROBE_SETS.get(body.probe_set, 4)
     dispatch(body.target, body.probe_set, probes)
     return JSONResponse(
@@ -263,9 +254,7 @@ interface RunBody {
 }
 
 app.post('/v1/redteam/runs', async (request, reply) => {
-  // TODO: this starter dispatches at whatever the caller put in "target" (no registry, so no way to
-  // refuse production), checks nothing about the environment, and starts a fresh run on every
-  // retry. Resolve the target, refuse production, and answer a replay with the existing run.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RunBody;
   const probes = PROBE_SETS[body.probe_set] ?? 4;
@@ -384,9 +373,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func createRun(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter dispatches at whatever the caller put in "target" (no registry, so no way to
-	// refuse production), checks nothing about the environment, and starts a fresh run on every
-	// retry. Resolve the target, refuse production, and answer a replay with the existing run.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	var body RunRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -554,10 +541,7 @@ object Api {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RunRequest]) { body =>
-            // TODO: this starter dispatches at whatever the caller put in "target" (no registry, so
-            // no way to refuse production), checks nothing about the environment, and starts a
-            // fresh run on every retry. Resolve the target, refuse production, and answer a replay
-            // with the existing run.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val probes = ProbeSets.getOrElse(body.probe_set, 4)
             dispatch(body.target, body.probe_set, probes)
             complete(
@@ -688,9 +672,7 @@ int main() {
     const auto tenant = req.get_header_value("X-Tenant-Id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this starter dispatches at whatever the caller put in "target" (no registry, so no way
-    // to refuse production), checks nothing about the environment, and starts a fresh run on every
-    // retry. Resolve the target, refuse production, and answer a replay with the existing run.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto target = body.value("target", std::string());
     const auto probeSet = body.value("probe_set", std::string());
     const int probes = kProbeSets.count(probeSet) > 0 ? kProbeSets.at(probeSet) : 4;
@@ -806,9 +788,9 @@ int main() {
     },
   },
   hints: [
-    'Resolve first, dispatch second. Everything the caller sends is a name; `TARGET_REGISTRY` is the only thing that can turn a name into an endpoint, and the run id is created after that lookup succeeds, so a rejected target cannot leave a partially started run behind.',
-    'The environment check belongs next to the lookup, not in the probe runner: by the time a probe is dispatched the decision has already been made. One `PRODUCTION_ENVIRONMENTS` membership test is the difference between a sandbox run and an incident.',
-    'Idempotency here is about blast radius, not about tidy bookkeeping: the second submission of the same probe set is more adversarial traffic at the target. Look the key up before you validate anything expensive, return the stored run with 200, and let the client believe it started a run.',
+    'An operator retries a timed-out submission and the sandbox logs show the probe set ran twice; a second run, aimed at a hostname that exists in no registry, reached a production host.',
+    'The handler passes `body.target` straight to `dispatch` and mints a new `uuid4` on every call: there is no registry lookup, no environment test, and `idem_key` is parsed but read nowhere.',
+    'Before `dispatch`: look up `run_store.get(tenant, idem_key)` and return the stored run with 200; call `resolve_target` against `TARGET_REGISTRY` (400 unknown, 403 for `PRODUCTION_ENVIRONMENTS`); then `run_store.put` and dispatch.',
   ],
-  debrief: `The interviewer is testing whether you can debug a run-creation endpoint that aims a hostile workload at a host. The starter reads fine because a demo passes one sandbox hostname and never retries. Three defects are being checked. First, the target is a registry key, not a URL: the service refuses what it does not know, so a typo cannot become an attack. Second, the environment filter: production is out of scope for adversarial probing, and the refusal happens before any probe is dispatched, which is what makes it a control rather than a log line. Third, idempotency keyed by tenant so a retry cannot re-launch a completed probe set. Real platforms add per-target approval records, probe sets pinned to a target version, a hard egress allowlist at the sandbox and a short-lived token the runner uses to prove it is allowed to probe.`,
+  debrief: `The fix has its shape because every decision happens before the side effect. A registry turns the caller's string into a key the platform owns, so a typo is a 400 and a hostname is not an input at all. The environment test sits next to that lookup, so a production target is refused while the probe set is still a number in memory. The idempotency lookup runs first of all, because the cheapest way to not double adversarial traffic is to never reach the dispatch call. Production platforms go further on the egress side: the sandbox itself carries an allowlist of hosts it may reach, so a bug in this handler cannot become an incident, and the runner proves it is allowed to probe with a short-lived token tied to the target record.`,
 };

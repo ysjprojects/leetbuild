@@ -13,27 +13,16 @@ sends it through the gRPC \`Warehouse\` stub, adds the reply's row count to a ru
 any exception loops back and sends again. It serves the demo, where the first attempt succeeds, and
 hides 5 flaws.
 
-Implement the warehouse client that writes one partition of a manifest over gRPC.
+**Failure mode the checks target.** A fresh append on retry duplicates rows, and the summed count
+hides it; no deadline turns a slow warehouse into a stuck worker; retrying \`PERMISSION_DENIED\` burns
+the budget on a request that cannot succeed.
 
-- Every attempt carries a **30-second deadline** (\`DEADLINE_S\`). A merge that hangs holds a worker
-  and a warehouse slot; the deadline is what turns a stall into a retryable failure.
-- A \`merge\` (and a \`replace\`) writes **keyed by \`(manifest id, partition id)\`**: the statement is
-  a \`MERGE\` whose match condition is \`t.manifest_id = … AND t.partition_id = …\`, so a retried
-  partition **replaces itself** instead of adding a second copy of the same rows. An \`append\` is
-  only for a partition the progress set (step 2) says is new.
-- Retry **only** the statuses that mean "try again": \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`, at
-  most \`MAX_ATTEMPTS\` (3) attempts with a growing backoff.
-- \`PERMISSION_DENIED\` is **terminal**: stop the load and raise a visible reason
-  (\`LoadFailed\`) — a credential problem does not fix itself by retrying, and the operator needs to
-  see which target and partition were refused.
-- The row count returned is the **warehouse's** count for the successful attempt
-  (\`reply.rows_written\`), **assigned**, not accumulated across attempts. Adding every attempt's
-  count is how a single day of orders is reported as two.
-
-**Failure mode the checks target.** A fresh append on retry duplicates rows in the warehouse and the
-duplicate is invisible in the count because the loader keeps adding its own attempts; a missing
-deadline turns a slow warehouse into a stuck worker; and treating \`PERMISSION_DENIED\` as retryable
-burns the retry budget on a request that can never succeed.`,
+- Every attempt carries a **30-second deadline** (\`DEADLINE_S\`).
+- \`merge\` and \`replace\` write a \`MERGE\` matched on \`t.manifest_id = … AND t.partition_id = …\`.
+- Retry only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`, at most \`MAX_ATTEMPTS\` (3), with growing
+  backoff.
+- \`PERMISSION_DENIED\` is terminal: raise \`LoadFailed\` naming target and partition.
+- Assign \`reply.rows_written\` from the successful attempt; do not accumulate across attempts.`,
   sequence: {
     participants: ['Load worker', 'Warehouse', 'Load report'],
     messages: [
@@ -209,7 +198,7 @@ def write_partition(
 `,
     },
     typescript: {
-      starter: `/** Warehouse writes: flawed code that appends a fresh statement on every retry. */
+      starter: `/** Warehouse writes. */
 import * as grpc from '@grpc/grpc-js';
 
 interface WriteRequest {

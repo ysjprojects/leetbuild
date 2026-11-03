@@ -10,34 +10,21 @@ export const readStep: Step = {
 
 **Starting point.** The starter serves \`GET /v1/users/{id}\`, the read behind the profile page and
 the support console: it requires \`X-User-Id\`, loads the account, answers **404** for an unknown id
-and returns one profile payload to every authenticated caller. It compiles, it serves the demo
-(one user viewing their own profile) and hides 4 flaws.
+and returns one profile payload to every authenticated caller. It serves the demo (one user viewing
+their own profile) and hides 4 flaws.
 
-Requirements:
+**Failure mode the checks target.** One payload for every viewer hands contact data to anyone with
+a token. A support read without an audit record is indistinguishable from exfiltration, and a
+projection without the verification state lets the platform treat an unverified account as verified.
 
-- The caller comes from \`X-User-Id\` (**401** when missing) and the role from \`X-Role\` (default
-  \`member\`). An unknown id is **404**.
-- The **owner** — the caller whose id equals the path id, decided by \`is_owner(caller_id, user_id)\` —
-  gets the full record from \`owner_view(account)\`: the stored row plus the verification state.
-- Everyone else gets \`public_projection(account)\`, built only from the allowlist \`PUBLIC_FIELDS\`
-  (\`user_id\`, \`handle\`, \`created_at\`) plus the verification state. The projection carries **no
-  contact data**: no email, no phone, no name, in no field, for any caller who is not the owner.
-- The verification state is **always present**, in the owner's payload and the public one, computed by
-  \`verification_state(account)\`, which normalises the stored value against \`VERIFICATION_STATES\`
-  (\`pending\`, \`verified\`, \`suppressed\`) and defaults to \`pending\`.
-- A caller whose \`X-Role\` is in \`SUPPORT_ROLES\` reads a record only through the audited tool:
-  \`audit_lookup(caller_id, user_id, reason)\` writes the lookup — who read whose record and why — and
-  \`X-Support-Reason\` is required (**400** without it) **before** the record is returned. A caller who is
-  not in a support role never reaches that branch.
-
-**Failure mode the checks target.** One payload for every viewer is the classic read-side leak: contact
-data and the verification state are the two things an identity service exists to control, and a GET that
-hands them to anyone with a token turns every proxy log, client cache and support screenshot into a copy
-of the identity database. Support is the other half of the same problem — the people who legitimately need
-a record are exactly the people whose access has to be attributable, so a support read without an audit
-record is indistinguishable from an exfiltration. And a projection that omits the verification state is
-worse than one that omits the address, because the rest of the platform then treats an unverified account
-as a verified one.`,
+- \`X-User-Id\` is required (**401**); \`X-Role\` defaults to \`member\`; an unknown id is **404**.
+- The owner (\`is_owner(caller_id, user_id)\`) gets \`owner_view(account)\`.
+- Everyone else gets \`public_projection(account)\` from \`PUBLIC_FIELDS\` (\`user_id\`, \`handle\`,
+  \`created_at\`): no email, phone or name.
+- Both payloads carry \`verification_state(account)\`, normalised against \`VERIFICATION_STATES\`
+  (\`pending\`, \`verified\`, \`suppressed\`), default \`pending\`.
+- A caller in \`SUPPORT_ROLES\` reads only through \`audit_lookup(caller_id, user_id, reason)\`, which
+  writes the lookup before the record is returned; \`X-Support-Reason\` is required (**400**).`,
   sequence: {
     participants: ['Member', 'Support agent', 'identityd', 'accounts', 'audit log'],
     messages: [
@@ -266,7 +253,7 @@ def read_user(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/users/:userId: flawed code that serves one payload to every caller. */
+      starter: `/** GET /v1/users/:userId. */
 import Fastify from 'fastify';
 
 import {store} from './account_store';
@@ -349,7 +336,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// GET /v1/users/{id}: flawed code that serves one payload to every caller.
+      starter: `// GET /v1/users/{id}.
 package main
 
 import (
@@ -786,7 +773,7 @@ int main() {
 `,
     },
   },
-  debrief: `The fix has the shape of a disclosure decision rather than a lookup, with a different answer for each viewer. \`is_owner(caller_id, user_id)\` decides the one caller who may see the stored row; everyone else gets \`public_projection\`, built from the \`PUBLIC_FIELDS\` allowlist by a single builder, because a projection built by subtraction silently grows a field the day someone adds one to the row. \`verification_state\` goes into both payloads because it is the field the rest of the platform keys its decisions on. The support branch is gated on \`SUPPORT_ROLES\` and goes through \`audit_lookup\` *before* the record leaves the service, so a legitimate lookup is attributable and an unattributed one is impossible.
+  debrief: `The fix has the shape of a disclosure decision rather than a lookup. \`is_owner(caller_id, user_id)\` decides the one caller who may see the stored row; everyone else gets \`public_projection\`, built from the \`PUBLIC_FIELDS\` allowlist, because a projection built by subtraction grows a field the day someone adds one to the row. \`verification_state\` goes into both payloads because the rest of the platform keys its decisions on it. The support branch writes \`audit_lookup\` *before* the record leaves the service, so every support read is attributable.
 
-Production systems add field-level access rules keyed to scopes rather than roles, response signing so a cached projection cannot be edited, per-viewer rate limits so enumeration is visible, and audit records in an append-only store with the reason code and request id so a lookup can be replayed years later.`,
+Production systems add field-level access rules keyed to scopes, per-viewer rate limits so enumeration is visible, and audit records in an append-only store with the request id.`,
 };

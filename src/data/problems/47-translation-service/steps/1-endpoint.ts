@@ -242,7 +242,7 @@ def translate(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/translations: flawed code that trusts its caller. */
+      starter: `/** POST /v1/translations. */
 import Fastify from 'fastify';
 
 import {detectLanguage} from './detector';

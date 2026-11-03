@@ -25,29 +25,21 @@ export const recommendationRankingProblem: Problem = {
   minutes: 70,
   statement: `# Recommendation Ranking
 
-A recommendation ranker is the piece of a product that answers "what should this person see next".
-The visible part is an ordered list; the parts that decide whether the list is correct, isolated and
-shippable are the intake boundary, the feature cache, the failure policy in front of the ranking
-model, the exposure stream you emit, and the config read that every reader shares.
+A recommendation ranker answers "what should this person see next". The visible part is an ordered
+list; correctness lives in the intake boundary, the feature cache, the failure policy around the
+model, the exposure stream and the shared config read.
 
 ## The real system
 
-Production rankers take candidates and a surface, not a user id a caller chose: the requester is
-resolved from the authenticated identity, so personalized output cannot be fetched for anyone
-else. Candidate lists are bounded, because an unbounded list is a free way to stall the ranking
-pool. Features are served from an online store keyed by entity with an expiry: Feast's Redis online
-store collocates every feature view for one entity in a single hash and lets you set
-\`key_ttl_seconds\`, a Redis \`EXPIRE\` on that hash, so stale entity data is evicted automatically
-instead of living until someone flushes it. A miss triggers one refresh that concurrent requests
-share, with the previous value kept long enough to serve when the feature service is down. Ranking
-itself runs over gRPC under a deadline, retries only the failures that deserve it, and degrades to
-a precomputed popularity order that is marked as degraded, because an empty list looks like a bug
-and an unmarked list corrupts the offline comparison. Impressions go to Kafka keyed by user, so one
-person's exposure stream stays ordered, carrying ids, positions and the model version rather than
-raw feature vectors that would leak behavior into a retained topic, with an outbox row behind the
-produce so a broker rejection cannot drop an exposure that will not be re-captured. And every
-reader resolves the surface's active version through one config read, so a rollout or a rollback
-is one switch rather than per-reader drift.
+Rankers resolve the requester from the authenticated identity and bound the candidate list. Features
+come from an online store keyed by entity with an expiry: Feast's Redis online store keeps every
+feature view for one entity in a single hash and sets \`key_ttl_seconds\` as a Redis \`EXPIRE\` on it,
+so stale entity data is evicted automatically. A miss triggers one shared refresh, with the previous
+value kept for when the feature service is down. Ranking runs over gRPC under a deadline and degrades
+to a popularity order marked as degraded, because an unmarked list corrupts offline comparison.
+Impressions go to Kafka keyed by user, carrying ids, positions and the model version rather than
+feature vectors, with an outbox behind the produce. Every reader resolves the surface's active
+version through one config read, so a rollback is one switch.
 
 ## What you build here
 
@@ -70,17 +62,13 @@ One service, **recsvc**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
-looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
-failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
-that fail on the starter and pass on your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Candidate retrieval and ANN indexes, feature engineering, model training and serving infrastructure,
-ranking quality metrics (NDCG, recall@k), experimentation assignment and guardrail metrics, per-user
-opt-out plumbing, retention policies for the impression topic, and the analytics dashboards. The
-five pieces above are the ones that decide whether the ranker is correct, isolated and shippable.`,
+Candidate retrieval and ANN indexes, feature engineering, model training, ranking quality metrics,
+experimentation assignment, impression retention policies and dashboards.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'recommend · impressions', x: 8, y: 50},

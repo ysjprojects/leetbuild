@@ -23,65 +23,45 @@ export const citationStoreProblem: Problem = {
   minutes: 70,
   statement: `# Citation Store
 
-A citation store is the piece of an AI platform that lets an answer name its evidence: this quote,
-from this document, at these offsets, in this version. The visible part is a quote under a generated
-answer; the parts that decide whether the product is trustworthy are the offset arithmetic, the
-version the offsets are resolved against, what happens when the document store cannot answer, and
-whether the recorded history of a document's citations survives an edit.
+A citation store lets an answer name its evidence: this quote, from this document, at these offsets,
+in this version. Whether the product is trustworthy depends on the offset arithmetic, the version the
+offsets resolve against, what happens when the document store cannot answer, and whether a
+document's citation history survives an edit.
 
 ## The real system
 
 The Claude Messages API's citations feature returns, for each cited passage of a plain-text
 document, a \`char_location\` block with the \`cited_text\`, the \`document_index\` and the
 \`start_char_index\` / \`end_char_index\` the quote was extracted from; the quoted text is taken
-directly from the source rather than generated, which is what makes an offset pair worth storing.
-A store that keeps such citations has to defend that guarantee over time. It validates the span
-before it keeps it: document id, version, start and end offset and the quoted text, refusing the
-record when the quote is not exactly the bytes at those offsets in that version. Offsets are
-resolved against an immutable version rather than "the document", because a later edit re-points
-everything stored against a bare document id. Resolved span text is cached under a key that names
-the version, with a long TTL, since an immutable version cannot change. When the document store
-cannot serve a version, the service bounds the call with a deadline, treats a missing version as
-terminal, and marks a citation it cannot re-anchor as **broken** with a reason rather than dropping
-it. Verification results are published keyed by document, so a document's citation history stays
-ordered, and a broken citation is published like any other so regressions are visible. The read
-side returns the span, its version, its status and the full offset range for the owning tenant
-only, and an answer's status is the worst status among its citations.
+directly from the source rather than generated, which is what makes an offset pair worth storing. A
+store that keeps such citations has to defend that guarantee over time, against immutable versions
+rather than "the document", because a later edit re-points everything stored against a bare id.
 
 ## What you build here
 
 One service, **citations**, with five pieces:
 
 1. \`POST /v1/citations\`: authenticated tenant, a validated span (version, \`start < end\`, quote
-   cap), the quote compared against the bytes at those offsets in the **named version**, an offset
-   mismatch answering **422** with both the stored and the supplied text, and an
-   \`Idempotency-Key\` so recording the same citation twice cannot diverge.
-2. A **Redis** span cache keyed by \`span:{document_id}:{version}:{start}:{end}\` with numeric,
-   normalized offsets and a long TTL, because an immutable version cannot change and nothing needs
-   invalidating.
-3. A **gRPC** document fetch: a 1-second deadline per attempt, terminal \`NOT_FOUND\` for a version
-   that does not exist, a bounded retry for the retryable codes only, and a citation whose span
-   cannot be re-anchored marked \`broken\` with a reason.
-4. A **Kafka** \`citation.event\` path keyed by document id, carrying version, span and status, an
-   idempotent \`acks=all\` producer, verification before the publish, and an outbox row when the
-   broker rejects the produce.
-5. \`GET /v1/citations/{id}\`: the span, its document version, its verification status and the full
-   offset range for the owning tenant, **404** for a foreign citation, plus an answer's citation
-   list that reports the worst status, \`degraded\` when any citation is broken.
+   cap), the quote compared against the bytes in the **named version**, a mismatch answering **422**
+   with both texts, and an \`Idempotency-Key\` so a retry cannot diverge.
+2. A **Redis** span cache keyed by \`span:{document_id}:{version}:{start}:{end}\` with normalized
+   offsets and a long TTL, because an immutable version cannot change.
+3. A **gRPC** document fetch: a 1-second deadline per attempt, terminal \`NOT_FOUND\`, a bounded retry
+   for retryable codes only, and a span that cannot be re-anchored marked \`broken\` with a reason.
+4. A **Kafka** \`citation.event\` path keyed by document id, carrying version, span and status, with an
+   idempotent \`acks=all\` producer, verification before publish, and an outbox on rejection.
+5. \`GET /v1/citations/{id}\`: span, version, status and offset range for the owning tenant, **404**
+   for a foreign citation, and an answer list reporting the worst status.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, find the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path and looks right. Debug
+it against the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Text extraction and OCR pipelines, per-format byte offsets, document storage and retention, span
-highlighting UIs, re-anchoring heuristics for rewritten prose, citation quality scoring, answer
-generation itself, and cross-document deduplication. The five pieces above are the ones that decide
-whether a citation means anything.`,
+Text extraction and OCR, per-format byte offsets, document storage, highlighting UIs, re-anchoring
+heuristics for rewritten prose, citation quality scoring, and answer generation itself.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'cite · read', x: 8, y: 50},

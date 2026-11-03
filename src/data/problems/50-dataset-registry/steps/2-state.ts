@@ -252,7 +252,7 @@ def promote_version(
 `,
     },
     typescript: {
-      starter: `/** Latest-version pointers and consumer pins: flawed code. */
+      starter: `/** Latest-version pointers and consumer pins. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

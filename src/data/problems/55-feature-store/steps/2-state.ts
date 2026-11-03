@@ -216,7 +216,7 @@ def read_value(
 `,
     },
     typescript: {
-      starter: `/** POST|GET /v1/features/:name/values: flawed code that reads the latest key. */
+      starter: `/** POST|GET /v1/features/:name/values. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

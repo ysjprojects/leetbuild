@@ -23,27 +23,18 @@ export const syntheticDataProblem: Problem = {
   minutes: 70,
   statement: `# Synthetic Data
 
-A synthetic data service is the piece of an AI platform that turns a small set of licensed seed
-records into a corpus big enough to train on. The visible part is a row count in a dashboard; the
-parts that decide whether the corpus is worth anything are the seed funnel, the diversity windows,
-the judge that scores each record, the events that carry provenance, and the report a data reviewer
-reads before the set ships.
+A synthetic data service turns a small set of licensed seed records into a corpus big enough to
+train on. Whether that corpus is worth anything depends on the seed funnel, the diversity windows,
+the judge that scores each record, the provenance events and the report a data reviewer reads.
 
 ## The real system
 
-NVIDIA's NeMo Curator ships the generation pipelines used to build Nemotron-4 340B, a model whose
-supervised fine-tuning data was 98% synthetic. Every generated conversation is sent to a reward
-model that returns separate helpfulness, correctness, coherence, complexity and verbosity scores,
-and the pipeline filters on those scores before the row reaches training; a list the model fails
-to return in the requested shape raises a conversion error instead of being accepted short. The
-service in this course applies the same discipline earlier in the funnel: a seed is expanded only
-if its registered license permits derivatives, the record cap belongs to the service rather than
-to the client holding the connection, repeats of one seed entity are throttled per window so a
-prolific entity cannot fill the quota, and a judge call that times out parks the record as
-unscored. Admitted records are published keyed by recipe so one recipe's history stays ordered,
-carrying seed digests and judge scores rather than text, and the record is persisted before the
-event announces it. The report resolves every admitted record to the digest of its seed, breaks
-coverage down per entity, and answers a foreign job id with 404.
+NVIDIA's NeMo Curator ships the generation pipelines used to build Nemotron-4 340B, whose supervised
+fine-tuning data was 98% synthetic. Every generated conversation goes to a reward model that returns
+separate helpfulness, correctness, coherence, complexity and verbosity scores, and the pipeline
+filters on them before a row reaches training. This course applies the same discipline earlier: a
+seed is expanded only if its license permits derivatives, repeats of one entity are throttled per
+window, and a judge timeout parks the record as unscored.
 
 ## What you build here
 
@@ -67,17 +58,13 @@ One service, **synthd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real data pipeline: debug it
-against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that
-fail on the starter and pass on your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Seed crawling and consent capture, generation model fine-tuning, prompt templates per entity,
-dedupe across recipes, cost accounting for generation and judging, human review queues, training
-pipelines and the dashboard. The five pieces above are the ones that decide whether the corpus is
-licensable, diverse, scored and traceable.`,
+Seed crawling and consent capture, generation model fine-tuning, prompt templates, cross-recipe
+dedupe, cost accounting and human review queues.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Data curator', sub: 'submit · report', x: 8, y: 50},

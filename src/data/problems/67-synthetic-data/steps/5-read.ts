@@ -13,26 +13,16 @@ handed, reads the \`X-Tenant-Id\` header without using it, and returns \`total\`
 \`provenance_digest\` that \`recompute_digest\` hashes from the seed row as it looks today. It
 compiles, serves the demo and hides 5 flaws.
 
-**Failure mode the checks target.** Provenance looks like a field and is the difference between a
-corpus you can defend and a pile of text; recomputing the digest from the current seed is cheap
-and wrong the moment a seed gets re-versioned. Foreign-job reads are the isolation bug, and a
-totals-only body is the report that let the collapsed, timeout-ridden corpus through in the first
-place.
+**Failure mode the checks target.** A digest recomputed from the current seed is wrong once a seed is
+re-versioned; foreign-job reads break isolation; and a totals-only body is the report that lets a
+collapsed, timeout-ridden corpus ship.
 
-The route is the report a reviewer reads before the corpus ships:
-
-- The job is looked up for the **authenticated tenant**: \`assert_tenant_owns(tenant, job_id)\`. A job
-  belonging to another tenant, or one that does not exist, answers **404**, so a foreign job id is
-  indistinguishable from a missing one.
-- The body reports the four outcomes: **\`generated\`**, **\`admitted\`**, **\`parked\`** and
-  **\`rejected\`**. Records a timed-out judge did not score are neither admitted nor rejected, and a
-  report that only shows a total hides them.
-- The body carries **\`coverage\`**: the per-entity counts read from the job's coverage hash
-  (\`HGETALL synth:cov:{job_id}\`), not a single total.
-- The body carries the **\`judge_version\`** that scored the corpus.
-- Every admitted record **resolves to a seed digest**: read the digest stored on the admitted record
-  (\`records.admitted(job_id)\`) and return it per record, so a record generated before a seed
-  version bump still points at the seed it came from.`,
+- Look the job up for the **authenticated tenant** with \`assert_tenant_owns(tenant, job_id)\`; a
+  foreign or missing job is **404**.
+- Report **\`generated\`**, **\`admitted\`**, **\`parked\`** and **\`rejected\`**.
+- Include **\`coverage\`** from \`HGETALL synth:cov:{job_id}\`, not a single total.
+- Include the **\`judge_version\`**.
+- Return each admitted record's **stored seed digest** from \`records.admitted(job_id)\`.`,
   sequence: {
     participants: ['Data curator', 'Synthetic Data API', 'record store', 'Redis'],
     messages: [

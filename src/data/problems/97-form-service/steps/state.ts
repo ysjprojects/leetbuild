@@ -235,7 +235,7 @@ def submit(form_id: str, body: dict, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** Abuse controls for public form submissions — flawed code. */
+      starter: `/** Abuse controls for public form submissions. */
 import {Redis} from 'ioredis';
 import Fastify from 'fastify';
 

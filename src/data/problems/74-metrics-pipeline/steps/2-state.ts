@@ -118,7 +118,7 @@ not a window boundary. A merge without a batch id doubles the series when the br
   ],
   code: {
     python: {
-      starter: `"""merge_batch: flawed code that sends one INCRBY per sample."""
+      starter: `"""merge_batch."""
 from dataclasses import dataclass
 
 import redis
@@ -161,7 +161,7 @@ def merge_batch(tenant: str, batch: Batch) -> dict:
 
 
 def sweep_closed_windows(tenant: str) -> int:
-    """Cleanup job: the sweep runs every few hours, so keys outlive their window."""
+    """Cleanup job."""
     swept = 0
     for key in r.scan_iter(match=f"metrics:{tenant}:*"):
         if r.ttl(key) < 0:
@@ -235,7 +235,7 @@ def merge_batch(tenant: str, batch: Batch) -> dict:
 `,
     },
     typescript: {
-      starter: `/** mergeBatch: flawed code that sends one INCRBY per sample. */
+      starter: `/** mergeBatch. */
 import {Redis} from 'ioredis';
 
 const r = new Redis({host: 'redis', port: 6379});
@@ -273,7 +273,7 @@ export async function mergeBatch(tenant: string, batch: Batch): Promise<{applied
   return {applied, window_start: start};
 }
 
-/** Cleanup job: the sweep runs every few hours, so keys outlive their window. */
+/** Cleanup job. */
 export async function sweepClosedWindows(tenant: string): Promise<number> {
   let swept = 0;
   for (const key of await r.keys(\`metrics:\${tenant}:*\`)) {
@@ -394,7 +394,7 @@ func mergeBatch(ctx context.Context, tenant string, batch Batch) (int, error) {
 	return len(batch.Samples), nil
 }
 
-// sweepClosedWindows is the cleanup job: it runs hours later, so keys outlive their window.
+// sweepClosedWindows is the cleanup job.
 func sweepClosedWindows(ctx context.Context, tenant string) (int, error) {
 	keys, _ := rdb.Keys(ctx, fmt.Sprintf("metrics:%s:*", tenant)).Result()
 	swept := 0
@@ -517,7 +517,7 @@ object MetricsStore {
     Map("applied" -> batch.samples.size.toLong, "window_start" -> start)
   }
 
-  // sweepClosedWindows is the cleanup job: it runs hours later, so keys outlive their window.
+  // sweepClosedWindows is the cleanup job.
   def sweepClosedWindows(tenant: String): Long = {
     import scala.jdk.CollectionConverters._
     var swept = 0L
@@ -625,7 +625,7 @@ int merge_batch(const std::string& tenant, const Batch& batch) {
   return static_cast<int>(batch.samples.size());
 }
 
-// sweep_closed_windows is the cleanup job: it runs hours later, so keys outlive their window.
+// sweep_closed_windows is the cleanup job.
 long long sweep_closed_windows(const std::string& tenant) {
   std::vector<std::string> keys;
   redis.keys("metrics:" + tenant + ":*", std::back_inserter(keys));

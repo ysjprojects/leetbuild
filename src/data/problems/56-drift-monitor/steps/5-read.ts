@@ -204,7 +204,7 @@ def monitor_report(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/monitors/{id}/report: flawed code. */
+      starter: `/** GET /v1/monitors/{id}/report. */
 import Fastify from 'fastify';
 
 import {store} from './store';

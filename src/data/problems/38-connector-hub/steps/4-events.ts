@@ -14,10 +14,9 @@ it to \`connector.sync\` keyed by \`vendor_id\` on a producer with default setti
 consumer in the same file commits the offset, then sets \`connector:{connector_id}:cursor\`. It
 compiles, serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** The vendor key is the ordering bug; the unconfigured producer
-is the duplication bug; the token and the record sample in a retained, replicated topic are a leak
-with a long tail; and commit-before-write trades correctness for code that looks exactly-once. Only
-the leak is visible on a read-through; the rest wait for a replay, a rebalance or a broker hiccup.
+**Failure mode the checks target.** The vendor key breaks ordering; the unconfigured producer
+duplicates; the token and record sample leak through a retained topic; commit-before-write loses
+the cursor advance on a crash.
 
 - Publish exactly one \`connector.sync\` event per page and per run with the **connector id as the
   message key**, so one connector's run log stays in one partition and in order.
@@ -245,7 +244,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** publishEvent: flawed code that keys by vendor and commits too early. */
+      starter: `/** publishEvent. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';

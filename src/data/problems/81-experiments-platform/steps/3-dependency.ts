@@ -19,22 +19,17 @@ check off, and a paused experiment is ramped without earning a fresh pass.
 - The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**. \`to_percent\` must be an
   integer, greater than the experiment's current percentage and at most **100**; anything else is
   **400**.
-- Before the new percentage is applied, ask the stats service over gRPC:
-  \`CheckGuardrails(experiment_id, metric_bounds)\` with a **2 000 ms deadline**
-  (\`timeout=2.0\` / \`{deadline: Date.now() + 2000}\` / \`context.WithTimeout(..., 2*time.Second)\` /
-  a Scala deadline of 2 seconds / \`ClientContext.set_deadline(..., milliseconds(2000))\`).
-- A breached bound **pauses** the ramp: persist the experiment \`paused\`, do **not** apply the new
-  percentage, and answer **409** with the offending metric:
-  \`{"status": "paused", "metric": "error_rate", "limit": 0.05, "observed": 0.12}\`. The check runs
-  *before* the percentage moves.
-- A \`PAUSED\` verdict is terminal for that request. Only a transient failure (\`UNAVAILABLE\`,
-  \`DEADLINE_EXCEEDED\`) may be retried, at most once (\`MAX_GUARDRAIL_ATTEMPTS\` = 2 attempts), and a
-  check that does not succeed does not apply the ramp.
-- Nothing in the body may override the gate: \`skip_guardrails\`, \`override\` or \`force\` is
-  **400**, and the bounds come from service config (\`GUARDRAIL_BOUNDS\`), not from the request.
-- A \`paused\` experiment is not resumed by the stored flag: a ramp request re-runs the check, stays
-  \`paused\` and answers **409** again while the breach is present, and only a fresh pass lifts the
-  pause and applies the percentage.
+- Before the percentage is applied, call \`CheckGuardrails(experiment_id, metric_bounds)\` over gRPC
+  with a **2 000 ms deadline** (\`timeout=2.0\` / \`{deadline: Date.now() + 2000}\` /
+  \`context.WithTimeout(..., 2*time.Second)\` / a Scala 2-second deadline /
+  \`ClientContext.set_deadline(..., milliseconds(2000))\`).
+- A breached bound **pauses** the ramp: persist \`paused\`, do **not** apply the percentage, and
+  answer **409** with \`{"status": "paused", "metric": "error_rate", "limit": 0.05, "observed": 0.12}\`.
+- \`PAUSED\` is terminal for the request. Only \`UNAVAILABLE\` or \`DEADLINE_EXCEEDED\` may be retried,
+  at most once (\`MAX_GUARDRAIL_ATTEMPTS\` = 2), and a check that does not succeed applies nothing.
+- \`skip_guardrails\`, \`override\` or \`force\` in the body is **400**; bounds come from
+  \`GUARDRAIL_BOUNDS\` config.
+- A \`paused\` experiment re-runs the check on every ramp request; only a fresh pass lifts the pause.
 - Log the experiment id, the metric and the observed value, not the raw request body.`,
   sequence: {
     participants: ['Ramp caller', 'Experiment API', 'Stats service'],
@@ -219,7 +214,7 @@ check off, and a paused experiment is ramped without earning a fresh pass.
   ],
   code: {
     python: {
-      starter: `"""POST /v1/experiments/{id}/ramp: flawed code that retries the verdict until it passes."""
+      starter: `"""POST /v1/experiments/{id}/ramp."""
 import logging
 
 import grpc
@@ -383,7 +378,7 @@ def ramp(experiment_id: str, body: dict, tenant: str | None = Header(default=Non
 `,
     },
     typescript: {
-      starter: `/** POST /v1/experiments/:id/ramp: flawed code that trusts the body and retries the verdict. */
+      starter: `/** POST /v1/experiments/:id/ramp. */
 import Fastify from 'fastify';
 
 import {stats} from './stats';
@@ -1263,7 +1258,6 @@ consulted but does not stand in for the call, so a resume has to earn a fresh pa
 The override fields are the trust boundary: bounds live in config, and a caller who can skip the
 check holds an unauthenticated control plane.
 
-Production platforms add a cooldown between ramp attempts, an alert when an experiment stays
-paused, an audit record of every ramp decision with the metric that blocked it, and automatic
-resume only after a metric has held its bound for a full evaluation window.`,
+Production platforms add a cooldown between ramp attempts and resume automatically only after a
+metric has held its bound for a full evaluation window.`,
 };

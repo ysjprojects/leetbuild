@@ -200,7 +200,7 @@ def read_case(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/moderation/items/{id}: flawed code that treats the case id as access. */
+      starter: `/** GET /v1/moderation/items/{id}. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

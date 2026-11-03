@@ -248,7 +248,7 @@ def fetch_page(connector: dict) -> bytes:
 `,
     },
     typescript: {
-      starter: `/** fetchPage: flawed code that retries every status in a tight loop. */
+      starter: `/** fetchPage. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

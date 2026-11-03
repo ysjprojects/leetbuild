@@ -12,6 +12,11 @@ export const eventsStep: Step = {
 behind \`GET /v1/autocomplete\`, keyed by the prefix, with a default-configured producer and a
 \`try/except\` around the send. It compiles, the topic fills in the demo, and it hides 5 flaws.
 
+**Failure mode the checks target.** Keying by prefix scatters one tenant's events across partitions,
+so per-session sequences look shuffled. The raw prefix text ships a possible name into a retained,
+replicated topic. And the starter catches a produce failure, logs it and moves on, so a broker
+hiccup silently loses the events the product makes decisions on.
+
 - Events publish to the **\`suggest.event\`** topic, **keyed by tenant**, so every event for one tenant
   lands on one partition and stays ordered. Impression and selection events for the same session
   arrive in the order they happened.
@@ -22,13 +27,7 @@ behind \`GET /v1/autocomplete\`, keyed by the prefix, with a default-configured 
   can be replayed, rather than dropping it. The producer is configured **idempotent with
   \`acks=all\`**, so a retry cannot duplicate an event.
 - The outbox row is the durable record; the replay publishes it with the same key so ordering holds.
-- The event never carries the raw prefix, in the payload or in a log line.
-
-**Failure mode the checks target.** Keying by prefix scatters one tenant's events across partitions,
-so ordering is gone and per-session sequences look shuffled. Publishing the raw prefix text ships a
-possible name into a retained, replicated topic, the one place a search term should not land. The
-subtle part is the swallowed produce failure: the starter catches the exception, logs it and moves
-on, so during a broker hiccup the metrics silently lose the events the product makes decisions on.`,
+- The event never carries the raw prefix, in the payload or in a log line.`,
   sequence: {
     participants: ['Autocomplete API', 'suggest.event', 'Event consumer'],
     messages: [

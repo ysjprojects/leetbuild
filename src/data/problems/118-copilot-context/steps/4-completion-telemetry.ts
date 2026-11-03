@@ -19,21 +19,14 @@ in the event is a data leak with a long tail; and commit-before-process makes th
 rate silently wrong after every consumer restart.
 
 The body is
-\`{"event": "shown" | "accepted", "request_id": "…", "language": "python", "candidate_len": 142, "latency_ms": 210}\`,
-and the consumer turns those events into the acceptance rate, the number GitHub's A/B tests were
-run on.
+\`{"event": "shown" | "accepted", "request_id": "…", "language": "python", "candidate_len": 142, "latency_ms": 210}\`.
 
-- Publish one event per report to \`completion.shown\` or \`completion.accepted\` with the
-  **session** as the message key, so one developer's shown/accepted pairs stay on one partition
-  and in order. The event carries \`request_id\`, \`session\`, \`language\`, \`candidate_len\` and
-  \`latency_ms\`. An \`event\` outside \`ALLOWED_EVENTS\` is **400**.
-- The completion text, the prefix and the suffix stay out of the event and out of every log line.
-  The topic is retained and replicated; code written there outlives the session, the file and
-  the retention policy that the request path has.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` plus hashed, stable keys), so a retried produce cannot count one acceptance twice.
-- The consumer updates \`HINCRBY acceptance:{language} shown|accepted\` in Redis and **only
-  then** commits the offset. Commit first and one crash loses the counter update.`,
+- Publish to \`completion.shown\` or \`completion.accepted\` keyed by **session**, carrying
+  \`request_id\`, \`session\`, \`language\`, \`candidate_len\` and \`latency_ms\`. An \`event\` outside
+  \`ALLOWED_EVENTS\` is **400**.
+- No completion text, prefix or suffix in the event or any log line.
+- The producer is **idempotent with \`acks=all\`** (or required acks \`all\` with stable keys).
+- The consumer runs \`HINCRBY acceptance:{language} shown|accepted\` and **only then** commits.`,
   sequence: {
     participants: ['Editor', 'completiond', 'completion.accepted', 'Acceptance consumer', 'Redis'],
     messages: [

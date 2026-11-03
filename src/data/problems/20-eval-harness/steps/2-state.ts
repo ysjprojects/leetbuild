@@ -199,7 +199,7 @@ def record_sample(result: SampleResult) -> dict:
 `,
     },
     typescript: {
-      starter: `/** recordSample: flawed code that reads, then writes, one counter at a time. */
+      starter: `/** recordSample. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

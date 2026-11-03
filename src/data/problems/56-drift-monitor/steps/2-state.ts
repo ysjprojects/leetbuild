@@ -212,7 +212,7 @@ def freeze_baseline(tenant: str, baseline_ref: str, batch: dict[int, int]) -> bo
 `,
     },
     typescript: {
-      starter: `/** Windowed sketches in Redis: flawed code. */
+      starter: `/** Windowed sketches in Redis. */
 import Redis from 'ioredis';
 
 export const r = new Redis({host: 'redis', port: 6379});

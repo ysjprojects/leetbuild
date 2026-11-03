@@ -270,7 +270,7 @@ def score(body: ScoreRequest) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/scores: flawed code that scores whatever the caller declares. */
+      starter: `/** POST /v1/scores. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -800,7 +800,7 @@ object Api {
 `,
     },
     cpp: {
-      starter: `// POST /v1/scores: flawed code that scores whatever the caller declares.
+      starter: `// POST /v1/scores.
 #include <string>
 
 #include <httplib.h>

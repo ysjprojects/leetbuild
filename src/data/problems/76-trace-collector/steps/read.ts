@@ -225,7 +225,7 @@ def read_trace(trace_id: str, tenant: str | None = Header(default=None, alias="X
 `,
     },
     typescript: {
-      starter: `/** GET /v1/traces/{id}: flawed code that tidies the tree up. */
+      starter: `/** GET /v1/traces/{id}. */
 import Fastify from 'fastify';
 
 import {store} from './trace_store';

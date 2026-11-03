@@ -237,7 +237,7 @@ def create_monitor(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/monitors: flawed code that registers whatever it is handed. */
+      starter: `/** POST /v1/monitors. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

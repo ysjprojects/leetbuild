@@ -23,12 +23,10 @@ export const mapsRoutingProblem: Problem = {
   minutes: 70,
   statement: `# Maps Routing
 
-A maps routing service is the piece of a navigation platform that turns an origin, a destination and
-a handful of waypoints into a route a driver can follow, and hands that route back later when the
-same trip is reopened or shared. The visible part is a polyline on a map; the parts that decide
-whether the service is safe are the validation funnel in front of the solver, the cache key that
-decides what "the same route" even means, the failure policy for the day the engine goes quiet, and
-the provenance of every route the read path returns.
+A maps routing service turns an origin, a destination and a handful of waypoints into a route a
+driver can follow, and hands that route back later when the trip is reopened or shared. The visible
+part is a polyline on a map; the hard parts are the validation in front of the solver, the cache
+key, the failure policy when the engine goes quiet, and the provenance of every route returned.
 
 ## The real system
 
@@ -38,12 +36,7 @@ many of them, answers a request its solver cannot place with a distinct code ins
 \`NoSegment\` when a coordinate cannot snap to any street, \`TooBig\` when the request exceeds the
 server's configured coordinate limit, and \`NoRoute\` when no road connects the points. Every OSRM
 response also carries a \`data_version\` timestamp naming the map extract it was computed from.
-This course's pieces are the service-side counterparts of those ideas: a coverage check and a
-waypoint cap in front of the solver, a traffic epoch that plays the role of \`data_version\` for
-the cache and the read path, a \`NO_ROUTE\` answer that is terminal, and a degraded marker so a
-straight-line estimate is not mistaken for a road route. Route telemetry is keyed by map region
-and carries coarse cells rather than exact endpoints, because the first and last hundred metres
-of a trip are where someone lives.
+This course's traffic epoch plays the role of \`data_version\` for the cache and the read path.
 
 ## What you build here
 
@@ -65,10 +58,8 @@ One service, **mapsd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
-starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

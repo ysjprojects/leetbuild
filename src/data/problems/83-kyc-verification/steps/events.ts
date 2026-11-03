@@ -10,28 +10,18 @@ export const eventsStep: Step = {
 
 **Starting point.** The starter handles the reviewer's decision call, builds a \`kyc.decided\` event
 from the case, produces it to Kafka, writes the decision record, and runs the status consumer that
-turns those events into per-tenant counters. It serves the demo and hides five flaws, each visible
-only when you read the starter against the failure mode it was supposed to prevent.
+turns those events into per-tenant counters. It serves the demo and hides five flaws.
 
-**Failure mode the checks target.** A downstream system replays one applicant's history and sees
-their decisions out of order. A replicated, long-retained topic turns out to hold names and document
-numbers nobody can delete. A process dies mid-request and the topic announces a decision the audit
-trail never recorded. A produce is acknowledged while the message is still only in the client's
-buffer. And the consumers that need to act on a refusal cannot tell why it happened.
+**Failure mode the checks target.** One applicant's history replays out of order, a retained topic
+holds names and document numbers nobody can delete, a crash announces a decision the audit trail
+never recorded, a produce is acknowledged while still buffered, and consumers cannot tell why a
+refusal happened.
 
-\`kyc.decided\` is the only record most downstream systems ever read about a decision, so the event
-is an interface contract:
-
-- Key every event by the **applicant reference**: the key is the partition key, and one applicant's
-  history has to stay ordered end to end.
-- The payload carries the **decision and its reason codes** plus one **digest per document**, enough
-  for downstream systems to act and audit without opening the case store. It carries no document
-  images, names or numbers, because identity data written to a retained topic outlives every
-  retention policy the case store has.
-- Publish the event **only after the decision record commits**. A produce before the commit puts a
-  decision on the topic that the audit trail did not record.
-- Configure the producer for **durable delivery** (\`acks=all\` or the stack's equivalent), so an
-  acknowledged produce is replicated rather than merely buffered in the client.`,
+- Key every event by the **applicant reference**.
+- The payload carries the **decision and its reason codes** plus one **digest per document**; no
+  document images, names or numbers.
+- Publish **only after the decision record commits**.
+- Configure the producer for **durable delivery** (\`acks=all\` or the stack's equivalent).`,
   sequence: {
     participants: ['KYC API', 'Decision store', 'kyc.decided', 'Status consumer', 'Redis'],
     messages: [
@@ -771,14 +761,12 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The decision event is a contract, which is why the fix touches the key, the payload and the
-order of writes rather than the shape of the produce call. The message key is an ordering contract:
-partition by applicant and one applicant's history arrives in order; key by the reviewer and the
-reviewer's whole queue interleaves. The topic is the wrong place for identity data: it is retained,
-replicated and read by systems with weaker access control than the case store, so the event carries
-the decision, the reason codes and document digests only. The commit and the produce are a dual
-write with no transaction across them: publish after the record commits, and an idempotent retry
-replays the produce instead of announcing a decision that was never recorded. \`acks=all\` is the
-durability half; without it the produce is worth little. What this step did not do: enforce the
-contract through a schema registry, or relay failed produces through an outbox.`,
+  debrief: `The decision event is a contract, so the fix touches the key, the payload and the order of
+writes rather than the produce call. Partition by applicant and one applicant's history arrives in
+order; key by reviewer and the reviewer's queue interleaves. The topic is retained, replicated and
+read by systems with weaker access control than the case store, so it carries decisions, reason codes
+and digests only. Commit and produce are a dual write with no transaction: publish after the record
+commits, and a retry replays the produce instead of announcing an unrecorded decision. \`acks=all\`
+makes the acknowledgement mean replicated. What this step did not do: enforce the contract through a
+schema registry, or relay failed produces through an outbox.`,
 };

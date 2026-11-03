@@ -8,44 +8,29 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code for the event publisher: it
-builds a payload, produces it to \`job.event\` and acks, so the demo shows a history consumer with
-something to read. It compiles, it serves the happy path, and it hides four production flaws that
-only surface once more than one worker is draining the queue. Debug it like the owner of a topic
-whose consumer rebuilds each job's history, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the job event publisher: \`publish_event\` produces a payload with
+the type, \`job_id\` and \`attempts\` to \`job.event\` keyed by the worker; \`record_event\` catches
+any producer error and logs it; \`complete_job\` publishes \`completed\`, then calls
+\`mark_completed\`; \`enqueued\` and \`started\` have hooks, \`failed\` and \`dead_lettered\` do not.
+It compiles, serves the happy path and hides four flaws.
 
-The worker reports a job's life through one publisher; \`job.event\` carries one record per
-transition of a job — \`enqueued\`, \`started\`, \`completed\`, \`failed\`, \`dead_lettered\`.
+**Failure mode the checks target.** A retry routed to another pod lands on another partition, and
+a consumer applies \`started\` after \`completed\`. The log says a charge happened while the worker
+was still one crash away from it. During a broker blip the \`dead_lettered\` event a paging rule
+depends on is logged as a warning and gone. And the history has no \`failed\` or \`dead_lettered\`
+record and no duration.
 
-- One publisher emits **every** transition, and each payload carries the \`job_id\`, the
-  **\`attempts\`** count and the **\`duration_ms\`** of the attempt where they apply. The starter
-  publishes three of the five and drops \`failed\` and \`dead_lettered\`, so the consumer never sees
-  the events a support engineer actually gets paged about.
-- Every produce is **keyed by the job id** (\`key=job_id\`, \`key: jobId\`, \`Key: []byte(jobID)\`,
-  \`ProducerRecord(topic, jobId, payload)\`, the message key argument). The key chooses the
-  partition, and the partition is what keeps one job's history ordered while other jobs' events
-  interleave. The starter keys by the **worker** that ran the job, so two workers draining the queue
-  interleave, a retry lands on a different partition, and a consumer can apply \`started\` after
-  \`completed\`.
-- \`completed\` is published **only after the side effect has committed** — the worker's report marks
-  the job completed first (\`mark_completed\`), and the produce follows that commit. The starter
-  publishes \`completed\` and only then marks the job, so the history claims a charge, an email or a
-  webhook that may never have happened.
-- The job's new state and a **\`job_outbox\` row** are written in **one store call**
-  (\`INSERT INTO job_outbox\`), and the produce follows it; when the broker rejects the produce the
-  row stays pending and a **relay** (\`relay_outbox\`) republishes it, in outbox order, clearing a
-  row only after the ack. The starter has no outbox: a rejection is caught, logged and forgotten, so a
-  broker outage silently punches holes in the only history the job has.
-- The consumer owns the other end: it appends the event to the job's history and **only then**
-  commits the offset, so a crash between the two replays the record instead of losing it.
-
-**Failure mode the checks target.** The key is the subtle one: keying by worker looks harmless with
-one worker and turns into a history that reorders itself the moment a retry is routed to a different
-pod, because the job's own records no longer share a partition. Publishing \`completed\` before the
-effect commits is the lie that costs money — the log says the side effect happened when the worker
-was still one crash away from it. The missing outbox is the one that hides for months: invisible
-until the broker blinks, and then a \`dead_lettered\` event a paging rule depends on is simply absent
-from the log.`,
+- One publisher emits every transition (\`enqueued\`, \`started\`, \`completed\`, \`failed\`,
+  \`dead_lettered\`) with the \`job_id\`, the \`attempts\` count and the \`duration_ms\` where they
+  apply.
+- Every produce is keyed by the job id (\`key=job_id\`, \`key: jobId\`, \`Key: []byte(jobID)\`,
+  \`ProducerRecord(topic, jobId, payload)\`).
+- \`completed\` is published only after the side effect has committed: \`mark_completed\` first, the
+  produce after it.
+- The job's new state and a \`job_outbox\` row (\`INSERT INTO job_outbox\`) are written in one store
+  call; the produce follows, and when the broker rejects it the row stays pending for
+  \`relay_outbox\` to republish in outbox order, clearing a row only after the ack.
+- The consumer appends the event to the job's history and only then commits the offset.`,
   sequence: {
     participants: ['Worker pool', 'job.event', 'History consumer', 'Job store · outbox'],
     messages: [
@@ -229,9 +214,7 @@ store = JobStore()
 
 
 def publish_event(job_id: str, worker: str, event_type: str, attempts: int) -> None:
-    # TODO: this starter keys the event by the worker that ran the job, publishes \`completed\` before
-    # the side effect has committed, publishes three of the five transitions, and swallows a
-    # producer rejection with a log line where the job_outbox row belongs.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     payload = json.dumps({"type": event_type, "job_id": job_id, "attempts": attempts}).encode("utf-8")
     producer.produce(TOPIC, key=worker.encode("utf-8"), value=payload)
     producer.flush()
@@ -438,9 +421,7 @@ class JobStore {
 const store = new JobStore();
 
 async function publishEvent(jobId: string, workerId: string, event: JobEvent): Promise<void> {
-  // TODO: this starter keys the event by the worker that ran the job, publishes 'completed' before
-  // the side effect has committed, publishes three of the five transitions, and swallows a
-  // producer rejection with a log line where the job_outbox row belongs.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   void jobId;
   await producer.send({topic: TOPIC, messages: [{key: workerId, value: JSON.stringify(event)}]});
 }
@@ -668,9 +649,7 @@ type JobStore interface {
 var store JobStore
 
 func publishEvent(ctx context.Context, workerID string, event jobEvent) error {
-	// TODO: this starter keys the event by the worker that ran the job, publishes "completed" before
-	// the side effect has committed, publishes three of the five transitions, and swallows a
-	// producer rejection with a log line where the job_outbox row belongs.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -890,9 +869,7 @@ object Events {
   }
 
   def publishEvent(event: JobEvent, workerId: String): Unit = {
-    // TODO: this starter keys the event by the worker that ran the job, publishes "completed" before
-    // the side effect has committed, publishes three of the five transitions, and swallows a
-    // producer rejection with a log line where the job_outbox row belongs.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     val payload =
       """{"type":"%s","job_id":"%s","attempts":%d}""".format(event.eventType, event.jobId, event.attempts)
     producer.send(new ProducerRecord[String, String](JobEventTopic, workerId, payload))
@@ -1076,9 +1053,7 @@ struct JobStore {
 JobStore store;
 
 static void publish_event(RdKafka::Producer* producer, const JobEvent& event, const std::string& worker_id) {
-  // TODO: this starter keys the event by the worker that ran the job, publishes "completed" before
-  // the side effect has committed, publishes three of the five transitions, and swallows a
-  // producer rejection with a log line where the job_outbox row belongs.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const std::string payload =
       json{{"type", event.type}, {"job_id", event.job_id}, {"attempts", event.attempts}}.dump();
   producer->produce(kJobEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
@@ -1253,9 +1228,9 @@ int main() {
     },
   },
   hints: [
-    'The message key decides the partition, and the partition decides the order the history consumer replays. Key by `job_id` — the thing whose history must stay ordered — not by the worker that happened to claim the attempt; a retry on another worker moves the job to another partition.',
-    'A history is only complete if every transition is on it: `enqueued`, `started`, `completed`, `failed`, `dead_lettered`, each carrying `attempts` and `duration_ms`. Three of five is a history with holes exactly where someone is paging.',
-    '`completed` is a claim about a side effect that has already happened, so commit the effect and mark the job first and produce second. Then treat the produce as part of the same store call: the state change and the `job_outbox` row commit together, only the ack clears the row, and a relay republishes whatever the broker rejected — in outbox order.',
+    "Support opens a job whose history reads completed, started, enqueued in that order, and a dead-lettered job from last Tuesday's broker incident has no event at all.",
+    '`key=worker` puts a retried attempt on another partition; `record_event` runs before `store.mark_completed`; `except Exception: logger.warning` is where the outbox row should be; two of five transitions have no hook.',
+    'Produce with `key=job_id`; call `mark_completed` and `INSERT INTO job_outbox` in one store call, then produce; add `failed`/`dead_lettered` with `duration_ms`; have `relay_outbox` republish pending rows after an ack.',
   ],
-  debrief: `The interviewer is testing whether you understand a topic as a log ordered per key, and an event as a claim about something that already happened. The starter reads fine with one worker, one producer and a healthy broker: it produces a valid payload, a valid key and a valid ack, and the flaws only appear when a retry is routed to another pod, when the side effect fails after the completion was announced, or when the broker is unreachable for a minute. The checks cover exactly those: the job-id key (one job's records share a partition), the full transition set with attempts and durations (a history a support engineer can replay), the ordering of the completion after the effect commits (no claim ahead of the fact), and the state change plus job_outbox row in one store call with a relay behind it (recoverable on rejection). The key is the subtle one, because keying by worker looks like it preserves order while one worker is draining the queue and silently stops doing so the moment the pool scales out. The outbox is the one that hides: nothing breaks until the broker blinks, and then the missing records are the ones paging rules and dashboards read. Real platforms add a schema registry with per-event versions, a consumer that stores the last applied transition so a replayed partition cannot move a job backwards, a retention window sized to the longest job, and a relay that publishes in outbox order with a metric on its lag and an alert when it grows.`,
+  debrief: `A topic is a log ordered per key, and an event is a claim about something that already happened; the fix follows from both. The job id is the key because a job's history is what must stay ordered, and keying by worker stops preserving that order the moment the pool scales out. \`completed\` follows the effect's commit because the history must not claim what has not happened. The outbox makes the state change and the event one durable fact: the row commits with the state, the produce is an attempt to deliver it, and the relay finishes the job after an outage in the order the rows were written. Production systems also have the consumer store the last applied transition so a replayed partition cannot move a job backwards, and alert when the relay's lag grows.`,
 };

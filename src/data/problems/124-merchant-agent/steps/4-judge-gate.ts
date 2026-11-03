@@ -8,35 +8,30 @@ export const judgeGateStep: Step = {
   focus: ['api', 'judge', 'gtx'],
   task: `## Task
 
-**Starting point.** The starter is working code for the release gate: before a
-new prompt or model version ships, it scores a few conversations with a judge model and returns a
-verdict. It runs, it prints a number, and it is exactly what Sidekick's team calls vibe testing. It
-hides five flaws. Debug it, fix it, and prove the fix.
+**Starting point.** The starter implements \`gate(version)\`, the release gate run before a new
+prompt or model version ships: it samples five conversations, asks one judge to "Rate this
+conversation 0-10" on the last message of each, with no deadline and no schema check, averages the
+scores and returns true above 0.5. It is what Sidekick's team calls vibe testing. It hides five
+flaws.
 
-Implement \`gate(version)\` over \`Judge.Score\` (\`turns\`, \`criterion\`, \`rubric\` → \`score\`
-in 0..1) and the ground-truth set:
+**Failure mode the checks target.** A 0.79 ships over a 0.91 because both "looked fine". Five
+conversations cannot tell a regression from noise. A judge nobody calibrated may agree with humans
+no better than a coin flip. Judging the last message hides a wrong tool call three turns earlier,
+and a filter such as \`customer_tags CONTAINS 'enabled'\` passes because no schema is checked.
 
-- **Ground-truth set, not a golden file**: sample **\`SAMPLE_SIZE = 200\`** conversations replayed
-  through the candidate version (\`gtx.sample(version, SAMPLE_SIZE)\`); the set reflects what
-  merchants actually ask. Every judge call carries a **15 s** deadline.
-- **One judge per criterion** with a written rubric: \`CRITERIA\` are \`correctness\`,
-  \`schema_compliance\` and \`helpfulness\`, each scored over the **whole conversation**, not the last
-  message. There is no "rate this 0–10" judge.
-- **Calibrate before trusting**: on the human-labelled subset, compare each judge's labels with the
-  human labels with **Cohen's kappa** and refuse to gate when a judge's kappa is below
-  **\`MIN_JUDGE_KAPPA = 0.6\`** — the source's judges went from 0.02 to 0.61 against a human
-  baseline of 0.69, and a judge below that bar is not evidence.
-- **Procedural validation first**: every tool call's arguments are checked against the tool's
-  schema (\`validate_schema\`) before any judge runs; a conversation with an invalid filter such as
-  \`customer_tags CONTAINS 'enabled'\` scores 0 on every criterion without spending a judge call.
-- **The gate**: a version ships only when every criterion's mean is at least
-  **\`MIN_SCORE = 0.8\`** and no criterion regresses more than **\`MAX_REGRESSION = 0.02\`** below
-  the recorded baseline of the version in production. Record the scores on success.
-
-**Failure mode the checks target.** Five conversations and a 0–10 vibe score cannot tell a
-regression from noise; a judge nobody calibrated may agree with humans no better than a coin
-flip; judging the last message hides a wrong tool call three turns earlier; and a gate that never
-compares against the baseline ships a 0.79 over a 0.91 because both "looked fine".`,
+- Sample \`SAMPLE_SIZE = 200\` conversations replayed through the candidate
+  (\`gtx.sample(version, SAMPLE_SIZE)\`). Every judge call carries a **15 s** deadline
+  (\`JUDGE_DEADLINE_S\`).
+- One judge per criterion with a written rubric: \`CRITERIA\` are \`correctness\`,
+  \`schema_compliance\` and \`helpfulness\`, each scored over the whole conversation
+  (\`rubric=RUBRICS[criterion]\`).
+- Calibrate before trusting: on the human-labelled subset, compare each judge's labels with
+  \`human_labels\` using \`cohen_kappa\` and refuse to gate below \`MIN_JUDGE_KAPPA = 0.6\`.
+- Procedural validation first: \`validate_schema\` checks every tool call's arguments before any
+  judge runs; an invalid conversation scores 0 on every criterion and spends no judge call.
+- The gate: a version ships only when every criterion's mean is at least \`MIN_SCORE = 0.8\` and no
+  criterion regresses more than \`MAX_REGRESSION = 0.02\` below \`releases.baseline(criterion)\`;
+  \`record\` the means on success.`,
   sequence: {
     participants: ['Release gate', 'ground-truth set', 'Judge'],
     messages: [
@@ -66,9 +61,9 @@ compares against the baseline ships a 0.79 over a 0.91 because both "looked fine
     ],
   },
   hints: [
-    'Three constants fix three flaws: `SAMPLE_SIZE = 200` on the sample, `JUDGE_DEADLINE_S` on every `Score` call, and a `CRITERIA` tuple with a `RUBRICS` entry each. Send `conversation.turns` whole — the judge needs the tool calls, not just the final sentence.',
-    'Calibration is a comparison, not a prompt: for each criterion, score the labelled conversations, binarise the judge’s score at 0.5, and compute `cohen_kappa(human, judge)`. Below `MIN_JUDGE_KAPPA` the judge is not evidence, so the gate refuses rather than guesses.',
-    'Run `validate_schema` on the conversation’s tool calls before the first judge call: an invalid filter is a 0 on every criterion and no judge is spent on it. Then gate on both `MIN_SCORE` and `baseline(criterion) - MAX_REGRESSION`, and `record` the means only when the version passes.',
+    "A release that passed the gate dropped merchant task completion by a tenth, and the judge's scores on the labelled set agree with the product experts about as often as a coin.",
+    '`gtx.sample(version, 5)` and `turns=conversation.turns[-1:]` give the judge too little; one `"Rate this conversation 0-10"` rubric measures nothing named; `>= 0.5` is compared with no baseline.',
+    'Sample `SAMPLE_SIZE`, run `validate_schema` first, score each `CRITERIA` entry with `RUBRICS[criterion]` over full `turns` and `timeout=JUDGE_DEADLINE_S`, require `cohen_kappa >= MIN_JUDGE_KAPPA`, then gate on `MIN_SCORE` and `baseline - MAX_REGRESSION`.',
   ],
   checks: [
     {
@@ -187,9 +182,7 @@ releases = ReleaseStore()
 
 
 def gate(version: str) -> bool:
-    # TODO: this starter scores five conversations with one "rate this 0-10" judge on the last
-    # message, never calibrates the judge against human labels, skips schema validation of the
-    # tool calls, sets no deadline, and ships without comparing against the baseline.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     sample = gtx.sample(version, 5)
     total = 0.0
     for conversation in sample:
@@ -344,9 +337,7 @@ export interface Conversation {
 }
 
 export async function gate(version: string): Promise<boolean> {
-  // TODO: this starter scores five conversations with one "rate this 0-10" judge on the last
-  // message, never calibrates the judge against human labels, skips schema validation of the
-  // tool calls, sets no deadline, and ships without comparing against the baseline.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const sample = await gtx.sample(version, 5);
   let total = 0;
   for (const conversation of sample) {
@@ -510,9 +501,7 @@ var (
 	releases ReleaseStore
 )
 
-// TODO: this starter scores five conversations with one "rate this 0-10" judge on the last message,
-// never calibrates the judge against human labels, skips schema validation of the tool calls, sets
-// no deadline, and ships without comparing against the baseline.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func Gate(ctx context.Context, version string) (bool, error) {
 	sample, err := gtx.Sample(ctx, version, 5)
 	if err != nil {
@@ -764,9 +753,7 @@ object JudgeGate {
   val gtx = GroundTruthSet.open()
   val releases = ReleaseStore.open()
 
-  // TODO: this starter scores five conversations with one "rate this 0-10" judge on the last message,
-  // never calibrates the judge against human labels, skips schema validation of the tool calls,
-  // sets no deadline, and ships without comparing against the baseline.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def gate(version: String): Boolean = {
     val sample = gtx.sample(version, 5)
     val total = sample.map { conversation =>
@@ -926,9 +913,7 @@ std::unique_ptr<sidekick::Judge::Stub> judge =
 GroundTruthSet gtx;
 ReleaseStore releases;
 
-// TODO: this starter scores five conversations with one "rate this 0-10" judge on the last message,
-// never calibrates the judge against human labels, skips schema validation of the tool calls, sets
-// no deadline, and ships without comparing against the baseline.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 bool gate(const std::string& version) {
   const auto sample = gtx.sample(version, 5);
   double total = 0;
@@ -1103,5 +1088,5 @@ bool gate(const std::string& version) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can tell evaluation from reassurance. The starter is what the source calls vibe testing: a handful of conversations, one judge asked for a number, and a threshold nobody derived. Shopify's answer has five parts and the checks follow them. Sample from a ground-truth set that mirrors what merchants really ask, in numbers that can detect a regression. Build one judge per criterion with a rubric, and score whole conversations because the failure is usually a tool call several turns back. Calibrate every judge against human labels with an agreement statistic — their judges went from a kappa of 0.02 to 0.61 against a human ceiling of 0.69, and until a judge clears that bar its score is not evidence. Put procedural validation in front of the semantic judge: the tag-hacking filters their training found (\`customer_tags CONTAINS 'enabled'\` for an account status) are caught by a schema check that costs nothing. And gate against the baseline, not a feeling. Real pipelines add the merchant simulator that replays conversation goals through several candidates at once, Kendall's tau and Pearson alongside kappa, and the test the source describes: swap a judge for a human at random and see whether anyone can tell.`,
+  debrief: `Evaluation differs from reassurance in where its numbers come from. The sample comes from a ground-truth set that mirrors what merchants ask, in numbers that can detect a regression. Each criterion has its own judge and rubric, scoring whole conversations, because the failure is usually a tool call several turns back. Every judge is calibrated against human labels with an agreement statistic; Shopify's judges went from a kappa of 0.02 to 0.61 against a human ceiling of 0.69, and until a judge clears that bar its score is not evidence. Procedural validation sits in front of the semantic judge because tag-hacking filters are caught by a schema check that costs nothing. The gate compares against the baseline rather than a feeling. Production pipelines add a merchant simulator and the test the source describes: swap a judge for a human at random and see whether anyone can tell.`,
 };

@@ -12,6 +12,11 @@ export const readStep: Step = {
 from the index and returns each one as a trend entry with its count and the \`user_id\` that
 triggered it. It compiles, it shows something on the demo, and it hides 4 flaws.
 
+**Failure mode the checks target.** A single occurrence promoted to a trend publishes one person's
+name on the highest-traffic rail, and a \`user_id\` on each entry turns an analytics read into a
+privacy leak. Without a window and a sensitive-category filter, "popular" means "ever" and a
+category that should not surface becomes the top trend.
+
 - A term trends only when it has at least **\`MIN_TREND_COUNT = 100\` occurrences** in the window. One
   search is a search, not a trend.
 - The window is explicit (\`WINDOW_SECONDS\`), so "popular" has a time bound rather than meaning "ever".
@@ -19,14 +24,7 @@ triggered it. It compiles, it shows something on the demo, and it hides 4 flaws.
   even when their count is high.
 - A trend entry carries the **term and its count only**: no user id, no session id, nothing
   that links the trend back to the person who searched. A trend is an aggregate, not a person.
-- The response shape is \`{"window_seconds": …, "entries": [{"term": …, "count": …}]}\`.
-
-**Failure mode the checks target.** A single occurrence promoted to a trend publishes one person's
-name to everyone on the next page load, and the trending rail is the highest-traffic place a search
-term can land. Linking each entry to the user who triggered it turns an analytics read into a
-privacy leak that survives in logs and caches. The missing window and sensitive-category filter
-are the quieter part: without them a high-count term from a category that should not surface
-becomes the top trend, and "popular" means "ever".`,
+- The response shape is \`{"window_seconds": …, "entries": [{"term": …, "count": …}]}\`.`,
   sequence: {
     participants: ['Client', 'Autocomplete API', 'Trend index'],
     messages: [

@@ -254,7 +254,7 @@ def refund_via_psp(refund_id: str, payment_id: str, amount_minor: int) -> str:
 `,
     },
     typescript: {
-      starter: `/** PSP refund call: flawed code that mints a key per attempt. */
+      starter: `/** PSP refund call. */
 import {randomUUID} from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';

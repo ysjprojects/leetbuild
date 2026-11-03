@@ -12,24 +12,18 @@ export const readStep: Step = {
 polls after a submission: it looks the case up by applicant id, returns the status with the vendor's
 reason codes and attaches a document URL. It compiles, it serves the demo, and it hides four flaws.
 
-**Failure mode the checks target.** One tenant's app reads another tenant's applicant, and the 404
-that should hide existence does not happen. Refusals reach customers in the vendor's internal
-vocabulary, one the vendor can change under you. An identity-document link survives the case, the
-account and the deletion request, kept alive by every screenshot and share. And the app shows a
-verdict while the service is still waiting on a human.
+**Failure mode the checks target.** One tenant's app reads another tenant's applicant, refusals
+reach customers in the vendor's internal vocabulary, an identity-document link outlives the case
+and the deletion request, and the app shows a verdict while a human is still deciding.
 
-Requirements. The caller is the authenticated tenant in \`X-Tenant-Id\`.
+The caller is the authenticated tenant in \`X-Tenant-Id\`.
 
-- The lookup is scoped to that tenant: an applicant whose case belongs to another tenant is **404**,
-  the same answer as an applicant that does not exist, so the read cannot confirm that someone
-  else's case exists.
-- \`reasons\` are the **customer-facing** reason codes, mapped from the vendor's internal vocabulary
-  through \`PUBLIC_REASONS\`; an internal code with no public mapping does not leave the service.
-- Document images do not come back as permanent links: each document carries a **short-lived signed
-  link** with an \`expires_at\`, so a URL copied out of a response stops working.
-- The response reports whether the case is \`degraded\` (a vendor timeout or error sent it to a
-  human) and whether it is awaiting manual review, so the app can say "still deciding" instead of
-  showing a verdict the service does not have.`,
+- Scope the lookup to that tenant: another tenant's applicant is **404**, like a missing one.
+- \`reasons\` are the **customer-facing** codes mapped through \`PUBLIC_REASONS\`; an unmapped internal
+  code does not leave the service.
+- Each document carries a **short-lived signed link** with an \`expires_at\`, not a permanent URL.
+- Report whether the case is \`degraded\` and whether it awaits manual review, so the app can say
+  "still deciding".`,
   sequence: {
     participants: ['Applicant app', 'KYC API', 'Decision store', 'Document storage'],
     messages: [

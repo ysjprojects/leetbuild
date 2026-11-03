@@ -204,7 +204,7 @@ def export(
 `,
     },
     typescript: {
-      starter: `/** Submissions read and export — flawed code. */
+      starter: `/** Submissions read and export. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

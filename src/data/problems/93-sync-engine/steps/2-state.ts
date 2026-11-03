@@ -14,23 +14,17 @@ then writes the watermark with a plain \`SET\`. It compiles, a happy-path client
 it stopped, and it hides five flaws. They only show on a crash, a replay or a quiet week.
 
 **Failure mode the checks target.** A worker dies between the cursor write and the apply, and the
-device is told "you already sent this" while its batch was never applied: the user's own edits are
-gone with no error anywhere. A laptop closed for eight days comes back to a cursor that has expired
-and takes a full snapshot. Two devices pushing at once leave the watermark on the older revision, so
-a reader sees it move backwards.
+device is told "you already sent this" while its batch was never applied. A laptop closed for eight
+days comes back to an expired cursor. Two concurrent pushes leave the watermark moving backwards.
 
-Requirements:
-
-- Each device has its own cursor key (\`cursor:{device}\`) holding the last revision that device was
-  sent. The watermark lives under one well-known key, named by \`WATERMARK_KEY\`.
-- The cursor advances only after the batch it represents is applied (\`apply_batch\`, and only then
-  \`commit_cursor\`). A crash between the apply and the cursor write replays the batch instead of
-  losing it: the cursor is the device's receipt and may not run ahead of durable work.
-- A cursor does not expire. A device closed for a week comes back to a cursor that is still valid.
-- The cursor does not move backwards. A duplicate or replayed batch names an older revision, so the
-  advance is a compare-and-set (\`CURSOR_LUA\`) that keeps the higher value.
-- The server watermark only moves forward under concurrent advances (\`WATERMARK_LUA\`): one atomic
-  server-side step, like the cursor.`,
+- Each device has its own cursor key (\`cursor:{device}\`); the watermark lives under
+  \`WATERMARK_KEY\`.
+- The cursor advances only after its batch is applied (\`apply_batch\`, then \`commit_cursor\`), so a
+  crash in between replays the batch instead of losing it.
+- A cursor does not expire.
+- The cursor does not move backwards: the advance is a compare-and-set (\`CURSOR_LUA\`) that keeps the
+  higher value.
+- The server watermark only moves forward under concurrent advances (\`WATERMARK_LUA\`).`,
   sequence: {
     participants: ['Sync Engine', 'revisions', 'Redis'],
     messages: [

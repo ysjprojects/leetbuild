@@ -17,17 +17,13 @@ store that the cache does not count, so the operator staffing the queue under-co
 is under stress; nobody sees how long the oldest item has waited or how much work is stuck assigned;
 and one tenant can read another's review backlog.
 
-- **Depth per priority, from the item store.** \`queue_depth(tenant, priority)\` counts the items
-  actually queued, including the ones the lease-expiry sweeper returned, by asking the item store
-  (\`store.count(tenant, priority, "queued")\`) rather than a counter that goes stale when a lease
-  expires.
-- **Oldest age, always reported.** \`oldest_age(tenant, priority)\` returns the age in seconds of the
-  oldest queued item, or \`null\` when the queue is empty. It is present in the response every time,
-  not omitted and not \`-1\`.
-- **SLA breach count.** The response carries \`breach_count\`: how many items in this queue have
-  breached their SLA, so an operator can see the queue degrading before reviewers notice.
-- **Assignment state distribution.** The response carries \`assignment_states\`: how many items are
-  \`queued\`, \`assigned\` and \`breached\`, so an operator can see whether work is stuck assigned.
+- **Depth per priority, from the item store.** \`queue_depth(tenant, priority)\` asks
+  \`store.count(tenant, priority, "queued")\`, which includes items the sweeper returned.
+- **Oldest age, always reported.** \`oldest_age(tenant, priority)\` returns the oldest queued item's
+  age in seconds, or \`null\` when empty; never omitted, never \`-1\`.
+- **SLA breach count** as \`breach_count\`.
+- **Assignment state distribution** as \`assignment_states\`: counts of \`queued\`, \`assigned\` and
+  \`breached\`.
 - **Tenant scope.** The caller's \`X-Tenant-Id\` owns the queue; asking for another tenant's queue
   (\`?tenant=…\` different from the header) is **403**. A missing header is **401**.`,
   sequence: {
@@ -180,7 +176,7 @@ def read_queue(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/review/queues/{p}: flawed code that reads a stale cache. */
+      starter: `/** GET /v1/review/queues/{p}. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

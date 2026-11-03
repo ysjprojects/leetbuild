@@ -19,19 +19,12 @@ the file complete before the commit returns means readers and the search index s
 the store never committed. And a listing that does not filter on the committed state shows interrupted
 uploads as finished ones.
 
-Requirements:
-
-- Every \`PutChunk\` runs under a **15-second deadline**, so a stuck stream cannot hold the upload open
-  forever.
-- The chunk request carries the chunk's \`chunk_hash\` (SHA-256 of the bytes), so the store can dedupe a
-  chunk that has already been written, including one written by another upload.
-- A failed chunk is retried **in place**: only that chunk is re-sent, up to three attempts, and only on
-  \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. Anything else surfaces immediately. The retry must not
-  restart the multipart upload or re-send the chunks that already succeeded.
-- \`complete\` waits for the store's \`CommitMultipart\` response and only then marks the file complete in
-  the local index; a commit the store did not confirm leaves the file incomplete.
-- Listings only contain files whose state is \`committed\`, so an upload interrupted between its chunks
-  and its commit is not shown to a reader as a finished file.`,
+- Every \`PutChunk\` runs under a **15-second deadline**.
+- The chunk request carries its \`chunk_hash\` (SHA-256 of the bytes), so the store can dedupe it.
+- A failed chunk is retried **in place**: only that chunk, up to three attempts, and only on
+  \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`; anything else surfaces immediately.
+- \`complete\` marks the file complete in the local index only after \`CommitMultipart\` confirms.
+- Listings only contain files whose state is \`committed\`.`,
   sequence: {
     participants: ['Upload API', 'Object store'],
     messages: [

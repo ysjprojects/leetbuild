@@ -8,42 +8,28 @@ export const invoiceStateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-Finalizing an invoice is the one-way transition from a mutable draft to an issued document: it takes
-the tenant's next number, marks the invoice finalized, and only then is the number part of the
-tenant's books. Numbers are **gapless per tenant** — a number that has been handed out is carried by
-an invoice, and two invoices of one tenant may never share one.
+**Starting point.** The starter serves \`POST /v1/invoices/{invoice_id}/finalize\`, the one-way
+transition from a mutable draft to an issued document: it loads the draft, answers 409 if it is not
+one, takes the next number by \`GET\`-ting \`inv:seq:{tenant}\`, adding one in the handler and
+\`SET\`-ting it back, then validates the totals and writes \`finalized\` with the number. The demo
+passes. It hides five flaws.
 
-**Starting point.** The starter is working code: the happy path finalizes and returns a number, so
-the demo passes. It reads the tenant's last number with \`GET\`, adds one **in the handler** and
-writes it back with \`SET\`; and it takes that number **before** it validates the totals, so every
-rejected finalize burns a number.
+**Failure mode the checks target.** Two concurrent finalizes both read the same last number and two
+invoices of one tenant share a legal identifier. Every rejected finalize burns a number, because the
+claim comes before the validation. A flushed counter restarts at zero and reissues numbers already
+on issued documents. The status check and the claim are two steps, so a loser can finalize an
+invoice finalized a moment ago. And the store keeps both duplicates.
 
-Implement the finalize path:
-
-- The sequence is **per tenant**: the key is \`inv:seq:{tenant}\`, built from the authenticated
-  tenant. A tenant-less key hands one tenant's numbers to another; a key without the tenant can
-  never be reconciled per tenant.
-- The **increment happens inside Redis**: one Lua script run with \`EVAL\` (or a single \`INCR\`)
-  does the arithmetic. A \`GET\`-then-\`SET\` read-modify-write in the handler lets two concurrent
-  finalizes read the same last number and both write \`last + 1\`.
-- **Claim and transition are one atomic step**: the script reads the claim's \`status\`, refuses
-  anything that is no longer a draft, \`INCR\`s the sequence and writes \`finalized\` plus the claimed
-  number on the same key. Two concurrent finalizes must receive **distinct** numbers and the loser
-  must be told the invoice is already finalized.
-- **Validate before you claim**: the totals (\`validate_totals\`) are checked first, and a failed
-  finalize consumes **no** number and leaves the draft untouched. Claiming first turns every
-  validation failure into a permanent gap in the tenant's sequence.
-- **Reconcile the counter**: \`reconcile_sequence(tenant)\` compares the Redis counter with the
-  highest number among that tenant's issued invoices and repairs the counter upward with \`SET\`, so
-  a lost or flushed counter is detected instead of reissuing numbers.
-- **Let the store enforce uniqueness**: the invoice rows carry \`UNIQUE (tenant_id, number)\`, so a
-  bug that persists the same number twice fails loudly instead of shipping two documents that share
-  a legal identifier.
-
-**Failure mode the checks target.** Two concurrent finalizes both read the last number and both
-write the same one; a validation failure after the claim burns a number no invoice will ever carry;
-a flushed counter starts from zero and reissues numbers that are already on issued documents; and a
-store with no constraint keeps both duplicates without a word.`,
+- The sequence is per tenant: the key is \`inv:seq:{tenant}\`, incremented inside Redis by one Lua
+  script (\`CLAIM_SCRIPT\`) run with \`EVAL\`.
+- Claim and transition are one atomic step: the script reads the claim's \`status\`, refuses anything
+  that is no longer \`draft\`, \`INCR\`s the sequence and \`HSET\`s \`finalized\` plus the number on
+  the same key, so concurrent finalizes receive distinct numbers and the loser gets a conflict.
+- Validate before you claim: \`validate_totals\` runs before \`claim_number\`.
+- \`reconcile_sequence(tenant)\` compares the counter with \`MAX(number)\` among the tenant's issued
+  invoices and repairs it upward with \`SET\`.
+- The invoice rows carry \`UNIQUE (tenant_id, number)\` and the write path turns an
+  \`IntegrityError\` into a conflict.`,
   sequence: {
     participants: ['Client', 'Invoice Service', 'Redis', 'Invoice store'],
     messages: [
@@ -73,9 +59,9 @@ store with no constraint keeps both duplicates without a word.`,
     ],
   },
   hints: [
-    "A `GET` followed by a `SET` is two operations with a window between them: two concurrent finalizes both read the same last number. Move the read and the increment into one `EVAL` with `redis.call('incr', KEYS[2])`, so Redis serializes the claim for you.",
-    'The claim is worthless if it is taken before the invoice is known to be valid. Validate the totals first; the claim must be the first and only mutation in the finalize path, and it must refuse a claim whose status is no longer `draft`, returning the already-issued number so the caller can answer 409.',
-    'Redis can lose the counter (flush, failover without persistence, a deleted key). `reconcile_sequence(tenant)` reads `MAX(number)` for the tenant from the invoice store and writes it back with `SET` when the counter is behind, and the store itself keeps `UNIQUE (tenant_id, number)` as the last line of defence.',
+    'An auditor finds two invoices from one tenant with the same number, and a run of missing numbers that line up with the day a client kept submitting empty drafts.',
+    '`next_number` does `GET`, add one, `SET`, so two handlers read the same last value; it is called before `validate_totals`, so a 422 has already consumed a number; the status check happens outside the claim.',
+    'Run `validate_totals` first, then one `EVAL` of `CLAIM_SCRIPT` that checks `status == draft`, `INCR`s `inv:seq:{tenant}` and `HSET`s finalized plus the number; add `reconcile_sequence` with `MAX(number)` and `UNIQUE (tenant_id, number)`.',
   ],
   checks: [
     {
@@ -204,10 +190,7 @@ def validate_totals(invoice: dict) -> int:
 
 
 async def next_number(tenant: str) -> int:
-    # TODO: the counter is read and written in the handler, and the number is claimed before the
-    # totals are validated. Claim inside one atomic Redis script taken after validation, guard it on
-    # the draft state, reconcile the counter against the issued invoices, and let the store reject a
-    # duplicate (tenant_id, number).
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = f"{SEQUENCE_KEY_PREFIX}{tenant}"
     last = int(await r.get(key) or 0)
     number = last + 1
@@ -410,10 +393,7 @@ function validateTotals(invoice: Invoice): number {
 }
 
 async function nextNumber(tenant: string): Promise<number> {
-  // TODO: the counter is read and written in the handler, and the number is claimed before the
-  // totals are validated. Claim inside one atomic Redis script taken after validation, guard it on
-  // the draft state, reconcile the counter against the issued invoices, and let the store reject a
-  // duplicate (tenant_id, number).
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`\${SEQUENCE_KEY_PREFIX}\${tenant}\`;
   const last = Number((await r.get(key)) ?? 0);
   const number = last + 1;
@@ -637,10 +617,7 @@ func validateTotals(lines []Line) (int64, error) {
 }
 
 func nextNumber(ctx context.Context, tenant string) (int64, error) {
-	// TODO: the counter is read and written in the handler, and the number is claimed before the
-	// totals are validated. Claim inside one atomic Redis script taken after validation, guard it on
-	// the draft state, reconcile the counter against the issued invoices, and let the store reject a
-	// duplicate (tenant_id, number).
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("%s%s", sequenceKeyPrefix, tenant)
 	last, _ := rdb.Get(ctx, key).Int64()
 	number := last + 1
@@ -910,10 +887,7 @@ object InvoiceStateApi {
   }
 
   def nextNumber(tenant: String): Long = {
-    // TODO: the counter is read and written in the handler, and the number is claimed before the
-    // totals are validated. Claim inside one atomic Redis script taken after validation, guard it on
-    // the draft state, reconcile the counter against the issued invoices, and let the store reject a
-    // duplicate (tenant_id, number).
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val key = s"$SequenceKeyPrefix$tenant"
     val last = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
     val number = last + 1
@@ -1134,10 +1108,7 @@ long long validateTotals(const json& lines) {
 }
 
 long long nextNumber(sw::redis::Redis& redis, const std::string& tenant) {
-  // TODO: the counter is read and written in the handler, and the number is claimed before the
-  // totals are validated. Claim inside one atomic Redis script taken after validation, guard it on
-  // the draft state, reconcile the counter against the issued invoices, and let the store reject a
-  // duplicate (tenant_id, number).
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto key = std::string(kSequenceKeyPrefix) + tenant;
   const auto last = redis.get(key);
   const long long number = (last ? std::stoll(*last) : 0) + 1;
@@ -1342,5 +1313,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is what "gapless numbering" costs. A counter in Redis looks like a one-liner until two finalizes arrive at once: read-modify-write in the handler gives both of them the same number, and the sequence is only gapless if the claim is also the transition — one script reads the draft state, refuses anything already finalized, takes the number with \`INCR\` and writes \`finalized\` on the same key, so Redis's single-threaded execution orders the claims for you. The second half is ordering: a claim taken before \`validate_totals\` burns a number on every rejection, and a burned number is invisible — the sequence stays monotonic while the invoices have a hole, which is exactly what an auditor looks for. Reconcile closes the remaining failure: Redis can lose the counter, so \`reconcile_sequence\` lifts it to \`MAX(number)\` of the tenant's issued invoices instead of restarting at one, and \`UNIQUE (tenant_id, number)\` makes a duplicate impossible to persist even if both of those guards are wrong. Real billing systems add per-tenant number formats and fiscal-year resets, reservation of ranges so a whole batch can be numbered without a round trip each, and an audit table of every claimed number so a gap can be explained rather than merely detected.`,
+  debrief: `Gapless numbering is a claim about two things at once: no two invoices share a number, and no number is handed out without an invoice. The first is why the claim is also the transition: one script reads the draft state, refuses anything already finalized, takes the number with \`INCR\` and writes \`finalized\` on the same key, so Redis's single-threaded execution orders the claims. The second is why validation comes before the claim: a number burned on a 422 is invisible, since the sequence stays monotonic while the invoices have a hole. Reconcile covers the counter Redis can lose, lifting it to \`MAX(number)\` instead of restarting at one, and the unique constraint makes a duplicate impossible to persist even when both guards are wrong. Production billing systems add fiscal-year resets and an audit table of every claimed number so a gap can be explained rather than only detected.`,
 };

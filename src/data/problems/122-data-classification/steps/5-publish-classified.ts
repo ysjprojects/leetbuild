@@ -220,7 +220,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** entity.classified: flawed code that keys by event id and commits too early. */
+      starter: `/** entity.classified. */
 import {Kafka} from 'kafkajs';
 
 import {store} from './store';

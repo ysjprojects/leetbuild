@@ -19,20 +19,17 @@ creates experiments from a body like
 \`{"variants": [{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}], "unit": "user", "min_sample": 10000}\`,
 and its 201 looks right for a 50/50 split. It serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** A design that was not approved runs anyway: an unbalanced split
-is reweighted instead of rejected, a misspelt unit randomizes the wrong entity, a one-variant
-experiment is created, and a \`PATCH\` moves users between variants mid-flight so every downstream
-number is contaminated.
+**Failure mode the checks target.** An unapproved design runs anyway: an unbalanced split is
+reweighted, a misspelt unit randomizes the wrong entity, and a \`PATCH\` moves users between variants
+mid-flight.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing or empty tenant is **401**.
 - At least **2** variants, with distinct non-empty \`key\`s; anything else is **400**.
-- Every \`weight\` is a non-negative integer and the weights must sum to **exactly 100**: 99 or 101 is
-  **400**. Do not normalize; a reweighted split is a different experiment than the one the operator
-  approved.
+- Every \`weight\` is a non-negative integer and the weights sum to **exactly 100**: 99 or 101 is
+  **400**. Do not normalize.
 - \`unit\` is one of \`user\`, \`session\`, \`account\`; anything else is **400**.
-- \`min_sample\` is an integer \`>= 1\` (**400** otherwise) and is pinned with the rest of the design.
-- The \`salt\` is pinned at creation: the caller's if supplied, otherwise generated server-side, and not
-  derived from the split.
+- \`min_sample\` is an integer \`>= 1\` (**400** otherwise).
+- The \`salt\` is pinned at creation: the caller's if supplied, otherwise generated server-side.
 - Answer **201** echoing the experiment id, \`version\` starting at **1**, the \`salt\`, the pinned
   split exactly as validated, and \`status: "running"\`.
 - \`PATCH /v1/experiments/{id}\` may only touch \`name\` and \`description\`. A patch that carries

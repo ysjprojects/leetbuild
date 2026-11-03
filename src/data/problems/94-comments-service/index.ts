@@ -23,28 +23,19 @@ export const commentsServiceProblem: Problem = {
   minutes: 70,
   statement: `# Comments Service
 
-A comments service looks like the easiest CRUD in the platform: insert a row, list the rows. The
-parts that decide whether it is correct are none of those. A reply has to be proven to belong to the
-thread it claims, a retried request has to produce one comment rather than two, the counters a UI
-trusts have to be committed with the comment instead of "shortly after", the moderation and author
-notification calls have to survive a timeout without duplicating a ping or blocking the post, and
-pagination has to keep its promise while other people keep writing.
+A comments service looks like the easiest CRUD in the platform. What decides correctness is
+elsewhere: replies proven to belong to their thread, retries that produce one comment, counters
+committed with the comment, fan-out calls that survive a timeout, and pagination that holds while
+others keep writing.
 
 ## The real system
 
 Disqus, which hosts comment threads for millions of sites, paginates its public API with cursors:
 \`posts/list\` returns a \`cursor\` object with an opaque \`next\` token and a \`hasNext\` flag, and
 most endpoints give no \`total\` at all, because a count is a different question from a position.
-That is the read side of this course. The rest is what any comment service has to settle: writes
-carry an idempotency key because clients, queues and proxies all retry; the reply tree is enforced,
-so a parent from another thread is a client bug the service refuses; bodies are stored escaped and
-rendered from a safe subset, because between the write and the read there is always another client.
-Per-thread counters live in a cache where the read path can afford to look, but they are updated in
-the same atomic step as the comment, otherwise a crash between the two leaves the UI showing fewer
-comments than exist. Moderation and notification leave the process over gRPC under a deadline, each
-attempt carrying the comment id as its idempotency token, so a retry pings an author once and a
-moderation timeout becomes an asynchronous review flag rather than a failed post. Read models are
-fed by events keyed by thread, published only after the comment is durable.
+That is the read side of this course; the write side adds idempotency keys, an enforced reply tree,
+escaped storage, counters updated atomically with the comment, and a moderation timeout that becomes
+an asynchronous review flag rather than a failed post.
 
 ## What you build here
 
@@ -67,16 +58,13 @@ One service, **commentsd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Attachment uploads, mentions and notification digests, per-comment edit history, search indexing,
-spam scoring models, webhooks to tenant systems, and the admin UI for the review queue. The five
-pieces above are the ones that decide whether the service is correct, isolated and shippable.`,
+Attachments, mentions, edit history, search indexing, spam scoring, tenant webhooks and the review
+queue UI.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'web · mobile', x: 8, y: 50},

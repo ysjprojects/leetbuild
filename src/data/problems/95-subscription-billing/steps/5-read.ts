@@ -13,27 +13,19 @@ subscription id from the path, lists the subscription's periods, computes an amo
 the plan price and the granted credits, and returns \`{"subscription_id", "periods"}\`. It compiles,
 it serves the demo, and it hides four flaws.
 
-**Failure mode the checks target.** Every flaw survives the demo. The seeded subscription belongs to
-the caller and its plan does not change, so a figure recomputed from plan prices agrees with the
-invoice by accident, until a proration or a mid-period change makes the two disagree. No credit has
-been granted yet, so a response that nets credits into the amount looks correct. The processor's
-records have not yet differed from the ledger, so a response that does not ask it looks reconciled.
+**Failure mode the checks target.** A ledger that agrees with the invoice by accident: the seeded
+subscription is the caller's, its plan never changes, no credit was granted and the processor has
+not diverged, so recomputed, netted and unreconciled figures all look right.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**, and a
-  subscription that belongs to another tenant is **404**. A **403** would confirm that the id
-  exists, so it is the wrong answer.
-- Each period carries \`period_start\`, \`period_end\` and \`amount_cents\` read from the **stored
-  invoice row**, the amount that was actually charged, not a figure recomputed from plan prices. A
-  ledger that re-derives the number cannot be tied out against the processor.
-- Credits are returned as their own lines (\`credit_id\`, \`amount_cents\`, \`reason\`), not netted
-  into the period's amount: the customer is entitled to see why the total is what it is.
+- Tenant from \`X-Tenant-Id\` (**401** if missing); another tenant's subscription is **404**, not
+  **403**, which would confirm the id exists.
+- Each period's \`period_start\`, \`period_end\` and \`amount_cents\` come from the **stored invoice
+  row**, not from plan prices.
+- Credits are their own lines (\`credit_id\`, \`amount_cents\`, \`reason\`), not netted into the amount.
 - \`payment_references\` lists the processor charge references for the period.
-- \`reconciled\` is true only when the stored invoiced amount agrees with the processor's own records
-  for that period: read the processor's total with \`GetInvoice\` and report the comparison as
-  \`processor_total_cents\`, so a missing or a duplicated charge is visible to the customer and to
-  support instead of surfacing in a nightly report nobody reads.
-- The endpoint is read-only: it charges nothing, mutates nothing, and puts no card data in the
-  response or in the logs.`,
+- \`reconciled\` is true only when the stored amount matches the processor's \`GetInvoice\` total,
+  reported as \`processor_total_cents\`.
+- Read-only: no charges, no mutations, no card data in the response or logs.`,
   sequence: {
     participants: ['Client', 'Billing Service', 'billing db', 'Payment processor'],
     messages: [

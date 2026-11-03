@@ -207,7 +207,7 @@ def shadow_report(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/shadow/configs/{id}/report: flawed code that celebrates too early. */
+      starter: `/** GET /v1/shadow/configs/{id}/report. */
 import Fastify from 'fastify';
 
 import {reportStore} from './store';

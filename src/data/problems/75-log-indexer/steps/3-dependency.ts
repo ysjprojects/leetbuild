@@ -202,7 +202,7 @@ def bulk_write(stub, index: str, records: list[bytes]) -> str:
 `,
     },
     typescript: {
-      starter: `/** Index shard client: flawed code that re-mints the batch id per attempt. */
+      starter: `/** Index shard client. */
 import {randomUUID} from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';

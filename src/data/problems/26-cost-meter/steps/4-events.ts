@@ -216,7 +216,7 @@ def publish_usage(
 `,
     },
     typescript: {
-      starter: `/** publish_usage: flawed code that keys by model and drops failures. */
+      starter: `/** publish_usage. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

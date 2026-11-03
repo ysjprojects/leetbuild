@@ -12,18 +12,12 @@ export const stateStep: Step = {
 cache key from the query string, looks it up, runs the engine on a miss and stores the result set
 with a plain \`SET\`. It compiles, it speeds up the demo, and it hides five flaws.
 
-**Failure mode the checks target.** A cache key is a contract: it must name everything the cached
-value depends on. The starter's key names one of five inputs, so a hit can be wrong: wrong filters,
-wrong tenant, wrong catalog version. Because nothing expires, the wrong answer is permanent. The fix
-is to derive the key from a normalized query and a canonical filter hash, include the tenant and
-the page, and let the index version rotate the key namespace on every catalog publish.
+**Failure mode the checks target.** The starter's key names one of five inputs, so a hit can carry
+the wrong filters, tenant or catalog version, and with no expiry the wrong answer is permanent.
 
-- The key covers **every input that changes the results**: the tenant, the **normalized** query, the
-  **filter hash**, the page, and the **catalog index version**. A filter-less key serves a cached
-  unfiltered result set to a filtered request; a tenant-less key serves one tenant's products to
-  another; a version-less key keeps serving an old price.
-- Normalize the query before keying (\`strip\` / \`trim\` + lowercase + collapse whitespace), so the
-  same search typed with different spacing hits one entry.
+- The key covers the tenant, the **normalized** query, the **filter hash**, the page and the
+  **catalog index version**.
+- Normalize the query (\`strip\` / \`trim\` + lowercase + collapse whitespace).
 - Hash the filters deterministically: canonical JSON with sorted keys, then a digest
   (\`sha256\` / \`createHash\` / \`MessageDigest\` / FNV-1a), so filter order cannot create two entries
   that mean the same thing.

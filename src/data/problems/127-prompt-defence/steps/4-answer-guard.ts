@@ -13,26 +13,20 @@ document, calls \`answer(document, question)\`, logs the answer text and returns
 to the client as it came back. It serves the demo and hides five flaws.
 
 **Failure mode the checks target.** The starter trusts the model: a diverged reply, a leaked
-instruction block or a memorised e-mail address goes straight to the user, and the starter writes the
-answer into the log on the way. Each guard is cheap; the signature is what lets the next step count
-attacks without storing what the model said.
+instruction block or a memorised e-mail address goes straight to the user, and the answer lands in
+the log on the way.
 
 The output guard runs after \`answer\` returns \`{answer, spans}\`:
 
-- **Grounding.** Every cited span must be a substring of the document, and there must be at least
-  one. An answer whose spans are not in the document was not answered from the document.
-- **Secrets and PII.** A table of patterns (AWS access keys \`AKIA\` + 16, private-key headers,
-  e-mail addresses, US social-security numbers, card numbers) is run over the answer; a match that
-  the document does **not** contain came from somewhere else, and the source shows where: memorised
-  training data, PII included.
-- **Degeneration.** The answer's tokens are measured with the same repeat ratio as the input: above
-  **0.4** (\`MAX_OUTPUT_REPEAT_RATIO\`) at 64 tokens or more, the model has diverged into a loop,
-  the source's "It is to be a good person." repeated until the token limit, and the output is a
-  training-data-extraction signal, not an answer.
-- When any signal fires, or the model layer raised \`Rejected\`, **refuse**: respond with the fixed
-  refusal text and \`refused: true\`, and log user, document hash, the signal names and a
-  **signature** (SHA-256 of document hash and sorted signals, 16 hex). The answer text and the
-  document stay out of the log.
+- **Grounding.** At least one cited span, and every span a substring of the document.
+- **Secrets and PII.** A pattern table (AWS keys \`AKIA\` + 16, private-key headers, e-mail
+  addresses, US social-security numbers, card numbers) runs over the answer; a match the document
+  does **not** contain is a signal.
+- **Degeneration.** A repeat ratio above **0.4** (\`MAX_OUTPUT_REPEAT_RATIO\`) at 64 tokens or more
+  is a signal.
+- On any signal, or \`Rejected\` from the model layer, respond with the fixed refusal and
+  \`refused: true\`, and log user, document hash, signal names and a **signature** (SHA-256 of
+  document hash and sorted signals, 16 hex), with no answer or document text.
 - Only an answer with no signals is returned, with its spans.`,
   sequence: {
     participants: ['Client', 'promptguard', 'Model'],
@@ -272,7 +266,7 @@ def ask(body: AskRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse
 `,
     },
     typescript: {
-      starter: `/** POST /v1/ask: flawed code that returns whatever the model says. */
+      starter: `/** POST /v1/ask. */
 import Fastify from 'fastify';
 
 import {docs} from './docs';

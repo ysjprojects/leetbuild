@@ -23,15 +23,10 @@ message ConfirmReply   { string status = 1; }  // CONFIRMED, or REJECTED for FAI
 on top of the generated stub: it calls \`ConfirmReservation\`, records \`confirmed\` on success, and
 releases the hold on anything else, retrying once. It compiles, serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The starter reads a deadline as a rejection: it releases the hold
-when the warehouse is merely slow, so a valid sale is cancelled and the units go to the next buyer;
-it retries with a fresh \`uuid()\`, so the warehouse books a second reservation for units it already
-holds; and its rejection path releases without reading the reservation status, so a replayed
-confirmation gives the units back twice. A demo where the warehouse answers in milliseconds enters
-none of those paths.
-
-The warehouse treats \`reservation_id\` as the **idempotency id**: a retry carrying the same id is
-the same confirmation, a retry that mints a fresh id is a second reservation for the same units.
+**Failure mode the checks target.** A deadline read as a rejection: a slow warehouse cancels a valid
+sale and hands the units to the next buyer; the retry's fresh \`uuid()\` books a second reservation;
+and a replayed rejection gives the units back twice. The warehouse treats \`reservation_id\` as the
+**idempotency id**, so a retry must carry the same one.
 
 - Every attempt carries a **2 second** deadline (\`CONFIRM_DEADLINE_MS = 2000\`) as the call's own
   deadline, and at most \`MAX_CONFIRM_ATTEMPTS = 2\` attempts are made.
@@ -247,7 +242,7 @@ the same confirmation, a retry that mints a fresh id is a second reservation for
   ],
   code: {
     python: {
-      starter: `"""Warehouse confirmation: the starter releases the hold when the warehouse is slow."""
+      starter: `"""Warehouse confirmation."""
 
 import uuid
 
@@ -339,7 +334,7 @@ def confirm(store, redis, reservation_id: str, sku: str, quantity: int) -> str:
 `,
     },
     typescript: {
-      starter: `/** Warehouse confirmation: the starter releases the hold when the warehouse is slow. */
+      starter: `/** Warehouse confirmation. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {randomUUID} from 'node:crypto';
@@ -916,5 +911,5 @@ Outcome confirm(
 `,
     },
   },
-  debrief: `\`PENDING\` is the only answer a deadline supports: the client knows that the warehouse did not answer within two seconds, and a rejection is a fact it does not have. Releasing the hold on a timeout converts "we do not know" into "sold to someone else", which is the wrong default for a sale that may still be confirmed, so the timeout path records \`pending\` and leaves the hold alone. The retry then has to be the *same* request, because the reservation id is what the warehouse dedupes on; a fresh id turns one confirmation into two reservations. The release is a guarded state transition rather than an action, so a duplicate confirmation finds \`released\` and does nothing. Production services add a reconciliation sweep for reservations left pending past the hold TTL, export the pending count as a metric so a slow warehouse is visible before units are lost, and accept a late confirmation over a callback instead of relying on one client retry.`,
+  debrief: `\`PENDING\` is the only answer a deadline supports: the client knows the warehouse did not answer within two seconds, and a rejection is a fact it does not have. Releasing on a timeout turns "we do not know" into "sold to someone else", so the timeout path records \`pending\` and keeps the hold. The retry has to be the *same* request, because the warehouse dedupes on the reservation id; a fresh id turns one confirmation into two reservations. The release is a guarded state transition, so a duplicate confirmation finds \`released\` and does nothing. Production services add a reconciliation sweep for reservations left pending past the hold TTL and accept a late confirmation over a callback instead of relying on one client retry.`,
 };

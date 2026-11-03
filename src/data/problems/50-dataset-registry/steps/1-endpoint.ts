@@ -221,7 +221,7 @@ def register(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/datasets: flawed code that trusts whatever the caller sends. */
+      starter: `/** POST /v1/datasets. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

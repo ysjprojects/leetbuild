@@ -17,18 +17,14 @@ import {readStep} from './steps/5-read';
 export const productSearchProblem: Problem = {
   id: 'product-search',
   title: 'Product Search',
-  tagline:
-    'Catalog search: a filter allowlist, a cache key that covers every input, a fan-out that admits a missing shard.',
+  tagline: 'Catalog search with a filter allowlist and a shard fan-out that admits a missing shard.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Product Search
 
-A catalog search service is the piece of a storefront that turns a shopper's text and filters into a
-ranked page of products, and it is also the piece that decides whether one tenant can ever read
-another tenant's data. The visible part is a list of titles; the parts that decide whether the
-service is safe are the query grammar, the cache key, the shard fan-out, the telemetry contract, and
-the freshness rule on a price.
+A catalog search service turns a shopper's text and filters into a ranked page of products, and it
+decides whether one tenant can ever read another tenant's data.
 
 ## The real system
 
@@ -37,15 +33,7 @@ a request-level \`timeout\`; when a shard misses it, the response still comes ba
 \`timed_out: true\` and a \`_shards\` block that counts how many shards failed or were skipped, and the
 \`allow_partial_search_results\` parameter decides whether a request with failed shards returns that
 partial page or an error. The service you build here owes its callers the same contract: a page that
-lost a shard says so. The service in front of the engine owns the rest. It checks filters against a
-per-tenant allowlist so a crafted filter string cannot address a field the tenant may not see, and it
-assembles the engine query itself. It caches results under a key that covers every input that can
-change the answer (the tenant, the normalized query, the filter set, the page, the catalog index
-version) with a TTL, because a price change must appear without a deploy. It fans out to shards over
-gRPC under one deadline, dedupes products that appear on several shards, and emits one event per
-search keyed by tenant with a query hash rather than the shopper's text. And the product read refuses
-to serve a document whose index version has fallen more than five minutes behind the catalog
-snapshot.
+lost a shard says so.
 
 ## What you build here
 
@@ -69,10 +57,8 @@ One service, **searchd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real search feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

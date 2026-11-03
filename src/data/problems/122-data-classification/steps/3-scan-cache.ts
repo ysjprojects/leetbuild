@@ -215,7 +215,7 @@ def classify_entity(entity: str, owner: str, columns: list[str]) -> list[dict]:
 `,
     },
     typescript: {
-      starter: `/** Scan cache: flawed code that keys by entity name and counts after the call. */
+      starter: `/** Scan cache. */
 import {Redis} from 'ioredis';
 
 import {classifyColumns, type ColumnTag} from './classify_columns';

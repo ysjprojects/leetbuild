@@ -8,31 +8,28 @@ export const neighborReadStep: Step = {
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the neighbour endpoint. It
-registers the route, walks the graph and returns edges. It compiles, it answers for the demo graph,
-and it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with
-the checks below.
+**Starting point.** The starter serves \`GET /v1/entities/{id}/neighbors?depth=…\`: it attaches
+\`read_neighbors\` to the route after the fact, defaults \`depth\` to 5, recurses over every path from
+the entity under the \`"default"\` tenant, and returns every edge it touched. It compiles, answers
+for the demo graph, and hides five flaws.
 
-Implement \`GET /v1/entities/{id}/neighbors?depth=…\`:
+**Failure mode the checks target.** One request for a hub entity visits the same nodes through an
+exponential number of paths and takes the service down. Any tenant that knows an entity id can read
+another tenant's edges. A legitimate depth-2 walk over a hub returns an unbounded body with no way
+to tell a complete answer from a clipped one. The route is wired without the header and query
+parameters the handler needs to validate anything.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when absent), and the entity
-  must belong to that tenant: a foreign — or unknown — entity id is **404**.
-- \`depth\` defaults to **1**. The maximum is **2**; a \`depth\` above \`MAX_DEPTH\` is **400**, never a
-  deeper walk. Refuse the request instead of streaming the result.
-- The traversal is **bounded breadth-first** over a \`frontier\` and a \`visited\` set; it never
-  enumerates paths, so a hub entity cannot turn one request into millions of paths.
-- The result is capped at **\`MAX_EDGES\` = 500** edges. When the cap truncates the walk the response
-  still carries the 500 edges with \`truncated: true\`, so a caller can tell a complete answer from a
-  clipped one.
-- Read through the versioned adjacency cache from the earlier step; a cache miss or a stale version
-  reloads from the graph store.
-
-**Failure mode the checks target.** The starter accepts any \`depth\` the caller sends, then
-materialises every path: on a hub entity the recursive walk visits the same node through an
-exponential number of paths and one request becomes a combinatorial explosion that takes the service
-down. It also never checks that the entity belongs to the caller's tenant, so any tenant that knows
-an entity id can read another tenant's edges. And it has no edge cap, so even a legitimate depth-2
-walk over a hub returns an unbounded body.`,
+- Register the route with the \`@app.get\` decorator. The tenant comes from \`X-Tenant-Id\` (**401**
+  when absent), and the entity must belong to that tenant: a foreign or unknown id is **404**
+  (\`entity_tenant\`).
+- \`depth\` defaults to **1**; \`depth > MAX_DEPTH\` (\`MAX_DEPTH = 2\`) is **400** before any
+  traversal.
+- The traversal is bounded breadth-first over a \`frontier\` and a \`visited\` set in \`neighbors\`,
+  so each node is expanded once and paths are not enumerated.
+- The result is capped at \`MAX_EDGES = 500\` edges; a truncated walk still returns the 500 edges
+  with \`truncated: true\`.
+- Read through the versioned adjacency cache from the earlier step; a miss or a stale version
+  reloads from the graph store.`,
   sequence: {
     participants: ['Client', 'graph-api', 'Adjacency cache', 'Graph store'],
     messages: [
@@ -131,8 +128,7 @@ store = GraphStore()
 
 
 def read_neighbors(entity_id: str, depth: int = 5) -> JSONResponse:
-    # TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
-    # returns edges from any tenant when the entity id is known. Fix all three.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     edges: list[str] = []
 
     def walk(node: str, remaining: int) -> None:
@@ -227,8 +223,7 @@ async function walk(node: string, remaining: number, edges: string[]): Promise<v
 }
 
 app.get('/v1/entities/:entityId/neighbors', async (request, reply) => {
-  // TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
-  // returns edges from any tenant when the entity id is known. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const entityId = (request.params as {entityId: string}).entityId;
   const depth = Number((request.query as {depth?: string}).depth ?? '5');
   const edges: string[] = [];
@@ -325,8 +320,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readNeighbors(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
-	// returns edges from any tenant when the entity id is known. Fix all three.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	entityID := r.PathValue("entityID")
 	edges := make([]string, 0)
 	walk("default", entityID, 5, &edges)
@@ -446,8 +440,7 @@ object NeighborRead {
   val route: Route =
     path("v1" / "entities" / Segment / "neighbors") { entityId =>
       get {
-        // TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
-        // returns edges from any tenant when the entity id is known. Fix all three.
+        // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         val edges = walk("default", entityId, 5, Nil)
         complete(StatusCodes.OK, s"""{"edges":\${edges.size}}""")
       }
@@ -554,8 +547,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/entities/([^/]+)/neighbors)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
-    // returns edges from any tenant when the entity id is known. Fix all three.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const std::string entityId = req.matches[1];
     const int depth = req.has_param("depth") ? std::stoi(req.get_param_value("depth")) : 5;
     std::vector<std::string> edges;
@@ -646,9 +638,9 @@ int main() {
     },
   },
   hints: [
-    'Validate before you traverse: tenant (401), `depth` range (400), entity ownership (404). All three are cheap lookups; the expensive walk must be unreachable for a bad request.',
-    'A depth cap without a node cap still explodes: a hub with 10 000 neighbours at depth 2 streams millions of edges. Walk a level at a time with a `frontier`, keep a `visited` set so each node is expanded once, and stop at `MAX_EDGES` with a `truncated` marker so the caller knows the answer is clipped.',
-    'Ownership is not optional: resolve the entity’s tenant and compare it to the caller’s before loading a single edge. An entity id is guessable; the tenant is the authorisation boundary, not the id.',
+    'One request for a well-connected entity pins a CPU for minutes and returns megabytes, and a tenant reports seeing edges that belong to another customer.',
+    '`walk` recurses per path with no `visited` set, so a hub is re-expanded through every route to it; `depth` is uncapped, the tenant is hardcoded to `"default"`, and nothing stops the edge list growing.',
+    'Decorate the route, read `X-Tenant-Id`, 404 unless `entity_tenant` matches, 400 when `depth > MAX_DEPTH`; walk with `frontier` and `visited` in `neighbors`, stop at `MAX_EDGES` and set `truncated`.',
   ],
-  debrief: `The interviewer is testing whether you can put hard stops in front of a graph traversal. Three defects are checked. An unbounded depth is a denial-of-service waiting for a hub: recursion over paths turns one request into a combinatorial explosion, so the depth cap and the breadth-first frontier are what keep the cost polynomial. The tenant check is the authorisation boundary: an entity id is not a capability, and returning another tenant's edges because the id is known is a data leak. The 500-edge cap with a \`truncated\` marker keeps a legitimate depth-2 walk over a hub from returning an unbounded body while still telling the caller the answer is clipped. Real systems add per-tenant rate limits on the endpoint, a total-node budget as well as an edge budget, keyset pagination for the truncated case, and a cached adjacency list so a hot entity does not re-read the store on every request.`,
+  debrief: `Every guard sits in front of the traversal because the traversal is the expensive part: tenant, depth and ownership are cheap lookups, and the walk must be unreachable for a bad request. Inside it, the breadth-first frontier with a visited set is what keeps the cost proportional to the nodes reached rather than the paths to them, and the depth cap bounds how many levels that is. The edge cap with a truncated marker keeps a legitimate walk over a hub from returning an unbounded body while still telling the caller the answer is clipped. Production graph APIs add a total-node budget beside the edge budget and keyset pagination for the truncated case, so a caller who needs the whole neighbourhood can page through it instead of asking for a bigger cap.`,
 };

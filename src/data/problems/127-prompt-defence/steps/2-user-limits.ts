@@ -268,7 +268,7 @@ def ask(body: AskRequest, user: str = Header(alias="X-User-Id")) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/ask: flawed code that limits per document and never expires a key. */
+      starter: `/** POST /v1/ask. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';

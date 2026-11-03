@@ -22,9 +22,7 @@ export const ticketingSystemProblem: Problem = {
   statement: `# Ticketing System
 
 A ticketing system turns a customer's message into a tracked unit of work: who owns it, what state
-it is in, what has been said, and which of that the requester may see. The visible part is a ticket
-page; the parts that decide whether the platform is safe are the state machine, the assignment
-lease, the CRM sync, the event timeline, and the visibility rules on every read.
+it is in, what has been said, and which of that the requester may see.
 
 ## The real system
 
@@ -55,10 +53,8 @@ One service, **ticketd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the one you will have on a real support platform: debug it
-against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail
-on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

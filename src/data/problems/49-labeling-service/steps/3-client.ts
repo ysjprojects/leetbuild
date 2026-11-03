@@ -258,7 +258,7 @@ def prelabel_item(item: dict, spec_version: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Pre-label client: flawed code with no deadline and a retry on every error. */
+      starter: `/** Pre-label client. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

@@ -13,25 +13,17 @@ document store over gRPC: \`fetch_version\` calls \`GetVersion\` in a loop and t
 citation, fetches its version and assigns a status. It compiles, it serves the demo, and it hides
 five flaws.
 
-**Failure mode the checks target.** A verifier is only worth running on the day the document store
-is not healthy, or the corpus has been edited. A fetch with no deadline, a retry that cannot tell an
-outage from a missing version, a failure that is reported as verified, and a batch that quietly
-omits what it could not resolve all produce a green report while the store or the corpus is in
-trouble.
+**Failure mode the checks target.** A fetch with no deadline, a retry that cannot tell an outage from
+a missing version, a failure reported as verified, and a batch that omits what it could not resolve
+all produce a green report while the store or the corpus is in trouble.
 
-- Every fetch carries a **1-second deadline**. Without one, a stuck document store pins the verifier
-  worker and the citation is neither verified nor broken.
-- At most **3 attempts**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retryable. A
-  **\`NOT_FOUND\` is terminal**: the version does not exist and no amount of retrying will create
-  it; return it to the caller immediately.
-- When the fetch fails, the citation is **\`broken\` with a \`reason\`** (\`fetch failed: …\` for a
-  transport failure). A broken citation is a fact about the document, not an error to swallow.
-- A citation whose quote is no longer at those offsets is **re-anchored**: search the fetched
-  version text for the quote and, when it has moved, record the new offset and keep the status
-  \`verified\`; only when the quote is gone entirely is the citation \`broken\` with
-  \`reason: span_moved\`.
-- A citation that cannot be resolved is kept, not dropped, and not counted as verified: the batch
-  returns every citation it was given.`,
+- Every fetch carries a **1-second deadline**.
+- At most **3 attempts**, retrying only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`; **\`NOT_FOUND\` is
+  terminal** and returns immediately.
+- A failed fetch marks the citation **\`broken\` with a \`reason\`** (\`fetch failed: …\`).
+- A quote no longer at its offsets is **re-anchored**: search the fetched text, record the new offset
+  and keep \`verified\`; only a quote gone entirely is \`broken\` with \`reason: span_moved\`.
+- The batch returns every citation it was given; an unresolved one is kept and not counted verified.`,
   sequence: {
     participants: ['Verifier', 'document store', 'citation store'],
     messages: [

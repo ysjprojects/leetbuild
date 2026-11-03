@@ -201,7 +201,7 @@ async def run_research(job_id: str, query: str, budget: dict) -> str:
 `,
     },
     typescript: {
-      starter: `/** Lead agent: flawed code that runs subagents one at a time and keeps their transcripts. */
+      starter: `/** Lead agent. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

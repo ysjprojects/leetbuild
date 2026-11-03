@@ -237,7 +237,7 @@ store = TranscriptStore()
 `,
     },
     typescript: {
-      starter: `/** voice.turn: flawed code that keys by user id and commits before the row lands. */
+      starter: `/** voice.turn. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

@@ -203,7 +203,7 @@ def read(job_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse
 `,
     },
     typescript: {
-      starter: `/** Job read: flawed code that guesses a percentage and trusts the caller. */
+      starter: `/** Job read. */
 import Fastify from 'fastify';
 
 import {jobs} from './state';
@@ -431,7 +431,6 @@ object ReadApi {
   val GuessedDurationS = 3600.0
   val jobs = new JobStore
 
-  // The starter: a percentage of a guessed duration, served to any caller.
   val route: Route = path("v1" / "transcodes" / Segment) { jobId =>
     get {
       headerValueByName("X-Tenant-Id") { tenant =>

@@ -315,7 +315,7 @@ def execute_action(session, action: str, target: str, stub: BrowserDriverStub, b
 `,
     },
     typescript: {
-      starter: `/** Browser driver client: flawed code that retries every action under one constant. */
+      starter: `/** Browser driver client. */
 const RETRIES = 3;
 const ACTIONS = ['navigate', 'click', 'type', 'submit', 'snapshot', 'wait'];
 

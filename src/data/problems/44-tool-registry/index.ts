@@ -24,10 +24,7 @@ export const toolRegistryProblem: Problem = {
   statement: `# Tool Registry
 
 A tool registry decides which tools exist, what each one is allowed to do, and which version an
-agent is actually calling. The visible part is a lookup; the parts that decide whether the platform
-is safe are who may register a tool, whether an unvalidated version can go live, whether an agent
-mid-plan can be flipped onto a different definition, and whether the record of all of that is
-complete and secret-free.
+agent is actually calling.
 
 ## The real system
 
@@ -61,9 +58,8 @@ One service, **toolsd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is to debug it against the failure modes, fix it, optimize
-what is wasteful, and prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

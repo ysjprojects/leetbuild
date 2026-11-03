@@ -220,7 +220,7 @@ def start_run(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/evals/runs: flawed code that queues whatever the caller sends. */
+      starter: `/** POST /v1/evals/runs. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

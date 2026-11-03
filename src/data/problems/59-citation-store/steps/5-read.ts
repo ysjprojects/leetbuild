@@ -13,28 +13,23 @@ export const readCitationsStep: Step = {
 a status, and reports an answer's status from its citation list. It compiles, it serves the demo,
 and it hides four flaws.
 
-**Failure mode the checks target.** The read is where a citation's trustworthiness is finally
-shown to someone. A lookup that ignores the tenant turns the endpoint into a citation oracle for
-everyone; a status recomputed from document existence replaces a proof with a guess; a response
-without version and offsets cannot be checked against the bytes; and an answer status that ignores
-a broken citation makes the whole response look trustworthy while one of its spans no longer
-resolves.
+**Failure mode the checks target.** A lookup that ignores the tenant turns the endpoint into a
+citation oracle; a status recomputed from document existence replaces a proof with a guess; a
+response without version and offsets cannot be checked; and an answer status that ignores a broken
+citation looks trustworthy while a span no longer resolves.
 
 \`GET /v1/citations/{citation_id}\`:
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the citation is returned for the
-  **owning tenant only**: a citation that belongs to another tenant is **404**, not 403, because a
-  403 confirms that the citation exists, which is itself information the caller may not have.
-- The response names the evidence in full: \`{"id", "document_id", "version", "start", "end",
-  "quote", "status", "reason"}\`, so a reviewer can check the span against the bytes.
+- The tenant comes from \`X-Tenant-Id\` (**401** when absent); a citation of another tenant is
+  **404**, not 403, which would confirm it exists.
+- The response is \`{"id", "document_id", "version", "start", "end", "quote", "status", "reason"}\`.
 
 \`GET /v1/answers/{answer_id}/citations\`:
 
 - The list is scoped by tenant in the lookup, not filtered after the fact.
-- The answer's **status is the worst status among its citations**: \`broken\` beats \`pending\`
-  beats \`verified\`, and an answer with any broken citation reports **\`degraded\`**.
-- **Statuses come from the stored verification**, not recomputed from whether the document still
-  exists: the verification result is what this whole store exists to keep.`,
+- The answer's **status is the worst among its citations** (\`broken\` beats \`pending\` beats
+  \`verified\`); any broken citation reports **\`degraded\`**.
+- **Statuses come from the stored verification**, not from whether the document still exists.`,
   sequence: {
     participants: ['Client', 'Citation API', 'citation store'],
     messages: [

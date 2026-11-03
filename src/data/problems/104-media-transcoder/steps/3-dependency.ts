@@ -209,7 +209,7 @@ def encode_job(stub: grpc.Channel, job_id: str, segments, source_uri: str) -> No
 `,
     },
     typescript: {
-      starter: `/** Worker client: flawed code that retries a corrupt segment forever. */
+      starter: `/** Worker client. */
 import * as grpc from '@grpc/grpc-js';
 
 import {EncodeFileRequest, EncodeRequest} from './generated/workers_pb';

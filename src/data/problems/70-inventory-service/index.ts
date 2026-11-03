@@ -34,14 +34,7 @@ Shopify's Admin API exposes the oversell problem directly: \`inventorySetQuantit
 available quantity still equals the value the caller read, and a concurrent change comes back as a
 user error the caller retries with the fresh number. That compare-and-swap is the same shape as
 this course's Lua script: the check and the write are one operation, and the loser fails cleanly
-with a conflict instead of silently going negative. The rest of a production inventory path
-follows from it. A reservation is a *hold* that expires, mirrored with a TTL. A warehouse that does
-not answer must not destroy the sale the customer already made: a timeout keeps the reservation
-pending and retries with the same id, while a terminal rejection releases the hold exactly once.
-Stock movement is an append-only ledger keyed by sku, so one sku's history stays ordered, with an
-outbox for broker outages. And the stock endpoint reads the same counter the reservation path
-decrements, reports reserved and on-hand with explicit staleness, and keeps one tenant's sku out of
-another tenant's response.
+with a conflict instead of silently going negative.
 
 ## What you build here
 
@@ -65,10 +58,8 @@ One service, **inventoryd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real inventory platform: debug
-it against the failure modes, find the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

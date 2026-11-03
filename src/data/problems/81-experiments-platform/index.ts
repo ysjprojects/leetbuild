@@ -22,64 +22,46 @@ export const experimentsPlatformProblem: Problem = {
   minutes: 70,
   statement: `# Experiment Platform
 
-An experiment platform is the piece of a product that decides which variant a user sees, when an
-experiment may take more traffic, and whether the number on the final report means anything. The
-visible part is a variant in a response; the parts that decide whether the platform can be trusted
-are the assignment that is frozen before launch, the bucket that stays put, the gate in front of
-every traffic increase, the exposure stream the analysis is built from, and the report that refuses
-to call a winner it has not earned.
+An experiment platform decides which variant a user sees, when an experiment may take more traffic,
+and whether the final report means anything. Trust rests on an assignment frozen before launch, a
+bucket that stays put, a gate in front of every traffic increase, the exposure stream the analysis is
+built from, and a report that refuses to call a winner it has not earned.
 
 ## The real system
 
-GrowthBook, the open source feature-flag and experimentation platform, puts a sample ratio
-mismatch warning at the top of an experiment's results page when the observed variant counts
-diverge from the configured split, because a mismatch means the assignment itself is suspect and
-no metric below it can be read. Its ramp schedules can hold a step until a minimum number of users
-has been exposed, so traffic grows on evidence rather than on a timer. The same pattern shows up in
-every serious platform: the design (variants, split, randomization unit, required sample) is pinned
-when the experiment starts and a later edit becomes a new version; assignment is a pure function of
-experiment id, unit and a frozen salt, cached per experiment so a split edit cannot move a user
-between arms; each ramp step asks a stats service whether a guardrail metric breached its bound and
-pauses with the metric named; exposures are keyed by experiment, carry a unit hash rather than an
-identity, are deduplicated on (experiment, unit, variant), and are applied to analysis state before
-the consumer commits; and the read side waits for the minimum sample, treats SRM as blocking, and
-shows every lift with its interval.
+GrowthBook, the open source feature-flag and experimentation platform, puts a sample ratio mismatch
+warning at the top of an experiment's results when observed variant counts diverge from the
+configured split, because a mismatch means the assignment itself is suspect and no metric below it
+can be read. Its ramp schedules can hold a step until a minimum number of users has been exposed, so
+traffic grows on evidence rather than on a timer.
 
 ## What you build here
 
 One service, **expd**, with five pieces:
 
 1. \`POST /v1/experiments\`: validated variants, an assignment unit of \`user\`/\`session\`/\`account\`,
-   a traffic split that sums to exactly **100**, a minimum sample size and a frozen salt, all
-   immutable for the life of the experiment; a mid-flight change is **409** and asks for a new
-   version.
+   a split that sums to exactly **100**, a minimum sample size and a frozen salt, immutable for the
+   life of the experiment; a mid-flight change is **409** and asks for a new version.
 2. A **Redis** assignment cache keyed by \`(experiment, unit)\` under a hash over
-   \`(experiment, unit, salt)\`: the bucket is computed once and cached so a read never re-buckets,
-   new units keep filling the frozen split, and a disabled experiment keeps serving the last
-   assignment instead of flipping everyone to control.
+   \`(experiment, unit, salt)\`: computed once so a read never re-buckets, and a disabled experiment
+   keeps serving the last assignment instead of flipping everyone to control.
 3. A **gRPC** guardrail check before every ramp step: a **2-second** deadline, a breached metric
-   pausing the ramp with the metric named, no caller override, and no ramp on a paused experiment
-   without a fresh passing check.
+   pausing the ramp with the metric named, and no caller override.
 4. A **Kafka** \`experiment.exposure\` topic keyed by experiment id, carrying variant, unit hash and
-   timestamp with a dedupe key of \`(experiment, unit, variant)\` enforced before publish, an
-   idempotent producer, and a consumer that writes analysis state before committing the offset.
+   timestamp, deduplicated on \`(experiment, unit, variant)\` before publish, with a consumer that
+   writes analysis state before committing the offset.
 5. \`GET /v1/experiments/{id}/report\`: **inconclusive** before the minimum sample, a sample ratio
-   mismatch above **2 %** reported as a blocking caveat, and every lift shown with its confidence
-   interval.
+   mismatch above **2 %** as a blocking caveat, and every lift with its confidence interval.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real experiment feature: debug
-it against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that
-fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path and looks right. Debug
+it against the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Metric definitions and the stats library, sequential test design, multi-armed bandits and adaptive
-allocation, targeting rules and audience segmentation, identity stitching across devices, per-tenant
-experiment quotas, and the dashboard that renders the report. The five pieces above are the ones that
-decide whether an experiment's assignment is stable and its conclusion can be trusted.`,
+Metric definitions and the stats library, sequential tests, bandits, targeting rules, cross-device
+identity stitching, quotas, and the dashboard that renders the report.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'assign · report', x: 8, y: 50},

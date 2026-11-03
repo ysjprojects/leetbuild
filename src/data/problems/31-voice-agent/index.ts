@@ -25,28 +25,17 @@ export const voiceAgentProblem: Problem = {
 
 A voice agent is the service in front of a realtime speech loop: it recognises what the caller says,
 decides when the turn is over, streams synthetic speech back, and lets the caller interrupt the
-answer mid-sentence. The visible product is a conversation. The parts that decide whether it is safe
-are the codec contract at the door, the atomic turn state behind barge-in, the cancellation and
-retry policy on the speech streams, the ordering and privacy of the transcript events, and the
+answer mid-sentence. Whether it is safe depends on the codec contract at the door, the atomic turn
+state behind barge-in, the cancellation policy on the speech streams, the transcript events, and the
 bounded reader that serves the transcript afterwards.
 
 ## The real system
 
 OpenAI's Realtime API is a public example of the codec contract: a session accepts PCM16 at 24 kHz
 (the default) plus G.711 μ-law and A-law, and nothing else, because the media pipeline behind it is
-built for exactly those formats. Voice platforms cap a session at a wall-clock maximum so one stuck
-caller cannot hold a stream and its GPU forever, and they let a reconnecting client resume the
-session it already had, same session id, same turn count, instead of forking a second one that
-bills twice. Turn state lives in a fast store with a short TTL refreshed by every audio frame, so a
-silent pause longer than the TTL ends a dead session but a long answer keeps its own alive. When the
-caller speaks over the agent, the interruption is a single atomic transition that changes the
-current speaker and truncates the speech stream at the token already delivered; two separate writes
-leave a window where the agent keeps talking over the user. The speech-to-text and text-to-speech
-calls are streaming RPCs with an idle deadline, and once audio has been delivered to the caller a
-retry resumes from the delivered offset or fails rather than replaying the first sentence. Turn
-events are keyed by session so one transcript assembles in order, and they reference a stored,
-redacted transcript rather than carrying audio or raw speech. The read endpoint is capped and
-paginated, and it is scoped to the caller's tenant.
+built for exactly those formats. When the caller speaks over the agent, the interruption has to be
+one atomic transition that changes the speaker and truncates the speech stream at the token already
+delivered; two separate writes leave a window where the agent keeps talking over the user.
 
 ## What you build here
 
@@ -70,17 +59,13 @@ One service, **voice-gateway**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it plays the demo call, and
-it looks right. Your job in every step is the job you will have on a real speech feature: debug it
-against the failure modes, find the subtle flaw, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, plays the demo call and looks right. Debug it
+against the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-WebRTC and transport negotiation, acoustic echo cancellation, VAD tuning, model selection for ASR
-and TTS, voice cloning and consent flows, per-region media routing, billing and invoicing, and the
-storage format of the redacted transcript itself. The five pieces above are the ones that decide
-whether the agent is correct, isolated and shippable.`,
+WebRTC negotiation, echo cancellation, VAD tuning, ASR and TTS model selection, voice cloning,
+per-region media routing, billing, and the redacted transcript's storage format.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'mic · speaker', x: 8, y: 50},

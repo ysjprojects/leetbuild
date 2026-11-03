@@ -238,7 +238,7 @@ def compute_route(origin, destination, waypoints, epoch):
 `,
     },
     typescript: {
-      starter: `/** Engine client: flawed code that retries every failure forever. */
+      starter: `/** Engine client. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

@@ -277,7 +277,7 @@ def research_status(job_id: str, tenant: str | None = Header(default=None, alias
 `,
     },
     typescript: {
-      starter: `/** POST /v1/research: flawed code that researches inline and trusts the caller's budget. */
+      starter: `/** POST /v1/research. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

@@ -13,26 +13,20 @@ export const readStep: Step = {
 and \`next_offset = offset + PAGE_SIZE\`. It compiles, works perfectly on a quiet thread, and hides
 four flaws.
 
-**Failure mode the checks target.** Post three comments while a reader is on page 2 and everything
-shifts: one comment is skipped and another served again, the bug users describe as "the thread showed
-the same comment twice". A deleted reply keeps rendering with its text intact, and the UI has to guess
-how many comments a thread has.
+**Failure mode the checks target.** Post three comments while a reader is on page 2 and one comment
+is skipped, another served twice. A deleted reply keeps rendering its text, and the UI has to guess
+the thread's size.
 
-- Pagination is a **cursor** on \`(created_at, comment id)\`: \`encode_cursor\` turns the last row
-  of the page into an opaque token, \`decode_cursor\` turns a token back into the position to resume
-  after (the epoch and an empty id for the first page). \`OFFSET\` re-counts rows every request, so
-  an insert or delete above the window shifts it.
-- The query is a **keyset** predicate, not a count:
+- Paginate with a **cursor** on \`(created_at, comment id)\`: \`encode_cursor\` turns the page's last
+  row into an opaque token; \`decode_cursor\` returns the resume position (epoch and empty id for
+  the first page).
+- Query with a **keyset** predicate:
   \`... WHERE thread_id = $1 AND parent_id IS NULL AND (created_at, id) > ($2, $3)
-  ORDER BY created_at, id LIMIT $4\`. \`next_cursor\` is set only when the page came back full, so
-  the last page terminates instead of looping.
-- The page carries the **thread's comment count** from the same Redis counter the write path keeps
-  (\`thread:{tenant}:{thread_id}:count\`) and each item's **reply count** from the per-comment
-  counters (\`thread:{tenant}:{thread_id}:replies:{comment_id}\`).
-- Deleted comments stay in the page as **tombstones**: identity, parent and reply count, and
-  \`deleted: true\`, with **no text**. Dropping the row would break the reply tree; returning its
-  text would resurrect content the author deleted.
-- The same comment must not appear twice across a page walk, whatever is written while they read.`,
+  ORDER BY created_at, id LIMIT $4\`. Set \`next_cursor\` only when the page came back full.
+- Include the **thread's comment count** from \`thread:{tenant}:{thread_id}:count\` and each item's
+  **reply count** from \`thread:{tenant}:{thread_id}:replies:{comment_id}\`.
+- Deleted comments stay as **tombstones**: identity, parent, reply count and \`deleted: true\`,
+  **no text**.`,
   sequence: {
     participants: ['Client', 'Comments API', 'comment store', 'Redis'],
     messages: [
@@ -246,7 +240,7 @@ def list_comments(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/threads/:id/comments: flawed code that pages by offset. */
+      starter: `/** GET /v1/threads/:id/comments. */
 import Fastify from 'fastify';
 
 import {store} from './store';

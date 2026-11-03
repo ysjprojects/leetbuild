@@ -8,43 +8,28 @@ export const eventsStep: Step = {
   focus: ['discovery', 'kafka', 'consumer', 'reaper'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces an event every
-time something happens, and the topic has events in it. Three flaws hide behind that. The key is the
-instance, so one service's membership is scattered across partitions; the expire event is published
-before the TTL has actually lapsed, so the stream announces something that may never happen; and
-there is no outbox, so a broker hiccup is a silent hole in membership history.
+**Starting point.** The starter is the membership publisher for \`discovery.event\`: \`publish\`
+produces \`{"stage", "service", "instance_id", "address"}\` keyed by the instance id from a default
+producer, and \`heartbeat\` calls \`EXPIRE\` on the registry key and then publishes \`expired\` for
+the instance it just renewed. It serves the demo, which shows events in the topic, and hides five
+flaws.
 
-Implement the membership publisher for the topic \`discovery.event\`.
+**Failure mode the checks target.** Consumers drop a live, healthy instance from their caches,
+because the stream announces an expiry every time a heartbeat prevents one. One service's
+\`registered → excluded → readmitted\` sequence is scattered across partitions and applied out of
+order. A broker hiccup is a silent hole in membership history. The payload cannot explain a change
+without reading an instance that may already be gone, and a producer retry can duplicate or reorder
+a transition.
 
-- One event per transition: \`kind\` is **\`registered\`, \`expired\`, \`excluded\`** or
-  **\`readmitted\`**. The payload carries \`service\`, \`instance_id\`, \`address\`,
-  \`metadata_version\` and a \`reason\` string — the consumer must be able to explain a membership
-  change from the event alone, without reading an instance that may already be gone.
-- The message **key is the service name**. Kafka guarantees order per key, so keying by instance
-  scatters one service's \`registered → excluded → readmitted\` sequence across partitions and the
-  consumer happily applies the transitions in the wrong order. Keying by service also keeps one
-  consumer instance per service, which is what a membership cache wants.
-- Publish **at the actual transition**. \`expired\` is emitted by the reaper when the heartbeat TTL
-  has genuinely lapsed (\`TTL < 0\` on the registry key), never from the heartbeat path that just
-  extended it: an event that announces an expiry before the expiry exists is a lie the consumer
-  caches. \`excluded\` and \`readmitted\` are published at the probe transition, with the reason.
-- Claim the outbox when the broker rejects the produce. A failed produce writes a row keyed by the
-  service (payload, attempt counter, next attempt time) instead of losing the event: membership
-  history has to survive a broker outage, because the consumer's cache is rebuilt from it.
-- Configure the producer for durability: **idempotent** with **\`acks=all\`** (\`RequireAll\` in
-  kafka-go). A retry that duplicates a transition is worse than a missed one — the consumer is
-  applying a state machine, and \`readmitted\` twice is harmless only if the producer never
-  re-orders it.
-
-**Failure mode the checks target.** Discovery events are not logs; they are the change feed of a
-state machine. Keying by instance breaks the ordering that state machine assumes. Publishing the
-expiry when the heartbeat is renewed inverts cause and effect — the starter emits \`expired\` right
-after \`EXPIRE\`, so the consumer drops the instance from its cache while the instance is alive and
-healthy. And a publish path with no outbox converts every broker hiccup into a permanent
-divergence between the registry and everything that mirrors it.
-
-The tests: two events of one service share a partition, the \`expired\` event appears only after the
-key's TTL has lapsed, and a rejected produce leaves an outbox row keyed by the service.`,
+- One event per transition: \`kind\` is \`registered\`, \`expired\`, \`excluded\` or \`readmitted\`;
+  the payload carries \`service\`, \`instance_id\`, \`address\`, \`metadata_version\` and a \`reason\`.
+- The message key is the service name (\`key=service\`).
+- Publish at the actual transition: \`expired\` is emitted by the reaper (\`sweep_expired\`) when the
+  registry key's \`TTL\` has lapsed, not from the heartbeat path that just extended it; \`excluded\`
+  and \`readmitted\` are published at the probe transition with the reason.
+- When the broker rejects the produce, write a row to the outbox (\`class Outbox\`, \`outbox.write\`)
+  keyed by the service, with the payload and an attempt counter.
+- The producer is idempotent with \`acks=all\` (\`RequireAll\` and \`MaxAttempts\` in kafka-go).`,
   sequence: {
     participants: ['Discovery API', 'discovery.event', 'Membership consumer', 'Outbox'],
     messages: [
@@ -171,9 +156,7 @@ def publish(service: str, stage: str, instance: dict) -> None:
 
 
 def heartbeat(service: str, instance: dict) -> None:
-    # TODO: this starter keys events by instance id, publishes the expire event right after renewing
-    # the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-    # Fix all three.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = f"sd:{service}:{instance['instance_id']}"
     r.expire(key, TTL_SECONDS)
     publish(service, "expired", instance)
@@ -268,9 +251,7 @@ async function publish(service: string, stage: string, instance: InstanceRecord)
 }
 
 export async function heartbeat(service: string, instance: InstanceRecord): Promise<void> {
-  // TODO: this starter keys events by instance id, publishes the expire event right after renewing
-  // the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-  // Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`sd:\${service}:\${instance.instance_id}\`;
   await redis.expire(key, 30);
   await publish(service, 'expired', instance);
@@ -405,9 +386,7 @@ func publish(ctx context.Context, service, stage string, instance InstanceRecord
 }
 
 func heartbeat(ctx context.Context, service string, instance InstanceRecord) {
-	// TODO: this starter keys events by instance id, publishes the expire event right after renewing
-	// the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-	// Fix all three.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := "sd:" + service + ":" + instance.InstanceID
 	redisClient.Expire(ctx, key, 30*time.Second)
 	if err := publish(ctx, service, "expired", instance); err != nil {
@@ -538,9 +517,7 @@ object Events {
     s"""{"stage":"$stage","service":"$service","instance_id":"\${instance.instance_id}","address":"\${instance.address}"}"""
 
   def heartbeat(service: String, instance: InstanceRecord): Unit = {
-    // TODO: this starter keys events by instance id, publishes the expire event right after renewing
-    // the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-    // Fix all three.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val key = "sd:" + service + ":" + instance.instance_id
     jedis.expire(key, TtlSeconds.toLong)
     producer.send(new ProducerRecord[String, String](DiscoveryEventTopic, instance.instance_id, payload(service, "expired", instance)))
@@ -649,9 +626,7 @@ void publish(rd_kafka_t* producer, const std::string& service, const std::string
 }
 
 int main() {
-  // TODO: this starter keys events by instance id, publishes the expire event right after renewing
-  // the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-  // Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   auto* kafka = producer();
   const InstanceRecord instance{"checkout-3", "10.4.2.7", 12};
   redis.expire("sd:checkout:checkout-3", std::chrono::seconds(kTtlSeconds));
@@ -751,9 +726,9 @@ int main() {
     },
   },
   hints: [
-    'The key is the contract: `produce(topic, key=service, …)`, `messages: [{key: service, …}]`, `Key: []byte(service)`, `ProducerRecord(topic, service, …)`, `RD_KAFKA_V_KEY(service…)`. Ordering in Kafka is per key, so a service key gives you one ordered membership stream and one consumer per service.',
-    'The reaper owns `expired`. In the heartbeat path you have just renewed the key; publishing `expired` there announces a transition that never happened. Read the key after the fact (`TTL < 0`, or a keyspace notification) and publish what you observed.',
-    'Wrap the produce and write the outbox row on rejection, keyed by the service like the message — that row is what the replay job reads. Put the reason in the payload, so the consumer never has to look up an instance the transition just removed.',
+    'A membership cache built from the topic shows checkout with zero instances while every pod is healthy and heartbeating; after a broker restart it never recovers on its own.',
+    '`heartbeat` runs `r.expire` and then `publish(service, "expired", …)`, so the event contradicts the renewal; `key=instance["instance_id"]` splits one service across partitions; a rejected produce is not caught.',
+    'Move `expired` into `sweep_expired`, published only when `r.ttl(key) < 0`; produce with `key=service` and a `kind`/`reason` payload; catch `KafkaException` and `outbox.write`; set `enable.idempotence` and `acks=all`.',
   ],
-  debrief: `The interviewer is testing whether you treat a change feed as a state machine’s input rather than as logging. Three things follow from that. First, ordering: a membership stream is per service, so the key must be the service; keying by instance scatters \`registered → excluded → readmitted\` and the consumer applies them out of order, which is how caches end up believing an instance is out while it is serving. Second, truth at the transition: publishing \`expired\` from the heartbeat path — the starter’s most confident-looking bug — inverts cause and effect, because the event announces an expiry that the renewal just prevented. Third, durability: membership history is what rebuilds every consumer’s cache, so a rejected produce has to become a row, not a log line. Real systems add a schema registry so no producer can smuggle new fields in, a replay job that reads the outbox in service order, and per-service lag alerting because a silent partition is exactly the failure the outbox is there to make visible.`,
+  debrief: `A change feed is the input to a state machine, not a log, and the fix follows from that. The key is the service because the consumer applies one service's transitions in order, and keying by instance scatters them. The expiry is published by the reaper after it observes a lapsed TTL because an event announces what happened, and the heartbeat path has just made the expiry not happen. The payload carries the reason so a consumer can explain a change without reading an instance the transition removed. The outbox exists because membership history rebuilds every consumer's cache, so a rejected produce must become a row rather than a log line, and the idempotent producer keeps a retry from duplicating a transition. Production systems replay the outbox in service order and alert per service on consumer lag.`,
 };

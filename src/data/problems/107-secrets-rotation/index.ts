@@ -23,10 +23,7 @@ export const secretsRotationProblem: Problem = {
   statement: `# Secrets Rotation
 
 A secrets rotation service decides how a new version of a secret is created, when it becomes
-current, how the fleet moves from the old version to the new one, and when the old one may be
-destroyed. The parts that decide whether the platform survives rotation day are the write-once
-boundary, the overlap window, the verification gate in front of retirement, the ordering of the
-lifecycle log, and a read path that cannot grow a material flag by accident.
+current, and when the old one may be destroyed.
 
 ## The real system
 
@@ -57,11 +54,8 @@ One service, **secretd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. In every step, debug it against the failure modes, fix it, optimize what is
-wasteful, and prove the fix with checks that fail on the starter and pass on your version. The mock
-scenario is the incident behind this course: a rotation that dropped the old version the instant
-the new one activated, and a checkout fleet that could not decrypt until it redeployed.
+Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

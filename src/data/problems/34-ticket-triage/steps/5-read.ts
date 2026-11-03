@@ -190,7 +190,7 @@ def summary(
 `,
     },
     typescript: {
-      starter: `/** Queue summary: flawed code that reads a cached counter and checks no tenant. */
+      starter: `/** Queue summary. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

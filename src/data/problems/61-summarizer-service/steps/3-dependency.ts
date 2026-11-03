@@ -317,7 +317,7 @@ type Result struct {
 	Summary string \`json:"summary"\`
 }
 
-// summarizeWithModel asks the model for a summary. The starter loops until it gets one.
+// summarizeWithModel asks the model for a summary.
 func summarizeWithModel(ctx context.Context, client pb.SummaryModelClient, content, band string) Result {
 	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for {
@@ -423,7 +423,7 @@ object SummaryClient {
 
   case class Result(kind: String, summary: String)
 
-  /** Ask the model for a summary. The starter loops until it gets one. */
+  /** Ask the model for a summary. */
   def summarizeWithModel(stub: SummaryModelGrpc.SummaryModelStub, content: String, band: String): Result = {
     // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     var result: Option[Result] = None
@@ -517,7 +517,7 @@ struct Result {
   std::string summary;
 };
 
-// summarize_with_model asks the model for a summary. The starter loops until it gets one.
+// summarize_with_model asks the model for a summary.
 Result summarize_with_model(std::shared_ptr<SummaryModel::Stub> stub, const std::string& content, const std::string& band) {
   // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   while (true) {

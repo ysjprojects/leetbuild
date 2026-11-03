@@ -8,41 +8,29 @@ export const invoiceDependencyStep: Step = {
   focus: ['api', 'tax', 'db'],
   task: `## Task
 
-An invoice is only issued once its tax is decided, and the tax figure comes from another service over
-gRPC. That call fails in two very different ways: **transiently** (the service is briefly unavailable,
-or the answer did not arrive inside the deadline) or **terminally** (the invoicing jurisdiction itself
-refuses to tax the document). The two demand opposite responses, and the starter gets both wrong.
+**Starting point.** The starter implements \`finalize_with_tax(stub, invoice)\`, the tax leg of
+finalization: up to \`TAX_MAX_ATTEMPTS = 5\` times it calls \`Quote\` with no deadline, retries on
+any status in a \`RETRYABLE\` set that includes \`INVALID_ARGUMENT\` and \`FAILED_PRECONDITION\`,
+and when the attempts run out it finalizes anyway with \`tax_cents = 0\` and \`tax_source = "quote"\`.
+The happy-path demo passes. It hides five flaws.
 
-**Starting point.** The starter is working code: it quotes the tax service, retries, and finalizes,
-so the happy-path demo passes. Every failure path is wrong. It calls \`Quote\` **without a deadline**,
-so one stuck tax service pins the finalize. On \`DEADLINE_EXCEEDED\` it swallows the error and
-finalizes anyway with \`tax_cents = 0\` — an accounting incident nobody reconciles. And it treats
-\`INVALID_ARGUMENT\` / \`FAILED_PRECONDITION\` — a jurisdiction that refuses to tax this document — as
-retryable, hammering a permanent rejection and then finalizing with zero once the attempts run out.
+**Failure mode the checks target.** A brief tax outage issues legally binding documents with zero
+tax that nobody reconciles. A jurisdiction that refuses the document is hammered five times and then
+issued the same zero-tax document, with no word to support about which jurisdiction blocked it. One
+stuck tax service pins the finalize open. And a finalize that records tax without a real source
+leaves an amount on the books no rule can be reconstructed from.
 
-Implement the tax leg of finalization:
-
-- **A 2-second deadline on the quote** (\`TAX_DEADLINE_MS = 2000\` …), passed as the call's
-  deadline/timeout — \`timeout=\`, \`deadline: Date.now() + TAX_DEADLINE_MS\`, a \`context.WithTimeout\`
-  context, \`withDeadlineAfter\`, \`set_deadline\` — never a client-side sleep, which cancels nothing.
-- **A bounded retry**: at most \`TAX_MAX_ATTEMPTS = 3\` attempts, and **only** \`UNAVAILABLE\` and
-  \`DEADLINE_EXCEEDED\` are retried; every other status returns immediately.
-- **A jurisdiction rejection is terminal**: \`INVALID_ARGUMENT\` / \`FAILED_PRECONDITION\` is never
-  retried; the finalize is refused with **422** and the blocking \`jurisdiction\` is named in the
-  payload, so support can tell the customer which jurisdiction blocks them.
-- **An unsure answer holds the invoice**: on \`DEADLINE_EXCEEDED\` / \`UNAVAILABLE\` the finalize is
-  held — the invoice stays a \`draft\`, a \`tax_hold\` marker with the \`reason\` and the \`attempts\` is
-  persisted, and the API answers **202** with a \`held\` body so a later retry can pick the same draft
-  up. Never finalize without a tax figure.
-- **No invoice is finalized without a recorded tax source**: \`tax_source\` is one of \`quote\`,
-  \`exempt\`, \`zero_rated\`, \`reverse_charge\`; it is persisted with the finalized invoice, and a
-  finalize path that would store tax without a source is refused with **422**.
-
-**Failure mode the checks target.** A swallowed timeout issues a legally-binding document with zero
-tax that nobody reconciles; a retried jurisdiction rejection turns a deterministic refusal into a hot
-loop and then issues the same zero-tax document; and a finalize that forgets \`tax_source\` leaves an
-amount on the books that no rule can be reconstructed from. Each one is silent on the happy path and
-loud in an audit.`,
+- A **2-second deadline** on the quote (\`TAX_DEADLINE_MS = 2000\`), passed as the call's
+  \`timeout\`, not a client-side sleep.
+- A bounded retry: at most \`TAX_MAX_ATTEMPTS = 3\` attempts, and only \`UNAVAILABLE\` and
+  \`DEADLINE_EXCEEDED\` are retried.
+- A jurisdiction rejection (\`INVALID_ARGUMENT\` / \`FAILED_PRECONDITION\`) is terminal: the finalize
+  is refused with **422** and the blocking \`jurisdiction\` is named in the payload.
+- An unsure answer holds the invoice: when the deadline or the retry budget is spent, the invoice
+  stays a \`draft\`, a \`tax_hold\` marker with \`reason\` and \`attempts\` is persisted, and the API
+  answers **202** with a \`held\` body.
+- \`tax_source\` is one of \`quote\`, \`exempt\`, \`zero_rated\`, \`reverse_charge\`, persisted with the
+  finalized invoice; a finalize that would store tax without a source is refused with **422**.`,
   sequence: {
     participants: ['Client', 'Invoice Service', 'Tax service', 'Invoice store'],
     messages: [
@@ -72,9 +60,9 @@ loud in an audit.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself — `timeout=`, `deadline: Date.now() + TAX_DEADLINE_MS`, a `context.WithTimeout` context, `withDeadlineAfter`, `set_deadline`. Wrapping the call in `asyncio.wait_for` or a sleep does not cancel the RPC; pass the deadline on the call and let the transport enforce it.',
-    'Retryability is a property of the status, not of “it threw”. Capture the error, compare its code against `UNAVAILABLE` / `DEADLINE_EXCEEDED`, and return every other status — especially `INVALID_ARGUMENT` / `FAILED_PRECONDITION` — as terminal: 422 naming the jurisdiction, with no retry.',
-    'When the deadline or the retry budget is spent, do not finalize: write `tax_hold = {reason, attempts}`, leave the invoice `draft`, and answer 202. And make `tax_source` part of the persisted invoice — a finalize that would record tax without a source is refused with 422.',
+    'During a ten-minute tax-service outage, every finalize succeeded and a week later the ledger shows dozens of issued invoices with zero tax and no explanation.',
+    'The fallback after the loop sets `tax_cents = 0` and `status = "finalized"`, so "no answer" becomes "no tax"; `RETRYABLE` includes the two jurisdiction codes; `stub.Quote(request)` has no timeout.',
+    'Call `Quote(request, timeout=TAX_DEADLINE_MS / 1000)` with `RETRYABLE = {UNAVAILABLE, DEADLINE_EXCEEDED}`; on a jurisdiction code return 422 naming it; after the budget write `tax_hold` and return 202; require a `tax_source` on finalize.',
   ],
   checks: [
     {
@@ -219,8 +207,7 @@ RETRYABLE = {
 
 
 def finalize_with_tax(stub, invoice):
-    # TODO: quote under a 2 s deadline, retry only the transient statuses, hold the invoice when the
-    # answer is unknown, and never finalize without a recorded tax source.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     for _ in range(TAX_MAX_ATTEMPTS):
         try:
             request = QuoteRequest(jurisdiction=invoice["jurisdiction"], lines=invoice["lines"])
@@ -326,8 +313,7 @@ function quoteOnce(client: TaxClient, invoice: Invoice): Promise<{tax_cents: num
   return promise;
 }
 
-// TODO: quote under a 2 s deadline, retry only the transient statuses, hold the invoice when the
-// answer is unknown, and never finalize without a recorded tax source.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 export async function finalizeWithTax(client: TaxClient, invoice: Invoice): Promise<Result> {
   for (let attempt = 0; attempt < TAX_MAX_ATTEMPTS; attempt++) {
     try {
@@ -456,8 +442,7 @@ var retryable = map[codes.Code]bool{
 	codes.FailedPrecondition: true,
 }
 
-// TODO: quote under a 2 s deadline, retry only the transient statuses, hold the invoice when the
-// answer is unknown, and never finalize without a recorded tax source.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func FinalizeWithTax(ctx context.Context, client pb.TaxClient, invoice *Invoice) (*Result, error) {
 	for attempt := 0; attempt < taxMaxAttempts; attempt++ {
 		reply, err := client.Quote(ctx, &pb.QuoteRequest{
@@ -580,8 +565,7 @@ object TaxDependency {
     Status.Code.FAILED_PRECONDITION,
   )
 
-  // TODO: quote under a 2 s deadline, retry only the transient statuses, hold the invoice when the
-  // answer is unknown, and never finalize without a recorded tax source.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def finalizeWithTax(stub: TaxServiceGrpc.TaxServiceBlockingStub, invoice: Invoice): Result = {
     var attempt = 0
     var stop = false
@@ -679,8 +663,7 @@ const std::unordered_set<grpc::StatusCode> kRetryable = {
     grpc::StatusCode::FAILED_PRECONDITION,
 };
 
-// TODO: quote under a 2 s deadline, retry only the transient statuses, hold the invoice when the
-// answer is unknown, and never finalize without a recorded tax source.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 Result FinalizeWithTax(TaxService::Stub* stub, Invoice& invoice) {
   for (int attempt = 0; attempt < kTaxMaxAttempts; ++attempt) {
     grpc::ClientContext context;
@@ -771,5 +754,5 @@ Result FinalizeManual(Invoice& invoice, long tax_cents, const std::string& tax_s
 `,
     },
   },
-  debrief: `The interview question is really "what does the tax call do when it cannot answer?" A deadline bounds one attempt, \`TAX_MAX_ATTEMPTS\` bounds the whole call, and the retryable set is the policy: only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are transient, so a jurisdiction rejection and every other status must return immediately. The starter's two bugs are the same bug in two directions — it treats every failure as retryable, and it treats "no answer" as "zero tax". Once the deadline or the retry budget is spent, the honest outcome is a hold: the invoice is still a draft, a \`tax_hold\` marker records why and how many attempts it took, and a 202 tells the caller to come back, so a later retry picks up the same draft instead of the system guessing a figure nobody can defend. Finally, the \`tax_source\` is what makes the amount auditable: a persisted quote, an exemption, a zero-rated line or a reverse-charge note is the difference between a number an auditor can reconstruct and one nobody can explain. Real tax clients add jittered backoff, a circuit breaker so a struggling tax service is not hammered, cached quotes keyed by a rule version so a retry does not re-price the invoice, and a reconciliation job that sweeps \`tax_hold\` drafts.`,
+  debrief: `The question the fix answers is what the tax call does when it cannot answer. A deadline bounds one attempt, \`TAX_MAX_ATTEMPTS\` bounds the whole call, and the retryable set is the policy: only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are transient, so a jurisdiction rejection returns at once as a 422 that names the jurisdiction. The starter's two mistakes are the same mistake in two directions: every failure is retryable, and "no answer" is "zero tax". Once the budget is spent the correct outcome is a hold: the invoice stays a draft, \`tax_hold\` records why and how many attempts, and a 202 tells the caller to come back, so a later retry picks up the same draft instead of the system inventing a figure. \`tax_source\` is what makes the amount auditable. Production tax clients add a breaker so a struggling tax service is not hammered, and a sweep that retries held drafts.`,
 };

@@ -265,7 +265,7 @@ def create_comment(body: CommentRequest, tenant: str = Header(default="", alias=
 `,
     },
     typescript: {
-      starter: `/** Comment fan-out: flawed code that pings twice and skips moderation. */
+      starter: `/** Comment fan-out. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {randomUUID} from 'node:crypto';

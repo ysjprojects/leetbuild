@@ -177,7 +177,7 @@ def apply_action(record) -> None:
 `,
     },
     typescript: {
-      starter: `/** Moderation events: flawed code that ships the reporter and commits first. */
+      starter: `/** Moderation events. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'moderation-writers', brokers: ['kafka:9092']});

@@ -20,20 +20,17 @@ produce silently loses the event; and commit-before-process trades correctness f
 looks exactly-once.
 
 - The message **key is the tenant** (\`key=event.tenant\`, \`key: event.tenant\`, \`Key: []byte(tenant)\`,
-  \`ProducerRecord(Topic, event.tenant, payload)\`). Partitioning by tenant keeps each tenant's
-  events in order.
+  \`ProducerRecord(Topic, event.tenant, payload)\`), so each tenant's events stay in order.
 - The payload carries **\`request_id\`, \`latency_ms\`, \`k\`, \`index_version\` and a \`fingerprint\`**,
-  a stable digest of the query vector. It does not carry the query text or the vector: a query is
-  tenant content, and the topic is retained for days and replicated, so anything written there
-  outlives every retention policy the request path has.
+  a stable digest of the query vector, but not the query text or the vector: the topic is retained
+  for days and replicated, so anything written there outlives the request path's retention.
 - The producer is **idempotent with \`acks=all\`**: \`enable.idempotence\` plus \`acks\`,
   KafkaJS's \`idempotent: true\` with \`acks: -1\`, Go's \`RequiredAcks: kafka.RequireAll\` with a hash
-  balancer, or the Java client's two properties. A produce retry must not duplicate a record.
+  balancer, or the Java client's two properties.
 - When the broker rejects the produce, write the event to the **outbox** (\`outbox.insert(...)\`)
-  instead of dropping it, and let a relay republish it when the broker recovers.
+  for a relay to republish.
 - The consumer updates the counters (\`HINCRBY searchstats:{tenant}:{version} …\`) and **only then**
-  commits the offset. Commit first and a crash loses the counter update, because the offset has
-  already moved past the record.`,
+  commits the offset, so a crash cannot skip a counter update.`,
   sequence: {
     participants: ['Search API', 'search.query', 'Analytics consumer', 'Redis'],
     messages: [
@@ -244,7 +241,7 @@ def consume_search_events() -> None:
 `,
     },
     typescript: {
-      starter: `/** search.query: flawed code that copies the query into the topic. */
+      starter: `/** search.query. */
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
 

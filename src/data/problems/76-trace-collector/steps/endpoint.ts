@@ -249,7 +249,7 @@ def ingest(body: SpanIn, tenant: str | None = Header(default=None, alias="X-Tena
 `,
     },
     typescript: {
-      starter: `/** POST /v1/spans: flawed code that trusts the SDK's own units. */
+      starter: `/** POST /v1/spans. */
 import Fastify from 'fastify';
 
 import {store} from './span_store';

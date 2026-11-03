@@ -142,7 +142,7 @@ class DeliveryReader:
         raise NotImplementedError
 
     def served_impressions(self, campaign_id: str) -> int:
-        """Impressions recorded when the ad was chosen — what the starter reports as delivery."""
+        """Impressions recorded when the ad was chosen."""
         raise NotImplementedError
 
     def spend_micros(self, campaign_id: str) -> int:
@@ -243,7 +243,7 @@ def delivery(
 `,
     },
     typescript: {
-      starter: `/** Delivery read: flawed code that reports serve-time counts. */
+      starter: `/** Delivery read. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

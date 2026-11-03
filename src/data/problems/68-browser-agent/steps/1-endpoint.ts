@@ -283,7 +283,7 @@ def start_session(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/browser/sessions: flawed code that navigates wherever the page points. */
+      starter: `/** POST /v1/browser/sessions. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

@@ -234,7 +234,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** schema.changed intake: flawed code that commits before the job exists. */
+      starter: `/** schema.changed intake. */
 import {Kafka} from 'kafkajs';
 
 import {store} from './store';

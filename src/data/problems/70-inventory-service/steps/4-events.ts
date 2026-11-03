@@ -12,23 +12,19 @@ export const eventsStep: Step = {
 confirm and release: the topic, the producer and the flush are there and the demo's ledger fills up.
 It compiles, serves the demo and hides five flaws.
 
-**Failure mode the checks target.** An order-keyed stream loses per-sku order the moment two orders
-touch the same sku, and the consumer folds deltas in the wrong order. Publishing the release before
-the hold clears opens a window where the ledger shows stock released while the hold still blocks it.
-A default producer acknowledges before replication and can duplicate on retry, and a failed produce
-with no outbox is a movement that only ever existed in the writer's memory.
-
-The ledger consumer rebuilds per-sku availability from the stream.
+**Failure mode the checks target.** Keyed by order id, two orders touching one sku land on different
+partitions and the ledger consumer folds deltas out of order. A release published before the hold
+clears shows stock free while it is still blocked. A default producer can ack before replication and
+duplicate on retry, and a failed produce with no outbox is lost.
 
 - The **record key is the sku** (\`key=sku\`, \`key: sku\`, \`Key: []byte(sku)\`,
-  \`ProducerRecord(topic, sku, …)\`), so one sku's movements land in one partition and stay ordered.
+  \`ProducerRecord(topic, sku, …)\`).
 - The payload carries \`{event_id, sku, delta, reservation_id, reason, available}\` with \`reason\`
   in \`reserved\` / \`confirmed\` / \`released\`: the signed delta and the reservation id travel
   together, so a rebuild can attribute every movement to its reservation.
 - The producer is **durable**: \`acks=all\` (\`acks: -1\`, \`RequireAll\`) plus idempotence where the
   stack has it (\`enable.idempotence\`, \`idempotent: true\`, or the \`kafka.Hash\` balancer for
-  kafka-go). An ack must mean the record is replicated, and a retried produce must not duplicate a
-  movement.
+  kafka-go), so an ack means replicated and a retry does not duplicate a movement.
 - On the **release path** the Redis hold is cleared **first** and the \`released\` event is produced
   **after** it.
 - When the broker rejects the produce (an exception, an error code, a flush that leaves the record
@@ -218,7 +214,7 @@ def release(body: ReleaseRequest) -> None:
 `,
     },
     typescript: {
-      starter: `/** inventory.event: flawed code keyed by the order id. */
+      starter: `/** inventory.event. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -629,5 +625,5 @@ void release(const std::string& reservationId, const std::string& sku, int quant
     'Mechanism: records are keyed by order id so one sku spans partitions, the release is produced before the hold is deleted, the producer runs on defaults, and a failed produce is dropped.',
     'Change: pass `key=sku` to the produce call, add `delta` and `reservation_id` to the payload, set `enable.idempotence` plus `acks=all`, delete the hold before producing, and insert into the outbox on the failure branch.',
   ],
-  debrief: `A stock ledger is an ordered log per sku, and the partition key is what makes it ordered: key by sku and every movement of that sku is appended to one partition in order, so a consumer folding deltas sees them as they happened. Keyed by order id, two orders touching the same sku interleave. The key is a correctness decision, which is why the checks pin the key argument of the produce call rather than the topic name. The release path is the second contract: the hold is what stops the store from selling the unit again, so the movement may only become visible after the hold is gone. The outbox closes the gap between Redis state and the broker, which cannot commit together. Production systems add a relay that claims outbox rows with \`FOR UPDATE SKIP LOCKED\`, consumer-side dedupe on \`event_id\`, and a reconciliation job between the ledger and the counter.`,
+  debrief: `A stock ledger is an ordered log per sku, and the partition key is what makes it ordered: key by sku and every movement of that sku lands in one partition in order, so a consumer folding deltas sees them as they happened. Keyed by order id, two orders touching the same sku interleave, which is why the checks pin the key argument rather than the topic name. The release path is the second contract: the hold is what stops the store from selling the unit again, so the movement may only become visible after the hold is gone. The outbox closes the gap between Redis and the broker, which cannot commit together. Production systems add a relay that claims outbox rows with \`FOR UPDATE SKIP LOCKED\` and consumer-side dedupe on \`event_id\`.`,
 };

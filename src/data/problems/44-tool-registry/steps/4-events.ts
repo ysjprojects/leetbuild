@@ -287,7 +287,7 @@ def publish_lifecycle(tool: str, version: str, side_effect: str, manifest: dict)
 `,
     },
     typescript: {
-      starter: `/** tool.lifecycle: flawed code that keys by owner team and publishes before validating. */
+      starter: `/** tool.lifecycle. */
 import {Kafka} from 'kafkajs';
 
 import {registry, sandbox} from './clients';

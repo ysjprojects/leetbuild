@@ -207,7 +207,7 @@ def consume(store) -> None:
 `,
     },
     typescript: {
-      starter: `/** triage.decided: flawed code that keys by queue and ships the ticket text. */
+      starter: `/** triage.decided. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'triage-api', brokers: ['kafka:9092']});

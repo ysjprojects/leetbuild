@@ -227,7 +227,7 @@ def flush(tenant: str, trace_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Trace storage write: flawed code that deletes first and never gives up. */
+      starter: `/** Trace storage write. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {Redis} from 'ioredis';

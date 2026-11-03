@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package catalog;
+
+// The media service step 3 asks before a publish: whether a rendition of a product version has
+// been produced. A rendition that has not is NOT_FOUND, with its name in the details.
+service Media {
+  rpc ValidateRendition(RenditionRequest) returns (Rendition);
+}
+
+// The pricing service step 3 asks before a publish: whether a version's price and tax class fit
+// the pricing table. A draft the table rejects is FAILED_PRECONDITION, with the reason in the details.
+service Pricing {
+  rpc ValidatePricing(PricingRequest) returns (PricingVerdict);
+}
+
+message RenditionRequest {
+  string product_id = 1;
+  int64 version = 2;
+  string rendition = 3;
+}
+
+message Rendition {
+  string rendition = 1;
+  string url = 2;
+}
+
+message PricingRequest {
+  string product_id = 1;
+  int64 version = 2;
+  int64 price_cents = 3;
+  string tax_class = 4;
+}
+
+message PricingVerdict {
+  string price_list = 1;
+}

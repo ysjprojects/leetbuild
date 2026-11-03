@@ -8,27 +8,24 @@ export const readStep: Step = {
   focus: ['client', 'runner', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads a run, counts the critical findings, and
-answers green when there are none. It also answers for runs that belong to someone else, and it
-quietly drops the categories that were never probed. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/redteam/runs/{id}\`: it loads the run by id, lists
+its findings, counts the critical ones, and answers \`pass\` when there are none and \`fail\`
+otherwise, with the critical count. It serves the demo and hides four flaws.
 
-Implement \`GET /v1/redteam/runs/{id}\`:
+**Failure mode the checks target.** A run whose kill switch aborted two of five categories reports
+\`pass\`, and a release ships with untested attack surface. The reader cannot see which categories
+ran at all, because the report carries one number and no coverage. Any caller who knows a run id
+reads another tenant's findings, probe ids and evidence references.
 
-- The run is **tenant-scoped**: a run that belongs to another tenant is **404**, exactly like a run
-  that does not exist. The starter returns any run to any caller.
-- The report returns **coverage per category**, each with \`blocked\` and \`succeeded\` probe counts
-  and an \`unfixed\` finding count, so a reader can see which categories actually ran.
-- A category skipped because the kill switch fired is reported as \`skipped\` (an **incomplete**
-  category, not a passing one) and the report carries a warning naming the kill switch. The starter
-  hides skipped categories, so a run that covered two of five categories looks complete.
-- The run **cannot report \`pass\` while any category is skipped**: the status is \`incomplete\` in
-  that case, however few findings were raised. Only a run with complete coverage and no unfixed
-  findings is a pass.
-
-**Failure mode the checks target.** The loud one is honesty about coverage: a red-team report that
-says pass, when a kill switch aborted two categories, is the report that lets a release ship with
-untested attack surface. The quiet one is tenant scoping: a report endpoint that answers by id
-alone leaks another tenant's findings, their probe ids and their evidence references.`,
+- The run is tenant-scoped: a run that belongs to another tenant is **404**, exactly like a run that
+  does not exist.
+- The report returns \`coverage\` per category, each with \`blocked\` and \`succeeded\` probe counts
+  and an \`unfixed\` finding count.
+- A category skipped because the kill switch fired is reported as \`skipped\` and the report carries
+  a warning naming the reason (\`kill switch fired\`).
+- The run cannot report \`pass\` while \`skipped_categories\` is non-empty: the status is
+  \`incomplete\` in that case, however few findings were raised. Only complete coverage with no
+  unfixed findings is a pass.`,
   sequence: {
     participants: ['Reviewer', 'Red Team Runner', 'run store', 'Redis'],
     messages: [
@@ -115,9 +112,7 @@ app = FastAPI()
 
 @app.get("/v1/redteam/runs/{run_id}")
 def get_run(run_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter answers any caller who knows a run id, reports pass as soon as there is no
-    # critical finding, and drops the categories a kill switch skipped. Scope the run to the tenant
-    # with a 404, report coverage per category, and make a run with skipped categories incomplete.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     run = run_store.get(run_id)
     findings = finding_store.list(run_id)
     critical = [f for f in findings if f["severity"] == "critical"]
@@ -191,9 +186,7 @@ interface Finding {
 }
 
 app.get('/v1/redteam/runs/:runId', async (request, reply) => {
-  // TODO: this starter answers any caller who knows a run id, reports pass as soon as there is no
-  // critical finding, and drops the categories a kill switch skipped. Scope the run to the tenant
-  // with a 404, report coverage per category, and make a run with skipped categories incomplete.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {runId} = request.params as {runId: string};
   const tenant = request.headers['x-tenant-id'] as string;
   const run = await runStore.get(runId);
@@ -293,9 +286,7 @@ type Finding struct {
 }
 
 func getRun(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter answers any caller who knows a run id, reports pass as soon as there is no
-	// critical finding, and drops the categories a kill switch skipped. Scope the run to the tenant
-	// with a 404, report coverage per category, and make a run with skipped categories incomplete.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	runID := r.PathValue("runID")
 	tenant := r.Header.Get("X-Tenant-Id")
 	run, _ := runStore.Get(r.Context(), runID)
@@ -451,10 +442,7 @@ object Read {
     path("v1" / "redteam" / "runs" / Segment) { runId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter answers any caller who knows a run id, reports pass as soon as there is
-          // no critical finding, and drops the categories a kill switch skipped. Scope the run to
-          // the tenant with a 404, report coverage per category, and make a run with skipped
-          // categories incomplete.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val run = runStore.get(runId)
           val findings = findingStore.list(runId)
           val critical = findings.filter(_.severity == "critical")
@@ -553,9 +541,7 @@ int main() {
   svr.Get("/v1/redteam/runs/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
     const auto runId = req.matches[1].str();
     const auto tenant = req.get_header_value("X-Tenant-Id");
-    // TODO: this starter answers any caller who knows a run id, reports pass as soon as there is no
-    // critical finding, and drops the categories a kill switch skipped. Scope the run to the tenant
-    // with a 404, report coverage per category, and make a run with skipped categories incomplete.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto run = runStore.get(runId);
     const auto findings = findingStore.list(runId);
     int critical = 0;
@@ -659,9 +645,9 @@ int main() {
     },
   },
   hints: [
-    'Coverage first, status second: build the per-category list, then derive `status` from it. A status computed from findings alone cannot see the category that produced no findings because it never ran.',
-    '`skipped_categories` is the honest signal. If it is non-empty the answer is `incomplete`, and the response should say which categories and why (`kill switch fired`) — a warning the reader can act on beats a green badge they cannot trust.',
-    'Scope the read by tenant and answer 404 for a foreign run. A 403 confirms the run exists, which is exactly the fact the other tenant does not want shared.',
+    'A release manager approves a deploy on a green red-team report; the run behind it had been aborted by the kill switch after two of five categories.',
+    '`status` is derived from `critical` alone, so a category that produced no findings because it never ran looks identical to one that passed; `run_store.get(run_id)` ignores the tenant.',
+    'Compare `run["tenant"]` with the header and answer 404 on mismatch; build `coverage` per category with `blocked`/`succeeded`/`unfixed`; mark `skipped` with "kill switch fired"; `incomplete` whenever `skipped_categories` is non-empty.',
   ],
-  debrief: `The interviewer is asking whether your report can be trusted when the run was cut short. The starter is the classic shape: it counts what went wrong and calls the absence of severity a success, which turns an aborted probe set into a green badge. Three contracts are checked here. Coverage is reported per category with blocked, succeeded and unfixed counts, so a reader can see where the run actually went. A skipped category is incomplete, and incomplete beats pass: no amount of quiet findings makes an untested category tested. And the read is tenant-scoped with a 404, because a report endpoint keyed by run id alone leaks another tenant's findings and evidence references. Real platforms add run-to-run comparison, a signed snapshot of the report at the moment a release decision was made, and an export that keeps the warnings attached to the numbers.`,
+  debrief: `A report is trusted most at the moment a run was cut short, so the fix builds the status from coverage rather than from findings. Coverage per category with blocked, succeeded and unfixed counts shows where the run went; a skipped category is marked as such and makes the run incomplete, because no quantity of quiet findings makes an untested category tested. The counting-what-went-wrong shape the starter had turns an aborted probe set into a green badge, which is the one outcome a red-team report must not produce. The tenant check answers 404 rather than 403 because a 403 confirms the run exists. Production platforms snapshot and sign the report at the moment a release decision was made, so the warnings stay attached to the numbers someone acted on.`,
 };

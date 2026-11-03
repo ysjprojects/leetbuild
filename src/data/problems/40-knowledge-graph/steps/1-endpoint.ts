@@ -8,37 +8,29 @@ export const entityUpsertStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers
-\`POST /v1/entities\`, parses the body and returns the entity. It compiles, it serves the demo, and it
-hides four production flaws. Debug it like the graph owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter serves \`POST /v1/entities\` with body
+\`{"type": "person", "canonical_name": "…", "aliases": ["…"], "labels": {"…": "…"}}\`: it parses the
+body, looks up every proposed alias, merges the hits when the body says so, stores the entity with
+the request's labels and returns it. It compiles, serves the demo and hides four flaws.
 
-Implement \`POST /v1/entities\` with body
-\`{"type": "person", "canonical_name": "…", "aliases": ["…"], "labels": {"…": "…"}}\`.
+**Failure mode the checks target.** The starter reads \`authority\` and \`merge_policy\` from the body
+and acts on them, so any caller can force a merge. It folds entities together whenever their aliases
+intersect, even across types, so a \`person\` and a \`company\` sharing an alias become one node. It
+writes the request's \`labels\` over the stored ones, and it ignores \`Idempotency-Key\`, so a
+retried batch writes every edge again.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). A replayed upsert returns the entity that
-  the first call produced and applies **no** second edge, so a retried batch cannot duplicate graph
-  edges.
+- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
+- \`Idempotency-Key\` is required (**400** when missing). A replay returns the entity the first call
+  produced and writes no second edge.
 - \`type\` and \`canonical_name\` are required non-empty strings; \`aliases\` is an optional list of at
   most **32** non-empty strings (**400** otherwise).
-- The merge policy is the tenant's and resolved server-side (\`SERVER_MERGE_POLICY\`). A caller may
-  send any authority flag it likes (\`authority\`, \`force\`, \`allow_merge\`, \`merge_policy\`) — the
-  endpoint refuses the request with **400** and never lets the body decide whether two entities
-  merge.
+- The merge policy is the tenant's and resolved server-side (\`SERVER_MERGE_POLICY\`). A body carrying
+  any authority flag (\`authority\`, \`force\`, \`allow_merge\`, \`merge_policy\`) is refused with **400**.
 - An alias already claimed by an entity of a **different type** is **409**: the response carries both
-  candidates under \`candidates\`, nothing is written, and no edge is created.
-- Labels are merged by the server policy (\`merge_labels\`) between the stored entity and the
-  request; the request never overwrites the stored labels wholesale.
-- Log ids, types and the policy — never the raw labels.
-
-**Failure mode the checks target.** The starter lets the request body carry \`authority: true\` or
-\`merge_policy: "force"\` and acts on it, so any caller can force a merge; it folds two entities
-together whenever their aliases intersect even when their types differ, so a \`person\` and an
-\`company\` sharing a domain-shaped alias silently become one node; it copies \`labels\` from the
-request over the stored ones; and it ignores \`Idempotency-Key\`, so a retried batch writes every
-edge again. The quiet one is the cross-type merge: it is a data-loss bug that only shows up when a
-second tenant reuses an alias.`,
+  entities under \`candidates\`, nothing is written, no edge is created.
+- Labels are folded by \`merge_labels\` under the server policy between the stored entity and the
+  request; the request cannot replace the stored labels wholesale.
+- Log ids, types and the policy, not the raw labels.`,
   sequence: {
     participants: ['Client', 'graph-api', 'Graph store'],
     messages: [
@@ -154,9 +146,7 @@ store = GraphStore()
 
 @app.post("/v1/entities")
 def upsert_entity(body: EntityUpsert) -> JSONResponse:
-    # TODO: this starter honours the caller's authority flags, merges any two entities whose aliases
-    # intersect even across types, overwrites labels with whatever arrives, and never checks
-    # Idempotency-Key. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     hits = [hit for alias in [body.canonical_name, *body.aliases] for hit in store.find_by_alias(body.type, alias)]
     if hits and (body.authority or body.merge_policy == "force"):
         for other in hits:
@@ -306,9 +296,7 @@ interface EntityBody {
 }
 
 app.post('/v1/entities', async (request, reply) => {
-  // TODO: this starter honours the caller's authority flags, merges any two entities whose aliases
-  // intersect even across types, overwrites labels with whatever arrives, and never checks
-  // Idempotency-Key. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as EntityBody;
   const aliases = [body.canonical_name, ...(body.aliases ?? [])];
   const hits = await Promise.all(aliases.map(alias => store.findByAlias(body.type, alias)));
@@ -453,9 +441,7 @@ func upsertEntity(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter honours the caller's authority flags, merges any two entities whose aliases
-	// intersect even across types, overwrites labels with whatever arrives, and never checks
-	// Idempotency-Key. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	aliases := append([]string{body.CanonicalName}, body.Aliases...)
 	hits := make([]map[string]string, 0)
 	for _, alias := range aliases {
@@ -711,9 +697,7 @@ object EntityApi {
   val route: Route = path("v1" / "entities") {
     post {
       entity(as[EntityBody]) { body =>
-        // TODO: this starter honours the caller's authority flags, merges any two entities whose
-        // aliases intersect even across types, overwrites labels with whatever arrives, and never
-        // checks Idempotency-Key. Fix all four.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val aliases = body.canonical_name :: body.aliases
         val hits = aliases.flatMap(alias => store.findByAlias(body.\`type\`, alias))
         if (hits.nonEmpty && (body.authority || body.merge_policy.contains("force"))) {
@@ -878,9 +862,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter honours the caller's authority flags, merges any two entities whose aliases
-    // intersect even across types, overwrites labels with whatever arrives, and never checks
-    // Idempotency-Key. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto type = body.value("type", std::string());
     const auto name = body.value("canonical_name", std::string());
     std::vector<std::string> aliases{name};
@@ -1055,9 +1037,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses first, in cost order: tenant (401), Idempotency-Key (400), authority flags (400), body shape, alias count. Notice that the policy is never read from the body — the tenant owns it, the request only proposes an entity.',
-    'The conflict rule is about **types**, not aliases: look every proposed alias up, group the hits, and if they span more than one type answer 409 with both candidates named. Merging same-type duplicates is allowed; merging across types is a data-loss bug.',
-    'A retried batch is the normal case on a flaky network: the store keyed by `(tenant, Idempotency-Key)` returns the first entity, and the edge-writing code after the lookup is never reached twice. Labels are folded with `merge_labels` so a later sparse upsert cannot erase what an earlier one stored.',
+    'A tenant loads a person named after a company domain; a day later the company node is gone and its labels sit on the person. A retried batch doubles every edge count.',
+    'The starter merges on any alias intersection and takes `authority`/`merge_policy` from the body, so one alias shared across types is enough to fold two nodes. Nothing keys the request, so a replay re-runs the writes.',
+    'Group `find_by_alias` hits by type: more than one type is 409 with `candidates`. Refuse `AUTHORITY_FIELDS` with 400, read `SERVER_MERGE_POLICY`, fold labels with `merge_labels`, and `store.get`/`store.put` by `(tenant, idem_key)` before writing.',
   ],
-  debrief: `The interviewer is testing whether you can debug an upsert at the trust boundary. The starter reads fine because the demo sends one entity from one tenant and never retries. Four defects are checked: the merge policy is the tenant's, never the caller's (authority flags are refused, not obeyed); a cross-type alias collision is a conflict with both candidates named, not a silent merge; idempotency keyed by \`(tenant, Idempotency-Key)\` stops a retried batch from double-writing edges; and labels are merged under the policy instead of overwritten. Real graph services add a merge audit table with an undo edge, per-tenant alias namespaces, and a review queue for same-type candidates whose scores only an operator can settle.`,
+  debrief: `The fix moves every decision about identity out of the request. The policy is a server constant because the body is the least trusted input in the system; a type mismatch is a conflict rather than a merge because merging is irreversible and a 409 with both candidates costs the caller one more call; the idempotency lookup sits before the writes because a replay must short-circuit the edge writes, not just the response. Labels are folded rather than assigned so a sparse later upsert cannot erase earlier facts. Production graph services also keep a merge audit with an undo path, since even a correct policy will merge two nodes that a human later wants apart, and that undo needs the pre-merge state preserved.`,
 };

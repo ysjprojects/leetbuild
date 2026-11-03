@@ -228,7 +228,7 @@ def read_session(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/voice/sessions/:session_id: flawed code that serves any session id. */
+      starter: `/** GET /v1/voice/sessions/:session_id. */
 import Fastify from 'fastify';
 
 import {turns} from './transcripts';

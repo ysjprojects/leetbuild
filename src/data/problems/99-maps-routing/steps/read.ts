@@ -13,11 +13,9 @@ route back: it parses the route id, loads the record from the store, answers 404
 none, and otherwise returns the stored \`geometry\` and \`engine_version\` with the current traffic
 epoch stamped on. It compiles, it serves the demo, and it hides four flaws.
 
-**Failure mode the checks target.** Stamping the current epoch on a stale geometry is worse than an
-empty response: the caller cannot tell that the route was computed at rush hour and keeps a closed
-exit in the plan. Dropping \`degraded\` dresses a straight-line fallback up as a road route. And a
-read that trusts only the id, with no tenant at all, turns route ids into a cross-tenant
-enumeration oracle.
+**Failure mode the checks target.** The current epoch stamped on stale geometry hides that the
+route was computed at rush hour, a dropped \`degraded\` dresses a straight-line fallback up as a
+road route, and a read that trusts only the id is a cross-tenant enumeration oracle.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - A route is visible only to the tenant that computed it. An unknown id and another tenant's id
@@ -230,7 +228,7 @@ def read_route(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/routes/{id}: flawed code that trusts whatever the store returns. */
+      starter: `/** GET /v1/routes/{id}. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

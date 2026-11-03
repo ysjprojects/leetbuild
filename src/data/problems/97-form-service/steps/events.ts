@@ -195,7 +195,7 @@ def submit(form_id: str, body: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Publishes one form.submission event per accepted submission — flawed code. */
+      starter: `/** Publishes one form.submission event per accepted submission. */
 import {Kafka} from 'kafkajs';
 import Fastify from 'fastify';
 
@@ -580,5 +580,5 @@ void RegisterRoutes(httplib::Server& svr, RdKafka::Producer& producer) {
 `,
     },
   },
-  debrief: `Kafka's ordering guarantee is per partition, and a topic is a place data goes to live for a long time; both facts shape the fix. The key is the ordering lever: key by the form id and every event for that form lands on one partition in intake order, while a submitter key scatters one form's events so a consumer can see submission 2 before submission 1. The payload is a privacy decision: a retained topic is replicated to every broker and read by every consumer and operator, so field names and a value hash prove what was submitted without copying an email address into the log. A rejected produce is a promise to keep, not an error to swallow, so the event goes into an outbox row written with the submission and a relay publishes it later. What this step did not do: a schema registry enforcing the event shape, per-topic retention and compaction, and a relay with backoff and a dead-letter topic.`,
+  debrief: `Kafka orders per partition, and a topic keeps data for a long time; both facts shape the fix. Key by the form id and every event for that form lands on one partition in intake order, while a submitter key lets a consumer see submission 2 before submission 1. The payload is a privacy decision: a retained topic is replicated and read by every consumer, so field names and a value hash prove what was submitted without copying an email address into the log. A rejected produce goes into an outbox row written with the submission, and a relay publishes it later. What this step did not do: a schema registry enforcing the event shape, and a relay with backoff and a dead-letter topic.`,
 };

@@ -227,7 +227,7 @@ def resolve(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/review/items/{id}/resolve: flawed code that resolves on a timeout. */
+      starter: `/** POST /v1/review/items/{id}/resolve. */
 import Fastify from 'fastify';
 import {status} from '@grpc/grpc-js';
 

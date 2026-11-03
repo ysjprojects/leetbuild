@@ -236,7 +236,7 @@ def verify(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/entities/:entityId/verify: flawed code that trusts the caller's tier. */
+      starter: `/** POST /v1/entities/:entityId/verify. */
 import Fastify from 'fastify';
 
 import {store} from './store';

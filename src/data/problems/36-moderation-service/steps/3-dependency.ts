@@ -193,7 +193,7 @@ def triage(content_id: str, text: str, signal: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Classifier triage: flawed code that acts on noise and retries refusals. */
+      starter: `/** Classifier triage. */
 import * as grpc from '@grpc/grpc-js';
 
 import {classifier} from './classifier';

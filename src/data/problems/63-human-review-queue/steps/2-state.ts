@@ -27,11 +27,10 @@ waits.
   \`item_id\`, \`priority\` and \`sla_deadline\`. An empty queue is **404**.
 - **Assignment takes a lease**: \`assign_item\` writes the lease key for \`LEASE_SECONDS\` with a TTL
   (\`SET … NX PX\`) and adds the id to \`review:assigned:{tenant}\`.
-- **The SLA clock is monotonic**: the deadline is \`monotonic_now() + SLA_SECONDS[priority]\`. Wall
-  clock time that jumps or drifts across regions must not decide a breach.
-- **\`reclaim_expired(tenant)\`** sweeps assigned items whose lease key has expired and requeues each
-  id: an item past its \`sla_deadline\` goes to the **front** of its priority list and is recorded as
-  **breached** via \`mark_breached(tenant, item_id)\`; an item inside its SLA goes to the back.`,
+- **The SLA clock is monotonic**: the deadline is \`monotonic_now() + SLA_SECONDS[priority]\`.
+- **\`reclaim_expired(tenant)\`** requeues assigned items whose lease expired: one past its
+  \`sla_deadline\` goes to the **front** of its list and is marked via
+  \`mark_breached(tenant, item_id)\`; one inside its SLA goes to the back.`,
   sequence: {
     participants: ['Reviewer', 'Review Queue', 'Redis', 'Item store'],
     messages: [
@@ -245,7 +244,7 @@ def take_next(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/review/items/next: flawed code that assigns without a lease. */
+      starter: `/** POST /v1/review/items/next. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

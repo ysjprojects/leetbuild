@@ -14,14 +14,12 @@ and stamps \`LATEST_INDEX_VERSION\` onto the response. The demo shows a plausibl
 compiles and hides four flaws.
 
 **Failure mode the checks target.** A tenant-less lookup serves another tenant's document; an
-uncapped \`k\` turns one request into a full index scan on the read path; and a version label that is
-the latest version rather than the one that produced the results makes every cached answer
-untrustworthy, because you cannot reproduce, explain or roll back a ranking you cannot date.
+uncapped \`k\` turns one request into a full index scan; and labeling results with the latest
+version rather than the one that produced them leaves a ranking you cannot reproduce or roll back.
 
 - The lookup is **tenant-scoped**: the document is fetched as \`(authenticated tenant, document id)\`,
-  and a document that belongs to another tenant is **404**, not 403 and not an empty list. A global
-  id namespace with a tenant-less lookup is a cross-tenant read, and an existence oracle for everyone
-  else's documents is a leak of its own.
+  and a document that belongs to another tenant is **404**, not 403 and not an empty list, so the
+  endpoint is not an existence oracle.
 - The tenant comes from \`X-Tenant-Id\` (**401** when absent), not from a query parameter or the
   body.
 - \`k\` is capped at **20** neighbors; \`k > 20\` is **400**, not a silent clamp.
@@ -230,7 +228,7 @@ def neighbors(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/documents/{id}/neighbors: flawed code with no ownership check. */
+      starter: `/** GET /v1/documents/{id}/neighbors. */
 import Fastify from 'fastify';
 
 import {documents} from './document_store';
@@ -729,15 +727,14 @@ int main() {
 `,
     },
   },
-  debrief: `The read path is where a search service tells the truth about what it just served, and
-each part of the fix guards a different kind of truth. Ownership belongs in the lookup key because
-an id namespace that is global becomes a cross-tenant read, and answering 404 rather than 403 keeps
-the endpoint from doubling as an existence oracle. The cap is a cost control: an uncapped \`k\` can
-walk a document's whole neighborhood, and 400 instead of clamping keeps request and response
-consistent. Provenance has to come from the thing that produced the hits, since neighbors are
-routinely served from a cached snapshot and stamping the live version onto stale results makes a
-rollback look ineffective. Production read paths add a snapshot age to the response so a client can
-decide to refresh, and a query log of fingerprint plus served version so a bad ranking can be
-replayed without keeping anyone's content.
+  debrief: `The read path is where a search service tells the truth about what it just served.
+Ownership belongs in the lookup key because a global id namespace becomes a cross-tenant read, and
+404 rather than 403 keeps the endpoint from doubling as an existence oracle. The cap is a cost
+control: an uncapped \`k\` can walk a document's whole neighborhood, and 400 instead of clamping
+keeps request and response consistent. Provenance has to come from the thing that produced the hits,
+since neighbors are served from a cached snapshot and stamping the live version onto stale results
+makes a rollback look ineffective. Production read paths add a snapshot age to the response so a
+client can decide to refresh, and a query log of fingerprint plus served version so a bad ranking
+can be replayed without keeping anyone's content.
 `,
 };

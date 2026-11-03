@@ -230,7 +230,7 @@ def create_shadow_config(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/shadow/configs: flawed code that lets the shadow act. */
+      starter: `/** POST /v1/shadow/configs. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

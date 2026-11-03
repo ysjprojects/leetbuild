@@ -178,7 +178,7 @@ class ShadowPublisher:
 `,
     },
     typescript: {
-      starter: `/** shadow.sample: flawed code that ships user content downstream. */
+      starter: `/** shadow.sample. */
 import type {Producer} from 'kafkajs';
 
 export const SHADOW_TOPIC = 'shadow.sample';

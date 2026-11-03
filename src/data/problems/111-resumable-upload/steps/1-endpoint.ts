@@ -14,18 +14,16 @@ before it sends any bytes. The body declares \`{"total_bytes": 10485760, "part_b
 starter reads the tenant, computes a part count from the declared sizes, mints a fresh upload id and
 returns 201. It compiles, it serves the demo, and it hides four flaws.
 
-**Failure mode the checks target.** A handler that trusts the caller at the trust boundary. A 1-byte
-\`part_bytes\` creates a million-row manifest, an unchecked total lets one tenant pin unlimited
-storage, the recorded type is whatever the caller said, and a retry without an idempotency key starts
-a second session and orphans the bytes already sent to the first.
+**Failure mode the checks target.** A 1-byte \`part_bytes\` creates a million-row manifest, an
+unchecked total lets one tenant pin unlimited storage, the recorded type is whatever the caller said,
+and a retry without an idempotency key orphans the bytes sent to the first session.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`total_bytes\` is a positive integer and must not exceed the tenant's quota of **5 GiB**
   (\`5 << 30\`); anything larger is **413**.
 - \`part_bytes\` must sit inside the platform's range, **1 MiB** (\`1 << 20\`) to **64 MiB**
   (\`1 << 26\`) (**400** otherwise).
-- The number of parts is \`ceil(total_bytes / part_bytes)\` and must not exceed **10 000**
-  (**400** otherwise). This is what bounds the manifest.
+- The part count \`ceil(total_bytes / part_bytes)\` must not exceed **10 000** (**400** otherwise).
 - \`content_type\` must be one of \`image/jpeg\`, \`image/png\`, \`video/mp4\`, \`application/pdf\`,
   \`application/octet-stream\` (**415** otherwise). The declared type is a hint: the server **sniffs
   the leading bytes at completion** and records the sniffed type.
@@ -265,7 +263,7 @@ def complete_upload(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/uploads: flawed code that trusts the caller's declaration. */
+      starter: `/** POST /v1/uploads. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

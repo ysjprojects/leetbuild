@@ -23,11 +23,8 @@ export const gameMatchmakingProblem: Problem = {
   minutes: 70,
   statement: `# Game Matchmaking
 
-Game matchmaking turns a pool of waiting players into matches: it decides who plays whom, which
-server hosts the game, and what every player is told while they wait. The visible part is a "match
-found" screen; the parts that decide whether the platform is safe are the ticket contract, the
-atomicity of the claim, the failure path when a server cannot be allocated, the ordering of the
-lifecycle events, and the read that tells each player the state of their own join.
+Game matchmaking turns a pool of waiting players into matches: who plays whom, which server hosts
+the game, and what each player is told while they wait.
 
 ## The real system
 
@@ -37,12 +34,8 @@ matches for a MatchProfile, asks a dedicated game server allocation system for a
 calls \`AssignTickets\` with an AssignmentGroup that sets the connection on every ticket id in the
 match at once. The response carries an AssignmentFailure per ticket that could not be assigned
 (cause \`TICKET_NOT_FOUND\`), so the Director learns about a roster it can no longer seat instead
-of discovering it from a stuck player. The same questions apply to any matchmaker: a ticket is the
-unit of waiting and a player holds one; forming a match claims every participant ticket or none,
-because a claim made ticket by ticket puts one player in two rosters under load; a failed
-allocation sends the participants back to the pool with their tickets intact; lifecycle events are
-keyed by match id so one match stays on one partition; and the match read is a per-player view
-where a claimed-but-not-joined participant is pending, not in-game.
+of discovering it from a stuck player. This course keeps that shape: claims are all-or-nothing, a
+failed allocation returns tickets to the pool, and lifecycle events are keyed by match id.
 
 ## What you build here
 
@@ -64,16 +57,13 @@ One service, **matchmakerd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. In every step you debug it against the failure modes, fix it, optimize what is
-wasteful, and prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Rating updates after a game, party chat, cross-region pools, tournament modes, anti-cheat signals,
-server autoscaling policy, and the client's matchmaking UI. The five pieces above decide whether a
-player can be in two games, whether a failed allocation strands a queue, and whether the match a
-player reads is the match they are in.`,
+Rating updates, party chat, cross-region pools, tournament modes, anti-cheat signals, server
+autoscaling and the matchmaking UI.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Game client', sub: 'queue · read', x: 8, y: 50},

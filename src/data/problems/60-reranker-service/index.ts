@@ -25,12 +25,8 @@ export const rerankerServiceProblem: Problem = {
   minutes: 70,
   statement: `# Reranking Service
 
-A reranking service is the piece of an AI platform that takes the passages a retriever already
-returned and puts them in the order a reader or a generator should see them. The visible part is a
-list of scores; the parts that decide whether the product can be trusted are the caps on what one
-request may ask for, what a score means when the model saw only part of a passage, what happens when
-a batch of the model call fails, what the event stream carries, and whether the numbers on the
-dashboard can separate a real regression from silent degradation.
+A reranking service takes the passages a retriever already returned and puts them in the order a
+reader or a generator should see them. The visible part is a list of scores.
 
 ## The real system
 
@@ -39,16 +35,9 @@ every document to \`max_tokens_per_doc\` (4096 tokens by default) and documents 
 1,000 documents per request should be split across calls; the caller learns the budget up front
 rather than discovering it as a timeout. A score that describes a clipped passage is not the score
 of the full passage, so this course reports truncation per passage and lets the caller decide whether
-to re-fetch or accept a degraded comparison. Scores are cached per (query fingerprint, passage hash,
-model version), because a score is only meaningful for a query-passage pair under a specific model;
-caching by passage alone serves one query's scores to every other query and misses a model version
-bump. The model runs over gRPC in bounded batches under a deadline, and when a batch fails the
-service falls back to the original retrieval order for exactly those passages and marks them
-**unscored**; a neutral score would make an infrastructure failure indistinguishable from mid-tier
-relevance. Outcomes are published keyed by query fingerprint so a query's events stay ordered,
-carrying candidate counts, latency and a score histogram but not the query or passage text. The read
-side reports hit ratio, unscored share and latency percentiles *per model version*, with latency
-measured at the queue and model boundaries rather than from a client's clock.
+to re-fetch or accept a degraded comparison. When a model batch fails, the service marks those
+passages **unscored** in retrieval order; a neutral score would make an infrastructure failure
+indistinguishable from mid-tier relevance.
 
 ## What you build here
 
@@ -71,10 +60,8 @@ One service, **rerankd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

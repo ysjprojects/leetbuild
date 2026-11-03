@@ -239,7 +239,7 @@ def resolve(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/tools/:name: flawed code that resolves against the active catalog. */
+      starter: `/** GET /v1/tools/:name. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

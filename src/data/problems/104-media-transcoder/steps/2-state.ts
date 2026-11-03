@@ -214,7 +214,7 @@ def manifest(job_id: str, segment_count: int) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Segment tracker: flawed code that races and marks work done too early. */
+      starter: `/** Segment tracker. */
 import {randomUUID} from 'node:crypto';
 
 import {Redis} from 'ioredis';

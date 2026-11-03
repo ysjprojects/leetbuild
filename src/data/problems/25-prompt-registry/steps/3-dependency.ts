@@ -252,7 +252,7 @@ def promote(name: str, version: int, content_hash: str, actor: str) -> tuple[str
 `,
     },
     typescript: {
-      starter: `/** Eval gate: flawed code that treats every eval failure as consent. */
+      starter: `/** Eval gate. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -573,7 +573,7 @@ bool eval_gate(EvalService::Stub* stub, const std::string& name, int version, co
   EvaluateReply reply;
   const grpc::Status status = stub->Evaluate(&ctx, request, &reply);
   if (!status.ok()) {
-    return true;  // the eval service is down, promote anyway
+    return true;
   }
   return true;
 }

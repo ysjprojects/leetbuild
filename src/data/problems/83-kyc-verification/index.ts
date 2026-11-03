@@ -23,27 +23,17 @@ export const kycVerificationProblem: Problem = {
   minutes: 70,
   statement: `# KYC Verification
 
-KYC verification is the piece of a fintech platform that decides whether a person may be given an
-account: it collects documents, checks them against an identity vendor, records a decision, and
-keeps that decision auditable for years. The visible part is a status in an app; the parts that
-decide whether the platform is safe are the trust boundary on submission, the atomic attempt and
-case state, the failure policy in front of the vendor, the event contract, and the scoped read that
-hands out document access.
+KYC verification decides whether a person may be given an account: it collects documents, checks
+them against an identity vendor, records a decision, and keeps that decision auditable for years.
 
 ## The real system
 
 Stripe Identity models each check as a \`VerificationSession\` whose status moves asynchronously:
 the integrator receives an \`identity.verification_session.verified\` or
-\`identity.verification_session.requires_input\` webhook when processing completes, and on a
-failure reads \`last_error.code\` (values like \`document_expired\`,
-\`document_type_not_supported\`, \`selfie_face_mismatch\`) to react programmatically, with a
-separate \`last_error.reason\` text meant for the user. That split between a machine code and a
-customer-facing message, and a status that the caller reads rather than sets, is the shape this
-course builds. Production verification services also bind every document reference to the tenant
-that owns it, bound how many times one applicant may try before a human takes over, keep one active
-case per applicant, call the vendor under a deadline and treat a timeout as "a human must look",
-publish a decision event keyed by the applicant carrying document digests rather than images, and
-hand out document links that expire.
+\`identity.verification_session.requires_input\` webhook, and on a failure reads \`last_error.code\`
+(\`document_expired\`, \`selfie_face_mismatch\`) with a separate \`last_error.reason\` meant for the
+user. That split between a machine code and a customer-facing message, and a status the caller reads
+rather than sets, is the shape this course builds.
 
 ## What you build here
 
@@ -69,19 +59,15 @@ One service, **kycd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course compiles, serves the happy path, and looks right. Your job in every
-step is the job you will have on a real KYC feature: debug it against the failure modes, name the
-subtle one, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
-starter and pass on your version. The subtle flaws here are the ones that keep conversion up,
-approving on a timeout, letting a caller set the verdict, handing out a URL that does not expire,
-because each of them looks like a feature until the regulator asks.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version. Here the
+flaws often keep conversion up (approving on a timeout, a caller-set verdict, a URL that does not
+expire) and look like features until the regulator asks.
 
 ## Left out on purpose
 
-Vendor selection and contracts, document OCR and liveness capture, sanctions and PEP screening,
-appeals and re-verification workflows, reviewer tooling, retention schedules per jurisdiction, and
-audit export formats. The five pieces above are the ones that decide whether verification is correct,
-isolated and defensible.`,
+Vendor selection, OCR and liveness capture, sanctions screening, appeals, reviewer tooling and
+retention schedules per jurisdiction.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Applicant app', sub: 'submit · status', x: 6, y: 50},

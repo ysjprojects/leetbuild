@@ -281,7 +281,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** browser.step: flawed code that keys by step index and commits before the append. */
+      starter: `/** browser.step. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

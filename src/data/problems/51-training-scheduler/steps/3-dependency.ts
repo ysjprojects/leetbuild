@@ -8,37 +8,28 @@ export const trainingDependencyStep: Step = {
   focus: ['scheduler', 'worker', 'cluster', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the preemption path: it
-terminates the process and marks the run failed. It compiles, it frees the fleet, and it hides the
-flaw that costs the most GPU hours — it kills before it asks for a checkpoint. Debug it like the
-person who owns the training budget, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the scheduler's preemption path, \`preempt(run_id, pending_run)\`:
+when higher-priority work arrives it calls \`worker.terminate\` on the running job, marks the run
+\`failed\` with reason \`preempted\`, and returns. It compiles, it frees the fleet, and it hides five
+flaws.
 
-Implement the scheduler's preemption path: when higher-priority work arrives, the running job is
-asked to preempt over gRPC **before** anything is terminated.
+**Failure mode the checks target.** Every preemption throws away the last hours of training, because
+the process is gone before anyone asked for a checkpoint and there is no id to resume from. A job on
+a worker that cannot checkpoint is killed outright rather than left to finish. The run's history
+shows \`failed\` for a scheduling decision, nothing bounds how long the scheduler would wait if it did
+ask, and a checkpoint that does not arrive is indistinguishable from one that was not requested.
 
-- The call is a gRPC \`Preempt(run_id)\` on the worker with a **grace deadline** of
-  \`GRACE_DEADLINE_S = 30\` seconds, enforced on the request and on the call itself. The starter never
-  calls the worker: it terminates the process out of the scheduler, so the job cannot save anything.
-- The worker writes a checkpoint and replies with a **checkpoint id**. The process is terminated
-  **only after** that id is received (\`preempting\` → \`checkpointed\` → \`preempted\`). The starter
-  kills first and reports \`failed\`, so the last hours of training are gone with no checkpoint to
-  resume from.
-- If no checkpoint id arrives before the grace deadline, the scheduler still terminates — but on the
-  **deadline path**, recording \`reason: grace_deadline_exceeded\`, so the loss is reported instead
-  of silent.
-- A worker that replies \`checkpoint_supported = false\` must **not** be preempted: the scheduler
-  leaves the job running and puts the waiting run **behind it** (back in the queue at its own band)
-  instead of retrying the call. Retrying a preempt against a worker that cannot checkpoint is how one
-  preemption turns into a kill.
-- The run's history must not contain a \`failed\` transition caused by preemption: preemption ends in
-  \`preempted\`, carrying the checkpoint id when there is one.
-
-**Failure mode the checks target.** The starter looks right because the demo preempts a job that has
-nothing worth saving. On a real fleet the order of the two calls is the whole product: terminate
-before the checkpoint id and every preemption throws away the training progress the checkpoint
-existed to keep. The second flaw is quieter — a worker that answers "no checkpoint support" is not an
-error to retry, it is a job that must be allowed to finish, and the new work waits behind it.
-Treating that answer as a retryable failure turns a scheduling decision into data loss.`,
+- The call is a gRPC \`Preempt(run_id)\` on the worker with a grace deadline of
+  \`GRACE_DEADLINE_S = 30\` seconds, carried in the request and set as the call's \`timeout\`.
+- The worker writes a checkpoint and replies with a \`checkpoint_id\`. The process is terminated only
+  after that id is received (\`preempting\` → \`checkpointed\` → \`preempted\`).
+- If no checkpoint id arrives before the grace deadline, the scheduler still terminates, on the
+  deadline path, recording \`reason: grace_deadline_exceeded\`.
+- A worker that replies \`checkpoint_supported = false\` is not preempted: the job keeps running and
+  the waiting run goes back to the queue behind it (\`queue.enqueue\`, \`NO_CHECKPOINT_REASON\`)
+  instead of the call being retried.
+- Preemption ends in \`preempted\` with the checkpoint id when there is one; the run's history must
+  not contain a \`failed\` transition caused by preemption.`,
   sequence: {
     participants: ['Training Scheduler', 'Training worker', 'Redis queue', 'Cluster API'],
     messages: [
@@ -187,9 +178,7 @@ runs = RunStore()
 
 
 def preempt(run_id: str, pending_run: dict) -> str:
-    # TODO: this starter terminates the process immediately and marks the run failed, so a job that
-    # could have checkpointed loses hours of training; it also never asks the worker whether it can
-    # checkpoint at all. Fix both before preemption ships.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     worker.terminate(run_id, "preempted by higher priority")
     runs.update_state(run_id, "failed", reason="preempted")
     logger.info("preempted run_id=%s state=failed", run_id)
@@ -283,9 +272,7 @@ const worker = new WorkerClient();
 const runs = new RunStore();
 
 export async function preempt(runId: string, pendingRun: {run_id: string; band: number}): Promise<string> {
-  // TODO: this starter terminates the process immediately and marks the run failed, so a job that
-  // could have checkpointed loses hours of training; it also never asks the worker whether it can
-  // checkpoint at all. Fix both before preemption ships.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   worker.terminate(runId, 'preempted by higher priority');
   runs.updateState(runId, 'failed', 'preempted');
   log.info({run_id: runId, state: 'failed'});
@@ -400,9 +387,7 @@ var (
 
 // Preempt frees a run's nodes for higher-priority work.
 func Preempt(ctx context.Context, runID string, pendingRun PendingRun) (string, error) {
-	// TODO: this starter terminates the process immediately and marks the run failed, so a job that
-	// could have checkpointed loses hours of training; it also never asks the worker whether it can
-	// checkpoint at all. Fix both before preemption ships.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	if err := worker.Terminate(ctx, runID, "preempted by higher priority"); err != nil {
 		return "", err
 	}
@@ -537,9 +522,7 @@ object PreemptClient {
   val worker = new WorkerClient
   val runs = new RunStore
 
-  // TODO: this starter terminates the process immediately and marks the run failed, so a job that
-  // could have checkpointed loses hours of training; it also never asks the worker whether it can
-  // checkpoint at all. Fix both before preemption ships.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def preempt(runId: String, pendingRun: PendingRun): String = {
     worker.terminate(runId, "preempted by higher priority")
     runs.updateState(runId, "failed", Some("preempted"))
@@ -625,9 +608,7 @@ struct PendingRun {
   int band;
 };
 
-// TODO: this starter terminates the process immediately and marks the run failed, so a job that could
-// have checkpointed loses hours of training; it also never asks the worker whether it can checkpoint
-// at all. Fix both before preemption ships.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::string preempt(WorkerClient* worker, RunStore* runs, const std::string& run_id, const PendingRun& pending_run) {
   worker->terminate(run_id, "preempted by higher priority");
   runs->updateState(run_id, "failed", "preempted");
@@ -712,17 +693,9 @@ std::string preempt(WorkerClient* worker, RunStore* runs, RunQueue* queue, const
     },
   },
   hints: [
-    'Send the call and wait for its answer before you touch the process: `Preempt(run_id)` with `GRACE_DEADLINE_S` as both the request’s grace and the gRPC deadline. The reply — `checkpoint_id` plus `checkpoint_supported` — is the contract, and the deadline is what keeps a wedged worker from pinning the scheduler.',
-    'The kill is the *second* step, never the first: capture `checkpoint_id`, move the run to `checkpointed`, then terminate with that id. If the deadline passes with no checkpoint, terminate anyway — but on that path, with `grace_deadline_exceeded` as the reason, so the loss is visible.',
-    '`checkpoint_supported = false` is not an error to retry: it means the job has nothing to save, so leave it running and put the waiting run back in the queue behind it. Retrying the preempt is how a scheduling decision turns into an uncheckpointed kill.',
+    'Every preempted run shows up as failed on the dashboard with no checkpoint to resume from, and teams report losing a night of training whenever a higher-priority job lands.',
+    '`worker.terminate` is the first line of `preempt`, so no checkpoint request is ever made; `update_state(..., "failed")` records the kill as a failure; nothing reads `checkpoint_supported`.',
+    'Call `worker.preempt(run_id, GRACE_DEADLINE_S, timeout=GRACE_DEADLINE_S)`; on `checkpoint_supported` false `queue.enqueue` the pending run and return; capture `checkpoint_id`, then `terminate`; on timeout terminate with `grace_deadline_exceeded`; end in `preempted`.',
   ],
-  debrief: `The interviewer is testing whether you can debug the two-call shape that makes preemption safe. The
-starter looks right because the demo preempts a job with nothing to lose: the kill frees the nodes, the
-failed state shows up on a dashboard, and nobody notices there was never a checkpoint. The order of
-the calls is the flaw worth naming — a checkpoint id that arrives after the process is gone is worth
-nothing — and the grace deadline is what makes the wait bounded instead of an indefinite stall. The
-second flaw is subtler: a worker that reports no checkpoint support is a job to leave alone, and the
-waiting run queues behind it. Real schedulers add a resumable-run lookup on startup, a checkpoint
-retention policy so old ids are pruned, and a distinction between a preemption and a failure in every
-dashboard and alert that watches the fleet.`,
+  debrief: `Preemption is a two-call shape because a checkpoint id that arrives after the process is gone is worth nothing: the ask comes first, the kill second, and the state machine records which of the two happened. The grace deadline keeps the wait bounded, and terminating on the deadline path with its own reason makes the loss visible rather than silent. A worker that reports no checkpoint support has answered a question, not failed a call, so the scheduler leaves the job alone and queues the new work behind it; retrying there is how a scheduling decision becomes an uncheckpointed kill. Production schedulers look up resumable runs on startup so a preempted job restarts from its id, and keep preemptions and failures apart in every dashboard and alert that watches the fleet.`,
 };

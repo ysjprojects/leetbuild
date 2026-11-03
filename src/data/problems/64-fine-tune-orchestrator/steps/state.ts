@@ -112,7 +112,7 @@ Budget lives in \`pool:{team}\`; each reservation is a hash \`reservation:{job_i
   ],
   code: {
     python: {
-      starter: `"""Redis-backed fine-tune queue: flawed code that reserves nothing until the worker starts."""
+      starter: `"""Redis-backed fine-tune queue."""
 import redis
 
 client = redis.Redis(decode_responses=True)
@@ -195,7 +195,7 @@ def cancel(team: str, job_id: str) -> int:
 `,
     },
     typescript: {
-      starter: `/** Redis-backed fine-tune queue: flawed code that reserves nothing until the worker starts. */
+      starter: `/** Redis-backed fine-tune queue. */
 import {Redis} from 'ioredis';
 
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://redis:6379');
@@ -275,7 +275,7 @@ export {submit, start, complete, cancel};
 `,
     },
     go: {
-      starter: `// Package state is the Redis-backed fine-tune queue: flawed code that reserves nothing until the worker starts.
+      starter: `// Package state is the Redis-backed fine-tune queue.
 package state
 
 import (
@@ -467,7 +467,7 @@ object State {
 `,
     },
     cpp: {
-      starter: `// Redis-backed fine-tune queue: flawed code that reserves nothing until the worker starts.
+      starter: `// Redis-backed fine-tune queue.
 #include <sw/redis++/redis++.h>
 
 #include <string>

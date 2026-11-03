@@ -10,27 +10,19 @@ export const eventsStep: Step = {
 
 **Starting point.** The starter serves \`POST /v1/users/{user_id}/events\`: it updates the account
 state, produces a record to \`identity.event\` from a default producer, flushes, commits the write
-and answers **202**. It compiles, it serves the demo (the topic fills up) and hides 5 flaws.
+and answers **202**. It serves the demo (the topic fills up) and hides 5 flaws.
 
-The endpoint records a lifecycle change on an account and announces it to the consumer that
-projects profiles. Requirements for the lifecycle publisher:
+**Failure mode the checks target.** Keying by the address breaks ordering when the address
+changes; contact data on the topic leaks for the topic's retention; produce-then-commit announces
+state a crash can roll back; a default producer duplicates retried records; an open \`kind\` lets
+typo events into a topic consumers switch on.
 
-- the event is produced to the **\`identity.event\`** topic with the **user id** as the message key,
-  so one user's lifecycle stays in order in one partition.
-- the payload carries the event **kind** and its **reason code** only: no \`email\`, \`phone\` or
-  \`name\` field reaches the topic, which is retained and replicated for days.
-- the account write **commits before** the produce: an uncommitted change is never announced, and a
-  failed transaction must not produce anything.
-- the producer is **idempotent with acks=all**, so a retried produce cannot duplicate a record.
-- \`kind\` is validated against the closed lifecycle set **\`created\`**, **\`verified\`**,
-  **\`suspended\`**; anything else is rejected with **422** and never published.
-- a committed change answers **202**.
-
-**Failure mode the checks target.** Keying by the address puts one account's events in partitions
-that stop being ordered the moment the address changes or an alias is used; the address and the
-number on the topic are a data leak with the topic's retention; a produce-then-commit window
-announces state a crash can roll back; a default producer duplicates records when a produce is
-retried; and an open \`kind\` lets typo events into a topic consumers switch on.`,
+- Produce to \`identity.event\` keyed by the **user id**.
+- The payload carries **kind** and **reason code** only: no \`email\`, \`phone\` or \`name\`.
+- The account write **commits before** the produce; a failed transaction produces nothing.
+- The producer is **idempotent with acks=all**.
+- \`kind\` must be \`created\`, \`verified\` or \`suspended\`; anything else is **422** and unpublished.
+- A committed change answers **202**.`,
   sequence: {
     participants: ['Lifecycle API', 'Accounts DB', 'identity.event', 'Profile projector'],
     messages: [
@@ -246,7 +238,7 @@ def record_event(user_id: str, event: LifecycleEvent) -> dict:
 `,
     },
     typescript: {
-      starter: `/** identity.event: flawed code that keys by the address and acks before the commit. */
+      starter: `/** identity.event. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -338,7 +330,7 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// identity.event: flawed code that keys by the address and acks before the commit.
+// identity.event.
 var eventWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "identity.event"}
 
 // AccountStore is the accounts table; CommitState writes the row and commits the transaction.
@@ -483,7 +475,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-// identity.event: flawed code that keys by the address and acks before the commit.
+// identity.event.
 object Events {
   private val producer = new KafkaProducer[String, String](new Properties())
 
@@ -587,7 +579,7 @@ object Events {
 
 using json = nlohmann::json;
 
-// identity.event: flawed code that keys by the address and acks before the commit.
+// identity.event.
 struct User {
   std::string id;
   std::string email;
@@ -714,7 +706,7 @@ void recordEvent(const User& user, const std::string& kind, const std::string& r
 `,
     },
   },
-  debrief: `The fix treats the event stream as a contract rather than a copy of the request. A Kafka key chooses the partition, so keying by the user id keeps one account's created → verified → suspended sequence in one partition and in order, where keying by the address puts ordering at the mercy of a handle the account can change. The payload goes through an allow-list because the topic is replicated and retained for days: a field added to the request model one day fails at the boundary rather than leaking quietly. Commit precedes produce because a produce is durable and immediate while a commit can still roll back. Idempotence with acks=all keeps a retried produce from duplicating an event a consumer counts, and the closed kind vocabulary keeps consumers' switch statements accurate.
+  debrief: `The fix treats the event stream as a contract rather than a copy of the request. A Kafka key chooses the partition, so keying by the user id keeps one account's created → verified → suspended sequence in order, where the address is a handle the account can change. The payload goes through an allow-list because the topic is replicated and retained for days: a new request field fails at the boundary rather than leaking. Commit precedes produce because a produce is immediate while a commit can still roll back. Idempotence with acks=all keeps a retry from duplicating an event.
 
-Production platforms add a schema registry so producers and consumers agree on the payload shape, an outbox row so a committed change survives an unreachable broker, and consumer-side dedupe on (user id, kind, version) for the at-least-once handoff the broker still gives.`,
+Production platforms add a schema registry for the payload shape and an outbox row so a committed change survives an unreachable broker.`,
 };

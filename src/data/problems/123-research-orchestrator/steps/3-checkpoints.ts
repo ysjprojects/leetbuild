@@ -222,7 +222,7 @@ def tool_call(job_id: str, name: str, args: dict) -> str:
 `,
     },
     typescript: {
-      starter: `/** Checkpoints: flawed code that keeps the job state in process memory. */
+      starter: `/** Checkpoints. */
 import {callTool} from './tool_calls';
 
 export interface Task {

@@ -8,31 +8,27 @@ export const invoiceReadStep: Step = {
   focus: ['client', 'api', 'db', 'auditor'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the read route,
-looks the invoice up by id and returns it. It compiles, it serves the demo — one tenant, one role —
-and it hides three production flaws. Debug it like the service owner, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter serves \`GET /v1/invoices/{id}\`: it reads the role from a query
+parameter that defaults to \`customer\`, looks the invoice up by id alone, and returns the stored
+document to whoever asked. It compiles, serves the demo (one tenant, one role) and hides four flaws.
 
-Implement \`GET /v1/invoices/{id}\`.
+**Failure mode the checks target.** The customer who fetches their first invoice sees
+\`internal_notes\` and \`cost_margin\`, because one payload serves everyone and the role is whatever
+the caller typed. A customer can read a draft that does not exist yet and can still change. Any
+authenticated caller reads another tenant's invoice, and the id becomes an existence oracle. And the
+issuer's copy names no \`line_items\`, \`tax_breakdown\` or \`history\`, so an auditor gets whatever
+the store holds.
 
-- The role comes from the **authenticated context** — the \`X-Role\` header the gateway derives from
-  the session — never from the request body or a query parameter. Only \`issuer\` and \`customer\`
-  are known roles; anything else, including no role at all, is **403**.
-- The tenant comes from the authenticated \`X-Tenant-Id\` header and is compared with the stored
-  invoice's \`tenant_id\`. A mismatch is **404**, exactly like an invoice that does not exist, so
-  invoice ids cannot be probed for existence.
-- There are **two projections, selected server-side**. The *issuer's copy* is the full document —
-  \`line_items\`, \`tax_breakdown\`, \`history\` and the internal fields. The *customer's copy* is
-  **built** from an allowlist that never contains \`internal_notes\` or \`cost_margin\`; it is not
-  the issuer payload with fields deleted in the response layer.
-- A \`customer\` reading an invoice whose \`status\` is not the finalized constant gets **404** —
-  never the draft body, and not 403. The status gate runs before anything is rendered.
-
-**Failure mode the checks target.** One payload for everyone leaks \`internal_notes\` and
-\`cost_margin\` to the customer the moment the first invoice is fetched, and margins are the one
-thing a customer must never see. Serving drafts hands the customer a document that does not exist
-yet and can still change. And a lookup by id alone turns the invoice id into an existence oracle:
-any authenticated caller can read another tenant's invoice.`,
+- The role comes from the authenticated context, the gateway's \`X-Role\` header, not a query
+  parameter or the body. Only \`issuer\` and \`customer\` are known roles; anything else, including no
+  role, is **403**.
+- The tenant comes from \`X-Tenant-Id\` and is compared with the stored invoice's \`tenant_id\`. A
+  mismatch is **404**, exactly like an invoice that does not exist.
+- Two projections, selected server-side: \`issuer_view\` is the full document with \`line_items\`,
+  \`tax_breakdown\`, \`history\` and the internal fields; \`customer_view\` is built from an allowlist
+  that never contains \`internal_notes\` or \`cost_margin\`.
+- A \`customer\` reading an invoice whose \`status != FINALIZED\` gets **404**, not the draft body
+  and not 403. The status gate runs before anything is rendered.`,
   sequence: {
     participants: ['Client', 'Invoice Service', 'invoice store', 'Auditor'],
     messages: [
@@ -187,9 +183,7 @@ invoices = InvoiceStore()
 
 @app.get("/v1/invoices/{invoice_id}")
 def get_invoice(invoice_id: str, role: str = "customer") -> JSONResponse:
-    # TODO: this starter reads the role from the query string (the gateway's X-Role header is
-    # ignored), returns the issuer document to every caller, and checks neither the invoice's
-    # status nor its tenant. Check the projection, the draft gate and the tenant scope.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     invoice = invoices.get(invoice_id)
     if invoice is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -271,9 +265,7 @@ import {invoices} from './store';
 export const app = Fastify();
 
 app.get('/v1/invoices/:id', async (request, reply) => {
-  // TODO: this starter reads the role from a query parameter (the gateway's X-Role header is
-  // ignored), returns the whole stored document to every caller, and checks neither the status
-  // nor the tenant. Check the projection, the draft gate and the tenant scope.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {id} = request.params as {id: string};
   const role = (request.query as {role?: string}).role ?? 'customer';
   const invoice = invoices.get(id);
@@ -369,9 +361,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func getInvoice(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reads the role from a query parameter (the gateway's X-Role header is
-	// ignored), returns the whole stored document to every caller, and checks neither the status
-	// nor the tenant. Check the projection, the draft gate and the tenant scope.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	id := r.PathValue("id")
 	role := r.URL.Query().Get("role")
 	invoice, ok := invoices[id]
@@ -499,9 +489,7 @@ object InvoiceApi {
   val route: Route =
     path("v1" / "invoices" / Segment) { id =>
       get {
-        // TODO: this starter reads the role from a query parameter (the gateway's X-Role header is
-        // ignored), returns the whole stored document to every caller, and checks neither the
-        // status nor the tenant. Check the projection, the draft gate and the tenant scope.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         parameter("role".?) { role =>
           system.log.info(s"read invoice=$id role=\${role.getOrElse("")}")
           invoices.get(id) match {
@@ -619,9 +607,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/invoices/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reads the role from a query parameter (the gateway's X-Role header is
-    // ignored), returns the whole stored document to every caller, and checks neither the status
-    // nor the tenant. Check the projection, the draft gate and the tenant scope.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto id = req.matches[1].str();
     const auto role = req.get_param_value("role");
     const auto invoice = store.get(id);
@@ -720,9 +706,9 @@ int main() {
     },
   },
   hints: [
-    'Fix the guards in cost order before you touch the projections: resolve the role from the `X-Role` header and reject anything that is not `issuer`/`customer` with 403, then load the invoice and answer 404 for both `invoice == null` and `invoice.tenant_id != tenant`, then run the `customer` draft gate. Each guard returns before a single field of the document is read.',
-    'The two projections are separate builders, not one payload you trim. Write an `issuer_view` that names every field (including `internal_notes` and `cost_margin`) and a `customer_view` that iterates an allowlist — the allowlist is the contract, so a later field can never leak into the customer copy by being present on the invoice.',
-    'The 404s are deliberate, not lazy: a draft the customer cannot see yet and an invoice that belongs to another tenant must be indistinguishable from a missing invoice, otherwise "does invoice 1042 exist?" becomes answerable by anyone who can guess an id.',
+    'A customer opens an invoice link and sees a `cost_margin` column, and a support ticket shows a customer quoting a draft total that changed before it was issued.',
+    '`role: str = "customer"` is a query parameter, so the caller chooses it; the handler returns `invoice` unchanged for every role and compares neither `status` nor `tenant_id` before rendering.',
+    'Read `X-Role` and `X-Tenant-Id` (403 unknown role, 404 tenant mismatch); for `customer` answer 404 when `status != FINALIZED`; return `issuer_view(invoice)` or `customer_view(invoice)` built from `CUSTOMER_VIEW_FIELDS`.',
   ],
-  debrief: `The read is where an invoice service either keeps a business's data separated or quietly gives it away. The starter is convincing because it returns the stored document and the demo has exactly one caller — the flaw only appears when a customer loads the same id. Three properties are being checked: authentication that decides the projection (the role comes from the gateway's session header, never from anything the caller can set on the request body or query string), a status gate that makes a draft invisible to the customer rather than forbidden, and a tenant comparison that makes another tenant's invoice indistinguishable from a missing one. The projection discipline matters more than it looks: building the customer copy from an allowlist means the next internal field has to be added deliberately, while deleting fields from a shared payload means the next internal field leaks by default. Real services push this further — the issuer view is scoped to the roles that may see margins, reads are logged with the invoice id and the requesting tenant, and the customer copy is served from a projection maintained at finalize time so the read never re-derives it.`,
+  debrief: `The read is where an invoice service either keeps a business's data separated or quietly gives it away, and the fix is three properties in order. The role comes from the gateway's session header because anything the caller can set on the request is the caller's claim, not the platform's. The draft gate and the tenant comparison both answer 404 so a draft the customer cannot see yet and another tenant's invoice are indistinguishable from a missing one. The projection discipline matters more than it looks: building the customer copy from an allowlist means the next internal field has to be added deliberately, while deleting fields from a shared payload means the next internal field leaks by default. Production services log every read with the invoice id and the requesting tenant, and serve the customer copy from a projection written at finalize time so the read never re-derives it.`,
 };

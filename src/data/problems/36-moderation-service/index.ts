@@ -24,12 +24,9 @@ export const moderationServiceProblem: Problem = {
   minutes: 70,
   statement: `# Moderation Service
 
-A moderation service is the piece of a product that turns a user's report into a decision someone
-can stand behind: whether the content is real and belongs to the tenant that reported it, who is
-reviewing it right now, whether a model is allowed to act on its own, what the platform records
-about the action, and who may ever see the reporter. The visible part is a status on a case; the
-parts that decide whether the platform is safe are the validation funnel, the claim that cannot be
-double-held, the evidence bar in front of an automatic removal, and the redaction on every read.
+A moderation service turns a user's report into a decision someone can stand behind: whether the
+content belongs to the reporting tenant, who is reviewing it, whether a model may act alone, and
+who may ever see the reporter.
 
 ## The real system
 
@@ -37,14 +34,8 @@ Mastodon's admin reports API is a concrete example of the human side of this pip
 carries a category and the reporter's comment, a moderator calls "assign report to self" so the
 report shows an \`assigned_account\`, and the report can be unassigned, resolved or reopened, so
 two moderators are not working the same item without knowing it. Larger platforms put a classifier
-in front of that queue and treat it as advice under a tight deadline rather than authority: an
-automatic action requires a very high confidence *and* a second, independent signal, and anything
-weaker, including a timeout, lands in the human queue with the evidence recorded. They publish one
-action event per item keyed by the content id so an item's history stays ordered, carrying the
-action, the rule and the reviewer's role but not the reporter's identity or the verbatim report
-text, and they persist the action before committing the consumer offset so a crash cannot replay a
-removal into silence. The case file goes only to a caller who owns the content, names the reporter
-only to the surveyor role, and escapes free text before it reaches a console.
+in front of that queue and treat it as advice under a tight deadline: an automatic action requires
+very high confidence *and* a second signal, and anything weaker lands in the human queue.
 
 ## What you build here
 
@@ -70,16 +61,13 @@ One service, **moderated**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
-looks right. Your job in every step is the job you will have on a real trust-and-safety feature:
-debug it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove
-the fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Reporter account management, appeals and reinstatement, the human review UI itself, per-jurisdiction
-policy packs, model training and evaluation, and long-term evidence retention. The five pieces above
-are the ones that decide whether the pipeline is correct, isolated and shippable.`,
+Reporter account management, appeals, the human review UI, per-jurisdiction policy packs, model
+training, and long-term evidence retention.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Reporter', sub: 'POST /v1/reports', x: 6, y: 50},

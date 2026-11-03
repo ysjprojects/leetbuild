@@ -252,7 +252,7 @@ def read_session(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/browser/sessions/:sessionId: flawed code that replays everything. */
+      starter: `/** GET /v1/browser/sessions/:sessionId. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

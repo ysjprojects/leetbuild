@@ -8,37 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'registry', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, mints a
-job id and answers \`201 queued\`. It compiles, it serves the demo, and it hides three production
-flaws. Debug it like the owner of the queue, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/jobs\` with body
+\`{"type": "email.send", "payload": {"to": "…", "subject": "…"}}\`: it reads \`X-Tenant-Id\`, mints a
+counter id, pushes the job onto the queue and answers **201** \`queued\`. It compiles, serves the demo
+and hides four flaws.
 
-Implement \`POST /v1/jobs\` with body \`{"type": "email.send", "payload": {"to": "…", "subject": "…"}}\`.
+**Failure mode the checks target.** A client retries a timed-out enqueue and the same email goes out
+twice, because the starter reads no \`Dedupe-Key\`. A typo in \`type\` is accepted and every worker
+skips it. A bad payload is discovered only after a worker has claimed the job and failed it five
+times. And the counter id is handed out with no job row behind it, so a status read finds nothing.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`type\` must be a key of the **job registry** — the map of job types to the payload schema each one
-  accepts. Anything else is **400**, and the rejection happens **before** the dedupe reservation, the
-  job row or any queue write: a type no worker knows is a job that is accepted and then skipped
-  forever.
-- \`payload\` is validated against the schema of *that* type. A missing field, a field of the wrong
-  type, or a field the schema does not list is **422** with the offending path in the body:
-  \`{"error": "invalid payload", "path": "amount_cents"}\`. The registry is **closed**: the fields a
-  schema lists are exactly the fields the type accepts, in every language.
-- \`Dedupe-Key\` is required (**400** when missing) and is reserved as
-  \`SET jobs:dedupe:{tenant}:{key} <job_id> NX EX DEDUPE_WINDOW_S\` with \`DEDUPE_WINDOW_S = 86400\`
-  **before** the job is enqueued. A replay inside the window answers **200** with the **original**
-  job id and enqueues no second job; only the request that won the \`NX\` reservation may enqueue.
-- The \`job_id\` is issued by the **API** (a fresh UUID) and the job row is written to the store
-  **before** the response, so the id a client retries with is one the queue can actually find.
-- Answer **201** with \`{"job_id", "state": "queued"}\`.
-- Log the decision (job id, tenant, type) — the payload never appears in a log line.
-
-**Failure mode the checks target.** The dedupe reservation is the one that costs money: the caller's
-retry is not the queue's duplicate, so without the reservation a timed-out enqueue runs the same
-side effect twice. The registry lookup is the one that loses work quietly: a typo in \`type\` is
-accepted, a job row exists, and every worker skips a type it does not know — nothing errors and
-nothing runs. The payload check is the one that moves a producer bug into the worker: an
-unvalidated payload is only discovered after a worker has claimed the job, retried it five times and
-dead-lettered it for a reason that was knowable at the door.`,
+- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
+- \`type\` must be a key of \`JOB_REGISTRY\`, the map from job type to payload schema; anything else
+  is **400**, decided before the dedupe reservation, the job row and the queue write.
+- \`payload\` is validated against that schema. A missing field, a wrong type, or an unlisted field
+  is **422** with the offending path: \`{"error": "invalid payload", "path": "amount_cents"}\`.
+- \`Dedupe-Key\` is required (**400** when missing) and reserved as
+  \`SET jobs:dedupe:{tenant}:{key} <job_id> NX EX DEDUPE_WINDOW_S\` (\`DEDUPE_WINDOW_S = 86400\`)
+  before the enqueue. A replay inside the window answers **200** with the original job id and
+  enqueues nothing.
+- The \`job_id\` is a fresh UUID issued by the API, and \`store.put()\` writes the job row before the
+  response. Answer **201** with \`{"job_id", "state": "queued"}\`. Log job id, tenant and type only.`,
   sequence: {
     participants: ['Client', 'Job API', 'Job registry', 'Redis queue'],
     messages: [
@@ -156,9 +146,7 @@ queue = JobQueue()
 
 @app.post("/v1/jobs")
 def enqueue(body: EnqueueRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter accepts any job type (so a worker silently skips an unknown one), passes the
-    # payload through unvalidated, and has no dedupe key, so a retried enqueue runs the job twice.
-    # Fix all three before a job is allowed to reach a worker.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     job_id = f"job-{next(job_counter)}"
     logger.info("job enqueued job_id=%s tenant=%s type=%s", job_id, tenant, body.type)
     queue.enqueue({"job_id": job_id, "type": body.type, "payload": body.payload})
@@ -285,9 +273,7 @@ const queue = {
 };
 
 app.post('/v1/jobs', async (request, reply) => {
-  // TODO: this starter accepts any job type (so a worker silently skips an unknown one), passes the
-  // payload through unvalidated, and has no dedupe key, so a retried enqueue runs the job twice.
-  // Fix all three before a job is allowed to reach a worker.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as EnqueueBody;
   const jobId = \`job-\${++jobCounter}\`;
@@ -406,9 +392,7 @@ func enqueue(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter accepts any job type (so a worker silently skips an unknown one), passes the
-	// payload through unvalidated, and has no dedupe key, so a retried enqueue runs the job twice.
-	// Fix all three before a job is allowed to reach a worker.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	jobID := fmt.Sprintf("job-%d", jobCounter.Add(1))
 	log.Printf("job enqueued job_id=%s tenant=%s type=%s", jobID, tenant, body.Type)
 	queue.Enqueue(r.Context(), map[string]any{"job_id": jobID, "type": body.Type, "payload": body.Payload})
@@ -592,9 +576,7 @@ object JobApi {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[String]) { raw =>
             val body = raw.parseJson.asJsObject
-            // TODO: this starter accepts any job type (so a worker silently skips an unknown one),
-            // passes the payload through unvalidated, and has no dedupe key, so a retried enqueue
-            // runs the job twice. Fix all three before a job is allowed to reach a worker.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val jobType = body.fields.get("type").collect { case JsString(value) => value }.getOrElse("")
             val jobId = s"job-\${jobCounter.incrementAndGet()}"
             system.log.info(s"job enqueued job_id=$jobId tenant=$tenant type=$jobType")
@@ -724,9 +706,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter accepts any job type (so a worker silently skips an unknown one), passes the
-    // payload through unvalidated, and has no dedupe key, so a retried enqueue runs the job twice.
-    // Fix all three before a job is allowed to reach a worker.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto jobId = "job-" + std::to_string(++jobCounter);
     const auto jobType = body.value("type", std::string());
     std::cerr << "job enqueued job_id=" << jobId << " tenant=" << tenant << " type=" << jobType << "\\n";
@@ -861,18 +841,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guard clauses by cost: tenant, `Dedupe-Key`, then the registry lookup, then the payload schema. Every one of them answers before `store.put` and `queue.enqueue`, so a rejected submission never reserves a dedupe key or occupies a queue position.',
-    'The dedupe reservation must be one command: `SET jobs:dedupe:{tenant}:{key} <job_id> NX EX DEDUPE_WINDOW_S`. `NX` is what makes concurrent enqueues of the same key pick exactly one winner; the expiry is the documented window, so the key is a suppression window and not a permanent lock.',
-    'The payload schema is closed and the rejection names a path, not the payload: `{"error": "invalid payload", "path": "amount_cents"}`. Return the path so the caller can fix the producer, and keep the payload out of the response and out of the log line.',
+    'Support sees the same invoice charged twice after one client timeout, and a job id from the 201 response that `GET /v1/jobs/{id}` cannot find.',
+    'The handler enqueues on every call: nothing reads `Dedupe-Key`, nothing looks `type` up, nothing writes a job row, so a retry is just a second enqueue with a second counter id.',
+    'Guard tenant, `Dedupe-Key`, `JOB_REGISTRY` and `validate_payload()`; mint `uuid.uuid4()`, then `reserve_dedupe()`; on a loss answer 200 with `peek_dedupe()`, on a win `store.put()` then `queue.enqueue()`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the admission boundary of a
-queue. The starter reads fine because the demo posts one valid job from one tenant and never retries.
-Three defects are being checked: the registry lookup that keeps an unknown type from becoming a job
-no worker will ever run, the schema validation that turns a producer bug into a 422 at the door
-instead of five failed attempts in a worker, and the dedupe reservation that makes a client retry
-idempotent — the caller's retry is *not* the queue's duplicate. The fourth habit is the durable id:
-the API issues it and writes the job row before it answers, so the id it hands out is one the queue
-can actually find. Real queues add per-tenant quotas, a DLQ for schema-violating producers, payload
-size caps, and a dedupe key scoped to the tenant so one tenant's key can never suppress another's
-job.`,
+  debrief: `The handler's shape is guards, reservation, row, enqueue, response, because each stage settles a question the next one depends on: an unknown type or a bad payload must not reach the reservation, a replay must not reach the enqueue, and the worker must not see an id the store cannot resolve. The dedupe key is scoped to the tenant inside the Redis key itself, so one tenant's key cannot suppress another tenant's job. Production queues also cap payload size at the door, since a payload that fits the schema can still be a megabyte that every worker has to deserialize, and they expire the reservation on the same clock as the job retention so a key never outlives the row it points at.`,
 };

@@ -122,7 +122,7 @@ Body: \`{"base_model", "dataset_version", "hyperparameters": {…}, "compute_bud
   ],
   code: {
     python: {
-      starter: `"""Fine-tune job submission API: flawed code that trusts the caller's dataset file."""
+      starter: `"""Fine-tune job submission API."""
 import logging
 from typing import Any, Dict
 
@@ -244,7 +244,7 @@ async def create_job(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/finetune/jobs: flawed code that trusts the caller's dataset file. */
+      starter: `/** POST /v1/finetune/jobs. */
 import Fastify from 'fastify';
 import {createClient} from 'ioredis';
 
@@ -340,7 +340,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// Package api is the fine-tune job submission API: flawed code that trusts the caller's dataset file.
+      starter: `// Package api is the fine-tune job submission API.
 package api
 
 import (
@@ -580,7 +580,7 @@ object Api {
 `,
     },
     cpp: {
-      starter: `// Fine-tune job submission API: flawed code that trusts the caller's dataset file.
+      starter: `// Fine-tune job submission API.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 

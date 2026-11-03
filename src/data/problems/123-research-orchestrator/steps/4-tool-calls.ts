@@ -262,7 +262,7 @@ def verify_citations(citations: list[Citation], sources: dict[str, str]) -> list
 `,
     },
     typescript: {
-      starter: `/** Tool calls: flawed code that retries forever and trusts every result and citation. */
+      starter: `/** Tool calls. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

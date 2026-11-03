@@ -202,7 +202,7 @@ def completeness(service: str, tenant: str | None = Header(default=None, alias="
 `,
     },
     typescript: {
-      starter: `/** GET /v1/services/:service/completeness: flawed code with one total. */
+      starter: `/** GET /v1/services/:service/completeness. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

@@ -22,11 +22,8 @@ export const cronSchedulerProblem: Problem = {
   minutes: 70,
   statement: `# Cron Scheduler
 
-A cron scheduler is the piece of a platform that decides **when** work happens and **how many
-times** it happens. The visible part is a job running on time; the parts that decide whether the
-platform survives are the time spec it accepts, the lease that makes one window fire once across
-the whole fleet, the misfire policy that turns a pause into a policy decision instead of a burst,
-and the event history that makes a pause visible afterwards.
+A cron scheduler decides **when** work happens and **how many times** it happens, across a fleet
+that pauses, restarts and races.
 
 ## The real system
 
@@ -36,9 +33,7 @@ trigger row under the database lock fires it, and the others see it as taken. It
 missed fire as a first-class case: a trigger that passes its next fire time by more than
 \`misfireThreshold\` (60 seconds by default) is handled according to the misfire instruction on the
 trigger, and \`maxMisfiresToHandleAtATime\` bounds how many misfires one pass recovers so a long
-pause does not turn into one enormous transaction. That is the shape this course rebuilds on Redis,
-gRPC and Kafka: a time spec that resolves, one claim per window across the fleet, a policy that
-decides what a pause owes, and a history that shows the decisions, not just the successes.
+pause does not turn into one enormous transaction.
 
 ## What you build here
 
@@ -60,17 +55,13 @@ One service, **cronsched**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. In every step you debug it against the failure modes the task describes, fix it,
-optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on your
-version.
+Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Cron parsing beyond the five-field form, distributed clock synchronisation details, the target job's
-own execution semantics, per-tenant schedule quotas, cost attribution, alerting and on-call routing,
-and the UI for authoring schedules. The five pieces above are the ones that decide whether the
-scheduler is correct, isolated and shippable.`,
+Cron parsing beyond the five-field form, clock synchronisation, the target job's own semantics,
+schedule quotas, alerting, and the authoring UI.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'schedules · history', x: 8, y: 50},

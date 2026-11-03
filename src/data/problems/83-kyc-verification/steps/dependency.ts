@@ -10,32 +10,20 @@ export const dependencyStep: Step = {
 
 **Starting point.** The starter is the KYC service's vendor client: \`check_document(applicant,
 doc_type, ref)\` calls the vendor's \`CheckDocument\` over gRPC in a retry loop, maps the reply onto
-a verdict and moves the case along. Against a healthy vendor the demo verifies applicants and the
-funnel stays open. It compiles and hides four flaws, and all of them look like features on a
-conversion dashboard.
+a verdict and moves the case along. It compiles, verifies applicants against a healthy vendor, and
+hides four flaws.
 
-**Failure mode the checks target.** During a vendor outage the service keeps approving: identities
-nobody checked come out verified, a bad deployment mints approved applicants from the error path,
-and an applicant whose documents the vendor rejected is approved anyway once the retries run out.
-None of this is visible while the vendor is healthy, because the demo sees no timeout, no error and
-no rejection.
+**Failure mode the checks target.** During a vendor outage the service keeps approving: unchecked
+identities come out verified, the error path mints approvals, and a rejected applicant is approved
+once retries run out. A healthy vendor shows none of it.
 
-Requirements:
-
-- The \`CheckDocument\` call carries a **10 s** deadline as a named constant on the call itself
-  (\`DEADLINE_S = 10\` with \`timeout=DEADLINE_S\`, \`DEADLINE_MS = 10_000\` with
-  \`deadline: Date.now() + DEADLINE_MS\`, a \`context.WithTimeout\`, a \`withDeadlineAfter\`, a
-  \`set_deadline\`).
-- The vendor answers **\`APPROVED\`**, **\`REJECTED\`** or **\`MANUAL_REVIEW\`**, and nothing else counts
-  as an approval: the vendor's own \`MANUAL_REVIEW\`, and any outcome you cannot classify, is a
-  human's call.
-- A **timeout or a vendor error** (\`DEADLINE_EXCEEDED\`, \`UNAVAILABLE\`, anything else) routes the
-  case to **manual review** with a **\`degraded\`** marker. Identity is a legal decision, and an
-  outage is not a verification.
-- A **rejection is terminal**: it carries the vendor's **reason**, and the case ends there. The same
-  documents buy the same answer, so a second call only adds latency.
-- The outcome (decision, reason and the \`degraded\` flag) is **persisted to the decision store**
-  before \`check_document\` returns, so the case record cannot disagree with what the vendor said.`,
+- \`CheckDocument\` carries a **10 s** deadline as a named constant on the call (\`DEADLINE_S = 10\`,
+  \`DEADLINE_MS = 10_000\`, \`context.WithTimeout\`, \`withDeadlineAfter\`, \`set_deadline\`).
+- Only **\`APPROVED\`** approves; \`MANUAL_REVIEW\` and any unclassified outcome go to a human.
+- A **timeout or vendor error** routes the case to **manual review** marked **\`degraded\`**.
+- A **rejection is terminal**, carries the vendor's **reason**, and is not retried.
+- **Persist** decision, reason and \`degraded\` to the decision store before \`check_document\`
+  returns.`,
   sequence: {
     participants: ['KYC API', 'Vendor', 'Review queue', 'Decision store'],
     messages: [

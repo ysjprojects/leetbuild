@@ -253,7 +253,7 @@ def classify(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/classify: flawed code that returns whatever the model invents. */
+      starter: `/** POST /v1/classify. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

@@ -8,32 +8,26 @@ export const eventsStep: Step = {
   focus: ['ingest', 'kafka', 'rollup'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes an event per
-window and the consumer sees data arrive, so the demo shows a topic filling up. Three production
-contracts are broken, and the first one silently reorders a fleet's stream. Find them, fix them, and
-prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/rollups\`, the ingest path's event side: it builds
+an event with the device id, the metric and the raw samples, produces it to \`telemetry.rollup\`
+keyed by the metric name from a default producer, and answers accepted without looking at the
+result. The demo shows a topic filling up. It hides five flaws.
 
-Implement \`publish_rollup(device_id, window_start, buckets)\`, the ingest path's event side:
+**Failure mode the checks target.** A device's "hot, then cold" sequence arrives interleaved across
+partitions and no consumer can put it back. The downsampled topic carries every raw reading, so it is
+the firehose it was meant to replace, retained and replicated at fleet scale, with no window named
+for any value. A client retry publishes the rollup twice. And a broker rejection is a rollup that is
+simply lost, because nothing observes the produce result.
 
-- Publish one \`telemetry.rollup\` event per device per window with the **device id as the message
-  key**. The key is the partition key: one device’s events then land in one partition and keep their
-  order, which is what every consumer of a device’s history assumes. The starter keys by metric name,
-  so a device’s events scatter across partitions and their order is gone.
-- The payload carries the **downsampled bucket result**: \`window_start\` and, per metric, the
-  bucket **mean**, **count** and peak. It must **not** carry the raw samples — a topic that carries
-  every raw reading is a topic that is retained and replicated at fleet scale, and “consumers can
-  recompute” is not a reason to publish them.
-- The producer must be **idempotent with \`acks=all\`** (or the stack’s equivalent: required acks
-  \`all\` plus hashed, stable keys), so a retried produce cannot duplicate a rollup and an ack means
-  the broker has the record.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
-  failing the ingest path: a relay republishes outbox rows when the broker returns. Observe the
-  produce result and flush it before returning, or a rejection has nowhere to go.
-
-**Failure mode the checks target.** Keying by metric breaks per-device ordering; shipping raw
-samples turns a downsampled topic back into the firehose it was meant to replace; a producer without
-idempotence duplicates a rollup whenever the client retries; and a rejection that nobody looks at is
-a rollup that is simply lost.`,
+- Publish one \`telemetry.rollup\` event per device per window with the device id as the message key
+  (\`key=device_id\`).
+- The payload carries \`window_start\` and \`buckets\`: per metric the bucket \`mean\`, \`count\` and
+  peak. No raw \`samples\` array.
+- The producer is idempotent with \`acks=all\` (\`enable.idempotence\` with \`acks\`; KafkaJS
+  \`idempotent: true\` with \`acks: -1\`; required acks \`all\` with a hash balancer), and the produce
+  is flushed or awaited so a rejection is observable.
+- When the broker rejects the produce, write the event to the outbox (\`insert_outbox\`) instead of
+  dropping it or failing the ingest path; a relay republishes outbox rows when the broker returns.`,
   sequence: {
     participants: ['Telemetry Ingest', 'telemetry.rollup', 'Rollup consumer'],
     messages: [
@@ -60,9 +54,9 @@ a rollup that is simply lost.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=device_id` (or `key: deviceId`, `Key: []byte(deviceID)`, `ProducerRecord(topic, deviceId, payload)`). Keyed by the metric name, one device’s events land in different partitions and their order is no longer guaranteed — and no consumer can fix that afterwards.',
-    'The event carries the answer, not the inputs: `window_start`, and per metric the bucket `mean`, `count` and peak. Raw samples in a retained topic are the leak and the cost that downsampling existed to avoid; keep them in the store, where they belong.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` plus `acks: -1`, or required acks `all` with a hash balancer. Then wrap the produce and, when the broker rejects it, insert an outbox row — and flush or await so you actually see the rejection.',
+    "A device's rollup consumer reports it cooling before it warmed, the topic's retention bill is the size of the raw store, and a broker restart leaves a ten-minute hole in every dashboard.",
+    '`key=window.metric` splits one device across partitions; the event ships `samples` instead of a bucket; `Producer({...})` has defaults and `producer.produce` is never flushed, so a rejection is invisible.',
+    'Produce `{"window_start", "buckets": {metric: {"mean", "count", "max"}}}` with `key=device_id`; configure `enable.idempotence` and `"acks": "all"`; `producer.flush()` and on `KafkaException` call `insert_outbox`.',
   ],
   checks: [
     {
@@ -162,9 +156,7 @@ class RollupWindow(BaseModel):
 
 @app.post("/v1/rollups")
 def publish(window: RollupWindow) -> dict:
-    # TODO: the starter keys by the metric name, so one device's events scatter across partitions and
-    # lose their order; it publishes the raw samples for consumers to recompute; it runs a default
-    # producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {
         "device_id": window.device_id,
         "metric": window.metric,
@@ -233,9 +225,7 @@ interface Sample {
 }
 
 export async function publishRollup(deviceId: string, metricName: string, samples: Sample[]): Promise<void> {
-  // TODO: the starter keys by the metric name, so one device's events scatter across partitions and
-  // lose their order; it publishes the raw samples for consumers to recompute; it runs a default
-  // producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const event = {device_id: deviceId, metric: metricName, samples};
   void producer.send({
     topic: 'telemetry.rollup',
@@ -309,9 +299,7 @@ type Sample struct {
 }
 
 func publishRollup(ctx context.Context, deviceID, metricName string, samples []Sample) error {
-	// TODO: the starter keys by the metric name, so one device's events scatter across partitions and
-	// lose their order; it publishes the raw samples for consumers to recompute; it runs a default
-	// producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{"device_id": deviceID, "metric": metricName, "samples": samples}
 	payload, _ := json.Marshal(event)
 	return rollupWriter.WriteMessages(ctx, kafka.Message{Key: []byte(metricName), Value: payload})
@@ -380,9 +368,7 @@ import spray.json._
 object RollupPublisher {
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: the starter keys by the metric name, so one device's events scatter across partitions and
-  // lose their order; it publishes the raw samples for consumers to recompute; it runs a default
-  // producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publishRollup(deviceId: String, metricName: String, samples: List[Sample]): Unit = {
     val event = Map(
       "device_id" -> deviceId,
@@ -452,9 +438,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: the starter keys by the metric name, so one device's events scatter across partitions and
-// lose their order; it publishes the raw samples for consumers to recompute; it runs a default
-// producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publishRollup(const std::string& deviceId, const std::string& metricName, const json& samples) {
   const json event = {{"device_id", deviceId}, {"metric", metricName}, {"samples", samples}};
   const auto payload = event.dump();
@@ -535,5 +519,5 @@ void publishRollup(const std::string& deviceId, long long windowStart, const std
 `,
     },
   },
-  debrief: `Three separate contracts are being checked here. The first is ordering: a message key decides the partition, and partition is the only ordering guarantee Kafka offers, so keying by device is what makes "this device was hot, then cold" a readable sequence rather than an interleaving. The second is payload responsibility: a pipeline that publishes raw samples has moved the aggregation cost, the storage cost and the retention risk downstream, and has published tenant data into a replicated log for no reason — buckets carry the mean, the count and the peak, which is everything an alert or a dashboard actually needs. The third is durability: an idempotent producer with acks=all makes a retry harmless and an ack meaningful, and the outbox turns a broker outage into a delay instead of data loss, which is the difference between a pipeline that is down and a pipeline that is behind. Real platforms add a schema registry so a future producer cannot smuggle raw points back in, outbox relays with their own publish keys, and per-device quota on the topic.`,
+  debrief: `Three contracts shape the fix. Ordering: a message key decides the partition, and the partition is the only ordering guarantee Kafka offers, so keying by device is what makes "hot, then cold" a readable sequence. Payload responsibility: a pipeline that publishes raw samples has moved the aggregation cost, the storage cost and the retention risk downstream and put tenant data in a replicated log for no reason; buckets with mean, count and peak are everything an alert or a dashboard needs. Durability: an idempotent producer with \`acks=all\` makes a retry harmless and an ack meaningful, and the outbox turns a broker outage into a delay rather than data loss, the difference between a pipeline that is down and one that is behind. Production platforms register the event schema so a future producer cannot smuggle raw points back in, and apply per-device quotas on the topic.`,
 };

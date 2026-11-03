@@ -174,7 +174,7 @@ def report(job_id: str, tenant: str | None = Header(default=None, alias="X-Tenan
 `,
     },
     typescript: {
-      starter: `/** Job report: flawed code that serves a cached counter to any caller. */
+      starter: `/** Job report. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

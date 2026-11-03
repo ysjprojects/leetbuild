@@ -37,10 +37,7 @@ immudb is an open source database built for exactly this shape: every transactio
 append-only logs with a monotonically increasing transaction id, a Merkle tree is maintained over
 them, and the client SDKs offer verified reads that check a cryptographic inclusion proof against a
 state the client keeps locally, so a tampered or truncated history is detected on the client side
-rather than trusted from the server. The same ideas drive this course at a smaller scale: a digest
-instead of the content, a per-tenant hash chain whose head advances in one atomic step, a signed
-receipt or an explicit unsigned state, a content-free event with an outbox, and a verifier that
-recomputes every hash and reports the first position that disagrees.
+rather than trusted from the server. This course applies the same idea at a smaller scale.
 
 ## What you build here
 
@@ -63,17 +60,13 @@ One service, **auditd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
-starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path and looks right. Debug
+it against the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Model registries and version catalogs, retention schedules and legal hold, key management and signing
-key rotation, cross-region replication of the ledger, auditor-facing query tooling, and the policy
-engine that produced the decision in the first place. The five pieces above are the ones that decide
-whether the trail is correct, isolated and shippable.`,
+Model registries, retention and legal hold, signing key rotation, ledger replication, auditor query
+tooling, and the policy engine that produced the decision.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'append · verify', x: 8, y: 50},

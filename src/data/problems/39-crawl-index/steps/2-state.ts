@@ -240,7 +240,7 @@ def throttle(job_id: str, host: str, retry_after_s: int, attempts: int) -> int:
 `,
     },
     typescript: {
-      starter: `/** The Redis frontier: flawed code with one queue and one bucket. */
+      starter: `/** The Redis frontier. */
 import Redis from 'ioredis';
 
 export const r = new Redis({host: 'redis', port: 6379});

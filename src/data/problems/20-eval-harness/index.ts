@@ -35,11 +35,7 @@ The open source \`openai/evals\` framework registers every eval under a name of 
 \`<eval_name>.<split>.<version>\`, with the rule that a changed eval bumps its version so scores
 from different runs stay comparable. Its basic templates (\`Match\`, \`Includes\`, \`FuzzyMatch\`)
 score each sample by comparing the completion with an \`ideal\` label, next to model-graded evals
-that hand the sample to a judge model. A hosted harness wraps that spine in a service: runs that
-start only for a dataset the service owns, workers that score samples concurrently and report
-progress through one atomic step, judge calls under a deadline with a deterministic fallback,
-results published keyed by run with ids and scores rather than sample text, and a report that
-cannot be read stale or gated by a threshold the caller chose.
+that hand the sample to a judge model. This course wraps that spine in a hosted service.
 
 ## What you build here
 
@@ -48,7 +44,7 @@ One service, **evald**, with five pieces:
 1. \`POST /v1/evals/runs\`: authenticated tenant, a dataset that exists, a 1..5000 sample budget,
    a non-empty model version, and an \`Idempotency-Key\` so a retry resumes the original run.
 2. A **Redis** progress ledger: \`scored\`, \`passed\` and \`failed\` counters per run, a per-sample
-   dedupe key, and a TTL tied to the run — all moved inside one atomic script.
+   dedupe key, and a TTL tied to the run, all moved inside one atomic script.
 3. A **gRPC** judge client: an 800 ms deadline per attempt, at most three attempts, retries only on
    \`UNAVAILABLE\`, a deterministic string metric as the fallback, a breaker after five failures for
    30 seconds, and no retry of a malformed sample.
@@ -60,9 +56,8 @@ One service, **evald**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path,
-and it looks right. Debug it against the failure modes, fix it, optimize what is wasteful, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

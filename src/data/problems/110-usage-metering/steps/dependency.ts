@@ -190,7 +190,7 @@ def flush_period(account: str, period: str) -> str:
 `,
     },
     typescript: {
-      starter: `/** Billing flush: flawed code that re-mints the close id on every attempt. */
+      starter: `/** Billing flush. */
 import {randomUUID} from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';

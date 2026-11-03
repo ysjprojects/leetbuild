@@ -607,7 +607,6 @@ object RunReadApi {
 
 using json = nlohmann::json;
 
-// The starter stores definitions, not runs: the newest step list is all it can answer with.
 struct DefinitionStore {
   std::optional<std::vector<std::string>> latest(const std::string& run_id);
 };

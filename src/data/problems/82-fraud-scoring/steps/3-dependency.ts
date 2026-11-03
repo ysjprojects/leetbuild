@@ -240,7 +240,7 @@ def score_transaction(stub, features: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** The scorer's model layer — flawed code. */
+      starter: `/** The scorer's model layer. */
 import * as grpc from '@grpc/grpc-js';
 
 import {client} from './stubs';
@@ -668,7 +668,7 @@ object ModelClient {
 `,
     },
     cpp: {
-      starter: `// The scorer's model layer — flawed code.
+      starter: `// The scorer's model layer.
 #include <string>
 
 #include <grpcpp/grpcpp.h>

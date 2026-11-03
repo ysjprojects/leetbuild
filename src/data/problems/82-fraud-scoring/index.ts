@@ -24,11 +24,8 @@ export const fraudScoringProblem: Problem = {
   minutes: 70,
   statement: `# Fraud Scoring
 
-A fraud scorer is the piece of a payments platform that decides, in a few dozen milliseconds, whether
-a transaction is approved, declined or sent to review. The visible part is a risk number; the parts
-that decide whether the platform is safe are the trust boundary around the feature vector, the
-velocity counters that make a burst visible, the failure policy when the model is unreachable, and
-what the review console is allowed to see.
+A fraud scorer decides, in a few dozen milliseconds, whether a transaction is approved, declined or
+sent to review.
 
 ## The real system
 
@@ -36,19 +33,9 @@ Stripe Radar is the documented version of this shape. Its rules are \`{action} i
 predicates (\`Block if :amount_in_usd: > 1000.00\`) evaluated in a fixed order, request-3DS, allow,
 block, review, and the velocity attributes they read, such as \`total_charges_per_customer_hourly\`,
 are windowed counts maintained by Stripe over previous attempts, so the entity being scored cannot
-supply its own count. Some of those counters are bounded: once the cap is reached the oldest
-timestamps fall out and newer ones replace them. The decision lands in one of a small set of bands,
-and payments placed in review go to a queue where a human sees the outcome, not the raw card.
-
-This course builds the same bones in one service. Features are derived server-side so the request
-cannot carry its own risk. Every attempt is counted in Redis before the model is asked anything,
-because a declined attempt is the signal a fraud ring produces when it retries, and the windows are
-keyed by card, device and bucket so they reset on time. The model is called over gRPC under a
-deadline; when it is unreachable the service degrades to a deterministic rules score inside a
-configured band and marks the verdict as a fallback. Outcomes go to a retained topic keyed by
-account, carrying a digest rather than the feature vector, and the alerting consumer moves its
-counters before it commits an offset. A case detail shows masked identifiers; raw card data lives
-behind one separately audited tool.
+supply its own count. Payments placed in review go to a queue where a human sees the outcome, not
+the raw card. This course builds the same bones: server-derived features, velocity counted before
+the model is asked, a rules fallback when the model is unreachable, and masked case details.
 
 ## What you build here
 
@@ -72,16 +59,13 @@ One service, **scorer**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is to debug it against the failure modes, fix it, optimize
-what is wasteful, and prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Feature engineering and model training, the rules authoring UI, chargeback feedback loops, the
-analyst queue, multi-region scoring, key management for the card vault, and the audit warehouse. The
-five pieces above are the ones that decide whether the scorer is trustworthy, degradable and
-shippable.`,
+Feature engineering and model training, rules authoring, chargeback feedback, the analyst queue,
+multi-region scoring and card vault key management.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Merchant client', sub: 'POST /v1/scores', x: 8, y: 40},

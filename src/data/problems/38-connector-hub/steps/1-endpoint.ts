@@ -12,12 +12,10 @@ export const endpointStep: Step = {
 \`{"source_type", "token_ref", "base_url"}\`, probes the supplied \`base_url\` with an HTTP GET,
 inserts a connector row and returns it. It compiles, serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** Trusting the caller's \`base_url\` turns registration into an
-SSRF probe: the starter fetches it "to validate it", so any tenant can make the platform issue a
-request to whatever host it names, the cloud metadata endpoint included. Echoing the token
-reference back lands it in access logs, browser histories and support tickets, where it outlives
-the connector. The missing allowlist and the un-keyed registration are the loud ones: an arbitrary
-source type, and a duplicate connector on every client retry.
+**Failure mode the checks target.** Fetching the caller's \`base_url\` "to validate it" is an SSRF
+probe: any tenant can make the platform request any host, the cloud metadata endpoint included.
+Echoing the token reference lands it in access logs. An open source type and an un-keyed
+registration add the rest.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`source_type\` is one of \`github\`, \`slack\`, \`stripe\`, \`notion\` (**400** otherwise).
@@ -280,7 +278,7 @@ def register(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/connectors: flawed code that trusts the caller's URL. */
+      starter: `/** POST /v1/connectors. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

@@ -8,46 +8,30 @@ export const endpointStep: Step = {
   focus: ['client', 'discovery', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it takes a registration,
-writes it to Redis under a key, answers 200 and the demo looks perfect. It hides three production
-flaws — it trusts the address, it trusts the caller, and it writes an entry that can never die.
+**Starting point.** The starter serves \`POST /v1/instances\` with body
+\`{"service": "checkout", "instance_id": "checkout-3", "address": "10.4.2.7", "port": 8080, "heartbeat_interval": 5, "metadata_version": 12}\`:
+it reads \`X-Client-Id\`, builds the record, writes it to Redis with \`HSET\` under
+\`sd:{service}:{instance_id}\` and answers **200** with \`{"ok": true}\`. It compiles, serves the demo
+and hides five flaws.
 
-Implement \`POST /v1/instances\` with body
-\`{"service": "checkout", "instance_id": "checkout-3", "address": "10.4.2.7", "port": 8080, "heartbeat_interval": 5, "metadata_version": 12}\`.
+**Failure mode the checks target.** An instance whose address is a laptop or another cluster's
+range is registered and routed to, because the address is not tested against the deployment CIDR. A
+token scoped to checkout registers into payments. A crashed instance stays routable for good,
+because the hash has no expiry. A port of 0 or a 24-hour heartbeat interval becomes a routing entry.
+And the caller cannot see the TTL it must beat, because the response is a bare 200.
 
-- The caller is identified by the mesh-authenticated \`X-Client-Id\` header; a missing or empty
-  value is **401**.
-- \`service\` must exist in the registry: **404** when the registry holds no deployment for it.
-- The caller must be scoped to that service (\`registry.allowed_services(client_id)\`). A client
-  that is authenticated but not scoped for the requested service gets **403**. The starter lets any
-  caller register into any service, which is how one team's rollout ends up in another team's
-  membership and how a compromised sidecar enumerates the fleet.
-- \`instance_id\` must be a non-empty slug of at most 63 characters (**400**).
-- \`address\` must parse as an IP literal (**400** when it does not) *and* lie inside the CIDR the
-  service's deployment declared (\`registry.deployment_cidr(service)\`). An address outside that
-  CIDR — a laptop's public address, another cluster's routable range, an unroutable \`169.254\`
-  link-local — is **422**: syntactically fine, semantically not ours. The starter accepts anything,
-  so traffic can be pointed at whatever the caller typed.
-- \`port\` is an integer in \`1..65535\` (**400**), \`heartbeat_interval\` an integer in \`2..60\`
-  seconds (**400**), \`metadata_version\` at least 1 (**400**).
-- Store the instance under \`sd:{service}:{instance_id}\` as a JSON record — service, instance id,
-  address, port, metadata version, heartbeat interval, \`last_heartbeat\` unix seconds — and set
-  the key's expiry to **three heartbeat intervals in the same write**:
-  \`SET key value EX 3 * heartbeat_interval\`. A registration without a TTL is a routing entry that
-  no crash, no deploy and no decommission can ever remove, and it looks like it worked.
+- The caller is identified by the mesh-authenticated \`X-Client-Id\` header; missing is **401**.
+- \`service\` must exist in the registry: **404** when \`registry.deployment_cidr(service)\` is None.
+- The caller must be scoped to that service (\`registry.allowed_services(client_id)\`): else **403**.
+- \`instance_id\` is a non-empty slug of at most 63 characters (**400**).
+- \`address\` must parse as an IP literal (**400**) and lie inside the deployment CIDR (**422**
+  outside it).
+- \`port\` is in \`1..65535\`, \`heartbeat_interval\` in \`2..60\` seconds, \`metadata_version\` at
+  least 1; each failure is **400**.
+- Store the record as JSON under \`sd:{service}:{instance_id}\` with the expiry in the same write:
+  \`SET key value EX 3 * heartbeat_interval\`.
 - Answer **201** with \`instance_id\`, \`service\`, \`address\`, \`port\`, \`metadata_version\`,
-  \`heartbeat_interval\`, \`ttl_seconds\` and the Redis \`key\`.
-
-**Failure mode the checks target.** Registration is the trust boundary of the whole discovery
-plane: every later routing decision reads what this handler wrote. A handler that takes the address
-on faith registers instances nobody can reach (and, worse, instances whose addresses were chosen by
-whoever holds a service token), a handler that ignores the caller's scope lets any service write
-another service's membership, and a handler that stores without a TTL creates the ghost instance:
-registered forever, routable forever, gone for minutes.
-
-The tests: an address outside the deployment CIDR is rejected with 422, an authenticated caller
-registering into a service it is not scoped for is rejected with 403, and a registration whose key
-carries no expiry — a heartbeat that stops — is never routable again.`,
+  \`heartbeat_interval\`, \`ttl_seconds\` and the Redis \`key\`.`,
   sequence: {
     participants: ['Instance agent', 'Discovery API', 'service registry', 'Redis'],
     messages: [
@@ -182,9 +166,7 @@ registry = Registry()
 
 @app.post("/v1/instances")
 def register(body: RegisterRequest, client_id: str = Header(default="", alias="X-Client-Id")) -> JSONResponse:
-    # TODO: this starter trusts the address (no deployment CIDR check, so no 422), trusts the caller
-    # (any authenticated client may register into any service), and keeps the registration without
-    # a TTL. Fix all three.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = f"sd:{body.service}:{body.instance_id}"
     record = {
         "service": body.service,
@@ -316,9 +298,7 @@ interface RegisterBody {
 }
 
 app.post('/v1/instances', async (request, reply) => {
-  // TODO: this starter trusts the address (no deployment CIDR check, so no 422), trusts the caller
-  // (any authenticated client may register into any service), and keeps the registration without
-  // a TTL. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const body = request.body as RegisterBody;
   const key = \`sd:\${body.service}:\${body.instance_id}\`;
   await redis.hset(key, {
@@ -483,9 +463,7 @@ func register(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter trusts the address (no deployment CIDR check, so no 422), trusts the caller
-	// (any authenticated client may register into any service), and keeps the registration without
-	// a TTL. Fix all three.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := "sd:" + body.Service + ":" + body.InstanceID
 	record := map[string]any{
 		"service":            body.Service,
@@ -697,9 +675,7 @@ object Api {
       post {
         optionalHeaderValueByName("X-Client-Id") { _ =>
           entity(as[RegisterRequest]) { body =>
-            // TODO: this starter trusts the address (no deployment CIDR check, so no 422), trusts the
-            // caller (any authenticated client may register into any service), and keeps the
-            // registration without a TTL. Fix all three.
+            // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
             val key = "sd:" + body.service + ":" + body.instance_id
             jedis.hset(
               key,
@@ -876,9 +852,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter trusts the address (no deployment CIDR check, so no 422), trusts the caller
-    // (any authenticated client may register into any service), and keeps the registration without
-    // a TTL. Fix all three.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto service = body.value("service", std::string());
     const auto instanceId = body.value("instance_id", std::string());
     const auto key = "sd:" + service + ":" + instanceId;
@@ -1041,9 +1015,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guards in cost order: caller identity, service lookup, scope, then the body — instance id, address literal, CIDR membership, port, heartbeat interval, metadata version. Every guard returns before anything is written, so a rejected registration leaves no key behind.',
-    'The address check is two steps, not one: parse the literal (`ipaddress.ip_address`, `isIP`, `net.ParseIP`, `InetAddress`, `inet_pton`) and then test membership in the deployment CIDR. A literal that parses but falls outside is **422**, not 400 — the request is well formed, the instance is simply not ours.',
-    'The TTL is not decoration: `SET sd:{service}:{instance_id} payload EX 3 * heartbeat_interval` is the registry’s entire expiry mechanism. The heartbeat renews the same key, and a registration whose key never expires is a routing entry no crash, deploy or decommission can remove.',
+    "Traffic for checkout is being routed to an engineer's laptop, and a pod that was OOM-killed yesterday is still in the routing table this morning.",
+    'The handler builds the record and calls `HSET` straight away: no `registry.deployment_cidr` test on `address`, no `registry.allowed_services` test on the caller, and a hash with no expiry.',
+    'Guard 401, 404, 403, then the body (slug, `ip_address`, CIDR membership → 422, `port`, `heartbeat_interval`, `metadata_version`); write `SET key json EX 3 * heartbeat_interval`; answer 201 with `ttl_seconds`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the boundary where the discovery plane is written to. The starter reads fine because the demo registers one instance, from one client, at one address, and never stops. Three separate defects are checked: the CIDR (an instance address is a fact the platform owns, not a string the caller chooses — public and link-local addresses are rejected as *unprocessable*, not *bad request*), the scope (the mesh tells you who called; the registry tells you what they may register, so a team token that only covers checkout cannot write payments), and the TTL (the registration must expire on its own, because every other safeguard in the system — the reaper, the probe loop, the read API — exists to handle entries that are already wrong). Real discovery services add per-deployment address pools, a registration audit trail, and a two-phase drain so a removing instance stops receiving traffic before its key disappears.`,
+  debrief: `Every guard runs before the write because a rejected registration must leave no key behind. The address check has two steps with two codes: a literal that does not parse is a bad request, a literal that parses but lies outside the deployment CIDR is unprocessable, because the request is well formed and the instance is simply not ours. The scope check exists because the mesh tells you who called and the registry tells you what they may register. The TTL in the same \`SET\` is the registry's entire expiry mechanism: the heartbeat renews the same key, and an entry without one survives every crash, deploy and decommission. Production discovery services add a registration audit trail and a two-phase drain, so a departing instance stops receiving traffic before its key disappears.`,
 };

@@ -10,36 +10,21 @@ export const stateStep: Step = {
 
 **Starting point.** The starter serves \`POST /v1/signup\`: it lowercases the email, checks
 \`handle:email:{email}\` with \`EXISTS\`, writes the key with a separate \`SET\`, inserts the row and
-answers **201**; a second signup with the same email gets **409**. It compiles, it serves the demo
-and hides 5 flaws.
+answers **201**; a second signup with the same email gets **409**. It serves the demo and hides 5
+flaws.
 
-Requirements for the handle claims:
+**Failure mode the checks target.** \`EXISTS\`-then-\`SET\` lets two concurrent signups both see
+\`alice@x.com\` as free; nothing protects the phone, so two accounts can share one number; and a
+claim that is never released refuses the address to its real owner for the whole TTL.
 
-- Email and phone uniqueness are enforced by **atomic set-if-absent keys in one Redis namespace**:
-  the key is \`handle:{kind}:{value}\` — \`kind\` is \`email\` or \`phone\`, \`value\` is the
-  normalized handle — built by one \`handle_key\` helper from \`HANDLE_KEY_PREFIX\`. Keys spelled out
-  inline on one path and not on another are two namespaces, and two namespaces mean two identities.
-- Claims are **durable**: they live in Redis, not in a process-local set, and carry
-  \`HANDLE_TTL_S\` (**7 days**), so a claim survives a restart and ages out on its own instead of
-  pinning an address forever.
-- Each handle is claimed with **one atomic set-if-absent** command (\`SET … NX EX\`, \`setnx\`,
-  \`SetNX\`, \`SET … NOT_EXIST\`), and its reply decides: truthy means you own the key, falsy means
-  somebody else does. \`EXISTS\` followed by \`SET\` is two round trips with a window between them —
-  two concurrent signups for one address both see it free and both create an account.
-- **Every** handle is claimed, the email *and* the phone: a phone number identifies a person as much
-  as an address does, and a signup that claims only the email lets a second account take the same
-  number. If the second claim of a pair is refused, the first is released before the signup answers
-  **409 Conflict** — a refusal must leave nobody's handle claimed.
-- The claims happen **before** the row is inserted, and a signup that loses a claim creates **no**
-  row: of two concurrent signups for one handle exactly one account exists afterwards.
-- If the insert fails, **every key the signup claimed is deleted** before the **503**, so the next
-  attempt with that address starts from a clean state instead of tripping over a ghost claim.
-
-**Failure mode the checks target.** \`EXISTS\`-then-\`SET\` lets two concurrent signups both observe
-\`alice@x.com\` as free and both insert — the store's \`UNIQUE (email)\` turns that into a failed
-insert rather than two accounts, but nothing at all protects the phone, so two accounts really can
-share one number; and a claim that is never released outlives its account, refusing the address to
-its real owner for the whole TTL.`,
+- Keys are \`handle:{kind}:{value}\` (\`kind\` is \`email\` or \`phone\`), built by one \`handle_key\`
+  helper from \`HANDLE_KEY_PREFIX\`, stored in Redis with \`HANDLE_TTL_S\` (**7 days**).
+- Each handle is claimed with one atomic set-if-absent (\`SET … NX EX\`, \`setnx\`, \`SetNX\`,
+  \`SET … NOT_EXIST\`) whose reply decides ownership.
+- Claim the email *and* the phone; if the second claim is refused, release the first, then answer
+  **409 Conflict**.
+- Claims happen **before** the insert; a signup that loses a claim creates no row.
+- If the insert fails, delete every claimed key before the **503**.`,
   sequence: {
     participants: ['Client', 'Identity Service', 'Redis', 'Accounts DB'],
     messages: [
@@ -280,7 +265,7 @@ def signup(body: SignupRequest) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/signup: flawed code that claims only the email handle. */
+      starter: `/** POST /v1/signup. */
 import {createHash, randomUUID} from 'node:crypto';
 
 import Database from 'better-sqlite3';
@@ -1155,7 +1140,7 @@ int main() {
 `,
     },
   },
-  debrief: `The fix is one atomic command because a claim has to be the check: \`SET NX EX\` both asks "is this handle free?" and makes it not free in a single round trip, so a thousand concurrent signups for one address produce exactly one account, where the read-then-write starter passes every serial test and fails the moment two people sign up together. One \`handle_key\` helper under \`HANDLE_KEY_PREFIX\` is what makes the phone protected exactly like the email, and the TTL keeps a claim nobody confirmed from pinning an address forever. Releasing on abort follows from what a claim is: a reservation for an account that does not exist yet, which has to go back when the insert fails.
+  debrief: `The fix is one atomic command because a claim has to be the check: \`SET NX EX\` asks "is this handle free?" and takes it in one round trip, so concurrent signups for one address produce one account. One \`handle_key\` helper protects the phone exactly like the email, and the TTL keeps an unconfirmed claim from pinning an address forever. A claim is a reservation for an account that does not exist yet, so it goes back when the insert fails.
 
-Production identity services normalize handles before claiming them so aliases collapse, store the user id in the claim so a taken address traces to its account, give email and phone separate TTLs, and keep \`UNIQUE (email, phone)\` in the table as the last line of defence for the day a claim-path bug ships.`,
+Production identity services store the user id in the claim so a taken address traces to its account, and keep \`UNIQUE (email, phone)\` in the table as the last defence against a claim-path bug.`,
 };

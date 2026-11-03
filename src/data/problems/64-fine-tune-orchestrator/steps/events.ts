@@ -113,7 +113,7 @@ default producer can duplicate an event on retry.
   ],
   code: {
     python: {
-      starter: `"""Fine-tune lifecycle events on Kafka: flawed code that leaks the recipe into the topic."""
+      starter: `"""Fine-tune lifecycle events on Kafka."""
 import json
 import logging
 
@@ -190,7 +190,7 @@ class EventPublisher:
 `,
     },
     typescript: {
-      starter: `/** Fine-tune lifecycle events on Kafka: flawed code that leaks the recipe into the topic. */
+      starter: `/** Fine-tune lifecycle events on Kafka. */
 import {Kafka, type Producer} from 'kafkajs';
 
 export class EventPublisher {
@@ -256,7 +256,7 @@ export class EventPublisher {
 `,
     },
     go: {
-      starter: `// Package events publishes fine-tune lifecycle events to Kafka: flawed code that leaks the recipe into the topic.
+      starter: `// Package events publishes fine-tune lifecycle events to Kafka.
 package events
 
 import (
@@ -407,7 +407,7 @@ object Events {
 `,
     },
     cpp: {
-      starter: `// Fine-tune lifecycle events on Kafka: flawed code that leaks the recipe into the topic.
+      starter: `// Fine-tune lifecycle events on Kafka.
 #include <librdkafka/rdkafkacpp.h>
 
 #include <string>

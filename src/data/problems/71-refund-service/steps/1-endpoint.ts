@@ -279,7 +279,7 @@ def create_refund(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/refunds: flawed code that refunds whatever the client asks for. */
+      starter: `/** POST /v1/refunds. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

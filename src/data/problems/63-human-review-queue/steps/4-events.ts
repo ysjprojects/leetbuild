@@ -18,18 +18,15 @@ resolved and then assigned; a reviewer's name and user text sit in a retained, r
 crash between produce and commit leaves an event for a resolution that did not happen; a broker
 failover drops the event; enqueue, assign and breach produce nothing at all.
 
-- **One topic, keyed by source id.** Publish to \`review.event\` with the message key from
-  \`event_key(source_id)\`, so every enqueue, assign, resolve and breach for one source lands in one
-  partition and stays ordered. One reviewer handles many sources, so the reviewer is the wrong key.
-- **The four lifecycle events.** \`enqueued\`, \`assigned\`, \`resolved\` and \`breached\` are the
-  event types. Each carries \`priority\`, the SLA state, the outcome category and the tenant.
-- **Reviewer references only.** The event carries \`reviewer_ref\`, an opaque id used for audit. The
-  reviewer's name or email must not appear in the event, and neither must the payload text.
-- **Publish after commit.** The item record commits first; the event is produced only after
-  \`store.commit(record)\` succeeds (\`publish_after_commit\`), so an event cannot describe a state
-  the item store did not reach.
-- **Idempotent producer with \`acks=all\`.** Set \`acks\` to all and idempotence on, so a broker
-  failover cannot silently drop or duplicate the event.`,
+- **One topic, keyed by source id.** Publish to \`review.event\` keyed by \`event_key(source_id)\`, so
+  every event for one source stays ordered in one partition.
+- **The four lifecycle events.** \`enqueued\`, \`assigned\`, \`resolved\` and \`breached\`, each with
+  \`priority\`, the SLA state, the outcome category and the tenant.
+- **Reviewer references only.** The event carries an opaque \`reviewer_ref\`; no reviewer name or
+  email, no payload text.
+- **Publish after commit**: produce only after \`store.commit(record)\` succeeds
+  (\`publish_after_commit\`).
+- **Idempotent producer with \`acks=all\`.**`,
   sequence: {
     participants: ['Review Queue', 'Item store', 'review.event', 'Event consumer'],
     messages: [
@@ -235,7 +232,7 @@ def resolve(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/review/items/{id}/resolve: flawed code that publishes too early. */
+      starter: `/** POST /v1/review/items/{id}/resolve. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

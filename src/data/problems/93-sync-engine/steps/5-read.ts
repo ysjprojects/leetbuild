@@ -14,25 +14,17 @@ and answers \`{entries, watermark}\` with \`store.latest_revision()\` as the wat
 the demo client renders the changes, and it hides four flaws. Two of them make a device believe it
 is caught up when it is not.
 
-**Failure mode the checks target.** A phone returns after a week with 2,400 changes waiting, gets the
-first 1,000 and a watermark equal to the newest write, and stops pulling: 1,400 changes are skipped
-with no error anywhere. While another device is writing, the offset shifts and a resuming device
-duplicates one change and skips another. Neither shows in a demo with one device and no concurrent
-writers.
+**Failure mode the checks target.** A phone returns with 2,400 changes waiting, gets the first 1,000
+and a watermark equal to the newest write, and stops pulling: 1,400 changes are skipped. While
+another device writes, the offset shifts and a resuming device duplicates one change and skips one.
 
-Requirements:
-
-- The device is authenticated by the \`X-Device-Id\` header (**401** when missing); \`cursor\` is the
-  last revision the device holds and defaults to **0**.
-- Return the changes after that cursor, ordered by revision, capped at 1000 entries
-  (\`MAX_DELTA_ENTRIES\`). The cap is the point at which the device must come back.
+- The device is authenticated by \`X-Device-Id\` (**401** when missing); \`cursor\` defaults to **0**.
+- Return the changes after that cursor, ordered by revision, capped at 1000 (\`MAX_DELTA_ENTRIES\`).
 - The response is \`{entries, watermark, next_cursor, has_more}\`. The watermark covers exactly the
-  entries returned (\`covered_watermark\`): the revision of the last entry, or the device's own cursor
-  when nothing was returned. It is not the newest write in the system.
-- \`has_more\` is true when the cap was reached, and \`next_cursor\` resumes exactly where this
-  response stopped. A full page is an instruction to pull again.
-- Pagination is cursor-based (\`changes_after(start_after, limit)\`), not offset-based. A cursor names
-  a revision and rows are ordered by revision, so the same cursor always resumes at the same place.`,
+  entries returned (\`covered_watermark\`): the last entry's revision, or the device's cursor when
+  nothing was returned.
+- \`has_more\` is true when the cap was reached, and \`next_cursor\` resumes where this page stopped.
+- Pagination is cursor-based (\`changes_after(start_after, limit)\`), not offset-based.`,
   sequence: {
     participants: ['Device', 'Sync Engine', 'revisions'],
     messages: [
@@ -200,7 +192,7 @@ def pull(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/sync/pull: flawed code that answers with the newest revision. */
+      starter: `/** GET /v1/sync/pull. */
 import Fastify from 'fastify';
 
 import {store} from './revisions';

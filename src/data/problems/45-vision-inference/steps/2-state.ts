@@ -12,24 +12,18 @@ export const stateStep: Step = {
 returns false when the counter is empty, otherwise sends \`DECR\` and returns true; the route already
 answers **429** with \`Retry-After\` when admission fails. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A read followed by a decrement is correct in a serial test and
-over-admits the moment two requests arrive together, and because the guard runs on the client the
-counter can also go negative. No TTL is set and no release exists, so every crashed worker removes one
-slot from the tenant's pool until Redis restarts.
+**Failure mode the checks target.** A read then a decrement passes a serial test and over-admits
+under concurrency, driving the counter negative. With no TTL and no release, every crashed worker
+removes a slot from the tenant's pool until Redis restarts.
 
-Requirements for the per-tenant **GPU admission pool**:
-
-- Each tenant holds \`GPU_TOKENS_PER_TENANT = 10\` concurrent inference tokens in Redis:
-  \`gpu:tokens:{tenant}\` counts the tokens still available and \`gpu:holders:{tenant}\` is the hash of
-  the tickets currently holding one.
-- Admission is **one atomic Lua \`EVAL\`** (\`ADMIT_LUA\`): read the counter, return a rejection
-  tuple when it is empty, decrement when it is not, and record the ticket in the same call.
-- The TTL (\`TOKEN_TTL_S\`) is set **at first write, inside the script** (\`SET key value EX ttl\`),
-  so a token held by a dead worker expires back into the pool on its own.
-- Admission returns a **lock id**; release runs through \`RELEASE_LUA\`, which increments only when the
-  caller still holds that ticket (\`HDEL\` returns 1). A late release from a retried worker must not
-  hand out a token that already expired and went to someone else.
-- When the pool is empty answer **429** with \`Retry-After\` (seconds) and **do not queue** the request.`,
+- Each tenant holds \`GPU_TOKENS_PER_TENANT = 10\` tokens: \`gpu:tokens:{tenant}\` counts the free
+  ones, \`gpu:holders:{tenant}\` hashes the tickets holding one.
+- Admit in **one atomic Lua \`EVAL\`** (\`ADMIT_LUA\`): read, reject when empty, decrement and record
+  the ticket in the same call.
+- Set the TTL (\`TOKEN_TTL_S\`) **at first write, inside the script** (\`SET key value EX ttl\`).
+- Admission returns a **lock id**; \`RELEASE_LUA\` increments only when \`HDEL\` of that ticket returns
+  1, so a late release cannot free a token already reassigned.
+- When the pool is empty answer **429** with \`Retry-After\` and **do not queue**.`,
   sequence: {
     participants: ['Vision API', 'Redis', 'Inference worker'],
     messages: [
@@ -110,7 +104,7 @@ Requirements for the per-tenant **GPU admission pool**:
   ],
   code: {
     python: {
-      starter: `"""GPU admission tokens: flawed code that checks and then decrements."""
+      starter: `"""GPU admission tokens."""
 import redis
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -228,7 +222,7 @@ def create_inference(body: InferenceRequest, tenant: str = Header(alias="X-Tenan
 `,
     },
     typescript: {
-      starter: `/** GPU admission tokens: flawed code that checks and then decrements. */
+      starter: `/** GPU admission tokens. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 

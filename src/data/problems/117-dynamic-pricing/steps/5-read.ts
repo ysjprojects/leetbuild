@@ -186,7 +186,7 @@ afterwards where the number came from, when it was set, or how much room the win
   ],
   code: {
     python: {
-      starter: `"""GET /v1/prices/{sku}: flawed code that serves the experiment candidate to everyone."""
+      starter: `"""GET /v1/prices/{sku}."""
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -291,7 +291,7 @@ def read_price(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/prices/:sku: flawed code that serves the experiment candidate to everyone. */
+      starter: `/** GET /v1/prices/:sku. */
 import Fastify from 'fastify';
 
 import {store} from './price_store';
@@ -371,7 +371,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// GET /v1/prices/{sku}: flawed code that serves the experiment candidate to everyone.
+      starter: `// GET /v1/prices/{sku}.
 package main
 
 import (
@@ -527,7 +527,7 @@ func main() {
 `,
     },
     scala: {
-      starter: `/** GET /v1/prices/{sku}: flawed code that serves the experiment candidate to everyone. */
+      starter: `/** GET /v1/prices/{sku}. */
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
@@ -645,7 +645,7 @@ object PriceApi {
 `,
     },
     cpp: {
-      starter: `/** GET /v1/prices/{sku}: flawed code that serves the experiment candidate to everyone. */
+      starter: `/** GET /v1/prices/{sku}. */
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 

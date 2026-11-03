@@ -8,35 +8,27 @@ export const agentLoopStep: Step = {
   focus: ['api', 'model', 'tools'],
   task: `## Task
 
-**Starting point.** The starter is working code for the loop behind every
-assist turn: the model reads the conversation, picks a tool or answers, the tool runs, the result
-goes back to the model. It works on the demo. It hides four production flaws — one of them is the
-exact failure Shopify's Sidekick team describes as *death by a thousand instructions*. Debug it, fix
-it, and prove the fix.
+**Starting point.** The starter implements \`run_agent(shop, scopes, message, page)\`, the loop
+behind every assist turn, over \`Model.Complete\` and \`Tools.Invoke\`: it concatenates every tool's
+instructions onto \`SYSTEM_PROMPT\` and onto each tool's description, loops with \`while True\`
+calling \`Complete\` and \`Invoke\` with no deadline, and invokes whatever tool name the model
+returns. It works on the demo and hides five flaws, one of them the failure Shopify's Sidekick team
+calls *death by a thousand instructions*.
 
-Implement \`run_agent(shop, scopes, message, page)\` over two gRPC services: \`Model.Complete\`
-(\`system\`, \`messages\`, \`tools\`, \`instructions\` → text or a \`tool_call\`) and
-\`Tools.Invoke\` (\`shop\`, \`name\`, \`args_json\` → \`result_json\`).
+**Failure mode the checks target.** The system prompt grows with every tool, conflicts with itself,
+breaks the provider's prompt cache on every edit, and still gets the model to pick the wrong tool.
+One confused conversation pins a worker forever. And a read-only staff account becomes a product
+editor, because the loop invokes any tool the model names.
 
-- The **system prompt is a constant** (\`SYSTEM_PROMPT\`): fundamental agent behaviour only. It is
-  sent unchanged on every turn, so the provider's prompt cache keeps hitting.
-- The model sees a **compact tool list** each turn — a name and a one-line description per tool —
-  never the tools' instructions.
-- **Just-in-time instructions**: when the model calls a tool, that tool's instructions travel back
-  with the tool's result, in the \`instructions\` field of the **next** \`Complete\` call only, and
-  are cleared afterwards. A tool the merchant never uses never costs a token.
-- The loop is bounded: at most **\`MAX_TURNS = 6\`** model turns, a **10 s** deadline on every
-  \`Complete\` and \`Invoke\` call, and a **30 s** budget for the whole loop. When either runs out,
-  return a short reply saying so, with the tools used so far.
-- **Scope gate**: a tool call whose \`required_scope\` is not in the merchant's scopes (or an
-  unknown tool name) is **not invoked**. Append a \`PERMISSION_DENIED\` tool result so the model can
-  explain and move on.
-
-**Failure mode the checks target.** A system prompt that concatenates every tool's guidance grows
-with every tool, conflicts with itself, breaks the prompt cache on every edit, and still gets the
-model to pick the wrong tool; an unbounded loop with no deadline lets one looping conversation pin
-a worker and a budget; and a loop that invokes whatever the model names turns a read-only staff
-account into a product editor.`,
+- The system prompt is the constant \`SYSTEM_PROMPT\`, sent unchanged on every turn; the model sees
+  a compact tool list, a name and a one-line description per tool.
+- Just-in-time instructions: when the model calls a tool, that tool's instructions travel back with
+  the result in the \`instructions\` field (\`jit_instructions\`) of the next \`Complete\` call only.
+- The loop is bounded: \`MAX_TURNS = 6\`, a **10 s** deadline (\`MODEL_DEADLINE_S\`) on every
+  \`Complete\` and \`Invoke\`, and a **30 s** budget (\`LOOP_BUDGET_S\`) for the whole loop. When
+  either runs out, return a short reply with the tools used so far.
+- Scope gate: a tool call whose \`required_scope\` is not in the merchant's scopes, or an unknown
+  tool name, is not invoked; append a \`PERMISSION_DENIED\` tool result instead.`,
   sequence: {
     participants: ['sidekick API', 'Model', 'Tools'],
     messages: [
@@ -55,9 +47,9 @@ account into a product editor.`,
     ],
   },
   hints: [
-    'Split the three things the starter stuffs into one prompt: a constant `SYSTEM_PROMPT` (sent as-is), a `ToolSpec(name, description)` list the model sees every turn, and each tool’s `instructions`, which only exist to be handed back when that tool fires.',
-    'Keep a `jit_instructions` variable: set it from the invoked tool after a successful `Invoke`, pass it in the next `Complete` request’s `instructions` field, then reset it to empty. The conversation messages carry the tool result; the instructions ride alongside, for one turn.',
-    'Bound the loop three ways: `for _ in range(MAX_TURNS)` instead of `while True`, `timeout=` on every stub call, and an elapsed-time check against `LOOP_BUDGET_S` at the top of each turn. Before invoking, look the tool up and compare its `required_scope` with the merchant’s scopes; on a miss, append a `PERMISSION_DENIED` tool message instead of calling anything.',
+    "Adding the fortieth tool made the assistant slower and worse at picking the first thirty-nine, one merchant's chat has been spinning for an hour, and a support agent with read-only access edited a product.",
+    "`system = SYSTEM_PROMPT + …join(t.instructions …)` and `description + t.instructions` put every tool's guidance in every turn; `while True` has no exit, the stubs have no `timeout`, and `call.name` goes straight to `Invoke`.",
+    'Send `system=SYSTEM_PROMPT` and bare `ToolSpec(name, description)`; keep a `jit_instructions` set after each `Invoke` and passed to the next `Complete`; `for _ in range(MAX_TURNS)` with `timeout=MODEL_DEADLINE_S` and a `LOOP_BUDGET_S` check; refuse when `required_scope not in scopes`.',
   ],
   checks: [
     {
@@ -201,9 +193,7 @@ class Outcome:
 
 
 def run_agent(shop: str, scopes: list[str], message: str, page: str) -> Outcome:
-    # TODO: this starter dumps every tool's instructions into the system prompt and the tool list,
-    # loops until the model stops calling tools, sets no deadline, and invokes any tool the model
-    # names. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     system = SYSTEM_PROMPT + "\\n\\n" + "\\n\\n".join(t.instructions for t in TOOLS.values())
     specs = [
         sidekick_pb2.ToolSpec(name=t.name, description=t.description + "\\n" + t.instructions)
@@ -375,9 +365,7 @@ export async function runAgent(input: {
   message: string;
   page: string;
 }): Promise<Outcome> {
-  // TODO: this starter dumps every tool's instructions into the system prompt and the tool list,
-  // loops until the model stops calling tools, sets no deadline, and invokes any tool the model
-  // names. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const system = SYSTEM_PROMPT + '\\n\\n' + Object.values(TOOLS).map(t => t.instructions).join('\\n\\n');
   const specs = Object.values(TOOLS).map(t => ({name: t.name, description: t.description + '\\n' + t.instructions}));
   const messages: Message[] = [{role: 'user', content: \`[page: \${input.page}] \${input.message}\`}];
@@ -535,9 +523,7 @@ type Outcome struct {
 	ToolsUsed []string
 }
 
-// TODO: this starter dumps every tool's instructions into the system prompt and the tool list, loops
-// until the model stops calling tools, sets no deadline, and invokes any tool the model names.
-// Fix all four.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func Run(ctx context.Context, shop string, scopes []string, message, page string) (Outcome, error) {
 	var parts []string
 	var specs []*pb.ToolSpec
@@ -729,9 +715,7 @@ object Agent {
   val model = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
   val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forAddress("tools", 9000).usePlaintext().build())
 
-  // TODO: this starter dumps every tool's instructions into the system prompt and the tool list, loops
-  // until the model stops calling tools, sets no deadline, and invokes any tool the model names.
-  // Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def run(shop: String, scopes: List[String], message: String, page: String): Outcome = {
     val systemPrompt = SystemPrompt + "\\n\\n" + Tools.values.map(_.instructions).mkString("\\n\\n")
     val specs = Tools.values.map(t => ToolSpec(name = t.name, description = t.description + "\\n" + t.instructions)).toSeq
@@ -884,9 +868,7 @@ std::unique_ptr<sidekick::Model::Stub> model =
 std::unique_ptr<sidekick::Tools::Stub> tools =
     sidekick::Tools::NewStub(grpc::CreateChannel("tools:9000", grpc::InsecureChannelCredentials()));
 
-// TODO: this starter dumps every tool's instructions into the system prompt and the tool list, loops
-// until the model stops calling tools, sets no deadline, and invokes any tool the model names.
-// Fix all four.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 AgentOutcome runAgent(
     const std::string& shop,
     const std::vector<std::string>& scopes,
@@ -1053,5 +1035,5 @@ AgentOutcome runAgent(
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand what an agent's context window is for. Sidekick's team hit it at scale: past twenty tools the boundaries blur, past fifty there are several ways to do everything, and a system prompt that tries to cover every case becomes a pile of conflicting special cases that slows the model and cannot be maintained. The fix is structural, not a better prompt: the system prompt holds fundamental behaviour and never changes (so the provider's prompt cache keeps hitting), the tool list is compact, and each tool's guidance is delivered just in time — alongside that tool's result, for the next turn only. The other three flaws are the ones every first loop has: no turn bound, no deadline, and no check that the tool the model picked is one this merchant's staff account may use. Real loops add per-tool argument schemas validated before invocation, instruction variants by beta flag, model version and page context (the source's modularity point), and a token budget per turn alongside the time budget.`,
+  debrief: `An agent's context window is a budget, and the fix is structural rather than a better prompt. Sidekick's team hit the limit at scale: past twenty tools the boundaries blur, past fifty there are several ways to do everything, and a system prompt that covers every case becomes a pile of conflicting special cases. So the system prompt holds fundamental behaviour and does not change, which keeps the provider's prompt cache hitting; the tool list is compact; and each tool's guidance arrives just in time, alongside that tool's result, for the next turn only. The turn bound, the deadlines and the loop budget make a confused model a bounded cost, and the scope gate makes the merchant's staff permissions the loop's permissions. Production loops validate each tool's arguments against a schema before invocation and add a token budget per turn beside the time budget.`,
 };

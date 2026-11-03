@@ -234,7 +234,7 @@ def deliver_all(submission_id: str, tenant: str = Header(alias="X-Tenant-Id")) -
 `,
     },
     typescript: {
-      starter: `/** Delivery fan-out to downstream handlers — flawed code. */
+      starter: `/** Delivery fan-out to downstream handlers. */
 import {randomUUID} from 'node:crypto';
 import {promisify} from 'node:util';
 import * as grpc from '@grpc/grpc-js';

@@ -17,26 +17,20 @@ export const endpointStep: Step = {
 body, calls the feature service, the scorer and the creative cache in sequence and returns a bid. It
 compiles, it answers the demo request, and it hides four flaws.
 
-**Failure mode the checks target.** The starter never reads \`timeout_ms\`, so the budget exists only
-in the caller's head: features, scoring and the creative cache run back to back at their own latency
-and the response lands after the exchange's 100 ms close. It validates nothing either, so a negative
-\`floor_cents\` produces a bid the bidder cannot afford. The checks require a validation funnel, one
-shared deadline that reaches every stage, and a no-bid path that answers inside the budget.
+**Failure mode the checks target.** The starter ignores \`timeout_ms\`, so features, scoring and the
+creative cache run back to back and the response lands after the exchange's 100 ms close. It
+validates nothing, so a negative \`floor_cents\` produces a bid the bidder cannot afford.
 
 - The bidder comes from the authenticated \`X-Bidder-Id\` header; a missing bidder is **401**.
 - \`auction_id\` is a non-empty string (**400** otherwise).
-- \`timeout_ms\` is the auction's **total** budget: an integer from **1** to **200**, defaulting to
+- \`timeout_ms\` is the auction's **total** budget: an integer from **1** to **200**, default
   **100**; anything else is **400**.
-- \`floor_cents\` is an integer from **0** to **1 000 000**; a negative or absurd floor is **400**.
-  Otherwise \`max(floor_cents, score + 1)\` turns a negative floor into a nonsense bid that wins the
-  auction and loses money.
+- \`floor_cents\` is an integer from **0** to **1 000 000**, else **400**.
 - The budget is started **once**, at the top of the handler, as a \`Deadline\`/clock object; every
-  downstream call is handed \`remaining_ms()\` (\`budget_ms=\` / \`budgetMs:\` / \`BudgetMs:\`) instead of
-  a fresh full timeout.
-- Before spending on the next stage, compare the remaining budget against \`MIN_BID_MS\` and, when the
-  request cannot finish inside the auction's budget, abandon gracefully: **200** with
-  \`{"auction_id": …, "bid": null, "reason": "deadline_exceeded", "degraded": true}\`. A late bid is
-  worse than no bid, because the auction has already closed.
+  downstream call is handed \`remaining_ms()\` (\`budget_ms=\` / \`budgetMs:\` / \`BudgetMs:\`), not a
+  fresh full timeout.
+- When the remaining budget is below \`MIN_BID_MS\` before a stage, answer **200** with
+  \`{"auction_id": …, "bid": null, "reason": "deadline_exceeded", "degraded": true}\`.
 - A bid that did finish returns \`{"auction_id", "bid_cents", "creative_id", "degraded"}\`.`,
   sequence: {
     participants: ['Ad exchange', 'Bidding service', 'Feature service', 'Creative cache'],
@@ -282,7 +276,7 @@ def bid(body: BidRequest, bidder: str | None = Header(default=None, alias="X-Bid
 `,
     },
     typescript: {
-      starter: `/** POST /v1/bids: flawed code that never reads the auction budget. */
+      starter: `/** POST /v1/bids. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

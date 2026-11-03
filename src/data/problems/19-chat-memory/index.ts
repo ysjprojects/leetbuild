@@ -37,14 +37,7 @@ LangGraph's Redis checkpointer (\`langgraph-checkpoint-redis\`) stores each conv
 state under its \`thread_id\` and takes a \`ttl\` configuration with a \`default_ttl\` in minutes and
 a \`refresh_on_read\` flag, so an idle thread expires on its own and an active one keeps renewing
 its lease. That is the decision this course asks for at the write path: one window per
-conversation, expired by the store rather than by a reaper. A multi-tenant memory layer adds the
-rest. Every field a client sends is a claim: the session id in the path, the role, the content
-size, the idempotency key. A retried append answers with the turn already written. The window is
-mutated in one atomic step, so concurrent appends cannot lose a turn. An overflowing span is
-summarized under a deadline with a deterministic identity, so two workers race on one key. Events
-carry ids and token counts rather than text, because the topic outlives any buffer TTL. The read
-path shares the write path's tenant scope and carries a cache key that changes with the
-conversation.
+conversation, expired by the store rather than by a reaper.
 
 ## What you build here
 
@@ -63,10 +56,8 @@ One service, **memd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path,
-and it looks right. In every step you debug it against the failure modes, name the subtle one, fix
-it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on
-your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

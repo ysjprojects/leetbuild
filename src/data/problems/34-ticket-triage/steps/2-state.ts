@@ -228,7 +228,7 @@ def triage(body: TriageRequest, tenant: str = Header(alias="X-Tenant-Id")) -> di
 `,
     },
     typescript: {
-      starter: `/** Triage state: flawed code that races on the dedupe key. */
+      starter: `/** Triage state. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';

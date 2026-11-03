@@ -12,28 +12,20 @@ export const stateStep: Step = {
 makes before it scores a request: it reads the cached vector, returns it on a hit, and on a miss
 asks the feature service and writes the result back. It serves the demo and hides five flaws.
 
-**Failure mode the checks target.** A wrong ranking served from another tenant's data, a stale
-vector that outlives every catalog change, a herd of identical feature-service calls at every
-expiry, empty rankings while the feature service restarts, and a key that stays wedged after one
-failed refresh.
+**Failure mode the checks target.** Rankings served from another tenant's data, a vector that
+outlives catalog changes, a herd of feature-service calls at every expiry, empty rankings while the
+feature service restarts, and a key wedged after one failed refresh.
 
-- The vector is cached **per \`(tenant, user)\`** under \`features:{tenant}:{user}\`. A user id is only
-  unique inside a tenant; the endpoint's **401** and **400** cannot catch a collision because both
-  requests are well-formed.
-- The fresh copy is written with a **TTL of 300 s** (\`TTL_S = 300\`, passed to the client as
-  \`ex=\`/\`EX\`/\`Expire\`/\`setex\`), so a catalog change reaches the ranking within the TTL.
+- Key the vector **per \`(tenant, user)\`** as \`features:{tenant}:{user}\`; a user id is only unique
+  inside a tenant.
+- Write the fresh copy with a **TTL of 300 s** (\`TTL_S = 300\`, as \`ex=\`/\`EX\`/\`Expire\`/\`setex\`).
 - A miss is refreshed by **exactly one caller**: take
-  \`SET lock:features:{tenant}:{user} 1 NX EX LOCK_TTL_S\` (5 s) before calling the feature service.
-  Every other caller waits on the same published value: sleep 50 ms, re-read
-  \`features:{tenant}:{user}\`, repeat until it appears or the lock TTL passes.
-- Keep a **longer-lived stale copy** at \`features:stale:{tenant}:{user}\` (\`STALE_TTL_S = 86_400\`),
-  written on every successful refresh. When the refresh fails, return that copy with \`stale=True\`
-  rather than empty features; the vector exists, it is just old.
+  \`SET lock:features:{tenant}:{user} 1 NX EX LOCK_TTL_S\` (5 s) first. Others sleep 50 ms and
+  re-read \`features:{tenant}:{user}\` until it appears or the lock TTL passes.
+- On every successful refresh write a **stale copy** at \`features:stale:{tenant}:{user}\`
+  (\`STALE_TTL_S = 86_400\`); when the refresh fails, return it with \`stale=True\`.
 - Release the lock in a \`finally\`/\`defer\`/scope guard, on the failure path too, and let a
-  follower that outlives the lock TTL take over the refresh.
-
-This step owns only the feature cache: the surface config cache (\`surface:{surface}:config\`, TTL
-5 s) and the request endpoint belong to other steps.`,
+  follower that outlives the lock TTL take over the refresh.`,
   sequence: {
     participants: ['Ranking path', 'Concurrent request', 'Redis', 'Feature service'],
     messages: [
@@ -794,15 +786,14 @@ FeatureResult loadFeatures(const std::string& tenant, const std::string& user) {
     'The key omits the tenant, the write has no expiry, every concurrent miss calls the service because nothing elects a refresher, and a failed refresh has no older copy to fall back to.',
     'Key by `features:{tenant}:{user}`, `set` with `ex=TTL_S`, `SET lock NX EX LOCK_TTL_S` then poll on loss, write `features:stale:` with `STALE_TTL_S` on success and return it with `stale=True` on failure, delete the lock in `finally`.',
   ],
-  debrief: `Cache-aside plus two additions that only matter under load and under failure. The lock is a
-per-key mutex: \`NX\` elects one refresher, \`EX\` makes a crashed one harmless, and the waiters read the
-value the winner publishes, which turns "one key, N concurrent misses" into one feature-service call
-per TTL. The stale copy is the second half: the fresh key expires after 300 s because a catalog
-change must become visible, but the previous value is still far better than none, so a longer-lived
-copy is kept and served marked degraded. The tenant in the key is not optional: a user id is only
-unique inside a tenant, and the endpoint's authentication has already promised it.
+  debrief: `Cache-aside plus two additions that matter under load and under failure. The lock is a
+per-key mutex: \`NX\` elects one refresher, \`EX\` makes a crashed one harmless, and waiters read the
+value the winner publishes, so N concurrent misses become one feature-service call per TTL. The
+fresh key expires after 300 s so catalog changes become visible, but an old vector beats none, so a
+longer-lived copy is served marked degraded. The tenant belongs in the key because a user id is only
+unique inside a tenant.
 
-Production caches go further with in-process single-flight so one machine makes a single call per key,
-jittered TTLs so entries written together do not expire together, a lock token so a slow refresher
-cannot delete a successor's lock, and background revalidation so nobody waits at all.`,
+Production caches add in-process single-flight, jittered TTLs so entries written together do not
+expire together, a lock token so a slow refresher cannot delete a successor's lock, and background
+revalidation so nobody waits.`,
 };

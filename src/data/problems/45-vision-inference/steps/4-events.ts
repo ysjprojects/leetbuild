@@ -13,26 +13,18 @@ latency, confidence, the storage key and the presigned URL, produces it to \`vis
 \`key=tenant\` from a producer built with only \`bootstrap.servers\`, and polls once. It serves the
 demo and hides four flaws.
 
-**Failure mode the checks target.** Keyed by tenant, one model version's events scatter across the
-topic and nobody can answer "how did vision-large-3.1.0 behave on Tuesday?". The presigned URL sits
-in a retained, replicated log long after it expired everywhere else. With the default \`acks=1\` and
-no idempotence a retry duplicates an event. And a rejected produce is dropped, so every broker hiccup
-removes an inference from the counters.
+**Failure mode the checks target.** Keyed by tenant, one model version's events scatter and nobody
+can answer "how did vision-large-3.1.0 behave on Tuesday?". The presigned URL outlives its expiry in
+a retained log, default \`acks=1\` without idempotence duplicates on retry, and a rejected produce
+drops an inference from the counters.
 
-Requirements for the event path on \`vision.inference\`:
-
-- Exactly one event per completed inference, **keyed by the model version**
-  (\`key = event["model_version"]\`, a \`Hash\`/hash partitioner), so each version's quality stream
-  stays ordered inside one partition.
-- The payload carries the **task**, the **latency**, a **confidence summary** and the **digest** of
-  the storage key, and **no image bytes and no URLs**: a presigned URL in a retained topic is a
-  standing grant of access that outlives the request, the tenant and the retention window.
-- The producer is configured once, idempotently, with \`acks=all\`; not per request.
-- When the broker rejects the produce, write an **outbox row** and let a relay retry it. Dropping the
-  event loses a completed inference from quality accounting; blocking on the broker couples the GPU's
-  latency to Kafka's.
-- The consumer updates the per-version counter and **commits after** it, so a crash replays rather
-  than skips.`,
+- One event per completed inference, **keyed by the model version** (\`key = event["model_version"]\`,
+  a hash partitioner).
+- The payload carries **task**, **latency**, a **confidence summary** and the storage key's
+  **digest**; **no image bytes and no URLs**.
+- Configure the producer once, idempotent, with \`acks=all\`.
+- When the broker rejects the produce, write an **outbox row** for a relay; do not drop or block.
+- The consumer updates the per-version counter and **commits after** it.`,
   sequence: {
     participants: ['Inference worker', 'Kafka', 'Quality consumer', 'Outbox relay'],
     messages: [
@@ -118,7 +110,7 @@ Requirements for the event path on \`vision.inference\`:
   ],
   code: {
     python: {
-      starter: `"""Inference events: flawed code that publishes everything it knows."""
+      starter: `"""Inference events."""
 import json
 
 from confluent_kafka import Producer
@@ -213,7 +205,7 @@ def consume(consumer: Consumer, counter) -> None:
 `,
     },
     typescript: {
-      starter: `/** Inference events: flawed code that publishes everything it knows. */
+      starter: `/** Inference events. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'vision.inference';

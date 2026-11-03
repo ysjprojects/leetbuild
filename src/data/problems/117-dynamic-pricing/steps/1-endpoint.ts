@@ -254,7 +254,7 @@ def propose(body: PriceRequest, caller: str | None = Header(default=None, alias=
 `,
     },
     typescript: {
-      starter: `/** POST /v1/prices: flawed code that applies whatever multiplier the caller sends. */
+      starter: `/** POST /v1/prices. */
 import Fastify from 'fastify';
 
 import {store} from './store';

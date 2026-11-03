@@ -13,25 +13,17 @@ export const completionEndpointStep: Step = {
 prefix, suffix and every tab's text to the model and returns the candidates with the token. It
 serves the demo and hides three flaws.
 
-**Failure mode the checks target.** Serving without a session makes one developer's open tabs
-another developer's context, and a reply with no id cannot be matched to a keystroke, so a slow
-reply overwrites a newer one. An untrimmed prefix either fails at the model or costs the window
-that the neighboring-tab snippets needed. The log line is the subtle one: it ships source code
-into the log pipeline on every keystroke, where it outlives the session and the retention policy.
+**Failure mode the checks target.** Without a session one developer's open tabs become another's
+context, and a reply with no id lets a slow reply overwrite a newer one. An untrimmed prefix fails
+at the model or eats the snippets' window, and the log line ships source code on every keystroke.
 
-- The session comes from the authenticated \`X-Session-Id\` header; a missing session is **401**.
-  Completions are per developer: the open tabs in the body are that developer's code.
-- The model reads about **6,000 characters** (\`PROMPT_WINDOW_CHARS\`). The editor sends the whole
-  file; the service makes it fit: the prefix keeps its **last 3,500** characters
-  (\`MAX_PREFIX_CHARS\`), the suffix its **first 1,000** (\`MAX_SUFFIX_CHARS\`), and the open-tab
-  snippets fill what is left (\`MAX_TABS_CHARS\`), at most **20** tabs (\`MAX_OPEN_TABS\`). Trim,
-  do not reject: a 40 KB file is normal.
-- A request whose prefix, suffix and tabs together exceed **1 MiB** (\`MAX_BODY_BYTES\`) is **413**;
-  an empty \`language\` or \`path\` is **400**.
-- Every reply carries a fresh \`request_id\` and echoes the editor's \`token\`: the editor fires on
-  every keystroke and drops any reply whose token is older than its latest request.
-- Log session, request id, language, prompt size and snippet count, and not the prefix, the
-  suffix or a tab's text.`,
+- \`X-Session-Id\` is required (**401**).
+- The model reads about **6,000 characters** (\`PROMPT_WINDOW_CHARS\`): keep the prefix's **last
+  3,500** (\`MAX_PREFIX_CHARS\`), the suffix's **first 1,000** (\`MAX_SUFFIX_CHARS\`), tabs in the rest
+  (\`MAX_TABS_CHARS\`), at most **20** tabs (\`MAX_OPEN_TABS\`). Trim, do not reject.
+- Over **1 MiB** (\`MAX_BODY_BYTES\`) is **413**; an empty \`language\` or \`path\` is **400**.
+- Every reply carries a fresh \`request_id\` and echoes the editor's \`token\`.
+- Log session, request id, language, prompt size and snippet count, never code.`,
   sequence: {
     participants: ['Editor', 'completiond', 'Model service'],
     messages: [

@@ -8,36 +8,28 @@ export const invoiceEndpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers all three invoice
-routes and serves the happy path, and it hides three production flaws. Debug it like the service
-owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/invoices\`, \`PATCH /v1/invoices/{id}\` and
+\`POST /v1/invoices/{id}/finalize\` with body
+\`{"currency": "usd", "line_items": [{"description": "Consulting", "quantity": 2, "unit_price_cents": 25000}]}\`:
+it stores a draft in a dict, replaces its line items on PATCH, and on finalize sets \`status\` to
+\`finalized\` and sums \`subtotal_cents\`. It serves the demo and hides four flaws.
 
-Implement the draft/final lifecycle of an invoice:
+**Failure mode the checks target.** The update handler does not read \`status\`, so the line items
+of an issued invoice can be rewritten weeks after it was paid. The finalize handler does not read
+the line items, so an empty invoice is issued with a total of 0. It ignores \`Idempotency-Key\`, so a
+client retry mints a second invoice. And no request field is validated, so any currency, quantity
+or price lands in the store.
 
-- \`POST /v1/invoices\` — the tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when
-  missing) and the body is
-  \`{"currency": "usd", "line_items": [{"description": "Consulting", "quantity": 2, "unit_price_cents": 25000}]}\`.
-  It creates a **draft**: \`id\` server-side, \`status\` \`draft\`, \`number\` \`null\`. \`currency\` is
-  one of \`usd\`, \`eur\`, \`gbp\` (**400** otherwise). At most **100** line items, each \`description\`
-  **1..120** characters, \`quantity\` an integer in **1..1000** and \`unit_price_cents\` an integer in
-  **0..10 000 000** (**400** otherwise). A draft may be created with no line items at all — that is
-  exactly the state the finalize guard has to refuse.
-- \`PATCH /v1/invoices/{id}\` replaces the line items of a **draft** and returns it. On a **finalized**
-  invoice it answers **409** and changes nothing.
-- \`POST /v1/invoices/{id}/finalize\` with an \`Idempotency-Key\` header (**400** when missing):
-  validates the totals, locks the invoice, and returns it. An invoice with **no line items cannot
-  finalize** (**422**). A replay of the same \`(tenant, Idempotency-Key)\` returns the ORIGINAL
-  finalized invoice: one invoice, one number, never a second document.
-- The number is not yours to compute here — the state step claims it atomically. Call the claim after
-  validation has passed, and store the finalized document under the idempotency key.
-- Money is integer minor units end to end: \`subtotal_cents = Σ quantity × unit_price_cents\`.
-
-**Failure mode the checks target.** The starter treats \`finalize\` as a label instead of a lock. The
-update handler never looks at \`status\`, so line items of an issued — even paid — invoice can be
-re-written weeks later and every downstream reconciliation built on that document silently becomes
-wrong. The finalize handler never looks at the line items, so an empty invoice is issued as a zero
-total. And it always writes a fresh document, so a client retry after a timeout mints a duplicate
-invoice with a second number. None of the three throws; all three corrupt the books.`,
+- \`POST /v1/invoices\`: the tenant comes from \`X-Tenant-Id\` (**401** when missing). It creates a
+  **draft** with a server-side \`id\`, \`status\` \`draft\`, \`number\` \`null\`. \`currency\` is one of
+  \`usd\`, \`eur\`, \`gbp\`; at most **100** line items, each \`description\` **1..120** characters,
+  \`quantity\` in **1..1000**, \`unit_price_cents\` in **0..10 000 000** (**400** otherwise).
+- \`PATCH /v1/invoices/{id}\` replaces the line items of a **draft**; on a **finalized** invoice it
+  answers **409** and changes nothing.
+- \`POST /v1/invoices/{id}/finalize\` requires \`Idempotency-Key\` (**400** when missing); no line
+  items is **422**; a replay of the same \`(tenant, Idempotency-Key)\` returns the original finalized
+  invoice. The number comes from the state step's atomic claim, called after validation.
+- Money is integer minor units: \`subtotal_cents = Σ quantity × unit_price_cents\`.`,
   sequence: {
     participants: ['Issuer', 'Invoice Service', 'invoice store'],
     messages: [
@@ -200,9 +192,7 @@ class InvoiceDraft(BaseModel):
     line_items: list[LineItem] = Field(default_factory=list)
 
 
-# TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
-# finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-# mints another invoice because Idempotency-Key is ignored. Fix all three.
+# TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 
 
 @app.post("/v1/invoices")
@@ -438,9 +428,7 @@ interface Invoice {
 
 const drafts = new Map<string, Invoice>();
 
-// TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
-// finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-// mints another invoice because Idempotency-Key is ignored. Fix all three.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 
 app.post('/v1/invoices', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'] as string;
@@ -694,9 +682,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-// TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
-// finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-// mints another invoice because Idempotency-Key is ignored. Fix all three.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 
 func createInvoice(rw http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -1078,9 +1064,7 @@ object InvoiceApi {
   def subtotalCents(lines: List[LineItem]): Long =
     lines.map(line => line.quantity.toLong * line.unit_price_cents).sum
 
-  // TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
-  // finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-  // mints another invoice because Idempotency-Key is ignored. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 
   val routes: Route =
     path("v1" / "invoices") {
@@ -1316,9 +1300,7 @@ int main() {
     res.set_content(invoice.dump(), "application/json");
   });
 
-  // TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
-  // finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-  // mints another invoice because Idempotency-Key is ignored. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 
   svr.Patch(R"(/v1/invoices/(\\d+))", [](const httplib::Request& req, httplib::Response& res) {
     const auto invoiceId = req.matches[1].str();
@@ -1533,9 +1515,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses in cost order and never let an update reach a finalized invoice: load by `(tenant, id)`, `require_draft(invoice)` → **409**, and only then touch `line_items`. A `status` field is not protection; the check in front of the write is.',
-    'Finalization has four refusals in front of the claim: missing tenant, missing `Idempotency-Key`, an invoice that is already finalized (replay the stored one instead), and an invoice with no line items (**422**). Only after those does the state step hand out a number.',
-    'Key the retry by `(tenant, Idempotency-Key)` and store the finalized document, not the request: a replay must answer with the number the first attempt already issued. Money stays in integer minor units — `subtotal_cents = Σ quantity × unit_price_cents` — because a float total is an invoice that will never balance.',
+    'Finance reports an invoice paid in March whose line items changed in May, and a customer billed twice for one finalize call that timed out on their side.',
+    '`update_invoice` and `finalize_invoice` read the row by id and write it without reading `status`, the line items or the `Idempotency-Key` header, so every request is treated as a fresh first attempt.',
+    'Add `FINALIZED`, `require_draft(invoice)` answering 409 in the PATCH path, a 422 when `line_items` is empty, and `finalize_store.get`/`.put` keyed by `(tenant, Idempotency-Key)` around the claim.',
   ],
-  debrief: `The interviewer is testing whether you review a generated billing handler as a state machine, not as CRUD. The draft reads fine because every demo request is well formed, hits a draft, and never retries. The three defects are one defect repeated: the code never asks what state the invoice is in. An update that does not check \`status\` turns a finalized — already taxed, already sent, possibly already paid — document into a mutable one, which invalidates every ledger row, PDF and reconciliation built on it. A finalize that does not check the line items issues a zero-total invoice that no one will query for. A finalize that does not check \`Idempotency-Key\` mints a second invoice with its own number for a request the client never saw acknowledged, which is exactly how duplicate billing happens in production. Real services add an append-only status history, a freeze on the whole document (not just the lines), and an amendment/credit-note path for the rare correction, so "changing a finalized invoice" becomes a new document instead of an update.`,
+  debrief: `The fix is a state machine wrapped around CRUD. Each handler first asks what state the invoice is in and refuses the transitions that state forbids: an update on a finalized document, a finalize of an empty one, a second finalize for a key already recorded. The guards run before the write because once \`status\` flips to \`finalized\` the document is referenced by tax, PDFs and the ledger, and nothing downstream will re-read it. Storing the finalized document under the idempotency key, not the request, lets a replay answer with the number already issued. Production billing systems freeze the whole document and route corrections through credit notes, so "changing a finalized invoice" becomes a new document with its own number instead of an update.`,
 };

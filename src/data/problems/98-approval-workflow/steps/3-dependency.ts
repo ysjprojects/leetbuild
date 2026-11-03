@@ -14,20 +14,17 @@ decision through \`state.advance\`, then calls \`CheckEligibility(actor, request
 Eligibility gRPC stub in a loop until a reply with \`eligible == true\` arrives, and returns the
 recorded result. It serves the demo and hides 5 flaws.
 
-**Failure mode the checks target.** An approver who left the company decides, an ineligible
-approver is retried until the call happens to succeed, a hung eligibility service holds the
-approval open indefinitely, and a transport error is swallowed and retried. The chain has already
-moved before any of this is known. All of it is invisible in a demo where the dependency is healthy
-and every approver is valid.
+**Failure mode the checks target.** A departed approver decides, an ineligible approver is retried
+until the call happens to succeed, a hung eligibility service holds the approval open, and a
+transport error is swallowed and retried, all after the chain has already moved.
 
 - Eligibility and delegation status come from the **Eligibility service over gRPC**:
-  \`CheckEligibility(actor, request_id)\` → \`{active, eligible, delegated_to}\`. A session cookie is
-  not eligibility; the workflow does not own the directory that says who still works here.
+  \`CheckEligibility(actor, request_id)\` → \`{active, eligible, delegated_to}\`, not from the session.
 - Every attempt carries a **1-second deadline** (\`1000 ms\`).
 - Retries are **bounded** (\`2\` attempts) and only a deadline is retried; any other transport error
   is an unverified decision.
-- **A timeout denies** (\`eligibility_timeout\` / \`eligibility_unverified\`). Failing open because
-  the approver has a valid session is how an outage approves spend.
+- **A timeout denies** (\`eligibility_timeout\` / \`eligibility_unverified\`); failing open is how an
+  outage approves spend.
 - **A departed approver cannot decide**: \`active == false\` is denied (\`approver_departed\`).
 - A delegation must name the actor: a \`delegated_to\` that is somebody else is denied
   (\`delegation_mismatch\`), and so is \`eligible == false\` (\`approver_ineligible\`).
@@ -262,7 +259,7 @@ def decide(
 `,
     },
     typescript: {
-      starter: `/** Decision path: flawed code that trusts the session for eligibility. */
+      starter: `/** Decision path. */
 import * as grpc from '@grpc/grpc-js';
 import Fastify from 'fastify';
 

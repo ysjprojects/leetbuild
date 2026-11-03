@@ -36,14 +36,7 @@ Istio's traffic mirroring is the mesh-level version: a \`VirtualService\` names 
 destination and a \`mirrorPercentage\`, the proxy sends that fraction of requests to the mirrored
 service with \`-shadow\` appended to the Host header, and the mirrored requests are fire and forget,
 their responses discarded. That gives you the request copy and the share; everything above the
-proxy is what this course builds. A shadow runner for models keeps the candidate path
-**observe-only**: it may read the request and write into its own namespace, and it may not mutate
-production state or consume a key production still needs. Its Redis state is keyed by config id so
-a shadow cannot draw on a tenant's production quota, and one enabled flag makes a disable take
-effect everywhere on the next request. The candidate call runs beside the request, not inside it:
-a short deadline, a hard concurrency cap, overloads dropped and counted, no retries. Each
-comparison publishes one event keyed by config id with both versions, scores and a fingerprint,
-without prompt or completions, and the report says inconclusive below the sample threshold.
+proxy is what this course builds, starting with a candidate path that is **observe-only**.
 
 ## What you build here
 

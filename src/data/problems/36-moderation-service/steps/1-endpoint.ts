@@ -237,7 +237,7 @@ def create_report(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/reports: flawed code that trusts the body and duplicates cases. */
+      starter: `/** POST /v1/reports. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

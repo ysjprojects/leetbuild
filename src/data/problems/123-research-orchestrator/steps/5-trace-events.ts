@@ -259,7 +259,7 @@ def evaluate() -> None:
 `,
     },
     typescript: {
-      starter: `/** research.trace: flawed code that keys by agent, ships content, and commits too early. */
+      starter: `/** research.trace. */
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
 

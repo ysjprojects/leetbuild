@@ -60,9 +60,8 @@ One service, the prompt cache, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course compiles, serves the happy path and looks right. Your job in every step
-is to debug it against the failure modes the checks name, fix it, and prove the fix with checks that
-fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

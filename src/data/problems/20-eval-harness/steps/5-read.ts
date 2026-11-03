@@ -14,20 +14,16 @@ otherwise reads the counters from \`evals:run:{id}\`, computes the pass rate, co
 \`threshold\` query parameter defaulting to 0.9, labels the run \`passed\` or \`failed\`, and caches
 the body for 60 s. It compiles, serves the demo and hides 5 flaws.
 
-**Failure mode the checks target.** The report is the artifact a release decision is made from,
-so every flaw here is a release bug: any tenant can read any run, a run is declared green on twelve
-samples, the caller chooses the bar its own release must clear, and a report cached early in the
-run hides the failures of the last batch from the person clicking ship.
-
-Requirements:
+**Failure mode the checks target.** A release decision is made from this report, so every flaw is a
+release bug: any tenant can read any run, a run is green on twelve samples, the caller chooses its
+own bar, and a report cached early hides the last batch's failures.
 
 - The run is looked up for the **authenticated tenant** (\`assert_tenant_owns\`); a run that
   belongs to another tenant, or does not exist, answers **404**.
 - A run is judged only once it has at least **200 scored samples** (\`MIN_SCORED_SAMPLES\`); below
   that the status is **\`pending\`**, with the floor and the current count in the body.
 - Above the floor the run **passes** only when the pass rate clears \`RELEASE_THRESHOLD\` **and**
-  beats the previous release's pass rate; a version that merely ties the incumbent has not earned
-  a rollout. Otherwise it is **\`failed\`**.
+  beats the previous release's pass rate (a tie has not earned a rollout); otherwise **\`failed\`**.
 - The threshold comes from **server config** (\`RELEASE_THRESHOLD\`); a \`threshold\` in the query
   string is ignored.
 - The cache key includes the **scored count**: \`report:{tenant}:{run_id}:{scored}\`, so the report
@@ -225,7 +221,7 @@ def read_run(id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/evals/runs/:id: flawed code that lets the caller set the bar. */
+      starter: `/** GET /v1/evals/runs/:id. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

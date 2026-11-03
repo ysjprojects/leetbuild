@@ -14,25 +14,19 @@ answer text, through a producer with default settings; the consumer in group \`s
 each offset, then \`HINCRBY\`s a single global \`signatures\` hash. It serves the demo and hides
 five flaws.
 
-**Failure mode the checks target.** Keying by event id scatters one user's events across
-partitions; an unconfigured producer duplicates on retry; the question and the answer in the event
-are a retained copy of exactly the text the guard refused to log; a single global counter cannot
-show when an attack started; and commit-before-write trades correctness for code that looks
-exactly-once.
+**Failure mode the checks target.** Keying by event id scatters one user's events; an unconfigured
+producer duplicates on retry; the question and answer in the event are a retained copy of the text
+the guard refused to log; a global counter cannot show when an attack started; commit-before-write
+loses counts on a crash.
 
-- Publish **one** event per decision with the **user** as the message key, so one user's events
-  stay ordered on one partition. The payload carries the event id, user, document hash, signal
-  names, the decision (\`served\` / \`refused\`), the signature and a timestamp.
-- The question, the answer and the document text stay out of the event and out of every log line:
-  the topic is retained and replicated, and the whole point of the signature is to count incidents
-  without storing what was said.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` plus a stable hash balancer), so a retried produce cannot duplicate a record.
-- The consumer buckets each refusal by hour (\`HOUR_S = 3600\`, key \`signatures:{hour}\`) and
-  \`HINCRBY\`s the signature's count; a bucket expires after seven days. Served decisions are not
-  counted.
-- The consumer commits the offset **after** the Redis write. Commit first and a crash between the
-  two loses the count forever, because the offset already moved past the record.`,
+- Publish **one** event per decision keyed by **user**, carrying event id, user, document hash,
+  signal names, decision (\`served\` / \`refused\`), signature and timestamp.
+- No question, answer or document text in the event or any log line.
+- The producer is **idempotent with \`acks=all\`** (or required acks \`all\` with a stable hash
+  balancer).
+- The consumer buckets each refusal by hour (\`HOUR_S = 3600\`, key \`signatures:{hour}\`),
+  \`HINCRBY\`s the signature, and expires a bucket after seven days; served decisions are not counted.
+- Commit the offset **after** the Redis write.`,
   sequence: {
     participants: ['promptguard', 'prompt.security', 'Signature consumer', 'Redis'],
     messages: [
@@ -231,7 +225,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** prompt.security: flawed code that keys by event id and commits too early. */
+      starter: `/** prompt.security. */
 import {randomUUID} from 'node:crypto';
 
 import {Kafka} from 'kafkajs';

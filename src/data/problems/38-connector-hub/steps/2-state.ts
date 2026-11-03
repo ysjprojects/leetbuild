@@ -185,7 +185,7 @@ def commit_page(commit: PageCommit) -> dict:
 `,
     },
     typescript: {
-      starter: `/** commitPage: flawed code that expires the cursor and moves it too early. */
+      starter: `/** commitPage. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

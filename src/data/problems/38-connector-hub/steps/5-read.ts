@@ -195,7 +195,7 @@ def health(id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id
 `,
     },
     typescript: {
-      starter: `/** GET /v1/connectors/{id}/health: flawed code that trusts the path id. */
+      starter: `/** GET /v1/connectors/{id}/health. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

@@ -23,11 +23,8 @@ export const connectorHubProblem: Problem = {
   minutes: 70,
   statement: `# Connector Hub
 
-A connector hub is the piece of a platform that keeps a vendor's records in sync with yours. The
-visible part is a "connected" badge and a row count; the parts that decide whether the platform is
-safe are the registration funnel, the durability of the sync cursor, the failure policy against a
-vendor you do not control, the event that reports progress, and the health read that on-call pages
-on.
+A connector hub keeps a vendor's records in sync with yours, holding customers' OAuth tokens and
+a sync cursor against a vendor you do not control.
 
 ## The real system
 
@@ -38,14 +35,9 @@ records are read, and the cursor field is the vendor's own ordering (an updated-
 opaque page token), which is what this course's Redis ledger reproduces with a claim key per page and
 a cursor that moves only after the page has been committed.
 
-The other pieces follow the same shape in any hub that holds customers' OAuth tokens. Registration
-compares the caller's base URL against a host the operator registered instead of fetching it,
-because "validate this URL for me" is a request forgery probe made with the platform's network
-position. The token is referenced, not echoed. Vendor calls distinguish a 429 (backoff with jitter,
-honouring \`Retry-After\`) from a 401 (one attempt, then disable with a reason) and from a run of 5xx
-(a breaker). Progress events are keyed by connector id so one run reads back in order, and carry
-counts and cursors rather than tokens or record contents, because the topic is retained. The health
-read is an alert input: lag from the last successful page, consecutive failures, breaker state.
+Registration compares the caller's base URL against a registered host instead of fetching it, and
+vendor calls tell a 429 (backoff honouring \`Retry-After\`) from a 401 (disable) and from a run of
+5xx (a breaker).
 
 ## What you build here
 
@@ -67,16 +59,13 @@ One service, **connectord**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is to debug it against the failure modes, fix it, optimize
-what is wasteful, and prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-OAuth consent flows and token refresh, vendor-specific pagination shapes, cursor compaction,
-backfill tooling, connector scheduling and quotas, PII classification of vendor records, and the
-dashboard. The five pieces above are the ones that decide whether a connector platform is correct,
-durable and shippable.`,
+OAuth consent flows and token refresh, vendor-specific pagination shapes, backfill tooling,
+connector scheduling and quotas, and the dashboard.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Operator / Sync', sub: 'register · health', x: 8, y: 50},

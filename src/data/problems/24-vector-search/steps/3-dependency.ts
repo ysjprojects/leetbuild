@@ -15,13 +15,11 @@ export const dependencyStep: Step = {
 well. It compiles and hides five flaws.
 
 **Failure mode the checks target.** Waiting for the slowest shard makes one hot shard's latency the
-service's latency. Catching a shard error into an empty list is the subtle one: the ranking looks
-plausible, the recall is gone, and nothing in the response says so. Unbounded retries on top of an
-unbounded wait means a partial shard outage becomes a full outage under load.
+service's latency. A shard error caught into an empty list keeps the ranking plausible while recall
+is gone, and unbounded retries turn a partial shard outage into a full one under load.
 
 - Every shard call carries a **400 ms deadline** (\`timeout\`, \`deadline:\`, \`WithTimeout\`,
-  \`withDeadlineAfter\`, \`set_deadline\`). A shard that has not answered by then is a *missing*
-  answer, not a slow one: the call is abandoned and the query proceeds.
+  \`withDeadlineAfter\`, \`set_deadline\`); a shard that has not answered by then is *missing*.
 - Retries are **bounded**: at most **2 attempts** per shard and a **150 ms retry budget** measured
   from the first attempt.
 - A shard reply set must reach a **quorum**, a majority of the configured shards
@@ -282,7 +280,7 @@ async def search(
 `,
     },
     typescript: {
-      starter: `/** Scatter-gather over index shards: flawed code with no bounds. */
+      starter: `/** Scatter-gather over index shards. */
 import * as grpc from '@grpc/grpc-js';
 import Fastify from 'fastify';
 

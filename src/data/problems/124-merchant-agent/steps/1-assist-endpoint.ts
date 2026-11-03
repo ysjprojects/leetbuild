@@ -8,31 +8,26 @@ export const assistEndpointStep: Step = {
   focus: ['merchant', 'api', 'turns'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and hands the message to the agent. It compiles, it serves the demo, and it hides four
-production flaws. Debug it like the owner of a merchant-facing assistant, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter serves \`POST /v1/assist\` with body
+\`{"shop_id": "…", "message": "which of my customers are from Toronto?", "page": {"type": "customers", "id": ""}, "scopes": [...]}\`:
+it logs the shop and the message, calls \`run_agent\` with the body's shop and scopes, and answers
+**200** with the turn id, reply and tools used. It compiles, serves the demo and hides four flaws.
 
-Implement \`POST /v1/assist\` with body
-\`{"message": "which of my customers are from Toronto?", "page": {"type": "customers", "id": ""}}\`.
+**Failure mode the checks target.** A shop id in the body is a cross-merchant read. A caller-supplied
+scope list is a privilege escalation the agent acts on. With no size cap and no page whitelist, one
+pasted spreadsheet becomes a model bill and a free-form page string becomes prompt text. Without an
+idempotency key, a client retry runs the form-filling tool twice.
 
-- The shop comes from the authenticated session, surfaced to the handler as \`X-Shop-Id\`; a missing
-  shop is **401**. The body never names the shop — a caller that can name a shop can read another
-  merchant's data.
+- The shop comes from the authenticated session, surfaced as \`X-Shop-Id\`; a missing shop is
+  **401**. The body does not name the shop.
 - \`message\` is a non-empty string of at most **8 KiB** (\`1 << 13\` bytes) of UTF-8; larger is
   **413**. \`page.type\` is one of \`home\`, \`products\`, \`orders\`, \`customers\`, \`analytics\`
-  (**400** otherwise): the page is context the admin sends, not a free-form string the model reads.
+  (**400** otherwise).
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(shop, key)\`
-  returns the stored turn instead of running the agent — and its write tools — again.
+  returns the stored turn instead of running the agent and its write tools again.
 - The merchant's **permission set** is attached server-side from the permission store
-  (\`scopes_for(shop)\`) and passed to the agent. The starter takes \`scopes\` from the body, so any
-  caller can grant itself \`write_products\`.
-- Log the turn with shop, page and turn id — never the message text.
-
-**Failure mode the checks target.** A shop id in the body is a cross-merchant read; a caller-supplied
-scope list is a privilege escalation that the agent will faithfully act on; the missing caps turn one
-pasted spreadsheet into a model bill; and an un-keyed assist endpoint runs a form-filling tool twice
-on every client retry.`,
+  (\`scopes_for(shop)\`) and passed to the agent; \`scopes\` is not read from the body.
+- Log the turn with shop, page and turn id, not the message text.`,
   sequence: {
     participants: ['Admin', 'sidekick API', 'permission store', 'turn store'],
     messages: [
@@ -143,8 +138,7 @@ class AssistRequest(BaseModel):
 
 @app.post("/v1/assist")
 def assist(body: AssistRequest) -> JSONResponse:
-    # TODO: this starter takes the shop and its scopes from the body, caps neither the message nor the
-    # page type, ignores Idempotency-Key, and logs the message. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     turn_id = str(uuid.uuid4())
     logger.info("assist shop=%s message=%r", body.shop_id, body.message)
     outcome = run_agent(shop=body.shop_id, scopes=body.scopes, message=body.message, page=body.page.type)
@@ -246,8 +240,7 @@ interface AssistBody {
 }
 
 app.post('/v1/assist', async (request, reply) => {
-  // TODO: this starter takes the shop and its scopes from the body, caps neither the message nor the
-  // page type, ignores Idempotency-Key, and logs the message. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as AssistBody;
   const turnId = randomUUID();
   request.log.info({shop: body.shop_id, message: body.message}, 'assist');
@@ -354,8 +347,7 @@ func assist(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter takes the shop and its scopes from the body, caps neither the message nor
-	// the page type, ignores Idempotency-Key, and logs the message. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	turnID := uuid.NewString()
 	log.Printf("assist shop=%s message=%q", body.ShopID, body.Message)
 	outcome, err := agent.Run(r.Context(), body.ShopID, body.Scopes, body.Message, body.Page.Type)
@@ -523,8 +515,7 @@ object AssistApi {
     path("v1" / "assist") {
       post {
         entity(as[AssistRequest]) { body =>
-          // TODO: this starter takes the shop and its scopes from the body, caps neither the message
-          // nor the page type, ignores Idempotency-Key, and logs the message. Fix all four.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val turnId = UUID.randomUUID().toString
           system.log.info(s"assist shop=\${body.shop_id} message=\${body.message}")
           val outcome = Agent.run(body.shop_id, body.scopes, body.message, body.page.\`type\`)
@@ -636,8 +627,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter takes the shop and its scopes from the body, caps neither the message nor
-    // the page type, ignores Idempotency-Key, and logs the message. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto shop = body.value("shop_id", std::string());
     const auto message = body.value("message", std::string());
     const auto page = body.value("page", json::object()).value("type", std::string());
@@ -746,9 +736,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses first, in cost order: shop header, Idempotency-Key, message shape, byte length, page whitelist. Every one returns before the agent runs, so a malformed request never spends a model call or touches a tool.',
-    'Two things in the body must move to the server: the shop (the `X-Shop-Id` header the session layer sets) and the scopes (`scopes_for(shop)` from the permission store). Delete both fields from the request model so a caller cannot even send them.',
-    'The idempotency lookup is keyed by `(shop, key)` and happens before the agent runs; a hit returns the stored turn. Store the finished turn — reply and tools used — so a replay never re-runs a write tool.',
+    "Support sees one merchant asking about another shop's customers, and a product form filled twice after a flaky retry. Neither request looked malformed.",
+    'The handler trusts `shop_id` and `scopes` from the body and runs `run_agent` on every call; nothing checks a header, a size, a page type or a prior turn.',
+    'Read `X-Shop-Id` and `Idempotency-Key` as headers (401/400 when missing), cap bytes at `1 << 13` (413), whitelist `page.type` (400), `store.get(shop, key)` before the agent, scopes from `scopes_for(shop)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a multi-tenant assistant. The starter reads fine because the demo sends one shop's requests with the right scopes and never retries. Four separate defects are being checked: the shop identity (it comes from the session, never the body — a body field is a cross-merchant read), the permission set (attached server-side, because the agent will act on whatever scopes it is given), input caps (cheap rejections before an expensive agentic loop), and idempotency keyed by shop so a retry cannot run a form-filling tool twice. The log line is the one candidates forget: a merchant's message can contain customer names and order details, so it never goes to a log sink verbatim. Real assistants add a per-staff-member identity beside the shop, a page-context schema instead of a free string, and a request-scoped trace id that follows the turn through the loop.`,
+  debrief: `The handler's shape is guards, lookup, agent, store, response, and the order follows cost: a bad header is rejected for free, a replay is answered from the turn store without a model call, and only a fresh request pays for the agentic loop and its tools. Identity and permissions come from the server side of the trust boundary because the agent acts on whatever scopes it receives; a body field for either is an invitation. The log line matters for the same reason: a merchant's message can carry customer names and order details, so it stays out of log sinks. Production assistants go further: the turn store holds an in-progress marker so two concurrent requests with one key do not both run the agent, and the message cap is paired with a per-shop rate limit.`,
 };

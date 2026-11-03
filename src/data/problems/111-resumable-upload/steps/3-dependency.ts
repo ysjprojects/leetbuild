@@ -183,7 +183,7 @@ def resume_list(upload_id: str, part_count: int, manifest: dict) -> list[int]:
 `,
     },
     typescript: {
-      starter: `/** WritePart: flawed code that marks a part stored on the store's acceptance. */
+      starter: `/** WritePart. */
 import * as grpc from '@grpc/grpc-js';
 
 const WRITE_DEADLINE_S = 30;

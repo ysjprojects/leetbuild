@@ -8,35 +8,30 @@ export const stateStep: Step = {
   focus: ['runner', 'redis', 'sandbox'],
   task: `## Task
 
-**Starting point.** The starter is working code: a probe runs, the target's counter goes up, and a
-duplicate is skipped. It races under concurrency, it keeps spending after the cap is reached, and
-its keys never die. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter serves \`POST /v1/redteam/probes\` with body
+\`{"target": "checkout-shadow", "probe_hash": "9f2c…", "category": "prompt-injection"}\`, called
+once per executed probe: it \`GET\`s the dedupe key, returns early if present, \`SET\`s it, then
+\`INCR\`s one counter per target and refuses above \`PROBE_BUDGET\`. It serves the demo and hides
+five flaws.
 
-Implement \`record_probe\`, called once per executed probe with
-\`{"target": "checkout-shadow", "probe_hash": "9f2c…", "category": "prompt-injection"}\`:
+**Failure mode the checks target.** Two workers replaying the same probe both run it. Two concurrent
+probes both pass the budget check. A target that exhausted its budget once stays exhausted until
+someone deletes a key by hand, because the counter has no window and no expiry. A
+\`resource-exhaustion\` probe set spends the whole target budget, and nothing scopes the keys to the
+hour they belong to.
 
-- A probe is identified by \`(target, probe_hash)\` and lives under its **own dedupe key**
-  \`redteam:probe:{target}:{probe_hash}\`, claimed with **one atomic \`SET\` … \`NX\` \`EX\`** with
-  \`DEDUPE_TTL_S = 86_400\`. Two workers replaying the same probe must not both run it; a client-side
-  \`GET\` followed by a \`SET\` is exactly the race the starter has.
-- Each target gets an **hourly probe budget** under \`redteam:budget:{target}:{window}\`, where the
-  window is \`int(time.time()) // WINDOW_S\` and \`WINDOW_S = 3600\`. The read, the check and the
-  increment happen in **one atomic Lua \`EVAL\`** that also sets \`EXPIRE\` from the window at first
-  write, so the budget resets with its hour instead of accumulating forever.
-- A **destructive** category (\`resource-exhaustion\`, \`data-exfil\`) draws from its own smaller cap
-  \`DESTRUCTIVE_PROBE_BUDGET = 20\` under its own key suffix, so it can never spend the general
-  budget of \`PROBE_BUDGET = 200\` even when the general budget has room.
-- The dedupe claim happens **before** the budget is reserved: a replayed probe must not count and
-  must not re-spend. When the reservation is refused, release the claim so an operator can retry
-  after the window rolls.
-- Return \`{applied, remaining, ttl}\`; \`applied\` is false for a replayed probe or a refused
-  reservation.
-
-**Failure mode the checks target.** The subtle one is the order of the two steps: mark-then-spend
-means a replay is free, spend-then-mark means every retry buys more adversarial traffic. The loud
-one is the read-modify-write budget, which two concurrent probes both pass. The silent one is the
-missing expiry and the missing window bucket: one shared key per target means its probe history
-blocks every future run, forever.`,
+- A probe is identified by \`(target, probe_hash)\` and claimed under its own dedupe key
+  \`redteam:probe:{target}:{probe_hash}\` with one atomic \`SET … NX EX\`, \`DEDUPE_TTL_S = 86_400\`.
+- Each target gets an hourly budget under \`redteam:budget:{target}:{window}\` (\`budget_key\`),
+  \`window = int(time.time()) // WINDOW_S\`, \`WINDOW_S = 3600\`. The read, the check and the increment
+  happen in one atomic Lua \`EVAL\` (\`RESERVE_LUA\`) that also sets \`EXPIRE\` from the window on first
+  write.
+- A destructive category (\`DESTRUCTIVE_CATEGORIES\`: \`resource-exhaustion\`, \`data-exfil\`) draws
+  from its own cap \`DESTRUCTIVE_PROBE_BUDGET = 20\` under its own key suffix, not from
+  \`PROBE_BUDGET = 200\`.
+- The dedupe claim happens before the budget is reserved (\`reserve_budget\`). When the reservation is
+  refused, release the claim so an operator can retry after the window rolls.
+- Return \`{applied, remaining, ttl}\`; \`applied\` is false for a replay or a refused reservation.`,
   sequence: {
     participants: ['Probe runner', 'Second runner', 'Redis'],
     messages: [
@@ -139,10 +134,7 @@ def dedupe_key(target: str, probe_hash: str) -> str:
 
 @app.post("/v1/redteam/probes")
 def record_probe(body: ProbeResult) -> dict:
-    # TODO: this starter reads the dedupe key with GET before writing it, so two concurrent
-    # duplicates both run; it increments a single never-expiring counter per target with no window,
-    # and it has no separate cap for destructive categories. Make the claim atomic, move the budget
-    # into one script with a TTL, and give destructive probes their own cap.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     seen = r.get(dedupe_key(body.target, body.probe_hash))
     if seen is not None:
         return {"applied": False}
@@ -244,10 +236,7 @@ function dedupeKey(target: string, probeHash: string): string {
 }
 
 app.post('/v1/redteam/probes', async (request, reply) => {
-  // TODO: this starter reads the dedupe key with get before writing it, so two concurrent duplicates
-  // both run; it increments a single never-expiring counter per target with no window, and it has
-  // no separate cap for destructive categories. Make the claim atomic, move the budget into one
-  // script with a TTL, and give destructive probes their own cap.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const body = request.body as ProbeBody;
   const key = dedupeKey(body.target, body.probe_hash);
   const seen = await r.get(key);
@@ -363,10 +352,7 @@ func dedupeKey(target, probeHash string) string {
 }
 
 func recordProbe(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reads the dedupe key with Get before writing it, so two concurrent
-	// duplicates both run; it increments a single never-expiring counter per target with no window,
-	// and it has no separate cap for destructive categories. Make the claim atomic, move the budget
-	// into one script with a TTL, and give destructive probes their own cap.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	var body ProbeResult
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	ctx := r.Context()
@@ -490,10 +476,7 @@ object State {
 
   def dedupeKey(target: String, probeHash: String): String = s"redteam:probe:$target:$probeHash"
 
-  // TODO: this starter reads the dedupe key with get before writing it, so two concurrent duplicates
-  // both run; it increments a single never-expiring counter per target with no window, and it has
-  // no separate cap for destructive categories. Make the claim atomic, move the budget into one
-  // script with a TTL, and give destructive probes their own cap.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def recordProbe(body: ProbeResult): String = {
     val key = dedupeKey(body.target, body.probe_hash)
     if (jedis.get(key) != null) {
@@ -598,10 +581,7 @@ std::string dedupeKey(const std::string& target, const std::string& probeHash) {
   return "redteam:probe:" + target + ":" + probeHash;
 }
 
-// TODO: this starter reads the dedupe key with get before writing it, so two concurrent duplicates
-// both run; it increments a single never-expiring counter per target with no window, and it has no
-// separate cap for destructive categories. Make the claim atomic, move the budget into one script
-// with a TTL, and give destructive probes their own cap.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::string recordProbe(
     sw::redis::Redis& redis,
     const std::string& target,
@@ -690,9 +670,9 @@ std::string recordProbe(
     },
   },
   hints: [
-    'Two workers, one probe: only the command itself can decide the winner. `SET key value NX EX ttl` returns `OK` for exactly one of them, so the loser returns "duplicate" without running anything. A `GET` before the write cannot distinguish them.',
-    'Put read, compare and increment in the Lua body and let Redis serialize it. Set the TTL inside the script only when the key was created, so a window that started 59 minutes ago expires in a minute rather than living for a day.',
-    'The category is data, not decoration: it selects the cap and the key suffix. Separate the destructive cap from the general one, and keep the general key untouched so an aggressive probe set cannot starve the next ordinary run against the same target.',
+    "The sandbox logs show the same probe executed twice within a millisecond, and a target that hit its cap during yesterday's run still refuses every probe this morning.",
+    '`r.get` then `r.set` is a check-then-set race, so two workers both see nothing and both run; `redteam:budget:{target}` has no window and no `EXPIRE`, so the count only ever grows.',
+    'Claim with `r.set(dedupe_key(...), "1", nx=True, ex=DEDUPE_TTL_S)` first; then `reserve_budget` via one `EVAL` on `budget_key(target, window, category)` that `INCRBY`s, compares to the cap and `EXPIRE`s on creation.',
   ],
-  debrief: `The interviewer is testing atomicity and lifetime in one shot. Two contracts are being checked. First, a replay must be free: the dedupe claim is a single atomic command, and it runs before the budget is reserved, so a redelivered probe neither executes twice nor spends twice. Second, a budget must be a window, not a monument: the counter is keyed by the hour and expires with it, which is the difference between throttling a target for an hour and locking it out until someone deletes a key by hand. The separate destructive cap is the third, quieter contract: probe categories are not interchangeable, and a shared cap lets the most aggressive category decide whether harmless probes can run at all. Real platforms add per-target approval limits, a global circuit breaker for the fleet, and an audit row for every refused reservation so a coverage gap is visible.`,
+  debrief: `The fix is about atomicity and lifetime at once. A replay must be free, so the dedupe claim is a single command that only one caller can win, and it runs before the budget is reserved, so a redelivered probe neither executes twice nor spends twice. A budget must be a window rather than a monument, so the counter is keyed by the hour and expires with it; that is the difference between throttling a target for an hour and locking it out until someone deletes a key. The separate destructive cap exists because probe categories are not interchangeable, and a shared cap lets the most aggressive category decide whether harmless probes can run at all. Production platforms add a per-target approval limit above these caps, and release a claim automatically when the probe's execution fails, so a crashed worker does not pin a probe for a day.`,
 };

@@ -8,32 +8,28 @@ export const merchantBudgetStep: Step = {
   focus: ['api', 'redis', 'tools'],
   task: `## Task
 
-**Starting point.** The starter is working code for the spending layer the loop
-calls: it charges a per-shop budget, caches tool results, and invokes tools. A single shop with budget
-left sails through, so the demo passes. It hides a race, a leak, a cross-merchant cache and a
-double write. Debug it, fix it, and prove the fix.
+**Starting point.** The starter is the spending layer every assist turn goes through: \`charge\`
+\`GET\`s two counters under \`budget:{shop}\` and \`INCRBY\`s them when the turn fits; \`invoke_tool\`
+caches read-tool results under \`tool:{name}:{digest}\` with no TTL and runs write tools on every
+call; \`assist_turn\` calls \`Complete\` first and charges afterwards. A single shop with budget
+left sails through, so the demo passes. It hides five flaws.
 
-Implement the spending layer every assist turn goes through:
+**Failure mode the checks target.** Two concurrent turns both pass the budget check and overspend.
+A shop that had one busy minute is locked out for good, because the key has no window. A "customers
+from Toronto" answer computed for one merchant is served to another from the cache. A retried turn
+fills the merchant's product form twice. And an over-budget turn has already been paid for by the
+time it is refused.
 
 - Each shop gets **30 requests** and **150 000 tokens** per **60-second window**. The key is
-  \`budget:{shop}:{window}\` where \`window\` is \`floor(unix_seconds / 60)\`; a window-less key
-  never resets.
-- One **atomic Lua \`EVAL\`** reads both counters, rejects when either reservation does not fit, and
-  increments both when it does, setting \`EXPIRE\` on first write. A read followed by a separate
-  increment lets two concurrent turns both pass the same check.
-- **Reserve before the model call.** The starter charges after the answer, so an over-budget turn has
-  already been paid for.
-- **Tool-result cache**: read-tool results are cached under \`tool:{shop}:{name}:{digest}\` (digest
-  = SHA-256 of the args JSON) for **\`CACHE_TTL_S = 120\`** seconds. The starter keys by
-  \`(name, digest)\` only — the same "customers from Toronto" query served from another shop's
-  cache is a cross-merchant data leak.
-- **Write tools run once per turn**: \`fill_product_form\` is claimed with \`SET NX EX\` on
+  \`budget:{shop}:{window}\`, \`window = floor(unix_seconds / WINDOW_S)\`, \`WINDOW_S = 60\`.
+- One atomic Lua \`EVAL\` (\`RESERVE_LUA\`) reads both counters, rejects when either reservation does
+  not fit, and \`HINCRBY\`s both when it does, setting \`EXPIRE\` on first write.
+- \`reserve\` runs before \`model.Complete\`; a refused turn is 429 with \`Retry-After\`.
+- Read-tool results are cached under \`tool:{shop}:{name}:{digest}\` (digest = SHA-256 of the args
+  JSON) with \`ex=CACHE_TTL_S\` (\`CACHE_TTL_S = 120\`).
+- Write tools run once per turn: \`fill_product_form\` is claimed with \`SET NX EX\` on
   \`write:{shop}:{turn_id}:{name}\` (24 h); a second attempt in the same turn returns the stored
-  result instead of filling the form again.
-
-**Failure mode the checks target.** Two concurrent turns both pass the budget and overspend; a key
-without a window locks a shop out after one busy minute, forever; a tenant-less cache key serves one
-merchant's customer list to another; and a retried write tool edits the merchant's product twice.`,
+  result.`,
   sequence: {
     participants: ['sidekick API', 'Redis', 'Model', 'Tools'],
     messages: [
@@ -53,9 +49,9 @@ merchant's customer list to another; and a retried write tool edits the merchant
     ],
   },
   hints: [
-    'The script does all of it on the server: `HGET` both counters, compare against the limits, `HINCRBY` both on success, `EXPIRE` when the key was just created. The key carries the shop and the minute bucket so budgets are per merchant and reset on their own.',
-    'A cache key is a tenancy decision. Put the shop first — `tool:{shop}:{name}:{digest}` — and give the entry an `EX` of 120 s. Without the shop, the fastest path through your cache is the one that leaks.',
-    'Write tools are not cacheable; they are claimable. `SET write:{shop}:{turn_id}:{name} pending NX EX 86400` succeeds once; when it fails, return what the first run stored. Call `reserve(...)` before `Complete(...)`, and return 429 with `Retry-After` when it refuses.',
+    "A merchant's staff see another shop's customer list in a segment answer, and a shop that was busy for one minute last Tuesday still gets 429 on every assist turn.",
+    '`charge` does `GET` then `INCRBY` on `budget:{shop}` with no window or expiry; `tool:{name}:{digest}` has no shop in it; `charge` is called after `model.Complete`; nothing claims a write tool.',
+    'Move both counters into `RESERVE_LUA` on `budget:{shop}:{window}` with `EXPIRE` on creation; call `reserve` before `Complete`; key the cache `tool:{shop}:{name}:{digest}` with `ex=CACHE_TTL_S`; `SET write:{shop}:{turn_id}:{name} NX EX`.',
   ],
   checks: [
     {
@@ -145,9 +141,7 @@ WRITE_TOOLS = {"fill_product_form"}
 
 
 def charge(shop: str, tokens: int) -> tuple[bool, int, int]:
-    # TODO: replace the client-side GET-then-INCRBY with one atomic EVAL on a per-window key with
-    # a TTL, scope the tool cache by shop and expire it, claim write tools with SET NX, and reserve
-    # before the model call instead of charging after it.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = f"budget:{shop}"
     used_req = int(r.get(f"{key}:req") or 0)
     used_tok = int(r.get(f"{key}:tok") or 0)
@@ -315,9 +309,7 @@ export class BudgetExceeded extends Error {
 }
 
 async function charge(shop: string, tokens: number): Promise<[boolean, number, number]> {
-  // TODO: replace the client-side GET-then-INCRBY with one atomic EVAL on a per-window key with
-  // a TTL, scope the tool cache by shop and expire it, claim write tools with SET NX, and reserve
-  // before the model call instead of charging after it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`budget:\${shop}\`;
   const usedReq = Number((await r.get(\`\${key}:req\`)) ?? 0);
   const usedTokens = Number((await r.get(\`\${key}:tok\`)) ?? 0);
@@ -490,9 +482,7 @@ var (
 var ErrBudget = errors.New("shop budget exceeded")
 
 func charge(ctx context.Context, shop string, tokens int64) (bool, int64, int64) {
-	// TODO: replace the client-side GET-then-INCRBY with one atomic EVAL on a per-window key with
-	// a TTL, scope the tool cache by shop and expire it, claim write tools with SetNX, and reserve
-	// before the model call instead of charging after it.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("budget:%s", shop)
 	usedReq, _ := rdb.Get(ctx, key+":req").Int64()
 	usedTokens, _ := rdb.Get(ctx, key+":tok").Int64()
@@ -707,9 +697,7 @@ object BudgetCache {
   val model = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
   val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forAddress("tools", 9000).usePlaintext().build())
 
-  // TODO: replace the client-side GET-then-INCRBY with one atomic EVAL on a per-window key with a
-  // TTL, scope the tool cache by shop and expire it, claim write tools with SET NX, and reserve
-  // before the model call instead of charging after it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def charge(shop: String, tokens: Long): (Boolean, Long, Long) = {
     val key = s"budget:$shop"
     val usedReq = Option(jedis.get(key + ":req")).map(_.toLong).getOrElse(0L)
@@ -913,9 +901,7 @@ std::string digestOf(const std::string& argsJson) {
   return out.str();
 }
 
-// TODO: replace the client-side GET-then-INCRBY with one atomic EVAL on a per-window key with a
-// TTL, scope the tool cache by shop and expire it, claim write tools with SET NX, and reserve
-// before the model call instead of charging after it.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::tuple<bool, long long, long long> charge(const std::string& shop, long long tokens) {
   const auto key = "budget:" + shop;
   auto rawReq = redis.get(key + ":req");
@@ -1107,5 +1093,5 @@ json assistTurn(const std::string& shop, const std::string& turnId, const std::s
 `,
     },
   },
-  debrief: `The interview question behind this step is tenancy under concurrency. A read-then-increment budget passes every serial test and fails when the assistant is busy, which is when the budget matters; one Lua script makes read, check and increment a single step and sets the window's expiry at creation, so a shop's counters die with their minute instead of accumulating forever. Reserving before the model call is the second half of the contract: a refused turn must never be paid for. The cache is where the code quietly crosses merchants — a key built from the tool and its arguments is the same key for every shop that asks the same question, and the fastest path through the cache becomes the leak. The write claim is the agent-specific flaw: an assistant that fills product forms is a system that edits merchant data, and a retried turn, a retried tool call or a replayed request must not edit it twice. Real systems add per-tool TTLs (an analytics answer can live longer than a customer segment), invalidation when the merchant edits the underlying record, and a refund of reserved tokens when the model reports lower usage than estimated.`,
+  debrief: `The step is tenancy under concurrency. A read-then-increment budget passes every serial test and fails when the assistant is busy, which is when the budget matters; one Lua script makes read, check and increment a single step and sets the window's expiry at creation, so a shop's counters die with their minute instead of accumulating forever. Reserving before the model call means a refused turn is not paid for. The cache is where the code quietly crosses merchants: a key built from the tool and its arguments is the same key for every shop that asks the same question, so the shop goes first in the key. The write claim is the agent-specific part: an assistant that fills product forms edits merchant data, and a retried turn must not edit it twice. Production systems add per-tool TTLs and invalidate the cache when the merchant edits the underlying record.`,
 };

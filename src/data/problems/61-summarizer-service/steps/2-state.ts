@@ -237,7 +237,7 @@ def write_chunk(
 `,
     },
     typescript: {
-      starter: `/** Per-source summary progress in Redis: flawed code. */
+      starter: `/** Per-source summary progress in Redis. */
 import {Redis} from 'ioredis';
 
 const r = new Redis({host: 'redis', port: 6379});
@@ -358,8 +358,7 @@ func progressKey(tenant, sourceID string) string {
 	return fmt.Sprintf("summary:progress:%s:%s", tenant, sourceID)
 }
 
-// applyChunk folds one chunk into the rolling summary. The starter does it in two
-// steps and keys by source id.
+// applyChunk folds one chunk into the rolling summary.
 func applyChunk(ctx context.Context, rdb *redis.Client, tenant, sourceID string, body ChunkBody) (map[string]any, error) {
 	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := progressKey(tenant, sourceID)
@@ -473,7 +472,7 @@ object SourceProgress {
 
   def progressKey(tenant: String, sourceId: String): String = s"summary:progress:$tenant:$sourceId"
 
-  /** Fold one chunk into the rolling summary. The starter does it in two steps. */
+  /** Fold one chunk into the rolling summary. */
   def applyChunk(tenant: String, sourceId: String, chunkIndex: Int, chunkSummary: String): Map[String, String] = {
     // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val key = progressKey(tenant, sourceId)
@@ -557,7 +556,7 @@ static std::string progress_key(const std::string& tenant, const std::string& so
   return "summary:progress:" + tenant + ":" + source_id;
 }
 
-/** Fold one chunk into the rolling summary. The starter does it in two steps. */
+/** Fold one chunk into the rolling summary. */
 std::string apply_chunk(Redis& redis, const std::string& tenant, const std::string& source_id, int chunk_index,
                         const std::string& chunk_summary) {
   // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.

@@ -774,8 +774,7 @@ job row exist, and only after the manifest pointer is stored does the work set g
 the API process, which is what makes a one-million-record cap enforceable at all. Storing the whole
 job under \`(tenant, key)\` lets a replay answer 202 without recomputing anything.
 
-What this step left out: the stored idempotency record should carry a hash of the request body so a
-key reused with a different manifest is rejected rather than silently answered, the key needs an
-expiry, and a tenant quota reservation belongs before the job row so a burst of submits cannot
-exceed the account's concurrency.`,
+What this step left out: the idempotency record should carry a body hash so a key reused with a
+different manifest is rejected, the key needs an expiry, and a tenant quota reservation belongs
+before the job row.`,
 };

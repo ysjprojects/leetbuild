@@ -134,7 +134,7 @@ tenant, so the query API doubles as an enumeration oracle.
   ],
   code: {
     python: {
-      starter: `"""GET /v1/series: flawed code with an open-ended range."""
+      starter: `"""GET /v1/series."""
 from fastapi import FastAPI
 
 app = FastAPI()
@@ -240,7 +240,7 @@ def series(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/series: flawed code with an open-ended range. */
+      starter: `/** GET /v1/series. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

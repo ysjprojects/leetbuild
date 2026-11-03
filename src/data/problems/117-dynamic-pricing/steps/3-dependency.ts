@@ -265,7 +265,7 @@ def publish_from_demand(store, cache, sku: str, window: int, reason: str, update
 `,
     },
     typescript: {
-      starter: `/** Demand client: flawed code that caches the last suggestion and serves it on failure. */
+      starter: `/** Demand client. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

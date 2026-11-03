@@ -16,28 +16,27 @@ import {neighborReadStep} from './steps/5-read';
 export const knowledgeGraphProblem: Problem = {
   id: 'knowledge-graph',
   title: 'Knowledge Graph',
-  tagline: 'Entities and edges that merge deliberately, cache safely and never traverse unbounded.',
+  tagline: 'Entity upserts with a server-side merge policy, a versioned adjacency cache and a bounded neighbour walk.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Knowledge Graph
 
-A knowledge graph is the piece of an AI platform that remembers what the platform knows about
-entities — people, organisations, documents — and how they relate. The visible part is a lookup: an
-entity comes back with its neighbours. The parts that decide whether the platform is safe are the
-merge policy, the cache invalidation, the failure policy of resolution, the event ordering, and the
-bounds on traversal.
+A knowledge graph remembers what an AI platform knows about entities, such as people, organisations
+and documents, and how they relate. The visible part is a lookup: an entity comes back with its
+neighbours. What decides whether the platform is safe is the merge policy, the cache invalidation,
+the failure policy of resolution, the event ordering, and the bounds on traversal.
 
 ## The real system
 
-Production graphs receive entity upserts from many tenants and must never let the request body choose
-whether two entities become one. They cache adjacency lists per tenant and invalidate them in a way
-that cannot race with a concurrent read. They resolve candidate pairs over gRPC under a deadline, and
-they treat a timeout as a reason to ask a human — not as evidence that two entities differ, because
-that mistake silently splits the graph every hour the resolver is slow. They publish change events
-keyed by entity so an entity's history stays ordered, after the graph transaction commits, with an
-outbox for the produce the broker rejected. And they bound traversal: a depth cap, a node budget and
-an ownership check, because a hub entity and a known id are all an attacker needs.
+Wikidata treats a merge as the most dangerous edit in the graph. Two items are folded into one by
+moving every label, alias, sitelink and statement to the recipient, and the obsolete item is kept as
+a redirect because item ids are persistent and are not reused. Its automated merge tools stop when
+they find a sitelink conflict, the signal that the two items may not be the same thing, and the
+editor settles it by hand. A multi-tenant graph service has the same shape: the request body does
+not decide whether two entities become one, a pair the resolver cannot score goes to a review queue
+rather than being split or merged by default, and a cross-type alias collision is a conflict the
+caller is told about.
 
 ## What you build here
 
@@ -47,30 +46,25 @@ One service, **graph-api**, with five pieces:
    \`Idempotency-Key\` so a retried batch cannot double-write edges, a **server-side** merge policy,
    and a cross-type alias collision answered \`409\` with both candidates named.
 2. A **Redis** adjacency cache keyed by \`(tenant, entity)\` with a 5-minute TTL, invalidated by a
-   version counter rather than a delete, so a read raced against a write is consistent with at most
-   one operation.
+   version counter rather than a delete.
 3. A **gRPC** resolution client with a 1-second deadline: \`DEADLINE_EXCEEDED\` parks the pair in a
-   review queue, a rejection is terminal, and only a score at or above the threshold merges without
-   review.
+   review queue, a rejection is terminal, and only a score at or above the threshold merges.
 4. A **Kafka** \`graph.changed\` path keyed by entity id, carrying old and new labels and the policy
-   version, published after the commit, backed by an outbox, and consumed idempotently before the
-   offset is committed.
+   version, published after the commit, backed by an outbox, consumed idempotently before the offset
+   is committed.
 5. \`GET /v1/entities/{id}/neighbors\`: depth bounded at 2, a 500-edge cap with a truncation marker,
    and a \`404\` for an entity that belongs to another tenant.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+Every starter in this course is working code with flaws: it compiles, serves the happy path and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
 checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Entity-resolution scoring models, graph storage engines and query languages, bulk import pipelines,
-per-tenant schema extensions, graph analytics, and the UI that lets an operator settle a review-queue
-pair. The five pieces above are the ones that decide whether the graph is correct, isolated and
-shippable.`,
+Entity-resolution scoring models, graph storage engines and query languages, bulk import, per-tenant
+schema extensions, graph analytics, and the UI an operator uses to settle a review-queue pair.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'entity · edge APIs', x: 8, y: 50},
