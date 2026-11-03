@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package fleet;
+
+// The dispatch service step 3 calls: one geofence check per applied position. Dispatch keeps the
+// idempotency keys it has seen, so a retried check under the same key raises no second alert.
+service Dispatch {
+  rpc CheckGeofence(GeofenceCheckRequest) returns (GeofenceCheckResponse);
+}
+
+message GeofenceCheckRequest {
+  string vehicle_id = 1;
+  double lat = 2;
+  double lon = 3;
+  int64 device_timestamp_ms = 4;
+  int64 sequence = 5;
+  string idempotency_key = 6;
+}
+
+message GeofenceCheckResponse {
+  bool alert = 1;
+  string zone = 2;
+}

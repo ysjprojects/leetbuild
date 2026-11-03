@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package distill;
+
+// The teacher model step 3 calls for every sample: one unary RPC per attempt, with a deadline. The
+// harness serves a deterministic stand-in at teacher:9000 (distill/teacher in the support modules).
+service Teacher {
+  rpc Generate(GenerateRequest) returns (GenerateReply);
+}
+
+message GenerateRequest {
+  string job_id = 1;
+  string prompt_id = 2;
+  string prompt = 3;
+}
+
+message GenerateReply {
+  string text = 1;
+  bool refused = 2;
+  string teacher_version = 3;
+}

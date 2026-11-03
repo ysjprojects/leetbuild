@@ -2,585 +2,322 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Placement events keyed by node for utilization replay',
+  title: 'The placement stream: one event per booking, after the ledger',
   concept: 'kafka',
   file: 'events',
-  focus: ['scheduler', 'kafka', 'consumer', 'redis'],
+  focus: ['scheduler', 'redis', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces an event on the
-happy path and moves a Redis counter right after, so the demo shows \`gpu.placement\` filling up and
-the ledger looking busy. Four contracts are broken. Debug it like the owner of the stream, fix it,
-and prove the fix with the checks below.
+**Starting point.** The starter wraps the ledger: \`allocate_and_publish\` produces a record to
+\`gpu.placement\` and books the node, \`release_and_publish\` releases it, \`relay_outbox\` resends
+whatever the outbox holds. It publishes the demo placement and hides five flaws.
 
-\`gpu.placement\` is not telemetry. Every consumer replays it to answer "what is this node running
-right now", so the scheduler's publish path is a correctness surface with the same weight as the
-counters it mirrors.
+**Failure mode the checks target.** A refused placement still shows up in the stream; a produce the
+broker refuses is lost without a trace; the consumer that rebuilds a node's occupancy sees every
+tenant's events interleaved and no releases at all, so its picture of the node only ever grows.
 
-- **Key the record by the NODE id.** The message key is the partition key, and partitioning by node
-  is what keeps one node's occupancy stream ordered, so a replay sees its allocations and releases
-  in the order the scheduler committed them. The starter sends \`key=tenant\`: every node behind a
-  tenant is interleaved across partitions and the per-node history is no longer recoverable.
-- **Carry what a replay needs.** Each value is \`event_type\` (\`allocation\` / \`release\`) plus
-  \`placement_id\`, \`node_id\`, \`gpu_count\` and \`memory_gb\`. Ids and numbers only — the topic is
-  retained and replicated, so tenant payloads must never reach it.
-- **Commit the ledger first, produce second.** One atomic Lua script per transition moves both
-  counters on the server (\`HINCRBY allocated_gpus\` with \`HINCRBY allocated_memory_gb\`), and only
-  then does the record reach the broker. Produce first and a crash between the two writes leaves the
-  stream claiming GPUs the counters never booked: the replay then over-reports occupancy on a node
-  that owes capacity.
-- **Never drop a produce.** When the broker rejects the produce, insert an **outbox** row instead of
-  swallowing the error; a relay resends the unsent rows under the same node key and marks each row
-  sent. The producer is idempotent (\`enable.idempotence\` with \`acks=all\`, KafkaJS
-  \`idempotent: true\` with \`acks: -1\`, kafka-go \`RequiredAcks: kafka.RequireAll\` with a
-  \`kafka.Hash{}\` balancer), so a resend cannot duplicate a record.
-- **Publish releases too, and reconcile.** A release is a first-class event: allocation adds
-  \`gpu_count\`, release subtracts it. Fold a node's ordered stream and compare the result with the
-  Redis counters that back \`GET /v1/nodes/{id}\`; a stream that only ever allocates drifts upward
-  forever and the read path starts promising GPUs that are already in use.
-
-**What each check looks for.**
-
-1. \`node-key\` — the record goes to the topic \`gpu.placement\` and its key is the node id
-   (\`key=node_id\` / \`Key: []byte(nodeID)\` / \`ProducerRecord(topic, nodeId, …)\`); the starter's
-   tenant key is gone.
-2. \`event-fields\` — the payload builder the handlers use emits \`placement_id\`, \`gpu_count\` and
-   \`memory_gb\` next to the event type, so a replay can attribute and rebuild occupancy.
-3. \`publish-after-commit\` — the atomic counter script runs **before** the produce in the same
-   transition, in that order: the ledger is the source of truth and the event replicates it.
-4. \`outbox-relay\` — a rejected produce writes an outbox row in the error branch, a relay resends
-   unsent rows and marks them sent, and the producer is configured idempotent with \`acks=all\`.
-5. \`release-reconcile\` — allocation **and** release events are published, and a reconstruction of a
-   node's event stream is compared against that node's Redis counters.
-
-**Failure mode the checks target.** Keying by tenant turns a per-node history into a per-tenant
-shuffle; producing before the counter commit invents capacity that was never reserved; a silently
-dropped produce loses one node's release and leaks its GPUs out of the pool forever; and a stream
-with allocations only can never be reconciled with the ledger it claims to mirror.`,
+- \`allocate_and_publish(node_id, placement_id, tenant, count, memory_gb)\` calls \`allocate\` and,
+  only on \`ALLOCATED\`, produces one event; it returns the ledger's answer. The placement hash
+  keeps \`tenant\` and \`memory_gb\` for the release.
+- \`release_and_publish(node_id, placement_id)\` calls \`release\` and produces a \`release\` event
+  only when the counters moved.
+- Events go to \`TOPIC\` (\`gpu.placement\`) **keyed by the node id**, as JSON with \`type\`
+  (\`allocation\` or \`release\`), \`placement_id\`, \`node_id\`, \`tenant\`, \`gpu_count\`,
+  \`memory_gb\` and \`ts\`. Folding a node's events (\`+gpu_count\` per allocation, \`-gpu_count\` per
+  release) must equal the node's \`allocated\`.
+- A delivery failure is reported through the producer's **delivery callback**; it appends the event
+  (key and value) to the Redis list \`OUTBOX\`. \`relay_outbox()\` produces every row again and
+  returns how many it sent.`,
   sequence: {
-    participants: ['GPU Scheduler', 'Redis', 'gpu.placement', 'Utilization consumer', 'placement_outbox'],
+    participants: ['gpusched', 'Redis', 'Kafka'],
     messages: [
+      {from: 'gpusched', to: 'Redis', label: 'EVAL allocate gpu-1 p-7 4 → ALLOCATED', kind: 'sync'},
+      {from: 'gpusched', to: 'Kafka', label: 'produce gpu.placement key=gpu-1 {allocation, p-7, 4, 80}', kind: 'async'},
+      {from: 'Kafka', to: 'gpusched', label: 'delivery report: ok', kind: 'reply'},
       {
-        from: 'GPU Scheduler',
+        from: 'gpusched',
         to: 'Redis',
-        label: 'host: evalsha ALLOCATE_LUA · HINCRBY allocated_gpus + allocated_memory_gb',
+        label: 'EVAL allocate gpu-1 p-8 6 → NO_CAPACITY (nothing produced)',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'GPU Scheduler', label: 'committed: allocated_gpus', kind: 'reply'},
-      {
-        from: 'GPU Scheduler',
-        to: 'gpu.placement',
-        label: 'produce key=node_id · value {event_type: allocation, placement_id, gpu_count, memory_gb}',
-        kind: 'async',
-      },
-      {
-        from: 'GPU Scheduler',
-        to: 'placement_outbox',
-        label: 'insert_outbox(row) when the broker rejects the produce',
-        kind: 'async',
-      },
-      {
-        from: 'placement_outbox',
-        to: 'gpu.placement',
-        label: 'relay_outbox(): resend unsent rows with the same node key, acks=all, then mark_sent',
-        kind: 'async',
-      },
-      {
-        from: 'GPU Scheduler',
-        to: 'gpu.placement',
-        label: 'produce key=node_id · value {event_type: release, placement_id, gpu_count, memory_gb}',
-        kind: 'async',
-      },
-      {from: 'gpu.placement', to: 'Utilization consumer', label: "one node's records, in commit order", kind: 'async'},
-      {
-        from: 'Utilization consumer',
-        to: 'Redis',
-        label: 'reconstruct_utilization(events) vs HGET node:{id} allocated_gpus',
-        kind: 'sync',
-      },
+      {from: 'gpusched', to: 'Kafka', label: 'produce key=gpu-1 {release, p-7, 4}', kind: 'async'},
+      {from: 'Kafka', to: 'gpusched', label: 'delivery report: timed out', kind: 'reply'},
+      {from: 'gpusched', to: 'Redis', label: 'RPUSH outbox:gpu.placement {key, value}', kind: 'sync'},
+      {from: 'gpusched', to: 'Kafka', label: 'relay_outbox: produce the row again', kind: 'async'},
     ],
   },
+  hints: [
+    'The utilization dashboard shows a node at 14 of 8 GPUs: it counted a placement the ledger refused, and nothing ever subtracts. After a broker hiccup the stream is missing bookings that Redis has.',
+    'The record is produced before the ledger answers, keyed by tenant, with no release counterpart; the broker’s delivery report is never looked at, so a refused produce is gone.',
+    'Produce after `allocate` returns ALLOCATED, with `key=node_id` and the full payload; add a release event in `release_and_publish`; in the delivery callback, `RPUSH OUTBOX` the key and value on error.',
+  ],
   checks: [
     {
       id: 'node-key',
-      title: 'Publishes to gpu.placement keyed by the node id',
+      title: 'Events go to gpu.placement keyed by the node id',
       detail:
-        'The record goes to the topic `gpu.placement` and the message key is the **node** id, so one node’s occupancy stream stays ordered in a single partition. The starter uses the tenant as the key, which interleaves every node behind a tenant.',
+        'The record key is the node id, so one node’s events share a partition and stay ordered for the consumer that folds them. The starter keys by tenant.',
       match: {
-        python: {all: [/PLACEMENT_TOPIC/, /key=body\.node_id/], none: [/key=[^\n]*tenant/]},
-        typescript: {all: [/PLACEMENT_TOPIC/, /key:\s*body\.node_id/], none: [/key:\s*tenant/]},
-        go: {all: [/placementTopic/, /Key:\s*\[\]byte\(body\.NodeID\)/], none: [/Key:\s*\[\]byte\(tenant\)/]},
+        python: {all: [/TOPIC/, /producer\.produce\([\s\S]{0,300}?key\s*=\s*node_id/], none: [/key\s*=\s*tenant/]},
+        typescript: {all: [/TOPIC/, /key:\s*nodeId|publish\(nodeId,/], none: [/key:\s*tenant/]},
+        go: {
+          all: [/config\.Topic/, /Key:\s*\[\]byte\(\s*nodeID\s*\)|publish\(ctx, nodeID,/],
+          none: [/Key:\s*\[\]byte\(\s*tenant\s*\)/],
+        },
         scala: {
-          all: [/PlacementTopic/, /ProducerRecord\(PlacementTopic,\s*nodeId/],
-          none: [/ProducerRecord\(PlacementTopic,\s*tenant/],
+          all: [/Topic/, /new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*nodeId\s*,|publish\(nodeId,/],
+          none: [/ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*tenant\s*,/],
         },
         cpp: {
-          all: [/kPlacementTopic/, /nodeId\.data\(\), nodeId\.size\(\)/],
-          none: [/tenant\.data\(\), tenant\.size\(\)/],
+          all: [/kTopic/, /node_id\.c_str\(\)\s*,\s*node_id\.(size|length)\(\)/],
+          none: [/tenant\.c_str\(\)\s*,\s*tenant\.(size|length)\(\)/],
         },
       },
     },
     {
       id: 'event-fields',
-      title: 'The payload carries placement id, gpu count and memory',
+      title: 'The payload carries type, placement id, node, tenant, gpu_count and memory_gb',
       detail:
-        'The event builder the handlers publish emits the event type plus `placement_id`, `gpu_count` and `memory_gb` — the ids and numbers a replay needs to attribute occupancy and rebuild it. The starter forwards a bare `{id, tenant, gpus}` blob.',
+        'A replay needs the event type and the numbers to attribute occupancy: `type`, `placement_id`, `node_id`, `tenant`, `gpu_count`, `memory_gb`, `ts`. The starter sends `{id, tenant, gpus}`.',
       match: {
-        python: {all: [/def placement_event\(/, /"placement_id"/, /"gpu_count"/, /"memory_gb"/]},
-        typescript: {
-          all: [/function placementEvent\(/, /\bplacement_id\b/, /\bgpu_count\b/, /\bmemory_gb\b/],
+        python: {
+          all: [/["']type["']/, /["']placement_id["']/, /["']gpu_count["']/, /["']memory_gb["']/, /["']node_id["']/],
         },
-        go: {all: [/func placementEvent\(/, /\bPlacementID\b/, /\bGPUCount\b/, /\bMemoryGB\b/]},
-        scala: {all: [/def placementEvent\(/, /"placement_id"/, /"gpu_count"/, /"memory_gb"/]},
-        cpp: {all: [/json placementEvent\(/, /"placement_id"/, /"gpu_count"/, /"memory_gb"/]},
+        typescript: {all: [/\btype:/, /placement_id:/, /gpu_count:/, /memory_gb:/, /node_id:/]},
+        go: {all: [/json:"type"/, /json:"placement_id"/, /json:"gpu_count"/, /json:"memory_gb"/, /json:"node_id"/]},
+        scala: {all: [/"type"/, /"placement_id"/, /"gpu_count"/, /"memory_gb"/, /"node_id"/]},
+        cpp: {all: [/"type"/, /"placement_id"/, /"gpu_count"/, /"memory_gb"/, /"node_id"/]},
       },
     },
     {
       id: 'publish-after-commit',
-      title: 'The counters commit before the event is produced',
+      title: 'The event is produced only after the ledger says ALLOCATED',
       detail:
-        'The atomic counter script (`eval` of the allocate script, both `HINCRBY`s together) runs first and the produce follows. Publishing first means a crash between the two leaves the stream claiming capacity the ledger never booked; the starter produces before any counter call.',
+        '`allocate` runs first and the produce follows its answer; a refused placement produces nothing. The starter produces first and books afterwards, so the stream claims capacity the ledger refused.',
       match: {
-        python: {order: [/\.eval\(ALLOCATE_LUA/, /producer\.produce\(/]},
-        typescript: {order: [/\.eval\(ALLOCATE_LUA/, /producer\.send\(/]},
-        go: {order: [/\.Eval\(r\.Context\(\),\s*allocateLua/, /\.WriteMessages\(/]},
-        scala: {order: [/\.eval\(AllocateLua/, /producer\.send\(/]},
-        cpp: {order: [/eval<std::vector<long long>>\(kAllocateLua/, /produce\(kPlacementTopic/]},
+        python: {all: [/(=|if)\s*allocate\(/], none: [/producer\.produce\([\s\S]{0,400}?return allocate\(/]},
+        typescript: {all: [/(=|if \()\s*await allocate\(/], none: [/producer\.send\([\s\S]{0,400}?return allocate\(/]},
+        go: {all: [/(=|if)\s*allocate\(/], none: [/WriteMessages\([\s\S]{0,400}?return allocate\(/]},
+        scala: {all: [/(=|if \()\s*State\.allocate\(/], none: [/producer\.send\([^\n]*\n\s*State\.allocate\(/]},
+        cpp: {all: [/(=|if \()\s*allocate\(/], none: [/producer->produce\([\s\S]{0,600}?return allocate\(/]},
       },
     },
     {
       id: 'outbox-relay',
-      title: 'Outbox row on rejection, relayed idempotently',
+      title: 'A refused delivery lands in the outbox and is relayed',
       detail:
-        'A rejected produce writes an outbox row inside the error branch instead of dropping the event; a relay resends the unsent rows and marks them sent, and the producer is idempotent with `acks=all`. The starter ignores the broker result entirely and has no outbox.',
+        'The delivery callback appends the key and value to `OUTBOX` when the broker reports an error, and `relay_outbox` produces the rows again. The starter never looks at the delivery report.',
       match: {
-        python: {
-          all: [
-            /insert_outbox\(/,
-            /except KafkaException/,
-            /relay_outbox\(/,
-            /mark_sent\(/,
-            /enable\.idempotence/,
-            /["']acks["']\s*:\s*["']all["']/,
-          ],
-        },
-        typescript: {
-          all: [/insert_outbox\(/, /catch\s*\(/, /relayOutbox\(/, /mark_sent\(/, /idempotent:\s*true/, /acks:\s*-1/],
-        },
-        go: {
-          all: [
-            /InsertOutbox\(/,
-            /if err != nil/,
-            /RelayOutbox\(/,
-            /MarkSent\(/,
-            /RequiredAcks:\s*kafka\.RequireAll/,
-            /Balancer:\s*&kafka\.Hash\{\}/,
-          ],
-        },
-        scala: {
-          all: [/insertOutbox\(/, /catch\s*\{/, /relayOutbox\(/, /markSent\(/, /enable\.idempotence/, /"acks"/],
-        },
-        cpp: {
-          all: [
-            /insertOutbox\(/,
-            /ERR_NO_ERROR/,
-            /relayOutbox\(/,
-            /markSent\(/,
-            /enable\.idempotence/,
-            /set\("acks",\s*"all"/,
-          ],
-        },
+        python: {all: [/on_delivery\s*=/, /rpush\(\s*OUTBOX/, /def relay_outbox/], none: [/except KafkaException/]},
+        typescript: {all: [/\bcatch\b/, /rpush\(\s*OUTBOX/, /relayOutbox/]},
+        go: {all: [/err != nil/, /RPush\([^\n]*config\.Outbox/, /func relayOutbox/]},
+        scala: {all: [/Callback/, /rpush\(\s*Outbox/, /def relayOutbox/]},
+        cpp: {all: [/dr_cb\(/, /rpush\(\s*gpusched::kOutbox|rpush\(\s*kOutbox/, /relay_outbox\(/]},
       },
     },
     {
       id: 'release-reconcile',
-      title: 'Releases are published and the stream reconciles with Redis',
+      title: 'Releases are in the stream, so folding it matches the ledger',
       detail:
-        'Both `allocation` and `release` events are produced — with a release subtractive script against the same counters — and a reconstruction helper folds a node’s ordered stream and compares it with the node’s Redis counters. The starter publishes no release at all, so reconstructed utilization only ever grows.',
+        '`release_and_publish` produces a `release` event when the counters moved, so a node’s folded stream equals its `allocated`. The starter publishes no release, and a rebuilt occupancy only ever grows.',
       match: {
-        python: {all: [/EVENT_ALLOCATION/, /EVENT_RELEASE/, /RELEASE_LUA/, /reconstruct_utilization\(/]},
-        typescript: {all: [/EVENT_ALLOCATION/, /EVENT_RELEASE/, /RELEASE_LUA/, /reconstructUtilization\(/]},
-        go: {all: [/\beventAllocation\b/, /\beventRelease\b/, /\breleaseLua\b/, /ReconstructUtilization\(/]},
-        scala: {all: [/EventAllocation/, /EventRelease/, /ReleaseLua/, /reconstructUtilization\(/]},
-        cpp: {all: [/kEventAllocation/, /kEventRelease/, /kReleaseLua/, /reconstructUtilization\(/]},
+        python: {
+          all: [/["']release["']/, /def release_and_publish(?:(?!\ndef )[\s\S])*?(producer\.produce\(|_publish\()/],
+        },
+        typescript: {
+          all: [/['"]release['"]/, /function releaseAndPublish(?:(?!\n\})[\s\S])*?(producer\.send\(|publish\()/],
+        },
+        go: {all: [/"release"/, /func releaseAndPublish(?:(?!\n\})[\s\S])*?(WriteMessages\(|publish\()/]},
+        scala: {all: [/"release"/, /def releaseAndPublish(?:(?!\n {2}def )[\s\S])*?(producer\.send\(|publish\()/]},
+        cpp: {all: [/"release"/, /release_and_publish\((?:(?!\n\})[\s\S])*?(producer->produce\(|publish\()/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
-import logging
+import time
 
 import redis
 from confluent_kafka import Producer
-from fastapi import FastAPI, Header
-from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("gpusched")
+from gpusched.config import OUTBOX, TOPIC
+from state import allocate, release
 
-PLACEMENT_TOPIC = "gpu.placement"
-
-producer = Producer({"bootstrap.servers": "kafka:9092"})
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all"})
+
+# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 
 
-class Placement(BaseModel):
-    placement_id: str
-    node_id: str
-    gpu_count: int
-    memory_gb: int
+def allocate_and_publish(node_id: str, placement_id: str, tenant: str, count: int, memory_gb: int) -> str:
+    """Book the node and tell the stream: the ledger's answer."""
+    event = json.dumps({"id": placement_id, "tenant": tenant, "gpus": count, "ts": time.time()})
+    producer.produce(TOPIC, key=tenant, value=event)
+    producer.poll(0)
+    return allocate(node_id, placement_id, count)
 
 
-@app.post("/v1/placements")
-def place(body: Placement, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: the starter keys by tenant, produces the allocation before the counters confirm it,
-    # publishes no release event, and has no outbox. Fix all four.
-    logger.info("place node=%s placement=%s", body.node_id, body.placement_id)
-    event = {"id": body.placement_id, "tenant": tenant, "gpus": body.gpu_count}
-    producer.produce(PLACEMENT_TOPIC, key=tenant, value=json.dumps(event))
-    producer.flush(2.0)
-    r.hincrby(f"node:{body.node_id}", "allocated_gpus", body.gpu_count)
-    return {"placement_id": body.placement_id, "node_id": body.node_id, "state": "allocated"}
+def release_and_publish(node_id: str, placement_id: str) -> bool:
+    """Return the placement's GPUs; True when the counters moved."""
+    return release(node_id, placement_id)
 
 
-def consume() -> None:
-    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "utilization"})
-    consumer.subscribe([PLACEMENT_TOPIC])
-    while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
-            continue
-        consumer.commit(msg)
-        json.loads(msg.value())
+def relay_outbox() -> int:
+    """Produce every outbox row again; how many were sent."""
+    sent = 0
+    while (row := r.lpop(OUTBOX)) is not None:
+        event = json.loads(row)
+        producer.produce(TOPIC, key=event["key"], value=event["value"])
+        sent += 1
+    producer.poll(0)
+    return sent
 `,
       solution: `import json
+import time
 
 import redis
-from confluent_kafka import Consumer, KafkaException, Producer
-from fastapi import FastAPI
-from pydantic import BaseModel
+from confluent_kafka import Producer
 
-app = FastAPI()
+from gpusched.config import OUTBOX, TOPIC
+from state import allocate, release
 
-PLACEMENT_TOPIC = "gpu.placement"
-EVENT_ALLOCATION = "allocation"
-EVENT_RELEASE = "release"
-
-# One script per transition: the gpu and the memory counter always move together, on the server.
-ALLOCATE_LUA = """
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', ARGV[1])
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', ARGV[2])
-return redis.call('HGET', KEYS[1], 'allocated_gpus')
-"""
-
-RELEASE_LUA = """
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))
-return redis.call('HGET', KEYS[1], 'allocated_gpus')
-"""
-
-producer = Producer(
-    {"bootstrap.servers": "kafka:9092", "enable.idempotence": True, "acks": "all"}
-)
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all"})
 
 
-class Placement(BaseModel):
-    placement_id: str
-    node_id: str
-    gpu_count: int
-    memory_gb: int
+def _on_delivery(err, msg) -> None:
+    """The broker's answer, later: a refused record goes to the outbox for relay_outbox."""
+    if err is not None:
+        r.rpush(OUTBOX, json.dumps({"key": msg.key().decode(), "value": msg.value().decode()}))
 
 
-class PlacementOutbox:
-    def insert_outbox(self, node_id: str, event: dict) -> None:
-        """One unsent row per rejected produce; the relay republishes it later."""
-        raise NotImplementedError
-
-    def unsent(self) -> list[dict]:
-        """Rows the relay has not produced yet, oldest first."""
-        raise NotImplementedError
-
-    def mark_sent(self, row_id: str) -> None:
-        raise NotImplementedError
+def _publish(node_id: str, value: str) -> None:
+    producer.produce(TOPIC, key=node_id, value=value, on_delivery=_on_delivery)
+    producer.poll(0)
 
 
-outbox = PlacementOutbox()
+def _event(kind: str, placement_id: str, node_id: str, tenant: str, count: int, memory_gb: float) -> str:
+    return json.dumps({"type": kind, "placement_id": placement_id, "node_id": node_id, "tenant": tenant, "gpu_count": count, "memory_gb": memory_gb, "ts": time.time()})
 
 
-def node_counters_key(node_id: str) -> str:
-    return f"node:{node_id}"
+def allocate_and_publish(node_id: str, placement_id: str, tenant: str, count: int, memory_gb: int) -> str:
+    """Book the node and tell the stream: the ledger's answer."""
+    result = allocate(node_id, placement_id, count)
+    if result == "ALLOCATED":
+        r.hset(f"placement:{placement_id}", mapping={"tenant": tenant, "memory_gb": memory_gb})
+        _publish(node_id, _event("allocation", placement_id, node_id, tenant, count, memory_gb))
+    return result
 
 
-def placement_event(event_type: str, body: Placement) -> dict:
-    """Ids and numbers only: a replay attributes and rebuilds occupancy from these."""
-    return {
-        "event_type": event_type,
-        "placement_id": body.placement_id,
-        "node_id": body.node_id,
-        "gpu_count": body.gpu_count,
-        "memory_gb": body.memory_gb,
-    }
+def release_and_publish(node_id: str, placement_id: str) -> bool:
+    """Return the placement's GPUs; True when the counters moved, and then the stream hears of it."""
+    record = r.hgetall(f"placement:{placement_id}")
+    moved = release(node_id, placement_id)
+    if moved:
+        _publish(node_id, _event("release", placement_id, node_id, record.get("tenant", ""), int(record.get("count", 0)), float(record.get("memory_gb", 0))))
+    return moved
 
 
-@app.post("/v1/placements")
-def place(body: Placement) -> dict:
-    # Commit the ledger first, then replicate it: a rejected produce must never be able to leave
-    # the stream claiming GPUs the counters never booked.
-    r.eval(ALLOCATE_LUA, 1, node_counters_key(body.node_id), body.gpu_count, body.memory_gb)
-    event = placement_event(EVENT_ALLOCATION, body)
-    try:
-        producer.produce(PLACEMENT_TOPIC, key=body.node_id, value=json.dumps(event))
-        producer.flush(2.0)
-    except KafkaException:
-        outbox.insert_outbox(body.node_id, event)
-    return {"placement_id": body.placement_id, "node_id": body.node_id, "state": "allocated"}
-
-
-@app.delete("/v1/placements/{placement_id}")
-def release(placement_id: str, body: Placement) -> dict:
-    # The release is a first-class event: without it a replay of the stream only ever adds.
-    r.eval(RELEASE_LUA, 1, node_counters_key(body.node_id), body.gpu_count, body.memory_gb)
-    event = placement_event(EVENT_RELEASE, body)
-    try:
-        producer.produce(PLACEMENT_TOPIC, key=body.node_id, value=json.dumps(event))
-        producer.flush(2.0)
-    except KafkaException:
-        outbox.insert_outbox(body.node_id, event)
-    return {"placement_id": placement_id, "node_id": body.node_id, "state": "released"}
-
-
-def relay_outbox() -> None:
-    """Republishes unsent rows under the same node key, then marks them sent; acks=all makes the
-    resend safe to repeat."""
-    for row in outbox.unsent():
-        producer.produce(PLACEMENT_TOPIC, key=row["node_id"], value=json.dumps(row["event"]))
-        producer.flush(2.0)
-        outbox.mark_sent(row["id"])
-
-
-def reconstruct_utilization(events: list[dict]) -> int:
-    """Allocations add their gpu count, releases subtract theirs — a node's ordered fold."""
-    gpus = 0
-    for event in events:
-        sign = 1 if event["event_type"] == EVENT_ALLOCATION else -1
-        gpus += sign * event["gpu_count"]
-    return gpus
-
-
-def reconcile(node_id: str, events: list[dict]) -> bool:
-    counters = r.hgetall(node_counters_key(node_id))
-    ledger = int(counters.get("allocated_gpus", 0))
-    return reconstruct_utilization(events) == ledger
-
-
-def consume() -> None:
-    consumer = Consumer(
-        {"bootstrap.servers": "kafka:9092", "group.id": "utilization", "enable.auto.commit": False}
-    )
-    consumer.subscribe([PLACEMENT_TOPIC])
-    seen: dict[str, list[dict]] = {}
-    while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
-            continue
-        event = json.loads(msg.value())
-        seen.setdefault(event["node_id"], []).append(event)
-        if not reconcile(event["node_id"], seen[event["node_id"]]):
-            continue  # stream and ledger disagree: replay the record instead of committing a lie
-        consumer.commit(msg)
+def relay_outbox() -> int:
+    """Produce every outbox row again; how many were sent."""
+    sent = 0
+    while (row := r.lpop(OUTBOX)) is not None:
+        event = json.loads(row)
+        producer.produce(TOPIC, key=event["key"], value=event["value"], on_delivery=_on_delivery)
+        sent += 1
+    producer.poll(0)
+    return sent
 `,
     },
     typescript: {
-      starter: `/** gpu.placement: flawed code that keys by tenant and produces before the counters. */
-import Fastify from 'fastify';
+      starter: `import Redis from 'ioredis';
 import {Kafka} from 'kafkajs';
-import {Redis} from 'ioredis';
 
-export const app = Fastify();
+import {OUTBOX, TOPIC} from 'gpusched/config';
+import {allocate, release} from './state';
+
+const redis = new Redis({host: 'redis', port: 6379});
 const kafka = new Kafka({clientId: 'gpusched', brokers: ['kafka:9092']});
 const producer = kafka.producer();
 void producer.connect();
-const r = new Redis('redis://redis:6379');
 
-const PLACEMENT_TOPIC = 'gpu.placement';
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 
-interface PlacementBody {
-  placement_id: string;
-  node_id: string;
-  gpu_count: number;
-  memory_gb: number;
+/** Book the node and tell the stream: the ledger's answer. */
+export async function allocateAndPublish(nodeId: string, placementId: string, tenant: string, count: number, memoryGb: number): Promise<string> {
+  const event = JSON.stringify({id: placementId, tenant, gpus: count, ts: Date.now() / 1000});
+  await producer.send({topic: TOPIC, messages: [{key: tenant, value: event}], acks: -1});
+  return allocate(nodeId, placementId, count);
 }
 
-app.post('/v1/placements', async (request, reply) => {
-  // TODO: the starter keys by tenant, produces the allocation before the counters confirm it,
-  // publishes no release event, and has no outbox. Fix all four.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as PlacementBody;
-  const event = {id: body.placement_id, tenant, gpus: body.gpu_count};
-  await producer.send({topic: PLACEMENT_TOPIC, messages: [{key: tenant, value: JSON.stringify(event)}]});
-  await r.hincrby('node:' + body.node_id, 'allocated_gpus', body.gpu_count);
-  return reply.code(201).send({placement_id: body.placement_id, state: 'allocated'});
-});
-
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'utilization'});
-  await consumer.connect();
-  await consumer.subscribe({topic: PLACEMENT_TOPIC});
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({topic, partition, message}) => {
-      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-      JSON.parse(message.value?.toString() ?? '{}');
-    },
-  });
+/** Return the placement's GPUs; true when the counters moved. */
+export async function releaseAndPublish(nodeId: string, placementId: string): Promise<boolean> {
+  return release(nodeId, placementId);
 }
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** Produce every outbox row again; how many were sent. */
+export async function relayOutbox(): Promise<number> {
+  let sent = 0;
+  for (let row = await redis.lpop(OUTBOX); row !== null; row = await redis.lpop(OUTBOX)) {
+    const {key, value} = JSON.parse(row) as {key: string; value: string};
+    await producer.send({topic: TOPIC, messages: [{key, value}], acks: -1});
+    sent += 1;
+  }
+  return sent;
+}
 `,
-      solution: `/** gpu.placement: node-keyed allocation and release events, committed after the ledger. */
-import Fastify from 'fastify';
+      solution: `import Redis from 'ioredis';
 import {Kafka} from 'kafkajs';
-import {Redis} from 'ioredis';
 
-export const app = Fastify();
+import {OUTBOX, TOPIC} from 'gpusched/config';
+import {allocate, release} from './state';
+
+const redis = new Redis({host: 'redis', port: 6379});
 const kafka = new Kafka({clientId: 'gpusched', brokers: ['kafka:9092']});
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+const producer = kafka.producer();
 void producer.connect();
-const r = new Redis('redis://redis:6379');
 
-const PLACEMENT_TOPIC = 'gpu.placement';
-const EVENT_ALLOCATION = 'allocation';
-const EVENT_RELEASE = 'release';
-
-const ALLOCATE_LUA = \`
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', ARGV[1])
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', ARGV[2])
-return redis.call('HGET', KEYS[1], 'allocated_gpus')
-\`;
-
-const RELEASE_LUA = \`
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))
-return redis.call('HGET', KEYS[1], 'allocated_gpus')
-\`;
-
-interface PlacementBody {
-  placement_id: string;
-  node_id: string;
-  gpu_count: number;
-  memory_gb: number;
-}
-
-interface PlacementEvent {
-  event_type: string;
-  placement_id: string;
-  node_id: string;
-  gpu_count: number;
-  memory_gb: number;
-}
-
-class PlacementOutbox {
-  async insert_outbox(node_id: string, event: PlacementEvent): Promise<void> {
-    throw new Error('one unsent row per rejected produce');
-  }
-  async unsent(): Promise<Array<{id: string; node_id: string; event: PlacementEvent}>> {
-    throw new Error('rows the relay has not produced yet, oldest first');
-  }
-  async mark_sent(row_id: string): Promise<void> {
-    throw new Error('flip the row to sent once acks=all confirms it');
-  }
-}
-
-const outbox = new PlacementOutbox();
-
-function placementEvent(eventType: string, placementId: string, nodeId: string, gpuCount: number, memoryGb: number): PlacementEvent {
-  return {
-    event_type: eventType,
-    placement_id: placementId,
-    node_id: nodeId,
-    gpu_count: gpuCount,
-    memory_gb: memoryGb,
-  };
-}
-
-app.post('/v1/placements', async (request, reply) => {
-  const body = request.body as PlacementBody;
-  // The ledger commits first and the event replicates it: produce first and a crash between the
-  // two writes leaves the stream claiming capacity the counters never booked.
-  await r.eval(ALLOCATE_LUA, 1, 'node:' + body.node_id, body.gpu_count, body.memory_gb);
-  const event = placementEvent(EVENT_ALLOCATION, body.placement_id, body.node_id, body.gpu_count, body.memory_gb);
+/** One record to the stream; a delivery the broker refuses goes to the outbox for relayOutbox. */
+async function publish(key: string, value: string): Promise<void> {
   try {
-    await producer.send({
-      topic: PLACEMENT_TOPIC,
-      acks: -1,
-      messages: [{key: body.node_id, value: JSON.stringify(event)}],
-    });
-  } catch (error) {
-    await outbox.insert_outbox(body.node_id, event);
-  }
-  return reply.code(201).send({placement_id: body.placement_id, node_id: body.node_id, state: 'allocated'});
-});
-
-app.delete('/v1/placements/:placement_id', async (request, reply) => {
-  const body = request.body as PlacementBody;
-  const {placement_id} = request.params as {placement_id: string};
-  // A release is a first-class event: without it a replay of the stream only ever adds.
-  await r.eval(RELEASE_LUA, 1, 'node:' + body.node_id, body.gpu_count, body.memory_gb);
-  const event = placementEvent(EVENT_RELEASE, placement_id, body.node_id, body.gpu_count, body.memory_gb);
-  try {
-    await producer.send({
-      topic: PLACEMENT_TOPIC,
-      acks: -1,
-      messages: [{key: body.node_id, value: JSON.stringify(event)}],
-    });
-  } catch (error) {
-    await outbox.insert_outbox(body.node_id, event);
-  }
-  return reply.code(200).send({placement_id, node_id: body.node_id, state: 'released'});
-});
-
-export async function relayOutbox(): Promise<void> {
-  for (const row of await outbox.unsent()) {
-    await producer.send({
-      topic: PLACEMENT_TOPIC,
-      acks: -1,
-      messages: [{key: row.node_id, value: JSON.stringify(row.event)}],
-    });
-    await outbox.mark_sent(row.id);
+    await producer.send({topic: TOPIC, messages: [{key, value}], acks: -1});
+  } catch {
+    await redis.rpush(OUTBOX, JSON.stringify({key, value}));
   }
 }
 
-/** Allocations add their gpu count, releases subtract theirs — a node's ordered fold. */
-export function reconstructUtilization(events: PlacementEvent[]): number {
-  let gpus = 0;
-  for (const event of events) gpus += (event.event_type === EVENT_ALLOCATION ? 1 : -1) * event.gpu_count;
-  return gpus;
+const event = (type: string, placementId: string, nodeId: string, tenant: string, count: number, memoryGb: number): string =>
+  JSON.stringify({type, placement_id: placementId, node_id: nodeId, tenant, gpu_count: count, memory_gb: memoryGb, ts: Date.now() / 1000});
+
+/** Book the node and tell the stream: the ledger's answer. */
+export async function allocateAndPublish(nodeId: string, placementId: string, tenant: string, count: number, memoryGb: number): Promise<string> {
+  const result = await allocate(nodeId, placementId, count);
+  if (result === 'ALLOCATED') {
+    await redis.hset(\`placement:\${placementId}\`, 'tenant', tenant, 'memory_gb', memoryGb);
+    await publish(nodeId, event('allocation', placementId, nodeId, tenant, count, memoryGb));
+  }
+  return result;
 }
 
-export async function reconcile(nodeId: string, events: PlacementEvent[]): Promise<boolean> {
-  const ledger = Number((await r.hget('node:' + nodeId, 'allocated_gpus')) ?? 0);
-  return reconstructUtilization(events) === ledger;
+/** Return the placement's GPUs; true when the counters moved, and then the stream hears of it. */
+export async function releaseAndPublish(nodeId: string, placementId: string): Promise<boolean> {
+  const record = await redis.hgetall(\`placement:\${placementId}\`);
+  const moved = await release(nodeId, placementId);
+  if (moved) await publish(nodeId, event('release', placementId, nodeId, record.tenant ?? '', Number(record.count ?? 0), Number(record.memory_gb ?? 0)));
+  return moved;
 }
 
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'utilization'});
-  await consumer.connect();
-  await consumer.subscribe({topic: PLACEMENT_TOPIC});
-  const seen: Record<string, PlacementEvent[]> = {};
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as PlacementEvent;
-      (seen[event.node_id] ??= []).push(event);
-      if (!(await reconcile(event.node_id, seen[event.node_id]))) return; // do not commit a lie
-      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-    },
-  });
+/** Produce every outbox row again; how many were sent. */
+export async function relayOutbox(): Promise<number> {
+  let sent = 0;
+  for (let row = await redis.lpop(OUTBOX); row !== null; row = await redis.lpop(OUTBOX)) {
+    const {key, value} = JSON.parse(row) as {key: string; value: string};
+    await publish(key, value);
+    sent += 1;
+  }
+  return sent;
 }
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -589,61 +326,67 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
+
+	"gpusched/config"
 )
 
-const placementTopic = "gpu.placement"
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
+var writer = &kafka.Writer{
+	Addr:         kafka.TCP("kafka:9092"),
+	Topic:        config.Topic,
+	Balancer:     &kafka.Hash{},
+	RequiredAcks: kafka.RequireAll,
+	BatchTimeout: time.Millisecond,
+}
+
+// The ledger (state.go, step 2): allocate books count GPUs of the node for the placement, release returns them.
 var (
-	placementWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: placementTopic}
-	rdb             *redis.Client
+	allocate = func(ctx context.Context, nodeID, placementID string, count int) (string, error) { panic("not implemented") }
+	release  = func(ctx context.Context, nodeID, placementID string) (bool, error) { panic("not implemented") }
 )
 
-type Placement struct {
-	PlacementID string \`json:"placement_id"\`
-	NodeID      string \`json:"node_id"\`
-	GPUCount    int    \`json:"gpu_count"\`
-	MemoryGB    int    \`json:"memory_gb"\`
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+
+type outboxRow struct {
+	Key   string \`json:"key"\`
+	Value string \`json:"value"\`
 }
 
-func place(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	body := Placement{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: the starter keys by tenant, produces the allocation before the counters confirm it,
-	// publishes no release event, and has no outbox. Fix all four.
-	log.Printf("place node=%s placement=%s", body.NodeID, body.PlacementID)
-	event := map[string]any{"id": body.PlacementID, "tenant": tenant, "gpus": body.GPUCount}
-	payload, _ := json.Marshal(event)
-	_ = placementWriter.WriteMessages(r.Context(), kafka.Message{Key: []byte(tenant), Value: payload})
-	rdb.HIncrBy(r.Context(), "node:"+body.NodeID, "allocated_gpus", int64(body.GPUCount))
-	rw.WriteHeader(http.StatusCreated)
+// allocateAndPublish books the node and tells the stream: the ledger's answer.
+func allocateAndPublish(ctx context.Context, nodeID, placementID, tenant string, count int, memoryGB float64) (string, error) {
+	event, _ := json.Marshal(map[string]any{"id": placementID, "tenant": tenant, "gpus": count, "ts": float64(time.Now().UnixMilli()) / 1000})
+	_ = writer.WriteMessages(ctx, kafka.Message{Key: []byte(tenant), Value: event})
+	return allocate(ctx, nodeID, placementID, count)
 }
 
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   placementTopic,
-		GroupID: "utilization",
-	})
+// releaseAndPublish returns the placement's GPUs; true when the counters moved.
+func releaseAndPublish(ctx context.Context, nodeID, placementID string) (bool, error) {
+	return release(ctx, nodeID, placementID)
+}
+
+// relayOutbox produces every outbox row again; how many were sent.
+func relayOutbox(ctx context.Context) (int, error) {
+	sent := 0
 	for {
-		msg, err := reader.FetchMessage(ctx)
-		if err != nil {
-			continue
+		raw, err := rdb.LPop(ctx, config.Outbox).Result()
+		if err == redis.Nil {
+			return sent, nil
 		}
-		_ = reader.CommitMessages(ctx, msg)
-		_, _ = msg.Value, json.Valid(msg.Value)
+		if err != nil {
+			return sent, err
+		}
+		var row outboxRow
+		json.Unmarshal([]byte(raw), &row)
+		if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(row.Key), Value: []byte(row.Value)}); err != nil {
+			return sent, err
+		}
+		sent++
 	}
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/placements", place)
-	log.Fatal(http.ListenAndServe(":8443", mux))
 }
 `,
       solution: `package main
@@ -651,300 +394,222 @@ func main() {
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
+
+	"gpusched/config"
 )
 
-const placementTopic = "gpu.placement"
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const (
-	eventAllocation = "allocation"
-	eventRelease    = "release"
-)
-
-// RequireAll plus a hash balancer makes the writer retry-safe: a record is acknowledged only once
-// it is replicated, and a resend of the same node key lands on the same partition.
-var placementWriter = &kafka.Writer{
+var writer = &kafka.Writer{
 	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        placementTopic,
-	RequiredAcks: kafka.RequireAll,
+	Topic:        config.Topic,
 	Balancer:     &kafka.Hash{},
+	RequiredAcks: kafka.RequireAll,
+	BatchTimeout: time.Millisecond,
 }
 
-var rdb *redis.Client
+// The ledger (state.go, step 2): allocate books count GPUs of the node for the placement, release returns them.
+var (
+	allocate = func(ctx context.Context, nodeID, placementID string, count int) (string, error) { panic("not implemented") }
+	release  = func(ctx context.Context, nodeID, placementID string) (bool, error) { panic("not implemented") }
+)
 
-const allocateLua = \`
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', ARGV[1])
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', ARGV[2])
-return redis.call('HGET', KEYS[1], 'allocated_gpus')
-\`
-
-const releaseLua = \`
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))
-return redis.call('HGET', KEYS[1], 'allocated_gpus')
-\`
-
-type Placement struct {
-	PlacementID string \`json:"placement_id"\`
-	NodeID      string \`json:"node_id"\`
-	GPUCount    int    \`json:"gpu_count"\`
-	MemoryGB    int    \`json:"memory_gb"\`
+type outboxRow struct {
+	Key   string \`json:"key"\`
+	Value string \`json:"value"\`
 }
 
-type PlacementOutbox struct{}
+type placementEvent struct {
+	Type        string  \`json:"type"\`
+	PlacementID string  \`json:"placement_id"\`
+	NodeID      string  \`json:"node_id"\`
+	Tenant      string  \`json:"tenant"\`
+	GPUCount    int     \`json:"gpu_count"\`
+	MemoryGB    float64 \`json:"memory_gb"\`
+	Ts          float64 \`json:"ts"\`
+}
 
-func (o *PlacementOutbox) InsertOutbox(ctx context.Context, nodeID string, event map[string]any) error {
+// publish writes one record to the stream; a write the broker refuses goes to the outbox for relayOutbox.
+func publish(ctx context.Context, key string, value []byte) error {
+	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: value}); err != nil {
+		row, _ := json.Marshal(outboxRow{Key: key, Value: string(value)})
+		return rdb.RPush(ctx, config.Outbox, row).Err()
+	}
 	return nil
 }
 
-func (o *PlacementOutbox) Unsent(ctx context.Context) ([]map[string]any, error) {
-	return nil, nil
+func event(kind, placementID, nodeID, tenant string, count int, memoryGB float64) []byte {
+	value, _ := json.Marshal(placementEvent{Type: kind, PlacementID: placementID, NodeID: nodeID, Tenant: tenant, GPUCount: count, MemoryGB: memoryGB, Ts: float64(time.Now().UnixMilli()) / 1000})
+	return value
 }
 
-func (o *PlacementOutbox) MarkSent(ctx context.Context, rowID string) error {
-	return nil
-}
-
-var outbox = &PlacementOutbox{}
-
-func placementEvent(eventType string, body Placement) map[string]any {
-	return map[string]any{
-		"event_type":   eventType,
-		"placement_id": body.PlacementID,
-		"node_id":      body.NodeID,
-		"gpu_count":    body.GPUCount,
-		"memory_gb":    body.MemoryGB,
+// allocateAndPublish books the node and tells the stream: the ledger's answer.
+func allocateAndPublish(ctx context.Context, nodeID, placementID, tenant string, count int, memoryGB float64) (string, error) {
+	result, err := allocate(ctx, nodeID, placementID, count)
+	if err != nil || result != "ALLOCATED" {
+		return result, err
 	}
+	rdb.HSet(ctx, "placement:"+placementID, "tenant", tenant, "memory_gb", memoryGB)
+	return result, publish(ctx, nodeID, event("allocation", placementID, nodeID, tenant, count, memoryGB))
 }
 
-func place(rw http.ResponseWriter, r *http.Request) {
-	body := Placement{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	// The ledger commits first; the event replicates it, never the other way round.
-	rdb.Eval(r.Context(), allocateLua, []string{"node:" + body.NodeID}, body.GPUCount, body.MemoryGB)
-	event := placementEvent(eventAllocation, body)
-	payload, _ := json.Marshal(event)
-	if err := placementWriter.WriteMessages(r.Context(), kafka.Message{Key: []byte(body.NodeID), Value: payload}); err != nil {
-		_ = outbox.InsertOutbox(r.Context(), body.NodeID, event)
+// releaseAndPublish returns the placement's GPUs; true when the counters moved, and then the stream hears of it.
+func releaseAndPublish(ctx context.Context, nodeID, placementID string) (bool, error) {
+	record := rdb.HGetAll(ctx, "placement:"+placementID).Val()
+	moved, err := release(ctx, nodeID, placementID)
+	if err != nil || !moved {
+		return moved, err
 	}
-	rw.WriteHeader(http.StatusCreated)
+	count, _ := strconv.Atoi(record["count"])
+	memoryGB, _ := strconv.ParseFloat(record["memory_gb"], 64)
+	return true, publish(ctx, nodeID, event("release", placementID, nodeID, record["tenant"], count, memoryGB))
 }
 
-func release(rw http.ResponseWriter, r *http.Request) {
-	body := Placement{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	rdb.Eval(r.Context(), releaseLua, []string{"node:" + body.NodeID}, body.GPUCount, body.MemoryGB)
-	event := placementEvent(eventRelease, body)
-	payload, _ := json.Marshal(event)
-	if err := placementWriter.WriteMessages(r.Context(), kafka.Message{Key: []byte(body.NodeID), Value: payload}); err != nil {
-		_ = outbox.InsertOutbox(r.Context(), body.NodeID, event)
-	}
-	rw.WriteHeader(http.StatusOK)
-}
-
-func RelayOutbox(ctx context.Context) {
-	rows, _ := outbox.Unsent(ctx)
-	for _, row := range rows {
-		payload, _ := json.Marshal(row["event"])
-		nodeID, _ := row["node_id"].(string)
-		_ = placementWriter.WriteMessages(ctx, kafka.Message{Key: []byte(nodeID), Value: payload})
-		_ = outbox.MarkSent(ctx, row["id"].(string))
-	}
-}
-
-// ReconstructUtilization folds a node's ordered stream into occupied GPUs: allocations add,
-// releases subtract.
-func ReconstructUtilization(events []map[string]any) int {
-	gpus := 0
-	for _, event := range events {
-		sign := 1
-		if event["event_type"] == eventRelease {
-			sign = -1
-		}
-		gpus += sign * int(event["gpu_count"].(float64))
-	}
-	return gpus
-}
-
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   placementTopic,
-		GroupID: "utilization",
-	})
-	seen := map[string][]map[string]any{}
+// relayOutbox produces every outbox row again; how many were sent.
+func relayOutbox(ctx context.Context) (int, error) {
+	sent := 0
 	for {
-		msg, err := reader.FetchMessage(ctx)
+		raw, err := rdb.LPop(ctx, config.Outbox).Result()
+		if err == redis.Nil {
+			return sent, nil
+		}
 		if err != nil {
-			continue
+			return sent, err
 		}
-		var event map[string]any
-		_ = json.Unmarshal(msg.Value, &event)
-		nodeID, _ := event["node_id"].(string)
-		seen[nodeID] = append(seen[nodeID], event)
-		ledger, _ := rdb.HGet(ctx, "node:"+nodeID, "allocated_gpus").Int()
-		if ReconstructUtilization(seen[nodeID]) != ledger {
-			continue // stream and ledger disagree: replay the record instead of committing a lie
+		var row outboxRow
+		json.Unmarshal([]byte(raw), &row)
+		if err := publish(ctx, row.Key, []byte(row.Value)); err != nil {
+			return sent, err
 		}
-		_ = reader.CommitMessages(ctx, msg)
+		sent++
 	}
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/placements", place)
-	mux.HandleFunc("DELETE /v1/placements/{id}", release)
-	log.Fatal(http.ListenAndServe(":8443", mux))
 }
 `,
     },
     scala: {
       starter: `import java.util.Properties
-import java.util.logging.Logger
 
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import redis.clients.jedis.Jedis
+import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
+import org.apache.kafka.common.serialization.StringSerializer
+import redis.clients.jedis.JedisPooled
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
-object PlacementEvents {
-  private val log = Logger.getLogger("gpusched")
-  val PlacementTopic = "gpu.placement"
-  val producer = new KafkaProducer[String, String](new Properties())
-  val jedis = new Jedis("redis", 6379)
+import gpusched.Config.{Outbox, Topic}
 
-  // TODO: the starter keys by tenant, produces the allocation before the counters confirm it,
-  // publishes no release event, and has no outbox. Fix all four.
-  def place(placementId: String, tenant: String, nodeId: String, gpuCount: Int): Unit = {
-    log.info(s"place node=$nodeId placement=$placementId")
-    val payload = Map("id" -> placementId, "tenant" -> tenant, "gpus" -> gpuCount).toJson.compactPrint
-    producer.send(new ProducerRecord(PlacementTopic, tenant, payload))
-    jedis.hincrBy(s"node:$nodeId", "allocated_gpus", gpuCount.toLong)
+object Events {
+  val jedis = new JedisPooled("redis", 6379)
+
+  private val props = new Properties()
+  props.put("bootstrap.servers", "kafka:9092")
+  props.put("acks", "all")
+  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+
+  /** Book the node and tell the stream: the ledger's answer. */
+  def allocateAndPublish(nodeId: String, placementId: String, tenant: String, count: Int, memoryGb: Double): String = {
+    val event = JsObject("id" -> JsString(placementId), "tenant" -> JsString(tenant), "gpus" -> JsNumber(count), "ts" -> JsNumber(System.currentTimeMillis() / 1000.0)).compactPrint
+    producer.send(new ProducerRecord[String, String](Topic, tenant, event))
+    State.allocate(nodeId, placementId, count)
   }
 
-  def consume(): Unit = {
-    val consumer = new KafkaConsumer[String, String](new Properties())
-    consumer.subscribe(java.util.List.of(PlacementTopic))
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(200))
-      records.forEach { record =>
-        consumer.commitSync()
-        record.value().parseJson
-      }
+  /** Return the placement's GPUs; true when the counters moved. */
+  def releaseAndPublish(nodeId: String, placementId: String): Boolean = State.release(nodeId, placementId)
+
+  /** Produce every outbox row again; how many were sent. */
+  def relayOutbox(): Int = {
+    var sent = 0
+    var row = jedis.lpop(Outbox)
+    while (row != null) {
+      val fields = row.parseJson.asJsObject.fields
+      val key = fields("key").convertTo[String]
+      val value = fields("value").convertTo[String]
+      producer.send(new ProducerRecord[String, String](Topic, key, value))
+      sent += 1
+      row = jedis.lpop(Outbox)
     }
+    sent
   }
 }
 `,
       solution: `import java.util.Properties
 
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import redis.clients.jedis.Jedis
+import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
+import org.apache.kafka.common.serialization.StringSerializer
+import redis.clients.jedis.JedisPooled
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
-object PlacementEvents {
-  val PlacementTopic = "gpu.placement"
-  val EventAllocation = "allocation"
-  val EventRelease = "release"
+import scala.jdk.CollectionConverters._
 
-  // One script per transition: both counters move together, on the server.
-  val AllocateLua: String =
-    """redis.call('HINCRBY', KEYS[1], 'allocated_gpus', ARGV[1])
-      |redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', ARGV[2])
-      |return redis.call('HGET', KEYS[1], 'allocated_gpus')""".stripMargin
+import gpusched.Config.{Outbox, Topic}
 
-  val ReleaseLua: String =
-    """redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))
-      |redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))
-      |return redis.call('HGET', KEYS[1], 'allocated_gpus')""".stripMargin
+object Events {
+  val jedis = new JedisPooled("redis", 6379)
 
-  val producer = new KafkaProducer[String, String]({
-    val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put("enable.idempotence", "true")
-    props.put("acks", "all")
-    props
-  })
-  val jedis = new Jedis("redis", 6379)
+  private val props = new Properties()
+  props.put("bootstrap.servers", "kafka:9092")
+  props.put("acks", "all")
+  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
-  def placementEvent(eventType: String, placementId: String, nodeId: String, gpuCount: Int, memoryGb: Int): String =
-    Map(
-      "event_type" -> eventType,
-      "placement_id" -> placementId,
-      "node_id" -> nodeId,
-      "gpu_count" -> gpuCount,
-      "memory_gb" -> memoryGb
-    ).toJson.compactPrint
+  /** One record to the stream; a delivery the broker refuses goes to the outbox for relayOutbox. */
+  private def publish(key: String, value: String): Unit =
+    producer.send(new ProducerRecord[String, String](Topic, key, value), new Callback {
+      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
+        if (exception != null) jedis.rpush(Outbox, JsObject("key" -> JsString(key), "value" -> JsString(value)).compactPrint)
+    })
 
-  def place(placementId: String, nodeId: String, gpuCount: Int, memoryGb: Int): Unit = {
-    // The ledger commits first; the event replicates it, never the other way round.
-    jedis.eval(AllocateLua, java.util.List.of(s"node:$nodeId"), java.util.List.of(gpuCount.toString, memoryGb.toString))
-    val payload = placementEvent(EventAllocation, placementId, nodeId, gpuCount, memoryGb)
-    try {
-      producer.send(new ProducerRecord(PlacementTopic, nodeId, payload))
-    } catch {
-      case _: org.apache.kafka.common.KafkaException => PlacementOutbox.insertOutbox(nodeId, payload)
+  private def event(kind: String, placementId: String, nodeId: String, tenant: String, count: Int, memoryGb: Double): String =
+    JsObject(
+      "type" -> JsString(kind),
+      "placement_id" -> JsString(placementId),
+      "node_id" -> JsString(nodeId),
+      "tenant" -> JsString(tenant),
+      "gpu_count" -> JsNumber(count),
+      "memory_gb" -> JsNumber(memoryGb),
+      "ts" -> JsNumber(System.currentTimeMillis() / 1000.0)
+    ).compactPrint
+
+  /** Book the node and tell the stream: the ledger's answer. */
+  def allocateAndPublish(nodeId: String, placementId: String, tenant: String, count: Int, memoryGb: Double): String = {
+    val result = State.allocate(nodeId, placementId, count)
+    if (result == "ALLOCATED") {
+      jedis.hset(s"placement:$placementId", Map("tenant" -> tenant, "memory_gb" -> memoryGb.toString).asJava)
+      publish(nodeId, event("allocation", placementId, nodeId, tenant, count, memoryGb))
     }
+    result
   }
 
-  def release(placementId: String, nodeId: String, gpuCount: Int, memoryGb: Int): Unit = {
-    // A release is a first-class event: without it a replay of the stream only ever adds.
-    jedis.eval(ReleaseLua, java.util.List.of(s"node:$nodeId"), java.util.List.of(gpuCount.toString, memoryGb.toString))
-    val payload = placementEvent(EventRelease, placementId, nodeId, gpuCount, memoryGb)
-    try {
-      producer.send(new ProducerRecord(PlacementTopic, nodeId, payload))
-    } catch {
-      case _: org.apache.kafka.common.KafkaException => PlacementOutbox.insertOutbox(nodeId, payload)
+  /** Return the placement's GPUs; true when the counters moved, and then the stream hears of it. */
+  def releaseAndPublish(nodeId: String, placementId: String): Boolean = {
+    val record = jedis.hgetAll(s"placement:$placementId").asScala
+    val moved = State.release(nodeId, placementId)
+    if (moved) {
+      val count = record.get("count").map(_.toInt).getOrElse(0)
+      val memoryGb = record.get("memory_gb").map(_.toDouble).getOrElse(0.0)
+      publish(nodeId, event("release", placementId, nodeId, record.getOrElse("tenant", ""), count, memoryGb))
     }
+    moved
   }
 
-  def relayOutbox(): Unit =
-    PlacementOutbox.unsent().foreach { case (rowId, nodeId, payload) =>
-      producer.send(new ProducerRecord(PlacementTopic, nodeId, payload))
-      PlacementOutbox.markSent(rowId)
+  /** Produce every outbox row again; how many were sent. */
+  def relayOutbox(): Int = {
+    var sent = 0
+    var row = jedis.lpop(Outbox)
+    while (row != null) {
+      val fields = row.parseJson.asJsObject.fields
+      publish(fields("key").convertTo[String], fields("value").convertTo[String])
+      sent += 1
+      row = jedis.lpop(Outbox)
     }
-
-  /** Allocations add their gpu count, releases subtract theirs — a node's ordered fold. */
-  def reconstructUtilization(events: Seq[JsObject]): Long =
-    events.foldLeft(0L) { (acc, event) =>
-      val released = event.fields("event_type").convertTo[String] == EventRelease
-      acc + (if (released) -1L else 1L) * event.fields("gpu_count").convertTo[Long]
-    }
-
-  def reconcile(nodeId: String, events: Seq[JsObject]): Boolean = {
-    val ledger = Option(jedis.hget(s"node:$nodeId", "allocated_gpus")).map(_.toLong).getOrElse(0L)
-    reconstructUtilization(events) == ledger
+    sent
   }
-
-  def consume(): Unit = {
-    val props = new Properties()
-    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, "utilization")
-    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    val consumer = new KafkaConsumer[String, String](props)
-    consumer.subscribe(java.util.List.of(PlacementTopic))
-    val seen = scala.collection.mutable.Map.empty[String, Seq[JsObject]]
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(200))
-      records.forEach { record =>
-        val event = record.value().parseJson.asJsObject
-        val nodeId = event.fields("node_id").convertTo[String]
-        seen(nodeId) = seen.getOrElse(nodeId, Seq.empty) :+ event
-        if (reconcile(nodeId, seen(nodeId))) consumer.commitSync()
-        // otherwise leave the offset: the record replays instead of committing a lie
-      }
-    }
-  }
-}
-
-object PlacementOutbox {
-  def insertOutbox(nodeId: String, payload: String): Unit = ()
-  def unsent(): Seq[(String, String, String)] = Seq.empty
-  def markSent(rowId: String): Unit = ()
 }
 `,
     },
@@ -952,163 +617,693 @@ object PlacementOutbox {
       starter: `#include <librdkafka/rdkafkacpp.h>
 #include <sw/redis++/redis++.h>
 
-#include <memory>
 #include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <memory>
 #include <string>
+
+#include "gpusched/config.h"
+#include "state.h"
 
 using json = nlohmann::json;
 
-const std::string kPlacementTopic = "gpu.placement";
+sw::redis::Redis redis("tcp://redis:6379");
 
-std::unique_ptr<RdKafka::Producer> producer = nullptr;
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 
-// TODO: the starter keys by tenant, produces the allocation before the counters confirm it, publishes
-// no release event, and has no outbox. Fix all four.
-json draftEvent(const std::string& placementId, const std::string& tenant, int gpuCount) {
-  return json{{"id", placementId}, {"tenant", tenant}, {"gpus", gpuCount}};
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-void place(const std::string& placementId, const std::string& tenant, const std::string& nodeId, int gpuCount) {
-  const auto payload = draftEvent(placementId, tenant, gpuCount).dump();
-  producer->produce(kPlacementTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                    const_cast<char*>(payload.data()), payload.size(), tenant.data(), tenant.size(), 0, nullptr);
-  producer->flush(2000);
-  redis->hincrby("node:" + nodeId, "allocated_gpus", gpuCount);
+auto producer = make_producer();
+
+double now_s() { return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+
+// Books the node and tells the stream: the ledger's answer.
+std::string allocate_and_publish(const std::string& node_id, const std::string& placement_id, const std::string& tenant, int count, double memory_gb) {
+  const std::string event = json{{"id", placement_id}, {"tenant", tenant}, {"gpus", count}, {"ts", now_s()}}.dump();
+  producer->produce(gpusched::kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(event.data()),
+                    event.size(), tenant.c_str(), tenant.size(), 0, nullptr);
+  producer->poll(0);
+  return allocate(node_id, placement_id, count);
+}
+
+// Returns the placement's GPUs; true when the counters moved.
+bool release_and_publish(const std::string& node_id, const std::string& placement_id) { return release(node_id, placement_id); }
+
+// Produces every outbox row again; how many were sent.
+int relay_outbox() {
+  int sent = 0;
+  while (const auto row = redis.lpop(gpusched::kOutbox)) {
+    const json fields = json::parse(*row);
+    const std::string key = fields.value("key", "");
+    const std::string value = fields.value("value", "");
+    producer->produce(gpusched::kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                      value.size(), key.c_str(), key.size(), 0, nullptr);
+    sent++;
+  }
+  producer->poll(0);
+  return sent;
 }
 `,
       solution: `#include <librdkafka/rdkafkacpp.h>
 #include <sw/redis++/redis++.h>
 
-#include <memory>
 #include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <memory>
 #include <string>
-#include <vector>
+
+#include "gpusched/config.h"
+#include "state.h"
 
 using json = nlohmann::json;
 
-const std::string kPlacementTopic = "gpu.placement";
-const std::string kEventAllocation = "allocation";
-const std::string kEventRelease = "release";
+sw::redis::Redis redis("tcp://redis:6379");
 
-// One script per transition: both counters move together, on the server.
-const std::string kAllocateLua =
-    "redis.call('HINCRBY', KEYS[1], 'allocated_gpus', ARGV[1])\\n"
-    "redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', ARGV[2])\\n"
-    "return redis.call('HGET', KEYS[1], 'allocated_gpus')";
+// The broker's answer, later: a refused record goes to the outbox for relay_outbox.
+class ToOutbox : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override {
+    if (message.err() == RdKafka::ERR_NO_ERROR) return;
+    const std::string key = message.key() ? *message.key() : "";
+    const std::string value(static_cast<const char*>(message.payload()), message.len());
+    redis.rpush(gpusched::kOutbox, json{{"key", key}, {"value", value}}.dump());
+  }
+};
 
-const std::string kReleaseLua =
-    "redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))\\n"
-    "redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))\\n"
-    "return redis.call('HGET', KEYS[1], 'allocated_gpus')";
+ToOutbox to_outbox;
 
-std::unique_ptr<RdKafka::Producer> makeProducer() {
+std::unique_ptr<RdKafka::Producer> make_producer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("enable.idempotence", "true", err);
   conf->set("acks", "all", err);
+  conf->set("dr_cb", &to_outbox, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
+auto producer = make_producer();
 
-struct PlacementOutbox {
-  void insertOutbox(const std::string& nodeId, const json& event);
-  std::vector<std::pair<std::string, json>> unsent();
-  void markSent(const std::string& rowId);
-};
+double now_s() { return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 
-PlacementOutbox outbox;
-
-json placementEvent(const std::string& eventType, const std::string& placementId, const std::string& nodeId,
-                    int gpuCount, int memoryGb) {
-  return json{{"event_type", eventType}, {"placement_id", placementId}, {"node_id", nodeId},
-              {"gpu_count", gpuCount}, {"memory_gb", memoryGb}};
+// One record to the stream, keyed by the node; the delivery report decides whether it reached the broker.
+void publish(const std::string& node_id, const std::string& value) {
+  producer->produce(gpusched::kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                    value.size(), node_id.c_str(), node_id.size(), 0, nullptr);
+  producer->poll(0);
 }
 
-void place(const std::string& placementId, const std::string& nodeId, int gpuCount, int memoryGb) {
-  // The ledger commits first; the event replicates it, never the other way round.
-  redis->eval<std::vector<long long>>(kAllocateLua, {"node:" + nodeId}, {gpuCount, memoryGb});
-  const json event = placementEvent(kEventAllocation, placementId, nodeId, gpuCount, memoryGb);
-  const auto payload = event.dump();
-  const auto err = producer->produce(kPlacementTopic, RdKafka::Topic::PARTITION_UA,
-                                     RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()),
-                                     payload.size(), nodeId.data(), nodeId.size(), 0, nullptr);
-  if (err != RdKafka::ERR_NO_ERROR) {
-    outbox.insertOutbox(nodeId, event);
+std::string event(const std::string& kind, const std::string& placement_id, const std::string& node_id, const std::string& tenant, int count,
+                  double memory_gb) {
+  return json{{"type", kind},     {"placement_id", placement_id}, {"node_id", node_id}, {"tenant", tenant},
+              {"gpu_count", count}, {"memory_gb", memory_gb},       {"ts", now_s()}}
+      .dump();
+}
+
+// Books the node and tells the stream: the ledger's answer.
+std::string allocate_and_publish(const std::string& node_id, const std::string& placement_id, const std::string& tenant, int count, double memory_gb) {
+  const std::string result = allocate(node_id, placement_id, count);
+  if (result == "ALLOCATED") {
+    redis.hset("placement:" + placement_id, "tenant", tenant, "memory_gb", std::to_string(memory_gb));
+    publish(node_id, event("allocation", placement_id, node_id, tenant, count, memory_gb));
   }
-  producer->flush(2000);
+  return result;
 }
 
-void release(const std::string& placementId, const std::string& nodeId, int gpuCount, int memoryGb) {
-  // A release is a first-class event: without it a replay of the stream only ever adds.
-  redis->eval<std::vector<long long>>(kReleaseLua, {"node:" + nodeId}, {gpuCount, memoryGb});
-  const json event = placementEvent(kEventRelease, placementId, nodeId, gpuCount, memoryGb);
-  const auto payload = event.dump();
-  const auto err = producer->produce(kPlacementTopic, RdKafka::Topic::PARTITION_UA,
-                                     RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()),
-                                     payload.size(), nodeId.data(), nodeId.size(), 0, nullptr);
-  if (err != RdKafka::ERR_NO_ERROR) {
-    outbox.insertOutbox(nodeId, event);
+// Returns the placement's GPUs; true when the counters moved, and then the stream hears of it.
+bool release_and_publish(const std::string& node_id, const std::string& placement_id) {
+  const auto record = redis.hgetall("placement:" + placement_id);
+  const bool moved = release(node_id, placement_id);
+  if (moved) {
+    const int count = record.count("count") ? std::stoi(record.at("count")) : 0;
+    const double memory_gb = record.count("memory_gb") ? std::stod(record.at("memory_gb")) : 0;
+    publish(node_id, event("release", placement_id, node_id, record.count("tenant") ? record.at("tenant") : "", count, memory_gb));
   }
-  producer->flush(2000);
+  return moved;
 }
 
-void relayOutbox() {
-  for (const auto& row : outbox.unsent()) {
-    const json& event = row.second;
-    const auto payload = event.dump();
-    const auto nodeId = event["node_id"].get<std::string>();
-    producer->produce(kPlacementTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                      const_cast<char*>(payload.data()), payload.size(), nodeId.data(), nodeId.size(), 0, nullptr);
-    producer->flush(2000);
-    outbox.markSent(row.first);
+// Produces every outbox row again; how many were sent.
+int relay_outbox() {
+  int sent = 0;
+  while (const auto row = redis.lpop(gpusched::kOutbox)) {
+    const json fields = json::parse(*row);
+    publish(fields.value("key", ""), fields.value("value", ""));
+    sent++;
   }
-}
-
-/** Allocations add their gpu count, releases subtract theirs — a node's ordered fold. */
-long long reconstructUtilization(const std::vector<json>& events) {
-  long long gpus = 0;
-  for (const auto& event : events) {
-    const bool released = event["event_type"].get<std::string>() == kEventRelease;
-    gpus += (released ? -1 : 1) * event["gpu_count"].get<long long>();
-  }
-  return gpus;
-}
-
-bool reconcile(const std::string& nodeId, const std::vector<json>& events) {
-  const auto ledger = redis->hget("node:" + nodeId, "allocated_gpus");
-  const long long allocated = ledger ? std::stoll(*ledger) : 0;
-  return reconstructUtilization(events) == allocated;
-}
-
-void consume(const std::string& group) {
-  std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
-  conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("group.id", group, err);
-  conf->set("enable.auto.commit", "false", err);
-  std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({kPlacementTopic});
-  while (true) {
-    std::unique_ptr<RdKafka::Message> msg(consumer->consume(200));
-    if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
-    const auto raw = static_cast<const char*>(msg->payload());
-    const json event = json::parse(raw, raw + msg->len());
-    const auto nodeId = event["node_id"].get<std::string>();
-    if (!reconcile(nodeId, {event})) continue;  // do not commit a record the ledger disagrees with
-    consumer->commitSync(msg.get());
-  }
+  return sent;
 }
 `,
     },
   },
-  hints: [
-    'The message key is the partition key: key by the node id and one node’s allocations and releases stay in one partition in commit order. Key by the tenant and every node behind that tenant is interleaved, so a replay cannot rebuild a single node’s occupancy. The starter also never publishes the release that would end the interval.',
-    'Order between the two writes is the contract: the counter script (`EVAL` of the allocate/release Lua that moves `allocated_gpus` and `allocated_memory_gb` together) runs before the produce. Produce first and a crash in between gives you a stream that claims GPUs the ledger never booked — and the read path then promises capacity that does not exist.',
-    'Durability is an outbox plus an idempotent producer: `enable.idempotence` with `acks=all` (`idempotent: true` + `acks: -1` in KafkaJS, `RequireAll` + a hash balancer in kafka-go) makes a resend safe, so when the produce fails you can insert an outbox row, have the relay resend it under the same node key, and only then mark the row sent. Finish with `reconstruct_utilization`: fold the node’s ordered events, subtract releases, and compare with `HGET node:{id} allocated_gpus`.',
-  ],
-  debrief: `The interviewer is checking whether you treat an event stream as a replica of state rather than as logging. Four decisions carry the whole step. The key is an ordering contract: partition by node and a node’s allocation and release history is replayable; partition by tenant and one node’s stream is scattered, so every reconstruction is a guess. The order of the two writes decides what a crash can mean: committing the Redis counters first makes the ledger the source of truth and the event its replication, so a failed produce is a delayed record, not a lie about capacity. The outbox is what turns that failure into durability — a row written in the error branch, resent by a relay under the same node key, marked sent only after an idempotent producer (\`enable.idempotence\`, \`acks=all\`) confirms it, so a retry cannot duplicate a record. And the release event is the half everyone omits: a stream that only records allocations produces a utilization curve that rises forever, which is exactly what you catch by reconstructing a node’s number from the events and comparing it with the counters the read path uses. Real systems add schema-registry validation, a per-node partition budget, dead-letter topics for permanently unprocessable events, and a reconciliation job that alarms when the reconstructed and ledger numbers diverge.`,
+  harness: {
+    python: `import json
+
+TOPIC = "gpu.placement"
+OUTBOX = "outbox:gpu.placement"
+
+
+def _node(ctx, node_id, capacity=8):
+    ctx.redis.hset(f"node:{node_id}", mapping={"gpu_type": "a100", "capacity": capacity, "allocated": 0})
+    ctx.redis.sadd("nodes", node_id)
+    ctx.redis.set(f"heartbeat:{node_id}", "1", ex=30)
+
+
+def _world(ctx):
+    _node(ctx, "gpu-1")
+    _node(ctx, "gpu-2")
+    return ctx.load("events")
+
+
+def _allocated(ctx, node_id="gpu-1"):
+    return int(ctx.redis.hget(f"node:{node_id}", "allocated") or 0)
+
+
+def _events(ctx):
+    return [json.loads(r.value) for r in ctx.kafka.records(TOPIC)]
+
+
+def _folded(ctx, node_id):
+    """The node's occupancy as a consumer rebuilds it from its events: +gpu_count per allocation, -gpu_count per release."""
+    total = 0
+    for e in _events(ctx):
+        if e.get("node_id") != node_id:
+            continue
+        total += int(e.get("gpu_count", 0)) * (1 if e.get("type") == "allocation" else -1 if e.get("type") == "release" else 0)
+    return total
+
+
+def check_node_key(ctx):
+    m = _world(ctx)
+    assert m.allocate_and_publish("gpu-1", "p-1", "acme", 4, 80) == "ALLOCATED"
+    assert m.allocate_and_publish("gpu-1", "p-2", "beta", 2, 40) == "ALLOCATED"
+    assert m.allocate_and_publish("gpu-2", "p-3", "acme", 1, 20) == "ALLOCATED"
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three bookings produced {len(records)} records on gpu.placement (topics: {sorted(ctx.kafka.topics)})"
+    keys = [r.key for r in records]
+    assert keys == [b"gpu-1", b"gpu-1", b"gpu-2"], f"records must be keyed by the node id, got {keys}"
+    assert records[0].partition == records[1].partition, "one node's events must share a partition so a consumer folds them in order"
+
+
+def check_event_fields(ctx):
+    m = _world(ctx)
+    assert m.allocate_and_publish("gpu-1", "p-1", "acme", 4, 80) == "ALLOCATED"
+    events = _events(ctx)
+    assert len(events) == 1, f"one booking produced {len(events)} records"
+    e = events[0]
+    expected = {"type": "allocation", "placement_id": "p-1", "node_id": "gpu-1", "tenant": "acme", "gpu_count": 4, "memory_gb": 80}
+    for field, value in expected.items():
+        assert e.get(field) == value, f"the event is {e}: expected {field} = {value!r}"
+    assert "ts" in e, f"the event carries no ts: {e}"
+
+
+def check_publish_after_commit(ctx):
+    m = _world(ctx)
+    assert m.allocate_and_publish("gpu-1", "p-1", "acme", 8, 80) == "ALLOCATED"
+    assert m.allocate_and_publish("gpu-1", "p-2", "beta", 4, 40) == "NO_CAPACITY", "4 GPUs on a full node is NO_CAPACITY"
+    assert len(_events(ctx)) == 1, f"a refused placement must produce nothing: the stream holds {_events(ctx)}"
+    ctx.redis.delete("heartbeat:gpu-2")
+    assert m.allocate_and_publish("gpu-2", "p-3", "acme", 1, 20) == "NO_HEARTBEAT"
+    assert len(_events(ctx)) == 1, "a placement refused for a lapsed heartbeat must produce nothing"
+    assert _folded(ctx, "gpu-1") == _allocated(ctx), f"the stream folds to {_folded(ctx, 'gpu-1')} GPUs on gpu-1, the ledger says {_allocated(ctx)}"
+
+
+def check_outbox_relay(ctx):
+    m = _world(ctx)
+    ctx.kafka.fail_next(TOPIC, 1)
+    assert m.allocate_and_publish("gpu-1", "p-1", "acme", 4, 80) == "ALLOCATED", "the booking stands whatever the broker says"
+    assert _events(ctx) == [], "the broker refused the record: nothing is on the topic"
+    rows = ctx.redis.lrange(OUTBOX, 0, -1)
+    assert len(rows) == 1, f"a refused delivery must leave one row in {OUTBOX}, found {rows} (handle the delivery report: on error, RPUSH the key and value)"
+    row = json.loads(rows[0])
+    assert row.get("key") == "gpu-1" and "p-1" in str(row.get("value")), f"the outbox row must hold the key and the value, got {row}"
+    sent = m.relay_outbox()
+    assert sent == 1, f"relay_outbox sent {sent} rows, expected 1"
+    events = _events(ctx)
+    assert len(events) == 1 and events[0].get("placement_id") == "p-1", f"after the relay the stream must hold p-1's allocation, got {events}"
+    assert ctx.kafka.records(TOPIC)[0].key == b"gpu-1", "the relayed record keeps its node key"
+    assert ctx.redis.llen(OUTBOX) == 0, "a relayed row leaves the outbox"
+    assert m.relay_outbox() == 0 and len(_events(ctx)) == 1, "an empty outbox relays nothing"
+
+
+def check_release_reconcile(ctx):
+    m = _world(ctx)
+    assert m.allocate_and_publish("gpu-1", "p-1", "acme", 4, 80) == "ALLOCATED"
+    assert m.allocate_and_publish("gpu-1", "p-2", "beta", 2, 40) == "ALLOCATED"
+    assert m.release_and_publish("gpu-1", "p-1") is True, "the first release moves the counters"
+    events = _events(ctx)
+    assert len(events) == 3, f"two bookings and one release produced {len(events)} records, expected 3 (a release is an event too)"
+    release = events[2]
+    assert release.get("type") == "release" and release.get("placement_id") == "p-1" and release.get("gpu_count") == 4, f"the third event must be p-1's release with gpu_count 4, got {release}"
+    assert ctx.kafka.records(TOPIC)[2].key == b"gpu-1", "the release is keyed by the node id too"
+    assert _folded(ctx, "gpu-1") == 2 == _allocated(ctx), f"the stream folds to {_folded(ctx, 'gpu-1')} GPUs on gpu-1, the ledger says {_allocated(ctx)}"
+    assert m.release_and_publish("gpu-1", "p-1") is False and len(_events(ctx)) == 3, "a repeated release moves nothing and produces nothing"
+`,
+    typescript: `const TOPIC = 'gpu.placement';
+const OUTBOX = 'outbox:gpu.placement';
+
+function node(ctx, id: string, capacity = 8): void {
+  ctx.redis.hset(\`node:\${id}\`, 'gpu_type', 'a100', 'capacity', capacity, 'allocated', 0);
+  ctx.redis.sadd('nodes', id);
+  ctx.redis.set(\`heartbeat:\${id}\`, '1', 'EX', 30);
+}
+
+function world(ctx) {
+  node(ctx, 'gpu-1');
+  node(ctx, 'gpu-2');
+  return ctx.load('events');
+}
+
+const allocated = (ctx, id = 'gpu-1'): number => Number(ctx.redis.hget(\`node:\${id}\`, 'allocated') ?? 0);
+const events = (ctx): Record<string, unknown>[] => ctx.kafka.records(TOPIC).map(r => JSON.parse(r.value.toString()));
+
+/** The node's occupancy as a consumer rebuilds it from its events: +gpu_count per allocation, -gpu_count per release. */
+function folded(ctx, id: string): number {
+  let total = 0;
+  for (const e of events(ctx)) {
+    if (e.node_id !== id) continue;
+    total += Number(e.gpu_count ?? 0) * (e.type === 'allocation' ? 1 : e.type === 'release' ? -1 : 0);
+  }
+  return total;
+}
+
+export async function check_node_key(ctx) {
+  const m = world(ctx);
+  assert.equal(await m.allocateAndPublish('gpu-1', 'p-1', 'acme', 4, 80), 'ALLOCATED');
+  assert.equal(await m.allocateAndPublish('gpu-1', 'p-2', 'beta', 2, 40), 'ALLOCATED');
+  assert.equal(await m.allocateAndPublish('gpu-2', 'p-3', 'acme', 1, 20), 'ALLOCATED');
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, 'three bookings produced records on gpu.placement');
+  const keys = records.map(r => r.key?.toString() ?? null);
+  assert.deepStrictEqual(keys, ['gpu-1', 'gpu-1', 'gpu-2'], \`records must be keyed by the node id, got \${JSON.stringify(keys)}\`);
+  assert.equal(records[0].partition, records[1].partition, "one node's events must share a partition so a consumer folds them in order");
+}
+
+export async function check_event_fields(ctx) {
+  const m = world(ctx);
+  assert.equal(await m.allocateAndPublish('gpu-1', 'p-1', 'acme', 4, 80), 'ALLOCATED');
+  const all = events(ctx);
+  assert.equal(all.length, 1, 'one booking produced records');
+  const e = all[0];
+  const expected = {type: 'allocation', placement_id: 'p-1', node_id: 'gpu-1', tenant: 'acme', gpu_count: 4, memory_gb: 80};
+  for (const [field, value] of Object.entries(expected)) assert.strictEqual(e[field], value, \`the event is \${JSON.stringify(e)}: expected \${field} = \${JSON.stringify(value)}\`);
+  assert('ts' in e, \`the event carries no ts: \${JSON.stringify(e)}\`);
+}
+
+export async function check_publish_after_commit(ctx) {
+  const m = world(ctx);
+  assert.equal(await m.allocateAndPublish('gpu-1', 'p-1', 'acme', 8, 80), 'ALLOCATED');
+  assert.equal(await m.allocateAndPublish('gpu-1', 'p-2', 'beta', 4, 40), 'NO_CAPACITY', '4 GPUs on a full node');
+  assert.equal(events(ctx).length, 1, \`a refused placement must produce nothing: the stream holds \${JSON.stringify(events(ctx))}\`);
+  ctx.redis.del('heartbeat:gpu-2');
+  assert.equal(await m.allocateAndPublish('gpu-2', 'p-3', 'acme', 1, 20), 'NO_HEARTBEAT');
+  assert.equal(events(ctx).length, 1, 'a placement refused for a lapsed heartbeat must produce nothing');
+  assert.equal(folded(ctx, 'gpu-1'), allocated(ctx), 'the stream folded for gpu-1 against the ledger');
+}
+
+export async function check_outbox_relay(ctx) {
+  const m = world(ctx);
+  ctx.kafka.failNext(TOPIC, 1);
+  assert.equal(await m.allocateAndPublish('gpu-1', 'p-1', 'acme', 4, 80), 'ALLOCATED', 'the booking stands whatever the broker says');
+  assert.deepEqual(events(ctx), [], 'the broker refused the record: nothing is on the topic');
+  const rows = ctx.redis.lrange(OUTBOX, 0, -1);
+  assert.equal(rows.length, 1, \`a refused delivery must leave one row in \${OUTBOX}, found \${JSON.stringify(rows)} (catch the failed send: RPUSH the key and value)\`);
+  const row = JSON.parse(rows[0]);
+  assert(row.key === 'gpu-1' && String(row.value).includes('p-1'), \`the outbox row must hold the key and the value, got \${rows[0]}\`);
+  assert.equal(await m.relayOutbox(), 1, 'rows relayOutbox sent');
+  const all = events(ctx);
+  assert(all.length === 1 && all[0].placement_id === 'p-1', \`after the relay the stream must hold p-1's allocation, got \${JSON.stringify(all)}\`);
+  assert.equal(ctx.kafka.records(TOPIC)[0].key?.toString(), 'gpu-1', 'the relayed record keeps its node key');
+  assert.equal(ctx.redis.llen(OUTBOX), 0, 'a relayed row leaves the outbox');
+  assert((await m.relayOutbox()) === 0 && events(ctx).length === 1, 'an empty outbox relays nothing');
+}
+
+export async function check_release_reconcile(ctx) {
+  const m = world(ctx);
+  assert.equal(await m.allocateAndPublish('gpu-1', 'p-1', 'acme', 4, 80), 'ALLOCATED');
+  assert.equal(await m.allocateAndPublish('gpu-1', 'p-2', 'beta', 2, 40), 'ALLOCATED');
+  assert.equal(await m.releaseAndPublish('gpu-1', 'p-1'), true, 'the first release moves the counters');
+  const all = events(ctx);
+  assert.equal(all.length, 3, 'two bookings and one release produced records (a release is an event too)');
+  const release = all[2];
+  assert(release.type === 'release' && release.placement_id === 'p-1' && release.gpu_count === 4, \`the third event must be p-1's release with gpu_count 4, got \${JSON.stringify(release)}\`);
+  assert.equal(ctx.kafka.records(TOPIC)[2].key?.toString(), 'gpu-1', 'the release is keyed by the node id too');
+  assert(folded(ctx, 'gpu-1') === 2 && allocated(ctx) === 2, \`the stream folds to \${folded(ctx, 'gpu-1')} GPUs on gpu-1, the ledger says \${allocated(ctx)}\`);
+  assert((await m.releaseAndPublish('gpu-1', 'p-1')) === false && events(ctx).length === 3, 'a repeated release moves nothing and produces nothing');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"strconv"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const (
+	eventsTopic  = "gpu.placement"
+	eventsOutbox = "outbox:gpu.placement"
+)
+
+func eventsNode(ctx *harness.Ctx, id string) {
+	ctx.Redis.Do("HSET", "node:"+id, "gpu_type", "a100", "capacity", 8, "allocated", 0)
+	ctx.Redis.Do("SADD", "nodes", id)
+	ctx.Redis.Do("SET", "heartbeat:"+id, "1", "EX", 30)
+}
+
+// eventsLedger stands in for allocate and release (state.go, step 2).
+func eventsLedger(ctx *harness.Ctx) {
+	allocate = func(_ context.Context, nodeID, placementID string, count int) (string, error) {
+		if ctx.Redis.Exists("heartbeat:"+nodeID) == 0 {
+			return "NO_HEARTBEAT", nil
+		}
+		if ctx.Redis.SIsMember("node:"+nodeID+":placements", placementID) {
+			return "ALLOCATED", nil
+		}
+		fields := ctx.Redis.HGetAll("node:" + nodeID)
+		capacity, _ := strconv.Atoi(fields["capacity"])
+		booked, _ := strconv.Atoi(fields["allocated"])
+		if booked+count > capacity {
+			return "NO_CAPACITY", nil
+		}
+		ctx.Redis.Do("HINCRBY", "node:"+nodeID, "allocated", count)
+		ctx.Redis.Do("HSET", "placement:"+placementID, "node_id", nodeID, "count", count, "status", "allocated")
+		ctx.Redis.Do("SADD", "node:"+nodeID+":placements", placementID)
+		return "ALLOCATED", nil
+	}
+	release = func(_ context.Context, nodeID, placementID string) (bool, error) {
+		if !ctx.Redis.SIsMember("node:"+nodeID+":placements", placementID) {
+			return false, nil
+		}
+		count, _ := ctx.Redis.HGet("placement:"+placementID, "count")
+		n, _ := strconv.Atoi(count)
+		ctx.Redis.Do("HINCRBY", "node:"+nodeID, "allocated", -n)
+		ctx.Redis.Do("HSET", "placement:"+placementID, "status", "released")
+		ctx.Redis.Do("SREM", "node:"+nodeID+":placements", placementID)
+		return true, nil
+	}
+}
+
+func eventsWorld(ctx *harness.Ctx) {
+	eventsNode(ctx, "gpu-1")
+	eventsNode(ctx, "gpu-2")
+	eventsLedger(ctx)
+}
+
+func eventsAllocated(ctx *harness.Ctx, id string) int {
+	v, _ := ctx.Redis.HGet("node:"+id, "allocated")
+	n, _ := strconv.Atoi(v)
+	return n
+}
+
+func eventsAll(ctx *harness.Ctx) []map[string]any {
+	var out []map[string]any
+	for _, r := range ctx.Kafka.Records(eventsTopic) {
+		var e map[string]any
+		json.Unmarshal(r.Value, &e)
+		out = append(out, e)
+	}
+	return out
+}
+
+// eventsFolded is the node's occupancy as a consumer rebuilds it from its events.
+func eventsFolded(ctx *harness.Ctx, id string) int {
+	total := 0
+	for _, e := range eventsAll(ctx) {
+		nodeID, _ := e["node_id"].(string)
+		if nodeID != id {
+			continue
+		}
+		count, _ := e["gpu_count"].(float64)
+		kind, _ := e["type"].(string)
+		if kind == "allocation" {
+			total += int(count)
+		} else if kind == "release" {
+			total -= int(count)
+		}
+	}
+	return total
+}
+
+func eventsBook(ctx *harness.Ctx, nodeID, pid, tenant string, count int, memoryGB float64) string {
+	result, err := allocateAndPublish(context.Background(), nodeID, pid, tenant, count, memoryGB)
+	ctx.NoError(err, "allocateAndPublish(%s, %s)", nodeID, pid)
+	ctx.Settle()
+	return result
+}
+
+func CheckNodeKey(ctx *harness.Ctx) {
+	eventsWorld(ctx)
+	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1")
+	ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2")
+	ctx.Equal(eventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "ALLOCATED", "booking p-3")
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three bookings must produce three records on gpu.placement; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"gpu-1", "gpu-1", "gpu-2"}, "records must be keyed by the node id")
+	ctx.Equal(records[0].Partition, records[1].Partition, "one node's events must share a partition so a consumer folds them in order; gpu-1's partitions")
+}
+
+func CheckEventFields(ctx *harness.Ctx) {
+	eventsWorld(ctx)
+	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1")
+	all := eventsAll(ctx)
+	ctx.Equal(len(all), 1, "one booking's records")
+	e := all[0]
+	for field, want := range map[string]any{"type": "allocation", "placement_id": "p-1", "node_id": "gpu-1", "tenant": "acme", "gpu_count": 4, "memory_gb": 80} {
+		ctx.Equal(e[field], want, "the event is %v: %s", e, field)
+	}
+	_, hasTS := e["ts"]
+	ctx.Assert(hasTS, "the event carries no ts: %v", e)
+}
+
+func CheckPublishAfterCommit(ctx *harness.Ctx) {
+	eventsWorld(ctx)
+	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 8, 80), "ALLOCATED", "booking 8")
+	ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 4, 40), "NO_CAPACITY", "4 GPUs on a full node")
+	ctx.Equal(len(eventsAll(ctx)), 1, "a refused placement must produce nothing: the stream holds %v; the records", eventsAll(ctx))
+	ctx.Redis.Del("heartbeat:gpu-2")
+	ctx.Equal(eventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "NO_HEARTBEAT", "a node whose heartbeat lapsed")
+	ctx.Equal(len(eventsAll(ctx)), 1, "a placement refused for a lapsed heartbeat must produce nothing; the records")
+	ctx.Equal(eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"), "the stream folded for gpu-1 against the ledger")
+}
+
+func CheckOutboxRelay(ctx *harness.Ctx) {
+	eventsWorld(ctx)
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "the booking stands whatever the broker says")
+	ctx.Equal(len(eventsAll(ctx)), 0, "the broker refused the record: nothing is on the topic; the records")
+	rows := ctx.Redis.LRange(eventsOutbox, 0, -1)
+	ctx.Equal(len(rows), 1, "a refused delivery must leave one row in %s, found %q (on a write error, RPUSH the key and value); the rows", eventsOutbox, rows)
+	var row map[string]any
+	json.Unmarshal([]byte(rows[0]), &row)
+	key, _ := row["key"].(string)
+	value, _ := row["value"].(string)
+	ctx.Assert(key == "gpu-1" && strings.Contains(value, "p-1"), "the outbox row must hold the key and the value, got %s", rows[0])
+	sent, err := relayOutbox(context.Background())
+	ctx.NoError(err, "relayOutbox")
+	ctx.Settle()
+	ctx.Equal(sent, 1, "rows relayOutbox sent")
+	all := eventsAll(ctx)
+	relayedPid := ""
+	if len(all) == 1 {
+		relayedPid, _ = all[0]["placement_id"].(string)
+	}
+	ctx.Assert(relayedPid == "p-1", "after the relay the stream must hold p-1's allocation, got %v", all)
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"gpu-1"}, "the relayed record keeps its node key")
+	ctx.Equal(ctx.Redis.LLen(eventsOutbox), 0, "a relayed row leaves the outbox; rows left")
+	sent, _ = relayOutbox(context.Background())
+	ctx.Assert(sent == 0 && len(eventsAll(ctx)) == 1, "an empty outbox relays nothing")
+}
+
+func CheckReleaseReconcile(ctx *harness.Ctx) {
+	eventsWorld(ctx)
+	ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1")
+	ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2")
+	moved, err := releaseAndPublish(context.Background(), "gpu-1", "p-1")
+	ctx.NoError(err, "releaseAndPublish")
+	ctx.Settle()
+	ctx.Equal(moved, true, "the first release moves the counters")
+	all := eventsAll(ctx)
+	ctx.Equal(len(all), 3, "two bookings and one release must produce three records (a release is an event too); the records")
+	rel := all[2]
+	kind, _ := rel["type"].(string)
+	pid, _ := rel["placement_id"].(string)
+	ctx.Assert(kind == "release" && pid == "p-1" && rel["gpu_count"] == float64(4), "the third event must be p-1's release with gpu_count 4, got %v", rel)
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic)[2], "gpu-1", "the release is keyed by the node id too")
+	ctx.Assert(eventsFolded(ctx, "gpu-1") == 2 && eventsAllocated(ctx, "gpu-1") == 2, "the stream folds to %d GPUs on gpu-1, the ledger says %d", eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"))
+	moved, _ = releaseAndPublish(context.Background(), "gpu-1", "p-1")
+	ctx.Settle()
+	ctx.Assert(!moved && len(eventsAll(ctx)) == 3, "a repeated release moves nothing and produces nothing")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kEventsTopic = "gpu.placement";
+const std::string kEventsOutbox = "outbox:gpu.placement";
+
+harness::Ctx* eventsCtx = nullptr;
+
+void eventsNode(harness::Ctx& ctx, const std::string& id) {
+  ctx.Redis.Do("HSET", "node:" + id, "gpu_type", "a100", "capacity", 8, "allocated", 0);
+  ctx.Redis.Do("SADD", "nodes", id);
+  ctx.Redis.Do("SET", "heartbeat:" + id, "1", "EX", 30);
+}
+
+void eventsWorld(harness::Ctx& ctx) {
+  eventsCtx = &ctx;
+  eventsNode(ctx, "gpu-1");
+  eventsNode(ctx, "gpu-2");
+}
+
+int eventsAllocated(harness::Ctx& ctx, const std::string& id) {
+  const auto v = ctx.Redis.HGet("node:" + id, "allocated");
+  return v ? std::stoi(*v) : 0;
+}
+
+std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> out;
+  for (const auto& r : ctx.Kafka.Records(kEventsTopic)) out.push_back(nlohmann::json::parse(r.Value.value_or(""), nullptr, false));
+  return out;
+}
+
+// The node's occupancy as a consumer rebuilds it from its events.
+int eventsFolded(harness::Ctx& ctx, const std::string& id) {
+  int total = 0;
+  for (const auto& e : eventsAll(ctx)) {
+    if (!e.is_object() || e.value("node_id", "") != id) continue;
+    const int count = e.value("gpu_count", 0);
+    const std::string type = e.value("type", "");
+    total += type == "allocation" ? count : type == "release" ? -count : 0;
+  }
+  return total;
+}
+
+std::string eventsBook(harness::Ctx& ctx, const std::string& node, const std::string& pid, const std::string& tenant, int count, double memory_gb) {
+  const std::string result = allocate_and_publish(node, pid, tenant, count, memory_gb);
+  ctx.Settle();
+  return result;
+}
+
+}  // namespace
+
+// The ledger (state.cpp, step 2) as the harness stands in for it.
+std::string allocate(const std::string& node_id, const std::string& placement_id, int count) {
+  harness::Ctx& ctx = *eventsCtx;
+  if (ctx.Redis.Exists("heartbeat:" + node_id) == 0) return "NO_HEARTBEAT";
+  if (ctx.Redis.SIsMember("node:" + node_id + ":placements", placement_id)) return "ALLOCATED";
+  const auto fields = ctx.Redis.HGetAll("node:" + node_id);
+  const int capacity = fields.count("capacity") ? std::stoi(fields.at("capacity")) : 0;
+  const int booked = fields.count("allocated") ? std::stoi(fields.at("allocated")) : 0;
+  if (booked + count > capacity) return "NO_CAPACITY";
+  ctx.Redis.Do("HINCRBY", "node:" + node_id, "allocated", count);
+  ctx.Redis.Do("HSET", "placement:" + placement_id, "node_id", node_id, "count", count, "status", "allocated");
+  ctx.Redis.Do("SADD", "node:" + node_id + ":placements", placement_id);
+  return "ALLOCATED";
+}
+
+bool release(const std::string& node_id, const std::string& placement_id) {
+  harness::Ctx& ctx = *eventsCtx;
+  if (!ctx.Redis.SIsMember("node:" + node_id + ":placements", placement_id)) return false;
+  const auto count = ctx.Redis.HGet("placement:" + placement_id, "count");
+  ctx.Redis.Do("HINCRBY", "node:" + node_id, "allocated", -(count ? std::stoi(*count) : 0));
+  ctx.Redis.Do("HSET", "placement:" + placement_id, "status", "released");
+  ctx.Redis.Do("SREM", "node:" + node_id + ":placements", placement_id);
+  return true;
+}
+
+void CheckNodeKey(harness::Ctx& ctx) {
+  eventsWorld(ctx);
+  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1");
+  ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2");
+  ctx.Equal(eventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "ALLOCATED", "booking p-3");
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 3, "three bookings must produce three records on gpu.placement; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"gpu-1", "gpu-1", "gpu-2"}, "records must be keyed by the node id");
+  ctx.Equal(records[0].Partition, records[1].Partition, "one node's events must share a partition so a consumer folds them in order; gpu-1's partitions");
+}
+
+void CheckEventFields(harness::Ctx& ctx) {
+  eventsWorld(ctx);
+  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1");
+  const auto all = eventsAll(ctx);
+  ctx.Equal(all.size(), 1, "one booking's records");
+  const nlohmann::json& e = all[0];
+  ctx.Assert(e.is_object(), "the event is not a JSON object: %s", ctx.Kafka.Values(kEventsTopic)[0]);
+  ctx.Equal(e.value("type", ""), "allocation", "the event's type (%s)", e.dump());
+  ctx.Equal(e.value("placement_id", ""), "p-1", "the event's placement_id (%s)", e.dump());
+  ctx.Equal(e.value("node_id", ""), "gpu-1", "the event's node_id (%s)", e.dump());
+  ctx.Equal(e.value("tenant", ""), "acme", "the event's tenant (%s)", e.dump());
+  ctx.Equal(e.value("gpu_count", -1), 4, "the event's gpu_count (%s)", e.dump());
+  ctx.Equal(e.value("memory_gb", -1.0), 80.0, "the event's memory_gb (%s)", e.dump());
+  ctx.Assert(e.contains("ts"), "the event carries no ts: %s", e.dump());
+}
+
+void CheckPublishAfterCommit(harness::Ctx& ctx) {
+  eventsWorld(ctx);
+  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 8, 80), "ALLOCATED", "booking 8");
+  ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 4, 40), "NO_CAPACITY", "4 GPUs on a full node");
+  ctx.Equal(eventsAll(ctx).size(), 1, "a refused placement must produce nothing; the records");
+  ctx.Redis.Del("heartbeat:gpu-2");
+  ctx.Equal(eventsBook(ctx, "gpu-2", "p-3", "acme", 1, 20), "NO_HEARTBEAT", "a node whose heartbeat lapsed");
+  ctx.Equal(eventsAll(ctx).size(), 1, "a placement refused for a lapsed heartbeat must produce nothing; the records");
+  ctx.Equal(eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"), "the stream folded for gpu-1 against the ledger");
+}
+
+void CheckOutboxRelay(harness::Ctx& ctx) {
+  eventsWorld(ctx);
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "the booking stands whatever the broker says");
+  ctx.Equal(eventsAll(ctx).size(), 0, "the broker refused the record: nothing is on the topic; the records");
+  const auto rows = ctx.Redis.LRange(kEventsOutbox, 0, -1);
+  ctx.Equal(rows.size(), 1, "a refused delivery must leave one row in %s, found %q (in the delivery report, on error, RPUSH the key and value); the rows", kEventsOutbox, rows);
+  const auto row = nlohmann::json::parse(rows[0], nullptr, false);
+  ctx.Assert(row.is_object() && row.value("key", "") == "gpu-1" && row.value("value", "").find("p-1") != std::string::npos,
+             "the outbox row must hold the key and the value, got %s", rows[0]);
+  const int sent = relay_outbox();
+  ctx.Settle();
+  ctx.Equal(sent, 1, "rows relay_outbox sent");
+  const auto all = eventsAll(ctx);
+  ctx.Assert(all.size() == 1 && all[0].is_object() && all[0].value("placement_id", "") == "p-1", "after the relay the stream must hold p-1's allocation, got %v", ctx.Kafka.Values(kEventsTopic));
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"gpu-1"}, "the relayed record keeps its node key");
+  ctx.Equal(ctx.Redis.LLen(kEventsOutbox), 0, "a relayed row leaves the outbox; rows left");
+  ctx.Assert(relay_outbox() == 0 && eventsAll(ctx).size() == 1, "an empty outbox relays nothing");
+}
+
+void CheckReleaseReconcile(harness::Ctx& ctx) {
+  eventsWorld(ctx);
+  ctx.Equal(eventsBook(ctx, "gpu-1", "p-1", "acme", 4, 80), "ALLOCATED", "booking p-1");
+  ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2");
+  const bool moved = release_and_publish("gpu-1", "p-1");
+  ctx.Settle();
+  ctx.Equal(moved, true, "the first release moves the counters");
+  const auto all = eventsAll(ctx);
+  ctx.Equal(all.size(), 3, "two bookings and one release must produce three records (a release is an event too); the records");
+  const nlohmann::json& rel = all[2];
+  ctx.Assert(rel.is_object() && rel.value("type", "") == "release" && rel.value("placement_id", "") == "p-1" && rel.value("gpu_count", 0) == 4,
+             "the third event must be p-1's release with gpu_count 4, got %s", rel.dump());
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic)[2], "gpu-1", "the release is keyed by the node id too");
+  ctx.Assert(eventsFolded(ctx, "gpu-1") == 2 && eventsAllocated(ctx, "gpu-1") == 2, "the stream folds to %d GPUs on gpu-1, the ledger says %d", eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"));
+  const bool again = release_and_publish("gpu-1", "p-1");
+  ctx.Settle();
+  ctx.Assert(!again && eventsAll(ctx).size() == 3, "a repeated release moves nothing and produces nothing");
+}
+`,
+  },
+  debrief: `The order is ledger, then stream, because the ledger is the truth and the stream is its history: an event for a booking the ledger refused is a lie that every consumer will repeat. Keying by node id puts one node's allocations and releases on one partition in the order they happened, which is the only order in which folding them means anything. The outbox is the answer to a produce the broker refuses: the booking already happened, so the event must happen too, later. Reading the delivery report (the callback in librdkafka and the Java client, the rejected promise in kafkajs, the returned error in kafka-go) is what makes a refusal visible at all. Production systems write the outbox row in the same transaction as the booking and let a relay own every produce, so the request path never talks to Kafka.`,
 };

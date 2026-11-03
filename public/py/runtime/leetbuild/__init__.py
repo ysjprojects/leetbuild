@@ -108,6 +108,12 @@ def _patch_redis() -> None:
     redis.asyncio.Redis = AsyncRedis
     redis.asyncio.StrictRedis = AsyncRedis
     redis.asyncio.from_url = AsyncRedis.from_url
+    # A key is gone at the instant it expires, as in the TypeScript and Go Redis models. Real Redis
+    # keeps it through that millisecond (`now > when`), but real time never stands still: on the
+    # frozen clock a check that advances exactly the TTL means "the TTL has passed".
+    from fakeredis._core._database import Database
+
+    Database.expired = lambda self, item: item.expireat is not None and item.expireat <= self.time
 
 
 def boot() -> None:

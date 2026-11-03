@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package booking;
+
+// The external calendar the confirmation step syncs with. In this course it is a stand-in served by
+// the harness at calendar:9000: Sync is an upsert on idempotency_key (a retried sync with the same
+// key updates the one event; a sync without a key creates a new event every time), GetEvent looks
+// an event up by that key so a timed-out sync can be reconciled instead of guessed about.
+service Calendar {
+  rpc Sync(SyncRequest) returns (SyncReply);
+  rpc GetEvent(GetEventRequest) returns (GetEventReply);
+}
+
+message SyncRequest {
+  string booking_id = 1;
+  // The booking's idempotency key: the calendar keeps one event per key.
+  string idempotency_key = 2;
+  string resource_id = 3;
+  // ISO-8601 instants.
+  string start = 4;
+  string end = 5;
+}
+
+message SyncReply {
+  string event_id = 1;
+}
+
+message GetEventRequest {
+  string idempotency_key = 1;
+}
+
+message GetEventReply {
+  bool found = 1;
+  string event_id = 2;
+}

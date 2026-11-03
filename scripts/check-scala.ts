@@ -9,6 +9,7 @@
  *
  *   yarn check:scala                          # every course
  *   yarn check:scala --problem stripe-ledger  # one course
+ *   yarn check:scala --shard 2/4              # the second of four balanced shares of the courses (CI)
  *   yarn check:scala --verbose                # every compiler error in full
  */
 import {spawn} from 'node:child_process';
@@ -70,6 +71,31 @@ const flag = (name: string): string | null => {
 };
 const onlyProblem = flag('--problem');
 const verbose = args.includes('--verbose');
+/** `--shard 2/4`: the second of four shares of the courses, balanced by the compiles each course takes. */
+const shard = ((): {index: number; count: number} | null => {
+  const value = flag('--shard');
+  if (value === null) return null;
+  const [index, count] = value.split('/').map(Number);
+  if (!(Number.isInteger(index) && Number.isInteger(count) && index >= 1 && index <= count)) {
+    throw new Error(`--shard ${value}: expected i/n with 1 ≤ i ≤ n`);
+  }
+  return {index: index - 1, count};
+})();
+
+/** This run's share of the courses (all of them without `--shard`): heaviest first, each to the lightest shard. */
+function shareOf(courses: Problem[]): Problem[] {
+  if (shard === null) return courses;
+  const weight = (problem: Problem): number =>
+    1 + problem.steps.filter(step => step.harness !== undefined && step.code.scala !== undefined).length;
+  const loads = new Array<number>(shard.count).fill(0);
+  const share = new Set<Problem>();
+  for (const problem of [...courses].sort((a, b) => weight(b) - weight(a) || a.id.localeCompare(b.id))) {
+    const lightest = loads.indexOf(Math.min(...loads));
+    loads[lightest] += weight(problem);
+    if (lightest === shard.index) share.add(problem);
+  }
+  return courses.filter(problem => share.has(problem));
+}
 
 const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
 
@@ -286,10 +312,12 @@ async function checkCourse(cli: string, problem: Problem, files: Record<string, 
 
 async function main(): Promise<void> {
   const cli = await fetchScalaCli();
-  const courses = problems.filter(
-    problem =>
-      (onlyProblem === null || problem.id === onlyProblem) &&
-      problem.steps.some(step => step.harness !== undefined && step.code.scala !== undefined),
+  const courses = shareOf(
+    problems.filter(
+      problem =>
+        (onlyProblem === null || problem.id === onlyProblem) &&
+        problem.steps.some(step => step.harness !== undefined && step.code.scala !== undefined),
+    ),
   );
   if (courses.length === 0)
     throw new Error(`no course with Scala to compile${onlyProblem ? ` named ${onlyProblem}` : ''}`);

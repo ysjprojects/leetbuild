@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package firewall;
+
+// The prompt validation service step 3 calls: a score from 1 to 99 (1 the most likely prompt
+// injection) and topic tags. In this course it is a stand-in served by the harness at
+// promptguard:9000.
+service PromptGuard {
+  rpc Detect(DetectRequest) returns (DetectReply);
+}
+
+message DetectRequest {
+  string prompt = 1;
+  string request_id = 2;
+}
+
+message DetectReply {
+  int32 score = 1;
+  repeated string tags = 2;
+}
+
+// The LLM application the firewall fronts, reached through the provided `forward` (aifw/upstream)
+// at llm-app:9001. In this course it is a stand-in served by the harness.
+service Assistant {
+  rpc Chat(ChatRequest) returns (ChatReply);
+}
+
+message ChatRequest {
+  string prompt = 1;
+  string request_id = 2;
+}
+
+message ChatReply {
+  string text = 1;
+}

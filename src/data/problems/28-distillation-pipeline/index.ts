@@ -1,22 +1,25 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * Distillation pipeline: the course is not "call a teacher model", it is the debugging you owe a
- * pipeline before its output becomes a student's training set. A budgeted, idempotent job → an
- * atomic Redis budget plus counters → teacher calls with a deadline, bounded retries and refusals
- * that are recorded → dataset-keyed sample events behind a dedupe filter with an outbox → an
- * acceptance report that reconciles its own counters and distrusts a rate that looks too good.
+ * Distillation pipeline: the debugging a pipeline owes before its output becomes a student's
+ * training set. A budgeted, idempotent job → a Redis budget reservation in one Lua script → teacher
+ * calls with a deadline, bounded retries and refusals that are recorded → dataset-keyed sample events
+ * behind a shared dedupe index with an outbox → an acceptance report that reconciles its counters and
+ * flags a rate that looks too good. The teacher is a deterministic stand-in the harness serves over gRPC.
  */
 export const distillationPipelineProblem: Problem = {
   id: 'distillation-pipeline',
   title: 'Distillation Pipeline',
-  tagline: 'Generate teacher outputs, filter them, and prove a student can learn from the survivors.',
+  tagline:
+    'Teacher samples under a token budget: a Redis reservation, a dedupe index, a dataset-keyed topic, a report that adds up.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -24,73 +27,72 @@ export const distillationPipelineProblem: Problem = {
   statement: `# Distillation Pipeline
 
 Distillation is how a small, cheap student model inherits the behaviour of a large, expensive
-teacher: you generate teacher outputs over a corpus, filter them, and train the student on what
-survives. The visible artefact is a student checkpoint; the parts that decide whether it is worth
-anything are the job budget, the filter, and the report that proves what the student actually saw.
+teacher: generate teacher outputs over a corpus, filter them, train the student on what survives.
+The artefact is a student checkpoint; what decides its worth is the job budget, the filter, and the
+report that proves what the student saw.
 
 ## The real system
 
-Production pipelines start a distillation job with a hard sample budget, because teacher tokens are
-the cost centre and an unbounded job is an unbounded bill. They hold the job's remaining budget in
-Redis and move the budget and the progress counters in one atomic step, so a worker crash cannot
-leave a sample paid for but uncounted. They call the teacher under a per-attempt deadline, retry only
-the failures that are worth retrying, and treat a refusal or an empty completion as a data point
-rather than an error to hammer. They publish the survivors to a topic keyed by dataset, so the
-training consumer sees one dataset in one order, and they keep the prompt text out of both the topic
-and the logs. Finally, they report what happened: counts that reconcile, rejection reasons by name,
-and a warning — never a certificate — when the acceptance rate looks too good to be true.
+NVIDIA's NeMo Curator runs the filter at corpus scale: its exact-duplicate workflow hashes each
+document's text (MD5) and writes only the ids of the documents to remove, not their content; a fuzzy
+pass (MinHash) catches near duplicates. A pipeline that feeds a student from a teacher puts that filter
+in front of training and adds what this course builds around it: a per-job token budget every worker
+can see, a teacher call with a deadline and a retry policy that knows a refusal from an outage, and a
+report whose counts are checked against each other before anyone trusts the rate.
 
 ## What you build here
 
-One service, **distilld**, with five pieces:
+One service, **distilld**, with five pieces sharing one contract, the \`distill\` support package
+(\`config\`: the teacher address, the topic, the key layout, the cost of a call):
 
-1. \`POST /v1/distill/jobs\`: an approved teacher from a server-side catalog, a dataset id, a sample
-   cap between 100 and 10 000, and an \`Idempotency-Key\` so a replayed request resumes the same job
-   instead of starting a second one. Every rejection happens before any sampling.
-2. A **Redis** job state: a per-job token budget, the sampled/accepted/rejected counters and the
-   rejection reasons, all moved by one Lua script that checks the dedupe set before it spends, so a
-   cached hit costs nothing and a crash cannot orphan a sample.
-3. A **gRPC** teacher client: a four-second deadline per attempt, retries only on \`UNAVAILABLE\` and
-   at most twice, a refusal or an empty completion recorded as rejected, a hung call cut off and
-   marked timed out, and no retry that would push the budget negative.
-4. A **Kafka** sample path: accepted samples published to \`distill.sample\` keyed by dataset, with
-   the teacher version and the dedupe hash in the payload, a duplicate never reaching the topic, and
-   an outbox row when the broker rejects the produce.
-5. \`GET /v1/distill/jobs/{id}\`: sampled/accepted/rejected counts read from the live counters, the
-   rejection reasons, an explicit reconciliation of the three counts, and a flag — not a clean bill
-   of health — when the acceptance rate is above 95 percent.
+1. \`POST /v1/distill/jobs\`: a catalog teacher, a dataset id, a cap of 100..10 000, an
+   \`Idempotency-Key\`; the job is stored under \`(tenant, key)\` so a replay resumes it.
+2. **Redis job state**: \`distill:budget:{job}\`, the seen set of prompt hashes, the progress hash
+   (\`sampled\`, \`accepted\`, \`rejected\`, \`duplicate\`, \`updated_at\`), the reasons hash. \`reserve\` is one
+   Lua script: a seen hash is a \`duplicate\` and costs nothing, an unaffordable call is \`budget\`,
+   otherwise it draws \`TOKENS_PER_CALL\` and counts \`sampled\`. \`record\` adds \`accepted\` or \`rejected\`
+   with a reason. Invariant: \`sampled == accepted + rejected\` once every reservation is recorded.
+3. **Teacher client** (gRPC, a stand-in the checks serve): reserve, then up to three attempts under a
+   four-second deadline, retrying \`UNAVAILABLE\` only; refusals, empty completions and deadlines are
+   recorded as rejected with a reason, once per sample.
+4. **Kafka**: accepted samples on \`distill.sample\` keyed by dataset, ids only, behind the shared dedupe
+   index, with an outbox row written from the delivery report when the broker refuses.
+5. \`GET /v1/distill/jobs/{id}\`: live counters with \`updated_at\`, the reasons, 409 when the counts do
+   not reconcile, a flag above a 95 percent acceptance rate.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
-looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
-failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
-that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path and looks right. The task
+says where the flaws live; the checks say what must change.
 
 ## Left out on purpose
 
-Teacher hosting and quantization, near-duplicate detection beyond an exact hash, sample quality
-scoring and curriculum ordering, the trainer itself, checkpoint evaluation, and cost accounting.
-The five pieces above are the ones that decide whether the data the student learns from is
-trustworthy, bounded and reproducible.`,
+Teacher hosting, near-duplicate detection beyond an exact hash, sample quality scoring, the trainer,
+checkpoint evaluation, the outbox relay and cost accounting. The five pieces above decide whether the
+training data is bounded, deduplicated and accounted for.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Distill client', sub: 'start · poll', x: 8, y: 50},
-      {id: 'api', kind: 'http', label: 'Distill API', sub: 'HTTPS :8443', x: 26, y: 50},
-      {id: 'db', kind: 'db', label: 'jobs · outbox', sub: 'status · replay', x: 44, y: 12},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'budget · counters', x: 44, y: 62},
-      {id: 'teacher', kind: 'grpc', label: 'Teacher model', sub: 'Generate', x: 66, y: 12},
-      {id: 'kafka', kind: 'kafka', label: 'distill.sample', sub: 'key = dataset', x: 44, y: 88},
-      {id: 'trainer', kind: 'service', label: 'Trainer', sub: 'consume · group student', x: 66, y: 88},
+      {id: 'api', kind: 'http', label: 'distilld', sub: 'API + worker', x: 28, y: 50},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'jobs · budget · seen · progress · outbox', x: 50, y: 20},
+      {id: 'teacher', kind: 'grpc', label: 'Teacher', sub: 'Generate · 4 s', x: 50, y: 80},
+      {id: 'kafka', kind: 'kafka', label: 'distill.sample', sub: 'key = dataset_id', x: 72, y: 50},
+      {id: 'trainer', kind: 'service', label: 'Trainer', sub: 'consumer group student', x: 92, y: 50},
     ],
     edges: [
-      {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
-      {from: 'api', to: 'db', kind: 'plain', label: 'jobs · outbox'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'budget · counters'},
+      {from: 'client', to: 'api', kind: 'http', label: 'POST / GET jobs'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'EVALSHA reserve · record · HGETALL'},
       {from: 'api', to: 'teacher', kind: 'grpc', label: 'Generate'},
-      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce distill.sample'},
+      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce (ids only)'},
       {from: 'kafka', to: 'trainer', kind: 'kafka', label: 'consume'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

@@ -89,8 +89,8 @@ export class Clock {
 
   /**
    * Stop following real time until the next reset: the clock moves only when advanced or when it
-   * jumps to a sleep. The Go runtime's checks run this way, its interpreted code being slow enough
-   * for real time to show (a rate limiter would refill between two requests). It stops on a whole
+   * jumps to a sleep. Every runtime's checks run this way, so that real time on a slow or loaded
+   * machine never shows (a rate limiter would refill between two requests). It stops on a whole
    * second, so that sub-second arithmetic on epoch seconds (a float64 of seconds is coarse to a
    * quarter microsecond today) rounds the same in every run.
    */
@@ -157,6 +157,11 @@ export class Clock {
     });
   }
 
+  /** Drop a virtual timer: the learner's `clearTimeout`, and the runtime's own models (a gRPC call's deadline). */
+  clearTimer(id: number): void {
+    this.timers = this.timers.filter(t => t.id !== id);
+  }
+
   // ---- the globals the learner's code sees -------------------------------------------------------
 
   /** Replace `Date.now`, `performance.now`, `setTimeout`/`setInterval` (and their clears) with virtual ones. */
@@ -169,7 +174,7 @@ export class Clock {
     GLOBALS.setTimeout = (fn: () => void, ms?: number): number => this.setTimeout(fn, ms);
     GLOBALS.clearTimeout = (id?: number): void => {
       if (id === 0 || id === undefined) return;
-      this.timers = this.timers.filter(t => t.id !== id);
+      this.clearTimer(id);
     };
     GLOBALS.setInterval = (fn: () => void, ms?: number): number => {
       const every = Math.max(1, Number(ms) || 1);
@@ -220,6 +225,19 @@ export class Clock {
       Object.assign(GLOBALS, virtual);
     }
   }
+
+  /** The learner's `setTimeout`, and the runtime's own models' timers (cancel with `clearTimer`). */
+  setTimeout(fn: () => void, ms?: number): number {
+    const delay = Math.max(0, Number(ms) || 0);
+    if (delay === 0) {
+      realSetTimeout(fn, 0);
+      return 0;
+    }
+    const id = this.nextTimer++;
+    this.timers.push({id, at: this.now() + delay, fn, interval: null});
+    this.schedulePump();
+    return id;
+  }
   private fire(): void {
     for (const fn of [...this.advanceListeners]) fn();
     // Timers fire in due order; a callback may schedule more.
@@ -264,18 +282,6 @@ export class Clock {
       this.fire();
       if (this.timers.some(t => t.interval === null)) this.schedulePump();
     });
-  }
-
-  private setTimeout(fn: () => void, ms?: number): number {
-    const delay = Math.max(0, Number(ms) || 0);
-    if (delay === 0) {
-      realSetTimeout(fn, 0);
-      return 0;
-    }
-    const id = this.nextTimer++;
-    this.timers.push({id, at: this.now() + delay, fn, interval: null});
-    this.schedulePump();
-    return id;
   }
 }
 

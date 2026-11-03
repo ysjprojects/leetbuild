@@ -2,120 +2,155 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis job progress with an atomic deadline budget',
+  title: 'Redis job state: a budget reservation in one script',
   concept: 'redis',
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it spends budget, counts samples and answers a
-verdict, so the demo dashboard moves. Two invariants are broken — one costs money, one loses
-correctness. Find them, fix them, and prove the fix.
+**Starting point.** The starter keeps a job's state under the keys \`distill/config\` defines:
+\`start_job(job_id, sample_cap)\` seeds the budget to \`sample_cap * TOKENS_PER_CALL\` and zero counters;
+\`reserve(job_id, prompt)\` draws one call from the budget, tests the prompt against the seen set and
+answers \`{verdict, remaining, dedupe_hash}\` with \`ok\` or \`duplicate\`; \`record(job_id, outcome, reason)\`
+bumps \`accepted\` or \`rejected\`. The demo dashboard moves. It hides five flaws.
 
-The worker records every sample against the job's Redis state. Keep the whole move in **one** Lua
-script per language's client.
+**Failure mode the checks target.** Drawing the budget before the dedupe test is the expensive one: a
+dataset with 40 percent repeated prompts drains the budget on samples that produce nothing, which is how
+a run ends with "accepted" counts its budget could never have paid for. Separate commands cost
+correctness: two workers with the same prompt both see an empty set, and a worker that dies between
+DECRBY and HINCRBY leaves counters that disagree with the budget.
 
-- The job has a **token budget** at \`distill:budget:{job_id}\`, seeded to
-  \`sample_cap * TOKENS_PER_CALL\` when the job starts. Each teacher call that actually runs draws
-  **exactly once** from it; a call the dedupe cache skips draws **nothing**.
-- The dedupe set \`distill:seen:{job_id}\` holds the **SHA-256 of the prompt**, never the prompt
-  text: the prompt is tenant content and Redis is not the place to keep it.
-- A hash already in the set is a **duplicate**: it increments \`rejected\` in
-  \`distill:progress:{job_id}\` and the reason counter \`duplicate\` in
-  \`distill:reasons:{job_id}\`, and it does **not** touch the budget.
-- A fresh sample **decrements the budget** and increments \`sampled\`, then either \`accepted\` or
-  \`rejected\` (plus its reason) in the same script: the budget and all three counters move together,
-  so a crash between them cannot pay for a sample nobody counted, or count one nobody paid for.
-- Every key the job owns gets a **TTL** (\`TTL_S\` = 86 400) refreshed by the same script, so a
-  finished or abandoned job stops pinning memory.
-- The script returns \`(spent, remaining, verdict)\` — one round trip, no read-back race.
-- A sample with no budget left is \`budget\`, not a call that runs and overspends.
+Requirements, kept by **one Lua script** per operation:
 
-**Failure mode the checks target.** Decrementing before the dedupe check is the expensive one: a
-dataset with 40 percent repeated prompts drains the budget on samples that produce nothing, which is
-exactly how a run ends with "accepted" counts its budget could never have paid for. The second flaw
-is quieter: three separate \`HINCRBY\`s and a \`DECRBY\` are four chances for a worker to die mid-way
-and leave counts that disagree with the budget forever.`,
+- \`reserve\`: a prompt whose SHA-256 is in \`distill:seen:{job_id}\` is a \`duplicate\` (\`duplicate\` up,
+  budget untouched); with fewer than \`TOKENS_PER_CALL\` tokens left the verdict is \`budget\` (\`sampled\`
+  and \`rejected\` up, reason \`budget\`, budget untouched); otherwise \`DECRBY\`, \`SADD\` the hash,
+  \`sampled\` up, verdict \`ok\`.
+- The set holds the hash, not the prompt: the prompt is tenant content.
+- \`record(job_id, "rejected", reason)\` counts the reason by name in \`distill:reasons:{job_id}\`.
+- Every script stamps \`updated_at\` (unix seconds) in the progress hash and refreshes a \`TTL_S\` expiry
+  on the keys it touched.
+- Invariant through step 5: \`sampled == accepted + rejected\` once every reservation is recorded.`,
   sequence: {
-    participants: ['Worker', 'Redis', 'Lua script'],
+    participants: ['Worker', 'Redis'],
     messages: [
-      {from: 'Worker', to: 'Redis', label: 'record(job, prompt, outcome, reason) · EVAL', kind: 'sync'},
-      {from: 'Redis', to: 'Lua script', label: 'SISMEMBER distill:seen:{job}', kind: 'sync'},
-      {from: 'Lua script', to: 'Worker', label: 'duplicate → rejected += 1, budget untouched', kind: 'reply'},
-      {from: 'Lua script', to: 'Lua script', label: 'DECRBY budget · HINCRBY sampled/accepted', kind: 'sync'},
-      {from: 'Lua script', to: 'Redis', label: 'EXPIRE seen · budget · progress · reasons', kind: 'async'},
-      {from: 'Lua script', to: 'Worker', label: '{spent, remaining, verdict}', kind: 'reply'},
+      {
+        from: 'Worker',
+        to: 'Redis',
+        label: 'EVALSHA reserve · seen budget progress reasons · hash cost ttl now',
+        kind: 'sync',
+      },
+      {from: 'Redis', to: 'Redis', label: 'SISMEMBER seen hash → 0 · GET budget ≥ cost', kind: 'sync'},
+      {from: 'Redis', to: 'Redis', label: 'DECRBY budget · SADD seen · HINCRBY sampled · EXPIRE ×4', kind: 'sync'},
+      {from: 'Redis', to: 'Worker', label: '{ok, remaining}', kind: 'reply'},
+      {
+        from: 'Worker',
+        to: 'Redis',
+        label: 'EVALSHA record · progress reasons · rejected refusal ttl now',
+        kind: 'sync',
+      },
+      {from: 'Redis', to: 'Worker', label: 'sampled', kind: 'reply'},
     ],
   },
   hints: [
-    'Order inside the script is the whole first half of the fix: read `SISMEMBER` on the dedupe set *before* any `DECRBY` on the budget, and return early on a hit. A cached prompt already paid for its teacher call in an earlier job — charging for it again is how the budget disappears without samples.',
-    'The second half is atomicity: one registered script (redis-py `register_script`, ioredis `defineCommand`, go-redis `NewScript`, Jedis `eval`, redis-plus-plus `eval`) that does the membership test, the `DECRBY`, the `SADD` and every `HINCRBY`. Four separate commands are four chances to crash halfway.',
-    'Keep the payload small and the keys self-cleaning: `SADD` the SHA-256 of the prompt, not the prompt, and `EXPIRE` every key in the same script with `TTL_S`. A job whose worker died should disappear on its own, not wait for a human to flush it.',
+    'Symptom: a job with 40 percent repeated prompts runs out of budget at 60 percent of its cap, two workers on the same prompt both get `ok`, and a worker crash leaves `sampled` ahead of the budget.',
+    'Mechanism: `reserve` runs DECRBY first and SISMEMBER second, so a duplicate pays; the commands are separate round trips, so another worker lands between them; the member is the raw prompt, and nothing expires.',
+    'Change: one `register_script` / `defineCommand` / `NewScript` / `eval` per operation: SISMEMBER, then GET and the budget floor, then DECRBY + SADD + HINCRBY, HSET updated_at, EXPIRE each key; SADD the `sha256` hex.',
   ],
   checks: [
     {
       id: 'dedupe-before-spend',
-      title: 'Checks the dedupe set before it spends budget',
+      title: 'A duplicate costs nothing and the budget stays at or above zero',
       detail:
-        '`SISMEMBER` on the dedupe set happens **before** any `DECRBY` on the budget, so a cached prompt costs nothing. The starter decrements first and only then looks at the cache, draining the budget on duplicates.',
+        'SISMEMBER runs before any DECRBY, so a repeated prompt leaves the budget where it was; with fewer than TOKENS_PER_CALL tokens left the verdict is budget and nothing is drawn. The starter decrements first and looks at the set second.',
       match: {
-        python: {order: [/SISMEMBER/, /DECRBY/]},
-        typescript: {order: [/SISMEMBER/, /DECRBY/]},
-        go: {order: [/SISMEMBER/, /DECRBY/]},
-        scala: {order: [/SISMEMBER/, /DECRBY/]},
-        cpp: {order: [/SISMEMBER/, /DECRBY/]},
+        python: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrby\(/]},
+        typescript: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrby\(/]},
+        go: {order: [/SISMEMBER/, /DECRBY/], none: [/\.DecrBy\(/]},
+        scala: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrBy\(/]},
+        cpp: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrby\(/]},
       },
     },
     {
       id: 'atomic-script',
-      title: 'Moves budget and counters in one script',
+      title: 'Reserves in one Lua script',
       detail:
-        'One Lua script does the membership test, the budget decrement and every counter increment, registered and called from the client (`register_script` / `defineCommand` / `NewScript` / `eval`). The starter issues separate `DECRBY`/`HINCRBY` commands, so a crash between them leaves the job’s state inconsistent.',
+        'The membership test, the budget floor, DECRBY, SADD and HINCRBY happen inside one EVAL/EVALSHA, so two workers reserving the same prompt spend once. The starter issues them as separate commands and a second worker lands between them.',
       match: {
-        python: {all: [/register_script\(/, /redis\.call\(\s*['"]HINCRBY['"]/]},
-        typescript: {all: [/defineCommand\(/, /redis\.call\(\s*['"]HINCRBY['"]/]},
-        go: {all: [/redis\.NewScript\(/, /redis\.call\(\s*['"]HINCRBY['"]/]},
-        scala: {all: [/jedis\.eval\(/, /redis\.call\(\s*['"]HINCRBY['"]/]},
-        cpp: {all: [/\.eval\b/, /redis\.call\(\s*['"]HINCRBY['"]/]},
+        python: {
+          all: [
+            /register_script\(|\.eval\(|\.evalsha\(/,
+            /redis\.call\(\s*['"]DECRBY['"]/,
+            /redis\.call\(\s*['"]SADD['"]/,
+          ],
+        },
+        typescript: {
+          all: [
+            /defineCommand\(|\.eval\(|\.evalsha\(/,
+            /redis\.call\(\s*['"]DECRBY['"]/,
+            /redis\.call\(\s*['"]SADD['"]/,
+          ],
+        },
+        go: {
+          all: [
+            /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/,
+            /redis\.call\(\s*['"]DECRBY['"]/,
+            /redis\.call\(\s*['"]SADD['"]/,
+          ],
+        },
+        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]DECRBY['"]/, /redis\.call\(\s*['"]SADD['"]/]},
+        cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]DECRBY['"]/, /redis\.call\(\s*['"]SADD['"]/]},
       },
     },
     {
       id: 'hashed-prompt',
-      title: 'Stores the prompt hash, never the prompt',
+      title: 'Stores the SHA-256 of the prompt, not the prompt',
       detail:
-        'The dedupe set stores a SHA-256 of the prompt (`hashlib.sha256`, `createHash("sha256")`, `sha256.Sum256`, `MessageDigest.getInstance("SHA-256")`, `SHA256()`), and the hash is what `SISMEMBER` tests. The starter puts the raw prompt — tenant content — into a Redis key.',
+        'The seen set holds the hex SHA-256 of the prompt and reserve answers it as dedupe_hash; the prompt text appears in no key and no member. The starter puts the raw prompt, tenant content, into Redis.',
       match: {
-        python: {all: [/hashlib\.sha256\(/, /SISMEMBER/]},
-        typescript: {all: [/createHash\(\s*'sha256'/, /SISMEMBER/]},
-        go: {all: [/sha256\.Sum256\(/, /SISMEMBER/]},
-        scala: {all: [/MessageDigest\.getInstance\("SHA-256"\)/, /SISMEMBER/]},
-        cpp: {all: [/SHA256\(/, /SISMEMBER/]},
+        python: {
+          all: [/hashlib\.sha256\(/],
+          none: [/\.s(is)?member\(\s*[^,]+,\s*prompt\s*\)|\.sadd\(\s*[^,]+,\s*prompt\s*\)/],
+        },
+        typescript: {
+          all: [/createHash\(\s*['"]sha256['"]/],
+          none: [/\.s(is)?member\(\s*[^,]+,\s*prompt\s*\)|\.sadd\(\s*[^,]+,\s*prompt\s*\)/],
+        },
+        go: {
+          all: [/sha256\.Sum256\(/],
+          none: [/\.S(Is)?Member\(\s*[^,]+,\s*[^,]+,\s*prompt\s*\)|\.SAdd\(\s*[^,]+,\s*[^,]+,\s*prompt\s*\)/],
+        },
+        scala: {
+          all: [/MessageDigest\.getInstance\("SHA-256"\)/],
+          none: [/\.s(is)?member\(\s*[^,]+,\s*prompt\s*\)|\.sadd\(\s*[^,]+,\s*prompt\s*\)/],
+        },
+        cpp: {all: [/sha256_hex\(/], none: [/\.s(is)?member\(\s*[^,]+,\s*prompt\s*\)|\.sadd\(\s*[^,]+,\s*prompt\s*\)/]},
       },
     },
     {
       id: 'reject-reason',
       title: 'Records a reason for every rejection',
       detail:
-        'A rejection increments a named reason counter in `distill:reasons:{job_id}` — `duplicate` for a hash already seen, otherwise the outcome’s own reason. The starter counts rejections without saying why, so a run that rejected 40 percent of its samples cannot be explained afterwards.',
+        'A rejection increments its reason in distill:reasons:{job_id} (refusal, empty, deadline, unavailable, budget) beside rejected, so a run that rejected 40 percent of its samples can be explained. The starter counts rejections and nothing else.',
       match: {
-        python: {all: [/SISMEMBER/, /reason/]},
-        typescript: {all: [/SISMEMBER/, /reason/]},
-        go: {all: [/SISMEMBER/, /[Rr]eason/]},
-        scala: {all: [/SISMEMBER/, /reason/]},
-        cpp: {all: [/SISMEMBER/, /reason/]},
+        python: {all: [/reasons_key\(|distill:reasons:/, /HINCRBY/]},
+        typescript: {all: [/reasonsKey\(|distill:reasons:/, /HINCRBY/]},
+        go: {all: [/ReasonsKey\(|distill:reasons:/, /HINCRBY/]},
+        scala: {all: [/reasonsKey\(|distill:reasons:/, /HINCRBY/]},
+        cpp: {all: [/reasons_key\(|distill:reasons:/, /HINCRBY/]},
       },
     },
     {
       id: 'key-ttl',
-      title: 'Expires the job keys from inside the script',
+      title: 'Expires the job keys and stamps updated_at from inside the script',
       detail:
-        'The script runs `EXPIRE` on the keys it touches with the caller’s `TTL_S`, so a finished or abandoned job stops holding memory. The starter sets no expiry at all and leaves every job’s budget and counters in Redis forever.',
+        'Every key the script touches gets EXPIRE TTL_S and the progress hash carries updated_at, so an abandoned job disappears on its own and a report can tell two readings apart. The starter sets no expiry and no stamp.',
       match: {
-        python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TTL_S/]},
-        typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TTL_S/]},
-        go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /ttlSeconds/]},
-        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TtlSeconds/]},
-        cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /kTtlSeconds/]},
+        python: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
+        typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
+        go: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.Expire\(/, /TTLSeconds/, /updated_at/]},
+        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TtlSeconds/, /updated_at/]},
+        cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /kTtlSeconds/, /updated_at/]},
       },
     },
   ],
@@ -123,426 +158,553 @@ and leave counts that disagree with the budget forever.`,
     python: {
       starter: `import redis
 
-CACHE_PREFIX = "distill:seen:"
-BUDGET_PREFIX = "distill:budget:"
-PROGRESS_PREFIX = "distill:progress:"
-TOKENS_PER_CALL = 512
+from distill.config import TOKENS_PER_CALL, budget_key, progress_key, seen_key
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-def record(job_id: str, prompt: str, outcome: str) -> dict:
-    # TODO: this starter draws the budget down before it knows whether the call runs at all, stores
-    # the raw prompt in Redis, and moves the three counters with three separate commands. Fix
-    # all three: a crash between them leaves progress that no longer matches the budget.
-    budget_key = BUDGET_PREFIX + job_id
-    progress_key = PROGRESS_PREFIX + job_id
-    r.decrby(budget_key, TOKENS_PER_CALL)
-    if r.sismember(CACHE_PREFIX + job_id, prompt):
-        return {"spent": 0, "verdict": "duplicate"}
-    r.sadd(CACHE_PREFIX + job_id, prompt)
-    r.hincrby(progress_key, "sampled", 1)
-    if outcome == "accepted":
-        r.hincrby(progress_key, "accepted", 1)
-    else:
-        r.hincrby(progress_key, "rejected", 1)
-    return {"spent": TOKENS_PER_CALL, "verdict": outcome}
+def start_job(job_id: str, sample_cap: int) -> None:
+    """Seed the job's state: one teacher call costs TOKENS_PER_CALL of the job's budget."""
+    r.set(budget_key(job_id), sample_cap * TOKENS_PER_CALL)
+    r.hset(progress_key(job_id), mapping={"sampled": 0, "accepted": 0, "rejected": 0, "duplicate": 0})
+
+
+def reserve(job_id: str, prompt: str) -> dict:
+    """Pay for one teacher call unless the prompt was sampled already: {verdict, remaining, dedupe_hash}."""
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    remaining = r.decrby(budget_key(job_id), TOKENS_PER_CALL)
+    if r.sismember(seen_key(job_id), prompt):
+        r.hincrby(progress_key(job_id), "duplicate", 1)
+        return {"verdict": "duplicate", "remaining": remaining, "dedupe_hash": prompt}
+    r.sadd(seen_key(job_id), prompt)
+    r.hincrby(progress_key(job_id), "sampled", 1)
+    return {"verdict": "ok", "remaining": remaining, "dedupe_hash": prompt}
+
+
+def record(job_id: str, outcome: str, reason: str = "") -> None:
+    """Count the sample's outcome: accepted, or rejected with its reason."""
+    r.hincrby(progress_key(job_id), "accepted" if outcome == "accepted" else "rejected", 1)
 `,
       solution: `import hashlib
+import time
 
 import redis
 
-CACHE_PREFIX = "distill:seen:"
-BUDGET_PREFIX = "distill:budget:"
-PROGRESS_PREFIX = "distill:progress:"
-REASONS_PREFIX = "distill:reasons:"
-TOKENS_PER_CALL = 512
-TTL_S = 86_400
+from distill.config import TOKENS_PER_CALL, TTL_S, budget_key, progress_key, reasons_key, seen_key
 
-RECORD_SAMPLE = """
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+RESERVE = """
 local seen, budget, progress, reasons = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
-local hash, cost, outcome, reason, ttl = ARGV[1], tonumber(ARGV[2]), ARGV[3], ARGV[4], tonumber(ARGV[5])
+local hash, cost, ttl, now = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
 if redis.call('SISMEMBER', seen, hash) == 1 then
-  redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, redis.call('GET', budget), 'duplicate'}
+  redis.call('HINCRBY', progress, 'duplicate', 1)
+  redis.call('HSET', progress, 'updated_at', now)
+  redis.call('EXPIRE', progress, ttl)
+  return {'duplicate', redis.call('GET', budget) or '0'}
 end
-local remaining = tonumber(redis.call('GET', budget) or '-1')
-if remaining >= 0 and remaining < cost then
+local remaining = tonumber(redis.call('GET', budget) or '0')
+if remaining < cost then
+  redis.call('HINCRBY', progress, 'sampled', 1)
   redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, tostring(remaining), 'budget'}
+  redis.call('HINCRBY', reasons, 'budget', 1)
+  redis.call('HSET', progress, 'updated_at', now)
+  redis.call('EXPIRE', progress, ttl)
+  redis.call('EXPIRE', reasons, ttl)
+  return {'budget', tostring(remaining)}
 end
-redis.call('DECRBY', budget, cost)
+remaining = redis.call('DECRBY', budget, cost)
 redis.call('SADD', seen, hash)
 redis.call('HINCRBY', progress, 'sampled', 1)
+redis.call('HSET', progress, 'updated_at', now)
+redis.call('EXPIRE', seen, ttl)
+redis.call('EXPIRE', budget, ttl)
+redis.call('EXPIRE', progress, ttl)
+redis.call('EXPIRE', reasons, ttl)
+return {'ok', tostring(remaining)}
+"""
+
+RECORD = """
+local progress, reasons = KEYS[1], KEYS[2]
+local outcome, reason, ttl, now = ARGV[1], ARGV[2], tonumber(ARGV[3]), ARGV[4]
 if outcome == 'accepted' then
   redis.call('HINCRBY', progress, 'accepted', 1)
 else
   redis.call('HINCRBY', progress, 'rejected', 1)
   redis.call('HINCRBY', reasons, reason, 1)
+  redis.call('EXPIRE', reasons, ttl)
 end
-redis.call('EXPIRE', seen, ttl)
-redis.call('EXPIRE', budget, ttl)
+redis.call('HSET', progress, 'updated_at', now)
 redis.call('EXPIRE', progress, ttl)
-redis.call('EXPIRE', reasons, ttl)
-return {1, redis.call('GET', budget), outcome}
+return redis.call('HGET', progress, 'sampled')
 """
 
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-record_sample = r.register_script(RECORD_SAMPLE)
+reserve_sample = r.register_script(RESERVE)
+record_outcome = r.register_script(RECORD)
 
 
-def start_job_state(job_id: str, sample_cap: int) -> None:
+def start_job(job_id: str, sample_cap: int) -> None:
     """Seed the job's state: one teacher call costs TOKENS_PER_CALL of the job's budget."""
-    r.set(BUDGET_PREFIX + job_id, TOKENS_PER_CALL * sample_cap, ex=TTL_S)
-    r.hset(PROGRESS_PREFIX + job_id, mapping={"sampled": 0, "accepted": 0, "rejected": 0})
-    r.expire(PROGRESS_PREFIX + job_id, TTL_S)
+    r.set(budget_key(job_id), sample_cap * TOKENS_PER_CALL, ex=TTL_S)
+    r.hset(progress_key(job_id), mapping={"sampled": 0, "accepted": 0, "rejected": 0, "duplicate": 0, "updated_at": int(time.time())})
+    r.expire(progress_key(job_id), TTL_S)
 
 
-def record(job_id: str, prompt: str, outcome: str, reason: str = "none") -> dict:
-    """One atomic move: the dedupe test, the budget and every counter, or none of them."""
-    hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    spent, remaining, verdict = record_sample(
-        keys=[
-            CACHE_PREFIX + job_id,
-            BUDGET_PREFIX + job_id,
-            PROGRESS_PREFIX + job_id,
-            REASONS_PREFIX + job_id,
-        ],
-        args=[hash, TOKENS_PER_CALL, outcome, reason, TTL_S],
-        client=r,
+def reserve(job_id: str, prompt: str) -> dict:
+    """Pay for one teacher call unless the prompt was sampled already: {verdict, remaining, dedupe_hash}."""
+    dedupe_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    verdict, remaining = reserve_sample(
+        keys=[seen_key(job_id), budget_key(job_id), progress_key(job_id), reasons_key(job_id)],
+        args=[dedupe_hash, TOKENS_PER_CALL, TTL_S, int(time.time())],
     )
-    return {"spent": int(spent), "remaining": int(remaining), "verdict": verdict}
+    return {"verdict": verdict, "remaining": int(remaining), "dedupe_hash": dedupe_hash}
+
+
+def record(job_id: str, outcome: str, reason: str = "") -> None:
+    """Count the sample's outcome: accepted, or rejected with its reason."""
+    record_outcome(
+        keys=[progress_key(job_id), reasons_key(job_id)],
+        args=[outcome, reason or "unknown", TTL_S, int(time.time())],
+    )
 `,
     },
     typescript: {
-      starter: `/** Job progress in Redis: flawed code that spends before it checks. */
-import Redis from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-const CACHE_PREFIX = 'distill:seen:';
-const BUDGET_PREFIX = 'distill:budget:';
-const PROGRESS_PREFIX = 'distill:progress:';
-const TOKENS_PER_CALL = 512;
+import {TOKENS_PER_CALL, budgetKey, progressKey, seenKey} from 'distill/config';
 
 export const redis = new Redis({host: 'redis', port: 6379});
 
-export interface SampleOutcome {
-  spent: number;
-  verdict: string;
+export interface Reservation {
+  verdict: 'ok' | 'duplicate' | 'budget';
+  remaining: number;
+  dedupeHash: string;
 }
 
-export async function record(jobId: string, prompt: string, outcome: string): Promise<SampleOutcome> {
-  // TODO: this starter draws the budget down before it knows whether the call runs at all, stores the
-  // raw prompt in Redis, and moves the three counters with three separate commands. Fix all
-  // three: a crash between them leaves progress that no longer matches the budget.
-  await redis.decrby(BUDGET_PREFIX + jobId, TOKENS_PER_CALL);
-  if ((await redis.sismember(CACHE_PREFIX + jobId, prompt)) === 1) return {spent: 0, verdict: 'duplicate'};
-  await redis.sadd(CACHE_PREFIX + jobId, prompt);
-  await redis.hincrby(PROGRESS_PREFIX + jobId, 'sampled', 1);
-  if (outcome === 'accepted') await redis.hincrby(PROGRESS_PREFIX + jobId, 'accepted', 1);
-  else await redis.hincrby(PROGRESS_PREFIX + jobId, 'rejected', 1);
-  return {spent: TOKENS_PER_CALL, verdict: outcome};
+/** Seed the job's state: one teacher call costs TOKENS_PER_CALL of the job's budget. */
+export async function startJob(jobId: string, sampleCap: number): Promise<void> {
+  await redis.set(budgetKey(jobId), sampleCap * TOKENS_PER_CALL);
+  await redis.hset(progressKey(jobId), {sampled: 0, accepted: 0, rejected: 0, duplicate: 0});
+}
+
+/** Pay for one teacher call unless the prompt was sampled already. */
+export async function reserve(jobId: string, prompt: string): Promise<Reservation> {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  const remaining = await redis.decrby(budgetKey(jobId), TOKENS_PER_CALL);
+  if ((await redis.sismember(seenKey(jobId), prompt)) === 1) {
+    await redis.hincrby(progressKey(jobId), 'duplicate', 1);
+    return {verdict: 'duplicate', remaining, dedupeHash: prompt};
+  }
+  await redis.sadd(seenKey(jobId), prompt);
+  await redis.hincrby(progressKey(jobId), 'sampled', 1);
+  return {verdict: 'ok', remaining, dedupeHash: prompt};
+}
+
+/** Count the sample's outcome: accepted, or rejected with its reason. */
+export async function record(jobId: string, outcome: string, reason = ''): Promise<void> {
+  void reason;
+  await redis.hincrby(progressKey(jobId), outcome === 'accepted' ? 'accepted' : 'rejected', 1);
 }
 `,
-      solution: `/** Job progress in Redis: dedupe, budget and counters move in one script. */
-import {createHash} from 'node:crypto';
+      solution: `import {createHash} from 'node:crypto';
 
 import Redis from 'ioredis';
 
-const CACHE_PREFIX = 'distill:seen:';
-const BUDGET_PREFIX = 'distill:budget:';
-const PROGRESS_PREFIX = 'distill:progress:';
-const REASONS_PREFIX = 'distill:reasons:';
-const TOKENS_PER_CALL = 512;
-const TTL_S = 86_400;
+import {TOKENS_PER_CALL, TTL_S, budgetKey, progressKey, reasonsKey, seenKey} from 'distill/config';
 
-const RECORD_SAMPLE = \`
+const RESERVE = \`
 local seen, budget, progress, reasons = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
-local hash, cost, outcome, reason, ttl = ARGV[1], tonumber(ARGV[2]), ARGV[3], ARGV[4], tonumber(ARGV[5])
+local hash, cost, ttl, now = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
 if redis.call('SISMEMBER', seen, hash) == 1 then
-  redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, redis.call('GET', budget), 'duplicate'}
+  redis.call('HINCRBY', progress, 'duplicate', 1)
+  redis.call('HSET', progress, 'updated_at', now)
+  redis.call('EXPIRE', progress, ttl)
+  return {'duplicate', redis.call('GET', budget) or '0'}
 end
-local remaining = tonumber(redis.call('GET', budget) or '-1')
-if remaining >= 0 and remaining < cost then
+local remaining = tonumber(redis.call('GET', budget) or '0')
+if remaining < cost then
+  redis.call('HINCRBY', progress, 'sampled', 1)
   redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, tostring(remaining), 'budget'}
+  redis.call('HINCRBY', reasons, 'budget', 1)
+  redis.call('HSET', progress, 'updated_at', now)
+  redis.call('EXPIRE', progress, ttl)
+  redis.call('EXPIRE', reasons, ttl)
+  return {'budget', tostring(remaining)}
 end
-redis.call('DECRBY', budget, cost)
+remaining = redis.call('DECRBY', budget, cost)
 redis.call('SADD', seen, hash)
 redis.call('HINCRBY', progress, 'sampled', 1)
+redis.call('HSET', progress, 'updated_at', now)
+redis.call('EXPIRE', seen, ttl)
+redis.call('EXPIRE', budget, ttl)
+redis.call('EXPIRE', progress, ttl)
+redis.call('EXPIRE', reasons, ttl)
+return {'ok', tostring(remaining)}
+\`;
+
+const RECORD = \`
+local progress, reasons = KEYS[1], KEYS[2]
+local outcome, reason, ttl, now = ARGV[1], ARGV[2], tonumber(ARGV[3]), ARGV[4]
 if outcome == 'accepted' then
   redis.call('HINCRBY', progress, 'accepted', 1)
 else
   redis.call('HINCRBY', progress, 'rejected', 1)
   redis.call('HINCRBY', reasons, reason, 1)
+  redis.call('EXPIRE', reasons, ttl)
 end
-redis.call('EXPIRE', seen, ttl)
-redis.call('EXPIRE', budget, ttl)
+redis.call('HSET', progress, 'updated_at', now)
 redis.call('EXPIRE', progress, ttl)
-redis.call('EXPIRE', reasons, ttl)
-return {1, redis.call('GET', budget), outcome}
+return redis.call('HGET', progress, 'sampled')
 \`;
 
-export interface SampleOutcome {
-  spent: number;
+interface StateRedis extends Redis {
+  reserveSample(seen: string, budget: string, progress: string, reasons: string, hash: string, cost: number, ttl: number, now: number): Promise<[string, string]>;
+  recordOutcome(progress: string, reasons: string, outcome: string, reason: string, ttl: number, now: number): Promise<string>;
+}
+
+export const redis = new Redis({host: 'redis', port: 6379}) as StateRedis;
+redis.defineCommand('reserveSample', {numberOfKeys: 4, lua: RESERVE});
+redis.defineCommand('recordOutcome', {numberOfKeys: 2, lua: RECORD});
+
+export interface Reservation {
+  verdict: 'ok' | 'duplicate' | 'budget';
   remaining: number;
-  verdict: string;
+  dedupeHash: string;
 }
 
-interface DistillRedis extends Redis {
-  recordSample(...args: (string | number)[]): Promise<[number, string, string]>;
+const now = (): number => Math.floor(Date.now() / 1000);
+
+/** Seed the job's state: one teacher call costs TOKENS_PER_CALL of the job's budget. */
+export async function startJob(jobId: string, sampleCap: number): Promise<void> {
+  await redis.set(budgetKey(jobId), sampleCap * TOKENS_PER_CALL, 'EX', TTL_S);
+  await redis.hset(progressKey(jobId), {sampled: 0, accepted: 0, rejected: 0, duplicate: 0, updated_at: now()});
+  await redis.expire(progressKey(jobId), TTL_S);
 }
 
-export const redis = new Redis({host: 'redis', port: 6379}) as DistillRedis;
-redis.defineCommand('recordSample', {numberOfKeys: 4, lua: RECORD_SAMPLE});
-
-export async function startJobState(jobId: string, sampleCap: number): Promise<void> {
-  await redis.set(BUDGET_PREFIX + jobId, TOKENS_PER_CALL * sampleCap, 'EX', TTL_S);
-  await redis.hset(PROGRESS_PREFIX + jobId, {sampled: 0, accepted: 0, rejected: 0});
-  await redis.expire(PROGRESS_PREFIX + jobId, TTL_S);
-}
-
-export async function record(jobId: string, prompt: string, outcome: string, reason = 'none'): Promise<SampleOutcome> {
-  const hash = createHash('sha256').update(prompt, 'utf8').digest('hex');
-  const [spent, remaining, verdict] = await redis.recordSample(
-    CACHE_PREFIX + jobId,
-    BUDGET_PREFIX + jobId,
-    PROGRESS_PREFIX + jobId,
-    REASONS_PREFIX + jobId,
-    hash,
-    TOKENS_PER_CALL,
-    outcome,
-    reason,
-    TTL_S,
+/** Pay for one teacher call unless the prompt was sampled already. */
+export async function reserve(jobId: string, prompt: string): Promise<Reservation> {
+  const dedupeHash = createHash('sha256').update(prompt).digest('hex');
+  const [verdict, remaining] = await redis.reserveSample(
+    seenKey(jobId), budgetKey(jobId), progressKey(jobId), reasonsKey(jobId),
+    dedupeHash, TOKENS_PER_CALL, TTL_S, now(),
   );
-  return {spent: Number(spent), remaining: Number(remaining), verdict: String(verdict)};
+  return {verdict: verdict as Reservation['verdict'], remaining: Number(remaining), dedupeHash};
+}
+
+/** Count the sample's outcome: accepted, or rejected with its reason. */
+export async function record(jobId: string, outcome: string, reason = ''): Promise<void> {
+  await redis.recordOutcome(progressKey(jobId), reasonsKey(jobId), outcome, reason || 'unknown', TTL_S, now());
 }
 `,
     },
     go: {
-      starter: `package state
+      starter: `package main
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/redis/go-redis/v9"
+
+	"distill/config" // config.TokensPerCall, config.TTLSeconds, config.BudgetKey/SeenKey/ProgressKey/ReasonsKey — provided
 )
 
-const (
-	cachePrefix    = "distill:seen:"
-	budgetPrefix   = "distill:budget:"
-	progressPrefix = "distill:progress:"
-	tokensPerCall  = 512
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type SampleOutcome struct {
-	Spent   int64
-	Verdict string
+// Reservation is reserve's answer: the verdict (ok, duplicate, budget), the tokens left, the prompt's hash.
+type Reservation struct {
+	Verdict    string
+	Remaining  int64
+	DedupeHash string
 }
 
-func Record(ctx context.Context, rdb *redis.Client, jobID, prompt, outcome string) (SampleOutcome, error) {
-	// TODO: this starter draws the budget down before it knows whether the call runs at all, stores
-	// the raw prompt in Redis, and moves the three counters with three separate commands. Fix all
-	// three: a crash between them leaves progress that no longer matches the budget.
-	if err := rdb.DecrBy(ctx, budgetPrefix+jobID, tokensPerCall).Err(); err != nil {
-		return SampleOutcome{}, err
+// startJob seeds the job's state: one teacher call costs TokensPerCall of the job's budget.
+func startJob(ctx context.Context, jobID string, sampleCap int) error {
+	if err := rdb.Set(ctx, config.BudgetKey(jobID), int64(sampleCap)*config.TokensPerCall, 0).Err(); err != nil {
+		return err
 	}
-	if seen, err := rdb.SIsMember(ctx, cachePrefix+jobID, prompt).Result(); err != nil {
-		return SampleOutcome{}, err
-	} else if seen {
-		return SampleOutcome{Verdict: "duplicate"}, nil
+	return rdb.HSet(ctx, config.ProgressKey(jobID), "sampled", 0, "accepted", 0, "rejected", 0, "duplicate", 0).Err()
+}
+
+// reserve pays for one teacher call unless the prompt was sampled already.
+func reserve(ctx context.Context, jobID, prompt string) (Reservation, error) {
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+	remaining, err := rdb.DecrBy(ctx, config.BudgetKey(jobID), config.TokensPerCall).Result()
+	if err != nil {
+		return Reservation{}, err
 	}
-	if err := rdb.SAdd(ctx, cachePrefix+jobID, prompt).Err(); err != nil {
-		return SampleOutcome{}, err
+	seen, err := rdb.SIsMember(ctx, config.SeenKey(jobID), prompt).Result()
+	if err != nil {
+		return Reservation{}, err
 	}
-	if err := rdb.HIncrBy(ctx, progressPrefix+jobID, "sampled", 1).Err(); err != nil {
-		return SampleOutcome{}, err
+	if seen {
+		rdb.HIncrBy(ctx, config.ProgressKey(jobID), "duplicate", 1)
+		return Reservation{Verdict: "duplicate", Remaining: remaining, DedupeHash: prompt}, nil
 	}
+	rdb.SAdd(ctx, config.SeenKey(jobID), prompt)
+	rdb.HIncrBy(ctx, config.ProgressKey(jobID), "sampled", 1)
+	return Reservation{Verdict: "ok", Remaining: remaining, DedupeHash: prompt}, nil
+}
+
+// record counts the sample's outcome: accepted, or rejected with its reason.
+func record(ctx context.Context, jobID, outcome, reason string) error {
+	field := "rejected"
 	if outcome == "accepted" {
-		if err := rdb.HIncrBy(ctx, progressPrefix+jobID, "accepted", 1).Err(); err != nil {
-			return SampleOutcome{}, err
-		}
-	} else if err := rdb.HIncrBy(ctx, progressPrefix+jobID, "rejected", 1).Err(); err != nil {
-		return SampleOutcome{}, err
+		field = "accepted"
 	}
-	return SampleOutcome{Spent: tokensPerCall, Verdict: outcome}, nil
+	_ = reason
+	return rdb.HIncrBy(ctx, config.ProgressKey(jobID), field, 1).Err()
+}
+
+func main() {
+	ctx := context.Background()
+	if err := startJob(ctx, "job-demo", 100); err != nil {
+		fmt.Println(err)
+	}
 }
 `,
-      solution: `package state
+      solution: `package main
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"distill/config" // config.TokensPerCall, config.TTLSeconds, config.BudgetKey/SeenKey/ProgressKey/ReasonsKey — provided
 )
 
-const (
-	cachePrefix    = "distill:seen:"
-	budgetPrefix   = "distill:budget:"
-	progressPrefix = "distill:progress:"
-	reasonsPrefix  = "distill:reasons:"
-	tokensPerCall  = 512
-	ttlSeconds     = 86400
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var recordSampleCmd = redis.NewScript(\`
+var reserveSample = redis.NewScript(\`
 local seen, budget, progress, reasons = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
-local hash, cost, outcome, reason, ttl = ARGV[1], tonumber(ARGV[2]), ARGV[3], ARGV[4], tonumber(ARGV[5])
+local hash, cost, ttl, now = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
 if redis.call('SISMEMBER', seen, hash) == 1 then
-  redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, redis.call('GET', budget), 'duplicate'}
+  redis.call('HINCRBY', progress, 'duplicate', 1)
+  redis.call('HSET', progress, 'updated_at', now)
+  redis.call('EXPIRE', progress, ttl)
+  return {'duplicate', redis.call('GET', budget) or '0'}
 end
-local remaining = tonumber(redis.call('GET', budget) or '-1')
-if remaining >= 0 and remaining < cost then
+local remaining = tonumber(redis.call('GET', budget) or '0')
+if remaining < cost then
+  redis.call('HINCRBY', progress, 'sampled', 1)
   redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, tostring(remaining), 'budget'}
+  redis.call('HINCRBY', reasons, 'budget', 1)
+  redis.call('HSET', progress, 'updated_at', now)
+  redis.call('EXPIRE', progress, ttl)
+  redis.call('EXPIRE', reasons, ttl)
+  return {'budget', tostring(remaining)}
 end
-redis.call('DECRBY', budget, cost)
+remaining = redis.call('DECRBY', budget, cost)
 redis.call('SADD', seen, hash)
 redis.call('HINCRBY', progress, 'sampled', 1)
+redis.call('HSET', progress, 'updated_at', now)
+redis.call('EXPIRE', seen, ttl)
+redis.call('EXPIRE', budget, ttl)
+redis.call('EXPIRE', progress, ttl)
+redis.call('EXPIRE', reasons, ttl)
+return {'ok', tostring(remaining)}
+\`)
+
+var recordOutcome = redis.NewScript(\`
+local progress, reasons = KEYS[1], KEYS[2]
+local outcome, reason, ttl, now = ARGV[1], ARGV[2], tonumber(ARGV[3]), ARGV[4]
 if outcome == 'accepted' then
   redis.call('HINCRBY', progress, 'accepted', 1)
 else
   redis.call('HINCRBY', progress, 'rejected', 1)
   redis.call('HINCRBY', reasons, reason, 1)
+  redis.call('EXPIRE', reasons, ttl)
 end
-redis.call('EXPIRE', seen, ttl)
-redis.call('EXPIRE', budget, ttl)
+redis.call('HSET', progress, 'updated_at', now)
 redis.call('EXPIRE', progress, ttl)
-redis.call('EXPIRE', reasons, ttl)
-return {1, redis.call('GET', budget), outcome}
+return redis.call('HGET', progress, 'sampled')
 \`)
 
-type SampleOutcome struct {
-	Spent     int64
-	Remaining int64
-	Verdict   string
+// Reservation is reserve's answer: the verdict (ok, duplicate, budget), the tokens left, the prompt's hash.
+type Reservation struct {
+	Verdict    string
+	Remaining  int64
+	DedupeHash string
 }
 
-func StartJobState(ctx context.Context, rdb *redis.Client, jobID string, sampleCap int) error {
-	ttl := time.Duration(ttlSeconds) * time.Second
-	if err := rdb.Set(ctx, budgetPrefix+jobID, tokensPerCall*sampleCap, ttl).Err(); err != nil {
+// startJob seeds the job's state: one teacher call costs TokensPerCall of the job's budget.
+func startJob(ctx context.Context, jobID string, sampleCap int) error {
+	if err := rdb.Set(ctx, config.BudgetKey(jobID), int64(sampleCap)*config.TokensPerCall, config.TTLSeconds*time.Second).Err(); err != nil {
 		return err
 	}
-	if err := rdb.HSet(ctx, progressPrefix+jobID, map[string]any{"sampled": 0, "accepted": 0, "rejected": 0}).Err(); err != nil {
+	if err := rdb.HSet(ctx, config.ProgressKey(jobID), "sampled", 0, "accepted", 0, "rejected", 0, "duplicate", 0, "updated_at", time.Now().Unix()).Err(); err != nil {
 		return err
 	}
-	return rdb.Expire(ctx, progressPrefix+jobID, ttl).Err()
+	return rdb.Expire(ctx, config.ProgressKey(jobID), config.TTLSeconds*time.Second).Err()
 }
 
-func Record(ctx context.Context, rdb *redis.Client, jobID, prompt, outcome, reason string) (SampleOutcome, error) {
+// reserve pays for one teacher call unless the prompt was sampled already.
+func reserve(ctx context.Context, jobID, prompt string) (Reservation, error) {
 	sum := sha256.Sum256([]byte(prompt))
-	keys := []string{cachePrefix + jobID, budgetPrefix + jobID, progressPrefix + jobID, reasonsPrefix + jobID}
-	values, err := recordSampleCmd.Run(
-		ctx, rdb, keys,
-		hex.EncodeToString(sum[:]), tokensPerCall, outcome, reason, ttlSeconds,
-	).Slice()
+	dedupeHash := hex.EncodeToString(sum[:])
+	keys := []string{config.SeenKey(jobID), config.BudgetKey(jobID), config.ProgressKey(jobID), config.ReasonsKey(jobID)}
+	reply, err := reserveSample.Run(ctx, rdb, keys, dedupeHash, config.TokensPerCall, config.TTLSeconds, time.Now().Unix()).Slice()
 	if err != nil {
-		return SampleOutcome{}, err
+		return Reservation{}, err
 	}
-	spent, _ := values[0].(int64)
-	remaining, _ := strconv.ParseInt(values[1].(string), 10, 64)
-	verdict, _ := values[2].(string)
-	return SampleOutcome{Spent: spent, Remaining: remaining, Verdict: verdict}, nil
+	remaining, _ := strconv.ParseInt(fmt.Sprint(reply[1]), 10, 64)
+	return Reservation{Verdict: fmt.Sprint(reply[0]), Remaining: remaining, DedupeHash: dedupeHash}, nil
+}
+
+// record counts the sample's outcome: accepted, or rejected with its reason.
+func record(ctx context.Context, jobID, outcome, reason string) error {
+	if reason == "" {
+		reason = "unknown"
+	}
+	keys := []string{config.ProgressKey(jobID), config.ReasonsKey(jobID)}
+	return recordOutcome.Run(ctx, rdb, keys, outcome, reason, config.TTLSeconds, time.Now().Unix()).Err()
+}
+
+func main() {
+	ctx := context.Background()
+	if err := startJob(ctx, "job-demo", 100); err != nil {
+		fmt.Println(err)
+	}
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
+
+import scala.jdk.CollectionConverters._
+
+import distill.Config
+
+/** reserve's answer: the verdict (ok, duplicate, budget), the tokens left, the prompt's hash. */
+final case class Reservation(verdict: String, remaining: Long, dedupeHash: String)
 
 object JobState {
-  val CachePrefix = "distill:seen:"
-  val BudgetPrefix = "distill:budget:"
-  val ProgressPrefix = "distill:progress:"
-  val TokensPerCall = 512
+  val jedis = new JedisPooled("redis", 6379)
 
-  val jedis = new Jedis("redis", 6379)
+  /** Seed the job's state: one teacher call costs TokensPerCall of the job's budget. */
+  def startJob(jobId: String, sampleCap: Int): Unit = {
+    jedis.set(Config.budgetKey(jobId), (sampleCap * Config.TokensPerCall).toString)
+    jedis.hset(Config.progressKey(jobId), Map("sampled" -> "0", "accepted" -> "0", "rejected" -> "0", "duplicate" -> "0").asJava)
+    ()
+  }
 
-  def record(jobId: String, prompt: String, outcome: String): Unit = {
-    // TODO: this starter draws the budget down before it knows whether the call runs at all, stores
-    // the raw prompt in Redis, and moves the three counters with three separate commands. Fix
-    // all three: a crash between them leaves progress that no longer matches the budget.
-    jedis.decrBy(BudgetPrefix + jobId, TokensPerCall)
-    if (jedis.sismember(CachePrefix + jobId, prompt)) return
-    jedis.sadd(CachePrefix + jobId, prompt)
-    jedis.hincrBy(ProgressPrefix + jobId, "sampled", 1L)
-    if (outcome == "accepted") jedis.hincrBy(ProgressPrefix + jobId, "accepted", 1L)
-    else jedis.hincrBy(ProgressPrefix + jobId, "rejected", 1L)
+  /** Pay for one teacher call unless the prompt was sampled already. */
+  def reserve(jobId: String, prompt: String): Reservation = {
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    val remaining = jedis.decrBy(Config.budgetKey(jobId), Config.TokensPerCall)
+    if (jedis.sismember(Config.seenKey(jobId), prompt)) {
+      jedis.hincrBy(Config.progressKey(jobId), "duplicate", 1)
+      Reservation("duplicate", remaining, prompt)
+    } else {
+      jedis.sadd(Config.seenKey(jobId), prompt)
+      jedis.hincrBy(Config.progressKey(jobId), "sampled", 1)
+      Reservation("ok", remaining, prompt)
+    }
+  }
+
+  /** Count the sample's outcome: accepted, or rejected with its reason. */
+  def record(jobId: String, outcome: String, reason: String = ""): Unit = {
+    jedis.hincrBy(Config.progressKey(jobId), if (outcome == "accepted") "accepted" else "rejected", 1)
+    ()
   }
 }
 `,
-      solution: `import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.util
+      solution: `import java.security.MessageDigest
 
-import redis.clients.jedis.Jedis
+import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
+
+import scala.jdk.CollectionConverters._
+
+import distill.Config
+
+/** reserve's answer: the verdict (ok, duplicate, budget), the tokens left, the prompt's hash. */
+final case class Reservation(verdict: String, remaining: Long, dedupeHash: String)
 
 object JobState {
-  val CachePrefix = "distill:seen:"
-  val BudgetPrefix = "distill:budget:"
-  val ProgressPrefix = "distill:progress:"
-  val ReasonsPrefix = "distill:reasons:"
-  val TokensPerCall = 512
-  val TtlSeconds = 86400
+  val jedis = new JedisPooled("redis", 6379)
 
-  val RecordSample: String =
+  val Reserve: String =
     """local seen, budget, progress, reasons = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
-local hash, cost, outcome, reason, ttl = ARGV[1], tonumber(ARGV[2]), ARGV[3], ARGV[4], tonumber(ARGV[5])
-if redis.call('SISMEMBER', seen, hash) == 1 then
-  redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, redis.call('GET', budget), 'duplicate'}
-end
-local remaining = tonumber(redis.call('GET', budget) or '-1')
-if remaining >= 0 and remaining < cost then
-  redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, tostring(remaining), 'budget'}
-end
-redis.call('DECRBY', budget, cost)
-redis.call('SADD', seen, hash)
-redis.call('HINCRBY', progress, 'sampled', 1)
-if outcome == 'accepted' then
-  redis.call('HINCRBY', progress, 'accepted', 1)
-else
-  redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-end
-redis.call('EXPIRE', seen, ttl)
-redis.call('EXPIRE', budget, ttl)
-redis.call('EXPIRE', progress, ttl)
-redis.call('EXPIRE', reasons, ttl)
-return {1, redis.call('GET', budget), outcome}"""
+      |local hash, cost, ttl, now = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
+      |if redis.call('SISMEMBER', seen, hash) == 1 then
+      |  redis.call('HINCRBY', progress, 'duplicate', 1)
+      |  redis.call('HSET', progress, 'updated_at', now)
+      |  redis.call('EXPIRE', progress, ttl)
+      |  return {'duplicate', redis.call('GET', budget) or '0'}
+      |end
+      |local remaining = tonumber(redis.call('GET', budget) or '0')
+      |if remaining < cost then
+      |  redis.call('HINCRBY', progress, 'sampled', 1)
+      |  redis.call('HINCRBY', progress, 'rejected', 1)
+      |  redis.call('HINCRBY', reasons, 'budget', 1)
+      |  redis.call('HSET', progress, 'updated_at', now)
+      |  redis.call('EXPIRE', progress, ttl)
+      |  redis.call('EXPIRE', reasons, ttl)
+      |  return {'budget', tostring(remaining)}
+      |end
+      |remaining = redis.call('DECRBY', budget, cost)
+      |redis.call('SADD', seen, hash)
+      |redis.call('HINCRBY', progress, 'sampled', 1)
+      |redis.call('HSET', progress, 'updated_at', now)
+      |redis.call('EXPIRE', seen, ttl)
+      |redis.call('EXPIRE', budget, ttl)
+      |redis.call('EXPIRE', progress, ttl)
+      |redis.call('EXPIRE', reasons, ttl)
+      |return {'ok', tostring(remaining)}
+      |""".stripMargin
 
-  val jedis = new Jedis("redis", 6379)
+  val Record: String =
+    """local progress, reasons = KEYS[1], KEYS[2]
+      |local outcome, reason, ttl, now = ARGV[1], ARGV[2], tonumber(ARGV[3]), ARGV[4]
+      |if outcome == 'accepted' then
+      |  redis.call('HINCRBY', progress, 'accepted', 1)
+      |else
+      |  redis.call('HINCRBY', progress, 'rejected', 1)
+      |  redis.call('HINCRBY', reasons, reason, 1)
+      |  redis.call('EXPIRE', reasons, ttl)
+      |end
+      |redis.call('HSET', progress, 'updated_at', now)
+      |redis.call('EXPIRE', progress, ttl)
+      |return redis.call('HGET', progress, 'sampled')
+      |""".stripMargin
 
-  def startJobState(jobId: String, sampleCap: Int): Unit = {
-    jedis.setex(BudgetPrefix + jobId, TtlSeconds, (TokensPerCall * sampleCap).toString)
-    jedis.hset(ProgressPrefix + jobId, util.Map.of("sampled", "0", "accepted", "0", "rejected", "0"))
-    jedis.expire(ProgressPrefix + jobId, TtlSeconds)
+  private def now: String = (System.currentTimeMillis() / 1000).toString
+
+  private def sha256Hex(text: String): String =
+    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
+
+  /** Seed the job's state: one teacher call costs TokensPerCall of the job's budget. */
+  def startJob(jobId: String, sampleCap: Int): Unit = {
+    jedis.set(Config.budgetKey(jobId), (sampleCap * Config.TokensPerCall).toString, SetParams.setParams().ex(Config.TtlSeconds))
+    jedis.hset(
+      Config.progressKey(jobId),
+      Map("sampled" -> "0", "accepted" -> "0", "rejected" -> "0", "duplicate" -> "0", "updated_at" -> now).asJava
+    )
+    jedis.expire(Config.progressKey(jobId), Config.TtlSeconds)
+    ()
   }
 
-  def record(jobId: String, prompt: String, outcome: String, reason: String = "none"): util.List[String] = {
-    val digest = MessageDigest.getInstance("SHA-256")
-    val hash = digest.digest(prompt.getBytes(StandardCharsets.UTF_8)).map("%02x".format(_)).mkString
-    val keys = util.Arrays.asList(
-      CachePrefix + jobId,
-      BudgetPrefix + jobId,
-      ProgressPrefix + jobId,
-      ReasonsPrefix + jobId
-    )
-    val args = util.Arrays.asList(hash, TokensPerCall.toString, outcome, reason, TtlSeconds.toString)
-    jedis.eval(RecordSample, keys, args)
+  /** Pay for one teacher call unless the prompt was sampled already. */
+  def reserve(jobId: String, prompt: String): Reservation = {
+    val dedupeHash = sha256Hex(prompt)
+    val keys = List(Config.seenKey(jobId), Config.budgetKey(jobId), Config.progressKey(jobId), Config.reasonsKey(jobId))
+    val args = List(dedupeHash, Config.TokensPerCall.toString, Config.TtlSeconds.toString, now)
+    val reply = jedis.eval(Reserve, keys.asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(_.toString)
+    Reservation(reply(0), reply(1).toLong, dedupeHash)
+  }
+
+  /** Count the sample's outcome: accepted, or rejected with its reason. */
+  def record(jobId: String, outcome: String, reason: String = ""): Unit = {
+    val keys = List(Config.progressKey(jobId), Config.reasonsKey(jobId))
+    val args = List(outcome, if (reason.isEmpty) "unknown" else reason, Config.TtlSeconds.toString, now)
+    jedis.eval(Record, keys.asJava, args.asJava)
+    ()
   }
 }
 `,
@@ -551,114 +713,584 @@ return {1, redis.call('GET', budget), outcome}"""
       starter: `#include <sw/redis++/redis++.h>
 
 #include <string>
+#include <unordered_map>
 
-constexpr int kTokensPerCall = 512;
-const std::string kCachePrefix = "distill:seen:";
-const std::string kBudgetPrefix = "distill:budget:";
-const std::string kProgressPrefix = "distill:progress:";
+#include "distill/config.h"  // config::kTokensPerCall, config::kTtlSeconds, config::budget_key/seen_key/progress_key/reasons_key — provided
 
-struct SampleOutcome {
-  long long spent;
+sw::redis::Redis redis("tcp://redis:6379");
+
+// reserve's answer: the verdict (ok, duplicate, budget), the tokens left, the prompt's hash.
+struct Reservation {
   std::string verdict;
+  long long remaining = 0;
+  std::string dedupe_hash;
 };
 
-SampleOutcome record(sw::redis::Redis& redis, const std::string& jobId, const std::string& prompt,
-                     const std::string& outcome) {
-  // TODO: this starter draws the budget down before it knows whether the call runs at all, stores the
-  // raw prompt in Redis, and moves the three counters with three separate commands. Fix all
-  // three: a crash between them leaves progress that no longer matches the budget.
-  redis.decrby(kBudgetPrefix + jobId, kTokensPerCall);
-  if (redis.sismember(kCachePrefix + jobId, prompt)) return {0, "duplicate"};
-  redis.sadd(kCachePrefix + jobId, prompt);
-  redis.hincrby(kProgressPrefix + jobId, "sampled", 1);
-  if (outcome == "accepted") redis.hincrby(kProgressPrefix + jobId, "accepted", 1);
-  else redis.hincrby(kProgressPrefix + jobId, "rejected", 1);
-  return {kTokensPerCall, outcome};
+// Seed the job's state: one teacher call costs kTokensPerCall of the job's budget.
+void start_job(const std::string& job_id, int sample_cap) {
+  redis.set(config::budget_key(job_id), std::to_string(sample_cap * config::kTokensPerCall));
+  redis.hset(config::progress_key(job_id), {{"sampled", "0"}, {"accepted", "0"}, {"rejected", "0"}, {"duplicate", "0"}});
+}
+
+// Pay for one teacher call unless the prompt was sampled already.
+Reservation reserve(const std::string& job_id, const std::string& prompt) {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  const long long remaining = redis.decrby(config::budget_key(job_id), config::kTokensPerCall);
+  if (redis.sismember(config::seen_key(job_id), prompt)) {
+    redis.hincrby(config::progress_key(job_id), "duplicate", 1);
+    return {"duplicate", remaining, prompt};
+  }
+  redis.sadd(config::seen_key(job_id), prompt);
+  redis.hincrby(config::progress_key(job_id), "sampled", 1);
+  return {"ok", remaining, prompt};
+}
+
+// Count the sample's outcome: accepted, or rejected with its reason.
+void record(const std::string& job_id, const std::string& outcome, const std::string& reason = "") {
+  (void)reason;
+  redis.hincrby(config::progress_key(job_id), outcome == "accepted" ? "accepted" : "rejected", 1);
 }
 `,
       solution: `#include <sw/redis++/redis++.h>
 
-#include <openssl/sha.h>
-
-#include <iomanip>
-#include <sstream>
+#include <chrono>
 #include <string>
-#include <vector>
+#include <tuple>
+#include <unordered_map>
 
-constexpr int kTokensPerCall = 512;
-constexpr int kTtlSeconds = 86400;
-const std::string kCachePrefix = "distill:seen:";
-const std::string kBudgetPrefix = "distill:budget:";
-const std::string kProgressPrefix = "distill:progress:";
-const std::string kReasonsPrefix = "distill:reasons:";
+#include "digest.h"          // sha256_hex(bytes) — provided
+#include "distill/config.h"  // config::kTokensPerCall, config::kTtlSeconds, config::budget_key/seen_key/progress_key/reasons_key — provided
 
-const std::string kRecordSample = R"lua(
+sw::redis::Redis redis("tcp://redis:6379");
+
+const std::string kReserve = R"lua(
 local seen, budget, progress, reasons = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
-local hash, cost, outcome, reason, ttl = ARGV[1], tonumber(ARGV[2]), ARGV[3], ARGV[4], tonumber(ARGV[5])
+local hash, cost, ttl, now = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
 if redis.call('SISMEMBER', seen, hash) == 1 then
-  redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, redis.call('GET', budget), 'duplicate'}
+  redis.call('HINCRBY', progress, 'duplicate', 1)
+  redis.call('HSET', progress, 'updated_at', now)
+  redis.call('EXPIRE', progress, ttl)
+  return {'duplicate', redis.call('GET', budget) or '0'}
 end
-local remaining = tonumber(redis.call('GET', budget) or '-1')
-if remaining >= 0 and remaining < cost then
+local remaining = tonumber(redis.call('GET', budget) or '0')
+if remaining < cost then
+  redis.call('HINCRBY', progress, 'sampled', 1)
   redis.call('HINCRBY', progress, 'rejected', 1)
-  redis.call('HINCRBY', reasons, reason, 1)
-  return {0, tostring(remaining), 'budget'}
+  redis.call('HINCRBY', reasons, 'budget', 1)
+  redis.call('HSET', progress, 'updated_at', now)
+  redis.call('EXPIRE', progress, ttl)
+  redis.call('EXPIRE', reasons, ttl)
+  return {'budget', tostring(remaining)}
 end
-redis.call('DECRBY', budget, cost)
+remaining = redis.call('DECRBY', budget, cost)
 redis.call('SADD', seen, hash)
 redis.call('HINCRBY', progress, 'sampled', 1)
+redis.call('HSET', progress, 'updated_at', now)
+redis.call('EXPIRE', seen, ttl)
+redis.call('EXPIRE', budget, ttl)
+redis.call('EXPIRE', progress, ttl)
+redis.call('EXPIRE', reasons, ttl)
+return {'ok', tostring(remaining)}
+)lua";
+
+const std::string kRecord = R"lua(
+local progress, reasons = KEYS[1], KEYS[2]
+local outcome, reason, ttl, now = ARGV[1], ARGV[2], tonumber(ARGV[3]), ARGV[4]
 if outcome == 'accepted' then
   redis.call('HINCRBY', progress, 'accepted', 1)
 else
   redis.call('HINCRBY', progress, 'rejected', 1)
   redis.call('HINCRBY', reasons, reason, 1)
+  redis.call('EXPIRE', reasons, ttl)
 end
-redis.call('EXPIRE', seen, ttl)
-redis.call('EXPIRE', budget, ttl)
+redis.call('HSET', progress, 'updated_at', now)
 redis.call('EXPIRE', progress, ttl)
-redis.call('EXPIRE', reasons, ttl)
-return {1, redis.call('GET', budget), outcome}
+return redis.call('HGET', progress, 'sampled')
 )lua";
 
-struct SampleOutcome {
-  long long spent;
-  long long remaining;
+// reserve's answer: the verdict (ok, duplicate, budget), the tokens left, the prompt's hash.
+struct Reservation {
   std::string verdict;
+  long long remaining = 0;
+  std::string dedupe_hash;
 };
 
-void startJobState(sw::redis::Redis& redis, const std::string& jobId, int sampleCap) {
-  redis.setex(kBudgetPrefix + jobId, kTtlSeconds, std::to_string(kTokensPerCall * sampleCap));
-  redis.hset(kProgressPrefix + jobId, "sampled", "0");
-  redis.hset(kProgressPrefix + jobId, "accepted", "0");
-  redis.hset(kProgressPrefix + jobId, "rejected", "0");
-  redis.expire(kProgressPrefix + jobId, kTtlSeconds);
+std::string now_s() {
+  return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-SampleOutcome record(sw::redis::Redis& redis, const std::string& jobId, const std::string& prompt,
-                     const std::string& outcome, const std::string& reason) {
-  unsigned char digest[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char*>(prompt.data()), prompt.size(), digest);
-  std::ostringstream hash;
-  for (unsigned char byte : digest) {
-    hash << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
-  }
-  const std::vector<std::string> keys = {
-      kCachePrefix + jobId, kBudgetPrefix + jobId, kProgressPrefix + jobId, kReasonsPrefix + jobId};
-  const std::vector<std::string> args = {
-      hash.str(), std::to_string(kTokensPerCall), outcome, reason, std::to_string(kTtlSeconds)};
-  const auto reply = redis.eval<std::vector<std::string>>(kRecordSample, keys, args);
-  SampleOutcome result{0, 0, "none"};
-  if (reply.size() == 3) {
-    result.spent = std::stoll(reply[0]);
-    result.remaining = std::stoll(reply[1]);
-    result.verdict = reply[2];
-  }
-  return result;
+// Seed the job's state: one teacher call costs kTokensPerCall of the job's budget.
+void start_job(const std::string& job_id, int sample_cap) {
+  redis.set(config::budget_key(job_id), std::to_string(sample_cap * config::kTokensPerCall), config::kTtlSeconds);
+  redis.hset(config::progress_key(job_id), {{"sampled", "0"}, {"accepted", "0"}, {"rejected", "0"}, {"duplicate", "0"}, {"updated_at", now_s()}});
+  redis.expire(config::progress_key(job_id), config::kTtlSeconds);
+}
+
+// Pay for one teacher call unless the prompt was sampled already.
+Reservation reserve(const std::string& job_id, const std::string& prompt) {
+  const std::string dedupe_hash = sha256_hex(prompt);
+  const auto [verdict, remaining] = redis.eval<std::string, std::string>(
+      kReserve,
+      {config::seen_key(job_id), config::budget_key(job_id), config::progress_key(job_id), config::reasons_key(job_id)},
+      {dedupe_hash, std::to_string(config::kTokensPerCall), std::to_string(config::kTtlSeconds), now_s()});
+  return {verdict, std::stoll(remaining), dedupe_hash};
+}
+
+// Count the sample's outcome: accepted, or rejected with its reason.
+void record(const std::string& job_id, const std::string& outcome, const std::string& reason = "") {
+  redis.eval(kRecord, {config::progress_key(job_id), config::reasons_key(job_id)},
+             {outcome, reason.empty() ? std::string("unknown") : reason, std::to_string(config::kTtlSeconds), now_s()});
 }
 `,
     },
   },
-  debrief: `This is the step where a distillation run either has a budget or has a story about one. The starter looks correct because the counters move and the demo shows a rate; what it hides is that a duplicate prompt costs a teacher call it never made, and that four separate commands are four chances to leave the budget and the counters disagreeing forever. The invariant to state out loud is "budget spent equals unique teacher calls that ran": the dedupe test comes first, the decrement happens once, and the counters move in the same script as the decrement. Real pipelines add near-duplicate detection on embeddings, a reservation before the call rather than after, and per-job keys hashed into a Redis Cluster slot so the script stays runnable.`,
+  harness: {
+    python: `import hashlib
+
+JOB = "j1"
+COST = 512
+
+
+def _state(ctx, cap=100):
+    m = ctx.load("state")
+    m.start_job(JOB, cap)
+    return m
+
+
+def _budget(ctx):
+    return int(ctx.redis.get(f"distill:budget:{JOB}") or 0)
+
+
+def _progress(ctx):
+    return {k: v for k, v in ctx.redis.hgetall(f"distill:progress:{JOB}").items()}
+
+
+def _count(ctx, field):
+    return int(_progress(ctx).get(field, 0))
+
+
+def _sha(prompt):
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
+def check_dedupe_before_spend(ctx):
+    m = _state(ctx, cap=2)
+    first = m.reserve(JOB, "What is the capital of France?")
+    assert first["verdict"] == "ok", f"a fresh prompt must be reserved (verdict ok), got {first}"
+    assert _budget(ctx) == COST, f"one reservation draws one call: budget is {_budget(ctx)}, expected {COST}"
+    again = m.reserve(JOB, "What is the capital of France?")
+    assert again["verdict"] == "duplicate", f"the same prompt again must be a duplicate, got {again}"
+    assert _budget(ctx) == COST, f"a duplicate costs nothing: budget is {_budget(ctx)} after the repeat, expected {COST} (DECRBY ran before SISMEMBER)"
+    assert _count(ctx, "duplicate") == 1 and _count(ctx, "sampled") == 1, f"a duplicate counts as duplicate, not sampled: {_progress(ctx)}"
+    second = m.reserve(JOB, "What is the capital of Peru?")
+    assert second["verdict"] == "ok" and _budget(ctx) == 0, f"the second unique prompt spends the last call: {second}, budget {_budget(ctx)}"
+    third = m.reserve(JOB, "What is the capital of Chile?")
+    assert third["verdict"] == "budget", f"with no budget left the verdict must be budget, got {third}"
+    assert _budget(ctx) == 0, f"the budget went to {_budget(ctx)}: a job must stop at zero, not run negative"
+    assert _count(ctx, "rejected") == 1 and ctx.redis.hget(f"distill:reasons:{JOB}", "budget") == "1", f"a budget refusal is a rejected sample with reason budget: {_progress(ctx)}, reasons {ctx.redis.hgetall(f'distill:reasons:{JOB}')}"
+
+
+def check_atomic_script(ctx):
+    m = _state(ctx)
+    prompt = "Explain photosynthesis to a ten-year-old."
+    hash = _sha(prompt)
+
+    def other_worker():
+        # another worker reserving the same prompt, landing between two of this worker's commands
+        if ctx.redis.sismember(f"distill:seen:{JOB}", hash):
+            return "duplicate"
+        ctx.redis.sadd(f"distill:seen:{JOB}", hash)
+        ctx.redis.decrby(f"distill:budget:{JOB}", COST)
+        ctx.redis.hincrby(f"distill:progress:{JOB}", "sampled", 1)
+        return "ok"
+
+    probe = ctx.redis_after(f"distill:seen:{JOB}", other_worker)
+    mine = m.reserve(JOB, prompt)
+    assert probe.fired, "reserve never touched the seen set"
+    verdicts = sorted([mine["verdict"], probe.result])
+    assert verdicts == ["duplicate", "ok"], f"two workers reserved the same prompt and the verdicts were {verdicts}: the membership test and the spend must run in one script, so exactly one of them pays"
+    assert _budget(ctx) == 100 * COST - COST, f"two workers, one prompt: the budget is {_budget(ctx)}, expected one call drawn ({100 * COST - COST})"
+    assert _count(ctx, "sampled") == 1, f"two workers, one prompt: sampled is {_count(ctx, 'sampled')}, expected 1"
+
+
+def check_hashed_prompt(ctx):
+    m = _state(ctx)
+    prompt = "Summarise the attached contract in three bullet points."
+    r = m.reserve(JOB, prompt)
+    members = ctx.redis.smembers(f"distill:seen:{JOB}")
+    assert prompt not in members, "the seen set holds the raw prompt: tenant content must not be stored in Redis"
+    assert _sha(prompt) in members, f"the seen set must hold the hex SHA-256 of the prompt ({_sha(prompt)[:12]}…), it holds {sorted(members)}"
+    assert r["dedupe_hash"] == _sha(prompt), f"reserve must answer the hash as dedupe_hash, got {r.get('dedupe_hash')!r}"
+    for key in ctx.redis.keys("*"):
+        assert "contract" not in key, f"the prompt leaked into a key name: {key}"
+
+
+def check_reject_reason(ctx):
+    m = _state(ctx)
+    for prompt, outcome, reason in (("p1", "accepted", ""), ("p2", "rejected", "refusal"), ("p3", "rejected", "refusal"), ("p4", "rejected", "empty")):
+        assert m.reserve(JOB, prompt)["verdict"] == "ok"
+        m.record(JOB, outcome, reason)
+    progress = _progress(ctx)
+    assert (int(progress["sampled"]), int(progress["accepted"]), int(progress["rejected"])) == (4, 1, 3), f"four reservations, one accepted, three rejected: {progress}"
+    reasons = ctx.redis.hgetall(f"distill:reasons:{JOB}")
+    assert reasons.get("refusal") == "2" and reasons.get("empty") == "1", f"distill:reasons:{JOB} must count refusal 2 and empty 1, holds {reasons}"
+    assert "accepted" not in reasons and "" not in reasons, f"only rejections carry a reason: {reasons}"
+
+
+def check_key_ttl(ctx):
+    m = _state(ctx)
+    m.reserve(JOB, "p1")
+    m.record(JOB, "rejected", "deadline")
+    for key in (f"distill:budget:{JOB}", f"distill:seen:{JOB}", f"distill:progress:{JOB}", f"distill:reasons:{JOB}"):
+        ttl = ctx.redis.ttl(key)
+        assert ttl != -2, f"{key} does not exist after a reservation and a record"
+        assert 0 < ttl <= 86_400, f"{key} has TTL {ttl}: every key the job owns expires TTL_S (86400 s) after its last move"
+    stamp = ctx.redis.hget(f"distill:progress:{JOB}", "updated_at")
+    assert stamp is not None and stamp.isdigit(), f"the progress hash must carry updated_at (unix seconds), it holds {_progress(ctx)}"
+    ctx.clock.advance(86_401)
+    assert ctx.redis.keys(f"distill:*:{JOB}") == [], f"a day after its last move the job must be gone, found {ctx.redis.keys(f'distill:*:{JOB}')}"
+`,
+    typescript: `import {createHash} from 'node:crypto';
+
+const JOB = 'j1';
+const COST = 512;
+
+async function state(ctx, cap = 100) {
+  const m = ctx.load('state');
+  await m.startJob(JOB, cap);
+  return m;
+}
+
+const budget = ctx => Number(ctx.redis.get(\`distill:budget:\${JOB}\`) ?? 0);
+const progress = ctx => ctx.redis.hgetall(\`distill:progress:\${JOB}\`);
+const count = (ctx, field: string) => Number(progress(ctx)[field] ?? 0);
+const sha = (prompt: string) => createHash('sha256').update(prompt).digest('hex');
+
+export async function check_dedupe_before_spend(ctx) {
+  const m = await state(ctx, 2);
+  const first = await m.reserve(JOB, 'What is the capital of France?');
+  assert.equal(first.verdict, 'ok', \`a fresh prompt must be reserved (verdict ok), got \${JSON.stringify(first)}\`);
+  assert.equal(budget(ctx), COST, \`one reservation draws one call: budget is \${budget(ctx)}, expected \${COST}\`);
+  const again = await m.reserve(JOB, 'What is the capital of France?');
+  assert.equal(again.verdict, 'duplicate', \`the same prompt again must be a duplicate, got \${JSON.stringify(again)}\`);
+  assert.equal(budget(ctx), COST, \`a duplicate costs nothing: budget is \${budget(ctx)} after the repeat, expected \${COST} (DECRBY ran before SISMEMBER)\`);
+  assert(count(ctx, 'duplicate') === 1 && count(ctx, 'sampled') === 1, \`a duplicate counts as duplicate, not sampled: \${JSON.stringify(progress(ctx))}\`);
+  const second = await m.reserve(JOB, 'What is the capital of Peru?');
+  assert(second.verdict === 'ok' && budget(ctx) === 0, \`the second unique prompt spends the last call: \${JSON.stringify(second)}, budget \${budget(ctx)}\`);
+  const third = await m.reserve(JOB, 'What is the capital of Chile?');
+  assert.equal(third.verdict, 'budget', \`with no budget left the verdict must be budget, got \${JSON.stringify(third)}\`);
+  assert.equal(budget(ctx), 0, \`the budget went to \${budget(ctx)}: a job must stop at zero, not run negative\`);
+  assert(count(ctx, 'rejected') === 1 && ctx.redis.hget(\`distill:reasons:\${JOB}\`, 'budget') === '1', \`a budget refusal is a rejected sample with reason budget: \${JSON.stringify(progress(ctx))}, reasons \${JSON.stringify(ctx.redis.hgetall(\`distill:reasons:\${JOB}\`))}\`);
+}
+
+export async function check_atomic_script(ctx) {
+  const m = await state(ctx);
+  const prompt = 'Explain photosynthesis to a ten-year-old.';
+  const hash = sha(prompt);
+  // another worker reserving the same prompt, landing between two of this worker's commands
+  const probe = ctx.redisAfter(\`distill:seen:\${JOB}\`, () => {
+    if (ctx.redis.sismember(\`distill:seen:\${JOB}\`, hash) === 1) return 'duplicate';
+    ctx.redis.sadd(\`distill:seen:\${JOB}\`, hash);
+    ctx.redis.decrby(\`distill:budget:\${JOB}\`, COST);
+    ctx.redis.hincrby(\`distill:progress:\${JOB}\`, 'sampled', 1);
+    return 'ok';
+  });
+  const mine = await m.reserve(JOB, prompt);
+  assert(probe.fired, 'reserve never touched the seen set');
+  const verdicts = [mine.verdict, probe.result].sort();
+  assert.deepEqual(verdicts, ['duplicate', 'ok'], \`two workers reserved the same prompt and the verdicts were \${JSON.stringify(verdicts)}: the membership test and the spend must run in one script, so exactly one of them pays\`);
+  assert.equal(budget(ctx), 100 * COST - COST, \`two workers, one prompt: the budget is \${budget(ctx)}, expected one call drawn (\${100 * COST - COST})\`);
+  assert.equal(count(ctx, 'sampled'), 1, \`two workers, one prompt: sampled is \${count(ctx, 'sampled')}, expected 1\`);
+}
+
+export async function check_hashed_prompt(ctx) {
+  const m = await state(ctx);
+  const prompt = 'Summarise the attached contract in three bullet points.';
+  const r = await m.reserve(JOB, prompt);
+  const members: string[] = ctx.redis.smembers(\`distill:seen:\${JOB}\`);
+  assert(!members.includes(prompt), 'the seen set holds the raw prompt: tenant content must not be stored in Redis');
+  assert(members.includes(sha(prompt)), \`the seen set must hold the hex SHA-256 of the prompt (\${sha(prompt).slice(0, 12)}…), it holds \${JSON.stringify(members)}\`);
+  assert.equal(r.dedupeHash, sha(prompt), \`reserve must answer the hash as dedupeHash, got \${JSON.stringify(r.dedupeHash)}\`);
+  for (const key of ctx.redis.keys('*')) assert(!key.includes('contract'), \`the prompt leaked into a key name: \${key}\`);
+}
+
+export async function check_reject_reason(ctx) {
+  const m = await state(ctx);
+  for (const [prompt, outcome, reason] of [['p1', 'accepted', ''], ['p2', 'rejected', 'refusal'], ['p3', 'rejected', 'refusal'], ['p4', 'rejected', 'empty']]) {
+    assert.equal((await m.reserve(JOB, prompt)).verdict, 'ok');
+    await m.record(JOB, outcome, reason);
+  }
+  const p = progress(ctx);
+  assert.deepEqual([Number(p.sampled), Number(p.accepted), Number(p.rejected)], [4, 1, 3], \`four reservations, one accepted, three rejected: \${JSON.stringify(p)}\`);
+  const reasons = ctx.redis.hgetall(\`distill:reasons:\${JOB}\`);
+  assert(reasons.refusal === '2' && reasons.empty === '1', \`distill:reasons:\${JOB} must count refusal 2 and empty 1, holds \${JSON.stringify(reasons)}\`);
+  assert(!('accepted' in reasons) && !('' in reasons), \`only rejections carry a reason: \${JSON.stringify(reasons)}\`);
+}
+
+export async function check_key_ttl(ctx) {
+  const m = await state(ctx);
+  await m.reserve(JOB, 'p1');
+  await m.record(JOB, 'rejected', 'deadline');
+  for (const key of [\`distill:budget:\${JOB}\`, \`distill:seen:\${JOB}\`, \`distill:progress:\${JOB}\`, \`distill:reasons:\${JOB}\`]) {
+    const ttl = Number(ctx.redis.ttl(key));
+    assert(ttl !== -2, \`\${key} does not exist after a reservation and a record\`);
+    assert(0 < ttl && ttl <= 86_400, \`\${key} has TTL \${ttl}: every key the job owns expires TTL_S (86400 s) after its last move\`);
+  }
+  const stamp = ctx.redis.hget(\`distill:progress:\${JOB}\`, 'updated_at');
+  assert(typeof stamp === 'string' && /^\\d+$/.test(stamp), \`the progress hash must carry updated_at (unix seconds), it holds \${JSON.stringify(progress(ctx))}\`);
+  ctx.clock.advance(86_401);
+  assert.deepEqual(ctx.redis.keys(\`distill:*:\${JOB}\`), [], \`a day after its last move the job must be gone, found \${JSON.stringify(ctx.redis.keys(\`distill:*:\${JOB}\`))}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"regexp"
+	"sort"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+const (
+	stateJob  = "j1"
+	stateCost = 512
+)
+
+func stateStart(ctx *harness.Ctx, cap int) {
+	ctx.NoError(startJob(context.Background(), stateJob, cap), "startJob")
+}
+
+func stateReserve(ctx *harness.Ctx, prompt string) Reservation {
+	r, err := reserve(context.Background(), stateJob, prompt)
+	ctx.NoError(err, "reserve(%q)", prompt)
+	return r
+}
+
+func stateBudget(ctx *harness.Ctx) int64 {
+	raw, _ := ctx.Redis.Get("distill:budget:" + stateJob)
+	n, _ := strconv.ParseInt(raw, 10, 64)
+	return n
+}
+
+func stateCount(ctx *harness.Ctx, field string) int64 {
+	n, _ := strconv.ParseInt(ctx.Redis.HGetAll("distill:progress:"+stateJob)[field], 10, 64)
+	return n
+}
+
+func stateSha(prompt string) string {
+	sum := sha256.Sum256([]byte(prompt))
+	return hex.EncodeToString(sum[:])
+}
+
+func CheckDedupeBeforeSpend(ctx *harness.Ctx) {
+	stateStart(ctx, 2)
+	first := stateReserve(ctx, "What is the capital of France?")
+	ctx.Equal(first.Verdict, "ok", "a fresh prompt must be reserved; the verdict")
+	ctx.Equal(stateBudget(ctx), stateCost, "one reservation draws one call; the budget")
+	again := stateReserve(ctx, "What is the capital of France?")
+	ctx.Equal(again.Verdict, "duplicate", "the same prompt again; the verdict")
+	ctx.Equal(stateBudget(ctx), stateCost, "a duplicate costs nothing (DECRBY ran before SISMEMBER); the budget after the repeat")
+	ctx.Assert(stateCount(ctx, "duplicate") == 1 && stateCount(ctx, "sampled") == 1, "a duplicate counts as duplicate, not sampled: %v", ctx.Redis.HGetAll("distill:progress:"+stateJob))
+	second := stateReserve(ctx, "What is the capital of Peru?")
+	ctx.Assert(second.Verdict == "ok" && stateBudget(ctx) == 0, "the second unique prompt spends the last call: %+v, budget %d", second, stateBudget(ctx))
+	third := stateReserve(ctx, "What is the capital of Chile?")
+	ctx.Equal(third.Verdict, "budget", "with no budget left; the verdict")
+	ctx.Equal(stateBudget(ctx), 0, "a job must stop at zero, not run negative; the budget")
+	reason, _ := ctx.Redis.HGet("distill:reasons:"+stateJob, "budget")
+	ctx.Assert(stateCount(ctx, "rejected") == 1 && reason == "1", "a budget refusal is a rejected sample with reason budget: %v, reasons %v", ctx.Redis.HGetAll("distill:progress:"+stateJob), ctx.Redis.HGetAll("distill:reasons:"+stateJob))
+}
+
+func CheckAtomicScript(ctx *harness.Ctx) {
+	stateStart(ctx, 100)
+	prompt := "Explain photosynthesis to a ten-year-old."
+	hash := stateSha(prompt)
+	other := ""
+	// another worker reserving the same prompt, landing between two of this worker's commands
+	ctx.Redis.After("distill:seen:"+stateJob, func() any {
+		if ctx.Redis.SIsMember("distill:seen:"+stateJob, hash) {
+			other = "duplicate"
+			return nil
+		}
+		ctx.Redis.Do("SADD", "distill:seen:"+stateJob, hash)
+		ctx.Redis.Do("DECRBY", "distill:budget:"+stateJob, stateCost)
+		ctx.Redis.Do("HINCRBY", "distill:progress:"+stateJob, "sampled", 1)
+		other = "ok"
+		return nil
+	})
+	mine := stateReserve(ctx, prompt)
+	ctx.Assert(other != "", "reserve never touched the seen set")
+	verdicts := []string{mine.Verdict, other}
+	sort.Strings(verdicts)
+	ctx.Equal(verdicts, []string{"duplicate", "ok"}, "two workers reserved the same prompt: the membership test and the spend must run in one script, so exactly one of them pays; the verdicts")
+	ctx.Equal(stateBudget(ctx), 100*stateCost-stateCost, "two workers, one prompt: one call drawn; the budget")
+	ctx.Equal(stateCount(ctx, "sampled"), 1, "two workers, one prompt; sampled")
+}
+
+func CheckHashedPrompt(ctx *harness.Ctx) {
+	stateStart(ctx, 100)
+	prompt := "Summarise the attached contract in three bullet points."
+	r := stateReserve(ctx, prompt)
+	members := ctx.Redis.SMembers("distill:seen:" + stateJob)
+	hasRaw, hasHash := false, false
+	for _, m := range members {
+		hasRaw = hasRaw || m == prompt
+		hasHash = hasHash || m == stateSha(prompt)
+	}
+	ctx.Assert(!hasRaw, "the seen set holds the raw prompt: tenant content must not be stored in Redis")
+	ctx.Assert(hasHash, "the seen set must hold the hex SHA-256 of the prompt (%s…), it holds %v", stateSha(prompt)[:12], members)
+	ctx.Equal(r.DedupeHash, stateSha(prompt), "reserve must answer the hash as DedupeHash")
+	for _, key := range ctx.Redis.Keys("*") {
+		ctx.Assert(!regexp.MustCompile("contract").MatchString(key), "the prompt leaked into a key name: %s", key)
+	}
+}
+
+func CheckRejectReason(ctx *harness.Ctx) {
+	stateStart(ctx, 100)
+	for _, s := range [][3]string{{"p1", "accepted", ""}, {"p2", "rejected", "refusal"}, {"p3", "rejected", "refusal"}, {"p4", "rejected", "empty"}} {
+		ctx.Equal(stateReserve(ctx, s[0]).Verdict, "ok", "reserve %s", s[0])
+		ctx.NoError(record(context.Background(), stateJob, s[1], s[2]), "record")
+	}
+	progress := ctx.Redis.HGetAll("distill:progress:" + stateJob)
+	ctx.Equal([]int64{stateCount(ctx, "sampled"), stateCount(ctx, "accepted"), stateCount(ctx, "rejected")}, []int64{4, 1, 3}, "four reservations, one accepted, three rejected (%v); sampled, accepted, rejected", progress)
+	reasons := ctx.Redis.HGetAll("distill:reasons:" + stateJob)
+	ctx.Assert(reasons["refusal"] == "2" && reasons["empty"] == "1", "distill:reasons:%s must count refusal 2 and empty 1, holds %v", stateJob, reasons)
+	_, acc := reasons["accepted"]
+	_, blank := reasons[""]
+	ctx.Assert(!acc && !blank, "only rejections carry a reason: %v", reasons)
+}
+
+func CheckKeyTtl(ctx *harness.Ctx) {
+	stateStart(ctx, 100)
+	stateReserve(ctx, "p1")
+	ctx.NoError(record(context.Background(), stateJob, "rejected", "deadline"), "record")
+	for _, key := range []string{"distill:budget:" + stateJob, "distill:seen:" + stateJob, "distill:progress:" + stateJob, "distill:reasons:" + stateJob} {
+		ttl := ctx.Redis.TTL(key)
+		ctx.Assert(ttl != -2, "%s does not exist after a reservation and a record", key)
+		ctx.Assert(0 < ttl && ttl <= 86_400, "%s has TTL %d: every key the job owns expires TTLSeconds (86400 s) after its last move", key, ttl)
+	}
+	stamp, ok := ctx.Redis.HGet("distill:progress:"+stateJob, "updated_at")
+	ctx.Assert(ok && regexp.MustCompile(\`^\\d+$\`).MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("distill:progress:"+stateJob))
+	ctx.Clock.Advance(86_401)
+	ctx.Equal(len(ctx.Redis.Keys("distill:*:"+stateJob)), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("distill:*:"+stateJob))
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "digest.h"
+
+namespace {
+
+const std::string kJob = "j1";
+constexpr long long kCost = 512;
+
+long long stateBudget(harness::Ctx& ctx) {
+  const auto raw = ctx.Redis.Get("distill:budget:" + kJob);
+  return raw ? std::strtoll(raw->c_str(), nullptr, 10) : 0;
+}
+
+long long stateCount(harness::Ctx& ctx, const std::string& field) {
+  const auto all = ctx.Redis.HGetAll("distill:progress:" + kJob);
+  const auto it = all.find(field);
+  return it == all.end() ? 0 : std::strtoll(it->second.c_str(), nullptr, 10);
+}
+
+}  // namespace
+
+void CheckDedupeBeforeSpend(harness::Ctx& ctx) {
+  start_job(kJob, 2);
+  const auto first = reserve(kJob, "What is the capital of France?");
+  ctx.Equal(first.verdict, "ok", "a fresh prompt must be reserved; the verdict");
+  ctx.Equal(stateBudget(ctx), kCost, "one reservation draws one call; the budget");
+  const auto again = reserve(kJob, "What is the capital of France?");
+  ctx.Equal(again.verdict, "duplicate", "the same prompt again; the verdict");
+  ctx.Equal(stateBudget(ctx), kCost, "a duplicate costs nothing (DECRBY ran before SISMEMBER); the budget after the repeat");
+  ctx.Assert(stateCount(ctx, "duplicate") == 1 && stateCount(ctx, "sampled") == 1, "a duplicate counts as duplicate, not sampled: %v", ctx.Redis.HGetAll("distill:progress:" + kJob));
+  const auto second = reserve(kJob, "What is the capital of Peru?");
+  ctx.Assert(second.verdict == "ok" && stateBudget(ctx) == 0, "the second unique prompt spends the last call: verdict %s, budget %d", second.verdict, stateBudget(ctx));
+  const auto third = reserve(kJob, "What is the capital of Chile?");
+  ctx.Equal(third.verdict, "budget", "with no budget left; the verdict");
+  ctx.Equal(stateBudget(ctx), 0, "a job must stop at zero, not run negative; the budget");
+  const auto reason = ctx.Redis.HGet("distill:reasons:" + kJob, "budget");
+  ctx.Assert(stateCount(ctx, "rejected") == 1 && reason && *reason == "1", "a budget refusal is a rejected sample with reason budget: %v, reasons %v", ctx.Redis.HGetAll("distill:progress:" + kJob), ctx.Redis.HGetAll("distill:reasons:" + kJob));
+}
+
+void CheckAtomicScript(harness::Ctx& ctx) {
+  start_job(kJob, 100);
+  const std::string prompt = "Explain photosynthesis to a ten-year-old.";
+  const std::string hash = sha256_hex(prompt);
+  std::string other;
+  // another worker reserving the same prompt, landing between two of this worker's commands
+  ctx.Redis.After("distill:seen:" + kJob, [&] {
+    if (ctx.Redis.SIsMember("distill:seen:" + kJob, hash)) {
+      other = "duplicate";
+      return;
+    }
+    ctx.Redis.Do("SADD", "distill:seen:" + kJob, hash);
+    ctx.Redis.Do("DECRBY", "distill:budget:" + kJob, kCost);
+    ctx.Redis.Do("HINCRBY", "distill:progress:" + kJob, "sampled", 1);
+    other = "ok";
+  });
+  const auto mine = reserve(kJob, prompt);
+  ctx.Assert(!other.empty(), "reserve never touched the seen set");
+  std::vector<std::string> verdicts = {mine.verdict, other};
+  std::sort(verdicts.begin(), verdicts.end());
+  ctx.Equal(verdicts, {"duplicate", "ok"}, "two workers reserved the same prompt: the membership test and the spend must run in one script, so exactly one of them pays; the verdicts");
+  ctx.Equal(stateBudget(ctx), 100 * kCost - kCost, "two workers, one prompt: one call drawn; the budget");
+  ctx.Equal(stateCount(ctx, "sampled"), 1, "two workers, one prompt; sampled");
+}
+
+void CheckHashedPrompt(harness::Ctx& ctx) {
+  start_job(kJob, 100);
+  const std::string prompt = "Summarise the attached contract in three bullet points.";
+  const auto r = reserve(kJob, prompt);
+  const auto members = ctx.Redis.SMembers("distill:seen:" + kJob);
+  const bool hasRaw = std::find(members.begin(), members.end(), prompt) != members.end();
+  const bool hasHash = std::find(members.begin(), members.end(), sha256_hex(prompt)) != members.end();
+  ctx.Assert(!hasRaw, "the seen set holds the raw prompt: tenant content must not be stored in Redis");
+  ctx.Assert(hasHash, "the seen set must hold the hex SHA-256 of the prompt (%s…), it holds %v", sha256_hex(prompt).substr(0, 12), members);
+  ctx.Equal(r.dedupe_hash, sha256_hex(prompt), "reserve must answer the hash as dedupe_hash");
+  for (const auto& key : ctx.Redis.Keys("*")) ctx.Assert(key.find("contract") == std::string::npos, "the prompt leaked into a key name: %s", key);
+}
+
+void CheckRejectReason(harness::Ctx& ctx) {
+  start_job(kJob, 100);
+  const std::vector<std::vector<std::string>> samples = {{"p1", "accepted", ""}, {"p2", "rejected", "refusal"}, {"p3", "rejected", "refusal"}, {"p4", "rejected", "empty"}};
+  for (const auto& s : samples) {
+    ctx.Equal(reserve(kJob, s[0]).verdict, "ok", "reserve %s", s[0]);
+    record(kJob, s[1], s[2]);
+  }
+  ctx.Equal(std::vector<long long>{stateCount(ctx, "sampled"), stateCount(ctx, "accepted"), stateCount(ctx, "rejected")}, std::vector<long long>{4, 1, 3},
+            "four reservations, one accepted, three rejected (%v); sampled, accepted, rejected", ctx.Redis.HGetAll("distill:progress:" + kJob));
+  const auto reasons = ctx.Redis.HGetAll("distill:reasons:" + kJob);
+  ctx.Assert(reasons.count("refusal") && reasons.at("refusal") == "2" && reasons.count("empty") && reasons.at("empty") == "1", "distill:reasons:%s must count refusal 2 and empty 1, holds %v", kJob, reasons);
+  ctx.Assert(!reasons.count("accepted") && !reasons.count(""), "only rejections carry a reason: %v", reasons);
+}
+
+void CheckKeyTtl(harness::Ctx& ctx) {
+  start_job(kJob, 100);
+  reserve(kJob, "p1");
+  record(kJob, "rejected", "deadline");
+  for (const std::string key : {"distill:budget:" + kJob, "distill:seen:" + kJob, "distill:progress:" + kJob, "distill:reasons:" + kJob}) {
+    const long long ttl = ctx.Redis.TTL(key);
+    ctx.Assert(ttl != -2, "%s does not exist after a reservation and a record", key);
+    ctx.Assert(0 < ttl && ttl <= 86400, "%s has TTL %d: every key the job owns expires kTtlSeconds (86400 s) after its last move", key, ttl);
+  }
+  const auto stamp = ctx.Redis.HGet("distill:progress:" + kJob, "updated_at");
+  ctx.Assert(stamp && !stamp->empty() && std::all_of(stamp->begin(), stamp->end(), [](char c) { return c >= '0' && c <= '9'; }),
+             "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("distill:progress:" + kJob));
+  ctx.Clock.Advance(86401);
+  ctx.Equal(ctx.Redis.Keys("distill:*:" + kJob).size(), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("distill:*:" + kJob));
+}
+`,
+  },
+  debrief: `The reservation is the shape of the fix: a worker asks for budget before it spends it, and the answer settles three questions at once (seen before? affordable? then draw) because Redis runs the script alone. Splitting those into round trips is what let two workers both see an empty set, and what let a dying worker leave the budget and the counters out of step. The hash is a privacy decision as much as a size one: the set must recognise a prompt without holding it. The TTL and the stamp are for the people who come later, a report in step 5 and an operator a week on. Production pipelines also catch near duplicates (MinHash over shingles, as NeMo Curator's fuzzy pass does) and hash each job's keys into one Redis Cluster slot so the script stays runnable when the keyspace is sharded.`,
 };

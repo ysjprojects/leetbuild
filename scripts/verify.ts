@@ -97,6 +97,8 @@ const cppPrograms = (): string => {
 const MIN_STEPS = 4;
 const MIN_CHECKS = 3;
 const HINTS = {min: 2, max: 3};
+/** The flaw counts a task spells out ("hides three flaws"). */
+const WORD_NUMBERS: Record<string, number> = {one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7};
 
 /**
  * Invariants of the judge itself, checked before any content: comment blanking per language, the
@@ -219,6 +221,26 @@ function verifyStep(problem: Problem, step: Step, index: number): string[] {
           .join(', ')})`,
       );
     for (const r of sol.results) if (!r.passed) errors.push(`${tag} [${language}]: solution fails check '${r.id}'`);
+  }
+  // A debugging step: "Starting point … hides N flaws" counts what the checks find wrong with the
+  // starter (the Python starter's failing checks), and the debrief explains the fix, never an
+  // interviewer; a systems course never frames its copy as an interview.
+  if (problem.track !== 'dllm') {
+    const stated = /hides (one|two|three|four|five|six|seven|\d+) (?:production )?flaws?\b/i.exec(step.task);
+    const python = step.code.python;
+    if (stated !== null && python !== undefined) {
+      const n = WORD_NUMBERS[stated[1].toLowerCase()] ?? Number(stated[1]);
+      const failing = judge(step, 'python', python.starter).results.filter(r => !r.passed).length;
+      if (n !== failing)
+        errors.push(`${tag}: the task says the starter hides ${n} flaw(s) but the checks find ${failing} in Python`);
+    }
+    const interview = /\binterviewer\b|\binterview (question|signal)\b/i.exec(
+      `${step.task}\n${step.debrief}\n${step.hints.join('\n')}`,
+    );
+    if (interview !== null)
+      errors.push(
+        `${tag}: the copy frames the step as an interview ("${interview[0]}"); say what the fix is about instead`,
+      );
   }
   if (index === 0 && step.concept !== problem.concepts[0])
     errors.push(`${tag}: problem.concepts[0] should be the first step's concept (${step.concept})`);
@@ -585,9 +607,11 @@ async function precompileCpp(problems: Problem[]): Promise<void> {
       ]),
   );
   // A worker peaks near 2 GB (Node, clang, the sysroot); past what memory holds (4 GB left to this
-  // process's runtimes), more workers only swap.
+  // process's runtimes), more workers only swap. LEETBUILD_CPP_WORKERS caps them further when several
+  // runs share one machine (1: compile in this process, one program at a time).
   const byMemory = Math.floor((totalmem() - 2 ** 32) / 2 ** 31);
-  const workers = Math.min(Math.max(1, cpus().length - 1), byMemory, 8, Math.ceil(jobs.length / 4));
+  const cap = Number(process.env.LEETBUILD_CPP_WORKERS) || Infinity;
+  const workers = Math.min(Math.max(1, cpus().length - 1), byMemory, 8, Math.ceil(jobs.length / 4), cap);
   if (workers < 2) return;
   const file = join(cppPrograms(), 'jobs.json');
   writeFileSync(file, JSON.stringify(jobs));

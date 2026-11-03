@@ -318,6 +318,9 @@ export async function runChecks(
     resetWorld(modules);
     ctx._rearm();
     CLOCK.install();
+    // Time moves only when advanced or slept, as in the Go and C++ checks: real time spent on a
+    // loaded machine (between two requests to a rate limiter) never reaches the check.
+    CLOCK.freeze();
     console.log = console.info = console.debug = (...args: unknown[]) => void output.stdout.push(line(args));
     console.warn = console.error = (...args: unknown[]) => void output.stderr.push(line(args));
     let budget: ReturnType<typeof CLOCK.realTimeout> | null = null;

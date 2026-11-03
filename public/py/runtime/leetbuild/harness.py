@@ -1,8 +1,9 @@
 """
 Runs a step's harness against the learner's files. A harness is a Python module with one
 `check_<id>(ctx)` per check (sync or async); each check starts from a clean world — empty Redis,
-empty broker, no gRPC peers, the clock at zero, every learner/support module unloaded — and
-passes unless it raises. `AssertionError` messages become the verdict's explanation.
+empty broker, no gRPC peers, the clock at zero with a sleep budget (SLEEP_LIMIT), every
+learner/support module unloaded — and passes unless it raises. `AssertionError` messages become
+the verdict's explanation.
 
 `ctx` is the harness's handle on that world: the learner's modules (`ctx.load`), Redis
 (`ctx.redis`, `ctx.redis_bytes`, and `ctx.redis_after` to land a parallel request between two of
@@ -36,6 +37,11 @@ from .metrics import METRICS
 WORK = "/work"
 SUPPORT = "/support"
 SERVER = fakeredis.FakeServer()
+# Virtual sleeps one check may take before the next sleep in the check's own code (not in a
+# background task it started) raises KeyboardInterrupt, as the TypeScript runtime's SLEEP_LIMIT stops
+# its loops: a loop that never ends fails fast ("the loop never ended") instead of running until
+# memory runs out. A check that needs more raises `ctx.clock.sleep_limit`.
+SLEEP_LIMIT = 500
 
 
 class RedisProbe:
@@ -160,7 +166,8 @@ def _purge_modules() -> None:
 
 
 def reset_world() -> None:
-    CLOCK.reset()
+    CLOCK.reset(SLEEP_LIMIT)
+    CLOCK.freeze()
     fakeredis.FakeRedis(server=SERVER).flushall()
     BROKER.reset()
     REGISTRY.reset()
@@ -225,6 +232,7 @@ async def run_checks(harness_src: str, check_ids: list[str], files: dict[str, st
     except BaseException as exc:
         return [{"id": cid, "passed": False, "message": f"the harness failed to load: {_explain(exc)}"} for cid in check_ids]
     results: list[dict] = []
+    CLOCK.task = asyncio.current_task()
     for cid in check_ids:
         name = "check_" + cid.replace("-", "_")
         check = namespace.get(name)

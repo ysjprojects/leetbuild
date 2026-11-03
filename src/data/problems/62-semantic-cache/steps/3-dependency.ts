@@ -2,703 +2,1252 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Answer calls on miss with a write-back contract',
+  title: 'The model call on a miss, and what may be written back',
   concept: 'grpc',
   file: 'client',
-  focus: ['cache', 'llm', 'policy'],
+  focus: ['cache', 'llm', 'policy', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: on a cache miss it calls the model, retries when
-the reply is refused or the call fails, and writes whatever came back into the store. It compiles,
-the demo answers, and every flaw it has either burns model calls or poisons the entry that the next
-near-duplicate question will hit. Debug the miss path, fix it, prove the fix.
+**Starting point.** The starter is the miss path. \`answer_once(tenant, model_version, question)\`
+calls \`Model.Answer\` and asks again, up to three times, when the call fails or the reply is
+refused; \`write_back(tenant, model_version, embedding, result)\` mints an entry id and stores the
+reply through \`put_entry\`; \`answer_on_miss\` runs the two and returns \`{answer, entry_id,
+cached}\`. It serves the demo and hides five flaws.
 
-Implement the model client the cache calls on a miss:
+\`\`\`proto
+service Model { rpc Answer(AnswerRequest) returns (AnswerResult); }
+message AnswerResult {
+  string text = 1; bool refused = 2; bool self_contained = 3; bool deterministic = 4;
+  Policy policy = 5; repeated ToolCall tool_calls = 6;
+}
+\`\`\`
 
-- \`answer_once(channel, question)\` makes **exactly one** \`Answer\` call, carrying the **4-second**
-  per-call deadline \`MODEL_DEADLINE_SECONDS\`. A miss without a deadline holds a request thread and a
-  client timeout budget open on a stuck model, and a retry loop around it multiplies that wait by
-  three. Retrying is the caller's decision, not the client's.
-- **A refusal is terminal.** A reply whose \`refused\` flag is set raises \`RefusalError\`: the caller
-  surfaces the refusal and nothing is cached, because the model already declined this question and
-  asking again cannot turn that into a yes.
-- \`is_cacheable(result)\` is the only gate on the write. It is true only when the answer is
-  \`self_contained\`, \`deterministic\`, and its \`policy.cacheable\` flag is set. A sampled or partial
-  answer is one instance of the model's distribution, and the index will serve that instance to
-  every near-duplicate for the entry's TTL.
-- **A tool-dependent answer is never cacheable.** Any result carrying \`tool_calls\` fails the gate
-  and is returned to its own caller only: a tool result belongs to the question that triggered the
-  tool, not to a question that merely looks similar.
-- \`write_back(store, tenant, model_version, result)\` runs **only** for a cacheable answer and
-  stores it under \`entry:{tenant}:{model_version}:{entry_id}\` together with
-  \`policy_version: SERVING_POLICY_VERSION\` (\`"2024-06-1"\`). Without the version stamp, a change to
-  the serving policy can never invalidate what the old policy approved.
+**Failure mode the checks target.** A stuck model holds a request thread for as long as it likes,
+three times over. A refusal is asked again and then cached, so the next near-duplicate question is
+told "I can't help with that" for a day. And every reply is cached, including one draw from a
+sampled model and an answer built from a tool call made for one caller.
 
-**Failure mode the checks target.** Every flaw is the same confusion between "a reply arrived" and
-"an answer may be reused". A refusal is a decision, a tool result is a fragment of one conversation,
-and a sampled or partial answer is one draw from a distribution — yet the starter writes all of them
-under a key whose whole promise is "this question has this answer". The retry loop is the other half:
-it spends three model calls on a refusal that cannot change, and after the third it caches the
-refusal, so the next near-duplicate question is answered "I can't help with that" for the entry's
-whole TTL — with no policy version on it that could ever invalidate it.`,
+- One \`Answer\` call under \`MODEL_DEADLINE_SECONDS\` (4); no retry loop.
+- A reply with \`refused\` raises \`RefusalError\`: nothing is cached and the caller sees the refusal.
+- \`is_cacheable(result)\` is true only when \`self_contained\`, \`deterministic\` and
+  \`policy.cacheable\` hold and \`tool_calls\` is empty; \`write_back\` stores nothing otherwise and
+  \`answer_on_miss\` answers \`cached: false\`.
+- The entry carries \`policy_version = SERVING_POLICY_VERSION\` (\`"2024-06-1"\`), the serving
+  policy that approved it; the model version is a different thing.`,
   sequence: {
-    participants: ['Client', 'Semantic Cache', 'Model service', 'Serving policy'],
+    participants: ['Semantic Cache', 'Model', 'Serving policy', 'Redis'],
     messages: [
-      {from: 'Client', to: 'Semantic Cache', label: 'lookup · no hit above the floor', kind: 'sync'},
       {
         from: 'Semantic Cache',
-        to: 'Model service',
-        label: 'Answer(question) · deadline 4 s · one attempt',
+        to: 'Model',
+        label: 'Answer(tenant, model_version, question) · deadline 4 s · one attempt',
         kind: 'sync',
       },
-      {from: 'Model service', to: 'Semantic Cache', label: 'AnswerResult(text | refused | tool_calls)', kind: 'reply'},
+      {
+        from: 'Model',
+        to: 'Semantic Cache',
+        label: 'AnswerResult{text, refused, self_contained, deterministic, policy, tool_calls}',
+        kind: 'reply',
+      },
+      {from: 'Semantic Cache', to: 'Semantic Cache', label: 'refused → RefusalError, nothing written', kind: 'sync'},
       {from: 'Semantic Cache', to: 'Serving policy', label: 'is_cacheable(result)', kind: 'sync'},
       {
         from: 'Serving policy',
         to: 'Semantic Cache',
-        label: 'self_contained · deterministic · cacheable',
+        label: 'self_contained · deterministic · policy.cacheable · no tool_calls',
         kind: 'reply',
       },
-      {from: 'Semantic Cache', to: 'Semantic Cache', label: 'refused → RefusalError, nothing written', kind: 'sync'},
-      {from: 'Semantic Cache', to: 'Semantic Cache', label: 'write back answer + policy_version', kind: 'async'},
-      {from: 'Semantic Cache', to: 'Client', label: '200 answer · refusal surfaced', kind: 'reply'},
+      {from: 'Semantic Cache', to: 'Redis', label: 'put_entry(…, SERVING_POLICY_VERSION) when cacheable', kind: 'sync'},
     ],
   },
   hints: [
-    'The deadline is an argument of the call itself — `timeout=MODEL_DEADLINE_SECONDS`, a `deadline` of `Date.now() + MODEL_DEADLINE_SECONDS * 1000`, `context.WithTimeout(ctx, modelDeadlineSeconds*time.Second)`, `withDeadlineAfter(ModelDeadlineSeconds, TimeUnit.SECONDS)`, `set_deadline(now + std::chrono::seconds(kModelDeadlineSeconds))`. Delete the `for` loop while you are there: one miss is one attempt.',
-    'Write the cacheability decision as one boolean before any write: `result.self_contained and result.deterministic and result.policy.cacheable`, and false for a refusal or for any result with `tool_calls`. Then `write_back` is a gate, a key and a store call — and "a tool-dependent answer is never stored" is that one boolean.',
-    'Stamp the entry with the policy that approved it: `{"answer": …, "policy_version": SERVING_POLICY_VERSION}`. The version on the entry is what lets the next policy change invalidate the answers the old policy approved instead of guessing which ones to trust.',
+    'A miss on a slow model takes twelve seconds to fail, a question the model declined is answered with the refusal for a day, and a near-duplicate of "what is my order status" gets another customer\u2019s order.',
+    'The call carries no deadline and sits in a loop that retries refusals; the write-back has no gate, so refusals, sampled replies and tool-built replies all become entries; and the entry is stamped with the model version instead of the serving policy version.',
+    'One call with `timeout=MODEL_DEADLINE_SECONDS` (a `deadline`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), raise `RefusalError` on `refused`, gate the write on `is_cacheable`, and pass `SERVING_POLICY_VERSION` to `put_entry`.',
   ],
   checks: [
     {
       id: 'deadline',
       title: 'One attempt under a 4-second deadline',
       detail:
-        'The single `Answer` call carries the `MODEL_DEADLINE_SECONDS = 4` per-call deadline (`timeout=`, `deadline: Date.now() + 4s`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) and there is no retry loop around it. The starter calls the model with no bound and retries three times, so one stuck model turns a single miss into twelve seconds of held thread and connection.',
+        'The single `Answer` call carries a deadline of about 4 s and is not retried: a stuck model fails the miss with DEADLINE_EXCEEDED after four seconds, once. The starter calls with no bound and tries three times.',
       match: {
-        python: {
-          all: [/MODEL_DEADLINE_SECONDS\s*=\s*4\b/, /timeout=MODEL_DEADLINE_SECONDS/, /\.Answer\(/],
-          none: [/for\s+attempt\s+in\s+range/, /while\s+True/, /\bretry\s*\(/],
-        },
-        typescript: {
-          all: [
-            /MODEL_DEADLINE_SECONDS\s*=\s*4\b/,
-            /deadline:\s*Date\.now\(\)\s*\+\s*MODEL_DEADLINE_SECONDS\s*\*\s*1_?000/,
-            /\.Answer\(/,
-          ],
-          none: [/for\s*\(\s*let\s+attempt/, /while\s*\(/, /\bretry\s*\(/],
-        },
-        go: {
-          all: [
-            /modelDeadlineSeconds\s*=\s*4\b/,
-            /context\.WithTimeout\(ctx,\s*modelDeadlineSeconds\s*\*\s*time\.Second\)/,
-            /\.Answer\(/,
-          ],
-          none: [/for\s+attempt/, /\bwhile\b/, /\bretry\s*\(/],
-        },
-        scala: {
-          all: [
-            /ModelDeadlineSeconds\s*=\s*4L?\b/,
-            /withDeadlineAfter\(ModelDeadlineSeconds,\s*TimeUnit\.SECONDS\)/,
-            /\.answer\(/,
-          ],
-          none: [/while\s*\(/, /\bvar attempt\b/, /\bretry\s*\(/],
-        },
-        cpp: {
-          all: [/kModelDeadlineSeconds\s*=\s*4\b/, /set_deadline\([^;]*kModelDeadlineSeconds/, /->Answer\(/],
-          none: [/while\s*\(/, /for\s*\(\s*int\s+attempt/, /\bretry\s*\(/],
-        },
+        python: {all: [/timeout\s*=/], none: [/for\s+\w+\s+in\s+range\(/, /while\s+True/]},
+        typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/], none: [/for\s*\(\s*let\s+\w+\s*=/, /while\s*\(/]},
+        go: {all: [/context\.WithTimeout\(/], none: [/for\s+\w+\s*:=\s*0;|for\s+range\b|for\s+\w+\s*:=\s*range\b/]},
+        scala: {all: [/withDeadlineAfter\(/], none: [/while\s*\(/, /\bfor\s*\(/]},
+        cpp: {all: [/set_deadline\(/], none: [/for\s*\(\s*int\s+\w+\s*=/, /while\s*\(/]},
       },
     },
     {
       id: 'refusal-terminal',
       title: 'A refusal is terminal',
       detail:
-        'A refused reply raises `RefusalError` and is never retried and never written back: the model made a decision, and a cached refusal would answer an unrelated near-duplicate question with "I can not help with that" for the entry\u2019s whole TTL. The starter retries the refusal three times and then hands it to `write_back` like an answer.',
+        'A reply with `refused` raises `RefusalError`, is not asked again and is not written back. The starter retries it and then stores the refusal text as the answer.',
       match: {
-        python: {all: [/class RefusalError/, /refused/, /raise RefusalError\(/]},
-        typescript: {all: [/class RefusalError/, /refused/, /throw new RefusalError\(/]},
-        go: {all: [/type RefusalError struct/, /Refused/, /&RefusalError\{/]},
-        scala: {all: [/class RefusalError/, /refused/, /throw new RefusalError\(/]},
-        cpp: {all: [/struct RefusalError/, /refused\(\)/, /throw RefusalError\(/]},
+        python: {all: [/raise RefusalError\(/]},
+        typescript: {all: [/throw new RefusalError\(/]},
+        go: {all: [/&RefusalError\{/]},
+        scala: {all: [/throw new RefusalError\(/]},
+        cpp: {all: [/throw RefusalError\(/]},
       },
     },
     {
       id: 'cacheable-gate',
       title: 'Only self-contained, deterministic, policy-cacheable answers are cached',
       detail:
-        '`is_cacheable` is true only when the reply is `self_contained`, `deterministic` and its `policy.cacheable` flag is set; everything else is returned to its own caller and stored for nobody. The starter has no gate, so the first caller\u2019s sample or partial answer becomes the answer for the whole index.',
+        'The write-back runs only when `self_contained`, `deterministic` and `policy.cacheable` all hold; anything else is answered to its caller and stored for nobody. The starter has no gate.',
       match: {
-        python: {all: [/def is_cacheable\(/, /self_contained/, /deterministic/, /policy\.cacheable/]},
-        typescript: {all: [/isCacheable\s*[(=]/, /self_contained/, /deterministic/, /policy\.cacheable/]},
+        python: {all: [/self_contained/, /deterministic/, /policy\.cacheable/]},
+        typescript: {all: [/self_contained/, /deterministic/, /policy\??\.cacheable/]},
         go: {
           all: [
-            /func isCacheable\(/,
-            /GetSelfContained\(\)/,
-            /GetDeterministic\(\)/,
-            /GetPolicy\(\)\.GetCacheable\(\)/,
+            /GetSelfContained\(\)|\.SelfContained\b/,
+            /GetDeterministic\(\)|\.Deterministic\b/,
+            /GetCacheable\(\)|\.Cacheable\b/,
           ],
         },
-        scala: {all: [/def isCacheable\(/, /selfContained/, /deterministic/, /\.getPolicy\.cacheable/]},
-        cpp: {all: [/bool isCacheable\(/, /self_contained\(\)/, /deterministic\(\)/, /policy\(\)\.cacheable\(\)/]},
+        scala: {all: [/selfContained/, /deterministic/, /cacheable/]},
+        cpp: {all: [/self_contained\(\)/, /deterministic\(\)/, /policy\(\)\.cacheable\(\)/]},
       },
     },
     {
       id: 'no-tool-cache',
-      title: 'A tool-dependent answer is never cached',
+      title: 'An answer built from a tool call is never cached',
       detail:
-        'A result carrying `tool_calls` fails the gate and returns false: a tool result belongs to the question that triggered the tool, not to every near-duplicate the index will match. The starter stores it like any other answer, so a one-time tool result is served as an answer for an hour.',
+        'A result with `tool_calls` fails the gate: the tool ran for this question, and its result belongs to no near-duplicate. The starter stores it like any answer.',
       match: {
-        python: {all: [/if[^\n]*tool_calls[^\n]*:/, /return False/]},
-        typescript: {all: [/if[^\n]*tool_calls[^\n]*\)/, /return false/]},
-        go: {all: [/if[^\n]*ToolCalls[^\n]*\{/, /return false/]},
-        scala: {all: [/if\s*\([^\n]*toolCalls[^\n]*\)/, /\bfalse\b/]},
-        cpp: {all: [/if\s*\([^\n]*tool_calls_size\(\)[^\n]*\)/, /return false/]},
+        python: {all: [/tool_calls/]},
+        typescript: {all: [/\btool_calls\b(?!\??:)/]},
+        go: {all: [/GetToolCalls\(\)|\.ToolCalls\b/]},
+        scala: {all: [/toolCalls/]},
+        cpp: {all: [/tool_calls(_size)?\(\)/]},
       },
     },
     {
       id: 'policy-version',
-      title: 'Cacheable answers carry their policy version',
+      title: 'Cached answers carry the serving policy version',
       detail:
-        'The entry written back carries `policy_version: SERVING_POLICY_VERSION` (`"2024-06-1"`), so a policy change can invalidate every answer the old policy approved. The starter stores the answer with no version, so a policy change can never reach the entries already in the index.',
+        'The entry is written with `policy_version = SERVING_POLICY_VERSION` (`"2024-06-1"`), so a policy change can find every answer the old policy approved. The starter stamps the model version instead.',
       match: {
-        python: {all: [/SERVING_POLICY_VERSION\s*=\s*["']2024-06-1["']/, /"policy_version"\s*:/]},
-        typescript: {all: [/SERVING_POLICY_VERSION\s*=\s*'2024-06-1'/, /policy_version\s*:/]},
-        go: {all: [/servingPolicyVersion\s*=\s*"2024-06-1"/, /json:"policy_version"/]},
-        scala: {all: [/ServingPolicyVersion\s*=\s*"2024-06-1"/, /policy_version/]},
-        cpp: {all: [/kServingPolicyVersion\s*=\s*"2024-06-1"/, /"policy_version"/]},
+        python: {all: [/SERVING_POLICY_VERSION\s*=\s*["']2024-06-1["']/, /put_entry\([^\n]*SERVING_POLICY_VERSION/]},
+        typescript: {all: [/SERVING_POLICY_VERSION\s*=\s*['"]2024-06-1['"]/, /putEntry\([^\n]*SERVING_POLICY_VERSION/]},
+        go: {all: [/servingPolicyVersion\s*=\s*"2024-06-1"/, /putEntry\([^\n]*servingPolicyVersion/]},
+        scala: {all: [/ServingPolicyVersion\s*=\s*"2024-06-1"/, /putEntry\([^\n]*ServingPolicyVersion/]},
+        cpp: {all: [/kServingPolicyVersion\s*=\s*"2024-06-1"/, /put_entry\([^\n]*kServingPolicyVersion/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import uuid
+      starter: `"""The miss path: ask the model, store the reply."""
+import uuid
 
 import grpc
 
-import answer_pb2
-import answer_pb2_grpc
+import model_pb2
+import model_pb2_grpc
+import state  # put_entry(tenant, model_version, entry_id, embedding, answer, policy_version) (step 2)
+
+MAX_ATTEMPTS = 3
+SERVING_POLICY_VERSION = "2024-06-1"
+
+channel = grpc.insecure_channel("model:9000")
+stub = model_pb2_grpc.ModelStub(channel)
 
 
-class EntryStore:
-    def put(self, key: str, entry: dict) -> None:
-        """Write an entry under key = entry:{tenant}:{model_version}:{entry_id}."""
-        raise NotImplementedError
+class RefusalError(Exception):
+    """The model declined the question: terminal, and cached for nobody."""
 
 
-def answer_once(channel: grpc.Channel, question: str):
-    # TODO: this starter calls the model with no deadline, retries three times — the refusal
-    # included — and writes every reply: a refusal or a tool-dependent answer becomes the answer
-    # for the next near-duplicate, and no policy version is stamped on the entry. Fix all of it.
-    stub = answer_pb2_grpc.AnswerServiceStub(channel)
-    reply = None
-    for attempt in range(3):
+def answer_once(tenant: str, model_version: str, question: str) -> model_pb2.AnswerResult:
+    """The model's reply, asking again when the call fails or the model refuses."""
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    request = model_pb2.AnswerRequest(tenant=tenant, model_version=model_version, question=question)
+    last: model_pb2.AnswerResult | grpc.RpcError | None = None
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            reply = stub.Answer(answer_pb2.AnswerRequest(question=question))
-        except grpc.RpcError:
+            result = stub.Answer(request)
+        except grpc.RpcError as e:
+            last = e
             continue
-        if not reply.refused:
-            break
-    if reply is None:
-        raise RuntimeError("model unavailable")
-    return reply
+        if not result.refused:
+            return result
+        last = result
+    if isinstance(last, grpc.RpcError):
+        raise last
+    return last
 
 
-def write_back(store: EntryStore, tenant: str, model_version: str, result) -> str:
+def write_back(tenant: str, model_version: str, embedding: list[float], result: model_pb2.AnswerResult) -> str:
     entry_id = str(uuid.uuid4())
-    store.put(
-        f"entry:{tenant}:{model_version}:{entry_id}",
-        {"answer": result.text, "refused": result.refused},
-    )
+    state.put_entry(tenant, model_version, entry_id, embedding, result.text, model_version)
     return entry_id
+
+
+def answer_on_miss(tenant: str, model_version: str, question: str, embedding: list[float]) -> dict:
+    result = answer_once(tenant, model_version, question)
+    entry_id = write_back(tenant, model_version, embedding, result)
+    return {"answer": result.text, "entry_id": entry_id, "cached": True}
 `,
-      solution: `import uuid
+      solution: `"""The miss path: one model call under a deadline, and the gate on what may be written back."""
+import uuid
 
 import grpc
 
-import answer_pb2
-import answer_pb2_grpc
+import model_pb2
+import model_pb2_grpc
+import state  # put_entry(tenant, model_version, entry_id, embedding, answer, policy_version) (step 2)
 
 MODEL_DEADLINE_SECONDS = 4
 SERVING_POLICY_VERSION = "2024-06-1"
 
+channel = grpc.insecure_channel("model:9000")
+stub = model_pb2_grpc.ModelStub(channel)
+
 
 class RefusalError(Exception):
-    """The model declined to answer: terminal for this question, and never cacheable."""
+    """The model declined the question: terminal, and cached for nobody."""
 
 
-class EntryStore:
-    def put(self, key: str, entry: dict) -> None:
-        """Write an entry under key = entry:{tenant}:{model_version}:{entry_id}."""
-        raise NotImplementedError
+def answer_once(tenant: str, model_version: str, question: str) -> model_pb2.AnswerResult:
+    """Exactly one Answer call under the deadline; a refusal raises."""
+    request = model_pb2.AnswerRequest(tenant=tenant, model_version=model_version, question=question)
+    result = stub.Answer(request, timeout=MODEL_DEADLINE_SECONDS)
+    if result.refused:
+        raise RefusalError(result.text)
+    return result
 
 
-def answer_once(channel: grpc.Channel, question: str):
-    """One Answer call per miss, under the 4-second deadline; a refusal is raised, not returned."""
-    stub = answer_pb2_grpc.AnswerServiceStub(channel)
-    reply = stub.Answer(answer_pb2.AnswerRequest(question=question), timeout=MODEL_DEADLINE_SECONDS)
-    if reply.refused:
-        raise RefusalError(reply.refusal_reason)
-    return reply
+def is_cacheable(result: model_pb2.AnswerResult) -> bool:
+    if result.tool_calls:
+        return False  # built from a call made for this question alone
+    return result.self_contained and result.deterministic and result.policy.cacheable
 
 
-def is_cacheable(result) -> bool:
-    """Only a self-contained, deterministic answer the serving policy allows may be reused."""
-    if result.refused or result.tool_calls:
-        return False
-    return bool(result.self_contained and result.deterministic and result.policy.cacheable)
-
-
-def write_back(store: EntryStore, tenant: str, model_version: str, result) -> str | None:
-    """Store the answer with the policy version that approved it; nothing else is ever stored."""
+def write_back(tenant: str, model_version: str, embedding: list[float], result: model_pb2.AnswerResult) -> str | None:
+    """The new entry's id, or None when the reply may not be reused."""
     if not is_cacheable(result):
         return None
     entry_id = str(uuid.uuid4())
-    store.put(
-        f"entry:{tenant}:{model_version}:{entry_id}",
-        {"answer": result.text, "policy_version": SERVING_POLICY_VERSION},
-    )
+    state.put_entry(tenant, model_version, entry_id, embedding, result.text, SERVING_POLICY_VERSION)
     return entry_id
+
+
+def answer_on_miss(tenant: str, model_version: str, question: str, embedding: list[float]) -> dict:
+    result = answer_once(tenant, model_version, question)
+    entry_id = write_back(tenant, model_version, embedding, result)
+    return {"answer": result.text, "entry_id": entry_id, "cached": entry_id is not None}
 `,
     },
     typescript: {
-      starter: `/** The model client the cache calls on a miss: flawed code. */
+      starter: `/** The miss path: ask the model, store the reply. */
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 import {randomUUID} from 'node:crypto';
 
-import * as grpc from '@grpc/grpc-js';
+import {putEntry} from './state'; // putEntry(tenant, modelVersion, entryId, embedding, answer, policyVersion) (step 2)
 
-interface AnswerResult {
-  text: string;
-  refused: boolean;
-  refusal_reason: string;
-  self_contained: boolean;
-  deterministic: boolean;
-  tool_calls: string[];
-  policy: {cacheable: boolean};
-}
-
-interface AnswerClient {
-  Answer(
-    request: {question: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, reply: AnswerResult) => void,
-  ): grpc.ClientUnaryCall;
-}
-
-interface EntryStore {
-  put(key: string, entry: Record<string, unknown>): Promise<void>;
-}
-
-export async function answerOnce(stub: AnswerClient, question: string): Promise<AnswerResult> {
-  // TODO: this starter calls the model with no deadline, retries three times — the refusal included —
-  // and writes every reply: a refusal or a tool-dependent answer becomes the answer for the next
-  // near-duplicate, and no policy version is stamped on the entry. Fix all of it.
-  let reply: AnswerResult | null = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      reply = await new Promise<AnswerResult>((resolve, reject) => {
-        stub.Answer({question}, new grpc.Metadata(), {}, (error, value) => {
-          if (error === null) resolve(value);
-          else reject(error);
-        });
-      });
-    } catch {
-      continue;
-    }
-    if (!reply.refused) break;
-  }
-  if (reply === null) throw new Error('model unavailable');
-  return reply;
-}
-
-export async function writeBack(
-  store: EntryStore,
-  tenant: string,
-  modelVersion: string,
-  result: AnswerResult,
-): Promise<string> {
-  const entryId = randomUUID();
-  await store.put('entry:' + tenant + ':' + modelVersion + ':' + entryId, {
-    answer: result.text,
-    refused: result.refused,
-  });
-  return entryId;
-}
-`,
-      solution: `/** The model client the cache calls on a miss: one deadline-bounded attempt and a gated write-back. */
-import {randomUUID} from 'node:crypto';
-
-import * as grpc from '@grpc/grpc-js';
-
-export const MODEL_DEADLINE_SECONDS = 4;
+export const MAX_ATTEMPTS = 3;
 export const SERVING_POLICY_VERSION = '2024-06-1';
-
-export class RefusalError extends Error {}
 
 export interface AnswerResult {
   text: string;
   refused: boolean;
-  refusal_reason: string;
   self_contained: boolean;
   deterministic: boolean;
-  tool_calls: string[];
-  policy: {cacheable: boolean};
+  policy?: {cacheable: boolean};
+  tool_calls?: {name: string; arguments: string}[];
 }
 
-export interface AnswerClient {
-  Answer(
-    request: {question: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, reply: AnswerResult) => void,
-  ): grpc.ClientUnaryCall;
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('model.proto')) as unknown as {
+  semcache: {Model: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.semcache.Model('model:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Answer(request: {tenant: string; model_version: string; question: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<AnswerResult>;
+};
+
+/** The model declined the question: terminal, and cached for nobody. */
+export class RefusalError extends Error {}
+
+/** The model's reply, asking again when the call fails or the model refuses. */
+export async function answerOnce(tenant: string, modelVersion: string, question: string): Promise<AnswerResult> {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  const request = {tenant, model_version: modelVersion, question};
+  let last: AnswerResult | Error | null = null;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const result = await stub.Answer(request, new grpc.Metadata(), {});
+      if (!result.refused) return result;
+      last = result;
+    } catch (e) {
+      last = e as Error;
+    }
+  }
+  if (last instanceof Error) throw last;
+  return last as AnswerResult;
 }
 
-export interface EntryStore {
-  put(key: string, entry: Record<string, unknown>): Promise<void>;
+export async function writeBack(tenant: string, modelVersion: string, embedding: number[], result: AnswerResult): Promise<string> {
+  const entryId = randomUUID();
+  await putEntry(tenant, modelVersion, entryId, embedding, result.text, modelVersion);
+  return entryId;
 }
 
-export async function answerOnce(stub: AnswerClient, question: string): Promise<AnswerResult> {
-  const reply = await new Promise<AnswerResult>((resolve, reject) => {
-    stub.Answer(
-      {question},
-      new grpc.Metadata(),
-      {deadline: Date.now() + MODEL_DEADLINE_SECONDS * 1_000},
-      (error, value) => {
-        if (error === null) resolve(value);
-        else reject(error);
-      },
-    );
-  });
-  if (reply.refused) throw new RefusalError(reply.refusal_reason);
-  return reply;
+export async function answerOnMiss(tenant: string, modelVersion: string, question: string, embedding: number[]) {
+  const result = await answerOnce(tenant, modelVersion, question);
+  const entryId = await writeBack(tenant, modelVersion, embedding, result);
+  return {answer: result.text, entry_id: entryId, cached: true};
+}
+`,
+      solution: `/** The miss path: one model call under a deadline, and the gate on what may be written back. */
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {randomUUID} from 'node:crypto';
+
+import {putEntry} from './state'; // putEntry(tenant, modelVersion, entryId, embedding, answer, policyVersion) (step 2)
+
+export const MODEL_DEADLINE_MS = 4000;
+export const SERVING_POLICY_VERSION = '2024-06-1';
+
+export interface AnswerResult {
+  text: string;
+  refused: boolean;
+  self_contained: boolean;
+  deterministic: boolean;
+  policy?: {cacheable: boolean};
+  tool_calls?: {name: string; arguments: string}[];
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('model.proto')) as unknown as {
+  semcache: {Model: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.semcache.Model('model:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Answer(request: {tenant: string; model_version: string; question: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<AnswerResult>;
+};
+
+/** The model declined the question: terminal, and cached for nobody. */
+export class RefusalError extends Error {}
+
+/** Exactly one Answer call under the deadline; a refusal throws. */
+export async function answerOnce(tenant: string, modelVersion: string, question: string): Promise<AnswerResult> {
+  const result = await stub.Answer({tenant, model_version: modelVersion, question}, new grpc.Metadata(), {deadline: Date.now() + MODEL_DEADLINE_MS});
+  if (result.refused) throw new RefusalError(result.text);
+  return result;
 }
 
 export function isCacheable(result: AnswerResult): boolean {
-  if (result.refused || result.tool_calls.length > 0) return false;
-  return result.self_contained && result.deterministic && result.policy.cacheable;
+  if ((result.tool_calls ?? []).length > 0) return false; // built from a call made for this question alone
+  return result.self_contained && result.deterministic && result.policy?.cacheable === true;
 }
 
-export async function writeBack(
-  store: EntryStore,
-  tenant: string,
-  modelVersion: string,
-  result: AnswerResult,
-): Promise<string | null> {
+/** The new entry's id, or null when the reply may not be reused. */
+export async function writeBack(tenant: string, modelVersion: string, embedding: number[], result: AnswerResult): Promise<string | null> {
   if (!isCacheable(result)) return null;
   const entryId = randomUUID();
-  await store.put('entry:' + tenant + ':' + modelVersion + ':' + entryId, {
-    answer: result.text,
-    policy_version: SERVING_POLICY_VERSION,
-  });
+  await putEntry(tenant, modelVersion, entryId, embedding, result.text, SERVING_POLICY_VERSION);
   return entryId;
+}
+
+export async function answerOnMiss(tenant: string, modelVersion: string, question: string, embedding: number[]) {
+  const result = await answerOnce(tenant, modelVersion, question);
+  const entryId = await writeBack(tenant, modelVersion, embedding, result);
+  return {answer: result.text, entry_id: entryId, cached: entryId !== null};
 }
 `,
     },
     go: {
-      starter: `package client
+      starter: `// The miss path: ask the model, store the reply.
+package main
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
-	pb "semcache/answerpb"
+	pb "semcache/gen/model"
 )
 
-// CacheEntry is one cached answer.
-type CacheEntry struct {
-	Answer string \`json:"answer"\`
+const (
+	maxAttempts          = 3
+	servingPolicyVersion = "2024-06-1"
+)
+
+var conn, _ = grpc.NewClient("model:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+var stub = pb.NewModelClient(conn)
+
+// putEntry writes an entry into the store (state, step 2).
+var putEntry = func(ctx context.Context, tenant, modelVersion, entryID string, embedding []float64, answer, policyVersion string) error {
+	panic("provided by state (step 2)")
 }
 
-// EntryStore is the cache store this client writes entries into.
-type EntryStore struct{}
+// RefusalError: the model declined the question; terminal, and cached for nobody.
+type RefusalError struct{ Text string }
 
-func (s *EntryStore) Put(ctx context.Context, key string, entry CacheEntry) error {
-	return nil
+func (e *RefusalError) Error() string { return "the model refused: " + e.Text }
+
+// Answered is what the miss path hands back to the request.
+type Answered struct {
+	Answer  string
+	EntryID string
+	Cached  bool
 }
 
-func answerOnce(ctx context.Context, client pb.AnswerServiceClient, question string) (*pb.AnswerResult, error) {
-	// TODO: this starter calls the model with no deadline, retries three times — the refusal
-	// included — and writes every reply: a refusal or a tool-dependent answer becomes the answer
-	// for the next near-duplicate, and no policy version is stamped on the entry. Fix all of it.
-	var reply *pb.AnswerResult
-	for attempt := 0; attempt < 3; attempt++ {
-		got, err := client.Answer(ctx, &pb.AnswerRequest{Question: question})
+// answerOnce is the model's reply, asking again when the call fails or the model refuses.
+func answerOnce(ctx context.Context, tenant, modelVersion, question string) (*pb.AnswerResult, error) {
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+	request := &pb.AnswerRequest{Tenant: tenant, ModelVersion: modelVersion, Question: question}
+	var refusal *pb.AnswerResult
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		var result *pb.AnswerResult
+		result, err = stub.Answer(ctx, request)
 		if err != nil {
 			continue
 		}
-		reply = got
-		if !got.GetRefused() {
-			break
+		if !result.GetRefused() {
+			return result, nil
 		}
+		refusal = result
 	}
-	if reply == nil {
-		return nil, fmt.Errorf("model unavailable")
+	if refusal != nil {
+		return refusal, nil
 	}
-	return reply, nil
+	return nil, err
 }
 
-func writeBack(ctx context.Context, store *EntryStore, tenant, modelVersion string, result *pb.AnswerResult) (string, error) {
+func writeBack(ctx context.Context, tenant, modelVersion string, embedding []float64, result *pb.AnswerResult) (string, error) {
 	entryID := uuid.NewString()
-	entry := CacheEntry{Answer: result.GetText()}
-	if err := store.Put(ctx, fmt.Sprintf("entry:%s:%s:%s", tenant, modelVersion, entryID), entry); err != nil {
+	if err := putEntry(ctx, tenant, modelVersion, entryID, embedding, result.GetText(), modelVersion); err != nil {
 		return "", err
 	}
 	return entryID, nil
 }
+
+func answerOnMiss(ctx context.Context, tenant, modelVersion, question string, embedding []float64) (Answered, error) {
+	result, err := answerOnce(ctx, tenant, modelVersion, question)
+	if err != nil {
+		return Answered{}, err
+	}
+	entryID, err := writeBack(ctx, tenant, modelVersion, embedding, result)
+	if err != nil {
+		return Answered{}, err
+	}
+	return Answered{Answer: result.GetText(), EntryID: entryID, Cached: true}, nil
+}
 `,
-      solution: `package client
+      solution: `// The miss path: one model call under a deadline, and the gate on what may be written back.
+package main
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
-	pb "semcache/answerpb"
+	pb "semcache/gen/model"
 )
 
 const (
-	modelDeadlineSeconds = 4
+	modelDeadline        = 4 * time.Second
 	servingPolicyVersion = "2024-06-1"
 )
 
-// RefusalError means the model declined to answer: terminal for this question, and never cacheable.
-type RefusalError struct {
-	Reason string
+var conn, _ = grpc.NewClient("model:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+var stub = pb.NewModelClient(conn)
+
+// putEntry writes an entry into the store (state, step 2).
+var putEntry = func(ctx context.Context, tenant, modelVersion, entryID string, embedding []float64, answer, policyVersion string) error {
+	panic("provided by state (step 2)")
 }
 
-func (e *RefusalError) Error() string {
-	return "model refused: " + e.Reason
+// RefusalError: the model declined the question; terminal, and cached for nobody.
+type RefusalError struct{ Text string }
+
+func (e *RefusalError) Error() string { return "the model refused: " + e.Text }
+
+// Answered is what the miss path hands back to the request.
+type Answered struct {
+	Answer  string
+	EntryID string
+	Cached  bool
 }
 
-// CacheEntry is what the store keeps for the next lookup.
-type CacheEntry struct {
-	Answer        string \`json:"answer"\`
-	PolicyVersion string \`json:"policy_version"\`
-}
-
-// EntryStore is the cache store this client writes entries into.
-type EntryStore struct{}
-
-func (s *EntryStore) Put(ctx context.Context, key string, entry CacheEntry) error {
-	return nil
-}
-
-func answerOnce(ctx context.Context, client pb.AnswerServiceClient, question string) (*pb.AnswerResult, error) {
-	callCtx, cancel := context.WithTimeout(ctx, modelDeadlineSeconds*time.Second)
+// answerOnce makes exactly one Answer call under the deadline; a refusal is an error.
+func answerOnce(ctx context.Context, tenant, modelVersion, question string) (*pb.AnswerResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, modelDeadline)
 	defer cancel()
-	reply, err := client.Answer(callCtx, &pb.AnswerRequest{Question: question})
+	result, err := stub.Answer(ctx, &pb.AnswerRequest{Tenant: tenant, ModelVersion: modelVersion, Question: question})
 	if err != nil {
 		return nil, err
 	}
-	if reply.GetRefused() {
-		return nil, &RefusalError{Reason: reply.GetRefusalReason()}
+	if result.GetRefused() {
+		return nil, &RefusalError{Text: result.GetText()}
 	}
-	return reply, nil
+	return result, nil
 }
 
 func isCacheable(result *pb.AnswerResult) bool {
-	if result.GetRefused() || len(result.GetToolCalls()) > 0 {
-		return false
+	if len(result.GetToolCalls()) > 0 {
+		return false // built from a call made for this question alone
 	}
 	return result.GetSelfContained() && result.GetDeterministic() && result.GetPolicy().GetCacheable()
 }
 
-func writeBack(ctx context.Context, store *EntryStore, tenant, modelVersion string, result *pb.AnswerResult) (string, error) {
+// writeBack returns the new entry's id, or "" when the reply may not be reused.
+func writeBack(ctx context.Context, tenant, modelVersion string, embedding []float64, result *pb.AnswerResult) (string, error) {
 	if !isCacheable(result) {
 		return "", nil
 	}
 	entryID := uuid.NewString()
-	entry := CacheEntry{Answer: result.GetText(), PolicyVersion: servingPolicyVersion}
-	if err := store.Put(ctx, fmt.Sprintf("entry:%s:%s:%s", tenant, modelVersion, entryID), entry); err != nil {
+	if err := putEntry(ctx, tenant, modelVersion, entryID, embedding, result.GetText(), servingPolicyVersion); err != nil {
 		return "", err
 	}
 	return entryID, nil
+}
+
+func answerOnMiss(ctx context.Context, tenant, modelVersion, question string, embedding []float64) (Answered, error) {
+	result, err := answerOnce(ctx, tenant, modelVersion, question)
+	if err != nil {
+		return Answered{}, err
+	}
+	entryID, err := writeBack(ctx, tenant, modelVersion, embedding, result)
+	if err != nil {
+		return Answered{}, err
+	}
+	return Answered{Answer: result.GetText(), EntryID: entryID, Cached: entryID != ""}, nil
 }
 `,
     },
     scala: {
       starter: `import java.util.UUID
 
-import io.grpc.StatusRuntimeException
+import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+import semcache.model.{AnswerRequest, AnswerResult, ModelGrpc}
 
-import answer.AnswerServiceGrpc
-import answer.AnswerOuterClass.{AnswerRequest, AnswerResult}
+/** The miss path: ask the model, store the reply. */
+object Client {
+  val MaxAttempts = 3
+  val ServingPolicyVersion = "2024-06-1"
 
-final case class CacheEntry(answer: String)
+  private val channel = ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build()
+  private val stub = ModelGrpc.blockingStub(channel)
 
-trait EntryStore {
-  def put(key: String, entry: CacheEntry): Unit
-}
+  /** The model declined the question: terminal, and cached for nobody. */
+  class RefusalError(text: String) extends RuntimeException(s"the model refused: $text")
 
-object AnswerClient {
-  def answerOnce(stub: AnswerServiceGrpc.AnswerServiceBlockingStub, question: String): AnswerResult = {
-    // TODO: this starter calls the model with no deadline, retries three times — the refusal
-    // included — and writes every reply: a refusal or a tool-dependent answer becomes the answer
-    // for the next near-duplicate, and no policy version is stamped on the entry. Fix all of it.
-    var reply: Option[AnswerResult] = None
+  /** What the miss path hands back to the request. */
+  case class Answered(answer: String, entryId: Option[String], cached: Boolean)
+
+  /** The model's reply, asking again when the call fails or the model refuses. */
+  def answerOnce(tenant: String, modelVersion: String, question: String): AnswerResult = {
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    val request = AnswerRequest(tenant = tenant, modelVersion = modelVersion, question = question)
+    var last: Either[StatusRuntimeException, AnswerResult] = Left(null)
     var attempt = 0
-    while (attempt < 3) {
+    while (attempt < MaxAttempts) {
       attempt += 1
       try {
-        val got = stub.answer(AnswerRequest(question = question))
-        reply = Some(got)
-        if (!got.refused) return got
+        val result = stub.answer(request)
+        if (!result.refused) return result
+        last = Right(result)
       } catch {
-        case _: StatusRuntimeException => ()
+        case e: StatusRuntimeException => last = Left(e)
       }
     }
-    reply.getOrElse(throw new RuntimeException("model unavailable"))
+    last match {
+      case Right(result) => result
+      case Left(e)       => throw e
+    }
   }
 
-  def writeBack(store: EntryStore, tenant: String, modelVersion: String, result: AnswerResult): String = {
+  def writeBack(tenant: String, modelVersion: String, embedding: Seq[Double], result: AnswerResult): String = {
     val entryId = UUID.randomUUID().toString
-    store.put(s"entry:$tenant:$modelVersion:$entryId", CacheEntry(answer = result.text))
+    State.putEntry(tenant, modelVersion, entryId, embedding, result.text, modelVersion)
     entryId
+  }
+
+  def answerOnMiss(tenant: String, modelVersion: String, question: String, embedding: Seq[Double]): Answered = {
+    val result = answerOnce(tenant, modelVersion, question)
+    val entryId = writeBack(tenant, modelVersion, embedding, result)
+    Answered(result.text, Some(entryId), cached = true)
   }
 }
 `,
       solution: `import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-import answer.AnswerServiceGrpc
-import answer.AnswerOuterClass.{AnswerRequest, AnswerResult}
+import io.grpc.ManagedChannelBuilder
+import semcache.model.{AnswerRequest, AnswerResult, ModelGrpc}
 
-final case class CacheEntry(answer: String, policy_version: String)
-
-trait EntryStore {
-  def put(key: String, entry: CacheEntry): Unit
-}
-
-object AnswerClient {
+/** The miss path: one model call under a deadline, and the gate on what may be written back. */
+object Client {
   val ModelDeadlineSeconds = 4L
   val ServingPolicyVersion = "2024-06-1"
 
-  class RefusalError(reason: String) extends RuntimeException(reason)
+  private val channel = ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build()
+  private val stub = ModelGrpc.blockingStub(channel)
 
-  def answerOnce(stub: AnswerServiceGrpc.AnswerServiceBlockingStub, question: String): AnswerResult = {
-    val reply = stub.withDeadlineAfter(ModelDeadlineSeconds, TimeUnit.SECONDS).answer(AnswerRequest(question = question))
-    if (reply.refused) throw new RefusalError(reply.refusalReason)
-    reply
+  /** The model declined the question: terminal, and cached for nobody. */
+  class RefusalError(text: String) extends RuntimeException(s"the model refused: $text")
+
+  /** What the miss path hands back to the request. */
+  case class Answered(answer: String, entryId: Option[String], cached: Boolean)
+
+  /** Exactly one Answer call under the deadline; a refusal throws. */
+  def answerOnce(tenant: String, modelVersion: String, question: String): AnswerResult = {
+    val request = AnswerRequest(tenant = tenant, modelVersion = modelVersion, question = question)
+    val result = stub.withDeadlineAfter(ModelDeadlineSeconds, TimeUnit.SECONDS).answer(request)
+    if (result.refused) throw new RefusalError(result.text)
+    result
   }
 
   def isCacheable(result: AnswerResult): Boolean =
-    if (result.refused || result.toolCalls.nonEmpty) false
-    else result.selfContained && result.deterministic && result.getPolicy.cacheable
+    result.toolCalls.isEmpty && result.selfContained && result.deterministic && result.policy.exists(_.cacheable)
 
-  def writeBack(store: EntryStore, tenant: String, modelVersion: String, result: AnswerResult): Option[String] =
+  /** The new entry's id, or None when the reply may not be reused. */
+  def writeBack(tenant: String, modelVersion: String, embedding: Seq[Double], result: AnswerResult): Option[String] =
     if (!isCacheable(result)) None
     else {
       val entryId = UUID.randomUUID().toString
-      store.put(
-        s"entry:$tenant:$modelVersion:$entryId",
-        CacheEntry(answer = result.text, policy_version = ServingPolicyVersion)
-      )
+      State.putEntry(tenant, modelVersion, entryId, embedding, result.text, ServingPolicyVersion)
       Some(entryId)
     }
+
+  def answerOnMiss(tenant: String, modelVersion: String, question: String, embedding: Seq[Double]): Answered = {
+    val result = answerOnce(tenant, modelVersion, question)
+    val entryId = writeBack(tenant, modelVersion, embedding, result)
+    Answered(result.text, entryId, cached = entryId.isDefined)
+  }
 }
 `,
     },
     cpp: {
-      starter: `#include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
+      starter: `// The miss path: ask the model, store the reply.
+#include <grpcpp/grpcpp.h>
 
-#include <chrono>
-#include <optional>
-#include <string>
-
-#include "answer.grpc.pb.h"
-
-// EntryStore is the cache store this client writes entries into.
-struct EntryStore {
-  void put(const std::string& key, const nlohmann::json& entry);
-};
-
-std::string uuidString();
-
-std::optional<answer::AnswerResult> answerOnce(answer::AnswerService::StubInterface* stub,
-                                               const std::string& question) {
-  // TODO: this starter calls the model with no deadline, retries three times — the refusal
-  // included — and writes every reply: a refusal or a tool-dependent answer becomes the answer
-  // for the next near-duplicate, and no policy version is stamped on the entry. Fix all of it.
-  answer::AnswerRequest request;
-  request.set_question(question);
-  std::optional<answer::AnswerResult> reply;
-  for (int attempt = 0; attempt < 3; ++attempt) {
-    grpc::ClientContext context;
-    answer::AnswerResult got;
-    const grpc::Status status = stub->Answer(&context, request, &got);
-    if (status.ok()) reply = got;
-    if (status.ok() && !got.refused()) break;
-  }
-  return reply;
-}
-
-std::string writeBack(EntryStore& store, const std::string& tenant, const std::string& modelVersion,
-                      const answer::AnswerResult& result) {
-  const std::string entryId = uuidString();
-  store.put("entry:" + tenant + ":" + modelVersion + ":" + entryId,
-            nlohmann::json{{"answer", result.text()}, {"refused", result.refused()}});
-  return entryId;
-}
-`,
-      solution: `#include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
-
-#include <chrono>
-#include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
-#include "answer.grpc.pb.h"
+#include "ids.h"  // std::string new_uuid();
+#include "model.grpc.pb.h"
+#include "state.h"  // put_entry(tenant, model_version, entry_id, embedding, answer, policy_version) (step 2)
 
-constexpr int kModelDeadlineSeconds = 4;
+constexpr int kMaxAttempts = 3;
 const std::string kServingPolicyVersion = "2024-06-1";
 
-// RefusalError means the model declined: terminal for this question, and never cacheable.
+auto channel = grpc::CreateChannel("model:9000", grpc::InsecureChannelCredentials());
+auto stub = semcache::Model::NewStub(channel);
+
+// The model declined the question: terminal, and cached for nobody.
 struct RefusalError : std::runtime_error {
-  explicit RefusalError(const std::string& reason) : std::runtime_error(reason) {}
+  using std::runtime_error::runtime_error;
 };
 
-// EntryStore is the cache store this client writes entries into.
-struct EntryStore {
-  void put(const std::string& key, const nlohmann::json& entry);
+// What the miss path hands back to the request.
+struct Answered {
+  std::string answer;
+  std::string entry_id;  // "" when nothing was cached
+  bool cached;
 };
 
-std::string uuidString();
-
-answer::AnswerResult answerOnce(answer::AnswerService::StubInterface* stub, const std::string& question) {
-  answer::AnswerRequest request;
+// The model's reply, asking again when the call fails or the model refuses.
+semcache::AnswerResult answer_once(const std::string& tenant, const std::string& model_version, const std::string& question) {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  semcache::AnswerRequest request;
+  request.set_tenant(tenant);
+  request.set_model_version(model_version);
   request.set_question(question);
-  grpc::ClientContext context;
-  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kModelDeadlineSeconds));
-  answer::AnswerResult reply;
-  const grpc::Status status = stub->Answer(&context, request, &reply);
-  if (!status.ok()) throw std::runtime_error("model call failed: " + status.error_message());
-  if (reply.refused()) throw RefusalError(reply.refusal_reason());
-  return reply;
+  semcache::AnswerResult result;
+  grpc::Status status;
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
+    grpc::ClientContext ctx;
+    status = stub->Answer(&ctx, request, &result);
+    if (status.ok() && !result.refused()) return result;
+  }
+  if (!status.ok()) throw std::runtime_error("Answer failed: " + status.error_message());
+  return result;
 }
 
-bool isCacheable(const answer::AnswerResult& result) {
-  if (result.refused() || result.tool_calls_size() > 0) return false;
+std::string write_back(const std::string& tenant, const std::string& model_version, const std::vector<double>& embedding,
+                       const semcache::AnswerResult& result) {
+  const std::string entry_id = new_uuid();
+  put_entry(tenant, model_version, entry_id, embedding, result.text(), model_version);
+  return entry_id;
+}
+
+Answered answer_on_miss(const std::string& tenant, const std::string& model_version, const std::string& question,
+                        const std::vector<double>& embedding) {
+  const semcache::AnswerResult result = answer_once(tenant, model_version, question);
+  const std::string entry_id = write_back(tenant, model_version, embedding, result);
+  return Answered{result.text(), entry_id, true};
+}
+`,
+      solution: `// The miss path: one model call under a deadline, and the gate on what may be written back.
+#include <grpcpp/grpcpp.h>
+
+#include <chrono>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "ids.h"  // std::string new_uuid();
+#include "model.grpc.pb.h"
+#include "state.h"  // put_entry(tenant, model_version, entry_id, embedding, answer, policy_version) (step 2)
+
+constexpr std::chrono::seconds kModelDeadline{4};
+const std::string kServingPolicyVersion = "2024-06-1";
+
+auto channel = grpc::CreateChannel("model:9000", grpc::InsecureChannelCredentials());
+auto stub = semcache::Model::NewStub(channel);
+
+// The model declined the question: terminal, and cached for nobody.
+struct RefusalError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// What the miss path hands back to the request.
+struct Answered {
+  std::string answer;
+  std::string entry_id;  // "" when nothing was cached
+  bool cached;
+};
+
+// Exactly one Answer call under the deadline; a refusal throws.
+semcache::AnswerResult answer_once(const std::string& tenant, const std::string& model_version, const std::string& question) {
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + kModelDeadline);
+  semcache::AnswerRequest request;
+  request.set_tenant(tenant);
+  request.set_model_version(model_version);
+  request.set_question(question);
+  semcache::AnswerResult result;
+  const grpc::Status status = stub->Answer(&ctx, request, &result);
+  if (!status.ok()) throw std::runtime_error("Answer failed: " + status.error_message());
+  if (result.refused()) throw RefusalError(result.text());
+  return result;
+}
+
+bool is_cacheable(const semcache::AnswerResult& result) {
+  if (result.tool_calls_size() > 0) return false;  // built from a call made for this question alone
   return result.self_contained() && result.deterministic() && result.policy().cacheable();
 }
 
-std::optional<std::string> writeBack(EntryStore& store, const std::string& tenant, const std::string& modelVersion,
-                                     const answer::AnswerResult& result) {
-  if (!isCacheable(result)) return std::nullopt;
-  const std::string entryId = uuidString();
-  store.put("entry:" + tenant + ":" + modelVersion + ":" + entryId,
-            nlohmann::json{{"answer", result.text()}, {"policy_version", kServingPolicyVersion}});
-  return entryId;
+// The new entry's id, or "" when the reply may not be reused.
+std::string write_back(const std::string& tenant, const std::string& model_version, const std::vector<double>& embedding,
+                       const semcache::AnswerResult& result) {
+  if (!is_cacheable(result)) return "";
+  const std::string entry_id = new_uuid();
+  put_entry(tenant, model_version, entry_id, embedding, result.text(), kServingPolicyVersion);
+  return entry_id;
+}
+
+Answered answer_on_miss(const std::string& tenant, const std::string& model_version, const std::string& question,
+                        const std::vector<double>& embedding) {
+  const semcache::AnswerResult result = answer_once(tenant, model_version, question);
+  const std::string entry_id = write_back(tenant, model_version, embedding, result);
+  return Answered{result.text(), entry_id, !entry_id.empty()};
 }
 `,
     },
   },
-  debrief: `The interviewer is testing the miss path, which a first attempt always gets "working" because the demo's model only ever returns text. The four defects are one idea: a cache entry is a promise about future questions, so only an answer that is self-contained, deterministic and approved by the serving policy may be written — a refusal is a decision about one question, and a tool result is a fragment of one conversation, so both are returned to their own caller and stored for nobody. The 4-second deadline and the single attempt are the other half of the contract: without them one slow or refusing model turns a single miss into three calls and an unbounded wait. Real clients add jittered backoff one layer above, shadow traffic that compares cached answers against fresh ones before the cache is trusted, and a policy version on every entry so a policy change can invalidate what the old policy approved.`,
+  harness: {
+    python: `import grpc
+
+import model_pb2
+import model_pb2_grpc
+
+MV = "2024-06"
+V = [1.0, 0.0, 0.0, 0.0]
+QUESTION = "What is the refund window?"
+
+
+class FakeModel(model_pb2_grpc.ModelServicer):
+    """Answers every question; a prefix picks the reply's shape: refuse:, tool:, sample:, partial:, nocache:."""
+
+    def Answer(self, request, context):
+        q = request.question
+        result = model_pb2.AnswerResult(
+            text=f"Answer to: {q}",
+            refused=q.startswith("refuse:"),
+            self_contained=not q.startswith("partial:"),
+            deterministic=not q.startswith("sample:"),
+            policy=model_pb2.Policy(cacheable=not q.startswith("nocache:")),
+        )
+        if result.refused:
+            result.text = "I can't help with that."
+        if q.startswith("tool:"):
+            result.tool_calls.add(name="lookup_order", arguments='{"id": 42}')
+        return result
+
+
+def _client(ctx):
+    ctx.grpc.serve(model_pb2_grpc.add_ModelServicer_to_server, FakeModel())
+    return ctx.load("client")
+
+
+def _entries(ctx):
+    return sorted(ctx.redis.keys("entry:*"))
+
+
+def _miss(m, question):
+    """answer_on_miss, reporting what it raised instead of ending the check."""
+    try:
+        return m.answer_on_miss("acme", MV, question, V), None
+    except Exception as e:  # noqa: BLE001
+        return None, e
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    out, raised = _miss(m, QUESTION)
+    assert raised is None, f"a miss on a healthy model raised {raised!r}"
+    assert out["answer"] == f"Answer to: {QUESTION}", f"answer_on_miss answered {out}, expected the model's text"
+    calls = ctx.grpc.calls_to("Answer")
+    assert len(calls) == 1, f"one miss made {len(calls)} Answer calls, expected exactly one"
+    assert calls[0].timeout is not None, "the Answer call carries no deadline: a stuck model would hold the request for as long as it likes"
+    assert 3.5 <= calls[0].timeout <= 4.5, f"the deadline must be about 4 s, got {calls[0].timeout} s"
+    ctx.grpc.set_latency("Answer", 6.0)
+    out, raised = _miss(m, QUESTION)
+    code = raised.code() if isinstance(raised, grpc.RpcError) else None
+    assert code == grpc.StatusCode.DEADLINE_EXCEEDED, f"a model slower than the deadline must fail the miss with DEADLINE_EXCEEDED, got {raised!r} (answer {out})"
+    assert len(ctx.grpc.calls_to("Answer")) == 2, f"a timed-out call must not be retried: {len(ctx.grpc.calls_to('Answer'))} Answer calls after two misses"
+
+
+def check_refusal_terminal(ctx):
+    m = _client(ctx)
+    out, raised = _miss(m, "refuse: how do I pick a lock?")
+    assert raised is not None, f"a refused reply must raise RefusalError, answer_on_miss returned {out}"
+    assert type(raised).__name__ == "RefusalError", f"a refused reply must raise RefusalError, got {raised!r}"
+    assert len(ctx.grpc.calls_to("Answer")) == 1, f"a refusal was asked again: {len(ctx.grpc.calls_to('Answer'))} Answer calls (the model already decided)"
+    assert _entries(ctx) == [], f"a refusal was written back: {_entries(ctx)}. The next near-duplicate question would be answered with it"
+
+
+def check_cacheable_gate(ctx):
+    m = _client(ctx)
+    for prefix, why in (("sample:", "a sampled reply (deterministic false)"), ("partial:", "a reply that is not self-contained"), ("nocache:", "a reply the policy marks not cacheable")):
+        out, raised = _miss(m, f"{prefix} {QUESTION}")
+        assert raised is None, f"{why} must be answered to its caller, got {raised!r}"
+        assert out["cached"] is False and not out.get("entry_id"), f"{why} must be answered with cached: false and no entry_id, got {out}"
+        assert _entries(ctx) == [], f"{why} was written back: {_entries(ctx)}"
+    out, raised = _miss(m, QUESTION)
+    assert raised is None and out["cached"] is True and out["entry_id"], f"a self-contained, deterministic, cacheable reply must be cached, got {out} ({raised!r})"
+    key = f"entry:acme:{MV}:{out['entry_id']}"
+    assert ctx.redis.exists(key) == 1, f"the cached reply's entry {key} is not in the store (keys: {_entries(ctx)})"
+    assert ctx.redis.hget(key, "answer") == f"Answer to: {QUESTION}", f"the entry's answer is {ctx.redis.hget(key, 'answer')!r}"
+
+
+def check_no_tool_cache(ctx):
+    m = _client(ctx)
+    out, raised = _miss(m, "tool: where is my order?")
+    assert raised is None, f"a tool-built reply must be answered to its caller, got {raised!r}"
+    assert out["answer"] == "Answer to: tool: where is my order?" and out["cached"] is False, f"a tool-built reply is answered with cached: false, got {out}"
+    assert _entries(ctx) == [], f"a reply built from a tool call was written back: {_entries(ctx)}. The tool ran for this caller's order"
+
+
+def check_policy_version(ctx):
+    m = _client(ctx)
+    out, raised = _miss(m, QUESTION)
+    assert raised is None and out.get("entry_id"), f"a cacheable reply must be cached, got {out} ({raised!r})"
+    key = f"entry:acme:{MV}:{out['entry_id']}"
+    raw = ctx.redis.hgetall(key)
+    assert raw, f"no entry at {key} (keys: {_entries(ctx)})"
+    assert raw.get("policy_version") == "2024-06-1", f"the entry's policy_version is {raw.get('policy_version')!r}, expected the serving policy version 2024-06-1 (the model version is {MV})"
+    assert key in ctx.redis.smembers(f"semantic:acme:{MV}"), "the entry must be listed in the tenant's index"
+`,
+    typescript: `const MV = '2024-06';
+const V = [1, 0, 0, 0];
+const QUESTION = 'What is the refund window?';
+
+/** The model: answers every question; a prefix picks the reply's shape: refuse:, tool:, sample:, partial:, nocache:. */
+function client(ctx) {
+  const pkg = ctx.proto('model.proto');
+  ctx.grpc.serve(pkg.semcache.Model.service, {
+    Answer(call, callback) {
+      const q: string = call.request.question;
+      const refused = q.startsWith('refuse:');
+      callback(null, {
+        text: refused ? "I can't help with that." : \`Answer to: \${q}\`,
+        refused,
+        self_contained: !q.startsWith('partial:'),
+        deterministic: !q.startsWith('sample:'),
+        policy: {cacheable: !q.startsWith('nocache:')},
+        tool_calls: q.startsWith('tool:') ? [{name: 'lookup_order', arguments: '{"id": 42}'}] : [],
+      });
+    },
+  });
+  return ctx.load('client');
+}
+
+const entries = ctx => ctx.redis.keys('entry:*').sort();
+
+/** answerOnMiss, reporting what it threw instead of ending the check. */
+async function miss(m, question: string): Promise<{out; raised: unknown}> {
+  try {
+    return {out: await m.answerOnMiss('acme', MV, question, V), raised: null};
+  } catch (e) {
+    return {out: null, raised: e};
+  }
+}
+
+export async function check_deadline(ctx) {
+  const m = client(ctx);
+  let {out, raised} = await miss(m, QUESTION);
+  assert.equal(raised, null, \`a miss on a healthy model threw \${raised}\`);
+  assert.equal(out.answer, \`Answer to: \${QUESTION}\`, \`answerOnMiss answered \${JSON.stringify(out)}, expected the model's text\`);
+  const calls = ctx.grpc.callsTo('Answer');
+  assert.equal(calls.length, 1, \`one miss made \${calls.length} Answer calls, expected exactly one\`);
+  assert(calls[0].timeout !== null, 'the Answer call carries no deadline: a stuck model would hold the request for as long as it likes');
+  assert(3.5 <= calls[0].timeout && calls[0].timeout <= 4.5, \`the deadline must be about 4 s, got \${calls[0].timeout} s\`);
+  ctx.grpc.setLatency('Answer', 6.0);
+  ({out, raised} = await miss(m, QUESTION));
+  const code = (raised as {code?: number} | null)?.code ?? null;
+  assert.equal(code, ctx.grpc.status.DEADLINE_EXCEEDED, \`a model slower than the deadline must fail the miss with DEADLINE_EXCEEDED, got \${raised} (answer \${JSON.stringify(out)})\`);
+  assert.equal(ctx.grpc.callsTo('Answer').length, 2, \`a timed-out call must not be retried: \${ctx.grpc.callsTo('Answer').length} Answer calls after two misses\`);
+}
+
+export async function check_refusal_terminal(ctx) {
+  const m = client(ctx);
+  const {out, raised} = await miss(m, 'refuse: how do I pick a lock?');
+  assert(raised !== null, \`a refused reply must throw RefusalError, answerOnMiss returned \${JSON.stringify(out)}\`);
+  assert.equal((raised as Error).constructor.name, 'RefusalError', \`a refused reply must throw RefusalError, got \${raised}\`);
+  assert.equal(ctx.grpc.callsTo('Answer').length, 1, \`a refusal was asked again: \${ctx.grpc.callsTo('Answer').length} Answer calls (the model already decided)\`);
+  assert.deepEqual(entries(ctx), [], \`a refusal was written back: \${JSON.stringify(entries(ctx))}. The next near-duplicate question would be answered with it\`);
+}
+
+export async function check_cacheable_gate(ctx) {
+  const m = client(ctx);
+  for (const [prefix, why] of [['sample:', 'a sampled reply (deterministic false)'], ['partial:', 'a reply that is not self-contained'], ['nocache:', 'a reply the policy marks not cacheable']]) {
+    const {out, raised} = await miss(m, \`\${prefix} \${QUESTION}\`);
+    assert.equal(raised, null, \`\${why} must be answered to its caller, got \${raised}\`);
+    assert(out.cached === false && !out.entry_id, \`\${why} must be answered with cached: false and no entry_id, got \${JSON.stringify(out)}\`);
+    assert.deepEqual(entries(ctx), [], \`\${why} was written back: \${JSON.stringify(entries(ctx))}\`);
+  }
+  const {out, raised} = await miss(m, QUESTION);
+  assert(raised === null && out.cached === true && out.entry_id, \`a self-contained, deterministic, cacheable reply must be cached, got \${JSON.stringify(out)} (\${raised})\`);
+  const key = \`entry:acme:\${MV}:\${out.entry_id}\`;
+  assert.equal(ctx.redis.exists(key), 1, \`the cached reply's entry \${key} is not in the store (keys: \${JSON.stringify(entries(ctx))})\`);
+  assert.equal(ctx.redis.hget(key, 'answer'), \`Answer to: \${QUESTION}\`, \`the entry's answer is \${JSON.stringify(ctx.redis.hget(key, 'answer'))}\`);
+}
+
+export async function check_no_tool_cache(ctx) {
+  const m = client(ctx);
+  const {out, raised} = await miss(m, 'tool: where is my order?');
+  assert.equal(raised, null, \`a tool-built reply must be answered to its caller, got \${raised}\`);
+  assert(out.answer === 'Answer to: tool: where is my order?' && out.cached === false, \`a tool-built reply is answered with cached: false, got \${JSON.stringify(out)}\`);
+  assert.deepEqual(entries(ctx), [], \`a reply built from a tool call was written back: \${JSON.stringify(entries(ctx))}. The tool ran for this caller's order\`);
+}
+
+export async function check_policy_version(ctx) {
+  const m = client(ctx);
+  const {out, raised} = await miss(m, QUESTION);
+  assert(raised === null && out.entry_id, \`a cacheable reply must be cached, got \${JSON.stringify(out)} (\${raised})\`);
+  const key = \`entry:acme:\${MV}:\${out.entry_id}\`;
+  const raw = ctx.redis.hgetall(key);
+  assert(Object.keys(raw).length > 0, \`no entry at \${key} (keys: \${JSON.stringify(entries(ctx))})\`);
+  assert.equal(raw.policy_version, '2024-06-1', \`the entry's policy_version is \${JSON.stringify(raw.policy_version)}, expected the serving policy version 2024-06-1 (the model version is \${MV})\`);
+  assert(ctx.redis.smembers(\`semantic:acme:\${MV}\`).includes(key), "the entry must be listed in the tenant's index");
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"leetbuild/harness"
+
+	pb "semcache/gen/model"
+)
+
+const (
+	clientMV       = "2024-06"
+	clientQuestion = "What is the refund window?"
+)
+
+var clientV = []float64{1, 0, 0, 0}
+
+// modelPeer answers every question; a prefix picks the reply's shape: refuse:, tool:, sample:, partial:, nocache:.
+type modelPeer struct {
+	pb.UnimplementedModelServer
+}
+
+func (modelPeer) Answer(_ context.Context, req *pb.AnswerRequest) (*pb.AnswerResult, error) {
+	q := req.GetQuestion()
+	result := &pb.AnswerResult{
+		Text:          "Answer to: " + q,
+		Refused:       strings.HasPrefix(q, "refuse:"),
+		SelfContained: !strings.HasPrefix(q, "partial:"),
+		Deterministic: !strings.HasPrefix(q, "sample:"),
+		Policy:        &pb.Policy{Cacheable: !strings.HasPrefix(q, "nocache:")},
+	}
+	if result.Refused {
+		result.Text = "I can't help with that."
+	}
+	if strings.HasPrefix(q, "tool:") {
+		result.ToolCalls = []*pb.ToolCall{{Name: "lookup_order", Arguments: "{\\"id\\": 42}"}}
+	}
+	return result, nil
+}
+
+// clientWorld serves the model and stands in for the store (step 2): putEntry writes the entry as the store does.
+func clientWorld(ctx *harness.Ctx) {
+	pb.RegisterModelServer(ctx.GRPC.Server(""), &modelPeer{})
+	putEntry = func(_ context.Context, tenant, modelVersion, entryID string, embedding []float64, answer, policyVersion string) error {
+		key := fmt.Sprintf("entry:%s:%s:%s", tenant, modelVersion, entryID)
+		now := float64(ctx.Clock.Now()) / 1000
+		vec, _ := json.Marshal(embedding)
+		ctx.Redis.Do("HSET", key, "embedding", string(vec), "answer", answer, "created_at", now, "expires_at", now+86400, "policy_version", policyVersion)
+		ctx.Redis.Do("EXPIRE", key, 86400)
+		ctx.Redis.Do("SADD", fmt.Sprintf("semantic:%s:%s", tenant, modelVersion), key)
+		return nil
+	}
+}
+
+func clientEntries(ctx *harness.Ctx) []string { return ctx.Redis.Keys("entry:*") }
+
+// clientMiss is answerOnMiss, reporting a panic as an error instead of ending the check.
+func clientMiss(question string) (out Answered, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = errors.New("panic: " + harness.Show(e))
+		}
+	}()
+	return answerOnMiss(context.Background(), "acme", clientMV, question, clientV)
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	out, err := clientMiss(clientQuestion)
+	ctx.NoError(err, "a miss on a healthy model")
+	ctx.Equal(out.Answer, "Answer to: "+clientQuestion, "answerOnMiss must answer the model's text")
+	calls := ctx.GRPC.CallsTo("Answer", "")
+	ctx.Equal(len(calls), 1, "one miss must make exactly one Answer call; the calls")
+	ctx.Assert(calls[0].HasDeadline(), "the Answer call carries no deadline: a stuck model would hold the request for as long as it likes")
+	ctx.Assert(3500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 4500*time.Millisecond, "the deadline must be about 4 s, got %v", calls[0].Timeout)
+	ctx.GRPC.SetLatency("Answer", 6.0, "")
+	out, err = clientMiss(clientQuestion)
+	ctx.Assert(status.Code(err) == codes.DeadlineExceeded, "a model slower than the deadline must fail the miss with DeadlineExceeded, got %v (answer %v)", err, out)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Answer", "")), 2, "a timed-out call must not be retried; Answer calls after two misses")
+}
+
+func CheckRefusalTerminal(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	out, err := clientMiss("refuse: how do I pick a lock?")
+	ctx.Assert(err != nil, "a refused reply must fail with a RefusalError, answerOnMiss returned %v", out)
+	var refusal *RefusalError
+	ctx.Assert(errors.As(err, &refusal), "a refused reply must fail with a *RefusalError, got %v", err)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Answer", "")), 1, "a refusal was asked again (the model already decided); Answer calls")
+	ctx.Equal(len(clientEntries(ctx)), 0, "a refusal was written back (%v): the next near-duplicate question would be answered with it; entries", clientEntries(ctx))
+}
+
+func CheckCacheableGate(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	for _, c := range []struct{ prefix, why string }{
+		{"sample:", "a sampled reply (deterministic false)"},
+		{"partial:", "a reply that is not self-contained"},
+		{"nocache:", "a reply the policy marks not cacheable"},
+	} {
+		out, err := clientMiss(c.prefix + " " + clientQuestion)
+		ctx.NoError(err, "%s must be answered to its caller", c.why)
+		ctx.Assert(!out.Cached && out.EntryID == "", "%s must be answered with Cached false and no EntryID, got %v", c.why, out)
+		ctx.Equal(len(clientEntries(ctx)), 0, "%s was written back (%v); entries", c.why, clientEntries(ctx))
+	}
+	out, err := clientMiss(clientQuestion)
+	ctx.NoError(err, "a cacheable reply")
+	ctx.Assert(out.Cached && out.EntryID != "", "a self-contained, deterministic, cacheable reply must be cached, got %v", out)
+	key := fmt.Sprintf("entry:acme:%s:%s", clientMV, out.EntryID)
+	ctx.Equal(ctx.Redis.Exists(key), 1, "the cached reply's entry %s must be in the store (keys: %v); EXISTS", key, clientEntries(ctx))
+	answer, _ := ctx.Redis.HGet(key, "answer")
+	ctx.Equal(answer, "Answer to: "+clientQuestion, "the entry's answer")
+}
+
+func CheckNoToolCache(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	out, err := clientMiss("tool: where is my order?")
+	ctx.NoError(err, "a tool-built reply must be answered to its caller")
+	ctx.Assert(out.Answer == "Answer to: tool: where is my order?" && !out.Cached, "a tool-built reply is answered with Cached false, got %v", out)
+	ctx.Equal(len(clientEntries(ctx)), 0, "a reply built from a tool call was written back (%v): the tool ran for this caller's order; entries", clientEntries(ctx))
+}
+
+func CheckPolicyVersion(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	out, err := clientMiss(clientQuestion)
+	ctx.NoError(err, "a cacheable reply")
+	ctx.Assert(out.EntryID != "", "a cacheable reply must be cached, got %v", out)
+	key := fmt.Sprintf("entry:acme:%s:%s", clientMV, out.EntryID)
+	raw := ctx.Redis.HGetAll(key)
+	ctx.Assert(len(raw) > 0, "no entry at %s (keys: %v)", key, clientEntries(ctx))
+	ctx.Equal(raw["policy_version"], "2024-06-1", "the entry's policy_version must be the serving policy version (the model version is %s)", clientMV)
+	ctx.Assert(ctx.Redis.SIsMember("semantic:acme:"+clientMV, key), "the entry must be listed in the tenant's index")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <exception>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kMV = "2024-06";
+const std::string kQuestion = "What is the refund window?";
+const std::vector<double> kV = {1, 0, 0, 0};
+
+harness::Ctx* world = nullptr;
+
+// The model: answers every question; a prefix picks the reply's shape: refuse:, tool:, sample:, partial:, nocache:.
+class ModelPeer final : public semcache::Model::Service {
+ public:
+  grpc::Status Answer(grpc::ServerContext*, const semcache::AnswerRequest* req, semcache::AnswerResult* result) override {
+    const std::string q = req->question();
+    const bool refused = q.rfind("refuse:", 0) == 0;
+    result->set_text(refused ? "I can't help with that." : "Answer to: " + q);
+    result->set_refused(refused);
+    result->set_self_contained(q.rfind("partial:", 0) != 0);
+    result->set_deterministic(q.rfind("sample:", 0) != 0);
+    result->mutable_policy()->set_cacheable(q.rfind("nocache:", 0) != 0);
+    if (q.rfind("tool:", 0) == 0) {
+      auto* call = result->add_tool_calls();
+      call->set_name("lookup_order");
+      call->set_arguments("{\\"id\\": 42}");
+    }
+    return grpc::Status::OK;
+  }
+};
+
+void clientWorld(harness::Ctx& ctx) {
+  static ModelPeer* peer = nullptr;
+  delete peer;
+  peer = new ModelPeer;
+  world = &ctx;
+  ctx.GRPC.Server("")->RegisterService(peer);
+}
+
+std::vector<std::string> clientEntries(harness::Ctx& ctx) { return ctx.Redis.Keys("entry:*"); }
+
+struct Missed {
+  std::optional<Answered> out;
+  std::string raised;  // the exception's type name, "" when none
+  std::string message;
+};
+
+// answer_on_miss, reporting what it threw instead of ending the check.
+Missed clientMiss(const std::string& question) {
+  try {
+    return Missed{answer_on_miss("acme", kMV, question, kV), "", ""};
+  } catch (const RefusalError& e) {
+    return Missed{std::nullopt, "RefusalError", e.what()};
+  } catch (const std::exception& e) {
+    return Missed{std::nullopt, "exception", e.what()};
+  }
+}
+
+std::string show(const std::optional<Answered>& a) {
+  if (!a) return "<nil>";
+  return "{answer=" + harness::Quote(a->answer) + " entry_id=" + a->entry_id + " cached=" + (a->cached ? "true" : "false") + "}";
+}
+
+}  // namespace
+
+// The stand-in for the store (step 2): put_entry writes the entry as the store does.
+void put_entry(const std::string& tenant, const std::string& model_version, const std::string& entry_id,
+               const std::vector<double>& embedding, const std::string& answer, const std::string& policy_version) {
+  const std::string key = "entry:" + tenant + ":" + model_version + ":" + entry_id;
+  const double now = static_cast<double>(world->Clock.Now()) / 1000;
+  world->Redis.Do("HSET", key, "embedding", nlohmann::json(embedding).dump(), "answer", answer, "created_at", harness::Value(now),
+                  "expires_at", harness::Value(now + 86400), "policy_version", policy_version);
+  world->Redis.Do("EXPIRE", key, 86400);
+  world->Redis.Do("SADD", "semantic:" + tenant + ":" + model_version, key);
+}
+
+void CheckDeadline(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  auto m = clientMiss(kQuestion);
+  ctx.Equal(m.raised, "", "a miss on a healthy model threw (%s);", m.message);
+  ctx.Equal(m.out->answer, "Answer to: " + kQuestion, "answer_on_miss must answer the model's text");
+  const auto calls = ctx.GRPC.CallsTo("Answer");
+  ctx.Equal(calls.size(), 1, "one miss must make exactly one Answer call; the calls");
+  ctx.Assert(calls[0].HasDeadline(), "the Answer call carries no deadline: a stuck model would hold the request for as long as it likes");
+  ctx.Assert(3.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 4.5, "the deadline must be about 4 s, got %vs",
+             calls[0].TimeoutSeconds());
+  ctx.GRPC.SetLatency("Answer", 6.0);
+  m = clientMiss(kQuestion);
+  const auto after = ctx.GRPC.CallsTo("Answer");
+  ctx.Assert(!m.raised.empty() && after.back().Code == grpc::StatusCode::DEADLINE_EXCEEDED,
+             "a model slower than the deadline must fail the miss with DEADLINE_EXCEEDED, got %s (%s, answer %s)", m.raised, m.message,
+             show(m.out));
+  ctx.Equal(after.size(), 2, "a timed-out call must not be retried; Answer calls after two misses");
+}
+
+void CheckRefusalTerminal(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  const auto m = clientMiss("refuse: how do I pick a lock?");
+  ctx.Assert(!m.raised.empty(), "a refused reply must throw RefusalError, answer_on_miss returned %s", show(m.out));
+  ctx.Equal(m.raised, "RefusalError", "a refused reply must throw RefusalError (%s); it threw", m.message);
+  ctx.Equal(ctx.GRPC.CallsTo("Answer").size(), 1, "a refusal was asked again (the model already decided); Answer calls");
+  ctx.Equal(clientEntries(ctx).size(), 0, "a refusal was written back (%v): the next near-duplicate question would be answered with it; entries",
+            clientEntries(ctx));
+}
+
+void CheckCacheableGate(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"sample:", "a sampled reply (deterministic false)"},
+      {"partial:", "a reply that is not self-contained"},
+      {"nocache:", "a reply the policy marks not cacheable"}};
+  for (const auto& [prefix, why] : cases) {
+    const auto m = clientMiss(prefix + " " + kQuestion);
+    ctx.Equal(m.raised, "", "%s must be answered to its caller (%s); it threw", why, m.message);
+    ctx.Assert(!m.out->cached && m.out->entry_id.empty(), "%s must be answered with cached false and no entry_id, got %s", why, show(m.out));
+    ctx.Equal(clientEntries(ctx).size(), 0, "%s was written back (%v); entries", why, clientEntries(ctx));
+  }
+  const auto m = clientMiss(kQuestion);
+  ctx.Equal(m.raised, "", "a cacheable reply threw (%s);", m.message);
+  ctx.Assert(m.out->cached && !m.out->entry_id.empty(), "a self-contained, deterministic, cacheable reply must be cached, got %s", show(m.out));
+  const std::string key = "entry:acme:" + kMV + ":" + m.out->entry_id;
+  ctx.Equal(ctx.Redis.Exists(key), 1, "the cached reply's entry %s must be in the store (keys: %v); EXISTS", key, clientEntries(ctx));
+  ctx.Equal(ctx.Redis.HGet(key, "answer"), "Answer to: " + kQuestion, "the entry's answer");
+}
+
+void CheckNoToolCache(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  const auto m = clientMiss("tool: where is my order?");
+  ctx.Equal(m.raised, "", "a tool-built reply must be answered to its caller (%s); it threw", m.message);
+  ctx.Assert(m.out->answer == "Answer to: tool: where is my order?" && !m.out->cached, "a tool-built reply is answered with cached false, got %s",
+             show(m.out));
+  ctx.Equal(clientEntries(ctx).size(), 0, "a reply built from a tool call was written back (%v): the tool ran for this caller's order; entries",
+            clientEntries(ctx));
+}
+
+void CheckPolicyVersion(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  const auto m = clientMiss(kQuestion);
+  ctx.Equal(m.raised, "", "a cacheable reply threw (%s);", m.message);
+  ctx.Assert(!m.out->entry_id.empty(), "a cacheable reply must be cached, got %s", show(m.out));
+  const std::string key = "entry:acme:" + kMV + ":" + m.out->entry_id;
+  const auto raw = ctx.Redis.HGetAll(key);
+  ctx.Assert(!raw.empty(), "no entry at %s (keys: %v)", key, clientEntries(ctx));
+  ctx.Equal(raw.count("policy_version") ? raw.at("policy_version") : "", "2024-06-1",
+            "the entry's policy_version must be the serving policy version (the model version is %s)", kMV);
+  ctx.Assert(ctx.Redis.SIsMember("semantic:acme:" + kMV, key), "the entry must be listed in the tenant's index");
+}
+`,
+  },
+  debrief: `The deadline is on the call and there is no loop around it because a miss is already the slow path: a request that waited four seconds for the model should fail to its caller, who owns the retry budget, rather than wait twelve. A refusal is terminal for the same reason a 403 is: the model decided, and asking again spends money to hear it again. The gate exists because an entry is a promise that the stored text answers every question within 0.82 of this one; a sampled reply, a partial one or a tool result keep that promise for nobody. The policy version on the entry is what makes a policy change actionable later. A production client also hedges a second call at the tail, sends the serving policy with the request, and records the model's token usage per tenant.`,
 };

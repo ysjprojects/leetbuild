@@ -2,231 +2,158 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/placements: a request the scheduler can actually satisfy',
+  title: 'POST /v1/placements: admit, pick a node, book it',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'scheduler', 'registry', 'redis'],
+  focus: ['client', 'scheduler', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers \`POST /v1/placements\`,
-parses the body and answers with a node. It compiles, it places the demo job, and it hides four
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/placements\`, picks the node with the most
+free GPUs of the requested type from a node set it read once, when the service started serving,
+books it through the ledger's \`allocate\` and answers \`201\`. It serves the demo and hides four
+flaws.
 
-Implement \`POST /v1/placements\` with body
-\`{"gpu_type": "a100", "count": 4, "memory_gb": 80, "max_hourly_bid": 3.5}\`.
+**Failure mode the checks target.** A typo in \`gpu_type\` lands on whatever node is free; a count
+no node could ever hold goes to the ledger instead of being refused; a node that filled up or joined
+after boot is invisible, so the scheduler offers GPUs it no longer has and ignores ones it does; the
+log line carries the tenant's bid.
 
-- \`gpu_type\` must be one of the known types — \`a100\`, \`h100\`, \`l40s\` — and anything else is
-  **400**. The starter treats an unlisted type as *whatever is free*, so a typo silently lands a job on
-  an arbitrary node instead of failing the caller.
-- \`count\` must be a positive integer (**400** otherwise) and must not exceed the largest node's
-  capacity — the constant is \`MAX_NODE_GPUS\` (**8** here). A request no node can ever satisfy is
-  rejected **before** the placement is queued: queueing it first leaves work that can never start.
-- \`memory_gb\` and \`max_hourly_bid\` must be numbers (**400** otherwise).
-- Capacity is read from the node registry **once per request** (\`node_registry.list_nodes()\`) and the
-  read carries a \`capacity_as_of\` timestamp. A snapshot older than \`CAPACITY_TTL_S\` is marked stale
-  (**503 \`STALE_CAPACITY\`**) instead of being trusted. The starter schedules against \`BOOT_CAPACITY\`,
-  the snapshot loaded while the process booted, so a node that filled up an hour ago still looks empty.
-- The placement decision is logged with the placement id, the node id and the counters
-  (\`count\`, \`free\`) — never with the request body. A GPU request carries tenant payloads, and the
-  log pipeline outlives the request.
-- A placed request answers **201** with \`placement_id\`, \`node_id\`, \`free\` and \`capacity_as_of\`;
-  when nothing fits, **409**.
-
-**Failure mode the checks target.** An unlisted type falling back to "whatever is free" turns a
-typo into a placement on a machine that cannot run the job; an uncapped \`count\` queues a request
-that no node can satisfy, so it occupies the queue forever; a boot-time capacity snapshot goes stale
-the moment a node fills up, and the scheduler keeps offering GPUs that are already allocated to
-someone else. The logged request body is the quiet one: it ships tenant content, memory footprints
-and bids into the log pipeline on every placement.`,
+- Body: \`{"gpu_type", "count", "memory_gb", "max_hourly_bid"}\`. \`gpu_type\` must be in
+  \`KNOWN_GPU_TYPES\`, \`count\` an integer from 1 to \`MAX_NODE_GPUS\`, the other two numbers;
+  anything else is **400**, before any node is read.
+- Read \`nodes\` and each \`node:{id}\` from Redis on every request; a node counts only while
+  \`heartbeat:{id}\` exists. Try candidates of the type by free GPUs, most first, through
+  \`allocate(node_id, placement_id, count)\`; the first \`ALLOCATED\` wins.
+- **201** with \`placement_id\`, \`node_id\` and \`free\` (after the booking); **409** when no node
+  takes it.
+- Log the decision with the placement id, the node id and the counts; the request body stays out
+  of the log.`,
   sequence: {
-    participants: ['Client', 'GPU Scheduler', 'node registry'],
+    participants: ['Client', 'gpusched', 'Redis'],
     messages: [
+      {from: 'Client', to: 'gpusched', label: 'POST /v1/placements {a100, 4, 80, 3.5}', kind: 'sync'},
+      {from: 'gpusched', to: 'gpusched', label: 'validate: known type · 1 ≤ count ≤ 8 · numbers', kind: 'sync'},
       {
-        from: 'Client',
-        to: 'GPU Scheduler',
-        label: 'POST /v1/placements · {gpu_type, count, memory_gb, max_hourly_bid}',
+        from: 'gpusched',
+        to: 'Redis',
+        label: 'SMEMBERS nodes · HGETALL node:{id} · EXISTS heartbeat:{id}',
         kind: 'sync',
       },
-      {
-        from: 'GPU Scheduler',
-        to: 'GPU Scheduler',
-        label: 'validate: known gpu_type · count ≥ 1 · count ≤ MAX_NODE_GPUS',
-        kind: 'sync',
-      },
-      {
-        from: 'GPU Scheduler',
-        to: 'node registry',
-        label: 'list_nodes() · fresh capacity + capacity_as_of',
-        kind: 'sync',
-      },
-      {from: 'node registry', to: 'GPU Scheduler', label: '{nodes, capacity_as_of}', kind: 'reply'},
-      {
-        from: 'GPU Scheduler',
-        to: 'GPU Scheduler',
-        label: 'queue placement · log node id + counters, never the body',
-        kind: 'sync',
-      },
-      {
-        from: 'GPU Scheduler',
-        to: 'Client',
-        label: '201 {placement_id, node_id, free} · 400 unknown type / impossible count · 503 stale',
-        kind: 'reply',
-      },
+      {from: 'gpusched', to: 'Redis', label: 'EVAL allocate gpu-2 p-7 4', kind: 'sync'},
+      {from: 'Redis', to: 'gpusched', label: 'ALLOCATED', kind: 'reply'},
+      {from: 'gpusched', to: 'Client', label: '201 {placement_id: p-7, node_id: gpu-2, free: 4}', kind: 'reply'},
+      {from: 'Client', to: 'gpusched', label: 'POST {tpu, 4, …}', kind: 'sync'},
+      {from: 'gpusched', to: 'Client', label: '400 unknown gpu_type', kind: 'reply'},
     ],
   },
   hints: [
-    'Validate the body shape yourself, in cost order, before any registry work: parse the JSON, then `gpu_type`, `count`, `memory_gb`, `max_hourly_bid`. Every failure returns **400** — a count of `0`, `2.5` or `"four"` is never a placement.',
-    'The type whitelist and the capacity ceiling are different guards. `KNOWN_GPU_TYPES` answers "does this GPU type exist at all?" and `MAX_NODE_GPUS` answers "could any node ever hold this many?" Both must run **before** `enqueue`: a queued request that can never start is worse than a rejection, because no one will ever notice it.',
-    "Drop the boot snapshot. Read `node_registry.list_nodes()` on every request and carry its `capacity_as_of` with the decision; when the read is older than `CAPACITY_TTL_S`, answer **503** instead of scheduling from memory. And keep the log line to ids and counters — the request body is the tenant's, and their bid is not yours to retain.",
+    'A request for `gpu_type: "tpu"` answers 201 on an a100 node; `count: 9` answers 409 instead of 400; a node that joined an hour after the scheduler started is never chosen.',
+    'The node list is a module-level constant filled at import time, so every request schedules against the fleet as it was at boot; the body is typed, not checked against the known types or the ceiling.',
+    'Validate the body yourself and answer 400 before touching Redis; read `nodes`, `node:{id}` and `heartbeat:{id}` inside the handler; log `placement_id`, `node_id`, `count` and `free` rather than the body.',
   ],
   checks: [
     {
       id: 'route-shape',
-      title: 'Registers POST /v1/placements and validates the body shape',
+      title: 'POST /v1/placements books a node through the ledger',
       detail:
-        'The route is registered on `POST /v1/placements`, `gpu_type` is checked against the known types, `count` against a positive-integer helper, and `memory_gb` / `max_hourly_bid` against a number helper — each rejection a **400**. The starter accepts any value the JSON parser tolerates, so `count: 0` or a missing bid reaches the queue.',
+        'The route is registered on `POST /v1/placements` and a valid body is booked with `allocate`, answering 201 with `placement_id`, `node_id` and `free`. The starter does this already.',
       match: {
-        python: {
-          all: [
-            /@app\.post\(\s*["']\/v1\/placements["']/,
-            /KNOWN_GPU_TYPES/,
-            /is_positive_int\(/,
-            /is_number\(/,
-            /status_code=400/,
-          ],
-        },
-        typescript: {
-          all: [
-            /app\.post\(\s*['"]\/v1\/placements['"]/,
-            /KNOWN_GPU_TYPES/,
-            /isPositiveInt\(/,
-            /isFiniteNumber\(/,
-            /code\(\s*400\s*\)/,
-          ],
-        },
-        go: {
-          all: [/"POST \/v1\/placements"/, /knownGpuTypes/, /isPositiveInt\(/, /isFiniteNumber\(/, /StatusBadRequest/],
-        },
-        scala: {
-          all: [
-            /path\(\s*"v1"\s*\/\s*"placements"\s*\)/,
-            /\bpost\s*\{/,
-            /KnownGpuTypes/,
-            /isPositiveInt\(/,
-            /isFiniteNumber\(/,
-            /StatusCodes\.BadRequest/,
-          ],
-        },
-        cpp: {
-          all: [/svr\.Post\(\s*"\/v1\/placements"/, /kKnownGpuTypes/, /isPositiveInt\(/, /isFiniteNumber\(/, /\b400\b/],
-        },
+        python: {all: [/@app\.post\(\s*["']\/v1\/placements["']/, /\ballocate\(/, /status_code=201/]},
+        typescript: {all: [/app\.post\(\s*['"]\/v1\/placements['"]/, /\ballocate\(/, /code\(\s*201\s*\)/]},
+        go: {all: [/"POST \/v1\/placements"/, /\ballocate\(/, /StatusCreated|\b201\b/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"placements"\s*\)/, /State\.allocate\(/, /StatusCodes\.Created/]},
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/placements"/, /\ballocate\(/, /status\s*=\s*201/]},
       },
     },
     {
       id: 'unknown-type',
-      title: 'Rejects an unknown GPU type with 400 before queueing',
+      title: 'An unknown gpu_type is 400 before any node is read',
       detail:
-        'An unknown `gpu_type` is a **400** raised before the placement is enqueued, and the order is the point: a fallback to "whatever is free" sends a typo to a node that cannot run the job, and queueing before the check makes the rejection impossible. The starter picks the first node it finds instead.',
+        '`gpu_type` is checked against `KNOWN_GPU_TYPES` and refused with 400 before the node set is read or `allocate` runs. The starter has no such check and lands a typo on any node of the fleet.',
       match: {
-        python: {
-          all: [/status_code=400/],
-          order: [/gpu_type not in KNOWN_GPU_TYPES/, /\benqueue\(/],
-        },
-        typescript: {
-          all: [/code\(\s*400\s*\)/],
-          order: [/KNOWN_GPU_TYPES\[gpuType\] !== true/, /\benqueue\(/],
-        },
-        go: {
-          all: [/StatusBadRequest/],
-          order: [/!knownGpuTypes\[gpuType\]/, /\bEnqueue\(/],
-        },
-        scala: {
-          all: [/StatusCodes\.BadRequest/],
-          order: [/!KnownGpuTypes\.contains/, /\.enqueue\(/],
-        },
-        cpp: {
-          all: [/\b400\b/],
-          order: [/kKnownGpuTypes\.count/, /\benqueue\(/],
-        },
+        python: {all: [/status_code=400/], order: [/not in KNOWN_GPU_TYPES/, /\ballocate\(/]},
+        typescript: {all: [/code\(\s*400\s*\)/], order: [/KNOWN_GPU_TYPES\[/, /\ballocate\(/]},
+        go: {all: [/StatusBadRequest/], order: [/config\.KnownGPUTypes\[/, /\ballocate\(/]},
+        scala: {all: [/StatusCodes\.BadRequest/], order: [/KnownGpuTypes\.contains/, /State\.allocate\(/]},
+        cpp: {all: [/\b400\b/], order: [/kKnownGpuTypes\.count/, /\ballocate\(/]},
       },
     },
     {
       id: 'capacity-ceiling',
-      title: 'Rejects a count above the largest node before queueing',
+      title: 'count is an integer from 1 to MAX_NODE_GPUS',
       detail:
-        '`count` is compared against the per-node ceiling (`MAX_NODE_GPUS` / `maxNodeGpus` / `MaxNodeGpus` / `kMaxNodeGpus`) and the rejection happens before `enqueue`. A request that exceeds every node is unsatisfiable, so queueing it first leaves permanent backlog. The starter never looks at the number.',
+        '`count` is compared against `MAX_NODE_GPUS` (and refused below 1) with a 400 before `allocate` runs. The starter passes any integer to the ledger, so an impossible request is a 409 and a zero is a booking.',
       match: {
-        python: {all: [/status_code=400/], order: [/count > MAX_NODE_GPUS/, /\benqueue\(/]},
-        typescript: {all: [/code\(\s*400\s*\)/], order: [/count > MAX_NODE_GPUS/, /\benqueue\(/]},
-        go: {all: [/StatusBadRequest/], order: [/countInt > maxNodeGpus/, /\bEnqueue\(/]},
-        scala: {all: [/StatusCodes\.BadRequest/], order: [/body\.count > MaxNodeGpus/, /\.enqueue\(/]},
-        cpp: {all: [/\b400\b/], order: [/count > kMaxNodeGpus/, /\benqueue\(/]},
+        python: {all: [/status_code=400/], order: [/[<>]=?\s*MAX_NODE_GPUS|MAX_NODE_GPUS\s*[<>]=?/, /\ballocate\(/]},
+        typescript: {
+          all: [/code\(\s*400\s*\)/],
+          order: [/[<>]=?\s*MAX_NODE_GPUS|MAX_NODE_GPUS\s*[<>]=?/, /\ballocate\(/],
+        },
+        go: {
+          all: [/StatusBadRequest/],
+          order: [/[<>]=?\s*config\.MaxNodeGPUs|config\.MaxNodeGPUs\s*[<>]=?/, /\ballocate\(/],
+        },
+        scala: {
+          all: [/StatusCodes\.BadRequest/],
+          order: [/[<>]=?\s*MaxNodeGpus|MaxNodeGpus\s*[<>]=?/, /State\.allocate\(/],
+        },
+        cpp: {all: [/\b400\b/], order: [/[<>]=?\s*(gpusched::)?kMaxNodeGpus|kMaxNodeGpus\s*[<>]=?/, /\ballocate\(/]},
       },
     },
     {
       id: 'fresh-capacity',
-      title: 'Reads capacity fresh per request, with the boot snapshot gone',
+      title: 'The node set is read on every request',
       detail:
-        "Every request reads the registry live (`node_registry.list_nodes()` / `nodeRegistry.list()` / `nodeRegistry.ListNodes()` / `nodeRegistry.list()`) and keeps the read's `capacity_as_of` timestamp, so a stale snapshot can be detected (`CAPACITY_TTL_S` / `CAPACITY_TTL_MS` / `capacityTtlSec` / `CapacityTtlSeconds` / `kCapacityTtlSeconds`) rather than trusted. The starter schedules from `BOOT_CAPACITY` — a snapshot taken at boot — which any later allocation invalidates.",
+        'The handler reads `nodes` and the node hashes from Redis each time (`schedulable_nodes()` inside the handler) and the boot snapshot is gone. The starter schedules against `BOOT_NODES`, read once at import.',
       match: {
-        python: {
-          all: [/node_registry\.list_nodes\(\)/, /capacity_as_of/, /CAPACITY_TTL_S/],
-          none: [/BOOT_CAPACITY|cached_nodes/],
-        },
-        typescript: {
-          all: [/nodeRegistry\.list\(\)/, /capacityAsOf/, /CAPACITY_TTL_MS/],
-          none: [/BOOT_CAPACITY|cachedNodes/],
-        },
-        go: {
-          all: [/nodeRegistry\.ListNodes\(\)/, /CapacityAsOf/, /capacityTtlSec/],
-          none: [/bootCapacity|cachedNodes/],
-        },
-        scala: {
-          all: [/nodeRegistry\.list\(\)/, /capacityAsOf/, /CapacityTtlSeconds/],
-          none: [/BootCapacity|CachedNodes/],
-        },
-        cpp: {
-          all: [/nodeRegistry\.list\(\)/, /capacityAsOf/, /kCapacityTtlSeconds/],
-          none: [/kBootCapacity|cachedNodes/],
-        },
+        python: {all: [/def place[\s\S]*?schedulable_nodes\(\)/], none: [/BOOT_NODES/]},
+        typescript: {all: [/app\.post\([\s\S]*?schedulableNodes\(\)/], none: [/BOOT_NODES/]},
+        go: {all: [/func place[\s\S]*?schedulableNodes\(/], none: [/bootNodes/]},
+        scala: {all: [/val route[\s\S]*?schedulableNodes\(\)/], none: [/BootNodes/]},
+        cpp: {all: [/void place[\s\S]*?schedulable_nodes\(\)/], none: [/kBootNodes/]},
       },
     },
     {
       id: 'log-no-payload',
-      title: 'Logs the placement with node id and counters, never the body',
+      title: 'The log line names ids and counts, not the body',
       detail:
-        "The placement decision is logged with the placement id, the node id and the counters. The request body never reaches a log line: the starter logs it verbatim, shipping the tenant's memory footprint and hourly bid into every log sink, where it outlives the request and the retention policy.",
+        'The decision is logged with the placement id, the node id and the counts. The request body and its `max_hourly_bid` stay out of the log; the starter logs the body verbatim.',
       match: {
         python: {
-          all: [/logger\.info\(/, /node_id/],
-          none: [/logger\.\w+\([^)]*\bbody\b/, /logger\.\w+\([^)]*max_hourly_bid/],
+          all: [/logger\.info\(/, /placement_id/],
+          none: [/logger\.\w+\([^)]*model_dump|logger\.\w+\([^)]*\bbody\b|logger\.\w+\([^)]*max_hourly_bid/],
         },
         typescript: {
-          all: [/request\.log\.info\(/, /nodeId/],
-          none: [/\.info\([^)]*\bbody\b/, /\.info\([^)]*max_hourly_bid/],
+          all: [/console\.info\(/, /placement_id|placementId/],
+          none: [/console\.\w+\([^)]*\bbody\b|console\.\w+\([^)]*max_hourly_bid/],
         },
-        go: {all: [/log\.Printf\(/, /nodeID/], none: [/log\.\w+\([^)]*\bbody\b/, /log\.\w+\([^)]*MaxHourlyBid/]},
-        scala: {all: [/system\.log\.info\(/, /nodeId/], none: [/\.info\([^)]*\bbody\b/, /\.info\([^)]*max_hourly_bid/]},
-        cpp: {
-          all: [/(std::)?(cerr|clog)\s*<</, /nodeId/],
-          none: [/(std::)?(cerr|clog)[^;]*\bbody\b/, /(std::)?(cerr|clog)[^;]*max_hourly_bid/],
+        go: {
+          all: [/log\.Printf\(/, /placementID/],
+          none: [/log\.\w+\([^)]*\bbody\b|log\.\w+\([^)]*MaxHourlyBid|log\.\w+\([^)]*max_hourly_bid/],
         },
+        scala: {all: [/println\(/, /placementId/], none: [/println\([^)]*\bbody\b|println\([^)]*max_hourly_bid/]},
+        cpp: {all: [/std::clog\s*<</, /placement_id/], none: [/std::clog[^;]*\bbody\b|std::clog[^;]*max_hourly_bid/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import logging
+import uuid
 
+import redis
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from gpusched.config import KNOWN_GPU_TYPES, MAX_NODE_GPUS
+from state import allocate
+
 app = FastAPI()
 logger = logging.getLogger("gpusched")
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# Capacity is loaded once while the service boots.
-BOOT_CAPACITY = load_boot_capacity()
+# TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
 
 class PlacementRequest(BaseModel):
@@ -236,59 +163,63 @@ class PlacementRequest(BaseModel):
     max_hourly_bid: float
 
 
-class NodeRegistry:
-    def enqueue(self, placement: dict, node: dict) -> str:
-        """Queue the placement for \`node\`; returns the placement id."""
-        raise NotImplementedError
+def schedulable_nodes() -> list[dict]:
+    """Every node with a live heartbeat: id, gpu_type, capacity, allocated and free."""
+    nodes = []
+    for node_id in r.smembers("nodes"):
+        if not r.exists(f"heartbeat:{node_id}"):
+            continue
+        node = r.hgetall(f"node:{node_id}")
+        capacity, allocated = int(node.get("capacity", 0)), int(node.get("allocated", 0))
+        nodes.append({"id": node_id, "gpu_type": node.get("gpu_type"), "capacity": capacity, "allocated": allocated, "free": max(capacity - allocated, 0)})
+    return nodes
 
 
-node_registry = NodeRegistry()
+# The fleet, read once while the service boots.
+BOOT_NODES = schedulable_nodes()
 
 
 @app.post("/v1/placements")
 def place(body: PlacementRequest) -> JSONResponse:
-    # TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free, places
-    # against the capacity snapshot taken at boot, and logs the request body. Fix all four.
-    node = next((n for n in BOOT_CAPACITY if n["gpu_type"] == body.gpu_type), BOOT_CAPACITY[0])
-    placement_id = node_registry.enqueue(body.model_dump(), node)
-    logger.info("placement queued payload=%r", body.model_dump())
-    return JSONResponse(
-        {"placement_id": placement_id, "node_id": node["id"], "status": "queued"}, status_code=201
-    )
+    nodes = sorted(BOOT_NODES, key=lambda n: n["free"], reverse=True)
+    candidates = [n for n in nodes if n["gpu_type"] == body.gpu_type] or nodes
+    placement_id = f"p-{uuid.uuid4().hex[:12]}"
+    for node in candidates:
+        if allocate(node["id"], placement_id, body.count) == "ALLOCATED":
+            free = node["free"] - body.count
+            logger.info("placement queued payload=%r node=%s", body.model_dump(), node["id"])
+            return JSONResponse({"placement_id": placement_id, "node_id": node["id"], "free": free}, status_code=201)
+    return JSONResponse({"error": "NO_CAPACITY"}, status_code=409)
 `,
       solution: `import logging
-import time
+import uuid
 
+import redis
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from gpusched.config import KNOWN_GPU_TYPES, MAX_NODE_GPUS
+from state import allocate
+
 app = FastAPI()
 logger = logging.getLogger("gpusched")
-
-KNOWN_GPU_TYPES = {"a100", "h100", "l40s"}
-MAX_NODE_GPUS = 8
-CAPACITY_TTL_S = 2
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-def is_positive_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+def schedulable_nodes() -> list[dict]:
+    """Every node with a live heartbeat: id, gpu_type, capacity, allocated and free."""
+    nodes = []
+    for node_id in r.smembers("nodes"):
+        if not r.exists(f"heartbeat:{node_id}"):
+            continue
+        node = r.hgetall(f"node:{node_id}")
+        capacity, allocated = int(node.get("capacity", 0)), int(node.get("allocated", 0))
+        nodes.append({"id": node_id, "gpu_type": node.get("gpu_type"), "capacity": capacity, "allocated": allocated, "free": max(capacity - allocated, 0)})
+    return nodes
 
 
 def is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-class NodeRegistry:
-    def list_nodes(self) -> dict:
-        """Every schedulable node plus when its capacity was read: {"nodes", "capacity_as_of"}."""
-        raise NotImplementedError
-
-    def enqueue(self, placement: dict, node: dict) -> str:
-        """Queue the placement for \`node\`; returns the placement id."""
-        raise NotImplementedError
-
-
-node_registry = NodeRegistry()
 
 
 @app.post("/v1/placements")
@@ -299,704 +230,1164 @@ async def place(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="malformed JSON body")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
-
     gpu_type = body.get("gpu_type")
-    if not isinstance(gpu_type, str) or gpu_type not in KNOWN_GPU_TYPES:
+    if gpu_type not in KNOWN_GPU_TYPES:
         raise HTTPException(status_code=400, detail="unknown gpu_type")
     count = body.get("count")
-    if not is_positive_int(count):
-        raise HTTPException(status_code=400, detail="count must be a positive integer")
-    if not is_number(body.get("memory_gb")):
-        raise HTTPException(status_code=400, detail="memory_gb must be a number")
-    if not is_number(body.get("max_hourly_bid")):
-        raise HTTPException(status_code=400, detail="max_hourly_bid must be a number")
-    if count > MAX_NODE_GPUS:
-        raise HTTPException(status_code=400, detail="count exceeds the largest node")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1 or count > MAX_NODE_GPUS:
+        raise HTTPException(status_code=400, detail=f"count must be an integer from 1 to {MAX_NODE_GPUS}")
+    if not is_number(body.get("memory_gb")) or not is_number(body.get("max_hourly_bid")):
+        raise HTTPException(status_code=400, detail="memory_gb and max_hourly_bid must be numbers")
 
-    snapshot = node_registry.list_nodes()
-    capacity_as_of = snapshot["capacity_as_of"]
-    if time.time() - capacity_as_of > CAPACITY_TTL_S:
-        raise HTTPException(status_code=503, detail="STALE_CAPACITY")
-
-    best = None
-    for node in snapshot["nodes"]:
+    nodes = sorted(schedulable_nodes(), key=lambda n: n["free"], reverse=True)
+    placement_id = f"p-{uuid.uuid4().hex[:12]}"
+    for node in nodes:
         if node["gpu_type"] != gpu_type or node["free"] < count:
             continue
-        if best is None or node["free"] > best["free"]:
-            best = node
-    if best is None:
-        return JSONResponse({"error": "no node with enough free capacity"}, status_code=409)
-
-    placement = {
-        "gpu_type": gpu_type,
-        "count": count,
-        "memory_gb": body["memory_gb"],
-        "max_hourly_bid": body["max_hourly_bid"],
-        "node_id": best["id"],
-    }
-    node_id = best["id"]
-    placement_id = node_registry.enqueue(placement, best)
-    logger.info(
-        "placed id=%s node=%s gpu_type=%s count=%d free=%d capacity_as_of=%s",
-        placement_id,
-        node_id,
-        gpu_type,
-        count,
-        best["free"],
-        capacity_as_of,
-    )
-    return JSONResponse(
-        {
-            "placement_id": placement_id,
-            "node_id": node_id,
-            "free": best["free"],
-            "capacity_as_of": capacity_as_of,
-        },
-        status_code=201,
-    )
+        if allocate(node["id"], placement_id, count) == "ALLOCATED":
+            free = node["free"] - count
+            logger.info("placed placement_id=%s node_id=%s count=%d free=%d", placement_id, node["id"], count, free)
+            return JSONResponse({"placement_id": placement_id, "node_id": node["id"], "free": free}, status_code=201)
+    return JSONResponse({"error": "NO_CAPACITY"}, status_code=409)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/placements: flawed code that trusts a boot-time capacity snapshot. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {KNOWN_GPU_TYPES, MAX_NODE_GPUS} from 'gpusched/config';
+import {allocate} from './state';
 
 export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
 
-/** Capacity snapshot taken once while the service boots. */
-const BOOT_CAPACITY = loadBootCapacity();
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
-interface NodeRecord {
+interface Node {
   id: string;
   gpuType: string;
+  capacity: number;
+  allocated: number;
   free: number;
 }
 
-const nodeRegistry = {
-  async enqueue(placement: Record<string, unknown>, node: NodeRecord): Promise<string> {
-    void placement;
-    void node;
-    throw new Error('NotImplemented');
-  },
-};
+/** Every node with a live heartbeat: id, gpu type, capacity, allocated and free. */
+async function schedulableNodes(): Promise<Node[]> {
+  const nodes: Node[] = [];
+  for (const id of await redis.smembers('nodes')) {
+    if (!(await redis.exists(\`heartbeat:\${id}\`))) continue;
+    const node = await redis.hgetall(\`node:\${id}\`);
+    const capacity = Number(node.capacity ?? 0);
+    const allocated = Number(node.allocated ?? 0);
+    nodes.push({id, gpuType: node.gpu_type, capacity, allocated, free: Math.max(capacity - allocated, 0)});
+  }
+  return nodes.sort((a, b) => b.free - a.free);
+}
+
+/** The fleet, read once while the service boots. */
+const BOOT_NODES = schedulableNodes();
+
+interface PlacementBody {
+  gpu_type: string;
+  count: number;
+  memory_gb: number;
+  max_hourly_bid: number;
+}
 
 app.post('/v1/placements', async (request, reply) => {
-  // TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free, places
-  // against the capacity snapshot taken at boot, and logs the request body. Fix all four.
-  const body = request.body as Record<string, unknown>;
-  const node =
-    BOOT_CAPACITY.find(candidate => candidate.gpuType === body.gpu_type) ?? BOOT_CAPACITY[0];
-  const placementId = await nodeRegistry.enqueue({...body, node_id: node.id}, node);
-  request.log.info({payload: body}, 'placement queued');
-  return reply.code(201).send({placement_id: placementId, node_id: node.id, status: 'queued'});
+  const body = request.body as PlacementBody;
+  const nodes = await BOOT_NODES;
+  const typed = nodes.filter(n => n.gpuType === body.gpu_type);
+  const placementId = \`p-\${Math.random().toString(16).slice(2, 14)}\`;
+  for (const node of typed.length > 0 ? typed : nodes) {
+    if ((await allocate(node.id, placementId, body.count)) === 'ALLOCATED') {
+      console.info('placement queued', JSON.stringify({payload: body, node_id: node.id}));
+      return reply.code(201).send({placement_id: placementId, node_id: node.id, free: node.free - body.count});
+    }
+  }
+  return reply.code(409).send({error: 'NO_CAPACITY'});
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/placements: validated admission, fresh capacity, and a log without the payload. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {KNOWN_GPU_TYPES, MAX_NODE_GPUS} from 'gpusched/config';
+import {allocate} from './state';
 
 export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
 
-const KNOWN_GPU_TYPES: Record<string, true> = {a100: true, h100: true, l40s: true};
-const MAX_NODE_GPUS = 8;
-const CAPACITY_TTL_MS = 2000;
-
-interface NodeRecord {
+interface Node {
   id: string;
   gpuType: string;
+  capacity: number;
+  allocated: number;
   free: number;
 }
 
-interface NodeSnapshot {
-  nodes: NodeRecord[];
-  capacityAsOf: number;
+/** Every node with a live heartbeat: id, gpu type, capacity, allocated and free. */
+async function schedulableNodes(): Promise<Node[]> {
+  const nodes: Node[] = [];
+  for (const id of await redis.smembers('nodes')) {
+    if (!(await redis.exists(\`heartbeat:\${id}\`))) continue;
+    const node = await redis.hgetall(\`node:\${id}\`);
+    const capacity = Number(node.capacity ?? 0);
+    const allocated = Number(node.allocated ?? 0);
+    nodes.push({id, gpuType: node.gpu_type, capacity, allocated, free: Math.max(capacity - allocated, 0)});
+  }
+  return nodes.sort((a, b) => b.free - a.free);
 }
 
-/** The node registry: read live per request, and queue a placement on the chosen node. */
-const nodeRegistry = {
-  async list(): Promise<NodeSnapshot> {
-    throw new Error('NotImplemented');
-  },
-  async enqueue(placement: Record<string, unknown>, node: NodeRecord): Promise<string> {
-    void placement;
-    void node;
-    throw new Error('NotImplemented');
-  },
-};
-
-function isPositiveInt(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 1;
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value);
-}
+const isNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
 app.post('/v1/placements', async (request, reply) => {
-  const body = request.body as Record<string, unknown> | null;
-  if (body === null || typeof body !== 'object')
+  const body = request.body;
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     return reply.code(400).send({error: 'body must be a JSON object'});
-
-  const gpuType = body.gpu_type;
-  if (typeof gpuType !== 'string' || KNOWN_GPU_TYPES[gpuType] !== true)
+  }
+  const {gpu_type: gpuType, count, memory_gb: memoryGb, max_hourly_bid: bid} = body as Record<string, unknown>;
+  if (typeof gpuType !== 'string' || KNOWN_GPU_TYPES[gpuType] !== true) {
     return reply.code(400).send({error: 'unknown gpu_type'});
-  const count = body.count;
-  if (!isPositiveInt(count)) return reply.code(400).send({error: 'count must be a positive integer'});
-  if (!isFiniteNumber(body.memory_gb)) return reply.code(400).send({error: 'memory_gb must be a number'});
-  if (!isFiniteNumber(body.max_hourly_bid))
-    return reply.code(400).send({error: 'max_hourly_bid must be a number'});
-  if (count > MAX_NODE_GPUS) return reply.code(400).send({error: 'count exceeds the largest node'});
-
-  const {nodes, capacityAsOf} = await nodeRegistry.list();
-  if (Date.now() - capacityAsOf > CAPACITY_TTL_MS)
-    return reply.code(503).send({error: 'STALE_CAPACITY'});
-
-  const candidates = nodes.filter(node => node.gpuType === gpuType && node.free >= count);
-  candidates.sort((a, b) => b.free - a.free);
-  const best = candidates[0];
-  if (best === undefined) return reply.code(409).send({error: 'no node with enough free capacity'});
-
-  const placementId = await nodeRegistry.enqueue(
-    {
-      gpu_type: gpuType,
-      count,
-      memory_gb: body.memory_gb,
-      max_hourly_bid: body.max_hourly_bid,
-      node_id: best.id,
-    },
-    best,
-  );
-  request.log.info(
-    {placementId, nodeId: best.id, gpuType, count, free: best.free, capacityAsOf},
-    'placed',
-  );
-  return reply
-    .code(201)
-    .send({placement_id: placementId, node_id: best.id, free: best.free, capacity_as_of: capacityAsOf});
+  }
+  if (!Number.isInteger(count) || (count as number) < 1 || (count as number) > MAX_NODE_GPUS) {
+    return reply.code(400).send({error: \`count must be an integer from 1 to \${MAX_NODE_GPUS}\`});
+  }
+  if (!isNumber(memoryGb) || !isNumber(bid)) {
+    return reply.code(400).send({error: 'memory_gb and max_hourly_bid must be numbers'});
+  }
+  const wanted = count as number;
+  const placementId = \`p-\${Math.random().toString(16).slice(2, 14)}\`;
+  for (const node of await schedulableNodes()) {
+    if (node.gpuType !== gpuType || node.free < wanted) continue;
+    if ((await allocate(node.id, placementId, wanted)) === 'ALLOCATED') {
+      const free = node.free - wanted;
+      console.info(\`placed placement_id=\${placementId} node_id=\${node.id} count=\${wanted} free=\${free}\`);
+      return reply.code(201).send({placement_id: placementId, node_id: node.id, free});
+    }
+  }
+  return reply.code(409).send({error: 'NO_CAPACITY'});
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/http"
+	"sort"
+	"strconv"
+
+	"github.com/redis/go-redis/v9"
+
+	"gpusched/config"
 )
 
-// bootCapacity is the node snapshot loaded once while the service boots.
-var bootCapacity = loadBootCapacity()
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type placementRequest struct {
-	GpuType      string  \`json:"gpu_type"\`
+// allocate books count GPUs of the node for the placement (state.go, step 2): ALLOCATED, NO_CAPACITY or NO_HEARTBEAT.
+var allocate = func(ctx context.Context, nodeID, placementID string, count int) (string, error) { panic("not implemented") }
+
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+
+type node struct {
+	ID        string
+	GPUType   string
+	Capacity  int
+	Allocated int
+	Free      int
+}
+
+// schedulableNodes is every node with a live heartbeat, most free GPUs first.
+func schedulableNodes(ctx context.Context) ([]node, error) {
+	ids, err := rdb.SMembers(ctx, "nodes").Result()
+	if err != nil {
+		return nil, err
+	}
+	var nodes []node
+	for _, id := range ids {
+		if rdb.Exists(ctx, "heartbeat:"+id).Val() == 0 {
+			continue
+		}
+		fields := rdb.HGetAll(ctx, "node:"+id).Val()
+		capacity, _ := strconv.Atoi(fields["capacity"])
+		allocated, _ := strconv.Atoi(fields["allocated"])
+		nodes = append(nodes, node{ID: id, GPUType: fields["gpu_type"], Capacity: capacity, Allocated: allocated, Free: max(capacity-allocated, 0)})
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Free > nodes[j].Free })
+	return nodes, nil
+}
+
+// bootNodes is the fleet as it was when the service booted.
+var bootNodes []node
+
+type placementBody struct {
+	GPUType      string  \`json:"gpu_type"\`
 	Count        int     \`json:"count"\`
-	MemoryGb     float64 \`json:"memory_gb"\`
+	MemoryGB     float64 \`json:"memory_gb"\`
 	MaxHourlyBid float64 \`json:"max_hourly_bid"\`
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
 func place(rw http.ResponseWriter, r *http.Request) {
-	var body placementRequest
+	var body placementBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "malformed JSON body", http.StatusBadRequest)
 		return
 	}
-	// TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free, places
-	// against the capacity snapshot taken at boot, and logs the request body. Fix all four.
-	node := bootCapacity[0]
-	for _, candidate := range bootCapacity {
-		if candidate.GpuType == body.GpuType {
-			node = candidate
-			break
+	_, _ = config.KnownGPUTypes, config.MaxNodeGPUs
+	var typed []node
+	for _, n := range bootNodes {
+		if n.GPUType == body.GPUType {
+			typed = append(typed, n)
 		}
 	}
-	placementID, _ := nodeRegistry.Enqueue(body, node)
-	log.Printf("placement queued payload=%v", body)
-	writeJSON(rw, http.StatusCreated, map[string]any{
-		"placement_id": placementID,
-		"node_id":      node.ID,
-		"status":       "queued",
-	})
+	if len(typed) == 0 {
+		typed = bootNodes
+	}
+	placementID := fmt.Sprintf("p-%012x", rand.Uint64()&0xffffffffffff)
+	for _, n := range typed {
+		result, err := allocate(r.Context(), n.ID, placementID, body.Count)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if result == "ALLOCATED" {
+			log.Printf("placement queued body=%+v node=%s", body, n.ID)
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusCreated)
+			json.NewEncoder(rw).Encode(map[string]any{"placement_id": placementID, "node_id": n.ID, "free": n.Free - body.Count})
+			return
+		}
+	}
+	http.Error(rw, "NO_CAPACITY", http.StatusConflict)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
+	bootNodes, _ = schedulableNodes(context.Background())
 	mux.HandleFunc("POST /v1/placements", place)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math"
+	"math/rand/v2"
 	"net/http"
-	"time"
+	"sort"
+	"strconv"
+
+	"github.com/redis/go-redis/v9"
+
+	"gpusched/config"
 )
 
-const (
-	maxNodeGpus    = 8
-	capacityTtlSec = 2
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var knownGpuTypes = map[string]bool{"a100": true, "h100": true, "l40s": true}
+// allocate books count GPUs of the node for the placement (state.go, step 2): ALLOCATED, NO_CAPACITY or NO_HEARTBEAT.
+var allocate = func(ctx context.Context, nodeID, placementID string, count int) (string, error) { panic("not implemented") }
 
-type placementRequest struct {
-	GpuType      string  \`json:"gpu_type"\`
-	Count        int     \`json:"count"\`
-	MemoryGb     float64 \`json:"memory_gb"\`
-	MaxHourlyBid float64 \`json:"max_hourly_bid"\`
+type node struct {
+	ID        string
+	GPUType   string
+	Capacity  int
+	Allocated int
+	Free      int
 }
 
-type nodeRecord struct {
-	ID      string \`json:"id"\`
-	GpuType string \`json:"gpu_type"\`
-	Free    int    \`json:"free"\`
+// schedulableNodes is every node with a live heartbeat, most free GPUs first.
+func schedulableNodes(ctx context.Context) ([]node, error) {
+	ids, err := rdb.SMembers(ctx, "nodes").Result()
+	if err != nil {
+		return nil, err
+	}
+	var nodes []node
+	for _, id := range ids {
+		if rdb.Exists(ctx, "heartbeat:"+id).Val() == 0 {
+			continue
+		}
+		fields := rdb.HGetAll(ctx, "node:"+id).Val()
+		capacity, _ := strconv.Atoi(fields["capacity"])
+		allocated, _ := strconv.Atoi(fields["allocated"])
+		nodes = append(nodes, node{ID: id, GPUType: fields["gpu_type"], Capacity: capacity, Allocated: allocated, Free: max(capacity-allocated, 0)})
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Free > nodes[j].Free })
+	return nodes, nil
 }
 
-type nodeSnapshot struct {
-	Nodes        []nodeRecord \`json:"nodes"\`
-	CapacityAsOf int64        \`json:"capacity_as_of"\`
-}
-
-type nodeRegistryClient struct{}
-
-var nodeRegistry = &nodeRegistryClient{}
-
-// ListNodes reads every schedulable node live, with the time its capacity was read.
-func (c *nodeRegistryClient) ListNodes() (nodeSnapshot, error) {
-	return nodeSnapshot{}, nil
-}
-
-// Enqueue queues the placement on the chosen node and returns its placement id.
-func (c *nodeRegistryClient) Enqueue(placement placementRequest, node nodeRecord) (string, error) {
-	return "", nil
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func isPositiveInt(value json.Number) bool {
-	n, err := value.Int64()
-	return err == nil && n >= 1
-}
-
-func isFiniteNumber(value json.Number) bool {
-	_, err := value.Float64()
-	return err == nil
+// isNumber is a JSON number: not a string, not a bool, not null.
+func isNumber(v any) bool {
+	f, ok := v.(float64)
+	return ok && !math.IsNaN(f) && !math.IsInf(f, 0)
 }
 
 func place(rw http.ResponseWriter, r *http.Request) {
-	dec := json.NewDecoder(r.Body)
-	dec.UseNumber()
 	var body map[string]any
-	if err := dec.Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "malformed JSON body"})
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body == nil {
+		http.Error(rw, "body must be a JSON object", http.StatusBadRequest)
 		return
 	}
-	gpuType, ok := body["gpu_type"].(string)
-	if !ok || !knownGpuTypes[gpuType] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown gpu_type"})
+	gpuType, _ := body["gpu_type"].(string)
+	if !config.KnownGPUTypes[gpuType] {
+		http.Error(rw, "unknown gpu_type", http.StatusBadRequest)
 		return
 	}
-	countRaw, ok := body["count"].(json.Number)
-	if !ok || !isPositiveInt(countRaw) {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "count must be a positive integer"})
+	raw, _ := body["count"].(float64)
+	count := int(raw)
+	if !isNumber(body["count"]) || float64(count) != raw || count < 1 || count > config.MaxNodeGPUs {
+		http.Error(rw, fmt.Sprintf("count must be an integer from 1 to %d", config.MaxNodeGPUs), http.StatusBadRequest)
 		return
 	}
-	memoryRaw, ok := body["memory_gb"].(json.Number)
-	if !ok || !isFiniteNumber(memoryRaw) {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "memory_gb must be a number"})
+	if !isNumber(body["memory_gb"]) || !isNumber(body["max_hourly_bid"]) {
+		http.Error(rw, "memory_gb and max_hourly_bid must be numbers", http.StatusBadRequest)
 		return
 	}
-	bidRaw, ok := body["max_hourly_bid"].(json.Number)
-	if !ok || !isFiniteNumber(bidRaw) {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "max_hourly_bid must be a number"})
-		return
-	}
-	countVal, _ := countRaw.Int64()
-	countInt := int(countVal)
-	if countInt > maxNodeGpus {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "count exceeds the largest node"})
-		return
-	}
-
-	snapshot, err := nodeRegistry.ListNodes()
+	nodes, err := schedulableNodes(r.Context())
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "node registry unavailable"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if time.Now().Unix()-snapshot.CapacityAsOf > capacityTtlSec {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "STALE_CAPACITY"})
-		return
-	}
-
-	var best *nodeRecord
-	for i := range snapshot.Nodes {
-		node := &snapshot.Nodes[i]
-		if node.GpuType != gpuType || node.Free < countInt {
+	placementID := fmt.Sprintf("p-%012x", rand.Uint64()&0xffffffffffff)
+	for _, n := range nodes {
+		if n.GPUType != gpuType || n.Free < count {
 			continue
 		}
-		if best == nil || node.Free > best.Free {
-			best = node
+		result, err := allocate(r.Context(), n.ID, placementID, count)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if result == "ALLOCATED" {
+			free := n.Free - count
+			log.Printf("placed placement_id=%s node_id=%s count=%d free=%d", placementID, n.ID, count, free)
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusCreated)
+			json.NewEncoder(rw).Encode(map[string]any{"placement_id": placementID, "node_id": n.ID, "free": free})
+			return
 		}
 	}
-	if best == nil {
-		writeJSON(rw, http.StatusConflict, map[string]string{"error": "no node with enough free capacity"})
-		return
-	}
-
-	memoryGb, _ := memoryRaw.Float64()
-	bid, _ := bidRaw.Float64()
-	placementID, err := nodeRegistry.Enqueue(placementRequest{
-		GpuType:      gpuType,
-		Count:        countInt,
-		MemoryGb:     memoryGb,
-		MaxHourlyBid: bid,
-	}, *best)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "node registry unavailable"})
-		return
-	}
-
-	nodeID := best.ID
-	log.Printf("placed id=%s node=%s gpu_type=%s count=%d free=%d capacity_as_of=%d",
-		placementID, nodeID, gpuType, countInt, best.Free, snapshot.CapacityAsOf)
-	writeJSON(rw, http.StatusCreated, map[string]any{
-		"placement_id":   placementID,
-		"node_id":        nodeID,
-		"free":           best.Free,
-		"capacity_as_of": snapshot.CapacityAsOf,
-	})
+	http.Error(rw, "NO_CAPACITY", http.StatusConflict)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/placements", place)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
+      starter: `import java.util.UUID
+
 import org.apache.pekko.http.scaladsl.model._
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import redis.clients.jedis.JedisPooled
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class PlacementRequest(gpu_type: String, count: Int, memory_gb: Double, max_hourly_bid: Double)
-final case class NodeRecord(id: String, gpu_type: String, free: Int)
+import scala.jdk.CollectionConverters._
+import scala.util.Try
 
-class NodeRegistry {
-  def enqueue(placement: PlacementRequest, node: NodeRecord): String = ""
-}
+import gpusched.Config.{KnownGpuTypes, MaxNodeGpus}
 
-object PlacementApi {
-  implicit val system: ActorSystem = ActorSystem("gpusched")
-  implicit val placementFormat: RootJsonFormat[PlacementRequest] = jsonFormat4(PlacementRequest)
+object Api {
+  val jedis = new JedisPooled("redis", 6379)
 
-  // Node capacity as loaded once while the service boots.
-  val BootCapacity: List[NodeRecord] = loadBootCapacity()
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
-  val nodeRegistry = new NodeRegistry()
-
-  val route: Route =
-    path("v1" / "placements") {
-      post {
-        entity(as[PlacementRequest]) { body =>
-          // TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free,
-          // places against the capacity snapshot taken at boot, and logs the request body.
-          val node = BootCapacity.find(_.gpu_type == body.gpu_type).getOrElse(BootCapacity.head)
-          val placementId = nodeRegistry.enqueue(body, node)
-          system.log.info(s"placement queued payload=$body")
-          complete(StatusCodes.Created, s"""{"placement_id":"$placementId","node_id":"$nodeId"}""")
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  final case class Node(id: String, gpuType: String, capacity: Int, allocated: Int) {
+    def free: Int = math.max(capacity - allocated, 0)
   }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class PlacementRequest(gpu_type: String, count: Int, memory_gb: Double, max_hourly_bid: Double)
-final case class NodeRecord(id: String, gpu_type: String, free: Int)
-final case class NodeSnapshot(nodes: List[NodeRecord], capacityAsOf: Long)
-final case class PlacementJob(
-    gpu_type: String,
-    count: Int,
-    memory_gb: Double,
-    max_hourly_bid: Double,
-    node_id: String,
-)
-final case class PlacementResponse(placement_id: String, node_id: String, free: Int, capacity_as_of: Long)
+  /** Every node with a live heartbeat, most free GPUs first. */
+  def schedulableNodes(): List[Node] =
+    jedis.smembers("nodes").asScala.toList.flatMap { id =>
+      if (jedis.exists(s"heartbeat:$id")) {
+        val fields = jedis.hgetAll(s"node:$id").asScala
+        Some(Node(id, fields.getOrElse("gpu_type", ""), fields.get("capacity").map(_.toInt).getOrElse(0), fields.get("allocated").map(_.toInt).getOrElse(0)))
+      } else None
+    }.sortBy(-_.free)
 
-class NodeRegistry {
-  /** Every schedulable node plus the time its capacity was read. */
-  def list(): NodeSnapshot = NodeSnapshot(Nil, 0L)
+  /** The fleet, read once while the service boots. */
+  val BootNodes: List[Node] = schedulableNodes()
 
-  def enqueue(placement: PlacementJob, node: NodeRecord): String = ""
-}
-
-object PlacementApi {
-  implicit val system: ActorSystem = ActorSystem("gpusched")
-  implicit val placementFormat: RootJsonFormat[PlacementRequest] = jsonFormat4(PlacementRequest)
-  implicit val responseFormat: RootJsonFormat[PlacementResponse] = jsonFormat4(PlacementResponse)
-
-  val KnownGpuTypes = Set("a100", "h100", "l40s")
-  val MaxNodeGpus = 8
-  val CapacityTtlSeconds = 2
-
-  val nodeRegistry = new NodeRegistry()
-
-  def isPositiveInt(value: Int): Boolean = value >= 1
-
-  def isFiniteNumber(value: Double): Boolean = !value.isNaN && !value.isInfinite
+  final case class PlacementBody(gpu_type: String, count: Int, memory_gb: Double, max_hourly_bid: Double)
+  implicit val bodyFormat: RootJsonFormat[PlacementBody] = jsonFormat4(PlacementBody)
 
   val route: Route =
     path("v1" / "placements") {
       post {
-        entity(as[PlacementRequest]) { body =>
-          if (!KnownGpuTypes.contains(body.gpu_type)) {
-            complete(StatusCodes.BadRequest, """{"error":"unknown gpu_type"}""")
-          } else if (!isPositiveInt(body.count)) {
-            complete(StatusCodes.BadRequest, """{"error":"count must be a positive integer"}""")
-          } else if (!isFiniteNumber(body.memory_gb)) {
-            complete(StatusCodes.BadRequest, """{"error":"memory_gb must be a number"}""")
-          } else if (!isFiniteNumber(body.max_hourly_bid)) {
-            complete(StatusCodes.BadRequest, """{"error":"max_hourly_bid must be a number"}""")
-          } else if (body.count > MaxNodeGpus) {
-            complete(StatusCodes.BadRequest, """{"error":"count exceeds the largest node"}""")
-          } else {
-            val snapshot = nodeRegistry.list()
-            if (System.currentTimeMillis() / 1000 - snapshot.capacityAsOf > CapacityTtlSeconds) {
-              complete(StatusCodes.ServiceUnavailable, """{"error":"STALE_CAPACITY"}""")
-            } else {
-              val candidates =
-                snapshot.nodes.filter(node => node.gpu_type == body.gpu_type && node.free >= body.count)
-              candidates.sortBy(node => -node.free).headOption match {
-                case None =>
-                  complete(StatusCodes.Conflict, """{"error":"no node with enough free capacity"}""")
-                case Some(best) =>
-                  val job = PlacementJob(body.gpu_type, body.count, body.memory_gb, body.max_hourly_bid, best.id)
-                  val placementId = nodeRegistry.enqueue(job, best)
-                  val nodeId = best.id
-                  val free = best.free
-                  val gpuType = body.gpu_type
-                  val count = body.count
-                  system.log.info(s"placed id=$placementId node=$nodeId gpu_type=$gpuType count=$count free=$free")
-                  complete(
-                    StatusCodes.Created,
-                    PlacementResponse(placementId, nodeId, free, snapshot.capacityAsOf),
-                  )
+        entity(as[String]) { raw =>
+          Try(raw.parseJson.convertTo[PlacementBody]).toOption match {
+            case None => complete(StatusCodes.BadRequest -> "malformed body")
+            case Some(body) =>
+              val typed = BootNodes.filter(_.gpuType == body.gpu_type)
+              val candidates = if (typed.nonEmpty) typed else BootNodes
+              val placementId = s"p-\${UUID.randomUUID().toString.take(12)}"
+              candidates.find(n => State.allocate(n.id, placementId, body.count) == "ALLOCATED") match {
+                case Some(node) =>
+                  println(s"placement queued body=$body node=\${node.id}")
+                  val json = s"""{"placement_id":"$placementId","node_id":"\${node.id}","free":\${node.free - body.count}}"""
+                  complete(HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, json)))
+                case None => complete(StatusCodes.Conflict -> "NO_CAPACITY")
               }
-            }
           }
         }
       }
     }
+}
+`,
+      solution: `import java.util.UUID
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+import org.apache.pekko.http.scaladsl.model._
+import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+import redis.clients.jedis.JedisPooled
+import spray.json._
+
+import scala.jdk.CollectionConverters._
+import scala.util.Try
+
+import gpusched.Config.{KnownGpuTypes, MaxNodeGpus}
+
+object Api {
+  val jedis = new JedisPooled("redis", 6379)
+
+  final case class Node(id: String, gpuType: String, capacity: Int, allocated: Int) {
+    def free: Int = math.max(capacity - allocated, 0)
   }
+
+  /** Every node with a live heartbeat, most free GPUs first. */
+  def schedulableNodes(): List[Node] =
+    jedis.smembers("nodes").asScala.toList.flatMap { id =>
+      if (jedis.exists(s"heartbeat:$id")) {
+        val fields = jedis.hgetAll(s"node:$id").asScala
+        Some(Node(id, fields.getOrElse("gpu_type", ""), fields.get("capacity").map(_.toInt).getOrElse(0), fields.get("allocated").map(_.toInt).getOrElse(0)))
+      } else None
+    }.sortBy(-_.free)
+
+  private def number(v: Option[JsValue]): Option[Double] = v.collect { case JsNumber(n) => n.toDouble }
+
+  /** The validated request, or what is wrong with it. */
+  private def validate(raw: String): Either[String, (String, Int)] =
+    Try(raw.parseJson.asJsObject).toOption match {
+      case None => Left("body must be a JSON object")
+      case Some(obj) =>
+        val fields = obj.fields
+        val gpuType = fields.get("gpu_type").collect { case JsString(s) => s }
+        val count = number(fields.get("count"))
+        if (!gpuType.exists(KnownGpuTypes.contains)) Left("unknown gpu_type")
+        else if (!count.exists(c => c == c.floor && c >= 1 && c <= MaxNodeGpus)) Left(s"count must be an integer from 1 to $MaxNodeGpus")
+        else if (number(fields.get("memory_gb")).isEmpty || number(fields.get("max_hourly_bid")).isEmpty) Left("memory_gb and max_hourly_bid must be numbers")
+        else Right((gpuType.get, count.get.toInt))
+    }
+
+  val route: Route =
+    path("v1" / "placements") {
+      post {
+        entity(as[String]) { raw =>
+          validate(raw) match {
+            case Left(reason) => complete(StatusCodes.BadRequest -> reason)
+            case Right((gpuType, count)) =>
+              val placementId = s"p-\${UUID.randomUUID().toString.take(12)}"
+              val candidates = schedulableNodes().filter(n => n.gpuType == gpuType && n.free >= count)
+              candidates.find(n => State.allocate(n.id, placementId, count) == "ALLOCATED") match {
+                case Some(node) =>
+                  val free = node.free - count
+                  println(s"placed placementId=$placementId nodeId=\${node.id} count=$count free=$free")
+                  val json = s"""{"placement_id":"$placementId","node_id":"\${node.id}","free":$free}"""
+                  complete(HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, json)))
+                case None => complete(StatusCodes.Conflict -> "NO_CAPACITY")
+              }
+          }
+        }
+      }
+    }
 }
 `,
     },
     cpp: {
       starter: `#include <httplib.h>
+#include <sw/redis++/redis++.h>
+
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
+#include "gpusched/config.h"
+#include "state.h"
+
 using json = nlohmann::json;
 
-struct NodeRecord {
+sw::redis::Redis redis("tcp://redis:6379");
+
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+
+struct Node {
   std::string id;
   std::string gpu_type;
-  int free;
+  int capacity = 0;
+  int allocated = 0;
+  int free = 0;
 };
 
-/** Node capacity as loaded once while the service boots. */
-std::vector<NodeRecord> loadBootCapacity();
+// Every node with a live heartbeat, most free GPUs first.
+std::vector<Node> schedulable_nodes() {
+  std::vector<Node> nodes;
+  for (const std::string& id : redis.smembers("nodes")) {
+    if (!redis.exists("heartbeat:" + id)) continue;
+    const auto fields = redis.hgetall("node:" + id);
+    Node n{id, fields.count("gpu_type") ? fields.at("gpu_type") : ""};
+    n.capacity = fields.count("capacity") ? std::stoi(fields.at("capacity")) : 0;
+    n.allocated = fields.count("allocated") ? std::stoi(fields.at("allocated")) : 0;
+    n.free = std::max(n.capacity - n.allocated, 0);
+    nodes.push_back(n);
+  }
+  std::sort(nodes.begin(), nodes.end(), [](const Node& a, const Node& b) { return a.free > b.free; });
+  return nodes;
+}
 
-const std::vector<NodeRecord> kBootCapacity = loadBootCapacity();
+// The fleet as it was when the service booted.
+std::vector<Node> kBootNodes;
 
-struct NodeRegistry {
-  std::string enqueue(const json& placement, const NodeRecord& node);
-};
+std::string new_placement_id() {
+  static std::mt19937_64 rng{std::random_device{}()};
+  char buf[16];
+  std::snprintf(buf, sizeof buf, "p-%012llx", static_cast<unsigned long long>(rng() & 0xffffffffffffULL));
+  return buf;
+}
 
-NodeRegistry nodeRegistry;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/placements", [](const httplib::Request& req, httplib::Response& res) {
-    const json body = json::parse(req.body, nullptr, false);
-    // TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free, places
-    // against the capacity snapshot taken at boot, and logs the request body. Fix all four.
-    const auto gpuType = body.value("gpu_type", std::string("a100"));
-    const NodeRecord* node = &kBootCapacity.front();
-    for (const auto& candidate : kBootCapacity) {
-      if (candidate.gpu_type == gpuType) {
-        node = &candidate;
-        break;
-      }
+void place(const httplib::Request& req, httplib::Response& res) {
+  json body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception&) {
+    res.status = 400;
+    res.set_content("malformed JSON body", "text/plain");
+    return;
+  }
+  const std::string gpu_type = body.value("gpu_type", "");
+  const int count = body.value("count", 0);
+  std::vector<Node> candidates;
+  for (const Node& n : kBootNodes) {
+    if (n.gpu_type == gpu_type) candidates.push_back(n);
+  }
+  if (candidates.empty()) candidates = kBootNodes;
+  const std::string placement_id = new_placement_id();
+  for (const Node& n : candidates) {
+    if (allocate(n.id, placement_id, count) == "ALLOCATED") {
+      std::clog << "placement queued body=" << body.dump() << " node=" << n.id << "\\n";
+      res.status = 201;
+      res.set_content(json{{"placement_id", placement_id}, {"node_id", n.id}, {"free", n.free - count}}.dump(), "application/json");
+      return;
     }
-    const auto placementId = nodeRegistry.enqueue(body, *node);
-    std::cerr << "placement queued payload=" << body.dump() << "\\n";
-    res.status = 201;
-    res.set_content(
-        json{{"placement_id", placementId}, {"node_id", node->id}, {"status", "queued"}}.dump(),
-        "application/json");
-  });
+  }
+  res.status = 409;
+  res.set_content("NO_CAPACITY", "text/plain");
+}
 
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  kBootNodes = schedulable_nodes();
+  svr.Post("/v1/placements", place);
 }
 `,
       solution: `#include <httplib.h>
+#include <sw/redis++/redis++.h>
+
 #include <nlohmann/json.hpp>
 
-#include <ctime>
+#include <algorithm>
 #include <iostream>
-#include <set>
+#include <random>
 #include <string>
 #include <vector>
 
+#include "gpusched/config.h"
+#include "state.h"
+
 using json = nlohmann::json;
 
-const std::set<std::string> kKnownGpuTypes = {"a100", "h100", "l40s"};
-constexpr int kMaxNodeGpus = 8;
-constexpr long kCapacityTtlSeconds = 2;
+sw::redis::Redis redis("tcp://redis:6379");
 
-struct NodeRecord {
+struct Node {
   std::string id;
   std::string gpu_type;
-  int free;
+  int capacity = 0;
+  int allocated = 0;
+  int free = 0;
 };
 
-struct NodeSnapshot {
-  std::vector<NodeRecord> nodes;
-  long capacityAsOf;
-};
-
-struct NodeRegistry {
-  /** Every schedulable node plus the time its capacity was read. */
-  NodeSnapshot list();
-
-  std::string enqueue(const json& placement, const NodeRecord& node);
-};
-
-NodeRegistry nodeRegistry;
-
-bool isPositiveInt(const json& value) {
-  return value.is_number_integer() && value.get<long long>() >= 1;
+// Every node with a live heartbeat, most free GPUs first.
+std::vector<Node> schedulable_nodes() {
+  std::vector<Node> nodes;
+  for (const std::string& id : redis.smembers("nodes")) {
+    if (!redis.exists("heartbeat:" + id)) continue;
+    const auto fields = redis.hgetall("node:" + id);
+    Node n{id, fields.count("gpu_type") ? fields.at("gpu_type") : ""};
+    n.capacity = fields.count("capacity") ? std::stoi(fields.at("capacity")) : 0;
+    n.allocated = fields.count("allocated") ? std::stoi(fields.at("allocated")) : 0;
+    n.free = std::max(n.capacity - n.allocated, 0);
+    nodes.push_back(n);
+  }
+  std::sort(nodes.begin(), nodes.end(), [](const Node& a, const Node& b) { return a.free > b.free; });
+  return nodes;
 }
 
-bool isFiniteNumber(const json& value) { return value.is_number(); }
-
-void fail(httplib::Response& res, int status, const char* message) {
-  res.status = status;
-  res.set_content(json{{"error", message}}.dump(), "application/json");
+std::string new_placement_id() {
+  static std::mt19937_64 rng{std::random_device{}()};
+  char buf[16];
+  std::snprintf(buf, sizeof buf, "p-%012llx", static_cast<unsigned long long>(rng() & 0xffffffffffffULL));
+  return buf;
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/placements", [](const httplib::Request& req, httplib::Response& res) {
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      fail(res, 400, "body must be a JSON object");
-      return;
-    }
-    if (!body.contains("gpu_type") || !body["gpu_type"].is_string() ||
-        kKnownGpuTypes.count(body["gpu_type"].get<std::string>()) == 0) {
-      fail(res, 400, "unknown gpu_type");
-      return;
-    }
-    if (!body.contains("count") || !isPositiveInt(body["count"])) {
-      fail(res, 400, "count must be a positive integer");
-      return;
-    }
-    if (!body.contains("memory_gb") || !isFiniteNumber(body["memory_gb"])) {
-      fail(res, 400, "memory_gb must be a number");
-      return;
-    }
-    if (!body.contains("max_hourly_bid") || !isFiniteNumber(body["max_hourly_bid"])) {
-      fail(res, 400, "max_hourly_bid must be a number");
-      return;
-    }
-    const int count = body["count"].get<int>();
-    if (count > kMaxNodeGpus) {
-      fail(res, 400, "count exceeds the largest node");
-      return;
-    }
-
-    const auto snapshot = nodeRegistry.list();
-    if (std::time(nullptr) - snapshot.capacityAsOf > kCapacityTtlSeconds) {
-      fail(res, 503, "STALE_CAPACITY");
-      return;
-    }
-
-    const auto gpuType = body["gpu_type"].get<std::string>();
-    const NodeRecord* best = nullptr;
-    for (const auto& node : snapshot.nodes) {
-      if (node.gpu_type != gpuType || node.free < count) continue;
-      if (best == nullptr || node.free > best->free) best = &node;
-    }
-    if (best == nullptr) {
-      fail(res, 409, "no node with enough free capacity");
-      return;
-    }
-
-    const auto placementId = nodeRegistry.enqueue(
-        json{{"gpu_type", gpuType},
-             {"count", count},
-             {"memory_gb", body["memory_gb"]},
-             {"max_hourly_bid", body["max_hourly_bid"]},
-             {"node_id", best->id}},
-        *best);
-    const auto nodeId = best->id;
-    std::cerr << "placed id=" << placementId << " node=" << nodeId << " count=" << count
-              << " free=" << best->free << " capacity_as_of=" << snapshot.capacityAsOf << "\\n";
-    res.status = 201;
-    res.set_content(
-        json{{"placement_id", placementId},
-             {"node_id", nodeId},
-             {"free", best->free},
-             {"capacity_as_of", snapshot.capacityAsOf}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void bad_request(httplib::Response& res, const std::string& why) {
+  res.status = 400;
+  res.set_content(why, "text/plain");
 }
+
+void place(const httplib::Request& req, httplib::Response& res) {
+  json body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception&) {
+    return bad_request(res, "malformed JSON body");
+  }
+  if (!body.is_object()) return bad_request(res, "body must be a JSON object");
+  if (!body["gpu_type"].is_string() || gpusched::kKnownGpuTypes.count(body["gpu_type"].get<std::string>()) == 0) {
+    return bad_request(res, "unknown gpu_type");
+  }
+  const std::string gpu_type = body["gpu_type"].get<std::string>();
+  if (!body["count"].is_number_integer()) return bad_request(res, "count must be an integer");
+  const int count = body["count"].get<int>();
+  if (count < 1 || count > gpusched::kMaxNodeGpus) {
+    return bad_request(res, "count must be an integer from 1 to " + std::to_string(gpusched::kMaxNodeGpus));
+  }
+  if (!body["memory_gb"].is_number() || !body["max_hourly_bid"].is_number()) {
+    return bad_request(res, "memory_gb and max_hourly_bid must be numbers");
+  }
+  const std::string placement_id = new_placement_id();
+  for (const Node& n : schedulable_nodes()) {
+    if (n.gpu_type != gpu_type || n.free < count) continue;
+    if (allocate(n.id, placement_id, count) == "ALLOCATED") {
+      const int free = n.free - count;
+      std::clog << "placed placement_id=" << placement_id << " node_id=" << n.id << " count=" << count << " free=" << free << "\\n";
+      res.status = 201;
+      res.set_content(json{{"placement_id", placement_id}, {"node_id", n.id}, {"free", free}}.dump(), "application/json");
+      return;
+    }
+  }
+  res.status = 409;
+  res.set_content("NO_CAPACITY", "text/plain");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/placements", place); }
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler at the admission boundary of a scheduler. The starter reads fine because the demo sends a well-formed request for a type that exists and fits: nothing in it exercises a typo, a count larger than the fleet, or a node that filled up since the process booted. Four defects are being checked, and they are ordered by how expensive they are to find in production. The unknown-type fallback is the loud one: a caller's typo becomes a placement on a machine that cannot run the job, and the GPU is wasted until someone notices. The uncapped count is the quiet one: nothing fails, the request simply sits in the queue forever, and the caller has no signal that it was impossible from the start. The boot-time capacity snapshot is the dangerous one, because it is *correct on the first request* and drifts afterwards — every later allocation the rest of the system performs is invisible to it, so the scheduler keeps handing out GPUs that are already taken. Reading capacity fresh per request, and carrying the read's \`capacity_as_of\` timestamp so a stale answer can be refused rather than trusted, is the same discipline the rest of this course applies to the Redis counters: never schedule from memory that something else can invalidate. The log line is the one candidates miss: a GPU request carries tenant ids, memory footprints and private bids, so the placement log must be ids and counters only. Real schedulers push further — a registry watch rather than a pull, a cache with an explicit invalidation epoch, per-tenant admission quotas before the capacity check, and a structured audit event for every rejected placement so that "why did my job never start" has an answer.`,
+  harness: {
+    python: `import logging
+
+BODY = {"gpu_type": "a100", "count": 4, "memory_gb": 80, "max_hourly_bid": 3.5}
+
+
+def _node(ctx, node_id, gpu_type="a100", capacity=8, allocated=0):
+    """A registered node with a live heartbeat, as the ledger (step 2) writes it."""
+    ctx.redis.hset(f"node:{node_id}", mapping={"gpu_type": gpu_type, "capacity": capacity, "allocated": allocated})
+    ctx.redis.sadd("nodes", node_id)
+    ctx.redis.set(f"heartbeat:{node_id}", "1", ex=30)
+
+
+class _Lines(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def _api(ctx):
+    """The scheduler with gpu-1 (a100, 8 GPUs) registered before it boots, and its log captured."""
+    _node(ctx, "gpu-1")
+    lines = _Lines()
+    logger = logging.getLogger("gpusched")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(lines)
+    m = ctx.load("api")
+    return m, lines
+
+
+async def _post(ctx, m, body):
+    async with ctx.client(m.app) as c:
+        return await c.post("/v1/placements", json=body)
+
+
+async def check_route_shape(ctx):
+    m, _ = _api(ctx)
+    r = await _post(ctx, m, BODY)
+    assert r.status_code == 201, f"POST /v1/placements with a valid body answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("node_id") == "gpu-1" and body.get("free") == 4 and isinstance(body.get("placement_id"), str), f"the answer was {body}, expected placement_id, node_id gpu-1 and free 4"
+    record = ctx.redis.hgetall(f"placement:{body['placement_id']}")
+    assert record.get("node_id") == "gpu-1" and record.get("count") == "4", f"placement:{body['placement_id']} is {record}: the placement must be booked through allocate"
+    assert ctx.redis.hget("node:gpu-1", "allocated") == "4", "allocate must have moved node:gpu-1's allocated to 4"
+
+
+async def check_unknown_type(ctx):
+    m, _ = _api(ctx)
+    r = await _post(ctx, m, {**BODY, "gpu_type": "tpu"})
+    assert r.status_code == 400, f"gpu_type tpu answered {r.status_code}, expected 400: an unknown type must be refused, not placed on whatever node is free"
+    assert ctx.redis.hget("node:gpu-1", "allocated") == "0", "a refused request must not book a node"
+    assert not ctx.redis.keys("placement:*"), f"a refused request must write no placement record, found {ctx.redis.keys('placement:*')}"
+    r = await _post(ctx, m, {**BODY, "gpu_type": 7})
+    assert r.status_code == 400, f"gpu_type 7 answered {r.status_code}, expected 400"
+
+
+async def check_capacity_ceiling(ctx):
+    m, _ = _api(ctx)
+    for count in (9, 0, -1, 2.5, "four"):
+        r = await _post(ctx, m, {**BODY, "count": count})
+        assert r.status_code == 400, f"count {count!r} answered {r.status_code}, expected 400 (an integer from 1 to MAX_NODE_GPUS = 8)"
+    assert ctx.redis.hget("node:gpu-1", "allocated") == "0" and not ctx.redis.keys("placement:*"), "no refused count may reach the ledger"
+    for field in ("memory_gb", "max_hourly_bid"):
+        r = await _post(ctx, m, {**BODY, field: "lots"})
+        assert r.status_code == 400, f"{field} 'lots' answered {r.status_code}, expected 400"
+    r = await _post(ctx, m, {**BODY, "count": 8})
+    assert r.status_code == 201, f"count 8 on an idle 8-GPU node answered {r.status_code}: {r.text}"
+
+
+async def check_fresh_capacity(ctx):
+    m, _ = _api(ctx)
+    # After boot: gpu-2 joins the fleet and gpu-1 fills up with placements from another replica.
+    _node(ctx, "gpu-2")
+    ctx.redis.hset("node:gpu-1", "allocated", 8)
+    r = await _post(ctx, m, BODY)
+    assert r.status_code == 201, f"with gpu-1 full and gpu-2 idle the request answered {r.status_code}: the node set must be read on every request, not at boot"
+    assert r.json().get("node_id") == "gpu-2", f"the request landed on {r.json().get('node_id')}, expected gpu-2 (gpu-1 has 0 free)"
+    ctx.redis.delete("heartbeat:gpu-2")
+    r = await _post(ctx, m, BODY)
+    assert r.status_code == 409, f"with gpu-1 full and gpu-2's heartbeat lapsed the request answered {r.status_code}, expected 409"
+
+
+async def check_log_no_payload(ctx):
+    m, lines = _api(ctx)
+    r = await _post(ctx, m, BODY)
+    assert r.status_code == 201, f"POST answered {r.status_code}: {r.text}"
+    placement_id = r.json()["placement_id"]
+    assert lines.lines, "the placement must be logged (logger gpusched, level INFO)"
+    for line in lines.lines:
+        assert "3.5" not in line and "max_hourly_bid" not in line and "80" not in line, f"the log line {line!r} carries the request body: log ids and counts, the tenant's bid stays out of the log"
+    assert any(placement_id in line and "gpu-1" in line for line in lines.lines), f"no log line names the placement id and the node id: {lines.lines}"
+`,
+    typescript: `const BODY = {gpu_type: 'a100', count: 4, memory_gb: 80, max_hourly_bid: 3.5};
+
+/** A registered node with a live heartbeat, as the ledger (step 2) writes it. */
+function node(ctx, id: string, gpuType = 'a100', capacity = 8, allocatedGpus = 0): void {
+  ctx.redis.hset(\`node:\${id}\`, 'gpu_type', gpuType, 'capacity', capacity, 'allocated', allocatedGpus);
+  ctx.redis.sadd('nodes', id);
+  ctx.redis.set(\`heartbeat:\${id}\`, '1', 'EX', 30);
+}
+
+/** The scheduler with gpu-1 (a100, 8 GPUs) registered before it boots, and its console captured. */
+function api(ctx) {
+  node(ctx, 'gpu-1');
+  const lines: string[] = [];
+  const original = {log: console.log, info: console.info};
+  console.log = console.info = (...args: unknown[]) => void lines.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  const m = ctx.load('api');
+  const c = ctx.client(m.app);
+  const restore = (): void => {
+    console.log = original.log;
+    console.info = original.info;
+  };
+  return {c, lines, restore, post: (body: unknown) => c.post('/v1/placements', {json: body})};
+}
+
+export async function check_route_shape(ctx) {
+  const {post, restore} = api(ctx);
+  try {
+    const r = await post(BODY);
+    assert.equal(r.status, 201, \`POST /v1/placements with a valid body answered \${r.status}: \${r.text}\`);
+    const body = r.json() as Record<string, unknown>;
+    assert(body.node_id === 'gpu-1' && body.free === 4 && typeof body.placement_id === 'string', \`the answer was \${r.text}, expected placement_id, node_id gpu-1 and free 4\`);
+    const record = ctx.redis.hgetall(\`placement:\${body.placement_id}\`);
+    assert(record.node_id === 'gpu-1' && record.count === '4', \`placement:\${body.placement_id} is \${JSON.stringify(record)}: the placement must be booked through allocate\`);
+    assert.equal(ctx.redis.hget('node:gpu-1', 'allocated'), '4', "allocate must have moved node:gpu-1's allocated");
+  } finally {
+    restore();
+  }
+}
+
+export async function check_unknown_type(ctx) {
+  const {post, restore} = api(ctx);
+  try {
+    let r = await post({...BODY, gpu_type: 'tpu'});
+    assert.equal(r.status, 400, 'gpu_type tpu: an unknown type must be refused, not placed on whatever node is free');
+    assert.equal(ctx.redis.hget('node:gpu-1', 'allocated'), '0', 'a refused request must not book a node');
+    assert.deepEqual(ctx.redis.keys('placement:*'), [], 'a refused request must write no placement record');
+    r = await post({...BODY, gpu_type: 7});
+    assert.equal(r.status, 400, 'gpu_type 7');
+  } finally {
+    restore();
+  }
+}
+
+export async function check_capacity_ceiling(ctx) {
+  const {post, restore} = api(ctx);
+  try {
+    for (const count of [9, 0, -1, 2.5, 'four']) {
+      const r = await post({...BODY, count});
+      assert.equal(r.status, 400, \`count \${JSON.stringify(count)} (an integer from 1 to MAX_NODE_GPUS = 8)\`);
+    }
+    assert(ctx.redis.hget('node:gpu-1', 'allocated') === '0' && ctx.redis.keys('placement:*').length === 0, 'no refused count may reach the ledger');
+    for (const field of ['memory_gb', 'max_hourly_bid']) {
+      const r = await post({...BODY, [field]: 'lots'});
+      assert.equal(r.status, 400, \`\${field} 'lots'\`);
+    }
+    const r = await post({...BODY, count: 8});
+    assert.equal(r.status, 201, \`count 8 on an idle 8-GPU node: \${r.text}\`);
+  } finally {
+    restore();
+  }
+}
+
+export async function check_fresh_capacity(ctx) {
+  const {post, restore} = api(ctx);
+  try {
+    // After boot: gpu-2 joins the fleet and gpu-1 fills up with placements from another replica.
+    node(ctx, 'gpu-2');
+    ctx.redis.hset('node:gpu-1', 'allocated', 8);
+    let r = await post(BODY);
+    assert.equal(r.status, 201, 'with gpu-1 full and gpu-2 idle: the node set must be read on every request, not at boot');
+    assert.equal((r.json() as {node_id: string}).node_id, 'gpu-2', 'the node the request landed on (gpu-1 has 0 free)');
+    ctx.redis.del('heartbeat:gpu-2');
+    r = await post(BODY);
+    assert.equal(r.status, 409, "with gpu-1 full and gpu-2's heartbeat lapsed");
+  } finally {
+    restore();
+  }
+}
+
+export async function check_log_no_payload(ctx) {
+  const {post, lines, restore} = api(ctx);
+  try {
+    const r = await post(BODY);
+    assert.equal(r.status, 201, \`POST answered \${r.status}: \${r.text}\`);
+    const {placement_id: placementId} = r.json() as {placement_id: string};
+    assert(lines.length > 0, 'the placement must be logged (console.info)');
+    for (const line of lines) {
+      assert(!line.includes('3.5') && !line.includes('max_hourly_bid') && !line.includes('80'), \`the log line \${JSON.stringify(line)} carries the request body: log ids and counts, the tenant's bid stays out of the log\`);
+    }
+    assert(lines.some(line => line.includes(placementId) && line.includes('gpu-1')), \`no log line names the placement id and the node id: \${JSON.stringify(lines)}\`);
+  } finally {
+    restore();
+  }
+}
+`,
+    go: `package main
+
+import (
+	"bytes"
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+var apiBody = map[string]any{"gpu_type": "a100", "count": 4, "memory_gb": 80, "max_hourly_bid": 3.5}
+
+// apiNode is a registered node with a live heartbeat, as the ledger (step 2) writes it.
+func apiNode(ctx *harness.Ctx, id, gpuType string, capacity, allocatedGPUs int) {
+	ctx.Redis.Do("HSET", "node:"+id, "gpu_type", gpuType, "capacity", capacity, "allocated", allocatedGPUs)
+	ctx.Redis.Do("SADD", "nodes", id)
+	ctx.Redis.Do("SET", "heartbeat:"+id, "1", "EX", 30)
+}
+
+// apiLedger stands in for allocate (state.go, step 2): the ledger's script.
+func apiLedger(ctx *harness.Ctx) {
+	allocate = func(_ context.Context, nodeID, placementID string, count int) (string, error) {
+		if ctx.Redis.Exists("heartbeat:"+nodeID) == 0 {
+			return "NO_HEARTBEAT", nil
+		}
+		fields := ctx.Redis.HGetAll("node:" + nodeID)
+		var capacity, allocatedGPUs int
+		for _, v := range []struct {
+			s string
+			p *int
+		}{{fields["capacity"], &capacity}, {fields["allocated"], &allocatedGPUs}} {
+			for _, c := range v.s {
+				*v.p = *v.p*10 + int(c-'0')
+			}
+		}
+		if allocatedGPUs+count > capacity {
+			return "NO_CAPACITY", nil
+		}
+		ctx.Redis.Do("HINCRBY", "node:"+nodeID, "allocated", count)
+		ctx.Redis.Do("HSET", "placement:"+placementID, "node_id", nodeID, "count", count, "status", "allocated")
+		ctx.Redis.Do("SADD", "node:"+nodeID+":placements", placementID)
+		return "ALLOCATED", nil
+	}
+}
+
+// apiBoot is the scheduler with gpu-1 (a100, 8 GPUs) registered before it boots, and its log captured.
+func apiBoot(ctx *harness.Ctx) (*harness.HTTP, *bytes.Buffer) {
+	apiNode(ctx, "gpu-1", "a100", 8, 0)
+	apiLedger(ctx)
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux), &logged
+}
+
+func apiWith(field string, value any) map[string]any {
+	body := map[string]any{}
+	for k, v := range apiBody {
+		body[k] = v
+	}
+	body[field] = value
+	return body
+}
+
+func CheckRouteShape(ctx *harness.Ctx) {
+	c, _ := apiBoot(ctx)
+	defer log.SetOutput(os.Stderr)
+	r := c.Post("/v1/placements", apiBody)
+	ctx.Equal(r.Status, 201, "POST /v1/placements with a valid body (%s)", r.Text())
+	body, _ := r.JSON().(map[string]any)
+	pid, _ := body["placement_id"].(string)
+	ctx.Assert(body["node_id"] == "gpu-1" && body["free"] == float64(4) && pid != "", "the answer was %s, expected placement_id, node_id gpu-1 and free 4", r.Text())
+	record := ctx.Redis.HGetAll("placement:" + pid)
+	ctx.Assert(record["node_id"] == "gpu-1" && record["count"] == "4", "placement:%s is %v: the placement must be booked through allocate", pid, record)
+	allocatedGPUs, _ := ctx.Redis.HGet("node:gpu-1", "allocated")
+	ctx.Equal(allocatedGPUs, "4", "allocate must have moved node:gpu-1's allocated")
+}
+
+func CheckUnknownType(ctx *harness.Ctx) {
+	c, _ := apiBoot(ctx)
+	defer log.SetOutput(os.Stderr)
+	r := c.Post("/v1/placements", apiWith("gpu_type", "tpu"))
+	ctx.Equal(r.Status, 400, "gpu_type tpu: an unknown type must be refused, not placed on whatever node is free")
+	allocatedGPUs, _ := ctx.Redis.HGet("node:gpu-1", "allocated")
+	ctx.Equal(allocatedGPUs, "0", "a refused request must not book a node; allocated")
+	ctx.Equal(len(ctx.Redis.Keys("placement:*")), 0, "a refused request must write no placement record; the records")
+	r = c.Post("/v1/placements", apiWith("gpu_type", 7))
+	ctx.Equal(r.Status, 400, "gpu_type 7")
+}
+
+func CheckCapacityCeiling(ctx *harness.Ctx) {
+	c, _ := apiBoot(ctx)
+	defer log.SetOutput(os.Stderr)
+	for _, count := range []any{9, 0, -1, 2.5, "four"} {
+		r := c.Post("/v1/placements", apiWith("count", count))
+		ctx.Equal(r.Status, 400, "count %v (an integer from 1 to MaxNodeGPUs = 8)", harness.Show(count))
+	}
+	allocatedGPUs, _ := ctx.Redis.HGet("node:gpu-1", "allocated")
+	ctx.Assert(allocatedGPUs == "0" && len(ctx.Redis.Keys("placement:*")) == 0, "no refused count may reach the ledger")
+	for _, field := range []string{"memory_gb", "max_hourly_bid"} {
+		r := c.Post("/v1/placements", apiWith(field, "lots"))
+		ctx.Equal(r.Status, 400, "%s 'lots'", field)
+	}
+	r := c.Post("/v1/placements", apiWith("count", 8))
+	ctx.Equal(r.Status, 201, "count 8 on an idle 8-GPU node (%s)", r.Text())
+}
+
+func CheckFreshCapacity(ctx *harness.Ctx) {
+	c, _ := apiBoot(ctx)
+	defer log.SetOutput(os.Stderr)
+	// After boot: gpu-2 joins the fleet and gpu-1 fills up with placements from another replica.
+	apiNode(ctx, "gpu-2", "a100", 8, 0)
+	ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 8)
+	r := c.Post("/v1/placements", apiBody)
+	ctx.Equal(r.Status, 201, "with gpu-1 full and gpu-2 idle: the node set must be read on every request, not at boot")
+	body, _ := r.JSON().(map[string]any)
+	ctx.Equal(body["node_id"], "gpu-2", "the node the request landed on (gpu-1 has 0 free)")
+	ctx.Redis.Del("heartbeat:gpu-2")
+	r = c.Post("/v1/placements", apiBody)
+	ctx.Equal(r.Status, 409, "with gpu-1 full and gpu-2's heartbeat lapsed")
+}
+
+func CheckLogNoPayload(ctx *harness.Ctx) {
+	c, logged := apiBoot(ctx)
+	defer log.SetOutput(os.Stderr)
+	r := c.Post("/v1/placements", apiBody)
+	ctx.Equal(r.Status, 201, "POST (%s)", r.Text())
+	body, _ := r.JSON().(map[string]any)
+	pid, _ := body["placement_id"].(string)
+	lines := strings.Split(strings.TrimSpace(logged.String()), "\\n")
+	ctx.Assert(logged.Len() > 0, "the placement must be logged (log.Printf)")
+	for _, line := range lines {
+		ctx.Assert(!strings.Contains(line, "3.5") && !strings.Contains(line, "max_hourly_bid") && !strings.Contains(line, "MaxHourlyBid") && !strings.Contains(line, "80"), "the log line %q carries the request body: log ids and counts, the tenant's bid stays out of the log", line)
+	}
+	named := false
+	for _, line := range lines {
+		named = named || (strings.Contains(line, pid) && strings.Contains(line, "gpu-1"))
+	}
+	ctx.Assert(named, "no log line names the placement id and the node id: %q", lines)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+harness::Ctx* apiCtx = nullptr;
+
+const nlohmann::json kApiBody = {{"gpu_type", "a100"}, {"count", 4}, {"memory_gb", 80}, {"max_hourly_bid", 3.5}};
+
+// A registered node with a live heartbeat, as the ledger (step 2) writes it.
+void apiNode(harness::Ctx& ctx, const std::string& id, const std::string& gpu_type = "a100", int capacity = 8, int allocated = 0) {
+  ctx.Redis.Do("HSET", "node:" + id, "gpu_type", gpu_type, "capacity", capacity, "allocated", allocated);
+  ctx.Redis.Do("SADD", "nodes", id);
+  ctx.Redis.Do("SET", "heartbeat:" + id, "1", "EX", 30);
+}
+
+nlohmann::json apiWith(const std::string& field, const nlohmann::json& value) {
+  nlohmann::json body = kApiBody;
+  body[field] = value;
+  return body;
+}
+
+struct ApiWorld {
+  httplib::Server svr;
+  std::ostringstream logged;
+  std::streambuf* clog = nullptr;
+  ~ApiWorld() {
+    if (clog) std::clog.rdbuf(clog);
+  }
+};
+
+ApiWorld* apiWorld = nullptr;
+
+// The scheduler with gpu-1 (a100, 8 GPUs) registered before it serves, and its log captured.
+harness::HTTP apiBoot(harness::Ctx& ctx) {
+  delete apiWorld;
+  apiWorld = new ApiWorld;
+  apiCtx = &ctx;
+  apiNode(ctx, "gpu-1");
+  apiWorld->clog = std::clog.rdbuf(apiWorld->logged.rdbuf());
+  register_routes(apiWorld->svr);
+  return ctx.HTTP(apiWorld->svr);
+}
+
+// What the handler wrote to std::clog so far, line by line.
+std::vector<std::string> apiLines() {
+  std::vector<std::string> lines;
+  std::istringstream in(apiWorld->logged.str());
+  for (std::string line; std::getline(in, line);) lines.push_back(line);
+  return lines;
+}
+
+harness::Response apiPost(harness::HTTP& c, const nlohmann::json& body) {
+  return c.Post("/v1/placements", body.dump(), "Content-Type", "application/json");
+}
+
+}  // namespace
+
+// The ledger (state.cpp, step 2) as the harness stands in for it: its script.
+std::string allocate(const std::string& node_id, const std::string& placement_id, int count) {
+  harness::Ctx& ctx = *apiCtx;
+  if (ctx.Redis.Exists("heartbeat:" + node_id) == 0) return "NO_HEARTBEAT";
+  const auto fields = ctx.Redis.HGetAll("node:" + node_id);
+  const int capacity = fields.count("capacity") ? std::stoi(fields.at("capacity")) : 0;
+  const int allocated = fields.count("allocated") ? std::stoi(fields.at("allocated")) : 0;
+  if (allocated + count > capacity) return "NO_CAPACITY";
+  ctx.Redis.Do("HINCRBY", "node:" + node_id, "allocated", count);
+  ctx.Redis.Do("HSET", "placement:" + placement_id, "node_id", node_id, "count", count, "status", "allocated");
+  ctx.Redis.Do("SADD", "node:" + node_id + ":placements", placement_id);
+  return "ALLOCATED";
+}
+
+void CheckRouteShape(harness::Ctx& ctx) {
+  auto c = apiBoot(ctx);
+  auto r = apiPost(c, kApiBody);
+  ctx.Equal(r.Status, 201, "POST /v1/placements with a valid body (%s)", r.Text());
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  const std::string pid = body.is_object() ? body.value("placement_id", "") : "";
+  ctx.Assert(body.is_object() && body.value("node_id", "") == "gpu-1" && body.value("free", -1) == 4 && !pid.empty(),
+             "the answer was %s, expected placement_id, node_id gpu-1 and free 4", r.Text());
+  const auto record = ctx.Redis.HGetAll("placement:" + pid);
+  ctx.Assert(record.count("node_id") && record.at("node_id") == "gpu-1" && record.count("count") && record.at("count") == "4",
+             "placement:%s is %v: the placement must be booked through allocate", pid, record);
+  ctx.Equal(ctx.Redis.HGet("node:gpu-1", "allocated"), "4", "allocate must have moved node:gpu-1's allocated");
+}
+
+void CheckUnknownType(harness::Ctx& ctx) {
+  auto c = apiBoot(ctx);
+  auto r = apiPost(c, apiWith("gpu_type", "tpu"));
+  ctx.Equal(r.Status, 400, "gpu_type tpu: an unknown type must be refused, not placed on whatever node is free");
+  ctx.Equal(ctx.Redis.HGet("node:gpu-1", "allocated"), "0", "a refused request must not book a node; allocated");
+  ctx.Equal(ctx.Redis.Keys("placement:*").size(), 0, "a refused request must write no placement record; the records");
+  r = apiPost(c, apiWith("gpu_type", 7));
+  ctx.Equal(r.Status, 400, "gpu_type 7");
+}
+
+void CheckCapacityCeiling(harness::Ctx& ctx) {
+  auto c = apiBoot(ctx);
+  for (const nlohmann::json count : {nlohmann::json(9), nlohmann::json(0), nlohmann::json(-1), nlohmann::json(2.5), nlohmann::json("four")}) {
+    auto r = apiPost(c, apiWith("count", count));
+    ctx.Equal(r.Status, 400, "count %s (an integer from 1 to kMaxNodeGpus = 8)", count.dump());
+  }
+  ctx.Assert(ctx.Redis.HGet("node:gpu-1", "allocated") == "0" && ctx.Redis.Keys("placement:*").empty(), "no refused count may reach the ledger");
+  for (const std::string field : {"memory_gb", "max_hourly_bid"}) {
+    auto r = apiPost(c, apiWith(field, "lots"));
+    ctx.Equal(r.Status, 400, "%s 'lots'", field);
+  }
+  auto r = apiPost(c, apiWith("count", 8));
+  ctx.Equal(r.Status, 201, "count 8 on an idle 8-GPU node (%s)", r.Text());
+}
+
+void CheckFreshCapacity(harness::Ctx& ctx) {
+  auto c = apiBoot(ctx);
+  // After boot: gpu-2 joins the fleet and gpu-1 fills up with placements from another replica.
+  apiNode(ctx, "gpu-2");
+  ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 8);
+  auto r = apiPost(c, kApiBody);
+  ctx.Equal(r.Status, 201, "with gpu-1 full and gpu-2 idle: the node set must be read on every request, not at boot");
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Equal(body.is_object() ? body.value("node_id", "") : "", "gpu-2", "the node the request landed on (gpu-1 has 0 free)");
+  ctx.Redis.Del("heartbeat:gpu-2");
+  r = apiPost(c, kApiBody);
+  ctx.Equal(r.Status, 409, "with gpu-1 full and gpu-2's heartbeat lapsed");
+}
+
+void CheckLogNoPayload(harness::Ctx& ctx) {
+  auto c = apiBoot(ctx);
+  auto r = apiPost(c, kApiBody);
+  ctx.Equal(r.Status, 201, "POST (%s)", r.Text());
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  const std::string pid = body.is_object() ? body.value("placement_id", "") : "";
+  std::clog.flush();
+  const std::vector<std::string> lines = apiLines();
+  ctx.Assert(!lines.empty(), "the placement must be logged (std::clog)");
+  for (const auto& line : lines) {
+    ctx.Assert(line.find("3.5") == std::string::npos && line.find("max_hourly_bid") == std::string::npos && line.find("80") == std::string::npos,
+               "the log line %q carries the request body: log ids and counts, the tenant's bid stays out of the log", line);
+  }
+  bool named = false;
+  for (const auto& line : lines) named = named || (line.find(pid) != std::string::npos && line.find("gpu-1") != std::string::npos);
+  ctx.Assert(named, "no log line names the placement id and the node id: %q", lines);
+}
+`,
+  },
+  debrief: `Admission is cheap checks in cost order, then the fleet, then the ledger: a body that can be refused from its own fields is refused before Redis is touched, and a count above \`MAX_NODE_GPUS\` is a 400 rather than a 409 because the caller can fix the first and only wait on the second. Reading the node set per request costs a few round trips and buys a picture of the fleet as old as the request, not as old as the process; the ledger's script is still the only thing that books, so a stale read costs one refused attempt, not an oversubscribed node. The log carries ids and counts because a bid is the tenant's and a log line outlives the request. Production schedulers cache the node set with a short TTL, invalidated by registration events, and score candidates by fragmentation.`,
 };

@@ -2,1248 +2,1192 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis node capacity with atomic allocation',
+  title: 'The node ledger: one script books, one script releases',
   concept: 'redis',
   file: 'state',
-  focus: ['scheduler', 'registry', 'redis'],
+  focus: ['scheduler', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: one allocation on an idle node
-succeeds, the demo job is placed and the counters look right. It hides four defects. Debug it like the owner of the node ledger, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the node ledger every other step calls: \`register_node\`
+writes \`node:{id}\` and \`heartbeat:{id}\`, \`allocate\` books GPUs for a placement, \`release\`
+returns them. It places the demo job and hides four flaws.
 
-The ledger the placement path calls lives in Redis:
+**Failure mode the checks target.** Two placements race for the last GPU and both win, because the
+free count is read on the client and moved in a second round trip; a machine that died keeps its
+place in the scheduling set because its heartbeat has no TTL; a retried release returns GPUs twice;
+a refused placement leaves its record behind.
 
-- Each node owns the hash \`node:{id}\` with \`capacity_gpus\`, \`capacity_memory_gb\`,
-  \`allocated_gpus\` and \`allocated_memory_gb\`. Registration writes the two capacity fields; every
-  allocation and release moves the two \`allocated_*\` counters. A request is admitted only while
-  \`allocated + wanted\` still fits under capacity — the counters the scheduler reads are the ones it
-  has to move.
-- Allocation must be **one atomic server-side operation**: a Lua \`EVAL\` that reads capacity and
-  allocated, refuses the request when it does not fit, and moves \`allocated_*\` in the same call. A
-  client-side \`HGET\` followed by a separate \`HINCRBY\` leaves a window in which two placements both
-  read the same free count and both decide they fit.
-- The counter move and the placement record \`placement:{id}\` are **one decision**. The starter writes
-  the record first and moves the counters afterwards, so a second placement can claim the GPUs the
-  first one already promised while the counters still agree with the first request.
-- \`heartbeat:{id}\` is a TTL marker set to \`HEARTBEAT_TTL_S\` (**30** seconds). While it exists the
-  node is schedulable; when it lapses the node is dead. The handler checks the node is alive before
-  it selects it. The starter never sets a TTL, so a machine that died hours ago stays in the scheduling
-  set forever and keeps being handed work.
-- Release is **idempotent** and keyed by the placement id: \`released:{placement_id}\` is set with
-  \`SET ... NX EX\`, and the release script moves \`allocated_*\` only when the marker was newly set. A
-  doubled release that simply decrements again inflates free capacity and lets the next placement
-  oversubscribe the node.
-- The loser of a race is reported honestly: the script returns \`NO_CAPACITY\` and the handler answers
-  **409** instead of granting capacity it could not move. The starter's client-side check looks fine
-  serially, but under load it grants what the ledger cannot back.
-
-**What each check looks for.**
-
-1. \`node-ledger-keys\` — the counters live under the node's own key: \`node:{id}\` with the
-   \`capacity_gpus\` and \`allocated_gpus\` fields, moved by allocation and release. The starter already
-   keys per node, so this check passes on it; the four below are where it fails.
-2. \`atomic-allocation\` — one \`EVAL\` of \`NODE_ALLOCATE_LUA\` reads capacity and allocated, compares
-   and moves the counters in the same script, and the starter's client-side \`HINCRBY\` is gone.
-3. \`heartbeat-liveness\` — \`HEARTBEAT_TTL_S\`, the \`heartbeat:{id}\` key and a \`node_alive\` check
-   gate every allocation, so a node whose heartbeat lapsed is refused before it is selected.
-4. \`idempotent-release\` — \`RELEASE_LUA\` moves the counters only behind a \`released:{placement_id}\`
-   marker set with \`SET ... NX\`, so a doubled release cannot inflate capacity.
-5. \`honest-contention\` — the script's \`NO_CAPACITY\` result is mapped to **409** rather than a grant,
-   so the loser of a race is told it lost instead of being handed GPUs the ledger cannot back.
-
-**Failure mode the checks target.** The client-side check and the post-record counter move are the
-same bug seen twice: both leave a gap between reading the free count and claiming it, and both are
-invisible until two placements race. A heartbeat that never expires keeps dead machines in the
-scheduling set, and a release that is not keyed by the placement id turns a retried release into
-capacity the fleet does not have.`,
+- \`node:{id}\` holds \`gpu_type\`, \`capacity\` and \`allocated\`; \`nodes\` is the set of ids.
+- \`heartbeat:{id}\` is set with a TTL of \`HEARTBEAT_TTL_S\` on registration and on every
+  \`heartbeat\`; while it exists the node is alive.
+- \`allocate(node_id, placement_id, count)\` is **one Lua script**: refuse with \`NO_HEARTBEAT\`
+  when the heartbeat lapsed, with \`NO_CAPACITY\` when \`allocated + count > capacity\`, otherwise
+  move \`allocated\`, write \`placement:{pid}\` (\`node_id\`, \`count\`, \`status\`), add the id to
+  \`node:{id}:placements\` and return \`ALLOCATED\`. A refused placement writes nothing.
+- \`release(node_id, placement_id)\` is one script keyed by the placement id: it moves the counters
+  only when the id is still in \`node:{id}:placements\`, and reports whether it did. The same key
+  makes \`allocate\` safe to retry: an id already in the set is \`ALLOCATED\` without booking again.`,
   sequence: {
-    participants: ['Node agent', 'GPU Scheduler', 'Redis'],
+    participants: ['gpusched', 'Redis'],
     messages: [
       {
-        from: 'Node agent',
-        to: 'GPU Scheduler',
-        label: 'POST /v1/nodes/gpu-7/register · {capacity_gpus: 8, capacity_memory_gb: 320}',
-        kind: 'sync',
-      },
-      {
-        from: 'GPU Scheduler',
+        from: 'gpusched',
         to: 'Redis',
-        label: 'HSET node:gpu-7 capacity_gpus · SET heartbeat:gpu-7 1 EX 30',
+        label: 'HSET node:gpu-1 … · SADD nodes · SET heartbeat:gpu-1 1 EX 30',
         kind: 'sync',
       },
       {
-        from: 'GPU Scheduler',
+        from: 'gpusched',
         to: 'Redis',
-        label: 'EVAL NODE_ALLOCATE_LUA · KEYS[node:gpu-7, heartbeat:gpu-7, placement:p-1]',
+        label: 'EVAL allocate · KEYS node:gpu-1 heartbeat:gpu-1 placement:p-1 node:gpu-1:placements',
         kind: 'sync',
       },
-      {
-        from: 'Redis',
-        to: 'GPU Scheduler',
-        label: '{1, allocated_gpus, allocated_memory_gb} — the record and the counters land together',
-        kind: 'reply',
-      },
-      {
-        from: 'GPU Scheduler',
-        to: 'GPU Scheduler',
-        label: '{-2} → 409 NO_HEARTBEAT when heartbeat:gpu-7 has lapsed',
-        kind: 'sync',
-      },
-      {
-        from: 'GPU Scheduler',
-        to: 'GPU Scheduler',
-        label: '{-1} → 409 NO_CAPACITY when the node cannot fit the request',
-        kind: 'sync',
-      },
-      {
-        from: 'GPU Scheduler',
-        to: 'Redis',
-        label: 'EVAL RELEASE_LUA · KEYS[node:gpu-7, released:p-1]',
-        kind: 'sync',
-      },
-      {
-        from: 'Redis',
-        to: 'GPU Scheduler',
-        label: '{0} — released:p-1 already existed, so nothing moved',
-        kind: 'reply',
-      },
+      {from: 'Redis', to: 'gpusched', label: 'ALLOCATED (allocated 0 → 4, placement:p-1 written)', kind: 'reply'},
+      {from: 'gpusched', to: 'Redis', label: 'EVAL allocate · p-2 wants 6', kind: 'sync'},
+      {from: 'Redis', to: 'gpusched', label: 'NO_CAPACITY (nothing written)', kind: 'reply'},
+      {from: 'gpusched', to: 'Redis', label: 'EVAL release · p-1, twice', kind: 'sync'},
+      {from: 'Redis', to: 'gpusched', label: '1, then 0', kind: 'reply'},
     ],
   },
   hints: [
-    'Do the whole decision in one script: `HGET capacity_gpus`, `HGET allocated_gpus`, compare, then `HINCRBY allocated_gpus` inside the same `EVAL`, so no placement can read the free count between the check and the move. A client-side `HGET` followed by a separate `HINCRBY` is the race — two placements both read the same number and both believe they fit. Move the counters in that script rather than after the placement record is written.',
-    'A node is schedulable only while `heartbeat:{id}` still has a TTL. Set it with `HEARTBEAT_TTL_S` seconds when the node registers, check the key exists before the node is selected, and let the script refuse the request when the heartbeat has lapsed — a node that died hours ago must not keep taking work.',
-    'Make release idempotent: `SET released:{placement_id} 1 NX EX ...` and move the counters only when the marker was newly set, so a doubled release cannot inflate capacity. And map the script’s `NO_CAPACITY` result to **409** — the loser of a race must be told it lost, not granted GPUs the ledger cannot back.',
+    'Under load two placements on one node both answer ALLOCATED and the node ends up over capacity; a node that was powered off yesterday still gets placements; a retried release leaves `allocated` negative.',
+    'The starter reads the counters with one command and moves them with another, so a second request lands between them and sees the same free count. SET without EX means the heartbeat never lapses; release does not ask whether the placement is still open.',
+    'Put the heartbeat check, the capacity compare, HINCRBY, HSET and SADD in one EVAL with the placement id in ARGV; SET heartbeat with EX HEARTBEAT_TTL_S; make release SISMEMBER the placement set first and return 0 when it is gone.',
   ],
   checks: [
     {
       id: 'node-ledger-keys',
-      title: 'Per-node counters live under the node key',
+      title: 'Registration writes node:{id}, nodes and the heartbeat',
       detail:
-        'The counters live in Redis under the node’s own key: `node:{id}` carries the `capacity_gpus` and `allocated_gpus` fields, written by registration and moved by allocation and release. The starter already keys per node — this check passes on it — but the four below are where it fails: a shared key or a key without the node id would let one machine spend another’s capacity.',
+        'The counters live under the node’s own key: `node:{id}` with `gpu_type`, `capacity` and `allocated`, the id in `nodes`, and `heartbeat:{id}` beside it. Allocation writes `placement:{pid}` and adds the id to `node:{id}:placements`. The starter keys per node already.',
       match: {
-        python: {all: [/def node_key\(/, /node:\{node_id\}/, /capacity_gpus/, /allocated_gpus/]},
-        typescript: {all: [/function nodeKey\(/, /node:\$\{nodeId\}/, /capacity_gpus/, /allocated_gpus/]},
-        go: {all: [/func nodeKey\(/, /"node:"\s*\+/, /capacity_gpus/, /allocated_gpus/]},
-        scala: {all: [/def nodeKey\(/, /node:\$nodeId/, /capacity_gpus/, /allocated_gpus/]},
-        cpp: {all: [/std::string nodeKey\(/, /"node:"\s*\+/, /capacity_gpus/, /allocated_gpus/]},
+        python: {
+          all: [
+            /f["']node:\{node_id\}["']/,
+            /["']nodes["']/,
+            /f["']heartbeat:\{node_id\}["']/,
+            /f["']placement:\{placement_id\}["']/,
+          ],
+        },
+        typescript: {
+          all: [/`node:\$\{nodeId\}`/, /['"]nodes['"]/, /`heartbeat:\$\{nodeId\}`/, /`placement:\$\{placementId\}`/],
+        },
+        go: {
+          all: [/"node:"\s*\+\s*nodeID/, /"nodes"/, /"heartbeat:"\s*\+\s*nodeID/, /"placement:"\s*\+\s*placementID/],
+        },
+        scala: {all: [/s"node:\$nodeId"/, /"nodes"/, /s"heartbeat:\$nodeId"/, /s"placement:\$placementId"/]},
+        cpp: {
+          all: [/"node:"\s*\+\s*node_id/, /"nodes"/, /"heartbeat:"\s*\+\s*node_id/, /"placement:"\s*\+\s*placement_id/],
+        },
       },
     },
     {
       id: 'atomic-allocation',
-      title: 'One atomic script admits and moves the counters',
+      title: 'One script compares and moves the counters',
       detail:
-        'Allocation is one `EVAL` of `NODE_ALLOCATE_LUA`: the script reads capacity and allocated, compares, and `HINCRBY`s `allocated_gpus` in the same call, writing the placement record in the same transaction. The starter reads the counters from the client and moves them only after the record is written, so two placements can both pass the same check and both be granted the same GPUs. A client-side `HINCRBY` of `allocated_gpus` is the flawed order.',
+        'Allocation is one `EVAL`: the script reads `capacity` and `allocated`, compares and runs `HINCRBY` in the same call. The starter reads with `HMGET` on the client and moves with a second round trip, so two placements both see the last GPU free.',
       match: {
         python: {
-          all: [/NODE_ALLOCATE_LUA/, /\.eval\(/, /HINCRBY/, /HSET/],
-          none: [/r\.hincrby\([^\n]*['"]allocated_gpus['"]/],
+          all: [
+            /redis\.call\(\s*['"]HM?GET['"]/,
+            /redis\.call\(\s*['"]HINCRBY['"]/,
+            /register_script\(|\.eval\(|\.evalsha\(/,
+          ],
+          none: [/\br\.hincrby\(/, /\br\.hmget\(/],
         },
         typescript: {
-          all: [/NODE_ALLOCATE_LUA/, /\.eval\(/, /HINCRBY/, /HSET/],
-          none: [/r\.hincrby\([^\n]*['"]allocated_gpus['"]/],
+          all: [
+            /redis\.call\(\s*['"]HM?GET['"]/,
+            /redis\.call\(\s*['"]HINCRBY['"]/,
+            /defineCommand\(|\.eval\(|\.evalsha\(/,
+          ],
+          none: [/redis\.hincrby\(/, /redis\.hmget\(/],
         },
         go: {
-          all: [/(nodeAllocateScript|NewScript)/, /\.Run\(/, /HINCRBY/, /HSET/],
-          none: [/rdb\.HIncrBy\([^\n]*"allocated_gpus"/],
+          all: [
+            /redis\.call\(\s*['"]HM?GET['"]/,
+            /redis\.call\(\s*['"]HINCRBY['"]/,
+            /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/,
+          ],
+          none: [/rdb\.HIncrBy\(/, /rdb\.HMGet\(/],
         },
         scala: {
-          all: [/NodeAllocateLua/, /\.eval\(\s*NodeAllocateLua/, /HINCRBY/, /HSET/],
-          none: [/jedis\.hincrBy\([^\n]*"allocated_gpus"/],
+          all: [/redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]HINCRBY['"]/, /jedis\.eval(sha)?\(/],
+          none: [/jedis\.hincrBy\(/, /jedis\.hmget\(/],
         },
         cpp: {
-          all: [/kNodeAllocateLua/, /\.eval</, /HINCRBY/, /HSET/],
-          none: [/redis\.hincrby\([^\n]*"allocated_gpus"/],
+          all: [/redis\.call\(\s*['"]HM?GET['"]/, /redis\.call\(\s*['"]HINCRBY['"]/, /redis\.eval(sha)?[<(]/],
+          none: [/redis\.hincrby\(/, /redis\.hmget\(/],
         },
       },
     },
     {
       id: 'heartbeat-liveness',
-      title: 'A node without a live heartbeat is refused',
+      title: 'A node whose heartbeat lapsed is refused',
       detail:
-        '`heartbeat:{id}` carries a TTL of `HEARTBEAT_TTL_S` seconds, set when the node registers, and the `node_alive` check runs before the node is selected — the script refuses a node whose heartbeat key has lapsed with `NO_HEARTBEAT`. The starter never sets a TTL, so a node that died hours ago stays schedulable forever and keeps being handed placements.',
+        '`heartbeat:{id}` is set with `EX HEARTBEAT_TTL_S` and the script refuses the node with `NO_HEARTBEAT` when the key is gone. The starter sets the key without a TTL, so a dead node stays schedulable.',
       match: {
-        python: {all: [/HEARTBEAT_TTL_S/, /def heartbeat_key\(/, /def node_alive\(/]},
-        typescript: {all: [/HEARTBEAT_TTL_S/, /function heartbeatKey\(/, /function nodeAlive\(/]},
-        go: {all: [/heartbeatTtlSeconds/, /func heartbeatKey\(/, /func nodeAlive\(/]},
-        scala: {all: [/HeartbeatTtlSeconds/, /def heartbeatKey\(/, /def nodeAlive\(/]},
-        cpp: {all: [/kHeartbeatTtlSeconds/, /std::string heartbeatKey\(/, /nodeAlive\(/]},
+        python: {
+          all: [
+            /HEARTBEAT_TTL_S/,
+            /\bex\s*=\s*HEARTBEAT_TTL_S|["']EX["']\s*,\s*HEARTBEAT_TTL_S/,
+            /redis\.call\(\s*['"]EXISTS['"]\s*,\s*KEYS\[2\]\s*\)/,
+            /NO_HEARTBEAT/,
+          ],
+        },
+        typescript: {
+          all: [
+            /HEARTBEAT_TTL_S/,
+            /['"]EX['"]\s*,\s*HEARTBEAT_TTL_S/,
+            /redis\.call\(\s*['"]EXISTS['"]\s*,\s*KEYS\[2\]\s*\)/,
+            /NO_HEARTBEAT/,
+          ],
+        },
+        go: {
+          all: [
+            /config\.HeartbeatTTL/,
+            /\.Set\([^\n]*config\.HeartbeatTTL\s*\)|\.SetEx\([^\n]*config\.HeartbeatTTL/,
+            /redis\.call\(\s*['"]EXISTS['"]\s*,\s*KEYS\[2\]\s*\)/,
+            /NO_HEARTBEAT/,
+          ],
+        },
+        scala: {
+          all: [
+            /HeartbeatTtlS/,
+            /\.setex\([^\n]*HeartbeatTtlS|\.ex\(\s*HeartbeatTtlS/,
+            /redis\.call\(\s*['"]EXISTS['"]\s*,\s*KEYS\[2\]\s*\)/,
+            /NO_HEARTBEAT/,
+          ],
+        },
+        cpp: {
+          all: [
+            /kHeartbeatTtlS/,
+            /\.set\([^\n]*kHeartbeatTtlS|\.setex\([^\n]*kHeartbeatTtlS/,
+            /redis\.call\(\s*['"]EXISTS['"]\s*,\s*KEYS\[2\]\s*\)/,
+            /NO_HEARTBEAT/,
+          ],
+        },
       },
     },
     {
       id: 'idempotent-release',
-      title: 'Release is idempotent, keyed by the placement id',
+      title: 'Release moves the counters once per placement id',
       detail:
-        'Release runs `RELEASE_LUA`, which sets `released:{placement_id}` with `SET ... NX EX` and moves `allocated_*` only when the marker was newly set. The starter decrements the counters on every call, so a doubled release inflates free capacity and the next placement oversubscribes the node.',
+        'The release script checks `SISMEMBER node:{id}:placements` first and returns 0 when the id is gone; the counters move only on the first call. The starter decrements on every call, so a retry inflates free capacity.',
       match: {
-        python: {all: [/RELEASE_LUA/, /def released_key\(/, /\.eval\(\s*RELEASE_LUA/, /NX/]},
-        typescript: {all: [/RELEASE_LUA/, /function releasedKey\(/, /\.eval\(\s*RELEASE_LUA/, /NX/]},
-        go: {all: [/releaseScript/, /func releasedKey\(/, /\.Run\(/, /NX/]},
-        scala: {all: [/ReleaseLua/, /def releasedKey\(/, /\.eval\(\s*ReleaseLua/, /NX/]},
-        cpp: {all: [/kReleaseLua/, /std::string releasedKey\(/, /\.eval</, /NX/]},
+        python: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
+        typescript: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
+        go: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
+        scala: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
+        cpp: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
       },
     },
     {
       id: 'honest-contention',
-      title: 'The loser of a race gets NO_CAPACITY, not a grant',
+      title: 'A refused placement writes nothing',
       detail:
-        'The atomic script returns `NO_CAPACITY` when the request does not fit and the handler answers **409** — the loser of a race is told it lost instead of being granted capacity the ledger could not move. The starter decides on the client, so under contention both requests see the same free count and both are granted.',
+        'The script compares before it writes: `NO_CAPACITY` comes back with `allocated`, `placement:{pid}` and `node:{id}:placements` untouched. The starter writes the placement record on the client before it decides.',
       match: {
-        python: {all: [/LUA_NO_CAPACITY/, /result\[0\]/, /status_code\s*=\s*409/]},
-        typescript: {all: [/LUA_NO_CAPACITY/, /result\[0\]/, /code\(\s*409\s*\)/]},
-        go: {all: [/luaNoCapacity/, /values\[0\]/, /StatusConflict|\b409\b/]},
-        scala: {all: [/LuaNoCapacity/, /result\.get\(0\)/, /StatusCodes\.Conflict|\b409\b/]},
-        cpp: {all: [/kLuaNoCapacity/, /result\[0\]/, /status\s*=\s*409/]},
+        python: {
+          all: [/NO_CAPACITY/, /redis\.call\(\s*['"]HSET['"]\s*,\s*KEYS\[3\]/],
+          none: [/\br\.hset\(\s*f?["']placement:/],
+        },
+        typescript: {
+          all: [/NO_CAPACITY/, /redis\.call\(\s*['"]HSET['"]\s*,\s*KEYS\[3\]/],
+          none: [/redis\.hset\(\s*`placement:/],
+        },
+        go: {
+          all: [/NO_CAPACITY/, /redis\.call\(\s*['"]HSET['"]\s*,\s*KEYS\[3\]/],
+          none: [/rdb\.HSet\([^\n]*"placement:"/],
+        },
+        scala: {
+          all: [/NO_CAPACITY/, /redis\.call\(\s*['"]HSET['"]\s*,\s*KEYS\[3\]/],
+          none: [/jedis\.hset\([^\n]*s"placement:/],
+        },
+        cpp: {
+          all: [/NO_CAPACITY/, /redis\.call\(\s*['"]HSET['"]\s*,\s*KEYS\[3\]/],
+          none: [/redis\.hset\([^\n]*"placement:"/],
+        },
       },
     },
   ],
   code: {
     python: {
       starter: `import redis
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
-app = FastAPI()
+from gpusched.config import HEARTBEAT_TTL_S
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-
-class RegisterRequest(BaseModel):
-    capacity_gpus: int
-    capacity_memory_gb: int
+# TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
 
-class AllocationRequest(BaseModel):
-    placement_id: str
-    gpu_count: int
-    memory_gb: int
+def register_node(node_id: str, gpu_type: str, capacity: int) -> None:
+    """A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity."""
+    r.hset(f"node:{node_id}", mapping={"gpu_type": gpu_type, "capacity": capacity})
+    r.hsetnx(f"node:{node_id}", "allocated", 0)
+    r.sadd("nodes", node_id)
+    r.set(f"heartbeat:{node_id}", "1")
 
 
-def node_key(node_id: str) -> str:
-    return f"node:{node_id}"
+def heartbeat(node_id: str) -> None:
+    """The node agent reports in."""
+    r.set(f"heartbeat:{node_id}", "1")
 
 
-def placement_key(placement_id: str) -> str:
-    return f"placement:{placement_id}"
+def allocate(node_id: str, placement_id: str, count: int) -> str:
+    """Book count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT."""
+    r.hset(f"placement:{placement_id}", mapping={"node_id": node_id, "count": count, "status": "allocated"})
+    capacity, allocated = r.hmget(f"node:{node_id}", "capacity", "allocated")
+    if int(allocated or 0) + count > int(capacity or 0):
+        return "NO_CAPACITY"
+    r.hincrby(f"node:{node_id}", "allocated", count)
+    r.sadd(f"node:{node_id}:placements", placement_id)
+    return "ALLOCATED"
 
 
-@app.post("/v1/nodes/{node_id}/register")
-def register(node_id: str, body: RegisterRequest) -> dict:
-    r.hset(node_key(node_id), mapping={"capacity_gpus": body.capacity_gpus, "capacity_memory_gb": body.capacity_memory_gb})
-    return {"node_id": node_id, "state": "registered"}
-
-
-@app.post("/v1/nodes/{node_id}/allocations")
-def allocate(node_id: str, body: AllocationRequest) -> dict:
-    # TODO: this starter reads the counters, decides client-side, writes the placement record and only
-    # then moves the counters. Two allocations can pass the same check, there is no heartbeat TTL and
-    # release is not idempotent. Fix all four.
-    capacity = int(r.hget(node_key(node_id), "capacity_gpus") or 0)
-    capacity_mem = int(r.hget(node_key(node_id), "capacity_memory_gb") or 0)
-    held = int(r.hget(node_key(node_id), "allocated_gpus") or 0)
-    held_mem = int(r.hget(node_key(node_id), "allocated_memory_gb") or 0)
-    if held + body.gpu_count > capacity or held_mem + body.memory_gb > capacity_mem:
-        raise HTTPException(status_code=409, detail="NO_CAPACITY")
-    r.hset(placement_key(body.placement_id), mapping={"node_id": node_id, "gpu_count": body.gpu_count, "memory_gb": body.memory_gb})
-    r.hincrby(node_key(node_id), "allocated_gpus", body.gpu_count)
-    r.hincrby(node_key(node_id), "allocated_memory_gb", body.memory_gb)
-    return {"placement_id": body.placement_id, "node_id": node_id, "state": "allocated"}
-
-
-@app.post("/v1/placements/{placement_id}/release")
-def release(placement_id: str) -> dict:
-    record = r.hgetall(placement_key(placement_id))
-    if not record:
-        return {"placement_id": placement_id, "state": "released"}
-    r.hincrby(node_key(record["node_id"]), "allocated_gpus", -int(record["gpu_count"]))
-    r.hincrby(node_key(record["node_id"]), "allocated_memory_gb", -int(record["memory_gb"]))
-    return {"placement_id": placement_id, "state": "released"}
+def release(node_id: str, placement_id: str) -> bool:
+    """Return the placement's GPUs to the node; True when the counters moved."""
+    count = int(r.hget(f"placement:{placement_id}", "count") or 0)
+    r.hincrby(f"node:{node_id}", "allocated", -count)
+    r.hset(f"placement:{placement_id}", "status", "released")
+    r.srem(f"node:{node_id}:placements", placement_id)
+    return True
 `,
       solution: `import redis
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-app = FastAPI()
+from gpusched.config import HEARTBEAT_TTL_S
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-HEARTBEAT_TTL_S = 30
-RELEASED_TTL_S = 3600
-LUA_ALLOCATED = 1
-LUA_NO_CAPACITY = -1
-LUA_NO_HEARTBEAT = -2
-
-NODE_ALLOCATE_LUA = """
-local capacity_gpus = tonumber(redis.call('HGET', KEYS[1], 'capacity_gpus')) or 0
-local capacity_mem = tonumber(redis.call('HGET', KEYS[1], 'capacity_memory_gb')) or 0
-local held = tonumber(redis.call('HGET', KEYS[1], 'allocated_gpus')) or 0
-local held_mem = tonumber(redis.call('HGET', KEYS[1], 'allocated_memory_gb')) or 0
-local want_gpus = tonumber(ARGV[1])
-local want_mem = tonumber(ARGV[2])
+# KEYS: node:{id}, heartbeat:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id, node_id, count
+ALLOCATE_LUA = """
 if redis.call('EXISTS', KEYS[2]) == 0 then
-  return {-2, held, held_mem}
+  return 'NO_HEARTBEAT'
 end
-if held + want_gpus > capacity_gpus or held_mem + want_mem > capacity_mem then
-  return {-1, held, held_mem}
+if redis.call('SISMEMBER', KEYS[4], ARGV[1]) == 1 then
+  return 'ALLOCATED'
 end
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', want_gpus)
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', want_mem)
-redis.call('HSET', KEYS[3], 'node_id', ARGV[3], 'gpu_count', want_gpus, 'memory_gb', want_mem)
-return {1, held + want_gpus, held_mem + want_mem}
+local node = redis.call('HMGET', KEYS[1], 'capacity', 'allocated')
+local capacity, allocated, count = tonumber(node[1]) or 0, tonumber(node[2]) or 0, tonumber(ARGV[3])
+if allocated + count > capacity then
+  return 'NO_CAPACITY'
+end
+redis.call('HINCRBY', KEYS[1], 'allocated', count)
+redis.call('HSET', KEYS[3], 'node_id', ARGV[2], 'count', ARGV[3], 'status', 'allocated')
+redis.call('SADD', KEYS[4], ARGV[1])
+return 'ALLOCATED'
 """
 
+# KEYS: node:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id
 RELEASE_LUA = """
-if redis.call('SET', KEYS[2], '1', 'NX', 'EX', tonumber(ARGV[3])) == false then
-  return {0}
+if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then
+  return 0
 end
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))
-return {1}
+local count = tonumber(redis.call('HGET', KEYS[2], 'count')) or 0
+redis.call('HINCRBY', KEYS[1], 'allocated', -count)
+redis.call('HSET', KEYS[2], 'status', 'released')
+redis.call('SREM', KEYS[3], ARGV[1])
+return 1
 """
 
-
-class RegisterRequest(BaseModel):
-    capacity_gpus: int
-    capacity_memory_gb: int
+allocate_script = r.register_script(ALLOCATE_LUA)
+release_script = r.register_script(RELEASE_LUA)
 
 
-class AllocationRequest(BaseModel):
-    placement_id: str
-    gpu_count: int
-    memory_gb: int
+def register_node(node_id: str, gpu_type: str, capacity: int) -> None:
+    """A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity."""
+    r.hset(f"node:{node_id}", mapping={"gpu_type": gpu_type, "capacity": capacity})
+    r.hsetnx(f"node:{node_id}", "allocated", 0)
+    r.sadd("nodes", node_id)
+    r.set(f"heartbeat:{node_id}", "1", ex=HEARTBEAT_TTL_S)
 
 
-def node_key(node_id: str) -> str:
-    return f"node:{node_id}"
+def heartbeat(node_id: str) -> None:
+    """The node agent reports in."""
+    r.set(f"heartbeat:{node_id}", "1", ex=HEARTBEAT_TTL_S)
 
 
-def heartbeat_key(node_id: str) -> str:
-    return f"heartbeat:{node_id}"
+def allocate(node_id: str, placement_id: str, count: int) -> str:
+    """Book count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT."""
+    keys = [f"node:{node_id}", f"heartbeat:{node_id}", f"placement:{placement_id}", f"node:{node_id}:placements"]
+    return str(allocate_script(keys=keys, args=[placement_id, node_id, count]))
 
 
-def placement_key(placement_id: str) -> str:
-    return f"placement:{placement_id}"
-
-
-def released_key(placement_id: str) -> str:
-    return f"released:{placement_id}"
-
-
-def node_alive(node_id: str) -> bool:
-    """Schedulable only while the heartbeat key still has a TTL."""
-    return bool(r.exists(heartbeat_key(node_id)))
-
-
-@app.post("/v1/nodes/{node_id}/register")
-def register(node_id: str, body: RegisterRequest) -> dict:
-    r.hset(node_key(node_id), mapping={"capacity_gpus": body.capacity_gpus, "capacity_memory_gb": body.capacity_memory_gb})
-    r.set(heartbeat_key(node_id), "1", ex=HEARTBEAT_TTL_S)
-    return {"node_id": node_id, "state": "registered"}
-
-
-@app.post("/v1/nodes/{node_id}/allocations")
-def allocate(node_id: str, body: AllocationRequest) -> JSONResponse:
-    if not node_alive(node_id):
-        return JSONResponse({"error": "NO_HEARTBEAT"}, status_code=409)
-    result = r.eval(
-        NODE_ALLOCATE_LUA,
-        3,
-        node_key(node_id),
-        heartbeat_key(node_id),
-        placement_key(body.placement_id),
-        body.gpu_count,
-        body.memory_gb,
-        node_id,
-    )
-    if int(result[0]) == LUA_NO_HEARTBEAT:
-        return JSONResponse({"error": "NO_HEARTBEAT"}, status_code=409)
-    if int(result[0]) == LUA_NO_CAPACITY:
-        return JSONResponse({"error": "NO_CAPACITY"}, status_code=409)
-    return JSONResponse({"placement_id": body.placement_id, "node_id": node_id, "state": "allocated"}, status_code=201)
-
-
-@app.post("/v1/placements/{placement_id}/release")
-def release(placement_id: str) -> dict:
-    record = r.hgetall(placement_key(placement_id))
-    if not record:
-        return {"placement_id": placement_id, "state": "released"}
-    result = r.eval(
-        RELEASE_LUA,
-        2,
-        node_key(record["node_id"]),
-        released_key(placement_id),
-        record["gpu_count"],
-        record["memory_gb"],
-        RELEASED_TTL_S,
-    )
-    return {"placement_id": placement_id, "state": "released", "applied": int(result[0])}
+def release(node_id: str, placement_id: str) -> bool:
+    """Return the placement's GPUs to the node; True when the counters moved."""
+    keys = [f"node:{node_id}", f"placement:{placement_id}", f"node:{node_id}:placements"]
+    return int(release_script(keys=keys, args=[placement_id])) == 1
 `,
     },
     typescript: {
-      starter: `/** Node ledger: flawed code that decides on the client and moves the counters last. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {HEARTBEAT_TTL_S} from 'gpusched/config';
 
-interface RegisterBody {
-  capacity_gpus: number;
-  capacity_memory_gb: number;
+const redis = new Redis({host: 'redis', port: 6379});
+
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+
+/** A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity. */
+export async function registerNode(nodeId: string, gpuType: string, capacity: number): Promise<void> {
+  await redis.hset(\`node:\${nodeId}\`, 'gpu_type', gpuType, 'capacity', capacity);
+  await redis.hsetnx(\`node:\${nodeId}\`, 'allocated', 0);
+  await redis.sadd('nodes', nodeId);
+  await redis.set(\`heartbeat:\${nodeId}\`, '1');
 }
 
-interface AllocationBody {
-  placement_id: string;
-  gpu_count: number;
-  memory_gb: number;
+/** The node agent reports in. */
+export async function heartbeat(nodeId: string): Promise<void> {
+  await redis.set(\`heartbeat:\${nodeId}\`, '1');
 }
 
-function nodeKey(nodeId: string): string {
-  return \`node:\${nodeId}\`;
+/** Book count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT. */
+export async function allocate(nodeId: string, placementId: string, count: number): Promise<string> {
+  await redis.hset(\`placement:\${placementId}\`, 'node_id', nodeId, 'count', count, 'status', 'allocated');
+  const [capacity, allocated] = await redis.hmget(\`node:\${nodeId}\`, 'capacity', 'allocated');
+  if (Number(allocated ?? 0) + count > Number(capacity ?? 0)) return 'NO_CAPACITY';
+  await redis.hincrby(\`node:\${nodeId}\`, 'allocated', count);
+  await redis.sadd(\`node:\${nodeId}:placements\`, placementId);
+  return 'ALLOCATED';
 }
 
-function placementKey(placementId: string): string {
-  return \`placement:\${placementId}\`;
+/** Return the placement's GPUs to the node; true when the counters moved. */
+export async function release(nodeId: string, placementId: string): Promise<boolean> {
+  const count = Number((await redis.hget(\`placement:\${placementId}\`, 'count')) ?? 0);
+  await redis.hincrby(\`node:\${nodeId}\`, 'allocated', -count);
+  await redis.hset(\`placement:\${placementId}\`, 'status', 'released');
+  await redis.srem(\`node:\${nodeId}:placements\`, placementId);
+  return true;
 }
-
-app.post('/v1/nodes/:nodeId/register', async (request, reply) => {
-  const {nodeId} = request.params as {nodeId: string};
-  const body = request.body as RegisterBody;
-  await r.hset(nodeKey(nodeId), {
-    capacity_gpus: String(body.capacity_gpus),
-    capacity_memory_gb: String(body.capacity_memory_gb),
-  });
-  return reply.code(201).send({node_id: nodeId, state: 'registered'});
-});
-
-app.post('/v1/nodes/:nodeId/allocations', async (request, reply) => {
-  const {nodeId} = request.params as {nodeId: string};
-  const body = request.body as AllocationBody;
-  // TODO: this starter reads the counters, decides on the client, writes the placement record and only
-  // then moves the counters. Two allocations can pass the same check, there is no heartbeat TTL and
-  // release is not idempotent. Fix all four.
-  const capacity = Number((await r.hget(nodeKey(nodeId), 'capacity_gpus')) ?? 0);
-  const capacityMem = Number((await r.hget(nodeKey(nodeId), 'capacity_memory_gb')) ?? 0);
-  const held = Number((await r.hget(nodeKey(nodeId), 'allocated_gpus')) ?? 0);
-  const heldMem = Number((await r.hget(nodeKey(nodeId), 'allocated_memory_gb')) ?? 0);
-  if (held + body.gpu_count > capacity || heldMem + body.memory_gb > capacityMem) {
-    return reply.code(409).send({error: 'NO_CAPACITY'});
-  }
-  await r.hset(placementKey(body.placement_id), {
-    node_id: nodeId,
-    gpu_count: String(body.gpu_count),
-    memory_gb: String(body.memory_gb),
-  });
-  await r.hincrby(nodeKey(nodeId), 'allocated_gpus', body.gpu_count);
-  await r.hincrby(nodeKey(nodeId), 'allocated_memory_gb', body.memory_gb);
-  return reply.code(201).send({placement_id: body.placement_id, node_id: nodeId, state: 'allocated'});
-});
-
-app.post('/v1/placements/:placementId/release', async (request, reply) => {
-  const {placementId} = request.params as {placementId: string};
-  const record = await r.hgetall(placementKey(placementId));
-  if (Object.keys(record).length === 0) {
-    return reply.code(200).send({placement_id: placementId, state: 'released'});
-  }
-  await r.hincrby(nodeKey(record.node_id), 'allocated_gpus', -Number(record.gpu_count));
-  await r.hincrby(nodeKey(record.node_id), 'allocated_memory_gb', -Number(record.memory_gb));
-  return reply.code(200).send({placement_id: placementId, state: 'released'});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** Node ledger: one atomic script owns node:{id} — admission, heartbeat gate and idempotent release. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {HEARTBEAT_TTL_S} from 'gpusched/config';
 
-const HEARTBEAT_TTL_S = 30;
-const RELEASED_TTL_S = 3600;
-const LUA_ALLOCATED = 1;
-const LUA_NO_CAPACITY = -1;
-const LUA_NO_HEARTBEAT = -2;
-
-const NODE_ALLOCATE_LUA = \`
-local capacity_gpus = tonumber(redis.call('HGET', KEYS[1], 'capacity_gpus')) or 0
-local capacity_mem = tonumber(redis.call('HGET', KEYS[1], 'capacity_memory_gb')) or 0
-local held = tonumber(redis.call('HGET', KEYS[1], 'allocated_gpus')) or 0
-local held_mem = tonumber(redis.call('HGET', KEYS[1], 'allocated_memory_gb')) or 0
-local want_gpus = tonumber(ARGV[1])
-local want_mem = tonumber(ARGV[2])
+// KEYS: node:{id}, heartbeat:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id, node_id, count
+const ALLOCATE_LUA = \`
 if redis.call('EXISTS', KEYS[2]) == 0 then
-  return {-2, held, held_mem}
+  return 'NO_HEARTBEAT'
 end
-if held + want_gpus > capacity_gpus or held_mem + want_mem > capacity_mem then
-  return {-1, held, held_mem}
+if redis.call('SISMEMBER', KEYS[4], ARGV[1]) == 1 then
+  return 'ALLOCATED'
 end
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', want_gpus)
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', want_mem)
-redis.call('HSET', KEYS[3], 'node_id', ARGV[3], 'gpu_count', want_gpus, 'memory_gb', want_mem)
-return {1, held + want_gpus, held_mem + want_mem}
+local node = redis.call('HMGET', KEYS[1], 'capacity', 'allocated')
+local capacity, allocated, count = tonumber(node[1]) or 0, tonumber(node[2]) or 0, tonumber(ARGV[3])
+if allocated + count > capacity then
+  return 'NO_CAPACITY'
+end
+redis.call('HINCRBY', KEYS[1], 'allocated', count)
+redis.call('HSET', KEYS[3], 'node_id', ARGV[2], 'count', ARGV[3], 'status', 'allocated')
+redis.call('SADD', KEYS[4], ARGV[1])
+return 'ALLOCATED'
 \`;
 
+// KEYS: node:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id
 const RELEASE_LUA = \`
-if redis.call('SET', KEYS[2], '1', 'NX', 'EX', tonumber(ARGV[3])) == false then
-  return {0}
+if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then
+  return 0
 end
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))
-return {1}
+local count = tonumber(redis.call('HGET', KEYS[2], 'count')) or 0
+redis.call('HINCRBY', KEYS[1], 'allocated', -count)
+redis.call('HSET', KEYS[2], 'status', 'released')
+redis.call('SREM', KEYS[3], ARGV[1])
+return 1
 \`;
 
-interface RegisterBody {
-  capacity_gpus: number;
-  capacity_memory_gb: number;
+interface LedgerRedis extends Redis {
+  allocateScript(node: string, heartbeat: string, placement: string, placements: string, placementId: string, nodeId: string, count: number): Promise<string>;
+  releaseScript(node: string, placement: string, placements: string, placementId: string): Promise<number>;
 }
 
-interface AllocationBody {
-  placement_id: string;
-  gpu_count: number;
-  memory_gb: number;
+const redis = new Redis({host: 'redis', port: 6379}) as LedgerRedis;
+redis.defineCommand('allocateScript', {numberOfKeys: 4, lua: ALLOCATE_LUA});
+redis.defineCommand('releaseScript', {numberOfKeys: 3, lua: RELEASE_LUA});
+
+/** A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity. */
+export async function registerNode(nodeId: string, gpuType: string, capacity: number): Promise<void> {
+  await redis.hset(\`node:\${nodeId}\`, 'gpu_type', gpuType, 'capacity', capacity);
+  await redis.hsetnx(\`node:\${nodeId}\`, 'allocated', 0);
+  await redis.sadd('nodes', nodeId);
+  await redis.set(\`heartbeat:\${nodeId}\`, '1', 'EX', HEARTBEAT_TTL_S);
 }
 
-function nodeKey(nodeId: string): string {
-  return \`node:\${nodeId}\`;
+/** The node agent reports in. */
+export async function heartbeat(nodeId: string): Promise<void> {
+  await redis.set(\`heartbeat:\${nodeId}\`, '1', 'EX', HEARTBEAT_TTL_S);
 }
 
-function heartbeatKey(nodeId: string): string {
-  return \`heartbeat:\${nodeId}\`;
+/** Book count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT. */
+export async function allocate(nodeId: string, placementId: string, count: number): Promise<string> {
+  return redis.allocateScript(\`node:\${nodeId}\`, \`heartbeat:\${nodeId}\`, \`placement:\${placementId}\`, \`node:\${nodeId}:placements\`, placementId, nodeId, count);
 }
 
-function placementKey(placementId: string): string {
-  return \`placement:\${placementId}\`;
+/** Return the placement's GPUs to the node; true when the counters moved. */
+export async function release(nodeId: string, placementId: string): Promise<boolean> {
+  const moved = await redis.releaseScript(\`node:\${nodeId}\`, \`placement:\${placementId}\`, \`node:\${nodeId}:placements\`, placementId);
+  return moved === 1;
 }
-
-function releasedKey(placementId: string): string {
-  return \`released:\${placementId}\`;
-}
-
-async function nodeAlive(nodeId: string): Promise<boolean> {
-  return (await r.exists(heartbeatKey(nodeId))) === 1;
-}
-
-app.post('/v1/nodes/:nodeId/register', async (request, reply) => {
-  const {nodeId} = request.params as {nodeId: string};
-  const body = request.body as RegisterBody;
-  await r.hset(nodeKey(nodeId), {
-    capacity_gpus: String(body.capacity_gpus),
-    capacity_memory_gb: String(body.capacity_memory_gb),
-  });
-  await r.set(heartbeatKey(nodeId), '1', 'EX', HEARTBEAT_TTL_S);
-  return reply.code(201).send({node_id: nodeId, state: 'registered'});
-});
-
-app.post('/v1/nodes/:nodeId/allocations', async (request, reply) => {
-  const {nodeId} = request.params as {nodeId: string};
-  const body = request.body as AllocationBody;
-  if (!(await nodeAlive(nodeId))) {
-    return reply.code(409).send({error: 'NO_HEARTBEAT'});
-  }
-  const result = (await r.eval(
-    NODE_ALLOCATE_LUA,
-    3,
-    nodeKey(nodeId),
-    heartbeatKey(nodeId),
-    placementKey(body.placement_id),
-    String(body.gpu_count),
-    String(body.memory_gb),
-    nodeId,
-  )) as number[];
-  if (result[0] === LUA_NO_HEARTBEAT) {
-    return reply.code(409).send({error: 'NO_HEARTBEAT'});
-  }
-  if (result[0] === LUA_NO_CAPACITY) {
-    return reply.code(409).send({error: 'NO_CAPACITY'});
-  }
-  return reply.code(201).send({placement_id: body.placement_id, node_id: nodeId, state: 'allocated'});
-});
-
-app.post('/v1/placements/:placementId/release', async (request, reply) => {
-  const {placementId} = request.params as {placementId: string};
-  const record = await r.hgetall(placementKey(placementId));
-  if (Object.keys(record).length === 0) {
-    return reply.code(200).send({placement_id: placementId, state: 'released'});
-  }
-  await r.eval(
-    RELEASE_LUA,
-    2,
-    nodeKey(record.node_id),
-    releasedKey(placementId),
-    record.gpu_count,
-    record.memory_gb,
-    String(RELEASED_TTL_S),
-  );
-  return reply.code(200).send({placement_id: placementId, state: 'released'});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"encoding/json"
-	"net/http"
+	"context"
 	"strconv"
 
 	"github.com/redis/go-redis/v9"
+
+	"gpusched/config"
 )
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type registerBody struct {
-	CapacityGpus     int64 \`json:"capacity_gpus"\`
-	CapacityMemoryGb int64 \`json:"capacity_memory_gb"\`
-}
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
-type allocationBody struct {
-	PlacementID string \`json:"placement_id"\`
-	GpuCount    int64  \`json:"gpu_count"\`
-	MemoryGb    int64  \`json:"memory_gb"\`
-}
-
-func nodeKey(nodeID string) string {
-	return "node:" + nodeID
-}
-
-func placementKey(placementID string) string {
-	return "placement:" + placementID
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func register(w http.ResponseWriter, r *http.Request) {
-	nodeID := r.PathValue("nodeID")
-	var body registerBody
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	rdb.HSet(r.Context(), nodeKey(nodeID), "capacity_gpus", body.CapacityGpus, "capacity_memory_gb", body.CapacityMemoryGb)
-	writeJSON(w, http.StatusCreated, map[string]any{"node_id": nodeID, "state": "registered"})
-}
-
-func allocate(w http.ResponseWriter, r *http.Request) {
-	nodeID := r.PathValue("nodeID")
-	var body allocationBody
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter reads the counters, decides in the handler, writes the placement record and
-	// only then moves the counters. Two allocations can pass the same check, there is no heartbeat
-	// TTL and release is not idempotent. Fix all four.
-	capacity, _ := rdb.HGet(r.Context(), nodeKey(nodeID), "capacity_gpus").Int64()
-	capacityMem, _ := rdb.HGet(r.Context(), nodeKey(nodeID), "capacity_memory_gb").Int64()
-	held, _ := rdb.HGet(r.Context(), nodeKey(nodeID), "allocated_gpus").Int64()
-	heldMem, _ := rdb.HGet(r.Context(), nodeKey(nodeID), "allocated_memory_gb").Int64()
-	if held+body.GpuCount > capacity || heldMem+body.MemoryGb > capacityMem {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "NO_CAPACITY"})
-		return
+// registerNode: a node joins the fleet (or re-registers after a reboot) with its GPU type and capacity.
+func registerNode(ctx context.Context, nodeID, gpuType string, capacity int) error {
+	if err := rdb.HSet(ctx, "node:"+nodeID, "gpu_type", gpuType, "capacity", capacity).Err(); err != nil {
+		return err
 	}
-	rdb.HSet(r.Context(), placementKey(body.PlacementID), "node_id", nodeID, "gpu_count", body.GpuCount, "memory_gb", body.MemoryGb)
-	rdb.HIncrBy(r.Context(), nodeKey(nodeID), "allocated_gpus", body.GpuCount)
-	rdb.HIncrBy(r.Context(), nodeKey(nodeID), "allocated_memory_gb", body.MemoryGb)
-	writeJSON(w, http.StatusCreated, map[string]any{"placement_id": body.PlacementID, "node_id": nodeID, "state": "allocated"})
+	rdb.HSetNX(ctx, "node:"+nodeID, "allocated", 0)
+	rdb.SAdd(ctx, "nodes", nodeID)
+	_ = config.HeartbeatTTL
+	return rdb.Set(ctx, "heartbeat:"+nodeID, "1", 0).Err()
 }
 
-func release(w http.ResponseWriter, r *http.Request) {
-	placementID := r.PathValue("placementID")
-	record, _ := rdb.HGetAll(r.Context(), placementKey(placementID)).Result()
-	if len(record) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"placement_id": placementID, "state": "released"})
-		return
+// heartbeat: the node agent reports in.
+func heartbeat(ctx context.Context, nodeID string) error {
+	return rdb.Set(ctx, "heartbeat:"+nodeID, "1", 0).Err()
+}
+
+// allocate books count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT.
+func allocate(ctx context.Context, nodeID, placementID string, count int) (string, error) {
+	if err := rdb.HSet(ctx, "placement:"+placementID, "node_id", nodeID, "count", count, "status", "allocated").Err(); err != nil {
+		return "", err
 	}
-	gpuCount, _ := strconv.ParseInt(record["gpu_count"], 10, 64)
-	memoryGb, _ := strconv.ParseInt(record["memory_gb"], 10, 64)
-	rdb.HIncrBy(r.Context(), nodeKey(record["node_id"]), "allocated_gpus", -gpuCount)
-	rdb.HIncrBy(r.Context(), nodeKey(record["node_id"]), "allocated_memory_gb", -memoryGb)
-	writeJSON(w, http.StatusOK, map[string]any{"placement_id": placementID, "state": "released"})
+	fields, err := rdb.HMGet(ctx, "node:"+nodeID, "capacity", "allocated").Result()
+	if err != nil {
+		return "", err
+	}
+	capacity, _ := strconv.Atoi(text(fields[0]))
+	allocated, _ := strconv.Atoi(text(fields[1]))
+	if allocated+count > capacity {
+		return "NO_CAPACITY", nil
+	}
+	if err := rdb.HIncrBy(ctx, "node:"+nodeID, "allocated", int64(count)).Err(); err != nil {
+		return "", err
+	}
+	rdb.SAdd(ctx, "node:"+nodeID+":placements", placementID)
+	return "ALLOCATED", nil
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/nodes/{nodeID}/register", register)
-	mux.HandleFunc("POST /v1/nodes/{nodeID}/allocations", allocate)
-	mux.HandleFunc("POST /v1/placements/{placementID}/release", release)
-	_ = http.ListenAndServe(":8443", mux)
+// release returns the placement's GPUs to the node; true when the counters moved.
+func release(ctx context.Context, nodeID, placementID string) (bool, error) {
+	count, _ := rdb.HGet(ctx, "placement:"+placementID, "count").Int()
+	if err := rdb.HIncrBy(ctx, "node:"+nodeID, "allocated", -int64(count)).Err(); err != nil {
+		return false, err
+	}
+	rdb.HSet(ctx, "placement:"+placementID, "status", "released")
+	rdb.SRem(ctx, "node:"+nodeID+":placements", placementID)
+	return true, nil
+}
+
+// text is a hash field as HMGET returns it: a string, or "" for a missing field.
+func text(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"strconv"
-	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"gpusched/config"
 )
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const (
-	heartbeatTtlSeconds = 30
-	releasedTtlSeconds  = 3600
-	luaAllocated        = 1
-	luaNoCapacity       = -1
-	luaNoHeartbeat      = -2
-)
-
-var nodeAllocateScript = redis.NewScript(\`
-local capacity_gpus = tonumber(redis.call('HGET', KEYS[1], 'capacity_gpus')) or 0
-local capacity_mem = tonumber(redis.call('HGET', KEYS[1], 'capacity_memory_gb')) or 0
-local held = tonumber(redis.call('HGET', KEYS[1], 'allocated_gpus')) or 0
-local held_mem = tonumber(redis.call('HGET', KEYS[1], 'allocated_memory_gb')) or 0
-local want_gpus = tonumber(ARGV[1])
-local want_mem = tonumber(ARGV[2])
+// KEYS: node:{id}, heartbeat:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id, node_id, count
+var allocateScript = redis.NewScript(\`
 if redis.call('EXISTS', KEYS[2]) == 0 then
-  return {-2, held, held_mem}
+  return 'NO_HEARTBEAT'
 end
-if held + want_gpus > capacity_gpus or held_mem + want_mem > capacity_mem then
-  return {-1, held, held_mem}
+if redis.call('SISMEMBER', KEYS[4], ARGV[1]) == 1 then
+  return 'ALLOCATED'
 end
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', want_gpus)
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', want_mem)
-redis.call('HSET', KEYS[3], 'node_id', ARGV[3], 'gpu_count', want_gpus, 'memory_gb', want_mem)
-return {1, held + want_gpus, held_mem + want_mem}
+local node = redis.call('HMGET', KEYS[1], 'capacity', 'allocated')
+local capacity, allocated, count = tonumber(node[1]) or 0, tonumber(node[2]) or 0, tonumber(ARGV[3])
+if allocated + count > capacity then
+  return 'NO_CAPACITY'
+end
+redis.call('HINCRBY', KEYS[1], 'allocated', count)
+redis.call('HSET', KEYS[3], 'node_id', ARGV[2], 'count', ARGV[3], 'status', 'allocated')
+redis.call('SADD', KEYS[4], ARGV[1])
+return 'ALLOCATED'
 \`)
 
+// KEYS: node:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id
 var releaseScript = redis.NewScript(\`
-if redis.call('SET', KEYS[2], '1', 'NX', 'EX', tonumber(ARGV[3])) == false then
-  return {0}
+if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then
+  return 0
 end
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))
-return {1}
+local count = tonumber(redis.call('HGET', KEYS[2], 'count')) or 0
+redis.call('HINCRBY', KEYS[1], 'allocated', -count)
+redis.call('HSET', KEYS[2], 'status', 'released')
+redis.call('SREM', KEYS[3], ARGV[1])
+return 1
 \`)
 
-type registerBody struct {
-	CapacityGpus     int64 \`json:"capacity_gpus"\`
-	CapacityMemoryGb int64 \`json:"capacity_memory_gb"\`
-}
-
-type allocationBody struct {
-	PlacementID string \`json:"placement_id"\`
-	GpuCount    int64  \`json:"gpu_count"\`
-	MemoryGb    int64  \`json:"memory_gb"\`
-}
-
-func nodeKey(nodeID string) string {
-	return "node:" + nodeID
-}
-
-func heartbeatKey(nodeID string) string {
-	return "heartbeat:" + nodeID
-}
-
-func placementKey(placementID string) string {
-	return "placement:" + placementID
-}
-
-func releasedKey(placementID string) string {
-	return "released:" + placementID
-}
-
-func nodeAlive(ctx context.Context, nodeID string) bool {
-	exists, _ := rdb.Exists(ctx, heartbeatKey(nodeID)).Result()
-	return exists == 1
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func register(w http.ResponseWriter, r *http.Request) {
-	nodeID := r.PathValue("nodeID")
-	var body registerBody
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	rdb.HSet(r.Context(), nodeKey(nodeID), "capacity_gpus", body.CapacityGpus, "capacity_memory_gb", body.CapacityMemoryGb)
-	rdb.Set(r.Context(), heartbeatKey(nodeID), "1", time.Duration(heartbeatTtlSeconds)*time.Second)
-	writeJSON(w, http.StatusCreated, map[string]any{"node_id": nodeID, "state": "registered"})
-}
-
-func allocate(w http.ResponseWriter, r *http.Request) {
-	nodeID := r.PathValue("nodeID")
-	var body allocationBody
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	if !nodeAlive(r.Context(), nodeID) {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "NO_HEARTBEAT"})
-		return
+// registerNode: a node joins the fleet (or re-registers after a reboot) with its GPU type and capacity.
+func registerNode(ctx context.Context, nodeID, gpuType string, capacity int) error {
+	if err := rdb.HSet(ctx, "node:"+nodeID, "gpu_type", gpuType, "capacity", capacity).Err(); err != nil {
+		return err
 	}
-	values, err := nodeAllocateScript.Run(
-		r.Context(),
-		rdb,
-		[]string{nodeKey(nodeID), heartbeatKey(nodeID), placementKey(body.PlacementID)},
-		body.GpuCount,
-		body.MemoryGb,
-		nodeID,
-	).Int64Slice()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "LEDGER_UNAVAILABLE"})
-		return
-	}
-	if values[0] == luaNoHeartbeat {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "NO_HEARTBEAT"})
-		return
-	}
-	if values[0] == luaNoCapacity {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "NO_CAPACITY"})
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"placement_id": body.PlacementID, "node_id": nodeID, "state": "allocated"})
+	rdb.HSetNX(ctx, "node:"+nodeID, "allocated", 0)
+	rdb.SAdd(ctx, "nodes", nodeID)
+	return rdb.Set(ctx, "heartbeat:"+nodeID, "1", config.HeartbeatTTL).Err()
 }
 
-func release(w http.ResponseWriter, r *http.Request) {
-	placementID := r.PathValue("placementID")
-	record, _ := rdb.HGetAll(r.Context(), placementKey(placementID)).Result()
-	if len(record) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"placement_id": placementID, "state": "released"})
-		return
-	}
-	gpuCount, _ := strconv.ParseInt(record["gpu_count"], 10, 64)
-	memoryGb, _ := strconv.ParseInt(record["memory_gb"], 10, 64)
-	_, err := releaseScript.Run(
-		r.Context(),
-		rdb,
-		[]string{nodeKey(record["node_id"]), releasedKey(placementID)},
-		gpuCount,
-		memoryGb,
-		releasedTtlSeconds,
-	).Result()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "LEDGER_UNAVAILABLE"})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"placement_id": placementID, "state": "released"})
+// heartbeat: the node agent reports in.
+func heartbeat(ctx context.Context, nodeID string) error {
+	return rdb.Set(ctx, "heartbeat:"+nodeID, "1", config.HeartbeatTTL).Err()
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/nodes/{nodeID}/register", register)
-	mux.HandleFunc("POST /v1/nodes/{nodeID}/allocations", allocate)
-	mux.HandleFunc("POST /v1/placements/{placementID}/release", release)
-	_ = http.ListenAndServe(":8443", mux)
+// allocate books count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT.
+func allocate(ctx context.Context, nodeID, placementID string, count int) (string, error) {
+	keys := []string{"node:" + nodeID, "heartbeat:" + nodeID, "placement:" + placementID, "node:" + nodeID + ":placements"}
+	return allocateScript.Run(ctx, rdb, keys, placementID, nodeID, count).Text()
+}
+
+// release returns the placement's GPUs to the node; true when the counters moved.
+func release(ctx context.Context, nodeID, placementID string) (bool, error) {
+	keys := []string{"node:" + nodeID, "placement:" + placementID, "node:" + nodeID + ":placements"}
+	moved, err := releaseScript.Run(ctx, rdb, keys, placementID).Int()
+	return moved == 1, err
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      starter: `import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
 
-final case class RegisterBody(capacity_gpus: Long, capacity_memory_gb: Long)
-final case class AllocationBody(placement_id: String, gpu_count: Long, memory_gb: Long)
+import scala.jdk.CollectionConverters._
 
-object NodeLedger {
-  implicit val system: ActorSystem = ActorSystem("gpu-scheduler")
-  implicit val registerFormat: RootJsonFormat[RegisterBody] = jsonFormat2(RegisterBody)
-  implicit val allocationFormat: RootJsonFormat[AllocationBody] = jsonFormat3(AllocationBody)
+import gpusched.Config.HeartbeatTtlS
 
-  val jedis = new Jedis("redis", 6379)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  def nodeKey(nodeId: String): String = s"node:$nodeId"
-  def placementKey(placementId: String): String = s"placement:$placementId"
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
-  val route: Route =
-    concat(
-      path("v1" / "nodes" / Segment / "register") { nodeId =>
-        post {
-          entity(as[RegisterBody]) { body =>
-            jedis.hset(nodeKey(nodeId), "capacity_gpus", body.capacity_gpus.toString)
-            jedis.hset(nodeKey(nodeId), "capacity_memory_gb", body.capacity_memory_gb.toString)
-            complete(StatusCodes.Created, HttpEntity(ContentTypes.\`application/json\`, """{"node_id":"$nodeId","state":"registered"}"""))
-          }
-        }
-      },
-      path("v1" / "nodes" / Segment / "allocations") { nodeId =>
-        post {
-          entity(as[AllocationBody]) { body =>
-            // TODO: this starter reads the counters, decides in the handler, writes the placement record
-            // and only then moves the counters. Two allocations can pass the same check, there is no
-            // heartbeat TTL and release is not idempotent. Fix all four.
-            val capacity = Option(jedis.hget(nodeKey(nodeId), "capacity_gpus")).map(_.toLong).getOrElse(0L)
-            val capacityMem = Option(jedis.hget(nodeKey(nodeId), "capacity_memory_gb")).map(_.toLong).getOrElse(0L)
-            val held = Option(jedis.hget(nodeKey(nodeId), "allocated_gpus")).map(_.toLong).getOrElse(0L)
-            val heldMem = Option(jedis.hget(nodeKey(nodeId), "allocated_memory_gb")).map(_.toLong).getOrElse(0L)
-            if (held + body.gpu_count > capacity || heldMem + body.memory_gb > capacityMem) {
-              complete(StatusCodes.Conflict, HttpEntity(ContentTypes.\`application/json\`, """{"error":"NO_CAPACITY"}"""))
-            } else {
-              val placementId = body.placement_id
-              jedis.hset(placementKey(placementId), "node_id", nodeId)
-              jedis.hset(placementKey(placementId), "gpu_count", body.gpu_count.toString)
-              jedis.hset(placementKey(placementId), "memory_gb", body.memory_gb.toString)
-              jedis.hincrBy(nodeKey(nodeId), "allocated_gpus", body.gpu_count)
-              jedis.hincrBy(nodeKey(nodeId), "allocated_memory_gb", body.memory_gb)
-              complete(StatusCodes.Created, HttpEntity(ContentTypes.\`application/json\`, """{"placement_id":"$placementId","state":"allocated"}"""))
-            }
-          }
-        }
-      },
-      path("v1" / "placements" / Segment / "release") { placementId =>
-        post {
-          val record = jedis.hgetAll(placementKey(placementId))
-          if (record.isEmpty) {
-            complete(StatusCodes.OK, HttpEntity(ContentTypes.\`application/json\`, """{"placement_id":"$placementId","state":"released"}"""))
-          } else {
-            val nodeId = record.get("node_id")
-            jedis.hincrBy(nodeKey(nodeId), "allocated_gpus", -record.get("gpu_count").toLong)
-            jedis.hincrBy(nodeKey(nodeId), "allocated_memory_gb", -record.get("memory_gb").toLong)
-            complete(StatusCodes.OK, HttpEntity(ContentTypes.\`application/json\`, """{"placement_id":"$placementId","state":"released"}"""))
-          }
-        }
-      }
-    )
+  /** A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity. */
+  def registerNode(nodeId: String, gpuType: String, capacity: Int): Unit = {
+    jedis.hset(s"node:$nodeId", Map("gpu_type" -> gpuType, "capacity" -> capacity.toString).asJava)
+    jedis.hsetnx(s"node:$nodeId", "allocated", "0")
+    jedis.sadd("nodes", nodeId)
+    jedis.set(s"heartbeat:$nodeId", "1")
+  }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** The node agent reports in. */
+  def heartbeat(nodeId: String): Unit = jedis.set(s"heartbeat:$nodeId", "1")
+
+  /** Book count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT. */
+  def allocate(nodeId: String, placementId: String, count: Int): String = {
+    jedis.hset(s"placement:$placementId", Map("node_id" -> nodeId, "count" -> count.toString, "status" -> "allocated").asJava)
+    val fields = jedis.hmget(s"node:$nodeId", "capacity", "allocated").asScala
+    val capacity = Option(fields(0)).map(_.toInt).getOrElse(0)
+    val allocated = Option(fields(1)).map(_.toInt).getOrElse(0)
+    if (allocated + count > capacity) return "NO_CAPACITY"
+    jedis.hincrBy(s"node:$nodeId", "allocated", count.toLong)
+    jedis.sadd(s"node:$nodeId:placements", placementId)
+    "ALLOCATED"
+  }
+
+  /** Return the placement's GPUs to the node; true when the counters moved. */
+  def release(nodeId: String, placementId: String): Boolean = {
+    val count = Option(jedis.hget(s"placement:$placementId", "count")).map(_.toLong).getOrElse(0L)
+    jedis.hincrBy(s"node:$nodeId", "allocated", -count)
+    jedis.hset(s"placement:$placementId", "status", "released")
+    jedis.srem(s"node:$nodeId:placements", placementId)
+    true
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      solution: `import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
 
-final case class RegisterBody(capacity_gpus: Long, capacity_memory_gb: Long)
-final case class AllocationBody(placement_id: String, gpu_count: Long, memory_gb: Long)
+import scala.jdk.CollectionConverters._
 
-object NodeLedger {
-  implicit val system: ActorSystem = ActorSystem("gpu-scheduler")
-  implicit val registerFormat: RootJsonFormat[RegisterBody] = jsonFormat2(RegisterBody)
-  implicit val allocationFormat: RootJsonFormat[AllocationBody] = jsonFormat3(AllocationBody)
+import gpusched.Config.HeartbeatTtlS
 
-  val HeartbeatTtlSeconds = 30L
-  val ReleasedTtlSeconds = 3600L
-  val LuaAllocated = 1L
-  val LuaNoCapacity = -1L
-  val LuaNoHeartbeat = -2L
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  val NodeAllocateLua =
-    """
-      |local capacity_gpus = tonumber(redis.call('HGET', KEYS[1], 'capacity_gpus')) or 0
-      |local capacity_mem = tonumber(redis.call('HGET', KEYS[1], 'capacity_memory_gb')) or 0
-      |local held = tonumber(redis.call('HGET', KEYS[1], 'allocated_gpus')) or 0
-      |local held_mem = tonumber(redis.call('HGET', KEYS[1], 'allocated_memory_gb')) or 0
-      |local want_gpus = tonumber(ARGV[1])
-      |local want_mem = tonumber(ARGV[2])
-      |if redis.call('EXISTS', KEYS[2]) == 0 then
-      |  return {-2, held, held_mem}
+  // KEYS: node:{id}, heartbeat:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id, node_id, count
+  val AllocateLua: String =
+    """if redis.call('EXISTS', KEYS[2]) == 0 then
+      |  return 'NO_HEARTBEAT'
       |end
-      |if held + want_gpus > capacity_gpus or held_mem + want_mem > capacity_mem then
-      |  return {-1, held, held_mem}
+      |if redis.call('SISMEMBER', KEYS[4], ARGV[1]) == 1 then
+      |  return 'ALLOCATED'
       |end
-      |redis.call('HINCRBY', KEYS[1], 'allocated_gpus', want_gpus)
-      |redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', want_mem)
-      |redis.call('HSET', KEYS[3], 'node_id', ARGV[3], 'gpu_count', want_gpus, 'memory_gb', want_mem)
-      |return {1, held + want_gpus, held_mem + want_mem}
+      |local node = redis.call('HMGET', KEYS[1], 'capacity', 'allocated')
+      |local capacity, allocated, count = tonumber(node[1]) or 0, tonumber(node[2]) or 0, tonumber(ARGV[3])
+      |if allocated + count > capacity then
+      |  return 'NO_CAPACITY'
+      |end
+      |redis.call('HINCRBY', KEYS[1], 'allocated', count)
+      |redis.call('HSET', KEYS[3], 'node_id', ARGV[2], 'count', ARGV[3], 'status', 'allocated')
+      |redis.call('SADD', KEYS[4], ARGV[1])
+      |return 'ALLOCATED'
       |""".stripMargin
 
-  val ReleaseLua =
-    """
-      |if redis.call('SET', KEYS[2], '1', 'NX', 'EX', tonumber(ARGV[3])) == false then
-      |  return {0}
+  // KEYS: node:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id
+  val ReleaseLua: String =
+    """if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then
+      |  return 0
       |end
-      |redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))
-      |redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))
-      |return {1}
+      |local count = tonumber(redis.call('HGET', KEYS[2], 'count')) or 0
+      |redis.call('HINCRBY', KEYS[1], 'allocated', -count)
+      |redis.call('HSET', KEYS[2], 'status', 'released')
+      |redis.call('SREM', KEYS[3], ARGV[1])
+      |return 1
       |""".stripMargin
 
-  val jedis = new Jedis("redis", 6379)
+  /** A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity. */
+  def registerNode(nodeId: String, gpuType: String, capacity: Int): Unit = {
+    jedis.hset(s"node:$nodeId", Map("gpu_type" -> gpuType, "capacity" -> capacity.toString).asJava)
+    jedis.hsetnx(s"node:$nodeId", "allocated", "0")
+    jedis.sadd("nodes", nodeId)
+    jedis.setex(s"heartbeat:$nodeId", HeartbeatTtlS, "1")
+  }
 
-  def nodeKey(nodeId: String): String = s"node:$nodeId"
-  def heartbeatKey(nodeId: String): String = s"heartbeat:$nodeId"
-  def placementKey(placementId: String): String = s"placement:$placementId"
-  def releasedKey(placementId: String): String = s"released:$placementId"
+  /** The node agent reports in. */
+  def heartbeat(nodeId: String): Unit = jedis.setex(s"heartbeat:$nodeId", HeartbeatTtlS, "1")
 
-  def nodeAlive(nodeId: String): Boolean = jedis.exists(heartbeatKey(nodeId))
+  /** Book count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT. */
+  def allocate(nodeId: String, placementId: String, count: Int): String = {
+    val keys = List(s"node:$nodeId", s"heartbeat:$nodeId", s"placement:$placementId", s"node:$nodeId:placements").asJava
+    val args = List(placementId, nodeId, count.toString).asJava
+    jedis.eval(AllocateLua, keys, args).toString
+  }
 
-  val route: Route =
-    concat(
-      path("v1" / "nodes" / Segment / "register") { nodeId =>
-        post {
-          entity(as[RegisterBody]) { body =>
-            jedis.hset(nodeKey(nodeId), "capacity_gpus", body.capacity_gpus.toString)
-            jedis.hset(nodeKey(nodeId), "capacity_memory_gb", body.capacity_memory_gb.toString)
-            jedis.setex(heartbeatKey(nodeId), HeartbeatTtlSeconds, "1")
-            complete(StatusCodes.Created, HttpEntity(ContentTypes.\`application/json\`, """{"node_id":"$nodeId","state":"registered"}"""))
-          }
-        }
-      },
-      path("v1" / "nodes" / Segment / "allocations") { nodeId =>
-        post {
-          entity(as[AllocationBody]) { body =>
-            val placementId = body.placement_id
-            if (!nodeAlive(nodeId)) {
-              complete(StatusCodes.Conflict, HttpEntity(ContentTypes.\`application/json\`, """{"error":"NO_HEARTBEAT"}"""))
-            } else {
-              val result = jedis
-                .eval(
-                  NodeAllocateLua,
-                  3,
-                  nodeKey(nodeId),
-                  heartbeatKey(nodeId),
-                  placementKey(placementId),
-                  body.gpu_count.toString,
-                  body.memory_gb.toString,
-                  nodeId
-                )
-                .asInstanceOf[java.util.List[Long]]
-              if (result.get(0) == LuaNoHeartbeat) {
-                complete(StatusCodes.Conflict, HttpEntity(ContentTypes.\`application/json\`, """{"error":"NO_HEARTBEAT"}"""))
-              } else if (result.get(0) == LuaNoCapacity) {
-                complete(StatusCodes.Conflict, HttpEntity(ContentTypes.\`application/json\`, """{"error":"NO_CAPACITY"}"""))
-              } else {
-                complete(StatusCodes.Created, HttpEntity(ContentTypes.\`application/json\`, """{"placement_id":"$placementId","state":"allocated"}"""))
-              }
-            }
-          }
-        }
-      },
-      path("v1" / "placements" / Segment / "release") { placementId =>
-        post {
-          val record = jedis.hgetAll(placementKey(placementId))
-          if (record.isEmpty) {
-            complete(StatusCodes.OK, HttpEntity(ContentTypes.\`application/json\`, """{"placement_id":"$placementId","state":"released"}"""))
-          } else {
-            val nodeId = record.get("node_id")
-            jedis
-              .eval(
-                ReleaseLua,
-                2,
-                nodeKey(nodeId),
-                releasedKey(placementId),
-                record.get("gpu_count"),
-                record.get("memory_gb"),
-                ReleasedTtlSeconds.toString
-              )
-              .asInstanceOf[java.util.List[Long]]
-            complete(StatusCodes.OK, HttpEntity(ContentTypes.\`application/json\`, """{"placement_id":"$placementId","state":"released"}"""))
-          }
-        }
-      }
-    )
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Return the placement's GPUs to the node; true when the counters moved. */
+  def release(nodeId: String, placementId: String): Boolean = {
+    val keys = List(s"node:$nodeId", s"placement:$placementId", s"node:$nodeId:placements").asJava
+    jedis.eval(ReleaseLua, keys, List(placementId).asJava).asInstanceOf[java.lang.Long] == 1L
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
 #include <string>
 
-using json = nlohmann::json;
+#include "gpusched/config.h"
+#include "state.h"
 
-std::string nodeKey(const std::string& node_id) { return "node:" + node_id; }
+sw::redis::Redis redis("tcp://redis:6379");
 
-std::string placementKey(const std::string& placement_id) { return "placement:" + placement_id; }
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  httplib::Server svr;
+// A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity.
+void register_node(const std::string& node_id, const std::string& gpu_type, int capacity) {
+  redis.hset("node:" + node_id, "gpu_type", gpu_type, "capacity", std::to_string(capacity));
+  redis.hsetnx("node:" + node_id, "allocated", "0");
+  redis.sadd("nodes", node_id);
+  redis.set("heartbeat:" + node_id, "1");
+}
 
-  svr.Post(R"(/v1/nodes/([^/]+)/register)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto node_id = req.matches[1];
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    redis.hset(nodeKey(node_id), "capacity_gpus", std::to_string(body.value("capacity_gpus", 0LL)));
-    redis.hset(nodeKey(node_id), "capacity_memory_gb", std::to_string(body.value("capacity_memory_gb", 0LL)));
-    res.status = 201;
-    res.set_content(json{{"node_id", node_id}, {"state", "registered"}}.dump(), "application/json");
-  });
+// The node agent reports in.
+void heartbeat(const std::string& node_id) { redis.set("heartbeat:" + node_id, "1"); }
 
-  svr.Post(R"(/v1/nodes/([^/]+)/allocations)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto node_id = req.matches[1];
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    const auto placement_id = body.value("placement_id", std::string());
-    const long long gpus = body.value("gpu_count", 0LL);
-    const long long memory = body.value("memory_gb", 0LL);
-    // TODO: this starter reads the counters, decides in the handler, writes the placement record and
-    // only then moves the counters. Two allocations can pass the same check, there is no heartbeat
-    // TTL and release is not idempotent. Fix all four.
-    const auto raw_capacity = redis.hget(nodeKey(node_id), "capacity_gpus");
-    const long long capacity = raw_capacity ? std::stoll(*raw_capacity) : 0;
-    const auto raw_capacity_mem = redis.hget(nodeKey(node_id), "capacity_memory_gb");
-    const long long capacity_mem = raw_capacity_mem ? std::stoll(*raw_capacity_mem) : 0;
-    const auto raw_held = redis.hget(nodeKey(node_id), "allocated_gpus");
-    const long long held = raw_held ? std::stoll(*raw_held) : 0;
-    const auto raw_held_mem = redis.hget(nodeKey(node_id), "allocated_memory_gb");
-    const long long held_mem = raw_held_mem ? std::stoll(*raw_held_mem) : 0;
-    if (held + gpus > capacity || held_mem + memory > capacity_mem) {
-      res.status = 409;
-      res.set_content(R"({"error":"NO_CAPACITY"})", "application/json");
-      return;
-    }
-    redis.hset(placementKey(placement_id), "node_id", node_id);
-    redis.hset(placementKey(placement_id), "gpu_count", std::to_string(gpus));
-    redis.hset(placementKey(placement_id), "memory_gb", std::to_string(memory));
-    redis.hincrby(nodeKey(node_id), "allocated_gpus", gpus);
-    redis.hincrby(nodeKey(node_id), "allocated_memory_gb", memory);
-    res.status = 201;
-    res.set_content(
-        json{{"placement_id", placement_id}, {"node_id", node_id}, {"state", "allocated"}}.dump(),
-        "application/json");
-  });
+// Books count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT.
+std::string allocate(const std::string& node_id, const std::string& placement_id, int count) {
+  redis.hset("placement:" + placement_id, "node_id", node_id, "count", std::to_string(count), "status", "allocated");
+  std::vector<sw::redis::OptionalString> fields;
+  redis.hmget("node:" + node_id, {"capacity", "allocated"}, std::back_inserter(fields));
+  const int capacity = fields[0] ? std::stoi(*fields[0]) : 0;
+  const int allocated = fields[1] ? std::stoi(*fields[1]) : 0;
+  if (allocated + count > capacity) return "NO_CAPACITY";
+  redis.hincrby("node:" + node_id, "allocated", count);
+  redis.sadd("node:" + node_id + ":placements", placement_id);
+  return "ALLOCATED";
+}
 
-  svr.Post(R"(/v1/placements/([^/]+)/release)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto placement_id = req.matches[1];
-    const auto record = redis.hgetall(placementKey(placement_id));
-    if (record.empty()) {
-      res.status = 200;
-      res.set_content(json{{"placement_id", placement_id}, {"state", "released"}}.dump(), "application/json");
-      return;
-    }
-    const auto node_id = record.at("node_id");
-    redis.hincrby(nodeKey(node_id), "allocated_gpus", -std::stoll(record.at("gpu_count")));
-    redis.hincrby(nodeKey(node_id), "allocated_memory_gb", -std::stoll(record.at("memory_gb")));
-    res.status = 200;
-    res.set_content(json{{"placement_id", placement_id}, {"state", "released"}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Returns the placement's GPUs to the node; true when the counters moved.
+bool release(const std::string& node_id, const std::string& placement_id) {
+  const auto count = redis.hget("placement:" + placement_id, "count");
+  redis.hincrby("node:" + node_id, "allocated", -(count ? std::stoi(*count) : 0));
+  redis.hset("placement:" + placement_id, "status", "released");
+  redis.srem("node:" + node_id + ":placements", placement_id);
+  return true;
 }
 `,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
 #include <string>
-#include <vector>
 
-using json = nlohmann::json;
+#include "gpusched/config.h"
+#include "state.h"
 
-constexpr long long kHeartbeatTtlSeconds = 30;
-constexpr long long kReleasedTtlSeconds = 3600;
-constexpr long long kLuaAllocated = 1;
-constexpr long long kLuaNoCapacity = -1;
-constexpr long long kLuaNoHeartbeat = -2;
+sw::redis::Redis redis("tcp://redis:6379");
 
-const char* kNodeAllocateLua = R"LUA(
-local capacity_gpus = tonumber(redis.call('HGET', KEYS[1], 'capacity_gpus')) or 0
-local capacity_mem = tonumber(redis.call('HGET', KEYS[1], 'capacity_memory_gb')) or 0
-local held = tonumber(redis.call('HGET', KEYS[1], 'allocated_gpus')) or 0
-local held_mem = tonumber(redis.call('HGET', KEYS[1], 'allocated_memory_gb')) or 0
-local want_gpus = tonumber(ARGV[1])
-local want_mem = tonumber(ARGV[2])
+// KEYS: node:{id}, heartbeat:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id, node_id, count
+const std::string kAllocateLua = R"lua(
 if redis.call('EXISTS', KEYS[2]) == 0 then
-  return {-2, held, held_mem}
+  return 'NO_HEARTBEAT'
 end
-if held + want_gpus > capacity_gpus or held_mem + want_mem > capacity_mem then
-  return {-1, held, held_mem}
+if redis.call('SISMEMBER', KEYS[4], ARGV[1]) == 1 then
+  return 'ALLOCATED'
 end
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', want_gpus)
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', want_mem)
-redis.call('HSET', KEYS[3], 'node_id', ARGV[3], 'gpu_count', want_gpus, 'memory_gb', want_mem)
-return {1, held + want_gpus, held_mem + want_mem}
-)LUA";
-
-const char* kReleaseLua = R"LUA(
-if redis.call('SET', KEYS[2], '1', 'NX', 'EX', tonumber(ARGV[3])) == false then
-  return {0}
+local node = redis.call('HMGET', KEYS[1], 'capacity', 'allocated')
+local capacity, allocated, count = tonumber(node[1]) or 0, tonumber(node[2]) or 0, tonumber(ARGV[3])
+if allocated + count > capacity then
+  return 'NO_CAPACITY'
 end
-redis.call('HINCRBY', KEYS[1], 'allocated_gpus', -tonumber(ARGV[1]))
-redis.call('HINCRBY', KEYS[1], 'allocated_memory_gb', -tonumber(ARGV[2]))
-return {1}
-)LUA";
+redis.call('HINCRBY', KEYS[1], 'allocated', count)
+redis.call('HSET', KEYS[3], 'node_id', ARGV[2], 'count', ARGV[3], 'status', 'allocated')
+redis.call('SADD', KEYS[4], ARGV[1])
+return 'ALLOCATED'
+)lua";
 
-std::string nodeKey(const std::string& node_id) { return "node:" + node_id; }
+// KEYS: node:{id}, placement:{pid}, node:{id}:placements · ARGV: placement_id
+const std::string kReleaseLua = R"lua(
+if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 0 then
+  return 0
+end
+local count = tonumber(redis.call('HGET', KEYS[2], 'count')) or 0
+redis.call('HINCRBY', KEYS[1], 'allocated', -count)
+redis.call('HSET', KEYS[2], 'status', 'released')
+redis.call('SREM', KEYS[3], ARGV[1])
+return 1
+)lua";
 
-std::string heartbeatKey(const std::string& node_id) { return "heartbeat:" + node_id; }
-
-std::string placementKey(const std::string& placement_id) { return "placement:" + placement_id; }
-
-std::string releasedKey(const std::string& placement_id) { return "released:" + placement_id; }
-
-bool nodeAlive(sw::redis::Redis& redis, const std::string& node_id) {
-  return redis.exists(heartbeatKey(node_id)) == 1;
+// A node joins the fleet (or re-registers after a reboot) with its GPU type and capacity.
+void register_node(const std::string& node_id, const std::string& gpu_type, int capacity) {
+  redis.hset("node:" + node_id, "gpu_type", gpu_type, "capacity", std::to_string(capacity));
+  redis.hsetnx("node:" + node_id, "allocated", "0");
+  redis.sadd("nodes", node_id);
+  redis.set("heartbeat:" + node_id, "1", gpusched::kHeartbeatTtlS);
 }
 
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  httplib::Server svr;
+// The node agent reports in.
+void heartbeat(const std::string& node_id) { redis.set("heartbeat:" + node_id, "1", gpusched::kHeartbeatTtlS); }
 
-  svr.Post(R"(/v1/nodes/([^/]+)/register)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto node_id = req.matches[1];
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    redis.hset(nodeKey(node_id), "capacity_gpus", std::to_string(body.value("capacity_gpus", 0LL)));
-    redis.hset(nodeKey(node_id), "capacity_memory_gb", std::to_string(body.value("capacity_memory_gb", 0LL)));
-    redis.setex(heartbeatKey(node_id), kHeartbeatTtlSeconds, "1");
-    res.status = 201;
-    res.set_content(json{{"node_id", node_id}, {"state", "registered"}}.dump(), "application/json");
-  });
+// Books count GPUs of the node for the placement: ALLOCATED, NO_CAPACITY or NO_HEARTBEAT.
+std::string allocate(const std::string& node_id, const std::string& placement_id, int count) {
+  const auto result = redis.eval<std::string>(
+      kAllocateLua, {"node:" + node_id, "heartbeat:" + node_id, "placement:" + placement_id, "node:" + node_id + ":placements"},
+      {placement_id, node_id, std::to_string(count)});
+  return result ? *result : "";
+}
 
-  svr.Post(R"(/v1/nodes/([^/]+)/allocations)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto node_id = req.matches[1];
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    const auto placement_id = body.value("placement_id", std::string());
-    const long long gpus = body.value("gpu_count", 0LL);
-    const long long memory = body.value("memory_gb", 0LL);
-    if (!nodeAlive(redis, node_id)) {
-      res.status = 409;
-      res.set_content(R"({"error":"NO_HEARTBEAT"})", "application/json");
-      return;
-    }
-    const auto result = redis.eval<std::vector<long long>>(
-        kNodeAllocateLua,
-        {nodeKey(node_id), heartbeatKey(node_id), placementKey(placement_id)},
-        {std::to_string(gpus), std::to_string(memory), node_id});
-    if (result[0] == kLuaNoHeartbeat) {
-      res.status = 409;
-      res.set_content(R"({"error":"NO_HEARTBEAT"})", "application/json");
-      return;
-    }
-    if (result[0] == kLuaNoCapacity) {
-      res.status = 409;
-      res.set_content(R"({"error":"NO_CAPACITY"})", "application/json");
-      return;
-    }
-    res.status = 201;
-    res.set_content(
-        json{{"placement_id", placement_id}, {"node_id", node_id}, {"state", "allocated"}}.dump(),
-        "application/json");
-  });
-
-  svr.Post(R"(/v1/placements/([^/]+)/release)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto placement_id = req.matches[1];
-    const auto record = redis.hgetall(placementKey(placement_id));
-    if (record.empty()) {
-      res.status = 200;
-      res.set_content(json{{"placement_id", placement_id}, {"state", "released"}}.dump(), "application/json");
-      return;
-    }
-    redis.eval<std::vector<long long>>(
-        kReleaseLua,
-        {nodeKey(record.at("node_id")), releasedKey(placement_id)},
-        {record.at("gpu_count"), record.at("memory_gb"), std::to_string(kReleasedTtlSeconds)});
-    res.status = 200;
-    res.set_content(json{{"placement_id", placement_id}, {"state", "released"}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Returns the placement's GPUs to the node; true when the counters moved.
+bool release(const std::string& node_id, const std::string& placement_id) {
+  return redis.eval<long long>(kReleaseLua, {"node:" + node_id, "placement:" + placement_id, "node:" + node_id + ":placements"},
+                               {placement_id}) == 1;
 }
 `,
     },
   },
-  debrief: `The interviewer is testing three properties of a ledger that hands out a scarce resource. **Atomicity**: the admission test and the counter move must be one server-side step, because a read-then-write pair is correct in every serial test and wrong exactly when two placements race — and the race is the only time the answer matters. **Order**: the counter move and the placement record are one decision; the starter commits the record first and moves the counters afterwards, so the record promises GPUs the ledger has not yet claimed, and the fix puts both in the same script. **Liveness**: the heartbeat key’s TTL is what removes a dead machine from the scheduling set. Without it the fleet keeps offering capacity that no longer exists, and the scheduler keeps handing work to a node that will never report back. **Idempotency** is the fourth: release keyed by the placement id, guarded by a \`SET NX\` marker, so a retried release cannot manufacture capacity. The honest 409 is what makes the loser of a race observable rather than a silent oversubscription. Real schedulers add per-resource-request queues with FIFO fairness, leases with a reaper for allocations whose owner vanished, and a reconciliation pass that rebuilds the counters from the placement ledger after a Redis failover.`,
+  harness: {
+    python: `NODE = "node:gpu-1"
+
+
+def _ledger(ctx):
+    m = ctx.load("state")
+    m.register_node("gpu-1", "a100", 8)
+    return m
+
+
+def _allocated(ctx, node="gpu-1"):
+    return int(ctx.redis.hget(f"node:{node}", "allocated") or 0)
+
+
+def check_node_ledger_keys(ctx):
+    m = _ledger(ctx)
+    assert ctx.redis.sismember("nodes", "gpu-1"), f"register_node must add the id to the nodes set (keys: {sorted(ctx.redis.keys('*'))})"
+    node = ctx.redis.hgetall(NODE)
+    assert node.get("gpu_type") == "a100" and node.get("capacity") == "8" and node.get("allocated") == "0", f"node:gpu-1 is {node}, expected gpu_type a100, capacity 8, allocated 0"
+    assert ctx.redis.exists("heartbeat:gpu-1"), "register_node must set heartbeat:gpu-1"
+    assert m.allocate("gpu-1", "p-1", 4) == "ALLOCATED", "4 of 8 GPUs on an idle node must be ALLOCATED"
+    assert _allocated(ctx) == 4, f"allocated is {_allocated(ctx)} after booking 4, expected 4"
+    record = ctx.redis.hgetall("placement:p-1")
+    assert record.get("node_id") == "gpu-1" and record.get("count") == "4" and record.get("status") == "allocated", f"placement:p-1 is {record}, expected node_id gpu-1, count 4, status allocated"
+    assert ctx.redis.smembers("node:gpu-1:placements") == {"p-1"}, f"node:gpu-1:placements is {ctx.redis.smembers('node:gpu-1:placements')}, expected {{p-1}}"
+    assert m.release("gpu-1", "p-1") is True, "the first release of p-1 moves the counters and reports True"
+    assert _allocated(ctx) == 0, f"allocated is {_allocated(ctx)} after the release, expected 0"
+    assert ctx.redis.hget("placement:p-1", "status") == "released", "release must mark placement:p-1 released"
+
+
+def check_atomic_allocation(ctx):
+    m = _ledger(ctx)
+
+    def rival():
+        """Another scheduler replica books the whole node the instant the first command on node:gpu-1 lands."""
+        if _allocated(ctx) + 8 > 8:
+            return "no room"
+        ctx.redis.hincrby(NODE, "allocated", 8)
+        ctx.redis.hset("placement:rival", mapping={"node_id": "gpu-1", "count": 8, "status": "allocated"})
+        ctx.redis.sadd("node:gpu-1:placements", "rival")
+        return "booked"
+
+    probe = ctx.redis_after(NODE, rival)
+    result = m.allocate("gpu-1", "p-1", 8)
+    assert probe.fired, "allocate never touched node:gpu-1"
+    assert probe.error is None, f"the rival's booking failed: {probe.error!r}"
+    allocated = _allocated(ctx)
+    assert allocated <= 8, f"node:gpu-1 has {allocated} GPUs allocated of 8: a rival replica booked the node between your read of the counters and your write ({probe.result}), and your request answered {result}. Compare and HINCRBY inside one EVAL"
+    if probe.result == "booked":
+        assert result == "NO_CAPACITY", f"the rival booked the node first, so the request must answer NO_CAPACITY, got {result}"
+    assert m.allocate("gpu-1", "p-2", 1) == "NO_CAPACITY", "with the node full the next placement is NO_CAPACITY"
+
+
+def check_heartbeat_liveness(ctx):
+    m = _ledger(ctx)
+    ttl = ctx.redis.ttl("heartbeat:gpu-1")
+    assert 0 < ttl <= 30, f"heartbeat:gpu-1 has TTL {ttl}: register_node must set it with EX HEARTBEAT_TTL_S (30), or a dead node stays schedulable"
+    ctx.clock.advance(31)
+    assert not ctx.redis.exists("heartbeat:gpu-1"), "31 s after registration the heartbeat must have lapsed"
+    result = m.allocate("gpu-1", "p-1", 2)
+    assert result == "NO_HEARTBEAT", f"a node whose heartbeat lapsed answered {result}, expected NO_HEARTBEAT"
+    assert _allocated(ctx) == 0 and not ctx.redis.exists("placement:p-1"), "a refused placement must write nothing"
+    m.heartbeat("gpu-1")
+    ttl = ctx.redis.ttl("heartbeat:gpu-1")
+    assert 0 < ttl <= 30, f"heartbeat() left TTL {ttl} on heartbeat:gpu-1, expected EX HEARTBEAT_TTL_S"
+    assert m.allocate("gpu-1", "p-1", 2) == "ALLOCATED", "once the agent reports in again the node takes placements"
+
+
+def check_idempotent_release(ctx):
+    m = _ledger(ctx)
+    assert m.allocate("gpu-1", "p-1", 4) == "ALLOCATED"
+    assert m.release("gpu-1", "p-1") is True, "the first release reports True"
+    second = m.release("gpu-1", "p-1")
+    assert _allocated(ctx) == 0, f"allocated is {_allocated(ctx)} after releasing p-1 twice, expected 0: a retried release must not move the counters again"
+    assert second is False, f"the second release of p-1 reported {second!r}, expected False"
+    assert m.release("gpu-1", "ghost") is False and _allocated(ctx) == 0, "releasing an unknown placement moves nothing"
+    assert m.allocate("gpu-1", "p-2", 8) == "ALLOCATED", "the node has all 8 GPUs free after one real release"
+
+
+def check_honest_contention(ctx):
+    m = _ledger(ctx)
+    assert m.allocate("gpu-1", "p-1", 6) == "ALLOCATED"
+    result = m.allocate("gpu-1", "p-2", 4)
+    assert result == "NO_CAPACITY", f"4 GPUs on a node with 2 free answered {result}, expected NO_CAPACITY"
+    assert _allocated(ctx) == 6, f"allocated is {_allocated(ctx)} after a refused placement, expected 6"
+    assert not ctx.redis.exists("placement:p-2"), "a refused placement must leave no placement:p-2 record"
+    assert ctx.redis.smembers("node:gpu-1:placements") == {"p-1"}, f"node:gpu-1:placements is {ctx.redis.smembers('node:gpu-1:placements')}, expected only p-1"
+    assert m.allocate("gpu-1", "p-1", 6) == "ALLOCATED" and _allocated(ctx) == 6, "a retried allocation of the same placement id is ALLOCATED without booking twice"
+`,
+    typescript: `const NODE = 'node:gpu-1';
+
+async function ledger(ctx) {
+  const m = ctx.load('state');
+  await m.registerNode('gpu-1', 'a100', 8);
+  return m;
+}
+
+const allocated = (ctx, node = 'gpu-1'): number => Number(ctx.redis.hget(\`node:\${node}\`, 'allocated') ?? 0);
+
+export async function check_node_ledger_keys(ctx) {
+  const m = await ledger(ctx);
+  assert.equal(ctx.redis.sismember('nodes', 'gpu-1'), 1, \`registerNode must add the id to the nodes set (keys: \${JSON.stringify(ctx.redis.keys('*').sort())})\`);
+  const node = ctx.redis.hgetall(NODE);
+  assert(node.gpu_type === 'a100' && node.capacity === '8' && node.allocated === '0', \`node:gpu-1 is \${JSON.stringify(node)}, expected gpu_type a100, capacity 8, allocated 0\`);
+  assert.equal(ctx.redis.exists('heartbeat:gpu-1'), 1, 'registerNode must set heartbeat:gpu-1');
+  assert.equal(await m.allocate('gpu-1', 'p-1', 4), 'ALLOCATED', '4 of 8 GPUs on an idle node must be ALLOCATED');
+  assert.equal(allocated(ctx), 4, 'allocated after booking 4');
+  const record = ctx.redis.hgetall('placement:p-1');
+  assert(record.node_id === 'gpu-1' && record.count === '4' && record.status === 'allocated', \`placement:p-1 is \${JSON.stringify(record)}, expected node_id gpu-1, count 4, status allocated\`);
+  assert.deepEqual(ctx.redis.smembers('node:gpu-1:placements'), ['p-1'], 'node:gpu-1:placements after one allocation');
+  assert.equal(await m.release('gpu-1', 'p-1'), true, 'the first release of p-1 moves the counters and reports true');
+  assert.equal(allocated(ctx), 0, 'allocated after the release');
+  assert.equal(ctx.redis.hget('placement:p-1', 'status'), 'released', 'release must mark placement:p-1 released');
+}
+
+export async function check_atomic_allocation(ctx) {
+  const m = await ledger(ctx);
+  // Another scheduler replica books the whole node the instant the first command on node:gpu-1 lands.
+  const probe = ctx.redisAfter(NODE, () => {
+    if (allocated(ctx) + 8 > 8) return 'no room';
+    ctx.redis.hincrby(NODE, 'allocated', 8);
+    ctx.redis.hset('placement:rival', 'node_id', 'gpu-1', 'count', 8, 'status', 'allocated');
+    ctx.redis.sadd('node:gpu-1:placements', 'rival');
+    return 'booked';
+  });
+  const result = await m.allocate('gpu-1', 'p-1', 8);
+  assert(probe.fired, 'allocate never touched node:gpu-1');
+  assert(probe.error === undefined, \`the rival's booking failed: \${probe.error}\`);
+  assert(allocated(ctx) <= 8, \`node:gpu-1 has \${allocated(ctx)} GPUs allocated of 8: a rival replica booked the node between your read of the counters and your write (\${probe.result}), and your request answered \${result}. Compare and HINCRBY inside one EVAL\`);
+  if (probe.result === 'booked') assert.equal(result, 'NO_CAPACITY', 'the rival booked the node first, so the request must answer NO_CAPACITY');
+  assert.equal(await m.allocate('gpu-1', 'p-2', 1), 'NO_CAPACITY', 'with the node full the next placement is NO_CAPACITY');
+}
+
+export async function check_heartbeat_liveness(ctx) {
+  const m = await ledger(ctx);
+  let ttl = ctx.redis.ttl('heartbeat:gpu-1');
+  assert(0 < ttl && ttl <= 30, \`heartbeat:gpu-1 has TTL \${ttl}: registerNode must set it with EX HEARTBEAT_TTL_S (30), or a dead node stays schedulable\`);
+  ctx.clock.advance(31);
+  assert.equal(ctx.redis.exists('heartbeat:gpu-1'), 0, '31 s after registration the heartbeat must have lapsed');
+  const result = await m.allocate('gpu-1', 'p-1', 2);
+  assert.equal(result, 'NO_HEARTBEAT', 'a node whose heartbeat lapsed');
+  assert(allocated(ctx) === 0 && ctx.redis.exists('placement:p-1') === 0, 'a refused placement must write nothing');
+  await m.heartbeat('gpu-1');
+  ttl = ctx.redis.ttl('heartbeat:gpu-1');
+  assert(0 < ttl && ttl <= 30, \`heartbeat() left TTL \${ttl} on heartbeat:gpu-1, expected EX HEARTBEAT_TTL_S\`);
+  assert.equal(await m.allocate('gpu-1', 'p-1', 2), 'ALLOCATED', 'once the agent reports in again the node takes placements');
+}
+
+export async function check_idempotent_release(ctx) {
+  const m = await ledger(ctx);
+  assert.equal(await m.allocate('gpu-1', 'p-1', 4), 'ALLOCATED');
+  assert.equal(await m.release('gpu-1', 'p-1'), true, 'the first release reports true');
+  const second = await m.release('gpu-1', 'p-1');
+  assert.equal(allocated(ctx), 0, 'allocated after releasing p-1 twice (a retried release must not move the counters again)');
+  assert.equal(second, false, 'the second release of p-1');
+  assert((await m.release('gpu-1', 'ghost')) === false && allocated(ctx) === 0, 'releasing an unknown placement moves nothing');
+  assert.equal(await m.allocate('gpu-1', 'p-2', 8), 'ALLOCATED', 'the node has all 8 GPUs free after one real release');
+}
+
+export async function check_honest_contention(ctx) {
+  const m = await ledger(ctx);
+  assert.equal(await m.allocate('gpu-1', 'p-1', 6), 'ALLOCATED');
+  assert.equal(await m.allocate('gpu-1', 'p-2', 4), 'NO_CAPACITY', '4 GPUs on a node with 2 free');
+  assert.equal(allocated(ctx), 6, 'allocated after a refused placement');
+  assert.equal(ctx.redis.exists('placement:p-2'), 0, 'a refused placement must leave no placement:p-2 record');
+  assert.deepEqual(ctx.redis.smembers('node:gpu-1:placements'), ['p-1'], 'node:gpu-1:placements after a refused placement');
+  assert((await m.allocate('gpu-1', 'p-1', 6)) === 'ALLOCATED' && allocated(ctx) === 6, 'a retried allocation of the same placement id is ALLOCATED without booking twice');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"sort"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+const stateNode = "node:gpu-1"
+
+func stateLedger(ctx *harness.Ctx) {
+	ctx.NoError(registerNode(context.Background(), "gpu-1", "a100", 8), "registerNode")
+}
+
+func stateAllocated(ctx *harness.Ctx) int {
+	v, _ := ctx.Redis.HGet(stateNode, "allocated")
+	n, _ := strconv.Atoi(v)
+	return n
+}
+
+func stateAllocate(ctx *harness.Ctx, pid string, count int) string {
+	result, err := allocate(context.Background(), "gpu-1", pid, count)
+	ctx.NoError(err, "allocate(%s, %d)", pid, count)
+	return result
+}
+
+func stateRelease(ctx *harness.Ctx, pid string) bool {
+	moved, err := release(context.Background(), "gpu-1", pid)
+	ctx.NoError(err, "release(%s)", pid)
+	return moved
+}
+
+func statePlacements(ctx *harness.Ctx) []string {
+	members := ctx.Redis.SMembers("node:gpu-1:placements")
+	sort.Strings(members)
+	return members
+}
+
+func CheckNodeLedgerKeys(ctx *harness.Ctx) {
+	stateLedger(ctx)
+	ctx.Assert(ctx.Redis.SIsMember("nodes", "gpu-1"), "registerNode must add the id to the nodes set (keys: %v)", ctx.Redis.Keys("*"))
+	node := ctx.Redis.HGetAll(stateNode)
+	ctx.Assert(node["gpu_type"] == "a100" && node["capacity"] == "8" && node["allocated"] == "0", "node:gpu-1 is %v, expected gpu_type a100, capacity 8, allocated 0", node)
+	ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 1, "registerNode must set heartbeat:gpu-1; its existence")
+	ctx.Equal(stateAllocate(ctx, "p-1", 4), "ALLOCATED", "4 of 8 GPUs on an idle node")
+	ctx.Equal(stateAllocated(ctx), 4, "allocated after booking 4")
+	record := ctx.Redis.HGetAll("placement:p-1")
+	ctx.Assert(record["node_id"] == "gpu-1" && record["count"] == "4" && record["status"] == "allocated", "placement:p-1 is %v, expected node_id gpu-1, count 4, status allocated", record)
+	ctx.Equal(statePlacements(ctx), []string{"p-1"}, "node:gpu-1:placements after one allocation")
+	ctx.Equal(stateRelease(ctx, "p-1"), true, "the first release of p-1 moves the counters and reports true")
+	ctx.Equal(stateAllocated(ctx), 0, "allocated after the release")
+	status, _ := ctx.Redis.HGet("placement:p-1", "status")
+	ctx.Equal(status, "released", "release must mark placement:p-1 released; its status")
+}
+
+func CheckAtomicAllocation(ctx *harness.Ctx) {
+	stateLedger(ctx)
+	// Another scheduler replica books the whole node the instant the first command on node:gpu-1 lands.
+	var rival string
+	ctx.Redis.After(stateNode, func() any {
+		if stateAllocated(ctx)+8 > 8 {
+			rival = "no room"
+			return nil
+		}
+		ctx.Redis.Do("HINCRBY", stateNode, "allocated", 8)
+		ctx.Redis.Do("HSET", "placement:rival", "node_id", "gpu-1", "count", 8, "status", "allocated")
+		ctx.Redis.Do("SADD", "node:gpu-1:placements", "rival")
+		rival = "booked"
+		return nil
+	})
+	result := stateAllocate(ctx, "p-1", 8)
+	ctx.Assert(rival != "", "allocate never touched node:gpu-1")
+	ctx.Assert(stateAllocated(ctx) <= 8, "node:gpu-1 has %d GPUs allocated of 8: a rival replica booked the node between your read of the counters and your write (%s), and your request answered %s. Compare and HINCRBY inside one EVAL", stateAllocated(ctx), rival, result)
+	if rival == "booked" {
+		ctx.Equal(result, "NO_CAPACITY", "the rival booked the node first, so the request")
+	}
+	ctx.Equal(stateAllocate(ctx, "p-2", 1), "NO_CAPACITY", "with the node full the next placement")
+}
+
+func CheckHeartbeatLiveness(ctx *harness.Ctx) {
+	stateLedger(ctx)
+	ttl := ctx.Redis.TTL("heartbeat:gpu-1")
+	ctx.Assert(0 < ttl && ttl <= 30, "heartbeat:gpu-1 has TTL %d: registerNode must set it with config.HeartbeatTTL (30 s), or a dead node stays schedulable", ttl)
+	ctx.Clock.Advance(31)
+	ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 0, "31 s after registration the heartbeat must have lapsed; its existence")
+	ctx.Equal(stateAllocate(ctx, "p-1", 2), "NO_HEARTBEAT", "a node whose heartbeat lapsed")
+	ctx.Assert(stateAllocated(ctx) == 0 && ctx.Redis.Exists("placement:p-1") == 0, "a refused placement must write nothing")
+	ctx.NoError(heartbeat(context.Background(), "gpu-1"), "heartbeat")
+	ttl = ctx.Redis.TTL("heartbeat:gpu-1")
+	ctx.Assert(0 < ttl && ttl <= 30, "heartbeat() left TTL %d on heartbeat:gpu-1, expected config.HeartbeatTTL", ttl)
+	ctx.Equal(stateAllocate(ctx, "p-1", 2), "ALLOCATED", "once the agent reports in again the node takes placements")
+}
+
+func CheckIdempotentRelease(ctx *harness.Ctx) {
+	stateLedger(ctx)
+	ctx.Equal(stateAllocate(ctx, "p-1", 4), "ALLOCATED", "booking 4")
+	ctx.Equal(stateRelease(ctx, "p-1"), true, "the first release")
+	second := stateRelease(ctx, "p-1")
+	ctx.Equal(stateAllocated(ctx), 0, "allocated after releasing p-1 twice (a retried release must not move the counters again)")
+	ctx.Equal(second, false, "the second release of p-1")
+	ctx.Assert(!stateRelease(ctx, "ghost") && stateAllocated(ctx) == 0, "releasing an unknown placement moves nothing")
+	ctx.Equal(stateAllocate(ctx, "p-2", 8), "ALLOCATED", "the node has all 8 GPUs free after one real release")
+}
+
+func CheckHonestContention(ctx *harness.Ctx) {
+	stateLedger(ctx)
+	ctx.Equal(stateAllocate(ctx, "p-1", 6), "ALLOCATED", "booking 6")
+	ctx.Equal(stateAllocate(ctx, "p-2", 4), "NO_CAPACITY", "4 GPUs on a node with 2 free")
+	ctx.Equal(stateAllocated(ctx), 6, "allocated after a refused placement")
+	ctx.Equal(ctx.Redis.Exists("placement:p-2"), 0, "a refused placement must leave no placement:p-2 record; its existence")
+	ctx.Equal(statePlacements(ctx), []string{"p-1"}, "node:gpu-1:placements after a refused placement")
+	ctx.Assert(stateAllocate(ctx, "p-1", 6) == "ALLOCATED" && stateAllocated(ctx) == 6, "a retried allocation of the same placement id is ALLOCATED without booking twice")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kStateNode = "node:gpu-1";
+
+void stateLedger() { register_node("gpu-1", "a100", 8); }
+
+int stateAllocated(harness::Ctx& ctx) {
+  const auto v = ctx.Redis.HGet(kStateNode, "allocated");
+  return v ? std::stoi(*v) : 0;
+}
+
+std::vector<std::string> statePlacements(harness::Ctx& ctx) {
+  auto members = ctx.Redis.SMembers("node:gpu-1:placements");
+  std::sort(members.begin(), members.end());
+  return members;
+}
+
+}  // namespace
+
+void CheckNodeLedgerKeys(harness::Ctx& ctx) {
+  stateLedger();
+  ctx.Assert(ctx.Redis.SIsMember("nodes", "gpu-1"), "register_node must add the id to the nodes set (keys: %v)", ctx.Redis.Keys("*"));
+  const auto node = ctx.Redis.HGetAll(kStateNode);
+  ctx.Assert(node.count("gpu_type") && node.at("gpu_type") == "a100" && node.count("capacity") && node.at("capacity") == "8" &&
+                 node.count("allocated") && node.at("allocated") == "0",
+             "node:gpu-1 is %v, expected gpu_type a100, capacity 8, allocated 0", node);
+  ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 1, "register_node must set heartbeat:gpu-1; its existence");
+  ctx.Equal(allocate("gpu-1", "p-1", 4), "ALLOCATED", "4 of 8 GPUs on an idle node");
+  ctx.Equal(stateAllocated(ctx), 4, "allocated after booking 4");
+  const auto record = ctx.Redis.HGetAll("placement:p-1");
+  ctx.Assert(record.count("node_id") && record.at("node_id") == "gpu-1" && record.count("count") && record.at("count") == "4" &&
+                 record.count("status") && record.at("status") == "allocated",
+             "placement:p-1 is %v, expected node_id gpu-1, count 4, status allocated", record);
+  ctx.Equal(statePlacements(ctx), {"p-1"}, "node:gpu-1:placements after one allocation");
+  ctx.Equal(release("gpu-1", "p-1"), true, "the first release of p-1 moves the counters and reports true");
+  ctx.Equal(stateAllocated(ctx), 0, "allocated after the release");
+  ctx.Equal(ctx.Redis.HGet("placement:p-1", "status"), "released", "release must mark placement:p-1 released; its status");
+}
+
+void CheckAtomicAllocation(harness::Ctx& ctx) {
+  stateLedger();
+  // Another scheduler replica books the whole node the instant the first command on node:gpu-1 lands.
+  std::string rival;
+  ctx.Redis.After(kStateNode, [&] {
+    if (stateAllocated(ctx) + 8 > 8) {
+      rival = "no room";
+      return;
+    }
+    ctx.Redis.Do("HINCRBY", kStateNode, "allocated", 8);
+    ctx.Redis.Do("HSET", "placement:rival", "node_id", "gpu-1", "count", 8, "status", "allocated");
+    ctx.Redis.Do("SADD", "node:gpu-1:placements", "rival");
+    rival = "booked";
+  });
+  const std::string result = allocate("gpu-1", "p-1", 8);
+  ctx.Assert(!rival.empty(), "allocate never touched node:gpu-1");
+  ctx.Assert(stateAllocated(ctx) <= 8,
+             "node:gpu-1 has %d GPUs allocated of 8: a rival replica booked the node between your read of the counters and "
+             "your write (%s), and your request answered %s. Compare and HINCRBY inside one EVAL",
+             stateAllocated(ctx), rival, result);
+  if (rival == "booked") ctx.Equal(result, "NO_CAPACITY", "the rival booked the node first, so the request");
+  ctx.Equal(allocate("gpu-1", "p-2", 1), "NO_CAPACITY", "with the node full the next placement");
+}
+
+void CheckHeartbeatLiveness(harness::Ctx& ctx) {
+  stateLedger();
+  long long ttl = ctx.Redis.TTL("heartbeat:gpu-1");
+  ctx.Assert(0 < ttl && ttl <= 30, "heartbeat:gpu-1 has TTL %d: register_node must set it with kHeartbeatTtlS (30), or a dead node stays schedulable", ttl);
+  ctx.Clock.Advance(31);
+  ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 0, "31 s after registration the heartbeat must have lapsed; its existence");
+  ctx.Equal(allocate("gpu-1", "p-1", 2), "NO_HEARTBEAT", "a node whose heartbeat lapsed");
+  ctx.Assert(stateAllocated(ctx) == 0 && ctx.Redis.Exists("placement:p-1") == 0, "a refused placement must write nothing");
+  heartbeat("gpu-1");
+  ttl = ctx.Redis.TTL("heartbeat:gpu-1");
+  ctx.Assert(0 < ttl && ttl <= 30, "heartbeat() left TTL %d on heartbeat:gpu-1, expected kHeartbeatTtlS", ttl);
+  ctx.Equal(allocate("gpu-1", "p-1", 2), "ALLOCATED", "once the agent reports in again the node takes placements");
+}
+
+void CheckIdempotentRelease(harness::Ctx& ctx) {
+  stateLedger();
+  ctx.Equal(allocate("gpu-1", "p-1", 4), "ALLOCATED", "booking 4");
+  ctx.Equal(release("gpu-1", "p-1"), true, "the first release");
+  const bool second = release("gpu-1", "p-1");
+  ctx.Equal(stateAllocated(ctx), 0, "allocated after releasing p-1 twice (a retried release must not move the counters again)");
+  ctx.Equal(second, false, "the second release of p-1");
+  ctx.Assert(!release("gpu-1", "ghost") && stateAllocated(ctx) == 0, "releasing an unknown placement moves nothing");
+  ctx.Equal(allocate("gpu-1", "p-2", 8), "ALLOCATED", "the node has all 8 GPUs free after one real release");
+}
+
+void CheckHonestContention(harness::Ctx& ctx) {
+  stateLedger();
+  ctx.Equal(allocate("gpu-1", "p-1", 6), "ALLOCATED", "booking 6");
+  ctx.Equal(allocate("gpu-1", "p-2", 4), "NO_CAPACITY", "4 GPUs on a node with 2 free");
+  ctx.Equal(stateAllocated(ctx), 6, "allocated after a refused placement");
+  ctx.Equal(ctx.Redis.Exists("placement:p-2"), 0, "a refused placement must leave no placement:p-2 record; its existence");
+  ctx.Equal(statePlacements(ctx), {"p-1"}, "node:gpu-1:placements after a refused placement");
+  ctx.Assert(allocate("gpu-1", "p-1", 6) == "ALLOCATED" && stateAllocated(ctx) == 6, "a retried allocation of the same placement id is ALLOCATED without booking twice");
+}
+`,
+  },
+  debrief: `The ledger is two Lua scripts because the decision and the write must be one event: Redis runs a script alone, so the compare and the \`HINCRBY\` cannot be split by another replica, and the placement record and the set membership land in the same instant as the counter. Keying both scripts by the placement id is what makes a retry safe: a second \`allocate\` finds the id in the set and answers \`ALLOCATED\` without booking again, a second \`release\` finds it gone and moves nothing. The heartbeat is a key with a TTL rather than a timestamp the scheduler compares, so liveness needs no clock agreement between machines. Production ledgers keep a per-node version so a reconcile can tell a late write from a lost one, and expire placement records once a release is older than any possible retry.`,
 };

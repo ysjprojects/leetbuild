@@ -647,6 +647,7 @@ export class ClientCall extends Emitter {
   readonly ready: Promise<void>;
   private readonly queue: unknown[] = [];
   private closed = false;
+  private error: ServiceError | null = null;
   private cancelledFlag = false;
   private readonly waiters: (() => void)[] = [];
   private serverCall: ServerCall | null = null;
@@ -678,6 +679,7 @@ export class ClientCall extends Emitter {
   _end(error?: ServiceError): void {
     if (this.closed) return;
     this.closed = true;
+    this.error = error ?? null;
     if (error !== undefined) this.emit('error', error);
     this.emit('status', {code: error?.code ?? status.OK, details: error?.details ?? ''});
     this.emit('end');
@@ -700,7 +702,11 @@ export class ClientCall extends Emitter {
   getPeer(): string {
     return 'ipv4:127.0.0.1:54321';
   }
-  /** `for await (const message of call)` — the responses, in order. */
+  /**
+   * `for await (const message of call)` — the responses, in order. A call that ends with a status
+   * other than OK throws its ServiceError once the responses that came before it are read, as a
+   * Node Readable's async iterator rethrows the stream's `error` (CANCELLED after `call.cancel()`).
+   */
   async *[Symbol.asyncIterator](): AsyncGenerator<unknown> {
     let i = 0;
     for (;;) {
@@ -708,7 +714,10 @@ export class ClientCall extends Emitter {
         yield this.queue[i++];
         continue;
       }
-      if (this.closed) return;
+      if (this.closed) {
+        if (this.error !== null) throw this.error;
+        return;
+      }
       await new Promise<void>(resolve => this.waiters.push(resolve));
     }
   }
@@ -847,14 +856,24 @@ function invoke(
   };
   // Latency elapses on the virtual clock while the caller waits: an awaited call pays for it, a
   // fire-and-forget one does not. A deadline shorter than the latency fails without reaching the handler.
-  if (timeout !== null && latency > timeout) {
-    void CLOCK.sleep(timeout * 1000).then(() => {
+  if (timeout === null || latency <= timeout) {
+    if (latency > 0) void CLOCK.sleep(latency * 1000).then(start);
+    else queueMicrotask(start);
+  }
+  // grpc-js's deadline timer: a call still unfinished when the deadline passes (a slow handler, a
+  // stream mid-way) is cancelled on the server and fails DEADLINE_EXCEEDED for the caller. A call
+  // that ends first drops the timer, so idle turns never jump the clock to it.
+  if (timeout !== null) {
+    const expire = (): void => {
+      if (serverCall._isEnded() || serverCall.cancelled) return;
       call.code = status.DEADLINE_EXCEEDED;
       serverCall._cancel();
       finish(new StatusError(status.DEADLINE_EXCEEDED, 'Deadline exceeded'));
-    });
-  } else if (latency > 0) void CLOCK.sleep(latency * 1000).then(start);
-  else queueMicrotask(start);
+    };
+    // On a microtask: a handler started at the same instant (latency equal to the timeout) answers first.
+    const deadline = CLOCK.setTimeout(() => queueMicrotask(expire), timeout * 1000);
+    client.once('end', () => CLOCK.clearTimer(deadline));
+  }
   return client;
 }
 
@@ -900,9 +919,14 @@ export function loadPackageDefinition(definition: PackageDefinition): Record<str
             if (!method.responseStream) {
               let response: unknown;
               call.on('data', m => (response = m));
-              call.on('error', e => callback?.(e as ServiceError));
+              // Once, as grpc-js does: the error, or the response when the call ends OK.
+              let failed = false;
+              call.on('error', e => {
+                failed = true;
+                callback?.(e as ServiceError);
+              });
               call.on('end', () => {
-                if (!call.cancelled) callback?.(null, response);
+                if (!failed) callback?.(null, response);
               });
               // Unary calls without a callback: a Promise (as `promisify` would give), for `await stub.M(req)`.
               if (callback === undefined)

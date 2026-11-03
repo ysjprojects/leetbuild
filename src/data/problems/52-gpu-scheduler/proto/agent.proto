@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package gpusched;
+
+// The node agent on every GPU machine, at {node_id}:50051. Start launches a workload's container;
+// Health reports whether it came up. The harness serves a deterministic agent: the image name
+// decides what happens (registry/infer:1 starts and turns healthy, registry/missing:9 cannot be
+// pulled, registry/crash:1 starts and dies, registry/hang:1 never reports healthy on the first node
+// it is started on).
+service NodeAgent {
+  rpc Start(StartRequest) returns (StartReply);
+  rpc Health(HealthRequest) returns (HealthReply);
+}
+
+message StartRequest {
+  string placement_id = 1;
+  string image = 2;
+  int32 gpu_count = 3;
+}
+
+message StartReply {
+  string container_id = 1;
+}
+
+message HealthRequest {
+  string placement_id = 1;
+}
+
+enum HealthStatus {
+  STARTING = 0;
+  HEALTHY = 1;
+  FAILED = 2;
+}
+
+message HealthReply {
+  HealthStatus status = 1;
+  string reason = 2;
+}

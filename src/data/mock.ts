@@ -985,18 +985,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'semantic-cache-the-cache-that-answered-a-different-question',
     problemId: 'semantic-cache',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The cache that answered a different question',
-    blurb: 'A zero threshold let unrelated questions hit.',
+    blurb: 'One index for every tenant let a similar question surface another tenant\u2019s answer.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A cached answer about refunds was served for a question about delivery, because the patch accepted a similarity threshold of zero from the caller and the tenant indexes were shared. Debug it, fix it, and prove similarity floors and tenant scoping.',
+      'Acme asked about its refund window and got Globex\u2019s refund policy: the store lists every tenant\u2019s entries in one index set, writes the embedding and the answer in two commands, and gives entries no expiry. Debug it, fix it, and prove the tenant-scoped index, the atomic write and the TTL.',
     signals: ['Evaluate', 'Secure', 'Verify'],
     aiNote:
-      'The patch lets the caller set the similarity threshold with no floor, so a zero turns the nearest entry into a hit regardless of meaning, and it indexes all tenants in one vector index, so a similar question from one tenant can be answered with another tenant’s cached response.',
+      'The starter\u2019s index_name returns semantic:all and the search scans that literal set, so the nearest neighbour of a question can be another tenant\u2019s entry; put_entry writes the embedding, then the answer, in two HSETs with no EXPIRE, so a crash between them leaves an embedding with no answer and get_entry returns it as if it were an entry.',
     testIdea:
-      'Request with threshold zero and assert the service enforces its floor; insert two similar queries from different tenants and assert no cross-tenant hit; write an entry whose answer failed and assert no lookup hits it.',
+      'Write the same embedding for two tenants and assert each search returns only its own answer and semantic:all does not exist; snapshot the hash right after the first Redis command and assert it already holds the answer; assert the key\u2019s TTL and that a hash without an answer raises IncompleteEntry.',
     followUps: [
       'What similarity floor is defensible, and how would you calibrate it?',
       'When should an answer be uncacheable?',
@@ -1139,18 +1139,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'booking-engine-the-slot-that-was-booked-twice',
     problemId: 'booking-engine',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The slot that was booked twice',
     blurb: 'Check-then-write holds let two bookings win one slot.',
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two team members booked the same room for the same hour, because the patch read the slot map, checked it in the handler, and wrote the hold in a separate step. The same patch never expired abandoned holds. Debug it, fix it, and prove holds are atomic and expiry works.',
+      'Two team members booked the same room for the same hour: take_hold asks HEXISTS for each slot and writes it with a later HSET, so two requests that arrive together both see a free map. The hold key is written without a TTL, confirm_hold only deletes that key, and release_hold frees every slot it is handed. Debug it, fix it, and prove the hold is one atomic transition with a payment window.',
     signals: ['Specify', 'Verify', 'Operate'],
     aiNote:
-      'The patch checks slot availability with a read and writes the hold with a later command, so concurrent requests both observe the same free map, and its hold key has no TTL, so an abandoned checkout blocks the slot permanently.',
+      'The starter checks each slot with HEXISTS from the client and writes it with HSET in a later call, so concurrent requests both win; its hold key has no TTL, so an abandoned checkout blocks the slot for good; confirm_hold deletes the hold key and leaves the slots pointing at a dead hold; release_hold deletes slots without checking who owns them.',
     testIdea:
-      'Fire two concurrent bookings for one slot and assert exactly one succeeds; abandon a hold and assert it frees after its TTL; reschedule with a replayed key and assert one external calendar event.',
+      'Fire two concurrent take_hold calls for one slot and assert exactly one wins; abandon a hold, advance the clock past 900 s and assert the slots are free again; confirm a hold, advance an hour and assert the slots still read booked:{id}.',
     followUps: [
       'How would you model recurring bookings without a slot explosion?',
       'What should a reschedule do when the new slot is taken?',
@@ -1822,18 +1822,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'fleet-tracking-the-car-that-teleported-backward',
     problemId: 'fleet-tracking',
-    stepId: 'endpoint',
+    stepId: 'state',
     title: 'The car that teleported backward',
-    blurb: 'Last-write-wins updates and dropped geofence checks.',
+    blurb: 'A delayed packet wins, a replay counts as accepted, two replicas lose a position.',
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'The dispatch map showed a truck six blocks behind its actual position, because a delayed cellular update wrote last and won, and a warehouse geofence alert never fired when the check call timed out. Debug it, fix it, and prove positions compare by timestamp and alerts cannot be lost or doubled.',
+      'The dispatch map showed a truck six blocks behind its actual position: a delayed cellular update landed last and the latest-position write kept it. After the device reconnected, its replayed batch answered "accepted: 40" though nothing moved. Debug update_latest, fix it, and prove the record only moves forward.',
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      "The patch writes the latest-arriving position regardless of its timestamp, so delayed packets roll a vehicle's state backward, and it drops geofence checks on timeout, then retries them under fresh keys so a generated alert can duplicate.",
+      'The starter reads the stored ts, decides on the client and writes: an older timestamp is refused but an equal one with a lower sequence overwrites, a replay is written again and reported as applied, another replica writing between the read and the write is lost, and every update costs two round trips.',
     testIdea:
-      'Deliver a new position then a delayed older one and assert the newer state stands; time out a geofence check and assert it retries under the same sequence key; check the snapshot freshness bound across lazily refreshed vehicles.',
+      'Deliver a position, then an older one with a higher sequence, and assert the newer stands; replay the same position and assert it reports ignored; land a fresher write between the read and the write and assert it survives.',
     followUps: [
       'What clock assumptions does a device sequence survive?',
       'How fresh must a dispatch snapshot be to be usable?',
@@ -2247,10 +2247,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'You own the firewall in front of a customer-facing assistant. The prompt validation service scores every prompt from 1 to 99 — 1 being the most likely injection — and tags it by topic. Last night the detector was down for twelve minutes and every prompt went through; this morning a prompt scored 4 and was forwarded. The client below looks right in a demo. Debug it, fix it, and prove the fix.',
+      'You own the firewall in front of a customer-facing assistant. The prompt validation service scores every prompt from 1 to 99, 1 being the most likely injection, and tags it by topic. Last night the detector was down for twelve minutes and every prompt went through; this morning a prompt scored 4 and was forwarded. The starter below, `decide(prompt, request_id, fail_open=False)`, looks right in a demo. Debug it, fix it, and prove the fix.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The patch compares the wrong way round: it blocks when the score is above 80, the benign end of the scale, so the prompts the detector is most sure about pass. It never reads the tags, so the topic rules are a no-op. The call carries no deadline, so a slow detector stalls every request. And the bare catch returns allow on any error, so a detector outage is a published off switch.',
+      'The starter compares the wrong way round: it blocks when the score is 80 or above, the benign end of the scale, so the prompts the detector is most sure about pass. It never reads the tags, so the topic rules are a no-op. The call carries no deadline, so a slow detector stalls every request. And the bare except returns allow on any error, so a detector outage is a published off switch; the fail_open argument it accepts is ignored.',
     testIdea:
       'Stub Detect to return score 4 with no tags and assert the decision is block with reason score; return score 90 with tag politics and assert block with reason tag:politics. Make the stub sleep past 150 ms and assert block with reason detector-unavailable, then pass fail_open and assert allow; make it return INVALID_ARGUMENT and assert the error propagates.',
     followUps: [

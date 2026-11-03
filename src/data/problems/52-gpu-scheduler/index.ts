@@ -1,107 +1,99 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModulesCpp, supportModulesGo, supportModulesPy, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * GPU scheduler: the course is not "accept a job and pick a machine", it is the debugging you owe
- * a placement path before it hands a GPU to two workloads at once. Validated placement requests
- * with fresh capacity → one atomic Redis reservation per node → a gRPC start gated on a health
- * report with a deadline and a rollback → node-keyed placement events that replay against the
- * counters → a node read that cannot double-count and is scoped to operators.
+ * GPU scheduler: the placement path of an AI platform, debugged before it hands a GPU to two
+ * workloads at once. Validated placement requests against fresh capacity → one Lua script per node
+ * ledger with a heartbeat and an idempotent release → a gRPC start gated on the agent's health
+ * report, with a deadline and a rollback → node-keyed placement events produced after the counters
+ * commit, with an outbox → an operator-only node read that cannot double-count.
  */
 export const gpuSchedulerProblem: Problem = {
   id: 'gpu-scheduler',
   title: 'GPU Scheduler',
-  tagline: 'Place GPU workloads on the right nodes and prove the placement is honest.',
+  tagline:
+    'The placement path of an AI platform: admission, a Redis node ledger, a health-gated start, a placement stream.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# GPU Scheduler
 
-A GPU scheduler is the piece of an AI platform that decides which physical machine runs each job,
-how much of a node's capacity that job may claim, whether the machine is alive at all, and how the
-platform tells the difference between a placement that is running and a placement that merely
-exists in a database. The visible part is a node id in a response; the parts that decide whether the
-fleet is safe are the admission funnel, the atomic reservation, the health gate on the start call,
-the event stream that can rebuild occupancy, and a read path that cannot invent free GPUs.
+A GPU scheduler decides which machine runs each workload, how much of that machine the workload
+may claim, whether the machine is alive at all, and when a placement counts as running rather than
+merely recorded. The visible part is a node id in a response; the parts that keep a fleet safe are
+the admission check, the atomic reservation, the health gate on the start call, the event stream
+that can rebuild occupancy, and a read path that cannot invent free GPUs.
 
 ## The real system
 
-Production schedulers receive placement requests from many tenants, each naming a GPU type, a count,
-a memory footprint and a maximum hourly bid. They reject requests they cannot satisfy before they
-queue anything, because a queued request that can never run is worse than a 400. They keep node
-capacity in memory that is decremented atomically, and they treat a lapsed heartbeat as
-unschedulable rather than hoping the machine comes back. They ask the node agent to start the
-workload under a deadline and only mark the placement running once the agent reports it healthy;
-a start that never reports health is rolled back so the GPUs return to the pool. They publish one
-placement event per allocation and per release, keyed by node so a node's occupancy stream stays
-ordered, and the counters are committed before the event is produced. And they never let a caller
-read an arbitrary node: the node view is an operator surface, and free capacity is computed through
-the same atomic path the scheduler writes, so a read can never promise GPUs a placement would refuse.
+Kubernetes keeps this shape for every node: the kubelet renews a Lease object in the
+\`kube-node-lease\` namespace every 10 seconds, and when the node controller has not heard from a
+node for \`node-monitor-grace-period\` (50 seconds by default) it marks the node's \`Ready\`
+condition \`Unknown\` and taints it so the scheduler stops placing pods there. Device plugins report
+how many GPUs a node has, the scheduler counts them against pod requests, and a pod is \`Running\`
+only once its containers pass their startup probes. Slurm and Ray keep the same three ideas
+(capacity counters, a liveness deadline, a start that is confirmed rather than assumed) with their
+own vocabulary.
 
 ## What you build here
 
-One service, **gpusched**, with five pieces:
+One service, **gpusched**, over Redis, Kafka and a gRPC node agent, with the \`gpusched\` support
+package holding the constants and the key scheme every step shares:
 
-1. \`POST /v1/placements\`: a placed request carries GPU type, count, memory and a max hourly bid;
-   an unknown type is \`400\`, a count above any node's capacity is rejected before anything is
-   queued, and capacity is read fresh — never from a snapshot cached at boot. Placements are logged
-   with ids and counters, never with tenant payloads.
-2. A **Redis** node ledger: per node, capacity and allocated counters move together in one atomic
-   script on allocation and on release, and each node's heartbeat key carries a TTL so a node whose
-   heartbeat lapses drops out of the scheduling set.
-3. A **gRPC** node agent client: \`Start\` with a 20-second deadline, running only after the agent
-   reports health, an image-pull rejection that stops after one node with a clear reason instead of
-   retrying the whole fleet, and a rollback that releases the allocation when the deadline passes.
-4. A **Kafka** placement stream: \`gpu.placement\` events keyed by node id, carrying GPU counts,
-   memory and placement id, published *after* the counters commit, with an outbox row when the
-   broker rejects the produce and a release event for every allocation so reconstructed utilization
-   matches the ledger.
-5. \`GET /v1/nodes/{id}\`: capacity, allocated and free counts computed through the same atomic path,
-   a node that rebooted reconciling to its real counters, and a node view scoped to operators.
-
-## The debugging habit
-
-Every starter in this course is working code with a flaw: it compiles, it places the demo job, and
-it looks right. Your job in every step is the job you will have on a real platform team: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+1. \`POST /v1/placements\` with \`{"gpu_type", "count", "memory_gb", "max_hourly_bid"}\`: a known
+   type, a count between 1 and \`MAX_NODE_GPUS\`, the node set read from Redis on every request, then
+   one call to the ledger. \`201\` with \`placement_id\`, \`node_id\` and \`free\`; \`409\` when no node
+   can take it.
+2. The **Redis node ledger**: \`node:{id}\` with \`gpu_type\`, \`capacity\` and \`allocated\`;
+   \`heartbeat:{id}\` with a 30-second TTL; \`placement:{pid}\` and \`node:{id}:placements\`. One
+   Lua script admits and books a placement, one releases it, both keyed by the placement id.
+3. The **gRPC start**: \`Start\` on the node's agent under a 20-second budget, \`Health\` polled until
+   the agent reports healthy, a rollback through \`release\` on every failure, a retry on another
+   node only for retryable failures.
+4. The **placement stream**: one \`gpu.placement\` event per allocation and per release, keyed by
+   node id, produced after the ledger commits, with an outbox for what the broker refuses.
+5. \`GET /v1/nodes/{id}\` for operators (a bearer token the service resolves in Redis): live
+   counters, \`free\` clamped at zero, and a reconcile that recomputes \`allocated\` from the open
+   placements.
 
 ## Left out on purpose
 
-Cluster autoscaling, preemption and fair-share between teams, network topology and rack affinity,
-CUDA driver installation, multi-region capacity, spot bid markets, and the autoscaler's own billing
-pipeline. The five pieces above are the ones that decide whether a placement is correct, isolated
-and honest.`,
+Autoscaling, preemption and fair share between teams, rack affinity, driver installation,
+multi-region capacity and billing. The five pieces above decide whether a placement is correct,
+isolated and recoverable.`,
   diagram: {
     nodes: [
-      {id: 'client', kind: 'client', label: 'Client', sub: 'placements · bids', x: 6, y: 34},
-      {id: 'operator', kind: 'client', label: 'Operator', sub: 'node reads', x: 6, y: 82},
-      {id: 'scheduler', kind: 'http', label: 'GPU Scheduler', sub: 'HTTPS :8443', x: 28, y: 50},
-      {id: 'registry', kind: 'db', label: 'Node registry', sub: 'capacity · heartbeat', x: 50, y: 10},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'capacity counters', x: 50, y: 46},
-      {id: 'kafka', kind: 'kafka', label: 'gpu.placement', sub: 'key = node', x: 50, y: 84},
-      {id: 'agent', kind: 'grpc', label: 'Node agent', sub: 'Start / Health', x: 74, y: 10},
-      {id: 'fleet', kind: 'external', label: 'Other nodes', sub: 'retry target', x: 74, y: 48},
-      {id: 'consumer', kind: 'service', label: 'Utilization consumer', sub: 'group by node', x: 74, y: 84},
+      {id: 'client', kind: 'client', label: 'Client', sub: 'POST /v1/placements', x: 6, y: 34},
+      {id: 'operator', kind: 'client', label: 'Operator', sub: 'bearer token', x: 6, y: 82},
+      {id: 'scheduler', kind: 'http', label: 'gpusched', sub: 'HTTP :8443', x: 30, y: 50},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'node:{id} · placement:{pid} · heartbeat:{id}', x: 56, y: 22},
+      {id: 'agent', kind: 'grpc', label: 'Node agent', sub: '{node}:50051 · Start / Health', x: 56, y: 58},
+      {id: 'kafka', kind: 'kafka', label: 'gpu.placement', sub: 'key = node id', x: 56, y: 88},
+      {id: 'consumer', kind: 'service', label: 'utilization', sub: 'folds the stream', x: 84, y: 88},
     ],
     edges: [
       {from: 'client', to: 'scheduler', kind: 'http', label: 'POST /v1/placements'},
       {from: 'operator', to: 'scheduler', kind: 'http', label: 'GET /v1/nodes/{id}'},
-      {from: 'scheduler', to: 'registry', kind: 'plain', label: 'node records'},
-      {from: 'scheduler', to: 'redis', kind: 'redis', label: 'allocate · release'},
-      {from: 'scheduler', to: 'agent', kind: 'grpc', label: 'Start · 20s'},
-      {from: 'agent', to: 'registry', kind: 'plain', label: 'health report'},
-      {from: 'scheduler', to: 'fleet', kind: 'grpc', label: 'retry on another node'},
-      {from: 'scheduler', to: 'kafka', kind: 'kafka', label: 'produce gpu.placement'},
-      {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume · replay'},
-      {from: 'consumer', to: 'redis', kind: 'redis', label: 'reconcile counters'},
+      {from: 'scheduler', to: 'redis', kind: 'redis', label: 'EVAL allocate · release'},
+      {from: 'scheduler', to: 'agent', kind: 'grpc', label: 'Start · Health · 20 s'},
+      {from: 'scheduler', to: 'kafka', kind: 'kafka', label: 'produce after commit'},
+      {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModulesPy},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

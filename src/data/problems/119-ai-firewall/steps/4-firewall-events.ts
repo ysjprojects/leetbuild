@@ -8,35 +8,24 @@ export const firewallEventsStep: Step = {
   focus: ['aifw', 'kafka', 'app', 'client'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes one event per
-decision and hands the application's answer back to the client, so the dashboard shows numbers
-moving. Four production contracts are broken. Find them, fix them, and prove the fix.
+**Starting point.** The starter is \`finish(api_key, request_id, decision, response_text, started_at)\`,
+step 1's last call once a decision exists: it publishes one record to \`ai.firewall.events\` with
+the request id, the caller, the decision and the latency, logs a line, and returns the text the
+client sees. It serves the demo and hides four flaws.
 
-\`finish(api_key, request_id, decision, response_text, started_at)\` is the last thing the proxy
-does on every request: it scans the application's response, publishes the decision event and
-returns the text the client will see. The source describes both halves: **Sensitive Data Detection**
-on the response phase, scanning for financial data such as card numbers and for secrets such as API
-keys, and every decision visible as a security event.
+**Failure mode the checks target.** The topic is retained and replicated; the record key picks a
+caller's partition. Keying by request id scatters one caller's trail; a producer at its defaults
+writes a retried record twice; the model's answer in the payload or a log line is a leak with a
+long tail; an unscanned response hands the asker a card number or a leaked key.
 
-- Publish **exactly one** \`ai.firewall.events\` record per request, keyed by **\`key_hash\`** — the
-  SHA-256 of the API key, first 16 hex characters — so one caller's events stay ordered on one
-  partition and the key itself is never written to a retained topic. The payload carries
-  \`request_id\`, \`key_hash\`, \`action\`, \`score\`, \`tags\`, \`reason\`, \`latency_ms\` and
-  \`redactions\`.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent), so a retried produce
-  cannot duplicate a record.
-- **Never** put the user's text — the request's input or the model's answer — in the event or a
-  log line: the topic is retained and replicated, and outlives every retention policy the request
-  pipeline has.
-- **Redact before the client sees it**: \`redact(text)\` replaces card numbers
-  (\`CARD_PATTERN\`, 13–19 digits with optional spaces or dashes) and API keys (\`API_KEY_PATTERN\`,
-  \`sk-\` or \`key-\` followed by 20+ alphanumerics) with \`[REDACTED]\` and counts them; the count
-  goes into the event as \`redactions\`.
-
-**Failure mode the checks target.** Keying by request id scatters one caller's events across
-partitions; an unconfigured producer duplicates on retry; the retained text is a data leak with a
-long tail; and an unscanned response hands a card number or a leaked key straight to whoever asked
-the model for it — the disclosure the source's SDD rules exist to catch.`,
+- One record per call, keyed by **\`key_hash\`**, the first 16 hex characters of the SHA-256 of the
+  API key; the key itself appears nowhere. Payload: \`request_id\`, \`key_hash\`, \`action\`,
+  \`score\`, \`tags\`, \`reason\`, \`latency_ms\`, \`redactions\`.
+- The producer is **idempotent with \`acks=all\`** (kafka-go: \`RequireAll\` and the hash balancer).
+- No user or model text in the event or the logs.
+- \`redact(text)\` replaces card numbers (\`CARD_PATTERN\`: 13 to 19 digits, spaces or dashes
+  between) and API keys (\`API_KEY_PATTERN\`: \`sk-\` or \`key-\` plus 20+ alphanumerics) with
+  \`[REDACTED]\`; \`finish\` returns that text and counts the hits in the event as \`redactions\`.`,
   sequence: {
     participants: ['LLM app', 'aifw', 'ai.firewall.events', 'Client'],
     messages: [
@@ -47,67 +36,81 @@ the model for it — the disclosure the source's SDD rules exist to catch.`,
     ],
   },
   hints: [
-    'The message key is the partition key and the topic is retained: hash the API key (`sha256`, first 16 hex) and use the hash as both the record key and the `key_hash` field. Keyed by request id, one caller’s events land on different partitions.',
-    'Idempotence is producer configuration: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or kafka-go’s `RequireAll` with a hash balancer. It needs the same key on every retry — the same fix as the key hash.',
-    'Scan the response before anything else: two compiled patterns, `[REDACTED]` as the replacement, the number of hits returned alongside the text. The count is what goes in the event; the matched text never does.',
+    'The dashboard shows one caller\u2019s events out of order and, after a broker hiccup, twice; a support ticket quotes a card number the assistant read back from the knowledge base.',
+    'Kafka partitions by record key, so a key that changes per request scatters a caller\u2019s trail; a producer that is not idempotent writes its retry again; nothing looks at the response before it goes back.',
+    'Key and `key_hash` both from `sha256(api_key)[:16]`; `enable.idempotence` with `acks=all` (`idempotent: true`, `RequireAll`); drop `text` from the event and the log; `redact` first, return its text.',
   ],
   checks: [
     {
       id: 'key-hash',
       title: 'Keyed by the API key’s SHA-256 hash',
       detail:
-        'The record key and the `key_hash` field are the first 16 hex characters of the SHA-256 of the API key. The starter keys by the request id and never hashes anything.',
+        'The record key and the payload’s `key_hash` are the first 16 hex characters of the SHA-256 of the API key; the key itself is not in the payload. The starter keys by the request id and writes the API key into the event.',
       match: {
-        python: {all: [/sha256\(/, /key=key_hash/, /\[:16\]/]},
-        typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /key:\s*keyHash/, /slice\(0,\s*16\)/]},
-        go: {all: [/sha256\.Sum256\(/, /Key:\s*\[\]byte\(keyHash\)/, /\[:16\]/]},
+        python: {all: [/sha256\(/, /\[:16\]|\[0:16\]/, /key\s*=\s*key_hash/], none: [/key\s*=\s*request_id/]},
+        typescript: {
+          all: [
+            /createHash\(\s*['"]sha256['"]\s*\)/,
+            /slice\(\s*0,\s*16\s*\)|substring\(\s*0,\s*16\s*\)/,
+            /key:\s*keyHash/,
+          ],
+          none: [/key:\s*requestId/],
+        },
+        go: {
+          all: [/sha256\.Sum256\(/, /\[:16\]/, /Key:\s*\[\]byte\(\s*keyHash/],
+          none: [/Key:\s*\[\]byte\(\s*requestID\s*\)/],
+        },
         scala: {
           all: [
             /MessageDigest\.getInstance\(\s*"SHA-256"\s*\)/,
-            /ProducerRecord\("ai\.firewall\.events",\s*keyHash/,
-            /take\(16\)/,
+            /take\(\s*16\s*\)|substring\(\s*0,\s*16\s*\)/,
+            /ProducerRecord(\[[^\]]*\])?\(\s*\w+\s*,\s*keyHash/,
           ],
+          none: [/ProducerRecord(\[[^\]]*\])?\(\s*\w+\s*,\s*requestId/],
         },
-        cpp: {all: [/SHA256\(/, /keyHash\.data\(\)/, /substr\(0,\s*16\)/]},
+        cpp: {
+          all: [/SHA256\(/, /substr\(\s*0,\s*16\s*\)/, /keyHash\.(data|c_str)\(\)/],
+          none: [/requestId\.(data|c_str)\(\)/],
+        },
       },
     },
     {
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` — `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, or kafka-go’s `RequireAll` with a hash balancer. A retried produce must not duplicate the record.',
+        'The producer is configured so a retried produce is written once and a leader failover loses nothing: `enable.idempotence` with `acks=all`, KafkaJS’s `idempotent: true`, librdkafka’s `enable.idempotence`. kafka-go has no idempotent mode: `RequiredAcks: kafka.RequireAll` is what it can promise. The starter leaves the producer at its defaults.',
       match: {
-        python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
-        typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
-        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /Balancer:\s*&kafka\.Hash\{\}/]},
-        scala: {all: [/enable\.idempotence/, /"acks"/]},
-        cpp: {all: [/enable\.idempotence/, /set\("acks",\s*"all"/]},
+        python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']?(all|-1)["']?/]},
+        typescript: {all: [/idempotent:\s*true/]},
+        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/], none: [/RequiredAcks:\s*kafka\.Require(None|One)/]},
+        scala: {all: [/"enable\.idempotence"\s*,\s*"true"/, /"acks"\s*,\s*"(all|-1)"/]},
+        cpp: {all: [/"enable\.idempotence"\s*,\s*"true"/, /"acks"\s*,\s*"(all|-1)"/]},
       },
     },
     {
       id: 'no-text',
       title: 'No user or model text in the event or the logs',
       detail:
-        'Neither the event payload nor any log line carries the request’s input or the model’s answer. The starter copies the input text into the event — a leak that is retained and replicated with the topic.',
+        'Neither the payload nor a log line carries the model’s answer: the event has `latency_ms` and the counts, not the text. The starter copies the response into the event and prints it.',
       match: {
-        python: {all: [/latency_ms/], none: [/\bprompt\b/i, /["']text["']\s*:/]},
-        typescript: {all: [/latency_ms/], none: [/\bprompt\b/i, /\btext:\s*responseText/]},
-        go: {all: [/latency_ms/], none: [/\bprompt\b/i, /"text":/]},
-        scala: {all: [/latency_ms/], none: [/\bprompt\b/i, /"text"\s*->/]},
-        cpp: {all: [/latency_ms/], none: [/\bprompt\b/i, /\{"text",/]},
+        python: {all: [/latency_ms/], none: [/["']text["']\s*:/, /logger\.\w+\([^\n]*response_text/]},
+        typescript: {all: [/latency_ms/], none: [/\btext:\s*responseText/, /(console|log)\.\w+\([^\n]*responseText/]},
+        go: {all: [/latency_ms/], none: [/"text":/, /log\.\w+\([^\n]*responseText/]},
+        scala: {all: [/latency_ms/], none: [/"text"\s*->/, /log\.\w+\([^\n]*responseText/]},
+        cpp: {all: [/latency_ms/], none: [/\{"text",/, /(cerr|clog|cout)[^;]*responseText/]},
       },
     },
     {
       id: 'redact',
       title: 'Redacts card numbers and API keys before the client sees the answer',
       detail:
-        '`redact(text)` applies `CARD_PATTERN` and `API_KEY_PATTERN`, replaces hits with `[REDACTED]` and returns the count; `finish` returns the redacted text and puts the count in the event as `redactions`. The starter returns the response untouched.',
+        '`redact(text)` applies `CARD_PATTERN` and `API_KEY_PATTERN`, replaces hits with `[REDACTED]` and counts them; `finish` returns the redacted text and puts the count in the event as `redactions`. The starter returns the response untouched.',
       match: {
-        python: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /["']redactions["']/]},
-        typescript: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /redactions/]},
-        go: {all: [/cardPattern/, /apiKeyPattern/, /\[REDACTED\]/, /:=\s*redact\(/, /"redactions"/]},
-        scala: {all: [/CardPattern/, /ApiKeyPattern/, /\[REDACTED\]/, /=\s*redact\(/, /"redactions"/]},
-        cpp: {all: [/kCardPattern/, /kApiKeyPattern/, /\[REDACTED\]/, /=\s*redact\(/, /"redactions"/]},
+        python: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /["']redactions["']\s*:/]},
+        typescript: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /redactions[,:\s}]/]},
+        go: {all: [/cardPattern/, /apiKeyPattern/, /\[REDACTED\]/, /:=\s*redact\(/, /"redactions":/]},
+        scala: {all: [/CardPattern/, /ApiKeyPattern/, /\[REDACTED\]/, /=\s*redact\(/, /"redactions"\s*->/]},
+        cpp: {all: [/kCardPattern/, /kApiKeyPattern/, /\[REDACTED\]/, /=\s*redact\(/, /\{"redactions",/]},
       },
     },
   ],
@@ -127,19 +130,20 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 TOPIC = "ai.firewall.events"
 
 
-def finish(api_key: str, request_id: str, decision: Decision, prompt: str, response_text: str, started_at: float) -> str:
-    # TODO: key by a hash of the API key instead of the request id, configure the idempotent
-    # producer with acks=all, keep the user's text and the model's answer out of the event and
-    # the logs, and redact card numbers and API keys from the response before returning it.
+def finish(api_key: str, request_id: str, decision: Decision, response_text: str, started_at: float) -> str:
+    """Publish the decision event; return the text the client will see."""
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     event = {
         "request_id": request_id,
         "api_key": api_key,
         "action": decision.action,
         "score": decision.score,
-        "prompt": prompt,
+        "tags": list(decision.tags),
+        "reason": decision.reason,
+        "latency_ms": int((time.monotonic() - started_at) * 1000),
         "text": response_text,
     }
-    logger.info("event rid=%s prompt=%r", request_id, prompt)
+    logger.info("event rid=%s action=%s text=%r", request_id, decision.action, response_text)
     producer.produce(TOPIC, key=request_id, value=json.dumps(event))
     producer.poll(0)
     return response_text
@@ -164,7 +168,7 @@ producer = Producer(
 )
 
 TOPIC = "ai.firewall.events"
-CARD_PATTERN = re.compile(r"\\b(?:\\d[ -]?){13,19}\\b")
+CARD_PATTERN = re.compile(r"\\b\\d(?:[ -]?\\d){12,18}\\b")
 API_KEY_PATTERN = re.compile(r"\\b(?:sk|key)-[A-Za-z0-9]{20,}\\b")
 REDACTED = "[REDACTED]"
 
@@ -182,6 +186,7 @@ def redact(text: str) -> tuple[str, int]:
 
 
 def finish(api_key: str, request_id: str, decision: Decision, response_text: str, started_at: float) -> str:
+    """Publish the decision event; return the text the client will see."""
     cleaned, redactions = redact(response_text)
     key_hash = key_hash_of(api_key)
     event = {
@@ -189,7 +194,7 @@ def finish(api_key: str, request_id: str, decision: Decision, response_text: str
         "key_hash": key_hash,
         "action": decision.action,
         "score": decision.score,
-        "tags": decision.tags,
+        "tags": list(decision.tags),
         "reason": decision.reason,
         "latency_ms": int((time.monotonic() - started_at) * 1000),
         "redactions": redactions,
@@ -201,7 +206,7 @@ def finish(api_key: str, request_id: str, decision: Decision, response_text: str
 `,
     },
     typescript: {
-      starter: `/** ai.firewall.events: flawed code that keys by request id and returns the answer as is. */
+      starter: `/** ai.firewall.events: one record per decision, and the text the client will see. */
 import {Kafka} from 'kafkajs';
 
 import type {Decision} from './detect';
@@ -210,33 +215,32 @@ const kafka = new Kafka({clientId: 'aifw', brokers: ['kafka:9092']});
 const producer = kafka.producer();
 void producer.connect();
 
-const TOPIC = 'ai.firewall.events';
+export const TOPIC = 'ai.firewall.events';
 
 export async function finish(
   apiKey: string,
   requestId: string,
   decision: Decision,
-  prompt: string,
   responseText: string,
   startedAt: number,
 ): Promise<string> {
-  // TODO: key by a hash of the API key instead of the request id, configure the idempotent
-  // producer with acks=all, keep the user's text and the model's answer out of the event and
-  // the logs, and redact card numbers and API keys from the response before returning it.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const event = {
     request_id: requestId,
     api_key: apiKey,
     action: decision.action,
     score: decision.score,
-    prompt,
+    tags: decision.tags,
+    reason: decision.reason ?? '',
+    latency_ms: Date.now() - startedAt,
     text: responseText,
   };
-  console.log(\`event rid=\${requestId} prompt=\${prompt}\`);
+  console.log(\`event rid=\${requestId} action=\${decision.action} text=\${responseText}\`);
   await producer.send({topic: TOPIC, messages: [{key: requestId, value: JSON.stringify(event)}]});
   return responseText;
 }
 `,
-      solution: `/** ai.firewall.events: one idempotent record per request keyed by the key hash; the answer redacted first. */
+      solution: `/** ai.firewall.events: one idempotent record per decision keyed by the key hash; the answer redacted first. */
 import {createHash} from 'node:crypto';
 
 import {Kafka} from 'kafkajs';
@@ -247,8 +251,8 @@ const kafka = new Kafka({clientId: 'aifw', brokers: ['kafka:9092']});
 const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
 void producer.connect();
 
-const TOPIC = 'ai.firewall.events';
-const CARD_PATTERN = /\\b(?:\\d[ -]?){13,19}\\b/g;
+export const TOPIC = 'ai.firewall.events';
+const CARD_PATTERN = /\\b\\d(?:[ -]?\\d){12,18}\\b/g;
 const API_KEY_PATTERN = /\\b(?:sk|key)-[A-Za-z0-9]{20,}\\b/g;
 const REDACTED = '[REDACTED]';
 
@@ -309,23 +313,28 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-var eventsWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "ai.firewall.events"}
+const eventsTopic = "ai.firewall.events"
 
-// TODO: key by a hash of the API key instead of the request id, configure acks=all / a hash
-// balancer, keep the user's text and the model's answer out of the event and the logs, and redact
-// card numbers and API keys from the response before returning it.
-func finish(ctx context.Context, apiKey, requestID string, decision Decision, prompt, responseText string, startedAt time.Time) string {
+var eventsWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: eventsTopic}
+
+// finish publishes the decision event and returns the text the client will see.
+func finish(ctx context.Context, apiKey, requestID string, decision Decision, responseText string, startedAt time.Time) string {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"request_id": requestID,
 		"api_key":    apiKey,
 		"action":     decision.Action,
 		"score":      decision.Score,
-		"prompt":     prompt,
+		"tags":       decision.Tags,
+		"reason":     decision.Reason,
+		"latency_ms": time.Since(startedAt).Milliseconds(),
 		"text":       responseText,
 	}
-	log.Printf("event rid=%s prompt=%q", requestID, prompt)
+	log.Printf("event rid=%s action=%s text=%q", requestID, decision.Action, responseText)
 	payload, _ := json.Marshal(event)
-	_ = eventsWriter.WriteMessages(ctx, kafka.Message{Key: []byte(requestID), Value: payload})
+	if err := eventsWriter.WriteMessages(ctx, kafka.Message{Key: []byte(requestID), Value: payload}); err != nil {
+		log.Printf("event rid=%s produce failed: %v", requestID, err)
+	}
 	return responseText
 }
 `,
@@ -343,23 +352,24 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// RequiredAcks=RequireAll with a stable hash balancer is the kafka-go equivalent of an idempotent
-// producer: the broker acknowledges only once the record is replicated, and retries of the same
-// key land on the same partition instead of duplicating across them.
+const eventsTopic = "ai.firewall.events"
+
+// kafka-go has no idempotent producer: RequireAll keeps a record through a leader failover, the
+// hash balancer keeps one caller's events on one partition, and a consumer de-duplicates a retried
+// write on request_id.
 var eventsWriter = &kafka.Writer{
 	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        "ai.firewall.events",
+	Topic:        eventsTopic,
 	RequiredAcks: kafka.RequireAll,
 	Balancer:     &kafka.Hash{},
-	Async:        false,
 }
 
 var (
-	cardPattern   = regexp.MustCompile(\`\\b(?:\\d[ -]?){13,19}\\b\`)
+	cardPattern   = regexp.MustCompile(\`\\b\\d(?:[ -]?\\d){12,18}\\b\`)
 	apiKeyPattern = regexp.MustCompile(\`\\b(?:sk|key)-[A-Za-z0-9]{20,}\\b\`)
 )
 
-const redacted = "[REDACTED]"
+const redactedText = "[REDACTED]"
 
 // keyHashOf is the record key: the API key itself never lands on a retained topic.
 func keyHashOf(apiKey string) string {
@@ -373,12 +383,13 @@ func redact(text string) (string, int) {
 	for _, pattern := range []*regexp.Regexp{cardPattern, apiKeyPattern} {
 		text = pattern.ReplaceAllStringFunc(text, func(string) string {
 			count++
-			return redacted
+			return redactedText
 		})
 	}
 	return text, count
 }
 
+// finish publishes the decision event and returns the text the client will see.
 func finish(ctx context.Context, apiKey, requestID string, decision Decision, responseText string, startedAt time.Time) string {
 	cleaned, redactions := redact(responseText)
 	keyHash := keyHashOf(apiKey)
@@ -406,28 +417,33 @@ func finish(ctx context.Context, apiKey, requestID string, decision Decision, re
 import java.util.logging.Logger
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 
 object Events {
   private val log = Logger.getLogger("aifw")
-  val producer = new KafkaProducer[String, String](new Properties())
   val Topic = "ai.firewall.events"
 
-  // TODO: key by a hash of the API key instead of the request id, configure the idempotent
-  // producer with acks=all, keep the user's text and the model's answer out of the event and the
-  // logs, and redact card numbers and API keys from the response before returning it.
-  def finish(apiKey: String, requestId: String, decision: Decision, prompt: String, responseText: String, startedAt: Long): String = {
-    val event = Map(
-      "request_id" -> requestId,
-      "api_key" -> apiKey,
-      "action" -> decision.action,
-      "score" -> decision.score.toString,
-      "prompt" -> prompt,
-      "text" -> responseText
+  private val props = new Properties()
+  props.put("bootstrap.servers", "kafka:9092")
+  val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+
+  /** Publishes the decision event; returns the text the client will see. */
+  def finish(apiKey: String, requestId: String, decision: Decision, responseText: String, startedAt: Long): String = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    val event = JsObject(
+      "request_id" -> JsString(requestId),
+      "api_key" -> JsString(apiKey),
+      "action" -> JsString(decision.action),
+      "score" -> JsNumber(decision.score),
+      "tags" -> decision.tags.toJson,
+      "reason" -> JsString(decision.reason),
+      "latency_ms" -> JsNumber(System.currentTimeMillis() - startedAt),
+      "text" -> JsString(responseText)
     )
-    log.info(s"event rid=$requestId prompt=$prompt")
-    producer.send(new ProducerRecord(Topic, requestId, event.toJson.compactPrint))
+    log.info(s"event rid=$requestId action=\${decision.action} text=$responseText")
+    producer.send(new ProducerRecord(Topic, requestId, event.compactPrint))
     responseText
   }
 }
@@ -437,23 +453,23 @@ import java.security.MessageDigest
 import java.util.Properties
 import java.util.logging.Logger
 
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 
 object Events {
   private val log = Logger.getLogger("aifw")
-  val producer = new KafkaProducer[String, String]({
-    val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put("enable.idempotence", "true")
-    props.put("acks", "all")
-    props
-  })
   val Topic = "ai.firewall.events"
-  val CardPattern = """\\b(?:\\d[ -]?){13,19}\\b""".r
+  val CardPattern = """\\b\\d(?:[ -]?\\d){12,18}\\b""".r
   val ApiKeyPattern = """\\b(?:sk|key)-[A-Za-z0-9]{20,}\\b""".r
   val Redacted = "[REDACTED]"
+
+  private val props = new Properties()
+  props.put("bootstrap.servers", "kafka:9092")
+  props.put("enable.idempotence", "true")
+  props.put("acks", "all")
+  val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
   /** The record key: the API key itself never lands on a retained topic. */
   def keyHashOf(apiKey: String): String = {
@@ -469,6 +485,7 @@ object Events {
     (ApiKeyPattern.replaceAllIn(afterCards, Redacted), cards + keys)
   }
 
+  /** Publishes the decision event; returns the text the client will see. */
   def finish(apiKey: String, requestId: String, decision: Decision, responseText: String, startedAt: Long): String = {
     val (cleaned, redactions) = redact(responseText)
     val keyHash = keyHashOf(apiKey)
@@ -483,98 +500,100 @@ object Events {
       "redactions" -> JsNumber(redactions)
     )
     log.info(s"event rid=$requestId key=$keyHash action=\${decision.action} redactions=$redactions")
-    producer.send(new ProducerRecord("ai.firewall.events", keyHash, event.compactPrint))
+    producer.send(new ProducerRecord(Topic, keyHash, event.compactPrint))
     cleaned
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <librdkafka/rdkafkacpp.h>
+      starter: `// ai.firewall.events: one record per decision, and the text the client will see.
+#pragma once
+
+#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <iostream>
 #include <memory>
-#include <nlohmann/json.hpp>
 #include <string>
 
-#include "detect.h"
+#include "detect.cpp"
 
-using json = nlohmann::json;
+const std::string kEventsTopic = "ai.firewall.events";
 
-const std::string kTopic = "ai.firewall.events";
+inline RdKafka::Producer& events_producer() {
+  static std::unique_ptr<RdKafka::Producer> producer = [] {
+    std::string err;
+    std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+    conf->set("bootstrap.servers", "kafka:9092", err);
+    return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+  }();
+  return *producer;
+}
 
-std::unique_ptr<RdKafka::Producer> producer;
-
-// TODO: key by a hash of the API key instead of the request id, configure the idempotent producer
-// with acks=all, keep the user's text and the model's answer out of the event and the logs, and
-// redact card numbers and API keys from the response before returning it.
-std::string finish(
-    const std::string& apiKey,
-    const std::string& requestId,
-    const Decision& decision,
-    const std::string& prompt,
-    const std::string& responseText,
-    std::chrono::steady_clock::time_point startedAt) {
-  const json event = {
+// Publishes the decision event; returns the text the client will see.
+inline std::string finish(const std::string& apiKey, const std::string& requestId, const Decision& decision,
+                          const std::string& responseText, std::chrono::steady_clock::time_point startedAt) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
+  const nlohmann::json event = {
       {"request_id", requestId},
       {"api_key", apiKey},
       {"action", decision.action},
       {"score", decision.score},
-      {"prompt", prompt},
+      {"tags", decision.tags},
+      {"reason", decision.reason},
+      {"latency_ms", latency.count()},
       {"text", responseText},
   };
-  std::cerr << "event rid=" << requestId << " prompt=" << prompt << "\\n";
-  const auto payload = event.dump();
-  producer->produce(
-      kTopic,
-      RdKafka::Topic::PARTITION_UA,
-      RdKafka::Producer::RK_MSG_COPY,
-      const_cast<char*>(payload.data()),
-      payload.size(),
-      requestId.data(),
-      requestId.size(),
-      0,
-      nullptr);
-  producer->poll(0);
+  std::cerr << "event rid=" << requestId << " action=" << decision.action << " text=" << responseText << "\\n";
+  const std::string payload = event.dump();
+  const RdKafka::ErrorCode err = events_producer().produce(
+      kEventsTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()),
+      payload.size(), requestId.data(), requestId.size(), 0, nullptr);
+  if (err != RdKafka::ERR_NO_ERROR) std::cerr << "event rid=" << requestId << " produce failed\\n";
+  events_producer().poll(0);
   return responseText;
 }
 `,
-      solution: `#include <librdkafka/rdkafkacpp.h>
+      solution: `// ai.firewall.events: one idempotent record per decision keyed by the key hash; the answer redacted first.
+#pragma once
+
+#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
 #include <openssl/sha.h>
 
 #include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <nlohmann/json.hpp>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <utility>
 
-#include "detect.h"
+#include "detect.cpp"
 
-using json = nlohmann::json;
-
-const std::string kTopic = "ai.firewall.events";
-const std::regex kCardPattern(R"(\\b(?:\\d[ -]?){13,19}\\b)");
+const std::string kEventsTopic = "ai.firewall.events";
+const std::regex kCardPattern(R"(\\b\\d(?:[ -]?\\d){12,18}\\b)");
 const std::regex kApiKeyPattern(R"(\\b(?:sk|key)-[A-Za-z0-9]{20,}\\b)");
 const std::string kRedacted = "[REDACTED]";
 
-std::unique_ptr<RdKafka::Producer> makeProducer() {
-  std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
-  conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("enable.idempotence", "true", err);
-  conf->set("acks", "all", err);
-  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+inline RdKafka::Producer& events_producer() {
+  static std::unique_ptr<RdKafka::Producer> producer = [] {
+    std::string err;
+    std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+    conf->set("bootstrap.servers", "kafka:9092", err);
+    conf->set("enable.idempotence", "true", err);
+    conf->set("acks", "all", err);
+    return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+  }();
+  return *producer;
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
-
 // The record key: the API key itself never lands on a retained topic.
-std::string keyHashOf(const std::string& apiKey) {
+inline std::string keyHashOf(const std::string& apiKey) {
   unsigned char digest[SHA256_DIGEST_LENGTH];
   SHA256(reinterpret_cast<const unsigned char*>(apiKey.data()), apiKey.size(), digest);
   std::ostringstream hex;
@@ -583,27 +602,24 @@ std::string keyHashOf(const std::string& apiKey) {
 }
 
 // The response with card numbers and API keys replaced, and how many were replaced.
-std::pair<std::string, int> redact(const std::string& text) {
+inline std::pair<std::string, int> redact(const std::string& text) {
   int count = 0;
   std::string cleaned = text;
   for (const auto* pattern : {&kCardPattern, &kApiKeyPattern}) {
-    count += static_cast<int>(std::distance(
-        std::sregex_iterator(cleaned.begin(), cleaned.end(), *pattern), std::sregex_iterator()));
+    count += static_cast<int>(
+        std::distance(std::sregex_iterator(cleaned.begin(), cleaned.end(), *pattern), std::sregex_iterator()));
     cleaned = std::regex_replace(cleaned, *pattern, kRedacted);
   }
   return {cleaned, count};
 }
 
-std::string finish(
-    const std::string& apiKey,
-    const std::string& requestId,
-    const Decision& decision,
-    const std::string& responseText,
-    std::chrono::steady_clock::time_point startedAt) {
+// Publishes the decision event; returns the text the client will see.
+inline std::string finish(const std::string& apiKey, const std::string& requestId, const Decision& decision,
+                          const std::string& responseText, std::chrono::steady_clock::time_point startedAt) {
   const auto [cleaned, redactions] = redact(responseText);
-  const auto keyHash = keyHashOf(apiKey);
+  const std::string keyHash = keyHashOf(apiKey);
   const auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
-  const json event = {
+  const nlohmann::json event = {
       {"request_id", requestId},
       {"key_hash", keyHash},
       {"action", decision.action},
@@ -615,23 +631,483 @@ std::string finish(
   };
   std::cerr << "event rid=" << requestId << " key=" << keyHash << " action=" << decision.action
             << " redactions=" << redactions << "\\n";
-  const auto payload = event.dump();
-  const auto err = producer->produce(
-      kTopic,
-      RdKafka::Topic::PARTITION_UA,
-      RdKafka::Producer::RK_MSG_COPY,
-      const_cast<char*>(payload.data()),
-      payload.size(),
-      keyHash.data(),
-      keyHash.size(),
-      0,
-      nullptr);
+  const std::string payload = event.dump();
+  const RdKafka::ErrorCode err = events_producer().produce(
+      kEventsTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()),
+      payload.size(), keyHash.data(), keyHash.size(), 0, nullptr);
   if (err != RdKafka::ERR_NO_ERROR) std::cerr << "event rid=" << requestId << " produce failed\\n";
-  producer->poll(0);
+  events_producer().poll(0);
   return cleaned;
 }
 `,
     },
   },
-  debrief: `The interviewer is checking the two things a firewall owes the rest of the platform: an audit trail that can be trusted and a response the client can be given. On the trail, the message key is an ordering contract and a retention contract at once — hash the API key and one caller's events stay in order without the secret ever reaching a replicated topic; idempotence and acks=all make a retried produce a no-op instead of a duplicate; and the text stays out because a topic outlives every retention policy upstream of it. On the response, the source's Sensitive Data Detection is a scan of what the model returned for card numbers and API keys — the disclosure class in OWASP's list — and the only place to do it is before the bytes reach the client, with the count, never the match, going into the event. Real firewalls add custom fingerprints per tenant, request-phase scanning and obfuscation of the input, an outbox for events the broker rejects, and a consumer that turns the topic into the security-events dashboard.`,
+  harness: {
+    python: `import hashlib
+import json
+import logging
+import time
+
+TOPIC = "ai.firewall.events"
+KEY = "key-7f3a"
+KEY_HASH = hashlib.sha256(KEY.encode()).hexdigest()[:16]
+ANSWER = "The zebra-pangolin tunnel opens at dawn."
+LEAKY = "Card 4111 1111 1111 1111 is on file; use sk-abcdefghijklmnopqrstuvwxyz123456 for the API, done."
+FIELDS = ("request_id", "key_hash", "action", "score", "tags", "reason", "latency_ms", "redactions")
+
+
+class Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def _events(ctx):
+    m = ctx.load("events")
+    capture = Capture()
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(capture)
+    return m, capture
+
+
+def _allow(m):
+    return m.Decision("allow", 90, ["travel"], "")
+
+
+def _event(ctx, i=0):
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) > i, f"the topic holds {len(records)} record(s), expected at least {i + 1} (topics: {sorted(ctx.kafka.topics)})"
+    try:
+        return json.loads(records[i].value), records[i]
+    except ValueError:
+        raise AssertionError(f"the record's value is not JSON: {records[i].value!r}")
+
+
+def check_key_hash(ctx):
+    m, _ = _events(ctx)
+    now = time.monotonic()
+    m.finish(KEY, "r-1", _allow(m), ANSWER, now)
+    m.finish(KEY, "r-2", _allow(m), ANSWER, now)
+    m.finish("key-b2c9", "r-3", _allow(m), ANSWER, now)
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three finish() calls produced {len(records)} records on {TOPIC}"
+    keys = [(r.key or b"").decode() for r in records]
+    assert keys[0] != "r-1", "the record is keyed by the request id: one caller's events scatter across partitions and a replay of one caller is a scan of the whole topic"
+    assert keys[0] == KEY_HASH, f"the record key is {keys[0]!r}, expected the first 16 hex characters of the SHA-256 of the API key ({KEY_HASH})"
+    assert keys[1] == KEY_HASH and keys[2] != KEY_HASH, f"keys over three calls were {keys}: the same API key must give the same key, another key another"
+    assert records[0].partition == records[1].partition, "two events of one caller landed on different partitions: the key must be the same for every request of a caller"
+    event, _ = _event(ctx)
+    assert event.get("key_hash") == KEY_HASH, f"the payload's key_hash is {event.get('key_hash')!r}, expected {KEY_HASH}"
+    assert KEY not in records[0].value.decode(), f"the API key itself is in the payload: {records[0].value!r}. Only its hash may reach a retained topic"
+    missing = [f for f in FIELDS if f not in event]
+    assert not missing, f"the payload lacks {missing}: {event}"
+
+
+def check_idempotent_acks(ctx):
+    m, _ = _events(ctx)
+    ctx.kafka.lose_acks(TOPIC, 1)
+    m.finish(KEY, "r-1", _allow(m), ANSWER, time.monotonic())
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one finish() whose acknowledgement was lost left {len(records)} records on the topic: the producer retried and the broker wrote it again. enable.idempotence makes the retry a no-op (it needs acks=all)"
+    ctx.kafka.failover(TOPIC)
+    assert len(ctx.kafka.records(TOPIC)) == 1, "after a leader failover the event is gone: it was acknowledged by the leader alone, the producer needs acks=all"
+    m.finish(KEY, "r-2", _allow(m), ANSWER, time.monotonic())
+    assert len(ctx.kafka.records(TOPIC)) == 2, "after the failover the producer must keep producing"
+
+
+def check_no_text(ctx):
+    m, capture = _events(ctx)
+    started = time.monotonic()
+    ctx.clock.advance(0.25)
+    m.finish(KEY, "r-1", _allow(m), ANSWER, started)
+    event, record = _event(ctx)
+    assert "zebra-pangolin" not in record.value.decode(), f"the event carries the model's answer: {record.value!r}. The topic is retained and replicated; the answer stays out"
+    logged = "\\n".join(capture.lines)
+    assert "zebra-pangolin" not in logged, f"a log line carries the model's answer: {logged!r}. Log the request id, the action and the counts"
+    latency = event.get("latency_ms")
+    assert isinstance(latency, int) and 200 <= latency <= 2000, f"latency_ms is {latency!r} for a request started 250 ms ago, expected an integer around 250"
+    assert event.get("action") == "allow" and event.get("score") == 90 and event.get("tags") == ["travel"], f"the payload must carry the decision's action, score and tags: {event}"
+
+
+def check_redact(ctx):
+    m, _ = _events(ctx)
+    out = m.finish(KEY, "r-1", _allow(m), LEAKY, time.monotonic())
+    assert "4111" not in out and "sk-abcdef" not in out, f"the response reached the client with the card number or the key still in it: {out!r}"
+    assert out.count("[REDACTED]") == 2, f"expected the card number and the key both replaced with [REDACTED], got {out!r}"
+    assert out.startswith("Card [REDACTED] is on file") and out.endswith("for the API, done."), f"the rest of the text must come through untouched: {out!r}"
+    event, record = _event(ctx)
+    assert event.get("redactions") == 2, f"the event's redactions is {event.get('redactions')!r}, expected 2"
+    assert "4111" not in record.value.decode(), f"the card number is in the event: {record.value!r}"
+    clean = m.finish(KEY, "r-2", _allow(m), ANSWER, time.monotonic())
+    assert clean == ANSWER, f"a clean answer must come through unchanged, got {clean!r}"
+    event, _ = _event(ctx, 1)
+    assert event.get("redactions") == 0, f"a clean answer's event has redactions {event.get('redactions')!r}, expected 0"
+    dashed = m.finish(KEY, "r-3", _allow(m), "Try 4111-1111-1111-1111 next.", time.monotonic())
+    assert dashed == "Try [REDACTED] next.", f"a dashed card number must be redacted too, got {dashed!r}"
+`,
+    typescript: `import {createHash} from 'node:crypto';
+
+const TOPIC = 'ai.firewall.events';
+const KEY = 'key-7f3a';
+const KEY_HASH = createHash('sha256').update(KEY).digest('hex').slice(0, 16);
+const ANSWER = 'The zebra-pangolin tunnel opens at dawn.';
+const LEAKY = 'Card 4111 1111 1111 1111 is on file; use sk-abcdefghijklmnopqrstuvwxyz123456 for the API, done.';
+const FIELDS = ['request_id', 'key_hash', 'action', 'score', 'tags', 'reason', 'latency_ms', 'redactions'];
+
+/** The learner's module, with every console line captured. */
+function events(ctx) {
+  const m = ctx.load('events');
+  const lines: string[] = [];
+  const capture = (...args: unknown[]): void => void lines.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  console.log = console.info = console.debug = console.warn = console.error = capture;
+  return {m, lines};
+}
+
+const allow = () => ({action: 'allow', score: 90, tags: ['travel'], reason: ''});
+
+function event(ctx, i = 0) {
+  const records = ctx.kafka.records(TOPIC);
+  assert(records.length > i, \`the topic holds \${records.length} record(s), expected at least \${i + 1}\`);
+  const value = records[i].value?.toString() ?? '';
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    assert.fail(\`the record's value is not JSON: \${JSON.stringify(value)}\`);
+  }
+  return {event: parsed, record: records[i], value};
+}
+
+export async function check_key_hash(ctx) {
+  const {m} = events(ctx);
+  const now = Date.now();
+  await m.finish(KEY, 'r-1', allow(), ANSWER, now);
+  await m.finish(KEY, 'r-2', allow(), ANSWER, now);
+  await m.finish('key-b2c9', 'r-3', allow(), ANSWER, now);
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three finish() calls produced \${records.length} records on \${TOPIC}\`);
+  const keys = records.map(r => r.key?.toString() ?? '');
+  assert(keys[0] !== 'r-1', "the record is keyed by the request id: one caller's events scatter across partitions and a replay of one caller is a scan of the whole topic");
+  assert.equal(keys[0], KEY_HASH, \`the record key is \${JSON.stringify(keys[0])}, expected the first 16 hex characters of the SHA-256 of the API key (\${KEY_HASH})\`);
+  assert(keys[1] === KEY_HASH && keys[2] !== KEY_HASH, \`keys over three calls were \${JSON.stringify(keys)}: the same API key must give the same key, another key another\`);
+  assert.equal(records[0].partition, records[1].partition, 'two events of one caller landed on different partitions: the key must be the same for every request of a caller');
+  const {event: e, value} = event(ctx);
+  assert.equal(e.key_hash, KEY_HASH, \`the payload's key_hash is \${JSON.stringify(e.key_hash)}, expected \${KEY_HASH}\`);
+  assert(!value.includes(KEY), \`the API key itself is in the payload: \${value}. Only its hash may reach a retained topic\`);
+  const missing = FIELDS.filter(f => !(f in e));
+  assert.equal(missing.length, 0, \`the payload lacks \${JSON.stringify(missing)}: \${value}\`);
+}
+
+export async function check_idempotent_acks(ctx) {
+  const {m} = events(ctx);
+  ctx.kafka.loseAcks(TOPIC, 1);
+  await m.finish(KEY, 'r-1', allow(), ANSWER, Date.now());
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 1, \`one finish() whose acknowledgement was lost left \${records.length} records on the topic: the producer retried and the broker wrote it again. idempotent: true makes the retry a no-op (it needs acks: -1)\`);
+  ctx.kafka.failover(TOPIC);
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'after a leader failover the event is gone: it was acknowledged by the leader alone, the producer needs acks: -1 (all)');
+  await m.finish(KEY, 'r-2', allow(), ANSWER, Date.now());
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, 'after the failover the producer must keep producing');
+}
+
+export async function check_no_text(ctx) {
+  const {m, lines} = events(ctx);
+  const started = Date.now();
+  ctx.clock.advance(0.25);
+  await m.finish(KEY, 'r-1', allow(), ANSWER, started);
+  const {event: e, value} = event(ctx);
+  assert(!value.includes('zebra-pangolin'), \`the event carries the model's answer: \${value}. The topic is retained and replicated; the answer stays out\`);
+  const logged = lines.join('\\n');
+  assert(!logged.includes('zebra-pangolin'), \`a log line carries the model's answer: \${JSON.stringify(logged)}. Log the request id, the action and the counts\`);
+  assert(Number.isInteger(e.latency_ms) && e.latency_ms >= 200 && e.latency_ms <= 2000, \`latency_ms is \${JSON.stringify(e.latency_ms)} for a request started 250 ms ago, expected an integer around 250\`);
+  assert(e.action === 'allow' && e.score === 90 && JSON.stringify(e.tags) === '["travel"]', \`the payload must carry the decision's action, score and tags: \${value}\`);
+}
+
+export async function check_redact(ctx) {
+  const {m} = events(ctx);
+  const out = await m.finish(KEY, 'r-1', allow(), LEAKY, Date.now());
+  assert(!out.includes('4111') && !out.includes('sk-abcdef'), \`the response reached the client with the card number or the key still in it: \${JSON.stringify(out)}\`);
+  assert.equal(out.split('[REDACTED]').length - 1, 2, \`expected the card number and the key both replaced with [REDACTED], got \${JSON.stringify(out)}\`);
+  assert(out.startsWith('Card [REDACTED] is on file') && out.endsWith('for the API, done.'), \`the rest of the text must come through untouched: \${JSON.stringify(out)}\`);
+  const first = event(ctx);
+  assert.equal(first.event.redactions, 2, \`the event's redactions is \${JSON.stringify(first.event.redactions)}, expected 2\`);
+  assert(!first.value.includes('4111'), \`the card number is in the event: \${first.value}\`);
+  const clean = await m.finish(KEY, 'r-2', allow(), ANSWER, Date.now());
+  assert.equal(clean, ANSWER, \`a clean answer must come through unchanged, got \${JSON.stringify(clean)}\`);
+  assert.equal(event(ctx, 1).event.redactions, 0, "a clean answer's event must have redactions 0");
+  const dashed = await m.finish(KEY, 'r-3', allow(), 'Try 4111-1111-1111-1111 next.', Date.now());
+  assert.equal(dashed, 'Try [REDACTED] next.', \`a dashed card number must be redacted too, got \${JSON.stringify(dashed)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"log"
+	"strings"
+	"time"
+
+	"leetbuild/harness"
+)
+
+const (
+	eventsTopicName = "ai.firewall.events"
+	eventsKey       = "key-7f3a"
+	eventsAnswer    = "The zebra-pangolin tunnel opens at dawn."
+	eventsLeaky     = "Card 4111 1111 1111 1111 is on file; use sk-abcdefghijklmnopqrstuvwxyz123456 for the API, done."
+)
+
+var eventsFields = []string{"request_id", "key_hash", "action", "score", "tags", "reason", "latency_ms", "redactions"}
+
+func eventsKeyHash() string {
+	sum := sha256.Sum256([]byte(eventsKey))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// Decision is the firewall's verdict on one prompt, as detect.go (step 3) declares it: the Go
+// runtime compiles one step's file at a time, so the harness carries the type here.
+type Decision struct {
+	Action string
+	Score  int32
+	Tags   []string
+	Reason string
+}
+
+func allowDecision() Decision { return Decision{Action: "allow", Score: 90, Tags: []string{"travel"}} }
+
+// eventAt is the i-th record's payload.
+func eventAt(ctx *harness.Ctx, i int) (map[string]any, harness.KafkaRecord) {
+	records := ctx.Kafka.Records(eventsTopicName)
+	ctx.Assert(len(records) > i, "the topic holds %d record(s), expected at least %d (topics: %v)", len(records), i+1, ctx.Kafka.Topics())
+	var event map[string]any
+	ctx.NoError(json.Unmarshal(records[i].Value, &event), "the record's value is not JSON: %s", records[i].Value)
+	return event, records[i]
+}
+
+func CheckKeyHash(ctx *harness.Ctx) {
+	now := time.Now()
+	finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsAnswer, now)
+	finish(context.Background(), eventsKey, "r-2", allowDecision(), eventsAnswer, now)
+	finish(context.Background(), "key-b2c9", "r-3", allowDecision(), eventsAnswer, now)
+	records := ctx.Kafka.Records(eventsTopicName)
+	ctx.Equal(len(records), 3, "three finish() calls must produce three records on %s; the records", eventsTopicName)
+	keys := ctx.Kafka.Keys(eventsTopicName)
+	ctx.Assert(keys[0] != "r-1", "the record is keyed by the request id: one caller's events scatter across partitions and a replay of one caller is a scan of the whole topic")
+	ctx.Equal(keys[0], eventsKeyHash(), "the record key must be the first 16 hex characters of the SHA-256 of the API key")
+	ctx.Assert(keys[1] == eventsKeyHash() && keys[2] != eventsKeyHash(), "keys over three calls were %q: the same API key must give the same key, another key another", keys)
+	ctx.Equal(records[0].Partition, records[1].Partition, "two events of one caller landed on different partitions: the key must be the same for every request of a caller, and the writer needs Balancer: &kafka.Hash{} (kafka-go's default is round robin); k1's partitions")
+	event, record := eventAt(ctx, 0)
+	ctx.Equal(event["key_hash"], eventsKeyHash(), "the payload's key_hash")
+	ctx.Assert(!strings.Contains(string(record.Value), eventsKey), "the API key itself is in the payload: %s. Only its hash may reach a retained topic", record.Value)
+	var missing []string
+	for _, f := range eventsFields {
+		if _, ok := event[f]; !ok {
+			missing = append(missing, f)
+		}
+	}
+	ctx.Assert(len(missing) == 0, "the payload lacks %v: %s", missing, record.Value)
+}
+
+func CheckIdempotentAcks(ctx *harness.Ctx) {
+	finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsAnswer, time.Now())
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopicName)), 1, "one finish() must leave one record; the records")
+	lost := ctx.Kafka.Failover(eventsTopicName)
+	ctx.Assert(lost == 0 && len(ctx.Kafka.Records(eventsTopicName)) == 1, "after a leader failover the event is gone: it was acknowledged by nobody or the leader alone (kafka-go's default RequiredAcks is RequireNone), the writer needs RequiredAcks: kafka.RequireAll")
+	finish(context.Background(), eventsKey, "r-2", allowDecision(), eventsAnswer, time.Now())
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopicName)), 2, "after the failover the writer must keep producing; the records")
+}
+
+func CheckNoText(ctx *harness.Ctx) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	started := time.Now()
+	ctx.Clock.Advance(0.25)
+	finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsAnswer, started)
+	event, record := eventAt(ctx, 0)
+	ctx.Assert(!strings.Contains(string(record.Value), "zebra-pangolin"), "the event carries the model's answer: %s. The topic is retained and replicated; the answer stays out", record.Value)
+	ctx.Assert(!strings.Contains(logged.String(), "zebra-pangolin"), "a log line carries the model's answer: %q. Log the request id, the action and the counts", logged.String())
+	latency, _ := event["latency_ms"].(float64)
+	ctx.Assert(latency >= 200 && latency <= 2000, "latency_ms is %v for a request started 250 ms ago, expected around 250", event["latency_ms"])
+	ctx.Assert(event["action"] == "allow" && event["score"] == float64(90), "the payload must carry the decision's action and score: %s", record.Value)
+	ctx.Equal(event["tags"], []any{"travel"}, "the payload's tags")
+}
+
+func CheckRedact(ctx *harness.Ctx) {
+	out := finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsLeaky, time.Now())
+	ctx.Assert(!strings.Contains(out, "4111") && !strings.Contains(out, "sk-abcdef"), "the response reached the client with the card number or the key still in it: %q", out)
+	ctx.Equal(strings.Count(out, "[REDACTED]"), 2, "the card number and the key must both be replaced with [REDACTED] (%q); the replacements", out)
+	ctx.Assert(strings.HasPrefix(out, "Card [REDACTED] is on file") && strings.HasSuffix(out, "for the API, done."), "the rest of the text must come through untouched: %q", out)
+	event, record := eventAt(ctx, 0)
+	ctx.Equal(event["redactions"], 2, "the event's redactions")
+	ctx.Assert(!strings.Contains(string(record.Value), "4111"), "the card number is in the event: %s", record.Value)
+	clean := finish(context.Background(), eventsKey, "r-2", allowDecision(), eventsAnswer, time.Now())
+	ctx.Equal(clean, eventsAnswer, "a clean answer must come through unchanged")
+	event, _ = eventAt(ctx, 1)
+	ctx.Equal(event["redactions"], 0, "a clean answer's event's redactions")
+	dashed := finish(context.Background(), eventsKey, "r-3", allowDecision(), "Try 4111-1111-1111-1111 next.", time.Now())
+	ctx.Equal(dashed, "Try [REDACTED] next.", "a dashed card number must be redacted too")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+#include <openssl/sha.h>
+
+#include <chrono>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kEventsTopicName = "ai.firewall.events";
+const std::string kEventsKey = "key-7f3a";
+const std::string kEventsAnswer = "The zebra-pangolin tunnel opens at dawn.";
+const std::string kEventsLeaky =
+    "Card 4111 1111 1111 1111 is on file; use sk-abcdefghijklmnopqrstuvwxyz123456 for the API, done.";
+const std::vector<std::string> kEventsFields = {"request_id", "key_hash", "action", "score",
+                                                "tags",       "reason",   "latency_ms", "redactions"};
+
+std::string eventsKeyHash() {
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  SHA256(reinterpret_cast<const unsigned char*>(kEventsKey.data()), kEventsKey.size(), digest);
+  std::ostringstream hex;
+  for (unsigned char byte : digest) hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+  return hex.str().substr(0, 16);
+}
+
+Decision allowDecision() { return Decision{"allow", 90, {"travel"}, ""}; }
+
+int count(const std::string& text, const std::string& needle) {
+  int n = 0;
+  for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) n++;
+  return n;
+}
+
+// The i-th record's payload.
+std::pair<nlohmann::json, harness::KafkaRecord> eventAt(harness::Ctx& ctx, size_t i) {
+  const auto records = ctx.Kafka.Records(kEventsTopicName);
+  ctx.Assert(records.size() > i, "the topic holds %d record(s), expected at least %d (topics: %v)", records.size(), i + 1,
+             ctx.Kafka.Topics());
+  nlohmann::json event = nlohmann::json::parse(records[i].Value.value_or(""), nullptr, false);
+  ctx.Assert(event.is_object(), "the record's value is not JSON: %s", records[i].Value.value_or(""));
+  return {event, records[i]};
+}
+
+// Everything the learner writes to cerr, clog or cout while alive.
+struct CaptureLogs {
+  std::ostringstream lines;
+  std::streambuf* err;
+  std::streambuf* clg;
+  std::streambuf* out;
+  CaptureLogs() : err(std::cerr.rdbuf(lines.rdbuf())), clg(std::clog.rdbuf(lines.rdbuf())), out(std::cout.rdbuf(lines.rdbuf())) {}
+  ~CaptureLogs() {
+    std::cerr.rdbuf(err);
+    std::clog.rdbuf(clg);
+    std::cout.rdbuf(out);
+  }
+};
+
+}  // namespace
+
+void CheckKeyHash(harness::Ctx& ctx) {
+  const auto now = std::chrono::steady_clock::now();
+  finish(kEventsKey, "r-1", allowDecision(), kEventsAnswer, now);
+  finish(kEventsKey, "r-2", allowDecision(), kEventsAnswer, now);
+  finish("key-b2c9", "r-3", allowDecision(), kEventsAnswer, now);
+  const auto records = ctx.Kafka.Records(kEventsTopicName);
+  ctx.Equal(records.size(), 3, "three finish() calls must produce three records on %s; the records", kEventsTopicName);
+  const auto keys = ctx.Kafka.Keys(kEventsTopicName);
+  ctx.Assert(keys[0] != "r-1",
+             "the record is keyed by the request id: one caller's events scatter across partitions and a replay of one "
+             "caller is a scan of the whole topic");
+  ctx.Equal(keys[0], eventsKeyHash(), "the record key must be the first 16 hex characters of the SHA-256 of the API key");
+  ctx.Assert(keys[1] == eventsKeyHash() && keys[2] != eventsKeyHash(),
+             "keys over three calls were %q: the same API key must give the same key, another key another", keys);
+  ctx.Equal(records[0].Partition, records[1].Partition,
+            "two events of one caller landed on different partitions: the key must be the same for every request of a "
+            "caller; k1's partitions");
+  const auto [event, record] = eventAt(ctx, 0);
+  ctx.Equal(event.value("key_hash", ""), eventsKeyHash(), "the payload's key_hash");
+  ctx.Assert(record.Value.value_or("").find(kEventsKey) == std::string::npos,
+             "the API key itself is in the payload: %s. Only its hash may reach a retained topic", record.Value.value_or(""));
+  std::vector<std::string> missing;
+  for (const auto& f : kEventsFields)
+    if (!event.contains(f)) missing.push_back(f);
+  ctx.Assert(missing.empty(), "the payload lacks %v: %s", missing, record.Value.value_or(""));
+}
+
+void CheckIdempotentAcks(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kEventsTopicName, 1);
+  finish(kEventsKey, "r-1", allowDecision(), kEventsAnswer, std::chrono::steady_clock::now());
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopicName).size(), 1,
+            "one finish() whose acknowledgement was lost must leave one record on the topic: the producer retried and "
+            "the broker wrote it again, enable.idempotence makes the retry a no-op (it needs acks=all); the records");
+  ctx.Kafka.Failover(kEventsTopicName);
+  ctx.Equal(ctx.Kafka.Records(kEventsTopicName).size(), 1,
+            "after a leader failover the event is gone: it was acknowledged by the leader alone, the producer needs "
+            "acks=all; the records");
+  finish(kEventsKey, "r-2", allowDecision(), kEventsAnswer, std::chrono::steady_clock::now());
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopicName).size(), 2, "after the failover the producer must keep producing; the records");
+}
+
+void CheckNoText(harness::Ctx& ctx) {
+  const auto started = std::chrono::steady_clock::now();
+  ctx.Clock.Advance(0.25);
+  std::string logged;
+  {
+    CaptureLogs capture;
+    finish(kEventsKey, "r-1", allowDecision(), kEventsAnswer, started);
+    logged = capture.lines.str();
+  }
+  const auto [event, record] = eventAt(ctx, 0);
+  ctx.Assert(record.Value.value_or("").find("zebra-pangolin") == std::string::npos,
+             "the event carries the model's answer: %s. The topic is retained and replicated; the answer stays out",
+             record.Value.value_or(""));
+  ctx.Assert(logged.find("zebra-pangolin") == std::string::npos,
+             "a log line carries the model's answer: %q. Log the request id, the action and the counts", logged);
+  const double latency = event.value("latency_ms", -1.0);
+  ctx.Assert(latency >= 200 && latency <= 2000, "latency_ms is %v for a request started 250 ms ago, expected around 250",
+             latency);
+  ctx.Assert(event.value("action", "") == "allow" && event.value("score", 0) == 90,
+             "the payload must carry the decision's action and score: %s", record.Value.value_or(""));
+  ctx.Equal(event.contains("tags") ? event["tags"] : nlohmann::json(), nlohmann::json::array({"travel"}),
+            "the payload's tags");
+}
+
+void CheckRedact(harness::Ctx& ctx) {
+  const std::string out = finish(kEventsKey, "r-1", allowDecision(), kEventsLeaky, std::chrono::steady_clock::now());
+  ctx.Assert(out.find("4111") == std::string::npos && out.find("sk-abcdef") == std::string::npos,
+             "the response reached the client with the card number or the key still in it: %q", out);
+  ctx.Equal(count(out, "[REDACTED]"), 2,
+            "the card number and the key must both be replaced with [REDACTED] (%q); the replacements", out);
+  ctx.Assert(out.rfind("Card [REDACTED] is on file", 0) == 0 &&
+                 out.size() >= 18 && out.compare(out.size() - 18, 18, "for the API, done.") == 0,
+             "the rest of the text must come through untouched: %q", out);
+  const auto [event, record] = eventAt(ctx, 0);
+  ctx.Equal(event.value("redactions", -1), 2, "the event's redactions");
+  ctx.Assert(record.Value.value_or("").find("4111") == std::string::npos, "the card number is in the event: %s",
+             record.Value.value_or(""));
+  const std::string clean = finish(kEventsKey, "r-2", allowDecision(), kEventsAnswer, std::chrono::steady_clock::now());
+  ctx.Equal(clean, kEventsAnswer, "a clean answer must come through unchanged");
+  ctx.Equal(eventAt(ctx, 1).first.value("redactions", -1), 0, "a clean answer's event's redactions");
+  const std::string dashed =
+      finish(kEventsKey, "r-3", allowDecision(), "Try 4111-1111-1111-1111 next.", std::chrono::steady_clock::now());
+  ctx.Equal(dashed, "Try [REDACTED] next.", "a dashed card number must be redacted too");
+}
+`,
+  },
+  debrief: `The record key does two jobs at once, which is why the fix hashes the API key rather than picking any unique value: it keeps one caller's events on one partition, in order, and it keeps the key itself off a topic that is replicated and kept for months. Idempotence is producer configuration because the producer is the only party that knows a write is a retry. The redaction happens in \`finish\` because that is the last point before the bytes leave: a scan anywhere earlier misses what the model composes. Production firewalls match far more than two patterns (Cloudflare's managed ruleset covers card numbers, SSNs and credentials, plus custom fingerprints), and they decide per application whether a hit is redacted, blocked or only logged.`,
 };

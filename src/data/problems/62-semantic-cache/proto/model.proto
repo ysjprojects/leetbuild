@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package semcache;
+
+// The model service the cache calls on a miss (step 3): one unary Answer under a deadline.
+service Model {
+  rpc Answer(AnswerRequest) returns (AnswerResult);
+}
+
+message AnswerRequest {
+  string tenant = 1;
+  string model_version = 2;
+  string question = 3;
+}
+
+// A tool the model invoked to produce its text: the answer depends on that call's result.
+message ToolCall {
+  string name = 1;
+  string arguments = 2;
+}
+
+// The serving policy's verdict on the reply.
+message Policy {
+  bool cacheable = 1;
+}
+
+message AnswerResult {
+  string text = 1;
+  // The model declined the question: text is the refusal.
+  bool refused = 2;
+  // The text stands on its own (no "as I said above", no reference to a conversation).
+  bool self_contained = 3;
+  // Decoded greedily: the same question gives the same text.
+  bool deterministic = 4;
+  Policy policy = 5;
+  repeated ToolCall tool_calls = 6;
+}
