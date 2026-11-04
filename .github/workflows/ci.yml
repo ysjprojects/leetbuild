@@ -47,15 +47,15 @@ jobs:
       - run: yarn verify --runtime python,typescript,go
 
   # Compiling every C++ program with the clang the browser runs (WebAssembly, one core per compile)
-  # takes one runner past half an hour, so the problems are split into balanced shares.
+  # takes one runner hours, so the problems are split into sixteen balanced shares.
   verify-cpp:
-    name: Verify courses in C++ (${{ matrix.shard }}/8)
+    name: Verify courses in C++ (${{ matrix.shard }}/16)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -65,7 +65,7 @@ jobs:
       - run: yarn install --frozen-lockfile
       # Fetches the WASI sysroot (wasi-sdk's release, pinned by digest), compiles the share's C++ programs
       # in parallel across the runner's cores, and runs their harnesses.
-      - run: yarn verify --runtime cpp --shard ${{ matrix.shard }}/8
+      - run: yarn verify --runtime cpp --shard ${{ matrix.shard }}/16
 
   scala:
     name: Compile Scala
