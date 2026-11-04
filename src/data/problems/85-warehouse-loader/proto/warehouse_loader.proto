@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package whloader;
+
+// The warehouse loaderd writes into. Step 3 writes one partition of a load per WritePartition;
+// step 5 asks CountRows how many rows a load really left in its table.
+service Warehouse {
+  // Runs sql into target for one partition and answers how many rows it wrote. With merge_key set,
+  // rows an earlier write left under the same merge_key are replaced (a MERGE); with merge_key
+  // empty the rows are inserted again (an INSERT). PERMISSION_DENIED: the loader may not write
+  // target. UNAVAILABLE: the warehouse did not answer, whether or not the write landed.
+  rpc WritePartition(WriteRequest) returns (WriteReply);
+  // How many rows target holds for load_id.
+  rpc CountRows(CountRequest) returns (CountReply);
+}
+
+message WriteRequest {
+  string target = 1;
+  string load_id = 2;
+  string partition_id = 3;
+  string sql = 4;
+  string merge_key = 5;
+}
+
+message WriteReply {
+  int64 rows_written = 1;
+}
+
+message CountRequest {
+  string target = 1;
+  string load_id = 2;
+}
+
+message CountReply {
+  int64 rows = 1;
+}

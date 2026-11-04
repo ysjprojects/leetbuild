@@ -1,868 +1,491 @@
 import type {Step} from '@/lib/types';
 
-export const experimentReadStep: Step = {
+export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/experiments/{id}/report: no peeked winners',
+  title: 'GET /v1/experiments/{id}/report: no winner without the sample',
   concept: 'http',
-  file: 'read',
-  focus: ['client', 'api', 'store', 'redis'],
+  file: 'report',
+  focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/experiments/{id}/report\`: it checks the tenant,
-reads the per-variant counters, computes a p-value and names a winner the moment that number is
-below 0.05. It serves the demo and hides 4 flaws.
+**Starting point.** The starter serves \`GET /v1/experiments/{id}/report\`: it reads the per-variant
+counts (\`store.exposures\`, \`store.conversions\`), compares each variant with control (the first
+variant) through \`stats.compare\` (\`expd.stats\`, provided: \`lift\`, \`ci_low\`, \`ci_high\`,
+\`p_value\`), reports \`lift\` and \`p_value\` per variant, and names the variant with the largest
+significant positive lift the winner, \`status: "complete"\`. It serves the demo and hides three
+flaws.
 
-**Failure mode the checks target.** The report calls winners it has not earned: a peek at any
-sample size mints one, a split that drifted from the frozen design stays hidden, and a lift is
-printed as one number so a two-point effect and noise look identical.
+**Failure mode the checks target.** The report calls winners it has not earned: a peek on day one
+mints one, a split that drifted from the frozen 50/50 (a sign assignment or logging is broken) stays
+hidden, and a lift printed alone makes a two-point effect and noise look the same.
 
-- **Totals from the analysis state.** Per-variant \`exposures\` and conversions come from the Redis
-  counters the exposure consumer writes, not from a total cached beside them.
-- **Minimum sample first.** Below the pinned \`min_sample\`, answer **200** with
-  \`{"winner": null, "status": "inconclusive", "reason": "minimum sample not reached", ...}\`,
-  regardless of the p-value.
-- **SRM is a blocking caveat.** A deviation above **2 %** from the frozen split
-  (\`abs(observed - expected) / expected > 0.02\`) is reported as
-  \`{"caveat": {"kind": "srm", "blocking": true, "observed": ..., "expected": ...}}\` and prevents
-  a winner even when \`p < 0.05\`.
-- **Every lift carries its interval**: \`{"lift": 0.12, "ci_low": 0.03, "ci_high": 0.21}\`, a 95 %
-  interval from the two proportions, on every branch.
-- A winner is named only when the sample is reached, no blocking caveat is present, and
-  \`p_value < 0.05\`; otherwise \`winner: null\` with status \`inconclusive\` or \`blocked\`.
-- Missing \`X-Tenant-Id\` is **401**; an unknown experiment (or one of another tenant) is **404**.
-- The sample guard and the SRM check run **before** the p-value comparison.`,
+- Below the experiment's \`min_sample\` total exposures: \`status: "inconclusive"\`, \`winner: null\`,
+  whatever the p-value.
+- A variant whose exposures deviate from its share of the split by more than \`SRM_TOLERANCE\` (2 %):
+  \`status: "blocked"\`, \`winner: null\`,
+  \`caveat: {"kind": "srm", "blocking": true, "variant", "observed", "expected"}\`.
+- Every variant row carries \`ci_low\` and \`ci_high\`, whatever the status.`,
   sequence: {
-    participants: ['Client', 'expd report', 'analysis state'],
+    participants: ['Analyst', 'Experiment API', 'Redis'],
     messages: [
-      {from: 'Client', to: 'expd report', label: 'GET /v1/experiments/exp_42/report · X-Tenant-Id: acme', kind: 'sync'},
-      {from: 'expd report', to: 'analysis state', label: 'design(exp_42) → {variants, min_sample}', kind: 'sync'},
+      {from: 'Analyst', to: 'Experiment API', label: 'GET /v1/experiments/{id}/report', kind: 'sync'},
       {
-        from: 'analysis state',
-        to: 'expd report',
-        label: 'totals per (experiment, variant) → exposures, conversions',
-        kind: 'reply',
-      },
-      {
-        from: 'expd report',
-        to: 'expd report',
-        label: 'sample < min_sample → 200 {inconclusive, winner: null}',
+        from: 'Experiment API',
+        to: 'Redis',
+        label: 'exp:{id} · exp:{id}:exposures · exp:{id}:conversions',
         kind: 'sync',
       },
-      {from: 'expd report', to: 'expd report', label: 'SRM > 2% → blocking caveat, before the p-value', kind: 'sync'},
-      {from: 'expd report', to: 'Client', label: '200 {winner|null, lift, ci_low, ci_high, p_value}', kind: 'reply'},
+      {
+        from: 'Experiment API',
+        to: 'Experiment API',
+        label: 'stats.compare per variant → lift, ci_low, ci_high, p_value',
+        kind: 'sync',
+      },
+      {
+        from: 'Experiment API',
+        to: 'Experiment API',
+        label: 'total < min_sample → inconclusive · SRM > 2 % → blocked',
+        kind: 'sync',
+      },
+      {from: 'Experiment API', to: 'Analyst', label: '200 {status, winner, variants, caveat}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/experiments/{id}/report',
-      detail:
-        'Register the report route on `GET /v1/experiments/{id}/report`, with the experiment id as a path parameter in every router.',
+      title: 'Serves the report with a winner when one is earned',
+      detail: 'Register `GET /v1/experiments/{id}/report`; an unknown experiment is **404**.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/experiments\/\{experiment_id\}\/report["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/experiments\/:experimentId\/report['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/experiments\/\{id\}\/report"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"experiments"\s*\/\s*Segment\s*\/\s*"report"\s*\)/, /\bget\s*\{/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/experiments\/:id\/report['"]/]},
+        go: {all: [/"GET \/v1\/experiments\/\{id\}\/report"/]},
+        scala: {all: [/"report"/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/experiments\//]},
       },
     },
     {
       id: 'min-sample',
-      title: 'Refuses a winner below the pinned minimum sample',
+      title: 'Inconclusive below the minimum sample',
       detail:
-        'Below `min_sample` the report is **200** with `status: "inconclusive"`, `winner: null` and `reason: "minimum sample not reached"`, with no winner however small the p-value. The starter names a winner at any sample size.',
+        "The total exposures are compared with the experiment's `min_sample` before any p-value is read; below it the report is `inconclusive` with no winner.",
       match: {
-        python: {all: [/min_sample/, /inconclusive/, /minimum sample not reached/, /winner["']?\s*:\s*None/]},
-        typescript: {all: [/min_sample/, /inconclusive/, /minimum sample not reached/, /winner:\s*null/]},
-        go: {all: [/MinSample/, /inconclusive/, /minimum sample not reached/, /Winner\s*=\s*nil/]},
-        scala: {all: [/min_sample/, /inconclusive/, /minimum sample not reached/, /"winner":\s*null/]},
-        cpp: {all: [/min_sample/, /inconclusive/, /minimum sample not reached/, /"winner",\s*nullptr/]},
+        python: {order: [/<\s*experiment\[["']min_sample["']\]/, /p_value["']\]\s*<\s*ALPHA/]},
+        typescript: {order: [/<\s*experiment\.min_sample/, /p_value\s*<\s*ALPHA/]},
+        go: {order: [/<\s*int64\(experiment\.MinSample\)/, /PValue\s*<\s*alpha/]},
+        scala: {order: [/<\s*experiment\.minSample/, /pValue\s*<\s*Alpha/]},
+        cpp: {order: [/<\s*experiment->min_sample/, /p_value\s*<\s*kAlpha/]},
       },
     },
     {
-      id: 'srm-caveat',
-      title: 'Reports a sample ratio mismatch as a blocking caveat',
+      id: 'srm',
+      title: 'A sample ratio mismatch blocks the winner',
       detail:
-        'A deviation of the observed variant share from the frozen split above **2 %** becomes `{"caveat": {"kind": "srm", "blocking": true, "observed": ..., "expected": ...}}` and prevents the winner call even when `p < 0.05`. The starter does not compute SRM.',
+        'A variant whose observed exposures deviate from its share of the frozen split by more than `SRM_TOLERANCE` (2 %) makes the report `blocked` with a blocking `srm` caveat and no winner.',
       match: {
-        python: {all: [/SRM_THRESHOLD/, /"kind":\s*"srm"/, /"blocking":\s*True/, /caveat/]},
-        typescript: {all: [/SRM_THRESHOLD/, /kind:\s*'srm'/, /blocking:\s*true/, /caveat/]},
-        go: {all: [/SRMThreshold/, /"srm"/, /Blocking:\s*true/, /Caveat/]},
-        scala: {all: [/SrmThreshold/, /"kind":\s*"srm"/, /"blocking":\s*true/, /caveat/]},
-        cpp: {all: [/kSrmThreshold/, /"srm"/, /"blocking",\s*true/, /"caveat"/]},
+        python: {all: [/>\s*SRM_TOLERANCE/, /["']blocked["']/]},
+        typescript: {all: [/>\s*SRM_TOLERANCE/, /['"]blocked['"]/]},
+        go: {all: [/>\s*srmTolerance/, /"blocked"/]},
+        scala: {all: [/>\s*SrmTolerance/, /"blocked"/]},
+        cpp: {all: [/>\s*kSrmTolerance/, /"blocked"/]},
       },
     },
     {
-      id: 'intervals',
-      title: 'Reports every lift with a 95 % confidence interval',
+      id: 'interval',
+      title: 'Every lift carries its 95 % interval',
       detail:
-        'A lift is always returned with `ci_low` and `ci_high`, the 95 % interval computed from the two proportions, including on a significant result. The starter reports a bare `lift`.',
+        'Each variant row carries `ci_low` and `ci_high` from `stats.compare` next to `lift`, whatever the status.',
       match: {
-        python: {all: [/ci_low/, /ci_high/, /lift/]},
-        typescript: {all: [/ci_low/, /ci_high/, /lift/]},
-        go: {all: [/"ci_low"/, /"ci_high"/, /Lift/]},
-        scala: {all: [/ci_low/, /ci_high/, /lift/]},
-        cpp: {all: [/"ci_low"/, /"ci_high"/, /"lift"/]},
-      },
-    },
-    {
-      id: 'no-peek',
-      title: 'The sample guard and the SRM check run before the p-value',
-      detail:
-        'The sample guard runs first, then the blocking SRM check, and only then is `p_value < 0.05` consulted for a winner. The starter compares the p-value before either guard.',
-      match: {
-        python: {
-          order: [
-            /sample\s*<\s*experiment\[["']min_sample["']\]/,
-            /abs\(observed\s*-\s*expected\)\s*\/\s*expected\s*>\s*SRM_THRESHOLD/,
-            /p_value\s*<\s*0\.05/,
-          ],
-        },
-        typescript: {
-          order: [
-            /sample\s*<\s*experiment\.min_sample/,
-            /Math\.abs\(observed\s*-\s*expected\)\s*\/\s*expected\s*>\s*SRM_THRESHOLD/,
-            /pValue\s*<\s*0\.05/,
-          ],
-        },
-        go: {
-          order: [
-            /sample\s*<\s*experiment\.MinSample/,
-            /math\.Abs\(observed\s*-\s*expected\)\s*\/\s*expected\s*>\s*SRMThreshold/,
-            /pValue\s*<\s*0\.05/,
-          ],
-        },
-        scala: {
-          order: [
-            /sample\s*<\s*experiment\.min_sample/,
-            /math\.abs\(observed\s*-\s*expected\)\s*\/\s*expected\s*>\s*SrmThreshold/,
-            /pValue\s*<\s*0\.05/,
-          ],
-        },
-        cpp: {
-          order: [
-            /sample\s*<\s*experiment->min_sample/,
-            /std::abs\(observed\s*-\s*expected\)\s*\/\s*expected\s*>\s*kSrmThreshold/,
-            /pValue\s*<\s*0\.05/,
-          ],
-        },
+        python: {all: [/ci_low/, /ci_high/]},
+        typescript: {all: [/ci_low/, /ci_high/]},
+        go: {all: [/CILow/, /CIHigh/]},
+        scala: {all: [/ciLow/, /ciHigh/]},
+        cpp: {all: [/ci_low/, /ci_high/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException
+
+from expd import stats, store  # stats.compare; store.get, exposures, conversions
 
 app = FastAPI()
 
-
-class ExperimentStore:
-    def get(self, tenant: str, experiment_id: str) -> dict | None:
-        """The pinned design for the tenant's experiment, or None when it does not exist."""
-        raise NotImplementedError
-
-    def totals(self, experiment_id: str) -> dict:
-        """Per-variant exposures and conversions from the analysis state."""
-        raise NotImplementedError
-
-
-store = ExperimentStore()
-
-
-def compute_p_value(control: dict, treatment: dict) -> float:
-    raise NotImplementedError
+ALPHA = 0.05
+SRM_TOLERANCE = 0.02
 
 
 @app.get("/v1/experiments/{experiment_id}/report")
-def report(
-    experiment_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    experiment = store.get(tenant, experiment_id)
+def report(experiment_id: str) -> dict:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    experiment = store.get(experiment_id)
     if experiment is None:
-        raise HTTPException(status_code=404, detail="unknown experiment")
-
-    totals = store.totals(experiment_id)
-    control = totals["control"]
-    treatment = totals["treatment"]
-    p_value = compute_p_value(control, treatment)
-    winner = "treatment" if p_value < 0.05 else "control"
-    lift = treatment["conversions"] / treatment["exposures"] - control["conversions"] / control["exposures"]
-    return JSONResponse(
-        {"experiment_id": experiment_id, "winner": winner, "lift": lift, "p_value": p_value},
-        status_code=200,
-    )
+        raise HTTPException(status_code=404, detail="no such experiment")
+    exposures = store.exposures(experiment_id)
+    conversions = store.conversions(experiment_id)
+    control = experiment["variants"][0]["key"]
+    total = sum(exposures.get(v["key"], 0) for v in experiment["variants"])
+    rows = []
+    for v in experiment["variants"][1:]:
+        key = v["key"]
+        result = stats.compare(exposures.get(control, 0), conversions.get(control, 0), exposures.get(key, 0), conversions.get(key, 0))
+        rows.append({"variant": key, "exposures": exposures.get(key, 0), "conversions": conversions.get(key, 0), "lift": result["lift"], "p_value": result["p_value"]})
+    significant = [row for row in rows if row["p_value"] < ALPHA and row["lift"] > 0]
+    winner = max(significant, key=lambda row: row["lift"])["variant"] if significant else None
+    return {"experiment_id": experiment_id, "exposures": total, "variants": rows, "winner": winner, "caveat": None, "status": "complete"}
 `,
-      solution: `from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+      solution: `from fastapi import FastAPI, HTTPException
+
+from expd import stats, store  # stats.compare; store.get, exposures, conversions
 
 app = FastAPI()
 
-SRM_THRESHOLD = 0.02
+ALPHA = 0.05
+SRM_TOLERANCE = 0.02
 
 
-class ExperimentStore:
-    def get(self, tenant: str, experiment_id: str) -> dict | None:
-        """The pinned design for the tenant's experiment, or None when it does not exist."""
-        raise NotImplementedError
-
-    def totals(self, experiment_id: str) -> dict:
-        """Per-variant exposures and conversions from the analysis state."""
-        raise NotImplementedError
-
-
-store = ExperimentStore()
-
-
-def compute_p_value(control: dict, treatment: dict) -> float:
-    """Two-proportion z-test p-value; the stats library owns the real implementation."""
-    raise NotImplementedError
-
-
-def lift_interval(control: dict, treatment: dict) -> tuple[float, float, float]:
-    """Lift and its 95% interval, computed from the two proportions."""
-    raise NotImplementedError
+def sample_ratio_mismatch(variants: list[dict], exposures: dict[str, int], total: int) -> dict | None:
+    """The first variant whose share of the exposures strays from its weight by more than SRM_TOLERANCE."""
+    for v in variants:
+        expected = total * v["weight"] / 100
+        observed = exposures.get(v["key"], 0)
+        if expected > 0 and abs(observed - expected) / expected > SRM_TOLERANCE:
+            return {"kind": "srm", "blocking": True, "variant": v["key"], "observed": observed, "expected": expected}
+    return None
 
 
 @app.get("/v1/experiments/{experiment_id}/report")
-def report(
-    experiment_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    experiment = store.get(tenant, experiment_id)
+def report(experiment_id: str) -> dict:
+    experiment = store.get(experiment_id)
     if experiment is None:
-        raise HTTPException(status_code=404, detail="unknown experiment")
-
-    totals = store.totals(experiment_id)
-    control = totals["control"]
-    treatment = totals["treatment"]
-    sample = control["exposures"] + treatment["exposures"]
-    lift, ci_low, ci_high = lift_interval(control, treatment)
-    p_value = compute_p_value(control, treatment)
-
-    if sample < experiment["min_sample"]:
-        return JSONResponse(
-            {
-                "experiment_id": experiment_id,
-                "status": "inconclusive",
-                "winner": None,
-                "reason": "minimum sample not reached",
-                "lift": lift,
-                "ci_low": ci_low,
-                "ci_high": ci_high,
-                "p_value": p_value,
-            },
-            status_code=200,
-        )
-
-    expected_share = {variant["key"]: variant["weight"] / 100 for variant in experiment["variants"]}
-    expected = expected_share["treatment"]
-    observed = treatment["exposures"] / sample
-    if abs(observed - expected) / expected > SRM_THRESHOLD:
-        return JSONResponse(
-            {
-                "experiment_id": experiment_id,
-                "status": "blocked",
-                "winner": None,
-                "caveat": {
-                    "kind": "srm",
-                    "blocking": True,
-                    "observed": observed,
-                    "expected": expected,
-                },
-                "lift": lift,
-                "ci_low": ci_low,
-                "ci_high": ci_high,
-                "p_value": p_value,
-            },
-            status_code=200,
-        )
-
-    if p_value < 0.05:
-        return JSONResponse(
-            {
-                "experiment_id": experiment_id,
-                "status": "significant",
-                "winner": "treatment" if lift > 0 else "control",
-                "lift": lift,
-                "ci_low": ci_low,
-                "ci_high": ci_high,
-                "p_value": p_value,
-            },
-            status_code=200,
-        )
-
-    return JSONResponse(
-        {
-            "experiment_id": experiment_id,
-            "status": "inconclusive",
-            "winner": None,
-            "lift": lift,
-            "ci_low": ci_low,
-            "ci_high": ci_high,
-            "p_value": p_value,
-        },
-        status_code=200,
-    )
+        raise HTTPException(status_code=404, detail="no such experiment")
+    exposures = store.exposures(experiment_id)
+    conversions = store.conversions(experiment_id)
+    control = experiment["variants"][0]["key"]
+    total = sum(exposures.get(v["key"], 0) for v in experiment["variants"])
+    rows = []
+    for v in experiment["variants"][1:]:
+        key = v["key"]
+        result = stats.compare(exposures.get(control, 0), conversions.get(control, 0), exposures.get(key, 0), conversions.get(key, 0))
+        # Every lift travels with its interval.
+        rows.append({"variant": key, "exposures": exposures.get(key, 0), "conversions": conversions.get(key, 0),
+                     "lift": result["lift"], "ci_low": result["ci_low"], "ci_high": result["ci_high"], "p_value": result["p_value"]})
+    body = {"experiment_id": experiment_id, "exposures": total, "variants": rows, "winner": None, "caveat": None}
+    # The sample and the split are judged before any p-value is read.
+    if total < experiment["min_sample"]:
+        return {**body, "status": "inconclusive", "reason": "minimum sample not reached"}
+    caveat = sample_ratio_mismatch(experiment["variants"], exposures, total)
+    if caveat is not None:
+        return {**body, "status": "blocked", "caveat": caveat}
+    significant = [row for row in rows if row["p_value"] < ALPHA and row["lift"] > 0]
+    winner = max(significant, key=lambda row: row["lift"])["variant"] if significant else None
+    return {**body, "status": "complete", "winner": winner}
 `,
     },
     typescript: {
-      starter: `/** Experiment report. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {compare} from 'expd/stats';
+import {conversions, exposures, get} from 'expd/store';
 
 export const app = Fastify();
 
-interface Variant {
-  key: string;
-  weight: number;
-}
+export const ALPHA = 0.05;
+export const SRM_TOLERANCE = 0.02;
 
-interface Experiment {
-  id: string;
-  tenant_id: string;
-  variants: Variant[];
-  min_sample: number;
-}
-
-interface VariantTotals {
-  exposures: number;
-  conversions: number;
-}
-
-class ExperimentStore {
-  async get(_tenant: string, _id: string): Promise<Experiment | null> {
-    return null;
-  }
-
-  async totals(_experimentId: string): Promise<Record<string, VariantTotals>> {
-    return {};
-  }
-}
-
-function computePValue(control: VariantTotals, treatment: VariantTotals): number {
-  return 1;
-}
-
-export function routes(store: ExperimentStore): void {
-  app.get('/v1/experiments/:experimentId/report', async (request, reply) => {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const tenant = request.headers['x-tenant-id'];
-    if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-    const {experimentId} = request.params as {experimentId: string};
-    const experiment = await store.get(tenant, experimentId);
-    if (experiment === null) return reply.code(404).send({error: 'unknown experiment'});
-
-    const totals = await store.totals(experimentId);
-    const control = totals['control'];
-    const treatment = totals['treatment'];
-    const pValue = computePValue(control, treatment);
-    const winner = pValue < 0.05 ? 'treatment' : 'control';
-    const lift = treatment.conversions / treatment.exposures - control.conversions / control.exposures;
-    return reply.code(200).send({experiment_id: experimentId, winner, lift, p_value: pValue});
+app.get('/v1/experiments/:id/report', async (request, reply) => {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const {id} = request.params as {id: string};
+  const experiment = await get(id);
+  if (experiment === null) return reply.code(404).send({error: 'no such experiment'});
+  const seen = await exposures(id);
+  const converted = await conversions(id);
+  const control = experiment.variants[0].key;
+  const total = experiment.variants.reduce((sum, v) => sum + (seen[v.key] ?? 0), 0);
+  const rows = experiment.variants.slice(1).map(v => {
+    const {lift, p_value} = compare(seen[control] ?? 0, converted[control] ?? 0, seen[v.key] ?? 0, converted[v.key] ?? 0);
+    return {variant: v.key, exposures: seen[v.key] ?? 0, conversions: converted[v.key] ?? 0, lift, p_value};
   });
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+  const significant = rows.filter(row => row.p_value < ALPHA && row.lift > 0).sort((a, b) => b.lift - a.lift);
+  return {experiment_id: id, exposures: total, variants: rows, winner: significant[0]?.variant ?? null, caveat: null, status: 'complete'};
+});
 `,
-      solution: `/** Experiment report: no peeked winners, SRM as a blocking caveat, every lift with its interval. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {compare} from 'expd/stats';
+import {type Variant, conversions, exposures, get} from 'expd/store';
 
 export const app = Fastify();
 
-const SRM_THRESHOLD = 0.02;
+export const ALPHA = 0.05;
+export const SRM_TOLERANCE = 0.02;
 
-interface Variant {
-  key: string;
-  weight: number;
-}
-
-interface Experiment {
-  id: string;
-  tenant_id: string;
-  variants: Variant[];
-  min_sample: number;
-}
-
-interface VariantTotals {
-  exposures: number;
-  conversions: number;
-}
-
-class ExperimentStore {
-  async get(_tenant: string, _id: string): Promise<Experiment | null> {
-    return null;
+/** The first variant whose share of the exposures strays from its weight by more than SRM_TOLERANCE. */
+function sampleRatioMismatch(variants: Variant[], seen: Record<string, number>, total: number): Record<string, unknown> | null {
+  for (const v of variants) {
+    const expected = (total * v.weight) / 100;
+    const observed = seen[v.key] ?? 0;
+    if (expected > 0 && Math.abs(observed - expected) / expected > SRM_TOLERANCE) {
+      return {kind: 'srm', blocking: true, variant: v.key, observed, expected};
+    }
   }
-
-  async totals(_experimentId: string): Promise<Record<string, VariantTotals>> {
-    return {};
-  }
+  return null;
 }
 
-function computePValue(control: VariantTotals, treatment: VariantTotals): number {
-  /** Two-proportion z-test p-value; the stats library owns the real implementation. */
-  return 1;
-}
-
-function liftInterval(
-  control: VariantTotals,
-  treatment: VariantTotals,
-): {lift: number; ciLow: number; ciHigh: number} {
-  /** Lift and its 95 % interval, computed from the two proportions. */
-  return {lift: 0, ciLow: 0, ciHigh: 0};
-}
-
-export function routes(store: ExperimentStore): void {
-  app.get('/v1/experiments/:experimentId/report', async (request, reply) => {
-    const tenant = request.headers['x-tenant-id'];
-    if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-    const {experimentId} = request.params as {experimentId: string};
-    const experiment = await store.get(tenant, experimentId);
-    if (experiment === null) return reply.code(404).send({error: 'unknown experiment'});
-
-    const totals = await store.totals(experimentId);
-    const control = totals['control'];
-    const treatment = totals['treatment'];
-    const sample = control.exposures + treatment.exposures;
-    const {lift, ciLow, ciHigh} = liftInterval(control, treatment);
-    const pValue = computePValue(control, treatment);
-
-    if (sample < experiment.min_sample) {
-      return reply.code(200).send({
-        experiment_id: experimentId,
-        status: 'inconclusive',
-        winner: null,
-        reason: 'minimum sample not reached',
-        lift,
-        ci_low: ciLow,
-        ci_high: ciHigh,
-        p_value: pValue,
-      });
-    }
-
-    const expected = experiment.variants.find(variant => variant.key === 'treatment')!.weight / 100;
-    const observed = treatment.exposures / sample;
-    if (Math.abs(observed - expected) / expected > SRM_THRESHOLD) {
-      return reply.code(200).send({
-        experiment_id: experimentId,
-        status: 'blocked',
-        winner: null,
-        caveat: {kind: 'srm', blocking: true, observed, expected},
-        lift,
-        ci_low: ciLow,
-        ci_high: ciHigh,
-        p_value: pValue,
-      });
-    }
-
-    if (pValue < 0.05) {
-      return reply.code(200).send({
-        experiment_id: experimentId,
-        status: 'significant',
-        winner: lift > 0 ? 'treatment' : 'control',
-        lift,
-        ci_low: ciLow,
-        ci_high: ciHigh,
-        p_value: pValue,
-      });
-    }
-
-    return reply.code(200).send({
-      experiment_id: experimentId,
-      status: 'inconclusive',
-      winner: null,
-      lift,
-      ci_low: ciLow,
-      ci_high: ciHigh,
-      p_value: pValue,
-    });
+app.get('/v1/experiments/:id/report', async (request, reply) => {
+  const {id} = request.params as {id: string};
+  const experiment = await get(id);
+  if (experiment === null) return reply.code(404).send({error: 'no such experiment'});
+  const seen = await exposures(id);
+  const converted = await conversions(id);
+  const control = experiment.variants[0].key;
+  const total = experiment.variants.reduce((sum, v) => sum + (seen[v.key] ?? 0), 0);
+  // Every lift travels with its interval.
+  const rows = experiment.variants.slice(1).map(v => {
+    const {lift, ci_low, ci_high, p_value} = compare(seen[control] ?? 0, converted[control] ?? 0, seen[v.key] ?? 0, converted[v.key] ?? 0);
+    return {variant: v.key, exposures: seen[v.key] ?? 0, conversions: converted[v.key] ?? 0, lift, ci_low, ci_high, p_value};
   });
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+  const body = {experiment_id: id, exposures: total, variants: rows, winner: null as string | null, caveat: null as Record<string, unknown> | null};
+  // The sample and the split are judged before any p-value is read.
+  if (total < experiment.min_sample) return {...body, status: 'inconclusive', reason: 'minimum sample not reached'};
+  const caveat = sampleRatioMismatch(experiment.variants, seen, total);
+  if (caveat !== null) return {...body, status: 'blocked', caveat};
+  const significant = rows.filter(row => row.p_value < ALPHA && row.lift > 0).sort((a, b) => b.lift - a.lift);
+  return {...body, status: 'complete', winner: significant[0]?.variant ?? null};
+});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"expd/stats" // stats.Compare
+	"expd/store" // store.Get, Exposures, Conversions
 )
 
-type Variant struct {
-	Key    string \`json:"key"\`
-	Weight int    \`json:"weight"\`
-}
+const alpha = 0.05
 
-type Experiment struct {
-	ID        string    \`json:"id"\`
-	TenantID  string    \`json:"tenant_id"\`
-	Variants  []Variant \`json:"variants"\`
-	MinSample int       \`json:"min_sample"\`
-}
+const srmTolerance = 0.02
 
-type VariantTotals struct {
-	Exposures   int \`json:"exposures"\`
-	Conversions int \`json:"conversions"\`
-}
-
-type ExperimentStore struct{}
-
-func (s *ExperimentStore) Get(ctx context.Context, tenant, experimentID string) (*Experiment, error) {
-	return nil, nil
-}
-
-func (s *ExperimentStore) Totals(ctx context.Context, experimentID string) (map[string]VariantTotals, error) {
-	return nil, nil
-}
-
-var store = &ExperimentStore{}
-
-func ComputePValue(control, treatment VariantTotals) float64 {
-	return 1
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, code int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	rw.WriteHeader(code)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func report(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	id := r.PathValue("id")
+	experiment := store.Get(r.Context(), id)
+	if experiment == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such experiment"})
 		return
 	}
-	experimentID := r.PathValue("id")
-	experiment, err := store.Get(r.Context(), tenant, experimentID)
-	if err != nil || experiment == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown experiment"})
-		return
+	exposures := store.Exposures(r.Context(), id)
+	conversions := store.Conversions(r.Context(), id)
+	control := experiment.Variants[0].Key
+	var total int64
+	for _, v := range experiment.Variants {
+		total += exposures[v.Key]
 	}
-	totals, err := store.Totals(r.Context(), experimentID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
+	rows := []map[string]any{}
+	var winner any
+	best := 0.0
+	for _, v := range experiment.Variants[1:] {
+		c := stats.Compare(exposures[control], conversions[control], exposures[v.Key], conversions[v.Key])
+		rows = append(rows, map[string]any{"variant": v.Key, "exposures": exposures[v.Key], "conversions": conversions[v.Key], "lift": c.Lift, "p_value": c.PValue})
+		if c.PValue < alpha && c.Lift > best {
+			best, winner = c.Lift, v.Key
+		}
 	}
-	control := totals["control"]
-	treatment := totals["treatment"]
-	pValue := ComputePValue(control, treatment)
-	winner := "control"
-	if pValue < 0.05 {
-		winner = "treatment"
-	}
-	lift := float64(treatment.Conversions)/float64(treatment.Exposures) - float64(control.Conversions)/float64(control.Exposures)
-	writeJSON(rw, http.StatusOK, map[string]any{"experiment_id": experimentID, "winner": winner, "lift": lift, "p_value": pValue})
+	writeJSON(rw, http.StatusOK, map[string]any{"experiment_id": id, "exposures": total, "variants": rows, "winner": winner, "caveat": nil, "status": "complete"})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/experiments/{id}/report", report)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"math"
 	"net/http"
+
+	"expd/stats" // stats.Compare
+	"expd/store" // store.Get, Exposures, Conversions
 )
 
-const SRMThreshold = 0.02
+const alpha = 0.05
 
-type Variant struct {
-	Key    string \`json:"key"\`
-	Weight int    \`json:"weight"\`
-}
+const srmTolerance = 0.02
 
-type Experiment struct {
-	ID        string    \`json:"id"\`
-	TenantID  string    \`json:"tenant_id"\`
-	Variants  []Variant \`json:"variants"\`
-	MinSample int       \`json:"min_sample"\`
-}
-
-type VariantTotals struct {
-	Exposures   int \`json:"exposures"\`
-	Conversions int \`json:"conversions"\`
-}
-
-type Caveat struct {
-	Kind     string  \`json:"kind"\`
-	Blocking bool    \`json:"blocking"\`
-	Observed float64 \`json:"observed"\`
-	Expected float64 \`json:"expected"\`
-}
-
-type Report struct {
-	ExperimentID string   \`json:"experiment_id"\`
-	Status       string   \`json:"status"\`
-	Winner       *string  \`json:"winner"\`
-	Reason       string   \`json:"reason,omitempty"\`
-	Caveat       *Caveat  \`json:"caveat,omitempty"\`
-	Lift         float64  \`json:"lift"\`
-	CILow        float64  \`json:"ci_low"\`
-	CIHigh       float64  \`json:"ci_high"\`
-	PValue       float64  \`json:"p_value"\`
-}
-
-type ExperimentStore struct{}
-
-func (s *ExperimentStore) Get(ctx context.Context, tenant, experimentID string) (*Experiment, error) {
-	return nil, nil
-}
-
-func (s *ExperimentStore) Totals(ctx context.Context, experimentID string) (map[string]VariantTotals, error) {
-	return nil, nil
-}
-
-var store = &ExperimentStore{}
-
-func ComputePValue(control, treatment VariantTotals) float64 {
-	return 1
-}
-
-func LiftInterval(control, treatment VariantTotals) (lift, ciLow, ciHigh float64) {
-	return 0, 0, 0
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, code int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	rw.WriteHeader(code)
+	json.NewEncoder(rw).Encode(v)
+}
+
+// sampleRatioMismatch is the first variant whose share of the exposures strays from its weight by
+// more than srmTolerance, or nil.
+func sampleRatioMismatch(variants []store.Variant, exposures map[string]int64, total int64) map[string]any {
+	for _, v := range variants {
+		expected := float64(total) * float64(v.Weight) / 100
+		observed := exposures[v.Key]
+		if expected > 0 && math.Abs(float64(observed)-expected)/expected > srmTolerance {
+			return map[string]any{"kind": "srm", "blocking": true, "variant": v.Key, "observed": observed, "expected": expected}
+		}
+	}
+	return nil
 }
 
 func report(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	id := r.PathValue("id")
+	experiment := store.Get(r.Context(), id)
+	if experiment == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such experiment"})
 		return
 	}
-	experimentID := r.PathValue("id")
-	experiment, err := store.Get(r.Context(), tenant, experimentID)
-	if err != nil || experiment == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown experiment"})
-		return
+	exposures := store.Exposures(r.Context(), id)
+	conversions := store.Conversions(r.Context(), id)
+	control := experiment.Variants[0].Key
+	var total int64
+	for _, v := range experiment.Variants {
+		total += exposures[v.Key]
 	}
-	totals, err := store.Totals(r.Context(), experimentID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
+	rows := []map[string]any{}
+	comparisons := []stats.Comparison{}
+	for _, v := range experiment.Variants[1:] {
+		c := stats.Compare(exposures[control], conversions[control], exposures[v.Key], conversions[v.Key])
+		comparisons = append(comparisons, c)
+		// Every lift travels with its interval.
+		rows = append(rows, map[string]any{"variant": v.Key, "exposures": exposures[v.Key], "conversions": conversions[v.Key],
+			"lift": c.Lift, "ci_low": c.CILow, "ci_high": c.CIHigh, "p_value": c.PValue})
 	}
-	control := totals["control"]
-	treatment := totals["treatment"]
-	sample := control.Exposures + treatment.Exposures
-	lift, ciLow, ciHigh := LiftInterval(control, treatment)
-	pValue := ComputePValue(control, treatment)
-	body := Report{ExperimentID: experimentID, Lift: lift, CILow: ciLow, CIHigh: ciHigh, PValue: pValue}
-
-	if sample < experiment.MinSample {
-		body.Status = "inconclusive"
-		body.Winner = nil
-		body.Reason = "minimum sample not reached"
+	body := map[string]any{"experiment_id": id, "exposures": total, "variants": rows, "winner": nil, "caveat": nil}
+	// The sample and the split are judged before any p-value is read.
+	if total < int64(experiment.MinSample) {
+		body["status"], body["reason"] = "inconclusive", "minimum sample not reached"
 		writeJSON(rw, http.StatusOK, body)
 		return
 	}
-
-	expectedShare := make(map[string]float64, len(experiment.Variants))
-	for _, variant := range experiment.Variants {
-		expectedShare[variant.Key] = float64(variant.Weight) / 100
-	}
-	expected := expectedShare["treatment"]
-	observed := float64(treatment.Exposures) / float64(sample)
-	if math.Abs(observed - expected) / expected > SRMThreshold {
-		body.Status = "blocked"
-		body.Winner = nil
-		body.Caveat = &Caveat{Kind: "srm", Blocking: true, Observed: observed, Expected: expected}
+	if caveat := sampleRatioMismatch(experiment.Variants, exposures, total); caveat != nil {
+		body["status"], body["caveat"] = "blocked", caveat
 		writeJSON(rw, http.StatusOK, body)
 		return
 	}
-
-	if pValue < 0.05 {
-		winner := "control"
-		if lift > 0 {
-			winner = "treatment"
+	var winner any
+	best := 0.0
+	for i, c := range comparisons {
+		if c.PValue < alpha && c.Lift > best {
+			best, winner = c.Lift, experiment.Variants[i+1].Key
 		}
-		body.Status = "significant"
-		body.Winner = &winner
-		writeJSON(rw, http.StatusOK, body)
-		return
 	}
-
-	body.Status = "inconclusive"
-	body.Winner = nil
+	body["status"], body["winner"] = "complete", winner
 	writeJSON(rw, http.StatusOK, body)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/experiments/{id}/report", report)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-final case class Variant(key: String, weight: Int)
-final case class Experiment(id: String, tenant_id: String, variants: Seq[Variant], min_sample: Int)
-final case class VariantTotals(exposures: Long, conversions: Long)
+import expd.{Stats, Store} // Stats.compare; Store.get, exposures, conversions
 
-trait ExperimentStore {
-  def get(tenant: String, id: String): Option[Experiment]
-  def totals(experimentId: String): Map[String, VariantTotals]
-}
+object Report {
+  val Alpha = 0.05
+  val SrmTolerance = 0.02
 
-object ExperimentReport {
-  implicit val system: ActorSystem = ActorSystem("expd")
-
-  val store: ExperimentStore = new ExperimentStore {
-    def get(tenant: String, id: String): Option[Experiment] = None
-    def totals(experimentId: String): Map[String, VariantTotals] = Map.empty
-  }
-
-  def computePValue(control: VariantTotals, treatment: VariantTotals): Double = 1.0
-
-  val route: Route =
-    path("v1" / "experiments" / Segment / "report") { experimentId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val tenant = tenantOpt.filter(_.nonEmpty)
-          if (tenant.isEmpty) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            store.get(tenant.get, experimentId) match {
-              case None =>
-                complete(StatusCodes.NotFound, """{"error":"unknown experiment"}""")
-              case Some(_) =>
-                val totals = store.totals(experimentId)
-                val control = totals("control")
-                val treatment = totals("treatment")
-                val pValue = computePValue(control, treatment)
-                val winner = if (pValue < 0.05) "treatment" else "control"
-                val lift = treatment.conversions.toDouble / treatment.exposures - control.conversions.toDouble / control.exposures
-                complete(
-                  StatusCodes.OK,
-                  s"""{"experiment_id":"$experimentId","winner":"$winner","lift":$lift,"p_value":$pValue}"""
-                )
-            }
-          }
-        }
+  def report(id: String): Option[JsObject] =
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    Store.get(id).map { experiment =>
+      val exposures = Store.exposures(id).withDefaultValue(0L)
+      val conversions = Store.conversions(id).withDefaultValue(0L)
+      val control = experiment.variants.head.key
+      val total = experiment.variants.map(v => exposures(v.key)).sum
+      val compared = experiment.variants.tail.map(v => v.key -> Stats.compare(exposures(control), conversions(control), exposures(v.key), conversions(v.key)))
+      val rows = compared.map { case (key, c) =>
+        JsObject("variant" -> JsString(key), "exposures" -> JsNumber(exposures(key)), "conversions" -> JsNumber(conversions(key)),
+          "lift" -> JsNumber(c.lift), "p_value" -> JsNumber(c.pValue))
       }
+      val winner = compared.filter { case (_, c) => c.pValue < Alpha && c.lift > 0 }.sortBy(-_._2.lift).headOption.map(_._1)
+      JsObject("experiment_id" -> JsString(id), "exposures" -> JsNumber(total), "variants" -> JsArray(rows.toVector),
+        "winner" -> winner.map(JsString(_)).getOrElse(JsNull), "caveat" -> JsNull, "status" -> JsString("complete"))
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  val route: Route = path("v1" / "experiments" / Segment / "report") { id =>
+    get {
+      report(id) match {
+        case None => complete(StatusCodes.NotFound -> "no such experiment")
+        case Some(body) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
+      }
+    }
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-final case class Variant(key: String, weight: Int)
-final case class Experiment(id: String, tenant_id: String, variants: Seq[Variant], min_sample: Int)
-final case class VariantTotals(exposures: Long, conversions: Long)
+import expd.{Stats, Store} // Stats.compare; Store.get, exposures, conversions
 
-trait ExperimentStore {
-  def get(tenant: String, id: String): Option[Experiment]
-  def totals(experimentId: String): Map[String, VariantTotals]
-}
+object Report {
+  val Alpha = 0.05
+  val SrmTolerance = 0.02
 
-object ExperimentReport {
-  val SrmThreshold = 0.02
-
-  implicit val system: ActorSystem = ActorSystem("expd")
-
-  val store: ExperimentStore = new ExperimentStore {
-    def get(tenant: String, id: String): Option[Experiment] = None
-    def totals(experimentId: String): Map[String, VariantTotals] = Map.empty
-  }
-
-  def computePValue(control: VariantTotals, treatment: VariantTotals): Double = 1.0
-
-  def liftInterval(control: VariantTotals, treatment: VariantTotals): (Double, Double, Double) = (0.0, 0.0, 0.0)
-
-  val route: Route =
-    path("v1" / "experiments" / Segment / "report") { experimentId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          val tenant = tenantOpt.filter(_.nonEmpty)
-          if (tenant.isEmpty) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            store.get(tenant.get, experimentId) match {
-              case None =>
-                complete(StatusCodes.NotFound, """{"error":"unknown experiment"}""")
-              case Some(experiment) =>
-                val totals = store.totals(experimentId)
-                val control = totals("control")
-                val treatment = totals("treatment")
-                val sample = control.exposures + treatment.exposures
-                val (lift, ciLow, ciHigh) = liftInterval(control, treatment)
-                val pValue = computePValue(control, treatment)
-
-                if (sample < experiment.min_sample) {
-                  complete(
-                    StatusCodes.OK,
-                    s"""{"experiment_id":"$experimentId","status":"inconclusive","winner":null,""" +
-                      s""""reason":"minimum sample not reached","lift":$lift,"ci_low":$ciLow,""" +
-                      s""""ci_high":$ciHigh,"p_value":$pValue}"""
-                  )
-                } else {
-                  val expectedShare = experiment.variants.map(variant => variant.key -> variant.weight.toDouble / 100).toMap
-                  val expected = expectedShare("treatment")
-                  val observed = treatment.exposures.toDouble / sample
-                  if (math.abs(observed - expected) / expected > SrmThreshold) {
-                    complete(
-                      StatusCodes.OK,
-                      s"""{"experiment_id":"$experimentId","status":"blocked","winner":null,""" +
-                        s""""caveat":{"kind":"srm","blocking":true,"observed":$observed,"expected":$expected},""" +
-                        s""""lift":$lift,"ci_low":$ciLow,"ci_high":$ciHigh,"p_value":$pValue}"""
-                    )
-                  } else if (pValue < 0.05) {
-                    val winner = if (lift > 0) "treatment" else "control"
-                    complete(
-                      StatusCodes.OK,
-                      s"""{"experiment_id":"$experimentId","status":"significant","winner":"$winner",""" +
-                        s""""lift":$lift,"ci_low":$ciLow,"ci_high":$ciHigh,"p_value":$pValue}"""
-                    )
-                  } else {
-                    complete(
-                      StatusCodes.OK,
-                      s"""{"experiment_id":"$experimentId","status":"inconclusive","winner":null,""" +
-                        s""""lift":$lift,"ci_low":$ciLow,"ci_high":$ciHigh,"p_value":$pValue}"""
-                    )
-                  }
-                }
-            }
-          }
-        }
-      }
+  /** The first variant whose share of the exposures strays from its weight by more than SrmTolerance. */
+  def sampleRatioMismatch(variants: Seq[Store.Variant], exposures: Map[String, Long], total: Long): Option[JsObject] =
+    variants.iterator.map { v =>
+      val expected = total.toDouble * v.weight / 100
+      val observed = exposures.getOrElse(v.key, 0L)
+      (v.key, observed, expected)
+    }.collectFirst {
+      case (key, observed, expected) if expected > 0 && math.abs(observed - expected) / expected > SrmTolerance =>
+        JsObject("kind" -> JsString("srm"), "blocking" -> JsTrue, "variant" -> JsString(key), "observed" -> JsNumber(observed), "expected" -> JsNumber(expected))
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  def report(id: String): Option[JsObject] =
+    Store.get(id).map { experiment =>
+      val exposures = Store.exposures(id).withDefaultValue(0L)
+      val conversions = Store.conversions(id).withDefaultValue(0L)
+      val control = experiment.variants.head.key
+      val total = experiment.variants.map(v => exposures(v.key)).sum
+      val compared = experiment.variants.tail.map(v => v.key -> Stats.compare(exposures(control), conversions(control), exposures(v.key), conversions(v.key)))
+      // Every lift travels with its interval.
+      val rows = compared.map { case (key, c) =>
+        JsObject("variant" -> JsString(key), "exposures" -> JsNumber(exposures(key)), "conversions" -> JsNumber(conversions(key)),
+          "lift" -> JsNumber(c.lift), "ci_low" -> JsNumber(c.ciLow), "ci_high" -> JsNumber(c.ciHigh), "p_value" -> JsNumber(c.pValue))
+      }
+      val body = Map[String, JsValue]("experiment_id" -> JsString(id), "exposures" -> JsNumber(total), "variants" -> JsArray(rows.toVector),
+        "winner" -> JsNull, "caveat" -> JsNull)
+      // The sample and the split are judged before any p-value is read.
+      if (total < experiment.minSample) JsObject(body ++ Map("status" -> JsString("inconclusive"), "reason" -> JsString("minimum sample not reached")))
+      else
+        sampleRatioMismatch(experiment.variants, exposures, total) match {
+          case Some(caveat) => JsObject(body ++ Map("status" -> JsString("blocked"), "caveat" -> caveat))
+          case None =>
+            val winner = compared.filter { case (_, c) => c.pValue < Alpha && c.lift > 0 }.sortBy(-_._2.lift).headOption.map(_._1)
+            JsObject(body ++ Map("status" -> JsString("complete"), "winner" -> winner.map(JsString(_)).getOrElse(JsNull)))
+        }
+    }
+
+  val route: Route = path("v1" / "experiments" / Segment / "report") { id =>
+    get {
+      report(id) match {
+        case None => complete(StatusCodes.NotFound -> "no such experiment")
+        case Some(body) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
+      }
+    }
   }
 }
 `,
@@ -872,69 +495,48 @@ object ExperimentReport {
 #include <nlohmann/json.hpp>
 
 #include <map>
-#include <optional>
 #include <string>
-#include <vector>
+
+#include "expd/stats.h"  // stats::compare
+#include "expd/store.h"  // store::get, exposures, conversions
 
 using json = nlohmann::json;
 
-struct Variant {
-  std::string key;
-  int weight;
-};
+constexpr double kAlpha = 0.05;
+constexpr double kSrmTolerance = 0.02;
 
-struct Experiment {
-  std::string id;
-  std::string tenant_id;
-  std::vector<Variant> variants;
-  long long min_sample;
-};
-
-struct VariantTotals {
-  long long exposures;
-  long long conversions;
-};
-
-struct ExperimentStore {
-  std::optional<Experiment> get(const std::string& tenant, const std::string& experimentId);
-  std::map<std::string, VariantTotals> totals(const std::string& experimentId);
-};
-
-ExperimentStore store;
-
-double computePValue(const VariantTotals& control, const VariantTotals& treatment) { return 1.0; }
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/experiments/([^/]+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
+void report(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const std::string id = req.matches[1];
+  const auto experiment = store::get(id);
+  if (!experiment) {
+    res.status = 404;
+    res.set_content("no such experiment", "text/plain");
+    return;
+  }
+  std::map<std::string, long long> exposures = store::exposures(id);
+  std::map<std::string, long long> conversions = store::conversions(id);
+  const std::string control = experiment->variants[0].key;
+  long long total = 0;
+  for (const auto& v : experiment->variants) total += exposures[v.key];
+  json rows = json::array();
+  json winner = nullptr;
+  double best = 0;
+  for (size_t i = 1; i < experiment->variants.size(); i++) {
+    const std::string& key = experiment->variants[i].key;
+    const stats::Comparison c = stats::compare(exposures[control], conversions[control], exposures[key], conversions[key]);
+    rows.push_back({{"variant", key}, {"exposures", exposures[key]}, {"conversions", conversions[key]}, {"lift", c.lift}, {"p_value", c.p_value}});
+    if (c.p_value < kAlpha && c.lift > best) {
+      best = c.lift;
+      winner = key;
     }
-    const std::string experimentId = req.matches[1];
-    const auto experiment = store.get(tenant, experimentId);
-    if (!experiment) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown experiment"})", "application/json");
-      return;
-    }
-    const auto totals = store.totals(experimentId);
-    const auto control = totals.at("control");
-    const auto treatment = totals.at("treatment");
-    const double pValue = computePValue(control, treatment);
-    const std::string winner = pValue < 0.05 ? "treatment" : "control";
-    const double lift = static_cast<double>(treatment.conversions) / treatment.exposures -
-                        static_cast<double>(control.conversions) / control.exposures;
-    res.status = 200;
-    res.set_content(json{{"experiment_id", experimentId}, {"winner", winner}, {"lift", lift}, {"p_value", pValue}}.dump(),
-                    "application/json");
-  });
+  }
+  const json body = {{"experiment_id", id}, {"exposures", total}, {"variants", rows}, {"winner", winner}, {"caveat", nullptr}, {"status", "complete"}};
+  res.set_content(body.dump(), "application/json");
+}
 
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/experiments/([\\w-]+)/report)", report);
 }
 `,
       solution: `#include <httplib.h>
@@ -942,156 +544,403 @@ int main() {
 
 #include <cmath>
 #include <map>
-#include <optional>
 #include <string>
-#include <tuple>
 #include <vector>
+
+#include "expd/stats.h"  // stats::compare
+#include "expd/store.h"  // store::get, exposures, conversions
 
 using json = nlohmann::json;
 
-constexpr double kSrmThreshold = 0.02;
+constexpr double kAlpha = 0.05;
+constexpr double kSrmTolerance = 0.02;
 
-struct Variant {
-  std::string key;
-  int weight;
-};
-
-struct Experiment {
-  std::string id;
-  std::string tenant_id;
-  std::vector<Variant> variants;
-  long long min_sample;
-};
-
-struct VariantTotals {
-  long long exposures;
-  long long conversions;
-};
-
-struct ExperimentStore {
-  std::optional<Experiment> get(const std::string& tenant, const std::string& experimentId);
-  std::map<std::string, VariantTotals> totals(const std::string& experimentId);
-};
-
-ExperimentStore store;
-
-double computePValue(const VariantTotals& control, const VariantTotals& treatment) {
-  // Two-proportion z-test p-value; the stats library owns the real implementation.
-  return 1.0;
+// The first variant whose share of the exposures strays from its weight by more than
+// kSrmTolerance, or null.
+json sample_ratio_mismatch(const std::vector<store::Variant>& variants, std::map<std::string, long long>& exposures, long long total) {
+  for (const auto& v : variants) {
+    const double expected = static_cast<double>(total) * v.weight / 100;
+    const long long observed = exposures[v.key];
+    if (expected > 0 && std::fabs(observed - expected) / expected > kSrmTolerance) {
+      return {{"kind", "srm"}, {"blocking", true}, {"variant", v.key}, {"observed", observed}, {"expected", expected}};
+    }
+  }
+  return nullptr;
 }
 
-std::tuple<double, double, double> liftInterval(const VariantTotals& control, const VariantTotals& treatment) {
-  // Lift and its 95 % interval, computed from the two proportions.
-  return {0.0, 0.0, 0.0};
+void report(const httplib::Request& req, httplib::Response& res) {
+  const std::string id = req.matches[1];
+  const auto experiment = store::get(id);
+  if (!experiment) {
+    res.status = 404;
+    res.set_content("no such experiment", "text/plain");
+    return;
+  }
+  std::map<std::string, long long> exposures = store::exposures(id);
+  std::map<std::string, long long> conversions = store::conversions(id);
+  const std::string control = experiment->variants[0].key;
+  long long total = 0;
+  for (const auto& v : experiment->variants) total += exposures[v.key];
+  json rows = json::array();
+  std::vector<stats::Comparison> compared;
+  for (size_t i = 1; i < experiment->variants.size(); i++) {
+    const std::string& key = experiment->variants[i].key;
+    const stats::Comparison c = stats::compare(exposures[control], conversions[control], exposures[key], conversions[key]);
+    compared.push_back(c);
+    // Every lift travels with its interval.
+    rows.push_back({{"variant", key}, {"exposures", exposures[key]}, {"conversions", conversions[key]}, {"lift", c.lift},
+                    {"ci_low", c.ci_low}, {"ci_high", c.ci_high}, {"p_value", c.p_value}});
+  }
+  json body = {{"experiment_id", id}, {"exposures", total}, {"variants", rows}, {"winner", nullptr}, {"caveat", nullptr}};
+  // The sample and the split are judged before any p-value is read.
+  if (total < experiment->min_sample) {
+    body["status"] = "inconclusive";
+    body["reason"] = "minimum sample not reached";
+  } else if (const json caveat = sample_ratio_mismatch(experiment->variants, exposures, total); !caveat.is_null()) {
+    body["status"] = "blocked";
+    body["caveat"] = caveat;
+  } else {
+    double best = 0;
+    for (size_t i = 0; i < compared.size(); i++) {
+      if (compared[i].p_value < kAlpha && compared[i].lift > best) {
+        best = compared[i].lift;
+        body["winner"] = experiment->variants[i + 1].key;
+      }
+    }
+    body["status"] = "complete";
+  }
+  res.set_content(body.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/experiments/([^/]+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const std::string experimentId = req.matches[1];
-    const auto experiment = store.get(tenant, experimentId);
-    if (!experiment) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown experiment"})", "application/json");
-      return;
-    }
-
-    const auto totals = store.totals(experimentId);
-    const auto control = totals.at("control");
-    const auto treatment = totals.at("treatment");
-    const long long sample = control.exposures + treatment.exposures;
-    const auto [lift, ciLow, ciHigh] = liftInterval(control, treatment);
-    const double pValue = computePValue(control, treatment);
-
-    if (sample < experiment->min_sample) {
-      res.status = 200;
-      res.set_content(
-          json{{"experiment_id", experimentId},
-               {"status", "inconclusive"},
-               {"winner", nullptr},
-               {"reason", "minimum sample not reached"},
-               {"lift", lift},
-               {"ci_low", ciLow},
-               {"ci_high", ciHigh},
-               {"p_value", pValue}}
-              .dump(),
-          "application/json");
-      return;
-    }
-
-    std::map<std::string, double> expectedShare;
-    for (const auto& variant : experiment->variants) expectedShare[variant.key] = variant.weight / 100.0;
-    const double expected = expectedShare.at("treatment");
-    const double observed = static_cast<double>(treatment.exposures) / static_cast<double>(sample);
-    if (std::abs(observed - expected) / expected > kSrmThreshold) {
-      res.status = 200;
-      res.set_content(
-          json{{"experiment_id", experimentId},
-               {"status", "blocked"},
-               {"winner", nullptr},
-               {"caveat", json{{"kind", "srm"}, {"blocking", true}, {"observed", observed}, {"expected", expected}}},
-               {"lift", lift},
-               {"ci_low", ciLow},
-               {"ci_high", ciHigh},
-               {"p_value", pValue}}
-              .dump(),
-          "application/json");
-      return;
-    }
-
-    if (pValue < 0.05) {
-      res.status = 200;
-      res.set_content(
-          json{{"experiment_id", experimentId},
-               {"status", "significant"},
-               {"winner", lift > 0 ? "treatment" : "control"},
-               {"lift", lift},
-               {"ci_low", ciLow},
-               {"ci_high", ciHigh},
-               {"p_value", pValue}}
-              .dump(),
-          "application/json");
-      return;
-    }
-
-    res.status = 200;
-    res.set_content(
-        json{{"experiment_id", experimentId},
-             {"status", "inconclusive"},
-             {"winner", nullptr},
-             {"lift", lift},
-             {"ci_low", ciLow},
-             {"ci_high", ciHigh},
-             {"p_value", pValue}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/experiments/([\\w-]+)/report)", report);
 }
 `,
     },
   },
-  hints: [
-    'A product manager refreshes the report on day two, sees `winner: treatment` with a 2 % lift, ships it, and the lift is gone a week later; nobody noticed the arms were 46/54.',
-    'The starter computes `p_value` from whatever counts exist and sets the winner from `p < 0.05` alone; it has no `min_sample` branch, no share comparison against the split, and returns `lift` with no interval.',
-    'Order the guards: `sample < min_sample` answers `inconclusive`; `abs(observed - expected) / expected > SRM_THRESHOLD` adds a blocking `caveat`; only then compare `p_value < 0.05`. Return `ci_low`/`ci_high` with every `lift`.',
-  ],
-  debrief: `The fix is ordering plus disclosure. The sample guard runs first because a p-value computed on
-whatever data exists turns a 5 % false-positive rate into a coin flip for anyone who refreshes the
-dashboard every morning. The SRM check runs next because a split that drifted from the frozen design
-invalidates the comparison itself, so it has to block rather than annotate. Only then is the p-value
-consulted, and every lift travels with its 95 % interval so a reader can tell a two-point move from
-noise.
+  harness: {
+    python: `import math
 
-Production platforms add sequential tests that make repeated looks valid, record the design version
-the report was computed against, and raise the SRM alarm on the consumer side before anyone opens a
-report.`,
+from expd import store
+
+SPLIT = [{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}]
+BALANCED = ({"control": 5000, "treatment": 5000}, {"control": 500, "treatment": 600})
+DRIFTED = ({"control": 5600, "treatment": 4400}, {"control": 560, "treatment": 528})
+
+
+def _experiment(ctx, min_sample, counts):
+    experiment_id = store.create({"name": "cta", "unit": "user", "variants": SPLIT, "min_sample": min_sample, "salt": "s-1"})["id"]
+    ctx.redis.hset(f"exp:{experiment_id}:exposures", mapping=counts[0])
+    ctx.redis.hset(f"exp:{experiment_id}:conversions", mapping=counts[1])
+    return experiment_id
+
+
+async def _report(ctx, experiment_id):
+    async with ctx.client(ctx.load("report").app) as c:
+        r = await c.get(f"/v1/experiments/{experiment_id}/report")
+    assert r.status_code == 200, f"GET /v1/experiments/{experiment_id}/report answered {r.status_code}: {r.text}"
+    return r.json()
+
+
+def _treatment(body):
+    row = next((row for row in body.get("variants") or [] if row.get("variant") == "treatment"), None)
+    assert row is not None, f"the report has no treatment row: {body}"
+    return row
+
+
+async def check_route(ctx):
+    e = _experiment(ctx, 2000, BALANCED)
+    body = await _report(ctx, e)
+    assert body.get("status") == "complete" and body.get("winner") == "treatment", f"10,000 balanced exposures with treatment converting 12 % against 10 % must name treatment, got {body}"
+    row = _treatment(body)
+    assert math.isclose(row.get("lift", 0), 0.02, abs_tol=1e-9) and row.get("p_value", 1) < 0.05, f"the treatment row must carry lift 0.02 and its p-value, got {row}"
+    async with ctx.client(ctx.load("report").app) as c:
+        r = await c.get("/v1/experiments/exp-404/report")
+    assert r.status_code == 404, f"an unknown experiment answered {r.status_code}, expected 404"
+
+
+async def check_min_sample(ctx):
+    e = _experiment(ctx, 20000, BALANCED)
+    body = await _report(ctx, e)
+    assert body.get("winner") is None, f"with 10,000 of the 20,000 exposures the design needs, the report named {body.get('winner')!r} the winner: a peek is not a result"
+    assert body.get("status") == "inconclusive", f"below min_sample the status must be inconclusive, got {body.get('status')!r}"
+
+
+async def check_srm(ctx):
+    e = _experiment(ctx, 2000, DRIFTED)
+    body = await _report(ctx, e)
+    assert body.get("winner") is None, f"a 56/44 split of a 50/50 design named {body.get('winner')!r} the winner: a sample ratio mismatch must block it"
+    caveat = body.get("caveat") or {}
+    assert body.get("status") == "blocked" and caveat.get("kind") == "srm" and caveat.get("blocking") is True, f"the report must be blocked with a blocking srm caveat, got status {body.get('status')!r}, caveat {body.get('caveat')}"
+    near = _experiment(ctx, 2000, ({"control": 5050, "treatment": 4950}, {"control": 505, "treatment": 594}))
+    body = await _report(ctx, near)
+    assert body.get("status") == "complete" and body.get("winner") == "treatment", f"a 50.5/49.5 split is within SRM_TOLERANCE and must not block, got {body}"
+
+
+async def check_interval(ctx):
+    for min_sample, counts, status in ((2000, BALANCED, "complete"), (20000, BALANCED, "inconclusive"), (2000, DRIFTED, "blocked")):
+        body = await _report(ctx, _experiment(ctx, min_sample, counts))
+        row = _treatment(body)
+        assert "ci_low" in row and "ci_high" in row, f"a {body.get('status')} report's treatment row has no interval: {row}. Every lift carries ci_low and ci_high"
+        (cn, n), (cx, x) = (counts[0]["control"], counts[0]["treatment"]), (counts[1]["control"], counts[1]["treatment"])
+        pc, pt = cx / cn, x / n
+        half = 1.959964 * math.sqrt(pc * (1 - pc) / cn + pt * (1 - pt) / n)
+        lift = pt - pc
+        assert math.isclose(row["ci_low"], lift - half, abs_tol=1e-6) and math.isclose(row["ci_high"], lift + half, abs_tol=1e-6), f"the {status} report's interval is [{row['ci_low']}, {row['ci_high']}], expected [{lift - half:.6f}, {lift + half:.6f}] from stats.compare"
+`,
+    typescript: `const SPLIT = [
+  {key: 'control', weight: 50},
+  {key: 'treatment', weight: 50},
+];
+type Counts = [Record<string, number>, Record<string, number>];
+const BALANCED: Counts = [{control: 5000, treatment: 5000}, {control: 500, treatment: 600}];
+const DRIFTED: Counts = [{control: 5600, treatment: 4400}, {control: 560, treatment: 528}];
+
+async function experiment(ctx, minSample: number, counts: Counts): Promise<string> {
+  const store = ctx.load('/support/expd/store.ts');
+  const id = (await store.create({name: 'cta', unit: 'user', variants: SPLIT, min_sample: minSample, salt: 's-1'})).id;
+  ctx.redis.hset(\`exp:\${id}:exposures\`, counts[0]);
+  ctx.redis.hset(\`exp:\${id}:conversions\`, counts[1]);
+  return id;
+}
+
+async function report(ctx, id: string) {
+  const r = await ctx.client(ctx.load('report').app).get(\`/v1/experiments/\${id}/report\`);
+  assert.equal(r.status, 200, \`GET /v1/experiments/\${id}/report answered \${r.status}: \${r.text}\`);
+  return r.json();
+}
+
+function treatment(body) {
+  const row = (body.variants ?? []).find(v => v.variant === 'treatment');
+  assert(row !== undefined, \`the report has no treatment row: \${JSON.stringify(body)}\`);
+  return row;
+}
+
+export async function check_route(ctx) {
+  const body = await report(ctx, await experiment(ctx, 2000, BALANCED));
+  assert(body.status === 'complete' && body.winner === 'treatment', \`10,000 balanced exposures with treatment converting 12 % against 10 % must name treatment, got \${JSON.stringify(body)}\`);
+  const row = treatment(body);
+  assert(Math.abs(row.lift - 0.02) < 1e-9 && row.p_value < 0.05, \`the treatment row must carry lift 0.02 and its p-value, got \${JSON.stringify(row)}\`);
+  const r = await ctx.client(ctx.load('report').app).get('/v1/experiments/exp-404/report');
+  assert.equal(r.status, 404, \`an unknown experiment answered \${r.status}, expected 404\`);
+}
+
+export async function check_min_sample(ctx) {
+  const body = await report(ctx, await experiment(ctx, 20000, BALANCED));
+  assert.equal(body.winner, null, \`with 10,000 of the 20,000 exposures the design needs, the report named \${body.winner} the winner: a peek is not a result\`);
+  assert.equal(body.status, 'inconclusive', \`below min_sample the status must be inconclusive, got \${body.status}\`);
+}
+
+export async function check_srm(ctx) {
+  let body = await report(ctx, await experiment(ctx, 2000, DRIFTED));
+  assert.equal(body.winner, null, \`a 56/44 split of a 50/50 design named \${body.winner} the winner: a sample ratio mismatch must block it\`);
+  const caveat = body.caveat ?? {};
+  assert(body.status === 'blocked' && caveat.kind === 'srm' && caveat.blocking === true, \`the report must be blocked with a blocking srm caveat, got status \${body.status}, caveat \${JSON.stringify(body.caveat)}\`);
+  body = await report(ctx, await experiment(ctx, 2000, [{control: 5050, treatment: 4950}, {control: 505, treatment: 594}]));
+  assert(body.status === 'complete' && body.winner === 'treatment', \`a 50.5/49.5 split is within SRM_TOLERANCE and must not block, got \${JSON.stringify(body)}\`);
+}
+
+export async function check_interval(ctx) {
+  const cases: [number, Counts, string][] = [[2000, BALANCED, 'complete'], [20000, BALANCED, 'inconclusive'], [2000, DRIFTED, 'blocked']];
+  for (const [minSample, counts, status] of cases) {
+    const body = await report(ctx, await experiment(ctx, minSample, counts));
+    const row = treatment(body);
+    assert('ci_low' in row && 'ci_high' in row, \`a \${body.status} report's treatment row has no interval: \${JSON.stringify(row)}. Every lift carries ci_low and ci_high\`);
+    const [cn, n, cx, x] = [counts[0].control, counts[0].treatment, counts[1].control, counts[1].treatment];
+    const pc = cx / cn;
+    const pt = x / n;
+    const half = 1.959964 * Math.sqrt((pc * (1 - pc)) / cn + (pt * (1 - pt)) / n);
+    const lift = pt - pc;
+    assert(Math.abs(row.ci_low - (lift - half)) < 1e-6 && Math.abs(row.ci_high - (lift + half)) < 1e-6, \`the \${status} report's interval is [\${row.ci_low}, \${row.ci_high}], expected [\${lift - half}, \${lift + half}] from compare\`);
+  }
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"math"
+	"net/http"
+
+	"expd/store"
+
+	"leetbuild/harness"
+)
+
+type counts struct{ cn, n, cx, x int64 }
+
+var (
+	balanced = counts{5000, 5000, 500, 600}
+	drifted  = counts{5600, 4400, 560, 528}
+)
+
+func reportOf(ctx *harness.Ctx, minSample int, c counts) map[string]any {
+	id := store.Create(context.Background(), store.Design{Name: "cta", Unit: "user", Variants: []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}}, MinSample: minSample, Salt: "s-1"}).ID
+	ctx.Redis.Do("HSET", "exp:"+id+":exposures", "control", c.cn, "treatment", c.n)
+	ctx.Redis.Do("HSET", "exp:"+id+":conversions", "control", c.cx, "treatment", c.x)
+	mux := http.NewServeMux()
+	register(mux)
+	r := ctx.HTTP(mux).Get("/v1/experiments/" + id + "/report")
+	ctx.Equal(r.Status, 200, "GET /v1/experiments/%s/report (%s)", id, r.Text())
+	var body map[string]any
+	r.Decode(&body)
+	return body
+}
+
+func treatmentRow(ctx *harness.Ctx, body map[string]any) map[string]any {
+	rows, _ := body["variants"].([]any)
+	for _, raw := range rows {
+		if row, ok := raw.(map[string]any); ok && row["variant"] == "treatment" {
+			return row
+		}
+	}
+	ctx.Fatalf("the report has no treatment row: %v", body)
+	return nil
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	body := reportOf(ctx, 2000, balanced)
+	ctx.Assert(body["status"] == "complete" && body["winner"] == "treatment", "10,000 balanced exposures with treatment converting 12 %% against 10 %% must name treatment, got %v", body)
+	row := treatmentRow(ctx, body)
+	lift, _ := row["lift"].(float64)
+	p, _ := row["p_value"].(float64)
+	ctx.Assert(math.Abs(lift-0.02) < 1e-9 && p < 0.05, "the treatment row must carry lift 0.02 and its p-value, got %v", row)
+	mux := http.NewServeMux()
+	register(mux)
+	r := ctx.HTTP(mux).Get("/v1/experiments/exp-404/report")
+	ctx.Equal(r.Status, 404, "an unknown experiment")
+}
+
+func CheckMinSample(ctx *harness.Ctx) {
+	body := reportOf(ctx, 20000, balanced)
+	ctx.Assert(body["winner"] == nil, "with 10,000 of the 20,000 exposures the design needs, the report named %v the winner: a peek is not a result", body["winner"])
+	ctx.Equal(body["status"], "inconclusive", "below min_sample the status")
+}
+
+func CheckSrm(ctx *harness.Ctx) {
+	body := reportOf(ctx, 2000, drifted)
+	ctx.Assert(body["winner"] == nil, "a 56/44 split of a 50/50 design named %v the winner: a sample ratio mismatch must block it", body["winner"])
+	caveat, _ := body["caveat"].(map[string]any)
+	ctx.Assert(body["status"] == "blocked" && caveat != nil && caveat["kind"] == "srm" && caveat["blocking"] == true, "the report must be blocked with a blocking srm caveat, got status %v, caveat %v", body["status"], body["caveat"])
+	body = reportOf(ctx, 2000, counts{5050, 4950, 505, 594})
+	ctx.Assert(body["status"] == "complete" && body["winner"] == "treatment", "a 50.5/49.5 split is within srmTolerance and must not block, got %v", body)
+}
+
+func CheckInterval(ctx *harness.Ctx) {
+	for _, tc := range []struct {
+		minSample int
+		c         counts
+		status    string
+	}{{2000, balanced, "complete"}, {20000, balanced, "inconclusive"}, {2000, drifted, "blocked"}} {
+		row := treatmentRow(ctx, reportOf(ctx, tc.minSample, tc.c))
+		low, okLow := row["ci_low"].(float64)
+		high, okHigh := row["ci_high"].(float64)
+		ctx.Assert(okLow && okHigh, "a %s report's treatment row has no interval: %v. Every lift carries ci_low and ci_high", tc.status, row)
+		pc, pt := float64(tc.c.cx)/float64(tc.c.cn), float64(tc.c.x)/float64(tc.c.n)
+		half := 1.959964 * math.Sqrt(pc*(1-pc)/float64(tc.c.cn)+pt*(1-pt)/float64(tc.c.n))
+		lift := pt - pc
+		ctx.Assert(math.Abs(low-(lift-half)) < 1e-6 && math.Abs(high-(lift+half)) < 1e-6, "the %s report's interval is [%v, %v], expected [%v, %v] from stats.Compare", tc.status, low, high, lift-half, lift+half)
+	}
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <cmath>
+#include <string>
+#include <vector>
+
+#include "expd/store.h"
+
+namespace {
+
+using json = nlohmann::json;
+
+struct Counts {
+  long long cn, n, cx, x;
+};
+
+const Counts kBalanced{5000, 5000, 500, 600};
+const Counts kDrifted{5600, 4400, 560, 528};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+json reportOf(harness::Ctx& ctx, long min_sample, const Counts& c) {
+  const std::string id = store::create(store::Design{"cta", "user", {{"control", 50}, {"treatment", 50}}, min_sample, "s-1"}).id;
+  ctx.Redis.Do("HSET", "exp:" + id + ":exposures", "control", c.cn, "treatment", c.n);
+  ctx.Redis.Do("HSET", "exp:" + id + ":conversions", "control", c.cx, "treatment", c.x);
+  auto http = api(ctx);
+  const auto r = http.Get("/v1/experiments/" + id + "/report");
+  ctx.Equal(r.Status, 200, "GET /v1/experiments/%s/report (%s)", id, r.Text());
+  return json::parse(r.Text(), nullptr, false);
+}
+
+json treatmentRow(harness::Ctx& ctx, const json& body) {
+  if (body.is_object() && body.contains("variants") && body["variants"].is_array()) {
+    for (const auto& row : body["variants"]) {
+      if (row.is_object() && row.value("variant", "") == "treatment") return row;
+    }
+  }
+  ctx.Fatalf("the report has no treatment row: %s", body.dump());
+}
+
+std::string text(const json& body, const char* field) { return body.contains(field) && body[field].is_string() ? body[field].get<std::string>() : ""; }
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  const json body = reportOf(ctx, 2000, kBalanced);
+  ctx.Assert(text(body, "status") == "complete" && text(body, "winner") == "treatment", "10,000 balanced exposures with treatment converting 12 %% against 10 %% must name treatment, got %s", body.dump());
+  const json row = treatmentRow(ctx, body);
+  ctx.Assert(std::fabs(row.value("lift", 0.0) - 0.02) < 1e-9 && row.value("p_value", 1.0) < 0.05, "the treatment row must carry lift 0.02 and its p-value, got %s", row.dump());
+  auto http = api(ctx);
+  ctx.Equal(http.Get("/v1/experiments/exp-404/report").Status, 404, "an unknown experiment");
+}
+
+void CheckMinSample(harness::Ctx& ctx) {
+  const json body = reportOf(ctx, 20000, kBalanced);
+  ctx.Assert(body.contains("winner") && body["winner"].is_null(), "with 10,000 of the 20,000 exposures the design needs, the report named %s the winner: a peek is not a result", body.value("winner", json()).dump());
+  ctx.Equal(text(body, "status"), "inconclusive", "below min_sample the status");
+}
+
+void CheckSrm(harness::Ctx& ctx) {
+  json body = reportOf(ctx, 2000, kDrifted);
+  ctx.Assert(body.contains("winner") && body["winner"].is_null(), "a 56/44 split of a 50/50 design named %s the winner: a sample ratio mismatch must block it", body.value("winner", json()).dump());
+  const json caveat = body.value("caveat", json());
+  ctx.Assert(text(body, "status") == "blocked" && caveat.is_object() && caveat.value("kind", "") == "srm" && caveat.value("blocking", false), "the report must be blocked with a blocking srm caveat, got status %q, caveat %s", text(body, "status"), caveat.dump());
+  body = reportOf(ctx, 2000, Counts{5050, 4950, 505, 594});
+  ctx.Assert(text(body, "status") == "complete" && text(body, "winner") == "treatment", "a 50.5/49.5 split is within kSrmTolerance and must not block, got %s", body.dump());
+}
+
+void CheckInterval(harness::Ctx& ctx) {
+  struct Case {
+    long min_sample;
+    Counts c;
+    std::string status;
+  };
+  for (const Case& tc : std::vector<Case>{{2000, kBalanced, "complete"}, {20000, kBalanced, "inconclusive"}, {2000, kDrifted, "blocked"}}) {
+    const json row = treatmentRow(ctx, reportOf(ctx, tc.min_sample, tc.c));
+    ctx.Assert(row.contains("ci_low") && row.contains("ci_high"), "a %s report's treatment row has no interval: %s. Every lift carries ci_low and ci_high", tc.status, row.dump());
+    const double pc = static_cast<double>(tc.c.cx) / tc.c.cn, pt = static_cast<double>(tc.c.x) / tc.c.n;
+    const double half = 1.959964 * std::sqrt(pc * (1 - pc) / tc.c.cn + pt * (1 - pt) / tc.c.n);
+    const double lift = pt - pc;
+    const double low = row.value("ci_low", 0.0), high = row.value("ci_high", 0.0);
+    ctx.Assert(std::fabs(low - (lift - half)) < 1e-6 && std::fabs(high - (lift + half)) < 1e-6, "the %s report's interval is [%v, %v], expected [%v, %v] from stats::compare", tc.status, low, high, lift - half, lift + half);
+  }
+}
+`,
+  },
+  hints: [
+    'Ask for the report an hour into a test: it names a winner from a few hundred users. Feed it a 56/44 split for a 50/50 design: it names a winner just the same.',
+    'The winner is chosen from the p-values alone: nothing compares the total with `min_sample` or the observed split with the frozen weights, and the rows copy `lift` and `p_value` out of `stats.compare` and drop the interval.',
+    'Build each row from the whole `stats.compare` result. Before reading any p-value, return `inconclusive` when the total is below `min_sample`, then `blocked` with the srm caveat when `abs(observed - expected) / expected > SRM_TOLERANCE` for any variant.',
+  ],
+  debrief: `The report answers the cheap structural questions before the statistical one. A sample below the minimum makes the p-value meaningless, because the test was sized for that sample, and reading it on every refresh is exactly how false winners pile up. A sample ratio mismatch says the assignment or the exposure logging is broken, so no metric computed from those groups can be trusted, however small its p-value. The interval travels with the lift because a reader needs the range of effects the data allows, not one number. Production platforms test the split with a chi-squared test instead of a fixed tolerance, correct for many metrics and repeated looks with sequential methods, and show the interval on a relative scale next to the absolute one.`,
 };

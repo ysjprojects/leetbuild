@@ -2,122 +2,98 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis per-path dedupe and a purge budget',
+  title: 'Redis per-path dedupe and a purge budget in one script',
   concept: 'redis',
   file: 'state',
-  focus: ['purge', 'redis', 'tenant'],
+  focus: ['purge', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`POST /v1/purges\` and runs \`reserve(tenant, domain, paths)\` before the provider call: it dedupes with a client-side \`EXISTS\`, marks paths afterwards with a \`SET\` that has no TTL, charges \`purge:budget:{domain}\` with a client-side \`INCRBY\`, and answers a bare \`429\`. It works when requests arrive one at a time, and it hides five flaws.
+**Starting point.** The starter's \`reserve(domain, paths)\` runs before a purge goes to the provider:
+it asks \`EXISTS purge:seen:{domain}:{path}\` for each path, charges \`purge:budget:{domain}\` with
+\`INCRBY\` by the number of new paths, marks each new path with \`SET\`, and refuses when the charge
+passes \`BUDGET_MAX\` = 1000. It answers \`{allowed, new_paths, duplicates, remaining, retry_after}\`.
+It works one request at a time and hides four flaws.
 
-**Failure mode the checks target.** A double-submitted deploy purges twice, because the check and the write are separate commands. The dedupe keys and the budget key are immortal, so a path purged once can not be purged again and after 1000 paths every purge for the domain is refused. The bare \`429\` tells the client to retry now.
+**Failure mode the checks target.** Two replicas reserve the same path at once and both purge it; a
+path purged once stays a duplicate forever; the budget never resets, so a week later every purge of
+the domain is refused; and a refused request still marks its paths, so its retry reports them as
+duplicates and they are never purged.
 
-\`reserve\` must run **one** Lua script (\`RESERVE_LUA\`) through \`EVAL\`:
-
-- **Per-path dedupe.** \`purge:seen:{tenant}:{domain}:{path}\` is set with \`SET … NX EX DEDUPE_TTL_S\` (**600**). A path whose key exists is a duplicate: reported back, not purged again.
-- **Per-domain budget.** \`purge:budget:{domain}:{window}\` (\`budget_key\`, \`window = now // WINDOW_S\`, \`WINDOW_S\` = **300**) is incremented by the number of **new** paths inside the script and gets \`EXPIRE WINDOW_S\` on first write; \`BUDGET_MAX\` is **1000**.
-- **The reply is positional**: allowed, remaining, TTL, new count, new paths, duplicates.
-
-The handler reserves **before** the provider call: budget exhausted is **429** with \`Retry-After\` (the window key's remaining TTL, at least 1) and \`X-Purge-Budget-Remaining: 0\`; otherwise the provider receives only the **new** paths.
+- One Lua script (\`EVAL\`) checks every path and reads the budget; only when the new paths fit does
+  it charge \`INCRBY\` and mark them with \`SET … EX\` \`DEDUPE_TTL_S\` = 600.
+- The budget key is \`purge:budget:{domain}:{window}\` with \`window = now // WINDOW_S\` (300 s), and
+  it expires (\`EXPIRE\`).
+- A refusal writes nothing and reports \`remaining\`; \`retry_after\` is the seconds until the window
+  ends (\`WINDOW_S - now % WINDOW_S\`), the value a \`429\`'s \`Retry-After\` names.
 
 :::widget token-bucket {"rate": 3, "burst": 1000}`,
   sequence: {
-    participants: ['Purge API', 'Redis', 'CDN provider'],
+    participants: ['Purge API', 'Redis'],
     messages: [
-      {from: 'Purge API', to: 'Purge API', label: 'window = now // 300 · keys for each path', kind: 'sync'},
-      {from: 'Purge API', to: 'Redis', label: 'EVAL reserve (budget, purge:seen:* · paths)', kind: 'sync'},
-      {from: 'Redis', to: 'Redis', label: 'EXISTS each path · charge budget · SET NX EX 600', kind: 'sync'},
-      {from: 'Redis', to: 'Purge API', label: '[allowed, remaining, ttl, new…, duplicates…]', kind: 'reply'},
-      {from: 'Purge API', to: 'Purge API', label: 'allowed = 0 → 429 Retry-After', kind: 'sync'},
-      {from: 'Purge API', to: 'CDN provider', label: 'SubmitPurge(purge_id, domain, new paths)', kind: 'async'},
+      {from: 'Purge API', to: 'Purge API', label: 'window = now // 300 · a seen key per path', kind: 'sync'},
+      {from: 'Purge API', to: 'Redis', label: 'EVAL reserve (budget key, seen keys · 1000, 300, 600)', kind: 'sync'},
+      {from: 'Redis', to: 'Redis', label: 'EXISTS each path · GET budget · fits? INCRBY, SET EX 600', kind: 'sync'},
+      {from: 'Redis', to: 'Purge API', label: '[allowed, remaining, new or duplicate per path]', kind: 'reply'},
+      {from: 'Purge API', to: 'Purge API', label: 'refused → retry_after = 300 - now % 300', kind: 'sync'},
     ],
   },
   checks: [
     {
       id: 'atomic-reserve',
-      title: 'Dedupe and budget live in one server-side script',
+      title: 'Two concurrent reservations cannot both win a path',
       detail:
-        'One `RESERVE_LUA` runs through `EVAL` and marks each path with `SET … NX EX` inside the script. The starter asks Redis `EXISTS` first and writes later, so two concurrent purges both see the path as new.',
+        'The existence checks and the writes run inside one script, so a reservation that lands between two of the starter’s commands sees the path as taken. The starter asks `EXISTS` from the client and writes later.',
       match: {
-        python: {all: [/RESERVE_LUA/, /'NX'/, /\.eval\(/], none: [/\.exists\(/]},
-        typescript: {all: [/RESERVE_LUA/, /'NX'/, /\.eval\(/], none: [/\.exists\(/]},
-        go: {all: [/reserveLua/, /'NX'/, /\.Eval\(/], none: [/\.Exists\(/]},
-        scala: {all: [/reserveLua/, /'NX'/, /\.eval\(/], none: [/\.exists\(/]},
-        cpp: {all: [/kReserveLua/, /'NX'/, /eval</], none: [/exists\(/]},
-      },
-    },
-    {
-      id: 'window-bucket',
-      title: 'The budget key is bucketed by window and expires with it',
-      detail:
-        'The budget key carries the window (`purge:budget:{domain}:{window}` via `budget_key`) and the script sets `EXPIRE WINDOW_S` on first write, so the counter resets per window. The starter uses one un-bucketed, immortal key, so the domain’s budget only ever shrinks.',
-      match: {
-        python: {all: [/purge:budget/, /WINDOW_S/, /EXPIRE/, /budget_key\(/]},
-        typescript: {all: [/purge:budget/, /WINDOW_S/, /EXPIRE/, /budgetKey\(/]},
-        go: {all: [/purge:budget/, /windowS/, /EXPIRE/, /budgetKey\(/]},
-        scala: {all: [/purge:budget/, /WindowS/, /EXPIRE/, /budgetKey\(/]},
-        cpp: {all: [/purge:budget/, /kWindowS/, /EXPIRE/, /budgetKey\(/]},
+        python: {
+          all: [/redis\.call\(\s*'EXISTS'/, /\.eval\(|register_script\(/],
+          none: [/\br\.exists\(/, /\br\.set\(/],
+        },
+        typescript: {
+          all: [/redis\.call\(\s*'EXISTS'/, /\.eval\(|defineCommand\(/],
+          none: [/redis\.exists\(/, /redis\.set\(/],
+        },
+        go: {all: [/redis\.call\(\s*'EXISTS'/, /redis\.NewScript\(|\.Eval\(/], none: [/rdb\.Exists\(/, /rdb\.Set\(/]},
+        scala: {all: [/redis\.call\(\s*'EXISTS'/, /jedis\.eval\(/], none: [/jedis\.exists\(/, /jedis\.set\(/]},
+        cpp: {all: [/redis\.call\(\s*'EXISTS'/, /\.eval[<(]/], none: [/redis\.exists\(/, /redis\.set\(/]},
       },
     },
     {
       id: 'dedupe-window',
-      title: 'Dedupe holds for ten minutes and only new paths are purged',
+      title: 'A path is a duplicate for ten minutes, then purgeable again',
       detail:
-        '`DEDUPE_TTL_S` = 600 gives each path a ten-minute window, and the reservation returns only `new_paths` to the provider while reporting the `duplicates`. The starter writes dedupe keys with no TTL at all, so a path purged once can never be purged again.',
+        'Each new path is marked with `SET … EX 600` (`DEDUPE_TTL_S`), so a repeat inside ten minutes is a duplicate and a later one is purged. The starter’s mark has no expiry.',
       match: {
-        python: {all: [/DEDUPE_TTL_S/, /new_paths/, /duplicates/]},
-        typescript: {all: [/DEDUPE_TTL_S/, /newPaths/, /duplicates/]},
-        go: {all: [/dedupeTtlS/, /NewPaths/, /duplicates/]},
-        scala: {all: [/DedupeTtlS/, /newPaths/, /duplicates/]},
-        cpp: {all: [/kDedupeTtlS/, /new_paths/, /duplicates/]},
+        python: {all: [/DEDUPE_TTL_S\s*=\s*600/, /'EX'/]},
+        typescript: {all: [/DEDUPE_TTL_S\s*=\s*600/, /'EX'/]},
+        go: {all: [/dedupeTTLS\s*=\s*600/, /'EX'/]},
+        scala: {all: [/DedupeTtlS\s*=\s*600/, /'EX'/]},
+        cpp: {all: [/kDedupeTtlS\s*=\s*600/, /'EX'/]},
       },
     },
     {
-      id: 'budget-429',
-      title: 'An exhausted budget answers 429 with Retry-After before the provider',
+      id: 'budget-window',
+      title: 'The budget belongs to a five-minute window and expires with it',
       detail:
-        '`BUDGET_MAX` paths per window; when the reservation is refused the handler answers **429** with `Retry-After` (the window’s remaining TTL) and `X-Purge-Budget-Remaining`, and never calls the provider. The starter sends a bare 429 and charges after the fact.',
+        'The budget key carries the window (`purge:budget:{domain}:{window}`), expires, and a refusal’s `retry_after` is the time left in the window; after it the domain can purge again. The starter’s one counter only grows.',
       match: {
-        python: {all: [/BUDGET_MAX/, /\b429\b/, /Retry-After/, /X-Purge-Budget-Remaining/]},
-        typescript: {all: [/BUDGET_MAX/, /\b429\b/, /Retry-After/, /X-Purge-Budget-Remaining/]},
-        go: {all: [/budgetMax/, /StatusTooManyRequests/, /Retry-After/, /X-Purge-Budget-Remaining/]},
-        scala: {
-          all: [/BudgetMax/, /StatusCodes\.TooManyRequests/, /Retry-After/, /X-Purge-Budget-Remaining/],
-        },
-        cpp: {all: [/kBudgetMax/, /\b429\b/, /Retry-After/, /X-Purge-Budget-Remaining/]},
+        python: {all: [/purge:budget:\{domain\}:\{window\}/, /'EXPIRE'/, /%\s*WINDOW_S/]},
+        typescript: {all: [/purge:budget:\$\{domain\}:\$\{window\}/, /'EXPIRE'/, /%\s*WINDOW_S/]},
+        go: {all: [/purge:budget:%s:%d/, /'EXPIRE'/, /%\s*windowS/]},
+        scala: {all: [/purge:budget:\$domain:\$window/, /'EXPIRE'/, /%\s*WindowS/]},
+        cpp: {all: [/"purge:budget:"\s*\+\s*domain\s*\+\s*":"/, /'EXPIRE'/, /%\s*kWindowS/]},
       },
     },
     {
-      id: 'reserve-before-submit',
-      title: 'The reservation settles before the provider is called',
+      id: 'refusal-clean',
+      title: 'A refused reservation charges nothing and marks nothing',
       detail:
-        'The reserve runs first, the provider sees only the paths the reservation accepted, and the budget is never adjusted from the application. The starter charges the counter from the client after deciding, which is a second place for the budget and the truth to disagree.',
+        'The script reads the budget (`GET`) and charges (`INCRBY`) only when the new paths fit, so a refusal leaves the budget and the paths as they were. The starter charges and marks first and compares afterwards.',
       match: {
-        python: {
-          all: [/providers\.SubmitPurge\(/],
-          order: [/\breserve\(/, /providers\.SubmitPurge\(/],
-          none: [/\.incrby\(/],
-        },
-        typescript: {
-          all: [/providers\.SubmitPurge\(/],
-          order: [/\breserve\(/, /providers\.SubmitPurge\(/],
-          none: [/\.incrby\(/],
-        },
-        go: {
-          all: [/provider\.SubmitPurge\(/],
-          order: [/\breserve\(/, /provider\.SubmitPurge\(/],
-          none: [/\.IncrBy\(/],
-        },
-        scala: {
-          all: [/\.submitPurge\(/],
-          order: [/\breserve\(/, /\.submitPurge\(/],
-          none: [/\.incrBy\(/],
-        },
-        cpp: {
-          all: [/provider\.SubmitPurge\(/],
-          order: [/\breserve\(/, /provider\.SubmitPurge\(/],
-          none: [/incrby\(/],
-        },
+        python: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.incrby\(/]},
+        typescript: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.incrby\(/]},
+        go: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.IncrBy\(/]},
+        scala: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.incrBy\(/]},
+        cpp: {order: [/redis\.call\(\s*'GET'/, /redis\.call\(\s*'INCRBY'/], none: [/\.incrby\(/]},
       },
     },
   ],
@@ -126,343 +102,192 @@ The handler reserves **before** the provider call: budget exhausted is **429** w
       starter: `import time
 
 import redis
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
 
-app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
+WINDOW_S = 300
 BUDGET_MAX = 1000
 
 
-class PurgeRequest(BaseModel):
-    domain: str
-    paths: list[str]
+def seen_key(domain: str, path: str) -> str:
+    return f"purge:seen:{domain}:{path}"
 
 
-class PurgeProvider:
-    def SubmitPurge(self, purge_id: str, domain: str, paths: list[str]) -> None:
-        """Hand the batch to the CDN provider."""
-        raise NotImplementedError
-
-
-providers = PurgeProvider()
-
-
-def budget_key(domain: str) -> str:
-    return f"purge:budget:{domain}"
-
-
-def dedupe_key(tenant: str, domain: str, path: str) -> str:
-    return f"purge:seen:{tenant}:{domain}:{path}"
-
-
-def reserve(tenant: str, domain: str, paths: list[str]) -> dict:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    seen = [path for path in paths if r.exists(dedupe_key(tenant, domain, path))]
-    fresh = [path for path in paths if path not in seen]
-    for path in fresh:
-        r.set(dedupe_key(tenant, domain, path), "1")
-    used = int(r.get(budget_key(domain)) or 0)
-    if used + len(fresh) > BUDGET_MAX:
-        return {"allowed": False, "remaining": 0, "ttl": 0, "new_paths": [], "duplicates": seen}
-    r.incrby(budget_key(domain), len(fresh))
-    return {
-        "allowed": True,
-        "remaining": BUDGET_MAX - used - len(fresh),
-        "ttl": 0,
-        "new_paths": fresh,
-        "duplicates": seen,
-    }
-
-
-@app.post("/v1/purges")
-def create_purge(body: PurgeRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    result = reserve(tenant, body.domain, body.paths)
-    if not result["allowed"]:
-        raise HTTPException(status_code=429, detail="domain purge budget exhausted")
-    providers.SubmitPurge(f"purge-{body.domain}", body.domain, result["new_paths"])
-    return {"domain": body.domain, "submitted": result["new_paths"], "remaining": result["remaining"]}
+def reserve(domain: str, paths: list[str]) -> dict:
+    """Reserve the domain's paths for a purge: which are new, which were purged recently, and whether the budget allows it."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    budget = f"purge:budget:{domain}"
+    new_paths = [path for path in paths if not r.exists(seen_key(domain, path))]
+    duplicates = [path for path in paths if path not in new_paths]
+    used = r.incrby(budget, len(new_paths))
+    for path in new_paths:
+        r.set(seen_key(domain, path), "1")
+    if used > BUDGET_MAX:
+        return {"allowed": False, "new_paths": [], "duplicates": duplicates, "remaining": 0, "retry_after": WINDOW_S}
+    return {"allowed": True, "new_paths": new_paths, "duplicates": duplicates, "remaining": BUDGET_MAX - used, "retry_after": 0}
 `,
       solution: `import time
 
 import redis
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
 
-app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-DEDUPE_TTL_S = 600
 WINDOW_S = 300
 BUDGET_MAX = 1000
+DEDUPE_TTL_S = 600
 
+# KEYS[1] the window's budget, KEYS[2..] one seen key per path; ARGV budget max, window, dedupe TTL.
+# The reply: allowed, remaining, then "1" (new) or "0" (duplicate) per path. A refusal writes nothing.
 RESERVE_LUA = """
--- KEYS[1] is the domain's window budget; KEYS[2..] are the per-path dedupe keys.
--- ARGV[1] dedupe ttl, ARGV[2] budget per window, ARGV[3] window ttl, ARGV[4..] the paths.
-local dedupe_ttl = tonumber(ARGV[1])
-local budget_max = tonumber(ARGV[2])
-local window_ttl = tonumber(ARGV[3])
-local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-local new_paths = {}
-local duplicates = {}
+local budget_max, window_s, dedupe_ttl = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local reply = {'0', '0'}
+local fresh = 0
 for i = 2, #KEYS do
   if redis.call('EXISTS', KEYS[i]) == 0 then
-    new_paths[#new_paths + 1] = ARGV[i + 2]
+    reply[i + 1] = '1'
+    fresh = fresh + 1
   else
-    duplicates[#duplicates + 1] = ARGV[i + 2]
+    reply[i + 1] = '0'
   end
 end
-local allowed = 1
-local remaining = budget_max - used - #new_paths
-if used + #new_paths > budget_max then
-  allowed = 0
-  remaining = math.max(budget_max - used, 0)
-else
-  for i = 1, #new_paths do
-    redis.call('SET', KEYS[i + 1], '1', 'NX', 'EX', dedupe_ttl)
-  end
-  redis.call('INCRBY', KEYS[1], #new_paths)
-  if redis.call('TTL', KEYS[1]) < 0 then
-    redis.call('EXPIRE', KEYS[1], window_ttl)
-  end
+local used = tonumber(redis.call('GET', KEYS[1]) or '0')
+if used + fresh > budget_max then
+  reply[2] = tostring(budget_max - used)
+  return reply
 end
--- Positional reply: allowed, remaining, ttl, how many paths are new, the new paths, then the
--- duplicates.
-local reply = {allowed, remaining, redis.call('TTL', KEYS[1]), #new_paths}
-for i = 1, #new_paths do reply[#reply + 1] = new_paths[i] end
-for i = 1, #duplicates do reply[#reply + 1] = duplicates[i] end
+if fresh > 0 then
+  used = redis.call('INCRBY', KEYS[1], fresh)
+  if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], window_s) end
+end
+for i = 2, #KEYS do
+  if reply[i + 1] == '1' then redis.call('SET', KEYS[i], '1', 'EX', dedupe_ttl) end
+end
+reply[1] = '1'
+reply[2] = tostring(budget_max - used)
 return reply
 """
 
 
-class PurgeRequest(BaseModel):
-    domain: str
-    paths: list[str]
+def seen_key(domain: str, path: str) -> str:
+    return f"purge:seen:{domain}:{path}"
 
 
-class PurgeProvider:
-    def SubmitPurge(self, purge_id: str, domain: str, paths: list[str]) -> None:
-        """Hand the batch to the CDN provider."""
-        raise NotImplementedError
-
-
-providers = PurgeProvider()
-
-
-def budget_key(domain: str, window: int) -> str:
-    return f"purge:budget:{domain}:{window}"
-
-
-def dedupe_key(tenant: str, domain: str, path: str) -> str:
-    return f"purge:seen:{tenant}:{domain}:{path}"
-
-
-def reserve(tenant: str, domain: str, paths: list[str]) -> dict:
-    """Dedupe the paths and charge the domain's window budget in one atomic script."""
-    window = int(time.time()) // WINDOW_S
-    keys = [budget_key(domain, window)] + [dedupe_key(tenant, domain, path) for path in paths]
-    reply = r.eval(RESERVE_LUA, len(keys), *keys, DEDUPE_TTL_S, BUDGET_MAX, WINDOW_S, *paths)
-    allowed, remaining, ttl, new_count = (int(value) for value in reply[:4])
-    new_paths = list(reply[4 : 4 + new_count])
+def reserve(domain: str, paths: list[str]) -> dict:
+    """Reserve the domain's paths for a purge: which are new, which were purged recently, and whether the budget allows it."""
+    now = int(time.time())
+    window = now // WINDOW_S
+    keys = [f"purge:budget:{domain}:{window}"] + [seen_key(domain, path) for path in paths]
+    reply = r.eval(RESERVE_LUA, len(keys), *keys, BUDGET_MAX, WINDOW_S, DEDUPE_TTL_S)
+    allowed = reply[0] == "1"
+    flags = reply[2:]
     return {
-        "allowed": allowed == 1,
-        "remaining": remaining,
-        "ttl": ttl,
-        "new_paths": new_paths,
-        "duplicates": list(reply[4 + new_count :]),
-    }
-
-
-@app.post("/v1/purges")
-def create_purge(body: PurgeRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    result = reserve(tenant, body.domain, body.paths)
-    if not result["allowed"]:
-        retry_after = max(result["ttl"], 1)
-        raise HTTPException(
-            status_code=429,
-            detail="domain purge budget exhausted",
-            headers={"Retry-After": str(retry_after), "X-Purge-Budget-Remaining": "0"},
-        )
-    if result["new_paths"]:
-        providers.SubmitPurge(f"purge-{body.domain}", body.domain, result["new_paths"])
-    return {
-        "domain": body.domain,
-        "submitted": result["new_paths"],
-        "duplicates": result["duplicates"],
-        "remaining": result["remaining"],
+        "allowed": allowed,
+        "new_paths": [path for path, flag in zip(paths, flags) if flag == "1"] if allowed else [],
+        "duplicates": [path for path, flag in zip(paths, flags) if flag == "0"],
+        "remaining": int(reply[1]),
+        "retry_after": 0 if allowed else WINDOW_S - now % WINDOW_S,  # the seconds until the window resets
     }
 `,
     },
     typescript: {
-      starter: `/** Purge intake. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-const BUDGET_MAX = 1000;
+export const WINDOW_S = 300;
+export const BUDGET_MAX = 1000;
 
-interface PurgeBody {
-  domain: string;
-  paths: string[];
+export interface Reservation {
+  allowed: boolean;
+  new_paths: string[];
+  duplicates: string[];
+  remaining: number;
+  retry_after: number;
 }
 
-const providers = {
-  async SubmitPurge(purgeId: string, domain: string, paths: string[]): Promise<void> {
-    throw new Error(\`not implemented: \${domain} \${paths.length} paths for \${purgeId}\`);
-  },
-};
+const seenKey = (domain: string, path: string): string => \`purge:seen:\${domain}:\${path}\`;
 
-function budgetKey(domain: string): string {
-  return \`purge:budget:\${domain}\`;
-}
-
-function dedupeKey(tenant: string, domain: string, path: string): string {
-  return \`purge:seen:\${tenant}:\${domain}:\${path}\`;
-}
-
-app.post('/v1/purges', async (request, reply) => {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as PurgeBody;
-  const seen: string[] = [];
-  const fresh: string[] = [];
-  for (const path of body.paths) {
-    if (await r.exists(dedupeKey(tenant, body.domain, path))) seen.push(path);
-    else fresh.push(path);
+/** Reserve the domain's paths for a purge: which are new, which were purged recently, and whether the budget allows it. */
+export async function reserve(domain: string, paths: string[]): Promise<Reservation> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const budget = \`purge:budget:\${domain}\`;
+  const newPaths: string[] = [];
+  const duplicates: string[] = [];
+  for (const path of paths) {
+    if ((await redis.exists(seenKey(domain, path))) === 0) newPaths.push(path);
+    else duplicates.push(path);
   }
-  for (const path of fresh) await r.set(dedupeKey(tenant, body.domain, path), '1');
-  const used = Number((await r.get(budgetKey(body.domain))) ?? 0);
-  if (used + fresh.length > BUDGET_MAX) return reply.code(429).send({error: 'domain purge budget exhausted'});
-  await r.incrby(budgetKey(body.domain), fresh.length);
-  await providers.SubmitPurge(\`purge-\${body.domain}\`, body.domain, fresh);
-  return reply.code(202).send({domain: body.domain, submitted: fresh, remaining: BUDGET_MAX - used - fresh.length});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+  const used = await redis.incrby(budget, newPaths.length);
+  for (const path of newPaths) await redis.set(seenKey(domain, path), '1');
+  if (used > BUDGET_MAX) return {allowed: false, new_paths: [], duplicates, remaining: 0, retry_after: WINDOW_S};
+  return {allowed: true, new_paths: newPaths, duplicates, remaining: BUDGET_MAX - used, retry_after: 0};
+}
 `,
-      solution: `/** Purge intake: per-path dedupe and a per-domain window budget in one atomic script. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-const DEDUPE_TTL_S = 600;
-const WINDOW_S = 300;
-const BUDGET_MAX = 1000;
+export const WINDOW_S = 300;
+export const BUDGET_MAX = 1000;
+export const DEDUPE_TTL_S = 600;
 
+// KEYS[1] the window's budget, KEYS[2..] one seen key per path; ARGV budget max, window, dedupe TTL.
+// The reply: allowed, remaining, then "1" (new) or "0" (duplicate) per path. A refusal writes nothing.
 const RESERVE_LUA = \`
--- KEYS[1] is the domain's window budget; KEYS[2..] are the per-path dedupe keys.
--- ARGV[1] dedupe ttl, ARGV[2] budget per window, ARGV[3] window ttl, ARGV[4..] the paths.
-local dedupe_ttl = tonumber(ARGV[1])
-local budget_max = tonumber(ARGV[2])
-local window_ttl = tonumber(ARGV[3])
-local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-local new_paths = {}
-local duplicates = {}
+local budget_max, window_s, dedupe_ttl = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local reply = {'0', '0'}
+local fresh = 0
 for i = 2, #KEYS do
   if redis.call('EXISTS', KEYS[i]) == 0 then
-    new_paths[#new_paths + 1] = ARGV[i + 2]
+    reply[i + 1] = '1'
+    fresh = fresh + 1
   else
-    duplicates[#duplicates + 1] = ARGV[i + 2]
+    reply[i + 1] = '0'
   end
 end
-local allowed = 1
-local remaining = budget_max - used - #new_paths
-if used + #new_paths > budget_max then
-  allowed = 0
-  remaining = math.max(budget_max - used, 0)
-else
-  for i = 1, #new_paths do
-    redis.call('SET', KEYS[i + 1], '1', 'NX', 'EX', dedupe_ttl)
-  end
-  redis.call('INCRBY', KEYS[1], #new_paths)
-  if redis.call('TTL', KEYS[1]) < 0 then
-    redis.call('EXPIRE', KEYS[1], window_ttl)
-  end
+local used = tonumber(redis.call('GET', KEYS[1]) or '0')
+if used + fresh > budget_max then
+  reply[2] = tostring(budget_max - used)
+  return reply
 end
--- Positional reply: allowed, remaining, ttl, how many paths are new, the new paths, then the
--- duplicates.
-local reply = {allowed, remaining, redis.call('TTL', KEYS[1]), #new_paths}
-for i = 1, #new_paths do reply[#reply + 1] = new_paths[i] end
-for i = 1, #duplicates do reply[#reply + 1] = duplicates[i] end
+if fresh > 0 then
+  used = redis.call('INCRBY', KEYS[1], fresh)
+  if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], window_s) end
+end
+for i = 2, #KEYS do
+  if reply[i + 1] == '1' then redis.call('SET', KEYS[i], '1', 'EX', dedupe_ttl) end
+end
+reply[1] = '1'
+reply[2] = tostring(budget_max - used)
 return reply
 \`;
 
-interface PurgeBody {
-  domain: string;
-  paths: string[];
-}
-
-interface Reservation {
+export interface Reservation {
   allowed: boolean;
-  remaining: number;
-  ttl: number;
-  newPaths: string[];
+  new_paths: string[];
   duplicates: string[];
+  remaining: number;
+  retry_after: number;
 }
 
-const providers = {
-  async SubmitPurge(purgeId: string, domain: string, paths: string[]): Promise<void> {
-    throw new Error(\`not implemented: \${domain} \${paths.length} paths for \${purgeId}\`);
-  },
-};
+const seenKey = (domain: string, path: string): string => \`purge:seen:\${domain}:\${path}\`;
 
-function budgetKey(domain: string, window: number): string {
-  return \`purge:budget:\${domain}:\${window}\`;
-}
-
-function dedupeKey(tenant: string, domain: string, path: string): string {
-  return \`purge:seen:\${tenant}:\${domain}:\${path}\`;
-}
-
-async function reserve(tenant: string, domain: string, paths: string[]): Promise<Reservation> {
-  const window = Math.floor(Date.now() / 1000 / WINDOW_S);
-  const keys = [budgetKey(domain, window)];
-  for (const path of paths) keys.push(dedupeKey(tenant, domain, path));
-  const reply = (await r.eval(
-    RESERVE_LUA,
-    keys.length,
-    ...keys,
-    String(DEDUPE_TTL_S),
-    String(BUDGET_MAX),
-    String(WINDOW_S),
-    ...paths,
-  )) as string[];
-  const newCount = Number(reply[3]);
+/** Reserve the domain's paths for a purge: which are new, which were purged recently, and whether the budget allows it. */
+export async function reserve(domain: string, paths: string[]): Promise<Reservation> {
+  const now = Math.floor(Date.now() / 1000);
+  const window = Math.floor(now / WINDOW_S);
+  const keys = [\`purge:budget:\${domain}:\${window}\`, ...paths.map(path => seenKey(domain, path))];
+  const reply = (await redis.eval(RESERVE_LUA, keys.length, ...keys, BUDGET_MAX, WINDOW_S, DEDUPE_TTL_S)) as string[];
+  const allowed = reply[0] === '1';
+  const flags = reply.slice(2);
   return {
-    allowed: Number(reply[0]) === 1,
+    allowed,
+    new_paths: allowed ? paths.filter((_, i) => flags[i] === '1') : [],
+    duplicates: paths.filter((_, i) => flags[i] === '0'),
     remaining: Number(reply[1]),
-    ttl: Number(reply[2]),
-    newPaths: reply.slice(4, 4 + newCount),
-    duplicates: reply.slice(4 + newCount),
+    retry_after: allowed ? 0 : WINDOW_S - (now % WINDOW_S), // the seconds until the window resets
   };
 }
-
-app.post('/v1/purges', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as PurgeBody;
-  const reservation = await reserve(tenant, body.domain, body.paths);
-  if (!reservation.allowed)
-    return reply
-      .code(429)
-      .header('Retry-After', String(Math.max(reservation.ttl, 1)))
-      .header('X-Purge-Budget-Remaining', '0')
-      .send({error: 'domain purge budget exhausted'});
-  if (reservation.newPaths.length > 0)
-    await providers.SubmitPurge(\`purge-\${body.domain}\`, body.domain, reservation.newPaths);
-  return reply.code(202).send({
-    domain: body.domain,
-    submitted: reservation.newPaths,
-    duplicates: reservation.duplicates,
-    remaining: reservation.remaining,
-  });
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -470,113 +295,66 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net/http"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const budgetMax = 1000
+const (
+	windowS   = 300
+	budgetMax = 1000
+)
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type PurgeRequest struct {
-	Domain string   \`json:"domain"\`
-	Paths  []string \`json:"paths"\`
-}
-
-type PurgeProvider struct{}
-
-func (p *PurgeProvider) SubmitPurge(ctx context.Context, purgeID, domain string, paths []string) error {
-	return nil
-}
-
-var provider = &PurgeProvider{}
-
-func budgetKey(domain string) string { return "purge:budget:" + domain }
-
-func dedupeKey(tenant, domain, path string) string {
-	return "purge:seen:" + tenant + ":" + domain + ":" + path
-}
-
+// Reservation says which paths are new, which were purged recently, and whether the budget allows the purge.
 type Reservation struct {
 	Allowed    bool
-	Remaining  int
-	TTL        int
 	NewPaths   []string
 	Duplicates []string
+	Remaining  int64
+	RetryAfter int64
 }
 
-func reserve(ctx context.Context, tenant, domain string, paths []string) (*Reservation, error) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	reservation := &Reservation{}
+func seenKey(domain, path string) string {
+	return "purge:seen:" + domain + ":" + path
+}
+
+// reserve reserves the domain's paths for a purge.
+func reserve(ctx context.Context, domain string, paths []string) (Reservation, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	budget := "purge:budget:" + domain
+	var res Reservation
 	for _, path := range paths {
-		exists, err := rdb.Exists(ctx, dedupeKey(tenant, domain, path)).Result()
+		n, err := rdb.Exists(ctx, seenKey(domain, path)).Result()
 		if err != nil {
-			return nil, err
+			return Reservation{}, err
 		}
-		if exists > 0 {
-			reservation.Duplicates = append(reservation.Duplicates, path)
+		if n == 0 {
+			res.NewPaths = append(res.NewPaths, path)
 		} else {
-			reservation.NewPaths = append(reservation.NewPaths, path)
+			res.Duplicates = append(res.Duplicates, path)
 		}
 	}
-	for _, path := range reservation.NewPaths {
-		if err := rdb.Set(ctx, dedupeKey(tenant, domain, path), "1", 0).Err(); err != nil {
-			return nil, err
-		}
-	}
-	used, err := rdb.Get(ctx, budgetKey(domain)).Int()
+	used, err := rdb.IncrBy(ctx, budget, int64(len(res.NewPaths))).Result()
 	if err != nil {
-		used = 0
+		return Reservation{}, err
 	}
-	if used+len(reservation.NewPaths) > budgetMax {
-		reservation.Allowed = false
-		reservation.NewPaths = nil
-		return reservation, nil
+	for _, path := range res.NewPaths {
+		rdb.Set(ctx, seenKey(domain, path), "1", 0)
 	}
-	rdb.IncrBy(ctx, budgetKey(domain), int64(len(reservation.NewPaths)))
-	reservation.Allowed = true
-	reservation.Remaining = budgetMax - used - len(reservation.NewPaths)
-	return reservation, nil
-}
-
-func createPurge(rw http.ResponseWriter, r *http.Request) {
-	var body PurgeRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
+	if used > budgetMax {
+		return Reservation{Duplicates: res.Duplicates, RetryAfter: windowS}, nil
 	}
-	reservation, err := reserve(r.Context(), r.Header.Get("X-Tenant-Id"), body.Domain, body.Paths)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if !reservation.Allowed {
-		writeJSON(rw, http.StatusTooManyRequests, map[string]string{"error": "domain purge budget exhausted"})
-		return
-	}
-	_ = provider.SubmitPurge(r.Context(), "purge-"+body.Domain, body.Domain, reservation.NewPaths)
-	writeJSON(rw, http.StatusAccepted, map[string]any{
-		"domain":    body.Domain,
-		"submitted": reservation.NewPaths,
-		"remaining": reservation.Remaining,
-	})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/purges", createPurge)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	res.Allowed = true
+	res.Remaining = budgetMax - used
+	return res, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -584,531 +362,620 @@ import (
 )
 
 const (
-	dedupeTtlS = 600
 	windowS    = 300
 	budgetMax  = 1000
+	dedupeTTLS = 600
 )
-
-// reserveLua dedupes the paths and charges the domain's window budget in one atomic step.
-const reserveLua = \`
--- KEYS[1] is the domain's window budget; KEYS[2..] are the per-path dedupe keys.
--- ARGV[1] dedupe ttl, ARGV[2] budget per window, ARGV[3] window ttl, ARGV[4..] the paths.
-local dedupe_ttl = tonumber(ARGV[1])
-local budget_max = tonumber(ARGV[2])
-local window_ttl = tonumber(ARGV[3])
-local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-local new_paths = {}
-local duplicates = {}
-for i = 2, #KEYS do
-  if redis.call('EXISTS', KEYS[i]) == 0 then
-    new_paths[#new_paths + 1] = ARGV[i + 2]
-  else
-    duplicates[#duplicates + 1] = ARGV[i + 2]
-  end
-end
-local allowed = 1
-local remaining = budget_max - used - #new_paths
-if used + #new_paths > budget_max then
-  allowed = 0
-  remaining = math.max(budget_max - used, 0)
-else
-  for i = 1, #new_paths do
-    redis.call('SET', KEYS[i + 1], '1', 'NX', 'EX', dedupe_ttl)
-  end
-  redis.call('INCRBY', KEYS[1], #new_paths)
-  if redis.call('TTL', KEYS[1]) < 0 then
-    redis.call('EXPIRE', KEYS[1], window_ttl)
-  end
-end
--- Positional reply: allowed, remaining, ttl, how many paths are new, the new paths, then the
--- duplicates.
-local reply = {allowed, remaining, redis.call('TTL', KEYS[1]), #new_paths}
-for i = 1, #new_paths do reply[#reply + 1] = new_paths[i] end
-for i = 1, #duplicates do reply[#reply + 1] = duplicates[i] end
-return reply
-\`
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type PurgeRequest struct {
-	Domain string   \`json:"domain"\`
-	Paths  []string \`json:"paths"\`
-}
+// reserveScript: KEYS[1] the window's budget, KEYS[2..] one seen key per path; ARGV budget max,
+// window, dedupe TTL. The reply: allowed, remaining, then "1" (new) or "0" (duplicate) per path.
+// A refusal writes nothing.
+var reserveScript = redis.NewScript(\`
+local budget_max, window_s, dedupe_ttl = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local reply = {'0', '0'}
+local fresh = 0
+for i = 2, #KEYS do
+  if redis.call('EXISTS', KEYS[i]) == 0 then
+    reply[i + 1] = '1'
+    fresh = fresh + 1
+  else
+    reply[i + 1] = '0'
+  end
+end
+local used = tonumber(redis.call('GET', KEYS[1]) or '0')
+if used + fresh > budget_max then
+  reply[2] = tostring(budget_max - used)
+  return reply
+end
+if fresh > 0 then
+  used = redis.call('INCRBY', KEYS[1], fresh)
+  if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], window_s) end
+end
+for i = 2, #KEYS do
+  if reply[i + 1] == '1' then redis.call('SET', KEYS[i], '1', 'EX', dedupe_ttl) end
+end
+reply[1] = '1'
+reply[2] = tostring(budget_max - used)
+return reply
+\`)
 
-type PurgeProvider struct{}
-
-func (p *PurgeProvider) SubmitPurge(ctx context.Context, purgeID, domain string, paths []string) error {
-	return nil
-}
-
-var provider = &PurgeProvider{}
-
-func budgetKey(domain string, window int64) string {
-	return "purge:budget:" + domain + ":" + strconv.FormatInt(window, 10)
-}
-
-func dedupeKey(tenant, domain, path string) string {
-	return "purge:seen:" + tenant + ":" + domain + ":" + path
-}
-
+// Reservation says which paths are new, which were purged recently, and whether the budget allows the purge.
 type Reservation struct {
 	Allowed    bool
-	Remaining  int
-	TTL        int
 	NewPaths   []string
 	Duplicates []string
+	Remaining  int64
+	RetryAfter int64
 }
 
-func replyInt(value any) int {
-	switch typed := value.(type) {
-	case int64:
-		return int(typed)
-	case string:
-		parsed, err := strconv.Atoi(typed)
-		if err == nil {
-			return parsed
+func seenKey(domain, path string) string {
+	return "purge:seen:" + domain + ":" + path
+}
+
+// reserve reserves the domain's paths for a purge.
+func reserve(ctx context.Context, domain string, paths []string) (Reservation, error) {
+	now := time.Now().Unix()
+	window := now / windowS
+	keys := []string{fmt.Sprintf("purge:budget:%s:%d", domain, window)}
+	for _, path := range paths {
+		keys = append(keys, seenKey(domain, path))
+	}
+	reply, err := reserveScript.Run(ctx, rdb, keys, budgetMax, windowS, dedupeTTLS).StringSlice()
+	if err != nil {
+		return Reservation{}, err
+	}
+	res := Reservation{Allowed: reply[0] == "1"}
+	res.Remaining, _ = strconv.ParseInt(reply[1], 10, 64)
+	for i, path := range paths {
+		if reply[i+2] == "0" {
+			res.Duplicates = append(res.Duplicates, path)
+		} else if res.Allowed {
+			res.NewPaths = append(res.NewPaths, path)
 		}
 	}
-	return 0
-}
-
-func replyStrings(value any) []string {
-	items, ok := value.([]any)
-	if !ok {
-		return nil
+	if !res.Allowed {
+		res.RetryAfter = windowS - now%windowS // the seconds until the window resets
 	}
-	values := make([]string, 0, len(items))
-	for _, item := range items {
-		if text, ok := item.(string); ok {
-			values = append(values, text)
-		}
-	}
-	return values
-}
-
-func reserve(ctx context.Context, tenant, domain string, paths []string) (*Reservation, error) {
-	window := time.Now().Unix() / windowS
-	keys := make([]string, 0, len(paths)+1)
-	keys = append(keys, budgetKey(domain, window))
-	for _, path := range paths {
-		keys = append(keys, dedupeKey(tenant, domain, path))
-	}
-	args := make([]any, 0, len(paths)+3)
-	args = append(args, dedupeTtlS, budgetMax, windowS)
-	for _, path := range paths {
-		args = append(args, path)
-	}
-	raw, err := rdb.Eval(ctx, reserveLua, keys, args...).Result()
-	if err != nil {
-		return nil, err
-	}
-	reply, ok := raw.([]any)
-	if !ok || len(reply) < 4 {
-		return nil, nil
-	}
-	newCount := replyInt(reply[3])
-	reservation := &Reservation{
-		Allowed:    replyInt(reply[0]) == 1,
-		Remaining:  replyInt(reply[1]),
-		TTL:        replyInt(reply[2]),
-		NewPaths:   replyStrings(reply[3:]),
-		Duplicates: []string{},
-	}
-	if newCount <= len(reservation.NewPaths) {
-		reservation.NewPaths = reservation.NewPaths[:newCount]
-		reservation.Duplicates = replyStrings(reply[3:])[newCount:]
-	}
-	return reservation, nil
-}
-
-func createPurge(rw http.ResponseWriter, r *http.Request) {
-	var body PurgeRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	reservation, err := reserve(r.Context(), r.Header.Get("X-Tenant-Id"), body.Domain, body.Paths)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if !reservation.Allowed {
-		rw.Header().Set("Retry-After", strconv.Itoa(max(reservation.TTL, 1)))
-		rw.Header().Set("X-Purge-Budget-Remaining", "0")
-		writeJSON(rw, http.StatusTooManyRequests, map[string]string{"error": "domain purge budget exhausted"})
-		return
-	}
-	if len(reservation.NewPaths) > 0 {
-		_ = provider.SubmitPurge(r.Context(), "purge-"+body.Domain, body.Domain, reservation.NewPaths)
-	}
-	writeJSON(rw, http.StatusAccepted, map[string]any{
-		"domain":     body.Domain,
-		"submitted":  reservation.NewPaths,
-		"duplicates": reservation.Duplicates,
-		"remaining":  reservation.Remaining,
-	})
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/purges", createPurge)
-	http.ListenAndServe(":8443", mux)
+	return res, nil
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
 
-final case class Reservation(
-    allowed: Boolean,
-    remaining: Int,
-    ttl: Int,
-    newPaths: List[String],
-    duplicates: List[String])
+/** Which paths are new, which were purged recently, and whether the budget allows the purge. */
+final case class Reservation(allowed: Boolean, newPaths: Seq[String], duplicates: Seq[String], remaining: Long, retryAfter: Long)
 
-object PurgeState {
-  val BudgetMax = 1000
+object State {
+  val WindowS = 300L
+  val BudgetMax = 1000L
 
-  val jedis = new Jedis("redis", 6379)
+  val jedis = new JedisPooled("redis", 6379)
 
-  def budgetKey(domain: String): String = s"purge:budget:$domain"
+  def seenKey(domain: String, path: String): String = s"purge:seen:$domain:$path"
 
-  def dedupeKey(tenant: String, domain: String, path: String): String =
-    s"purge:seen:$tenant:$domain:$path"
-
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def reserve(tenant: String, domain: String, paths: List[String]): Reservation = {
-    val duplicates = paths.filter(path => jedis.exists(dedupeKey(tenant, domain, path)))
-    val fresh = paths.filterNot(duplicates.contains)
-    fresh.foreach(path => jedis.set(dedupeKey(tenant, domain, path), "1"))
-    val used = Option(jedis.get(budgetKey(domain))).map(_.toInt).getOrElse(0)
-    if (used + fresh.length > BudgetMax) {
-      Reservation(allowed = false, remaining = 0, ttl = 0, newPaths = Nil, duplicates = duplicates)
-    } else {
-      jedis.incrBy(budgetKey(domain), fresh.length.toLong)
-      Reservation(allowed = true, remaining = BudgetMax - used - fresh.length, ttl = 0, fresh, duplicates)
-    }
-  }
-}
-
-object PurgeProvider {
-  def submitPurge(purgeId: String, domain: String, paths: List[String]): Unit = ???
-}
-
-object PurgeApi {
-  def createPurge(tenant: String, domain: String, paths: List[String]): Either[String, Reservation] = {
-    val reservation = PurgeState.reserve(tenant, domain, paths)
-    if (!reservation.allowed) Left("domain purge budget exhausted")
-    else {
-      PurgeProvider.submitPurge(s"purge-$domain", domain, reservation.newPaths)
-      Right(reservation)
-    }
+  /** Reserve the domain's paths for a purge. */
+  def reserve(domain: String, paths: Seq[String]): Reservation = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val budget = s"purge:budget:$domain"
+    val (duplicates, newPaths) = paths.partition(path => jedis.exists(seenKey(domain, path)))
+    val used = jedis.incrBy(budget, newPaths.size.toLong)
+    newPaths.foreach(path => jedis.set(seenKey(domain, path), "1"))
+    if (used > BudgetMax) Reservation(allowed = false, Seq.empty, duplicates, 0L, WindowS)
+    else Reservation(allowed = true, newPaths, duplicates, BudgetMax - used, 0L)
   }
 }
 `,
-      solution: `import org.apache.pekko.http.scaladsl.model.StatusCodes
-import redis.clients.jedis.Jedis
+      solution: `import redis.clients.jedis.JedisPooled
 
 import scala.jdk.CollectionConverters._
 
-final case class Reservation(
-    allowed: Boolean,
-    remaining: Int,
-    ttl: Int,
-    newPaths: List[String],
-    duplicates: List[String])
+/** Which paths are new, which were purged recently, and whether the budget allows the purge. */
+final case class Reservation(allowed: Boolean, newPaths: Seq[String], duplicates: Seq[String], remaining: Long, retryAfter: Long)
 
-object PurgeState {
-  val DedupeTtlS = 600
-  val WindowS = 300
-  val BudgetMax = 1000
+object State {
+  val WindowS = 300L
+  val BudgetMax = 1000L
+  val DedupeTtlS = 600L
 
-  val reserveLua = """
--- KEYS[1] is the domain's window budget; KEYS[2..] are the per-path dedupe keys.
--- ARGV[1] dedupe ttl, ARGV[2] budget per window, ARGV[3] window ttl, ARGV[4..] the paths.
-local dedupe_ttl = tonumber(ARGV[1])
-local budget_max = tonumber(ARGV[2])
-local window_ttl = tonumber(ARGV[3])
-local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-local new_paths = {}
-local duplicates = {}
+  val jedis = new JedisPooled("redis", 6379)
+
+  /**
+   * KEYS[1] the window's budget, KEYS[2..] one seen key per path; ARGV budget max, window, dedupe TTL.
+   * The reply: allowed, remaining, then "1" (new) or "0" (duplicate) per path. A refusal writes nothing.
+   */
+  val ReserveLua: String = """
+local budget_max, window_s, dedupe_ttl = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local reply = {'0', '0'}
+local fresh = 0
 for i = 2, #KEYS do
   if redis.call('EXISTS', KEYS[i]) == 0 then
-    new_paths[#new_paths + 1] = ARGV[i + 2]
+    reply[i + 1] = '1'
+    fresh = fresh + 1
   else
-    duplicates[#duplicates + 1] = ARGV[i + 2]
+    reply[i + 1] = '0'
   end
 end
-local allowed = 1
-local remaining = budget_max - used - #new_paths
-if used + #new_paths > budget_max then
-  allowed = 0
-  remaining = math.max(budget_max - used, 0)
-else
-  for i = 1, #new_paths do
-    redis.call('SET', KEYS[i + 1], '1', 'NX', 'EX', dedupe_ttl)
-  end
-  redis.call('INCRBY', KEYS[1], #new_paths)
-  if redis.call('TTL', KEYS[1]) < 0 then
-    redis.call('EXPIRE', KEYS[1], window_ttl)
-  end
+local used = tonumber(redis.call('GET', KEYS[1]) or '0')
+if used + fresh > budget_max then
+  reply[2] = tostring(budget_max - used)
+  return reply
 end
--- Positional reply: allowed, remaining, ttl, how many paths are new, the new paths, then the
--- duplicates.
-local reply = {allowed, remaining, redis.call('TTL', KEYS[1]), #new_paths}
-for i = 1, #new_paths do reply[#reply + 1] = new_paths[i] end
-for i = 1, #duplicates do reply[#reply + 1] = duplicates[i] end
+if fresh > 0 then
+  used = redis.call('INCRBY', KEYS[1], fresh)
+  if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], window_s) end
+end
+for i = 2, #KEYS do
+  if reply[i + 1] == '1' then redis.call('SET', KEYS[i], '1', 'EX', dedupe_ttl) end
+end
+reply[1] = '1'
+reply[2] = tostring(budget_max - used)
 return reply
 """
 
-  val jedis = new Jedis("redis", 6379)
+  def seenKey(domain: String, path: String): String = s"purge:seen:$domain:$path"
 
-  def budgetKey(domain: String, window: Long): String = s"purge:budget:$domain:$window"
-
-  def dedupeKey(tenant: String, domain: String, path: String): String =
-    s"purge:seen:$tenant:$domain:$path"
-
-  // reserve dedupes the paths and charges the domain's window budget in one atomic script.
-  def reserve(tenant: String, domain: String, paths: List[String]): Reservation = {
-    val window = System.currentTimeMillis() / 1000L / WindowS
-    val keys = (budgetKey(domain, window) :: paths.map(dedupeKey(tenant, domain, _))).asJava
-    val args = (List(DedupeTtlS.toString, BudgetMax.toString, WindowS.toString) ++ paths).asJava
-    val reply = jedis.eval(reserveLua, keys, args).asInstanceOf[java.util.List[AnyRef]]
-    val newCount = reply.get(3).toString.toInt
-    val tail = reply.subList(4, reply.size).asScala.toList.map(_.toString)
+  /** Reserve the domain's paths for a purge. */
+  def reserve(domain: String, paths: Seq[String]): Reservation = {
+    val now = System.currentTimeMillis() / 1000
+    val window = now / WindowS
+    val keys = s"purge:budget:$domain:$window" +: paths.map(seenKey(domain, _))
+    val args = Seq(BudgetMax, WindowS, DedupeTtlS).map(_.toString)
+    val reply = jedis.eval(ReserveLua, keys.asJava, args.asJava).asInstanceOf[java.util.List[AnyRef]].asScala.map(String.valueOf).toSeq
+    val allowed = reply.head == "1"
+    val flags = reply.drop(2)
     Reservation(
-      allowed = reply.get(0).toString.toInt == 1,
-      remaining = reply.get(1).toString.toInt,
-      ttl = reply.get(2).toString.toInt,
-      newPaths = tail.take(newCount),
-      duplicates = tail.drop(newCount),
+      allowed,
+      if (allowed) paths.zip(flags).collect { case (path, "1") => path } else Seq.empty,
+      paths.zip(flags).collect { case (path, "0") => path },
+      reply(1).toLong,
+      if (allowed) 0L else WindowS - now % WindowS // the seconds until the window resets
     )
-  }
-}
-
-object PurgeApi {
-  def createPurge(tenant: String, domain: String, paths: List[String]): (Int, Map[String, String], Reservation) = {
-    val reservation = PurgeState.reserve(tenant, domain, paths)
-    if (!reservation.allowed) {
-      val retryAfter = math.max(reservation.ttl, 1)
-      (StatusCodes.TooManyRequests.intValue, Map("Retry-After" -> retryAfter.toString, "X-Purge-Budget-Remaining" -> "0"), reservation)
-    } else {
-      if (reservation.newPaths.nonEmpty) PurgeProvider.submitPurge(s"purge-$domain", domain, reservation.newPaths)
-      (202, Map.empty, reservation)
-    }
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
-#include <memory>
 #include <string>
 #include <vector>
 
-using json = nlohmann::json;
+const long long kWindowS = 300;
+const long long kBudgetMax = 1000;
 
-constexpr int kBudgetMax = 1000;
+sw::redis::Redis redis("tcp://redis:6379");
 
-struct PurgeProvider {
-  void SubmitPurge(const std::string& purgeId, const std::string& domain, const std::vector<std::string>& paths);
-};
-
-PurgeProvider provider;
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
-
-std::string budgetKey(const std::string& domain) { return "purge:budget:" + domain; }
-
-std::string dedupeKey(const std::string& tenant, const std::string& domain, const std::string& path) {
-  return "purge:seen:" + tenant + ":" + domain + ":" + path;
-}
-
+// Which paths are new, which were purged recently, and whether the budget allows the purge.
 struct Reservation {
   bool allowed = false;
-  long long remaining = 0;
-  long long ttl = 0;
   std::vector<std::string> new_paths;
   std::vector<std::string> duplicates;
+  long long remaining = 0;
+  long long retry_after = 0;
 };
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-Reservation reserve(const std::string& tenant, const std::string& domain, const std::vector<std::string>& paths) {
-  Reservation reservation;
+std::string seenKey(const std::string& domain, const std::string& path) { return "purge:seen:" + domain + ":" + path; }
+
+// Reserve the domain's paths for a purge.
+Reservation reserve(const std::string& domain, const std::vector<std::string>& paths) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string budget = "purge:budget:" + domain;
+  Reservation res;
   for (const auto& path : paths) {
-    if (redis->exists(dedupeKey(tenant, domain, path)) > 0) {
-      reservation.duplicates.push_back(path);
+    if (redis.exists(seenKey(domain, path)) == 0) {
+      res.new_paths.push_back(path);
     } else {
-      reservation.new_paths.push_back(path);
+      res.duplicates.push_back(path);
     }
   }
-  for (const auto& path : reservation.new_paths) redis->set(dedupeKey(tenant, domain, path), "1");
-  const auto used = std::stoll(redis->get(budgetKey(domain)).value_or("0"));
-  if (used + static_cast<long long>(reservation.new_paths.size()) > kBudgetMax) return reservation;
-  redis->incrby(budgetKey(domain), static_cast<long long>(reservation.new_paths.size()));
-  reservation.allowed = true;
-  reservation.remaining = kBudgetMax - used - static_cast<long long>(reservation.new_paths.size());
-  return reservation;
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/purges", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto body = json::parse(req.body, nullptr, false);
-    const auto reservation = reserve(tenant, body.value("domain", std::string()), body.value("paths", std::vector<std::string>()));
-    if (!reservation.allowed) {
-      res.status = 429;
-      res.set_content(R"({"error":"domain purge budget exhausted"})", "application/json");
-      return;
-    }
-    provider.SubmitPurge("purge-" + body.value("domain", std::string()), body.value("domain", std::string()), reservation.new_paths);
-    res.status = 202;
-    res.set_content(json{{"domain", body.value("domain", std::string())}, {"submitted", reservation.new_paths}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+  const long long used = redis.incrby(budget, static_cast<long long>(res.new_paths.size()));
+  for (const auto& path : res.new_paths) redis.set(seenKey(domain, path), "1");
+  if (used > kBudgetMax) return Reservation{false, {}, res.duplicates, 0, kWindowS};
+  res.allowed = true;
+  res.remaining = kBudgetMax - used;
+  return res;
 }
 `,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
-#include <algorithm>
-#include <ctime>
-#include <memory>
+#include <chrono>
+#include <iterator>
 #include <string>
 #include <vector>
 
-using json = nlohmann::json;
+const long long kWindowS = 300;
+const long long kBudgetMax = 1000;
+const long long kDedupeTtlS = 600;
 
-constexpr int kDedupeTtlS = 600;
-constexpr int kWindowS = 300;
-constexpr long long kBudgetMax = 1000;
+sw::redis::Redis redis("tcp://redis:6379");
 
-// kReserveLua dedupes the paths and charges the domain's window budget in one atomic step.
+// KEYS[1] the window's budget, KEYS[2..] one seen key per path; ARGV budget max, window, dedupe TTL.
+// The reply: allowed, remaining, then "1" (new) or "0" (duplicate) per path. A refusal writes nothing.
 const std::string kReserveLua = R"lua(
--- KEYS[1] is the domain's window budget; KEYS[2..] are the per-path dedupe keys.
--- ARGV[1] dedupe ttl, ARGV[2] budget per window, ARGV[3] window ttl, ARGV[4..] the paths.
-local dedupe_ttl = tonumber(ARGV[1])
-local budget_max = tonumber(ARGV[2])
-local window_ttl = tonumber(ARGV[3])
-local used = tonumber(redis.call('GET', KEYS[1]) or '0')
-local new_paths = {}
-local duplicates = {}
+local budget_max, window_s, dedupe_ttl = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local reply = {'0', '0'}
+local fresh = 0
 for i = 2, #KEYS do
   if redis.call('EXISTS', KEYS[i]) == 0 then
-    new_paths[#new_paths + 1] = ARGV[i + 2]
+    reply[i + 1] = '1'
+    fresh = fresh + 1
   else
-    duplicates[#duplicates + 1] = ARGV[i + 2]
+    reply[i + 1] = '0'
   end
 end
-local allowed = 1
-local remaining = budget_max - used - #new_paths
-if used + #new_paths > budget_max then
-  allowed = 0
-  remaining = math.max(budget_max - used, 0)
-else
-  for i = 1, #new_paths do
-    redis.call('SET', KEYS[i + 1], '1', 'NX', 'EX', dedupe_ttl)
-  end
-  redis.call('INCRBY', KEYS[1], #new_paths)
-  if redis.call('TTL', KEYS[1]) < 0 then
-    redis.call('EXPIRE', KEYS[1], window_ttl)
-  end
+local used = tonumber(redis.call('GET', KEYS[1]) or '0')
+if used + fresh > budget_max then
+  reply[2] = tostring(budget_max - used)
+  return reply
 end
--- Positional reply: allowed, remaining, ttl, how many paths are new, the new paths, then the
--- duplicates.
-local reply = {allowed, remaining, redis.call('TTL', KEYS[1]), #new_paths}
-for i = 1, #new_paths do reply[#reply + 1] = new_paths[i] end
-for i = 1, #duplicates do reply[#reply + 1] = duplicates[i] end
+if fresh > 0 then
+  used = redis.call('INCRBY', KEYS[1], fresh)
+  if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], window_s) end
+end
+for i = 2, #KEYS do
+  if reply[i + 1] == '1' then redis.call('SET', KEYS[i], '1', 'EX', dedupe_ttl) end
+end
+reply[1] = '1'
+reply[2] = tostring(budget_max - used)
 return reply
 )lua";
 
-struct PurgeProvider {
-  void SubmitPurge(const std::string& purgeId, const std::string& domain, const std::vector<std::string>& paths);
-};
-
-PurgeProvider provider;
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
-
+// Which paths are new, which were purged recently, and whether the budget allows the purge.
 struct Reservation {
   bool allowed = false;
-  long long remaining = 0;
-  long long ttl = 0;
   std::vector<std::string> new_paths;
   std::vector<std::string> duplicates;
+  long long remaining = 0;
+  long long retry_after = 0;
 };
 
-std::string budgetKey(const std::string& domain, long long window) {
-  return "purge:budget:" + domain + ":" + std::to_string(window);
-}
+std::string seenKey(const std::string& domain, const std::string& path) { return "purge:seen:" + domain + ":" + path; }
 
-std::string dedupeKey(const std::string& tenant, const std::string& domain, const std::string& path) {
-  return "purge:seen:" + tenant + ":" + domain + ":" + path;
-}
-
-Reservation reserve(const std::string& tenant, const std::string& domain, const std::vector<std::string>& paths) {
-  const long long window = static_cast<long long>(std::time(nullptr)) / kWindowS;
-  std::vector<std::string> keys{budgetKey(domain, window)};
-  for (const auto& path : paths) keys.push_back(dedupeKey(tenant, domain, path));
-  std::vector<std::string> args{std::to_string(kDedupeTtlS), std::to_string(kBudgetMax), std::to_string(kWindowS)};
-  args.insert(args.end(), paths.begin(), paths.end());
-  const auto reply = redis->eval<std::vector<std::string>>(kReserveLua, keys.begin(), keys.end(), args.begin(), args.end());
-  Reservation reservation;
-  reservation.allowed = std::stoll(reply[0]) == 1;
-  reservation.remaining = std::stoll(reply[1]);
-  reservation.ttl = std::stoll(reply[2]);
-  const auto newCount = std::stoll(reply[3]);
-  reservation.new_paths.assign(reply.begin() + 4, reply.begin() + 4 + newCount);
-  reservation.duplicates.assign(reply.begin() + 4 + newCount, reply.end());
-  return reservation;
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/purges", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto body = json::parse(req.body, nullptr, false);
-    const auto domain = body.value("domain", std::string());
-    const auto reservation = reserve(tenant, domain, body.value("paths", std::vector<std::string>()));
-    if (!reservation.allowed) {
-      res.status = 429;
-      res.set_header("Retry-After", std::to_string(std::max<long long>(reservation.ttl, 1)));
-      res.set_header("X-Purge-Budget-Remaining", "0");
-      res.set_content(R"({"error":"domain purge budget exhausted"})", "application/json");
-      return;
+// Reserve the domain's paths for a purge.
+Reservation reserve(const std::string& domain, const std::vector<std::string>& paths) {
+  const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const long long window = now / kWindowS;
+  std::vector<std::string> keys = {"purge:budget:" + domain + ":" + std::to_string(window)};
+  for (const auto& path : paths) keys.push_back(seenKey(domain, path));
+  const std::vector<std::string> args = {std::to_string(kBudgetMax), std::to_string(kWindowS), std::to_string(kDedupeTtlS)};
+  std::vector<std::string> reply;
+  redis.eval(kReserveLua, keys.begin(), keys.end(), args.begin(), args.end(), std::back_inserter(reply));
+  Reservation res;
+  res.allowed = reply[0] == "1";
+  res.remaining = std::stoll(reply[1]);
+  for (size_t i = 0; i < paths.size(); i++) {
+    if (reply[i + 2] == "0") {
+      res.duplicates.push_back(paths[i]);
+    } else if (res.allowed) {
+      res.new_paths.push_back(paths[i]);
     }
-    if (!reservation.new_paths.empty()) provider.SubmitPurge("purge-" + domain, domain, reservation.new_paths);
-    res.status = 202;
-    res.set_content(
-        json{{"domain", domain}, {"submitted", reservation.new_paths}, {"duplicates", reservation.duplicates},
-             {"remaining", reservation.remaining}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+  }
+  if (!res.allowed) res.retry_after = kWindowS - now % kWindowS;  // the seconds until the window resets
+  return res;
 }
 `,
     },
   },
-  hints: [
-    'A deploy pipeline submits the same purge twice and the CDN receives both; a week later every purge for the domain is refused with a bare 429 that nobody can explain.',
-    '`reserve` asks `EXISTS`, then `SET`s with no TTL, then `INCRBY`s the budget from the client; two requests can pass the check before either writes, and `purge:budget:{domain}` has no window and no `EXPIRE`.',
-    'Put the check, `SET … NX EX DEDUPE_TTL_S` and the charge inside `RESERVE_LUA` via `r.eval`; key the budget with `budget_key(domain, window)` plus `EXPIRE WINDOW_S`; on refusal answer 429 with `Retry-After` and `X-Purge-Budget-Remaining`.',
-  ],
-  debrief: `The fix has its shape because a reservation is one decision, and a decision made in two halves is not one. Moving the dedupe check, the \`SET NX EX\` and the budget charge into a single \`EVAL\` lets Redis answer "these paths are new and the domain can afford them" with no other command landing in between, which is what a double-submitted deploy or two replicas would otherwise break. Keying the budget by \`window\` and expiring it with \`WINDOW_S\` gives the counter the same lifetime as the promise it enforces; \`Retry-After\` turns the 429 into a schedule instead of a retry storm.
+  harness: {
+    python: `DOMAIN = "shop.example.com"
+SEEN = f"purge:seen:{DOMAIN}:/pricing"
 
-Production systems load scripts once with \`EVALSHA\`, tune budgets per tenant tier, and put an exhausted window on a dashboard before deploys start being refused.`,
+
+def _settled(probe, what):
+    assert probe.fired, f"nothing touched {what}"
+    if probe.error is not None:
+        raise probe.error
+    return probe.result
+
+
+def _budget_used(ctx):
+    return sum(int(ctx.redis.get(key) or 0) for key in ctx.redis.keys(f"purge:budget:{DOMAIN}*"))
+
+
+def check_atomic_reserve(ctx):
+    m = ctx.load("state")
+    # A second replica reserves the same path right after this reservation's first command on it.
+    rival = ctx.redis_after(SEEN, lambda: m.reserve(DOMAIN, ["/pricing"]))
+    mine = m.reserve(DOMAIN, ["/pricing"])
+    theirs = _settled(rival, SEEN)
+    won = [res for res in (mine, theirs) if "/pricing" in res["new_paths"]]
+    assert len(won) == 1, f"two concurrent reservations of /pricing answered {mine} and {theirs}: {len(won)} of them won the path, so it is purged {len(won)} times. The check and the mark must run in one script"
+    assert _budget_used(ctx) == 1, f"one path reserved once charged the budget {_budget_used(ctx)}"
+
+
+def check_dedupe_window(ctx):
+    m = ctx.load("state")
+    first = m.reserve(DOMAIN, ["/pricing", "/img/logo.png"])
+    assert first["allowed"] and first["new_paths"] == ["/pricing", "/img/logo.png"], f"a first reservation answered {first}"
+    again = m.reserve(DOMAIN, ["/pricing", "/about"])
+    assert again["new_paths"] == ["/about"] and again["duplicates"] == ["/pricing"], f"/pricing again within ten minutes answered {again}: it is a duplicate, /about is new"
+    ttl = ctx.redis.ttl(SEEN)
+    assert 0 < ttl <= 600, f"{SEEN} has TTL {ttl}, expected the 600 s dedupe window: without it a path purged once is a duplicate forever"
+    ctx.clock.advance(601)
+    later = m.reserve(DOMAIN, ["/pricing"])
+    assert later["new_paths"] == ["/pricing"], f"/pricing eleven minutes later answered {later}: the dedupe window is over and the path must be purged again"
+
+
+def check_budget_window(ctx):
+    m = ctx.load("state")
+    full = m.reserve(DOMAIN, [f"/p/{i}" for i in range(1000)])
+    assert full["allowed"] and full["remaining"] == 0, f"1000 new paths in an empty window answered allowed={full['allowed']} remaining={full['remaining']}"
+    refused = m.reserve(DOMAIN, ["/one-more"])
+    expected = 300 - int(ctx.clock.time()) % 300
+    assert not refused["allowed"], f"a path past the budget of 1000 answered {refused}"
+    assert abs(refused["retry_after"] - expected) <= 1, f"retry_after is {refused['retry_after']}, but the window ends in {expected} s: a client told to wait the wrong time retries into another refusal"
+    keys = ctx.redis.keys(f"purge:budget:{DOMAIN}*")
+    assert keys and all(ctx.redis.ttl(key) > 0 for key in keys), f"the budget keys {keys} have TTLs {[ctx.redis.ttl(k) for k in keys]}: a counter without expiry only grows"
+    ctx.clock.advance(expected)
+    after = m.reserve(DOMAIN, ["/one-more"])
+    assert after["allowed"] and after["new_paths"] == ["/one-more"], f"after the window reset the domain was refused again: {after}. The budget key must belong to its window"
+
+
+def check_refusal_clean(ctx):
+    m = ctx.load("state")
+    m.reserve(DOMAIN, [f"/p/{i}" for i in range(999)])
+    refused = m.reserve(DOMAIN, ["/pricing", "/about"])
+    assert not refused["allowed"], f"two new paths with one left in the budget answered {refused}"
+    assert refused["remaining"] == 1, f"the refusal reports remaining {refused['remaining']}: a refused reservation must not spend the budget"
+    assert ctx.redis.exists(SEEN) == 0, "the refused reservation marked /pricing as purged: its retry reports it as a duplicate and the path is never purged"
+    one = m.reserve(DOMAIN, ["/pricing"])
+    assert one["allowed"] and one["new_paths"] == ["/pricing"], f"the one path the budget still holds answered {one}"
+`,
+    typescript: `const DOMAIN = 'shop.example.com';
+const SEEN = \`purge:seen:\${DOMAIN}:/pricing\`;
+
+async function settled(probe, what: string) {
+  assert(probe.fired, \`nothing touched \${what}\`);
+  if (probe.error !== undefined) throw probe.error;
+  return await probe.result;
+}
+
+const budgetUsed = ctx => (ctx.redis.keys(\`purge:budget:\${DOMAIN}*\`) as string[]).reduce((sum, key) => sum + Number(ctx.redis.get(key) ?? 0), 0);
+
+export async function check_atomic_reserve(ctx) {
+  const m = ctx.load('state');
+  // A second replica reserves the same path right after this reservation's first command on it.
+  const rival = ctx.redisAfter(SEEN, () => m.reserve(DOMAIN, ['/pricing']));
+  const mine = await m.reserve(DOMAIN, ['/pricing']);
+  const theirs = await settled(rival, SEEN);
+  const won = [mine, theirs].filter(res => res.new_paths.includes('/pricing'));
+  assert.equal(won.length, 1, \`two concurrent reservations of /pricing answered \${JSON.stringify(mine)} and \${JSON.stringify(theirs)}: \${won.length} of them won the path. The check and the mark must run in one script\`);
+  assert.equal(budgetUsed(ctx), 1, 'one path reserved once must charge the budget once');
+}
+
+export async function check_dedupe_window(ctx) {
+  const m = ctx.load('state');
+  const first = await m.reserve(DOMAIN, ['/pricing', '/img/logo.png']);
+  assert(first.allowed && JSON.stringify(first.new_paths) === JSON.stringify(['/pricing', '/img/logo.png']), \`a first reservation answered \${JSON.stringify(first)}\`);
+  const again = await m.reserve(DOMAIN, ['/pricing', '/about']);
+  assert(JSON.stringify(again.new_paths) === '["/about"]' && JSON.stringify(again.duplicates) === '["/pricing"]', \`/pricing again within ten minutes answered \${JSON.stringify(again)}: it is a duplicate, /about is new\`);
+  const ttl = ctx.redis.ttl(SEEN);
+  assert(0 < ttl && ttl <= 600, \`\${SEEN} has TTL \${ttl}, expected the 600 s dedupe window: without it a path purged once is a duplicate forever\`);
+  ctx.clock.advance(601);
+  const later = await m.reserve(DOMAIN, ['/pricing']);
+  assert.deepEqual(later.new_paths, ['/pricing'], \`/pricing eleven minutes later answered \${JSON.stringify(later)}: the dedupe window is over and the path must be purged again\`);
+}
+
+export async function check_budget_window(ctx) {
+  const m = ctx.load('state');
+  const full = await m.reserve(DOMAIN, Array.from({length: 1000}, (_, i) => \`/p/\${i}\`));
+  assert(full.allowed && full.remaining === 0, \`1000 new paths in an empty window answered allowed=\${full.allowed} remaining=\${full.remaining}\`);
+  const refused = await m.reserve(DOMAIN, ['/one-more']);
+  const expected = 300 - (Math.floor(ctx.clock.now() / 1000) % 300);
+  assert(!refused.allowed, \`a path past the budget of 1000 answered \${JSON.stringify(refused)}\`);
+  assert(Math.abs(refused.retry_after - expected) <= 1, \`retry_after is \${refused.retry_after}, but the window ends in \${expected} s: a client told to wait the wrong time retries into another refusal\`);
+  const keys = ctx.redis.keys(\`purge:budget:\${DOMAIN}*\`) as string[];
+  assert(keys.length > 0 && keys.every(key => ctx.redis.ttl(key) > 0), \`the budget keys \${JSON.stringify(keys)} have no expiry: a counter without one only grows\`);
+  ctx.clock.advance(expected);
+  const after = await m.reserve(DOMAIN, ['/one-more']);
+  assert(after.allowed && JSON.stringify(after.new_paths) === '["/one-more"]', \`after the window reset the domain was refused again: \${JSON.stringify(after)}. The budget key must belong to its window\`);
+}
+
+export async function check_refusal_clean(ctx) {
+  const m = ctx.load('state');
+  await m.reserve(DOMAIN, Array.from({length: 999}, (_, i) => \`/p/\${i}\`));
+  const refused = await m.reserve(DOMAIN, ['/pricing', '/about']);
+  assert(!refused.allowed, \`two new paths with one left in the budget answered \${JSON.stringify(refused)}\`);
+  assert.equal(refused.remaining, 1, \`the refusal reports remaining \${refused.remaining}: a refused reservation must not spend the budget\`);
+  assert.equal(ctx.redis.exists(SEEN), 0, 'the refused reservation marked /pricing as purged: its retry reports it as a duplicate and the path is never purged');
+  const one = await m.reserve(DOMAIN, ['/pricing']);
+  assert(one.allowed && JSON.stringify(one.new_paths) === '["/pricing"]', \`the one path the budget still holds answered \${JSON.stringify(one)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+const stateDomain = "shop.example.com"
+
+var (
+	stateBg   = context.Background()
+	stateSeen = "purge:seen:" + stateDomain + ":/pricing"
+)
+
+func mustReserve(ctx *harness.Ctx, paths []string) Reservation {
+	res, err := reserve(stateBg, stateDomain, paths)
+	ctx.NoError(err, "reserve(%s, %d paths) failed", stateDomain, len(paths))
+	return res
+}
+
+func numberedPaths(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("/p/%d", i)
+	}
+	return out
+}
+
+func budgetUsed(ctx *harness.Ctx) int {
+	used := 0
+	for _, key := range ctx.Redis.Keys("purge:budget:" + stateDomain + "*") {
+		raw, _ := ctx.Redis.Get(key)
+		n, _ := strconv.Atoi(raw)
+		used += n
+	}
+	return used
+}
+
+func CheckAtomicReserve(ctx *harness.Ctx) {
+	// A second replica reserves the same path right after this reservation's first command on it.
+	rival := ctx.Redis.After(stateSeen, func() any {
+		res, err := reserve(stateBg, stateDomain, []string{"/pricing"})
+		ctx.NoError(err, "the rival reservation failed")
+		return res
+	})
+	mine := mustReserve(ctx, []string{"/pricing"})
+	ctx.Assert(rival.Fired, "nothing touched %s", stateSeen)
+	theirs := rival.Result.(Reservation)
+	won := 0
+	for _, res := range []Reservation{mine, theirs} {
+		if fmt.Sprint(res.NewPaths) == "[/pricing]" {
+			won++
+		}
+	}
+	ctx.Assert(won == 1, "two concurrent reservations of /pricing answered %+v and %+v: %d of them won the path. The check and the mark must run in one script", mine, theirs, won)
+	ctx.Equal(budgetUsed(ctx), 1, "one path reserved once must charge the budget once; the budget used")
+}
+
+func CheckDedupeWindow(ctx *harness.Ctx) {
+	first := mustReserve(ctx, []string{"/pricing", "/img/logo.png"})
+	ctx.Assert(first.Allowed && fmt.Sprint(first.NewPaths) == "[/pricing /img/logo.png]", "a first reservation answered %+v", first)
+	again := mustReserve(ctx, []string{"/pricing", "/about"})
+	ctx.Assert(fmt.Sprint(again.NewPaths) == "[/about]" && fmt.Sprint(again.Duplicates) == "[/pricing]", "/pricing again within ten minutes answered %+v: it is a duplicate, /about is new", again)
+	ttl := ctx.Redis.TTL(stateSeen)
+	ctx.Assert(0 < ttl && ttl <= 600, "%s has TTL %d, expected the 600 s dedupe window: without it a path purged once is a duplicate forever", stateSeen, ttl)
+	ctx.Clock.Advance(601)
+	later := mustReserve(ctx, []string{"/pricing"})
+	ctx.Assert(fmt.Sprint(later.NewPaths) == "[/pricing]", "/pricing eleven minutes later answered %+v: the dedupe window is over and the path must be purged again", later)
+}
+
+func CheckBudgetWindow(ctx *harness.Ctx) {
+	full := mustReserve(ctx, numberedPaths(1000))
+	ctx.Assert(full.Allowed && full.Remaining == 0, "1000 new paths in an empty window answered allowed=%v remaining=%d", full.Allowed, full.Remaining)
+	refused := mustReserve(ctx, []string{"/one-more"})
+	expected := 300 - (ctx.Clock.Now()/1000)%300
+	ctx.Assert(!refused.Allowed, "a path past the budget of 1000 answered %+v", refused)
+	diff := refused.RetryAfter - int64(expected)
+	ctx.Assert(diff >= -1 && diff <= 1, "retry_after is %d, but the window ends in %d s: a client told to wait the wrong time retries into another refusal", refused.RetryAfter, expected)
+	keys := ctx.Redis.Keys("purge:budget:" + stateDomain + "*")
+	ctx.Assert(len(keys) > 0, "no budget key was written")
+	for _, key := range keys {
+		ctx.Assert(ctx.Redis.TTL(key) > 0, "the budget key %s has TTL %d: a counter without expiry only grows", key, ctx.Redis.TTL(key))
+	}
+	ctx.Clock.Advance(float64(expected))
+	after := mustReserve(ctx, []string{"/one-more"})
+	ctx.Assert(after.Allowed && fmt.Sprint(after.NewPaths) == "[/one-more]", "after the window reset the domain was refused again: %+v. The budget key must belong to its window", after)
+}
+
+func CheckRefusalClean(ctx *harness.Ctx) {
+	mustReserve(ctx, numberedPaths(999))
+	refused := mustReserve(ctx, []string{"/pricing", "/about"})
+	ctx.Assert(!refused.Allowed, "two new paths with one left in the budget answered %+v", refused)
+	ctx.Equal(refused.Remaining, int64(1), "a refused reservation must not spend the budget; the remaining it reports")
+	ctx.Equal(ctx.Redis.Exists(stateSeen), 0, "the refused reservation marked /pricing as purged: its retry reports it as a duplicate and the path is never purged; the seen key")
+	one := mustReserve(ctx, []string{"/pricing"})
+	ctx.Assert(one.Allowed && fmt.Sprint(one.NewPaths) == "[/pricing]", "the one path the budget still holds answered %+v", one)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cstdlib>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kStateDomain = "shop.example.com";
+const std::string kSeen = "purge:seen:shop.example.com:/pricing";
+
+std::vector<std::string> numberedPaths(int n) {
+  std::vector<std::string> out;
+  for (int i = 0; i < n; i++) out.push_back("/p/" + std::to_string(i));
+  return out;
+}
+
+long long budgetUsed(harness::Ctx& ctx) {
+  long long used = 0;
+  for (const auto& key : ctx.Redis.Keys("purge:budget:" + kStateDomain + "*")) {
+    const auto raw = ctx.Redis.Get(key);
+    if (raw) used += std::stoll(*raw);
+  }
+  return used;
+}
+
+bool only(const std::vector<std::string>& paths, const std::vector<std::string>& want) { return paths == want; }
+
+}  // namespace
+
+void CheckAtomicReserve(harness::Ctx& ctx) {
+  // A second replica reserves the same path right after this reservation's first command on it.
+  auto theirs = std::make_shared<std::optional<Reservation>>();
+  ctx.Redis.After(kSeen, [theirs] { *theirs = reserve(kStateDomain, {"/pricing"}); });
+  const Reservation mine = reserve(kStateDomain, {"/pricing"});
+  ctx.Assert(theirs->has_value(), "nothing touched %s", kSeen);
+  int won = 0;
+  for (const Reservation& res : std::vector<Reservation>{mine, theirs->value()}) {
+    if (only(res.new_paths, {"/pricing"})) won++;
+  }
+  ctx.Assert(won == 1, "two concurrent reservations of /pricing: %d of them won the path, so it is purged %d times. The check and the mark must run in one script", won, won);
+  ctx.Equal(budgetUsed(ctx), 1, "one path reserved once must charge the budget once; the budget used");
+}
+
+void CheckDedupeWindow(harness::Ctx& ctx) {
+  const Reservation first = reserve(kStateDomain, {"/pricing", "/img/logo.png"});
+  ctx.Assert(first.allowed && only(first.new_paths, {"/pricing", "/img/logo.png"}), "a first reservation must find both paths new");
+  const Reservation again = reserve(kStateDomain, {"/pricing", "/about"});
+  ctx.Assert(only(again.new_paths, {"/about"}) && only(again.duplicates, {"/pricing"}), "/pricing again within ten minutes is a duplicate and /about is new; new paths %q, duplicates %q", again.new_paths, again.duplicates);
+  const long long ttl = ctx.Redis.TTL(kSeen);
+  ctx.Assert(0 < ttl && ttl <= 600, "%s has TTL %d, expected the 600 s dedupe window: without it a path purged once is a duplicate forever", kSeen, ttl);
+  ctx.Clock.Advance(601);
+  const Reservation later = reserve(kStateDomain, {"/pricing"});
+  ctx.Assert(only(later.new_paths, {"/pricing"}), "/pricing eleven minutes later answered new paths %q: the dedupe window is over and the path must be purged again", later.new_paths);
+}
+
+void CheckBudgetWindow(harness::Ctx& ctx) {
+  const Reservation full = reserve(kStateDomain, numberedPaths(1000));
+  ctx.Assert(full.allowed && full.remaining == 0, "1000 new paths in an empty window answered allowed=%t remaining=%d", full.allowed, full.remaining);
+  const Reservation refused = reserve(kStateDomain, {"/one-more"});
+  const long long expected = 300 - (ctx.Clock.Now() / 1000) % 300;
+  ctx.Assert(!refused.allowed, "a path past the budget of 1000 was allowed");
+  ctx.Assert(std::llabs(refused.retry_after - expected) <= 1, "retry_after is %d, but the window ends in %d s: a client told to wait the wrong time retries into another refusal", refused.retry_after, expected);
+  const auto keys = ctx.Redis.Keys("purge:budget:" + kStateDomain + "*");
+  ctx.Assert(!keys.empty(), "no budget key was written");
+  for (const auto& key : keys) {
+    ctx.Assert(ctx.Redis.TTL(key) > 0, "the budget key %s has TTL %d: a counter without expiry only grows", key, ctx.Redis.TTL(key));
+  }
+  ctx.Clock.Advance(static_cast<double>(expected));
+  const Reservation after = reserve(kStateDomain, {"/one-more"});
+  ctx.Assert(after.allowed && only(after.new_paths, {"/one-more"}), "after the window reset the domain was refused again (allowed=%t). The budget key must belong to its window", after.allowed);
+}
+
+void CheckRefusalClean(harness::Ctx& ctx) {
+  reserve(kStateDomain, numberedPaths(999));
+  const Reservation refused = reserve(kStateDomain, {"/pricing", "/about"});
+  ctx.Assert(!refused.allowed, "two new paths with one left in the budget were allowed");
+  ctx.Equal(refused.remaining, 1, "a refused reservation must not spend the budget; the remaining it reports");
+  ctx.Equal(ctx.Redis.Exists(kSeen), 0, "the refused reservation marked /pricing as purged: its retry reports it as a duplicate and the path is never purged; the seen key");
+  const Reservation one = reserve(kStateDomain, {"/pricing"});
+  ctx.Assert(one.allowed && only(one.new_paths, {"/pricing"}), "the one path the budget still holds must be reserved (allowed=%t)", one.allowed);
+}
+`,
+  },
+  hints: [
+    'Two replicas submit the same deploy purge and both send `/pricing` to the provider; a week later every purge of the domain is refused; a refused purge retried later reports its paths as duplicates.',
+    '`EXISTS`, `INCRBY` and `SET` are separate round trips, so another reservation lands between them. The `SET` has no `EX`, `purge:budget:{domain}` has no window and no expiry, and the charge and the marks happen before the comparison.',
+    'One `EVAL`: `EXISTS` each key, `GET` the budget, return untouched if the new paths do not fit, else `INCRBY`, `EXPIRE WINDOW_S` on a fresh key, `SET … EX DEDUPE_TTL_S`. Key the budget by `now // WINDOW_S`; `retry_after = WINDOW_S - now % WINDOW_S`.',
+  ],
+  debrief: `A reservation is one decision, and a decision made in several round trips is several decisions another replica can interleave with. Inside \`EVAL\` nothing runs between the existence checks, the budget read and the writes, and because the script returns before writing when the paths do not fit, a refusal leaves nothing behind for the retry to trip over. The window lives in the key name rather than in a sweeper: the next window starts at zero by construction, and the \`EXPIRE\` only reclaims memory. That is also what makes \`retry_after\` exact. Production systems load the script once and call it with \`EVALSHA\`, size budgets per tenant tier, and keep the dedupe key per path short enough that a failed purge can be repeated soon.`,
 };

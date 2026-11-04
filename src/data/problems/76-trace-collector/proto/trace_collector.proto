@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package tracestore;
+
+// The span storage step 3 writes assembled traces to, served by the harness at storage:9000. A
+// trace is durable once Write answers OK. A trace the span schema refuses (a span without a
+// service) is INVALID_ARGUMENT with the reason as the details: sending it again cannot succeed.
+service TraceWriter {
+  rpc Write(WriteRequest) returns (WriteReply);
+}
+
+message Span {
+  string span_id = 1;
+  string parent_span_id = 2;
+  string service = 3;
+  int64 start_ms = 4;
+  int64 duration_ms = 5;
+}
+
+message WriteRequest {
+  string tenant = 1;
+  string trace_id = 2;
+  repeated Span spans = 3;
+  int64 missing = 4;
+}
+
+message WriteReply {
+  int64 stored = 1;
+}

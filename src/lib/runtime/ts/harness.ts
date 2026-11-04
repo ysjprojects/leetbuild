@@ -12,7 +12,8 @@
  *   ctx.dbAfter(pattern, fn) run `fn` right after the first statement containing `pattern`
  *   ctx.kafka                the broker: seed, records, values, keys, lag, commits, committedOffset, onCommit,
  *                            failNext, stall, resume, loseAcks, failover
- *   ctx.grpc                 peers: serve(serviceDef, impl, target?), stop(target), setLatency, fail, callsTo, status
+ *   ctx.grpc                 peers: serve(serviceDef, impl, target?), stop(target), setLatency, fail,
+ *                            clearFailures() (drops every injected failure not yet consumed), callsTo, calls, status
  *   ctx.proto(file)          the course's .proto as `loadPackageDefinition(loadSync(file))`
  *   ctx.clock                advance(seconds), now() in ms, sleeps
  *   ctx.client(app)          in-process HTTP: get/post/put/patch/delete/request → {status, headers, text, json()}
@@ -164,6 +165,7 @@ export class Ctx {
       grpc.REGISTRY.setLatency(method, seconds, target),
     fail: (method: string, code: grpc.StatusCode, details = '', times = 1, target: string | null = null): void =>
       grpc.REGISTRY.fail(method, code, details, times, target),
+    clearFailures: (): void => grpc.REGISTRY.failures.clear(),
     callsTo: (method: string, target: string | null = null): grpc.Call[] => grpc.REGISTRY.callsTo(method, target),
     calls: grpc.REGISTRY.calls,
     status: grpc.status,

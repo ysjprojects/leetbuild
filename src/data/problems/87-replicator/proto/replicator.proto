@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package replicatord;
+
+// The target region's apply endpoint step 3 calls: one change of one shard. The target dedupes by
+// change_id (a change it already applied answers duplicate = true and writes nothing); a change whose
+// shape the target's schema lacks is FAILED_PRECONDITION, with the named diff in the details.
+service TargetRegion {
+  rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeReply);
+}
+
+message ApplyChangeRequest {
+  string replication_id = 1;
+  int32 shard = 2;
+  string change_id = 3;
+  int64 offset = 4;
+  string key = 5;
+  string value = 6;
+}
+
+message ApplyChangeReply {
+  bool duplicate = 1;
+}

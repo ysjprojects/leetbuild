@@ -2,280 +2,222 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/services/{id}/completeness: gaps you can see',
+  title: 'GET /v1/services/{service}/completeness: gaps you can see',
   concept: 'http',
   file: 'read',
   focus: ['dash', 'api', 'ledger'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/services/{service}/completeness\`: it reads the
-tenant header, asks the ledger for the service's all-time \`total_count\`, and returns that total next
-to a global constant \`EXPECTED_PER_HOUR\`. It compiles, the page renders, and it hides four flaws,
-the ones that let the incident review conclude "100 %".
+**Starting point.** The starter serves \`GET /v1/services/{service}/completeness\`: it answers 401
+without \`X-Tenant-Id\`, sums \`ledger.hourly_counts(tenant, service, hours)\` over the 24 complete
+hours before now, and answers \`{service, indexed, expected, complete}\` against a global
+\`EXPECTED_PER_HOUR = 1000\`. It serves the demo and hides four flaws.
 
-- Missing \`X-Tenant-Id\` is **401**.
-- The report is **per hour**: buckets over the last **24 hours** (\`HOUR_MS\`), each with the
-  \`indexed\` count for that tenant's service.
-- Each hour carries an \`expected\` count from **that tenant's own service history**
-  (\`hourly_expectation(tenant, service, hours)\`), not a global average.
-- An hour below its expectation by more than **\`GAP_THRESHOLD\`** is flagged (\`gap\`), and the
-  response counts the flagged hours.
-- A \`service\` outside the caller's registry is **404**.
-- Return the service id, the hours, the gap count and the threshold; never the log text.
+**Failure mode the checks target.** A day with a dead hour sums to a healthy total; one global
+expectation makes a large service look fine at a tenth of its traffic and a small one look broken
+all day; no hour is ever called a gap; and any tenant can read the pipeline of a service it does not
+own.
 
-**Failure mode the checks target.** One number makes a service that indexed ten records in an outage
-hour and a million in a normal hour "look fine"; a global constant makes one tenant's volume every
-tenant's baseline, so genuine drops stop flagging; nothing is marked as a gap; and answering for any
-service id turns the completeness page into an existence oracle for other tenants' pipelines.`,
+- A \`service\` outside the caller's registry (\`registry.is_registered\`) is **404**.
+- \`hours\` lists the 24 complete hours (\`HOUR_S = 3600\`, each by its start in epoch seconds),
+  oldest first, each with its \`indexed\` count.
+- Each hour's \`expected\` is \`ledger.expected_per_hour(tenant, service, hours[0])\`: this service's
+  own mean over the 7 days before the window.
+- An hour whose \`indexed\` is below \`expected × (1 − GAP_THRESHOLD)\`, \`GAP_THRESHOLD = 0.5\`, has
+  \`gap: true\`; the body carries \`gaps\` (how many) and \`threshold\`.`,
   sequence: {
-    participants: ['Completeness UI', 'Ingest API', 'Index ledger'],
+    participants: ['Completeness UI', 'logindex', 'service registry', 'Index ledger'],
     messages: [
       {
         from: 'Completeness UI',
-        to: 'Ingest API',
-        label: 'GET /v1/services/{id}/completeness · X-Tenant-Id',
+        to: 'logindex',
+        label: 'GET /v1/services/checkout/completeness · X-Tenant-Id',
         kind: 'sync',
       },
-      {from: 'Ingest API', to: 'Ingest API', label: 'registry lookup → 404 when foreign', kind: 'sync'},
-      {from: 'Ingest API', to: 'Index ledger', label: 'hourly_counts(tenant, service, 24)', kind: 'sync'},
-      {from: 'Index ledger', to: 'Ingest API', label: 'counts per hour bucket', kind: 'reply'},
-      {from: 'Ingest API', to: 'Ingest API', label: 'expected = tenant history · flag gaps', kind: 'sync'},
-      {from: 'Ingest API', to: 'Completeness UI', label: '200 {hours[], gaps, threshold}', kind: 'reply'},
+      {from: 'logindex', to: 'service registry', label: 'is_registered(tenant, service) → else 404', kind: 'sync'},
+      {from: 'logindex', to: 'Index ledger', label: 'hourly_counts(tenant, service, 24 hours)', kind: 'sync'},
+      {from: 'logindex', to: 'Index ledger', label: 'expected_per_hour(tenant, service, hours[0])', kind: 'sync'},
+      {from: 'logindex', to: 'logindex', label: 'gap: indexed < expected × 0.5', kind: 'sync'},
+      {from: 'logindex', to: 'Completeness UI', label: '200 {hours[24], gaps, threshold}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/services/{id}/completeness',
-      detail: 'Register the completeness route with the service id as a path parameter.',
+      title: 'Answers GET /v1/services/{service}/completeness',
+      detail:
+        'Register the completeness route with the service id as a path parameter; a registered service is **200**.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/services\/\{service\}\/completeness["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/services\/:service\/completeness['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/services\/\{service\}\/completeness"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"services"\s*\/\s*Segment\s*\/\s*"completeness"\s*\)/, /\bget\s*\{/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"services"\s*\/\s*Segment\s*\/\s*"completeness"\s*\)/]},
         cpp: {all: [/svr\.Get\([^;]*completeness/]},
       },
     },
     {
-      id: 'hourly',
-      title: 'Reports indexed counts per hour bucket',
+      id: 'foreign-404',
+      title: "Answers 404 for a service outside the caller's registry",
       detail:
-        'The report buckets by `HOUR_MS` over a 24-hour window, so it shows *when* the pipeline stopped, not only that the total is low. The starter returns one number for the whole window.',
+        "A service the caller's tenant did not register, another tenant's included, is **404**; the starter reports on any service id, which tells a tenant what another tenant runs and how much it logs.",
       match: {
-        python: {all: [/HOUR_MS/, /hour_bucket\(/]},
-        typescript: {all: [/HOUR_MS/, /hourBucket\(/]},
-        go: {all: [/hourMS/, /hourBucket\(/]},
-        scala: {all: [/HourMs/, /hourBucket\(/]},
-        cpp: {all: [/kHourMs/, /hourBucket\(/]},
+        python: {all: [/registry\.is_registered\(/, /\b404\b/]},
+        typescript: {all: [/isRegistered\(/, /code\(\s*404\s*\)/]},
+        go: {all: [/registry\.IsRegistered\(/, /StatusNotFound/]},
+        scala: {all: [/Registry\.isRegistered\(/, /StatusCodes\.NotFound/]},
+        cpp: {all: [/registry::isRegistered\(/, /\b404\b/]},
+      },
+    },
+    {
+      id: 'hourly',
+      title: 'Reports each of the 24 complete hours',
+      detail:
+        '`hours` lists the 24 hours before the current one, oldest first, each with its start and its `indexed` count; the starter answers one sum, in which a dead hour disappears.',
+      match: {
+        python: {all: [/"hours"/, /"hour"/], none: [/sum\(ledger\.hourly_counts/]},
+        typescript: {all: [/hours:/, /hour,/], none: [/\.reduce\(/]},
+        go: {all: [/"hours"/, /json:"hour"/], none: [/total \+=/]},
+        scala: {all: [/"hours"/, /"hour"/], none: [/\.sum\b/]},
+        cpp: {all: [/"hours"/, /"hour"/], none: [/total \+=/]},
       },
     },
     {
       id: 'expectation-per-tenant',
-      title: "Computes the expectation from the tenant's own history",
+      title: "Compares each hour with the service's own baseline",
       detail:
-        'The expected count is read for `(tenant, service)` over the same window, not a global constant or a cross-tenant average. The starter compares every tenant with one global expectation, which hides real drops and invents fake ones.',
+        "`expected` comes from `expected_per_hour(tenant, service, …)`, the service's mean over the 7 days before the window; the starter's global `EXPECTED_PER_HOUR` makes every service's normal look like one tenant's.",
       match: {
-        python: {all: [/hourly_expectation\(tenant,\s*service/]},
-        typescript: {all: [/hourlyExpectation\(tenant,\s*service/]},
-        go: {all: [/HourlyExpectation\(ctx,\s*tenant,\s*service/]},
-        scala: {all: [/hourlyExpectation\(tenant,\s*service/]},
-        cpp: {all: [/hourlyExpectation\(tenant,\s*service/]},
-      },
-    },
-    {
-      id: 'foreign-404',
-      title: "Answers 404 for a service outside the tenant's registry",
-      detail:
-        "A `service` that is not in the caller's registry is **404**. The starter answers for any id, so the completeness page doubles as an existence oracle for other tenants' pipelines.",
-      match: {
-        python: {all: [/status_code\s*=\s*404/, /[Rr]egistry/]},
-        typescript: {all: [/code\(\s*404\s*\)/, /[Rr]egistry/]},
-        go: {all: [/StatusNotFound/, /[Rr]egistry/]},
-        scala: {all: [/StatusCodes\.NotFound/, /[Rr]egistry/]},
-        cpp: {all: [/\b404\b/, /[Rr]egistry/]},
+        python: {all: [/ledger\.expected_per_hour\(tenant,\s*service/], none: [/EXPECTED_PER_HOUR/]},
+        typescript: {all: [/expectedPerHour\(tenant,\s*service/], none: [/EXPECTED_PER_HOUR/]},
+        go: {all: [/ledger\.ExpectedPerHour\(r\.Context\(\),\s*tenant,\s*service/], none: [/expectedPerHour\s*=/]},
+        scala: {all: [/Ledger\.expectedPerHour\(tenant,\s*service/], none: [/ExpectedPerHour\s*=/]},
+        cpp: {all: [/ledger::expectedPerHour\(tenant,\s*service/], none: [/kExpectedPerHour/]},
       },
     },
     {
       id: 'gap-threshold',
-      title: 'Flags hours below the expectation by more than the threshold',
+      title: 'Flags an hour more than half below its baseline',
       detail:
-        'Each hour is marked `gap` when the indexed count falls more than `GAP_THRESHOLD` below its expectation, and the response totals the flagged hours. The starter has no per-hour comparison at all, which is why an outage looked complete.',
+        'An hour below `expected × (1 − GAP_THRESHOLD)` has `gap: true`, and the body counts them in `gaps` next to `threshold`; the starter flags nothing, so a dead hour never shows on the page.',
       match: {
-        python: {all: [/GAP_THRESHOLD/, /"gap"/]},
-        typescript: {all: [/GAP_THRESHOLD/, /\bgap\b/]},
-        go: {all: [/gapThreshold/, /"gap"/]},
-        scala: {all: [/GapThreshold/, /"gap"/]},
-        cpp: {all: [/kGapThreshold/, /"gap"/]},
+        python: {all: [/GAP_THRESHOLD\s*=\s*0\.5/, /"gap"/, /"gaps"/]},
+        typescript: {all: [/GAP_THRESHOLD\s*=\s*0\.5/, /gap:/, /gaps:/]},
+        go: {all: [/gapThreshold\s*=\s*0\.5/, /json:"gap"/, /"gaps"/]},
+        scala: {all: [/GapThreshold\s*=\s*0\.5/, /"gap"/, /"gaps"/]},
+        cpp: {all: [/kGapThreshold\s*=\s*0\.5/, /"gap"/, /"gaps"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""GET /v1/services/{id}/completeness."""
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+      starter: `import time
+
+from fastapi import FastAPI, HTTPException, Request
+
+from logindex import ledger  # ledger.hourly_counts(tenant, service, hours), ledger.expected_per_hour(tenant, service, before)
+from logindex import registry  # registry.is_registered(tenant, service) -> bool
 
 app = FastAPI()
 
+HOUR_S = 3600
+WINDOW_HOURS = 24
 EXPECTED_PER_HOUR = 1000
 
 
-class IndexLedger:
-    def total_count(self, tenant: str, service: str) -> int:
-        """Every record this tenant's service ever indexed."""
-        raise NotImplementedError
-
-
-ledger = IndexLedger()
-
-
 @app.get("/v1/services/{service}/completeness")
-def completeness(service: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    total = ledger.total_count(tenant, service)
-    return JSONResponse({"service": service, "indexed": total, "expected": EXPECTED_PER_HOUR})
+def completeness(service: str, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    current = int(time.time()) // HOUR_S * HOUR_S
+    hours = [current - HOUR_S * (WINDOW_HOURS - i) for i in range(WINDOW_HOURS)]
+    indexed = sum(ledger.hourly_counts(tenant, service, hours))
+    expected = EXPECTED_PER_HOUR * WINDOW_HOURS
+    return {"service": service, "indexed": indexed, "expected": expected, "complete": indexed >= expected}
 `,
-      solution: `"""GET /v1/services/{id}/completeness: hourly indexed counts against a tenanted expectation."""
-import time
+      solution: `import time
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+
+from logindex import ledger  # ledger.hourly_counts(tenant, service, hours), ledger.expected_per_hour(tenant, service, before)
+from logindex import registry  # registry.is_registered(tenant, service) -> bool
 
 app = FastAPI()
 
-HOUR_MS = 60 * 60 * 1000
+HOUR_S = 3600
 WINDOW_HOURS = 24
-GAP_THRESHOLD = 0.5  # an hour under half of its expectation is a gap
-
-
-class ServiceRegistry:
-    def services(self, tenant: str) -> set[str]:
-        """The service ids this tenant has registered."""
-        raise NotImplementedError
-
-
-class IndexLedger:
-    def hourly_counts(self, tenant: str, service: str, hours: int) -> dict[int, int]:
-        """Indexed records per hour bucket for one tenant's service."""
-        raise NotImplementedError
-
-
-class ExpectationStore:
-    def hourly_expectation(self, tenant: str, service: str, hours: int) -> dict[int, int]:
-        """What this tenant's own service normally indexes in an hour."""
-        raise NotImplementedError
-
-
-registry = ServiceRegistry()
-ledger = IndexLedger()
-expectations = ExpectationStore()
-
-
-def hour_bucket(epoch_ms: int) -> int:
-    return epoch_ms // HOUR_MS
+GAP_THRESHOLD = 0.5
 
 
 @app.get("/v1/services/{service}/completeness")
-def completeness(service: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    # A service that is not in the caller's registry is not the caller's to read.
-    if service not in registry.services(tenant):
-        raise HTTPException(status_code=404, detail=f"service '{service}' is not in the tenant registry")
-
-    newest = hour_bucket(int(time.time() * 1000))
-    indexed = ledger.hourly_counts(tenant, service, WINDOW_HOURS)
-    # The expectation comes from this tenant's own service history, never a global average.
-    expected = expectations.hourly_expectation(tenant, service, WINDOW_HOURS)
-
-    hours = []
-    gaps = 0
-    for offset in range(WINDOW_HOURS - 1, -1, -1):
-        bucket = newest - offset
-        count = indexed.get(bucket, 0)
-        want = expected.get(bucket, 0)
-        gap = want > 0 and count < want * (1 - GAP_THRESHOLD)
-        gaps += 1 if gap else 0
-        hours.append({"hour": bucket, "indexed": count, "expected": want, "gap": gap})
-
-    return JSONResponse({"service": service, "hours": hours, "gaps": gaps, "threshold": GAP_THRESHOLD})
+def completeness(service: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    # Another tenant's service is as absent as one that never existed.
+    if not registry.is_registered(tenant, service):
+        raise HTTPException(status_code=404, detail="no such service in the tenant's registry")
+    current = int(time.time()) // HOUR_S * HOUR_S
+    # The complete hours before the current one, oldest first: a partial hour would always look short.
+    hours = [current - HOUR_S * (WINDOW_HOURS - i) for i in range(WINDOW_HOURS)]
+    counts = ledger.hourly_counts(tenant, service, hours)
+    expected = ledger.expected_per_hour(tenant, service, hours[0])
+    buckets = [
+        {"hour": hour, "indexed": count, "expected": expected, "gap": count < expected * (1 - GAP_THRESHOLD)}
+        for hour, count in zip(hours, counts)
+    ]
+    return {"service": service, "hours": buckets, "gaps": sum(1 for b in buckets if b["gap"]), "threshold": GAP_THRESHOLD}
 `,
     },
     typescript: {
-      starter: `/** GET /v1/services/:service/completeness. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {expectedPerHour, hourlyCounts} from 'logindex/ledger'; // hourlyCounts(tenant, service, hours), expectedPerHour(tenant, service, before)
+import {isRegistered} from 'logindex/registry'; // isRegistered(tenant, service) → boolean
 
 export const app = Fastify();
 
+const HOUR_S = 3600;
+const WINDOW_HOURS = 24;
 const EXPECTED_PER_HOUR = 1000;
 
-export interface IndexLedger {
-  totalCount(tenant: string, service: string): Promise<number>;
-}
-
-export const ledger: IndexLedger = {totalCount: async () => 0};
-
 app.get('/v1/services/:service/completeness', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {service} = request.params as {service: string};
-  const tenant = request.headers['x-tenant-id'] as string;
-  const total = await ledger.totalCount(tenant, service);
-  return reply.code(200).send({service, indexed: total, expected: EXPECTED_PER_HOUR});
+  const current = Math.floor(Date.now() / 1000 / HOUR_S) * HOUR_S;
+  const hours = Array.from({length: WINDOW_HOURS}, (_, i) => current - HOUR_S * (WINDOW_HOURS - i));
+  const indexed = (await hourlyCounts(tenant, service, hours)).reduce((sum, n) => sum + n, 0);
+  const expected = EXPECTED_PER_HOUR * WINDOW_HOURS;
+  return {service, indexed, expected, complete: indexed >= expected};
 });
 `,
-      solution: `/** GET /v1/services/:service/completeness: hourly counts against a tenanted expectation. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {expectedPerHour, hourlyCounts} from 'logindex/ledger'; // hourlyCounts(tenant, service, hours), expectedPerHour(tenant, service, before)
+import {isRegistered} from 'logindex/registry'; // isRegistered(tenant, service) → boolean
 
 export const app = Fastify();
 
-const HOUR_MS = 60 * 60 * 1000;
+const HOUR_S = 3600;
 const WINDOW_HOURS = 24;
-const GAP_THRESHOLD = 0.5; // an hour under half of its expectation is a gap
-
-export interface ServiceRegistry {
-  services(tenant: string): Promise<Set<string>>;
-}
-
-export interface IndexLedger {
-  hourlyCounts(tenant: string, service: string, hours: number): Promise<Record<string, number>>;
-}
-
-export interface ExpectationStore {
-  hourlyExpectation(tenant: string, service: string, hours: number): Promise<Record<string, number>>;
-}
-
-export const registry: ServiceRegistry = {services: async () => new Set<string>()};
-export const ledger: IndexLedger = {hourlyCounts: async () => ({})};
-export const expectations: ExpectationStore = {hourlyExpectation: async () => ({})};
-
-const hourBucket = (epochMs: number): number => Math.floor(epochMs / HOUR_MS);
+export const GAP_THRESHOLD = 0.5;
 
 app.get('/v1/services/:service/completeness', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {service} = request.params as {service: string};
-
-  // A service that is not in the caller's registry is not the caller's to read.
-  const registered = await registry.services(tenant);
-  if (!registered.has(service))
-    return reply.code(404).send({error: \`service '\${service}' is not in the tenant registry\`});
-
-  const newest = hourBucket(Date.now());
-  const indexed = await ledger.hourlyCounts(tenant, service, WINDOW_HOURS);
-  // The expectation comes from this tenant's own service history, never a global average.
-  const expected = await expectations.hourlyExpectation(tenant, service, WINDOW_HOURS);
-
-  const hours: {hour: number; indexed: number; expected: number; gap: boolean}[] = [];
-  let gaps = 0;
-  for (let offset = WINDOW_HOURS - 1; offset >= 0; offset--) {
-    const bucket = newest - offset;
-    const count = indexed[String(bucket)] ?? 0;
-    const want = expected[String(bucket)] ?? 0;
-    const gap = want > 0 && count < want * (1 - GAP_THRESHOLD);
-    if (gap) gaps += 1;
-    hours.push({hour: bucket, indexed: count, expected: want, gap});
-  }
-  return reply.code(200).send({service, hours, gaps, threshold: GAP_THRESHOLD});
+  // Another tenant's service is as absent as one that never existed.
+  if (!(await isRegistered(tenant, service))) return reply.code(404).send({error: "no such service in the tenant's registry"});
+  const current = Math.floor(Date.now() / 1000 / HOUR_S) * HOUR_S;
+  // The complete hours before the current one, oldest first: a partial hour would always look short.
+  const hours = Array.from({length: WINDOW_HOURS}, (_, i) => current - HOUR_S * (WINDOW_HOURS - i));
+  const counts = await hourlyCounts(tenant, service, hours);
+  const expected = await expectedPerHour(tenant, service, hours[0]);
+  const buckets = hours.map((hour, i) => ({hour, indexed: counts[i], expected, gap: counts[i] < expected * (1 - GAP_THRESHOLD)}));
+  return {service, hours: buckets, gaps: buckets.filter(b => b.gap).length, threshold: GAP_THRESHOLD};
 });
 `,
     },
@@ -283,229 +225,215 @@ app.get('/v1/services/:service/completeness', async (request, reply) => {
       starter: `package main
 
 import (
-	"context"
+	"encoding/json"
 	"net/http"
+	"time"
+
+	"logindex/ledger" // ledger.HourlyCounts(ctx, tenant, service, hours), ledger.ExpectedPerHour(ctx, tenant, service, before)
+	// registry.IsRegistered(ctx, tenant, service) (bool, error) is in "logindex/registry"
 )
 
-const expectedPerHour = 1000
+const (
+	hourS           = 3600
+	windowHours     = 24
+	expectedPerHour = 1000
+)
 
-type IndexLedger struct{}
-
-func (l *IndexLedger) TotalCount(ctx context.Context, tenant, service string) (int64, error) {
-	return 0, nil
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
-
-var ledger = &IndexLedger{}
 
 func completeness(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
+		return
+	}
 	service := r.PathValue("service")
-	total, _ := ledger.TotalCount(r.Context(), tenant, service)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"service":  service,
-		"indexed":  total,
-		"expected": expectedPerHour,
-	})
+	current := time.Now().Unix() / hourS * hourS
+	hours := make([]int64, windowHours)
+	for i := range hours {
+		hours[i] = current - hourS*int64(windowHours-i)
+	}
+	counts, err := ledger.HourlyCounts(r.Context(), tenant, service, hours)
+	if err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	var total int64
+	for _, n := range counts {
+		total += n
+	}
+	expected := int64(expectedPerHour * windowHours)
+	writeJSON(rw, http.StatusOK, map[string]any{"service": service, "indexed": total, "expected": expected, "complete": total >= expected})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/services/{service}/completeness", completeness)
-	_ = http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux)
 }
 `,
       solution: `package main
 
 import (
-	"context"
+	"encoding/json"
 	"net/http"
 	"time"
+
+	"logindex/ledger"   // ledger.HourlyCounts(ctx, tenant, service, hours), ledger.ExpectedPerHour(ctx, tenant, service, before)
+	"logindex/registry" // registry.IsRegistered(ctx, tenant, service) (bool, error)
 )
 
 const (
-	hourMS       = 60 * 60 * 1000
+	hourS        = 3600
 	windowHours  = 24
 	gapThreshold = 0.5
 )
 
-type ServiceRegistry struct{}
-
-func (s *ServiceRegistry) Services(ctx context.Context, tenant string) (map[string]bool, error) {
-	return nil, nil
+type bucket struct {
+	Hour     int64 \`json:"hour"\`
+	Indexed  int64 \`json:"indexed"\`
+	Expected int64 \`json:"expected"\`
+	Gap      bool  \`json:"gap"\`
 }
 
-type IndexLedger struct{}
-
-func (l *IndexLedger) HourlyCounts(ctx context.Context, tenant, service string, hours int) (map[int64]int64, error) {
-	return nil, nil
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
-
-type ExpectationStore struct{}
-
-func (e *ExpectationStore) HourlyExpectation(ctx context.Context, tenant, service string, hours int) (map[int64]int64, error) {
-	return nil, nil
-}
-
-var (
-	registry     = &ServiceRegistry{}
-	ledger       = &IndexLedger{}
-	expectations = &ExpectationStore{}
-)
-
-func hourBucket(epochMS int64) int64 { return epochMS / hourMS }
 
 func completeness(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
 	service := r.PathValue("service")
-	ctx := r.Context()
-
-	// A service that is not in the caller's registry is not the caller's to read.
-	registered, err := registry.Services(ctx, tenant)
+	known, err := registry.IsRegistered(r.Context(), tenant, service)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "registry unavailable"})
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	if !registered[service] {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "service is not in the tenant registry"})
+	// Another tenant's service is as absent as one that never existed.
+	if !known {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such service in the tenant's registry"})
 		return
 	}
-
-	newest := hourBucket(time.Now().UnixMilli())
-	indexed, err := ledger.HourlyCounts(ctx, tenant, service, windowHours)
+	current := time.Now().Unix() / hourS * hourS
+	// The complete hours before the current one, oldest first: a partial hour would always look short.
+	hours := make([]int64, windowHours)
+	for i := range hours {
+		hours[i] = current - hourS*int64(windowHours-i)
+	}
+	counts, err := ledger.HourlyCounts(r.Context(), tenant, service, hours)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "ledger unavailable"})
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	// The expectation comes from this tenant's own service history, never a global average.
-	expected, err := expectations.HourlyExpectation(ctx, tenant, service, windowHours)
+	expected, err := ledger.ExpectedPerHour(r.Context(), tenant, service, hours[0])
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "expectation unavailable"})
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-
-	hours := make([]map[string]any, 0, windowHours)
+	buckets := make([]bucket, len(hours))
 	gaps := 0
-	for offset := windowHours - 1; offset >= 0; offset-- {
-		bucket := newest - int64(offset)
-		count := indexed[bucket]
-		want := expected[bucket]
-		gap := want > 0 && float64(count) < float64(want)*(1-gapThreshold)
+	for i, hour := range hours {
+		gap := float64(counts[i]) < float64(expected)*(1-gapThreshold)
 		if gap {
 			gaps++
 		}
-		hours = append(hours, map[string]any{"hour": bucket, "indexed": count, "expected": want, "gap": gap})
+		buckets[i] = bucket{Hour: hour, Indexed: counts[i], Expected: expected, Gap: gap}
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"service":   service,
-		"hours":     hours,
-		"gaps":      gaps,
-		"threshold": gapThreshold,
-	})
+	writeJSON(rw, http.StatusOK, map[string]any{"service": service, "hours": buckets, "gaps": gaps, "threshold": gapThreshold})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/services/{service}/completeness", completeness)
-	_ = http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import java.time.Instant
+
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
+
+import logindex.Ledger   // Ledger.hourlyCounts(tenant, service, hours), Ledger.expectedPerHour(tenant, service, before)
+import logindex.Registry // Registry.isRegistered(tenant, service): Boolean
 
 object Read {
-  implicit val system: ActorSystem = ActorSystem("log-indexer")
-
+  val HourS = 3600L
+  val WindowHours = 24
   val ExpectedPerHour = 1000L
-  val ledger = IndexLedger.open()
 
-  val route: Route =
-    path("v1" / "services" / Segment / "completeness") { service =>
-      get {
-        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-        val total = ledger.totalCount(service)
-        complete(StatusCodes.OK, s"""{"service":"$service","indexed":$total,"expected":$ExpectedPerHour}""")
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  def completeness(tenant: String, service: String): HttpResponse = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val current = Instant.now().getEpochSecond / HourS * HourS
+    val hours = (0 until WindowHours).map(i => current - HourS * (WindowHours - i))
+    val indexed = Ledger.hourlyCounts(tenant, service, hours).sum
+    val expected = ExpectedPerHour * WindowHours
+    json(StatusCodes.OK, JsObject("service" -> JsString(service), "indexed" -> JsNumber(indexed), "expected" -> JsNumber(expected), "complete" -> JsBoolean(indexed >= expected)))
+  }
+
+  val route: Route = path("v1" / "services" / Segment / "completeness") { service =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
+        case Some(tenant) => complete(completeness(tenant, service))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import java.time.Instant
+
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-final case class HourBucket(bucket: Long, count: Long, want: Long, gap: Boolean)
+import logindex.Ledger   // Ledger.hourlyCounts(tenant, service, hours), Ledger.expectedPerHour(tenant, service, before)
+import logindex.Registry // Registry.isRegistered(tenant, service): Boolean
 
 object Read {
-  implicit val system: ActorSystem = ActorSystem("log-indexer")
-
-  val HourMs = 60 * 60 * 1000L
+  val HourS = 3600L
   val WindowHours = 24
   val GapThreshold = 0.5
 
-  val registry = ServiceRegistry.open()
-  val ledger = IndexLedger.open()
-  val expectations = ExpectationStore.open()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def hourBucket(epochMs: Long): Long = epochMs / HourMs
-
-  val route: Route =
-    path("v1" / "services" / Segment / "completeness") { service =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          val tenant = tenantOpt.getOrElse("")
-          if (tenant.isEmpty) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else if (!registry.services(tenant).contains(service)) {
-            // A service that is not in the caller's registry is not the caller's to read.
-            complete(StatusCodes.NotFound, """{"error":"service is not in the tenant registry"}""")
-          } else {
-            val newest = hourBucket(System.currentTimeMillis())
-            val indexed = ledger.hourlyCounts(tenant, service, WindowHours)
-            // The expectation comes from this tenant's own service history, never a global average.
-            val expected = expectations.hourlyExpectation(tenant, service, WindowHours)
-            val hours = (WindowHours - 1 to 0 by -1).map { offset =>
-              val bucket = newest - offset
-              val count = indexed.getOrElse(bucket, 0L)
-              val want = expected.getOrElse(bucket, 0L)
-              val gap = want > 0 && count < (want * (1 - GapThreshold)).toLong
-              HourBucket(bucket, count, want, gap)
-            }.toList
-            val gapCount = hours.count(_.gap)
-            val hourJson = hours
-              .map { entry =>
-                val b = entry.bucket
-                val indexed = entry.count
-                val want = entry.want
-                val gap = entry.gap
-                s"""{"hour":$b,"indexed":$indexed,"expected":$want,"gap":$gap}"""
-              }
-              .mkString(",")
-            complete(
-              StatusCodes.OK,
-              s"""{"service":"$service","hours":[$hourJson],"gaps":$gapCount,"threshold":$GapThreshold}"""
-            )
-          }
-        }
+  def completeness(tenant: String, service: String): HttpResponse =
+    // Another tenant's service is as absent as one that never existed.
+    if (!Registry.isRegistered(tenant, service)) json(StatusCodes.NotFound, JsObject("error" -> JsString("no such service in the tenant's registry")))
+    else {
+      val current = Instant.now().getEpochSecond / HourS * HourS
+      // The complete hours before the current one, oldest first: a partial hour would always look short.
+      val hours = (0 until WindowHours).map(i => current - HourS * (WindowHours - i))
+      val counts = Ledger.hourlyCounts(tenant, service, hours)
+      val expected = Ledger.expectedPerHour(tenant, service, hours.head)
+      val buckets = hours.zip(counts).map { case (hour, count) =>
+        JsObject("hour" -> JsNumber(hour), "indexed" -> JsNumber(count), "expected" -> JsNumber(expected), "gap" -> JsBoolean(count < expected * (1 - GapThreshold)))
       }
+      val gaps = buckets.count(_.fields("gap") == JsTrue)
+      json(StatusCodes.OK, JsObject("service" -> JsString(service), "hours" -> JsArray(buckets.toVector), "gaps" -> JsNumber(gaps), "threshold" -> JsNumber(GapThreshold)))
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  val route: Route = path("v1" / "services" / Segment / "completeness") { service =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
+        case Some(tenant) => complete(completeness(tenant, service))
+      }
+    }
   }
 }
 `,
@@ -514,120 +442,544 @@ object Read {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <string>
+#include <vector>
+
+#include "logindex/ledger.h"    // ledger::hourlyCounts(tenant, service, hours), ledger::expectedPerHour(tenant, service, before)
+#include "logindex/registry.h"  // registry::isRegistered(tenant, service) -> bool
 
 using json = nlohmann::json;
 
+constexpr long long kHourS = 3600;
+constexpr int kWindowHours = 24;
 constexpr long long kExpectedPerHour = 1000;
 
-struct IndexLedger {
-  long long totalCount(const std::string& tenant, const std::string& service);
-};
-
-IndexLedger ledger;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/services/([^/]+)/completeness)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto service = req.matches[1].str();
-    const auto total = ledger.totalCount(tenant, service);
-    res.status = 200;
-    res.set_content(
-        json{{"service", service}, {"indexed", total}, {"expected", kExpectedPerHour}}.dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+void completeness(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "X-Tenant-Id is required"}});
+  const std::string service = req.matches[1];
+  const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const long long current = now / kHourS * kHourS;
+  std::vector<long long> hours;
+  for (int i = 0; i < kWindowHours; i++) hours.push_back(current - kHourS * (kWindowHours - i));
+  long long total = 0;
+  for (long long n : ledger::hourlyCounts(tenant, service, hours)) total += n;
+  const long long expected = kExpectedPerHour * kWindowHours;
+  reply(res, 200, {{"service", service}, {"indexed", total}, {"expected", expected}, {"complete", total >= expected}});
+}
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/services/([\\w.-]+)/completeness)", completeness); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
-#include <map>
-#include <set>
 #include <string>
+#include <vector>
+
+#include "logindex/ledger.h"    // ledger::hourlyCounts(tenant, service, hours), ledger::expectedPerHour(tenant, service, before)
+#include "logindex/registry.h"  // registry::isRegistered(tenant, service) -> bool
 
 using json = nlohmann::json;
 
-constexpr long long kHourMs = 60 * 60 * 1000;
+constexpr long long kHourS = 3600;
 constexpr int kWindowHours = 24;
 constexpr double kGapThreshold = 0.5;
 
-struct ServiceRegistry {
-  std::set<std::string> services(const std::string& tenant);
-};
-
-struct IndexLedger {
-  std::map<long long, long long> hourlyCounts(const std::string& tenant, const std::string& service, int hours);
-};
-
-struct ExpectationStore {
-  std::map<long long, long long> hourlyExpectation(const std::string& tenant, const std::string& service, int hours);
-};
-
-ServiceRegistry registry;
-IndexLedger ledger;
-ExpectationStore expectations;
-
-long long hourBucket(long long epochMs) { return epochMs / kHourMs; }
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/services/([^/]+)/completeness)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto service = req.matches[1].str();
-
-    // A service that is not in the caller's registry is not the caller's to read.
-    const auto registered = registry.services(tenant);
-    if (registered.count(service) == 0) {
-      res.status = 404;
-      res.set_content(R"({"error":"service is not in the tenant registry"})", "application/json");
-      return;
-    }
-
-    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-    const auto newest = hourBucket(now);
-    const auto indexed = ledger.hourlyCounts(tenant, service, kWindowHours);
-    // The expectation comes from this tenant's own service history, never a global average.
-    const auto expected = expectations.hourlyExpectation(tenant, service, kWindowHours);
-
-    json hours = json::array();
-    int gaps = 0;
-    for (int offset = kWindowHours - 1; offset >= 0; offset--) {
-      const long long bucket = newest - offset;
-      const auto count = indexed.count(bucket) > 0 ? indexed.at(bucket) : 0;
-      const auto want = expected.count(bucket) > 0 ? expected.at(bucket) : 0;
-      const bool gap = want > 0 && static_cast<double>(count) < static_cast<double>(want) * (1 - kGapThreshold);
-      if (gap) gaps += 1;
-      hours.push_back(json{{"hour", bucket}, {"indexed", count}, {"expected", want}, {"gap", gap}});
-    }
-    res.status = 200;
-    res.set_content(
-        json{{"service", service}, {"hours", hours}, {"gaps", gaps}, {"threshold", kGapThreshold}}.dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+void completeness(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "X-Tenant-Id is required"}});
+  const std::string service = req.matches[1];
+  // Another tenant's service is as absent as one that never existed.
+  if (!registry::isRegistered(tenant, service)) return reply(res, 404, {{"error", "no such service in the tenant's registry"}});
+  const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const long long current = now / kHourS * kHourS;
+  // The complete hours before the current one, oldest first: a partial hour would always look short.
+  std::vector<long long> hours;
+  for (int i = 0; i < kWindowHours; i++) hours.push_back(current - kHourS * (kWindowHours - i));
+  const std::vector<long long> counts = ledger::hourlyCounts(tenant, service, hours);
+  const long long expected = ledger::expectedPerHour(tenant, service, hours.front());
+  json buckets = json::array();
+  int gaps = 0;
+  for (size_t i = 0; i < hours.size(); i++) {
+    const bool gap = static_cast<double>(counts[i]) < static_cast<double>(expected) * (1 - kGapThreshold);
+    gaps += gap;
+    buckets.push_back({{"hour", hours[i]}, {"indexed", counts[i]}, {"expected", expected}, {"gap", gap}});
+  }
+  reply(res, 200, {{"service", service}, {"hours", buckets}, {"gaps", gaps}, {"threshold", kGapThreshold}});
+}
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/services/([\\w.-]+)/completeness)", completeness); }
 `,
     },
   },
+  harness: {
+    python: `import time
+
+from logindex import ledger, registry
+
+HOUR = 3600
+# Window hours (by index) that differ from the baseline.
+ACME = {5: 3000, 9: 6000, 20: 0}
+GLOBEX = {3: 8}
+
+
+def _window():
+    current = int(time.time()) // HOUR * HOUR
+    return [current - HOUR * (24 - i) for i in range(24)]
+
+
+def _api(ctx):
+    m = ctx.load("read")
+    registry.add_service("acme", "checkout")
+    registry.add_service("globex", "checkout")
+    registry.add_service("globex", "search")
+    hours = _window()
+    for i in range(1, 169):
+        ledger.record_indexed("acme", "checkout", hours[0] - HOUR * i, 10000)
+        ledger.record_indexed("globex", "checkout", hours[0] - HOUR * i, 10)
+    for i, hour in enumerate(hours):
+        ledger.record_indexed("acme", "checkout", hour, ACME.get(i, 10000))
+        ledger.record_indexed("globex", "checkout", hour, GLOBEX.get(i, 10))
+    ledger.record_indexed("acme", "checkout", hours[-1] + HOUR, 40)  # the current hour, still filling
+    return ctx.client(m.app), hours
+
+
+async def _get(c, service, tenant="acme"):
+    return await c.get(f"/v1/services/{service}/completeness", headers={"X-Tenant-Id": tenant} if tenant else {})
+
+
+async def _report(c, service="checkout", tenant="acme"):
+    r = await _get(c, service, tenant)
+    assert r.status_code == 200, f"{tenant}'s completeness of {service} answered {r.status_code}: {r.text}"
+    return r.json()
+
+
+def _buckets(body):
+    hours = body.get("hours")
+    assert isinstance(hours, list) and len(hours) == 24, f"the report must list the 24 complete hours, got hours {hours!r} in {body}"
+    return hours
+
+
+async def check_route(ctx):
+    c, _ = _api(ctx)
+    async with c:
+        body = await _report(c)
+    assert body.get("service") == "checkout", f"the report must name the service, got {body}"
+
+
+async def check_foreign_404(ctx):
+    c, _ = _api(ctx)
+    async with c:
+        anonymous = await _get(c, "checkout", tenant=None)
+        foreign = await _get(c, "search")
+        unknown = await _get(c, "chekout")
+        own = await _get(c, "checkout")
+    assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert foreign.status_code == 404, f"acme reading search, a service only globex registered, answered {foreign.status_code}: {foreign.text}. Another tenant's pipeline must be 404"
+    assert unknown.status_code == 404, f"a service nobody registered answered {unknown.status_code}, expected 404"
+    assert own.status_code == 200, f"acme reading its own checkout answered {own.status_code}: {own.text}"
+
+
+async def check_hourly(ctx):
+    c, hours = _api(ctx)
+    async with c:
+        buckets = _buckets(await _report(c))
+    assert [b.get("hour") for b in buckets] == hours, f"the hours must be the 24 complete hours before now, oldest first, by their start in epoch seconds: expected {hours[0]} … {hours[-1]}, got {buckets[0].get('hour')} … {buckets[-1].get('hour')}"
+    want = [ACME.get(i, 10000) for i in range(24)]
+    assert [b.get("indexed") for b in buckets] == want, f"each hour must carry its indexed count from the ledger: expected {want}, got {[b.get('indexed') for b in buckets]}"
+
+
+async def check_expectation_per_tenant(ctx):
+    c, _ = _api(ctx)
+    async with c:
+        acme = _buckets(await _report(c))
+        globex = _buckets(await _report(c, tenant="globex"))
+    assert {b.get("expected") for b in acme} == {10000}, f"acme's checkout indexed 10000 an hour all week, its hours expect {sorted({b.get('expected') for b in acme})}: the baseline is the service's own history"
+    assert {b.get("expected") for b in globex} == {10}, f"globex's checkout indexed 10 an hour all week, its hours expect {sorted({b.get('expected') for b in globex})}: one tenant's volume is not another's baseline"
+
+
+async def check_gap_threshold(ctx):
+    c, _ = _api(ctx)
+    async with c:
+        acme = await _report(c)
+        globex = await _report(c, tenant="globex")
+    flagged = [i for i, b in enumerate(_buckets(acme)) if b.get("gap") is True]
+    assert flagged == [5, 20], f"against a baseline of 10000, the hours with 3000 and 0 are gaps and the one with 6000 is not; flagged hours {flagged}, expected [5, 20]"
+    assert acme.get("gaps") == 2 and acme.get("threshold") == 0.5, f"the report must count its gaps (2) and carry the threshold (0.5), got gaps {acme.get('gaps')!r}, threshold {acme.get('threshold')!r}"
+    quiet = [i for i, b in enumerate(_buckets(globex)) if b.get("gap") is not False]
+    assert quiet == [] and globex.get("gaps") == 0, f"globex's checkout at 10 an hour (8 once) against its baseline of 10 has no gap, the report flags hours {quiet}"
+`,
+    typescript: `const HOUR = 3600;
+const ACME: Record<number, number> = {5: 3000, 9: 6000, 20: 0};
+const GLOBEX: Record<number, number> = {3: 8};
+
+async function api(ctx) {
+  const m = ctx.load('read');
+  const registry = ctx.load('/support/logindex/registry.ts');
+  const ledger = ctx.load('/support/logindex/ledger.ts');
+  await registry.addService('acme', 'checkout');
+  await registry.addService('globex', 'checkout');
+  await registry.addService('globex', 'search');
+  const current = Math.floor(ctx.clock.now() / 1000 / HOUR) * HOUR;
+  const hours = Array.from({length: 24}, (_, i) => current - HOUR * (24 - i));
+  for (let i = 1; i <= 168; i += 1) {
+    await ledger.recordIndexed('acme', 'checkout', hours[0] - HOUR * i, 10000);
+    await ledger.recordIndexed('globex', 'checkout', hours[0] - HOUR * i, 10);
+  }
+  for (let i = 0; i < 24; i += 1) {
+    await ledger.recordIndexed('acme', 'checkout', hours[i], ACME[i] ?? 10000);
+    await ledger.recordIndexed('globex', 'checkout', hours[i], GLOBEX[i] ?? 10);
+  }
+  await ledger.recordIndexed('acme', 'checkout', current, 40); // the current hour, still filling
+  return {c: ctx.client(m.app), hours};
+}
+
+const get = (c, service: string, tenant: string | null = 'acme') =>
+  c.get(\`/v1/services/\${service}/completeness\`, {headers: tenant === null ? {} : {'X-Tenant-Id': tenant}});
+
+async function report(c, service = 'checkout', tenant = 'acme') {
+  const r = await get(c, service, tenant);
+  assert.equal(r.status, 200, \`\${tenant}'s completeness of \${service} answered \${r.status}: \${r.text}\`);
+  return r.json();
+}
+
+function buckets(body) {
+  assert(Array.isArray(body.hours) && body.hours.length === 24, \`the report must list the 24 complete hours, got \${JSON.stringify(body)}\`);
+  return body.hours;
+}
+
+export async function check_route(ctx) {
+  const {c} = await api(ctx);
+  const body = await report(c);
+  assert.equal(body.service, 'checkout', \`the report must name the service, got \${JSON.stringify(body)}\`);
+}
+
+export async function check_foreign_404(ctx) {
+  const {c} = await api(ctx);
+  const anonymous = await get(c, 'checkout', null);
+  const foreign = await get(c, 'search');
+  const unknown = await get(c, 'chekout');
+  const own = await get(c, 'checkout');
+  assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(foreign.status, 404, \`acme reading search, a service only globex registered, answered \${foreign.status}: \${foreign.text}. Another tenant's pipeline must be 404\`);
+  assert.equal(unknown.status, 404, \`a service nobody registered answered \${unknown.status}, expected 404\`);
+  assert.equal(own.status, 200, \`acme reading its own checkout answered \${own.status}: \${own.text}\`);
+}
+
+export async function check_hourly(ctx) {
+  const {c, hours} = await api(ctx);
+  const b = buckets(await report(c));
+  assert.deepStrictEqual(b.map(x => x.hour), hours, \`the hours must be the 24 complete hours before now, oldest first, by their start in epoch seconds: expected \${hours[0]} … \${hours[23]}, got \${b[0].hour} … \${b[23].hour}\`);
+  const want = Array.from({length: 24}, (_, i) => ACME[i] ?? 10000);
+  assert.deepStrictEqual(b.map(x => x.indexed), want, \`each hour must carry its indexed count from the ledger: expected \${JSON.stringify(want)}, got \${JSON.stringify(b.map(x => x.indexed))}\`);
+}
+
+export async function check_expectation_per_tenant(ctx) {
+  const {c} = await api(ctx);
+  const acme = [...new Set(buckets(await report(c)).map(x => x.expected))];
+  const globex = [...new Set(buckets(await report(c, 'checkout', 'globex')).map(x => x.expected))];
+  assert.deepStrictEqual(acme, [10000], \`acme's checkout indexed 10000 an hour all week, its hours expect \${JSON.stringify(acme)}: the baseline is the service's own history\`);
+  assert.deepStrictEqual(globex, [10], \`globex's checkout indexed 10 an hour all week, its hours expect \${JSON.stringify(globex)}: one tenant's volume is not another's baseline\`);
+}
+
+export async function check_gap_threshold(ctx) {
+  const {c} = await api(ctx);
+  const acme = await report(c);
+  const globex = await report(c, 'checkout', 'globex');
+  const flagged = buckets(acme).flatMap((x, i) => (x.gap === true ? [i] : []));
+  assert.deepStrictEqual(flagged, [5, 20], \`against a baseline of 10000, the hours with 3000 and 0 are gaps and the one with 6000 is not; flagged hours \${JSON.stringify(flagged)}, expected [5, 20]\`);
+  assert(acme.gaps === 2 && acme.threshold === 0.5, \`the report must count its gaps (2) and carry the threshold (0.5), got gaps \${acme.gaps}, threshold \${acme.threshold}\`);
+  const quiet = buckets(globex).flatMap((x, i) => (x.gap !== false ? [i] : []));
+  assert(quiet.length === 0 && globex.gaps === 0, \`globex's checkout at 10 an hour (8 once) against its baseline of 10 has no gap, the report flags hours \${JSON.stringify(quiet)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	"logindex/ledger"
+	"logindex/registry"
+
+	"leetbuild/harness"
+)
+
+const readHour = 3600
+
+var (
+	readBg     = context.Background()
+	readAcme   = map[int]int64{5: 3000, 9: 6000, 20: 0}
+	readGlobex = map[int]int64{3: 8}
+)
+
+type readBucket struct {
+	Hour     int64 \`json:"hour"\`
+	Indexed  int64 \`json:"indexed"\`
+	Expected int64 \`json:"expected"\`
+	Gap      *bool \`json:"gap"\`
+}
+
+type readReport struct {
+	Service   string       \`json:"service"\`
+	Hours     []readBucket \`json:"hours"\`
+	Gaps      *int         \`json:"gaps"\`
+	Threshold *float64     \`json:"threshold"\`
+}
+
+func countOr(m map[int]int64, i int, fallback int64) int64 {
+	if n, ok := m[i]; ok {
+		return n
+	}
+	return fallback
+}
+
+func readAPI(ctx *harness.Ctx) (*harness.HTTP, []int64) {
+	registry.AddService(readBg, "acme", "checkout")
+	registry.AddService(readBg, "globex", "checkout")
+	registry.AddService(readBg, "globex", "search")
+	current := ctx.Clock.Now() / 1000 / readHour * readHour
+	hours := make([]int64, 24)
+	for i := range hours {
+		hours[i] = current - readHour*int64(24-i)
+	}
+	for i := int64(1); i <= 168; i++ {
+		ledger.RecordIndexed(readBg, "acme", "checkout", hours[0]-readHour*i, 10000)
+		ledger.RecordIndexed(readBg, "globex", "checkout", hours[0]-readHour*i, 10)
+	}
+	for i, hour := range hours {
+		ledger.RecordIndexed(readBg, "acme", "checkout", hour, countOr(readAcme, i, 10000))
+		ledger.RecordIndexed(readBg, "globex", "checkout", hour, countOr(readGlobex, i, 10))
+	}
+	ledger.RecordIndexed(readBg, "acme", "checkout", current, 40) // the current hour, still filling
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux), hours
+}
+
+func getReport(c *harness.HTTP, service, tenant string) *harness.Response {
+	if tenant == "" {
+		return c.Get("/v1/services/" + service + "/completeness")
+	}
+	return c.Get("/v1/services/"+service+"/completeness", "X-Tenant-Id", tenant)
+}
+
+func mustReport(ctx *harness.Ctx, c *harness.HTTP, tenant string) readReport {
+	r := getReport(c, "checkout", tenant)
+	ctx.Equal(r.Status, 200, "%s's completeness of checkout (%s)", tenant, r.Text())
+	var body readReport
+	json.Unmarshal(r.Body, &body)
+	ctx.Assert(len(body.Hours) == 24, "the report must list the 24 complete hours, got %s", r.Text())
+	return body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c, _ := readAPI(ctx)
+	r := getReport(c, "checkout", "acme")
+	ctx.Equal(r.Status, 200, "acme's completeness of checkout (%s)", r.Text())
+	var body readReport
+	json.Unmarshal(r.Body, &body)
+	ctx.Equal(body.Service, "checkout", "the report must name the service")
+}
+
+func CheckForeign404(ctx *harness.Ctx) {
+	c, _ := readAPI(ctx)
+	ctx.Equal(getReport(c, "checkout", "").Status, 401, "a read without X-Tenant-Id")
+	foreign := getReport(c, "search", "acme")
+	ctx.Equal(foreign.Status, 404, "acme reading search, a service only globex registered, must be 404 (%s); another tenant's pipeline", foreign.Text())
+	ctx.Equal(getReport(c, "chekout", "acme").Status, 404, "a service nobody registered")
+	ctx.Equal(getReport(c, "checkout", "acme").Status, 200, "acme reading its own checkout")
+}
+
+func CheckHourly(ctx *harness.Ctx) {
+	c, hours := readAPI(ctx)
+	body := mustReport(ctx, c, "acme")
+	got := make([]int64, 24)
+	indexed := make([]int64, 24)
+	want := make([]int64, 24)
+	for i, b := range body.Hours {
+		got[i] = b.Hour
+		indexed[i] = b.Indexed
+		want[i] = countOr(readAcme, i, 10000)
+	}
+	ctx.Equal(got, hours, "the hours must be the 24 complete hours before now, oldest first, by their start in epoch seconds")
+	ctx.Equal(indexed, want, "each hour must carry its indexed count from the ledger")
+}
+
+func CheckExpectationPerTenant(ctx *harness.Ctx) {
+	c, _ := readAPI(ctx)
+	for _, tc := range []struct {
+		tenant string
+		want   int64
+	}{{"acme", 10000}, {"globex", 10}} {
+		for _, b := range mustReport(ctx, c, tc.tenant).Hours {
+			ctx.Equal(b.Expected, tc.want, "%s's checkout indexed %d an hour all week: the baseline is the service's own history; an hour's expected", tc.tenant, tc.want)
+		}
+	}
+}
+
+func CheckGapThreshold(ctx *harness.Ctx) {
+	c, _ := readAPI(ctx)
+	acme := mustReport(ctx, c, "acme")
+	flagged := []int{}
+	for i, b := range acme.Hours {
+		if b.Gap != nil && *b.Gap {
+			flagged = append(flagged, i)
+		}
+	}
+	ctx.Equal(flagged, []int{5, 20}, "against a baseline of 10000, the hours with 3000 and 0 are gaps and the one with 6000 is not; the flagged hours")
+	ctx.Assert(acme.Gaps != nil && *acme.Gaps == 2 && acme.Threshold != nil && *acme.Threshold == 0.5, "the report must count its gaps (2) and carry the threshold (0.5)")
+	globex := mustReport(ctx, c, "globex")
+	quiet := []int{}
+	for i, b := range globex.Hours {
+		if b.Gap == nil || *b.Gap {
+			quiet = append(quiet, i)
+		}
+	}
+	ctx.Assert(len(quiet) == 0 && globex.Gaps != nil && *globex.Gaps == 0, "globex's checkout at 10 an hour (8 once) against its baseline of 10 has no gap, the report flags hours %v", quiet)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
+
+#include "logindex/ledger.h"
+#include "logindex/registry.h"
+
+using json = nlohmann::json;
+
+namespace {
+
+constexpr long long kHour = 3600;
+const std::map<int, long long> kAcme = {{5, 3000}, {9, 6000}, {20, 0}};
+const std::map<int, long long> kGlobex = {{3, 8}};
+
+long long countOr(const std::map<int, long long>& m, int i, long long fallback) { return m.count(i) ? m.at(i) : fallback; }
+
+std::vector<long long> window(harness::Ctx& ctx) {
+  const long long current = ctx.Clock.Now() / 1000 / kHour * kHour;
+  std::vector<long long> hours;
+  for (int i = 0; i < 24; i++) hours.push_back(current - kHour * (24 - i));
+  return hours;
+}
+
+harness::HTTP readAPI(harness::Ctx& ctx) {
+  registry::addService("acme", "checkout");
+  registry::addService("globex", "checkout");
+  registry::addService("globex", "search");
+  const auto hours = window(ctx);
+  for (long long i = 1; i <= 168; i++) {
+    ledger::recordIndexed("acme", "checkout", hours[0] - kHour * i, 10000);
+    ledger::recordIndexed("globex", "checkout", hours[0] - kHour * i, 10);
+  }
+  for (int i = 0; i < 24; i++) {
+    ledger::recordIndexed("acme", "checkout", hours[i], countOr(kAcme, i, 10000));
+    ledger::recordIndexed("globex", "checkout", hours[i], countOr(kGlobex, i, 10));
+  }
+  ledger::recordIndexed("acme", "checkout", hours.back() + kHour, 40);  // the current hour, still filling
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response getReport(harness::HTTP& c, const std::string& service, const std::string& tenant) {
+  if (tenant.empty()) return c.Get("/v1/services/" + service + "/completeness");
+  return c.Get("/v1/services/" + service + "/completeness", "X-Tenant-Id", tenant);
+}
+
+json mustReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& tenant) {
+  const auto r = getReport(c, "checkout", tenant);
+  ctx.Equal(r.Status, 200, "%s's completeness of checkout (%s)", tenant, r.Text());
+  const json body = json::parse(r.Text(), nullptr, false);
+  ctx.Assert(body.is_object() && body.contains("hours") && body["hours"].is_array() && body["hours"].size() == 24, "the report must list the 24 complete hours, got %s", r.Text());
+  return body;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  const auto r = getReport(c, "checkout", "acme");
+  ctx.Equal(r.Status, 200, "acme's completeness of checkout (%s)", r.Text());
+  const json body = json::parse(r.Text(), nullptr, false);
+  ctx.Equal(body.is_object() ? body.value("service", "") : std::string(), "checkout", "the report must name the service");
+}
+
+void CheckForeign404(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  ctx.Equal(getReport(c, "checkout", "").Status, 401, "a read without X-Tenant-Id");
+  const auto foreign = getReport(c, "search", "acme");
+  ctx.Equal(foreign.Status, 404, "acme reading search, a service only globex registered, must be 404 (%s); another tenant's pipeline", foreign.Text());
+  ctx.Equal(getReport(c, "chekout", "acme").Status, 404, "a service nobody registered");
+  ctx.Equal(getReport(c, "checkout", "acme").Status, 200, "acme reading its own checkout");
+}
+
+void CheckHourly(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  const auto hours = window(ctx);
+  const json body = mustReport(ctx, c, "acme");
+  std::vector<long long> got, indexed, want;
+  for (int i = 0; i < 24; i++) {
+    got.push_back(body["hours"][i].value("hour", 0LL));
+    indexed.push_back(body["hours"][i].value("indexed", -1LL));
+    want.push_back(countOr(kAcme, i, 10000));
+  }
+  ctx.Equal(got, hours, "the hours must be the 24 complete hours before now, oldest first, by their start in epoch seconds");
+  ctx.Equal(indexed, want, "each hour must carry its indexed count from the ledger");
+}
+
+void CheckExpectationPerTenant(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  for (const auto& [tenant, expected] : std::vector<std::pair<std::string, long long>>{{"acme", 10000}, {"globex", 10}}) {
+    for (const auto& b : mustReport(ctx, c, tenant)["hours"]) {
+      ctx.Equal(b.value("expected", -1LL), expected, "%s's checkout indexed %d an hour all week: the baseline is the service's own history; an hour's expected", tenant, expected);
+    }
+  }
+}
+
+void CheckGapThreshold(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  const json acme = mustReport(ctx, c, "acme");
+  std::vector<int> flagged;
+  for (int i = 0; i < 24; i++) {
+    const json& b = acme["hours"][i];
+    if (b.contains("gap") && b["gap"].is_boolean() && b["gap"].get<bool>()) flagged.push_back(i);
+  }
+  ctx.Equal(flagged, {5, 20}, "against a baseline of 10000, the hours with 3000 and 0 are gaps and the one with 6000 is not; the flagged hours");
+  ctx.Assert(acme.value("gaps", -1) == 2 && acme.value("threshold", -1.0) == 0.5, "the report must count its gaps (2) and carry the threshold (0.5), got %s", acme.dump().substr(0, 200));
+  const json globex = mustReport(ctx, c, "globex");
+  std::vector<int> quiet;
+  for (int i = 0; i < 24; i++) {
+    const json& b = globex["hours"][i];
+    if (!(b.contains("gap") && b["gap"].is_boolean() && !b["gap"].get<bool>())) quiet.push_back(i);
+  }
+  ctx.Assert(quiet.empty() && globex.value("gaps", -1) == 0, "globex's checkout at 10 an hour (8 once) against its baseline of 10 has no gap, the report flags hours %v", quiet);
+}
+`,
+  },
   hints: [
-    "A service that shipped nothing for six hours shows `indexed: 2400000, expected: 1000` and reads as healthy; a GET for a competitor's service id returns 200 with their count.",
-    'The handler calls `total_count` once, so time is collapsed into one number; `EXPECTED_PER_HOUR` is a constant shared by every tenant; the service id is used without a registry lookup, so any id is answered.',
-    'Look the service up in the registry and answer 404 when absent; build 24 `hour_bucket` windows of `HOUR_MS`, read `hourly_expectation(tenant, service, hours)`, and mark `"gap"` where indexed falls below expected by more than `GAP_THRESHOLD`.',
+    "Zero one hour of checkout's ledger: the report still reads close to complete. Ask for a service another tenant registered: it answers, with that tenant's volume. Nothing on the page ever says gap.",
+    'The handler sums the 24 hours into one number and compares it with `EXPECTED_PER_HOUR × 24`, the same for every service of every tenant, and it never asks the registry whether the caller owns the service.',
+    'Return 404 unless `registry.is_registered(tenant, service)`; build one bucket per hour from `hourly_counts` with `expected = expected_per_hour(tenant, service, hours[0])` and `gap = indexed < expected * (1 - GAP_THRESHOLD)`; return `hours`, `gaps` and `threshold`.',
   ],
-  debrief: `The report is a list of buckets rather than a total because a total answers "how much" and hides "when", and "when" is the only question an operator has during an outage. The expectation is per tenant and per service because a shared baseline makes a quiet tenant look broken and a broken tenant look fine. The threshold turns the comparison into a signal instead of a judgement made by eye. The 404 scopes the read to the caller's registry like every other read, because a completeness page that answers for any id leaks which pipelines exist and how healthy they are. Production platforms go further: retention and sampling context per hour, an explicit "expected from N days of history" note, anomaly detection on the bucket series, and an alert on the gap count rather than a page someone has to open.`,
+  debrief: `Completeness is a comparison, so both sides have to belong to the service: its own hours against its own week, which is why the baseline is read for the tenant and the service and why a missing hour has to stay its own bucket instead of vanishing into a sum. The window stops at the last complete hour, because the current one is always short. The 404 for another tenant's service keeps the page from telling one tenant what another runs. A production report would weight the baseline by hour of day and day of week, since nightly traffic is not daytime traffic, and would page someone on the first gap rather than wait for the page to be opened.`,
 };

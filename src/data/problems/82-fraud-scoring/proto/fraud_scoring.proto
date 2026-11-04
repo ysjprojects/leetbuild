@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package fraudscore;
+
+// The fraud model the scorer asks for a risk score (step 3 builds the client): one score per
+// feature vector, in [0, 1]. INVALID_ARGUMENT means the vector is malformed (a feature_version the
+// model was not trained on) and will be rejected the same way on every attempt; UNAVAILABLE and
+// DEADLINE_EXCEEDED say nothing about the vector.
+service Model {
+  rpc Score(ScoreRequest) returns (ScoreReply);
+}
+
+// The server-derived feature vector (fraud.features.derive_features).
+message ScoreRequest {
+  string feature_version = 1;
+  int64 account_age_days = 2;
+  int64 prior_chargebacks = 3;
+  int64 amount_cents = 4;
+}
+
+message ScoreReply {
+  double score = 1;
+  string model_version = 2;
+}

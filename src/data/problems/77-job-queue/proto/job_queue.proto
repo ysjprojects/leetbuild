@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package jobqueue;
+
+// The executor a worker hands a claimed job to (step 3): it runs the job's side effect once per
+// call. UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED and ABORTED mean "try again later";
+// INVALID_ARGUMENT, FAILED_PRECONDITION, PERMISSION_DENIED and NOT_FOUND mean the job as written
+// will not succeed.
+service JobRunner {
+  rpc Execute(ExecuteRequest) returns (ExecuteReply);
+}
+
+message ExecuteRequest {
+  string job_id = 1;
+  string job_type = 2;
+  // The job's payload as JSON.
+  string payload = 3;
+  // 1 for the first attempt, counted across every worker that ran the job.
+  int32 attempt = 4;
+}
+
+message ExecuteReply {
+  string result = 1;
+}

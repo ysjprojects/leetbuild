@@ -2,145 +2,94 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis exception and expansion caches per calendar',
+  title: 'A generation-stamped expansion cache in Redis',
   concept: 'redis',
   file: 'state',
-  focus: ['api', 'redis', 'store'],
+  focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/calendars/{id}/occurrences\` and
-\`POST /v1/calendars/{id}/exceptions\`: it lists the calendar's events, expands each one, memoises
-the expansion in Redis under the event id and drops the instances the caller has cancelled. It
-compiles, serves the demo, and hides five flaws.
+**Starting point.** The starter is the expansion cache every read goes through.
+\`cached_expansion(calendar_id, start, end)\` reads \`gen:{calendar}\`, answers the slice
+\`exp:{calendar}:{generation}\` when it is there, and otherwise expands every event with \`expand\`, lays
+\`exceptions:{calendar}\` over the result with \`apply_exceptions\` and caches it.
+\`bump_generation(calendar_id)\` is the \`INCR\` every write calls, and \`record_exception(calendar_id,
+occurrence_id, value)\` bumps the generation and then writes the exception. It serves the demo and
+hides four flaws.
 
-**Failure mode the checks target.** A cache keyed by event id cannot distinguish ranges or
-generations, so a modification invalidates nothing. An overlay applied in a second command after
-the expansion is read lets a cancellation land between the two, and that reader ships the
-cancelled occurrence. A key with no TTL outlives the events it came from.
+**Failure mode the checks target.** A week view and the next week of one calendar, a slice nobody
+reads again, a reader landing between the two commands of a change, and an instance that was moved
+or cancelled.
 
-- Slices are cached per **\`(calendar, range, generation)\`** under
-  \`exp:{calendar}:{start}:{end}:{generation}\`; nothing else may key an expansion.
-- Every key expires: the slice with \`EXPIRE ... EXPANSION_TTL_S\`, the exceptions hash with
-  \`EXPIRE ... EXCEPTION_TTL_S\`.
-- The read path resolves the current generation, reads the slice of **that** generation and
-  overlays the exceptions hash in one Lua \`EVAL\`: a \`cancelled\` instance is dropped, a moved
-  instance serves its overridden start, and the answer stamps the generation it was served under,
-  even when the slice was populated on a miss.
-- Every change bumps the generation first (\`INCR gen:{calendar}\`), drops every
-  \`exp:{calendar}:*\` slice of the old generations, then writes the exception, so one bump
-  invalidates all range slices at once.`,
+- A slice is \`exp:{calendar}:{generation}:{start}:{end}\`: each window has its own, and one bump
+  retires them all.
+- Every slice expires after \`EXPANSION_TTL_S = 300\` seconds.
+- \`record_exception\` writes the exception first and bumps second, so a reader that sees the new
+  generation also sees the exception.
+- \`"cancelled"\` drops the occurrence; \`"moved:{ISO start}"\` lists it once, under the same occurrence
+  id, at its new start with its length kept.`,
   sequence: {
-    participants: ['Calendar client', 'Calendar API', 'Redis', 'Expansion worker'],
+    participants: ['Calendar API', 'Redis'],
     messages: [
-      {
-        from: 'Calendar client',
-        to: 'Calendar API',
-        label: 'POST /v1/calendars/{id}/exceptions · instance moved or cancelled',
-        kind: 'sync',
-      },
-      {
-        from: 'Calendar API',
-        to: 'Redis',
-        label: 'INCR gen:{id} · SCAN+DEL exp:{id}:* · HSET exc:{id} · EXPIRE EXCEPTION_TTL_S',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Calendar API', label: 'generation N+1', kind: 'reply'},
-      {
-        from: 'Calendar client',
-        to: 'Calendar API',
-        label: 'GET /v1/calendars/{id}/occurrences?start · end',
-        kind: 'sync',
-      },
-      {
-        from: 'Calendar API',
-        to: 'Redis',
-        label: 'EVAL read · gen:{id} · exp:{id}:{start}:{end}:{gen} · exc:{id}',
-        kind: 'sync',
-      },
-      {
-        from: 'Redis',
-        to: 'Calendar API',
-        label: '{generation, occurrences} — cancelled dropped, moved overridden',
-        kind: 'reply',
-      },
-      {
-        from: 'Calendar API',
-        to: 'Expansion worker',
-        label: 'expand(calendar, range) only on a slice miss',
-        kind: 'sync',
-      },
-      {
-        from: 'Expansion worker',
-        to: 'Redis',
-        label: 'HSET exp:{id}:{start}:{end}:{gen} · EXPIRE EXPANSION_TTL_S',
-        kind: 'async',
-      },
+      {from: 'Calendar API', to: 'Redis', label: 'GET gen:{cal}', kind: 'sync'},
+      {from: 'Calendar API', to: 'Redis', label: 'GET exp:{cal}:{gen}:{start}:{end}', kind: 'sync'},
+      {from: 'Redis', to: 'Calendar API', label: 'slice · or miss', kind: 'reply'},
+      {from: 'Calendar API', to: 'Redis', label: 'miss: events · exceptions:{cal}', kind: 'sync'},
+      {from: 'Calendar API', to: 'Calendar API', label: 'expand · drop cancelled · move in place', kind: 'sync'},
+      {from: 'Calendar API', to: 'Redis', label: 'SET slice EX 300', kind: 'async'},
+      {from: 'Calendar API', to: 'Redis', label: 'change: HSET exceptions, then INCR gen', kind: 'async'},
     ],
   },
   checks: [
     {
       id: 'range-key',
-      title: 'Keys slices by (calendar, range, generation)',
+      title: 'Caches one slice per window',
       detail:
-        'The slice key is built from the calendar, the requested range and the generation (`EXPANSION_KEY` plus `expansion_key(calendar, start, end, generation)`). The starter keys by event id alone, so every range shares one slice and a new generation has nothing to point at.',
+        'The week of 2 March and the week of 9 March of one calendar answer their own occurrences. The starter keys the slice by calendar and generation only, so the second week is answered with the first.',
       match: {
-        python: {all: [/EXPANSION_KEY = "exp:\{calendar\}:\{start\}:\{end\}:\{generation\}"/, /def expansion_key\(/]},
-        typescript: {all: [/EXPANSION_KEY = 'exp'/, /function expansionKey\(/, /\$\{generation\}/]},
-        go: {all: [/expansionKeyFormat/, /"exp:%s:%s:%s:%s"/, /func expansionKey\(/]},
-        scala: {all: [/ExpansionKey = "exp:%s:%s:%s:%s"/, /def expansionKey\(/]},
-        cpp: {all: [/kExpansionKeyFormat/, /expansionKey\(/]},
-      },
-    },
-    {
-      id: 'generation-sweep',
-      title: 'One bump drops every range slice',
-      detail:
-        'Invalidation is an `INCR` of the per-calendar generation plus a scan/delete across the `exp:{calendar}:*` prefix, so every slice of the old generations dies with one bump. The starter deletes only the single slice it happens to know about.',
-      match: {
-        python: {all: [/def invalidate_calendar\(/, /\.incr\(/, /scan_iter\(/, /\.delete\(/]},
-        typescript: {all: [/function invalidateCalendar\(/, /\.incr\(/, /scanStream\(/, /\.del\(/]},
-        go: {all: [/func invalidateCalendar\(/, /\.Incr\(/, /\.Scan\(/, /\.Del\(/]},
-        scala: {all: [/def invalidateCalendar\(/, /\.incr\(/, /\.scan\(/, /\.del\(/]},
-        cpp: {all: [/invalidateCalendar\(/, /\.incr\(/, /\.scan\(/, /\.del\(/]},
-      },
-    },
-    {
-      id: 'atomic-overlay',
-      title: 'Overlays exceptions in the same EVAL',
-      detail:
-        'One Lua `EVAL` reads the generation, the slice of that generation and the exceptions hash, drops `cancelled` instances and lets a moved instance override its start. The starter reads the expansion, then applies the exception in a second command, so a cancellation written mid-read is missed.',
-      match: {
-        python: {all: [/READ_LUA/, /\.eval\(/, /HGETALL/, /'cancelled'/]},
-        typescript: {all: [/READ_LUA/, /\.eval\(/, /HGETALL/, /'cancelled'/]},
-        go: {all: [/readScript/, /\.Run\(/, /HGETALL/, /'cancelled'/]},
-        scala: {all: [/ReadLua/, /\.eval\(/, /HGETALL/, /'cancelled'/]},
-        cpp: {all: [/kReadLua/, /\.eval</, /HGETALL/, /'cancelled'/]},
+        python: {all: [/slice_key\(\s*[\w.]+\s*,\s*[\w.()]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
+        typescript: {all: [/sliceKey\(\s*[\w.]+\s*,\s*[\w.()\s]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
+        go: {all: [/sliceKey\(\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
+        scala: {all: [/sliceKey\(\s*\w+\s*,\s*[\w()]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
+        cpp: {all: [/sliceKey\(\s*\w+\s*,\s*[\w()]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
       },
     },
     {
       id: 'ttl',
-      title: 'Expansion and exception keys expire',
+      title: 'Expires every slice after 300 seconds',
       detail:
-        'The slice is written with `EXPIRE ... EXPANSION_TTL_S` and the overlay with `EXPIRE ... EXCEPTION_TTL_S`, so no cache entry outlives the change that produced it. The starter sets no expiry at all.',
+        'A cached slice carries a TTL of at most 300 s and is gone 301 s later. The starter writes slices that never expire, so every retired generation stays in memory.',
       match: {
-        python: {all: [/EXPANSION_TTL_S/, /EXCEPTION_TTL_S/, /\.expire\(/]},
-        typescript: {all: [/EXPANSION_TTL_S/, /EXCEPTION_TTL_S/, /\.expire\(/]},
-        go: {all: [/expansionTTLS/, /exceptionTTLS/, /\.Expire\(/]},
-        scala: {all: [/ExpansionTtlS/, /ExceptionTtlS/, /\.expire\(/]},
-        cpp: {all: [/kExpansionTtlS/, /kExceptionTtlS/, /\.expire\(/]},
+        python: {all: [/\bex\s*=\s*(EXPANSION_TTL_S|300)\b|setex\(/]},
+        typescript: {all: [/['"]EX['"]\s*,\s*(EXPANSION_TTL_S|300)\b/]},
+        go: {all: [/rdb\.Set\([^\n]*,\s*(expansionTTL|300\s*\*\s*time\.Second)\s*\)/]},
+        scala: {all: [/setex\([^\n]*(ExpansionTtlS|300)/]},
+        cpp: {all: [/\.set\([^\n]*(kExpansionTtl|std::chrono::seconds[({]\s*300)/]},
       },
     },
     {
-      id: 'generation-bump',
-      title: 'Bumps the generation before the write',
+      id: 'write-then-bump',
+      title: 'Writes the exception before bumping the generation',
       detail:
-        'Every change `INCR`s the per-calendar generation before the new exception is written, and the read answer carries the generation it was served under. The starter writes the exception with no generation at all, so nothing orders a reader against a writer.',
+        'At the instant `gen:{calendar}` moves, the exception is already in `exceptions:{calendar}`. The starter bumps first, so a reader in between expands the old calendar and caches it under the new generation for the whole TTL.',
       match: {
-        python: {order: [/\.incr\(/, /\.hset\(/], all: [/"generation": generation/]},
-        typescript: {order: [/\.incr\(/, /\.hset\(/], all: [/\{generation, occurrences\}/]},
-        go: {order: [/\.Incr\(/, /\.HSet\(/], all: [/"generation": generation/]},
-        scala: {order: [/\.incr\(/, /\.hset\(/], all: [/"generation":\$generation/]},
-        cpp: {order: [/\.incr\(/, /\.hset\(/], all: [/\{"generation", generation\}/]},
+        python: {order: [/def record_exception\(/, /store\.put_exception\(/, /bump_generation\(/]},
+        typescript: {order: [/function recordException\(/, /store\.putException\(/, /bumpGeneration\(/]},
+        go: {order: [/func recordException\(/, /store\.PutException\(/, /bumpGeneration\(/]},
+        scala: {order: [/def recordException\(/, /Store\.putException\(/, /bumpGeneration\(/]},
+        cpp: {order: [/void recordException\(/, /store::PutException\(/, /bumpGeneration\(/]},
+      },
+    },
+    {
+      id: 'exceptions',
+      title: 'Drops cancelled instances and moves moved ones in place',
+      detail:
+        'A cancelled occurrence is not listed; a moved one is listed once, at its new start and end, under its occurrence id. The starter ignores cancellations and lists a moved instance twice: at its old time and at its new one.',
+      match: {
+        python: {all: [/==\s*["']cancelled["']/], none: [/\.append\(\s*moved\s*\)/]},
+        typescript: {all: [/===\s*['"]cancelled['"]/], none: [/\.push\(\s*moved\s*\)/]},
+        go: {all: [/==\s*"cancelled"/], none: [/append\(\s*applied\s*,\s*moved\s*\)/]},
+        scala: {all: [/==\s*"cancelled"/], none: [/\+=\s*moved\b/]},
+        cpp: {all: [/==\s*"cancelled"/], none: [/push_back\(\s*moved\s*\)/]},
       },
     },
   ],
@@ -149,337 +98,247 @@ cancelled occurrence. A key with no TTL outlives the events it came from.
       starter: `import json
 
 import redis
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
 
-app = FastAPI()
+from calendard.rrule import expand, format_instant, parse_instant
+from calendard.store import store
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-class EventStore:
-    def list_events(self, calendar: str) -> list[dict]:
-        """The events whose rules can expand into the requested range."""
-        raise NotImplementedError
+def generation_key(calendar_id: str) -> str:
+    return f"gen:{calendar_id}"
 
 
-store = EventStore()
+def slice_key(calendar_id: str, generation: int) -> str:
+    return f"exp:{calendar_id}:{generation}"
 
 
-def expand_event(event: dict, start: str, end: str) -> list[dict]:
-    """RRULE expansion for one event; instances look like {"instance_id": ..., "start": ...}."""
-    raise NotImplementedError
+def current_generation(calendar_id: str) -> int:
+    return int(r.get(generation_key(calendar_id)) or 0)
 
 
-@app.get("/v1/calendars/{calendar}/occurrences")
-def read_occurrences(calendar: str, start: str = Query(), end: str = Query()) -> dict:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    occurrences: list[dict] = []
-    for event in store.list_events(calendar):
-        key = f"expansion:{event['id']}"
-        cached = r.get(key)
-        if cached is None:
-            cached = json.dumps(expand_event(event, start, end))
-            r.set(key, cached)
-        occurrences.extend(json.loads(cached))
-    exceptions = r.hgetall(f"exceptions:{calendar}")
-    return {"occurrences": [o for o in occurrences if o["instance_id"] not in exceptions]}
+def bump_generation(calendar_id: str) -> int:
+    """A change to the calendar: every slice cached under the old generation stops being read."""
+    return r.incr(generation_key(calendar_id))
 
 
-class ExceptionBody(BaseModel):
-    instance_id: str
-    event_id: str
-    status: str
-    new_start: str | None = None
+def apply_exceptions(occurrences: list[dict], exceptions: dict[str, str]) -> list[dict]:
+    """Lay the calendar's instance exceptions over its expansion."""
+    applied = []
+    for occurrence in occurrences:
+        applied.append(occurrence)
+        value = exceptions.get(occurrence["occurrence_id"], "")
+        if value.startswith("moved:"):
+            start = parse_instant(value[len("moved:"):])
+            length = parse_instant(occurrence["end"]) - parse_instant(occurrence["start"])
+            moved = {**occurrence, "start": format_instant(start), "end": format_instant(start + length)}
+            applied.append(moved)
+    return applied
 
 
-@app.post("/v1/calendars/{calendar}/exceptions")
-def apply_exception(calendar: str, body: ExceptionBody) -> dict:
-    r.delete(f"expansion:{body.event_id}")
-    r.hset(f"exceptions:{calendar}", body.instance_id, body.status)
-    return {"ok": True}
+def cached_expansion(calendar_id: str, start: int, end: int) -> list[dict]:
+    """The calendar's occurrences overlapping [start, end), exceptions applied, earliest first."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    key = slice_key(calendar_id, current_generation(calendar_id))
+    hit = r.get(key)
+    if hit is not None:
+        return json.loads(hit)
+    occurrences = [o for event in store.list_events(calendar_id) for o in expand(event, start, end)]
+    occurrences = apply_exceptions(occurrences, store.get_exceptions(calendar_id))
+    occurrences.sort(key=lambda o: (o["start"], o["occurrence_id"]))
+    r.set(key, json.dumps(occurrences))
+    return occurrences
+
+
+def record_exception(calendar_id: str, occurrence_id: str, value: str) -> None:
+    """Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence."""
+    bump_generation(calendar_id)
+    store.put_exception(calendar_id, occurrence_id, value)
 `,
-      solution: `import redis
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
+      solution: `import json
 
-app = FastAPI()
+import redis
+
+from calendard.rrule import expand, format_instant, parse_instant
+from calendard.store import store
+
+EXPANSION_TTL_S = 300
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-EXPANSION_KEY = "exp:{calendar}:{start}:{end}:{generation}"
-EXCEPTION_KEY = "exc:{calendar}"
-GENERATION_KEY = "gen:{calendar}"
-EXPANSION_TTL_S = 600
-EXCEPTION_TTL_S = 900
 
-READ_LUA = """
-local generation = redis.call('GET', KEYS[1]) or '0'
-local expansion = ARGV[1] .. generation
-local out = {generation, redis.call('EXISTS', expansion)}
-local occurrences = redis.call('HGETALL', expansion)
-local exceptions = redis.call('HGETALL', KEYS[2])
-local overlay = {}
-for i = 1, #exceptions, 2 do
-  overlay[exceptions[i]] = exceptions[i + 1]
-end
-for i = 1, #occurrences, 2 do
-  local state = overlay[occurrences[i]]
-  if state ~= 'cancelled' then
-    out[#out + 1] = occurrences[i]
-    out[#out + 1] = state or occurrences[i + 1]
-  end
-end
-return out
-"""
+def generation_key(calendar_id: str) -> str:
+    return f"gen:{calendar_id}"
 
 
-class EventStore:
-    def list_events(self, calendar: str) -> list[dict]:
-        """The events whose rules can expand into the requested range."""
-        raise NotImplementedError
+def slice_key(calendar_id: str, generation: int, start: int, end: int) -> str:
+    """One slice per window and generation: a bump retires every window at once."""
+    return f"exp:{calendar_id}:{generation}:{start}:{end}"
 
 
-store = EventStore()
+def current_generation(calendar_id: str) -> int:
+    return int(r.get(generation_key(calendar_id)) or 0)
 
 
-def expand_events(events: list[dict], start: str, end: str) -> list[dict]:
-    """RRULE expansion; instances look like {"instance_id": ..., "start": ...}."""
-    raise NotImplementedError
+def bump_generation(calendar_id: str) -> int:
+    """A change to the calendar: every slice cached under the old generation stops being read."""
+    return r.incr(generation_key(calendar_id))
 
 
-def expansion_key(calendar: str, start: str, end: str, generation: str) -> str:
-    return EXPANSION_KEY.format(calendar=calendar, start=start, end=end, generation=generation)
+def apply_exceptions(occurrences: list[dict], exceptions: dict[str, str]) -> list[dict]:
+    """A cancelled occurrence is dropped; a moved one is the same occurrence at its new start, listed once."""
+    applied = []
+    for occurrence in occurrences:
+        value = exceptions.get(occurrence["occurrence_id"], "")
+        if value == "cancelled":
+            continue
+        if value.startswith("moved:"):
+            start = parse_instant(value[len("moved:"):])
+            length = parse_instant(occurrence["end"]) - parse_instant(occurrence["start"])
+            occurrence = {**occurrence, "start": format_instant(start), "end": format_instant(start + length)}
+        applied.append(occurrence)
+    return applied
 
 
-def exception_key(calendar: str) -> str:
-    return EXCEPTION_KEY.format(calendar=calendar)
+def cached_expansion(calendar_id: str, start: int, end: int) -> list[dict]:
+    """The calendar's occurrences overlapping [start, end), exceptions applied, earliest first."""
+    # The generation is read before the events: a change that lands during the expansion bumps it,
+    # so what this call caches is filed under a generation no reader asks for any more.
+    key = slice_key(calendar_id, current_generation(calendar_id), start, end)
+    hit = r.get(key)
+    if hit is not None:
+        return json.loads(hit)
+    occurrences = [o for event in store.list_events(calendar_id) for o in expand(event, start, end)]
+    occurrences = apply_exceptions(occurrences, store.get_exceptions(calendar_id))
+    occurrences.sort(key=lambda o: (o["start"], o["occurrence_id"]))
+    r.set(key, json.dumps(occurrences), ex=EXPANSION_TTL_S)
+    return occurrences
 
 
-def generation_key(calendar: str) -> str:
-    return GENERATION_KEY.format(calendar=calendar)
-
-
-def populate_expansion(calendar: str, start: str, end: str, generation: str, occurrences: list[dict]) -> None:
-    key = expansion_key(calendar, start, end, generation)
-    if occurrences:
-        r.hset(key, mapping={o["instance_id"]: o["start"] for o in occurrences})
-    r.expire(key, EXPANSION_TTL_S)
-
-
-def invalidate_calendar(calendar: str) -> str:
-    generation = str(r.incr(generation_key(calendar)))
-    for key in r.scan_iter(match=f"exp:{calendar}:*", count=100):
-        r.delete(key)
-    return generation
-
-
-def read_once(calendar: str, start: str, end: str) -> tuple[str, bool, list[str]]:
-    prefix = EXPANSION_KEY.format(calendar=calendar, start=start, end=end, generation="")
-    reply = r.eval(READ_LUA, 2, generation_key(calendar), exception_key(calendar), prefix)
-    return str(reply[0]), bool(reply[1]), list(reply[2:])
-
-
-@app.get("/v1/calendars/{calendar}/occurrences")
-def read_occurrences(calendar: str, start: str = Query(), end: str = Query()) -> dict:
-    generation, exists, items = read_once(calendar, start, end)
-    if not exists:
-        populate_expansion(calendar, start, end, generation, expand_events(store.list_events(calendar), start, end))
-        generation, _, items = read_once(calendar, start, end)
-    occurrences = [{"instance_id": items[i], "start": items[i + 1]} for i in range(0, len(items), 2)]
-    return {"generation": generation, "occurrences": occurrences}
-
-
-class ExceptionBody(BaseModel):
-    instance_id: str
-    status: str
-    new_start: str | None = None
-
-
-@app.post("/v1/calendars/{calendar}/exceptions")
-def apply_exception(calendar: str, body: ExceptionBody) -> dict:
-    state = body.new_start if body.status == "moved" and body.new_start else "cancelled"
-    generation = invalidate_calendar(calendar)
-    key = exception_key(calendar)
-    r.hset(key, body.instance_id, state)
-    r.expire(key, EXCEPTION_TTL_S)
-    return {"generation": generation}
+def record_exception(calendar_id: str, occurrence_id: str, value: str) -> None:
+    """Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence."""
+    # Write, then bump: a reader that sees the new generation also sees the exception.
+    store.put_exception(calendar_id, occurrence_id, value)
+    bump_generation(calendar_id)
 `,
     },
     typescript: {
-      starter: `/** GET occurrences + POST exceptions: expansion cache for calendard. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {type Occurrence, expand, formatInstant, parseInstant} from 'calendard/rrule';
+import {store} from 'calendard/store';
 
-interface Occurrence {
-  instance_id: string;
-  start: string;
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const generationKey = (calendarId: string): string => \`gen:\${calendarId}\`;
+
+export const sliceKey = (calendarId: string, generation: number): string => \`exp:\${calendarId}:\${generation}\`;
+
+export async function currentGeneration(calendarId: string): Promise<number> {
+  return Number((await redis.get(generationKey(calendarId))) ?? 0);
 }
 
-const store = {
-  async listEvents(calendar: string): Promise<Array<{id: string; rrule: string}>> {
-    throw new Error('not implemented');
-  },
-};
-
-async function expandEvent(event: {id: string; rrule: string}, from: string, to: string): Promise<Occurrence[]> {
-  throw new Error('not implemented');
+/** A change to the calendar: every slice cached under the old generation stops being read. */
+export async function bumpGeneration(calendarId: string): Promise<number> {
+  return redis.incr(generationKey(calendarId));
 }
 
-app.get('/v1/calendars/:calendar/occurrences', async (request, reply) => {
-  const {calendar} = request.params as {calendar: string};
-  const {start, end} = request.query as {start: string; end: string};
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const occurrences: Occurrence[] = [];
-  for (const event of await store.listEvents(calendar)) {
-    const key = \`expansion:\${event.id}\`;
-    const cached = await r.get(key);
-    if (cached === null) {
-      const expanded = await expandEvent(event, start, end);
-      await r.set(key, JSON.stringify(expanded));
-      occurrences.push(...expanded);
-    } else {
-      occurrences.push(...(JSON.parse(cached) as Occurrence[]));
+/** Lay the calendar's instance exceptions over its expansion. */
+export function applyExceptions(occurrences: Occurrence[], exceptions: Record<string, string>): Occurrence[] {
+  const applied: Occurrence[] = [];
+  for (const occurrence of occurrences) {
+    applied.push(occurrence);
+    const value = exceptions[occurrence.occurrence_id] ?? '';
+    if (value.startsWith('moved:')) {
+      const start = parseInstant(value.slice('moved:'.length))!;
+      const length = parseInstant(occurrence.end)! - parseInstant(occurrence.start)!;
+      const moved = {...occurrence, start: formatInstant(start), end: formatInstant(start + length)};
+      applied.push(moved);
     }
   }
-  const exceptions = await r.hgetall(\`exceptions:\${calendar}\`);
-  return reply.code(200).send({occurrences: occurrences.filter(o => exceptions[o.instance_id] === undefined)});
-});
+  return applied;
+}
 
-app.post('/v1/calendars/:calendar/exceptions', async (request, reply) => {
-  const {calendar} = request.params as {calendar: string};
-  const body = request.body as {instance_id: string; event_id: string; status: string};
-  await r.del(\`expansion:\${body.event_id}\`);
-  await r.hset(\`exceptions:\${calendar}\`, body.instance_id, body.status);
-  return reply.code(200).send({ok: true});
-});
+/** The calendar's occurrences overlapping [start, end), exceptions applied, earliest first. */
+export async function cachedExpansion(calendarId: string, start: number, end: number): Promise<Occurrence[]> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const key = sliceKey(calendarId, await currentGeneration(calendarId));
+  const hit = await redis.get(key);
+  if (hit !== null) return JSON.parse(hit);
+  const expanded = (await store.listEvents(calendarId)).flatMap(event => expand(event, start, end));
+  const occurrences = applyExceptions(expanded, await store.getExceptions(calendarId));
+  occurrences.sort((a, b) => (a.start + a.occurrence_id < b.start + b.occurrence_id ? -1 : 1));
+  await redis.set(key, JSON.stringify(occurrences));
+  return occurrences;
+}
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence. */
+export async function recordException(calendarId: string, occurrenceId: string, value: string): Promise<void> {
+  await bumpGeneration(calendarId);
+  await store.putException(calendarId, occurrenceId, value);
+}
 `,
-      solution: `/** GET occurrences + POST exceptions: one generation, one atomic overlay, expiring slices. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {type Occurrence, expand, formatInstant, parseInstant} from 'calendard/rrule';
+import {store} from 'calendard/store';
 
-const EXPANSION_KEY = 'exp';
-const EXCEPTION_KEY = 'exc';
-const GENERATION_KEY = 'gen';
-const EXPANSION_TTL_S = 600;
-const EXCEPTION_TTL_S = 900;
+export const EXPANSION_TTL_S = 300;
 
-const READ_LUA = \`
-local generation = redis.call('GET', KEYS[1]) or '0'
-local expansion = ARGV[1] .. generation
-local out = {generation, redis.call('EXISTS', expansion)}
-local occurrences = redis.call('HGETALL', expansion)
-local exceptions = redis.call('HGETALL', KEYS[2])
-local overlay = {}
-for i = 1, #exceptions, 2 do
-  overlay[exceptions[i]] = exceptions[i + 1]
-end
-for i = 1, #occurrences, 2 do
-  local state = overlay[occurrences[i]]
-  if state ~= 'cancelled' then
-    out[#out + 1] = occurrences[i]
-    out[#out + 1] = state or occurrences[i + 1]
-  end
-end
-return out
-\`;
+const redis = new Redis({host: 'redis', port: 6379});
 
-interface Occurrence {
-  instance_id: string;
-  start: string;
+export const generationKey = (calendarId: string): string => \`gen:\${calendarId}\`;
+
+/** One slice per window and generation: a bump retires every window at once. */
+export const sliceKey = (calendarId: string, generation: number, start: number, end: number): string =>
+  \`exp:\${calendarId}:\${generation}:\${start}:\${end}\`;
+
+export async function currentGeneration(calendarId: string): Promise<number> {
+  return Number((await redis.get(generationKey(calendarId))) ?? 0);
 }
 
-const store = {
-  async listEvents(calendar: string): Promise<Array<{id: string; rrule: string}>> {
-    throw new Error('not implemented');
-  },
-};
-
-async function expandEvents(
-  events: Array<{id: string; rrule: string}>,
-  from: string,
-  to: string,
-): Promise<Occurrence[]> {
-  throw new Error('not implemented');
+/** A change to the calendar: every slice cached under the old generation stops being read. */
+export async function bumpGeneration(calendarId: string): Promise<number> {
+  return redis.incr(generationKey(calendarId));
 }
 
-function expansionKey(calendar: string, from: string, to: string, generation: string): string {
-  return \`\${EXPANSION_KEY}:\${calendar}:\${from}:\${to}:\${generation}\`;
-}
-
-function exceptionKey(calendar: string): string {
-  return \`\${EXCEPTION_KEY}:\${calendar}\`;
-}
-
-function generationKey(calendar: string): string {
-  return \`\${GENERATION_KEY}:\${calendar}\`;
-}
-
-async function populateExpansion(
-  calendar: string,
-  from: string,
-  to: string,
-  generation: string,
-  occurrences: Occurrence[],
-): Promise<void> {
-  const key = expansionKey(calendar, from, to, generation);
-  if (occurrences.length > 0) {
-    await r.hset(key, ...occurrences.flatMap(o => [o.instance_id, o.start]));
+/** A cancelled occurrence is dropped; a moved one is the same occurrence at its new start, listed once. */
+export function applyExceptions(occurrences: Occurrence[], exceptions: Record<string, string>): Occurrence[] {
+  const applied: Occurrence[] = [];
+  for (const occurrence of occurrences) {
+    const value = exceptions[occurrence.occurrence_id] ?? '';
+    if (value === 'cancelled') continue;
+    if (value.startsWith('moved:')) {
+      const start = parseInstant(value.slice('moved:'.length))!;
+      const length = parseInstant(occurrence.end)! - parseInstant(occurrence.start)!;
+      applied.push({...occurrence, start: formatInstant(start), end: formatInstant(start + length)});
+    } else {
+      applied.push(occurrence);
+    }
   }
-  await r.expire(key, EXPANSION_TTL_S);
+  return applied;
 }
 
-async function invalidateCalendar(calendar: string): Promise<string> {
-  const generation = String(await r.incr(generationKey(calendar)));
-  for await (const batch of r.scanStream({match: \`exp:\${calendar}:*\`, count: 100})) {
-    if (batch.length > 0) await r.del(...batch);
-  }
-  return generation;
+/** The calendar's occurrences overlapping [start, end), exceptions applied, earliest first. */
+export async function cachedExpansion(calendarId: string, start: number, end: number): Promise<Occurrence[]> {
+  // The generation is read before the events: a change that lands during the expansion bumps it,
+  // so what this call caches is filed under a generation no reader asks for any more.
+  const key = sliceKey(calendarId, await currentGeneration(calendarId), start, end);
+  const hit = await redis.get(key);
+  if (hit !== null) return JSON.parse(hit);
+  const expanded = (await store.listEvents(calendarId)).flatMap(event => expand(event, start, end));
+  const occurrences = applyExceptions(expanded, await store.getExceptions(calendarId));
+  occurrences.sort((a, b) => (a.start + a.occurrence_id < b.start + b.occurrence_id ? -1 : 1));
+  await redis.set(key, JSON.stringify(occurrences), 'EX', EXPANSION_TTL_S);
+  return occurrences;
 }
 
-async function readOnce(calendar: string, from: string, to: string): Promise<[string, boolean, string[]]> {
-  const prefix = \`\${EXPANSION_KEY}:\${calendar}:\${from}:\${to}:\`;
-  const reply = (await r.eval(READ_LUA, 2, generationKey(calendar), exceptionKey(calendar), prefix)) as string[];
-  return [String(reply[0]), Number(reply[1]) === 1, reply.slice(2)];
+/** Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence. */
+export async function recordException(calendarId: string, occurrenceId: string, value: string): Promise<void> {
+  // Write, then bump: a reader that sees the new generation also sees the exception.
+  await store.putException(calendarId, occurrenceId, value);
+  await bumpGeneration(calendarId);
 }
-
-app.get('/v1/calendars/:calendar/occurrences', async (request, reply) => {
-  const {calendar} = request.params as {calendar: string};
-  const {start, end} = request.query as {start: string; end: string};
-  let [generation, exists, items] = await readOnce(calendar, start, end);
-  if (!exists) {
-    await populateExpansion(
-      calendar,
-      start,
-      end,
-      generation,
-      await expandEvents(await store.listEvents(calendar), start, end),
-    );
-    [generation, , items] = await readOnce(calendar, start, end);
-  }
-  const occurrences: Occurrence[] = [];
-  for (let i = 0; i < items.length; i += 2) occurrences.push({instance_id: items[i], start: items[i + 1]});
-  return reply.code(200).send({generation, occurrences});
-});
-
-app.post('/v1/calendars/:calendar/exceptions', async (request, reply) => {
-  const {calendar} = request.params as {calendar: string};
-  const body = request.body as {instance_id: string; status: string; new_start?: string};
-  const state = body.status === 'moved' && body.new_start !== undefined ? body.new_start : 'cancelled';
-  const generation = await invalidateCalendar(calendar);
-  const key = exceptionKey(calendar);
-  await r.hset(key, body.instance_id, state);
-  await r.expire(key, EXCEPTION_TTL_S);
-  return reply.code(200).send({generation});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -488,88 +347,103 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
+	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/redis/go-redis/v9"
+
+	"calendard/rrule"
+	"calendard/store"
 )
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type occurrence struct {
-	InstanceID string \`json:"instance_id"\`
-	Start      string \`json:"start"\`
+func generationKey(calendarID string) string { return "gen:" + calendarID }
+
+func sliceKey(calendarID string, generation int64) string {
+	return "exp:" + calendarID + ":" + strconv.FormatInt(generation, 10)
 }
 
-type store struct{}
-
-func (s *store) listEvents(ctx context.Context, calendar string) ([]string, error) {
-	return nil, nil
-}
-
-func expandEvent(event string, from, to string) ([]occurrence, error) {
-	return nil, nil
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func readOccurrences(rw http.ResponseWriter, r *http.Request) {
-	calendar := r.PathValue("calendar")
-	from := r.URL.Query().Get("start")
-	to := r.URL.Query().Get("end")
-	ctx := r.Context()
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	events, _ := (&store{}).listEvents(ctx, calendar)
-	occurrences := []occurrence{}
-	for _, event := range events {
-		key := fmt.Sprintf("expansion:%s", event)
-		cached, err := rdb.Get(ctx, key).Result()
-		if err == redis.Nil {
-			expanded, _ := expandEvent(event, from, to)
-			raw, _ := json.Marshal(expanded)
-			rdb.Set(ctx, key, raw, 0)
-			occurrences = append(occurrences, expanded...)
-			continue
-		}
-		var parsed []occurrence
-		_ = json.Unmarshal([]byte(cached), &parsed)
-		occurrences = append(occurrences, parsed...)
+func currentGeneration(ctx context.Context, calendarID string) (int64, error) {
+	generation, err := rdb.Get(ctx, generationKey(calendarID)).Int64()
+	if err == redis.Nil {
+		return 0, nil
 	}
-	exceptions, _ := rdb.HGetAll(ctx, fmt.Sprintf("exceptions:%s", calendar)).Result()
-	visible := []occurrence{}
-	for _, occurrence := range occurrences {
-		if _, overridden := exceptions[occurrence.InstanceID]; !overridden {
-			visible = append(visible, occurrence)
+	return generation, err
+}
+
+// bumpGeneration is a change to the calendar: every slice cached under the old generation stops being read.
+func bumpGeneration(ctx context.Context, calendarID string) (int64, error) {
+	return rdb.Incr(ctx, generationKey(calendarID)).Result()
+}
+
+// applyExceptions lays the calendar's instance exceptions over its expansion.
+func applyExceptions(occurrences []rrule.Occurrence, exceptions map[string]string) []rrule.Occurrence {
+	applied := []rrule.Occurrence{}
+	for _, o := range occurrences {
+		applied = append(applied, o)
+		value := exceptions[o.OccurrenceID]
+		if strings.HasPrefix(value, "moved:") {
+			start, _ := rrule.ParseInstant(strings.TrimPrefix(value, "moved:"))
+			from, _ := rrule.ParseInstant(o.Start)
+			to, _ := rrule.ParseInstant(o.End)
+			moved := o
+			moved.Start, moved.End = rrule.FormatInstant(start), rrule.FormatInstant(start+to-from)
+			applied = append(applied, moved)
 		}
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{"occurrences": visible})
+	return applied
 }
 
-func applyException(rw http.ResponseWriter, r *http.Request) {
-	calendar := r.PathValue("calendar")
-	body := struct {
-		InstanceID string \`json:"instance_id"\`
-		EventID    string \`json:"event_id"\`
-		Status     string \`json:"status"\`
-	}{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	ctx := r.Context()
-	rdb.Del(ctx, fmt.Sprintf("expansion:%s", body.EventID))
-	rdb.HSet(ctx, fmt.Sprintf("exceptions:%s", calendar), body.InstanceID, body.Status)
-	writeJSON(rw, http.StatusOK, map[string]any{"ok": true})
+// cachedExpansion is the calendar's occurrences overlapping [start, end), exceptions applied, earliest first.
+func cachedExpansion(ctx context.Context, calendarID string, start, end int64) ([]rrule.Occurrence, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	generation, err := currentGeneration(ctx, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	key := sliceKey(calendarID, generation)
+	hit, err := rdb.Get(ctx, key).Result()
+	if err == nil {
+		var cached []rrule.Occurrence
+		if err := json.Unmarshal([]byte(hit), &cached); err != nil {
+			return nil, err
+		}
+		return cached, nil
+	}
+	if err != redis.Nil {
+		return nil, err
+	}
+	events, err := store.ListEvents(ctx, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	expanded := []rrule.Occurrence{}
+	for _, e := range events {
+		expanded = append(expanded, rrule.Expand(e, start, end)...)
+	}
+	exceptions, err := store.GetExceptions(ctx, calendarID)
+	if err != nil {
+		return nil, err
+	}
+	occurrences := applyExceptions(expanded, exceptions)
+	sort.Slice(occurrences, func(i, j int) bool {
+		return occurrences[i].Start+occurrences[i].OccurrenceID < occurrences[j].Start+occurrences[j].OccurrenceID
+	})
+	value, _ := json.Marshal(occurrences)
+	if err := rdb.Set(ctx, key, value, 0).Err(); err != nil {
+		return nil, err
+	}
+	return occurrences, nil
 }
 
-func main() {
-	rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/calendars/{calendar}/occurrences", readOccurrences)
-	mux.HandleFunc("POST /v1/calendars/{calendar}/exceptions", applyException)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+// recordException cancels ("cancelled") or moves ("moved:{ISO start}") one occurrence.
+func recordException(ctx context.Context, calendarID, occurrenceID, value string) error {
+	if _, err := bumpGeneration(ctx, calendarID); err != nil {
+		return err
+	}
+	return store.PutException(ctx, calendarID, occurrenceID, value)
 }
 `,
       solution: `package main
@@ -577,604 +451,754 @@ func main() {
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"calendard/rrule"
+	"calendard/store"
 )
 
-const (
-	expansionKeyFormat  = "exp:%s:%s:%s:%s"
-	exceptionKeyFormat  = "exc:%s"
-	generationKeyFormat = "gen:%s"
-	expansionTTLS       = 600
-	exceptionTTLS       = 900
-)
+const expansionTTL = 300 * time.Second
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var readScript = redis.NewScript(\`
-local generation = redis.call('GET', KEYS[1]) or '0'
-local expansion = ARGV[1] .. generation
-local out = {generation, redis.call('EXISTS', expansion)}
-local occurrences = redis.call('HGETALL', expansion)
-local exceptions = redis.call('HGETALL', KEYS[2])
-local overlay = {}
-for i = 1, #exceptions, 2 do
-  overlay[exceptions[i]] = exceptions[i + 1]
-end
-for i = 1, #occurrences, 2 do
-  local state = overlay[occurrences[i]]
-  if state ~= 'cancelled' then
-    out[#out + 1] = occurrences[i]
-    out[#out + 1] = state or occurrences[i + 1]
-  end
-end
-return out
-\`)
+func generationKey(calendarID string) string { return "gen:" + calendarID }
 
-type occurrence struct {
-	InstanceID string \`json:"instance_id"\`
-	Start      string \`json:"start"\`
+// sliceKey names one slice per window and generation: a bump retires every window at once.
+func sliceKey(calendarID string, generation, start, end int64) string {
+	return "exp:" + calendarID + ":" + strconv.FormatInt(generation, 10) + ":" + strconv.FormatInt(start, 10) + ":" + strconv.FormatInt(end, 10)
 }
 
-type store struct{}
-
-func (s *store) listEvents(ctx context.Context, calendar string) ([]string, error) {
-	return nil, nil
+func currentGeneration(ctx context.Context, calendarID string) (int64, error) {
+	generation, err := rdb.Get(ctx, generationKey(calendarID)).Int64()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	return generation, err
 }
 
-func expandEvents(events []string, from, to string) ([]occurrence, error) {
-	return nil, nil
+// bumpGeneration is a change to the calendar: every slice cached under the old generation stops being read.
+func bumpGeneration(ctx context.Context, calendarID string) (int64, error) {
+	return rdb.Incr(ctx, generationKey(calendarID)).Result()
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+// applyExceptions drops a cancelled occurrence and lists a moved one once, at its new start.
+func applyExceptions(occurrences []rrule.Occurrence, exceptions map[string]string) []rrule.Occurrence {
+	applied := []rrule.Occurrence{}
+	for _, o := range occurrences {
+		value := exceptions[o.OccurrenceID]
+		if value == "cancelled" {
+			continue
+		}
+		if strings.HasPrefix(value, "moved:") {
+			start, _ := rrule.ParseInstant(strings.TrimPrefix(value, "moved:"))
+			from, _ := rrule.ParseInstant(o.Start)
+			to, _ := rrule.ParseInstant(o.End)
+			o.Start, o.End = rrule.FormatInstant(start), rrule.FormatInstant(start+to-from)
+		}
+		applied = append(applied, o)
+	}
+	return applied
 }
 
-func expansionKey(calendar, from, to, generation string) string {
-	return fmt.Sprintf(expansionKeyFormat, calendar, from, to, generation)
-}
-
-func exceptionKey(calendar string) string {
-	return fmt.Sprintf(exceptionKeyFormat, calendar)
-}
-
-func generationKey(calendar string) string {
-	return fmt.Sprintf(generationKeyFormat, calendar)
-}
-
-func invalidateCalendar(ctx context.Context, calendar string) (string, error) {
-	generation, err := rdb.Incr(ctx, generationKey(calendar)).Result()
+// cachedExpansion is the calendar's occurrences overlapping [start, end), exceptions applied, earliest first.
+func cachedExpansion(ctx context.Context, calendarID string, start, end int64) ([]rrule.Occurrence, error) {
+	// The generation is read before the events: a change that lands during the expansion bumps it,
+	// so what this call caches is filed under a generation no reader asks for any more.
+	generation, err := currentGeneration(ctx, calendarID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var cursor uint64
-	for {
-		keys, next, scanErr := rdb.Scan(ctx, cursor, fmt.Sprintf("exp:%s:*", calendar), 100).Result()
-		if scanErr != nil {
-			return "", scanErr
+	key := sliceKey(calendarID, generation, start, end)
+	hit, err := rdb.Get(ctx, key).Result()
+	if err == nil {
+		var cached []rrule.Occurrence
+		if err := json.Unmarshal([]byte(hit), &cached); err != nil {
+			return nil, err
 		}
-		if len(keys) > 0 {
-			rdb.Del(ctx, keys...)
-		}
-		if cursor = next; cursor == 0 {
-			break
-		}
+		return cached, nil
 	}
-	return fmt.Sprintf("%d", generation), nil
-}
-
-func readOnce(ctx context.Context, calendar, from, to string) (string, bool, []string) {
-	prefix := fmt.Sprintf("exp:%s:%s:%s:", calendar, from, to)
-	reply, err := readScript.Run(ctx, rdb, []string{generationKey(calendar), exceptionKey(calendar)}, prefix).StringSlice()
+	if err != redis.Nil {
+		return nil, err
+	}
+	events, err := store.ListEvents(ctx, calendarID)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	return reply[0], reply[1] == "1", reply[2:]
-}
-
-func readOccurrences(rw http.ResponseWriter, r *http.Request) {
-	calendar := r.PathValue("calendar")
-	from := r.URL.Query().Get("start")
-	to := r.URL.Query().Get("end")
-	ctx := r.Context()
-	generation, exists, items := readOnce(ctx, calendar, from, to)
-	if !exists {
-		events, _ := (&store{}).listEvents(ctx, calendar)
-		expanded, _ := expandEvents(events, from, to)
-		key := expansionKey(calendar, from, to, generation)
-		fields := make(map[string]any, len(expanded))
-		for _, occurrence := range expanded {
-			fields[occurrence.InstanceID] = occurrence.Start
-		}
-		if len(fields) > 0 {
-			rdb.HSet(ctx, key, fields)
-		}
-		rdb.Expire(ctx, key, expansionTTLS*time.Second)
-		generation, _, items = readOnce(ctx, calendar, from, to)
+	expanded := []rrule.Occurrence{}
+	for _, e := range events {
+		expanded = append(expanded, rrule.Expand(e, start, end)...)
 	}
-	occurrences := []occurrence{}
-	for i := 0; i+1 < len(items); i += 2 {
-		occurrences = append(occurrences, occurrence{InstanceID: items[i], Start: items[i+1]})
-	}
-	writeJSON(rw, http.StatusOK, map[string]any{"generation": generation, "occurrences": occurrences})
-}
-
-func applyException(rw http.ResponseWriter, r *http.Request) {
-	calendar := r.PathValue("calendar")
-	body := struct {
-		InstanceID string \`json:"instance_id"\`
-		Status     string \`json:"status"\`
-		NewStart   string \`json:"new_start"\`
-	}{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	ctx := r.Context()
-	state := "cancelled"
-	if body.Status == "moved" && body.NewStart != "" {
-		state = body.NewStart
-	}
-	generation, err := invalidateCalendar(ctx, calendar)
+	exceptions, err := store.GetExceptions(ctx, calendarID)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
+		return nil, err
 	}
-	key := exceptionKey(calendar)
-	rdb.HSet(ctx, key, body.InstanceID, state)
-	rdb.Expire(ctx, key, exceptionTTLS*time.Second)
-	writeJSON(rw, http.StatusOK, map[string]any{"generation": generation})
+	occurrences := applyExceptions(expanded, exceptions)
+	sort.Slice(occurrences, func(i, j int) bool {
+		return occurrences[i].Start+occurrences[i].OccurrenceID < occurrences[j].Start+occurrences[j].OccurrenceID
+	})
+	value, _ := json.Marshal(occurrences)
+	if err := rdb.Set(ctx, key, value, expansionTTL).Err(); err != nil {
+		return nil, err
+	}
+	return occurrences, nil
 }
 
-func main() {
-	rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/calendars/{calendar}/occurrences", readOccurrences)
-	mux.HandleFunc("POST /v1/calendars/{calendar}/exceptions", applyException)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+// recordException cancels ("cancelled") or moves ("moved:{ISO start}") one occurrence.
+func recordException(ctx context.Context, calendarID, occurrenceID, value string) error {
+	// Write, then bump: a reader that sees the new generation also sees the exception.
+	if err := store.PutException(ctx, calendarID, occurrenceID, value); err != nil {
+		return err
+	}
+	_, err := bumpGeneration(ctx, calendarID)
+	return err
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-import scala.jdk.CollectionConverters._
+import calendard.{Occurrence, Rrule, Store}
 
-final case class Occurrence(instance_id: String, start: String)
-final case class OccurrencesResponse(occurrences: List[Occurrence])
-final case class ExceptionRequest(instance_id: String, event_id: String, status: String)
+object ExpansionCache {
+  private val jedis = new JedisPooled("redis", 6379)
 
-object StateApi {
-  implicit val system: ActorSystem = ActorSystem("calendard")
-  implicit val occurrenceFormat: RootJsonFormat[Occurrence] = jsonFormat2(Occurrence)
-  implicit val responseFormat: RootJsonFormat[OccurrencesResponse] = jsonFormat1(OccurrencesResponse)
-  implicit val exceptionFormat: RootJsonFormat[ExceptionRequest] = jsonFormat3(ExceptionRequest)
+  def generationKey(calendarId: String): String = s"gen:$calendarId"
 
-  val jedis = new Jedis("redis", 6379)
+  def sliceKey(calendarId: String, generation: Long): String = s"exp:$calendarId:$generation"
 
-  val events = List("standup", "review")
+  def currentGeneration(calendarId: String): Long = Option(jedis.get(generationKey(calendarId))).map(_.toLong).getOrElse(0L)
 
-  def expandEvent(event: String, from: String, to: String): List[Occurrence] = Nil
+  /** A change to the calendar: every slice cached under the old generation stops being read. */
+  def bumpGeneration(calendarId: String): Long = jedis.incr(generationKey(calendarId))
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  val route: Route =
-    path("v1" / "calendars" / Segment / "occurrences") { calendar =>
-      get {
-        parameters("start", "end") { (from, to) =>
-          val occurrences = events.flatMap { event =>
-            val key = s"expansion:$event"
-            if (!jedis.exists(key)) {
-              val expanded = expandEvent(event, from, to)
-              if (expanded.nonEmpty) jedis.hset(key, expanded.map(o => o.instance_id -> o.start).toMap.asJava)
-            }
-            jedis.hgetAll(key).asScala.toList.map { case (instanceId, start) => Occurrence(instanceId, start) }
-          }
-          val exceptions = jedis.hgetAll(s"exceptions:$calendar").asScala.keySet
-          complete(StatusCodes.OK, OccurrencesResponse(occurrences.filterNot(o => exceptions.contains(o.instance_id))))
-        }
+  /** Lay the calendar's instance exceptions over its expansion. */
+  def applyExceptions(occurrences: Seq[Occurrence], exceptions: Map[String, String]): Seq[Occurrence] = {
+    val applied = Seq.newBuilder[Occurrence]
+    for (occurrence <- occurrences) {
+      applied += occurrence
+      val value = exceptions.getOrElse(occurrence.occurrence_id, "")
+      if (value.startsWith("moved:")) {
+        val start = Rrule.parseInstant(value.stripPrefix("moved:")).getOrElse(0L)
+        val length = Rrule.parseInstant(occurrence.end).getOrElse(0L) - Rrule.parseInstant(occurrence.start).getOrElse(0L)
+        val moved = occurrence.copy(start = Rrule.formatInstant(start), end = Rrule.formatInstant(start + length))
+        applied += moved
       }
-    } ~
-      path("v1" / "calendars" / Segment / "exceptions") { calendar =>
-        post {
-          entity(as[ExceptionRequest]) { body =>
-            jedis.del(s"expansion:\${body.event_id}")
-            jedis.hset(s"exceptions:$calendar", body.instance_id, body.status)
-            complete(StatusCodes.OK, """{"ok":true}""")
-          }
-        }
-      }
+    }
+    applied.result()
+  }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** The calendar's occurrences overlapping [start, end), exceptions applied, earliest first. */
+  def cachedExpansion(calendarId: String, start: Long, end: Long): Seq[Occurrence] = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val key = sliceKey(calendarId, currentGeneration(calendarId))
+    Option(jedis.get(key)) match {
+      case Some(hit) => hit.parseJson.convertTo[Seq[Occurrence]]
+      case None =>
+        val expanded = Store.listEvents(calendarId).flatMap(event => Rrule.expand(event, start, end))
+        val occurrences = applyExceptions(expanded, Store.getExceptions(calendarId)).sortBy(o => (o.start, o.occurrence_id))
+        jedis.set(key, occurrences.toJson.compactPrint)
+        occurrences
+    }
+  }
+
+  /** Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence. */
+  def recordException(calendarId: String, occurrenceId: String, value: String): Unit = {
+    bumpGeneration(calendarId)
+    Store.putException(calendarId, occurrenceId, value)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import redis.clients.jedis.params.ScanParams
+      solution: `import redis.clients.jedis.JedisPooled
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-import scala.jdk.CollectionConverters._
+import calendard.{Occurrence, Rrule, Store}
 
-final case class Occurrence(instance_id: String, start: String)
-final case class ExceptionRequest(instance_id: String, status: String, new_start: Option[String])
+object ExpansionCache {
+  val ExpansionTtlS = 300L
 
-object StateApi {
-  implicit val system: ActorSystem = ActorSystem("calendard")
-  implicit val occurrenceFormat: RootJsonFormat[Occurrence] = jsonFormat2(Occurrence)
-  implicit val exceptionFormat: RootJsonFormat[ExceptionRequest] = jsonFormat3(ExceptionRequest)
+  private val jedis = new JedisPooled("redis", 6379)
 
-  val ExpansionKey = "exp:%s:%s:%s:%s"
-  val ExceptionKey = "exc:%s"
-  val GenerationKey = "gen:%s"
-  val ExpansionTtlS = 600L
-  val ExceptionTtlS = 900L
+  def generationKey(calendarId: String): String = s"gen:$calendarId"
 
-  val jedis = new Jedis("redis", 6379)
+  /** One slice per window and generation: a bump retires every window at once. */
+  def sliceKey(calendarId: String, generation: Long, start: Long, end: Long): String = s"exp:$calendarId:$generation:$start:$end"
 
-  val ReadLua =
-    """
-      |local generation = redis.call('GET', KEYS[1]) or '0'
-      |local expansion = ARGV[1] .. generation
-      |local out = {generation, redis.call('EXISTS', expansion)}
-      |local occurrences = redis.call('HGETALL', expansion)
-      |local exceptions = redis.call('HGETALL', KEYS[2])
-      |local overlay = {}
-      |for i = 1, #exceptions, 2 do
-      |  overlay[exceptions[i]] = exceptions[i + 1]
-      |end
-      |for i = 1, #occurrences, 2 do
-      |  local state = overlay[occurrences[i]]
-      |  if state ~= 'cancelled' then
-      |    out[#out + 1] = occurrences[i]
-      |    out[#out + 1] = state or occurrences[i + 1]
-      |  end
-      |end
-      |return out
-      |""".stripMargin
+  def currentGeneration(calendarId: String): Long = Option(jedis.get(generationKey(calendarId))).map(_.toLong).getOrElse(0L)
 
-  val events = List("standup", "review")
+  /** A change to the calendar: every slice cached under the old generation stops being read. */
+  def bumpGeneration(calendarId: String): Long = jedis.incr(generationKey(calendarId))
 
-  def expandEvents(events: List[String], from: String, to: String): List[Occurrence] = Nil
+  /** A cancelled occurrence is dropped; a moved one is the same occurrence at its new start, listed once. */
+  def applyExceptions(occurrences: Seq[Occurrence], exceptions: Map[String, String]): Seq[Occurrence] =
+    occurrences.flatMap { occurrence =>
+      val value = exceptions.getOrElse(occurrence.occurrence_id, "")
+      if (value == "cancelled") None
+      else if (value.startsWith("moved:")) {
+        val start = Rrule.parseInstant(value.stripPrefix("moved:")).getOrElse(0L)
+        val length = Rrule.parseInstant(occurrence.end).getOrElse(0L) - Rrule.parseInstant(occurrence.start).getOrElse(0L)
+        Some(occurrence.copy(start = Rrule.formatInstant(start), end = Rrule.formatInstant(start + length)))
+      } else Some(occurrence)
+    }
 
-  def expansionKey(calendar: String, from: String, to: String, generation: Long): String =
-    ExpansionKey.format(calendar, from, to, generation.toString)
-
-  def exceptionKey(calendar: String): String = ExceptionKey.format(calendar)
-
-  def generationKey(calendar: String): String = GenerationKey.format(calendar)
-
-  def populateExpansion(calendar: String, from: String, to: String, generation: Long): Unit = {
-    val key = expansionKey(calendar, from, to, generation)
-    val occurrences = expandEvents(events, from, to)
-    if (occurrences.nonEmpty) jedis.hset(key, occurrences.map(o => o.instance_id -> o.start).toMap.asJava)
-    jedis.expire(key, ExpansionTtlS)
+  /** The calendar's occurrences overlapping [start, end), exceptions applied, earliest first. */
+  def cachedExpansion(calendarId: String, start: Long, end: Long): Seq[Occurrence] = {
+    // The generation is read before the events: a change that lands during the expansion bumps it,
+    // so what this call caches is filed under a generation no reader asks for any more.
+    val key = sliceKey(calendarId, currentGeneration(calendarId), start, end)
+    Option(jedis.get(key)) match {
+      case Some(hit) => hit.parseJson.convertTo[Seq[Occurrence]]
+      case None =>
+        val expanded = Store.listEvents(calendarId).flatMap(event => Rrule.expand(event, start, end))
+        val occurrences = applyExceptions(expanded, Store.getExceptions(calendarId)).sortBy(o => (o.start, o.occurrence_id))
+        jedis.setex(key, ExpansionTtlS, occurrences.toJson.compactPrint)
+        occurrences
+    }
   }
 
-  def invalidateCalendar(calendar: String): Long = {
-    val generation = jedis.incr(generationKey(calendar))
-    var cursor = "0"
-    val params = new ScanParams().match("exp:" + calendar + ":*").count(100)
-    do {
-      val result = jedis.scan(cursor, params)
-      val keys = result.getResult.asScala.toList
-      if (keys.nonEmpty) jedis.del(keys: _*)
-      cursor = result.getCursor
-    } while (cursor != "0")
-    generation
-  }
-
-  def readOnce(calendar: String, from: String, to: String): (String, Boolean, List[String]) = {
-    val prefix = ExpansionKey.format(calendar, from, to, "")
-    val reply = jedis
-      .eval(ReadLua, 2, generationKey(calendar), exceptionKey(calendar), prefix)
-      .asInstanceOf[java.util.List[String]]
-      .asScala
-      .toList
-    (reply.head, reply(1) == "1", reply.drop(2))
-  }
-
-  val route: Route =
-    path("v1" / "calendars" / Segment / "occurrences") { calendar =>
-      get {
-        parameters("start", "end") { (from, to) =>
-          val (firstGeneration, exists, firstItems) = readOnce(calendar, from, to)
-          val (generation, items) =
-            if (exists) {
-              (firstGeneration, firstItems)
-            } else {
-              populateExpansion(calendar, from, to, firstGeneration.toLong)
-              val reread = readOnce(calendar, from, to)
-              (reread._1, reread._3)
-            }
-          val occurrences =
-            items.grouped(2).collect { case List(instanceId, start) => Occurrence(instanceId, start) }.toList
-          val rendered = occurrences.map(o => s"""{"instance_id":"\${o.instance_id}","start":"\${o.start}"}""").mkString(",")
-          complete(
-            StatusCodes.OK,
-            HttpEntity(ContentTypes.\`application/json\`, s"""{"generation":$generation,"occurrences":[$rendered]}""")
-          )
-        }
-      }
-    } ~
-      path("v1" / "calendars" / Segment / "exceptions") { calendar =>
-        post {
-          entity(as[ExceptionRequest]) { body =>
-            val state = if (body.status == "moved") body.new_start.getOrElse("cancelled") else "cancelled"
-            val generation = invalidateCalendar(calendar)
-            jedis.hset(exceptionKey(calendar), body.instance_id, state)
-            jedis.expire(exceptionKey(calendar), ExceptionTtlS)
-            complete(StatusCodes.OK, s"""{"generation":$generation}""")
-          }
-        }
-      }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence. */
+  def recordException(calendarId: String, occurrenceId: String, value: String): Unit = {
+    // Write, then bump: a reader that sees the new generation also sees the exception.
+    Store.putException(calendarId, occurrenceId, value)
+    bumpGeneration(calendarId)
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
+      starter: `#include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
-#include <iterator>
+#include <algorithm>
+#include <map>
 #include <string>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
-using json = nlohmann::json;
+#include "calendard/rrule.h"
+#include "calendard/store.h"
 
-struct EventStore {
-  std::vector<std::string> listEvents(const std::string& calendar);
-};
-
-EventStore store;
-
-std::vector<std::pair<std::string, std::string>> expandEvent(const std::string& event, const std::string& from,
-                                                             const std::string& to);
-
-std::string encodeOccurrences(const std::vector<std::pair<std::string, std::string>>& occurrences) {
-  json encoded = json::array();
-  for (const auto& [instanceId, start] : occurrences) {
-    encoded.push_back({{"instance_id", instanceId}, {"start", start}});
-  }
-  return encoded.dump();
+static sw::redis::Redis& cacheRedis() {
+  static sw::redis::Redis redis("tcp://redis:6379");
+  return redis;
 }
 
-std::vector<std::pair<std::string, std::string>> decodeOccurrences(const std::string& raw) {
-  std::vector<std::pair<std::string, std::string>> occurrences;
-  for (const auto& entry : json::parse(raw, nullptr, false)) {
-    occurrences.emplace_back(entry["instance_id"].get<std::string>(), entry["start"].get<std::string>());
+std::string generationKey(const std::string& calendar_id) { return "gen:" + calendar_id; }
+
+std::string sliceKey(const std::string& calendar_id, long long generation) {
+  return "exp:" + calendar_id + ":" + std::to_string(generation);
+}
+
+long long currentGeneration(const std::string& calendar_id) {
+  const auto value = cacheRedis().get(generationKey(calendar_id));
+  return value ? std::stoll(*value) : 0;
+}
+
+// A change to the calendar: every slice cached under the old generation stops being read.
+long long bumpGeneration(const std::string& calendar_id) { return cacheRedis().incr(generationKey(calendar_id)); }
+
+// Lay the calendar's instance exceptions over its expansion.
+std::vector<calendard::Occurrence> applyExceptions(const std::vector<calendard::Occurrence>& occurrences,
+                                                   const std::map<std::string, std::string>& exceptions) {
+  std::vector<calendard::Occurrence> applied;
+  for (const auto& occurrence : occurrences) {
+    applied.push_back(occurrence);
+    const auto it = exceptions.find(occurrence.occurrence_id);
+    const std::string value = it == exceptions.end() ? "" : it->second;
+    if (value.rfind("moved:", 0) == 0) {
+      const int64_t start = calendard::rrule::ParseInstant(value.substr(6)).value_or(0);
+      const int64_t length = calendard::rrule::ParseInstant(occurrence.end).value_or(0) -
+                             calendard::rrule::ParseInstant(occurrence.start).value_or(0);
+      calendard::Occurrence moved = occurrence;
+      moved.start = calendard::rrule::FormatInstant(start);
+      moved.end = calendard::rrule::FormatInstant(start + length);
+      applied.push_back(moved);
+    }
   }
+  return applied;
+}
+
+// The calendar's occurrences overlapping [start, end), exceptions applied, earliest first.
+std::vector<calendard::Occurrence> cachedExpansion(const std::string& calendar_id, int64_t start, int64_t end) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string key = sliceKey(calendar_id, currentGeneration(calendar_id));
+  if (const auto hit = cacheRedis().get(key)) return nlohmann::json::parse(*hit).get<std::vector<calendard::Occurrence>>();
+  std::vector<calendard::Occurrence> expanded;
+  for (const auto& event : calendard::store::ListEvents(calendar_id)) {
+    for (const auto& o : calendard::rrule::Expand(event, start, end)) expanded.push_back(o);
+  }
+  auto occurrences = applyExceptions(expanded, calendard::store::GetExceptions(calendar_id));
+  std::sort(occurrences.begin(), occurrences.end(), [](const calendard::Occurrence& a, const calendard::Occurrence& b) {
+    return a.start + a.occurrence_id < b.start + b.occurrence_id;
+  });
+  cacheRedis().set(key, nlohmann::json(occurrences).dump());
   return occurrences;
 }
 
-void writeJSON(httplib::Response& res, int status, const json& body) {
-  res.status = status;
-  res.set_content(body.dump(), "application/json");
-}
-
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  httplib::SSLServer svr("cert.pem", "key.pem");
-
-  svr.Get(R"(/v1/calendars/([^/]+)/occurrences)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto calendar = req.matches[1].str();
-    const auto from = req.get_param_value("start");
-    const auto to = req.get_param_value("end");
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    json occurrences = json::array();
-    for (const auto& event : store.listEvents(calendar)) {
-      const auto key = "expansion:" + event;
-      auto cached = redis.get(key);
-      std::vector<std::pair<std::string, std::string>> expanded;
-      if (cached) {
-        expanded = decodeOccurrences(*cached);
-      } else {
-        expanded = expandEvent(event, from, to);
-        redis.set(key, encodeOccurrences(expanded));
-      }
-      for (const auto& [instanceId, start] : expanded) {
-        occurrences.push_back({{"instance_id", instanceId}, {"start", start}});
-      }
-    }
-    std::unordered_map<std::string, std::string> exceptions;
-    redis.hgetall("exceptions:" + calendar, std::inserter(exceptions, exceptions.end()));
-    json visible = json::array();
-    for (const auto& occurrence : occurrences) {
-      const auto instanceId = occurrence["instance_id"].get<std::string>();
-      if (exceptions.count(instanceId) == 0) visible.push_back(occurrence);
-    }
-    writeJSON(res, 200, json{{"occurrences", visible}});
-  });
-
-  svr.Post(R"(/v1/calendars/([^/]+)/exceptions)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto calendar = req.matches[1].str();
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      writeJSON(res, 400, json{{"error", "invalid json"}});
-      return;
-    }
-    redis.del("expansion:" + body.value("event_id", std::string()));
-    redis.hset("exceptions:" + calendar, body.value("instance_id", std::string()), body.value("status", std::string()));
-    writeJSON(res, 200, json{{"ok", true}});
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence.
+void recordException(const std::string& calendar_id, const std::string& occurrence_id, const std::string& value) {
+  bumpGeneration(calendar_id);
+  calendard::store::PutException(calendar_id, occurrence_id, value);
 }
 `,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
+      solution: `#include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
-#include <cstdio>
-#include <iterator>
+#include <algorithm>
+#include <chrono>
+#include <map>
 #include <string>
-#include <utility>
 #include <vector>
 
-using json = nlohmann::json;
+#include "calendard/rrule.h"
+#include "calendard/store.h"
 
-const std::string kExpansionKeyFormat = "exp:%s:%s:%s:%s";
-const std::string kExceptionKeyFormat = "exc:%s";
-const std::string kGenerationKeyFormat = "gen:%s";
-constexpr long long kExpansionTtlS = 600;
-constexpr long long kExceptionTtlS = 900;
+constexpr std::chrono::seconds kExpansionTtl{300};
 
-const char* kReadLua = R"LUA(
-local generation = redis.call('GET', KEYS[1]) or '0'
-local expansion = ARGV[1] .. generation
-local out = {generation, redis.call('EXISTS', expansion)}
-local occurrences = redis.call('HGETALL', expansion)
-local exceptions = redis.call('HGETALL', KEYS[2])
-local overlay = {}
-for i = 1, #exceptions, 2 do
-  overlay[exceptions[i]] = exceptions[i + 1]
-end
-for i = 1, #occurrences, 2 do
-  local state = overlay[occurrences[i]]
-  if state ~= 'cancelled' then
-    out[#out + 1] = occurrences[i]
-    out[#out + 1] = state or occurrences[i + 1]
-  end
-end
-return out
-)LUA";
-
-struct EventStore {
-  std::vector<std::string> listEvents(const std::string& calendar);
-};
-
-EventStore store;
-
-std::vector<std::pair<std::string, std::string>> expandEvents(const std::vector<std::string>& events,
-                                                              const std::string& from, const std::string& to);
-
-std::string expansionKey(const std::string& calendar, const std::string& from, const std::string& to,
-                         const std::string& generation) {
-  char buffer[512];
-  std::snprintf(buffer, sizeof(buffer), kExpansionKeyFormat.c_str(), calendar.c_str(), from.c_str(), to.c_str(),
-                generation.c_str());
-  return buffer;
+static sw::redis::Redis& cacheRedis() {
+  static sw::redis::Redis redis("tcp://redis:6379");
+  return redis;
 }
 
-std::string exceptionKey(const std::string& calendar) {
-  char buffer[256];
-  std::snprintf(buffer, sizeof(buffer), kExceptionKeyFormat.c_str(), calendar.c_str());
-  return buffer;
+std::string generationKey(const std::string& calendar_id) { return "gen:" + calendar_id; }
+
+// One slice per window and generation: a bump retires every window at once.
+std::string sliceKey(const std::string& calendar_id, long long generation, int64_t start, int64_t end) {
+  return "exp:" + calendar_id + ":" + std::to_string(generation) + ":" + std::to_string(start) + ":" + std::to_string(end);
 }
 
-std::string generationKey(const std::string& calendar) {
-  char buffer[256];
-  std::snprintf(buffer, sizeof(buffer), kGenerationKeyFormat.c_str(), calendar.c_str());
-  return buffer;
+long long currentGeneration(const std::string& calendar_id) {
+  const auto value = cacheRedis().get(generationKey(calendar_id));
+  return value ? std::stoll(*value) : 0;
 }
 
-void populateExpansion(sw::redis::Redis& redis, const std::string& calendar, const std::string& from,
-                       const std::string& to, const std::string& generation,
-                       const std::vector<std::pair<std::string, std::string>>& occurrences) {
-  const auto key = expansionKey(calendar, from, to, generation);
-  if (!occurrences.empty()) {
-    redis.hset(key, occurrences.begin(), occurrences.end());
+// A change to the calendar: every slice cached under the old generation stops being read.
+long long bumpGeneration(const std::string& calendar_id) { return cacheRedis().incr(generationKey(calendar_id)); }
+
+// A cancelled occurrence is dropped; a moved one is the same occurrence at its new start, listed once.
+std::vector<calendard::Occurrence> applyExceptions(const std::vector<calendard::Occurrence>& occurrences,
+                                                   const std::map<std::string, std::string>& exceptions) {
+  std::vector<calendard::Occurrence> applied;
+  for (calendard::Occurrence occurrence : occurrences) {
+    const auto it = exceptions.find(occurrence.occurrence_id);
+    const std::string value = it == exceptions.end() ? "" : it->second;
+    if (value == "cancelled") continue;
+    if (value.rfind("moved:", 0) == 0) {
+      const int64_t start = calendard::rrule::ParseInstant(value.substr(6)).value_or(0);
+      const int64_t length = calendard::rrule::ParseInstant(occurrence.end).value_or(0) -
+                             calendard::rrule::ParseInstant(occurrence.start).value_or(0);
+      occurrence.start = calendard::rrule::FormatInstant(start);
+      occurrence.end = calendard::rrule::FormatInstant(start + length);
+    }
+    applied.push_back(occurrence);
   }
-  redis.expire(key, kExpansionTtlS);
+  return applied;
 }
 
-std::string invalidateCalendar(sw::redis::Redis& redis, const std::string& calendar) {
-  const auto generation = std::to_string(redis.incr(generationKey(calendar)));
-  long long cursor = 0;
-  do {
-    std::vector<std::string> keys;
-    cursor = redis.scan(cursor, "exp:" + calendar + ":*", 100, std::back_inserter(keys));
-    if (!keys.empty()) {
-      redis.del(keys.begin(), keys.end());
-    }
-  } while (cursor != 0);
-  return generation;
-}
-
-void writeJSON(httplib::Response& res, int status, const json& body) {
-  res.status = status;
-  res.set_content(body.dump(), "application/json");
-}
-
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  httplib::SSLServer svr("cert.pem", "key.pem");
-
-  svr.Get(R"(/v1/calendars/([^/]+)/occurrences)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto calendar = req.matches[1].str();
-    const auto from = req.get_param_value("start");
-    const auto to = req.get_param_value("end");
-    const auto prefix = "exp:" + calendar + ":" + from + ":" + to + ":";
-    const auto readOnce = [&](std::string& generation, bool& exists, std::vector<std::string>& items) {
-      const auto reply =
-          redis.eval<std::vector<std::string>>(kReadLua, {generationKey(calendar), exceptionKey(calendar)}, {prefix});
-      generation = reply[0];
-      exists = reply[1] == "1";
-      items.assign(reply.begin() + 2, reply.end());
-    };
-    std::string generation;
-    bool exists = false;
-    std::vector<std::string> items;
-    readOnce(generation, exists, items);
-    if (!exists) {
-      populateExpansion(redis, calendar, from, to, generation, expandEvents(store.listEvents(calendar), from, to));
-      readOnce(generation, exists, items);
-    }
-    json occurrences = json::array();
-    for (std::size_t i = 0; i + 1 < items.size(); i += 2) {
-      occurrences.push_back({{"instance_id", items[i]}, {"start", items[i + 1]}});
-    }
-    writeJSON(res, 200, json{{"generation", generation}, {"occurrences", occurrences}});
+// The calendar's occurrences overlapping [start, end), exceptions applied, earliest first.
+std::vector<calendard::Occurrence> cachedExpansion(const std::string& calendar_id, int64_t start, int64_t end) {
+  // The generation is read before the events: a change that lands during the expansion bumps it,
+  // so what this call caches is filed under a generation no reader asks for any more.
+  const std::string key = sliceKey(calendar_id, currentGeneration(calendar_id), start, end);
+  if (const auto hit = cacheRedis().get(key)) return nlohmann::json::parse(*hit).get<std::vector<calendard::Occurrence>>();
+  std::vector<calendard::Occurrence> expanded;
+  for (const auto& event : calendard::store::ListEvents(calendar_id)) {
+    for (const auto& o : calendard::rrule::Expand(event, start, end)) expanded.push_back(o);
+  }
+  auto occurrences = applyExceptions(expanded, calendard::store::GetExceptions(calendar_id));
+  std::sort(occurrences.begin(), occurrences.end(), [](const calendard::Occurrence& a, const calendard::Occurrence& b) {
+    return a.start + a.occurrence_id < b.start + b.occurrence_id;
   });
+  cacheRedis().set(key, nlohmann::json(occurrences).dump(), kExpansionTtl);
+  return occurrences;
+}
 
-  svr.Post(R"(/v1/calendars/([^/]+)/exceptions)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto calendar = req.matches[1].str();
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("instance_id")) {
-      writeJSON(res, 400, json{{"error", "instance_id is required"}});
-      return;
-    }
-    const auto status = body.value("status", std::string("cancelled"));
-    const std::string state =
-        status == "moved" ? body.value("new_start", std::string("cancelled")) : std::string("cancelled");
-    const auto generation = invalidateCalendar(redis, calendar);
-    redis.hset(exceptionKey(calendar), body["instance_id"].get<std::string>(), state);
-    redis.expire(exceptionKey(calendar), kExceptionTtlS);
-    writeJSON(res, 200, json{{"generation", generation}});
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Cancel ("cancelled") or move ("moved:{ISO start}") one occurrence.
+void recordException(const std::string& calendar_id, const std::string& occurrence_id, const std::string& value) {
+  // Write, then bump: a reader that sees the new generation also sees the exception.
+  calendard::store::PutException(calendar_id, occurrence_id, value);
+  bumpGeneration(calendar_id);
 }
 `,
     },
   },
+  harness: {
+    python: `from calendard.rrule import parse_instant
+from calendard.store import store
+
+WEEK_1 = (parse_instant("2026-03-02T00:00:00Z"), parse_instant("2026-03-09T00:00:00Z"))
+WEEK_2 = (parse_instant("2026-03-09T00:00:00Z"), parse_instant("2026-03-16T00:00:00Z"))
+# A 30-minute daily standup, ten times from Monday 2 March 2026.
+EVENT = {
+    "event_id": "e-1",
+    "calendar_id": "c1",
+    "tenant": "t1",
+    "title": "Standup",
+    "rrule": "FREQ=DAILY;COUNT=10",
+    "dtstart": "2026-03-02T09:00:00Z",
+    "dtend": "2026-03-02T09:30:00Z",
+    "revision": 1,
+    "attendees": ["ana@example.com"],
+}
+
+
+def _world(ctx):
+    store.put_calendar("c1", "public", ["t1"])
+    store.put_event(dict(EVENT))
+    return ctx.load("state")
+
+
+def _occurrence(day):
+    return f"e-1:{parse_instant(f'2026-03-{day:02d}T09:00:00Z')}"
+
+
+def _starts(occurrences):
+    return [o["start"] for o in occurrences]
+
+
+def check_range_key(ctx):
+    m = _world(ctx)
+    week_1 = m.cached_expansion("c1", *WEEK_1)
+    assert len(week_1) == 7, f"the week of 2 March answered {len(week_1)} standups, expected 7: {_starts(week_1)}"
+    week_2 = m.cached_expansion("c1", *WEEK_2)
+    expected = ["2026-03-09T09:00:00Z", "2026-03-10T09:00:00Z", "2026-03-11T09:00:00Z"]
+    assert _starts(week_2) == expected, f"the week of 9 March answered {_starts(week_2)}, expected {expected}: the slice cached for one window was served for another"
+    again = m.cached_expansion("c1", *WEEK_1)
+    assert _starts(again) == _starts(week_1), f"the week of 2 March, read again, answered {_starts(again)}"
+
+
+def check_ttl(ctx):
+    m = _world(ctx)
+    m.cached_expansion("c1", *WEEK_1)
+    keys = ctx.redis.keys("exp:*")
+    assert keys, "cached_expansion cached nothing under exp:*"
+    for key in keys:
+        ttl = ctx.redis.ttl(key)
+        assert 0 < ttl <= 300, f"{key} has TTL {ttl}: a slice must expire within 300 s, or every retired generation stays in memory"
+    ctx.clock.advance(301)
+    assert ctx.redis.keys("exp:*") == [], f"301 s later Redis still holds {ctx.redis.keys('exp:*')}"
+
+
+def check_write_then_bump(ctx):
+    m = _world(ctx)
+    m.cached_expansion("c1", *WEEK_1)  # the week is cached
+    cancelled = _occurrence(4)
+    # The state of the world at the instant the generation moves: what a reader landing right then would expand.
+    probe = ctx.redis_after("gen:c1", lambda: ctx.redis.hget("exceptions:c1", cancelled))
+    m.record_exception("c1", cancelled, "cancelled")
+    assert probe.fired, "record_exception never bumped gen:c1: the cached week stays the week before the change"
+    assert probe.result == "cancelled", "when gen:c1 moved the exception was not written yet: a reader in between expands the old calendar and caches it under the new generation for the whole TTL. Write the exception, then bump"
+    ids = [o["occurrence_id"] for o in m.cached_expansion("c1", *WEEK_1)]
+    assert cancelled not in ids, "after record_exception the cancelled 4 March standup is still in the week"
+
+
+def check_exceptions(ctx):
+    m = _world(ctx)
+    store.put_exception("c1", _occurrence(3), "cancelled")
+    store.put_exception("c1", _occurrence(5), "moved:2026-03-05T14:00:00Z")
+    week = m.cached_expansion("c1", *WEEK_1)
+    ids = [o["occurrence_id"] for o in week]
+    assert _occurrence(3) not in ids, f"the cancelled 3 March standup is still listed: {_starts(week)}"
+    assert ids.count(_occurrence(5)) == 1, f"the moved 5 March standup is listed {ids.count(_occurrence(5))} times: {_starts(week)}. A moved instance replaces the original"
+    moved = next(o for o in week if o["occurrence_id"] == _occurrence(5))
+    assert moved["start"] == "2026-03-05T14:00:00Z" and moved["end"] == "2026-03-05T14:30:00Z", f"the moved standup is {moved}, expected 14:00 to 14:30 on 5 March"
+    assert len(week) == 6, f"the week answered {len(week)} standups, expected 6 (7 minus the cancelled one): {_starts(week)}"
+`,
+    typescript: `import {parseInstant} from 'calendard/rrule';
+import {store} from 'calendard/store';
+
+const WEEK_1: [number, number] = [parseInstant('2026-03-02T00:00:00Z')!, parseInstant('2026-03-09T00:00:00Z')!];
+const WEEK_2: [number, number] = [parseInstant('2026-03-09T00:00:00Z')!, parseInstant('2026-03-16T00:00:00Z')!];
+// A 30-minute daily standup, ten times from Monday 2 March 2026.
+const EVENT = {
+  event_id: 'e-1',
+  calendar_id: 'c1',
+  tenant: 't1',
+  title: 'Standup',
+  rrule: 'FREQ=DAILY;COUNT=10',
+  dtstart: '2026-03-02T09:00:00Z',
+  dtend: '2026-03-02T09:30:00Z',
+  revision: 1,
+  attendees: ['ana@example.com'],
+};
+
+async function world(ctx) {
+  await store.putCalendar('c1', 'public', ['t1']);
+  await store.putEvent({...EVENT});
+  return ctx.load('state');
+}
+
+const occurrence = (day: number): string => 'e-1:' + Date.UTC(2026, 2, day, 9) / 1000;
+const starts = (occurrences): string[] => occurrences.map(o => o.start);
+
+export async function check_range_key(ctx) {
+  const m = await world(ctx);
+  const week1 = await m.cachedExpansion('c1', ...WEEK_1);
+  assert.equal(week1.length, 7, \`the week of 2 March answered \${week1.length} standups, expected 7: \${JSON.stringify(starts(week1))}\`);
+  const week2 = await m.cachedExpansion('c1', ...WEEK_2);
+  const expected = ['2026-03-09T09:00:00Z', '2026-03-10T09:00:00Z', '2026-03-11T09:00:00Z'];
+  assert.deepEqual(starts(week2), expected, \`the week of 9 March answered \${JSON.stringify(starts(week2))}, expected \${JSON.stringify(expected)}: the slice cached for one window was served for another\`);
+  const again = await m.cachedExpansion('c1', ...WEEK_1);
+  assert.deepEqual(starts(again), starts(week1), \`the week of 2 March, read again, answered \${JSON.stringify(starts(again))}\`);
+}
+
+export async function check_ttl(ctx) {
+  const m = await world(ctx);
+  await m.cachedExpansion('c1', ...WEEK_1);
+  const keys = ctx.redis.keys('exp:*');
+  assert(keys.length > 0, 'cachedExpansion cached nothing under exp:*');
+  for (const key of keys) {
+    const ttl = ctx.redis.ttl(key);
+    assert(ttl > 0 && ttl <= 300, \`\${key} has TTL \${ttl}: a slice must expire within 300 s, or every retired generation stays in memory\`);
+  }
+  ctx.clock.advance(301);
+  assert.deepEqual(ctx.redis.keys('exp:*'), [], \`301 s later Redis still holds \${JSON.stringify(ctx.redis.keys('exp:*'))}\`);
+}
+
+export async function check_write_then_bump(ctx) {
+  const m = await world(ctx);
+  await m.cachedExpansion('c1', ...WEEK_1); // the week is cached
+  const cancelled = occurrence(4);
+  // The state of the world at the instant the generation moves: what a reader landing right then would expand.
+  const probe = ctx.redisAfter('gen:c1', () => ctx.redis.hget('exceptions:c1', cancelled));
+  await m.recordException('c1', cancelled, 'cancelled');
+  assert(probe.fired, 'recordException never bumped gen:c1: the cached week stays the week before the change');
+  assert.equal(probe.result, 'cancelled', 'when gen:c1 moved the exception was not written yet: a reader in between expands the old calendar and caches it under the new generation for the whole TTL. Write the exception, then bump');
+  const ids = (await m.cachedExpansion('c1', ...WEEK_1)).map(o => o.occurrence_id);
+  assert(!ids.includes(cancelled), 'after recordException the cancelled 4 March standup is still in the week');
+}
+
+export async function check_exceptions(ctx) {
+  const m = await world(ctx);
+  await store.putException('c1', occurrence(3), 'cancelled');
+  await store.putException('c1', occurrence(5), 'moved:2026-03-05T14:00:00Z');
+  const week = await m.cachedExpansion('c1', ...WEEK_1);
+  const ids = week.map(o => o.occurrence_id);
+  assert(!ids.includes(occurrence(3)), \`the cancelled 3 March standup is still listed: \${JSON.stringify(starts(week))}\`);
+  const copies = ids.filter(id => id === occurrence(5)).length;
+  assert.equal(copies, 1, \`the moved 5 March standup is listed \${copies} times: \${JSON.stringify(starts(week))}. A moved instance replaces the original\`);
+  const moved = week.find(o => o.occurrence_id === occurrence(5));
+  assert(moved.start === '2026-03-05T14:00:00Z' && moved.end === '2026-03-05T14:30:00Z', \`the moved standup is \${JSON.stringify(moved)}, expected 14:00 to 14:30 on 5 March\`);
+  assert.equal(week.length, 6, \`the week answered \${week.length} standups, expected 6 (7 minus the cancelled one): \${JSON.stringify(starts(week))}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strconv"
+
+	"leetbuild/harness"
+
+	"calendard/rrule"
+	"calendard/store"
+)
+
+func stAt(text string) int64 {
+	instant, _ := rrule.ParseInstant(text)
+	return instant
+}
+
+var (
+	stWeek1 = [2]int64{stAt("2026-03-02T00:00:00Z"), stAt("2026-03-09T00:00:00Z")}
+	stWeek2 = [2]int64{stAt("2026-03-09T00:00:00Z"), stAt("2026-03-16T00:00:00Z")}
+)
+
+// stWorld is a public calendar with a 30-minute daily standup, ten times from Monday 2 March 2026.
+func stWorld(ctx *harness.Ctx) {
+	ctx.NoError(store.PutCalendar(context.Background(), "c1", "public", "t1"), "seeding the calendar")
+	e := store.Event{
+		EventID: "e-1", CalendarID: "c1", Tenant: "t1", Title: "Standup", Rrule: "FREQ=DAILY;COUNT=10",
+		Dtstart: "2026-03-02T09:00:00Z", Dtend: "2026-03-02T09:30:00Z", Revision: 1, Attendees: []string{"ana@example.com"},
+	}
+	ctx.NoError(store.PutEvent(context.Background(), &e), "seeding the event")
+}
+
+func stOccurrence(day int) string {
+	return "e-1:" + strconv.FormatInt(stAt("2026-03-0"+strconv.Itoa(day)+"T09:00:00Z"), 10)
+}
+
+func stRead(ctx *harness.Ctx, window [2]int64) []rrule.Occurrence {
+	occurrences, err := cachedExpansion(context.Background(), "c1", window[0], window[1])
+	ctx.NoError(err, "cachedExpansion")
+	return occurrences
+}
+
+func stStarts(occurrences []rrule.Occurrence) []string {
+	starts := []string{}
+	for _, o := range occurrences {
+		starts = append(starts, o.Start)
+	}
+	return starts
+}
+
+func stIDs(occurrences []rrule.Occurrence) []string {
+	ids := []string{}
+	for _, o := range occurrences {
+		ids = append(ids, o.OccurrenceID)
+	}
+	return ids
+}
+
+func CheckRangeKey(ctx *harness.Ctx) {
+	stWorld(ctx)
+	week1 := stRead(ctx, stWeek1)
+	ctx.Equal(len(week1), 7, "the week of 2 March must answer 7 standups (%v); the count", stStarts(week1))
+	week2 := stRead(ctx, stWeek2)
+	ctx.Equal(stStarts(week2), []string{"2026-03-09T09:00:00Z", "2026-03-10T09:00:00Z", "2026-03-11T09:00:00Z"}, "the week of 9 March (a slice cached for one window must not be served for another)")
+	ctx.Equal(stStarts(stRead(ctx, stWeek1)), stStarts(week1), "the week of 2 March, read again")
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	stWorld(ctx)
+	stRead(ctx, stWeek1)
+	keys := ctx.Redis.Keys("exp:*")
+	ctx.Assert(len(keys) > 0, "cachedExpansion cached nothing under exp:*")
+	for _, key := range keys {
+		ttl := ctx.Redis.TTL(key)
+		ctx.Assert(ttl > 0 && ttl <= 300, "%s has TTL %d: a slice must expire within 300 s, or every retired generation stays in memory", key, ttl)
+	}
+	ctx.Clock.Advance(301)
+	ctx.Equal(ctx.Redis.Keys("exp:*"), []string{}, "the slices 301 s later")
+}
+
+func CheckWriteThenBump(ctx *harness.Ctx) {
+	stWorld(ctx)
+	stRead(ctx, stWeek1) // the week is cached
+	cancelled := stOccurrence(4)
+	// The state of the world at the instant the generation moves: what a reader landing right then would expand.
+	probe := ctx.Redis.After("gen:c1", func() any {
+		value, _ := ctx.Redis.HGet("exceptions:c1", cancelled)
+		return value
+	})
+	ctx.NoError(recordException(context.Background(), "c1", cancelled, "cancelled"), "recordException")
+	ctx.Assert(probe.Fired, "recordException never bumped gen:c1: the cached week stays the week before the change")
+	ctx.Equal(probe.Result, "cancelled", "when gen:c1 moved the exception was not written yet: a reader in between expands the old calendar and caches it under the new generation for the whole TTL. Write the exception, then bump; the exception at the bump")
+	for _, id := range stIDs(stRead(ctx, stWeek1)) {
+		ctx.Assert(id != cancelled, "after recordException the cancelled 4 March standup is still in the week")
+	}
+}
+
+func CheckExceptions(ctx *harness.Ctx) {
+	stWorld(ctx)
+	ctx.NoError(store.PutException(context.Background(), "c1", stOccurrence(3), "cancelled"), "seeding an exception")
+	ctx.NoError(store.PutException(context.Background(), "c1", stOccurrence(5), "moved:2026-03-05T14:00:00Z"), "seeding an exception")
+	week := stRead(ctx, stWeek1)
+	copies := 0
+	for _, o := range week {
+		ctx.Assert(o.OccurrenceID != stOccurrence(3), "the cancelled 3 March standup is still listed: %v", stStarts(week))
+		if o.OccurrenceID == stOccurrence(5) {
+			copies++
+			ctx.Assert(o.Start == "2026-03-05T14:00:00Z" && o.End == "2026-03-05T14:30:00Z", "the moved standup is %v, expected 14:00 to 14:30 on 5 March", o)
+		}
+	}
+	ctx.Equal(copies, 1, "the moved 5 March standup must be listed once, in place of the original (%v); the copies", stStarts(week))
+	ctx.Equal(len(week), 6, "the week must answer 6 standups, 7 minus the cancelled one (%v); the count", stStarts(week))
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+int64_t stAt(const std::string& text) { return calendard::rrule::ParseInstant(text).value_or(0); }
+
+const int64_t kWeek1Start = stAt("2026-03-02T00:00:00Z");
+const int64_t kWeek1End = stAt("2026-03-09T00:00:00Z");
+const int64_t kWeek2End = stAt("2026-03-16T00:00:00Z");
+
+// A public calendar with a 30-minute daily standup, ten times from Monday 2 March 2026.
+void stWorld() {
+  calendard::store::PutCalendar("c1", "public", {"t1"});
+  calendard::store::PutEvent({"e-1", "c1", "t1", "Standup", "FREQ=DAILY;COUNT=10", "2026-03-02T09:00:00Z", "2026-03-02T09:30:00Z", 1,
+                              {"ana@example.com"}});
+}
+
+std::string stOccurrence(int day) { return "e-1:" + std::to_string(stAt("2026-03-0" + std::to_string(day) + "T09:00:00Z")); }
+
+std::vector<std::string> stStarts(const std::vector<calendard::Occurrence>& occurrences) {
+  std::vector<std::string> starts;
+  for (const auto& o : occurrences) starts.push_back(o.start);
+  return starts;
+}
+
+}  // namespace
+
+void CheckRangeKey(harness::Ctx& ctx) {
+  stWorld();
+  const auto week1 = cachedExpansion("c1", kWeek1Start, kWeek1End);
+  ctx.Equal(week1.size(), 7, "the week of 2 March must answer 7 standups (%v); the count", stStarts(week1));
+  const auto week2 = cachedExpansion("c1", kWeek1End, kWeek2End);
+  ctx.Equal(stStarts(week2), {"2026-03-09T09:00:00Z", "2026-03-10T09:00:00Z", "2026-03-11T09:00:00Z"},
+            "the week of 9 March (a slice cached for one window must not be served for another)");
+  ctx.Equal(stStarts(cachedExpansion("c1", kWeek1Start, kWeek1End)), stStarts(week1), "the week of 2 March, read again");
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  stWorld();
+  cachedExpansion("c1", kWeek1Start, kWeek1End);
+  const auto keys = ctx.Redis.Keys("exp:*");
+  ctx.Assert(!keys.empty(), "cachedExpansion cached nothing under exp:*");
+  for (const auto& key : keys) {
+    const long long ttl = ctx.Redis.TTL(key);
+    ctx.Assert(ttl > 0 && ttl <= 300, "%s has TTL %d: a slice must expire within 300 s, or every retired generation stays in memory", key, ttl);
+  }
+  ctx.Clock.Advance(301);
+  ctx.Equal(ctx.Redis.Keys("exp:*"), std::vector<std::string>{}, "the slices 301 s later");
+}
+
+void CheckWriteThenBump(harness::Ctx& ctx) {
+  stWorld();
+  cachedExpansion("c1", kWeek1Start, kWeek1End);  // the week is cached
+  const std::string cancelled = stOccurrence(4);
+  // The state of the world at the instant the generation moves: what a reader landing right then would expand.
+  bool fired = false;
+  std::string atBump;
+  ctx.Redis.After("gen:c1", [&] {
+    fired = true;
+    atBump = ctx.Redis.HGet("exceptions:c1", cancelled).value_or("");
+  });
+  recordException("c1", cancelled, "cancelled");
+  ctx.Assert(fired, "recordException never bumped gen:c1: the cached week stays the week before the change");
+  ctx.Equal(atBump, "cancelled",
+            "when gen:c1 moved the exception was not written yet: a reader in between expands the old calendar and caches it "
+            "under the new generation for the whole TTL. Write the exception, then bump; the exception at the bump");
+  for (const auto& o : cachedExpansion("c1", kWeek1Start, kWeek1End)) {
+    ctx.Assert(o.occurrence_id != cancelled, "after recordException the cancelled 4 March standup is still in the week");
+  }
+}
+
+void CheckExceptions(harness::Ctx& ctx) {
+  stWorld();
+  calendard::store::PutException("c1", stOccurrence(3), "cancelled");
+  calendard::store::PutException("c1", stOccurrence(5), "moved:2026-03-05T14:00:00Z");
+  const auto week = cachedExpansion("c1", kWeek1Start, kWeek1End);
+  int copies = 0;
+  for (const auto& o : week) {
+    ctx.Assert(o.occurrence_id != stOccurrence(3), "the cancelled 3 March standup is still listed: %v", stStarts(week));
+    if (o.occurrence_id == stOccurrence(5)) {
+      copies++;
+      ctx.Assert(o.start == "2026-03-05T14:00:00Z" && o.end == "2026-03-05T14:30:00Z",
+                 "the moved standup runs %s to %s, expected 14:00 to 14:30 on 5 March", o.start, o.end);
+    }
+  }
+  ctx.Equal(copies, 1, "the moved 5 March standup must be listed once, in place of the original (%v); the copies", stStarts(week));
+  ctx.Equal(week.size(), 6, "the week must answer 6 standups, 7 minus the cancelled one (%v); the count", stStarts(week));
+}
+`,
+  },
   hints: [
-    'A user cancels next Tuesday, refreshes, and the instance is still in the week view; a day later a colleague on a different range sees it too, and it stays there until Redis restarts.',
-    'The slice is keyed by event id with no range, no generation and no TTL, and the exception is read in a second command, so a mid-read cancellation is missed and nothing invalidates the slice.',
-    'Key slices by `exp:{calendar}:{start}:{end}:{generation}`, `INCR gen:{calendar}` and sweep `exp:{calendar}:*` before each `hset`, overlay exceptions inside one `eval` of `READ_LUA`, and `expire` both keys.',
+    'The week of 9 March shows the standups of 2 March, a cancelled standup stays on the screen after the cancel, a moved one appears at both times, and Redis memory only ever grows.',
+    'The slice key names the calendar and the generation but not the window; a `SET` without `EX` lives forever; bumping before writing lets a reader cache the old calendar under the new generation; the overlay appends a copy.',
+    'Key slices `exp:{calendar}:{generation}:{start}:{end}`, write them with `EX` 300, call `store.put_exception` before `bump_generation`, and in `apply_exceptions` skip `"cancelled"` and replace a moved occurrence instead of appending it.',
   ],
-  debrief: `A cached expansion is only as good as the key that names it: per (calendar, range, generation) means one counter bump makes every slice of the old generation unreachable and the sweep reclaims them, while per-event keys freeze every range ever asked for. The overlay lives inside one Lua script because the exception and the slice it modifies must be read under the same generation; dropping the cancelled instance and applying the moved start before the answer leaves Redis closes the window a second command opens. TTLs bound the damage of anything the sweep misses. Calendar caches at scale shard by calendar, cap the slices kept per generation, and let the expansion worker publish a slice with a compare-and-set on the generation.`,
+  debrief: `A generation retires slices without deleting them: one \`INCR\` makes every slice of the old generation unreachable, whatever windows readers asked for, and the TTL reclaims the memory later. That only holds if the change is visible before the bump, because a reader between a bump and its write files stale data under the live generation. Bumping after the write means the worst a racing reader can do is cache stale data under a generation nobody reads. The moved instance keeps its occurrence id, as an exception keeps its original start, so clients see one instance that moved. Production calendars cache per event rather than per calendar, so one edit does not retire every slice, and bound the instances they ever materialize.`,
 };

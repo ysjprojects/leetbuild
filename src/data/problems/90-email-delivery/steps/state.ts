@@ -4,108 +4,112 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis suppression and per-recipient rate limits',
   concept: 'redis',
-  file: 'state',
-  focus: ['api', 'redis', 'relay'],
+  file: 'admission',
+  focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter calls \`relay.send\` first, then reads a \`suppression:{recipient}\`
-string key (written by \`suppress\` with \`ex=3600\`) and finally runs \`check_rate\`, which does a
-\`GET\` on \`rate:{recipient}:{window}\` and a separate \`INCR\` with no expiry. It compiles and it hides five flaws.
+**Starting point.** The starter is the admission gate the send path asks: \`suppress(address)\`
+writes \`mail:suppressed:{address}\` with a one-hour expiry, \`is_suppressed\` checks that key, and
+\`admit(address)\` answers \`"suppressed"\`, then reads the minute counter
+\`mail:rate:{address}:{window}\`, answers \`"rate_limited"\` once it reached \`RATE_LIMIT\` (5) and
+otherwise increments it. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A bounced or unsubscribed address is mailed again once the
-one-hour key lapses; concurrent sends read the same count and all pass the cap; the counter key lives
-forever; and the refusal arrives after the relay already has the message.
+**Failure mode the checks target.** An unsubscribe is forgotten after an hour; two sends racing at
+the fifth email of the minute both pass; every counter stays in Redis for good; and
+\`Ana@Example.com\` is treated as someone other than \`ana@example.com\`.
 
-Requirements:
-
-- Suppression and the minute counter are decided in one Lua script \`ADMIT_LUA\` run with
-  \`r.eval\`: \`SISMEMBER\` on the set, then \`INCR\` on the counter.
-- Suppression is durable: a set named by \`SUPPRESSED_SET\` (\`suppression:list\`), written with
-  \`r.sadd\` and no per-member expiry.
-- The counter \`rate:{recipient}:{window}\` gets \`EXPIRE WINDOW_S\` (60 seconds) on its first write,
-  with \`window = floor(unix_seconds / 60)\`.
-- \`def suppress(recipient)\` writes the set with \`r.sadd\`, so the next admission sees it at once.
-- \`admit(...)\` runs before \`relay.send\`; suppressed is **409**, over the limit is **429**, and a
-  refused send does not reach the relay.`,
+- Suppression is durable: \`SADD\` to the set \`SUPPRESSED_SET\` (\`mail:suppressed\`), with no expiry.
+- \`admit\` decides in **one Lua script** (\`register_script\` or \`EVAL\`): \`SISMEMBER\` on the set,
+  then \`INCR\` the counter, \`EXPIRE\` it for \`WINDOW_S\` (60 s) on its first increment, and compare
+  with \`RATE_LIMIT\`.
+- Every function normalizes the address first (\`normalize\`, provided in \`mail.address\`).`,
   sequence: {
-    participants: ['Email API', 'Redis', 'Relay'],
+    participants: ['Email API', 'Gate', 'Redis'],
     messages: [
+      {from: 'Email API', to: 'Gate', label: 'admit("Ana@Example.com")', kind: 'sync'},
+      {from: 'Gate', to: 'Gate', label: 'normalize → ana@example.com', kind: 'sync'},
       {
-        from: 'Email API',
+        from: 'Gate',
         to: 'Redis',
-        label: 'EVAL admit · KEYS[suppression:list, rate:{recipient}:{window}]',
+        label: 'EVAL: SISMEMBER mail:suppressed · INCR mail:rate:… · EXPIRE 60',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Email API', label: '{0, -1} suppressed / {-1, n} over limit / {1, n}', kind: 'reply'},
-      {from: 'Email API', to: 'Email API', label: 'unsubscribe → SADD suppression:list', kind: 'sync'},
-      {from: 'Email API', to: 'Relay', label: 'send(recipient) only when verdict is 1', kind: 'async'},
-      {from: 'Email API', to: 'Email API', label: '409 suppressed · 429 rate limited', kind: 'sync'},
+      {from: 'Redis', to: 'Gate', label: 'suppressed · rate_limited · ok', kind: 'reply'},
+      {from: 'Gate', to: 'Email API', label: 'verdict', kind: 'reply'},
     ],
   },
   checks: [
     {
-      id: 'atomic',
-      title: 'Decides suppression and the minute counter in one atomic script',
+      id: 'durable-suppression',
+      title: 'Keeps suppressed addresses in a set that never expires',
       detail:
-        'A single Lua `EVAL` reads suppression, increments the rate counter and sets its expiry; a client-side read followed by a separate increment races, so two concurrent sends can both pass.',
+        '`suppress` adds the address to the set `mail:suppressed` (`SADD`) and admission reads it with `SISMEMBER`; the starter writes a key with a one-hour expiry, so an unsubscribe lapses.',
       match: {
-        python: {all: [/ADMIT_LUA/, /\.eval\(/, /SISMEMBER/, /INCR/]},
-        typescript: {all: [/ADMIT_LUA/, /\.eval\(/, /sismember/i, /incr/i]},
-        go: {all: [/admitScript/, /\.Eval\(|\.Run\(/, /SISMEMBER/, /INCR/]},
-        scala: {all: [/AdmitLua/, /\.eval\(/, /SISMEMBER/, /INCR/]},
-        cpp: {all: [/kAdmitLua/, /EVAL/, /SISMEMBER/, /INCR/]},
+        python: {
+          all: [/SUPPRESSED_SET\s*=\s*["']mail:suppressed["']/, /\.sadd\(/, /SISMEMBER/],
+          none: [/\bex\s*=/, /setex/i, /SUPPRESSION_TTL/],
+        },
+        typescript: {
+          all: [/SUPPRESSED_SET\s*=\s*['"]mail:suppressed['"]/, /\.sadd\(/, /SISMEMBER/],
+          none: [/['"]EX['"]/, /setex/i, /SUPPRESSION_TTL/],
+        },
+        go: {
+          all: [/suppressedSet\s*=\s*"mail:suppressed"/, /\.SAdd\(/, /SISMEMBER/],
+          none: [/suppressionTTL/i, /SetEx\(|\.Set\([^\n]*mail:suppressed/],
+        },
+        scala: {
+          all: [/SuppressedSet\s*=\s*"mail:suppressed"/, /jedis\.sadd\(/, /SISMEMBER/],
+          none: [/setex/i, /SuppressionTtl/i],
+        },
+        cpp: {
+          all: [/kSuppressedSet\s*=\s*"mail:suppressed"/, /\.sadd\(/, /SISMEMBER/],
+          none: [/kSuppressionTtl/i, /\.set\([^\n]*mail:suppressed/],
+        },
       },
     },
     {
-      id: 'durable-suppression',
-      title: 'Suppression is durable and never expires on its own',
+      id: 'atomic-admission',
+      title: 'Decides suppression and the count in one Lua script',
       detail:
-        'Suppression lives in a set (`suppression:list`) written with `SADD`, so it has no TTL. The starter writes a `suppression:{recipient}` key with a one-hour expiry, so the unsubscribe is forgotten.',
+        'One script checks the set and increments the counter, so a second send cannot land between the read and the write; the starter reads the count with `GET` and increments it in another round trip.',
       match: {
-        python: {all: [/SUPPRESSED_SET/, /\.sadd\(/]},
-        typescript: {all: [/SUPPRESSED_SET/, /\.sadd\(/]},
-        go: {all: [/SuppressedSet/, /\.SAdd\(/]},
-        scala: {all: [/SuppressedSet/, /\.sadd\(/]},
-        cpp: {all: [/kSuppressedSet/, /SADD/]},
+        python: {
+          all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]INCR['"]/],
+          none: [/r\.incr\(/, /r\.get\(/],
+        },
+        typescript: {
+          all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]INCR['"]/],
+          none: [/redis\.incr\(/, /redis\.get\(/],
+        },
+        go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/rdb\.Incr\(/, /rdb\.Get\(/]},
+        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/jedis\.incr\(/, /jedis\.get\(/]},
+        cpp: {all: [/\.eval(sha)?</, /redis\.call\(\s*['"]INCR['"]/], none: [/\.incr\(/, /redis\.get\(/]},
       },
     },
     {
       id: 'rate-window',
-      title: 'The rate window expires with its minute',
+      title: 'Expires each minute counter with its window',
       detail:
-        'The rate counter carries an `EXPIRE` of one window, so the limit resets instead of accumulating forever. The starter increments a counter that never dies.',
+        'The script gives the counter `EXPIRE` for the window (60 s) on its first increment; without it every recipient leaves one key per minute in Redis for good.',
       match: {
-        python: {all: [/EXPIRE/, /WINDOW_S/]},
-        typescript: {all: [/EXPIRE/, /WINDOW_S/]},
-        go: {all: [/EXPIRE/, /windowSeconds/]},
-        scala: {all: [/EXPIRE/, /WindowSeconds/]},
-        cpp: {all: [/EXPIRE/, /kWindowSeconds/]},
+        python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /WINDOW_S\s*=\s*60\b/]},
+        typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /WINDOW_S\s*=\s*60\b/]},
+        go: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /windowSeconds\s*=\s*60\b/]},
+        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /WindowSeconds\s*=\s*60L?\b/]},
+        cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /kWindowSeconds\s*=\s*60\b/]},
       },
     },
     {
-      id: 'unsubscribe',
-      title: 'An unsubscribe takes effect within seconds',
+      id: 'normalized-address',
+      title: 'Normalizes the address before every key',
       detail:
-        '`suppress(recipient)` writes the durable set with `SADD`, so the next admission sees it immediately. The starter only writes an expiring cache key.',
+        'Suppression and the counter use the trimmed, lowercased address (`normalize`), so one mailbox written two ways is one entry.',
       match: {
-        python: {all: [/def suppress\(/, /\.sadd\(/]},
-        typescript: {all: [/function suppress/, /\.sadd\(/]},
-        go: {all: [/func Suppress\(/, /\.SAdd\(/]},
-        scala: {all: [/def suppress\(/, /\.sadd\(/]},
-        cpp: {all: [/void suppress\(/, /SADD/]},
-      },
-    },
-    {
-      id: 'admit-first',
-      title: 'The admission verdict gates the relay call',
-      detail:
-        'The atomic admission runs before the relay is called, so a suppressed or over-limit send never reaches the relay. The starter sends first and checks afterwards.',
-      match: {
-        python: {order: [/admit\(/, /relay\.send\(/]},
-        typescript: {order: [/admit\(/, /relay\.send\(/]},
-        go: {order: [/Admit\(/, /relay\.Send\(/]},
-        scala: {order: [/admit\(/, /relay\.send\(/]},
-        cpp: {order: [/admit\(/, /relay\.send\(/]},
+        python: {all: [/normalize\(\s*address\s*\)/]},
+        typescript: {all: [/normalize\(\s*address\s*\)/]},
+        go: {all: [/address\.Normalize\(/]},
+        scala: {all: [/Address\.normalize\(/]},
+        cpp: {all: [/address::normalize\(/]},
       },
     },
   ],
@@ -114,630 +118,684 @@ Requirements:
       starter: `import time
 
 import redis
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-app = FastAPI()
+from mail.address import normalize  # trimmed, lowercase
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 RATE_LIMIT = 5
+WINDOW_S = 60
+SUPPRESSION_TTL_S = 3600
 
 
-class SendBody(BaseModel):
-    recipient: str
+def rate_key(address: str, now: float) -> str:
+    return f"mail:rate:{address}:{int(now // WINDOW_S)}"
 
 
-class Relay:
-    def send(self, recipient: str) -> str:
-        """Hand the message to the relay and return a message id."""
-        raise NotImplementedError
+def suppress(address: str) -> None:
+    """Stop mailing an address (a hard bounce, a complaint, an unsubscribe)."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    r.set(f"mail:suppressed:{address}", "1", ex=SUPPRESSION_TTL_S)
 
 
-relay = Relay()
+def is_suppressed(address: str) -> bool:
+    return r.exists(f"mail:suppressed:{address}") == 1
 
 
-def is_suppressed(recipient: str) -> bool:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    return bool(r.get(f"suppression:{recipient}"))
-
-
-def suppress(recipient: str) -> None:
-    r.set(f"suppression:{recipient}", "1", ex=3600)
-
-
-def check_rate(recipient: str, window: int) -> bool:
-    count = int(r.get(f"rate:{recipient}:{window}") or 0)
-    if count >= RATE_LIMIT:
-        return False
-    r.incr(f"rate:{recipient}:{window}")
-    return True
-
-
-@app.post("/v1/emails")
-def send(body: SendBody) -> JSONResponse:
-    window = int(time.time()) // 60
-    message_id = relay.send(body.recipient)
-    if is_suppressed(body.recipient):
-        return JSONResponse({"error": "suppressed"}, status_code=409)
-    if not check_rate(body.recipient, window):
-        return JSONResponse({"error": "rate limited"}, status_code=429)
-    return JSONResponse({"message_id": message_id}, status_code=202)
+def admit(address: str) -> str:
+    """"suppressed", "rate_limited" or "ok" for one more email to the address."""
+    if is_suppressed(address):
+        return "suppressed"
+    key = rate_key(address, time.time())
+    sent = int(r.get(key) or 0)
+    if sent >= RATE_LIMIT:
+        return "rate_limited"
+    r.incr(key)
+    return "ok"
 `,
       solution: `import time
 
 import redis
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-app = FastAPI()
+from mail.address import normalize  # trimmed, lowercase
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-SUPPRESSED_SET = "suppression:list"
-RATE_PREFIX = "rate:"
+SUPPRESSED_SET = "mail:suppressed"
 RATE_LIMIT = 5
 WINDOW_S = 60
 
+# One decision, run whole by Redis: no other send can land between the check and the count.
 ADMIT_LUA = """
-local suppressed = redis.call('SISMEMBER', KEYS[1], ARGV[1])
-if suppressed == 1 then return {0, -1} end
-local count = redis.call('INCR', KEYS[2])
-if count == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
-if count > tonumber(ARGV[3]) then return {-1, count} end
-return {1, count}
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return 'suppressed' end
+local sent = redis.call('INCR', KEYS[2])
+if sent == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
+if sent > tonumber(ARGV[3]) then return 'rate_limited' end
+return 'ok'
 """
+admit_script = r.register_script(ADMIT_LUA)
 
 
-class SendBody(BaseModel):
-    recipient: str
+def rate_key(address: str, now: float) -> str:
+    return f"mail:rate:{address}:{int(now // WINDOW_S)}"
 
 
-class Relay:
-    def send(self, recipient: str) -> str:
-        """Hand the message to the relay and return a message id."""
-        raise NotImplementedError
+def suppress(address: str) -> None:
+    """Stop mailing an address (a hard bounce, a complaint, an unsubscribe)."""
+    r.sadd(SUPPRESSED_SET, normalize(address))  # durable: removed only by an explicit request
 
 
-relay = Relay()
+def is_suppressed(address: str) -> bool:
+    return bool(r.sismember(SUPPRESSED_SET, normalize(address)))
 
 
-def is_suppressed(recipient: str) -> bool:
-    """True when the recipient is on the durable suppression set."""
-    return bool(r.sismember(SUPPRESSED_SET, recipient))
-
-
-def suppress(recipient: str) -> None:
-    """Unsubscribe: durable, takes effect on the next admission."""
-    r.sadd(SUPPRESSED_SET, recipient)
-
-
-def admit(recipient: str, window: int) -> tuple[int, int]:
-    """One atomic check: suppression plus the per-recipient minute counter."""
-    verdict = r.eval(
-        ADMIT_LUA, 2, SUPPRESSED_SET, f"{RATE_PREFIX}{recipient}:{window}", recipient, WINDOW_S, RATE_LIMIT
-    )
-    return int(verdict[0]), int(verdict[1])
-
-
-@app.post("/v1/emails")
-def send(body: SendBody) -> JSONResponse:
-    window = int(time.time()) // WINDOW_S
-    verdict, _ = admit(body.recipient, window)
-    if verdict == 0:
-        return JSONResponse({"error": "suppressed"}, status_code=409)
-    if verdict < 0:
-        return JSONResponse({"error": "rate limited"}, status_code=429)
-    message_id = relay.send(body.recipient)
-    return JSONResponse({"message_id": message_id}, status_code=202)
+def admit(address: str) -> str:
+    """"suppressed", "rate_limited" or "ok" for one more email to the address."""
+    address = normalize(address)
+    return admit_script(keys=[SUPPRESSED_SET, rate_key(address, time.time())], args=[address, WINDOW_S, RATE_LIMIT])
 `,
     },
     typescript: {
-      starter: `import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {normalize} from 'mail/address'; // trimmed, lowercase
 
-const RATE_LIMIT = 5;
+const redis = new Redis({host: 'redis', port: 6379});
 
-interface SendBody {
-  recipient: string;
+export const RATE_LIMIT = 5;
+export const WINDOW_S = 60;
+export const SUPPRESSION_TTL_S = 3600;
+
+export const rateKey = (address: string, nowMs: number): string => \`mail:rate:\${address}:\${Math.floor(nowMs / 1000 / WINDOW_S)}\`;
+
+/** Stop mailing an address (a hard bounce, a complaint, an unsubscribe). */
+export async function suppress(address: string): Promise<void> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  await redis.set(\`mail:suppressed:\${address}\`, '1', 'EX', SUPPRESSION_TTL_S);
 }
 
-interface Relay {
-  send(recipient: string): Promise<string>;
+export async function isSuppressed(address: string): Promise<boolean> {
+  return (await redis.exists(\`mail:suppressed:\${address}\`)) === 1;
 }
 
-const relay: Relay = {
-  async send() {
-    throw new Error('Not implemented');
-  },
-};
-
-async function isSuppressed(recipient: string): Promise<boolean> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  return Boolean(await r.get(\`suppression:\${recipient}\`));
+/** 'suppressed', 'rate_limited' or 'ok' for one more email to the address. */
+export async function admit(address: string): Promise<string> {
+  if (await isSuppressed(address)) return 'suppressed';
+  const key = rateKey(address, Date.now());
+  const sent = Number((await redis.get(key)) ?? 0);
+  if (sent >= RATE_LIMIT) return 'rate_limited';
+  await redis.incr(key);
+  return 'ok';
 }
-
-async function suppress(recipient: string): Promise<void> {
-  await r.set(\`suppression:\${recipient}\`, '1', 'EX', 3600);
-}
-
-async function checkRate(recipient: string, window: number): Promise<boolean> {
-  const count = Number((await r.get(\`rate:\${recipient}:\${window}\`)) ?? 0);
-  if (count >= RATE_LIMIT) return false;
-  await r.incr(\`rate:\${recipient}:\${window}\`);
-  return true;
-}
-
-app.post('/v1/emails', async (request, reply) => {
-  const body = request.body as SendBody;
-  const window = Math.floor(Date.now() / 1000 / 60);
-  const messageId = await relay.send(body.recipient);
-  if (await isSuppressed(body.recipient)) {
-    return reply.code(409).send({error: 'suppressed'});
-  }
-  if (!(await checkRate(body.recipient, window))) {
-    return reply.code(429).send({error: 'rate limited'});
-  }
-  return reply.code(202).send({message_id: messageId});
-});
 `,
-      solution: `import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {normalize} from 'mail/address'; // trimmed, lowercase
 
-const SUPPRESSED_SET = 'suppression:list';
-const RATE_PREFIX = 'rate:';
-const RATE_LIMIT = 5;
-const WINDOW_S = 60;
+export const SUPPRESSED_SET = 'mail:suppressed';
+export const RATE_LIMIT = 5;
+export const WINDOW_S = 60;
 
-const ADMIT_LUA = \`
-local suppressed = redis.call('SISMEMBER', KEYS[1], ARGV[1])
-if suppressed == 1 then return {0, -1} end
-local count = redis.call('INCR', KEYS[2])
-if count == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
-if count > tonumber(ARGV[3]) then return {-1, count} end
-return {1, count}
+// One decision, run whole by Redis: no other send can land between the check and the count.
+export const ADMIT_LUA = \`
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return 'suppressed' end
+local sent = redis.call('INCR', KEYS[2])
+if sent == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
+if sent > tonumber(ARGV[3]) then return 'rate_limited' end
+return 'ok'
 \`;
 
-interface SendBody {
-  recipient: string;
+interface AdmitRedis extends Redis {
+  admitScript(suppressedSet: string, rateKey: string, address: string, windowS: number, limit: number): Promise<string>;
 }
 
-interface Relay {
-  send(recipient: string): Promise<string>;
+const redis = new Redis({host: 'redis', port: 6379}) as AdmitRedis;
+redis.defineCommand('admitScript', {numberOfKeys: 2, lua: ADMIT_LUA});
+
+export const rateKey = (address: string, nowMs: number): string => \`mail:rate:\${address}:\${Math.floor(nowMs / 1000 / WINDOW_S)}\`;
+
+/** Stop mailing an address (a hard bounce, a complaint, an unsubscribe). */
+export async function suppress(address: string): Promise<void> {
+  await redis.sadd(SUPPRESSED_SET, normalize(address)); // durable: removed only by an explicit request
 }
 
-const relay: Relay = {
-  async send() {
-    throw new Error('Not implemented');
-  },
-};
-
-async function isSuppressed(recipient: string): Promise<boolean> {
-  return Boolean(await r.sismember(SUPPRESSED_SET, recipient));
+export async function isSuppressed(address: string): Promise<boolean> {
+  return (await redis.sismember(SUPPRESSED_SET, normalize(address))) === 1;
 }
 
-async function suppress(recipient: string): Promise<void> {
-  await r.sadd(SUPPRESSED_SET, recipient);
+/** 'suppressed', 'rate_limited' or 'ok' for one more email to the address. */
+export async function admit(address: string): Promise<string> {
+  const normalized = normalize(address);
+  return redis.admitScript(SUPPRESSED_SET, rateKey(normalized, Date.now()), normalized, WINDOW_S, RATE_LIMIT);
 }
-
-async function admit(recipient: string, window: number): Promise<[number, number]> {
-  const verdict = (await r.eval(
-    ADMIT_LUA,
-    2,
-    SUPPRESSED_SET,
-    \`\${RATE_PREFIX}\${recipient}:\${window}\`,
-    recipient,
-    String(WINDOW_S),
-    String(RATE_LIMIT),
-  )) as [number, number];
-  return [Number(verdict[0]), Number(verdict[1])];
-}
-
-app.post('/v1/emails', async (request, reply) => {
-  const body = request.body as SendBody;
-  const window = Math.floor(Date.now() / 1000 / WINDOW_S);
-  const [verdict] = await admit(body.recipient, window);
-  if (verdict === 0) {
-    return reply.code(409).send({error: 'suppressed'});
-  }
-  if (verdict < 0) {
-    return reply.code(429).send({error: 'rate limited'});
-  }
-  const messageId = await relay.send(body.recipient);
-  return reply.code(202).send({message_id: messageId});
-});
 `,
     },
     go: {
-      starter: `package state
+      starter: `package main
 
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const RateLimit = 5
+// The address helpers live in "mail/address": address.Normalize(addr) is trimmed and lowercase.
 
-var Rdb *redis.Client
-
-type Relay interface {
-	Send(recipient string) (string, error)
-}
-
-func IsSuppressed(ctx context.Context, recipient string) bool {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	value, _ := Rdb.Get(ctx, "suppression:"+recipient).Result()
-	return value != ""
-}
-
-func Suppress(ctx context.Context, recipient string) {
-	Rdb.Set(ctx, "suppression:"+recipient, "1", time.Hour)
-}
-
-func CheckRate(ctx context.Context, recipient string, window int64) bool {
-	key := fmt.Sprintf("rate:%s:%d", recipient, window)
-	count, _ := Rdb.Get(ctx, key).Int()
-	if count >= RateLimit {
-		return false
-	}
-	Rdb.Incr(ctx, key)
-	return true
-}
-
-func Register(mux *http.ServeMux, relay Relay) {
-	mux.HandleFunc("POST /v1/emails", func(w http.ResponseWriter, r *http.Request) {
-		recipient := r.URL.Query().Get("recipient")
-		window := time.Now().Unix() / 60
-		messageID, _ := relay.Send(recipient)
-		if IsSuppressed(r.Context(), recipient) {
-			http.Error(w, "suppressed", http.StatusConflict)
-			return
-		}
-		if !CheckRate(r.Context(), recipient, window) {
-			http.Error(w, "rate limited", http.StatusTooManyRequests)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintf(w, "{\\"message_id\\":%q}", messageID)
-	})
-}
-`,
-      solution:
-        `package state
-
-import (
-	"context"
-	"fmt"
-	"net/http"
-	"time"
-
-	"github.com/redis/go-redis/v9"
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 const (
-	SuppressedSet = "suppression:list"
-	RatePrefix    = "rate:"
-	RateLimit     = 5
+	rateLimit      = 5
+	windowSeconds  = 60
+	suppressionTTL = time.Hour
+)
+
+func rateKey(addr string, now time.Time) string {
+	return fmt.Sprintf("mail:rate:%s:%d", addr, now.Unix()/windowSeconds)
+}
+
+// suppress stops mailing an address (a hard bounce, a complaint, an unsubscribe).
+func suppress(ctx context.Context, addr string) error {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	return rdb.Set(ctx, "mail:suppressed:"+addr, "1", suppressionTTL).Err()
+}
+
+func isSuppressed(ctx context.Context, addr string) (bool, error) {
+	n, err := rdb.Exists(ctx, "mail:suppressed:"+addr).Result()
+	return n == 1, err
+}
+
+// admit is "suppressed", "rate_limited" or "ok" for one more email to the address.
+func admit(ctx context.Context, addr string) (string, error) {
+	suppressed, err := isSuppressed(ctx, addr)
+	if err != nil {
+		return "", err
+	}
+	if suppressed {
+		return "suppressed", nil
+	}
+	key := rateKey(addr, time.Now())
+	sent, err := rdb.Get(ctx, key).Int()
+	if err != nil && err != redis.Nil {
+		return "", err
+	}
+	if sent >= rateLimit {
+		return "rate_limited", nil
+	}
+	return "ok", rdb.Incr(ctx, key).Err()
+}
+`,
+      solution: `package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"mail/address" // address.Normalize(addr): trimmed, lowercase
+)
+
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+const (
+	suppressedSet = "mail:suppressed"
+	rateLimit     = 5
 	windowSeconds = 60
 )
 
-const admitScript = ` +
-        '`' +
-        `
-local suppressed = redis.call('SISMEMBER', KEYS[1], ARGV[1])
-if suppressed == 1 then return {0, -1} end
-local count = redis.call('INCR', KEYS[2])
-if count == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
-if count > tonumber(ARGV[3]) then return {-1, count} end
-return {1, count}
-` +
-        '`' +
-        `
+// One decision, run whole by Redis: no other send can land between the check and the count.
+var admitScript = redis.NewScript(\`
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return 'suppressed' end
+local sent = redis.call('INCR', KEYS[2])
+if sent == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
+if sent > tonumber(ARGV[3]) then return 'rate_limited' end
+return 'ok'
+\`)
 
-var Rdb *redis.Client
-
-type Relay interface {
-	Send(recipient string) (string, error)
+func rateKey(addr string, now time.Time) string {
+	return fmt.Sprintf("mail:rate:%s:%d", addr, now.Unix()/windowSeconds)
 }
 
-func IsSuppressed(ctx context.Context, recipient string) bool {
-	ok, _ := Rdb.SIsMember(ctx, SuppressedSet, recipient).Result()
-	return ok
+// suppress stops mailing an address (a hard bounce, a complaint, an unsubscribe).
+func suppress(ctx context.Context, addr string) error {
+	return rdb.SAdd(ctx, suppressedSet, address.Normalize(addr)).Err() // durable: removed only by an explicit request
 }
 
-func Suppress(ctx context.Context, recipient string) {
-	Rdb.SAdd(ctx, SuppressedSet, recipient)
+func isSuppressed(ctx context.Context, addr string) (bool, error) {
+	return rdb.SIsMember(ctx, suppressedSet, address.Normalize(addr)).Result()
 }
 
-func Admit(ctx context.Context, recipient string, window int64) (int, int) {
-	values, _ := Rdb.Eval(
-		ctx,
-		admitScript,
-		[]string{SuppressedSet, fmt.Sprintf("%s%s:%d", RatePrefix, recipient, window)},
-		recipient,
-		windowSeconds,
-		RateLimit,
-	).Result()
-	results := values.([]interface{})
-	return int(results[0].(int64)), int(results[1].(int64))
-}
-
-func Register(mux *http.ServeMux, relay Relay) {
-	mux.HandleFunc("POST /v1/emails", func(w http.ResponseWriter, r *http.Request) {
-		recipient := r.URL.Query().Get("recipient")
-		window := time.Now().Unix() / windowSeconds
-		verdict, _ := Admit(r.Context(), recipient, window)
-		if verdict == 0 {
-			http.Error(w, "suppressed", http.StatusConflict)
-			return
-		}
-		if verdict < 0 {
-			http.Error(w, "rate limited", http.StatusTooManyRequests)
-			return
-		}
-		messageID, _ := relay.Send(recipient)
-		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintf(w, "{\\"message_id\\":%q}", messageID)
-	})
+// admit is "suppressed", "rate_limited" or "ok" for one more email to the address.
+func admit(ctx context.Context, addr string) (string, error) {
+	normalized := address.Normalize(addr)
+	return admitScript.Run(ctx, rdb, []string{suppressedSet, rateKey(normalized, time.Now())}, normalized, windowSeconds, rateLimit).Text()
 }
 `,
     },
     scala: {
-      starter: `package state
+      starter: `import redis.clients.jedis.JedisPooled
 
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
+import mail.Address // Address.normalize(address): trimmed, lowercase
 
-object State {
+object Admission {
+  val jedis = new JedisPooled("redis", 6379)
+
   val RateLimit = 5
+  val WindowSeconds = 60L
+  val SuppressionTtlSeconds = 3600L
 
-  trait Relay {
-    def send(recipient: String): String
+  def rateKey(address: String, nowMillis: Long): String = s"mail:rate:$address:\${nowMillis / 1000 / WindowSeconds}"
+
+  /** Stop mailing an address (a hard bounce, a complaint, an unsubscribe). */
+  def suppress(address: String): Unit = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    jedis.setex(s"mail:suppressed:$address", SuppressionTtlSeconds, "1")
+    ()
   }
 
-  def isSuppressed(redis: Redis, recipient: String): Boolean =
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    redis.get(s"suppression:$recipient").isDefined
+  def isSuppressed(address: String): Boolean = jedis.exists(s"mail:suppressed:$address")
 
-  def suppress(redis: Redis, recipient: String): Unit =
-    redis.set(s"suppression:$recipient", "1", ex = 3600)
-
-  def checkRate(redis: Redis, recipient: String, window: Long): Boolean = {
-    val count = redis.get(s"rate:$recipient:$window").map(_.toInt).getOrElse(0)
-    if (count >= RateLimit) false
+  /** "suppressed", "rate_limited" or "ok" for one more email to the address. */
+  def admit(address: String): String =
+    if (isSuppressed(address)) "suppressed"
     else {
-      redis.incr(s"rate:$recipient:$window")
-      true
-    }
-  }
-
-  def routes(redis: Redis, relay: Relay): Route =
-    path("v1" / "emails") {
-      post {
-        parameters("recipient") { recipient =>
-          val window = System.currentTimeMillis() / 1000 / 60
-          val messageId = relay.send(recipient)
-          if (isSuppressed(redis, recipient)) {
-            complete(StatusCodes.Conflict, "suppressed")
-          } else if (!checkRate(redis, recipient, window)) {
-            complete(StatusCodes.TooManyRequests, "rate limited")
-          } else {
-            complete(StatusCodes.Accepted, s"""{"message_id":"$messageId"}""")
-          }
-        }
+      val key = rateKey(address, System.currentTimeMillis())
+      val sent = Option(jedis.get(key)).map(_.toInt).getOrElse(0)
+      if (sent >= RateLimit) "rate_limited"
+      else {
+        jedis.incr(key)
+        "ok"
       }
     }
 }
 `,
-      solution: `package state
+      solution: `import redis.clients.jedis.JedisPooled
 
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
+import scala.jdk.CollectionConverters._
 
-object State {
-  val SuppressedSet = "suppression:list"
-  val RatePrefix = "rate:"
+import mail.Address // Address.normalize(address): trimmed, lowercase
+
+object Admission {
+  val jedis = new JedisPooled("redis", 6379)
+
+  val SuppressedSet = "mail:suppressed"
   val RateLimit = 5
-  val WindowSeconds = 60
+  val WindowSeconds = 60L
 
+  // One decision, run whole by Redis: no other send can land between the check and the count.
   val AdmitLua: String =
-    """local suppressed = redis.call('SISMEMBER', KEYS[1], ARGV[1])
-      |if suppressed == 1 then return {0, -1} end
-      |local count = redis.call('INCR', KEYS[2])
-      |if count == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
-      |if count > tonumber(ARGV[3]) then return {-1, count} end
-      |return {1, count}""".stripMargin
+    """if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return 'suppressed' end
+      |local sent = redis.call('INCR', KEYS[2])
+      |if sent == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
+      |if sent > tonumber(ARGV[3]) then return 'rate_limited' end
+      |return 'ok'
+      |""".stripMargin
 
-  trait Relay {
-    def send(recipient: String): String
+  def rateKey(address: String, nowMillis: Long): String = s"mail:rate:$address:\${nowMillis / 1000 / WindowSeconds}"
+
+  /** Stop mailing an address (a hard bounce, a complaint, an unsubscribe). */
+  def suppress(address: String): Unit = {
+    jedis.sadd(SuppressedSet, Address.normalize(address)) // durable: removed only by an explicit request
+    ()
   }
 
-  def isSuppressed(redis: Redis, recipient: String): Boolean =
-    redis.sismember(SuppressedSet, recipient)
+  def isSuppressed(address: String): Boolean = jedis.sismember(SuppressedSet, Address.normalize(address))
 
-  def suppress(redis: Redis, recipient: String): Unit =
-    redis.sadd(SuppressedSet, recipient)
-
-  def admit(redis: Redis, recipient: String, window: Long): (Int, Int) = {
-    val reply = redis.eval(
-      AdmitLua,
-      List(SuppressedSet, s"$RatePrefix$recipient:$window"),
-      List(recipient, WindowSeconds.toString, RateLimit.toString)
-    )
-    (reply.head.toInt, reply(1).toInt)
+  /** "suppressed", "rate_limited" or "ok" for one more email to the address. */
+  def admit(address: String): String = {
+    val normalized = Address.normalize(address)
+    val keys = List(SuppressedSet, rateKey(normalized, System.currentTimeMillis())).asJava
+    jedis.eval(AdmitLua, keys, List(normalized, WindowSeconds.toString, RateLimit.toString).asJava).toString
   }
-
-  def routes(redis: Redis, relay: Relay): Route =
-    path("v1" / "emails") {
-      post {
-        parameters("recipient") { recipient =>
-          val window = System.currentTimeMillis() / 1000 / WindowSeconds
-          val (verdict, _) = admit(redis, recipient, window)
-          if (verdict == 0) {
-            complete(StatusCodes.Conflict, "suppressed")
-          } else if (verdict < 0) {
-            complete(StatusCodes.TooManyRequests, "rate limited")
-          } else {
-            val messageId = relay.send(recipient)
-            complete(StatusCodes.Accepted, s"""{"message_id":"$messageId"}""")
-          }
-        }
-      }
-    }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
+      starter: `#include <sw/redis++/redis++.h>
 
-#include <ctime>
+#include <chrono>
 #include <string>
 
-namespace state {
+#include "mail/address.h"  // mail::address::normalize(addr): trimmed, lowercase
 
-constexpr int kRateLimit = 5;
+sw::redis::Redis redis("tcp://redis:6379");
 
-class Relay {
- public:
-  virtual std::string send(const std::string& recipient) = 0;
-};
+constexpr long kRateLimit = 5;
+constexpr long kWindowSeconds = 60;
+constexpr std::chrono::seconds kSuppressionTtl{3600};
 
-bool isSuppressed(redisContext* ctx, const std::string& recipient) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  redisReply* reply = (redisReply*)redisCommand(ctx, "GET suppression:%s", recipient.c_str());
-  const bool found = reply != nullptr && reply->type != REDIS_REPLY_NIL;
-  freeReplyObject(reply);
-  return found;
+std::string rateKey(const std::string& addr) {
+  const long now = static_cast<long>(
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  return "mail:rate:" + addr + ":" + std::to_string(now / kWindowSeconds);
 }
 
-void suppress(redisContext* ctx, const std::string& recipient) {
-  redisReply* reply = (redisReply*)redisCommand(ctx, "SET suppression:%s 1 EX 3600", recipient.c_str());
-  freeReplyObject(reply);
+// Stop mailing an address (a hard bounce, a complaint, an unsubscribe).
+void suppress(const std::string& addr) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  redis.set("mail:suppressed:" + addr, "1", kSuppressionTtl);
 }
 
-bool checkRate(redisContext* ctx, const std::string& recipient, long window) {
-  const std::string key = "rate:" + recipient + ":" + std::to_string(window);
-  redisReply* reply = (redisReply*)redisCommand(ctx, "GET %s", key.c_str());
-  const long count = reply != nullptr && reply->type == REDIS_REPLY_STRING ? std::stol(reply->str) : 0;
-  freeReplyObject(reply);
-  if (count >= kRateLimit) return false;
-  reply = (redisReply*)redisCommand(ctx, "INCR %s", key.c_str());
-  freeReplyObject(reply);
-  return true;
-}
+bool isSuppressed(const std::string& addr) { return redis.exists("mail:suppressed:" + addr) == 1; }
 
-void Register(httplib::Server& svr, redisContext* ctx, Relay& relay) {
-  svr.Post("/v1/emails", [&](const httplib::Request& req, httplib::Response& res) {
-    const std::string recipient = req.get_param_value("recipient");
-    const long window = static_cast<long>(time(nullptr)) / 60;
-    const std::string message_id = relay.send(recipient);
-    if (isSuppressed(ctx, recipient)) {
-      res.status = 409;
-      res.set_content("suppressed", "text/plain");
-      return;
-    }
-    if (!checkRate(ctx, recipient, window)) {
-      res.status = 429;
-      res.set_content("rate limited", "text/plain");
-      return;
-    }
-    res.status = 202;
-    res.set_content("{\\"message_id\\":\\"" + message_id + "\\"}", "application/json");
-  });
+// "suppressed", "rate_limited" or "ok" for one more email to the address.
+std::string admit(const std::string& addr) {
+  if (isSuppressed(addr)) return "suppressed";
+  const std::string key = rateKey(addr);
+  const auto sent = redis.get(key);
+  if (sent && std::stol(*sent) >= kRateLimit) return "rate_limited";
+  redis.incr(key);
+  return "ok";
 }
-
-}  // namespace state
 `,
-      solution: `#include <httplib.h>
+      solution: `#include <sw/redis++/redis++.h>
 
-#include <ctime>
+#include <chrono>
 #include <string>
 
-namespace state {
+#include "mail/address.h"  // mail::address::normalize(addr): trimmed, lowercase
 
-const std::string kSuppressedSet = "suppression:list";
-constexpr int kRateLimit = 5;
+namespace address = mail::address;
+
+sw::redis::Redis redis("tcp://redis:6379");
+
+const std::string kSuppressedSet = "mail:suppressed";
+constexpr long kRateLimit = 5;
 constexpr long kWindowSeconds = 60;
 
-const std::string kAdmitLua = R"(
-local suppressed = redis.call('SISMEMBER', KEYS[1], ARGV[1])
-if suppressed == 1 then return {0, -1} end
-local count = redis.call('INCR', KEYS[2])
-if count == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
-if count > tonumber(ARGV[3]) then return {-1, count} end
-return {1, count}
-)";
+// One decision, run whole by Redis: no other send can land between the check and the count.
+const std::string kAdmitLua = R"lua(
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return 'suppressed' end
+local sent = redis.call('INCR', KEYS[2])
+if sent == 1 then redis.call('EXPIRE', KEYS[2], ARGV[2]) end
+if sent > tonumber(ARGV[3]) then return 'rate_limited' end
+return 'ok'
+)lua";
 
-class Relay {
- public:
-  virtual std::string send(const std::string& recipient) = 0;
-};
-
-bool isSuppressed(redisContext* ctx, const std::string& recipient) {
-  redisReply* reply = (redisReply*)redisCommand(ctx, "SISMEMBER %s %s", kSuppressedSet.c_str(), recipient.c_str());
-  const bool found = reply != nullptr && reply->integer == 1;
-  freeReplyObject(reply);
-  return found;
+std::string rateKey(const std::string& addr) {
+  const long now = static_cast<long>(
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  return "mail:rate:" + addr + ":" + std::to_string(now / kWindowSeconds);
 }
 
-void suppress(redisContext* ctx, const std::string& recipient) {
-  redisReply* reply = (redisReply*)redisCommand(ctx, "SADD %s %s", kSuppressedSet.c_str(), recipient.c_str());
-  freeReplyObject(reply);
+// Stop mailing an address (a hard bounce, a complaint, an unsubscribe).
+void suppress(const std::string& addr) {
+  redis.sadd(kSuppressedSet, address::normalize(addr));  // durable: removed only by an explicit request
 }
 
-int admit(redisContext* ctx, const std::string& recipient, long window, int* count) {
-  const std::string key = "rate:" + recipient + ":" + std::to_string(window);
-  redisReply* reply = (redisReply*)redisCommand(ctx, "EVAL %s 2 %s %s %s %d %d",
-                                               kAdmitLua.c_str(), kSuppressedSet.c_str(), key.c_str(),
-                                               recipient.c_str(), static_cast<int>(kWindowSeconds), kRateLimit);
-  const long verdict = reply != nullptr && reply->type == REDIS_REPLY_ARRAY ? reply->element[0]->integer : -1;
-  *count = reply != nullptr && reply->type == REDIS_REPLY_ARRAY ? static_cast<int>(reply->element[1]->integer) : 0;
-  freeReplyObject(reply);
-  return static_cast<int>(verdict);
-}
+bool isSuppressed(const std::string& addr) { return redis.sismember(kSuppressedSet, address::normalize(addr)); }
 
-void Register(httplib::Server& svr, redisContext* ctx, Relay& relay) {
-  svr.Post("/v1/emails", [&](const httplib::Request& req, httplib::Response& res) {
-    const std::string recipient = req.get_param_value("recipient");
-    const long window = static_cast<long>(time(nullptr)) / kWindowSeconds;
-    int count = 0;
-    const int verdict = admit(ctx, recipient, window, &count);
-    if (verdict == 0) {
-      res.status = 409;
-      res.set_content("suppressed", "text/plain");
-      return;
-    }
-    if (verdict < 0) {
-      res.status = 429;
-      res.set_content("rate limited", "text/plain");
-      return;
-    }
-    const std::string message_id = relay.send(recipient);
-    res.status = 202;
-    res.set_content("{\\"message_id\\":\\"" + message_id + "\\"}", "application/json");
-  });
+// "suppressed", "rate_limited" or "ok" for one more email to the address.
+std::string admit(const std::string& addr) {
+  const std::string normalized = address::normalize(addr);
+  return redis.eval<std::string>(kAdmitLua, {kSuppressedSet, rateKey(normalized)},
+                                 {normalized, std::to_string(kWindowSeconds), std::to_string(kRateLimit)});
 }
-
-}  // namespace state
 `,
     },
   },
+  harness: {
+    python: `ADDR = "ana@example.com"
+
+
+def _settled(probe, what):
+    assert probe.fired, f"nothing touched {what}"
+    if probe.error is not None:
+        raise probe.error
+    return probe.result
+
+
+def check_durable_suppression(ctx):
+    m = ctx.load("admission")
+    m.suppress(ADDR)
+    verdict = m.admit(ADDR)
+    assert verdict == "suppressed", f"right after suppress({ADDR!r}) admit answered {verdict!r}"
+    ctx.clock.advance(2 * 3600)
+    verdict = m.admit(ADDR)
+    assert verdict == "suppressed", f"two hours after the unsubscribe admit answered {verdict!r}: the suppression expired and the customer is mailed again. Keep suppressed addresses in a set with no expiry"
+    assert m.is_suppressed(ADDR) is True, "is_suppressed must still answer True two hours later"
+    assert ctx.redis.sismember("mail:suppressed", ADDR), f"mail:suppressed does not hold {ADDR}; Redis holds {sorted(ctx.redis.keys('mail:*'))}"
+
+
+def check_atomic_admission(ctx):
+    m = ctx.load("admission")
+    for n in range(4):
+        verdict = m.admit(ADDR)
+        assert verdict == "ok", f"send {n + 1} of a 5-per-minute limit answered {verdict!r}"
+    keys = ctx.redis.keys("mail:rate:*")
+    assert len(keys) == 1, f"four sends to one address left the counters {keys}, expected one mail:rate:{{address}}:{{window}}"
+    # Another send lands between the fifth send's commands on the counter.
+    rival = ctx.redis_after(keys[0], lambda: m.admit(ADDR))
+    fifth = m.admit(ADDR)
+    racing = _settled(rival, keys[0])
+    assert sorted([fifth, racing]) == ["ok", "rate_limited"], f"the fifth send and a send racing it were answered {fifth!r} and {racing!r}: both read the count before either incremented it, so six emails went out under a limit of five. Decide in one Lua script"
+
+
+def check_rate_window(ctx):
+    m = ctx.load("admission")
+    verdicts = [m.admit(ADDR) for _ in range(6)]
+    assert verdicts == ["ok"] * 5 + ["rate_limited"], f"six sends in one minute answered {verdicts}, expected five ok and rate_limited"
+    keys = ctx.redis.keys("mail:rate:*")
+    assert keys, "no mail:rate:* counter in Redis"
+    for key in keys:
+        ttl = ctx.redis.ttl(key)
+        assert 0 < ttl <= 60, f"{key} has TTL {ttl}: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window"
+    ctx.clock.advance(61)
+    verdict = m.admit(ADDR)
+    assert verdict == "ok", f"a minute later the next send answered {verdict!r}, expected ok"
+
+
+def check_normalized_address(ctx):
+    m = ctx.load("admission")
+    m.suppress("  Ana@Example.COM")
+    verdict = m.admit("ana@example.com")
+    assert verdict == "suppressed", f"after suppress('  Ana@Example.COM'), admit('ana@example.com') answered {verdict!r}: one mailbox, two spellings. Normalize the address before every key"
+    assert m.is_suppressed("ANA@example.com ") is True, "is_suppressed('ANA@example.com ') must find the suppressed mailbox"
+    spellings = ["bo@example.com", "Bo@example.com", "BO@EXAMPLE.COM", " bo@example.com", "bo@Example.com", "Bo@Example.Com"]
+    verdicts = [m.admit(s) for s in spellings]
+    assert verdicts == ["ok"] * 5 + ["rate_limited"], f"six sends to one mailbox spelled six ways answered {verdicts}: each spelling got its own counter"
+`,
+    typescript: `const ADDR = 'ana@example.com';
+
+async function settled(probe, what: string) {
+  assert(probe.fired, \`nothing touched \${what}\`);
+  if (probe.error !== undefined) throw probe.error;
+  return await probe.result;
+}
+
+export async function check_durable_suppression(ctx) {
+  const m = ctx.load('admission');
+  await m.suppress(ADDR);
+  let verdict = await m.admit(ADDR);
+  assert.equal(verdict, 'suppressed', \`right after suppress(\${ADDR}) admit answered \${verdict}\`);
+  ctx.clock.advance(2 * 3600);
+  verdict = await m.admit(ADDR);
+  assert.equal(verdict, 'suppressed', \`two hours after the unsubscribe admit answered \${verdict}: the suppression expired and the customer is mailed again. Keep suppressed addresses in a set with no expiry\`);
+  assert.equal(await m.isSuppressed(ADDR), true, 'isSuppressed must still answer true two hours later');
+  assert.equal(ctx.redis.sismember('mail:suppressed', ADDR), 1, \`mail:suppressed does not hold \${ADDR}; Redis holds \${JSON.stringify(ctx.redis.keys('mail:*'))}\`);
+}
+
+export async function check_atomic_admission(ctx) {
+  const m = ctx.load('admission');
+  for (let n = 0; n < 4; n++) assert.equal(await m.admit(ADDR), 'ok', \`send \${n + 1} of a 5-per-minute limit\`);
+  const keys = ctx.redis.keys('mail:rate:*');
+  assert.equal(keys.length, 1, \`four sends to one address left the counters \${JSON.stringify(keys)}, expected one mail:rate:{address}:{window}\`);
+  // Another send lands between the fifth send's commands on the counter.
+  const rival = ctx.redisAfter(keys[0], () => m.admit(ADDR));
+  const fifth = await m.admit(ADDR);
+  const racing = await settled(rival, keys[0]);
+  assert.deepStrictEqual([fifth, racing].sort(), ['ok', 'rate_limited'], \`the fifth send and a send racing it were answered \${fifth} and \${racing}: both read the count before either incremented it, so six emails went out under a limit of five. Decide in one Lua script\`);
+}
+
+export async function check_rate_window(ctx) {
+  const m = ctx.load('admission');
+  const verdicts: string[] = [];
+  for (let n = 0; n < 6; n++) verdicts.push(await m.admit(ADDR));
+  assert.deepStrictEqual(verdicts, ['ok', 'ok', 'ok', 'ok', 'ok', 'rate_limited'], \`six sends in one minute answered \${JSON.stringify(verdicts)}\`);
+  const keys = ctx.redis.keys('mail:rate:*');
+  assert(keys.length > 0, 'no mail:rate:* counter in Redis');
+  for (const key of keys) {
+    const ttl = ctx.redis.ttl(key);
+    assert(ttl > 0 && ttl <= 60, \`\${key} has TTL \${ttl}: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window\`);
+  }
+  ctx.clock.advance(61);
+  assert.equal(await m.admit(ADDR), 'ok', 'a minute later the next send must be admitted');
+}
+
+export async function check_normalized_address(ctx) {
+  const m = ctx.load('admission');
+  await m.suppress('  Ana@Example.COM');
+  const verdict = await m.admit('ana@example.com');
+  assert.equal(verdict, 'suppressed', \`after suppress('  Ana@Example.COM'), admit('ana@example.com') answered \${verdict}: one mailbox, two spellings. Normalize the address before every key\`);
+  assert.equal(await m.isSuppressed('ANA@example.com '), true, "isSuppressed('ANA@example.com ') must find the suppressed mailbox");
+  const verdicts: string[] = [];
+  for (const s of ['bo@example.com', 'Bo@example.com', 'BO@EXAMPLE.COM', ' bo@example.com', 'bo@Example.com', 'Bo@Example.Com']) verdicts.push(await m.admit(s));
+  assert.deepStrictEqual(verdicts, ['ok', 'ok', 'ok', 'ok', 'ok', 'rate_limited'], \`six sends to one mailbox spelled six ways answered \${JSON.stringify(verdicts)}: each spelling got its own counter\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+
+	"leetbuild/harness"
+)
+
+const harnessAddr = "ana@example.com"
+
+var admissionBg = context.Background()
+
+func mustAdmit(ctx *harness.Ctx, addr string) string {
+	verdict, err := admit(admissionBg, addr)
+	ctx.NoError(err, "admit(%q) failed", addr)
+	return verdict
+}
+
+func CheckDurableSuppression(ctx *harness.Ctx) {
+	ctx.NoError(suppress(admissionBg, harnessAddr), "suppress failed")
+	ctx.Equal(mustAdmit(ctx, harnessAddr), "suppressed", "right after suppress, admit")
+	ctx.Clock.Advance(2 * 3600)
+	ctx.Equal(mustAdmit(ctx, harnessAddr), "suppressed", "two hours after the unsubscribe the suppression expired and the customer is mailed again (keep suppressed addresses in a set with no expiry); admit")
+	suppressed, err := isSuppressed(admissionBg, harnessAddr)
+	ctx.NoError(err, "isSuppressed failed")
+	ctx.Equal(suppressed, true, "isSuppressed two hours later")
+	ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", harnessAddr), "mail:suppressed does not hold %s; Redis holds %q", harnessAddr, ctx.Redis.Keys("mail:*"))
+}
+
+func CheckAtomicAdmission(ctx *harness.Ctx) {
+	for n := 0; n < 4; n++ {
+		ctx.Equal(mustAdmit(ctx, harnessAddr), "ok", "send %d of a 5-per-minute limit", n+1)
+	}
+	keys := ctx.Redis.Keys("mail:rate:*")
+	ctx.Equal(len(keys), 1, "four sends to one address must leave one mail:rate:{address}:{window} counter (%q); counters", keys)
+	// Another send lands between the fifth send's commands on the counter.
+	rival := ctx.Redis.After(keys[0], func() any {
+		verdict, _ := admit(admissionBg, harnessAddr)
+		return verdict
+	})
+	fifth := mustAdmit(ctx, harnessAddr)
+	ctx.Assert(rival.Fired, "nothing touched %s", keys[0])
+	racing, _ := rival.Result.(string)
+	ctx.Assert((fifth == "ok" && racing == "rate_limited") || (fifth == "rate_limited" && racing == "ok"),
+		"the fifth send and a send racing it were answered %q and %q: both read the count before either incremented it, so six emails went out under a limit of five. Decide in one Lua script", fifth, racing)
+}
+
+func CheckRateWindow(ctx *harness.Ctx) {
+	var verdicts []string
+	for n := 0; n < 6; n++ {
+		verdicts = append(verdicts, mustAdmit(ctx, harnessAddr))
+	}
+	ctx.Equal(verdicts, []string{"ok", "ok", "ok", "ok", "ok", "rate_limited"}, "six sends in one minute")
+	keys := ctx.Redis.Keys("mail:rate:*")
+	ctx.Assert(len(keys) > 0, "no mail:rate:* counter in Redis")
+	for _, key := range keys {
+		ttl := ctx.Redis.TTL(key)
+		ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window", key, ttl)
+	}
+	ctx.Clock.Advance(61)
+	ctx.Equal(mustAdmit(ctx, harnessAddr), "ok", "a minute later the next send")
+}
+
+func CheckNormalizedAddress(ctx *harness.Ctx) {
+	ctx.NoError(suppress(admissionBg, "  Ana@Example.COM"), "suppress failed")
+	ctx.Equal(mustAdmit(ctx, "ana@example.com"), "suppressed", "after suppress('  Ana@Example.COM') one mailbox has two spellings (normalize the address before every key); admit('ana@example.com')")
+	suppressed, _ := isSuppressed(admissionBg, "ANA@example.com ")
+	ctx.Equal(suppressed, true, "isSuppressed('ANA@example.com ')")
+	var verdicts []string
+	for _, s := range []string{"bo@example.com", "Bo@example.com", "BO@EXAMPLE.COM", " bo@example.com", "bo@Example.com", "Bo@Example.Com"} {
+		verdicts = append(verdicts, mustAdmit(ctx, s))
+	}
+	ctx.Equal(verdicts, []string{"ok", "ok", "ok", "ok", "ok", "rate_limited"}, "six sends to one mailbox spelled six ways (each spelling got its own counter)")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kAddr = "ana@example.com";
+
+}  // namespace
+
+void CheckDurableSuppression(harness::Ctx& ctx) {
+  suppress(kAddr);
+  ctx.Equal(admit(kAddr), "suppressed", "right after suppress, admit");
+  ctx.Clock.Advance(2 * 3600);
+  ctx.Equal(admit(kAddr), "suppressed", "two hours after the unsubscribe the suppression expired and the customer is mailed again (keep suppressed addresses in a set with no expiry); admit");
+  ctx.Equal(isSuppressed(kAddr), true, "isSuppressed two hours later");
+  ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", kAddr), "mail:suppressed does not hold %s; Redis holds %q", kAddr, ctx.Redis.Keys("mail:*"));
+}
+
+void CheckAtomicAdmission(harness::Ctx& ctx) {
+  for (int n = 0; n < 4; n++) ctx.Equal(admit(kAddr), "ok", "send %d of a 5-per-minute limit", n + 1);
+  const auto keys = ctx.Redis.Keys("mail:rate:*");
+  ctx.Equal(keys.size(), 1, "four sends to one address must leave one mail:rate:{address}:{window} counter (%q); counters", keys);
+  // Another send lands between the fifth send's commands on the counter.
+  auto racing = std::make_shared<std::string>();
+  ctx.Redis.After(keys[0], [racing] { *racing = admit(kAddr); });
+  const std::string fifth = admit(kAddr);
+  ctx.Assert(!racing->empty(), "nothing touched %s", keys[0]);
+  ctx.Assert((fifth == "ok" && *racing == "rate_limited") || (fifth == "rate_limited" && *racing == "ok"),
+             "the fifth send and a send racing it were answered %q and %q: both read the count before either incremented it, so six emails went out under a limit of five. Decide in one Lua script",
+             fifth, *racing);
+}
+
+void CheckRateWindow(harness::Ctx& ctx) {
+  std::vector<std::string> verdicts;
+  for (int n = 0; n < 6; n++) verdicts.push_back(admit(kAddr));
+  ctx.Equal(verdicts, std::vector<std::string>{"ok", "ok", "ok", "ok", "ok", "rate_limited"}, "six sends in one minute");
+  const auto keys = ctx.Redis.Keys("mail:rate:*");
+  ctx.Assert(!keys.empty(), "no mail:rate:* counter in Redis");
+  for (const auto& key : keys) {
+    const long long ttl = ctx.Redis.TTL(key);
+    ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window", key, ttl);
+  }
+  ctx.Clock.Advance(61);
+  ctx.Equal(admit(kAddr), "ok", "a minute later the next send");
+}
+
+void CheckNormalizedAddress(harness::Ctx& ctx) {
+  suppress("  Ana@Example.COM");
+  ctx.Equal(admit("ana@example.com"), "suppressed", "after suppress('  Ana@Example.COM') one mailbox has two spellings (normalize the address before every key); admit('ana@example.com')");
+  ctx.Equal(isSuppressed("ANA@example.com "), true, "isSuppressed('ANA@example.com ')");
+  std::vector<std::string> verdicts;
+  for (const std::string s : {"bo@example.com", "Bo@example.com", "BO@EXAMPLE.COM", " bo@example.com", "bo@Example.com", "Bo@Example.Com"}) {
+    verdicts.push_back(admit(s));
+  }
+  ctx.Equal(verdicts, std::vector<std::string>{"ok", "ok", "ok", "ok", "ok", "rate_limited"}, "six sends to one mailbox spelled six ways (each spelling got its own counter)");
+}
+`,
+  },
   hints: [
-    'A customer who unsubscribed in the morning gets the afternoon campaign, and a burst of twenty sends to one address all return 202 although the limit is five.',
-    '`suppress` writes a string key with `ex=3600`, so the flag vanishes after an hour, and `check_rate` reads the count in one round trip and increments in another, so concurrent calls all see the old value.',
-    'Store suppression with `r.sadd(SUPPRESSED_SET, recipient)` and decide both in one `ADMIT_LUA` script (`SISMEMBER`, `INCR`, `EXPIRE WINDOW_S`) called by `admit` before `relay.send`. The remaining checks follow from that.',
+    'Unsubscribe a customer and send again two hours later: the mail goes out. Fire two sends at the fifth email of the minute: both are admitted. `Ana@Example.com` escapes a suppression of `ana@example.com`.',
+    'The suppression is a key with a one-hour expiry. The counter is read with GET and raised with INCR in two round trips, so another send lands between them; nothing expires it; and the raw address is the key.',
+    '`SADD mail:suppressed normalize(address)`. One script: `SISMEMBER KEYS[1] ARGV[1]` → suppressed; `INCR KEYS[2]`, `EXPIRE KEYS[2] ARGV[2]` when it returns 1, above `ARGV[3]` → rate_limited, else ok.',
   ],
-  debrief: `The fix moves the decision into Redis because that is the only place it can be atomic: one \`EVAL\` sees the set membership, increments the counter and sets its expiry while no other client can interleave, which a client-side \`GET\` then \`INCR\` cannot promise. Suppression goes into a set without a TTL because the promise behind it has no expiry; a cache key with \`EX 3600\` encodes the wrong lifetime. The counter gets its expiry inside the same script so a crash between \`INCR\` and \`EXPIRE\` cannot leave an immortal key. Production senders also keep the suppression list in durable storage with an audit trail of who added each address and why, and scope rate limits per campaign and per sending domain as well as per recipient.`,
+  debrief: `Suppression is a fact about a person, not a cache entry, so it lives in a set with no expiry and leaves it only on an explicit request. The rate limit needs its read and its write to be one step, which a Lua script gives: Redis runs it whole, so no send can read the count between another send's check and its increment. The EXPIRE on the first increment keeps a fixed window cheap, one key per recipient per minute that cleans itself up, and normalizing first keeps one mailbox under one key. Providers also store the reason and the date with each suppressed address, keep a list per tenant as well as a global one, and smooth the burst at each minute boundary with a sliding window or a token bucket.`,
 };

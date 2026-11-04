@@ -5,66 +5,40 @@ export const readStep: Step = {
   title: 'GET /v1/jobs/{id}: state a support engineer can trust',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'api', 'redis', 'store', 'dlq'],
+  focus: ['client', 'api', 'redis', 'dlq'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/jobs/{id}\`: it reads the \`jobs\` row by id alone,
-answers **404** when there is none, and otherwise echoes the row's type, state, attempt counter and
-\`next_retry_at_ms\`. It compiles, answers correctly for a live job in a healthy demo, and hides four
+**Starting point.** The starter serves \`GET /v1/jobs/{id}\` with the header \`X-Tenant-Id\`: it reads
+the job record (\`store.get_job\`), answers \`404\` for an unknown id and \`403\` for another tenant's job,
+and otherwise returns \`{job_id, type, state, attempts, attempt_history, next_retry_at_ms,
+dead_reason}\` straight from the record and \`store.attempt_history\`. It serves the demo and hides three
 flaws.
 
-**Failure mode the checks target.** A job stranded in a crashed worker's claim is reported
-\`queued\` forever, so nobody retries it. The dashboard shows a retry time that already passed. A
-buried job has no reason and no history. And any authenticated caller reads any tenant's job by
-guessing an id.
+**Failure mode the checks target.** A caller learns which job ids exist in another tenant; a job
+whose worker died shows \`running\` long after its claim expired; a retry whose time has passed, because
+the reaper is behind, shows a \`next_retry_at_ms\` in the past with nothing to say so.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the job is resolved scoped to it:
-  another tenant's job id and an unknown id both answer **404**, not **403**.
-- \`state\` is reconciled against \`jobs:inflight\`: a job still in that set whose deadline (the
-  member's score, in ms) is past is \`stalled\` with \`claim_age_ms\`, not the row's \`queued\`. A
-  live claim keeps the queue's state from \`jobs:job:{job_id}\`.
-- \`attempt_history\` is read from \`job_attempts\` as an ordered list (\`ORDER BY attempt_no\`),
-  oldest first, with each attempt's error class, message and timings.
-- \`next_retry_at\` is compared against the clock; a stored time already past is replaced by a
-  recomputed backoff (\`BACKOFF_BASE_MS = 1000\` doubling per attempt, capped at
-  \`BACKOFF_CAP_MS = 30000\`) plus \`retry_overdue: true\`. A job past \`MAX_ATTEMPTS\` gets
-  \`next_retry_at: null\`.
-- \`dead_letter_reason\` is surfaced from \`job_dead_letter\`; a live job answers \`null\`.
-- Log the read with the job id, the tenant and the reconciled state.`,
+- Another tenant's job answers exactly what an unknown id answers: \`404\`, same body.
+- Reconcile the state with \`jobs:inflight\`: a \`running\` job whose score (its claim deadline) is at or
+  before now is \`stalled\`.
+- Add \`retry_overdue\`: true for a \`retrying\` job whose score (its retry time) is at or before now,
+  false otherwise.`,
   sequence: {
-    participants: ['Client', 'Job API', 'Redis', 'job store', 'Dead-letter store'],
+    participants: ['Support engineer', 'Job API', 'Redis'],
     messages: [
-      {from: 'Client', to: 'Job API', label: 'GET /v1/jobs/{id} · X-Tenant-Id', kind: 'sync'},
+      {from: 'Support engineer', to: 'Job API', label: 'GET /v1/jobs/{id} · X-Tenant-Id', kind: 'sync'},
+      {from: 'Job API', to: 'Redis', label: 'get_job(id) · tenant matches? else 404', kind: 'sync'},
+      {from: 'Job API', to: 'Redis', label: 'ZSCORE jobs:inflight id → deadline or retry time', kind: 'sync'},
       {
         from: 'Job API',
-        to: 'job store',
-        label: 'SELECT tenant, state, attempts, next_retry_at_ms FROM jobs WHERE id = $1',
-        kind: 'sync',
-      },
-      {from: 'job store', to: 'Job API', label: 'job row / no row → 404, never 403', kind: 'reply'},
-      {
-        from: 'Job API',
-        to: 'Redis',
-        label: 'ZSCORE jobs:inflight {id} · HGETALL jobs:job:{id}',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Job API', label: 'claim deadline in ms · state · worker', kind: 'reply'},
-      {
-        from: 'Job API',
-        to: 'job store',
-        label: 'SELECT attempt_no, error_class FROM job_attempts WHERE job_id = $1 ORDER BY attempt_no',
+        to: 'Job API',
+        label: 'running past deadline → stalled · retrying past due → retry_overdue',
         kind: 'sync',
       },
       {
         from: 'Job API',
-        to: 'Dead-letter store',
-        label: 'SELECT reason FROM job_dead_letter WHERE job_id = $1',
-        kind: 'sync',
-      },
-      {
-        from: 'Job API',
-        to: 'Client',
-        label: '200 {state: stalled, claim_age_ms, next_retry_at, retry_overdue, attempt_history, dead_letter_reason}',
+        to: 'Support engineer',
+        label: '200 {state, attempts, attempt_history, dead_reason, …}',
         kind: 'reply',
       },
     ],
@@ -72,423 +46,199 @@ guessing an id.
   checks: [
     {
       id: 'status-route',
-      title: 'Serves GET /v1/jobs/{id}',
+      title: 'Serves GET /v1/jobs/{id} from the job record',
       detail:
-        'Register the status read on `GET /v1/jobs/{id}` with the job id taken from the path — the read side of the submission route.',
+        "A queued job answers `queued` with no attempts; a buried job answers `dead` with its `dead_reason` and an `attempt_history` holding each attempt's error.",
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/jobs\/\{job_id\}["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/jobs\/:jobId['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/jobs\/\{jobID\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"jobs"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/jobs\//]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/jobs\/\{job_id\}["']/, /store\.attempt_history\(/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/jobs\/:jobId['"]/, /store\.attemptHistory\(/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/jobs\/\{id\}"/, /store\.AttemptHistory\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"jobs"\s*\/\s*Segment\s*\)/, /Store\.attemptHistory\(/]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/jobs\//, /store::attemptHistory\(/]},
       },
     },
     {
-      id: 'stalled-inflight',
-      title: 'A stranded in-flight claim reads as stalled with its claim age',
+      id: 'tenant-404',
+      title: "Another tenant's job is 404, as an unknown id is",
       detail:
-        'The state is reconciled against `jobs:inflight` before it is reported: an entry whose score (the claim deadline in ms) is already past is `stalled` with `claim_age_ms`, never the row’s `queued`. The starter returns the stored state verbatim, so a job stranded in a crashed worker’s claim looks queued forever.',
+        "Tenant `t-2` reading `t-1`'s job gets the same status and body as for an id that never existed. The starter answers 403, which confirms the job exists.",
       match: {
-        python: {
-          all: [/jobs:inflight/, /['"]stalled['"]/, /claim_age_ms/, /now_ms\(\)/],
-          order: [/jobs:inflight/, /['"]stalled['"]/],
-        },
-        typescript: {
-          all: [/jobs:inflight/, /['"]stalled['"]/, /claim_age_ms/, /nowMs\(\)/],
-          order: [/jobs:inflight/, /['"]stalled['"]/],
-        },
-        go: {
-          all: [/jobs:inflight/, /"stalled"/, /claim_age_ms/, /nowMS\(\)/],
-          order: [/jobs:inflight/, /"stalled"/],
-        },
-        scala: {
-          all: [/jobs:inflight/, /"stalled"/, /claim_age_ms/, /nowMs\(\)/],
-          order: [/jobs:inflight/, /"stalled"/],
-        },
-        cpp: {
-          all: [/jobs:inflight/, /"stalled"/, /claim_age_ms/, /nowMs\(\)/],
-          order: [/jobs:inflight/, /"stalled"/],
-        },
+        python: {all: [/job\[["']tenant["']\]\s*!=\s*tenant/], none: [/\b403\b/]},
+        typescript: {all: [/job\.tenant\s*!==\s*tenant/], none: [/\b403\b/]},
+        go: {all: [/job\.Tenant\s*!=\s*tenant/], none: [/StatusForbidden|\b403\b/]},
+        scala: {all: [/\.tenant\s*(!=|==)\s*tenant/], none: [/Forbidden|\b403\b/]},
+        cpp: {all: [/job->tenant\s*!=\s*tenant/], none: [/\b403\b/]},
+      },
+    },
+    {
+      id: 'stalled-claim',
+      title: 'A claim past its deadline reads as stalled',
+      detail:
+        "A claimed job reads `running`; 61 s later, with nobody reaping it, the same read answers `stalled`. The starter reports the record's state, which still says `running`.",
+      match: {
+        python: {all: [/\.zscore\(/, /["']stalled["']/]},
+        typescript: {all: [/\.zscore\(/, /['"]stalled['"]/]},
+        go: {all: [/\.ZScore\(/, /"stalled"/]},
+        scala: {all: [/jedis\.zscore\(/, /"stalled"/]},
+        cpp: {all: [/redis\.zscore\(/, /"stalled"/]},
       },
     },
     {
       id: 'retry-overdue',
-      title: 'next_retry_at is checked against the clock, or flagged retry_overdue',
+      title: 'A retry whose time has passed is flagged retry_overdue',
       detail:
-        'The stored retry time is compared with `now`: a time still ahead of the clock is reported as it is, a time in the past is replaced by a recomputed backoff (`BACKOFF_BASE_MS` doubling per attempt, capped at `BACKOFF_CAP_MS`) and flagged `retry_overdue: true`. The starter copies `next_retry_at` out of the row without ever looking at the clock, so the dashboard can show a retry that already passed.',
+        'A job retrying in 2 s reads `retrying` with `retry_overdue: false` and its `next_retry_at_ms`; 3 s later it still reads `retrying`, with `retry_overdue: true`. The starter has no such field.',
       match: {
-        python: {
-          all: [/BACKOFF_BASE_MS/, /BACKOFF_CAP_MS/, /next_retry_at/, /retry_overdue/, /backoff_ms\(/],
-          order: [/now_ms\(\)/, /retry_overdue/],
-        },
-        typescript: {
-          all: [/BACKOFF_BASE_MS/, /BACKOFF_CAP_MS/, /next_retry_at/, /retry_overdue/, /backoffMs\(/],
-          order: [/nowMs\(\)/, /retry_overdue/],
-        },
-        go: {
-          all: [/backoffBaseMS/, /backoffCapMS/, /next_retry_at/, /retry_overdue/, /backoffMS\(/],
-          order: [/nowMS\(\)/, /retry_overdue/],
-        },
-        scala: {
-          all: [/BackoffBaseMs/, /BackoffCapMs/, /next_retry_at/, /retry_overdue/, /backoffMs\(/],
-          order: [/nowMs\(\)/, /retry_overdue/],
-        },
-        cpp: {
-          all: [/kBackoffBaseMs/, /kBackoffCapMs/, /next_retry_at/, /retry_overdue/, /backoffMs\(/],
-          order: [/nowMs\(\)/, /retry_overdue/],
-        },
-      },
-    },
-    {
-      id: 'tenant-scoped-404',
-      title: 'A foreign job id is 404, never 403 with existence',
-      detail:
-        'The tenant comes from `X-Tenant-Id` and the job is resolved scoped to it; a job belonging to another tenant answers **404** — the same answer the caller gets for an id that never existed — and never **403**, which would confirm that the job exists. The starter looks the job up by id alone, so a job id is treated as a capability.',
-      match: {
-        python: {
-          all: [/X-Tenant-Id/, /row\["tenant"\]/, /\b404\b/],
-          none: [/\b403\b/],
-          order: [/row\["tenant"\]/, /\b404\b/],
-        },
-        typescript: {
-          all: [/x-tenant-id/, /row\.tenant/, /code\(\s*404\s*\)/],
-          none: [/code\(\s*403\s*\)/],
-          order: [/row\.tenant/, /code\(\s*404\s*\)/],
-        },
-        go: {
-          all: [/X-Tenant-Id/, /row\.Tenant != tenant/, /StatusNotFound/],
-          none: [/StatusForbidden/],
-          order: [/row\.Tenant != tenant/, /StatusNotFound/],
-        },
-        scala: {
-          all: [/X-Tenant-Id/, /row\.tenant/, /StatusCodes\.NotFound/],
-          none: [/StatusCodes\.Forbidden/],
-          order: [/row\.tenant/, /StatusCodes\.NotFound/],
-        },
-        cpp: {
-          all: [/X-Tenant-Id/, /\["tenant"\]/, /\b404\b/],
-          none: [/\b403\b/],
-          order: [/\["tenant"\]/, /\b404\b/],
-        },
-      },
-    },
-    {
-      id: 'job-history',
-      title: 'Attempt history and dead-letter reason come from the job’s own tables',
-      detail:
-        '`attempt_history` is read from `job_attempts` as an ordered list (`ORDER BY attempt_no`) and `dead_letter_reason` is surfaced from `job_dead_letter`. The starter answers with the row’s attempt counter and says nothing about why a buried job died, so the history the endpoint exists to show is missing.',
-      match: {
-        python: {
-          all: [/job_attempts/, /ORDER BY attempt_no/, /attempt_history/, /job_dead_letter/, /dead_letter_reason/],
-        },
-        typescript: {
-          all: [/job_attempts/, /ORDER BY attempt_no/, /attempt_history/, /job_dead_letter/, /dead_letter_reason/],
-        },
-        go: {
-          all: [/job_attempts/, /ORDER BY attempt_no/, /attempt_history/, /job_dead_letter/, /dead_letter_reason/],
-        },
-        scala: {
-          all: [/job_attempts/, /ORDER BY attempt_no/, /attempt_history/, /job_dead_letter/, /dead_letter_reason/],
-        },
-        cpp: {
-          all: [/job_attempts/, /ORDER BY attempt_no/, /attempt_history/, /job_dead_letter/, /dead_letter_reason/],
-        },
+        python: {all: [/["']retry_overdue["']/]},
+        typescript: {all: [/retry_overdue/]},
+        go: {all: [/"retry_overdue"/]},
+        scala: {all: [/"retry_overdue"/]},
+        cpp: {all: [/"retry_overdue"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""GET /v1/jobs/{job_id}: flawed code that echoes the stored jobs row."""
-import logging
-
-from fastapi import FastAPI, Header
+      starter: `import redis
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
-logger = logging.getLogger("jobqd")
-
-
-def job_row(job_id: str) -> dict | None:
-    cur.execute(
-        "SELECT type, state, attempts, next_retry_at_ms FROM jobs WHERE id = %s",
-        (job_id,),
-    )
-    return cur.fetchone()
-
-
-@app.get("/v1/jobs/{job_id}")
-def read_job(job_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    row = job_row(job_id)
-    if row is None:
-        return JSONResponse({"error": "unknown job"}, status_code=404)
-    logger.info("job read job_id=%s tenant=%s", job_id, tenant)
-    return JSONResponse(
-        {
-            "job_id": job_id,
-            "type": row["type"],
-            "state": row["state"],
-            "attempts": row["attempts"],
-            "next_retry_at": row["next_retry_at_ms"],
-        },
-        status_code=200,
-    )
-`,
-      solution: `"""GET /v1/jobs/{job_id}: the job's state reconciled against the queue's own sets."""
-import logging
-import time
-
-import redis
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-
-app = FastAPI()
-logger = logging.getLogger("jobqd")
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
+from jobs import store  # get_job, attempt_history
 
 INFLIGHT_KEY = "jobs:inflight"
-JOB_KEY = "jobs:job:{job_id}"
-VISIBILITY_TIMEOUT_S = 60
-MAX_ATTEMPTS = 5
-BACKOFF_BASE_MS = 1000
-BACKOFF_CAP_MS = 30000
 
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def backoff_ms(attempts: int) -> int:
-    """The exponential backoff for an attempt count, capped at BACKOFF_CAP_MS."""
-    return min(BACKOFF_BASE_MS * (2 ** max(attempts - 1, 0)), BACKOFF_CAP_MS)
-
-
-def job_row(job_id: str) -> dict | None:
-    """The jobs row: the record of what the platform wrote, tenant included."""
-    cur.execute(
-        "SELECT tenant, type, state, attempts, next_retry_at_ms FROM jobs WHERE id = %s",
-        (job_id,),
-    )
-    return cur.fetchone()
-
-
-def attempt_history(job_id: str) -> list[dict]:
-    """Every attempt so far, oldest first: the history a support engineer reads."""
-    cur.execute(
-        "SELECT attempt_no, error_class, error_message, started_at_ms, finished_at_ms"
-        " FROM job_attempts WHERE job_id = %s ORDER BY attempt_no",
-        (job_id,),
-    )
-    return cur.fetchall()
-
-
-def dead_letter_reason(job_id: str) -> str | None:
-    """Why the job was buried, or None while it is still alive."""
-    cur.execute("SELECT reason FROM job_dead_letter WHERE job_id = %s", (job_id,))
-    row = cur.fetchone()
-    return None if row is None else row["reason"]
-
-
-def claim_age_ms(job_id: str, now: int) -> int | None:
-    """The age of an expired claim: the job is in jobs:inflight with a deadline already past."""
-    deadline = r.zscore(INFLIGHT_KEY, job_id)
-    if deadline is None or deadline > now:
-        return None
-    return now - int(deadline)
-
-
-def next_retry(attempts: int, stored_ms: int | None, now: int) -> tuple[int | None, bool]:
-    """A retry time the caller can trust: the stored one while it is still ahead of the clock,
-    otherwise a recomputed backoff plus retry_overdue, so support knows a retry is owed."""
-    if stored_ms is not None and stored_ms > now:
-        return stored_ms, False
-    if attempts >= MAX_ATTEMPTS:
-        return None, True
-    return now + backoff_ms(attempts), True
+app = FastAPI()
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 @app.get("/v1/jobs/{job_id}")
-def read_job(job_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    row = job_row(job_id)
-    # 404, not 403: a foreign job must be indistinguishable from one that never existed.
-    if row is None or row["tenant"] != tenant:
-        raise HTTPException(status_code=404, detail="unknown job")
-
-    now = now_ms()
-    queue_state = r.hgetall(JOB_KEY.format(job_id=job_id))
-    stranded_for = claim_age_ms(job_id, now)
-    state = "stalled" if stranded_for is not None else queue_state.get("state", row["state"])
-    retry_at, overdue = next_retry(row["attempts"], row["next_retry_at_ms"], now)
-    logger.info("job read job_id=%s tenant=%s state=%s", job_id, tenant, state)
+def read_job(job_id: str, request: Request) -> JSONResponse:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    job = store.get_job(job_id)
+    if job is None:
+        return JSONResponse({"error": "no such job"}, status_code=404)
+    if job["tenant"] != tenant:
+        return JSONResponse({"error": "this job belongs to another tenant"}, status_code=403)
     return JSONResponse(
         {
             "job_id": job_id,
-            "type": row["type"],
+            "type": job["type"],
+            "state": job["state"],
+            "attempts": job["attempts"],
+            "attempt_history": store.attempt_history(job_id),
+            "next_retry_at_ms": job["next_retry_at_ms"],
+            "dead_reason": job["dead_reason"],
+        }
+    )
+`,
+      solution: `import time
+
+import redis
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from jobs import store  # get_job, attempt_history
+
+INFLIGHT_KEY = "jobs:inflight"
+
+app = FastAPI()
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+
+@app.get("/v1/jobs/{job_id}")
+def read_job(job_id: str, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    job = store.get_job(job_id)
+    # Another tenant's job answers exactly as a missing one: a job id is not a capability.
+    if job is None or job["tenant"] != tenant:
+        return JSONResponse({"error": "no such job"}, status_code=404)
+    state = job["state"]
+    retry_overdue = False
+    # The record says what the last writer meant; jobs:inflight says whether it still holds.
+    due = r.zscore(INFLIGHT_KEY, job_id)
+    if due is not None and due <= time.time() * 1000:
+        if state == "running":
+            state = "stalled"
+        elif state == "retrying":
+            retry_overdue = True
+    return JSONResponse(
+        {
+            "job_id": job_id,
+            "type": job["type"],
             "state": state,
-            "attempts": row["attempts"],
-            "worker": queue_state.get("worker"),
-            "claim_age_ms": stranded_for,
-            "next_retry_at": retry_at,
-            "retry_overdue": overdue,
-            "attempt_history": attempt_history(job_id),
-            "dead_letter_reason": dead_letter_reason(job_id),
-        },
-        status_code=200,
+            "attempts": job["attempts"],
+            "attempt_history": store.attempt_history(job_id),
+            "next_retry_at_ms": job["next_retry_at_ms"],
+            "retry_overdue": retry_overdue,
+            "dead_reason": job["dead_reason"],
+        }
     )
 `,
     },
     typescript: {
-      starter: `/** GET /v1/jobs/:jobId: flawed code that echoes the stored jobs row. */
-import Fastify from 'fastify';
-
-export const app = Fastify();
-
-interface JobRow {
-  type: string;
-  state: string;
-  attempts: number;
-  next_retry_at_ms: number | null;
-}
-
-/** The jobs row as the platform stored it; this step only reads it. */
-async function jobRow(jobId: string): Promise<JobRow | undefined> {
-  const {rows} = (await db.query('SELECT type, state, attempts, next_retry_at_ms FROM jobs WHERE id = $1', [
-    jobId,
-  ])) as {rows: JobRow[]};
-  return rows[0];
-}
-
-app.get('/v1/jobs/:jobId', async (request, reply) => {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'];
-  const {jobId} = request.params as {jobId: string};
-  const row = await jobRow(jobId);
-  if (row === undefined) return reply.code(404).send({error: 'unknown job'});
-  request.log.info({job_id: jobId, tenant}, 'job read');
-  return reply.code(200).send({
-    job_id: jobId,
-    type: row.type,
-    state: row.state,
-    attempts: row.attempts,
-    next_retry_at: row.next_retry_at_ms,
-  });
-});
-`,
-      solution: `/** GET /v1/jobs/:jobId: the job's state reconciled against the queue's own sets. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 import Redis from 'ioredis';
 
+import * as store from 'jobs/store'; // getJob, attemptHistory
+
+export const INFLIGHT_KEY = 'jobs:inflight';
+
 export const app = Fastify();
-export const redis = new Redis({host: 'redis', port: 6379});
-
-const INFLIGHT_KEY = 'jobs:inflight';
-const JOB_KEY_PREFIX = 'jobs:job:';
-const VISIBILITY_TIMEOUT_S = 60;
-const MAX_ATTEMPTS = 5;
-const BACKOFF_BASE_MS = 1000;
-const BACKOFF_CAP_MS = 30000;
-
-interface JobRow {
-  tenant: string;
-  type: string;
-  state: string;
-  attempts: number;
-  next_retry_at_ms: number | null;
-}
-
-interface AttemptRow {
-  attempt_no: number;
-  error_class: string;
-  error_message: string;
-  started_at_ms: number;
-  finished_at_ms: number | null;
-}
-
-export function nowMs(): number {
-  return Date.now();
-}
-
-/** The exponential backoff for an attempt count, capped at BACKOFF_CAP_MS. */
-function backoffMs(attempts: number): number {
-  return Math.min(BACKOFF_BASE_MS * 2 ** Math.max(attempts - 1, 0), BACKOFF_CAP_MS);
-}
-
-/** The jobs row: the record of what the platform wrote, tenant included. */
-async function jobRow(jobId: string): Promise<JobRow | undefined> {
-  const {rows} = (await db.query(
-    'SELECT tenant, type, state, attempts, next_retry_at_ms FROM jobs WHERE id = $1',
-    [jobId],
-  )) as {rows: JobRow[]};
-  return rows[0];
-}
-
-/** Every attempt so far, oldest first: the history a support engineer reads. */
-async function attemptHistory(jobId: string): Promise<AttemptRow[]> {
-  const {rows} = (await db.query(
-    'SELECT attempt_no, error_class, error_message, started_at_ms, finished_at_ms' +
-      ' FROM job_attempts WHERE job_id = $1 ORDER BY attempt_no',
-    [jobId],
-  )) as {rows: AttemptRow[]};
-  return rows;
-}
-
-/** Why the job was buried, or null while it is still alive. */
-async function deadLetterReason(jobId: string): Promise<string | null> {
-  const {rows} = (await db.query('SELECT reason FROM job_dead_letter WHERE job_id = $1', [jobId])) as {
-    rows: {reason: string}[];
-  };
-  return rows[0]?.reason ?? null;
-}
-
-/** The age of an expired claim: the job is in jobs:inflight with a deadline already past. */
-async function claimAgeMs(jobId: string, now: number): Promise<number | null> {
-  const deadline = await redis.zscore(INFLIGHT_KEY, jobId);
-  if (deadline === null || Number(deadline) > now) return null;
-  return now - Number(deadline);
-}
-
-/** A retry time the caller can trust: the stored one while it is still ahead of the clock,
- * otherwise a recomputed backoff plus retry_overdue, so support knows a retry is owed. */
-function nextRetry(
-  attempts: number,
-  storedMs: number | null,
-  now: number,
-): {retryAt: number | null; overdue: boolean} {
-  if (storedMs !== null && storedMs > now) return {retryAt: storedMs, overdue: false};
-  if (attempts >= MAX_ATTEMPTS) return {retryAt: null, overdue: true};
-  return {retryAt: now + backoffMs(attempts), overdue: true};
-}
+const redis = new Redis({host: 'redis', port: 6379});
 
 app.get('/v1/jobs/:jobId', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
-
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
   const {jobId} = request.params as {jobId: string};
-  const row = await jobRow(jobId);
-  // 404, not 403: a foreign job must be indistinguishable from one that never existed.
-  if (row === undefined || row.tenant !== tenant) return reply.code(404).send({error: 'unknown job'});
-
-  const now = nowMs();
-  const queueState = await redis.hgetall(JOB_KEY_PREFIX + jobId);
-  const strandedFor = await claimAgeMs(jobId, now);
-  const state = strandedFor === null ? queueState['state'] ?? row.state : 'stalled';
-  const retry = nextRetry(row.attempts, row.next_retry_at_ms, now);
-  request.log.info({job_id: jobId, tenant, state}, 'job read');
-  return reply.code(200).send({
+  const tenant = request.headers['x-tenant-id'] ?? '';
+  const job = await store.getJob(jobId);
+  if (job === null) return reply.code(404).send({error: 'no such job'});
+  if (job.tenant !== tenant) return reply.code(403).send({error: 'this job belongs to another tenant'});
+  return {
     job_id: jobId,
-    type: row.type,
+    type: job.type,
+    state: job.state,
+    attempts: job.attempts,
+    attempt_history: await store.attemptHistory(jobId),
+    next_retry_at_ms: job.next_retry_at_ms,
+    dead_reason: job.dead_reason,
+  };
+});
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import * as store from 'jobs/store'; // getJob, attemptHistory
+
+export const INFLIGHT_KEY = 'jobs:inflight';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+app.get('/v1/jobs/:jobId', async (request, reply) => {
+  const {jobId} = request.params as {jobId: string};
+  const tenant = request.headers['x-tenant-id'] ?? '';
+  const job = await store.getJob(jobId);
+  // Another tenant's job answers exactly as a missing one: a job id is not a capability.
+  if (job === null || job.tenant !== tenant) return reply.code(404).send({error: 'no such job'});
+  let state = job.state;
+  let retryOverdue = false;
+  // The record says what the last writer meant; jobs:inflight says whether it still holds.
+  const due = await redis.zscore(INFLIGHT_KEY, jobId);
+  if (due !== null && Number(due) <= Date.now()) {
+    if (state === 'running') state = 'stalled';
+    else if (state === 'retrying') retryOverdue = true;
+  }
+  return {
+    job_id: jobId,
+    type: job.type,
     state,
-    attempts: row.attempts,
-    worker: queueState['worker'] ?? null,
-    claim_age_ms: strandedFor,
-    next_retry_at: retry.retryAt,
-    retry_overdue: retry.overdue,
-    attempt_history: await attemptHistory(jobId),
-    dead_letter_reason: await deadLetterReason(jobId),
-  });
+    attempts: job.attempts,
+    attempt_history: await store.attemptHistory(jobId),
+    next_retry_at_ms: job.next_retry_at_ms,
+    retry_overdue: retryOverdue,
+    dead_reason: job.dead_reason,
+  };
 });
 `,
     },
@@ -497,486 +247,215 @@ app.get('/v1/jobs/:jobId', async (request, reply) => {
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"github.com/redis/go-redis/v9"
+
+	"jobs/store" // store.GetJob, AttemptHistory
 )
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+const inflightKey = "jobs:inflight"
+
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-// jobRow is the stored jobs row; this step only reads it.
-type jobRow struct {
-	Type          string
-	State         string
-	Attempts      int64
-	NextRetryAtMs *int64
-}
-
-func readJobRow(r *http.Request, jobID string) (jobRow, error) {
-	var row jobRow
-	err := db.QueryRowContext(
-		r.Context(),
-		"SELECT type, state, attempts, next_retry_at_ms FROM jobs WHERE id = $1",
-		jobID,
-	).Scan(&row.Type, &row.State, &row.Attempts, &row.NextRetryAtMs)
-	return row, err
+// orNull is v, or JSON null for the zero value of a field that does not apply.
+func orNull[T comparable](v T) any {
+	var zero T
+	if v == zero {
+		return nil
+	}
+	return v
 }
 
 func readJob(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	jobID := r.PathValue("id")
 	tenant := r.Header.Get("X-Tenant-Id")
-	jobID := r.PathValue("jobID")
-	row, err := readJobRow(r, jobID)
-	if err != nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown job"})
+	job := store.GetJob(r.Context(), jobID)
+	if job == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such job"})
 		return
 	}
-	log.Printf("job read job_id=%s tenant=%s", jobID, tenant)
+	if job.Tenant != tenant {
+		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "this job belongs to another tenant"})
+		return
+	}
 	writeJSON(rw, http.StatusOK, map[string]any{
-		"job_id":        jobID,
-		"type":          row.Type,
-		"state":         row.State,
-		"attempts":      row.Attempts,
-		"next_retry_at": row.NextRetryAtMs,
+		"job_id":           jobID,
+		"type":             job.Type,
+		"state":            job.State,
+		"attempts":         job.Attempts,
+		"attempt_history":  store.AttemptHistory(r.Context(), jobID),
+		"next_retry_at_ms": orNull(job.NextRetryAtMs),
+		"dead_reason":      orNull(job.DeadReason),
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/jobs/{jobID}", readJob)
-	_ = http.ListenAndServe("0.0.0.0:8443", mux)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/jobs/{id}", readJob)
 }
 `,
       solution: `package main
 
 import (
-	"database/sql"
 	"encoding/json"
-	"errors"
-	"log"
 	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"jobs/store" // store.GetJob, AttemptHistory
 )
 
-const (
-	inflightKey      = "jobs:inflight"
-	jobKeyPrefix     = "jobs:job:"
-	visibilityTimeoS = 60
-	maxAttempts      = 5
-	backoffBaseMS    = 1000
-	backoffCapMS     = 30000
-)
+const inflightKey = "jobs:inflight"
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func nowMS() int64 {
-	return time.Now().UnixMilli()
-}
-
-// backoffMS is the exponential backoff for an attempt count, capped at backoffCapMS.
-func backoffMS(attempts int64) int64 {
-	shift := attempts - 1
-	if shift < 0 {
-		shift = 0
+// orNull is v, or JSON null for the zero value of a field that does not apply.
+func orNull[T comparable](v T) any {
+	var zero T
+	if v == zero {
+		return nil
 	}
-	if backoff := backoffBaseMS << shift; backoff < backoffCapMS {
-		return backoff
-	}
-	return backoffCapMS
-}
-
-// jobRow is the stored jobs row: the record of what the platform wrote, tenant included.
-type jobRow struct {
-	Tenant        string
-	Type          string
-	State         string
-	Attempts      int64
-	NextRetryAtMs *int64
-}
-
-// attemptRow is one attempt of the job, in the order it happened.
-type attemptRow struct {
-	AttemptNo    int64  \`json:"attempt_no"\`
-	ErrorClass   string \`json:"error_class"\`
-	ErrorMessage string \`json:"error_message"\`
-	StartedAtMs  int64  \`json:"started_at_ms"\`
-	FinishedAtMs *int64 \`json:"finished_at_ms"\`
-}
-
-func readJobRow(r *http.Request, jobID string) (jobRow, error) {
-	var row jobRow
-	err := db.QueryRowContext(
-		r.Context(),
-		"SELECT tenant, type, state, attempts, next_retry_at_ms FROM jobs WHERE id = $1",
-		jobID,
-	).Scan(&row.Tenant, &row.Type, &row.State, &row.Attempts, &row.NextRetryAtMs)
-	return row, err
-}
-
-// attemptHistory reads every attempt so far, oldest first: the history a support engineer reads.
-func attemptHistory(r *http.Request, jobID string) ([]attemptRow, error) {
-	rows, err := db.QueryContext(
-		r.Context(),
-		"SELECT attempt_no, error_class, error_message, started_at_ms, finished_at_ms"+
-			" FROM job_attempts WHERE job_id = $1 ORDER BY attempt_no",
-		jobID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	history := []attemptRow{}
-	for rows.Next() {
-		var attempt attemptRow
-		if scanErr := rows.Scan(
-			&attempt.AttemptNo,
-			&attempt.ErrorClass,
-			&attempt.ErrorMessage,
-			&attempt.StartedAtMs,
-			&attempt.FinishedAtMs,
-		); scanErr != nil {
-			return nil, scanErr
-		}
-		history = append(history, attempt)
-	}
-	return history, rows.Err()
-}
-
-// deadLetterReason is why the job was buried, or nil while it is still alive.
-func deadLetterReason(r *http.Request, jobID string) (any, error) {
-	var reason string
-	err := db.QueryRowContext(
-		r.Context(),
-		"SELECT reason FROM job_dead_letter WHERE job_id = $1",
-		jobID,
-	).Scan(&reason)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return reason, nil
-}
-
-// claimAgeMS is the age of an expired claim: the job is in jobs:inflight with a deadline already past.
-func claimAgeMS(r *http.Request, jobID string, now int64) (*int64, error) {
-	deadline, err := rdb.ZScore(r.Context(), inflightKey, jobID).Result()
-	if errors.Is(err, redis.Nil) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if int64(deadline) > now {
-		return nil, nil
-	}
-	age := now - int64(deadline)
-	return &age, nil
-}
-
-// nextRetry is a retry time the caller can trust: the stored one while it is still ahead of the
-// clock, otherwise a recomputed backoff plus retry_overdue, so support knows a retry is owed.
-func nextRetry(attempts int64, storedMS *int64, now int64) (*int64, bool) {
-	if storedMS != nil && *storedMS > now {
-		return storedMS, false
-	}
-	if attempts >= maxAttempts {
-		return nil, true
-	}
-	at := now + backoffMS(attempts)
-	return &at, true
+	return v
 }
 
 func readJob(rw http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("id")
 	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	job := store.GetJob(r.Context(), jobID)
+	// Another tenant's job answers exactly as a missing one: a job id is not a capability.
+	if job == nil || job.Tenant != tenant {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such job"})
 		return
 	}
-	jobID := r.PathValue("jobID")
-	row, err := readJobRow(r, jobID)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown job"})
-		return
+	state := job.State
+	retryOverdue := false
+	// The record says what the last writer meant; jobs:inflight says whether it still holds.
+	if due, err := rdb.ZScore(r.Context(), inflightKey, jobID).Result(); err == nil && int64(due) <= time.Now().UnixMilli() {
+		if state == "running" {
+			state = "stalled"
+		} else if state == "retrying" {
+			retryOverdue = true
+		}
 	}
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "lookup failed"})
-		return
-	}
-	// 404, not 403: a foreign job must be indistinguishable from one that never existed.
-	if row.Tenant != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown job"})
-		return
-	}
-
-	now := nowMS()
-	queueState, err := rdb.HGetAll(r.Context(), jobKeyPrefix+jobID).Result()
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "queue state unavailable"})
-		return
-	}
-	claimAge, err := claimAgeMS(r, jobID, now)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "claim unavailable"})
-		return
-	}
-
-	state := row.State
-	if queued, ok := queueState["state"]; ok && queued != "" {
-		state = queued
-	}
-	if claimAge != nil {
-		state = "stalled"
-	}
-	var worker any
-	if name, ok := queueState["worker"]; ok && name != "" {
-		worker = name
-	}
-	retryAt, overdue := nextRetry(row.Attempts, row.NextRetryAtMs, now)
-
-	history, err := attemptHistory(r, jobID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "history unavailable"})
-		return
-	}
-	reason, err := deadLetterReason(r, jobID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "dead letter unavailable"})
-		return
-	}
-
-	log.Printf("job read job_id=%s tenant=%s state=%s", jobID, tenant, state)
 	writeJSON(rw, http.StatusOK, map[string]any{
-		"job_id":             jobID,
-		"type":               row.Type,
-		"state":              state,
-		"attempts":           row.Attempts,
-		"worker":             worker,
-		"claim_age_ms":       claimAge,
-		"next_retry_at":      retryAt,
-		"retry_overdue":      overdue,
-		"attempt_history":    history,
-		"dead_letter_reason": reason,
+		"job_id":           jobID,
+		"type":             job.Type,
+		"state":            state,
+		"attempts":         job.Attempts,
+		"attempt_history":  store.AttemptHistory(r.Context(), jobID),
+		"next_retry_at_ms": orNull(job.NextRetryAtMs),
+		"retry_overdue":    retryOverdue,
+		"dead_reason":      orNull(job.DeadReason),
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/jobs/{jobID}", readJob)
-	_ = http.ListenAndServe("0.0.0.0:8443", mux)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/jobs/{id}", readJob)
 }
 `,
     },
     scala: {
-      starter: `import java.sql.Connection
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import redis.clients.jedis.JedisPooled
 import spray.json._
 
-final case class JobRow(jobType: String, state: String, attempts: Long, nextRetryAtMs: Option[Long])
+import jobs.Store // Store.getJob, attemptHistory
 
-object JobRead {
-  implicit val system: ActorSystem = ActorSystem("jobqd")
+object Read {
+  val InflightKey = "jobs:inflight"
 
-  def jsonEntity(body: String): ResponseEntity =
-    HttpEntity(ContentTypes.\`application/json\`, body)
+  val jedis = new JedisPooled("redis", 6379)
 
-  /** The stored jobs row; this step only reads it. */
-  def jobRow(jobId: String): Option[JobRow] = {
-    val stmt = conn.prepareStatement("SELECT type, state, attempts, next_retry_at_ms FROM jobs WHERE id = ?")
-    stmt.setString(1, jobId)
-    val rows = stmt.executeQuery()
-    if (!rows.next()) None
-    else {
-      val attempts = rows.getLong("attempts")
-      val storedRetry = rows.getLong("next_retry_at_ms")
-      val retryAt = if (rows.wasNull()) None else Some(storedRetry)
-      Some(JobRow(rows.getString("type"), rows.getString("state"), attempts, retryAt))
-    }
-  }
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "jobs" / Segment) { jobId =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        jobRow(jobId) match {
-          case Some(row) =>
-            val response = JsObject(
+  private def history(jobId: String): JsArray = JsArray(Store.attemptHistory(jobId).toVector.map { a =>
+    JsObject("attempt" -> JsNumber(a.attempt), "error" -> JsString(a.error), "at_ms" -> JsNumber(a.atMs))
+  })
+
+  val route: Route = path("v1" / "jobs" / Segment) { jobId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
+        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+        val tenant = tenantHeader.getOrElse("")
+        Store.getJob(jobId) match {
+          case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such job"))))
+          case Some(job) if job.tenant != tenant =>
+            complete(json(StatusCodes.Forbidden, JsObject("error" -> JsString("this job belongs to another tenant"))))
+          case Some(job) =>
+            complete(json(StatusCodes.OK, JsObject(
               "job_id" -> JsString(jobId),
-              "type" -> JsString(row.jobType),
-              "state" -> JsString(row.state),
-              "attempts" -> JsNumber(row.attempts),
-              "next_retry_at" -> row.nextRetryAtMs.map(JsNumber(_)).getOrElse(JsNull)
-            )
-            complete(StatusCodes.OK, jsonEntity(response.compactPrint))
-          case None =>
-            complete(StatusCodes.NotFound, jsonEntity("""{"error":"unknown job"}"""))
+              "type" -> JsString(job.jobType),
+              "state" -> JsString(job.state),
+              "attempts" -> JsNumber(job.attempts),
+              "attempt_history" -> history(jobId),
+              "next_retry_at_ms" -> job.nextRetryAtMs.map(JsNumber(_)).getOrElse(JsNull),
+              "dead_reason" -> job.deadReason.map(JsString(_)).getOrElse(JsNull))))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.sql.Connection
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import redis.clients.jedis.JedisPooled
 import spray.json._
 
-/** The stored jobs row: the record of what the platform wrote, tenant included. */
-final case class JobRow(
-    tenant: String,
-    jobType: String,
-    state: String,
-    attempts: Long,
-    nextRetryAtMs: Option[Long],
-)
+import jobs.Store // Store.getJob, attemptHistory
 
-object JobRead {
-  implicit val system: ActorSystem = ActorSystem("jobqd")
-
+object Read {
   val InflightKey = "jobs:inflight"
-  val JobKeyPrefix = "jobs:job:"
-  val VisibilityTimeoutS = 60
-  val MaxAttempts = 5
-  val BackoffBaseMs = 1000L
-  val BackoffCapMs = 30000L
 
-  def jsonEntity(body: String): ResponseEntity =
-    HttpEntity(ContentTypes.\`application/json\`, body)
+  val jedis = new JedisPooled("redis", 6379)
 
-  def nowMs(): Long = System.currentTimeMillis()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  /** The exponential backoff for an attempt count, capped at BackoffCapMs. */
-  def backoffMs(attempts: Long): Long =
-    math.min(BackoffBaseMs * (1L << math.max(attempts - 1, 0).toInt), BackoffCapMs)
+  private def history(jobId: String): JsArray = JsArray(Store.attemptHistory(jobId).toVector.map { a =>
+    JsObject("attempt" -> JsNumber(a.attempt), "error" -> JsString(a.error), "at_ms" -> JsNumber(a.atMs))
+  })
 
-  def jobRow(jobId: String): Option[JobRow] = {
-    val stmt = conn.prepareStatement(
-      "SELECT tenant, type, state, attempts, next_retry_at_ms FROM jobs WHERE id = ?"
-    )
-    stmt.setString(1, jobId)
-    val rows = stmt.executeQuery()
-    if (!rows.next()) None
-    else {
-      val attempts = rows.getLong("attempts")
-      val storedRetry = rows.getLong("next_retry_at_ms")
-      val retryAt = if (rows.wasNull()) None else Some(storedRetry)
-      Some(
-        JobRow(
-          rows.getString("tenant"),
-          rows.getString("type"),
-          rows.getString("state"),
-          attempts,
-          retryAt
-        )
-      )
-    }
-  }
-
-  /** Every attempt so far, oldest first: the history a support engineer reads. */
-  def attemptHistory(jobId: String): List[JsObject] = {
-    val stmt = conn.prepareStatement(
-      "SELECT attempt_no, error_class, error_message, started_at_ms, finished_at_ms" +
-        " FROM job_attempts WHERE job_id = ? ORDER BY attempt_no"
-    )
-    stmt.setString(1, jobId)
-    val rows = stmt.executeQuery()
-    val history = List.newBuilder[JsObject]
-    while (rows.next()) {
-      val finished = rows.getLong("finished_at_ms")
-      val finishedJson = if (rows.wasNull()) JsNull else JsNumber(finished)
-      history += JsObject(
-        "attempt_no" -> JsNumber(rows.getLong("attempt_no")),
-        "error_class" -> JsString(rows.getString("error_class")),
-        "error_message" -> JsString(rows.getString("error_message")),
-        "started_at_ms" -> JsNumber(rows.getLong("started_at_ms")),
-        "finished_at_ms" -> finishedJson
-      )
-    }
-    history.result()
-  }
-
-  /** Why the job was buried, or None while it is still alive. */
-  def deadLetterReason(jobId: String): Option[String] = {
-    val stmt = conn.prepareStatement("SELECT reason FROM job_dead_letter WHERE job_id = ?")
-    stmt.setString(1, jobId)
-    val rows = stmt.executeQuery()
-    if (rows.next()) Some(rows.getString("reason")) else None
-  }
-
-  /** The age of an expired claim: the job is in jobs:inflight with a deadline already past. */
-  def claimAgeMs(jobId: String, now: Long): Option[Long] =
-    Option(jedis.zscore(InflightKey, jobId)).map(_.toLong).filter(_ <= now).map(deadline => now - deadline)
-
-  /** A retry time the caller can trust: the stored one while it is still ahead of the clock,
-    * otherwise a recomputed backoff plus retry_overdue, so support knows a retry is owed. */
-  def nextRetry(attempts: Long, storedMs: Option[Long], now: Long): (Option[Long], Boolean) =
-    storedMs.filter(_ > now) match {
-      case Some(stored)                    => (Some(stored), false)
-      case None if attempts >= MaxAttempts => (None, true)
-      case None                            => (Some(now + backoffMs(attempts)), true)
-    }
-
-  val route: Route =
-    path("v1" / "jobs" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          val tenant = tenantOpt.filter(_.nonEmpty)
-          if (tenant.isEmpty) complete(StatusCodes.Unauthorized, jsonEntity("""{"error":"missing X-Tenant-Id"}"""))
-          else {
-            jobRow(jobId) match {
-              // 404, not 403: a foreign job must be indistinguishable from one that never existed.
-              case Some(row) if row.tenant == tenant.get =>
-                val now = nowMs()
-                val queueState = Option(jedis.hget(JobKeyPrefix + jobId, "state"))
-                val strandedFor = claimAgeMs(jobId, now)
-                val state = if (strandedFor.isDefined) "stalled" else queueState.getOrElse(row.state)
-                val worker = Option(jedis.hget(JobKeyPrefix + jobId, "worker"))
-                val (retryAt, overdue) = nextRetry(row.attempts, row.nextRetryAtMs, now)
-                val response = JsObject(
-                  "job_id" -> JsString(jobId),
-                  "type" -> JsString(row.jobType),
-                  "state" -> JsString(state),
-                  "attempts" -> JsNumber(row.attempts),
-                  "worker" -> worker.map(JsString(_)).getOrElse(JsNull),
-                  "claim_age_ms" -> strandedFor.map(JsNumber(_)).getOrElse(JsNull),
-                  "next_retry_at" -> retryAt.map(JsNumber(_)).getOrElse(JsNull),
-                  "retry_overdue" -> JsBoolean(overdue),
-                  "attempt_history" -> JsArray(attemptHistory(jobId).toVector),
-                  "dead_letter_reason" -> deadLetterReason(jobId).map(JsString(_)).getOrElse(JsNull)
-                )
-                complete(StatusCodes.OK, jsonEntity(response.compactPrint))
-              case _ =>
-                complete(StatusCodes.NotFound, jsonEntity("""{"error":"unknown job"}"""))
-            }
-          }
+  val route: Route = path("v1" / "jobs" / Segment) { jobId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
+        val tenant = tenantHeader.getOrElse("")
+        Store.getJob(jobId).filter(_.tenant == tenant) match {
+          // Another tenant's job answers exactly as a missing one: a job id is not a capability.
+          case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such job"))))
+          case Some(job) =>
+            // The record says what the last writer meant; jobs:inflight says whether it still holds.
+            val past = Option(jedis.zscore(InflightKey, jobId)).exists(_.doubleValue <= System.currentTimeMillis)
+            val state = if (past && job.state == "running") "stalled" else job.state
+            complete(json(StatusCodes.OK, JsObject(
+              "job_id" -> JsString(jobId),
+              "type" -> JsString(job.jobType),
+              "state" -> JsString(state),
+              "attempts" -> JsNumber(job.attempts),
+              "attempt_history" -> history(jobId),
+              "next_retry_at_ms" -> job.nextRetryAtMs.map(JsNumber(_)).getOrElse(JsNull),
+              "retry_overdue" -> JsBoolean(past && job.state == "retrying"),
+              "dead_reason" -> job.deadReason.map(JsString(_)).getOrElse(JsNull))))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -984,167 +463,427 @@ object JobRead {
     cpp: {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
-#include <iostream>
 #include <string>
+
+#include "jobs/store.h"  // store::getJob, attemptHistory
 
 using json = nlohmann::json;
 
-int main() {
-  httplib::Server svr;
+const std::string kInflightKey = "jobs:inflight";
 
-  svr.Get(R"(/v1/jobs/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string tenant = req.get_header_value("X-Tenant-Id");
-    const std::string job_id = req.matches[1];
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    pqxx::work tx(db_pool());
-    const auto jobs = tx.exec_params(
-        "SELECT type, state, attempts, next_retry_at_ms FROM jobs WHERE id = $1", job_id);
-    if (jobs.empty()) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown job"})", "application/json");
-      return;
-    }
-    std::cerr << "job read job_id=" << job_id << " tenant=" << tenant << "\\n";
-    res.status = 200;
-    res.set_content(
-        json{{"job_id", job_id},
-             {"type", jobs[0]["type"].as<std::string>()},
-             {"state", jobs[0]["state"].as<std::string>()},
-             {"attempts", jobs[0]["attempts"].as<long long>()},
-             {"next_retry_at", jobs[0]["next_retry_at_ms"]}}
-            .dump(),
-        "application/json");
-  });
+sw::redis::Redis redis("tcp://redis:6379");
 
-  svr.listen("0.0.0.0", 8443);
+void reply_json(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+json history(const std::string& job_id) {
+  json out = json::array();
+  for (const auto& a : store::attemptHistory(job_id)) out.push_back({{"attempt", a.attempt}, {"error", a.error}, {"at_ms", a.at_ms}});
+  return out;
+}
+
+void read_job(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const std::string job_id = req.matches[1];
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const auto job = store::getJob(job_id);
+  if (!job) return reply_json(res, 404, {{"error", "no such job"}});
+  if (job->tenant != tenant) return reply_json(res, 403, {{"error", "this job belongs to another tenant"}});
+  reply_json(res, 200, {{"job_id", job_id},
+                        {"type", job->type},
+                        {"state", job->state},
+                        {"attempts", job->attempts},
+                        {"attempt_history", history(job_id)},
+                        {"next_retry_at_ms", job->next_retry_at_ms ? json(job->next_retry_at_ms) : json()},
+                        {"dead_reason", job->dead_reason.empty() ? json() : json(job->dead_reason)}});
+}
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/jobs/([\\w-]+))", read_job); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
-#include <algorithm>
-#include <chrono>
-#include <iostream>
-#include <optional>
 #include <string>
+
+#include "jobs/store.h"  // store::getJob, attemptHistory
 
 using json = nlohmann::json;
 
-constexpr int kVisibilityTimeoutS = 60;
-constexpr int kMaxAttempts = 5;
-constexpr long long kBackoffBaseMs = 1000;
-constexpr long long kBackoffCapMs = 30000;
-
 const std::string kInflightKey = "jobs:inflight";
-const std::string kJobKeyPrefix = "jobs:job:";
 
-long long nowMs() {
-  using namespace std::chrono;
-  return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+sw::redis::Redis redis("tcp://redis:6379");
+
+void reply_json(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-/** The exponential backoff for an attempt count, capped at kBackoffCapMs. */
-long long backoffMs(long long attempts) {
-  const long long shift = std::max<long long>(attempts - 1, 0);
-  return std::min(kBackoffBaseMs * (1LL << shift), kBackoffCapMs);
+json history(const std::string& job_id) {
+  json out = json::array();
+  for (const auto& a : store::attemptHistory(job_id)) out.push_back({{"attempt", a.attempt}, {"error", a.error}, {"at_ms", a.at_ms}});
+  return out;
 }
 
-/** The age of an expired claim: the job is in jobs:inflight with a deadline already past. */
-std::optional<long long> claimAgeMs(const std::string& job_id, long long now) {
-  const auto deadline = redis.zscore(kInflightKey, job_id);
-  if (!deadline.has_value() || static_cast<long long>(*deadline) > now) return std::nullopt;
-  return now - static_cast<long long>(*deadline);
+void read_job(const httplib::Request& req, httplib::Response& res) {
+  const std::string job_id = req.matches[1];
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const auto job = store::getJob(job_id);
+  // Another tenant's job answers exactly as a missing one: a job id is not a capability.
+  if (!job || job->tenant != tenant) return reply_json(res, 404, {{"error", "no such job"}});
+  std::string state = job->state;
+  bool retry_overdue = false;
+  // The record says what the last writer meant; jobs:inflight says whether it still holds.
+  const auto due = redis.zscore(kInflightKey, job_id);
+  if (due && *due <= static_cast<double>(store::nowMs())) {
+    if (state == "running") state = "stalled";
+    else if (state == "retrying") retry_overdue = true;
+  }
+  reply_json(res, 200, {{"job_id", job_id},
+                        {"type", job->type},
+                        {"state", state},
+                        {"attempts", job->attempts},
+                        {"attempt_history", history(job_id)},
+                        {"next_retry_at_ms", job->next_retry_at_ms ? json(job->next_retry_at_ms) : json()},
+                        {"retry_overdue", retry_overdue},
+                        {"dead_reason", job->dead_reason.empty() ? json() : json(job->dead_reason)}});
 }
 
-/** A retry time the caller can trust: the stored one while it is still ahead of the clock,
- * otherwise a recomputed backoff plus retry_overdue, so support knows a retry is owed. */
-std::pair<std::optional<long long>, bool> nextRetry(
-    long long attempts, const std::optional<long long>& stored_ms, long long now) {
-  if (stored_ms.has_value() && *stored_ms > now) return {stored_ms, false};
-  if (attempts >= kMaxAttempts) return {std::nullopt, true};
-  return {now + backoffMs(attempts), true};
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/jobs/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const std::string job_id = req.matches[1];
-
-    pqxx::work tx(db_pool());
-    const auto jobs = tx.exec_params(
-        "SELECT tenant, type, state, attempts, next_retry_at_ms FROM jobs WHERE id = $1", job_id);
-    // 404, not 403: a foreign job must be indistinguishable from one that never existed.
-    if (jobs.empty() || jobs[0]["tenant"].as<std::string>() != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown job"})", "application/json");
-      return;
-    }
-    const auto& row = jobs[0];
-    const long long attempts = row["attempts"].as<long long>();
-    std::optional<long long> stored_retry;
-    if (!row["next_retry_at_ms"].is_null()) stored_retry = row["next_retry_at_ms"].as<long long>();
-
-    const long long now = nowMs();
-    const auto queue_state = redis.hget(kJobKeyPrefix + job_id, "state");
-    const auto stranded_for = claimAgeMs(job_id, now);
-    std::string state = queue_state.value_or(row["state"].as<std::string>());
-    if (stranded_for.has_value()) state = "stalled";
-    const auto worker = redis.hget(kJobKeyPrefix + job_id, "worker");
-    const auto retry = nextRetry(attempts, stored_retry, now);
-
-    const auto history = tx.exec_params(
-        "SELECT attempt_no, error_class, error_message, started_at_ms, finished_at_ms"
-        " FROM job_attempts WHERE job_id = $1 ORDER BY attempt_no",
-        job_id);
-    json attempt_history = json::array();
-    for (const auto& attempt : history)
-      attempt_history.push_back(json{
-          {"attempt_no", attempt["attempt_no"].as<long long>()},
-          {"error_class", attempt["error_class"].as<std::string>()},
-          {"error_message", attempt["error_message"].as<std::string>()},
-          {"started_at_ms", attempt["started_at_ms"].as<long long>()},
-          {"finished_at_ms",
-           attempt["finished_at_ms"].is_null() ? json(nullptr)
-                                              : json(attempt["finished_at_ms"].as<long long>())}});
-
-    const auto buried = tx.exec_params("SELECT reason FROM job_dead_letter WHERE job_id = $1", job_id);
-    const json dead_letter_reason =
-        buried.empty() ? json(nullptr) : json(buried[0]["reason"].as<std::string>());
-
-    std::cerr << "job read job_id=" << job_id << " tenant=" << tenant << " state=" << state << "\\n";
-    res.status = 200;
-    res.set_content(
-        json{{"job_id", job_id},
-             {"type", row["type"].as<std::string>()},
-             {"state", state},
-             {"attempts", attempts},
-             {"worker", worker.has_value() ? json(*worker) : json(nullptr)},
-             {"claim_age_ms", stranded_for.has_value() ? json(*stranded_for) : json(nullptr)},
-             {"next_retry_at", retry.first.has_value() ? json(*retry.first) : json(nullptr)},
-             {"retry_overdue", retry.second},
-             {"attempt_history", attempt_history},
-             {"dead_letter_reason", dead_letter_reason}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/jobs/([\\w-]+))", read_job); }
 `,
     },
   },
+  harness: {
+    python: `import time
+
+from jobs import queue, store
+
+T1 = {"X-Tenant-Id": "t-1"}
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+def _job(job_id, tenant="t-1"):
+    store.create_job(job_id, tenant, "email.send", {"to": "ada@example.com", "template": "welcome"})
+
+
+async def check_status_route(ctx):
+    _job("job-1")
+    _job("job-2")
+    assert queue.claim("w-1") == "job-1"
+    store.begin_attempt("job-1")
+    store.record_attempt("job-1", 1, "INVALID_ARGUMENT: template welcome-v9 does not exist")
+    queue.bury("job-1", "permanent_error")
+    async with _api(ctx) as c:
+        queued = await c.get("/v1/jobs/job-2", headers=T1)
+        dead = await c.get("/v1/jobs/job-1", headers=T1)
+    assert queued.status_code == 200, f"GET /v1/jobs/job-2 answered {queued.status_code}: {queued.text}"
+    body = queued.json()
+    assert body.get("state") == "queued" and body.get("attempts") == 0 and body.get("attempt_history") == [], f"a queued job reads {body}"
+    assert dead.status_code == 200, f"GET /v1/jobs/job-1 answered {dead.status_code}: {dead.text}"
+    body = dead.json()
+    assert body.get("state") == "dead" and body.get("dead_reason") == "permanent_error", f"a buried job must read dead with its dead_reason, got {body}"
+    history = body.get("attempt_history") or []
+    assert len(history) == 1 and history[0].get("error", "").startswith("INVALID_ARGUMENT"), f"the attempt history must carry each attempt's error, got {history}"
+
+
+async def check_tenant_404(ctx):
+    _job("job-1", "t-1")
+    async with _api(ctx) as c:
+        missing = await c.get("/v1/jobs/job-404", headers={"X-Tenant-Id": "t-2"})
+        foreign = await c.get("/v1/jobs/job-1", headers={"X-Tenant-Id": "t-2"})
+        own = await c.get("/v1/jobs/job-1", headers=T1)
+    assert missing.status_code == 404, f"an unknown id answered {missing.status_code}"
+    assert foreign.status_code == 404, f"t-2 reading t-1's job got {foreign.status_code} {foreign.text}: anything but the 404 an unknown id gets tells t-2 the job exists"
+    assert foreign.text == missing.text, f"the 404 for another tenant's job ({foreign.text}) must be the 404 for an unknown id ({missing.text})"
+    assert own.status_code == 200, f"t-1 reading its own job answered {own.status_code}"
+
+
+async def check_stalled_claim(ctx):
+    _job("job-1")
+    assert queue.claim("w-1") == "job-1"
+    async with _api(ctx) as c:
+        fresh = await c.get("/v1/jobs/job-1", headers=T1)
+        assert fresh.json().get("state") == "running", f"a job claimed a moment ago reads {fresh.json()}"
+        ctx.clock.advance(61)  # the worker died; no reaper has run
+        late = await c.get("/v1/jobs/job-1", headers=T1)
+    state = late.json().get("state")
+    assert state == "stalled", f"61 s after the claim, with its deadline past, the job reads {state!r}: compare the jobs:inflight score with now and report stalled"
+
+
+async def check_retry_overdue(ctx):
+    _job("job-1")
+    assert queue.claim("w-1") == "job-1"
+    due = int(time.time() * 1000) + 2000
+    queue.retry_later("job-1", due)
+    async with _api(ctx) as c:
+        ahead = (await c.get("/v1/jobs/job-1", headers=T1)).json()
+        assert ahead.get("state") == "retrying" and ahead.get("next_retry_at_ms") == due, f"a job retrying in 2 s reads {ahead}"
+        assert ahead.get("retry_overdue") is False, f"with the retry still ahead the read must say retry_overdue false, got {ahead}"
+        ctx.clock.advance(3)  # the reaper is behind
+        late = (await c.get("/v1/jobs/job-1", headers=T1)).json()
+    assert late.get("state") == "retrying", f"an overdue retry is still retrying, got {late}"
+    assert late.get("retry_overdue") is True, f"3 s after its retry time the job reads {late}: a next_retry_at_ms in the past must come with retry_overdue true"
+`,
+    typescript: `const T1 = {'X-Tenant-Id': 't-1'};
+
+async function setup(ctx) {
+  return {c: ctx.client(ctx.load('read').app), queue: ctx.load('/support/jobs/queue.ts'), store: ctx.load('/support/jobs/store.ts')};
+}
+
+const job = (store, jobId: string, tenant = 't-1') => store.createJob(jobId, tenant, 'email.send', {to: 'ada@example.com', template: 'welcome'});
+
+export async function check_status_route(ctx) {
+  const {c, queue, store} = await setup(ctx);
+  await job(store, 'job-1');
+  await job(store, 'job-2');
+  assert.equal(await queue.claim('w-1'), 'job-1');
+  await store.beginAttempt('job-1');
+  await store.recordAttempt('job-1', 1, 'INVALID_ARGUMENT: template welcome-v9 does not exist');
+  await queue.bury('job-1', 'permanent_error');
+  const queued = await c.get('/v1/jobs/job-2', {headers: T1});
+  assert.equal(queued.status, 200, \`GET /v1/jobs/job-2 answered \${queued.status}: \${queued.text}\`);
+  let body = queued.json();
+  assert(body.state === 'queued' && body.attempts === 0 && body.attempt_history.length === 0, \`a queued job reads \${queued.text}\`);
+  const dead = await c.get('/v1/jobs/job-1', {headers: T1});
+  assert.equal(dead.status, 200, \`GET /v1/jobs/job-1 answered \${dead.status}: \${dead.text}\`);
+  body = dead.json();
+  assert(body.state === 'dead' && body.dead_reason === 'permanent_error', \`a buried job must read dead with its dead_reason, got \${dead.text}\`);
+  const history = body.attempt_history ?? [];
+  assert(history.length === 1 && String(history[0].error).startsWith('INVALID_ARGUMENT'), \`the attempt history must carry each attempt's error, got \${JSON.stringify(history)}\`);
+}
+
+export async function check_tenant_404(ctx) {
+  const {c, store} = await setup(ctx);
+  await job(store, 'job-1', 't-1');
+  const missing = await c.get('/v1/jobs/job-404', {headers: {'X-Tenant-Id': 't-2'}});
+  const foreign = await c.get('/v1/jobs/job-1', {headers: {'X-Tenant-Id': 't-2'}});
+  const own = await c.get('/v1/jobs/job-1', {headers: T1});
+  assert.equal(missing.status, 404, \`an unknown id answered \${missing.status}\`);
+  assert.equal(foreign.status, 404, \`t-2 reading t-1's job got \${foreign.status} \${foreign.text}: anything but the 404 an unknown id gets tells t-2 the job exists\`);
+  assert.equal(foreign.text, missing.text, \`the 404 for another tenant's job (\${foreign.text}) must be the 404 for an unknown id (\${missing.text})\`);
+  assert.equal(own.status, 200, \`t-1 reading its own job answered \${own.status}\`);
+}
+
+export async function check_stalled_claim(ctx) {
+  const {c, queue, store} = await setup(ctx);
+  await job(store, 'job-1');
+  assert.equal(await queue.claim('w-1'), 'job-1');
+  const fresh = await c.get('/v1/jobs/job-1', {headers: T1});
+  assert.equal(fresh.json().state, 'running', \`a job claimed a moment ago reads \${fresh.text}\`);
+  ctx.clock.advance(61); // the worker died; no reaper has run
+  const late = await c.get('/v1/jobs/job-1', {headers: T1});
+  const state = late.json().state;
+  assert.equal(state, 'stalled', \`61 s after the claim, with its deadline past, the job reads \${state}: compare the jobs:inflight score with now and report stalled\`);
+}
+
+export async function check_retry_overdue(ctx) {
+  const {c, queue, store} = await setup(ctx);
+  await job(store, 'job-1');
+  assert.equal(await queue.claim('w-1'), 'job-1');
+  const due = Date.now() + 2000;
+  await queue.retryLater('job-1', due);
+  const ahead = (await c.get('/v1/jobs/job-1', {headers: T1})).json();
+  assert(ahead.state === 'retrying' && ahead.next_retry_at_ms === due, \`a job retrying in 2 s reads \${JSON.stringify(ahead)}\`);
+  assert.equal(ahead.retry_overdue, false, \`with the retry still ahead the read must say retry_overdue false, got \${JSON.stringify(ahead)}\`);
+  ctx.clock.advance(3); // the reaper is behind
+  const late = (await c.get('/v1/jobs/job-1', {headers: T1})).json();
+  assert.equal(late.state, 'retrying', \`an overdue retry is still retrying, got \${JSON.stringify(late)}\`);
+  assert.equal(late.retry_overdue, true, \`3 s after its retry time the job reads \${JSON.stringify(late)}: a next_retry_at_ms in the past must come with retry_overdue true\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"jobs/queue"
+	"jobs/store"
+
+	"leetbuild/harness"
+)
+
+var readBg = context.Background()
+
+type readBody struct {
+	State          string           \`json:"state"\`
+	Attempts       int              \`json:"attempts"\`
+	AttemptHistory []map[string]any \`json:"attempt_history"\`
+	NextRetryAtMs  *int64           \`json:"next_retry_at_ms"\`
+	RetryOverdue   *bool            \`json:"retry_overdue"\`
+	DeadReason     *string          \`json:"dead_reason"\`
+}
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readJobFor(ctx *harness.Ctx, jobID, tenant string) {
+	ctx.NoError(store.CreateJob(readBg, jobID, tenant, "email.send", map[string]any{"to": "ada@example.com", "template": "welcome"}), "CreateJob")
+}
+
+func readGet(ctx *harness.Ctx, c *harness.HTTP, jobID string) readBody {
+	r := c.Get("/v1/jobs/"+jobID, "X-Tenant-Id", "t-1")
+	ctx.Equal(r.Status, 200, "GET /v1/jobs/%s (%s)", jobID, r.Text())
+	var body readBody
+	r.Decode(&body)
+	return body
+}
+
+func CheckStatusRoute(ctx *harness.Ctx) {
+	readJobFor(ctx, "job-1", "t-1")
+	readJobFor(ctx, "job-2", "t-1")
+	got, _ := queue.Claim(readBg, "w-1")
+	ctx.Equal(got, "job-1", "the harness's claim")
+	store.BeginAttempt(readBg, "job-1")
+	store.RecordAttempt(readBg, "job-1", 1, "INVALID_ARGUMENT: template welcome-v9 does not exist")
+	queue.Bury(readBg, "job-1", "permanent_error")
+	c := readAPI(ctx)
+	queued := readGet(ctx, c, "job-2")
+	ctx.Assert(queued.State == "queued" && queued.Attempts == 0 && len(queued.AttemptHistory) == 0, "a queued job reads %+v", queued)
+	dead := readGet(ctx, c, "job-1")
+	ctx.Assert(dead.State == "dead" && dead.DeadReason != nil && *dead.DeadReason == "permanent_error", "a buried job must read dead with its dead_reason, got %+v", dead)
+	ctx.Assert(len(dead.AttemptHistory) == 1 && strings.HasPrefix(dead.AttemptHistory[0]["error"].(string), "INVALID_ARGUMENT"), "the attempt history must carry each attempt's error, got %v", dead.AttemptHistory)
+}
+
+func CheckTenant404(ctx *harness.Ctx) {
+	readJobFor(ctx, "job-1", "t-1")
+	c := readAPI(ctx)
+	missing := c.Get("/v1/jobs/job-404", "X-Tenant-Id", "t-2")
+	foreign := c.Get("/v1/jobs/job-1", "X-Tenant-Id", "t-2")
+	own := c.Get("/v1/jobs/job-1", "X-Tenant-Id", "t-1")
+	ctx.Equal(missing.Status, 404, "an unknown id")
+	ctx.Assert(foreign.Status == 404, "t-2 reading t-1's job got %d %s: anything but the 404 an unknown id gets tells t-2 the job exists", foreign.Status, foreign.Text())
+	ctx.Equal(foreign.Text(), missing.Text(), "the 404 for another tenant's job must be the 404 for an unknown id")
+	ctx.Equal(own.Status, 200, "t-1 reading its own job")
+}
+
+func CheckStalledClaim(ctx *harness.Ctx) {
+	readJobFor(ctx, "job-1", "t-1")
+	got, _ := queue.Claim(readBg, "w-1")
+	ctx.Equal(got, "job-1", "the harness's claim")
+	c := readAPI(ctx)
+	ctx.Equal(readGet(ctx, c, "job-1").State, "running", "a job claimed a moment ago; its state")
+	ctx.Clock.Advance(61) // the worker died; no reaper has run
+	state := readGet(ctx, c, "job-1").State
+	ctx.Assert(state == "stalled", "61 s after the claim, with its deadline past, the job reads %q: compare the jobs:inflight score with now and report stalled", state)
+}
+
+func CheckRetryOverdue(ctx *harness.Ctx) {
+	readJobFor(ctx, "job-1", "t-1")
+	got, _ := queue.Claim(readBg, "w-1")
+	ctx.Equal(got, "job-1", "the harness's claim")
+	due := ctx.Clock.Now() + 2000
+	ctx.NoError(queue.RetryLater(readBg, "job-1", due), "RetryLater")
+	c := readAPI(ctx)
+	ahead := readGet(ctx, c, "job-1")
+	ctx.Assert(ahead.State == "retrying" && ahead.NextRetryAtMs != nil && *ahead.NextRetryAtMs == due, "a job retrying in 2 s reads %+v", ahead)
+	ctx.Assert(ahead.RetryOverdue != nil && !*ahead.RetryOverdue, "with the retry still ahead the read must say retry_overdue false, got %+v", ahead)
+	ctx.Clock.Advance(3) // the reaper is behind
+	late := readGet(ctx, c, "job-1")
+	ctx.Equal(late.State, "retrying", "an overdue retry is still retrying; the state")
+	ctx.Assert(late.RetryOverdue != nil && *late.RetryOverdue, "3 s after its retry time the job reads %+v: a next_retry_at_ms in the past must come with retry_overdue true", late)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+#include "jobs/queue.h"
+#include "jobs/store.h"
+
+namespace {
+
+harness::HTTP readAPI(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+void readJobFor(const std::string& job_id, const std::string& tenant) {
+  store::createJob(job_id, tenant, "email.send", nlohmann::json{{"to", "ada@example.com"}, {"template", "welcome"}});
+}
+
+nlohmann::json readGet(harness::Ctx& ctx, harness::HTTP& c, const std::string& job_id) {
+  const auto r = c.Get("/v1/jobs/" + job_id, "X-Tenant-Id", "t-1");
+  ctx.Equal(r.Status, 200, "GET /v1/jobs/%s (%s)", job_id, r.Text());
+  return nlohmann::json::parse(r.Text(), nullptr, false);
+}
+
+}  // namespace
+
+void CheckStatusRoute(harness::Ctx& ctx) {
+  readJobFor("job-1", "t-1");
+  readJobFor("job-2", "t-1");
+  ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the harness's claim");
+  store::beginAttempt("job-1");
+  store::recordAttempt("job-1", 1, "INVALID_ARGUMENT: template welcome-v9 does not exist");
+  queue::bury("job-1", "permanent_error");
+  auto c = readAPI(ctx);
+  const auto queued = readGet(ctx, c, "job-2");
+  ctx.Assert(queued.value("state", "") == "queued" && queued.value("attempts", -1) == 0 && queued["attempt_history"].empty(), "a queued job reads %s", queued.dump());
+  const auto dead = readGet(ctx, c, "job-1");
+  ctx.Assert(dead.value("state", "") == "dead" && dead["dead_reason"] == "permanent_error", "a buried job must read dead with its dead_reason, got %s", dead.dump());
+  const auto& history = dead["attempt_history"];
+  ctx.Assert(history.size() == 1 && history[0].value("error", "").rfind("INVALID_ARGUMENT", 0) == 0, "the attempt history must carry each attempt's error, got %s", history.dump());
+}
+
+void CheckTenant404(harness::Ctx& ctx) {
+  readJobFor("job-1", "t-1");
+  auto c = readAPI(ctx);
+  const auto missing = c.Get("/v1/jobs/job-404", "X-Tenant-Id", "t-2");
+  const auto foreign = c.Get("/v1/jobs/job-1", "X-Tenant-Id", "t-2");
+  const auto own = c.Get("/v1/jobs/job-1", "X-Tenant-Id", "t-1");
+  ctx.Equal(missing.Status, 404, "an unknown id");
+  ctx.Assert(foreign.Status == 404, "t-2 reading t-1's job got %d %s: anything but the 404 an unknown id gets tells t-2 the job exists", foreign.Status, foreign.Text());
+  ctx.Equal(foreign.Text(), missing.Text(), "the 404 for another tenant's job must be the 404 for an unknown id");
+  ctx.Equal(own.Status, 200, "t-1 reading its own job");
+}
+
+void CheckStalledClaim(harness::Ctx& ctx) {
+  readJobFor("job-1", "t-1");
+  ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the harness's claim");
+  auto c = readAPI(ctx);
+  ctx.Equal(readGet(ctx, c, "job-1").value("state", ""), "running", "a job claimed a moment ago; its state");
+  ctx.Clock.Advance(61);  // the worker died; no reaper has run
+  const std::string state = readGet(ctx, c, "job-1").value("state", "");
+  ctx.Assert(state == "stalled", "61 s after the claim, with its deadline past, the job reads %q: compare the jobs:inflight score with now and report stalled", state);
+}
+
+void CheckRetryOverdue(harness::Ctx& ctx) {
+  readJobFor("job-1", "t-1");
+  ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the harness's claim");
+  const long long due = ctx.Clock.Now() + 2000;
+  queue::retryLater("job-1", due);
+  auto c = readAPI(ctx);
+  const auto ahead = readGet(ctx, c, "job-1");
+  ctx.Assert(ahead.value("state", "") == "retrying" && ahead["next_retry_at_ms"] == due, "a job retrying in 2 s reads %s", ahead.dump());
+  ctx.Assert(ahead.contains("retry_overdue") && ahead["retry_overdue"] == false, "with the retry still ahead the read must say retry_overdue false, got %s", ahead.dump());
+  ctx.Clock.Advance(3);  // the reaper is behind
+  const auto late = readGet(ctx, c, "job-1");
+  ctx.Equal(late.value("state", ""), "retrying", "an overdue retry is still retrying; the state");
+  ctx.Assert(late.contains("retry_overdue") && late["retry_overdue"] == true, "3 s after its retry time the job reads %s: a next_retry_at_ms in the past must come with retry_overdue true", late.dump());
+}
+`,
+  },
   hints: [
-    'Support watches a job sit at "queued, next retry 09:14" for three hours after a worker node died at 09:10, and nothing ever retries it.',
-    '`job_row` selects by id with no tenant and the handler echoes `row["state"]` and `row["next_retry_at_ms"]`; nothing consults `jobs:inflight`, `job_attempts` or `job_dead_letter`, and the clock is not read.',
-    'Filter by tenant and answer 404 on mismatch; `ZSCORE jobs:inflight` and report `stalled` with `claim_age_ms` when the deadline is past; recompute backoff and set `retry_overdue` when stored time < now; read history and reason from their tables.',
+    "Read t-1's job as tenant t-2: the 403 confirms it exists. Read a claimed job a minute later with no reaper running: still `running`. Read a retrying job after its retry time: nothing says it is late.",
+    'The handler reports the job record as last written. Whether that still holds is in `jobs:inflight`, whose score is the claim deadline or the retry time, and the handler never reads it.',
+    'Answer the same 404 when `job["tenant"] != tenant`; read `r.zscore(INFLIGHT_KEY, job_id)` and, when it is at or before now, report `running` as `stalled` and set `retry_overdue` for a `retrying` job.',
   ],
-  debrief: `The read half of a queue is judged by whether it reports the state the queue is in, and whether this caller may see it. The row is written by the API and the worker, so a worker that dies mid-attempt leaves a row that still says \`queued\`; reconciling against \`jobs:inflight\` is how the endpoint sees the crash the row cannot. A stored retry time is a promise about the past, and only the clock turns it into one about the future, which is why the read recomputes and flags an overdue retry rather than echoing it. The history and the dead-letter reason come from their own tables because the row's counter explains nothing. The tenant lookup answers 404 so a guessed id confirms nothing. Production systems add a sweep that re-queues stalled claims instead of only reporting them.`,
+  debrief: `A status read is what someone trusts at three in the morning, so it reconciles the record with the structure that decides what happens next: the record says \`running\` because the last worker wrote it, and only the in-flight score can say that worker's time ran out. The same reading turns a past \`next_retry_at_ms\` into an explicit \`retry_overdue\`, which points at the reaper rather than the job. Another tenant's job answers the unknown-id 404, because a 403 turns guessed ids into a map of which jobs exist. Production status endpoints also show which worker holds the claim and since when, and keep the history after the job record expires.`,
 };

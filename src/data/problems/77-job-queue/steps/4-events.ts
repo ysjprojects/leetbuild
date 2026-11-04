@@ -5,181 +5,90 @@ export const eventsStep: Step = {
   title: 'Job events keyed by job id for a run history',
   concept: 'kafka',
   file: 'events',
-  focus: ['worker', 'kafka', 'consumer', 'store'],
+  focus: ['worker', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is the job event publisher: \`publish_event\` produces a payload with
-the type, \`job_id\` and \`attempts\` to \`job.event\` keyed by the worker; \`record_event\` catches
-any producer error and logs it; \`complete_job\` publishes \`completed\`, then calls
-\`mark_completed\`; \`enqueued\` and \`started\` have hooks, \`failed\` and \`dead_lettered\` do not.
-It compiles, serves the happy path and hides four flaws.
+**Starting point.** The starter is the \`job.event\` publisher. \`publish(event)\` produces the event
+\`{job_id, kind, attempts, duration_ms, worker}\` keyed by the worker id and logs the error if the
+produce call raises. \`complete(job_id, worker, duration_ms)\` publishes the \`completed\` event, then
+acks the claim (\`queue.ack\`) and returns the ack's answer. It serves the demo and hides three flaws.
 
-**Failure mode the checks target.** A retry routed to another pod lands on another partition, and
-a consumer applies \`started\` after \`completed\`. The log says a charge happened while the worker
-was still one crash away from it. During a broker blip the \`dead_lettered\` event a paging rule
-depends on is logged as a warning and gone. And the history has no \`failed\` or \`dead_lettered\`
-record and no duration.
+**Failure mode the checks target.** One job's events, written by the workers that ran its attempts,
+land on different partitions and arrive out of order; a worker whose claim already expired announces
+a completion while another worker runs the job; a record the broker refuses is lost, because the
+refusal arrives in the delivery report and nothing reads it.
 
-- One publisher emits every transition (\`enqueued\`, \`started\`, \`completed\`, \`failed\`,
-  \`dead_lettered\`) with the \`job_id\`, the \`attempts\` count and the \`duration_ms\` where they
-  apply.
-- Every produce is keyed by the job id (\`key=job_id\`, \`key: jobId\`, \`Key: []byte(jobID)\`,
-  \`ProducerRecord(topic, jobId, payload)\`).
-- \`completed\` is published only after the side effect has committed: \`mark_completed\` first, the
-  produce after it.
-- The job's new state and a \`job_outbox\` row (\`INSERT INTO job_outbox\`) are written in one store
-  call; the produce follows, and when the broker rejects it the row stays pending for
-  \`relay_outbox\` to republish in outbox order, clearing a row only after the ack.
-- The consumer appends the event to the job's history and only then commits the offset.`,
+- Key every record by \`job_id\`.
+- \`complete\` acks first; when the ack answers false it publishes nothing and returns false.
+- Handle the broker's answer where it arrives (\`on_delivery\`, the rejected \`send\`, the
+  \`WriteMessages\` error, \`dr_cb\`, a producer \`Callback\`): a refused event goes to
+  \`store.outbox_add(event)\`, and \`publish\` does not raise.`,
   sequence: {
-    participants: ['Worker pool', 'job.event', 'History consumer', 'Job store · outbox'],
+    participants: ['Worker', 'Queue', 'Kafka job.event', 'Outbox'],
     messages: [
+      {from: 'Worker', to: 'Queue', label: 'ack(job_id, worker)', kind: 'sync'},
+      {from: 'Queue', to: 'Worker', label: 'false → claim gone, publish nothing', kind: 'reply'},
       {
-        from: 'Worker pool',
-        to: 'Job store · outbox',
-        label: 'mark completed · the effect has already committed',
-        kind: 'sync',
+        from: 'Worker',
+        to: 'Kafka job.event',
+        label: 'produce key = job_id · {kind: completed, attempts, duration_ms}',
+        kind: 'async',
       },
-      {
-        from: 'Job store · outbox',
-        to: 'Worker pool',
-        label: 'commit · state + job_outbox row in one call',
-        kind: 'reply',
-      },
-      {from: 'Worker pool', to: 'job.event', label: 'produce · key = job_id · attempts · duration_ms', kind: 'async'},
-      {from: 'job.event', to: 'Worker pool', label: 'ack / broker rejection', kind: 'reply'},
-      {from: 'Job store · outbox', to: 'job.event', label: 'relay republishes pending rows in order', kind: 'async'},
-      {from: 'job.event', to: 'History consumer', label: 'consume · group job-history', kind: 'async'},
-      {
-        from: 'History consumer',
-        to: 'Job store · outbox',
-        label: 'append the history, then commit the offset',
-        kind: 'sync',
-      },
+      {from: 'Kafka job.event', to: 'Worker', label: 'delivery report: error', kind: 'reply'},
+      {from: 'Worker', to: 'Outbox', label: 'outbox_add(event) · the relay republishes it', kind: 'async'},
     ],
   },
   checks: [
     {
       id: 'event-envelope',
-      title: 'One publisher writes job.event with job_id and attempts',
+      title: 'A completed attempt publishes one job.event',
       detail:
-        'A single publisher produces to the `job.event` topic and the payload carries the `job_id` and the `attempts` count, so the consumer can attach the record to a job. The starter has this shape — it is the one thing the fix can keep.',
+        'A completed attempt produces one record on `job.event` carrying `job_id`, `kind: "completed"`, `attempts`, `duration_ms` and `worker`, and `complete` returns true.',
       match: {
-        python: {all: [/\bTOPIC\s*=\s*"job\.event"/, /def publish_event\(/, /"job_id"/, /"attempts"/]},
-        typescript: {all: [/\bTOPIC\s*=\s*'job\.event'/, /function publishEvent\(/, /job_id/, /attempts/]},
-        go: {all: [/jobEventTopic\s*=\s*"job\.event"/, /func publishEvent\(/, /"job_id"/, /"attempts"/]},
-        scala: {all: [/JobEventTopic\s*=\s*"job\.event"/, /def publishEvent\(/, /"job_id"/, /"attempts"/]},
-        cpp: {all: [/kJobEventTopic\s*=\s*"job\.event"/, /publish_event\(/, /"job_id"/, /"attempts"/]},
+        python: {all: [/TOPIC\s*=\s*["']job\.event["']/, /["']duration_ms["']/]},
+        typescript: {all: [/TOPIC\s*=\s*['"]job\.event['"]/, /duration_ms/]},
+        go: {all: [/"job\.event"/, /"duration_ms"/]},
+        scala: {all: [/"job\.event"/, /"duration_ms"/]},
+        cpp: {all: [/"job\.event"/, /"duration_ms"/]},
       },
     },
     {
-      id: 'key-by-job-id',
-      title: 'Every event is keyed by the job id, never by the worker',
+      id: 'job-key',
+      title: 'Keys every event by the job id',
       detail:
-        "The produce passes the job id as the message key (`key=job_id`, `key: jobId`, `Key: []byte(jobID)`, `ProducerRecord(topic, jobId, …)`), so one job's transitions share a partition and stay ordered. The starter keys by the worker id, so a retry that lands on another worker splits the job's history across partitions.",
+        "A job whose attempts ran on two workers has both events keyed by its id on one partition; another job's events carry its own id. The starter keys by the worker, so one job's history is spread over partitions.",
       match: {
-        python: {all: [/key=job_id/], none: [/key=worker/]},
-        typescript: {all: [/key:\s*jobId/], none: [/key:\s*workerId/]},
-        go: {all: [/Key:\s*\[\]byte\(jobID\)/], none: [/Key:\s*\[\]byte\(workerID\)/]},
-        scala: {
-          all: [/ProducerRecord\[String, String\]\(JobEventTopic,\s*(event\.)?jobId,/],
-          none: [/ProducerRecord\[String, String\]\(JobEventTopic,\s*workerId,/],
-        },
-        cpp: {all: [/job_id\.c_str\(\)/], none: [/worker_id\.c_str\(\)/]},
+        python: {all: [/key\s*=\s*event\[["']job_id["']\]/]},
+        typescript: {all: [/key:\s*event\.job_id/]},
+        go: {all: [/Key:\s*\[\]byte\(\s*event\.JobID\s*\)/]},
+        scala: {all: [/ProducerRecord\[String, String\]\(\s*Topic\s*,\s*field\(event,\s*"job_id"\)/]},
+        cpp: {all: [/key\s*=\s*event\.value\(\s*"job_id"/]},
       },
     },
     {
-      id: 'completed-after-effect',
-      title: 'completed is published only after the effect commits',
+      id: 'completed-after-ack',
+      title: 'Publishes completed only after the ack succeeded',
       detail:
-        'The worker marks the job completed first and the `completed` event follows that commit, so the history never claims a side effect that has not happened. The starter produces `completed` and only then marks the job, which is exactly the record an incident review will read back.',
+        'When the claim expired and another worker holds the job, `complete` returns false and the topic stays empty; the worker that holds the claim publishes its completion. The starter publishes first and acks afterwards.',
       match: {
-        python: {order: [/store\.mark_completed\(/, /publish_completed\(/]},
-        typescript: {order: [/store\.markCompleted\(/, /publishCompleted\(/]},
-        go: {order: [/store\.MarkCompleted\(/, /publishCompleted\(/]},
-        scala: {order: [/store\.markCompleted\(/, /publishCompleted\(/]},
-        cpp: {order: [/store\.mark_completed\(/, /publish_completed\(/]},
+        python: {all: [/if not queue\.ack\(/], order: [/queue\.ack\(/, /\bpublish\(\{/]},
+        typescript: {all: [/if \(!\(await queue\.ack\(/], order: [/queue\.ack\(/, /await publish\(\{/]},
+        go: {all: [/queue\.Ack\(/], order: [/queue\.Ack\(/, /publish\(ctx,\s*jobEvent\{/]},
+        scala: {all: [/if \(!Queue\.ack\(/], order: [/Queue\.ack\(/, /publish\(JsObject\(/]},
+        cpp: {all: [/if \(!queue::ack\(/], order: [/queue::ack\(/, /publish\(json\{/]},
       },
     },
     {
       id: 'outbox-on-rejection',
-      title: 'The state change and the outbox row commit together, and a relay republishes',
+      title: 'A refused record goes to the outbox from the delivery report',
       detail:
-        "The job's new state and an `INSERT INTO job_outbox` row go through one store call, the produce follows, and a relay republishes whatever the broker rejected. The starter has no outbox: a rejection is caught, logged and gone, so a short broker outage is a permanent hole in a job's history.",
+        'When the broker refuses the record, the event lands in `jobs:outbox`, nothing reaches the topic, and `complete` neither raises nor undoes the completed job. The starter looks only at errors the produce call itself raises.',
       match: {
-        python: {all: [/INSERT INTO job_outbox/, /def relay_outbox\(/, /except KafkaException/]},
-        typescript: {all: [/INSERT INTO job_outbox/, /relayOutbox\(/, /catch\s*\(/]},
-        go: {all: [/INSERT INTO job_outbox/, /func relayOutbox\(/, /err != nil/]},
-        scala: {all: [/INSERT INTO job_outbox/, /def relayOutbox\(/, /catch\s*\{/]},
-        cpp: {all: [/INSERT INTO job_outbox/, /relay_outbox\(/, /catch\s*\(/]},
-      },
-    },
-    {
-      id: 'all-transitions',
-      title: 'All five transitions carry attempts and duration_ms',
-      detail:
-        'One publisher emits `enqueued`, `started`, `completed`, `failed` and `dead_lettered`, each payload carrying `attempts` and `duration_ms`. The starter emits three of the five and has no duration at all, so the history cannot explain a slow job and never records the failure or the dead-letter move.',
-      match: {
-        python: {
-          all: [
-            /"enqueued"/,
-            /"started"/,
-            /"completed"/,
-            /"failed"/,
-            /"dead_lettered"/,
-            /"attempts"/,
-            /"duration_ms"/,
-            /record_event\(/,
-          ],
-        },
-        typescript: {
-          all: [
-            /'enqueued'/,
-            /'started'/,
-            /'completed'/,
-            /'failed'/,
-            /'dead_lettered'/,
-            /attempts/,
-            /duration_ms/,
-            /recordEvent\(/,
-          ],
-        },
-        go: {
-          all: [
-            /"enqueued"/,
-            /"started"/,
-            /"completed"/,
-            /"failed"/,
-            /"dead_lettered"/,
-            /"attempts"/,
-            /"duration_ms"/,
-            /recordEvent\(/,
-          ],
-        },
-        scala: {
-          all: [
-            /"enqueued"/,
-            /"started"/,
-            /"completed"/,
-            /"failed"/,
-            /"dead_lettered"/,
-            /"attempts"/,
-            /"duration_ms"/,
-            /recordEvent\(/,
-          ],
-        },
-        cpp: {
-          all: [
-            /"enqueued"/,
-            /"started"/,
-            /"completed"/,
-            /"failed"/,
-            /"dead_lettered"/,
-            /"attempts"/,
-            /"duration_ms"/,
-            /record_event\(/,
-          ],
-        },
+        python: {all: [/on_delivery\s*=/, /store\.outbox_add\(/], none: [/except\s+KafkaException/]},
+        typescript: {all: [/catch[\s\S]*store\.outboxAdd\(/]},
+        go: {all: [/store\.OutboxAdd\(/]},
+        scala: {all: [/Store\.outboxAdd\(/, /exception != null/]},
+        cpp: {all: [/store::outboxAdd\(/, /dr_cb/]},
       },
     },
   ],
@@ -188,434 +97,145 @@ record and no duration.
       starter: `import json
 import logging
 
-from confluent_kafka import Consumer, Producer
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from confluent_kafka import KafkaException, Producer
 
-app = FastAPI()
-logger = logging.getLogger("jobqd-events")
+from jobs import queue, store  # queue.ack · store.get_job, outbox_add
 
 TOPIC = "job.event"
 
+logger = logging.getLogger("jobqd.events")
 producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
-class JobStore:
-    def mark_completed(self, job_id: str, attempts: int, duration_ms: int) -> None:
-        """Record the job as completed, once the side effect has committed."""
-        raise NotImplementedError
-
-    def append_history(self, job_id: str, event: dict) -> None:
-        """Append one event to the job's history; this is the consumer's write."""
-        raise NotImplementedError
-
-
-store = JobStore()
-
-
-def publish_event(job_id: str, worker: str, event_type: str, attempts: int) -> None:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    payload = json.dumps({"type": event_type, "job_id": job_id, "attempts": attempts}).encode("utf-8")
-    producer.produce(TOPIC, key=worker.encode("utf-8"), value=payload)
-    producer.flush()
-
-
-def record_event(job_id: str, worker: str, event_type: str, attempts: int = 0) -> None:
+def publish(event: dict) -> None:
+    """Produce one job.event: {job_id, kind, attempts, duration_ms, worker}."""
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
     try:
-        publish_event(job_id, worker, event_type, attempts)
-    except Exception as err:
-        logger.warning("event dropped job_id=%s event=%s err=%s", job_id, event_type, err)
+        producer.produce(TOPIC, key=event["worker"], value=json.dumps(event))
+        producer.poll(0)
+    except KafkaException as exc:
+        logger.warning("job.event produce failed job=%s: %s", event["job_id"], exc)
 
 
-def on_enqueued(job_id: str, worker: str) -> None:
-    record_event(job_id, worker, "enqueued")
-
-
-def on_started(job_id: str, worker: str, attempts: int) -> None:
-    record_event(job_id, worker, "started", attempts)
-
-
-@app.post("/v1/jobs/{job_id}/completed")
-def complete_job(job_id: str, attempts: int, duration_ms: int) -> JSONResponse:
-    record_event(job_id, "worker-1", "completed", attempts)
-    store.mark_completed(job_id, attempts, duration_ms)
-    return JSONResponse({"job_id": job_id, "state": "completed"})
-
-
-def consume() -> None:
-    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "job-history"})
-    consumer.subscribe([TOPIC])
-    while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
-            continue
-        event = json.loads(msg.value())
-        store.append_history(event["job_id"], event)
-        consumer.commit(msg)
+def complete(job_id: str, worker: str, duration_ms: int) -> bool:
+    """Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone."""
+    job = store.get_job(job_id)
+    publish({"job_id": job_id, "kind": "completed", "attempts": job["attempts"], "duration_ms": duration_ms, "worker": worker})
+    return queue.ack(job_id, worker)
 `,
       solution: `import json
 import logging
 
-from confluent_kafka import Consumer, KafkaException, Producer
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from confluent_kafka import Producer
 
-app = FastAPI()
-logger = logging.getLogger("jobqd-events")
+from jobs import queue, store  # queue.ack · store.get_job, outbox_add
 
 TOPIC = "job.event"
-OUTBOX_BATCH = 100
 
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "acks": "all",
-        "enable.idempotence": True,
-    }
-)
+logger = logging.getLogger("jobqd.events")
+producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
-class JobStore:
-    """The platform's store: a job's state change and its job_outbox row share one call."""
+def publish(event: dict) -> None:
+    """Produce one job.event: {job_id, kind, attempts, duration_ms, worker}."""
 
-    def transaction(self) -> "object":
-        """The transaction that commits the job's new state together with the outbox row."""
-        raise NotImplementedError
+    def on_delivery(err, msg) -> None:
+        if err is not None:
+            # The broker said no, and it says so here, not at produce(): the relay republishes the row.
+            store.outbox_add(event)
+            logger.warning("job.event refused job=%s: %s", event["job_id"], err)
 
-    def mark_completed(self, job_id: str, attempts: int, duration_ms: int) -> None:
-        """Record the job as completed, after the side effect has committed."""
-        raise NotImplementedError
-
-    def pending_outbox(self, limit: int) -> list[dict]:
-        """Outbox rows a rejected produce left behind, oldest first."""
-        raise NotImplementedError
-
-    def mark_published(self, outbox_id: int) -> None:
-        raise NotImplementedError
-
-    def append_history(self, job_id: str, event: dict) -> None:
-        """Append one event to the job's history; this is the consumer's write."""
-        raise NotImplementedError
-
-
-store = JobStore()
-
-
-def event_payload(job_id: str, event_type: str, attempts: int, duration_ms: int, error: str = "") -> dict:
-    return {
-        "type": event_type,
-        "job_id": job_id,
-        "attempts": attempts,
-        "duration_ms": duration_ms,
-        "error": error,
-    }
-
-
-def publish_event(job_id: str, event_type: str, attempts: int, duration_ms: int, error: str = "") -> None:
-    """Keyed by the job id, so one job's history stays in one ordered partition."""
-    payload = json.dumps(event_payload(job_id, event_type, attempts, duration_ms, error)).encode("utf-8")
-    producer.produce(TOPIC, key=job_id.encode("utf-8"), value=payload)
+    # Keyed by the job: every attempt's events share one partition, in order.
+    producer.produce(TOPIC, key=event["job_id"], value=json.dumps(event), on_delivery=on_delivery)
     producer.poll(0)
 
 
-def record_event(job_id: str, event_type: str, attempts: int = 0, duration_ms: int = 0, error: str = "") -> None:
-    """The job's new state and its job_outbox row commit together, then the produce follows."""
-    with store.transaction() as tx:
-        tx.execute("UPDATE jobs SET state = %s, attempts = %s WHERE job_id = %s", (event_type, attempts, job_id))
-        tx.execute(
-            "INSERT INTO job_outbox (job_id, event_type, attempts, duration_ms, error) VALUES (%s, %s, %s, %s, %s)",
-            (job_id, event_type, attempts, duration_ms, error),
-        )
-    try:
-        publish_event(job_id, event_type, attempts, duration_ms, error)
-    except KafkaException as err:
-        logger.warning("event kept in the outbox job_id=%s event=%s err=%s", job_id, event_type, err)
-
-
-def relay_outbox() -> None:
-    """Republish what a broker outage left behind; a row is cleared only after the ack."""
-    for row in store.pending_outbox(OUTBOX_BATCH):
-        try:
-            publish_event(row["job_id"], row["event_type"], row["attempts"], row["duration_ms"], row["error"])
-        except KafkaException:
-            continue
-        store.mark_published(row["id"])
-
-
-def on_enqueued(job_id: str) -> None:
-    record_event(job_id, "enqueued")
-
-
-def on_started(job_id: str, attempts: int) -> None:
-    record_event(job_id, "started", attempts)
-
-
-def on_failed(job_id: str, attempts: int, error: str) -> None:
-    record_event(job_id, "failed", attempts, 0, error)
-
-
-def on_dead_lettered(job_id: str, attempts: int, error: str) -> None:
-    record_event(job_id, "dead_lettered", attempts, 0, error)
-
-
-def publish_completed(job_id: str, attempts: int, duration_ms: int) -> None:
-    """Produce the completed event only after the side effect has committed."""
-    record_event(job_id, "completed", attempts, duration_ms)
-
-
-@app.post("/v1/jobs/{job_id}/completed")
-def complete_job(job_id: str, attempts: int, duration_ms: int) -> JSONResponse:
-    store.mark_completed(job_id, attempts, duration_ms)
-    publish_completed(job_id, attempts, duration_ms)
-    return JSONResponse({"job_id": job_id, "state": "completed"})
-
-
-def consume() -> None:
-    consumer = Consumer(
-        {"bootstrap.servers": "kafka:9092", "group.id": "job-history", "enable.auto.commit": False}
-    )
-    consumer.subscribe([TOPIC])
-    while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
-            continue
-        event = json.loads(msg.value())
-        store.append_history(event["job_id"], event)
-        consumer.commit(msg)
+def complete(job_id: str, worker: str, duration_ms: int) -> bool:
+    """Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone."""
+    # The ack is the commit: a worker whose claim expired may not announce the job as done.
+    if not queue.ack(job_id, worker):
+        return False
+    job = store.get_job(job_id)
+    publish({"job_id": job_id, "kind": "completed", "attempts": job["attempts"], "duration_ms": duration_ms, "worker": worker})
+    return True
 `,
     },
     typescript: {
-      starter: `/** job.event: flawed code that keys by worker and publishes before the effect commits. */
-import Fastify from 'fastify';
-import {Kafka, type Producer} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
 
-export const app = Fastify();
+import * as queue from 'jobs/queue'; // ack
+import * as store from 'jobs/store'; // getJob, outboxAdd
 
-const TOPIC = 'job.event';
+export const TOPIC = 'job.event';
 
-const kafka = new Kafka({clientId: 'jobqd-events', brokers: ['kafka:9092']});
-const producer: Producer = kafka.producer();
-void producer.connect();
-
-interface JobEvent {
-  type: string;
+export interface JobEvent {
   job_id: string;
-  attempts: number;
-}
-
-class JobStore {
-  /** Record the job as completed, once the side effect has committed. */
-  async markCompleted(jobId: string, attempts: number, durationMs: number): Promise<void> {
-    void jobId;
-    void attempts;
-    void durationMs;
-  }
-
-  /** Append one event to the job's history; this is the consumer's write. */
-  async appendHistory(jobId: string, event: JobEvent): Promise<void> {
-    void jobId;
-    void event;
-  }
-}
-
-const store = new JobStore();
-
-async function publishEvent(jobId: string, workerId: string, event: JobEvent): Promise<void> {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  void jobId;
-  await producer.send({topic: TOPIC, messages: [{key: workerId, value: JSON.stringify(event)}]});
-}
-
-async function recordEvent(event: JobEvent, workerId: string): Promise<void> {
-  try {
-    await publishEvent(event.job_id, workerId, event);
-  } catch (err) {
-    app.log.warn({job_id: event.job_id, event: event.type, err}, 'event dropped');
-  }
-}
-
-async function onEnqueued(jobId: string, workerId: string): Promise<void> {
-  await recordEvent({type: 'enqueued', job_id: jobId, attempts: 0}, workerId);
-}
-
-async function onStarted(jobId: string, workerId: string, attempts: number): Promise<void> {
-  await recordEvent({type: 'started', job_id: jobId, attempts}, workerId);
-}
-
-app.post('/v1/jobs/:job_id/completed', async (request, reply) => {
-  const jobId = (request.params as {job_id: string}).job_id;
-  const body = request.body as {attempts: number; duration_ms: number};
-  await recordEvent({type: 'completed', job_id: jobId, attempts: body.attempts}, 'worker-1');
-  await store.markCompleted(jobId, body.attempts, body.duration_ms);
-  return reply.code(200).send({job_id: jobId, state: 'completed'});
-});
-
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'job-history'});
-  await consumer.connect();
-  await consumer.subscribe({topic: TOPIC});
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as JobEvent;
-      await store.appendHistory(event.job_id, event);
-      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-    },
-  });
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** job.event: one durable, job-keyed event per transition, completed only after the effect commits. */
-import Fastify from 'fastify';
-import {Kafka, type Producer} from 'kafkajs';
-
-export const app = Fastify();
-
-const TOPIC = 'job.event';
-const OUTBOX_BATCH = 100;
-
-interface JobEvent {
-  type: string;
-  job_id: string;
+  kind: string;
   attempts: number;
   duration_ms: number;
-  error?: string;
+  worker: string;
 }
 
-interface OutboxRow {
-  id: string;
-  event: JobEvent;
-}
-
-class JobStore {
-  /** The job's new state and the job_outbox row share one transaction. */
-  async transaction<T>(
-    body: (tx: {query: (sql: string, params: unknown[]) => Promise<void>}) => Promise<T>,
-  ): Promise<T> {
-    return body({query: async () => {}});
-  }
-
-  /** Record the job as completed, after the side effect has committed. */
-  async markCompleted(jobId: string, attempts: number, durationMs: number): Promise<void> {
-    void jobId;
-    void attempts;
-    void durationMs;
-  }
-
-  async pendingOutbox(limit: number): Promise<OutboxRow[]> {
-    void limit;
-    return [];
-  }
-
-  async markPublished(outboxId: string): Promise<void> {
-    void outboxId;
-  }
-
-  /** Append one event to the job's history; this is the consumer's write. */
-  async appendHistory(jobId: string, event: JobEvent): Promise<void> {
-    void jobId;
-    void event;
-  }
-}
-
-const store = new JobStore();
-
-const kafka = new Kafka({clientId: 'jobqd-events', brokers: ['kafka:9092']});
-const producer: Producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+const kafka = new Kafka({clientId: 'jobqd', brokers: ['kafka:9092']});
+const producer = kafka.producer();
 void producer.connect();
 
-function eventPayload(event: JobEvent): JobEvent {
-  return {
-    type: event.type,
-    job_id: event.job_id,
-    attempts: event.attempts,
-    duration_ms: event.duration_ms,
-    error: event.error,
-  };
-}
-
-/** Keyed by the job id, so one job's history stays in one ordered partition. */
-async function publishEvent(jobId: string, event: JobEvent): Promise<void> {
-  await producer.send({topic: TOPIC, messages: [{key: jobId, value: JSON.stringify(eventPayload(event))}]});
-}
-
-/** The job's new state and its job_outbox row commit together, then the produce follows. */
-async function recordEvent(event: JobEvent): Promise<void> {
-  await store.transaction(async tx => {
-    await tx.query('UPDATE jobs SET state = $1, attempts = $2 WHERE job_id = $3', [
-      event.type,
-      event.attempts,
-      event.job_id,
-    ]);
-    await tx.query(
-      'INSERT INTO job_outbox (job_id, event_type, attempts, duration_ms) VALUES ($1, $2, $3, $4)',
-      [event.job_id, event.type, event.attempts, event.duration_ms],
-    );
-  });
+/** Produce one job.event. */
+export async function publish(event: JobEvent): Promise<void> {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
   try {
-    await publishEvent(event.job_id, event);
+    await producer.send({topic: TOPIC, messages: [{key: event.worker, value: JSON.stringify(event)}]});
   } catch (err) {
-    app.log.warn({job_id: event.job_id, event: event.type, err}, 'event kept in the outbox for the relay');
+    console.warn(\`job.event produce failed job=\${event.job_id}: \${(err as Error).message}\`);
   }
 }
 
-/** Republish what a broker outage left behind; a row is cleared only after the ack. */
-async function relayOutbox(): Promise<void> {
-  for (const row of await store.pendingOutbox(OUTBOX_BATCH)) {
-    try {
-      await publishEvent(row.event.job_id, row.event);
-    } catch {
-      continue;
-    }
-    await store.markPublished(row.id);
+/** Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone. */
+export async function complete(jobId: string, worker: string, durationMs: number): Promise<boolean> {
+  const job = (await store.getJob(jobId)) as store.Job;
+  await publish({job_id: jobId, kind: 'completed', attempts: job.attempts, duration_ms: durationMs, worker});
+  return queue.ack(jobId, worker);
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+import * as queue from 'jobs/queue'; // ack
+import * as store from 'jobs/store'; // getJob, outboxAdd
+
+export const TOPIC = 'job.event';
+
+export interface JobEvent {
+  job_id: string;
+  kind: string;
+  attempts: number;
+  duration_ms: number;
+  worker: string;
+}
+
+const kafka = new Kafka({clientId: 'jobqd', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect();
+
+/** Produce one job.event. */
+export async function publish(event: JobEvent): Promise<void> {
+  try {
+    // Keyed by the job: every attempt's events share one partition, in order.
+    await producer.send({topic: TOPIC, messages: [{key: event.job_id, value: JSON.stringify(event)}]});
+  } catch (err) {
+    // The broker said no: keep the event for the relay instead of dropping it.
+    await store.outboxAdd({...event});
+    console.warn(\`job.event refused job=\${event.job_id}: \${(err as Error).message}\`);
   }
 }
 
-async function onEnqueued(jobId: string): Promise<void> {
-  await recordEvent({type: 'enqueued', job_id: jobId, attempts: 0, duration_ms: 0});
+/** Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone. */
+export async function complete(jobId: string, worker: string, durationMs: number): Promise<boolean> {
+  // The ack is the commit: a worker whose claim expired may not announce the job as done.
+  if (!(await queue.ack(jobId, worker))) return false;
+  const job = (await store.getJob(jobId)) as store.Job;
+  await publish({job_id: jobId, kind: 'completed', attempts: job.attempts, duration_ms: durationMs, worker});
+  return true;
 }
-
-async function onStarted(jobId: string, attempts: number): Promise<void> {
-  await recordEvent({type: 'started', job_id: jobId, attempts, duration_ms: 0});
-}
-
-async function onFailed(jobId: string, attempts: number, error: string): Promise<void> {
-  await recordEvent({type: 'failed', job_id: jobId, attempts, duration_ms: 0, error});
-}
-
-async function onDeadLettered(jobId: string, attempts: number, error: string): Promise<void> {
-  await recordEvent({type: 'dead_lettered', job_id: jobId, attempts, duration_ms: 0, error});
-}
-
-/** The completion is published only once the effect committed and the job was marked completed. */
-async function publishCompleted(jobId: string, attempts: number, durationMs: number): Promise<void> {
-  await recordEvent({type: 'completed', job_id: jobId, attempts, duration_ms: durationMs});
-}
-
-app.post('/v1/jobs/:job_id/completed', async (request, reply) => {
-  const jobId = (request.params as {job_id: string}).job_id;
-  const body = request.body as {attempts: number; duration_ms: number};
-  await store.markCompleted(jobId, body.attempts, body.duration_ms);
-  await publishCompleted(jobId, body.attempts, body.duration_ms);
-  return reply.code(200).send({job_id: jobId, state: 'completed'});
-});
-
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'job-history'});
-  await consumer.connect();
-  await consumer.subscribe({topic: TOPIC});
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as JobEvent;
-      await store.appendHistory(event.job_id, event);
-      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-    },
-  });
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -625,72 +245,42 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"net/http"
 
 	"github.com/segmentio/kafka-go"
+
+	"jobs/queue" // queue.Ack
+	"jobs/store" // store.GetJob, OutboxAdd
 )
 
-const jobEventTopic = "job.event"
+const topic = "job.event"
 
-var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Balancer: &kafka.Hash{}}
+var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: topic, Balancer: &kafka.Hash{}}
 
 type jobEvent struct {
-	Type     string \`json:"type"\`
-	JobID    string \`json:"job_id"\`
-	Attempts int    \`json:"attempts"\`
+	JobID      string \`json:"job_id"\`
+	Kind       string \`json:"kind"\`
+	Attempts   int    \`json:"attempts"\`
+	DurationMs int64  \`json:"duration_ms"\`
+	Worker     string \`json:"worker"\`
 }
 
-// JobStore is the platform's job store: the state change and its outbox row share one call.
-type JobStore interface {
-	MarkCompleted(ctx context.Context, jobID string, attempts, durationMS int) error
-	AppendHistory(ctx context.Context, jobID string, event jobEvent) error
-}
-
-var store JobStore
-
-func publishEvent(ctx context.Context, workerID string, event jobEvent) error {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	payload, err := json.Marshal(event)
-	if err != nil {
-		return err
+// publish produces one job.event.
+func publish(ctx context.Context, event jobEvent) error {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	value, _ := json.Marshal(event)
+	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(event.Worker), Value: value}); err != nil {
+		log.Printf("job.event produce failed job=%s: %v", event.JobID, err)
 	}
-	return writer.WriteMessages(ctx, kafka.Message{Topic: jobEventTopic, Key: []byte(workerID), Value: payload})
+	return nil
 }
 
-func recordEvent(ctx context.Context, workerID string, event jobEvent) {
-	if err := publishEvent(ctx, workerID, event); err != nil {
-		log.Printf("event dropped job_id=%s event=%s: %v", event.JobID, event.Type, err)
+// complete finishes an attempt that succeeded: ack the claim and publish completed. False when the claim was gone.
+func complete(ctx context.Context, jobID, worker string, durationMs int64) (bool, error) {
+	job := store.GetJob(ctx, jobID)
+	if err := publish(ctx, jobEvent{JobID: jobID, Kind: "completed", Attempts: job.Attempts, DurationMs: durationMs, Worker: worker}); err != nil {
+		return false, err
 	}
-}
-
-func onEnqueued(ctx context.Context, jobID, workerID string) {
-	recordEvent(ctx, workerID, jobEvent{Type: "enqueued", JobID: jobID})
-}
-
-func onStarted(ctx context.Context, jobID, workerID string, attempts int) {
-	recordEvent(ctx, workerID, jobEvent{Type: "started", JobID: jobID, Attempts: attempts})
-}
-
-func completeJob(rw http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("job_id")
-	recordEvent(r.Context(), "worker-1", jobEvent{Type: "completed", JobID: jobID, Attempts: 1})
-	if err := store.MarkCompleted(r.Context(), jobID, 1, 0); err != nil {
-		http.Error(rw, "TRY_AGAIN", http.StatusServiceUnavailable)
-		return
-	}
-	writeJSON(rw, http.StatusOK, map[string]any{"job_id": jobID, "state": "completed"})
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/jobs/{job_id}/completed", completeJob)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	return queue.Ack(ctx, jobID, worker)
 }
 `,
       solution: `package main
@@ -699,141 +289,46 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"net/http"
 
 	"github.com/segmentio/kafka-go"
+
+	"jobs/queue" // queue.Ack
+	"jobs/store" // store.GetJob, OutboxAdd
 )
 
-const (
-	jobEventTopic = "job.event"
-	outboxBatch   = 100
-)
+const topic = "job.event"
 
-var writer = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Balancer:     &kafka.Hash{},
-	RequiredAcks: kafka.RequireAll,
-}
+var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: topic, Balancer: &kafka.Hash{}}
 
 type jobEvent struct {
-	Type       string \`json:"type"\`
 	JobID      string \`json:"job_id"\`
+	Kind       string \`json:"kind"\`
 	Attempts   int    \`json:"attempts"\`
-	DurationMS int    \`json:"duration_ms"\`
-	Error      string \`json:"error,omitempty"\`
+	DurationMs int64  \`json:"duration_ms"\`
+	Worker     string \`json:"worker"\`
 }
 
-type outboxRow struct {
-	ID    string
-	Event jobEvent
-}
-
-// JobStore and its transaction are the platform's; the state change and the outbox row share one.
-type JobStore interface {
-	Begin(ctx context.Context) (Transaction, error)
-	MarkCompleted(ctx context.Context, jobID string, attempts, durationMS int) error
-	PendingOutbox(ctx context.Context, limit int) ([]outboxRow, error)
-	MarkPublished(ctx context.Context, outboxID string) error
-	AppendHistory(ctx context.Context, jobID string, event jobEvent) error
-}
-
-type Transaction interface {
-	Exec(ctx context.Context, sql string, params ...any) error
-	Commit(ctx context.Context) error
-	Rollback(ctx context.Context) error
-}
-
-var store JobStore
-
-// publishEvent keys by the job id, so one job's history stays in one ordered partition.
-func publishEvent(ctx context.Context, jobID string, event jobEvent) error {
-	payload, err := json.Marshal(event)
-	if err != nil {
-		return err
+// publish produces one job.event.
+func publish(ctx context.Context, event jobEvent) error {
+	value, _ := json.Marshal(event)
+	// Keyed by the job: every attempt's events share one partition, in order.
+	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(event.JobID), Value: value}); err != nil {
+		// The broker said no: keep the event for the relay instead of dropping it.
+		log.Printf("job.event refused job=%s: %v", event.JobID, err)
+		return store.OutboxAdd(ctx, event)
 	}
-	return writer.WriteMessages(ctx, kafka.Message{Topic: jobEventTopic, Key: []byte(jobID), Value: payload})
+	return nil
 }
 
-// recordEvent commits the job's new state and the job_outbox row together, then publishes.
-func recordEvent(ctx context.Context, event jobEvent) {
-	tx, err := store.Begin(ctx)
-	if err != nil {
-		log.Printf("no transaction for job_id=%s: %v", event.JobID, err)
-		return
+// complete finishes an attempt that succeeded: ack the claim and publish completed. False when the claim was gone.
+func complete(ctx context.Context, jobID, worker string, durationMs int64) (bool, error) {
+	// The ack is the commit: a worker whose claim expired may not announce the job as done.
+	acked, err := queue.Ack(ctx, jobID, worker)
+	if err != nil || !acked {
+		return false, err
 	}
-	update := "UPDATE jobs SET state = $1, attempts = $2 WHERE job_id = $3"
-	if err := tx.Exec(ctx, update, event.Type, event.Attempts, event.JobID); err != nil {
-		_ = tx.Rollback(ctx)
-		return
-	}
-	sql := "INSERT INTO job_outbox (job_id, event_type, attempts, duration_ms) VALUES ($1, $2, $3, $4)"
-	if err := tx.Exec(ctx, sql, event.JobID, event.Type, event.Attempts, event.DurationMS); err != nil {
-		_ = tx.Rollback(ctx)
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return
-	}
-	if err := publishEvent(ctx, event.JobID, event); err != nil {
-		log.Printf("event kept in the outbox job_id=%s event=%s: %v", event.JobID, event.Type, err)
-	}
-}
-
-// relayOutbox republishes what a broker outage left behind; a row is cleared only after the ack.
-func relayOutbox(ctx context.Context) {
-	rows, err := store.PendingOutbox(ctx, outboxBatch)
-	if err != nil {
-		return
-	}
-	for _, row := range rows {
-		if err := publishEvent(ctx, row.Event.JobID, row.Event); err != nil {
-			continue
-		}
-		store.MarkPublished(ctx, row.ID)
-	}
-}
-
-func onEnqueued(ctx context.Context, jobID string) {
-	recordEvent(ctx, jobEvent{Type: "enqueued", JobID: jobID})
-}
-
-func onStarted(ctx context.Context, jobID string, attempts int) {
-	recordEvent(ctx, jobEvent{Type: "started", JobID: jobID, Attempts: attempts})
-}
-
-func onFailed(ctx context.Context, jobID string, attempts int, errText string) {
-	recordEvent(ctx, jobEvent{Type: "failed", JobID: jobID, Attempts: attempts, Error: errText})
-}
-
-func onDeadLettered(ctx context.Context, jobID string, attempts int, errText string) {
-	recordEvent(ctx, jobEvent{Type: "dead_lettered", JobID: jobID, Attempts: attempts, Error: errText})
-}
-
-// publishCompleted is the only path that emits a completion: the effect has committed by now.
-func publishCompleted(ctx context.Context, jobID string, attempts, durationMS int) {
-	recordEvent(ctx, jobEvent{Type: "completed", JobID: jobID, Attempts: attempts, DurationMS: durationMS})
-}
-
-func completeJob(rw http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("job_id")
-	if err := store.MarkCompleted(r.Context(), jobID, 1, 0); err != nil {
-		http.Error(rw, "TRY_AGAIN", http.StatusServiceUnavailable)
-		return
-	}
-	publishCompleted(r.Context(), jobID, 1, 0)
-	writeJSON(rw, http.StatusOK, map[string]any{"job_id": jobID, "state": "completed"})
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/jobs/{job_id}/completed", completeJob)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	job := store.GetJob(ctx, jobID)
+	return true, publish(ctx, jobEvent{JobID: jobID, Kind: "completed", Attempts: job.Attempts, DurationMs: durationMs, Worker: worker})
 }
 `,
     },
@@ -841,396 +336,550 @@ func main() {
       starter: `import java.util.Properties
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
+import org.apache.kafka.common.KafkaException
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-final case class JobEvent(eventType: String, jobId: String, attempts: Int)
-
-/** The platform's job store: the state change and its outbox row share one call. */
-trait JobStore {
-  def markCompleted(jobId: String, attempts: Int, durationMs: Int): Unit
-  def appendHistory(jobId: String, event: JobEvent): Unit
-}
+import jobs.{Queue, Store} // Queue.ack · Store.getJob, outboxAdd
 
 object Events {
-  implicit val system: ActorSystem = ActorSystem("jobqd-events")
+  val Topic = "job.event"
 
-  val JobEventTopic = "job.event"
+  private val props = new Properties()
+  props.put("bootstrap.servers", "kafka:9092")
+  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
-  val producer = new KafkaProducer[String, String](new Properties())
-
-  private val store: JobStore = new JobStore {
-    def markCompleted(jobId: String, attempts: Int, durationMs: Int): Unit = ()
-    def appendHistory(jobId: String, event: JobEvent): Unit = ()
+  private def field(event: JsObject, name: String): String = event.fields(name) match {
+    case JsString(s) => s
+    case other => other.compactPrint
   }
 
-  def publishEvent(event: JobEvent, workerId: String): Unit = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val payload =
-      """{"type":"%s","job_id":"%s","attempts":%d}""".format(event.eventType, event.jobId, event.attempts)
-    producer.send(new ProducerRecord[String, String](JobEventTopic, workerId, payload))
+  /** Produce one job.event: {job_id, kind, attempts, duration_ms, worker}. */
+  def publish(event: JsObject): Unit = {
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    try producer.send(new ProducerRecord[String, String](Topic, field(event, "worker"), event.compactPrint))
+    catch { case e: KafkaException => System.err.println(s"job.event produce failed job=\${field(event, "job_id")}: \${e.getMessage}") }
   }
 
-  def recordEvent(event: JobEvent, workerId: String): Unit = {
-    try {
-      publishEvent(event, workerId)
-    } catch {
-      case err: Throwable => system.log.warning("event dropped jobId=%s err=%s".format(event.jobId, err.getMessage))
-    }
-  }
-
-  def onEnqueued(jobId: String, workerId: String): Unit =
-    recordEvent(JobEvent("enqueued", jobId, 0), workerId)
-
-  def onStarted(jobId: String, workerId: String, attempts: Int): Unit =
-    recordEvent(JobEvent("started", jobId, attempts), workerId)
-
-  val route: Route =
-    path("v1" / "jobs" / Segment / "completed") { jobId =>
-      post {
-        recordEvent(JobEvent("completed", jobId, 1), "worker-1")
-        store.markCompleted(jobId, 1, 0)
-        complete(StatusCodes.OK, """{"job_id":"%s","state":"completed"}""".format(jobId))
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone. */
+  def complete(jobId: String, worker: String, durationMs: Long): Boolean = {
+    val job = Store.getJob(jobId).getOrElse(throw new NoSuchElementException(s"no job $jobId"))
+    publish(JsObject("job_id" -> JsString(jobId), "kind" -> JsString("completed"), "attempts" -> JsNumber(job.attempts),
+      "duration_ms" -> JsNumber(durationMs), "worker" -> JsString(worker)))
+    Queue.ack(jobId, worker)
   }
 }
 `,
       solution: `import java.util.Properties
 
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
+import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-final case class JobEvent(eventType: String, jobId: String, attempts: Int, durationMs: Int, error: String)
-
-final case class OutboxRow(id: String, event: JobEvent)
-
-/** The platform's transaction: the job's state change and its job_outbox row share it. */
-trait Tx {
-  def execute(sql: String, params: Any*): Unit
-}
-
-/** The platform's job store, plus the outbox the relay drains. */
-trait JobStore {
-  def inTransaction(body: Tx => Unit): Unit
-  def markCompleted(jobId: String, attempts: Int, durationMs: Int): Unit
-  def pendingOutbox(limit: Int): Seq[OutboxRow]
-  def markPublished(outboxId: String): Unit
-  def appendHistory(jobId: String, event: JobEvent): Unit
-}
+import jobs.{Queue, Store} // Queue.ack · Store.getJob, outboxAdd
 
 object Events {
-  implicit val system: ActorSystem = ActorSystem("jobqd-events")
-
-  val JobEventTopic = "job.event"
-  val OutboxBatch = 100
+  val Topic = "job.event"
 
   private val props = new Properties()
   props.put("bootstrap.servers", "kafka:9092")
-  props.put("acks", "all")
-  props.put("enable.idempotence", "true")
-  val producer = new KafkaProducer[String, String](props)
+  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
-  private val store: JobStore = new JobStore {
-    def inTransaction(body: Tx => Unit): Unit = ???
-    def markCompleted(jobId: String, attempts: Int, durationMs: Int): Unit = ???
-    def pendingOutbox(limit: Int): Seq[OutboxRow] = ???
-    def markPublished(outboxId: String): Unit = ???
-    def appendHistory(jobId: String, event: JobEvent): Unit = ???
+  private def field(event: JsObject, name: String): String = event.fields(name) match {
+    case JsString(s) => s
+    case other => other.compactPrint
   }
 
-  private def eventJson(event: JobEvent): String =
-    """{"type":"%s","job_id":"%s","attempts":%d,"duration_ms":%d,"error":"%s"}"""
-      .format(event.eventType, event.jobId, event.attempts, event.durationMs, event.error)
-
-  /** Keyed by the job id, so one job's history stays in one ordered partition. */
-  def publishEvent(event: JobEvent): Unit = {
-    producer.send(new ProducerRecord[String, String](JobEventTopic, event.jobId, eventJson(event)))
+  /** Produce one job.event: {job_id, kind, attempts, duration_ms, worker}. */
+  def publish(event: JsObject): Unit = {
+    val onDelivery: Callback = new Callback {
+      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
+        if (exception != null) {
+          // The broker said no, and it says so here, not at send(): the relay republishes the row.
+          Store.outboxAdd(event)
+          System.err.println(s"job.event refused job=\${field(event, "job_id")}: \${exception.getMessage}")
+        }
+    }
+    // Keyed by the job: every attempt's events share one partition, in order.
+    producer.send(new ProducerRecord[String, String](Topic, field(event, "job_id"), event.compactPrint), onDelivery)
   }
 
-  /** The job's new state and its job_outbox row commit together, then the produce follows. */
-  def recordEvent(event: JobEvent): Unit = {
-    store.inTransaction { tx =>
-      tx.execute(
-        "UPDATE jobs SET state = ?, attempts = ? WHERE job_id = ?",
-        event.eventType,
-        event.attempts,
-        event.jobId
-      )
-      tx.execute(
-        "INSERT INTO job_outbox (job_id, event_type, attempts, duration_ms) VALUES (?, ?, ?, ?)",
-        event.jobId,
-        event.eventType,
-        event.attempts,
-        event.durationMs
-      )
-    }
-    try {
-      publishEvent(event)
-    } catch {
-      case err: Throwable =>
-        system.log.warning("event kept in the outbox jobId=%s err=%s".format(event.jobId, err.getMessage))
-    }
-  }
-
-  /** Republish what a broker outage left behind; a row is cleared only after the ack. */
-  def relayOutbox(): Unit = {
-    for (row <- store.pendingOutbox(OutboxBatch)) {
-      try {
-        publishEvent(row.event)
-      } catch {
-        case _: Throwable => () // the next pass picks the row up again
-      }
-      store.markPublished(row.id)
-    }
-  }
-
-  def onEnqueued(jobId: String): Unit = recordEvent(JobEvent("enqueued", jobId, 0, 0, ""))
-
-  def onStarted(jobId: String, attempts: Int): Unit = recordEvent(JobEvent("started", jobId, attempts, 0, ""))
-
-  def onFailed(jobId: String, attempts: Int, error: String): Unit =
-    recordEvent(JobEvent("failed", jobId, attempts, 0, error))
-
-  def onDeadLettered(jobId: String, attempts: Int, error: String): Unit =
-    recordEvent(JobEvent("dead_lettered", jobId, attempts, 0, error))
-
-  /** The completion is emitted only once the effect committed and the job was marked completed. */
-  def publishCompleted(jobId: String, attempts: Int, durationMs: Int): Unit =
-    recordEvent(JobEvent("completed", jobId, attempts, durationMs, ""))
-
-  val route: Route =
-    path("v1" / "jobs" / Segment / "completed") { jobId =>
-      post {
-        store.markCompleted(jobId, 1, 0)
-        publishCompleted(jobId, 1, 0)
-        complete(StatusCodes.OK, """{"job_id":"%s","state":"completed"}""".format(jobId))
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone. */
+  def complete(jobId: String, worker: String, durationMs: Long): Boolean = {
+    // The ack is the commit: a worker whose claim expired may not announce the job as done.
+    if (!Queue.ack(jobId, worker)) return false
+    val job = Store.getJob(jobId).getOrElse(throw new NoSuchElementException(s"no job $jobId"))
+    publish(JsObject("job_id" -> JsString(jobId), "kind" -> JsString("completed"), "attempts" -> JsNumber(job.attempts),
+      "duration_ms" -> JsNumber(durationMs), "worker" -> JsString(worker)))
+    true
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <librdkafka/rdkafkacpp.h>
+      starter: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
 #include <iostream>
+#include <memory>
 #include <string>
+
+#include "jobs/queue.h"  // queue::ack
+#include "jobs/store.h"  // store::getJob, outboxAdd
 
 using json = nlohmann::json;
 
-const std::string kJobEventTopic = "job.event";
+const std::string kTopic = "job.event";
 
-struct JobEvent {
-  std::string type;
-  std::string job_id;
-  int attempts = 0;
-};
-
-/** The platform's job store: the state change and its outbox row share one call. */
-struct JobStore {
-  void mark_completed(const std::string& job_id, int attempts, int duration_ms);
-  void append_history(const std::string& job_id, const JobEvent& event);
-};
-
-JobStore store;
-
-static void publish_event(RdKafka::Producer* producer, const JobEvent& event, const std::string& worker_id) {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const std::string payload =
-      json{{"type", event.type}, {"job_id", event.job_id}, {"attempts", event.attempts}}.dump();
-  producer->produce(kJobEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                    const_cast<char*>(payload.data()), payload.size(), worker_id.c_str(), worker_id.size(), 0,
-                    nullptr);
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-static void record_event(RdKafka::Producer* producer, const JobEvent& event, const std::string& worker_id) {
-  try {
-    publish_event(producer, event, worker_id);
-  } catch (const std::exception& err) {
-    std::cerr << "event dropped job_id=" << event.job_id << " err=" << err.what() << "\\n";
-  }
-}
+auto producer = make_producer();
 
-static void on_enqueued(RdKafka::Producer* producer, const std::string& job_id) {
-  record_event(producer, JobEvent{"enqueued", job_id, 0}, "worker-1");
-}
-
-static void on_started(RdKafka::Producer* producer, const std::string& job_id, int attempts) {
-  record_event(producer, JobEvent{"started", job_id, attempts}, "worker-1");
-}
-
-int main() {
-  std::string errstr;
-  auto* conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
-  conf->set("bootstrap.servers", "kafka:9092", errstr);
-  auto* producer = RdKafka::Producer::create(conf, errstr);
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/jobs/([^/]+)/completed)", [producer](const httplib::Request& req, httplib::Response& res) {
-    const std::string job_id = req.matches[1];
-    record_event(producer, JobEvent{"completed", job_id, 1}, "worker-1");
-    store.mark_completed(job_id, 1, 0);
-    res.status = 200;
-    res.set_content(json{{"job_id", job_id}, {"state", "completed"}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <httplib.h>
-#include <librdkafka/rdkafkacpp.h>
-#include <nlohmann/json.hpp>
-
-#include <iostream>
-#include <string>
-#include <vector>
-
-using json = nlohmann::json;
-
-const std::string kJobEventTopic = "job.event";
-constexpr int kOutboxBatch = 100;
-
-struct JobEvent {
-  std::string type;
-  std::string job_id;
-  int attempts = 0;
-  int duration_ms = 0;
-  std::string error;
-};
-
-struct OutboxRow {
-  std::string id;
-  JobEvent event;
-};
-
-/** The platform's transaction: the job's state change and its job_outbox row share it. */
-struct Transaction {
-  void execute(const std::string& sql, const std::vector<std::string>& params);
-  void commit();
-};
-
-/** The platform's job store, plus the outbox the relay drains. */
-struct JobStore {
-  Transaction begin_transaction();
-  void mark_completed(const std::string& job_id, int attempts, int duration_ms);
-  std::vector<OutboxRow> pending_outbox(int limit);
-  void mark_published(const std::string& outbox_id);
-  void append_history(const std::string& job_id, const JobEvent& event);
-};
-
-JobStore store;
-
-/** Keyed by the job id, so one job's history stays in one ordered partition. */
-static void publish_event(RdKafka::Producer* producer, const JobEvent& event) {
-  const std::string payload =
-      json{{"type", event.type},
-           {"job_id", event.job_id},
-           {"attempts", event.attempts},
-           {"duration_ms", event.duration_ms},
-           {"error", event.error}}
-          .dump();
-  producer->produce(kJobEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                    const_cast<char*>(payload.data()), payload.size(), event.job_id.c_str(), event.job_id.size(), 0,
-                    nullptr);
+// Produce one job.event: {job_id, kind, attempts, duration_ms, worker}.
+void publish(const json& event) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const std::string value = event.dump();
+  const std::string key = event.value("worker", "");
+  const RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
+                                                   const_cast<char*>(value.data()), value.size(), key.data(), key.size(), 0, nullptr);
+  if (err != RdKafka::ERR_NO_ERROR) std::cerr << "job.event produce failed: " << RdKafka::err2str(err) << "\\n";
   producer->poll(0);
 }
 
-/** The job's new state and its job_outbox row commit together, then the produce follows. */
-static void record_event(RdKafka::Producer* producer, const JobEvent& event) {
-  {
-    auto tx = store.begin_transaction();
-    tx.execute("UPDATE jobs SET state = $1, attempts = $2 WHERE job_id = $3",
-               {event.type, std::to_string(event.attempts), event.job_id});
-    tx.execute("INSERT INTO job_outbox (job_id, event_type, attempts, duration_ms) VALUES ($1, $2, $3, $4)",
-               {event.job_id, event.type, std::to_string(event.attempts), std::to_string(event.duration_ms)});
-    tx.commit();
+// Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone.
+bool complete(const std::string& job_id, const std::string& worker, long long duration_ms) {
+  const auto job = store::getJob(job_id);
+  publish(json{{"job_id", job_id}, {"kind", "completed"}, {"attempts", job ? job->attempts : 0}, {"duration_ms", duration_ms}, {"worker", worker}});
+  return queue::ack(job_id, worker);
+}
+`,
+      solution: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include <iostream>
+#include <memory>
+#include <string>
+
+#include "jobs/queue.h"  // queue::ack
+#include "jobs/store.h"  // store::getJob, outboxAdd
+
+using json = nlohmann::json;
+
+const std::string kTopic = "job.event";
+
+// The delivery report: the broker's refusal arrives here, not at produce(); the relay republishes the row.
+class ToOutbox : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override {
+    if (message.err() == RdKafka::ERR_NO_ERROR) return;
+    store::outboxAdd(json::parse(std::string(static_cast<const char*>(message.payload()), message.len())));
+    std::cerr << "job.event refused: " << message.errstr() << "\\n";
   }
-  try {
-    publish_event(producer, event);
-  } catch (const std::exception& err) {
-    std::cerr << "event kept in the outbox job_id=" << event.job_id << " err=" << err.what() << "\\n";
-  }
+};
+
+ToOutbox to_outbox;
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("dr_cb", &to_outbox, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-/** Republish what a broker outage left behind; a row is cleared only after the ack. */
-static void relay_outbox(RdKafka::Producer* producer) {
-  for (const OutboxRow& row : store.pending_outbox(kOutboxBatch)) {
-    try {
-      publish_event(producer, row.event);
-    } catch (const std::exception&) {
-      continue;
-    }
-    store.mark_published(row.id);
-  }
+auto producer = make_producer();
+
+// Produce one job.event: {job_id, kind, attempts, duration_ms, worker}.
+void publish(const json& event) {
+  const std::string value = event.dump();
+  // Keyed by the job: every attempt's events share one partition, in order.
+  const std::string key = event.value("job_id", "");
+  producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                    value.size(), key.data(), key.size(), 0, nullptr);
+  producer->poll(0);  // serve delivery reports already in; returns at once
 }
 
-static void on_enqueued(RdKafka::Producer* producer, const std::string& job_id) {
-  record_event(producer, JobEvent{"enqueued", job_id, 0, 0, ""});
-}
-
-static void on_started(RdKafka::Producer* producer, const std::string& job_id, int attempts) {
-  record_event(producer, JobEvent{"started", job_id, attempts, 0, ""});
-}
-
-static void on_failed(RdKafka::Producer* producer, const std::string& job_id, int attempts,
-                      const std::string& error) {
-  record_event(producer, JobEvent{"failed", job_id, attempts, 0, error});
-}
-
-static void on_dead_lettered(RdKafka::Producer* producer, const std::string& job_id, int attempts,
-                             const std::string& error) {
-  record_event(producer, JobEvent{"dead_lettered", job_id, attempts, 0, error});
-}
-
-/** The completion is emitted only once the effect committed and the job was marked completed. */
-static void publish_completed(RdKafka::Producer* producer, const std::string& job_id, int attempts, int duration_ms) {
-  record_event(producer, JobEvent{"completed", job_id, attempts, duration_ms, ""});
-}
-
-int main() {
-  std::string errstr;
-  auto* conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
-  conf->set("bootstrap.servers", "kafka:9092", errstr);
-  conf->set("acks", "all", errstr);
-  conf->set("enable.idempotence", "true", errstr);
-  auto* producer = RdKafka::Producer::create(conf, errstr);
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/jobs/([^/]+)/completed)", [producer](const httplib::Request& req, httplib::Response& res) {
-    const std::string job_id = req.matches[1];
-    store.mark_completed(job_id, 1, 0);
-    publish_completed(producer, job_id, 1, 0);
-    res.status = 200;
-    res.set_content(json{{"job_id", job_id}, {"state", "completed"}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Finish an attempt that succeeded: ack the claim and publish completed. False when the claim was gone.
+bool complete(const std::string& job_id, const std::string& worker, long long duration_ms) {
+  // The ack is the commit: a worker whose claim expired may not announce the job as done.
+  if (!queue::ack(job_id, worker)) return false;
+  const auto job = store::getJob(job_id);
+  publish(json{{"job_id", job_id}, {"kind", "completed"}, {"attempts", job ? job->attempts : 0}, {"duration_ms", duration_ms}, {"worker", worker}});
+  return true;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+from jobs import queue, store
+
+TOPIC = "job.event"
+
+
+def _claimed(job_id, worker="w-1"):
+    store.create_job(job_id, "t-1", "email.send", {"to": "ada@example.com", "template": "welcome"})
+    assert queue.claim(worker) == job_id, f"the harness could not claim {job_id}"
+    store.begin_attempt(job_id)
+
+
+def _settle(m):
+    """Serve the producer's delivery reports, as the worker's loop would between jobs."""
+    m.producer.poll(0)
+
+
+def _events(ctx):
+    return [json.loads(r.value) for r in ctx.kafka.records(TOPIC)]
+
+
+def check_event_envelope(ctx):
+    m = ctx.load("events")
+    _claimed("job-1")
+    assert m.complete("job-1", "w-1", 840) is True, "completing an attempt the worker holds must return True"
+    _settle(m)
+    events = _events(ctx)
+    assert len(events) == 1, f"one completed attempt produced {len(events)} records on {TOPIC}"
+    expected = {"job_id": "job-1", "kind": "completed", "attempts": 1, "duration_ms": 840, "worker": "w-1"}
+    for key, value in expected.items():
+        assert events[0].get(key) == value, f"the event must carry {key}={value!r}, got {events[0]}"
+
+
+def check_job_key(ctx):
+    m = ctx.load("events")
+    _claimed("job-1", "w-1")
+    _claimed("job-2", "w-2")
+    # job-1's first attempt ran on w-3 and failed; its second runs on w-1
+    m.publish({"job_id": "job-1", "kind": "failed", "attempts": 1, "duration_ms": 30000, "worker": "w-3"})
+    assert m.complete("job-1", "w-1", 900) is True
+    assert m.complete("job-2", "w-2", 450) is True
+    _settle(m)
+    records = ctx.kafka.records(TOPIC)
+    keys = sorted((r.key or b"").decode() for r in records)
+    assert keys == ["job-1", "job-1", "job-2"], f"the records are keyed {keys}, expected by job id: keyed by worker, a job retried on another worker has its history split across partitions"
+    partitions = {r.partition for r in records if r.key == b"job-1"}
+    assert len(partitions) == 1, f"job-1's two events landed on partitions {sorted(partitions)}: one job's history must share a partition to stay in order"
+
+
+def check_completed_after_ack(ctx):
+    m = ctx.load("events")
+    _claimed("job-1", "w-1")
+    ctx.clock.advance(61)  # w-1 was too slow: the claim expired and the job went to w-2
+    queue.return_expired()
+    assert queue.claim("w-2") == "job-1"
+    done = m.complete("job-1", "w-1", 61000)
+    _settle(m)
+    assert done is False, f"complete returned {done!r} for a claim w-1 no longer holds"
+    assert ctx.kafka.records(TOPIC) == [], f"w-1 lost its claim, yet it published {_events(ctx)}: the history says the job finished while w-2 is still running it. Ack first and publish only when the ack succeeded"
+    assert m.complete("job-1", "w-2", 700) is True, "the worker holding the claim must complete the job"
+    _settle(m)
+    events = _events(ctx)
+    assert len(events) == 1 and events[0].get("worker") == "w-2", f"the completion must be published once, by w-2: {events}"
+
+
+def check_outbox_on_rejection(ctx):
+    m = ctx.load("events")
+    _claimed("job-1")
+    ctx.kafka.fail_next(TOPIC, 1)
+    try:
+        done = m.complete("job-1", "w-1", 840)
+    except Exception as e:  # noqa: BLE001
+        raise AssertionError(f"complete raised when the broker refused the record: {e!r}; the event goes to the outbox and the worker goes on") from e
+    _settle(m)
+    rows = [json.loads(row) for row in ctx.redis.lrange("jobs:outbox", 0, -1)]
+    assert len(rows) == 1, f"the broker refused the completed event and jobs:outbox holds {len(rows)} rows: the refusal arrives in the delivery report, and the event must be kept for the relay"
+    assert rows[0].get("job_id") == "job-1" and rows[0].get("kind") == "completed", f"the outbox row must be the event itself, got {rows[0]}"
+    assert ctx.kafka.records(TOPIC) == [], "nothing reached the topic for the refused record"
+    assert done is True and store.get_job("job-1")["state"] == "completed", f"the job is done whatever the broker said: complete returned {done!r} and the job is {store.get_job('job-1')}"
+`,
+    typescript: `const TOPIC = 'job.event';
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+async function setup(ctx) {
+  return {m: ctx.load('events'), queue: ctx.load('/support/jobs/queue.ts'), store: ctx.load('/support/jobs/store.ts')};
+}
+
+async function claimed(queue, store, jobId: string, worker = 'w-1'): Promise<void> {
+  await store.createJob(jobId, 't-1', 'email.send', {to: 'ada@example.com', template: 'welcome'});
+  assert.equal(await queue.claim(worker), jobId, \`the harness could not claim \${jobId}\`);
+  await store.beginAttempt(jobId);
+}
+
+const events = ctx => ctx.kafka.records(TOPIC).map(r => JSON.parse(r.value.toString()));
+
+export async function check_event_envelope(ctx) {
+  const {m, queue, store} = await setup(ctx);
+  await claimed(queue, store, 'job-1');
+  assert.equal(await m.complete('job-1', 'w-1', 840), true, 'completing an attempt the worker holds must return true');
+  await settle();
+  const all = events(ctx);
+  assert.equal(all.length, 1, \`one completed attempt produced \${all.length} records on \${TOPIC}\`);
+  const expected = {job_id: 'job-1', kind: 'completed', attempts: 1, duration_ms: 840, worker: 'w-1'};
+  for (const [key, value] of Object.entries(expected)) assert.deepEqual(all[0][key], value, \`the event must carry \${key}=\${JSON.stringify(value)}, got \${JSON.stringify(all[0])}\`);
+}
+
+export async function check_job_key(ctx) {
+  const {m, queue, store} = await setup(ctx);
+  await claimed(queue, store, 'job-1', 'w-1');
+  await claimed(queue, store, 'job-2', 'w-2');
+  // job-1's first attempt ran on w-3 and failed; its second runs on w-1
+  await m.publish({job_id: 'job-1', kind: 'failed', attempts: 1, duration_ms: 30000, worker: 'w-3'});
+  assert.equal(await m.complete('job-1', 'w-1', 900), true);
+  assert.equal(await m.complete('job-2', 'w-2', 450), true);
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  const keys = records.map(r => r.key?.toString() ?? '').sort();
+  assert.deepEqual(keys, ['job-1', 'job-1', 'job-2'], \`the records are keyed \${JSON.stringify(keys)}, expected by job id: keyed by worker, a job retried on another worker has its history split across partitions\`);
+  const partitions = new Set(records.filter(r => r.key?.toString() === 'job-1').map(r => r.partition));
+  assert.equal(partitions.size, 1, \`job-1's two events landed on partitions \${JSON.stringify([...partitions])}: one job's history must share a partition to stay in order\`);
+}
+
+export async function check_completed_after_ack(ctx) {
+  const {m, queue, store} = await setup(ctx);
+  await claimed(queue, store, 'job-1', 'w-1');
+  ctx.clock.advance(61); // w-1 was too slow: the claim expired and the job went to w-2
+  await queue.returnExpired();
+  assert.equal(await queue.claim('w-2'), 'job-1');
+  const done = await m.complete('job-1', 'w-1', 61000);
+  await settle();
+  assert.equal(done, false, \`complete returned \${done} for a claim w-1 no longer holds\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 0, \`w-1 lost its claim, yet it published \${JSON.stringify(events(ctx))}: the history says the job finished while w-2 is still running it. Ack first and publish only when the ack succeeded\`);
+  assert.equal(await m.complete('job-1', 'w-2', 700), true, 'the worker holding the claim must complete the job');
+  await settle();
+  const all = events(ctx);
+  assert(all.length === 1 && all[0].worker === 'w-2', \`the completion must be published once, by w-2: \${JSON.stringify(all)}\`);
+}
+
+export async function check_outbox_on_rejection(ctx) {
+  const {m, queue, store} = await setup(ctx);
+  await claimed(queue, store, 'job-1');
+  ctx.kafka.failNext(TOPIC, 1);
+  let done;
+  try {
+    done = await m.complete('job-1', 'w-1', 840);
+  } catch (e) {
+    assert.fail(\`complete rejected when the broker refused the record: \${e}; the event goes to the outbox and the worker goes on\`);
+  }
+  await settle();
+  const rows = ctx.redis.lrange('jobs:outbox', 0, -1).map(row => JSON.parse(row));
+  assert.equal(rows.length, 1, \`the broker refused the completed event and jobs:outbox holds \${rows.length} rows: the event must be kept for the relay\`);
+  assert(rows[0].job_id === 'job-1' && rows[0].kind === 'completed', \`the outbox row must be the event itself, got \${JSON.stringify(rows[0])}\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing reached the topic for the refused record');
+  const job = await store.getJob('job-1');
+  assert(done === true && job.state === 'completed', \`the job is done whatever the broker said: complete returned \${done} and the job is \${JSON.stringify(job)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+
+	"jobs/queue"
+	"jobs/store"
+
+	"leetbuild/harness"
+)
+
+var eventsBg = context.Background()
+
+func eventsClaimed(ctx *harness.Ctx, jobID, worker string) {
+	ctx.NoError(store.CreateJob(eventsBg, jobID, "t-1", "email.send", map[string]any{"to": "ada@example.com", "template": "welcome"}), "CreateJob")
+	got, err := queue.Claim(eventsBg, worker)
+	ctx.NoError(err, "Claim")
+	ctx.Equal(got, jobID, "the harness's claim")
+	store.BeginAttempt(eventsBg, jobID)
+}
+
+func eventsComplete(ctx *harness.Ctx, jobID, worker string, durationMs int64) bool {
+	done, err := complete(eventsBg, jobID, worker, durationMs)
+	ctx.NoError(err, "complete(%s, %s)", jobID, worker)
+	return done
+}
+
+func eventsAll(ctx *harness.Ctx) []map[string]any {
+	out := []map[string]any{}
+	for _, r := range ctx.Kafka.Records(topic) {
+		var e map[string]any
+		ctx.NoError(json.Unmarshal(r.Value, &e), "the event is JSON: %s", r.Value)
+		out = append(out, e)
+	}
+	return out
+}
+
+func CheckEventEnvelope(ctx *harness.Ctx) {
+	eventsClaimed(ctx, "job-1", "w-1")
+	ctx.Assert(eventsComplete(ctx, "job-1", "w-1", 840), "completing an attempt the worker holds must return true")
+	ctx.Settle()
+	all := eventsAll(ctx)
+	ctx.Equal(len(all), 1, "one completed attempt's records on job.event")
+	ctx.Equal(all[0], map[string]any{"job_id": "job-1", "kind": "completed", "attempts": float64(1), "duration_ms": float64(840), "worker": "w-1"}, "the event")
+}
+
+func CheckJobKey(ctx *harness.Ctx) {
+	eventsClaimed(ctx, "job-1", "w-1")
+	eventsClaimed(ctx, "job-2", "w-2")
+	// job-1's first attempt ran on w-3 and failed; its second runs on w-1
+	ctx.NoError(publish(eventsBg, jobEvent{JobID: "job-1", Kind: "failed", Attempts: 1, DurationMs: 30000, Worker: "w-3"}), "publish")
+	ctx.Assert(eventsComplete(ctx, "job-1", "w-1", 900), "job-1 completes")
+	ctx.Assert(eventsComplete(ctx, "job-2", "w-2", 450), "job-2 completes")
+	ctx.Settle()
+	keys := ctx.Kafka.Keys(topic)
+	sort.Strings(keys)
+	ctx.Equal(keys, []string{"job-1", "job-1", "job-2"}, "the record keys (keyed by worker, a job retried on another worker has its history split across partitions)")
+	partitions := map[int]bool{}
+	for _, r := range ctx.Kafka.Records(topic) {
+		if string(r.Key) == "job-1" {
+			partitions[r.Partition] = true
+		}
+	}
+	ctx.Equal(len(partitions), 1, "one job's history must share a partition to stay in order; the partitions job-1's events landed on")
+}
+
+func CheckCompletedAfterAck(ctx *harness.Ctx) {
+	eventsClaimed(ctx, "job-1", "w-1")
+	ctx.Clock.Advance(61) // w-1 was too slow: the claim expired and the job went to w-2
+	queue.ReturnExpired(eventsBg)
+	got, _ := queue.Claim(eventsBg, "w-2")
+	ctx.Equal(got, "job-1", "w-2's claim")
+	done := eventsComplete(ctx, "job-1", "w-1", 61000)
+	ctx.Settle()
+	ctx.Assert(!done, "complete returned true for a claim w-1 no longer holds")
+	ctx.Assert(len(ctx.Kafka.Records(topic)) == 0, "w-1 lost its claim, yet it published %v: the history says the job finished while w-2 is still running it. Ack first and publish only when the ack succeeded", eventsAll(ctx))
+	ctx.Assert(eventsComplete(ctx, "job-1", "w-2", 700), "the worker holding the claim must complete the job")
+	ctx.Settle()
+	all := eventsAll(ctx)
+	ctx.Assert(len(all) == 1 && all[0]["worker"] == "w-2", "the completion must be published once, by w-2: %v", all)
+}
+
+func CheckOutboxOnRejection(ctx *harness.Ctx) {
+	eventsClaimed(ctx, "job-1", "w-1")
+	ctx.Kafka.FailNext(topic, 1)
+	done, err := complete(eventsBg, "job-1", "w-1", 840)
+	ctx.NoError(err, "complete must not fail when the broker refused the record (the event goes to the outbox and the worker goes on)")
+	ctx.Settle()
+	rows := ctx.Redis.LRange("jobs:outbox", 0, -1)
+	ctx.Equal(len(rows), 1, "the broker refused the completed event: it must be kept for the relay; outbox rows")
+	var row map[string]any
+	json.Unmarshal([]byte(rows[0]), &row)
+	ctx.Assert(row["job_id"] == "job-1" && row["kind"] == "completed", "the outbox row must be the event itself, got %s", rows[0])
+	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "nothing reached the topic for the refused record; records")
+	job := store.GetJob(eventsBg, "job-1")
+	ctx.Assert(done && job.State == "completed", "the job is done whatever the broker said: complete returned %v and the job is %+v", done, job)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <exception>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "jobs/queue.h"
+#include "jobs/store.h"
+
+namespace {
+
+void eventsClaimed(harness::Ctx& ctx, const std::string& job_id, const std::string& worker) {
+  store::createJob(job_id, "t-1", "email.send", nlohmann::json{{"to", "ada@example.com"}, {"template", "welcome"}});
+  ctx.Equal(queue::claim(worker).value_or(""), job_id, "the harness's claim");
+  store::beginAttempt(job_id);
+}
+
+// Serve the producer's delivery reports, as the worker's loop would between jobs.
+void eventsSettle(harness::Ctx& ctx) {
+  ctx.Settle();
+  producer->poll(0);
+}
+
+std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> out;
+  for (const auto& r : ctx.Kafka.Records(kTopic)) out.push_back(nlohmann::json::parse(r.Value.value_or("null"), nullptr, false));
+  return out;
+}
+
+}  // namespace
+
+void CheckEventEnvelope(harness::Ctx& ctx) {
+  eventsClaimed(ctx, "job-1", "w-1");
+  ctx.Assert(complete("job-1", "w-1", 840), "completing an attempt the worker holds must return true");
+  eventsSettle(ctx);
+  const auto all = eventsAll(ctx);
+  ctx.Equal(all.size(), 1, "one completed attempt's records on job.event");
+  ctx.Equal(all[0], nlohmann::json({{"job_id", "job-1"}, {"kind", "completed"}, {"attempts", 1}, {"duration_ms", 840}, {"worker", "w-1"}}), "the event");
+}
+
+void CheckJobKey(harness::Ctx& ctx) {
+  eventsClaimed(ctx, "job-1", "w-1");
+  eventsClaimed(ctx, "job-2", "w-2");
+  // job-1's first attempt ran on w-3 and failed; its second runs on w-1
+  publish(nlohmann::json{{"job_id", "job-1"}, {"kind", "failed"}, {"attempts", 1}, {"duration_ms", 30000}, {"worker", "w-3"}});
+  ctx.Assert(complete("job-1", "w-1", 900), "job-1 completes");
+  ctx.Assert(complete("job-2", "w-2", 450), "job-2 completes");
+  eventsSettle(ctx);
+  auto keys = ctx.Kafka.Keys(kTopic);
+  std::sort(keys.begin(), keys.end());
+  ctx.Equal(keys, std::vector<std::string>{"job-1", "job-1", "job-2"}, "the record keys (keyed by worker, a job retried on another worker has its history split across partitions)");
+  std::set<int> partitions;
+  for (const auto& r : ctx.Kafka.Records(kTopic)) {
+    if (r.Key.value_or("") == "job-1") partitions.insert(r.Partition);
+  }
+  ctx.Equal(partitions.size(), 1, "one job's history must share a partition to stay in order; the partitions job-1's events landed on");
+}
+
+void CheckCompletedAfterAck(harness::Ctx& ctx) {
+  eventsClaimed(ctx, "job-1", "w-1");
+  ctx.Clock.Advance(61);  // w-1 was too slow: the claim expired and the job went to w-2
+  queue::returnExpired();
+  ctx.Equal(queue::claim("w-2").value_or(""), "job-1", "w-2's claim");
+  const bool done = complete("job-1", "w-1", 61000);
+  eventsSettle(ctx);
+  ctx.Assert(!done, "complete returned true for a claim w-1 no longer holds");
+  ctx.Assert(ctx.Kafka.Records(kTopic).empty(), "w-1 lost its claim, yet it published %d completed event(s): the history says the job finished while w-2 is still running it. Ack first and publish only when the ack succeeded", eventsAll(ctx).size());
+  ctx.Assert(complete("job-1", "w-2", 700), "the worker holding the claim must complete the job");
+  eventsSettle(ctx);
+  const auto all = eventsAll(ctx);
+  ctx.Assert(all.size() == 1 && all[0].value("worker", "") == "w-2", "the completion must be published once, by w-2 (%d records)", all.size());
+}
+
+void CheckOutboxOnRejection(harness::Ctx& ctx) {
+  eventsClaimed(ctx, "job-1", "w-1");
+  ctx.Kafka.FailNext(kTopic, 1);
+  bool done = false;
+  try {
+    done = complete("job-1", "w-1", 840);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("complete threw when the broker refused the record: %s; the event goes to the outbox and the worker goes on", e.what());
+  }
+  eventsSettle(ctx);
+  const auto rows = ctx.Redis.LRange("jobs:outbox", 0, -1);
+  ctx.Equal(rows.size(), 1, "the broker refused the completed event: it must be kept for the relay; outbox rows");
+  const auto row = nlohmann::json::parse(rows.empty() ? "{}" : rows[0], nullptr, false);
+  ctx.Assert(row.value("job_id", "") == "job-1" && row.value("kind", "") == "completed", "the outbox row must be the event itself, got %s", rows.empty() ? "" : rows[0]);
+  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing reached the topic for the refused record; records");
+  ctx.Assert(done && store::getJob("job-1")->state == "completed", "the job is done whatever the broker said: complete returned %t and the job is %s", done, store::getJob("job-1")->state);
+}
+`,
+  },
   hints: [
-    "Support opens a job whose history reads completed, started, enqueued in that order, and a dead-lettered job from last Tuesday's broker incident has no event at all.",
-    '`key=worker` puts a retried attempt on another partition; `record_event` runs before `store.mark_completed`; `except Exception: logger.warning` is where the outbox row should be; two of five transitions have no hook.',
-    'Produce with `key=job_id`; call `mark_completed` and `INSERT INTO job_outbox` in one store call, then produce; add `failed`/`dead_lettered` with `duration_ms`; have `relay_outbox` republish pending rows after an ack.',
+    'Run one job on two workers and read its history from the topic: its events sit on two partitions. Let a claim expire and finish the attempt anyway: a completed event appears while another worker runs the job. Refuse one produce: the event is gone.',
+    "The key is the worker, and the partition follows the key. `complete` produces before it learns whether the ack worked. The `try` around `produce` sees only local errors; the broker's refusal comes back later, in the delivery report.",
+    'Produce with `key=event["job_id"]` and an `on_delivery` callback that calls `store.outbox_add(event)` on an error; in `complete`, return False when `queue.ack(job_id, worker)` does, and publish only after it returned True.',
   ],
-  debrief: `A topic is a log ordered per key, and an event is a claim about something that already happened; the fix follows from both. The job id is the key because a job's history is what must stay ordered, and keying by worker stops preserving that order the moment the pool scales out. \`completed\` follows the effect's commit because the history must not claim what has not happened. The outbox makes the state change and the event one durable fact: the row commits with the state, the produce is an attempt to deliver it, and the relay finishes the job after an outage in the order the rows were written. Production systems also have the consumer store the last applied transition so a replayed partition cannot move a job backwards, and alert when the relay's lag grows.`,
+  debrief: `The key is the job because the history is read per job and Kafka orders records only within a partition; keyed by worker, a job retried on another machine has its events split across partitions. The ack comes first because the event is a statement about committed state: a worker whose claim expired has lost the right to say the job finished, and the ack is where it finds out. The outbox is written from the delivery report because that is where the broker's answer arrives; a \`try\` around \`produce\` catches only a full local queue. Production pipelines write the outbox row in the same transaction as the state change and let a relay drain it, so a crash between the ack and the produce cannot lose the event either.`,
 };

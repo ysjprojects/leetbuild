@@ -1,290 +1,111 @@
 import type {Step} from '@/lib/types';
 
-/**
- * Step 1 — the experiment endpoint. The design of an experiment (variants, split, unit, minimum
- * sample and salt) is a document pinned at creation; a later edit is a new version, not a live
- * mutation, because a user who moved between variants mid-experiment contaminates every number
- * that follows.
- */
-export const experimentEndpointStep: Step = {
+export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/experiments: assignment frozen at start',
+  title: 'POST /v1/experiments: the approved design, frozen',
   concept: 'http',
   file: 'api',
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/experiments\` and \`PATCH /v1/experiments/{id}\`,
-creates experiments from a body like
-\`{"variants": [{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}], "unit": "user", "min_sample": 10000}\`,
-and its 201 looks right for a 50/50 split. It serves the demo and hides 4 flaws.
+**Starting point.** The starter serves the design side of the platform on the experiment store
+(\`expd.store\`, provided): \`POST /v1/experiments\` takes
+\`{name, unit, variants: [{key, weight}], min_sample, salt}\` and answers 201 with the stored
+experiment (version 1, \`running\`, the salt defaulting to the id), and \`PATCH /v1/experiments/{id}\`
+writes its body through \`store.update\`. It serves the demo and hides three flaws.
 
-**Failure mode the checks target.** An unapproved design runs anyway: an unbalanced split is
-reweighted, a misspelt unit randomizes the wrong entity, and a \`PATCH\` moves users between variants
-mid-flight.
+**Failure mode the checks target.** An approved design runs as something else: weights of 60 and
+50 are quietly rescaled to 55/45, a misspelt unit randomizes users instead of sessions, and a
+\`PATCH\` moves the split or the salt of a running experiment, which re-buckets units already counted.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing or empty tenant is **401**.
-- At least **2** variants, with distinct non-empty \`key\`s; anything else is **400**.
-- Every \`weight\` is a non-negative integer and the weights sum to **exactly 100**: 99 or 101 is
-  **400**. Do not normalize.
-- \`unit\` is one of \`user\`, \`session\`, \`account\`; anything else is **400**.
-- \`min_sample\` is an integer \`>= 1\` (**400** otherwise).
-- The \`salt\` is pinned at creation: the caller's if supplied, otherwise generated server-side.
-- Answer **201** echoing the experiment id, \`version\` starting at **1**, the \`salt\`, the pinned
-  split exactly as validated, and \`status: "running"\`.
-- \`PATCH /v1/experiments/{id}\` may only touch \`name\` and \`description\`. A patch that carries
-  \`variants\`, \`unit\`, \`min_sample\` or \`salt\` is **409** with
-  \`{"error": "…frozen…", "required": "new version"}\`: a design change is a new version.
-- Log the creation with the tenant and the experiment id, not the request body.`,
+- The split runs exactly as sent: at least 2 variants, distinct non-empty keys, non-negative integer
+  weights summing to exactly **100**; anything else is **400**.
+- \`unit\` is one of \`UNITS\` (\`user\`, \`session\`, \`account\`); anything else is **400**.
+- \`FROZEN_FIELDS\` are \`variants\`, \`unit\`, \`salt\` and \`min_sample\`: a \`PATCH\` naming one is
+  **409** with \`{"error": …, "required": "new version"}\` and writes nothing; \`name\` stays editable.`,
   sequence: {
     participants: ['Operator', 'Experiment API', 'experiment store'],
     messages: [
-      {from: 'Operator', to: 'Experiment API', label: 'POST /v1/experiments · X-Tenant-Id', kind: 'sync'},
+      {
+        from: 'Operator',
+        to: 'Experiment API',
+        label: 'POST /v1/experiments · variants, unit, min_sample',
+        kind: 'sync',
+      },
       {
         from: 'Experiment API',
         to: 'Experiment API',
-        label: '≥2 variants · weights sum exactly 100 · unit ∈ {user, session, account} · min_sample ≥ 1',
+        label: '≥ 2 variants · weights sum to 100 · unit ∈ UNITS → else 400',
         kind: 'sync',
       },
-      {
-        from: 'Experiment API',
-        to: 'experiment store',
-        label: 'insert design · version=1 · salt · status=running',
-        kind: 'sync',
-      },
-      {from: 'experiment store', to: 'Experiment API', label: 'experiment {id, version, salt}', kind: 'reply'},
-      {
-        from: 'Experiment API',
-        to: 'Operator',
-        label: '201 {id, version: 1, salt, variants, status} · logs tenant + id',
-        kind: 'reply',
-      },
+      {from: 'Experiment API', to: 'experiment store', label: 'create(design) → version 1, running', kind: 'sync'},
+      {from: 'Experiment API', to: 'Operator', label: '201 {id, version, salt, variants, status}', kind: 'reply'},
       {from: 'Operator', to: 'Experiment API', label: 'PATCH /v1/experiments/{id} · {"variants": …}', kind: 'sync'},
-      {from: 'Experiment API', to: 'Experiment API', label: 'design field → frozen, never mutated', kind: 'sync'},
-      {
-        from: 'Experiment API',
-        to: 'Operator',
-        label: '409 {error: "…frozen…", required: "new version"}',
-        kind: 'reply',
-      },
+      {from: 'Experiment API', to: 'Operator', label: '409 {required: "new version"} · nothing written', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Registers create and the design-changing update route',
-      detail:
-        '`POST /v1/experiments` and `PATCH /v1/experiments/{id}` are both registered: an experiment is created through one, and the update route is the one that has to refuse design changes.',
+      title: 'Registers the create and edit routes',
+      detail: 'Register `POST /v1/experiments` and `PATCH /v1/experiments/{id}`.',
       match: {
-        python: {
-          all: [
-            /@app\.post\(\s*["']\/v1\/experiments["']/,
-            /@app\.patch\(\s*["']\/v1\/experiments\/\{experiment_id\}["']/,
-          ],
-        },
-        typescript: {
-          all: [/app\.post\(\s*'\/v1\/experiments'/, /app\.patch\(\s*'\/v1\/experiments\/:id'/],
-        },
-        go: {
-          all: [/HandleFunc\(\s*"POST \/v1\/experiments"/, /HandleFunc\(\s*"PATCH \/v1\/experiments\/\{id\}"/],
-        },
-        scala: {
-          all: [/path\(\s*"v1"\s*\/\s*"experiments"\s*\)/, /\bpost\s*\{/, /\bpatch\s*\{/, /Segment/],
-        },
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/experiments"/, /svr\.Patch\(\s*R?"\(\/v1\/experiments/]},
+        python: {all: [/@app\.post\(\s*["']\/v1\/experiments["']/, /@app\.patch\(\s*["']\/v1\/experiments\/\{/]},
+        typescript: {all: [/app\.post\(\s*['"]\/v1\/experiments['"]/, /app\.patch\(\s*['"]\/v1\/experiments\/:/]},
+        go: {all: [/HandleFunc\(\s*"POST \/v1\/experiments"/, /"PATCH \/v1\/experiments\/\{id\}"/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"experiments"\s*\)/, /\bpatch\s*\{/]},
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/experiments"/, /svr\.Patch\(/]},
       },
     },
     {
-      id: 'variants',
-      title: 'Requires at least 2 variants with distinct non-empty keys',
+      id: 'split',
+      title: 'Refuses a split that is not exactly the one sent',
       detail:
-        'The create path counts the variants against `MIN_VARIANTS` (2) and rejects duplicate or empty `key`s with **400**. The starter never looks at the count, so a one-variant "experiment" is accepted and its whole traffic lands in a single arm that cannot be compared to anything.',
+        'Fewer than 2 variants, repeated or empty keys, a negative weight or weights that do not sum to exactly 100 answer **400** before anything is stored; nothing divides the weights by their total.',
       match: {
-        python: {
-          all: [
-            /MIN_VARIANTS\s*=\s*2/,
-            /def validate_variants\(/,
-            /len\(keys\)\s*!=\s*len\(variants\)/,
-            /status_code\s*=\s*400/,
-          ],
-        },
-        typescript: {
-          all: [
-            /MIN_VARIANTS\s*=\s*2/,
-            /function validateVariants\(/,
-            /keys\.size\s*!==\s*variants\.length/,
-            /HttpError\(\s*400\b/,
-          ],
-        },
-        go: {
-          all: [/minVariants\s*=\s*2/, /func validateVariants\(/, /duplicate variant keys/, /StatusBadRequest/],
-        },
-        scala: {
-          all: [
-            /val MinVariants\s*=\s*2/,
-            /def validateVariants\(/,
-            /map\(_\.key\)\.distinct\.size\s*!=\s*variants\.size/,
-            /StatusCodes\.BadRequest/,
-          ],
-        },
-        cpp: {
-          all: [/kMinVariants = 2/, /validate_variants\(/, /duplicate variant keys/, /\b400\b/],
-        },
+        python: {all: [/!=\s*100\b/, /<\s*2\b/], none: [/\/\s*total\b/]},
+        typescript: {all: [/!==?\s*100\b/, /<\s*2\b/], none: [/\/\s*total\b/]},
+        go: {all: [/!=\s*100\b/, /<\s*2\b/], none: [/\/\s*float64\(total\)/]},
+        scala: {all: [/!=\s*100\b/, /<\s*2\b/], none: [/\/\s*total\b/]},
+        cpp: {all: [/!=\s*100\b/, /<\s*2\b/], none: [/\/\s*total\b/]},
       },
     },
     {
-      id: 'split-exact',
-      title: 'Weights must sum to exactly 100 and are rejected, not normalized',
-      detail:
-        'The weights are validated as non-negative integers whose sum is compared against `SPLIT_TOTAL` (100) and a split that sums to 99 or 101 answers **400**. The starter divides by `sum(...) or 1` instead, so an unapproved split is silently reweighted and the experiment that runs is not the experiment that was asked for.',
+      id: 'unit',
+      title: 'Refuses an assignment unit outside UNITS',
+      detail: 'A `unit` that is not `user`, `session` or `account` answers **400**; nothing falls back to `user`.',
       match: {
-        python: {
-          all: [
-            /SPLIT_TOTAL\s*=\s*100/,
-            /def validate_split\(/,
-            /sum\(variant\.weight for variant in variants\)\s*!=\s*SPLIT_TOTAL/,
-            /status_code\s*=\s*400/,
-          ],
-          none: [/sum\([^\n]*\)\s*or\s+1/],
-        },
-        typescript: {
-          all: [
-            /SPLIT_TOTAL\s*=\s*100/,
-            /function validateSplit\(/,
-            /total\s*!==\s*SPLIT_TOTAL/,
-            /HttpError\(\s*400\b/,
-          ],
-          none: [/reduce\([^\n]*\)\s*\|\|\s*1/],
-        },
-        go: {
-          all: [/splitTotal\s*=\s*100/, /func validateSplit\(/, /total\s*!=\s*splitTotal/, /StatusBadRequest/],
-          none: [/float64\(total\)/],
-        },
-        scala: {
-          all: [
-            /val SplitTotal\s*=\s*100/,
-            /def validateSplit\(/,
-            /map\(_\.weight\)\.sum\s*!=\s*SplitTotal/,
-            /StatusCodes\.BadRequest/,
-          ],
-          none: [/safeTotal/],
-        },
-        cpp: {
-          all: [/kSplitTotal = 100/, /validate_split\(/, /total != kSplitTotal/, /\b400\b/],
-          none: [/std::max\(\s*total\s*,\s*1\s*\)/],
-        },
+        python: {all: [/not in UNITS/], none: [/else\s*["']user["']/]},
+        typescript: {all: [/!UNITS\.includes\(/], none: [/:\s*['"]user['"]/]},
+        go: {all: [/!units\[/], none: [/\.Unit\s*=\s*"user"/]},
+        scala: {all: [/!Units\.contains\(/], none: [/else\s*"user"/]},
+        cpp: {all: [/!kUnits\.count\(/], none: [/\.unit\s*=\s*"user"/]},
       },
     },
     {
-      id: 'unit-frozen',
-      title: 'Unit is restricted to the allowed set and frozen after launch',
+      id: 'frozen-design',
+      title: 'A design change is a new version: 409',
       detail:
-        'Create validates `unit` against the allowed set (**400**), and the update path treats a `unit` in the `PATCH` body as a design change (**409**). The starter takes any string as the unit and overwrites it in place on `PATCH`, so a typo silently re-randomizes a different entity than the one the analysis assumes.',
+        'A `PATCH` whose body names one of `FROZEN_FIELDS` (`variants`, `unit`, `salt`, `min_sample`) answers **409** with `"required": "new version"` and writes nothing; a `name` edit still goes through.',
       match: {
-        python: {
-          all: [
-            /UNITS\s*=\s*\{/,
-            /def validate_unit\(/,
-            /status_code\s*=\s*400/,
-            /patch\.unit is not None/,
-            /status_code\s*=\s*409/,
-          ],
-        },
-        typescript: {
-          all: [
-            /const UNITS\s*:/,
-            /function validateUnit\(/,
-            /HttpError\(\s*400\b/,
-            /patch\.unit\s*!==\s*undefined/,
-            /code\(\s*409\s*\)/,
-          ],
-        },
-        go: {
-          all: [
-            /var allowedUnits = map\[string\]bool\{/,
-            /func validateUnit\(/,
-            /StatusBadRequest/,
-            /patch\.Unit != nil/,
-            /StatusConflict/,
-          ],
-        },
-        scala: {
-          all: [
-            /val AllowedUnits = Set\(/,
-            /def validateUnit\(/,
-            /StatusCodes\.BadRequest/,
-            /patch\.unit\.isDefined/,
-            /StatusCodes\.Conflict/,
-          ],
-        },
-        cpp: {
-          all: [/kAllowedUnits = \{/, /validate_unit\(/, /\b400\b/, /body\.contains\("unit"\)/, /\b409\b/],
-        },
-      },
-    },
-    {
-      id: 'new-version',
-      title: 'A design change is 409 and demands a new version',
-      detail:
-        'A `PATCH` that carries `variants`, `unit`, `min_sample` or `salt` answers **409** with an error naming the frozen design and `required: "new version"`, so the live experiment is never mutated. The starter re-writes `weights` and `unit` of the running experiment and returns 200, which is exactly the incident this step exists for.',
-      match: {
-        python: {
-          all: [
-            /SPLIT_FROZEN\s*=\s*"[^"]*frozen[^"]*"/,
-            /REQUIRED_NEW_VERSION\s*=\s*"new version"/,
-            /status_code\s*=\s*409/,
-            /"required":\s*REQUIRED_NEW_VERSION/,
-          ],
-        },
-        typescript: {
-          all: [
-            /const SPLIT_FROZEN\s*=\s*'[^']*frozen[^']*'/,
-            /const REQUIRED_NEW_VERSION\s*=\s*'new version'/,
-            /code\(\s*409\s*\)/,
-            /required:\s*REQUIRED_NEW_VERSION/,
-          ],
-        },
-        go: {
-          all: [
-            /splitFrozen\s*=\s*"[^"]*frozen[^"]*"/,
-            /requiredNewVersion\s*=\s*"new version"/,
-            /StatusConflict/,
-            /"required":\s*requiredNewVersion/,
-          ],
-        },
-        scala: {
-          all: [
-            /val SplitFrozen\s*=\s*"[^"]*frozen[^"]*"/,
-            /val RequiredNewVersion\s*=\s*"new version"/,
-            /StatusCodes\.Conflict/,
-            /"required":"\$RequiredNewVersion"/,
-          ],
-        },
-        cpp: {
-          all: [
-            /kSplitFrozen = "[^"]*frozen[^"]*"/,
-            /kRequiredNewVersion = "new version"/,
-            /\b409\b/,
-            /\{"required", kRequiredNewVersion\}/,
-          ],
-        },
+        python: {all: [/FROZEN_FIELDS/, /\b409\b/, /new version/]},
+        typescript: {all: [/FROZEN_FIELDS/, /\b409\b/, /new version/]},
+        go: {all: [/frozenFields/, /StatusConflict|\b409\b/, /new version/]},
+        scala: {all: [/FrozenFields/, /Conflict|\b409\b/, /new version/]},
+        cpp: {all: [/kFrozenFields/, /\b409\b/, /new version/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""api.py — a first version of the experiment endpoint."""
-import logging
-import uuid
-
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("expd")
+from expd import store  # create, get, update
 
-EXPERIMENTS: dict[str, dict] = {}
+app = FastAPI()
+
+UNITS = ("user", "session", "account")
 
 
 class Variant(BaseModel):
@@ -292,71 +113,39 @@ class Variant(BaseModel):
     weight: int
 
 
-class ExperimentDesign(BaseModel):
-    variants: list[Variant]
+class ExperimentCreate(BaseModel):
+    name: str
     unit: str
-    min_sample: int
+    variants: list[Variant]
+    min_sample: int = 1000
     salt: str | None = None
 
 
-def split_shares(variants: list[Variant]) -> list[dict]:
-    total = sum(variant.weight for variant in variants) or 1
-    return [{"key": variant.key, "weight": round(variant.weight * 100 / total, 2)} for variant in variants]
-
-
-# TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-
-
-@app.post("/v1/experiments")
-def create_experiment(
-    body: ExperimentDesign, tenant: str = Header(alias="X-Tenant-Id")
-) -> JSONResponse:
-    experiment = {
-        "id": uuid.uuid4().hex,
-        "tenant_id": tenant,
-        "variants": split_shares(body.variants),
-        "unit": body.unit,
-        "min_sample": body.min_sample,
-        "salt": body.salt or uuid.uuid4().hex,
-        "version": 1,
-        "status": "running",
-    }
-    EXPERIMENTS[experiment["id"]] = experiment
-    logger.info("experiment created: %s", body.model_dump())
-    return JSONResponse(experiment, status_code=201)
+@app.post("/v1/experiments", status_code=201)
+def create_experiment(body: ExperimentCreate) -> dict:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    total = sum(v.weight for v in body.variants) or 1
+    variants = [{"key": v.key, "weight": round(v.weight * 100 / total)} for v in body.variants]
+    unit = body.unit if body.unit in UNITS else "user"
+    return store.create({"name": body.name, "unit": unit, "variants": variants, "min_sample": body.min_sample, "salt": body.salt})
 
 
 @app.patch("/v1/experiments/{experiment_id}")
-def update_experiment(experiment_id: str, body: ExperimentDesign) -> JSONResponse:
-    experiment = EXPERIMENTS[experiment_id]
-    experiment["variants"] = split_shares(body.variants)
-    experiment["unit"] = body.unit
-    return JSONResponse(experiment, status_code=200)
+async def edit_experiment(experiment_id: str, request: Request) -> dict:
+    if store.get(experiment_id) is None:
+        raise HTTPException(status_code=404, detail="no such experiment")
+    return store.update(experiment_id, await request.json())
 `,
-      solution: `"""POST /v1/experiments · PATCH /v1/experiments/{id}.
-
-The design — variants, split, unit, min_sample and the salt — is pinned when the experiment starts.
-A later design change is a new version, never a live mutation of the running experiment.
-"""
-
-import logging
-import uuid
-
-from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("expd")
+from expd import store  # create, get, update
 
-MIN_VARIANTS = 2
-SPLIT_TOTAL = 100
-MIN_SAMPLE_FLOOR = 1
-INITIAL_VERSION = 1
-RUNNING = "running"
-UNITS = {"user", "session", "account"}
-SPLIT_FROZEN = "the split, unit, min_sample and salt are frozen at start"
-REQUIRED_NEW_VERSION = "new version"
+app = FastAPI()
+
+UNITS = ("user", "session", "account")
+FROZEN_FIELDS = ("variants", "unit", "salt", "min_sample")
 
 
 class Variant(BaseModel):
@@ -364,1187 +153,932 @@ class Variant(BaseModel):
     weight: int
 
 
-class ExperimentDesign(BaseModel):
-    variants: list[Variant]
+class ExperimentCreate(BaseModel):
+    name: str
     unit: str
-    min_sample: int
+    variants: list[Variant]
+    min_sample: int = 1000
     salt: str | None = None
 
 
-class ExperimentPatch(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    variants: list[Variant] | None = None
-    unit: str | None = None
-    min_sample: int | None = None
-    salt: str | None = None
+def split_problem(variants: list[Variant]) -> str | None:
+    """Why the split cannot run exactly as sent, or None."""
+    if len(variants) < 2:
+        return "an experiment needs at least 2 variants"
+    keys = [v.key for v in variants]
+    if "" in keys or len(set(keys)) != len(keys):
+        return "variant keys must be distinct and non-empty"
+    if any(v.weight < 0 for v in variants):
+        return "weights must not be negative"
+    total = sum(v.weight for v in variants)
+    if total != 100:
+        return f"weights sum to {total}, not 100"
+    return None
 
 
-class ExperimentStore:
-    """Persistence seam; the state step adds the Redis assignment cache on top of it."""
-
-    def insert(self, experiment: dict) -> dict:
-        """Persist the experiment with its pinned design and return it."""
-        raise NotImplementedError
-
-    def get(self, tenant: str, experiment_id: str) -> dict | None:
-        """The experiment with this id when it belongs to this tenant."""
-        raise NotImplementedError
-
-    def save_cosmetic(self, experiment: dict) -> None:
-        """Persist a name/description-only update."""
-        raise NotImplementedError
-
-
-store = ExperimentStore()
-
-
-def require_tenant(tenant: str | None) -> str:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    return tenant
-
-
-def validate_variants(variants: list[Variant]) -> None:
-    if len(variants) < MIN_VARIANTS:
-        raise HTTPException(status_code=400, detail=f"at least {MIN_VARIANTS} variants are required")
-    keys = {variant.key for variant in variants}
-    if len(keys) != len(variants):
-        raise HTTPException(status_code=400, detail="duplicate variant keys")
-    if any(key == "" for key in keys):
-        raise HTTPException(status_code=400, detail="variant keys must be non-empty")
-
-
-def validate_split(variants: list[Variant]) -> None:
-    for variant in variants:
-        if isinstance(variant.weight, bool) or not isinstance(variant.weight, int) or variant.weight < 0:
-            raise HTTPException(status_code=400, detail="every weight must be a non-negative integer")
-    if sum(variant.weight for variant in variants) != SPLIT_TOTAL:
-        raise HTTPException(status_code=400, detail=f"weights must sum to exactly {SPLIT_TOTAL}")
-
-
-def validate_unit(unit: str) -> None:
-    if unit not in UNITS:
-        raise HTTPException(status_code=400, detail="unit must be one of user, session, account")
-
-
-def validate_min_sample(min_sample: int) -> None:
-    if isinstance(min_sample, bool) or not isinstance(min_sample, int) or min_sample < MIN_SAMPLE_FLOOR:
-        raise HTTPException(status_code=400, detail="min_sample must be an integer >= 1")
-
-
-def validate_design(body: ExperimentDesign) -> None:
-    validate_variants(body.variants)
-    validate_split(body.variants)
-    validate_unit(body.unit)
-    validate_min_sample(body.min_sample)
-
-
-def carries_design(patch: ExperimentPatch) -> bool:
-    return (
-        patch.variants is not None
-        or patch.unit is not None
-        or patch.min_sample is not None
-        or patch.salt is not None
-    )
-
-
-@app.post("/v1/experiments")
-def create_experiment(
-    body: ExperimentDesign, tenant: str | None = Header(default=None, alias="X-Tenant-Id")
-) -> JSONResponse:
-    tenant_id = require_tenant(tenant)
-    validate_design(body)
-    experiment = {
-        "id": uuid.uuid4().hex,
-        "tenant_id": tenant_id,
-        "name": "",
-        "description": "",
-        "variants": [{"key": variant.key, "weight": variant.weight} for variant in body.variants],
-        "unit": body.unit,
-        "min_sample": body.min_sample,
-        "salt": body.salt or uuid.uuid4().hex,
-        "version": INITIAL_VERSION,
-        "status": RUNNING,
-    }
-    store.insert(experiment)
-    logger.info("experiment created tenant=%s id=%s", tenant_id, experiment["id"])
-    return JSONResponse(experiment, status_code=201)
+@app.post("/v1/experiments", status_code=201)
+def create_experiment(body: ExperimentCreate) -> dict:
+    # The design runs as approved or not at all: nothing is rescaled or defaulted.
+    problem = split_problem(body.variants)
+    if problem is not None:
+        raise HTTPException(status_code=400, detail=problem)
+    if body.unit not in UNITS:
+        raise HTTPException(status_code=400, detail=f"unit must be one of {', '.join(UNITS)}")
+    variants = [{"key": v.key, "weight": v.weight} for v in body.variants]
+    return store.create({"name": body.name, "unit": body.unit, "variants": variants, "min_sample": body.min_sample, "salt": body.salt})
 
 
 @app.patch("/v1/experiments/{experiment_id}")
-def update_experiment(
-    experiment_id: str,
-    body: ExperimentPatch,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    tenant_id = require_tenant(tenant)
-    experiment = store.get(tenant_id, experiment_id)
-    if experiment is None:
-        raise HTTPException(status_code=404, detail="unknown experiment")
-    if carries_design(body):
-        raise HTTPException(
-            status_code=409,
-            detail={"error": SPLIT_FROZEN, "required": REQUIRED_NEW_VERSION},
-        )
-    if body.name is not None:
-        experiment["name"] = body.name
-    if body.description is not None:
-        experiment["description"] = body.description
-    store.save_cosmetic(experiment)
-    logger.info("experiment updated tenant=%s id=%s", tenant_id, experiment_id)
-    return JSONResponse(experiment, status_code=200)
+async def edit_experiment(experiment_id: str, request: Request):
+    if store.get(experiment_id) is None:
+        raise HTTPException(status_code=404, detail="no such experiment")
+    fields = await request.json()
+    frozen = [name for name in FROZEN_FIELDS if name in fields]
+    if frozen:
+        return JSONResponse(status_code=409, content={"error": f"{frozen[0]} is frozen while the experiment exists", "required": "new version"})
+    return store.update(experiment_id, {"name": fields["name"]} if "name" in fields else {})
 `,
     },
     typescript: {
-      starter: `/** api.ts — a first version of the experiment endpoint. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
-
-export const app = Fastify();
-
-interface Variant {
-  key: string;
-  weight: number;
-}
-
-interface ExperimentDesign {
-  variants: Variant[];
-  unit: string;
-  min_sample: number;
-  salt?: string;
-}
-
-interface Experiment extends ExperimentDesign {
-  id: string;
-  version: number;
-  status: string;
-}
-
-const experiments = new Map<string, Experiment>();
-
-// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-
-app.post('/v1/experiments', async (request, reply) => {
-  const body = request.body as ExperimentDesign;
-  const total = body.variants.reduce((sum, variant) => sum + variant.weight, 0) || 1;
-  const split = body.variants.map(variant => ({key: variant.key, weight: (variant.weight * 100) / total}));
-  const experiment: Experiment = {
-    id: randomUUID(),
-    variants: split,
-    unit: body.unit,
-    min_sample: body.min_sample,
-    salt: body.salt ?? randomUUID(),
-    version: 1,
-    status: 'running',
-  };
-  experiments.set(experiment.id, experiment);
-  request.log.info({tenant: request.headers['x-tenant-id'], body}, 'experiment created');
-  return reply.code(201).send(experiment);
-});
-
-app.patch('/v1/experiments/:id', async (request, reply) => {
-  const {id} = request.params as {id: string};
-  const body = request.body as Partial<ExperimentDesign>;
-  const experiment = experiments.get(id)!;
-  if (body.variants !== undefined) experiment.variants = body.variants;
-  if (body.unit !== undefined) experiment.unit = body.unit;
-  return reply.code(200).send(experiment);
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** POST /v1/experiments · PATCH /v1/experiments/:id.
-
-The design — variants, split, unit, min_sample and the salt — is pinned when the experiment starts.
-A later design change is a new version, never a live mutation of the running experiment.
- */
-import {randomUUID} from 'node:crypto';
-
-import Fastify from 'fastify';
+import {type Variant, create, get, update} from 'expd/store';
 
 export const app = Fastify();
 
-const MIN_VARIANTS = 2;
-const SPLIT_TOTAL = 100;
-const MIN_SAMPLE_FLOOR = 1;
-const INITIAL_VERSION = 1;
-const RUNNING = 'running';
-const UNITS: Record<string, true> = {user: true, session: true, account: true};
-const SPLIT_FROZEN = 'the split, unit, min_sample and salt are frozen at start';
-const REQUIRED_NEW_VERSION = 'new version';
+export const UNITS = ['user', 'session', 'account'];
 
-interface Variant {
-  key: string;
-  weight: number;
-}
-
-interface ExperimentDesign {
-  variants: Variant[];
-  unit: string;
-  min_sample: number;
-  salt?: string;
-}
-
-interface ExperimentPatch {
-  name?: string;
-  description?: string;
-  variants?: Variant[];
-  unit?: string;
-  min_sample?: number;
-  salt?: string;
-}
-
-interface Experiment {
-  id: string;
-  tenant_id: string;
+interface ExperimentBody {
   name: string;
-  description: string;
-  variants: Variant[];
   unit: string;
-  min_sample: number;
-  salt: string;
-  version: number;
-  status: string;
+  variants: Variant[];
+  min_sample?: number;
+  salt?: string | null;
 }
-
-class ExperimentStore {
-  async insert(experiment: Experiment): Promise<Experiment> {
-    return experiment;
-  }
-
-  async get(_tenant: string, _id: string): Promise<Experiment | null> {
-    return null;
-  }
-
-  async saveCosmetic(_experiment: Experiment): Promise<void> {}
-}
-
-const store = new ExperimentStore();
-
-class HttpError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-  ) {
-    super(message);
-  }
-}
-
-function requireTenant(tenant: unknown): string {
-  if (typeof tenant !== 'string' || tenant === '') throw new HttpError(401, 'missing X-Tenant-Id');
-  return tenant;
-}
-
-function validateVariants(variants: Variant[]): void {
-  if (variants.length < MIN_VARIANTS) throw new HttpError(400, \`at least \${MIN_VARIANTS} variants are required\`);
-  const keys = new Set(variants.map(variant => variant.key));
-  if (keys.size !== variants.length) throw new HttpError(400, 'duplicate variant keys');
-  if ([...keys].some(key => key === '')) throw new HttpError(400, 'variant keys must be non-empty');
-}
-
-function validateSplit(variants: Variant[]): void {
-  if (variants.some(variant => !Number.isInteger(variant.weight) || variant.weight < 0))
-    throw new HttpError(400, 'every weight must be a non-negative integer');
-  const total = variants.reduce((sum, variant) => sum + variant.weight, 0);
-  if (total !== SPLIT_TOTAL) throw new HttpError(400, \`weights must sum to exactly \${SPLIT_TOTAL}\`);
-}
-
-function validateUnit(unit: string): void {
-  if (UNITS[unit] !== true) throw new HttpError(400, 'unit must be one of user, session, account');
-}
-
-function validateMinSample(minSample: number): void {
-  if (!Number.isInteger(minSample) || minSample < MIN_SAMPLE_FLOOR)
-    throw new HttpError(400, 'min_sample must be an integer >= 1');
-}
-
-function validateDesign(body: ExperimentDesign): void {
-  validateVariants(body.variants);
-  validateSplit(body.variants);
-  validateUnit(body.unit);
-  validateMinSample(body.min_sample);
-}
-
-function carriesDesign(patch: ExperimentPatch): boolean {
-  return (
-    patch.variants !== undefined ||
-    patch.unit !== undefined ||
-    patch.min_sample !== undefined ||
-    patch.salt !== undefined
-  );
-}
-
-app.setErrorHandler((error, request, reply) => {
-  if (error instanceof HttpError) return reply.code(error.status).send({error: error.message});
-  request.log.error({err: error}, 'experiment request failed');
-  return reply.code(500).send({error: 'internal error'});
-});
 
 app.post('/v1/experiments', async (request, reply) => {
-  const tenant = requireTenant(request.headers['x-tenant-id']);
-  const body = (request.body ?? {}) as ExperimentDesign;
-  validateDesign(body);
-  const experiment: Experiment = {
-    id: randomUUID(),
-    tenant_id: tenant,
-    name: '',
-    description: '',
-    variants: body.variants.map(variant => ({key: variant.key, weight: variant.weight})),
-    unit: body.unit,
-    min_sample: body.min_sample,
-    salt: body.salt !== undefined && body.salt !== '' ? body.salt : randomUUID(),
-    version: INITIAL_VERSION,
-    status: RUNNING,
-  };
-  await store.insert(experiment);
-  request.log.info({tenant, id: experiment.id}, 'experiment created');
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const body = request.body as ExperimentBody;
+  const total = body.variants.reduce((sum, v) => sum + v.weight, 0) || 1;
+  const variants = body.variants.map(v => ({key: v.key, weight: Math.round((v.weight * 100) / total)}));
+  const unit = UNITS.includes(body.unit) ? body.unit : 'user';
+  const experiment = await create({name: body.name, unit, variants, min_sample: body.min_sample ?? 1000, salt: body.salt});
   return reply.code(201).send(experiment);
 });
 
 app.patch('/v1/experiments/:id', async (request, reply) => {
-  const tenant = requireTenant(request.headers['x-tenant-id']);
   const {id} = request.params as {id: string};
-  const experiment = await store.get(tenant, id);
-  if (experiment === null) throw new HttpError(404, 'unknown experiment');
-  const body = (request.body ?? {}) as ExperimentPatch;
-  if (carriesDesign(body))
-    return reply.code(409).send({error: SPLIT_FROZEN, required: REQUIRED_NEW_VERSION});
-  if (body.name !== undefined) experiment.name = body.name;
-  if (body.description !== undefined) experiment.description = body.description;
-  await store.saveCosmetic(experiment);
-  request.log.info({tenant, id}, 'experiment updated');
-  return reply.code(200).send(experiment);
+  if ((await get(id)) === null) return reply.code(404).send({error: 'no such experiment'});
+  return update(id, request.body as Record<string, unknown>);
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {type Variant, create, get, update} from 'expd/store';
+
+export const app = Fastify();
+
+export const UNITS = ['user', 'session', 'account'];
+export const FROZEN_FIELDS = ['variants', 'unit', 'salt', 'min_sample'];
+
+interface ExperimentBody {
+  name: string;
+  unit: string;
+  variants: Variant[];
+  min_sample?: number;
+  salt?: string | null;
+}
+
+/** Why the split cannot run exactly as sent, or null. */
+function splitProblem(variants: Variant[]): string | null {
+  if (!Array.isArray(variants) || variants.length < 2) return 'an experiment needs at least 2 variants';
+  const keys = variants.map(v => v.key);
+  if (keys.some(k => typeof k !== 'string' || k === '') || new Set(keys).size !== keys.length) return 'variant keys must be distinct and non-empty';
+  if (variants.some(v => !Number.isInteger(v.weight) || v.weight < 0)) return 'weights must be non-negative integers';
+  const sum = variants.reduce((acc, v) => acc + v.weight, 0);
+  if (sum !== 100) return \`weights sum to \${sum}, not 100\`;
+  return null;
+}
+
+app.post('/v1/experiments', async (request, reply) => {
+  const body = request.body as ExperimentBody;
+  // The design runs as approved or not at all: nothing is rescaled or defaulted.
+  const problem = splitProblem(body.variants);
+  if (problem !== null) return reply.code(400).send({error: problem});
+  if (!UNITS.includes(body.unit)) return reply.code(400).send({error: \`unit must be one of \${UNITS.join(', ')}\`});
+  const variants = body.variants.map(v => ({key: v.key, weight: v.weight}));
+  const experiment = await create({name: body.name, unit: body.unit, variants, min_sample: body.min_sample ?? 1000, salt: body.salt});
+  return reply.code(201).send(experiment);
 });
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.patch('/v1/experiments/:id', async (request, reply) => {
+  const {id} = request.params as {id: string};
+  if ((await get(id)) === null) return reply.code(404).send({error: 'no such experiment'});
+  const fields = request.body as Record<string, unknown>;
+  const frozen = FROZEN_FIELDS.find(name => name in fields);
+  if (frozen !== undefined) return reply.code(409).send({error: \`\${frozen} is frozen while the experiment exists\`, required: 'new version'});
+  return update(id, 'name' in fields ? {name: fields.name} : {});
+});
 `,
     },
     go: {
-      starter: `// api.go — a first version of the experiment endpoint.
-package main
+      starter: `package main
 
 import (
 	"encoding/json"
-	"log"
+	"math"
 	"net/http"
 
-	"github.com/google/uuid"
+	"expd/store" // store.Create, Get, Update
 )
 
-type Variant struct {
-	Key    string \`json:"key"\`
-	Weight int    \`json:"weight"\`
-}
+var units = map[string]bool{"user": true, "session": true, "account": true}
 
-type Split struct {
-	Key    string  \`json:"key"\`
-	Weight float64 \`json:"weight"\`
-}
-
-type Experiment struct {
-	ID        string  \`json:"id"\`
-	TenantID  string  \`json:"tenant_id"\`
-	Variants  []Split \`json:"variants"\`
-	Unit      string  \`json:"unit"\`
-	MinSample int     \`json:"min_sample"\`
-	Salt      string  \`json:"salt"\`
-	Version   int     \`json:"version"\`
-	Status    string  \`json:"status"\`
-}
-
-var experiments = map[string]Experiment{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-
 func createExperiment(rw http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Variants  []Variant \`json:"variants"\`
-		Unit      string    \`json:"unit"\`
-		MinSample int       \`json:"min_sample"\`
-		Salt      string    \`json:"salt"\`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	design := store.Design{MinSample: 1000}
+	if err := json.NewDecoder(r.Body).Decode(&design); err != nil {
+		http.Error(rw, "malformed design", http.StatusBadRequest)
 		return
 	}
 	total := 0
-	for _, variant := range body.Variants {
-		total += variant.Weight
+	for _, v := range design.Variants {
+		total += v.Weight
 	}
 	if total == 0 {
 		total = 1
 	}
-	split := make([]Split, 0, len(body.Variants))
-	for _, variant := range body.Variants {
-		split = append(split, Split{Key: variant.Key, Weight: float64(variant.Weight) * 100 / float64(total)})
+	for i := range design.Variants {
+		design.Variants[i].Weight = int(math.Round(float64(design.Variants[i].Weight) * 100 / float64(total)))
 	}
-	salt := body.Salt
-	if salt == "" {
-		salt = uuid.NewString()
+	if !units[design.Unit] {
+		design.Unit = "user"
 	}
-	experiment := Experiment{
-		ID:        uuid.NewString(),
-		TenantID:  r.Header.Get("X-Tenant-Id"),
-		Variants:  split,
-		Unit:      body.Unit,
-		MinSample: body.MinSample,
-		Salt:      salt,
-		Version:   1,
-		Status:    "running",
-	}
-	experiments[experiment.ID] = experiment
-	log.Printf("experiment created: %+v", body)
-	writeJSON(rw, http.StatusCreated, experiment)
+	writeJSON(rw, http.StatusCreated, store.Create(r.Context(), design))
 }
 
-func updateExperiment(rw http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Variants  []Variant \`json:"variants"\`
-		Unit      string    \`json:"unit"\`
-		MinSample int       \`json:"min_sample"\`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+func editExperiment(rw http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if store.Get(r.Context(), id) == nil {
+		http.Error(rw, "no such experiment", http.StatusNotFound)
 		return
 	}
-	experiment := experiments[r.PathValue("id")]
-	experiment.Unit = body.Unit
-	experiment.MinSample = body.MinSample
-	experiments[experiment.ID] = experiment
+	fields := map[string]any{}
+	json.NewDecoder(r.Body).Decode(&fields)
+	experiment, err := store.Update(r.Context(), id, fields)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusNotFound)
+		return
+	}
 	writeJSON(rw, http.StatusOK, experiment)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/experiments", createExperiment)
-	mux.HandleFunc("PATCH /v1/experiments/{id}", updateExperiment)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	mux.HandleFunc("PATCH /v1/experiments/{id}", editExperiment)
 }
 `,
-      solution: `// POST /v1/experiments · PATCH /v1/experiments/{id}.
-//
-// The design — variants, split, unit, min_sample and the salt — is pinned when the experiment
-// starts. A later design change is a new version, never a live mutation of the running experiment.
-package main
+      solution: `package main
 
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 
-	"github.com/google/uuid"
+	"expd/store" // store.Create, Get, Update
 )
 
-const (
-	minVariants    = 2
-	splitTotal     = 100
-	minSampleFloor = 1
-	initialVersion = 1
-	running        = "running"
-)
+var units = map[string]bool{"user": true, "session": true, "account": true}
 
-const (
-	splitFrozen        = "the split, unit, min_sample and salt are frozen at start"
-	requiredNewVersion = "new version"
-)
+var frozenFields = []string{"variants", "unit", "salt", "min_sample"}
 
-var allowedUnits = map[string]bool{"user": true, "session": true, "account": true}
-
-type Variant struct {
-	Key    string \`json:"key"\`
-	Weight int    \`json:"weight"\`
-}
-
-type ExperimentDesign struct {
-	Variants  []Variant \`json:"variants"\`
-	Unit      string    \`json:"unit"\`
-	MinSample int       \`json:"min_sample"\`
-	Salt      string    \`json:"salt"\`
-}
-
-type ExperimentPatch struct {
-	Name        *string   \`json:"name"\`
-	Description *string   \`json:"description"\`
-	Variants    []Variant \`json:"variants"\`
-	Unit        *string   \`json:"unit"\`
-	MinSample   *int      \`json:"min_sample"\`
-	Salt        *string   \`json:"salt"\`
-}
-
-type Experiment struct {
-	ID          string    \`json:"id"\`
-	TenantID    string    \`json:"tenant_id"\`
-	Name        string    \`json:"name"\`
-	Description string    \`json:"description"\`
-	Variants    []Variant \`json:"variants"\`
-	Unit        string    \`json:"unit"\`
-	MinSample   int       \`json:"min_sample"\`
-	Salt        string    \`json:"salt"\`
-	Version     int       \`json:"version"\`
-	Status      string    \`json:"status"\`
-}
-
-// ExperimentStore is implemented by the state step, which adds the Redis assignment cache on top.
-type ExperimentStore struct{}
-
-func (s *ExperimentStore) Insert(experiment Experiment) (Experiment, error) {
-	return experiment, nil
-}
-
-func (s *ExperimentStore) Get(tenant, id string) (Experiment, bool, error) {
-	return Experiment{}, false, nil
-}
-
-func (s *ExperimentStore) SaveCosmetic(experiment Experiment) error {
-	return nil
-}
-
-var store = &ExperimentStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func validateVariants(variants []Variant) string {
-	if len(variants) < minVariants {
-		return fmt.Sprintf("at least %d variants are required", minVariants)
+// splitProblem says why the split cannot run exactly as sent, or "".
+func splitProblem(variants []store.Variant) string {
+	if len(variants) < 2 {
+		return "an experiment needs at least 2 variants"
 	}
-	keys := map[string]bool{}
-	for _, variant := range variants {
-		if variant.Key == "" {
-			return "variant keys must be non-empty"
+	seen := map[string]bool{}
+	sum := 0
+	for _, v := range variants {
+		if v.Key == "" || seen[v.Key] {
+			return "variant keys must be distinct and non-empty"
 		}
-		if keys[variant.Key] {
-			return "duplicate variant keys"
+		seen[v.Key] = true
+		if v.Weight < 0 {
+			return "weights must not be negative"
 		}
-		keys[variant.Key] = true
+		sum += v.Weight
+	}
+	if sum != 100 {
+		return fmt.Sprintf("weights sum to %d, not 100", sum)
 	}
 	return ""
-}
-
-func validateSplit(variants []Variant) string {
-	total := 0
-	for _, variant := range variants {
-		if variant.Weight < 0 {
-			return "every weight must be a non-negative integer"
-		}
-		total += variant.Weight
-	}
-	if total != splitTotal {
-		return fmt.Sprintf("weights must sum to exactly %d", splitTotal)
-	}
-	return ""
-}
-
-func validateUnit(unit string) string {
-	if !allowedUnits[unit] {
-		return "unit must be one of user, session, account"
-	}
-	return ""
-}
-
-func validateMinSample(minSample int) string {
-	if minSample < minSampleFloor {
-		return "min_sample must be an integer >= 1"
-	}
-	return ""
-}
-
-func validateDesign(design ExperimentDesign) string {
-	for _, problem := range []string{
-		validateVariants(design.Variants),
-		validateSplit(design.Variants),
-		validateUnit(design.Unit),
-		validateMinSample(design.MinSample),
-	} {
-		if problem != "" {
-			return problem
-		}
-	}
-	return ""
-}
-
-func carriesDesign(patch ExperimentPatch) bool {
-	return patch.Variants != nil || patch.Unit != nil || patch.MinSample != nil || patch.Salt != nil
 }
 
 func createExperiment(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	design := store.Design{MinSample: 1000}
+	if err := json.NewDecoder(r.Body).Decode(&design); err != nil {
+		http.Error(rw, "malformed design", http.StatusBadRequest)
 		return
 	}
-	var body ExperimentDesign
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	if problem := validateDesign(body); problem != "" {
+	// The design runs as approved or not at all: nothing is rescaled or defaulted.
+	if problem := splitProblem(design.Variants); problem != "" {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": problem})
 		return
 	}
-	salt := body.Salt
-	if salt == "" {
-		salt = uuid.NewString()
-	}
-	experiment := Experiment{
-		ID:        uuid.NewString(),
-		TenantID:  tenant,
-		Variants:  body.Variants,
-		Unit:      body.Unit,
-		MinSample: body.MinSample,
-		Salt:      salt,
-		Version:   initialVersion,
-		Status:    running,
-	}
-	saved, err := store.Insert(experiment)
-	if err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "store unavailable"})
+	if !units[design.Unit] {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unit must be one of user, session, account"})
 		return
 	}
-	log.Printf("experiment created tenant=%s id=%s", tenant, saved.ID)
-	writeJSON(rw, http.StatusCreated, saved)
+	writeJSON(rw, http.StatusCreated, store.Create(r.Context(), design))
 }
 
-func updateExperiment(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+func editExperiment(rw http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if store.Get(r.Context(), id) == nil {
+		http.Error(rw, "no such experiment", http.StatusNotFound)
 		return
 	}
-	var body ExperimentPatch
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
+	fields := map[string]any{}
+	json.NewDecoder(r.Body).Decode(&fields)
+	for _, name := range frozenFields {
+		if _, ok := fields[name]; ok {
+			writeJSON(rw, http.StatusConflict, map[string]string{"error": name + " is frozen while the experiment exists", "required": "new version"})
+			return
+		}
 	}
-	experiment, found, err := store.Get(tenant, r.PathValue("id"))
+	editable := map[string]any{}
+	if name, ok := fields["name"]; ok {
+		editable["name"] = name
+	}
+	experiment, err := store.Update(r.Context(), id, editable)
 	if err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "store unavailable"})
+		http.Error(rw, err.Error(), http.StatusNotFound)
 		return
 	}
-	if !found {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown experiment"})
-		return
-	}
-	if carriesDesign(body) {
-		writeJSON(rw, http.StatusConflict, map[string]string{
-			"error":    splitFrozen,
-			"required": requiredNewVersion,
-		})
-		return
-	}
-	if body.Name != nil {
-		experiment.Name = *body.Name
-	}
-	if body.Description != nil {
-		experiment.Description = *body.Description
-	}
-	if err := store.SaveCosmetic(experiment); err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "store unavailable"})
-		return
-	}
-	log.Printf("experiment updated tenant=%s id=%s", tenant, experiment.ID)
 	writeJSON(rw, http.StatusOK, experiment)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/experiments", createExperiment)
-	mux.HandleFunc("PATCH /v1/experiments/{id}", updateExperiment)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	mux.HandleFunc("PATCH /v1/experiments/{id}", editExperiment)
 }
 `,
     },
     scala: {
-      starter: `// api.scala — a first version of the experiment endpoint.
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class Variant(key: String, weight: Int)
-final case class ExperimentDesign(variants: Seq[Variant], unit: String, min_sample: Int, salt: Option[String])
-final case class Experiment(
-    id: String,
-    variants: Seq[Variant],
-    unit: String,
-    min_sample: Int,
-    salt: String,
-    version: Int,
-    status: String
-)
+import expd.Store // Store.create, get, update
 
-object ExperimentApi {
-  implicit val system: ActorSystem = ActorSystem("expd")
-  implicit val variantFormat: RootJsonFormat[Variant] = jsonFormat2(Variant)
-  implicit val designFormat: RootJsonFormat[ExperimentDesign] = jsonFormat4(ExperimentDesign)
-  implicit val experimentFormat: RootJsonFormat[Experiment] = jsonFormat7(Experiment)
+object Api {
+  val Units: Seq[String] = Seq("user", "session", "account")
 
-  val experiments = scala.collection.mutable.Map.empty[String, Experiment]
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  private def text(fields: Map[String, JsValue], name: String): Option[String] = fields.get(name).collect { case JsString(s) => s }
+  private def number(fields: Map[String, JsValue], name: String): Option[Int] = fields.get(name).collect { case JsNumber(n) => n.toInt }
 
-  val route: Route =
+  /** The design a request body describes. */
+  private def design(body: JsObject): Store.Design = {
+    val variants = body.fields.get("variants").collect { case JsArray(items) =>
+      items.map(item => Store.Variant(text(item.asJsObject.fields, "key").getOrElse(""), number(item.asJsObject.fields, "weight").getOrElse(0)))
+    }
+    Store.Design(text(body.fields, "name").getOrElse(""), text(body.fields, "unit").getOrElse(""), variants.getOrElse(Vector.empty),
+      number(body.fields, "min_sample").getOrElse(1000), text(body.fields, "salt"))
+  }
+
+  val route: Route = concat(
     path("v1" / "experiments") {
       post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[ExperimentDesign]) { body =>
-            val total = body.variants.map(_.weight).sum
-            val safeTotal = if (total == 0) 1 else total
-            val split = body.variants.map(variant => Variant(variant.key, variant.weight * 100 / safeTotal))
-            val experiment = Experiment(
-              UUID.randomUUID().toString,
-              split,
-              body.unit,
-              body.min_sample,
-              body.salt.getOrElse(UUID.randomUUID().toString),
-              1,
-              "running"
-            )
-            experiments(experiment.id) = experiment
-            system.log.info(s"experiment created: $body")
-            complete(StatusCodes.Created, experiment)
+        entity(as[String]) { raw =>
+          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+          val d = design(raw.parseJson.asJsObject)
+          val total = math.max(d.variants.map(_.weight).sum, 1)
+          val variants = d.variants.map(v => v.copy(weight = math.round(v.weight * 100.0 / total).toInt))
+          val unit = if (Units.contains(d.unit)) d.unit else "user"
+          complete(json(StatusCodes.Created, Store.toJson(Store.create(d.copy(unit = unit, variants = variants)))))
+        }
+      }
+    },
+    path("v1" / "experiments" / Segment) { id =>
+      patch {
+        entity(as[String]) { raw =>
+          Store.get(id) match {
+            case None => complete(StatusCodes.NotFound -> "no such experiment")
+            case Some(_) => complete(json(StatusCodes.OK, Store.toJson(Store.update(id, raw.parseJson.asJsObject))))
           }
         }
       }
-    } ~
-      path("v1" / "experiments" / Segment) { experimentId =>
-        patch {
-          entity(as[ExperimentDesign]) { body =>
-            val experiment = experiments(experimentId)
-            val updated = experiment.copy(variants = body.variants, unit = body.unit)
-            experiments(experimentId) = updated
-            complete(StatusCodes.OK, updated)
-          }
-        }
-      }
-
-  def main(args: Array[String]): Unit = Http().newServerAt("0.0.0.0", 8443).bind(route)
+    },
+  )
 }
 `,
-      solution: `// POST /v1/experiments · PATCH /v1/experiments/{id}.
-//
-// The design — variants, split, unit, min_sample and the salt — is pinned when the experiment
-// starts. A later design change is a new version, never a live mutation of the running experiment.
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.{ExceptionHandler, Route}
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-final case class Variant(key: String, weight: Int)
-final case class ExperimentDesign(variants: Seq[Variant], unit: String, min_sample: Int, salt: Option[String])
-final case class ExperimentPatch(
-    name: Option[String],
-    description: Option[String],
-    variants: Option[Seq[Variant]],
-    unit: Option[String],
-    min_sample: Option[Int],
-    salt: Option[String]
-)
-final case class Experiment(
-    id: String,
-    name: String,
-    description: String,
-    variants: Seq[Variant],
-    unit: String,
-    min_sample: Int,
-    salt: String,
-    version: Int,
-    status: String
-)
+import expd.Store // Store.create, get, update
 
-final case class ApiError(status: StatusCode, message: String) extends RuntimeException(message)
+object Api {
+  val Units: Seq[String] = Seq("user", "session", "account")
+  val FrozenFields: Seq[String] = Seq("variants", "unit", "salt", "min_sample")
 
-// The store is implemented by the state step, which adds the Redis assignment cache on top.
-trait ExperimentStore {
-  def insert(experiment: Experiment): Experiment
-  def get(tenant: String, id: String): Option[Experiment]
-  def saveCosmetic(experiment: Experiment): Unit
-}
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-object ExperimentStore {
-  def open(): ExperimentStore = new ExperimentStore {
-    def insert(experiment: Experiment): Experiment = experiment
-    def get(tenant: String, id: String): Option[Experiment] = None
-    def saveCosmetic(experiment: Experiment): Unit = ()
-  }
-}
+  private def text(fields: Map[String, JsValue], name: String): Option[String] = fields.get(name).collect { case JsString(s) => s }
+  private def number(fields: Map[String, JsValue], name: String): Option[Int] = fields.get(name).collect { case JsNumber(n) => n.toInt }
 
-object ExperimentApi {
-  implicit val system: ActorSystem = ActorSystem("expd")
-  implicit val variantFormat: RootJsonFormat[Variant] = jsonFormat2(Variant)
-  implicit val designFormat: RootJsonFormat[ExperimentDesign] = jsonFormat4(ExperimentDesign)
-  implicit val patchFormat: RootJsonFormat[ExperimentPatch] = jsonFormat6(ExperimentPatch)
-  implicit val experimentFormat: RootJsonFormat[Experiment] = jsonFormat9(Experiment)
-
-  val MinVariants = 2
-  val SplitTotal = 100
-  val MinSampleFloor = 1
-  val InitialVersion = 1
-  val Running = "running"
-  val AllowedUnits = Set("user", "session", "account")
-  val SplitFrozen = "the split, unit, min_sample and salt are frozen at start"
-  val RequiredNewVersion = "new version"
-
-  val store: ExperimentStore = ExperimentStore.open()
-
-  def validateVariants(variants: Seq[Variant]): Unit = {
-    if (variants.size < MinVariants)
-      throw ApiError(StatusCodes.BadRequest, "at least 2 variants are required")
-    if (variants.map(_.key).distinct.size != variants.size)
-      throw ApiError(StatusCodes.BadRequest, "duplicate variant keys")
-    if (variants.exists(_.key.isEmpty))
-      throw ApiError(StatusCodes.BadRequest, "variant keys must be non-empty")
+  /** The design a request body describes. */
+  private def design(body: JsObject): Store.Design = {
+    val variants = body.fields.get("variants").collect { case JsArray(items) =>
+      items.map(item => Store.Variant(text(item.asJsObject.fields, "key").getOrElse(""), number(item.asJsObject.fields, "weight").getOrElse(0)))
+    }
+    Store.Design(text(body.fields, "name").getOrElse(""), text(body.fields, "unit").getOrElse(""), variants.getOrElse(Vector.empty),
+      number(body.fields, "min_sample").getOrElse(1000), text(body.fields, "salt"))
   }
 
-  def validateSplit(variants: Seq[Variant]): Unit = {
-    if (variants.exists(_.weight < 0))
-      throw ApiError(StatusCodes.BadRequest, "every weight must be a non-negative integer")
-    if (variants.map(_.weight).sum != SplitTotal)
-      throw ApiError(StatusCodes.BadRequest, "weights must sum to exactly 100")
+  /** Why the split cannot run exactly as sent. */
+  private def splitProblem(variants: Seq[Store.Variant]): Option[String] = {
+    val keys = variants.map(_.key)
+    if (variants.size < 2) Some("an experiment needs at least 2 variants")
+    else if (keys.contains("") || keys.distinct.size != keys.size) Some("variant keys must be distinct and non-empty")
+    else if (variants.exists(_.weight < 0)) Some("weights must not be negative")
+    else if (variants.map(_.weight).sum != 100) Some(s"weights sum to \${variants.map(_.weight).sum}, not 100")
+    else None
   }
 
-  def validateUnit(unit: String): Unit =
-    if (!AllowedUnits.contains(unit))
-      throw ApiError(StatusCodes.BadRequest, "unit must be one of user, session, account")
+  private def error(message: String): JsObject = JsObject("error" -> JsString(message))
 
-  def validateMinSample(minSample: Int): Unit =
-    if (minSample < MinSampleFloor)
-      throw ApiError(StatusCodes.BadRequest, "min_sample must be an integer >= 1")
-
-  def validateDesign(body: ExperimentDesign): Unit = {
-    validateVariants(body.variants)
-    validateSplit(body.variants)
-    validateUnit(body.unit)
-    validateMinSample(body.min_sample)
-  }
-
-  def carriesDesign(patch: ExperimentPatch): Boolean =
-    patch.variants.isDefined || patch.unit.isDefined || patch.min_sample.isDefined || patch.salt.isDefined
-
-  val handler: ExceptionHandler = ExceptionHandler { case ApiError(status, message) =>
-    complete(status, s"""{"error":"$message"}""")
-  }
-
-  val routes: Route = handleExceptions(handler) {
+  val route: Route = concat(
     path("v1" / "experiments") {
       post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[ExperimentDesign]) { body =>
-            validateDesign(body)
-            val experiment = Experiment(
-              UUID.randomUUID().toString,
-              "",
-              "",
-              body.variants,
-              body.unit,
-              body.min_sample,
-              body.salt.filter(_.nonEmpty).getOrElse(UUID.randomUUID().toString),
-              InitialVersion,
-              Running
-            )
-            store.insert(experiment)
-            system.log.info(s"experiment created tenant=$tenant id=\${experiment.id}")
-            complete(StatusCodes.Created, experiment)
+        entity(as[String]) { raw =>
+          val d = design(raw.parseJson.asJsObject)
+          // The design runs as approved or not at all: nothing is rescaled or defaulted.
+          splitProblem(d.variants) match {
+            case Some(problem) => complete(json(StatusCodes.BadRequest, error(problem)))
+            case None if !Units.contains(d.unit) => complete(json(StatusCodes.BadRequest, error("unit must be one of user, session, account")))
+            case None => complete(json(StatusCodes.Created, Store.toJson(Store.create(d))))
           }
         }
       }
-    } ~
-      path("v1" / "experiments" / Segment) { experimentId =>
-        patch {
-          headerValueByName("X-Tenant-Id") { tenant =>
-            entity(as[ExperimentPatch]) { body =>
-              store.get(tenant, experimentId) match {
-                case None => complete(StatusCodes.NotFound, """{"error":"unknown experiment"}""")
-                case Some(experiment) =>
-                  if (carriesDesign(body)) {
-                    complete(StatusCodes.Conflict, s"""{"error":"$SplitFrozen","required":"$RequiredNewVersion"}""")
-                  } else {
-                    val updated = experiment.copy(
-                      name = body.name.getOrElse(experiment.name),
-                      description = body.description.getOrElse(experiment.description)
-                    )
-                    store.saveCosmetic(updated)
-                    system.log.info(s"experiment updated tenant=$tenant id=$experimentId")
-                    complete(StatusCodes.OK, updated)
-                  }
+    },
+    path("v1" / "experiments" / Segment) { id =>
+      patch {
+        entity(as[String]) { raw =>
+          val fields = raw.parseJson.asJsObject
+          Store.get(id) match {
+            case None => complete(StatusCodes.NotFound -> "no such experiment")
+            case Some(_) =>
+              FrozenFields.find(fields.fields.contains) match {
+                case Some(frozen) =>
+                  complete(json(StatusCodes.Conflict, JsObject("error" -> JsString(s"$frozen is frozen while the experiment exists"), "required" -> JsString("new version"))))
+                case None =>
+                  complete(json(StatusCodes.OK, Store.toJson(Store.update(id, JsObject(fields.fields.filter(_._1 == "name"))))))
               }
-            }
           }
         }
       }
-  }
-
-  def main(args: Array[String]): Unit = Http().newServerAt("0.0.0.0", 8443).bind(routes)
+    },
+  )
 }
 `,
     },
     cpp: {
-      starter: `// api.cpp — a first version of the experiment endpoint.
-#include <httplib.h>
+      starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
-#include <iostream>
-#include <map>
-#include <string>
-
-using json = nlohmann::json;
-
-std::map<std::string, json> experiments;
-
-std::string new_id() {
-  static int counter = 0;
-  return "exp-" + std::to_string(++counter);
-}
-
-// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/experiments", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    int total = 0;
-    for (const auto& variant : body.value("variants", json::array())) total += variant.value("weight", 0);
-    const int safe_total = std::max(total, 1);
-    json split = json::array();
-    for (const auto& variant : body.value("variants", json::array())) {
-      split.push_back(json{{"key", variant.value("key", std::string())},
-                           {"weight", variant.value("weight", 0) * 100 / safe_total}});
-    }
-    json experiment = {
-        {"id", new_id()},
-        {"tenant_id", req.get_header_value("X-Tenant-Id")},
-        {"variants", split},
-        {"unit", body.value("unit", std::string())},
-        {"min_sample", body.value("min_sample", 0)},
-        {"salt", body.value("salt", new_id())},
-        {"version", 1},
-        {"status", "running"},
-    };
-    experiments[experiment["id"]] = experiment;
-    std::cerr << "experiment created: " << body.dump() << "\\n";
-    res.status = 201;
-    res.set_content(experiment.dump(), "application/json");
-  });
-
-  svr.Patch(R"(/v1/experiments/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const auto experiment_id = req.matches[1].str();
-    json body = json::parse(req.body, nullptr, false);
-    json experiment = experiments[experiment_id];
-    experiment["variants"] = body.value("variants", json::array());
-    experiment["unit"] = body.value("unit", std::string());
-    experiments[experiment_id] = experiment;
-    res.status = 200;
-    res.set_content(experiment.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `// POST /v1/experiments · PATCH /v1/experiments/([^/]+).
-//
-// The design — variants, split, unit, min_sample and the salt — is pinned when the experiment
-// starts. A later design change is a new version, never a live mutation of the running experiment.
-#include <httplib.h>
-#include <nlohmann/json.hpp>
-
-#include <iostream>
-#include <map>
+#include <cmath>
 #include <set>
 #include <string>
 
+#include "expd/store.h"  // store::create, get, update, toJson
+
 using json = nlohmann::json;
 
-constexpr int kMinVariants = 2;
-constexpr int kSplitTotal = 100;
-constexpr int kMinSampleFloor = 1;
-constexpr int kInitialVersion = 1;
-const char* const kRunning = "running";
-const std::set<std::string> kAllowedUnits = {"user", "session", "account"};
-const char* const kSplitFrozen = "the split, unit, min_sample and salt are frozen at start";
-const char* const kRequiredNewVersion = "new version";
+const std::set<std::string> kUnits = {"user", "session", "account"};
 
-// The store is implemented by the state step, which adds the Redis assignment cache on top.
-std::map<std::string, json> experiments;
-
-std::string new_id() {
-  static int counter = 0;
-  return "exp-" + std::to_string(++counter);
+store::Design design_of(const json& body) {
+  store::Design d;
+  d.name = body.value("name", "");
+  d.unit = body.value("unit", "");
+  d.min_sample = body.value("min_sample", 1000L);
+  if (body.contains("salt") && body["salt"].is_string()) d.salt = body["salt"];
+  for (const auto& v : body.value("variants", json::array())) d.variants.push_back({v.value("key", ""), v.value("weight", 0L)});
+  return d;
 }
 
-std::string validate_variants(const json& variants) {
-  if (variants.size() < static_cast<std::size_t>(kMinVariants)) return "at least 2 variants are required";
+void create_experiment(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) {
+    res.status = 400;
+    res.set_content("malformed design", "text/plain");
+    return;
+  }
+  store::Design d = design_of(body);
+  double total = 0;
+  for (const auto& v : d.variants) total += v.weight;
+  if (total == 0) total = 1;
+  for (auto& v : d.variants) v.weight = std::lround(v.weight * 100.0 / total);
+  if (!kUnits.count(d.unit)) d.unit = "user";
+  res.status = 201;
+  res.set_content(store::toJson(store::create(d)).dump(), "application/json");
+}
+
+void edit_experiment(const httplib::Request& req, httplib::Response& res) {
+  const std::string id = req.matches[1];
+  if (!store::get(id)) {
+    res.status = 404;
+    res.set_content("no such experiment", "text/plain");
+    return;
+  }
+  res.set_content(store::toJson(store::update(id, json::parse(req.body))).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/experiments", create_experiment);
+  svr.Patch(R"(/v1/experiments/([\\w-]+))", edit_experiment);
+}
+`,
+      solution: `#include <httplib.h>
+#include <nlohmann/json.hpp>
+
+#include <set>
+#include <string>
+#include <vector>
+
+#include "expd/store.h"  // store::create, get, update, toJson
+
+using json = nlohmann::json;
+
+const std::set<std::string> kUnits = {"user", "session", "account"};
+const std::vector<std::string> kFrozenFields = {"variants", "unit", "salt", "min_sample"};
+
+store::Design design_of(const json& body) {
+  store::Design d;
+  d.name = body.value("name", "");
+  d.unit = body.value("unit", "");
+  d.min_sample = body.value("min_sample", 1000L);
+  if (body.contains("salt") && body["salt"].is_string()) d.salt = body["salt"];
+  for (const auto& v : body.value("variants", json::array())) d.variants.push_back({v.value("key", ""), v.value("weight", 0L)});
+  return d;
+}
+
+// Why the split cannot run exactly as sent, or "".
+std::string split_problem(const std::vector<store::Variant>& variants) {
+  if (variants.size() < 2) return "an experiment needs at least 2 variants";
   std::set<std::string> keys;
-  for (const auto& variant : variants) {
-    const auto key = variant.value("key", std::string());
-    if (key.empty()) return "variant keys must be non-empty";
-    if (!keys.insert(key).second) return "duplicate variant keys";
+  long sum = 0;
+  for (const auto& v : variants) {
+    if (v.key.empty() || !keys.insert(v.key).second) return "variant keys must be distinct and non-empty";
+    if (v.weight < 0) return "weights must not be negative";
+    sum += v.weight;
   }
+  if (sum != 100) return "weights sum to " + std::to_string(sum) + ", not 100";
   return "";
 }
 
-std::string validate_split(const json& variants) {
-  long total = 0;
-  for (const auto& variant : variants) {
-    if (!variant.contains("weight") || !variant["weight"].is_number_integer())
-      return "every weight must be a non-negative integer";
-    const long weight = variant["weight"].get<long>();
-    if (weight < 0) return "every weight must be a non-negative integer";
-    total += weight;
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
+
+void create_experiment(const httplib::Request& req, httplib::Response& res) {
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return reply(res, 400, {{"error", "malformed design"}});
+  const store::Design d = design_of(body);
+  // The design runs as approved or not at all: nothing is rescaled or defaulted.
+  const std::string problem = split_problem(d.variants);
+  if (!problem.empty()) return reply(res, 400, {{"error", problem}});
+  if (!kUnits.count(d.unit)) return reply(res, 400, {{"error", "unit must be one of user, session, account"}});
+  reply(res, 201, store::toJson(store::create(d)));
+}
+
+void edit_experiment(const httplib::Request& req, httplib::Response& res) {
+  const std::string id = req.matches[1];
+  if (!store::get(id)) return reply(res, 404, {{"error", "no such experiment"}});
+  const json fields = json::parse(req.body, nullptr, false);
+  if (!fields.is_object()) return reply(res, 400, {{"error", "malformed edit"}});
+  for (const std::string& name : kFrozenFields) {
+    if (fields.contains(name)) return reply(res, 409, {{"error", name + " is frozen while the experiment exists"}, {"required", "new version"}});
   }
-  if (total != kSplitTotal) return "weights must sum to exactly 100";
-  return "";
+  json editable = json::object();
+  if (fields.contains("name")) editable["name"] = fields["name"];
+  reply(res, 200, store::toJson(store::update(id, editable)));
 }
 
-std::string validate_unit(const std::string& unit) {
-  if (kAllowedUnits.count(unit) == 0) return "unit must be one of user, session, account";
-  return "";
-}
-
-std::string validate_min_sample(const json& body) {
-  if (!body.contains("min_sample") || !body["min_sample"].is_number_integer())
-    return "min_sample must be an integer >= 1";
-  if (body["min_sample"].get<long>() < kMinSampleFloor) return "min_sample must be an integer >= 1";
-  return "";
-}
-
-std::string validate_design(const json& body) {
-  const auto variants = body.value("variants", json::array());
-  for (const auto& problem : {validate_variants(variants),
-                              validate_split(variants),
-                              validate_unit(body.value("unit", std::string())),
-                              validate_min_sample(body)}) {
-    if (!problem.empty()) return problem;
-  }
-  return "";
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/experiments", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto problem = validate_design(body);
-    if (!problem.empty()) {
-      res.status = 400;
-      res.set_content(json{{"error", problem}}.dump(), "application/json");
-      return;
-    }
-    const auto caller_salt = body.value("salt", std::string());
-    json experiment = {
-        {"id", new_id()},
-        {"tenant_id", tenant},
-        {"name", ""},
-        {"description", ""},
-        {"variants", body.value("variants", json::array())},
-        {"unit", body.value("unit", std::string())},
-        {"min_sample", body.value("min_sample", 0)},
-        {"salt", caller_salt.empty() ? new_id() : caller_salt},
-        {"version", kInitialVersion},
-        {"status", kRunning},
-    };
-    experiments[experiment["id"]] = experiment;
-    std::cerr << "experiment created tenant=" << tenant << " id=" << experiment["id"].get<std::string>()
-              << "\\n";
-    res.status = 201;
-    res.set_content(experiment.dump(), "application/json");
-  });
-
-  svr.Patch(R"(/v1/experiments/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto experiment_id = req.matches[1].str();
-    const auto found = experiments.find(experiment_id);
-    if (found == experiments.end()) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown experiment"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const bool design_carried =
-        body.contains("variants") || body.contains("unit") || body.contains("min_sample") || body.contains("salt");
-    if (design_carried) {
-      res.status = 409;
-      res.set_content(json{{"error", kSplitFrozen}, {"required", kRequiredNewVersion}}.dump(), "application/json");
-      return;
-    }
-    json experiment = found->second;
-    if (body.contains("name")) experiment["name"] = body["name"];
-    if (body.contains("description")) experiment["description"] = body["description"];
-    experiments[experiment_id] = experiment;
-    std::cerr << "experiment updated tenant=" << tenant << " id=" << experiment_id << "\\n";
-    res.status = 200;
-    res.set_content(experiment.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/experiments", create_experiment);
+  svr.Patch(R"(/v1/experiments/([\\w-]+))", edit_experiment);
 }
 `,
     },
   },
-  hints: [
-    'An operator submits a 60/41 split and gets a 201; a week later the report shows a split nobody approved, and a `PATCH` to the weights moved users between arms overnight.',
-    'The create path divides each weight by `sum(...) or 1`, takes any `unit` string, skips the variant count, and `PATCH` writes `weights` and `unit` straight onto the running row.',
-    'Add `validate_variants`, `validate_split` (sum must equal `SPLIT_TOTAL`, each a 400) and `validate_unit`; in `PATCH`, answer 409 with `SPLIT_FROZEN` and `required: REQUIRED_NEW_VERSION` when a design field is present.',
-  ],
-  debrief: `The fix has the shape of a funnel in front of the store: the design is validated as a whole, pinned
-once with a server-side salt, and the update route refuses to touch anything that affects bucketing.
-A split that sums to 99 is rejected rather than reweighted because the read side later checks the
-sample ratio against the design that was approved; a normalized split would make that check lie.
-A design change answers 409 and asks for a new version because the number being analysed only
-means something if the design that was analysed is the design that ran.
+  harness: {
+    python: `from expd import store
 
-Production platforms go further: designs are immutable rows with a parent link, the salt is
-generated from a server-side secret, every version is audited, and an operator who wants more
-traffic on a variant ramps it (step 3) instead of editing the split.`,
+SPLIT = [{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}]
+
+
+def _design(**overrides):
+    return {"name": "checkout-cta", "unit": "user", "variants": SPLIT, "min_sample": 2000, **overrides}
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+async def _create(c, **overrides):
+    r = await c.post("/v1/experiments", json=_design(**overrides))
+    assert r.status_code == 201, f"POST /v1/experiments with a valid 50/50 design answered {r.status_code}: {r.text}"
+    return r.json()["id"]
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/experiments", json=_design(salt="s-1"))
+        assert r.status_code == 201, f"POST /v1/experiments answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("version") == 1 and body.get("status") == "running" and body.get("salt") == "s-1", f"a new experiment answers version 1, running, with its salt; got {body}"
+        experiment_id = body["id"]
+        stored = store.get(experiment_id)
+        assert stored is not None and stored["variants"] == SPLIT, f"the store holds {stored}, expected the 50/50 split"
+        r = await c.post("/v1/experiments", json=_design())
+        assert r.status_code == 201 and r.json().get("salt") == r.json().get("id"), f"without a salt the experiment id is the salt; got {r.text}"
+        r = await c.patch(f"/v1/experiments/{experiment_id}", json={"name": "checkout-cta-v1"})
+    assert r.status_code == 200, f"PATCH /v1/experiments/{experiment_id} with a new name answered {r.status_code}: {r.text}"
+    assert store.get(experiment_id)["name"] == "checkout-cta-v1", f"the rename did not reach the store: {store.get(experiment_id)}"
+
+
+async def check_split(ctx):
+    async with _api(ctx) as c:
+        for variants, why in (
+            ([{"key": "control", "weight": 60}, {"key": "treatment", "weight": 50}], "weights summing to 110"),
+            ([{"key": "control", "weight": 49}, {"key": "treatment", "weight": 50}], "weights summing to 99"),
+            ([{"key": "control", "weight": 100}], "a single variant"),
+            ([{"key": "control", "weight": 50}, {"key": "control", "weight": 50}], "two variants keyed control"),
+            ([{"key": "control", "weight": 120}, {"key": "treatment", "weight": -20}], "a negative weight"),
+        ):
+            r = await c.post("/v1/experiments", json=_design(variants=variants))
+            assert r.status_code == 400, f"a design with {why} answered {r.status_code} {r.text}, expected 400: a split other than the one sent must not run"
+        assert ctx.redis.get("exp:seq") is None, f"{ctx.redis.get('exp:seq')} experiment(s) were stored from rejected designs"
+        three = [{"key": "control", "weight": 34}, {"key": "a", "weight": 33}, {"key": "b", "weight": 33}]
+        r = await c.post("/v1/experiments", json=_design(variants=three))
+    assert r.status_code == 201, f"a 34/33/33 design answered {r.status_code}: {r.text}"
+    assert store.get(r.json()["id"])["variants"] == three, f"the split must be stored exactly as sent, the store holds {store.get(r.json()['id'])['variants']}"
+
+
+async def check_unit(ctx):
+    async with _api(ctx) as c:
+        for unit in ("usr", "visitor"):
+            r = await c.post("/v1/experiments", json=_design(unit=unit))
+            assert r.status_code == 400, f"a design with unit {unit!r} answered {r.status_code} {r.text}, expected 400: an unknown unit must not fall back to user"
+        assert ctx.redis.get("exp:seq") is None, "an experiment was stored from a design with an unknown unit"
+        for unit in ("session", "account"):
+            experiment_id = await _create(c, unit=unit)
+            assert store.get(experiment_id)["unit"] == unit, f"a {unit} experiment was stored as {store.get(experiment_id)['unit']}"
+
+
+async def check_frozen_design(ctx):
+    async with _api(ctx) as c:
+        experiment_id = await _create(c, salt="s-1")
+        for fields in ({"variants": [{"key": "control", "weight": 90}, {"key": "treatment", "weight": 10}]}, {"salt": "s-2"}, {"unit": "session"}, {"min_sample": 50}):
+            r = await c.patch(f"/v1/experiments/{experiment_id}", json=fields)
+            assert r.status_code == 409, f"PATCH {fields} on a running experiment answered {r.status_code} {r.text}, expected 409: a design change is a new version"
+            assert "new version" in r.text, f"the 409 must say a new version is required, got {r.text}"
+        stored = store.get(experiment_id)
+        assert stored["variants"] == SPLIT and stored["salt"] == "s-1" and stored["unit"] == "user" and stored["min_sample"] == 2000, f"a refused PATCH changed the design: {stored}"
+        r = await c.patch(f"/v1/experiments/{experiment_id}", json={"name": "renamed"})
+    assert r.status_code == 200 and store.get(experiment_id)["name"] == "renamed", f"a name-only PATCH answered {r.status_code} {r.text}; the name stays editable"
+`,
+    typescript: `const SPLIT = [
+  {key: 'control', weight: 50},
+  {key: 'treatment', weight: 50},
+];
+
+const design = (overrides: Record<string, unknown> = {}) => ({name: 'checkout-cta', unit: 'user', variants: SPLIT, min_sample: 2000, ...overrides});
+
+function api(ctx) {
+  return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/expd/store.ts')};
+}
+
+async function create(c, overrides: Record<string, unknown> = {}): Promise<string> {
+  const r = await c.post('/v1/experiments', {json: design(overrides)});
+  assert.equal(r.status, 201, \`POST /v1/experiments with a valid 50/50 design answered \${r.status}: \${r.text}\`);
+  return r.json().id;
+}
+
+export async function check_route(ctx) {
+  const {c, store} = api(ctx);
+  let r = await c.post('/v1/experiments', {json: design({salt: 's-1'})});
+  assert.equal(r.status, 201, \`POST /v1/experiments answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.version === 1 && body.status === 'running' && body.salt === 's-1', \`a new experiment answers version 1, running, with its salt; got \${r.text}\`);
+  const stored = await store.get(body.id);
+  assert.deepStrictEqual(stored?.variants, SPLIT, \`the store holds \${JSON.stringify(stored)}, expected the 50/50 split\`);
+  r = await c.post('/v1/experiments', {json: design()});
+  assert(r.status === 201 && r.json().salt === r.json().id, \`without a salt the experiment id is the salt; got \${r.text}\`);
+  r = await c.patch(\`/v1/experiments/\${body.id}\`, {json: {name: 'checkout-cta-v1'}});
+  assert.equal(r.status, 200, \`PATCH /v1/experiments/\${body.id} with a new name answered \${r.status}: \${r.text}\`);
+  assert.equal((await store.get(body.id)).name, 'checkout-cta-v1', 'the rename did not reach the store');
+}
+
+export async function check_split(ctx) {
+  const {c, store} = api(ctx);
+  const cases: [unknown[], string][] = [
+    [[{key: 'control', weight: 60}, {key: 'treatment', weight: 50}], 'weights summing to 110'],
+    [[{key: 'control', weight: 49}, {key: 'treatment', weight: 50}], 'weights summing to 99'],
+    [[{key: 'control', weight: 100}], 'a single variant'],
+    [[{key: 'control', weight: 50}, {key: 'control', weight: 50}], 'two variants keyed control'],
+    [[{key: 'control', weight: 120}, {key: 'treatment', weight: -20}], 'a negative weight'],
+  ];
+  for (const [variants, why] of cases) {
+    const r = await c.post('/v1/experiments', {json: design({variants})});
+    assert.equal(r.status, 400, \`a design with \${why} answered \${r.status} \${r.text}, expected 400: a split other than the one sent must not run\`);
+  }
+  assert.equal(ctx.redis.get('exp:seq'), null, \`\${ctx.redis.get('exp:seq')} experiment(s) were stored from rejected designs\`);
+  const three = [{key: 'control', weight: 34}, {key: 'a', weight: 33}, {key: 'b', weight: 33}];
+  const r = await c.post('/v1/experiments', {json: design({variants: three})});
+  assert.equal(r.status, 201, \`a 34/33/33 design answered \${r.status}: \${r.text}\`);
+  assert.deepStrictEqual((await store.get(r.json().id)).variants, three, 'the split must be stored exactly as sent');
+}
+
+export async function check_unit(ctx) {
+  const {c, store} = api(ctx);
+  for (const unit of ['usr', 'visitor']) {
+    const r = await c.post('/v1/experiments', {json: design({unit})});
+    assert.equal(r.status, 400, \`a design with unit "\${unit}" answered \${r.status} \${r.text}, expected 400: an unknown unit must not fall back to user\`);
+  }
+  assert.equal(ctx.redis.get('exp:seq'), null, 'an experiment was stored from a design with an unknown unit');
+  for (const unit of ['session', 'account']) {
+    const id = await create(c, {unit});
+    assert.equal((await store.get(id)).unit, unit, \`a \${unit} experiment was stored with another unit\`);
+  }
+}
+
+export async function check_frozen_design(ctx) {
+  const {c, store} = api(ctx);
+  const id = await create(c, {salt: 's-1'});
+  const edits = [{variants: [{key: 'control', weight: 90}, {key: 'treatment', weight: 10}]}, {salt: 's-2'}, {unit: 'session'}, {min_sample: 50}];
+  for (const fields of edits) {
+    const r = await c.patch(\`/v1/experiments/\${id}\`, {json: fields});
+    assert.equal(r.status, 409, \`PATCH \${JSON.stringify(fields)} on a running experiment answered \${r.status} \${r.text}, expected 409: a design change is a new version\`);
+    assert(r.text.includes('new version'), \`the 409 must say a new version is required, got \${r.text}\`);
+  }
+  const stored = await store.get(id);
+  assert(
+    JSON.stringify(stored.variants) === JSON.stringify(SPLIT) && stored.salt === 's-1' && stored.unit === 'user' && stored.min_sample === 2000,
+    \`a refused PATCH changed the design: \${JSON.stringify(stored)}\`,
+  );
+  const r = await c.patch(\`/v1/experiments/\${id}\`, {json: {name: 'renamed'}});
+  assert(r.status === 200 && (await store.get(id)).name === 'renamed', \`a name-only PATCH answered \${r.status} \${r.text}; the name stays editable\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"expd/store"
+
+	"leetbuild/harness"
+)
+
+var split = []map[string]any{{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}}
+
+func design(overrides map[string]any) map[string]any {
+	d := map[string]any{"name": "checkout-cta", "unit": "user", "variants": split, "min_sample": 2000}
+	for k, v := range overrides {
+		d[k] = v
+	}
+	return d
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func created(ctx *harness.Ctx, r *harness.Response) store.Experiment {
+	ctx.Equal(r.Status, 201, "POST /v1/experiments with a valid design (%s)", r.Text())
+	var e store.Experiment
+	r.Decode(&e)
+	return e
+}
+
+func variantsOf(ctx *harness.Ctx, id string) []store.Variant {
+	e := store.Get(context.Background(), id)
+	ctx.Assert(e != nil, "experiment %s is not in the store", id)
+	return e.Variants
+}
+
+var split5050 = []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	e := created(ctx, c.Post("/v1/experiments", design(map[string]any{"salt": "s-1"})))
+	ctx.Assert(e.Version == 1 && e.Status == "running" && e.Salt == "s-1", "a new experiment answers version 1, running, with its salt; got %+v", e)
+	ctx.Equal(variantsOf(ctx, e.ID), split5050, "the stored split")
+	other := created(ctx, c.Post("/v1/experiments", design(nil)))
+	ctx.Equal(other.Salt, other.ID, "without a salt the experiment id is the salt; the salt")
+	r := c.Patch("/v1/experiments/"+e.ID, map[string]any{"name": "checkout-cta-v1"})
+	ctx.Equal(r.Status, 200, "PATCH /v1/experiments/%s with a new name (%s)", e.ID, r.Text())
+	ctx.Equal(store.Get(context.Background(), e.ID).Name, "checkout-cta-v1", "the rename must reach the store; the name")
+}
+
+func CheckSplit(ctx *harness.Ctx) {
+	c := api(ctx)
+	cases := []struct {
+		variants []map[string]any
+		why      string
+	}{
+		{[]map[string]any{{"key": "control", "weight": 60}, {"key": "treatment", "weight": 50}}, "weights summing to 110"},
+		{[]map[string]any{{"key": "control", "weight": 49}, {"key": "treatment", "weight": 50}}, "weights summing to 99"},
+		{[]map[string]any{{"key": "control", "weight": 100}}, "a single variant"},
+		{[]map[string]any{{"key": "control", "weight": 50}, {"key": "control", "weight": 50}}, "two variants keyed control"},
+		{[]map[string]any{{"key": "control", "weight": 120}, {"key": "treatment", "weight": -20}}, "a negative weight"},
+	}
+	for _, tc := range cases {
+		r := c.Post("/v1/experiments", design(map[string]any{"variants": tc.variants}))
+		ctx.Assert(r.Status == 400, "a design with %s answered %d %s, expected 400: a split other than the one sent must not run", tc.why, r.Status, r.Text())
+	}
+	seq, ok := ctx.Redis.Get("exp:seq")
+	ctx.Assert(!ok, "%s experiment(s) were stored from rejected designs", seq)
+	three := []map[string]any{{"key": "control", "weight": 34}, {"key": "a", "weight": 33}, {"key": "b", "weight": 33}}
+	e := created(ctx, c.Post("/v1/experiments", design(map[string]any{"variants": three})))
+	ctx.Equal(variantsOf(ctx, e.ID), []store.Variant{{Key: "control", Weight: 34}, {Key: "a", Weight: 33}, {Key: "b", Weight: 33}}, "the split must be stored exactly as sent; the stored split")
+}
+
+func CheckUnit(ctx *harness.Ctx) {
+	c := api(ctx)
+	for _, unit := range []string{"usr", "visitor"} {
+		r := c.Post("/v1/experiments", design(map[string]any{"unit": unit}))
+		ctx.Assert(r.Status == 400, "a design with unit %q answered %d %s, expected 400: an unknown unit must not fall back to user", unit, r.Status, r.Text())
+	}
+	_, ok := ctx.Redis.Get("exp:seq")
+	ctx.Assert(!ok, "an experiment was stored from a design with an unknown unit")
+	for _, unit := range []string{"session", "account"} {
+		e := created(ctx, c.Post("/v1/experiments", design(map[string]any{"unit": unit})))
+		ctx.Equal(store.Get(context.Background(), e.ID).Unit, unit, "the stored unit of a %s experiment", unit)
+	}
+}
+
+func CheckFrozenDesign(ctx *harness.Ctx) {
+	c := api(ctx)
+	e := created(ctx, c.Post("/v1/experiments", design(map[string]any{"salt": "s-1"})))
+	edits := []map[string]any{
+		{"variants": []map[string]any{{"key": "control", "weight": 90}, {"key": "treatment", "weight": 10}}},
+		{"salt": "s-2"}, {"unit": "session"}, {"min_sample": 50},
+	}
+	for _, fields := range edits {
+		r := c.Patch("/v1/experiments/"+e.ID, fields)
+		ctx.Assert(r.Status == 409, "PATCH %v on a running experiment answered %d %s, expected 409: a design change is a new version", fields, r.Status, r.Text())
+		ctx.Assert(strings.Contains(r.Text(), "new version"), "the 409 must say a new version is required, got %s", r.Text())
+	}
+	stored := store.Get(context.Background(), e.ID)
+	ctx.Assert(stored.Salt == "s-1" && stored.Unit == "user" && stored.MinSample == 2000, "a refused PATCH changed the design: %+v", stored)
+	ctx.Equal(stored.Variants, split5050, "a refused PATCH must leave the split; the stored split")
+	r := c.Patch("/v1/experiments/"+e.ID, map[string]any{"name": "renamed"})
+	ctx.Assert(r.Status == 200 && store.Get(context.Background(), e.ID).Name == "renamed", "a name-only PATCH answered %d %s; the name stays editable", r.Status, r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "expd/store.h"
+
+namespace {
+
+using json = nlohmann::json;
+
+const json kSplit = json::array({{{"key", "control"}, {"weight", 50}}, {{"key", "treatment"}, {"weight", 50}}});
+
+std::string design(const json& overrides = json::object()) {
+  json d = {{"name", "checkout-cta"}, {"unit", "user"}, {"variants", kSplit}, {"min_sample", 2000}};
+  d.update(overrides);
+  return d.dump();
+}
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response post(harness::HTTP& c, const std::string& body) { return c.Post("/v1/experiments", body, "Content-Type", "application/json"); }
+
+harness::Response patch(harness::HTTP& c, const std::string& id, const json& fields) {
+  return c.Patch("/v1/experiments/" + id, fields.dump(), "Content-Type", "application/json");
+}
+
+json created(harness::Ctx& ctx, const harness::Response& r) {
+  ctx.Equal(r.Status, 201, "POST /v1/experiments with a valid design (%s)", r.Text());
+  return json::parse(r.Text());
+}
+
+json storedSplit(const std::string& id) { return store::toJson(*store::get(id))["variants"]; }
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const json e = created(ctx, post(c, design({{"salt", "s-1"}})));
+  ctx.Assert(e.value("version", 0) == 1 && e.value("status", "") == "running" && e.value("salt", "") == "s-1", "a new experiment answers version 1, running, with its salt; got %s", e.dump());
+  const std::string id = e.value("id", "");
+  ctx.Equal(storedSplit(id), kSplit, "the stored split");
+  const json other = created(ctx, post(c, design()));
+  ctx.Equal(other.value("salt", ""), other.value("id", ""), "without a salt the experiment id is the salt; the salt");
+  const auto r = patch(c, id, {{"name", "checkout-cta-v1"}});
+  ctx.Equal(r.Status, 200, "PATCH /v1/experiments/%s with a new name (%s)", id, r.Text());
+  ctx.Equal(store::get(id)->name, "checkout-cta-v1", "the rename must reach the store; the name");
+}
+
+void CheckSplit(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::vector<std::pair<json, std::string>> cases = {
+      {json::array({{{"key", "control"}, {"weight", 60}}, {{"key", "treatment"}, {"weight", 50}}}), "weights summing to 110"},
+      {json::array({{{"key", "control"}, {"weight", 49}}, {{"key", "treatment"}, {"weight", 50}}}), "weights summing to 99"},
+      {json::array({{{"key", "control"}, {"weight", 100}}}), "a single variant"},
+      {json::array({{{"key", "control"}, {"weight", 50}}, {{"key", "control"}, {"weight", 50}}}), "two variants keyed control"},
+      {json::array({{{"key", "control"}, {"weight", 120}}, {{"key", "treatment"}, {"weight", -20}}}), "a negative weight"},
+  };
+  for (const auto& [variants, why] : cases) {
+    const auto r = post(c, design({{"variants", variants}}));
+    ctx.Assert(r.Status == 400, "a design with %s answered %d %s, expected 400: a split other than the one sent must not run", why, r.Status, r.Text());
+  }
+  ctx.Assert(!ctx.Redis.Get("exp:seq"), "%s experiment(s) were stored from rejected designs", ctx.Redis.Get("exp:seq").value_or(""));
+  const json three = json::array({{{"key", "control"}, {"weight", 34}}, {{"key", "a"}, {"weight", 33}}, {{"key", "b"}, {"weight", 33}}});
+  const json e = created(ctx, post(c, design({{"variants", three}})));
+  ctx.Equal(storedSplit(e.value("id", "")), three, "the split must be stored exactly as sent; the stored split");
+}
+
+void CheckUnit(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  for (const std::string unit : {"usr", "visitor"}) {
+    const auto r = post(c, design({{"unit", unit}}));
+    ctx.Assert(r.Status == 400, "a design with unit %q answered %d %s, expected 400: an unknown unit must not fall back to user", unit, r.Status, r.Text());
+  }
+  ctx.Assert(!ctx.Redis.Get("exp:seq"), "an experiment was stored from a design with an unknown unit");
+  for (const std::string unit : {"session", "account"}) {
+    const json e = created(ctx, post(c, design({{"unit", unit}})));
+    ctx.Equal(store::get(e.value("id", ""))->unit, unit, "the stored unit of a %s experiment", unit);
+  }
+}
+
+void CheckFrozenDesign(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::string id = created(ctx, post(c, design({{"salt", "s-1"}}))).value("id", "");
+  const std::vector<json> edits = {
+      {{"variants", json::array({{{"key", "control"}, {"weight", 90}}, {{"key", "treatment"}, {"weight", 10}}})}},
+      {{"salt", "s-2"}},
+      {{"unit", "session"}},
+      {{"min_sample", 50}},
+  };
+  for (const json& fields : edits) {
+    const auto r = patch(c, id, fields);
+    ctx.Assert(r.Status == 409, "PATCH %s on a running experiment answered %d %s, expected 409: a design change is a new version", fields.dump(), r.Status, r.Text());
+    ctx.Assert(r.Text().find("new version") != std::string::npos, "the 409 must say a new version is required, got %s", r.Text());
+  }
+  const auto stored = store::get(id);
+  ctx.Assert(stored->salt == "s-1" && stored->unit == "user" && stored->min_sample == 2000, "a refused PATCH changed the design: %s", store::toJson(*stored).dump());
+  ctx.Equal(storedSplit(id), kSplit, "a refused PATCH must leave the split; the stored split");
+  const auto r = patch(c, id, {{"name", "renamed"}});
+  ctx.Assert(r.Status == 200 && store::get(id)->name == "renamed", "a name-only PATCH answered %d %s; the name stays editable", r.Status, r.Text());
+}
+`,
+  },
+  hints: [
+    'Create an experiment with weights 60 and 50: it answers 201 and runs 55/45. Patch the split of a running experiment: it answers 200, and units start landing in other variants.',
+    'The create handler rescales the weights by their total and falls back to `user` for a unit it does not know, so no design is ever refused; the edit handler hands the whole body to `store.update`, which writes any field in place.',
+    'Before `store.create`, answer 400 for fewer than 2 variants, repeated or empty keys, a negative weight or a sum other than 100, and for a `unit` outside `UNITS`. In the edit, answer 409 when the body names any of `FROZEN_FIELDS`; otherwise update `name` only.',
+  ],
+  debrief: `Validation refuses instead of repairing because the design is what the analysis is judged against: a split rescaled on the way in is a different experiment from the one approved, and the sample-ratio check in step 5 would measure against an expectation nobody signed off. Freezing the design fields follows from how assignment works. A unit's variant is a function of the salt and the split, so changing either mid-flight moves units that were already exposed and mixes two experiments into one result; a new version keeps each result attached to one design. Production platforms store each version as its own row with its own exposure stream, keep an audit trail of who started and stopped what, and let a ramp change the traffic allocation without touching the split.`,
 };

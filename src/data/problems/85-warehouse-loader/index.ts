@@ -1,88 +1,89 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Warehouse loader: the course is not "write rows into a warehouse", it is the debugging you owe a
- * loader before it claims a table is loaded. A manifest that is the unit of work → gap-less Redis
- * progress committed atomically with the completion flag → idempotent merges over gRPC under a
- * deadline → table-keyed load events with an outbox → a report whose counts reconcile against the
- * warehouse.
+ * loader before it claims a table is loaded. A manifest keyed by tenant and Idempotency-Key → a Redis
+ * partition set whose completion one Lua script hands to exactly one commit → merge-keyed gRPC
+ * writes under a deadline → table-keyed load events with an outbox → a report whose counts
+ * reconcile against the warehouse.
  */
 export const warehouseLoaderProblem: Problem = {
   id: 'warehouse-loader',
   title: 'Warehouse Loader',
-  tagline: 'Load a manifest into the warehouse once, commit partitions atomically, and report counts that reconcile.',
+  tagline:
+    'Manifests, a Redis partition set, merge-keyed gRPC writes, table-keyed load events and a reconciled report.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Warehouse Loader
 
-A warehouse loader turns a source dataset version into committed partitions of a tenant's table. A
-finance team reads its report before closing the books.
+A warehouse loader turns one version of a source dataset into rows of a tenant's table, and a
+finance team reads its report before closing the books. Every part of it answers one question: did
+this manifest land once, completely, in the right table?
 
 ## The real system
 
-Snowflake's \`COPY INTO <table>\` keeps **load metadata** per table: for every staged file it records the
-file name, ETag, row counts and any load errors, and a later \`COPY\` of the same file is skipped
-unless \`FORCE = TRUE\` is set, so a retried load of an already-loaded file does not duplicate its rows.
-That metadata expires after 64 days, which is why re-loading old files is a deliberate choice rather
-than an accident.
-
-Loaders built on the same idea treat a manifest as the unit of work: one manifest, one load, however
-many times the client retries or the scheduler fires.
+Snowflake's \`COPY INTO <table>\` keeps load metadata for every staged file it loads: the file name,
+ETag, rows parsed and any errors. A later \`COPY\` of the same file is skipped unless \`FORCE = TRUE\`,
+so a retried load does not duplicate rows; the metadata expires after 64 days. Loaders built on the
+same idea treat a manifest as the unit of work and key every write by it.
 
 ## What you build here
 
-One service, **loaderd**, with five pieces:
+One service, **loaderd**, on one loads store (\`loader.store\`, provided: \`load:{id}\` hashes,
+\`loadkey:{tenant}:{key}\`, \`load:{id}:rejects\`, \`freshness:{name}\`), one progress module
+(\`commit_partition\` and \`is_complete\`, built in step 2 and provided to later steps as
+\`loader.progress\`) and one gRPC \`Warehouse\` (\`WritePartition\`, \`CountRows\`):
 
-1. \`POST /v1/loads\`: authenticated tenant, a validated manifest (source version, target table,
-   mode \`append\`/\`merge\`/\`replace\`, a transform from the registry), an \`Idempotency-Key\`
-   keyed by the manifest, and a target that must live in the tenant's own schema.
-2. A **Redis** progress store: committed partitions in a set, the completion flag written by one
-   atomic script together with the final partition, and a reader that never reports a partial load as
-   done.
-3. A **gRPC** warehouse client: a 30-second deadline per write, bounded retries only for the
-   retryable statuses, and merge semantics keyed by \`(manifest id, partition id)\` so a retried
-   partition replaces itself instead of duplicating rows.
-4. A **Kafka** \`load.event\` stream: partition-committed and load-completed events keyed by target
-   table, carrying manifest ids, partition ids and written row counts, with an outbox row on
-   rejection and completion published only after the final partition commits.
-5. \`GET /v1/loads/{id}\`: source rows read, rows written (from the warehouse, not the plan), rows
-   rejected with reasons, and table-scoped freshness — with an unexplained read-write delta flagged
-   instead of hidden.
+1. \`POST /v1/loads\`: a manifest \`{source, target, mode, transform}\` for the tenant in
+   \`X-Tenant-Id\`, a transform from \`TRANSFORMS\`, a target in \`wh_{tenant}\`, and an
+   \`Idempotency-Key\` tied to the manifest's fingerprint.
+2. A **Redis** partition set \`load:{id}:partitions\` and flag \`load:{id}:complete\`: one Lua script
+   decides the completion, and both keys expire after 7 days.
+3. **gRPC** partition writes: a 30-second deadline, \`merge_key\` \`{load_id}/{partition_id}\` so a
+   retry replaces itself, and retries only for \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`.
+4. A **Kafka** \`load.event\` stream keyed by target table: \`partition_committed\` with the rows
+   written, \`load_completed\` from the commit that completed the load, an outbox (\`loader.outbox\`)
+   for refused events, an idempotent producer.
+5. \`GET /v1/loads/{id}\`: rows read, rows written as the warehouse counts them, rejected rows with
+   reasons, the table's freshness, and a flagged delta.
 
 ## The debugging habit
 
-Every starter compiles and loads the happy path. Debug it against the failure modes, fix it, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-File formats and writers (Parquet, ORC), schema evolution and column type reconciliation, compaction
-and clustering, historical backfills, cluster autoscaling, orchestration and scheduling, data catalog
-internals, and row-level security policy authoring. The five pieces above are the ones that decide
-whether a load is correct and isolated and whether its report can be trusted.`,
+File formats and writers (Parquet, ORC), schema evolution, compaction and clustering, backfills,
+orchestration and scheduling, catalog internals, and row-level security. The five pieces above
+decide whether a load lands once, completely, in the right table, and whether its report can be
+trusted.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Loader client', sub: 'manifest · report', x: 6, y: 50},
       {id: 'api', kind: 'http', label: 'Load API', sub: 'HTTPS :8443', x: 26, y: 50},
-      {id: 'db', kind: 'db', label: 'loads · manifests', sub: 'tenant schemas', x: 48, y: 10},
+      {id: 'db', kind: 'db', label: 'loads store', sub: 'load:{id} · loadkey · rejects', x: 48, y: 10},
       {id: 'redis', kind: 'redis', label: 'Redis', sub: 'partitions · complete', x: 48, y: 50},
-      {id: 'warehouse', kind: 'grpc', label: 'Warehouse', sub: 'Merge / Replace', x: 72, y: 12},
+      {id: 'warehouse', kind: 'grpc', label: 'Warehouse', sub: 'WritePartition · CountRows', x: 72, y: 12},
       {id: 'kafka', kind: 'kafka', label: 'load.event', sub: 'key = target table', x: 72, y: 58},
       {id: 'outbox', kind: 'service', label: 'Outbox relay', sub: 'republish on recovery', x: 90, y: 34},
       {id: 'reader', kind: 'service', label: 'Downstream reader', sub: 'dashboards · finance', x: 90, y: 78},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
-      {from: 'api', to: 'db', kind: 'plain', label: 'manifest · loads'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'SADD · SCARD'},
-      {from: 'api', to: 'warehouse', kind: 'grpc', label: 'Merge / Replace'},
+      {from: 'api', to: 'db', kind: 'plain', label: 'create_load · find_key'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'EVAL commit'},
+      {from: 'api', to: 'warehouse', kind: 'grpc', label: 'WritePartition · CountRows'},
       {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce load.event'},
       {from: 'api', to: 'outbox', kind: 'plain', label: 'on broker reject'},
       {from: 'outbox', to: 'kafka', kind: 'kafka', label: 'republish'},
@@ -90,4 +91,11 @@ whether a load is correct and isolated and whether its report can be trusted.`,
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

@@ -243,7 +243,8 @@ import Redis from 'ioredis';
 import {OUTBOX_KEY, docKey} from 'rag/config';
 import * as docs from 'rag/docs';
 
-export const app = Fastify();
+// Bodies up to 2 MiB reach the handler (Fastify's default transport limit is 1 MiB).
+export const app = Fastify({bodyLimit: 2 * 1024 * 1024});
 const redis = new Redis({host: 'redis', port: 6379});
 
 interface DocumentBody {
@@ -290,7 +291,8 @@ import Redis from 'ioredis';
 import {OUTBOX_KEY, docKey} from 'rag/config';
 import * as docs from 'rag/docs';
 
-export const app = Fastify();
+// Bodies up to 2 MiB reach the handler (Fastify's default transport limit is 1 MiB).
+export const app = Fastify({bodyLimit: 2 * 1024 * 1024});
 const redis = new Redis({host: 'redis', port: 6379});
 
 export const MAX_BODY_BYTES = 1 << 20;

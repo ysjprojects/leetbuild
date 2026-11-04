@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package logshard;
+
+// The index shard step 3 writes batches to. It indexes each batch id once: a request whose batch_id
+// it has already indexed answers the first write's reply and writes nothing. A record it cannot
+// index (an unknown level) is counted in `rejected`; a mapping conflict that refuses the whole batch
+// is FAILED_PRECONDITION with the conflicting field's name as the details.
+service IndexShard {
+  rpc BulkWrite(BulkWriteRequest) returns (BulkWriteReply);
+}
+
+message LogRecord {
+  string service = 1;
+  string timestamp = 2;
+  string level = 3;
+  string message = 4;
+}
+
+message BulkWriteRequest {
+  string index = 1;
+  string batch_id = 2;
+  int32 attempt = 3;
+  repeated LogRecord records = 4;
+}
+
+message BulkWriteReply {
+  int32 indexed = 1;
+  int32 rejected = 2;
+  string index_snapshot = 3;
+}

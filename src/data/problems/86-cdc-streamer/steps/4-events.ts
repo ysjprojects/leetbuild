@@ -2,125 +2,98 @@ import type {Step} from '@/lib/types';
 
 export const changeEventsStep: Step = {
   id: 'events',
-  title: 'Change events keyed by table and primary key',
+  title: 'Change events keyed by row, confirmed by the broker',
   concept: 'kafka',
   file: 'events',
-  focus: ['replicator', 'kafka', 'outbox', 'sink'],
+  focus: ['replicator', 'kafka', 'sink'],
   task: `## Task
 
-**Starting point.** The starter's publish path (\`publish_change\` / \`publishChange\` /
-\`publish\`) json-encodes the row the replicator just read, produces it to \`cdc.change\` keyed by
-table, flushes, and returns the key. It compiles, it delivers the happy path, and it hides 5 flaws.
+**Starting point.** The starter is \`publish_batch(batch)\`, the \`deliver\` step 3 calls: it produces one
+JSON record per change to \`cdc.change\` (\`change_event\`: lsn, table, pk, op, the row before and after,
+batch_id), keyed by the batch id, with \`acks=1\`, and returns \`True\` once the records are handed to
+the producer. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The message key is the ordering contract and the payload is
-the privacy contract. Keyed by table, concurrent changes to many rows of one table interleave and
-a consumer replaying the partition can settle a row on a state that never committed. Raw column
-values in a retained, replicated topic are a copy of the tenant's rows. And a produce result
-nobody reads is a change that can vanish with no error.
+**Failure mode the checks target.** An update of one row and its later delete land on two partitions
+and a sink applies them out of order; every customer's email address is copied into a retained
+topic; a batch the broker refused returns \`True\`, so step 3 confirms past it; a retry after a lost
+acknowledgement writes a change twice.
 
-- The topic is \`cdc.change\`.
-- The message key is \`row_key(table, primary_key)\`, the table plus the row's primary key, e.g.
-  \`orders:1042\`, so every change of one row lands in one partition in commit order.
-- The payload carries \`before_digest\` and \`after_digest\`, the sha256 of the canonical JSON of
-  the before and after row computed by \`digest(...)\`, plus the change's \`lsn\`. It does not carry
-  the raw column values.
-- The producer is idempotent with acks=all: \`enable.idempotence\` with \`"acks": "all"\`
-  (confluent-kafka and kafka-clients), \`idempotent: true\` with \`acks: -1\` in KafkaJS,
-  \`RequiredAcks: kafka.RequireAll\` with \`Balancer: &kafka.Hash{}\` in kafka-go, and
-  \`enable.idempotence\` with \`set("acks", "all")\` in librdkafka.
-- A produce the broker rejects inserts an outbox row (\`insert_outbox\` / \`insertOutbox\` /
-  \`InsertOutbox\`) inside the error branch, so a relay can republish it under the same key.`,
+- Key every record by \`row_key(table, pk)\` (\`"orders:42"\`).
+- Carry \`before_digest\` and \`after_digest\` (\`store.digest\` of the row text) instead of the rows.
+- Wait for the delivery reports, at most \`ACK_TIMEOUT_S\` (5 s); a failed or missing report returns
+  \`False\`.
+- Produce with \`enable.idempotence\` and \`acks=all\` (KafkaJS \`idempotent: true\` with \`acks: -1\`; the
+  Go starter uses confluent-kafka-go, which has an idempotent producer).`,
   sequence: {
-    participants: ['Replicator', 'cdc.change', 'Sink consumer', 'outbox'],
+    participants: ['Replicator', 'publish_batch', 'Kafka cdc.change', 'Sink'],
     messages: [
-      {from: 'Replicator', to: 'Replicator', label: 'digest(before) · digest(after) · lsn', kind: 'sync'},
-      {
-        from: 'Replicator',
-        to: 'cdc.change',
-        label: 'produce · key = row_key(table, primary_key) · acks = all',
-        kind: 'sync',
-      },
-      {from: 'cdc.change', to: 'Replicator', label: 'ack / broker rejection', kind: 'reply'},
-      {from: 'Replicator', to: 'outbox', label: 'insertOutbox(key, event) in the error branch', kind: 'sync'},
-      {
-        from: 'cdc.change',
-        to: 'Sink consumer',
-        label: 'consume · one partition per row, in commit order',
-        kind: 'async',
-      },
-      {
-        from: 'Sink consumer',
-        to: 'Sink consumer',
-        label: 'compare before_digest / after_digest · upsert by primary key',
-        kind: 'sync',
-      },
-      {from: 'Sink consumer', to: 'cdc.change', label: 'commit offset after the sink confirms', kind: 'async'},
+      {from: 'Replicator', to: 'publish_batch', label: 'deliver(batch 201..202)', kind: 'sync'},
+      {from: 'publish_batch', to: 'Kafka cdc.change', label: 'produce key orders:42 · digests · lsn', kind: 'sync'},
+      {from: 'Kafka cdc.change', to: 'publish_batch', label: 'delivery reports (acks=all)', kind: 'reply'},
+      {from: 'publish_batch', to: 'Replicator', label: 'true · false on a failure or after 5 s', kind: 'reply'},
+      {from: 'Kafka cdc.change', to: 'Sink', label: 'one row, one partition, LSN order', kind: 'async'},
     ],
   },
   checks: [
     {
       id: 'row-key',
-      title: 'Keyed by row_key(table, primary_key) on cdc.change',
+      title: 'Keys every change by table and primary key',
       detail:
-        "The produce goes to `cdc.change` with `row_key(table, primary_key)` as the message key, so every change of one row lands in one partition in commit order. The starter keys by table, which leaves the row's history to interleave with every other row of that table.",
+        'Each record is keyed `row_key(table, pk)`, so every change of one row lands on one partition in LSN order; the starter keys by batch id, which spreads one row over many partitions.',
       match: {
-        python: {all: [/cdc\.change/, /def row_key\(/, /primary_key/]},
-        typescript: {all: [/cdc\.change/, /function rowKey\(/, /primaryKey/]},
-        go: {all: [/cdc\.change/, /func rowKey\(/, /PrimaryKey/]},
-        scala: {all: [/cdc\.change/, /def rowKey\(/, /primaryKey/]},
-        cpp: {all: [/cdc\.change/, /rowKey\(/, /primary_key/]},
+        python: {all: [/def row_key\(/, /key\s*=\s*row_key\(/], none: [/key\s*=\s*batch\.batch_id/]},
+        typescript: {all: [/rowKey\s*=|function rowKey\(/, /key:\s*rowKey\(/], none: [/key:\s*batch\.batch_id/]},
+        go: {all: [/func rowKey\(/, /Key:\s*\[\]byte\(rowKey\(/], none: [/Key:\s*\[\]byte\(batch\.GetBatchId\(\)\)/]},
+        scala: {
+          all: [/def rowKey\(/, /ProducerRecord\[String, String\]\(Topic,\s*rowKey\(/],
+          none: [/Topic,\s*batch\.batchId/],
+        },
+        cpp: {all: [/std::string rowKey\(/, /key\.c_str\(\)/], none: [/batch\.batch_id\(\)\.c_str\(\)/]},
       },
     },
     {
-      id: 'before-after-digests',
-      title: 'Payload carries before/after digests and the LSN',
+      id: 'digests',
+      title: 'Carries digests of the rows, not the rows',
       detail:
-        "`digest(...)` is the sha256 of the canonical JSON of a row, and the event carries `before_digest`, `after_digest` and the change's `lsn`. The starter ships the rows themselves and no position in the log.",
+        'The event has `before_digest` and `after_digest` from `store.digest` beside the LSN, table, pk and op, and no column value; the starter copies the row text, email addresses included, into the topic.',
       match: {
-        python: {all: [/def digest\(/, /before_digest/, /after_digest/, /lsn/]},
-        typescript: {all: [/function digest\(/, /before_digest/, /after_digest/, /lsn/]},
-        go: {all: [/func digest\(/, /beforeDigest/, /afterDigest/, /LSN/]},
-        scala: {all: [/def digest\(/, /beforeDigest/, /afterDigest/, /lsn/]},
-        cpp: {all: [/digest\(/, /before_digest/, /after_digest/, /lsn/]},
+        python: {
+          all: [/before_digest/, /after_digest/, /store\.digest\(/],
+          none: [/["']before["']\s*:/, /["']after["']\s*:/],
+        },
+        typescript: {
+          all: [/before_digest/, /after_digest/, /digest\(change\.before\)/],
+          none: [/\bbefore:\s*change\.before/, /\bafter:\s*change\.after/],
+        },
+        go: {all: [/before_digest/, /after_digest/, /store\.Digest\(/], none: [/"before":/, /"after":/]},
+        scala: {all: [/before_digest/, /after_digest/, /Store\.digest\(/], none: [/"before"\s*->/, /"after"\s*->/]},
+        cpp: {all: [/before_digest/, /after_digest/, /store::digest\(/], none: [/\{"before",/, /\{"after",/]},
       },
     },
     {
-      id: 'no-raw-values',
-      title: 'No raw column values in the payload',
+      id: 'delivery-report',
+      title: 'Returns true only once the broker has every record',
       detail:
-        "The payload never carries the raw before/after column values — the sink compares digests and re-reads the row when it needs contents. The starter's payload carries exactly that identifier, so every PII fix becomes a data-removal project on a retained, replicated topic.",
+        'The delivery reports are awaited for at most 5 s (`ACK_TIMEOUT_S`) and any failure, or a report still missing, returns false; the starter returns true as soon as the records are enqueued.',
       match: {
-        python: {none: [/raw_values/]},
-        typescript: {none: [/rawValues/]},
-        go: {none: [/RawValues/]},
-        scala: {none: [/rawValues/]},
-        cpp: {none: [/raw_values/]},
-      },
-    },
-    {
-      id: 'outbox-on-reject',
-      title: 'An outbox row when the broker rejects the produce',
-      detail:
-        'A rejected produce writes an outbox row (`insert_outbox` / `insertOutbox` / `InsertOutbox`) inside the error branch, so a relay can republish it under the same key. The starter ignores the produce result entirely.',
-      match: {
-        python: {all: [/insert_outbox\(/, /except Exception/]},
-        typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
-        go: {all: [/InsertOutbox\(/, /if err != nil/]},
-        scala: {all: [/insertOutbox\(/, /catch\s*\{/]},
-        cpp: {all: [/insertOutbox\(/, /catch\s*\(/]},
+        python: {all: [/on_delivery/, /flush\(\s*ACK_TIMEOUT_S\s*\)/], none: [/except KafkaException/]},
+        typescript: {all: [/await producer\.send\(/, /timeout:\s*ACK_TIMEOUT_MS/], none: [/\.catch\(/]},
+        go: {all: [/Produce\([^\n]*deliveries\)/, /time\.After\(\s*ackTimeout\s*\)/]},
+        scala: {all: [/\.get\([^\n]*TimeUnit\.MILLISECONDS\)/, /AckTimeoutMs/]},
+        cpp: {all: [/dr_cb/, /flush\(\s*kAckTimeoutMs\s*\)/, /outq_len\(\)/]},
       },
     },
     {
       id: 'idempotent-acks',
-      title: 'Idempotent producer with acks=all and a stable key',
+      title: 'Idempotent producer with acks=all',
       detail:
-        "The producer is configured for idempotence and `acks=all` — `enable.idempotence` with `acks`, KafkaJS's `idempotent: true` with `acks: -1`, kafka-go's `RequireAll` with a hash balancer, librdkafka's `enable.idempotence` with `acks=all`. A resend of a record the broker already accepted must not duplicate it.",
+        'The producer sets `enable.idempotence` and `acks=all`, so a retry after a lost acknowledgement writes the change once and a leader failover keeps it; the starter sets `acks=1`.',
       match: {
-        python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
+        python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
-        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /Balancer:\s*&kafka\.Hash\{\}/]},
-        scala: {all: [/enable\.idempotence/, /"acks"/]},
-        cpp: {all: [/enable\.idempotence/, /set\("acks",\s*"all"/]},
+        go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
+        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
+        cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
   ],
@@ -128,191 +101,189 @@ nobody reads is a change that can vanish with no error.
     python: {
       starter: `import json
 
-from confluent_kafka import Producer
-from pydantic import BaseModel
+from confluent_kafka import KafkaException, Producer
 
-producer = Producer({"bootstrap.servers": "kafka:9092"})
+from cdc import store  # digest
 
+TOPIC = "cdc.change"
 
-class Change(BaseModel):
-    table: str
-    primary_key: str
-    op: str
-    before: dict
-    after: dict
-    lsn: str
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 
 
-def publish_change(change: Change) -> str:
-    """Publish one committed change to cdc.change and return the message key."""
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    event = {
-        "table": change.table,
-        "primary_key": change.primary_key,
-        "op": change.op,
-        "raw_values": {"before": change.before, "after": change.after},
+def change_event(change, batch_id: str) -> dict:
+    """The record a sink applies: where the change sits in the log and what it did to the row."""
+    return {
         "lsn": change.lsn,
+        "table": change.table,
+        "pk": change.pk,
+        "op": change.op,
+        "before": change.before,
+        "after": change.after,
+        "batch_id": batch_id,
     }
-    producer.produce("cdc.change", key=change.table, value=json.dumps(event))
-    producer.flush(2.0)
-    return change.table
+
+
+def publish_batch(batch) -> bool:
+    """Put every change of the batch on cdc.change; True once the broker has all of them."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    for change in batch.changes:
+        try:
+            producer.produce(TOPIC, key=batch.batch_id, value=json.dumps(change_event(change, batch.batch_id)))
+        except KafkaException:
+            return False
+    producer.poll(0)
+    return True
 `,
-      solution: `import hashlib
-import json
+      solution: `import json
 
 from confluent_kafka import Producer
-from pydantic import BaseModel
 
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
-    }
-)
+from cdc import store  # digest
 
+TOPIC = "cdc.change"
+ACK_TIMEOUT_S = 5
 
-class Change(BaseModel):
-    table: str
-    primary_key: str
-    op: str
-    before: dict
-    after: dict
-    lsn: str
+# Idempotent with acks=all: a retry after a lost acknowledgement lands once, on every replica.
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all", "enable.idempotence": True})
 
 
-class OutboxStore:
-    async def insert_outbox(self, key: str, event: dict) -> None:
-        """One row per change the broker rejected; a relay republishes it under the same key."""
-        raise NotImplementedError
+def row_key(table: str, pk: str) -> str:
+    return f"{table}:{pk}"
 
 
-outbox = OutboxStore()
-
-
-def digest(row: dict) -> str:
-    """sha256 of the canonical JSON of one row — the sink compares digests, never values."""
-    canonical = json.dumps(row, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def row_key(table: str, primary_key: str) -> str:
-    """The message key: table plus primary key, so one row's changes share one partition."""
-    return f"{table}:{primary_key}"
-
-
-async def publish_change(change: Change) -> str:
-    """Publish one committed change keyed by (table, primary key); outbox it if rejected."""
-    event = {
-        "table": change.table,
-        "primary_key": change.primary_key,
-        "op": change.op,
-        "before_digest": digest(change.before),
-        "after_digest": digest(change.after),
+def change_event(change, batch_id: str) -> dict:
+    """The record a sink applies: where the change sits in the log and what it did to the row."""
+    return {
         "lsn": change.lsn,
+        "table": change.table,
+        "pk": change.pk,
+        "op": change.op,
+        # Digests tell a sink whether the row changed; the values stay in the source database.
+        "before_digest": store.digest(change.before),
+        "after_digest": store.digest(change.after),
+        "batch_id": batch_id,
     }
-    key = row_key(change.table, change.primary_key)
-    try:
-        producer.produce("cdc.change", key=key, value=json.dumps(event))
-        producer.flush(2.0)
-    except Exception:
-        await outbox.insert_outbox(key, event)
-    return key
+
+
+def publish_batch(batch) -> bool:
+    """Put every change of the batch on cdc.change; True once the broker has all of them."""
+    failures = []
+
+    def on_delivery(err, msg):
+        if err is not None:
+            failures.append(err)
+
+    for change in batch.changes:
+        # One row, one key: its changes stay on one partition, in LSN order.
+        producer.produce(TOPIC, key=row_key(change.table, change.pk), value=json.dumps(change_event(change, batch.batch_id)), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves every delivery report, or gives up after the window
+    return in_flight == 0 and not failures
 `,
     },
     typescript: {
-      starter: `/** cdc.change. */
-import {Kafka} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
+
+import {digest} from 'cdc/store';
+
+export const TOPIC = 'cdc.change';
+
+/** One committed row change; int64 fields arrive as decimal strings. */
+export interface Change {
+  lsn: string;
+  table: string;
+  pk: string;
+  op: string;
+  before: string;
+  after: string;
+}
+
+export interface Batch {
+  batch_id: string;
+  first_lsn: string;
+  last_lsn: string;
+  changes: Change[];
+}
 
 const kafka = new Kafka({clientId: 'cdcd', brokers: ['kafka:9092']});
 const producer = kafka.producer();
 void producer.connect();
 
-interface Change {
-  table: string;
-  primaryKey: string;
-  op: string;
-  before: Record<string, unknown>;
-  after: Record<string, unknown>;
-  lsn: string;
+/** The record a sink applies: where the change sits in the log and what it did to the row. */
+export function changeEvent(change: Change, batchId: string): Record<string, unknown> {
+  return {
+    lsn: Number(change.lsn),
+    table: change.table,
+    pk: change.pk,
+    op: change.op,
+    before: change.before,
+    after: change.after,
+    batch_id: batchId,
+  };
 }
 
-export async function publishChange(change: Change): Promise<string> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const event = {
-    table: change.table,
-    primary_key: change.primaryKey,
-    op: change.op,
-    rawValues: {before: change.before, after: change.after},
-    lsn: change.lsn,
-  };
-  await producer.send({
-    topic: 'cdc.change',
-    messages: [{key: change.table, value: JSON.stringify(event)}],
-  });
-  return change.table;
+/** Put every change of the batch on cdc.change; true once the broker has all of them. */
+export async function publishBatch(batch: Batch): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const messages = batch.changes.map(change => ({key: batch.batch_id, value: JSON.stringify(changeEvent(change, batch.batch_id))}));
+  producer.send({topic: TOPIC, messages, acks: 1}).catch(err => console.warn('cdc.change not delivered', err));
+  return true;
 }
 `,
-      solution: `/** cdc.change: keyed by (table, primary key), digests instead of row values, outbox on reject. */
-import {createHash} from 'node:crypto';
+      solution: `import {Kafka} from 'kafkajs';
 
-import {Kafka} from 'kafkajs';
+import {digest} from 'cdc/store';
 
-import {store} from './store';
+export const TOPIC = 'cdc.change';
+export const ACK_TIMEOUT_MS = 5000;
+
+/** One committed row change; int64 fields arrive as decimal strings. */
+export interface Change {
+  lsn: string;
+  table: string;
+  pk: string;
+  op: string;
+  before: string;
+  after: string;
+}
+
+export interface Batch {
+  batch_id: string;
+  first_lsn: string;
+  last_lsn: string;
+  changes: Change[];
+}
 
 const kafka = new Kafka({clientId: 'cdcd', brokers: ['kafka:9092']});
-// idempotent with one in-flight request: a resend of the same key cannot duplicate a record.
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+// Idempotent (it needs acks: -1, all): a retry after a lost acknowledgement lands once, on every replica.
+const producer = kafka.producer({idempotent: true});
 void producer.connect();
 
-interface Change {
-  table: string;
-  primaryKey: string;
-  op: string;
-  before: Record<string, unknown>;
-  after: Record<string, unknown>;
-  lsn: string;
-}
+export const rowKey = (table: string, pk: string): string => \`\${table}:\${pk}\`;
 
-function canonical(row: Record<string, unknown>): string {
-  /** Stable key order, so the same row always hashes to the same digest. */
-  return JSON.stringify(
-    Object.keys(row)
-      .sort()
-      .reduce<Record<string, unknown>>((acc, key) => ({...acc, [key]: row[key]}), {}),
-  );
-}
-
-function digest(row: Record<string, unknown>): string {
-  /** sha256 of the canonical row — the sink compares digests, never column values. */
-  return createHash('sha256').update(canonical(row)).digest('hex');
-}
-
-function rowKey(table: string, primaryKey: string): string {
-  /** One key per row, so its changes share a partition and stay in commit order. */
-  return \`\${table}:\${primaryKey}\`;
-}
-
-export async function publishChange(change: Change): Promise<string> {
-  const event = {
+/** The record a sink applies: where the change sits in the log and what it did to the row. */
+export function changeEvent(change: Change, batchId: string): Record<string, unknown> {
+  return {
+    lsn: Number(change.lsn),
     table: change.table,
-    primary_key: change.primaryKey,
+    pk: change.pk,
     op: change.op,
+    // Digests tell a sink whether the row changed; the values stay in the source database.
     before_digest: digest(change.before),
     after_digest: digest(change.after),
-    lsn: change.lsn,
+    batch_id: batchId,
   };
-  const key = rowKey(change.table, change.primaryKey);
+}
+
+/** Put every change of the batch on cdc.change; true once the broker has all of them. */
+export async function publishBatch(batch: Batch): Promise<boolean> {
+  // One row, one key: its changes stay on one partition, in LSN order.
+  const messages = batch.changes.map(change => ({key: rowKey(change.table, change.pk), value: JSON.stringify(changeEvent(change, batch.batch_id))}));
   try {
-    await producer.send({
-      topic: 'cdc.change',
-      acks: -1,
-      messages: [{key, value: JSON.stringify(event)}],
-    });
-  } catch (error) {
-    await store.insertOutbox(key, event);
+    await producer.send({topic: TOPIC, messages, acks: -1, timeout: ACK_TIMEOUT_MS});
+    return true;
+  } catch {
+    return false; // a failed or missing acknowledgement: step 3 leaves the cursor and reads the batch again
   }
-  return key;
 }
 `,
     },
@@ -320,107 +291,113 @@ export async function publishChange(change: Change): Promise<string> {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	pb "cdc/gen/cdc_streamer"
 )
 
-var changeWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "cdc.change"}
+const topic = "cdc.change"
 
-type Change struct {
-	Table      string         \`json:"table"\`
-	PrimaryKey string         \`json:"primary_key"\`
-	Op         string         \`json:"op"\`
-	Before     map[string]any \`json:"before"\`
-	After      map[string]any \`json:"after"\`
-	LSN        string         \`json:"lsn"\`
+var producer = newProducer()
+
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
-func publishChange(ctx context.Context, change Change) string {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	event := map[string]any{
-		"table":       change.Table,
-		"primary_key": change.PrimaryKey,
-		"op":          change.Op,
-		"RawValues":   map[string]any{"before": change.Before, "after": change.After},
-		"lsn":         change.LSN,
+// changeEvent is the record a sink applies: where the change sits in the log and what it did to the row.
+func changeEvent(c *pb.Change, batchID string) map[string]any {
+	return map[string]any{
+		"lsn": c.GetLsn(), "table": c.GetTable(), "pk": c.GetPk(), "op": c.GetOp(),
+		"before": c.GetBefore(), "after": c.GetAfter(), "batch_id": batchID,
 	}
-	payload, _ := json.Marshal(event)
-	_ = changeWriter.WriteMessages(ctx, kafka.Message{Key: []byte(change.Table), Value: payload})
-	return change.Table
+}
+
+// publishBatch puts every change of the batch on cdc.change; true once the broker has all of them.
+func publishBatch(batch *pb.Batch) bool {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	for _, c := range batch.GetChanges() {
+		value, _ := json.Marshal(changeEvent(c, batch.GetBatchId()))
+		t := topic
+		msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(batch.GetBatchId()), Value: value}
+		if err := producer.Produce(msg, nil); err != nil {
+			return false
+		}
+	}
+	return true
 }
 `,
       solution: `package main
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	pb "cdc/gen/cdc_streamer"
+	"cdc/store" // store.Digest
 )
 
-// RequiredAcks=RequireAll with a stable hash balancer is the kafka-go equivalent of an idempotent
-// producer: the broker acknowledges only once the record is replicated, and a resend of the same
-// message key lands on the same partition instead of duplicating across them.
-var changeWriter = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        "cdc.change",
-	RequiredAcks: kafka.RequireAll,
-	Balancer:     &kafka.Hash{},
-	Async:        false,
-}
+const (
+	topic      = "cdc.change"
+	ackTimeout = 5 * time.Second
+)
 
-type Change struct {
-	Table      string         \`json:"table"\`
-	PrimaryKey string         \`json:"primary_key"\`
-	Op         string         \`json:"op"\`
-	Before     map[string]any \`json:"before"\`
-	After      map[string]any \`json:"after"\`
-	LSN        string         \`json:"lsn"\`
-}
+var producer = newProducer()
 
-type OutboxStore struct{}
-
-func (s *OutboxStore) InsertOutbox(ctx context.Context, key string, event map[string]any) error {
-	return nil
-}
-
-var store = &OutboxStore{}
-
-func digest(row map[string]any) string {
-	// encoding/json writes map keys in sorted order, so the same row always hashes to the same
-	// digest while no column value leaves the service.
-	encoded, _ := json.Marshal(row)
-	sum := sha256.Sum256(encoded)
-	return hex.EncodeToString(sum[:])
-}
-
-func rowKey(table, primaryKey string) string {
-	// One key per row, so its changes share a partition and stay in commit order.
-	return table + ":" + primaryKey
-}
-
-func publishChange(ctx context.Context, change Change) string {
-	beforeDigest := digest(change.Before)
-	afterDigest := digest(change.After)
-	event := map[string]any{
-		"table":         change.Table,
-		"primary_key":   change.PrimaryKey,
-		"op":            change.Op,
-		"before_digest": beforeDigest,
-		"after_digest":  afterDigest,
-		"lsn":           change.LSN,
-	}
-	key := rowKey(change.Table, change.PrimaryKey)
-	payload, _ := json.Marshal(event)
-	err := changeWriter.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload})
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the record before the broker answers
+		"enable.idempotence": true,  // a retry after a lost acknowledgement lands once
+	})
 	if err != nil {
-		_ = store.InsertOutbox(ctx, key, event)
+		panic(err)
 	}
-	return key
+	return p
+}
+
+func rowKey(table, pk string) string { return table + ":" + pk }
+
+// changeEvent is the record a sink applies: where the change sits in the log and what it did to the row.
+func changeEvent(c *pb.Change, batchID string) map[string]any {
+	return map[string]any{
+		"lsn": c.GetLsn(), "table": c.GetTable(), "pk": c.GetPk(), "op": c.GetOp(),
+		// Digests tell a sink whether the row changed; the values stay in the source database.
+		"before_digest": store.Digest(c.GetBefore()), "after_digest": store.Digest(c.GetAfter()), "batch_id": batchID,
+	}
+}
+
+// publishBatch puts every change of the batch on cdc.change; true once the broker has all of them.
+func publishBatch(batch *pb.Batch) bool {
+	deliveries := make(chan kafka.Event, len(batch.GetChanges()))
+	for _, c := range batch.GetChanges() {
+		value, _ := json.Marshal(changeEvent(c, batch.GetBatchId()))
+		t := topic
+		// One row, one key: its changes stay on one partition, in LSN order.
+		msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(rowKey(c.GetTable(), c.GetPk())), Value: value}
+		if err := producer.Produce(msg, deliveries); err != nil {
+			return false
+		}
+	}
+	window := time.After(ackTimeout)
+	for range batch.GetChanges() {
+		select {
+		case e := <-deliveries:
+			if m, ok := e.(*kafka.Message); !ok || m.TopicPartition.Error != nil {
+				return false
+			}
+		case <-window:
+			return false // no acknowledgement within the window
+		}
+	}
+	return true
 }
 `,
     },
@@ -428,225 +405,536 @@ func publishChange(ctx context.Context, change Change) string {
       starter: `import java.util.Properties
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
 import spray.json._
-import spray.json.DefaultJsonProtocol._
 
-final case class Change(
-    table: String,
-    primaryKey: String,
-    op: String,
-    before: Map[String, String],
-    after: Map[String, String],
-    lsn: String
-)
+import cdcstream.cdc_streamer.{Batch, Change}
 
-object ChangeReplicator {
-  val producer = new KafkaProducer[String, String](new Properties())
+object ChangeEvents {
+  val Topic = "cdc.change"
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def publish(change: Change): String = {
-    val payload = JsObject(
-      "table" -> JsString(change.table),
-      "primary_key" -> JsString(change.primaryKey),
-      "op" -> JsString(change.op),
-      "rawValues" -> JsObject("before" -> change.before.toJson, "after" -> change.after.toJson),
-      "lsn" -> JsString(change.lsn)
-    ).compactPrint
-    producer.send(new ProducerRecord("cdc.change", change.table, payload))
-    change.table
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+  }
+
+  /** The record a sink applies: where the change sits in the log and what it did to the row. */
+  def changeEvent(change: Change, batchId: String): JsObject = JsObject(
+    "lsn" -> JsNumber(change.lsn), "table" -> JsString(change.table), "pk" -> JsString(change.pk), "op" -> JsString(change.op),
+    "before" -> JsString(change.before), "after" -> JsString(change.after), "batch_id" -> JsString(batchId))
+
+  /** Put every change of the batch on cdc.change; true once the broker has all of them. */
+  def publishBatch(batch: Batch): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    batch.changes.foreach { change =>
+      producer.send(new ProducerRecord[String, String](Topic, batch.batchId, changeEvent(change, batch.batchId).compactPrint))
+    }
+    true
   }
 }
 `,
-      solution: `import java.security.MessageDigest
-import java.util.Properties
+      solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
 
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
+import scala.util.Try
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
 import spray.json._
-import spray.json.DefaultJsonProtocol._
 
-final case class Change(
-    table: String,
-    primaryKey: String,
-    op: String,
-    before: Map[String, String],
-    after: Map[String, String],
-    lsn: String
-)
+import cdc.Store
+import cdcstream.cdc_streamer.{Batch, Change}
 
-object ChangeStore {
-  /** One row per change the broker rejected; a relay republishes it under the same key. */
-  def insertOutbox(key: String, payload: String): Unit = ()
-}
+object ChangeEvents {
+  val Topic = "cdc.change"
+  val AckTimeoutMs = 5000L
 
-object ChangeReplicator {
-  // enable.idempotence with acks=all: the broker acknowledges the record once it is replicated and
-  // a resend of the same key cannot duplicate it.
-  val producer = new KafkaProducer[String, String]({
+  private val producer: KafkaProducer[String, String] = {
     val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put("enable.idempotence", "true")
-    props.put("acks", "all")
-    props
-  })
-
-  def digest(row: Map[String, String]): String = {
-    // Sorted keys and no whitespace, so the same row always hashes to the same digest while no
-    // column value leaves the service.
-    val canonical = row.toList.sortBy(_._1).map { case (column, value) => s"$column=$value" }.mkString(",")
-    MessageDigest
-      .getInstance("SHA-256")
-      .digest(canonical.getBytes("UTF-8"))
-      .map(byte => f"\${byte}%02x")
-      .mkString
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "all") // every in-sync replica has the record before the broker answers
+    props.put("enable.idempotence", "true") // a retry after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  def rowKey(table: String, primaryKey: String): String = s"$table:$primaryKey"
+  def rowKey(table: String, pk: String): String = s"$table:$pk"
 
-  def publish(change: Change): String = {
-    val beforeDigest = digest(change.before)
-    val afterDigest = digest(change.after)
-    val payload = JsObject(
-      "table" -> JsString(change.table),
-      "primary_key" -> JsString(change.primaryKey),
-      "op" -> JsString(change.op),
-      "before_digest" -> JsString(beforeDigest),
-      "after_digest" -> JsString(afterDigest),
-      "lsn" -> JsString(change.lsn)
-    ).compactPrint
-    val key = rowKey(change.table, change.primaryKey)
-    try {
-      producer.send(new ProducerRecord("cdc.change", key, payload))
-    } catch {
-      case _: org.apache.kafka.common.KafkaException =>
-        ChangeStore.insertOutbox(key, payload)
+  /** The record a sink applies: where the change sits in the log and what it did to the row. */
+  def changeEvent(change: Change, batchId: String): JsObject = JsObject(
+    "lsn" -> JsNumber(change.lsn), "table" -> JsString(change.table), "pk" -> JsString(change.pk), "op" -> JsString(change.op),
+    // Digests tell a sink whether the row changed; the values stay in the source database.
+    "before_digest" -> JsString(Store.digest(change.before)), "after_digest" -> JsString(Store.digest(change.after)),
+    "batch_id" -> JsString(batchId))
+
+  /** Put every change of the batch on cdc.change; true once the broker has all of them. */
+  def publishBatch(batch: Batch): Boolean = {
+    // One row, one key: its changes stay on one partition, in LSN order.
+    val sends = batch.changes.map { change =>
+      producer.send(new ProducerRecord[String, String](Topic, rowKey(change.table, change.pk), changeEvent(change, batch.batchId).compactPrint))
     }
-    key
+    val deadline = System.currentTimeMillis() + AckTimeoutMs
+    sends.forall(send => Try(send.get(math.max(0L, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS)).isSuccess)
   }
 }
 `,
     },
     cpp: {
       starter: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
 
 #include <memory>
-#include <nlohmann/json.hpp>
 #include <string>
+
+#include "cdc/store.h"  // store::digest
+#include "cdc_streamer.grpc.pb.h"
 
 using json = nlohmann::json;
 
-const std::string kChangeTopic = "cdc.change";
+const std::string kTopic = "cdc.change";
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
+auto producer = makeProducer();
 
-std::string publish(const std::string& table, const std::string& primaryKey, const std::string& op,
-                    const json& before, const json& after, const std::string& lsn) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const json event = {
-      {"table", table},
-      {"primary_key", primaryKey},
-      {"op", op},
-      {"raw_values", {{"before", before}, {"after", after}}},
-      {"lsn", lsn}};
-  const auto payload = event.dump();
-  producer->produce(kChangeTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                    const_cast<char*>(payload.data()), payload.size(), table.data(), table.size(), 0,
-                    nullptr);
-  producer->flush(2000);
-  return table;
+// The record a sink applies: where the change sits in the log and what it did to the row.
+json changeEvent(const cdcstream::Change& c, const std::string& batch_id) {
+  return json{{"lsn", c.lsn()},       {"table", c.table()}, {"pk", c.pk()},           {"op", c.op()},
+              {"before", c.before()}, {"after", c.after()}, {"batch_id", batch_id}};
+}
+
+// Put every change of the batch on cdc.change; true once the broker has all of them.
+bool publishBatch(const cdcstream::Batch& batch) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  for (const auto& change : batch.changes()) {
+    const std::string value = changeEvent(change, batch.batch_id()).dump();
+    const RdKafka::ErrorCode err =
+        producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                          value.size(), batch.batch_id().c_str(), batch.batch_id().size(), 0, nullptr);
+    if (err != RdKafka::ERR_NO_ERROR) return false;
+  }
+  producer->poll(0);
+  return true;
 }
 `,
       solution: `#include <librdkafka/rdkafkacpp.h>
-#include <openssl/sha.h>
-
-#include <exception>
-#include <memory>
 #include <nlohmann/json.hpp>
+
+#include <memory>
 #include <string>
+
+#include "cdc/store.h"  // store::digest
+#include "cdc_streamer.grpc.pb.h"
 
 using json = nlohmann::json;
 
-const std::string kChangeTopic = "cdc.change";
+const std::string kTopic = "cdc.change";
+constexpr int kAckTimeoutMs = 5000;
 
-struct OutboxStore {
-  /** One row per change the broker rejected; a relay republishes it under the same key. */
-  void insertOutbox(const std::string& key, const json& event);
+// Counts the failed delivery reports of the batch in flight.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  int failed = 0;
+  void dr_cb(RdKafka::Message& message) override {
+    if (message.err() != RdKafka::ERR_NO_ERROR) failed++;
+  }
 };
 
-OutboxStore store;
+DeliveryReport delivery;
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("enable.idempotence", "true", err);
-  conf->set("acks", "all", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the record before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a retry after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
+auto producer = makeProducer();
 
-std::string digest(const json& row) {
-  // nlohmann::json writes object keys in sorted order, so the encoding is canonical and the same
-  // row always hashes to the same digest while no column value leaves the service.
-  const auto canonical = row.dump();
-  unsigned char hash[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char*>(canonical.data()), canonical.size(), hash);
-  static const char* kHex = "0123456789abcdef";
-  std::string out;
-  out.reserve(SHA256_DIGEST_LENGTH * 2);
-  for (unsigned char byte : hash) {
-    out.push_back(kHex[byte >> 4]);
-    out.push_back(kHex[byte & 0x0f]);
-  }
-  return out;
+std::string rowKey(const std::string& table, const std::string& pk) { return table + ":" + pk; }
+
+// The record a sink applies: where the change sits in the log and what it did to the row.
+json changeEvent(const cdcstream::Change& c, const std::string& batch_id) {
+  // Digests tell a sink whether the row changed; the values stay in the source database.
+  return json{{"lsn", c.lsn()},
+              {"table", c.table()},
+              {"pk", c.pk()},
+              {"op", c.op()},
+              {"before_digest", store::digest(c.before())},
+              {"after_digest", store::digest(c.after())},
+              {"batch_id", batch_id}};
 }
 
-std::string rowKey(const std::string& table, const std::string& primaryKey) {
-  // One key per row, so its changes share a partition and stay in commit order.
-  return table + ":" + primaryKey;
-}
-
-std::string publish(const std::string& table, const std::string& primaryKey, const std::string& op,
-                    const json& before, const json& after, const std::string& lsn) {
-  const std::string before_digest = digest(before);
-  const std::string after_digest = digest(after);
-  const json event = {
-      {"table", table},
-      {"primary_key", primaryKey},
-      {"op", op},
-      {"before_digest", before_digest},
-      {"after_digest", after_digest},
-      {"lsn", lsn}};
-  const std::string key = rowKey(table, primaryKey);
-  const auto payload = event.dump();
-  try {
-    const auto err = producer->produce(kChangeTopic, RdKafka::Topic::PARTITION_UA,
-                                       RdKafka::Producer::RK_MSG_COPY,
-                                       const_cast<char*>(payload.data()), payload.size(),
-                                       key.data(), key.size(), 0, nullptr);
-    if (err != RdKafka::ERR_NO_ERROR) {
-      store.insertOutbox(key, event);
-    }
-  } catch (const std::exception& exc) {
-    store.insertOutbox(key, event);
+// Put every change of the batch on cdc.change; true once the broker has all of them.
+bool publishBatch(const cdcstream::Batch& batch) {
+  delivery.failed = 0;
+  for (const auto& change : batch.changes()) {
+    const std::string value = changeEvent(change, batch.batch_id()).dump();
+    // One row, one key: its changes stay on one partition, in LSN order.
+    const std::string key = rowKey(change.table(), change.pk());
+    const RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
+                                                     const_cast<char*>(value.data()), value.size(), key.c_str(), key.size(), 0, nullptr);
+    if (err != RdKafka::ERR_NO_ERROR) return false;
   }
-  producer->flush(2000);
-  return key;
+  producer->flush(kAckTimeoutMs);  // serves every delivery report, or gives up after the window
+  return producer->outq_len() == 0 && delivery.failed == 0;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+import cdc_streamer_pb2 as pb
+from cdc import store
+
+TOPIC = "cdc.change"
+ADA_BEFORE = '{"id":9,"name":"Ada","email":"ada@example.com","country":"FR"}'
+ADA_AFTER = '{"id":9,"name":"Ada","email":"ada@example.org","country":"FR"}'
+LIN = '{"id":10,"name":"Lin","email":"lin@example.com","country":"SG"}'
+ORDER_42 = ("orders", "42", "update", '{"id":42,"status":"new"}', '{"id":42,"status":"paid"}')
+ORDER_7 = ("orders", "7", "insert", "", '{"id":7,"status":"new"}')
+ORDER_42_GONE = ("orders", "42", "delete", '{"id":42,"status":"paid"}', "")
+
+
+def _batch(first_lsn, changes):
+    out = [pb.Change(lsn=first_lsn + i, table=t, pk=pk, op=op, before=b, after=a) for i, (t, pk, op, b, a) in enumerate(changes)]
+    return pb.Batch(batch_id=f"cdc_sub_1@{first_lsn}", first_lsn=first_lsn, last_lsn=first_lsn + len(out) - 1, changes=out)
+
+
+def check_row_key(ctx):
+    m = ctx.load("events")
+    assert m.publish_batch(_batch(201, [ORDER_42, ORDER_7])) is True, "a batch the broker took must return True"
+    assert m.publish_batch(_batch(203, [ORDER_42_GONE])) is True, "a batch the broker took must return True"
+    records = ctx.kafka.records(TOPIC)
+    keys = [r.key for r in records]
+    assert keys == [b"orders:42", b"orders:7", b"orders:42"], f"the records are keyed {keys}, expected table:pk (orders:42, orders:7, orders:42)"
+    assert records[0].partition == records[2].partition, "the update and the delete of order 42 sit on two partitions: a sink can apply the delete first"
+
+
+def check_digests(ctx):
+    m = ctx.load("events")
+    m.publish_batch(_batch(301, [("customers", "9", "update", ADA_BEFORE, ADA_AFTER), ("customers", "10", "insert", "", LIN)]))
+    values = ctx.kafka.values(TOPIC)
+    assert len(values) == 2, f"a batch of two changes produced {len(values)} records"
+    text = values[0].decode()
+    assert "example.com" not in text and "example.org" not in text, f"the event carries the row's values: {text}. A retained, replicated topic now holds every email address"
+    event = json.loads(text)
+    assert event.get("before_digest") == store.digest(ADA_BEFORE) and event.get("after_digest") == store.digest(ADA_AFTER), f"the event is {event}, expected before_digest and after_digest = store.digest of the row text"
+    want = {"lsn": 301, "table": "customers", "pk": "9", "op": "update", "batch_id": "cdc_sub_1@301"}
+    assert all(event.get(k) == v for k, v in want.items()), f"the event is {event}, expected {want} beside the digests"
+    insert = json.loads(values[1])
+    assert insert.get("before_digest") == "" and insert.get("after_digest") == store.digest(LIN), f"an insert has no row before it: expected before_digest \\"\\", got {insert}"
+
+
+def check_delivery_report(ctx):
+    m = ctx.load("events")
+    assert m.publish_batch(_batch(201, [ORDER_42])) is True, "a batch the broker took must return True"
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_batch(_batch(202, [ORDER_7, ORDER_42_GONE]))
+    assert ok is False, f"the broker failed a record of the batch and publish_batch returned {ok!r}: step 3 confirms the cursor past a change no sink will see"
+    ctx.kafka.stall(TOPIC)
+    before = ctx.clock.time()
+    ok = m.publish_batch(_batch(204, [ORDER_7]))
+    waited = ctx.clock.time() - before
+    assert ok is False, f"with the broker not answering publish_batch returned {ok!r}, expected False"
+    assert waited <= 10, f"publish_batch waited {waited:.0f} s for a broker that does not answer: wait at most ACK_TIMEOUT_S"
+
+
+def check_idempotent_acks(ctx):
+    m = ctx.load("events")
+    ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
+    m.publish_batch(_batch(201, [ORDER_42]))
+    count = len(ctx.kafka.records(TOPIC))
+    assert count == 1, f"after one lost acknowledgement the topic holds {count} records: the producer's retry wrote the change twice. Enable idempotence"
+    m.publish_batch(_batch(202, [ORDER_7]))
+    ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
+    count = len(ctx.kafka.records(TOPIC))
+    assert count == 2, f"a leader failover left {count} records: a change the leader alone had acknowledged is gone. acks=all waits for every in-sync replica"
+`,
+    typescript: `const TOPIC = 'cdc.change';
+const ADA_BEFORE = '{"id":9,"name":"Ada","email":"ada@example.com","country":"FR"}';
+const ADA_AFTER = '{"id":9,"name":"Ada","email":"ada@example.org","country":"FR"}';
+const LIN = '{"id":10,"name":"Lin","email":"lin@example.com","country":"SG"}';
+const ORDER_42 = ['orders', '42', 'update', '{"id":42,"status":"new"}', '{"id":42,"status":"paid"}'];
+const ORDER_7 = ['orders', '7', 'insert', '', '{"id":7,"status":"new"}'];
+const ORDER_42_GONE = ['orders', '42', 'delete', '{"id":42,"status":"paid"}', ''];
+
+/** A batch as step 3 hands it over: int64 fields as decimal strings. */
+function batch(firstLsn: number, changes: string[][]) {
+  return {
+    batch_id: \`cdc_sub_1@\${firstLsn}\`,
+    first_lsn: String(firstLsn),
+    last_lsn: String(firstLsn + changes.length - 1),
+    changes: changes.map(([table, pk, op, before, after], i) => ({lsn: String(firstLsn + i), table, pk, op, before, after})),
+  };
+}
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+export async function check_row_key(ctx) {
+  const m = ctx.load('events');
+  assert.equal(await m.publishBatch(batch(201, [ORDER_42, ORDER_7])), true, 'a batch the broker took must resolve true');
+  assert.equal(await m.publishBatch(batch(203, [ORDER_42_GONE])), true, 'a batch the broker took must resolve true');
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepStrictEqual(keys, ['orders:42', 'orders:7', 'orders:42'], \`the records are keyed \${JSON.stringify(keys)}, expected table:pk (orders:42, orders:7, orders:42)\`);
+  assert.equal(records[0].partition, records[2].partition, 'the update and the delete of order 42 sit on two partitions: a sink can apply the delete first');
+}
+
+export async function check_digests(ctx) {
+  const m = ctx.load('events');
+  const {digest} = ctx.load('/support/cdc/store.ts');
+  await m.publishBatch(batch(301, [['customers', '9', 'update', ADA_BEFORE, ADA_AFTER], ['customers', '10', 'insert', '', LIN]]));
+  await settle();
+  const values = ctx.kafka.values(TOPIC);
+  assert.equal(values.length, 2, \`a batch of two changes produced \${values.length} records\`);
+  assert(!values[0].includes('example.com') && !values[0].includes('example.org'), \`the event carries the row's values: \${values[0]}. A retained, replicated topic now holds every email address\`);
+  const event = JSON.parse(values[0]);
+  assert(event.before_digest === digest(ADA_BEFORE) && event.after_digest === digest(ADA_AFTER), \`the event is \${values[0]}, expected before_digest and after_digest = digest of the row text\`);
+  const want = {lsn: 301, table: 'customers', pk: '9', op: 'update', batch_id: 'cdc_sub_1@301'};
+  for (const [k, v] of Object.entries(want)) assert.equal(event[k], v, \`the event is \${values[0]}, expected \${JSON.stringify(want)} beside the digests\`);
+  const insert = JSON.parse(values[1]);
+  assert(insert.before_digest === '' && insert.after_digest === digest(LIN), \`an insert has no row before it: expected before_digest "", got \${values[1]}\`);
+}
+
+export async function check_delivery_report(ctx) {
+  const m = ctx.load('events');
+  assert.equal(await m.publishBatch(batch(201, [ORDER_42])), true, 'a batch the broker took must resolve true');
+  ctx.kafka.failNext(TOPIC, 1);
+  let ok = await m.publishBatch(batch(202, [ORDER_7, ORDER_42_GONE]));
+  await settle();
+  assert.equal(ok, false, \`the broker failed a record of the batch and publishBatch resolved \${ok}: step 3 confirms the cursor past a change no sink will see\`);
+  ctx.kafka.stall(TOPIC);
+  const before = ctx.clock.now();
+  ok = await m.publishBatch(batch(204, [ORDER_7]));
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert.equal(ok, false, \`with the broker not answering publishBatch resolved \${ok}, expected false\`);
+  assert(waited <= 10, \`publishBatch waited \${waited.toFixed(0)} s for a broker that does not answer: wait at most ACK_TIMEOUT_MS\`);
+}
+
+export async function check_idempotent_acks(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
+  await m.publishBatch(batch(201, [ORDER_42]));
+  await settle();
+  let count = ctx.kafka.records(TOPIC).length;
+  assert.equal(count, 1, \`after one lost acknowledgement the topic holds \${count} records: the producer's retry wrote the change twice. Enable idempotence\`);
+  await m.publishBatch(batch(202, [ORDER_7]));
+  await settle();
+  ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
+  count = ctx.kafka.records(TOPIC).length;
+  assert.equal(count, 2, \`a leader failover left \${count} records: a change the leader alone had acknowledged is gone. acks: -1 (all) waits for every in-sync replica\`);
+}
+`,
+    go: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	pb "cdc/gen/cdc_streamer"
+	"cdc/store"
+
+	"leetbuild/harness"
+)
+
+const (
+	eventsTopic = "cdc.change"
+	adaBefore   = \`{"id":9,"name":"Ada","email":"ada@example.com","country":"FR"}\`
+	adaAfter    = \`{"id":9,"name":"Ada","email":"ada@example.org","country":"FR"}\`
+	lin         = \`{"id":10,"name":"Lin","email":"lin@example.com","country":"SG"}\`
+)
+
+var (
+	order42     = []string{"orders", "42", "update", \`{"id":42,"status":"new"}\`, \`{"id":42,"status":"paid"}\`}
+	order7      = []string{"orders", "7", "insert", "", \`{"id":7,"status":"new"}\`}
+	order42Gone = []string{"orders", "42", "delete", \`{"id":42,"status":"paid"}\`, ""}
+)
+
+func batchOf(firstLsn int64, changes ...[]string) *pb.Batch {
+	b := &pb.Batch{BatchId: fmt.Sprintf("cdc_sub_1@%d", firstLsn), FirstLsn: firstLsn, LastLsn: firstLsn + int64(len(changes)) - 1}
+	for i, c := range changes {
+		b.Changes = append(b.Changes, &pb.Change{Lsn: firstLsn + int64(i), Table: c[0], Pk: c[1], Op: c[2], Before: c[3], After: c[4]})
+	}
+	return b
+}
+
+func CheckRowKey(ctx *harness.Ctx) {
+	ctx.Equal(publishBatch(batchOf(201, order42, order7)), true, "a batch the broker took must return true; publishBatch")
+	ctx.Equal(publishBatch(batchOf(203, order42Gone)), true, "a batch the broker took must return true; publishBatch")
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"orders:42", "orders:7", "orders:42"}, "the records must be keyed table:pk; the keys")
+	ctx.Equal(records[0].Partition, records[2].Partition, "the update and the delete of order 42 must sit on one partition, or a sink can apply the delete first; the partitions")
+}
+
+func CheckDigests(ctx *harness.Ctx) {
+	publishBatch(batchOf(301, []string{"customers", "9", "update", adaBefore, adaAfter}, []string{"customers", "10", "insert", "", lin}))
+	ctx.Settle()
+	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 2, "a batch of two changes; the records")
+	ctx.Assert(!strings.Contains(values[0], "example.com") && !strings.Contains(values[0], "example.org"), "the event carries the row's values: %s. A retained, replicated topic now holds every email address", values[0])
+	var event map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
+	ctx.Assert(event["before_digest"] == store.Digest(adaBefore) && event["after_digest"] == store.Digest(adaAfter), "the event is %s, expected before_digest and after_digest = store.Digest of the row text", values[0])
+	ctx.Assert(event["lsn"] == float64(301) && event["table"] == "customers" && event["pk"] == "9" && event["op"] == "update" && event["batch_id"] == "cdc_sub_1@301",
+		"the event is %s, expected lsn 301, table customers, pk 9, op update and batch_id cdc_sub_1@301 beside the digests", values[0])
+	var insert map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[1]), &insert), "the event must be JSON")
+	ctx.Assert(insert["before_digest"] == "" && insert["after_digest"] == store.Digest(lin), "an insert has no row before it: expected before_digest \\"\\", got %s", values[1])
+}
+
+func CheckDeliveryReport(ctx *harness.Ctx) {
+	ctx.Equal(publishBatch(batchOf(201, order42)), true, "a batch the broker took must return true; publishBatch")
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok := publishBatch(batchOf(202, order7, order42Gone))
+	ctx.Settle()
+	ctx.Equal(ok, false, "the broker failed a record of the batch: returning true makes step 3 confirm the cursor past a change no sink will see; publishBatch")
+	ctx.Kafka.Stall(eventsTopic)
+	before := ctx.Clock.Now()
+	ok = publishBatch(batchOf(204, order7))
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Equal(ok, false, "with the broker not answering; publishBatch")
+	ctx.Assert(waited <= 10, "publishBatch waited %.0f s for a broker that does not answer: wait at most ackTimeout", waited)
+}
+
+func CheckIdempotentAcks(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	publishBatch(batchOf(201, order42))
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the change twice (enable.idempotence); the records")
+	publishBatch(batchOf(202, order7))
+	ctx.Settle()
+	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a change (acks=all waits for every in-sync replica); the records")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "cdc/store.h"
+#include "cdc_streamer.grpc.pb.h"
+
+namespace {
+
+using Row = std::array<std::string, 5>;
+
+const std::string kEventsTopic = "cdc.change";
+const std::string kAdaBefore = R"({"id":9,"name":"Ada","email":"ada@example.com","country":"FR"})";
+const std::string kAdaAfter = R"({"id":9,"name":"Ada","email":"ada@example.org","country":"FR"})";
+const std::string kLin = R"({"id":10,"name":"Lin","email":"lin@example.com","country":"SG"})";
+const Row kOrder42 = {"orders", "42", "update", R"({"id":42,"status":"new"})", R"({"id":42,"status":"paid"})"};
+const Row kOrder7 = {"orders", "7", "insert", "", R"({"id":7,"status":"new"})"};
+const Row kOrder42Gone = {"orders", "42", "delete", R"({"id":42,"status":"paid"})", ""};
+
+cdcstream::Batch batchOf(int64_t first_lsn, const std::vector<Row>& changes) {
+  cdcstream::Batch b;
+  b.set_batch_id("cdc_sub_1@" + std::to_string(first_lsn));
+  b.set_first_lsn(first_lsn);
+  b.set_last_lsn(first_lsn + static_cast<int64_t>(changes.size()) - 1);
+  for (size_t i = 0; i < changes.size(); i++) {
+    cdcstream::Change* c = b.add_changes();
+    c->set_lsn(first_lsn + static_cast<int64_t>(i));
+    c->set_table(changes[i][0]);
+    c->set_pk(changes[i][1]);
+    c->set_op(changes[i][2]);
+    c->set_before(changes[i][3]);
+    c->set_after(changes[i][4]);
+  }
+  return b;
+}
+
+nlohmann::json parse(harness::Ctx& ctx, const std::string& text) {
+  const auto event = nlohmann::json::parse(text, nullptr, false);
+  ctx.Assert(event.is_object(), "the event must be a JSON object, got %s", text);
+  return event;
+}
+
+}  // namespace
+
+void CheckRowKey(harness::Ctx& ctx) {
+  ctx.Equal(publishBatch(batchOf(201, {kOrder42, kOrder7})), true, "a batch the broker took must return true; publishBatch");
+  ctx.Equal(publishBatch(batchOf(203, {kOrder42Gone})), true, "a batch the broker took must return true; publishBatch");
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"orders:42", "orders:7", "orders:42"}, "the records must be keyed table:pk; the keys");
+  ctx.Equal(records.at(0).Partition, records.at(2).Partition,
+            "the update and the delete of order 42 must sit on one partition, or a sink can apply the delete first; the partitions");
+}
+
+void CheckDigests(harness::Ctx& ctx) {
+  publishBatch(batchOf(301, {{"customers", "9", "update", kAdaBefore, kAdaAfter}, {"customers", "10", "insert", "", kLin}}));
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(values.size(), 2, "a batch of two changes; the records");
+  ctx.Assert(values[0].find("example.com") == std::string::npos && values[0].find("example.org") == std::string::npos,
+             "the event carries the row's values: %s. A retained, replicated topic now holds every email address", values[0]);
+  const auto event = parse(ctx, values[0]);
+  ctx.Assert(event.value("before_digest", "") == store::digest(kAdaBefore) && event.value("after_digest", "") == store::digest(kAdaAfter),
+             "the event is %s, expected before_digest and after_digest = store::digest of the row text", values[0]);
+  ctx.Assert(event.value("lsn", 0L) == 301 && event.value("table", "") == "customers" && event.value("pk", "") == "9" && event.value("op", "") == "update" &&
+                 event.value("batch_id", "") == "cdc_sub_1@301",
+             "the event is %s, expected lsn 301, table customers, pk 9, op update and batch_id cdc_sub_1@301 beside the digests", values[0]);
+  const auto insert = parse(ctx, values[1]);
+  ctx.Assert(insert.contains("before_digest") && insert.value("before_digest", "x").empty() && insert.value("after_digest", "") == store::digest(kLin),
+             "an insert has no row before it: expected before_digest \\"\\", got %s", values[1]);
+}
+
+void CheckDeliveryReport(harness::Ctx& ctx) {
+  ctx.Equal(publishBatch(batchOf(201, {kOrder42})), true, "a batch the broker took must return true; publishBatch");
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  bool ok = publishBatch(batchOf(202, {kOrder7, kOrder42Gone}));
+  ctx.Settle();
+  ctx.Equal(ok, false, "the broker failed a record of the batch: returning true makes step 3 confirm the cursor past a change no sink will see; publishBatch");
+  ctx.Kafka.Stall(kEventsTopic);
+  const int64_t before = ctx.Clock.Now();
+  ok = publishBatch(batchOf(204, {kOrder7}));
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Equal(ok, false, "with the broker not answering; publishBatch");
+  ctx.Assert(waited <= 10, "publishBatch waited %.0f s for a broker that does not answer: wait at most kAckTimeoutMs", waited);
+}
+
+void CheckIdempotentAcks(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishBatch(batchOf(201, {kOrder42}));
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+            "after one lost acknowledgement the producer's retry must not write the change twice (enable.idempotence); the records");
+  publishBatch(batchOf(202, {kOrder7}));
+  ctx.Settle();
+  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a change (acks=all waits for every in-sync replica); the records");
+}
+`,
+  },
   hints: [
-    'The search index shows order 1042 as `paid` after it was refunded; a privacy request has to purge a Kafka topic; a broker outage leaves a gap in the sink with nothing in the logs.',
-    'The key is `change.table`, so two changes to one row can land in different partitions; the event holds `raw_values`; and the produce result is thrown away, so a rejection is silent.',
-    'Key with `row_key(table, primary_key)`, put `digest(before)`, `digest(after)` and `lsn` in the event, configure `enable.idempotence` with `acks=all`, and `insert_outbox(key, event)` in the `except` branch.',
+    'Publish an update of order 42, then its delete in the next batch: the two records sit on different partitions. Read any customers record: the email address is in it. Fail the broker: publish_batch still returns True.',
+    'The key is the batch id, so one row spreads over as many partitions as it has batches; the payload copies the row text; `produce` only enqueues, the try catches nothing a broker reports, and nothing reads the delivery reports.',
+    'Key by `row_key(change.table, change.pk)`, send `store.digest(before)` and `store.digest(after)`, collect errors in `on_delivery`, `flush(ACK_TIMEOUT_S)` and return `in_flight == 0 and not failures`; set `acks=all` with `enable.idempotence`.',
   ],
-  debrief: `The key and the payload are where ordering and privacy in a stream get decided. \`row_key(table, primary_key)\` makes one row's changes a log: the hash balancer pins them to one partition in commit order while other rows move in parallel. Digests plus the LSN let a sink decide whether it is behind without the topic holding every column of every tenant's table; a sink that needs contents re-reads the row. The outbox write sits inside the error branch under the same key because at-least-once plus an idempotent producer plus a stable key is what makes the eventual resend safe rather than a duplicate. Production pipelines add a schema registry that versions the digest's canonicalization, tombstones for deletes, per-table compaction policy, and a relay that drains the outbox in order.`,
+  debrief: `The return value is the contract with step 3: true promises the broker has every record, so it can only come from delivery reports, never from an enqueue. The key decides what stays ordered, and the order a sink needs is per row, so the key is the row. Digests let a sink tell whether a row changed and fetch it through its own access path, while the topic, retained and replicated, holds nothing a deletion request would have to chase. Idempotence closes the gap that waiting opens: a retry after a lost acknowledgement lands once. Debezium ships full before and after images by default and leaves masking to message transforms; pipelines that need the images often keep them on a restricted topic and publish digests or projections for everyone else.`,
 };

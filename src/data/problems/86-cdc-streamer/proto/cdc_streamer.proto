@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package cdcstream;
+
+// The source database's logical replication slots, one per subscription. The replicator (step 3)
+// reads changes from a slot; the lag read (step 5) asks where the slot stands. A slot that was
+// dropped, or invalidated because it fell behind the server's WAL retention, is NOT_FOUND.
+service Slots {
+  // The slot's changes after from_lsn, oldest first, at most max_changes. No change: an empty batch.
+  rpc ReadSlot(ReadSlotRequest) returns (Batch);
+  // The server's head LSN, the oldest LSN the slot still retains, and whether a consumer holds it.
+  rpc SlotStatus(SlotStatusRequest) returns (SlotState);
+}
+
+message ReadSlotRequest {
+  string slot = 1;
+  int64 from_lsn = 2;
+  int32 max_changes = 3;
+}
+
+// One committed row change. before and after are the row as JSON text ("" when there is none:
+// no before for an insert, no after for a delete).
+message Change {
+  int64 lsn = 1;
+  string table = 2;
+  string pk = 3;
+  string op = 4;
+  string before = 5;
+  string after = 6;
+}
+
+message Batch {
+  string batch_id = 1;
+  int64 first_lsn = 2;
+  int64 last_lsn = 3;
+  repeated Change changes = 4;
+}
+
+message SlotStatusRequest {
+  string slot = 1;
+}
+
+message SlotState {
+  int64 head_lsn = 1;
+  int64 restart_lsn = 2;
+  bool active = 3;
+}

@@ -224,7 +224,8 @@ def submit(body: SummaryRequest, request: Request) -> JSONResponse:
 
 import {createSummary, remember, replay} from 'summarizer/store';
 
-export const app = Fastify();
+// Bodies up to 2 MiB reach the handler, which applies the source cap itself.
+export const app = Fastify({bodyLimit: 2 * 1024 * 1024});
 
 export const BAND_TARGETS: Record<string, number> = {short: 100, medium: 250, long: 600};
 
@@ -257,7 +258,8 @@ app.post('/v1/summaries', async (request, reply) => {
 
 import {createSummary, remember, replay} from 'summarizer/store';
 
-export const app = Fastify();
+// Bodies up to 2 MiB reach the handler, which applies the source cap itself.
+export const app = Fastify({bodyLimit: 2 * 1024 * 1024});
 
 export const MAX_SOURCE_BYTES = 1 << 20;
 export const CHUNK_BYTES = 64 << 10;

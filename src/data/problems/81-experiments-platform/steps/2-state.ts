@@ -1,302 +1,193 @@
 import type {Step} from '@/lib/types';
 
-export const experimentStateStep: Step = {
+export const stateStep: Step = {
   id: 'state',
-  title: 'Redis variant assignment with a frozen hash',
+  title: 'Sticky assignments in Redis, one per experiment and unit',
   concept: 'redis',
   file: 'state',
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter hashes a unit with the experiment's salt, compares the bucket with
-the first weight of the split, caches the variant under \`assign:{unit}\` and serves it. It works for
-one 50/50 experiment whose split never moves. It serves the demo and hides 4 flaws.
+**Starting point.** The starter's \`assign(experiment_id, unit_id)\` loads the experiment
+(\`expd.store\`), picks the variant with \`bucket_of(experiment_id, unit_id, salt)\` and
+\`variant_for(variants, bucket)\` (\`expd.bucket\`, provided), caches it under \`assign:{unit}\` with a
+90-day TTL and returns it; a \`stopped\` experiment answers control. It serves the demo and hides
+four flaws.
 
-**Failure mode the checks target.** A unit sees two variants in one session after a split or salt is
-edited, one experiment's cached row answers another experiment's request, and stopping an experiment
-flips everyone to control instead of serving the assignment already written.
+**Failure mode the checks target.** A user sees treatment on Monday and control on Tuesday: a bulk
+edit of the split or salt re-buckets every unit on its next request, two experiments share one
+cached row, two replicas answer one new unit differently, and stopping an experiment flips everyone
+to control.
 
-An assignment is a pure function of **(experiment id, assignment unit, frozen salt)**:
-
-- Compute the bucket exactly as \`int(sha256(f"{experiment.id}:{unit}:{experiment.salt}").hexdigest()[:8], 16) % 100\`
-  (same shape in every language) with the experiment's **frozen salt**.
-- Key the cached assignment by \`exp:{experiment_id}:assign:{unit}\` (mirror per language).
-- Write the assignment with a conditional write (\`SET NX\` / \`setnx\`-style) so a concurrent request
-  cannot overwrite an existing assignment. The cached value is the variant key.
-- Read the cache **first**; only a miss computes the bucket, so a row stays put even if the split
-  or salt is later edited.
-- A new unit fills the **frozen** split (buckets \`0–49\` → \`control\`, \`50–99\` → \`treatment\`) by
-  walking its cumulative weights.
-- A \`stopped\` experiment serves the **last cached assignment**; a unit with none is refused
-  (**409** / \`None\`).
-- New assignments get a TTL (\`EX\`/\`ex=\` of the experiment's remaining life, or 30 days).`,
+- Cache under \`exp:{experiment_id}:assign:{unit_id}\` and read it **first**: a cached variant is the
+  answer, whatever the design says now.
+- On a miss, write with \`SET NX\` (keeping the TTL); a lost write answers the variant that won.
+- A \`stopped\` experiment serves the cached variant and assigns nothing new (\`None\`).`,
   sequence: {
-    participants: ['Experiment API', 'Redis', 'Experiment store'],
+    participants: ['Experiment API', 'Redis', 'experiment store'],
     messages: [
+      {from: 'Experiment API', to: 'experiment store', label: 'get(experiment_id) → split, salt, status', kind: 'sync'},
       {from: 'Experiment API', to: 'Redis', label: 'GET exp:{id}:assign:{unit}', kind: 'sync'},
-      {from: 'Redis', to: 'Experiment API', label: 'variant or nil', kind: 'reply'},
-      {from: 'Experiment API', to: 'Experiment store', label: 'load frozen split + salt', kind: 'sync'},
-      {from: 'Experiment store', to: 'Experiment API', label: '{split, salt, status}', kind: 'reply'},
+      {from: 'Redis', to: 'Experiment API', label: 'variant → answer it · nil → assign', kind: 'reply'},
       {
         from: 'Experiment API',
         to: 'Experiment API',
-        label: 'bucket = sha256(id:unit:salt)[:8] % 100 · walk cumulative split',
+        label: 'bucket_of · variant_for (none when stopped)',
         kind: 'sync',
       },
-      {from: 'Experiment API', to: 'Redis', label: 'SET exp:{id}:assign:{unit} variant NX EX 2592000', kind: 'async'},
-      {
-        from: 'Experiment API',
-        to: 'Experiment API',
-        label: 'return variant · 409 on stopped without an assignment',
-        kind: 'sync',
-      },
+      {from: 'Experiment API', to: 'Redis', label: 'SET exp:{id}:assign:{unit} variant NX EX 7776000', kind: 'sync'},
+      {from: 'Redis', to: 'Experiment API', label: 'nil → another replica won: GET its variant', kind: 'reply'},
     ],
   },
-  hints: [
-    'A user reports seeing the treatment page on Monday and the control page on Tuesday after an operator adjusted the split; a second experiment on the same site shows the same pattern.',
-    'The bucket is hashed from the unit and the live salt before the cache is read, the key is `assign:{unit}` with no experiment id, and the stopped branch returns control unconditionally.',
-    'Read `exp:{experiment.id}:assign:{unit}` first and return it (even when stopped); on a miss hash `experiment.id:unit:salt`, walk the cumulative split, and `SET NX` the variant with a TTL.',
-  ],
   checks: [
     {
-      id: 'bucket-hash',
-      title: 'Hashes experiment id, unit and the frozen salt together',
+      id: 'experiment-key',
+      title: 'One cached assignment per experiment and unit',
       detail:
-        'The hash input names the experiment id, the assignment unit and the experiment’s frozen salt in one expression. The starter hashes the unit and a mutable salt and recomputes on every request.',
+        'The assignment is cached under `exp:{experiment_id}:assign:{unit_id}`, so a unit in two experiments has two rows; the starter keys by the unit alone.',
       match: {
-        python: {all: [/sha256\([^)]*experiment\.id[^)]*unit[^)]*salt/]},
-        typescript: {all: [/update\(`[^`]*\$\{experiment\.id\}[^`]*\$\{unit\}[^`]*\$\{experiment\.salt\}/]},
-        go: {all: [/(sha256\.Sum256|sha256)/, /fmt\.Sprintf\([^)]*experiment\.ID[^)]*unit[^)]*Salt/]},
-        scala: {all: [/\$\{experiment\.id\}:\$unit:\$\{experiment\.salt\}/]},
-        cpp: {all: [/value\s*=\s*[^;]*experiment\.id[^;]*unit[^;]*salt/]},
+        python: {all: [/exp:\{experiment_id\}:assign:\{unit_id\}/], none: [/["']assign:\{unit_id\}/]},
+        typescript: {all: [/exp:\$\{experimentId\}:assign:\$\{unitId\}/], none: [/`assign:\$\{/]},
+        go: {all: [/"exp:"\s*\+\s*experimentID\s*\+\s*":assign:"\s*\+\s*unitID/], none: [/"assign:"\s*\+/]},
+        scala: {all: [/exp:\$\{?experimentId\}?:assign:\$\{?unitId/], none: [/s"assign:/]},
+        cpp: {all: [/"exp:"\s*\+\s*experiment_id\s*\+\s*":assign:"\s*\+\s*unit_id/], none: [/"assign:"\s*\+/]},
       },
     },
     {
-      id: 'cache-key',
-      title: 'Keys by experiment and unit, writes conditionally',
+      id: 'sticky',
+      title: 'Reads the cached assignment before hashing',
       detail:
-        'The key is `exp:{experiment_id}:assign:{unit}` and the write is conditional (`SET NX`/`setnx`-style), so a concurrent request cannot overwrite an existing assignment. The starter keys by unit alone and writes unconditionally.',
+        'A cached variant is returned before any bucket is computed, so an edit of the split or salt behind the API leaves exposed units where they are.',
       match: {
-        python: {all: [/exp:/, /experiment\.id/, /assign:/, /(unit|assignment_unit)/, /(nx=True|setnx|NX)/]},
-        typescript: {all: [/exp:/, /experiment\.id/, /assign:/, /(unit|assignmentUnit)/, /(NX|nx|setnx)/]},
-        go: {all: [/exp:/, /experiment\.ID/, /assign:/, /(unit|assignmentUnit)/, /(NX|nx|SetNX)/]},
-        scala: {all: [/exp:/, /experiment\.id/, /assign:/, /(unit|assignmentUnit)/, /(NX|nx|setnx)/]},
-        cpp: {all: [/exp:/, /experiment\.id/, /assign:/, /(unit|assignment_unit)/, /(NX|nx|SetNX|NOT_EXIST)/]},
+        python: {order: [/\br\.get\(/, /bucket_of\(/]},
+        typescript: {order: [/redis\.get\(/, /bucketOf\(/]},
+        go: {order: [/rdb\.Get\(/, /bucket\.BucketOf\(/]},
+        scala: {order: [/jedis\.get\(/, /Bucket\.bucketOf\(/]},
+        cpp: {order: [/redis\.get\(/, /bucket::bucketOf\(/]},
       },
     },
     {
-      id: 'cache-first',
-      title: 'Reads the cache before computing the bucket',
+      id: 'first-write-wins',
+      title: 'A new assignment is written with SET NX',
       detail:
-        'The cached assignment is read before any bucket computation. The starter computes the bucket first and only then consults the cache, so a split edit re-buckets a unit that already had an assignment.',
+        'The first assignment of a unit is written only if absent (`SET NX` with the TTL), and a request that lost the write answers the variant that won, so two replicas cannot serve one unit two variants.',
       match: {
-        python: {order: [/(r\.get|redis\.get|GET)/, /(sha256|bucket_for)/]},
-        typescript: {order: [/\.get\(/, /(createHash|bucketFor)/]},
-        go: {order: [/(rdb\.Get|redis\.Get|GET)/, /(sha256|bucketHash)/]},
-        scala: {order: [/(jedis\.get|GET)/, /(MessageDigest|bucketHash)/]},
-        cpp: {order: [/(redis\.get|GET)/, /(SHA256|bucketHash)/]},
+        python: {all: [/nx\s*=\s*True/]},
+        typescript: {all: [/['"]NX['"]/]},
+        go: {all: [/\.SetNX\(|Mode:\s*"NX"/]},
+        scala: {all: [/\.nx\(\)/]},
+        cpp: {all: [/UpdateType::NOT_EXIST/]},
       },
     },
     {
-      id: 'split-fill',
-      title: 'Walks the cumulative frozen split',
+      id: 'stopped',
+      title: 'A stopped experiment keeps its assignments',
       detail:
-        'The bucket walks the split’s cumulative weights to pick a variant (`0–49` → control, `50–99` → treatment). The starter uses a single threshold on the first weight, so a 30/70 split is served as if it were 50/50.',
+        'A stopped experiment answers the cached variant and assigns no new unit; nothing returns the first variant as a default.',
       match: {
-        python: {all: [/(cumulative|cum_sum|split)/, /(control|treatment)/]},
-        typescript: {all: [/(cumulative|split)/, /(control|treatment)/]},
-        go: {all: [/(cumulative|split)/, /(control|treatment)/]},
-        scala: {all: [/(cumulative|split)/, /(control|treatment)/]},
-        cpp: {all: [/(cumulative|split)/, /(control|treatment)/]},
-      },
-    },
-    {
-      id: 'stopped-serves',
-      title: 'Stopped experiment serves the stored assignment',
-      detail:
-        'A stopped or disabled experiment returns the assignment already stored instead of flipping everyone to control; only a unit with no assignment is refused. The starter returns control for everyone when the experiment is stopped.',
-      match: {
-        python: {
-          all: [/(stopped|disabled)/, /(cached|assignment|stored)/],
-          none: [/(stopped|disabled)[\s\S]{0,120}return\s+["']control["']/],
-        },
-        typescript: {
-          all: [/(stopped|disabled)/, /(cached|assignment|stored)/],
-          none: [/(stopped|disabled)[\s\S]{0,120}return\s+['"]control['"]/],
-        },
-        go: {
-          all: [/(stopped|disabled)/, /(cached|assignment|stored)/],
-          none: [/(stopped|disabled)[\s\S]{0,120}return\s+["']control["']/],
-        },
-        scala: {
-          all: [/(stopped|disabled)/, /(cached|assignment|stored)/],
-          none: [/(stopped|disabled)[\s\S]{0,120}return\s+["']control["']/],
-        },
-        cpp: {
-          all: [/(stopped|disabled)/, /(cached|assignment|stored)/],
-          none: [/(stopped|disabled)[\s\S]{0,120}return\s+["']control["']/],
-        },
+        python: {order: [/\br\.get\(/, /==\s*["']stopped["']/], none: [/\[0\]\[["']key["']\]/]},
+        typescript: {order: [/redis\.get\(/, /===\s*['"]stopped['"]/], none: [/variants\[0\]\.key/]},
+        go: {order: [/rdb\.Get\(/, /==\s*"stopped"/], none: [/Variants\[0\]\.Key/]},
+        scala: {order: [/jedis\.get\(/, /==\s*"stopped"/], none: [/variants\.head\.key/]},
+        cpp: {order: [/redis\.get\(/, /==\s*"stopped"/], none: [/variants\[0\]\.key|variants\.front\(\)\.key/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import hashlib
+      starter: `import redis
 
-import redis as redis_lib
-from fastapi import FastAPI
-from pydantic import BaseModel
+from expd import store  # get
+from expd.bucket import bucket_of, variant_for
 
-app = FastAPI()
-r = redis_lib.Redis(host="redis", port=6379, decode_responses=True)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-
-class Experiment(BaseModel):
-    id: str
-    salt: str
-    split: list[float]
-    status: str = "running"
+ASSIGNMENT_TTL_S = 90 * 24 * 3600
 
 
-def bucket_for(experiment: Experiment, unit: str) -> int:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    raw = hashlib.sha256(f"{unit}:{experiment.salt}".encode()).hexdigest()[:8]
-    return int(raw, 16) % 100
-
-
-def assign(experiment: Experiment, unit: str) -> str:
-    b = bucket_for(experiment, unit)
-    variant = "control" if b < experiment.split[0] else "treatment"
-    key = f"assign:{unit}"
-    cached = r.get(key)
-    if cached is not None:
-        return cached
-    r.set(key, variant)
-    if experiment.status == "stopped":
-        return "control"
+def assign(experiment_id: str, unit_id: str) -> str | None:
+    """The variant the unit sees in the experiment, or None when it has none."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    experiment = store.get(experiment_id)
+    if experiment is None:
+        return None
+    if experiment["status"] == "stopped":
+        return experiment["variants"][0]["key"]
+    variant = variant_for(experiment["variants"], bucket_of(experiment_id, unit_id, experiment["salt"]))
+    r.set(f"assign:{unit_id}", variant, ex=ASSIGNMENT_TTL_S)
     return variant
 `,
-      solution: `import hashlib
+      solution: `import redis
 
-import redis as redis_lib
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from expd import store  # get
+from expd.bucket import bucket_of, variant_for
 
-app = FastAPI()
-r = redis_lib.Redis(host="redis", port=6379, decode_responses=True)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-ASSIGN_TTL_S = 30 * 24 * 60 * 60
+ASSIGNMENT_TTL_S = 90 * 24 * 3600
 
 
-class Experiment(BaseModel):
-    id: str
-    salt: str
-    split: list[float]
-    status: str = "running"
-
-
-def bucket_for(experiment: Experiment, unit: str) -> int:
-    digest = hashlib.sha256(f"{experiment.id}:{unit}:{experiment.salt}".encode()).hexdigest()[:8]
-    return int(digest, 16) % 100
-
-
-def assign(experiment: Experiment, unit: str) -> str:
-    key = f"exp:{experiment.id}:assign:{unit}"
-    cached = r.get(key)
-    if cached is not None:
-        return cached
-    if experiment.status == "stopped":
-        raise HTTPException(status_code=409, detail="experiment stopped and unit not assigned")
-    b = bucket_for(experiment, unit)
-    cumulative = 0.0
-    variant = "control"
-    for name, weight in zip(("control", "treatment"), experiment.split):
-        cumulative += weight
-        if b < cumulative:
-            variant = name
-            break
-    r.set(key, variant, nx=True, ex=ASSIGN_TTL_S)
-    return variant
+def assign(experiment_id: str, unit_id: str) -> str | None:
+    """The variant the unit sees in the experiment, or None when it has none."""
+    experiment = store.get(experiment_id)
+    if experiment is None:
+        return None
+    key = f"exp:{experiment_id}:assign:{unit_id}"
+    # The first answer is the answer: a unit keeps its variant through edits, stops and races.
+    assigned = r.get(key)
+    if assigned is not None:
+        return assigned
+    if experiment["status"] == "stopped":
+        return None
+    variant = variant_for(experiment["variants"], bucket_of(experiment_id, unit_id, experiment["salt"]))
+    if r.set(key, variant, nx=True, ex=ASSIGNMENT_TTL_S):
+        return variant
+    return r.get(key)  # another replica assigned the unit first
 `,
     },
     typescript: {
-      starter: `/** Variant assignment. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
-import {createHash} from 'node:crypto';
+      starter: `import Redis from 'ioredis';
 
-const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {bucketOf, variantFor} from 'expd/bucket';
+import {get} from 'expd/store';
 
-interface Experiment {
-  id: string;
-  salt: string;
-  split: number[];
-  status: string;
-}
+const redis = new Redis({host: 'redis', port: 6379});
 
-function bucketFor(experiment: Experiment, unit: string): number {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const digest = createHash('sha256').update(\`\${unit}:\${experiment.salt}\`).digest('hex').slice(0, 8);
-  return parseInt(digest, 16) % 100;
-}
+export const ASSIGNMENT_TTL_S = 90 * 24 * 3600;
 
-async function assign(experiment: Experiment, unit: string): Promise<string> {
-  const b = bucketFor(experiment, unit);
-  const variant = b < experiment.split[0] ? 'control' : 'treatment';
-  const key = \`assign:\${unit}\`;
-  const cached = await r.get(key);
-  if (cached !== null) return cached;
-  await r.set(key, variant);
-  if (experiment.status === 'stopped') return 'control';
+/** The variant the unit sees in the experiment, or null when it has none. */
+export async function assign(experimentId: string, unitId: string): Promise<string | null> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const experiment = await get(experimentId);
+  if (experiment === null) return null;
+  if (experiment.status === 'stopped') return experiment.variants[0].key;
+  const variant = variantFor(experiment.variants, bucketOf(experimentId, unitId, experiment.salt));
+  await redis.set(\`assign:\${unitId}\`, variant, 'EX', ASSIGNMENT_TTL_S);
   return variant;
 }
-
-void app.listen({port: 8080, host: '0.0.0.0'});
 `,
-      solution: `/** Variant assignment: cache the frozen-hash bucket per experiment and unit. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
-import {createHash} from 'node:crypto';
+      solution: `import Redis from 'ioredis';
 
-const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {bucketOf, variantFor} from 'expd/bucket';
+import {get} from 'expd/store';
 
-const ASSIGN_TTL_S = 30 * 24 * 60 * 60;
+const redis = new Redis({host: 'redis', port: 6379});
 
-interface Experiment {
-  id: string;
-  salt: string;
-  split: number[];
-  status: string;
+export const ASSIGNMENT_TTL_S = 90 * 24 * 3600;
+
+/** The variant the unit sees in the experiment, or null when it has none. */
+export async function assign(experimentId: string, unitId: string): Promise<string | null> {
+  const experiment = await get(experimentId);
+  if (experiment === null) return null;
+  const key = \`exp:\${experimentId}:assign:\${unitId}\`;
+  // The first answer is the answer: a unit keeps its variant through edits, stops and races.
+  const assigned = await redis.get(key);
+  if (assigned !== null) return assigned;
+  if (experiment.status === 'stopped') return null;
+  const variant = variantFor(experiment.variants, bucketOf(experimentId, unitId, experiment.salt));
+  if ((await redis.set(key, variant, 'EX', ASSIGNMENT_TTL_S, 'NX')) === 'OK') return variant;
+  return redis.get(key); // another replica assigned the unit first
 }
-
-function bucketFor(experiment: Experiment, unit: string): number {
-  const digest = createHash('sha256').update(\`\${experiment.id}:\${unit}:\${experiment.salt}\`).digest('hex').slice(0, 8);
-  return parseInt(digest, 16) % 100;
-}
-
-async function assign(experiment: Experiment, unit: string): Promise<string> {
-  const key = \`exp:\${experiment.id}:assign:\${unit}\`;
-  const cached = await r.get(key);
-  if (cached !== null) return cached;
-  if (experiment.status === 'stopped') throw new Error('409: experiment stopped and unit not assigned');
-  const b = bucketFor(experiment, unit);
-  let cumulative = 0;
-  let variant = 'control';
-  const names = ['control', 'treatment'];
-  for (let i = 0; i < experiment.split.length; i++) {
-    cumulative += experiment.split[i];
-    if (b < cumulative) {
-      variant = names[i];
-      break;
-    }
-  }
-  await r.set(key, variant, 'NX', 'EX', ASSIGN_TTL_S);
-  return variant;
-}
-
-void app.listen({port: 8080, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -304,287 +195,465 @@ void app.listen({port: 8080, host: '0.0.0.0'});
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	"net/http"
-	"strconv"
+	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"expd/bucket" // bucket.BucketOf, VariantFor
+	"expd/store"  // store.Get
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type Experiment struct {
-	ID     string
-	Salt   string
-	Split  []float64
-	Status string
-}
+const assignmentTTL = 90 * 24 * time.Hour
 
-func bucketHash(unit string, salt string) int {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	sum := sha256.Sum256([]byte(unit + ":" + salt))
-	raw := hex.EncodeToString(sum[:])[:8]
-	parsed, _ := strconv.ParseInt(raw, 16, 64)
-	return int(parsed) % 100
-}
-
-func assign(ctx context.Context, experiment Experiment, unit string) (string, error) {
-	b := bucketHash(unit, experiment.Salt)
-	variant := "control"
-	if b >= 50 {
-		variant = "treatment"
+// assign is the variant the unit sees in the experiment; false when it has none.
+func assign(ctx context.Context, experimentID, unitID string) (string, bool) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	experiment := store.Get(ctx, experimentID)
+	if experiment == nil {
+		return "", false
 	}
-	key := fmt.Sprintf("assign:%s", unit)
-	cached, err := rdb.Get(ctx, key).Result()
-	if err == nil {
-		return cached, nil
-	}
-	rdb.Set(ctx, key, variant, 0)
 	if experiment.Status == "stopped" {
-		return "control", nil
+		return experiment.Variants[0].Key, true
 	}
-	return variant, nil
+	variant := bucket.VariantFor(experiment.Variants, bucket.BucketOf(experimentID, unitID, experiment.Salt))
+	rdb.Set(ctx, "assign:"+unitID, variant, assignmentTTL)
+	return variant, true
 }
-
-func main() {}
 `,
       solution: `package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"expd/bucket" // bucket.BucketOf, VariantFor
+	"expd/store"  // store.Get
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const assignTTLS = 30 * 24 * 60 * 60
+const assignmentTTL = 90 * 24 * time.Hour
 
-type Experiment struct {
-	ID     string
-	Salt   string
-	Split  []float64
-	Status string
-}
-
-func bucketHash(experiment Experiment, unit string) int {
-	value := fmt.Sprintf("%s:%s:%s", experiment.ID, unit, experiment.Salt)
-	sum := sha256.Sum256([]byte(value))
-	raw := hex.EncodeToString(sum[:])[:8]
-	parsed, _ := strconv.ParseInt(raw, 16, 64)
-	return int(parsed) % 100
-}
-
-func assign(ctx context.Context, experiment Experiment, unit string) (string, error) {
-	key := fmt.Sprintf("exp:%s:assign:%s", experiment.ID, unit)
-	cached, err := rdb.Get(ctx, key).Result()
-	if err == nil {
-		return cached, nil
+// assign is the variant the unit sees in the experiment; false when it has none.
+func assign(ctx context.Context, experimentID, unitID string) (string, bool) {
+	experiment := store.Get(ctx, experimentID)
+	if experiment == nil {
+		return "", false
+	}
+	key := "exp:" + experimentID + ":assign:" + unitID
+	// The first answer is the answer: a unit keeps its variant through edits, stops and races.
+	if assigned, err := rdb.Get(ctx, key).Result(); err == nil {
+		return assigned, true
 	}
 	if experiment.Status == "stopped" {
-		return "", fmt.Errorf("409: experiment stopped and unit not assigned")
+		return "", false
 	}
-	b := bucketHash(experiment, unit)
-	cumulative := 0.0
-	variant := "control"
-	names := []string{"control", "treatment"}
-	for i, weight := range experiment.Split {
-		cumulative += weight
-		if float64(b) < cumulative {
-			variant = names[i]
-			break
-		}
+	variant := bucket.VariantFor(experiment.Variants, bucket.BucketOf(experimentID, unitID, experiment.Salt))
+	won, err := rdb.SetNX(ctx, key, variant, assignmentTTL).Result()
+	if err != nil {
+		return "", false
 	}
-	rdb.SetNX(ctx, key, variant, time.Duration(assignTTLS)*time.Second)
-	return variant, nil
+	if won {
+		return variant, true
+	}
+	assigned, err := rdb.Get(ctx, key).Result() // another replica assigned the unit first
+	return assigned, err == nil
 }
-
-func main() {}
 `,
     },
     scala: {
-      starter: `import java.security.MessageDigest
-
-import redis.clients.jedis.Jedis
-
-case class Experiment(id: String, salt: String, split: Seq[Double], status: String)
-
-object AssignmentStore {
-  private val jedis = new Jedis("redis", 6379)
-
-  def bucketHash(unit: String, salt: String): Int = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    val digest = MessageDigest.getInstance("SHA-256").digest(s"$unit:$salt".getBytes("UTF-8"))
-    val raw = digest.map("%02x".format(_)).mkString.take(8)
-    Integer.parseInt(raw, 16) % 100
-  }
-
-  def assign(experiment: Experiment, unit: String): String = {
-    val b = bucketHash(unit, experiment.salt)
-    val variant = if (b < 50) "control" else "treatment"
-    val key = s"assign:$unit"
-    val cached = jedis.get(key)
-    if (cached != null) return cached
-    jedis.set(key, variant)
-    if (experiment.status == "stopped") return "control"
-    variant
-  }
-}
-`,
-      solution: `import java.security.MessageDigest
-
-import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
 import redis.clients.jedis.params.SetParams
 
-case class Experiment(id: String, salt: String, split: Seq[Double], status: String)
+import expd.{Bucket, Store} // Store.get, Bucket.bucketOf, variantFor
 
-object AssignmentStore {
-  val AssignTtlS = 30 * 24 * 60 * 60
+object State {
+  val AssignmentTtlSeconds: Long = 90L * 24 * 3600
 
-  private val jedis = new Jedis("redis", 6379)
+  private val jedis = new JedisPooled("redis", 6379)
 
-  def bucketHash(experiment: Experiment, unit: String): Int = {
-    val digest = MessageDigest.getInstance("SHA-256").digest(s"\${experiment.id}:$unit:\${experiment.salt}".getBytes("UTF-8"))
-    val raw = digest.map("%02x".format(_)).mkString.take(8)
-    Integer.parseInt(raw, 16) % 100
-  }
-
-  def assign(experiment: Experiment, unit: String): String = {
-    val key = s"exp:\${experiment.id}:assign:$unit"
-    val cached = jedis.get(key)
-    if (cached != null) return cached
-    if (experiment.status == "stopped") throw new RuntimeException("409: experiment stopped and unit not assigned")
-    val b = bucketHash(experiment, unit)
-    var cumulative = 0.0
-    var variant = "control"
-    val names = Seq("control", "treatment")
-    for ((weight, i) <- experiment.split.zipWithIndex) {
-      cumulative += weight
-      if (b < cumulative) {
-        variant = names(i)
-        break
+  /** The variant the unit sees in the experiment, or None when it has none. */
+  def assign(experimentId: String, unitId: String): Option[String] =
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    Store.get(experimentId).map { experiment =>
+      if (experiment.status == "stopped") experiment.variants.head.key
+      else {
+        val variant = Bucket.variantFor(experiment.variants, Bucket.bucketOf(experimentId, unitId, experiment.salt))
+        jedis.set(s"assign:$unitId", variant, SetParams.setParams().ex(AssignmentTtlSeconds))
+        variant
       }
     }
-    jedis.set(key, variant, SetParams.setParams().nx().ex(AssignTtlS))
-    variant
-  }
+}
+`,
+      solution: `import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
+
+import expd.{Bucket, Store} // Store.get, Bucket.bucketOf, variantFor
+
+object State {
+  val AssignmentTtlSeconds: Long = 90L * 24 * 3600
+
+  private val jedis = new JedisPooled("redis", 6379)
+
+  /** The variant the unit sees in the experiment, or None when it has none. */
+  def assign(experimentId: String, unitId: String): Option[String] =
+    Store.get(experimentId).flatMap { experiment =>
+      val key = s"exp:$experimentId:assign:$unitId"
+      // The first answer is the answer: a unit keeps its variant through edits, stops and races.
+      Option(jedis.get(key)).orElse {
+        if (experiment.status == "stopped") None
+        else {
+          val variant = Bucket.variantFor(experiment.variants, Bucket.bucketOf(experimentId, unitId, experiment.salt))
+          if (jedis.set(key, variant, SetParams.setParams().nx().ex(AssignmentTtlSeconds)) == "OK") Some(variant)
+          else Option(jedis.get(key)) // another replica assigned the unit first
+        }
+      }
+    }
 }
 `,
     },
     cpp: {
-      starter: `#include <openssl/sha.h>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
+#include <chrono>
+#include <optional>
 #include <string>
-#include <vector>
 
-struct Experiment {
-  std::string id;
-  std::string salt;
-  std::vector<double> split;
-  std::string status;
-};
+#include "expd/bucket.h"  // bucket::bucketOf, variantFor
+#include "expd/store.h"   // store::get
 
-std::string digest(const std::string& value) {
-  unsigned char hash[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), hash);
-  static const char* hex = "0123456789abcdef";
-  std::string out;
-  for (unsigned char byte : hash) {
-    out.push_back(hex[byte >> 4]);
-    out.push_back(hex[byte & 0x0f]);
-  }
-  return out.substr(0, 8);
-}
+sw::redis::Redis redis("tcp://redis:6379");
 
-int bucketHash(const std::string& unit, const std::string& salt) {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const std::string value = unit + ":" + salt;
-  return std::stoi(digest(value), nullptr, 16) % 100;
-}
+constexpr std::chrono::seconds kAssignmentTtl{90 * 24 * 3600};
 
-std::string assign(sw::redis::Redis& redis, const Experiment& experiment, const std::string& unit) {
-  const int b = bucketHash(unit, experiment.salt);
-  const std::string variant = b < 50 ? "control" : "treatment";
-  const std::string key = "assign:" + unit;
-  const auto cached = redis.get(key);
-  if (cached) return *cached;
-  redis.set(key, variant);
-  if (experiment.status == "stopped") return "control";
+// The variant the unit sees in the experiment, or none.
+std::optional<std::string> assign(const std::string& experiment_id, const std::string& unit_id) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const auto experiment = store::get(experiment_id);
+  if (!experiment) return std::nullopt;
+  if (experiment->status == "stopped") return experiment->variants[0].key;
+  const std::string variant = bucket::variantFor(experiment->variants, bucket::bucketOf(experiment_id, unit_id, experiment->salt));
+  redis.set("assign:" + unit_id, variant, kAssignmentTtl);
   return variant;
 }
 `,
-      solution: `#include <openssl/sha.h>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
 #include <chrono>
+#include <optional>
 #include <string>
-#include <vector>
 
-struct Experiment {
-  std::string id;
-  std::string salt;
-  std::vector<double> split;
-  std::string status;
-};
+#include "expd/bucket.h"  // bucket::bucketOf, variantFor
+#include "expd/store.h"   // store::get
 
-constexpr long long kAssignTtlS = 30LL * 24 * 60 * 60;
+sw::redis::Redis redis("tcp://redis:6379");
 
-std::string digest(const std::string& value) {
-  unsigned char hash[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), hash);
-  static const char* hex = "0123456789abcdef";
-  std::string out;
-  for (unsigned char byte : hash) {
-    out.push_back(hex[byte >> 4]);
-    out.push_back(hex[byte & 0x0f]);
-  }
-  return out.substr(0, 8);
-}
+constexpr std::chrono::seconds kAssignmentTtl{90 * 24 * 3600};
 
-int bucketHash(const Experiment& experiment, const std::string& unit) {
-  const std::string value = experiment.id + ":" + unit + ":" + experiment.salt;
-  return std::stoi(digest(value), nullptr, 16) % 100;
-}
-
-std::string assign(sw::redis::Redis& redis, const Experiment& experiment, const std::string& unit) {
-  const std::string key = "exp:" + experiment.id + ":assign:" + unit;
-  const auto cached = redis.get(key);
-  if (cached) return *cached;
-  if (experiment.status == "stopped") throw std::runtime_error("409: experiment stopped and unit not assigned");
-  const int b = bucketHash(experiment, unit);
-  double cumulative = 0.0;
-  std::string variant = "control";
-  const std::vector<std::string> names = {"control", "treatment"};
-  for (std::size_t i = 0; i < experiment.split.size(); ++i) {
-    cumulative += experiment.split[i];
-    if (b < cumulative) {
-      variant = names[i];
-      break;
-    }
-  }
-  redis.set(key, variant, std::chrono::seconds(kAssignTtlS), sw::redis::UpdateType::NOT_EXIST);
-  return variant;
+// The variant the unit sees in the experiment, or none.
+std::optional<std::string> assign(const std::string& experiment_id, const std::string& unit_id) {
+  const auto experiment = store::get(experiment_id);
+  if (!experiment) return std::nullopt;
+  const std::string key = "exp:" + experiment_id + ":assign:" + unit_id;
+  // The first answer is the answer: a unit keeps its variant through edits, stops and races.
+  if (const auto assigned = redis.get(key)) return *assigned;
+  if (experiment->status == "stopped") return std::nullopt;
+  const std::string variant = bucket::variantFor(experiment->variants, bucket::bucketOf(experiment_id, unit_id, experiment->salt));
+  if (redis.set(key, variant, kAssignmentTtl, sw::redis::UpdateType::NOT_EXIST)) return variant;
+  const auto winner = redis.get(key);  // another replica assigned the unit first
+  if (winner) return *winner;
+  return std::nullopt;
 }
 `,
     },
   },
-  debrief: `The fix reads the cache before it hashes because the hash exists to decide a row once; once the
-row is written, nothing about the current split or salt may change it, which is also why a stopped
-experiment can serve the row it wrote before it stopped. The key names the experiment and the unit
-because the assignment belongs to that pair, not to the unit. Hashing the experiment id with the
-frozen salt makes two experiments on the same site independent instead of correlated, and the
-conditional write closes the race between two concurrent first requests for the same unit.
+  harness: {
+    python: `from expd import store
 
-Production systems add a version field to the cached value so a row written under an old design can
-be detected, and keep the assignment TTL at least as long as the analysis window so a unit that
-returns after the experiment ends still gets its original variant.`,
+ALL_CONTROL = [{"key": "control", "weight": 100}, {"key": "treatment", "weight": 0}]
+ALL_TREATMENT = [{"key": "control", "weight": 0}, {"key": "treatment", "weight": 100}]
+
+
+def _experiment(variants):
+    return store.create({"name": "cta", "unit": "user", "variants": variants, "min_sample": 1000, "salt": "s-1"})["id"]
+
+
+def check_experiment_key(ctx):
+    m = ctx.load("state")
+    a = _experiment(ALL_CONTROL)
+    b = _experiment(ALL_TREATMENT)
+    assert m.assign(a, "u-1") == "control", f"in an all-control experiment u-1 got {m.assign(a, 'u-1')!r}"
+    assert m.assign(b, "u-1") == "treatment", f"in an all-treatment experiment u-1 got {m.assign(b, 'u-1')!r}: an assignment cached for another experiment answered this one"
+    keys = sorted(ctx.redis.keys("*assign*"))
+    for experiment_id, variant in ((a, "control"), (b, "treatment")):
+        key = f"exp:{experiment_id}:assign:u-1"
+        assert ctx.redis.get(key) == variant, f"{key} holds {ctx.redis.get(key)!r}, expected {variant!r}: cache each experiment's assignment under its own key (Redis holds {keys})"
+        assert ctx.redis.ttl(key) > 0, f"{key} has no TTL: assignments must expire"
+
+
+def check_sticky(ctx):
+    m = ctx.load("state")
+    e = _experiment(ALL_CONTROL)
+    assert m.assign(e, "u-1") == "control", f"in an all-control experiment u-1 got {m.assign(e, 'u-1')!r}"
+    # The bulk tool rewrites the split and the salt of the running experiment behind the API.
+    store.update(e, {"variants": ALL_TREATMENT, "salt": "s-2"})
+    again = m.assign(e, "u-1")
+    assert again == "control", f"after a bulk edit of the split and salt u-1 moved from control to {again!r}: read the cached assignment before hashing"
+    assert m.assign(e, "u-2") == "treatment", "a unit first seen after the edit gets the split in force"
+
+
+def check_first_write_wins(ctx):
+    m = ctx.load("state")
+    e = _experiment(ALL_TREATMENT)
+    key = f"exp:{e}:assign:u-1"
+
+    def other_replica():
+        # A replica still holding the design from before an edit assigns u-1 the way a correct one does.
+        return "control" if ctx.redis.set(key, "control", nx=True, ex=3600) else ctx.redis.get(key)
+
+    rival = ctx.redis_after(key, other_replica)
+    got = m.assign(e, "u-1")
+    assert rival.fired, f"nothing touched {key}: the assignment must be cached there"
+    if rival.error is not None:
+        raise rival.error
+    assert got == rival.result, f"another replica served u-1 {rival.result!r} and this request served {got!r}: write with SET NX and answer the variant that won"
+    assert ctx.redis.get(key) == got, f"{key} holds {ctx.redis.get(key)!r} but u-1 was served {got!r}"
+
+
+def check_stopped(ctx):
+    m = ctx.load("state")
+    e = _experiment(ALL_TREATMENT)
+    assert m.assign(e, "u-1") == "treatment", f"in an all-treatment experiment u-1 got {m.assign(e, 'u-1')!r}"
+    store.set_status(e, "stopped")
+    kept = m.assign(e, "u-1")
+    assert kept == "treatment", f"once the experiment stopped u-1 got {kept!r} instead of the treatment it was served: a stop must keep the assignments it wrote"
+    late = m.assign(e, "u-2")
+    assert late is None, f"a unit first seen after the stop was assigned {late!r}: a stopped experiment assigns no one new"
+    assert ctx.redis.get(f"exp:{e}:assign:u-2") is None, "a stopped experiment wrote a new assignment"
+`,
+    typescript: `const ALL_CONTROL = [
+  {key: 'control', weight: 100},
+  {key: 'treatment', weight: 0},
+];
+const ALL_TREATMENT = [
+  {key: 'control', weight: 0},
+  {key: 'treatment', weight: 100},
+];
+
+function setup(ctx) {
+  const store = ctx.load('/support/expd/store.ts');
+  const experiment = async (variants): Promise<string> => (await store.create({name: 'cta', unit: 'user', variants, min_sample: 1000, salt: 's-1'})).id;
+  return {m: ctx.load('state'), store, experiment};
+}
+
+export async function check_experiment_key(ctx) {
+  const {m, experiment} = setup(ctx);
+  const a = await experiment(ALL_CONTROL);
+  const b = await experiment(ALL_TREATMENT);
+  assert.equal(await m.assign(a, 'u-1'), 'control', 'in an all-control experiment u-1 must get control');
+  const got = await m.assign(b, 'u-1');
+  assert.equal(got, 'treatment', \`in an all-treatment experiment u-1 got \${got}: an assignment cached for another experiment answered this one\`);
+  const keys = ctx.redis.keys('*assign*').sort();
+  for (const [id, variant] of [[a, 'control'], [b, 'treatment']]) {
+    const key = \`exp:\${id}:assign:u-1\`;
+    assert.equal(ctx.redis.get(key), variant, \`\${key} holds \${ctx.redis.get(key)}, expected \${variant}: cache each experiment's assignment under its own key (Redis holds \${JSON.stringify(keys)})\`);
+    assert(ctx.redis.ttl(key) > 0, \`\${key} has no TTL: assignments must expire\`);
+  }
+}
+
+export async function check_sticky(ctx) {
+  const {m, store, experiment} = setup(ctx);
+  const e = await experiment(ALL_CONTROL);
+  assert.equal(await m.assign(e, 'u-1'), 'control', 'in an all-control experiment u-1 must get control');
+  // The bulk tool rewrites the split and the salt of the running experiment behind the API.
+  await store.update(e, {variants: ALL_TREATMENT, salt: 's-2'});
+  const again = await m.assign(e, 'u-1');
+  assert.equal(again, 'control', \`after a bulk edit of the split and salt u-1 moved from control to \${again}: read the cached assignment before hashing\`);
+  assert.equal(await m.assign(e, 'u-2'), 'treatment', 'a unit first seen after the edit gets the split in force');
+}
+
+export async function check_first_write_wins(ctx) {
+  const {m, experiment} = setup(ctx);
+  const e = await experiment(ALL_TREATMENT);
+  const key = \`exp:\${e}:assign:u-1\`;
+  // A replica still holding the design from before an edit assigns u-1 the way a correct one does.
+  const rival = ctx.redisAfter(key, () => (ctx.redis.set(key, 'control', 'NX', 'EX', 3600) === 'OK' ? 'control' : ctx.redis.get(key)));
+  const got = await m.assign(e, 'u-1');
+  assert(rival.fired, \`nothing touched \${key}: the assignment must be cached there\`);
+  if (rival.error !== undefined) throw rival.error;
+  assert.equal(got, rival.result, \`another replica served u-1 \${rival.result} and this request served \${got}: write with SET NX and answer the variant that won\`);
+  assert.equal(ctx.redis.get(key), got, \`\${key} holds \${ctx.redis.get(key)} but u-1 was served \${got}\`);
+}
+
+export async function check_stopped(ctx) {
+  const {m, store, experiment} = setup(ctx);
+  const e = await experiment(ALL_TREATMENT);
+  assert.equal(await m.assign(e, 'u-1'), 'treatment', 'in an all-treatment experiment u-1 must get treatment');
+  await store.setStatus(e, 'stopped');
+  const kept = await m.assign(e, 'u-1');
+  assert.equal(kept, 'treatment', \`once the experiment stopped u-1 got \${kept} instead of the treatment it was served: a stop must keep the assignments it wrote\`);
+  const late = await m.assign(e, 'u-2');
+  assert.equal(late, null, \`a unit first seen after the stop was assigned \${late}: a stopped experiment assigns no one new\`);
+  assert.equal(ctx.redis.get(\`exp:\${e}:assign:u-2\`), null, 'a stopped experiment wrote a new assignment');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+
+	"expd/store"
+
+	"leetbuild/harness"
+)
+
+var (
+	stateBg      = context.Background()
+	allControl   = []store.Variant{{Key: "control", Weight: 100}, {Key: "treatment", Weight: 0}}
+	allTreatment = []store.Variant{{Key: "control", Weight: 0}, {Key: "treatment", Weight: 100}}
+)
+
+func experiment(variants []store.Variant) string {
+	return store.Create(stateBg, store.Design{Name: "cta", Unit: "user", Variants: variants, MinSample: 1000, Salt: "s-1"}).ID
+}
+
+func mustAssign(ctx *harness.Ctx, experimentID, unitID, want, why string) {
+	got, ok := assign(stateBg, experimentID, unitID)
+	ctx.Assert(ok && got == want, "%s: %s got %q (assigned %t), expected %q", why, unitID, got, ok, want)
+}
+
+func CheckExperimentKey(ctx *harness.Ctx) {
+	a := experiment(allControl)
+	b := experiment(allTreatment)
+	mustAssign(ctx, a, "u-1", "control", "in an all-control experiment")
+	mustAssign(ctx, b, "u-1", "treatment", "in an all-treatment experiment (an assignment cached for another experiment must not answer this one)")
+	keys := ctx.Redis.Keys("*assign*")
+	for _, c := range []struct{ id, variant string }{{a, "control"}, {b, "treatment"}} {
+		key := "exp:" + c.id + ":assign:u-1"
+		got, _ := ctx.Redis.Get(key)
+		ctx.Assert(got == c.variant, "%s holds %q, expected %q: cache each experiment's assignment under its own key (Redis holds %q)", key, got, c.variant, keys)
+		ctx.Assert(ctx.Redis.TTL(key) > 0, "%s has no TTL: assignments must expire", key)
+	}
+}
+
+func CheckSticky(ctx *harness.Ctx) {
+	e := experiment(allControl)
+	mustAssign(ctx, e, "u-1", "control", "in an all-control experiment")
+	// The bulk tool rewrites the split and the salt of the running experiment behind the API.
+	store.Update(stateBg, e, map[string]any{"variants": allTreatment, "salt": "s-2"})
+	mustAssign(ctx, e, "u-1", "control", "after a bulk edit of the split and salt (read the cached assignment before hashing)")
+	mustAssign(ctx, e, "u-2", "treatment", "a unit first seen after the edit gets the split in force")
+}
+
+func CheckFirstWriteWins(ctx *harness.Ctx) {
+	e := experiment(allTreatment)
+	key := "exp:" + e + ":assign:u-1"
+	// A replica still holding the design from before an edit assigns u-1 the way a correct one does.
+	rival := ctx.Redis.After(key, func() any {
+		if ctx.Redis.Set(key, "control", "NX", "EX", 3600) {
+			return "control"
+		}
+		v, _ := ctx.Redis.Get(key)
+		return v
+	})
+	got, _ := assign(stateBg, e, "u-1")
+	ctx.Assert(rival.Fired, "nothing touched %s: the assignment must be cached there", key)
+	ctx.Assert(got == rival.Result, "another replica served u-1 %v and this request served %q: write with SET NX and answer the variant that won", rival.Result, got)
+	stored, _ := ctx.Redis.Get(key)
+	ctx.Equal(stored, got, "%s must hold what u-1 was served", key)
+}
+
+func CheckStopped(ctx *harness.Ctx) {
+	e := experiment(allTreatment)
+	mustAssign(ctx, e, "u-1", "treatment", "in an all-treatment experiment")
+	store.SetStatus(stateBg, e, "stopped")
+	mustAssign(ctx, e, "u-1", "treatment", "once the experiment stopped (a stop must keep the assignments it wrote)")
+	late, ok := assign(stateBg, e, "u-2")
+	ctx.Assert(!ok, "a unit first seen after the stop was assigned %q: a stopped experiment assigns no one new", late)
+	_, written := ctx.Redis.Get("exp:" + e + ":assign:u-2")
+	ctx.Assert(!written, "a stopped experiment wrote a new assignment")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "expd/store.h"
+
+namespace {
+
+const std::vector<store::Variant> kAllControl = {{"control", 100}, {"treatment", 0}};
+const std::vector<store::Variant> kAllTreatment = {{"control", 0}, {"treatment", 100}};
+
+std::string experiment(const std::vector<store::Variant>& variants) {
+  return store::create(store::Design{"cta", "user", variants, 1000, "s-1"}).id;
+}
+
+void mustAssign(harness::Ctx& ctx, const std::string& experiment_id, const std::string& unit_id, const std::string& want, const std::string& why) {
+  const auto got = assign(experiment_id, unit_id);
+  ctx.Assert(got && *got == want, "%s: %s got %q (assigned %t), expected %q", why, unit_id, got.value_or(""), got.has_value(), want);
+}
+
+}  // namespace
+
+void CheckExperimentKey(harness::Ctx& ctx) {
+  const std::string a = experiment(kAllControl);
+  const std::string b = experiment(kAllTreatment);
+  mustAssign(ctx, a, "u-1", "control", "in an all-control experiment");
+  mustAssign(ctx, b, "u-1", "treatment", "in an all-treatment experiment (an assignment cached for another experiment must not answer this one)");
+  const auto keys = ctx.Redis.Keys("*assign*");
+  for (const auto& [id, variant] : std::vector<std::pair<std::string, std::string>>{{a, "control"}, {b, "treatment"}}) {
+    const std::string key = "exp:" + id + ":assign:u-1";
+    ctx.Assert(ctx.Redis.Get(key).value_or("") == variant, "%s holds %q, expected %q: cache each experiment's assignment under its own key (Redis holds %q)", key, ctx.Redis.Get(key).value_or(""), variant, keys);
+    ctx.Assert(ctx.Redis.TTL(key) > 0, "%s has no TTL: assignments must expire", key);
+  }
+}
+
+void CheckSticky(harness::Ctx& ctx) {
+  const std::string e = experiment(kAllControl);
+  mustAssign(ctx, e, "u-1", "control", "in an all-control experiment");
+  // The bulk tool rewrites the split and the salt of the running experiment behind the API.
+  store::update(e, {{"variants", nlohmann::json::array({{{"key", "control"}, {"weight", 0}}, {{"key", "treatment"}, {"weight", 100}}})}, {"salt", "s-2"}});
+  mustAssign(ctx, e, "u-1", "control", "after a bulk edit of the split and salt (read the cached assignment before hashing)");
+  mustAssign(ctx, e, "u-2", "treatment", "a unit first seen after the edit gets the split in force");
+}
+
+void CheckFirstWriteWins(harness::Ctx& ctx) {
+  const std::string e = experiment(kAllTreatment);
+  const std::string key = "exp:" + e + ":assign:u-1";
+  auto rival = std::make_shared<std::optional<std::string>>();
+  // A replica still holding the design from before an edit assigns u-1 the way a correct one does.
+  ctx.Redis.After(key, [&ctx, rival, key] {
+    *rival = ctx.Redis.Set(key, "control", "NX", "EX", 3600) ? std::string("control") : ctx.Redis.Get(key).value_or("");
+  });
+  const auto got = assign(e, "u-1");
+  ctx.Assert(rival->has_value(), "nothing touched %s: the assignment must be cached there", key);
+  ctx.Assert(got.value_or("") == **rival, "another replica served u-1 %q and this request served %q: write with SET NX and answer the variant that won", **rival, got.value_or(""));
+  ctx.Equal(ctx.Redis.Get(key).value_or(""), got.value_or(""), "%s must hold what u-1 was served", key);
+}
+
+void CheckStopped(harness::Ctx& ctx) {
+  const std::string e = experiment(kAllTreatment);
+  mustAssign(ctx, e, "u-1", "treatment", "in an all-treatment experiment");
+  store::setStatus(e, "stopped");
+  mustAssign(ctx, e, "u-1", "treatment", "once the experiment stopped (a stop must keep the assignments it wrote)");
+  const auto late = assign(e, "u-2");
+  ctx.Assert(!late, "a unit first seen after the stop was assigned %q: a stopped experiment assigns no one new", late.value_or(""));
+  ctx.Assert(!ctx.Redis.Get("exp:" + e + ":assign:u-2"), "a stopped experiment wrote a new assignment");
+}
+`,
+  },
+  hints: [
+    'Assign a user, let the bulk tool change the split, assign again: the user moves. Stop the experiment and everyone reports control, including users who saw treatment for weeks.',
+    'The starter hashes on every call and only ever writes the cache, under a key without the experiment id, so the cache never answers. A plain `SET` lets whichever replica writes last win, and the stopped branch returns the first variant.',
+    'Read `exp:{experiment_id}:assign:{unit_id}` first and return a hit. Return `None` for a stopped experiment without one. Otherwise hash, `SET` it with `nx=True` and the TTL, and when that write loses, return what `GET` reads.',
+  ],
+  debrief: `The cache is the record of what each unit saw, not a speed-up for the hash: once a unit is exposed, its variant is a fact the analysis depends on, so it is read before anything is computed and written only if absent. That one ordering covers three failures at once: a design edited behind the API, two replicas racing on a new unit, and a stopped experiment. Keying by experiment matters because one user sits in many experiments and each has its own answer. Production assignment services keep sticky buckets in a durable store keyed by experiment and version, log the assignment with the exposure event, and delete the rows when the experiment is archived rather than on a fixed TTL.`,
 };

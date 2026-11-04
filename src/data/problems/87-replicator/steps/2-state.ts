@@ -2,45 +2,42 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis offsets per shard, durable and monotonic',
+  title: 'Redis offsets per shard, durable and only moving forward',
   concept: 'redis',
   file: 'state',
   focus: ['api', 'redis', 'target'],
   task: `## Task
 
-**Starting point.** The starter walks one shard's changes in \`replicate_shard(replication_id,
-shard, changes)\`, keeps the shard's offset in a Redis key under \`PAIR_KEY\`, moves it forward with
-\`GET\` plus \`SET\`, and offers \`resume_offset\` for a restart. It compiles, the demo converges,
-and it hides 5 flaws.
+**Starting point.** The starter is the offset store every later step uses: \`offset_key(replication_id,
+shard)\`, \`advance_offset(replication_id, shard, offset)\`, called once the target confirmed a shard up
+to \`offset\` and returning the shard's offset afterwards, and \`resume_offset(replication_id, shard)\`,
+where a restarted shard picks up. \`advance_offset\` reads the key with \`GET\` and writes it with
+\`SET … EX 3600\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The starter stores the offset with a one-hour TTL, so an idle
-shard restarts from zero and the target re-applies months of history; it compares offsets as
-strings, so the shard stalls at the first two-digit offset; it advances the offset before the
-target confirms; its key ignores the documented layout; and \`resume_offset\` answers 0 always.
+**Failure mode the checks target.** A shard that sat idle for an hour restarts from zero and the
+target re-applies its whole history; a shard stops advancing at offset 10; a confirmation that lands
+between another worker's read and write is overwritten by an older one; and two shards of one
+replication overwrite each other's progress.
 
-- Each shard's offset lives under \`offset:{replication_id}:{shard}\`, built by \`offset_key\`.
-- The key is **durable**: no \`EX\`, \`EXPIRE\`, \`SETEX\` or TTL of any kind.
-- The offset is **advanced only after the target confirms** the change: apply, check the
-  confirmation, then move the offset.
-- The advance is a **compare-and-set that does not regress**: confirmations arrive out of order, so
-  compare the candidate with the stored offset **as integers** (\`tonumber\` in a Lua script) and
-  leave the stored value alone when it is not larger. \`"10" < "9"\` lexicographically.
-- \`resume_offset(replication_id, shard)\` returns the confirmed offset parsed as an integer, and
-  \`0\` **only** when that shard has never confirmed anything.`,
+- One key per shard: \`offset:{replication_id}:{shard}\`.
+- The key carries **no expiry**.
+- The advance is **one Lua script**: compare the stored offset and the candidate **as numbers**
+  (\`tonumber\`), \`SET\` only when the candidate is larger, return the stored offset.
+- \`resume_offset\` answers the stored offset, or \`0\` when the shard never confirmed one.`,
   sequence: {
-    participants: ['Replication controller', 'Target region', 'Redis'],
+    participants: ['Replication worker', 'Redis'],
     messages: [
-      {from: 'Replication controller', to: 'Target region', label: 'Apply(change_id, offset)', kind: 'sync'},
-      {from: 'Target region', to: 'Replication controller', label: 'applied / not applied', kind: 'reply'},
+      {from: 'Replication worker', to: 'Redis', label: 'EVAL advance offset:rep-1:0 candidate=11', kind: 'sync'},
+      {from: 'Redis', to: 'Replication worker', label: 'tonumber(11) > tonumber(10) → SET · return 11', kind: 'reply'},
       {
-        from: 'Replication controller',
+        from: 'Replication worker',
         to: 'Redis',
-        label: 'EVAL compare-and-set offset:{replication}:{shard}',
+        label: 'EVAL advance offset:rep-1:0 candidate=9 (late confirmation)',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Replication controller', label: 'current offset', kind: 'reply'},
-      {from: 'Replication controller', to: 'Redis', label: 'GET offset on restart', kind: 'sync'},
-      {from: 'Redis', to: 'Replication controller', label: 'confirmed offset / nil', kind: 'reply'},
+      {from: 'Redis', to: 'Replication worker', label: 'not larger → 11', kind: 'reply'},
+      {from: 'Replication worker', to: 'Redis', label: 'GET offset:rep-1:0 on restart', kind: 'sync'},
+      {from: 'Redis', to: 'Replication worker', label: '11 (no TTL: still there after a quiet week)', kind: 'reply'},
     ],
   },
   checks: [
@@ -48,70 +45,52 @@ target confirms; its key ignores the documented layout; and \`resume_offset\` an
       id: 'durable-offset',
       title: 'The offset key does not expire',
       detail:
-        'The offset is written with a compare-and-set that carries **no expiry** — no `EX`, `EXPIRE` or `SETEX` anywhere. The starter stores it with a one-hour TTL, so a quiet shard forgets its offset and replays its whole history.',
+        'The offset is written with no expiry (no `EX`, `EXPIRE`, `SETEX`), so a shard that was quiet for hours still resumes at its confirmed offset.',
       match: {
-        python: {all: [/offset_script/, /redis\.call\('SET'/], none: [/EXPIRE|SETEX|'EX'/]},
-        typescript: {all: [/OFFSET_SCRIPT/, /redis\.call\('SET'/], none: [/EXPIRE|SETEX|'EX'/]},
-        go: {all: [/offsetScript/, /redis\.call\('SET'/], none: [/EXPIRE|SETEX|"EX"/]},
-        scala: {all: [/OffsetScript/, /redis\.call\('SET'/], none: [/EXPIRE|SETEX|'EX'/]},
-        cpp: {all: [/kOffsetScript/, /redis\.call\('SET'/], none: [/EXPIRE|SETEX|"EX"/]},
+        python: {all: [/def resume_offset\(/], none: [/\bex\s*=/, /expire/i, /setex/i]},
+        typescript: {all: [/function resumeOffset\(/], none: [/['"]EX['"]/, /expire/i, /setex/i]},
+        go: {all: [/func resumeOffset\(/], none: [/time\.Hour|time\.Second|offsetTTL/, /Expire\(/, /SetEX\(/i]},
+        scala: {all: [/def resumeOffset\(/], none: [/SetParams|\.ex\(/, /expire/i, /setex/i]},
+        cpp: {all: [/resumeOffset\(/], none: [/std::chrono/, /expire/i, /setex/i]},
       },
     },
     {
-      id: 'monotonic',
-      title: 'Offsets compare as numbers, so a shard cannot rewind',
+      id: 'numeric-compare',
+      title: 'Offsets compare as numbers',
       detail:
-        'The stored offset is parsed as a number (`tonumber`) and the candidate compared numerically, so an out-of-order confirmation of an older change cannot move it back. The starter compares the two as strings, where `"10" < "9"`.',
+        'The stored offset and the candidate are compared as numbers (`tonumber` in the script), so 10 is larger than 9; compared as strings, `"10" < "9"` and the shard stalls.',
       match: {
-        python: {all: [/tonumber\(redis\.call\('GET', KEYS\[1\]\)/, /candidate <= current/]},
-        typescript: {all: [/tonumber\(redis\.call\('GET', KEYS\[1\]\)/, /candidate <= current/]},
-        go: {all: [/tonumber\(redis\.call\('GET', KEYS\[1\]\)/, /candidate <= current/]},
-        scala: {all: [/tonumber\(redis\.call\('GET', KEYS\[1\]\)/, /candidate <= current/]},
-        cpp: {all: [/tonumber\(redis\.call\('GET', KEYS\[1\]\)/, /candidate <= current/]},
+        python: {all: [/tonumber\(/]},
+        typescript: {all: [/tonumber\(/]},
+        go: {all: [/tonumber\(/]},
+        scala: {all: [/tonumber\(/]},
+        cpp: {all: [/tonumber\(/]},
       },
     },
     {
-      id: 'advance-after-confirm',
-      title: 'The offset advances only after the target confirms',
+      id: 'atomic-advance',
+      title: 'The advance is one compare-and-set in Lua',
       detail:
-        'The apply call is made first, its confirmation is captured, and the offset advance happens only behind that confirmation. The starter advances the offset while reading the changes.',
+        'Read, compare and write run in one script (`register_script`/`eval`, `defineCommand`, `NewScript`, `jedis.eval`, `redis.eval`) that `SET`s only a larger offset; a client-side `GET` then `SET` lets a confirmation that lands in between be overwritten by an older one.',
       match: {
-        python: {order: [/confirmed = apply_to_target\(/, /advance_offset\(/]},
-        typescript: {order: [/const confirmed = await applyToTarget\(/, /advanceOffset\(/]},
-        go: {order: [/confirmed, err := applyToTarget\(/, /advanceOffset\(/]},
-        scala: {order: [/val confirmed = applyToTarget\(/, /advanceOffset\(/]},
-        cpp: {all: [/const bool confirmed = applyToTarget\(/, /if \(confirmed\) advanceOffset\(/]},
+        python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/\br\.set\(/]},
+        typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/redis\.set\(/]},
+        go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/rdb\.Set\(/]},
+        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]SET['"]/], none: [/jedis\.set\(/]},
+        cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]SET['"]/], none: [/redis\.set\(/]},
       },
     },
     {
       id: 'shard-key',
-      title: 'One durable key per (replication, shard)',
+      title: 'One offset key per (replication, shard)',
       detail:
-        'The key is `offset:{replication_id}:{shard}`: namespaced by the replication and by the shard, so two shards cannot overwrite each other’s progress. The starter keys the whole replication under one key.',
+        'The key is `offset:{replication_id}:{shard}`, so two shards of one replication keep separate progress; one key per replication lets them overwrite each other.',
       match: {
-        python: {all: [/offset:\{replication_id\}:\{shard\}/, /def offset_key\(/]},
-        typescript: {all: [/offset:\$\{replicationId\}:\$\{shard\}/, /function offsetKey\(/]},
-        go: {all: [/offset:%s:%d/, /func offsetKey\(/]},
-        scala: {all: [/offset:\$replicationId:\$shard/, /def offsetKey\(/]},
-        cpp: {
-          all: [
-            /offset:" \+ replicationId \+ ":" \+ std::to_string\(shard\)/,
-            /offsetKey\(const std::string& replicationId, int shard\)/,
-          ],
-        },
-      },
-    },
-    {
-      id: 'resume',
-      title: 'A restart resumes at the confirmed offset, zero only when there is none',
-      detail:
-        '`resume_offset` reads the durable key and parses it as a number; it answers 0 only when the shard has never confirmed anything. The starter returns 0 unconditionally, so every restart replays the shard.',
-      match: {
-        python: {all: [/def resume_offset\(/, /offset_key\(replication_id, shard\)/, /int\(raw\)/]},
-        typescript: {all: [/function resumeOffset\(/, /offsetKey\(replicationId, shard\)/, /Number\(raw\)/]},
-        go: {all: [/func resumeOffset\(/, /offsetKey\(replicationID, shard\)/, /strconv\.ParseInt\(raw/]},
-        scala: {all: [/def resumeOffset\(/, /offsetKey\(replicationId, shard\)/, /raw\.toLong/]},
-        cpp: {all: [/int64_t resumeOffset\(/, /offsetKey\(replicationId, shard\)/, /std::stoll\(\*raw/]},
+        python: {all: [/offset:\{replication_id\}:\{shard\}/]},
+        typescript: {all: [/offset:\$\{replicationId\}:\$\{shard\}/]},
+        go: {all: [/"offset:%s:%d"/]},
+        scala: {all: [/offset:\$replicationId:\$shard/]},
+        cpp: {all: [/"offset:"\s*\+\s*replication_id\s*\+\s*":"\s*\+\s*std::to_string\(shard\)/]},
       },
     },
   ],
@@ -121,156 +100,121 @@ target confirms; its key ignores the documented layout; and \`resume_offset\` an
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-OFFSET_TTL_SECONDS = 3600
-PAIR_KEY = "offset:{replication}->{shard}"
+OFFSET_TTL_S = 3600
 
 
-# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-def replicate_shard(replication_id: str, shard: int, changes: list[dict]) -> None:
-    key = PAIR_KEY.format(replication=replication_id, shard=shard)
-    for change in changes:
-        current = r.get(key) or "0"
-        if str(change["offset"]) > current:
-            r.set(key, str(change["offset"]), ex=OFFSET_TTL_SECONDS)
-        apply_to_target(replication_id, shard, change)
+def offset_key(replication_id: str, shard: int) -> str:
+    return f"offset:{replication_id}"
+
+
+def advance_offset(replication_id: str, shard: int, offset: int) -> int:
+    """Record that the target confirmed the shard up to offset; returns the shard's offset afterwards."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    key = offset_key(replication_id, shard)
+    current = r.get(key) or "0"
+    if str(offset) > current:
+        r.set(key, offset, ex=OFFSET_TTL_S)
+        return offset
+    return int(current)
 
 
 def resume_offset(replication_id: str, shard: int) -> int:
-    return 0
-
-
-def apply_to_target(replication_id: str, shard: int, change: dict) -> bool:
-    """Apply one change at the target region."""
-    raise NotImplementedError
+    """Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one."""
+    raw = r.get(offset_key(replication_id, shard))
+    return int(raw) if raw is not None else 0
 `,
       solution: `import redis
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# Compare-and-set: the offset only moves forward, and the key never carries a TTL — an offset that
-# expires silently rewinds the shard to zero and replays its whole history.
-OFFSET_SCRIPT = """
-local current = tonumber(redis.call('GET', KEYS[1]) or '-1')
+# Forward-only compare-and-set, as numbers: a late confirmation of an older offset changes nothing.
+ADVANCE_LUA = """
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local candidate = tonumber(ARGV[1])
-if candidate <= current then
-  return current
+if candidate > current then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return candidate
 end
-redis.call('SET', KEYS[1], candidate)
-return candidate
+return current
 """
-offset_script = r.register_script(OFFSET_SCRIPT)
-
-
-def replicate_shard(replication_id: str, shard: int, changes: list[dict]) -> None:
-    """Apply one shard's changes and advance its offset after each confirmation."""
-    for change in changes:
-        confirmed = apply_to_target(replication_id, shard, change)
-        if confirmed:
-            advance_offset(replication_id, shard, change["offset"])
+advance = r.register_script(ADVANCE_LUA)
 
 
 def offset_key(replication_id: str, shard: int) -> str:
-    """The durable offset key for one (replication, shard) pair."""
     return f"offset:{replication_id}:{shard}"
 
 
-def advance_offset(replication_id: str, shard: int, applied_offset: int) -> int:
-    """Advance the confirmed offset; an out-of-order confirmation never moves it back."""
-    return int(offset_script(keys=[offset_key(replication_id, shard)], args=[applied_offset]))
-
-
-def apply_to_target(replication_id: str, shard: int, change: dict) -> bool:
-    """Apply one change at the target region and report whether the target confirmed it."""
-    raise NotImplementedError
+def advance_offset(replication_id: str, shard: int, offset: int) -> int:
+    """Record that the target confirmed the shard up to offset; returns the shard's offset afterwards."""
+    # No TTL: an offset that expires rewinds the shard to zero and replays its history.
+    return int(advance(keys=[offset_key(replication_id, shard)], args=[offset]))
 
 
 def resume_offset(replication_id: str, shard: int) -> int:
-    """Where a restarted shard resumes: the confirmed offset, or 0 the first time."""
+    """Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one."""
     raw = r.get(offset_key(replication_id, shard))
     return int(raw) if raw is not None else 0
 `,
     },
     typescript: {
-      starter: `import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-const OFFSET_TTL_SECONDS = 3600;
+const OFFSET_TTL_S = 3600;
 
-interface Change {
-  change_id: string;
-  offset: number;
-  payload: string;
-}
+export const offsetKey = (replicationId: string, shard: number): string => \`offset:\${replicationId}\`;
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-export async function replicateShard(replicationId: string, shard: number, changes: Change[]): Promise<void> {
-  const key = pairCacheKey(replicationId, shard);
-  for (const change of changes) {
-    const current = (await r.get(key)) ?? '0';
-    if (String(change.offset) > current) await r.set(key, String(change.offset), 'EX', OFFSET_TTL_SECONDS);
-    await applyToTarget(replicationId, shard, change);
+/** Record that the target confirmed the shard up to offset; resolves the shard's offset afterwards. */
+export async function advanceOffset(replicationId: string, shard: number, offset: number): Promise<number> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const key = offsetKey(replicationId, shard);
+  const current = (await redis.get(key)) ?? '0';
+  if (String(offset) > current) {
+    await redis.set(key, String(offset), 'EX', OFFSET_TTL_S);
+    return offset;
   }
+  return Number(current);
 }
 
-function pairCacheKey(replicationId: string, shard: number): string {
-  return \`offset:\${replicationId}->\${shard}\`;
-}
-
+/** Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one. */
 export async function resumeOffset(replicationId: string, shard: number): Promise<number> {
-  return 0;
-}
-
-async function applyToTarget(replicationId: string, shard: number, change: Change): Promise<boolean> {
-  throw new Error('apply at the target region');
+  const raw = await redis.get(offsetKey(replicationId, shard));
+  return raw === null ? 0 : Number(raw);
 }
 `,
-      solution: `import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-const r = new Redis('redis://redis:6379');
-
-// Compare-and-set: the offset only moves forward, and the key never carries a TTL — an offset that
-// expires silently rewinds the shard to zero and replays its whole history.
-const OFFSET_SCRIPT = \`
-local current = tonumber(redis.call('GET', KEYS[1]) or '-1')
+// Forward-only compare-and-set, as numbers: a late confirmation of an older offset changes nothing.
+export const ADVANCE_LUA = \`
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local candidate = tonumber(ARGV[1])
-if candidate <= current then
-  return current
+if candidate > current then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return candidate
 end
-redis.call('SET', KEYS[1], candidate)
-return candidate
+return current
 \`;
 
-interface Change {
-  change_id: string;
-  offset: number;
-  payload: string;
+interface OffsetRedis extends Redis {
+  advance(key: string, offset: number): Promise<number>;
 }
 
-function offsetKey(replicationId: string, shard: number): string {
-  return \`offset:\${replicationId}:\${shard}\`;
+const redis = new Redis({host: 'redis', port: 6379}) as OffsetRedis;
+redis.defineCommand('advance', {numberOfKeys: 1, lua: ADVANCE_LUA});
+
+export const offsetKey = (replicationId: string, shard: number): string => \`offset:\${replicationId}:\${shard}\`;
+
+/** Record that the target confirmed the shard up to offset; resolves the shard's offset afterwards. */
+export async function advanceOffset(replicationId: string, shard: number, offset: number): Promise<number> {
+  // No TTL: an offset that expires rewinds the shard to zero and replays its history.
+  return Number(await redis.advance(offsetKey(replicationId, shard), offset));
 }
 
-export async function replicateShard(replicationId: string, shard: number, changes: Change[]): Promise<void> {
-  for (const change of changes) {
-    const confirmed = await applyToTarget(replicationId, shard, change);
-    if (confirmed) await advanceOffset(replicationId, shard, change.offset);
-  }
-}
-
-export async function advanceOffset(replicationId: string, shard: number, appliedOffset: number): Promise<number> {
-  const next = await r.eval(OFFSET_SCRIPT, 1, offsetKey(replicationId, shard), String(appliedOffset));
-  return Number(next);
-}
-
-async function applyToTarget(replicationId: string, shard: number, change: Change): Promise<boolean> {
-  throw new Error('apply at the target region');
-}
-
+/** Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one. */
 export async function resumeOffset(replicationId: string, shard: number): Promise<number> {
-  const raw = await r.get(offsetKey(replicationId, shard));
-  if (raw === null) return 0;
-  return Number(raw);
+  const raw = await redis.get(offsetKey(replicationId, shard));
+  return raw === null ? 0 : Number(raw);
 }
 `,
     },
@@ -279,56 +223,43 @@ export async function resumeOffset(replicationId: string, shard: number): Promis
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
 const offsetTTL = time.Hour
 
-var rdb *redis.Client
-
-type Change struct {
-	ChangeID string \`json:"change_id"\`
-	Offset   int64  \`json:"offset"\`
-	Payload  []byte \`json:"payload"\`
+func offsetKey(replicationID string, shard int) string {
+	return "offset:" + replicationID
 }
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-func replicateShard(ctx context.Context, replicationID string, shard int, changes []Change) error {
-	key := pairCacheKey(replicationID, shard)
-	for _, change := range changes {
-		current, err := rdb.Get(ctx, key).Result()
-		if err == redis.Nil {
-			current = "0"
-		} else if err != nil {
-			return err
-		}
-		candidate := strconv.FormatInt(change.Offset, 10)
-		if candidate > current {
-			if err := rdb.Set(ctx, key, candidate, offsetTTL).Err(); err != nil {
-				return err
-			}
-		}
-		if _, err := applyToTarget(ctx, replicationID, shard, change); err != nil {
-			return err
-		}
+// advanceOffset records that the target confirmed the shard up to offset; it returns the shard's offset afterwards.
+func advanceOffset(ctx context.Context, replicationID string, shard int, offset int64) (int64, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	key := offsetKey(replicationID, shard)
+	current, err := rdb.Get(ctx, key).Result()
+	if err == redis.Nil {
+		current = "0"
+	} else if err != nil {
+		return 0, err
 	}
-	return nil
+	if strconv.FormatInt(offset, 10) > current {
+		return offset, rdb.Set(ctx, key, offset, offsetTTL).Err()
+	}
+	return strconv.ParseInt(current, 10, 64)
 }
 
-func pairCacheKey(replicationID string, shard int) string {
-	return fmt.Sprintf("offset:%s->%d", replicationID, shard)
-}
-
+// resumeOffset is where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one.
 func resumeOffset(ctx context.Context, replicationID string, shard int) (int64, error) {
-	return 0, nil
-}
-
-func applyToTarget(ctx context.Context, replicationID string, shard int, change Change) (bool, error) {
-	return true, nil
+	offset, err := rdb.Get(ctx, offsetKey(replicationID, shard)).Int64()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	return offset, err
 }
 `,
       solution: `package main
@@ -336,239 +267,399 @@ func applyToTarget(ctx context.Context, replicationID string, shard int, change 
 import (
 	"context"
 	"fmt"
-	"strconv"
 
 	"github.com/redis/go-redis/v9"
 )
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-// offsetScript is a compare-and-set: the offset only moves forward, and the key never carries a
-// TTL — an offset that expires silently rewinds the shard to zero and replays its whole history.
-var offsetScript = redis.NewScript(\`
-local current = tonumber(redis.call('GET', KEYS[1]) or '-1')
+// advance is a forward-only compare-and-set, as numbers: a late confirmation of an older offset changes nothing.
+var advance = redis.NewScript(\`
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local candidate = tonumber(ARGV[1])
-if candidate <= current then
-  return current
+if candidate > current then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return candidate
 end
-redis.call('SET', KEYS[1], candidate)
-return candidate
+return current
 \`)
-
-type Change struct {
-	ChangeID string \`json:"change_id"\`
-	Offset   int64  \`json:"offset"\`
-	Payload  []byte \`json:"payload"\`
-}
 
 func offsetKey(replicationID string, shard int) string {
 	return fmt.Sprintf("offset:%s:%d", replicationID, shard)
 }
 
-func replicateShard(ctx context.Context, replicationID string, shard int, changes []Change) error {
-	for _, change := range changes {
-		confirmed, err := applyToTarget(ctx, replicationID, shard, change)
-		if err != nil {
-			return err
-		}
-		if confirmed {
-			if _, err := advanceOffset(ctx, replicationID, shard, change.Offset); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+// advanceOffset records that the target confirmed the shard up to offset; it returns the shard's offset afterwards.
+func advanceOffset(ctx context.Context, replicationID string, shard int, offset int64) (int64, error) {
+	// No TTL: an offset that expires rewinds the shard to zero and replays its history.
+	return advance.Run(ctx, rdb, []string{offsetKey(replicationID, shard)}, offset).Int64()
 }
 
-func advanceOffset(ctx context.Context, replicationID string, shard int, appliedOffset int64) (int64, error) {
-	return offsetScript.Run(ctx, rdb, []string{offsetKey(replicationID, shard)}, appliedOffset).Int64()
-}
-
-func applyToTarget(ctx context.Context, replicationID string, shard int, change Change) (bool, error) {
-	return false, nil
-}
-
+// resumeOffset is where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one.
 func resumeOffset(ctx context.Context, replicationID string, shard int) (int64, error) {
-	raw, err := rdb.Get(ctx, offsetKey(replicationID, shard)).Result()
+	offset, err := rdb.Get(ctx, offsetKey(replicationID, shard)).Int64()
 	if err == redis.Nil {
 		return 0, nil
 	}
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseInt(raw, 10, 64)
+	return offset, err
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
 
-final case class Change(change_id: String, offset: Long, payload: Array[Byte])
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-object OffsetStore {
-  private val jedis = new Jedis("redis", 6379)
-  val OffsetTtlSeconds = 3600
+  val OffsetTtlSeconds = 3600L
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def replicateShard(replicationId: String, shard: Int, changes: Seq[Change]): Unit = {
-    val key = pairCacheKey(replicationId, shard)
-    changes.foreach { change =>
-      val current = Option(jedis.get(key)).getOrElse("0")
-      if (change.offset.toString > current) jedis.setex(key, OffsetTtlSeconds, change.offset.toString)
-      applyToTarget(replicationId, shard, change)
-    }
+  def offsetKey(replicationId: String, shard: Int): String = s"offset:$replicationId"
+
+  /** Record that the target confirmed the shard up to offset; returns the shard's offset afterwards. */
+  def advanceOffset(replicationId: String, shard: Int, offset: Long): Long = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val key = offsetKey(replicationId, shard)
+    val current = Option(jedis.get(key)).getOrElse("0")
+    if (offset.toString > current) {
+      jedis.set(key, offset.toString, SetParams.setParams().ex(OffsetTtlSeconds))
+      offset
+    } else current.toLong
   }
 
-  def pairCacheKey(replicationId: String, shard: Int): String = s"offset:$replicationId->$shard"
-
-  def resumeOffset(replicationId: String, shard: Int): Long = 0L
-
-  def applyToTarget(replicationId: String, shard: Int, change: Change): Boolean = true
+  /** Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one. */
+  def resumeOffset(replicationId: String, shard: Int): Long =
+    Option(jedis.get(offsetKey(replicationId, shard))).map(_.toLong).getOrElse(0L)
 }
 `,
-      solution: `import redis.clients.jedis.Jedis
+      solution: `import scala.jdk.CollectionConverters._
 
-final case class Change(change_id: String, offset: Long, payload: Array[Byte])
+import redis.clients.jedis.JedisPooled
 
-object OffsetStore {
-  private val jedis = new Jedis("redis", 6379)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  // Compare-and-set: the offset only moves forward, and the key never carries a TTL — an offset
-  // that expires silently rewinds the shard to zero and replays its whole history.
-  val OffsetScript: String =
-    """local current = tonumber(redis.call('GET', KEYS[1]) or '-1')
+  /** Forward-only compare-and-set, as numbers: a late confirmation of an older offset changes nothing. */
+  val AdvanceLua: String =
+    """local current = tonumber(redis.call('GET', KEYS[1]) or '0')
       |local candidate = tonumber(ARGV[1])
-      |if candidate <= current then
-      |  return current
+      |if candidate > current then
+      |  redis.call('SET', KEYS[1], ARGV[1])
+      |  return candidate
       |end
-      |redis.call('SET', KEYS[1], candidate)
-      |return candidate""".stripMargin
+      |return current
+      |""".stripMargin
 
   def offsetKey(replicationId: String, shard: Int): String = s"offset:$replicationId:$shard"
 
-  def replicateShard(replicationId: String, shard: Int, changes: Seq[Change]): Unit = {
-    changes.foreach { change =>
-      val confirmed = applyToTarget(replicationId, shard, change)
-      if (confirmed) advanceOffset(replicationId, shard, change.offset)
-    }
-  }
+  /** Record that the target confirmed the shard up to offset; returns the shard's offset afterwards. */
+  def advanceOffset(replicationId: String, shard: Int, offset: Long): Long =
+    // No TTL: an offset that expires rewinds the shard to zero and replays its history.
+    jedis.eval(AdvanceLua, List(offsetKey(replicationId, shard)).asJava, List(offset.toString).asJava).asInstanceOf[java.lang.Long]
 
-  def advanceOffset(replicationId: String, shard: Int, appliedOffset: Long): Long = {
-    val raw = jedis.eval(OffsetScript, List(offsetKey(replicationId, shard)), List(appliedOffset.toString))
-    raw.asInstanceOf[java.lang.Long].longValue()
-  }
-
-  def applyToTarget(replicationId: String, shard: Int, change: Change): Boolean = false
-
-  def resumeOffset(replicationId: String, shard: Int): Long = {
-    val raw = jedis.get(offsetKey(replicationId, shard))
-    if (raw == null) 0L else raw.toLong
-  }
+  /** Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one. */
+  def resumeOffset(replicationId: String, shard: Int): Long =
+    Option(jedis.get(offsetKey(replicationId, shard))).map(_.toLong).getOrElse(0L)
 }
 `,
     },
     cpp: {
       starter: `#include <sw/redis++/redis++.h>
 
+#include <chrono>
 #include <string>
-#include <vector>
 
-using sw::redis::Redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-constexpr int kOffsetTtlSeconds = 3600;
+const std::chrono::seconds kOffsetTtl{3600};
 
-Redis redis("tcp://redis:6379");
+std::string offsetKey(const std::string& replication_id, int shard) { return "offset:" + replication_id; }
 
-struct Change {
-  std::string change_id;
-  int64_t offset;
-  std::string payload;
-};
-
-std::string pairCacheKey(const std::string& replicationId, int shard) {
-  return "offset:" + replicationId + "->" + std::to_string(shard);
-}
-
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-void replicateShard(const std::string& replicationId, int shard, const std::vector<Change>& changes) {
-  const auto key = pairCacheKey(replicationId, shard);
-  for (const auto& change : changes) {
-    const auto current = redis.get(key).value_or("0");
-    if (std::to_string(change.offset) > current) redis.setex(key, kOffsetTtlSeconds, std::to_string(change.offset));
-    applyToTarget(replicationId, shard, change);
+// Record that the target confirmed the shard up to offset; returns the shard's offset afterwards.
+long long advanceOffset(const std::string& replication_id, int shard, long long offset) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string key = offsetKey(replication_id, shard);
+  const std::string current = redis.get(key).value_or("0");
+  if (std::to_string(offset) > current) {
+    redis.set(key, std::to_string(offset), kOffsetTtl);
+    return offset;
   }
+  return std::stoll(current);
 }
 
-int64_t resumeOffset(const std::string& replicationId, int shard) {
-  return 0;
-}
-
-bool applyToTarget(const std::string& replicationId, int shard, const Change& change) {
-  return true;
+// Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one.
+long long resumeOffset(const std::string& replication_id, int shard) {
+  const auto raw = redis.get(offsetKey(replication_id, shard));
+  return raw ? std::stoll(*raw) : 0;
 }
 `,
       solution: `#include <sw/redis++/redis++.h>
 
-#include <cstdint>
-#include <stdexcept>
 #include <string>
-#include <vector>
 
-using sw::redis::Redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-// Compare-and-set: the offset only moves forward, and the key never carries a TTL — an offset that
-// expires silently rewinds the shard to zero and replays its whole history.
-const std::string kOffsetScript = R"(
-local current = tonumber(redis.call('GET', KEYS[1]) or '-1')
+// Forward-only compare-and-set, as numbers: a late confirmation of an older offset changes nothing.
+const std::string kAdvanceLua = R"lua(
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local candidate = tonumber(ARGV[1])
-if candidate <= current then
-  return current
+if candidate > current then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return candidate
 end
-redis.call('SET', KEYS[1], candidate)
-return candidate
-)";
+return current
+)lua";
 
-Redis redis("tcp://redis:6379");
-
-struct Change {
-  std::string change_id;
-  int64_t offset;
-  std::string payload;
-};
-
-std::string offsetKey(const std::string& replicationId, int shard) {
-  return "offset:" + replicationId + ":" + std::to_string(shard);
+std::string offsetKey(const std::string& replication_id, int shard) {
+  return "offset:" + replication_id + ":" + std::to_string(shard);
 }
 
-bool applyToTarget(const std::string& replicationId, int shard, const Change& change);
-int64_t advanceOffset(const std::string& replicationId, int shard, int64_t appliedOffset);
-
-void replicateShard(const std::string& replicationId, int shard, const std::vector<Change>& changes) {
-  for (const auto& change : changes) {
-    const bool confirmed = applyToTarget(replicationId, shard, change);
-    if (confirmed) advanceOffset(replicationId, shard, change.offset);
-  }
+// Record that the target confirmed the shard up to offset; returns the shard's offset afterwards.
+long long advanceOffset(const std::string& replication_id, int shard, long long offset) {
+  // No TTL: an offset that expires rewinds the shard to zero and replays its history.
+  return redis.eval<long long>(kAdvanceLua, {offsetKey(replication_id, shard)}, {std::to_string(offset)});
 }
 
-int64_t advanceOffset(const std::string& replicationId, int shard, int64_t appliedOffset) {
-  return redis.eval<int64_t>(kOffsetScript, {offsetKey(replicationId, shard)}, {std::to_string(appliedOffset)});
-}
-
-bool applyToTarget(const std::string& replicationId, int shard, const Change& change) {
-  return false;
-}
-
-int64_t resumeOffset(const std::string& replicationId, int shard) {
-  const auto raw = redis.get(offsetKey(replicationId, shard));
+// Where a restarted shard resumes: its confirmed offset, 0 when it never confirmed one.
+long long resumeOffset(const std::string& replication_id, int shard) {
+  const auto raw = redis.get(offsetKey(replication_id, shard));
   return raw ? std::stoll(*raw) : 0;
 }
 `,
     },
   },
+  harness: {
+    python: `def check_durable_offset(ctx):
+    m = ctx.load("state")
+    m.advance_offset("rep-1", 0, 42)
+    for key in ctx.redis.keys("offset:*"):
+        assert ctx.redis.ttl(key) == -1, f"{key} expires in {ctx.redis.ttl(key)} s: a shard that is quiet that long forgets its offset and the target re-applies its history"
+    ctx.clock.advance(7200)
+    resumed = m.resume_offset("rep-1", 0)
+    assert resumed == 42, f"after two quiet hours resume_offset(rep-1, 0) is {resumed}, expected the confirmed offset 42"
+
+
+def check_numeric_compare(ctx):
+    m = ctx.load("state")
+    m.advance_offset("rep-1", 0, 9)
+    after = m.advance_offset("rep-1", 0, 10)
+    resumed = m.resume_offset("rep-1", 0)
+    assert resumed == 10 and after == 10, f"confirming 9 then 10 left the shard at {resumed} (advance returned {after}): offsets compared as strings put '10' before '9'"
+    m.advance_offset("rep-1", 0, 11)
+    late = m.advance_offset("rep-1", 0, 7)
+    assert m.resume_offset("rep-1", 0) == 11 and late == 11, f"a late confirmation of 7 after 11 left the shard at {m.resume_offset('rep-1', 0)} (advance returned {late}), expected 11"
+
+
+def check_atomic_advance(ctx):
+    m = ctx.load("state")
+    m.advance_offset("rep-1", 0, 1)
+    rivals = [
+        ctx.redis_after(key, lambda: m.advance_offset("rep-1", 0, 20))
+        for key in ("offset:rep-1:0", "offset:rep-1")
+    ]
+    m.advance_offset("rep-1", 0, 15)
+    fired = [p for p in rivals if p.fired]
+    assert fired, "advance_offset never touched the shard's offset key"
+    if fired[0].error is not None:
+        raise fired[0].error
+    resumed = m.resume_offset("rep-1", 0)
+    assert resumed == 20, f"a worker confirmed 20 while this one advanced to 15, and the shard ended at {resumed}: read, compare and write must run in one script, or the older confirmation wins"
+
+
+def check_shard_key(ctx):
+    m = ctx.load("state")
+    m.advance_offset("rep-1", 0, 30)
+    m.advance_offset("rep-1", 1, 12)
+    first, second = m.resume_offset("rep-1", 0), m.resume_offset("rep-1", 1)
+    assert (first, second) == (30, 12), f"shards 0 and 1 resume at {first} and {second}, expected 30 and 12: each shard needs its own offset key"
+    assert ctx.redis.get("offset:rep-1:0") == "30" and ctx.redis.get("offset:rep-1:1") == "12", f"Redis holds {sorted(ctx.redis.keys('offset:*'))}, expected offset:rep-1:0 = 30 and offset:rep-1:1 = 12"
+`,
+    typescript: `export async function check_durable_offset(ctx) {
+  const m = ctx.load('state');
+  await m.advanceOffset('rep-1', 0, 42);
+  for (const key of ctx.redis.keys('offset:*')) {
+    assert.equal(ctx.redis.ttl(key), -1, \`\${key} expires in \${ctx.redis.ttl(key)} s: a shard that is quiet that long forgets its offset and the target re-applies its history\`);
+  }
+  ctx.clock.advance(7200);
+  const resumed = await m.resumeOffset('rep-1', 0);
+  assert.equal(resumed, 42, \`after two quiet hours resumeOffset(rep-1, 0) is \${resumed}, expected the confirmed offset 42\`);
+}
+
+export async function check_numeric_compare(ctx) {
+  const m = ctx.load('state');
+  await m.advanceOffset('rep-1', 0, 9);
+  const after = await m.advanceOffset('rep-1', 0, 10);
+  const resumed = await m.resumeOffset('rep-1', 0);
+  assert(resumed === 10 && after === 10, \`confirming 9 then 10 left the shard at \${resumed} (advance returned \${after}): offsets compared as strings put '10' before '9'\`);
+  await m.advanceOffset('rep-1', 0, 11);
+  const late = await m.advanceOffset('rep-1', 0, 7);
+  const now = await m.resumeOffset('rep-1', 0);
+  assert(now === 11 && late === 11, \`a late confirmation of 7 after 11 left the shard at \${now} (advance returned \${late}), expected 11\`);
+}
+
+export async function check_atomic_advance(ctx) {
+  const m = ctx.load('state');
+  await m.advanceOffset('rep-1', 0, 1);
+  const rivals = ['offset:rep-1:0', 'offset:rep-1'].map(key => ctx.redisAfter(key, () => m.advanceOffset('rep-1', 0, 20)));
+  await m.advanceOffset('rep-1', 0, 15);
+  const fired = rivals.filter(p => p.fired);
+  assert(fired.length > 0, 'advanceOffset never touched the shard offset key');
+  if (fired[0].error !== undefined) throw fired[0].error;
+  await fired[0].result;
+  const resumed = await m.resumeOffset('rep-1', 0);
+  assert.equal(resumed, 20, \`a worker confirmed 20 while this one advanced to 15, and the shard ended at \${resumed}: read, compare and write must run in one script, or the older confirmation wins\`);
+}
+
+export async function check_shard_key(ctx) {
+  const m = ctx.load('state');
+  await m.advanceOffset('rep-1', 0, 30);
+  await m.advanceOffset('rep-1', 1, 12);
+  const first = await m.resumeOffset('rep-1', 0);
+  const second = await m.resumeOffset('rep-1', 1);
+  assert(first === 30 && second === 12, \`shards 0 and 1 resume at \${first} and \${second}, expected 30 and 12: each shard needs its own offset key\`);
+  assert(ctx.redis.get('offset:rep-1:0') === '30' && ctx.redis.get('offset:rep-1:1') === '12', \`Redis holds \${JSON.stringify(ctx.redis.keys('offset:*'))}, expected offset:rep-1:0 = 30 and offset:rep-1:1 = 12\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+
+	"leetbuild/harness"
+)
+
+var stateBg = context.Background()
+
+func mustAdvance(ctx *harness.Ctx, shard int, offset int64) int64 {
+	after, err := advanceOffset(stateBg, "rep-1", shard, offset)
+	ctx.NoError(err, "advanceOffset(rep-1, %d, %d)", shard, offset)
+	return after
+}
+
+func mustResume(ctx *harness.Ctx, shard int) int64 {
+	offset, err := resumeOffset(stateBg, "rep-1", shard)
+	ctx.NoError(err, "resumeOffset(rep-1, %d)", shard)
+	return offset
+}
+
+func CheckDurableOffset(ctx *harness.Ctx) {
+	mustAdvance(ctx, 0, 42)
+	for _, key := range ctx.Redis.Keys("offset:*") {
+		ctx.Equal(ctx.Redis.TTL(key), int64(-1), "%s expires: a shard that is quiet that long forgets its offset and the target re-applies its history; its TTL", key)
+	}
+	ctx.Clock.Advance(7200)
+	ctx.Equal(mustResume(ctx, 0), int64(42), "after two quiet hours resumeOffset(rep-1, 0) must be the confirmed offset")
+}
+
+func CheckNumericCompare(ctx *harness.Ctx) {
+	mustAdvance(ctx, 0, 9)
+	after := mustAdvance(ctx, 0, 10)
+	resumed := mustResume(ctx, 0)
+	ctx.Assert(resumed == 10 && after == 10, "confirming 9 then 10 left the shard at %d (advance returned %d): offsets compared as strings put \\"10\\" before \\"9\\"", resumed, after)
+	mustAdvance(ctx, 0, 11)
+	late := mustAdvance(ctx, 0, 7)
+	now := mustResume(ctx, 0)
+	ctx.Assert(now == 11 && late == 11, "a late confirmation of 7 after 11 left the shard at %d (advance returned %d), expected 11", now, late)
+}
+
+func CheckAtomicAdvance(ctx *harness.Ctx) {
+	mustAdvance(ctx, 0, 1)
+	fired := false
+	for _, key := range []string{"offset:rep-1:0", "offset:rep-1"} {
+		ctx.Redis.After(key, func() any {
+			fired = true
+			after, err := advanceOffset(stateBg, "rep-1", 0, 20)
+			ctx.NoError(err, "the rival advance failed")
+			return after
+		})
+	}
+	mustAdvance(ctx, 0, 15)
+	ctx.Assert(fired, "advanceOffset never touched the shard's offset key")
+	ctx.Equal(mustResume(ctx, 0), int64(20), "a worker confirmed 20 while this one advanced to 15: read, compare and write must run in one script, or the older confirmation wins; the shard's offset")
+}
+
+func CheckShardKey(ctx *harness.Ctx) {
+	mustAdvance(ctx, 0, 30)
+	mustAdvance(ctx, 1, 12)
+	first, second := mustResume(ctx, 0), mustResume(ctx, 1)
+	ctx.Assert(first == 30 && second == 12, "shards 0 and 1 resume at %d and %d, expected 30 and 12: each shard needs its own offset key", first, second)
+	a, _ := ctx.Redis.Get("offset:rep-1:0")
+	b, _ := ctx.Redis.Get("offset:rep-1:1")
+	ctx.Assert(a == "30" && b == "12", "Redis holds %q, expected offset:rep-1:0 = 30 and offset:rep-1:1 = 12", ctx.Redis.Keys("offset:*"))
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <optional>
+#include <string>
+
+namespace {
+
+struct Rival {
+  bool fired = false;
+  std::optional<std::string> err;
+};
+
+std::shared_ptr<Rival> rivalAdvance(harness::Ctx& ctx, const std::string& key) {
+  auto out = std::make_shared<Rival>();
+  ctx.Redis.After(key, [out] {
+    out->fired = true;
+    try {
+      advanceOffset("rep-1", 0, 20);
+    } catch (const std::exception& e) {
+      out->err = e.what();
+    }
+  });
+  return out;
+}
+
+}  // namespace
+
+void CheckDurableOffset(harness::Ctx& ctx) {
+  advanceOffset("rep-1", 0, 42);
+  for (const auto& key : ctx.Redis.Keys("offset:*")) {
+    ctx.Equal(ctx.Redis.TTL(key), -1, "%s expires: a shard that is quiet that long forgets its offset and the target re-applies its history; its TTL", key);
+  }
+  ctx.Clock.Advance(7200);
+  ctx.Equal(resumeOffset("rep-1", 0), 42, "after two quiet hours resumeOffset(rep-1, 0) must be the confirmed offset");
+}
+
+void CheckNumericCompare(harness::Ctx& ctx) {
+  advanceOffset("rep-1", 0, 9);
+  const long long after = advanceOffset("rep-1", 0, 10);
+  const long long resumed = resumeOffset("rep-1", 0);
+  ctx.Assert(resumed == 10 && after == 10, "confirming 9 then 10 left the shard at %d (advance returned %d): offsets compared as strings put \\"10\\" before \\"9\\"", resumed, after);
+  advanceOffset("rep-1", 0, 11);
+  const long long late = advanceOffset("rep-1", 0, 7);
+  const long long now = resumeOffset("rep-1", 0);
+  ctx.Assert(now == 11 && late == 11, "a late confirmation of 7 after 11 left the shard at %d (advance returned %d), expected 11", now, late);
+}
+
+void CheckAtomicAdvance(harness::Ctx& ctx) {
+  advanceOffset("rep-1", 0, 1);
+  const auto shardKey = rivalAdvance(ctx, "offset:rep-1:0");
+  const auto sharedKey = rivalAdvance(ctx, "offset:rep-1");
+  advanceOffset("rep-1", 0, 15);
+  ctx.Assert(shardKey->fired || sharedKey->fired, "advanceOffset never touched the shard's offset key");
+  ctx.Assert(!shardKey->err && !sharedKey->err, "the rival advance failed: %s", shardKey->err.value_or(sharedKey->err.value_or("")));
+  ctx.Equal(resumeOffset("rep-1", 0), 20, "a worker confirmed 20 while this one advanced to 15: read, compare and write must run in one script, or the older confirmation wins; the shard's offset");
+}
+
+void CheckShardKey(harness::Ctx& ctx) {
+  advanceOffset("rep-1", 0, 30);
+  advanceOffset("rep-1", 1, 12);
+  const long long first = resumeOffset("rep-1", 0);
+  const long long second = resumeOffset("rep-1", 1);
+  ctx.Assert(first == 30 && second == 12, "shards 0 and 1 resume at %d and %d, expected 30 and 12: each shard needs its own offset key", first, second);
+  ctx.Assert(ctx.Redis.Get("offset:rep-1:0").value_or("") == "30" && ctx.Redis.Get("offset:rep-1:1").value_or("") == "12",
+             "Redis holds %q, expected offset:rep-1:0 = 30 and offset:rep-1:1 = 12", ctx.Redis.Keys("offset:*"));
+}
+`,
+  },
   hints: [
-    'Leave a shard idle for an hour and restart the controller: it replays the shard from offset 0. Run a busy shard past offset 9: it stops advancing, and a lost confirmation is not retried.',
-    '`SET ... ex=OFFSET_TTL_SECONDS` lets the checkpoint expire, `str(offset) > current` compares digits lexicographically, the write happens before `apply_to_target` returns, and `resume_offset` ignores Redis.',
-    'Register a Lua compare-and-set (`tonumber(GET)`, write only when `candidate > current`, no expiry) under `offset_key`, call it after `confirmed = apply_to_target(...)`, and make `resume_offset` `GET` plus `int(raw)`.',
+    'Confirm offset 42, let two hours pass and restart: the shard resumes at 0. Confirm 9 then 10: the shard stays at 9. Two shards of one replication show the same offset.',
+    'The key is set with a one-hour expiry and has no shard in its name; the compare is between two strings, where "10" sorts before "9"; and the GET and the SET are two round trips another worker can land between.',
+    'Key `offset:{replication_id}:{shard}`; one Lua script: `tonumber(GET or 0)`, `SET` the candidate only if `tonumber(ARGV[1])` is larger, return the stored value; no `ex`. `resume_offset` reads the same key.',
   ],
-  debrief: `The fix moves the checkpoint decision into one Lua compare-and-set because both ways a checkpoint fails, disappearing and moving backwards, are decided at the write: no expiry means the key outlives any quiet period, and a numeric compare inside the script means an out-of-order confirmation cannot rewind a shard or stall it at offset 10. Ordering the loop as apply, confirm, advance makes the offset a claim about what the target holds rather than what the reader has seen, so a crash between the two re-applies a change instead of losing it. Production replicators also store the offset in the same transaction as the applied rows where the target allows it, fence the key with a controller epoch so two controllers cannot both advance one shard, and alert on the offset's age.`,
+  debrief: `An offset is the replicator's only memory of where a shard stands, so everything about it is chosen so it cannot go backwards: no expiry, because time passing is not evidence that anything was applied; a numeric compare, because offsets are numbers; and the compare inside the script, because confirmations from parallel workers arrive in any order and the larger one must win whoever writes last. Keying by shard is what lets shards advance independently. Kafka Connect keeps source offsets in a compacted topic for the same reasons, and flushes them on an interval, which is why a crash replays a few changes and the target must dedupe them: the next step's change ids exist for that.`,
 };

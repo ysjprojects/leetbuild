@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package flagrelay;
+
+// The edge relay step 3 pushes a kill to: it tells every SDK stream it holds to drop the flag now,
+// without waiting for the next snapshot poll, and refetches the snapshot named by version.
+service Relay {
+  rpc PushKill(KillRequest) returns (KillAck);
+}
+
+message KillRequest {
+  string flag_key = 1;
+  int64 version = 2;
+  string actor = 3;
+}
+
+message KillAck {
+  int64 applied_version = 1;
+}

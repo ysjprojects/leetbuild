@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package expguard;
+
+// The stats service step 3 asks before a ramp: whether the experiment's guardrail metrics stay
+// inside their bounds at the current traffic. A breach is an answer (breached, with the metric),
+// not an error; an error status means the check itself did not happen.
+service Guardrails {
+  rpc CheckGuardrails(GuardrailRequest) returns (GuardrailVerdict);
+}
+
+message GuardrailRequest {
+  string experiment_id = 1;
+  int32 to_percent = 2;
+}
+
+message GuardrailVerdict {
+  bool breached = 1;
+  string metric = 2;
+  double limit = 3;
+  double observed = 4;
+}

@@ -1278,10 +1278,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Observability engineer · 20 min',
     minutes: 20,
     prompt:
-      'An incident review found stack traces missing their final frames: the POST /v1/logs starter slices every message at 16 KiB and returns accepted: true with no truncation marker, so the index claimed complete traces it did not hold. The same handler takes any service string, has no record cap, and buffers before it validates. Debug it, fix it, and prove truncation is visible and bad records are refused before they are buffered.',
+      'An incident review found stack traces missing their final frames: the POST /v1/logs starter keeps the first 16 × 1024 characters of every message and answers 202 {accepted, offset} with no truncation fields, so the index claimed complete traces it did not hold. The same handler takes any service string under any tenant header, has no record cap, and buffers records with any level or timestamp. Find the four flaws, fix them, and prove truncation is reported and bad records are refused before they are buffered.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The starter slices message to 16 KiB and builds the record without comparing lengths, so the response carries no truncated flag or byte counts; it passes the service id straight to buffer.append with no registry lookup, checks no record size, and appends before any validation could reject.',
+      'The starter slices message by characters and never compares lengths, so the 202 carries no truncated flag or byte counts; it passes the service id straight to buffer.append_record with no registry.is_registered lookup and no tenant check, reads a body of any size, and never checks the level or the timestamp skew.',
     testIdea:
       'Ingest a 20 KiB message and assert the response carries truncated, original_bytes and stored_bytes; send service "chekout" and assert 400 naming the registry; declare a 40 MiB body and assert 413 with no append.',
     followUps: [
@@ -1296,16 +1296,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'trace-collector',
     stepId: 'dependency',
     title: 'The trace that lost a leg',
-    blurb: 'Storage timeouts dropped traces and late roots duplicated trees.',
+    blurb: 'A storage slowdown erased traces from Redis, and the flusher retried them forever.',
     role: 'Observability engineer · 20 min',
     minutes: 20,
     prompt:
-      'Traces showed suspiciously fast checkout paths during a storage slowdown, because the patch deleted Redis state before the write confirmed and partial traces were rendered as complete. Late root spans also duplicated trees. Debug it, fix it, and prove deletion follows confirmation and gaps are visible.',
+      'During a storage slowdown whole traces vanished: the flusher had already deleted their Redis state when the write timed out, it waited on storage with no deadline, and a trace storage refused was sent again every second. Debug flush_trace, fix it, and prove the trace survives a timeout and a schema rejection is quarantined.',
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The patch deletes assembly state before storage acknowledges the write, so a timeout erases the only copy, and its non-atomic root recomputation lets a late-arriving root span create a second tree while readers observe the first.',
+      'The starter deletes the assembly hash before TraceWriter.Write answers, calls storage with no deadline, and sleeps and retries on every error without a bound, INVALID_ARGUMENT included, so a timeout erases the only copy and a refused trace is retried forever.',
     testIdea:
-      'Time out storage and assert the trace survives for the next cycle; deliver a root span after children and assert one tree; read a trace with a missing child and assert the partial marker.',
+      'Make storage slower than 2 s and assert every Write carries the deadline and the trace is kept; fail Write with UNAVAILABLE and assert three attempts and the trace still in Redis; refuse it with INVALID_ARGUMENT and assert one call and quarantine:{id}.',
     followUps: [
       'What TTL makes sense for partial traces and why?',
       'How would you sample traces without biasing the slow paths?',
@@ -1432,12 +1432,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "During a model outage the approval rate climbed to 100%: the starter's model client retries any gRPC error three times with no deadline and, when the attempts run out, returns score 0.0 in the approve band. Malformed feature vectors took three full round trips to fail. Debug it, fix it, and prove degradation is a clamped rules score marked as a fallback.",
+      "During a model outage the approval rate climbed to 100%: the starter's model client retries any gRPC error three times with no deadline and, when the attempts run out, returns score 0.0 in the approve band. Vectors the model refuses took three round trips and were still approved. Debug it, fix it, and prove an outage ends in a rules verdict marked as a fallback that never approves.",
     signals: ['Secure', 'Operate', 'Verify'],
     aiNote:
-      'The starter catches every RpcError and continues, so INVALID_ARGUMENT is retried like UNAVAILABLE; it sets no deadline on the call; and after the loop it returns {"score": 0.0, "band": "approve"}, which turns an outage into an approval wave instead of a rules verdict clamped to RULES_MAX_SCORE.',
+      'The starter calls Model.Score with no deadline, continues on every RpcError, so INVALID_ARGUMENT is retried like UNAVAILABLE, and after the loop returns {"score": 0.0, "band": "approve"}: an outage becomes an approval wave instead of a rules verdict raised to RULES_MIN_SCORE and marked fallback.',
     testIdea:
-      'Make the stub raise UNAVAILABLE three times and assert the verdict is rules_score clamped to RULES_MAX_SCORE with fallback true; raise INVALID_ARGUMENT once and assert exactly one call; assert each call carries a 300 ms deadline.',
+      'Fail Score with UNAVAILABLE three times and assert the verdict is max(rules_score, RULES_MIN_SCORE) with fallback true and RULES_VERSION; send a vector the model refuses and assert one call and InvalidFeatures; assert each call carries a 300 ms deadline.',
     followUps: [
       'Which fallback band is safest when the model is down?',
       'How would you replay a score for a disputed decision?',
@@ -1494,16 +1494,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'warehouse-loader',
     stepId: 'state',
     title: 'The load that counted itself done',
-    blurb: 'Completion was marked before partitions committed and merges doubled.',
+    blurb: 'A redelivered partition counted twice and two workers both announced the completion.',
     role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A finance table was missing two partitions while the load reported complete, and a re-run of the same manifest was "done" the instant it started. The starter sets the completion flag when the source file is read, logs partitions instead of recording them, and answers is_complete from the flag alone. Debug it, fix it, and prove completion follows the final partition commit.',
+      'A finance table was missing a partition while its load read as complete, and the completion event went out twice. The starter appends each committed partition to a Redis list, sets the completion flag once the list is as long as the partition count, and answers True to that caller, in three separate commands without a TTL. Debug it, fix it, and prove each partition counts once and exactly one commit completes the load.',
     signals: ['Verify', 'Operate', 'Specify'],
     aiNote:
-      'The starter flips the completion flag in begin_load, when the source file is read rather than when the final partition commits, so readers consume a load that is missing data; commit_partition only logs, so there is no set to count, no atomic script, no re-check in is_complete, and no TTL on the keys.',
+      'The starter counts deliveries with RPUSH and LLEN, so a redelivered partition fills the count early; the append, the count and the SET of load:{id}:complete are separate commands, so two workers finishing together both see a full count and both return True; neither key has a TTL.',
     testIdea:
-      'Crash after reading the manifest and assert the load is not visible as complete; commit the same partition twice and assert the set has one member; let the key outlive LOAD_TTL_S and assert a re-run of the manifest id starts clean.',
+      "Commit the same partition twice and assert the load is not complete; land a second worker's commit between this worker's commands and assert exactly one of them is told it completed the load; assert both keys carry LOAD_TTL_S.",
     followUps: [
       'How do you reconcile a load without re-reading the source?',
       'What partition size keeps retries cheap?',
@@ -1516,16 +1516,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'cdc-streamer',
     stepId: 'state',
     title: 'The stream that skipped a weekend',
-    blurb: 'A cursor TTL expired over a weekend and the restart resumed at the source head.',
+    blurb: 'A cursor TTL expired over a quiet weekend and the restart had no position to resume from.',
     role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "An incident review showed a tenant's changes missing for two days. The starter's tailer keeps the confirmed LSN in a subscription-wide Redis key with a 12-hour TTL, advances it as soon as changes are read, and resumes from the source head after a restart. Debug it, fix the cursor, and prove a restart resumes at the confirmed LSN.",
+      "An incident review found a tenant's warehouse re-applying a weekend of changes after a restart, and one table resuming from another table's position. The starter's `confirm` writes the LSN the sink applied to one subscription-wide Redis key with a 12-hour TTL and overwrites whatever is there. Debug it, fix the cursor, and prove it survives a quiet weekend, keeps each table apart and never moves back.",
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The starter keeps the confirmed LSN in an expiring cache key under one subscription-wide name, so a quiet period expires the cursor and the restart resumes at the source head, dropping the backlog; it also moves the cursor on read rather than after the sink applied the batch, so a crash between read and apply loses that batch.',
+      'The starter writes `cdc:cursor:{subscription_id}` with `SET … EX 43200`: a quiet table expires its cursor and the replicator resumes from nothing, two tables of one subscription share one position, and a plain overwrite lets a retried batch or a second replica move the cursor back.',
     testIdea:
-      'Expire the cursor key and assert the restart resumes at the confirmed LSN rather than the head; crash between read and apply and assert the batch is re-delivered; confirm a stale LSN and assert the cursor does not move backwards.',
+      'Confirm an LSN, advance the clock three days and assert it loads back with no TTL; confirm two tables and assert each keeps its own LSN; confirm 150 after 200 and assert the cursor stays at 200; land a replica confirming 300 inside a confirm of 250 and assert 300 wins.',
     followUps: [
       "How do you size a replication slot's retention before it forces a halt?",
       'What does exactly-once mean for a sink that is not transactional?',
@@ -1560,16 +1560,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'cdn-purge',
     stepId: 'read',
     title: 'The purge that never propagated',
-    blurb: 'Accepted meant done, and a wildcard purged the whole domain.',
+    blurb: 'Accepted read as propagated, and the refused paths vanished from the status.',
     role: 'Edge infrastructure engineer · 20 min',
     minutes: 20,
     prompt:
-      'A pricing fix stayed broken on some edges for six hours because the patch marked the purge done at provider acceptance, and a normal-token wildcard purge hammered the origin into an outage. Debug it, fix it, and prove status is honest and blast radius is gated.',
+      'A pricing fix stayed broken on some edges for six hours because the purge status said propagated as soon as the provider accepted the paths, and the two paths the provider refused never showed up in the response. Debug the status read, fix it, and prove it reports only what the edges confirmed.',
     signals: ['Operate', 'Verify', 'Secure'],
     aiNote:
-      'The patch reports done when the provider accepts the request, so propagation failures are invisible and on-call believes the cache is clean, and it lets a normal token request a domain-wide wildcard, turning one request into an origin stampede.',
+      'The starter answers propagated once every path is accepted, drops invalid_pattern and failed paths from the outcomes, stamps propagated_at with the acceptance time, and returns any purge to any tenant who knows its id.',
     testIdea:
-      'Return partial failure from the provider and assert the status reports partially failed with paths; request a wildcard with a normal token and assert 403; retry a purge with the same key and assert the provider is called once.',
+      'Mark both paths accepted and assert the status stays accepted until both are confirmed; give one path invalid_pattern and assert partially_failed with that path in the body; read a purge of another tenant and assert 404.',
     followUps: [
       'When does a targeted purge beat a versioned URL?',
       'How would you purge without knowing every path?',
@@ -1582,16 +1582,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'service-discovery',
     stepId: 'state',
     title: 'The discovery that routed to ghosts',
-    blurb: 'Expired instances stayed routable and deploy swaps collided.',
+    blurb: 'Lapsed instances came back invisible and a lagging replica rolled a rollout back.',
     role: 'Infrastructure engineer · 20 min',
     minutes: 20,
     prompt:
-      'Traffic kept landing on the old address of a restarted pod for minutes, and a deploy briefly had two instances claiming the same identity with different metadata. The starter for the heartbeat and replace writes renews the key with a bare EXPIRE on a constant TTL after a separate SET, never compares metadata versions, and writes the replacement before anything old is removed. Debug it, fix it, and prove metadata and liveness move together, versions only go forward, and one identity has one address.',
+      'After a long GC pause an instance kept heartbeating renewed for an hour while no router listed it, and a replica still on the old build flipped metadata_version back after a rollout. The heartbeat starter checks EXISTS, then HSETs the record and EXPIREs it after a constant 30 s, and never compares versions. Debug it, fix it, and prove a lapsed record stays gone, versions only move forward, and the expiry follows the promised interval.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The starter renews a heartbeat with GET, SET and a bare EXPIRE on a constant TTL, so two heartbeats can interleave and a restarted instance keeps stale routing metadata alive; it overwrites metadata_version with whatever arrives, so a lagging replica undoes a rollout; and its replace writes the new record before removing the old, so two addresses occupy one identity during a deploy window.',
+      'The starter renews a heartbeat with EXISTS, HSET and EXPIRE as three commands, so a record that lapses between them is written back outside the members set; it overwrites metadata_version with whatever arrives, so a lagging replica undoes a rollout; and it sets a constant 30 s TTL whatever heartbeat_interval the instance promised.',
     testIdea:
-      'Heartbeat with a new metadata version and assert the record and its TTL change in one script call; heartbeat with an older version and assert 409 and no write; replace an instance while the old one is live and assert no reader ever sees two addresses; stop heartbeats and assert the key expires after three intervals.',
+      'Delete the record and its member right after the heartbeat first touches it and assert the record stays gone and the next heartbeat answers gone; heartbeat with an older version and assert stale and no write; race versions 14 and 15 and assert the record ends at 15; heartbeat with a 2 s interval and assert the TTL is 6 s.',
     followUps: [
       'How many missed heartbeats mean dead?',
       'Should probes be centralized or per-caller?',
@@ -1611,9 +1611,9 @@ export const mockScenarios: readonly MockScenario[] = [
       'A customer who unsubscribed in the morning received the afternoon campaign, because the starter keeps suppression in a Redis key with a one-hour TTL, and a burst of concurrent sends to one address all passed the per-minute cap. Debug it, fix it, and prove suppression is durable and admission is atomic.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The starter writes suppression as a string key with EX 3600, so an unsubscribe is forgotten after an hour; it reads the rate counter and increments it in two round trips, so concurrent sends all see the same count; the counter has no expiry; and the relay call runs before the admission check.',
+      'The starter writes suppression as a string key with EX 3600, so an unsubscribe is forgotten after an hour; it reads the rate counter with GET and increments it in a second round trip, so two concurrent sends both see the same count; the counter has no expiry; and the raw address is the key, so Ana@Example.com escapes a suppression of ana@example.com.',
     testIdea:
-      'Suppress a recipient, advance the clock past an hour and assert the send is still refused with 409; fire ten concurrent sends at one address and assert at most five reach the relay; assert the rate key carries a TTL and that a refused send makes no relay call.',
+      "Suppress a recipient, advance the clock two hours and assert admit still answers suppressed; land a second admit between the fifth send's GET and INCR and assert only one of them is ok; assert every rate key carries a TTL of at most 60 seconds; suppress a mixed-case address and assert the lowercase one is refused.",
     followUps: [
       'Which bounces are terminal versus retryable?',
       'How do you reconcile an unknown relay outcome?',
@@ -1626,16 +1626,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'calendar-service',
     stepId: 'dependency',
     title: 'The invite that would not stop',
-    blurb: 'A fresh idempotency token per retry and a full invite for a timezone fix.',
+    blurb: 'A fresh token per retry, a new invitation for a title fix, and no cancel for the removed.',
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'A timezone correction re-invited 400 attendees, and the ones whose first notification timed out were invited twice because each retry used a fresh token. Debug the starter, fix it, and prove each attendee gets one notification per revision and a timezone fix sends a minimal update.',
+      'A title fix re-invited every attendee of a weekly meeting, the ones whose first notice timed out were invited twice because each retry drew a fresh token, and a colleague taken off the event was never told. Debug the starter, fix it, and prove each attendee gets one notice per change, of the right kind.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter mints the idempotency token inside the retry loop, so a timed-out first attempt and its retry carry different tokens and the notifier cannot dedupe them; the Notify call has no deadline, and a timezone correction goes out as a full invite.',
+      'The starter draws a new idempotency token for every attempt, so a retry after a lost reply is a second mail; NotifyAttendees carries no deadline; and every change goes out as create to the attendees of the new version, so kept attendees are invited again and removed ones get no cancel.',
     testIdea:
-      'Time out the first Notify and assert the retry carries the same token and the attendee gets one invite; hang the notifier and assert the call returns within its deadline; change only the timezone and assert no full re-invite is sent.',
+      'Lose the reply after the mail went out and assert the retry carries the same token and nobody is mailed twice; slow the notifier to 2 s and assert a 3 s deadline; change the title and add an attendee and assert update plus create; remove one and assert a cancel.',
     followUps: [
       'How do you bound recurrence expansion per request?',
       'When is a minimal update better than a full invite?',
@@ -1648,20 +1648,20 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'file-storage',
     stepId: 'state',
     title: 'The upload that grieved the quota',
-    blurb: 'Bytes were counted before storage and whole restarts re-sent everything.',
+    blurb: 'Two uploads fit a quota that held one, and retried parts were charged twice.',
     role: 'Storage engineer · 20 min',
     minutes: 20,
     prompt:
-      "A tenant's quota filled with data that never landed because the starter counted chunks before they were stored, and a flaky connection cost a multi-gigabyte re-upload per failed chunk. Debug it, fix it, and prove accounting follows storage and retries are chunk-scoped.",
+      "A tenant's quota is overrun: two uploads opened at the same moment both fit, a retried part is charged again, and the nightly sweep hands the same expired reservation back twice. Debug the starter's `open_session`, `ack_part` and `sweep`, fix them, and prove each reservation is taken once, counted once and released once.",
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The starter increments quota in a second INCRBY when a chunk is acknowledged, separate from the session write, so crash loops consume quota for bytes that do not exist; its retry path restarts the entire multipart upload instead of the failed chunk.',
+      'The starter reads quota:used and quota:limit, compares them in the application and then INCRBYs, so a second upload lands in between; it never sets an expiry on session:{upload_id}; ack_part does HSET then an unconditional HINCRBY, so a retried part adds its size again; and sweep DECRBYs every expired reservation without ZREM, so each sweep releases it again.',
     testIdea:
-      'Crash a chunk after ack and assert quota reflects stored bytes only; fail one chunk and assert the retry re-sends only that chunk; assert a download URL is dead after 10 minutes and that issuance is audited.',
+      'Land a second open_session between the quota read and the INCRBY and assert only one opens; assert the session TTL is 86400; ack part 1 twice and assert actual_bytes counts it once; sweep twice and assert the expired bytes are released once.',
     followUps: [
       'What does a quota reservation protect against versus actual usage?',
-      'How would you dedupe identical chunks across tenants safely?',
-      'When is client-side encryption the right call?',
+      'How would you reconcile quota:used against the file index?',
+      'Should a sweep run on every replica, or on one elected leader?',
     ],
     defaultLanguage: 'python',
   },
@@ -1696,10 +1696,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Users saw the same comment twice and missed another while scrolling a busy thread, a reply its author deleted still rendered with its text, and the comment count on the badge disagreed with the page. The starter pages by integer offset and returns rows as stored. Debug it, fix it, and prove a page walk is stable while people keep posting.',
+      'Users saw the same comment twice while scrolling a busy thread, a comment its author deleted still rendered with its text, and the badge said 20 comments on a thread of 25. The starter reads its cursor as a row offset into the thread index and returns rows as stored. Debug it, fix it, and prove a page walk is stable while people keep posting.',
     signals: ['Specify', 'Verify', 'Secure'],
     aiNote:
-      'The starter paginates by offset, so concurrent inserts shift the window and comments are duplicated or skipped mid-scroll; its serializer returns deleted rows untouched, text included; and it reads none of the Redis counters the write path keeps, so the page has no comment or reply counts.',
+      'The starter pages by row offset, so comments posted between two requests push rows into the next page and it repeats them; it always offers a next cursor; its serializer returns deleted rows with author and text; and it counts comment_count and reply_count from the 20 rows on the page instead of the Redis counters the write path keeps.',
     testIdea:
       'Page through a thread while concurrently posting and assert every comment appears exactly once; soft-delete a reply and assert the page carries a tombstone without text; compare comment_count on the page with the Redis counter the write path committed.',
     followUps: [
@@ -1721,7 +1721,7 @@ export const mockScenarios: readonly MockScenario[] = [
       'A plan change on the 31st billed both plans for that day, and the February invoice came out higher than the March one for the same plan. Support also noticed any caller could request a schedule for any subscription id. Debug the plan-change starter, fix it, and prove the proration is exclusive and over the real period.',
     signals: ['Specify', 'Verify', 'Operate'],
     aiNote:
-      'The starter prorates with a fixed 30-day divisor and bills the old plan for the whole period plus the new plan from the switch day, so that day is charged twice. It also checks no tenant, no plan, no proration policy and no effective date, so any caller gets any schedule.',
+      'The starter prorates with a fixed 30-day divisor and counts the old plan through the switch day while the new plan starts on it, so that day is billed on both plans. It reads no X-Tenant-Id and checks no plan, no proration policy and no effective date, so any caller re-prices any subscription.',
     testIdea:
       "Change plans mid-month in a 31-day period and assert the two line day counts sum to the period length; send a change with an arbitrary effective date and assert 400; request a schedule for another tenant's subscription and assert 404.",
     followUps: [
@@ -1784,10 +1784,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      "A spend request was approved by the requester's own account because the starter copies the caller's approvers array into the stored request, and a client retry created a second request with its own chain. Debug it, fix it, and prove approvers come from the pinned policy and a replayed Idempotency-Key returns the original request.",
+      "A spend request was approved by the requester's own account because the starter uses the caller's approvers array whenever one is sent, and a client retry created a second request with its own chain. Debug it, fix it, and prove approvers come from the pinned policy and a replayed Idempotency-Key returns the original request.",
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The starter stores body.approvers as the chain instead of resolving it from the pinned policy, so a requester can name a friend or themselves; it ignores Idempotency-Key and mints a fresh uuid per call; and it stores why without the 4 KiB cap.',
+      'The starter resolves the chain policy but prefers body.approvers when the caller sends any, and never checks whether the requester is on the resolved chain; it stores the Idempotency-Key with store.put but never looks it up, so a retry mints a second request; and it stores why with no 4096-byte cap.',
     testIdea:
       'Submit with caller-named approvers and assert the stored chain comes from the policy with chain_version pinned; submit as a requester on the chain and assert 409; post the same Idempotency-Key twice and assert the second answer replays the first request_id.',
     followUps: [
@@ -1802,16 +1802,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'maps-routing',
     stepId: 'state',
     title: 'The route that survived rush hour',
-    blurb: 'Cache keys lacked the traffic epoch and fallbacks served stale routes.',
+    blurb: 'Cache keys lacked the traffic epoch and kept a straight-line estimate after the engine recovered.',
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Navigation kept recommending a highway exit that had been closed for hours: the starter caches routes in Redis under raw float coordinates with no traffic epoch and no expiry, and its response says nothing about which traffic state the geometry belongs to. Debug it, fix it, and prove cache freshness.',
+      'Navigation kept recommending a highway exit that had been closed for hours: the starter caches routes in Redis under the raw floats of the two endpoints, with no traffic epoch, no waypoints and no expiry, and it caches the straight-line estimate it gets while the engine is down. Debug it, fix it, and prove the cache serves only the current traffic state.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter keys Redis by raw floating-point coordinates, so GPS jitter makes almost every request a miss; the entries that do match carry no traffic epoch and no TTL, so an old route is served as current, and the response omits `epoch` and `cached`, so the caller cannot tell.',
+      'The starter keys Redis by the raw coordinates of the origin and destination, so GPS jitter makes almost every request a miss while a trip through a waypoint hits the direct route; the key has no traffic epoch and the entry no TTL, so an old route is served as current; and the degraded estimate is stored like a road route.',
     testIdea:
-      'Compute the same route twice with a tiny coordinate difference and assert a hit with cell rounding; advance the epoch and assert recomputation with `cached: false` and the new `epoch`; check the written key carries a TTL of twice the epoch.',
+      'Ask for the same trip from 4 m apart and assert one engine solve; ask for it through a waypoint and assert a second solve; advance the clock one epoch and assert a recomputation with the new `epoch`; check the entry expires after 600 s; fail the engine three times and assert nothing is cached.',
     followUps: [
       'How coarse can a coordinate cell be before routes go wrong?',
       'What does a degraded estimate owe the caller?',

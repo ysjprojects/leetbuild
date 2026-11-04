@@ -422,6 +422,8 @@ export interface RouteOptions {
   preHandler?: Hook | Hook[];
   schema?: unknown;
   config?: unknown;
+  /** Bytes this route accepts, overriding the server's and the parser's limit. */
+  bodyLimit?: number;
 }
 
 interface Route {
@@ -429,6 +431,7 @@ interface Route {
   pattern: string;
   segments: string[];
   handler: RouteHandler;
+  bodyLimit: number | undefined;
   hooks: Hooks;
   owner: FastifyInstance;
 }
@@ -467,6 +470,8 @@ export interface FastifyOptions {
   trustProxy?: boolean | string | number;
   ignoreTrailingSlash?: boolean;
   caseSensitive?: boolean;
+  /** Bytes a request body may have; Fastify's default is 1 MiB (1048576). */
+  bodyLimit?: number;
 }
 
 let requestCounter = 0;
@@ -544,6 +549,7 @@ export class FastifyInstance {
         pattern,
         segments: pattern.split('/').filter(s => s !== ''),
         handler: options.handler,
+        bodyLimit: options.bodyLimit,
         hooks,
         owner: this,
       });
@@ -863,7 +869,8 @@ export class FastifyInstance {
       }
       request.params = {...this.lastParams};
       if (await this.runHooks([...owner.hooks.onRequest, ...route.hooks.onRequest], request, reply)) return;
-      request.body = await parseBody(request, bodyBytes, owner.parsers);
+      const serverLimit = this.initialConfig.bodyLimit ?? 1048576;
+      request.body = await parseBody(request, bodyBytes, owner.parsers, serverLimit, route.bodyLimit);
       if (await this.runHooks([...owner.hooks.preValidation, ...route.hooks.preValidation], request, reply)) return;
       if (await this.runHooks([...owner.hooks.preHandler, ...route.hooks.preHandler], request, reply)) return;
       await this.runHandler(route.handler, request, reply);
@@ -1025,11 +1032,15 @@ const matchSegments = (route: string[], path: string[]): Record<string, string> 
  * Picks the parser as Fastify does — the exact media type, then RegExp parsers in registration
  * order, then the `'*'` catch-all — and lets `+json` types and a body without a content type fall
  * back to the JSON and text parsers. No parser: 415. A parser's error answers with its statusCode, 400 by default.
+ * A body over the limit answers 413 before any parser runs: the route's `bodyLimit` when it sets one,
+ * else the parser's, else the server's (`limit`), as Fastify resolves them.
  */
 const parseBody = async (
   request: FastifyRequest,
   bytes: Uint8Array | undefined,
   parsers: Parser[],
+  limit: number,
+  routeLimit: number | undefined,
 ): Promise<unknown> => {
   if (bytes === undefined || request.method === 'GET' || request.method === 'HEAD') return undefined;
   const type = (request.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
@@ -1040,7 +1051,7 @@ const parseBody = async (
     (type.endsWith('+json') ? parsers.find(p => p.type === 'application/json') : undefined) ??
     (type === '' ? parsers.find(p => p.type === 'text/plain') : undefined);
   if (parser === undefined) throw ctpError('FST_ERR_CTP_INVALID_MEDIA_TYPE', `Unsupported Media Type: ${type}`, 415);
-  if (parser.bodyLimit !== undefined && bytes.length > parser.bodyLimit)
+  if (bytes.length > (routeLimit ?? parser.bodyLimit ?? limit))
     throw ctpError('FST_ERR_CTP_BODY_TOO_LARGE', 'Request body is too large', 413);
   const body = parser.parseAs === 'string' ? decoder.decode(bytes) : Buffer.from(bytes);
   try {

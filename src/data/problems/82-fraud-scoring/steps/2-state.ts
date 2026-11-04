@@ -2,379 +2,342 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis velocity windows per card and account',
+  title: 'Redis velocity windows per card and device',
   concept: 'redis',
   file: 'state',
-  focus: ['scorer', 'redis', 'consumer'],
+  focus: ['scorer', 'redis', 'model'],
   task: `## Task
 
-**Starting point.** The starter is the velocity store the scorer writes to at score time:
-\`record_attempt\` issues two client-side \`INCR\` calls on a card key and a device key bucketed by
-day, \`velocity_snapshot\` reads the raw counters back, \`should_alert\` compares them to literal
-thresholds, and \`score_with_velocity\` calls the model and then counts. It serves the demo and hides
-five flaws.
+**Starting point.** The starter is the velocity store the scorer uses at score time:
+\`record_attempt(card_ref, device_id, account_ref)\` sends \`INCR vel:card:{card_ref}\` and
+\`INCR vel:device:{device_id}\` from the client, \`velocity_snapshot\` reads both counters back,
+\`should_alert\` compares them with literal thresholds, and
+\`score_with_velocity(features, card_ref, device_id, account_ref)\` asks the model
+(\`model.score_transaction\`), then counts. It serves the demo and hides five flaws.
 
-**Failure mode the checks target.** The starter scores first and counts afterwards, so a model
-timeout is a free attempt; its keys carry only a day bucket and no TTL, so today's suspicious device
-is still suspicious next month; it counts attempts where the rule is about distinct accounts, so a
-ring of twenty accounts from one device reads as one account retrying; and its thresholds live as
-literals in one function while the read path reports raw numbers, so the alert and the dashboard
-disagree by construction.
+**Failure mode the checks target.** A model call that fails is a free attempt for a card-testing
+script; a reader landing between the two \`INCR\`s sees a card counted on a device that is not; a
+busy card stays flagged forever; a ring of twenty accounts on one phone reads as one account
+retrying; and the dashboard and the alert disagree about the same numbers.
 
-- **One atomic script.** A single Lua \`EVAL\` (\`VELOCITY_LUA\`) increments the card's counter and
-  adds the account to the device's set.
-- **Windows expire on their own boundary.** The key carries its bucket
-  (\`vel:card:{card_ref}:{hour}\`, \`vel:device:{device_id}:{day}\`) and the script sets the TTL on
-  the first write of that bucket (\`EXPIRE\` with \`ATTEMPT_WINDOW_S\` / \`DEVICE_WINDOW_S\`).
-- **Every attempt counts, including the failed ones.** The counter moves before the model call, and
-  nothing on the model's failure path may skip it.
-- **Distinct accounts per device per day**, not attempts: \`PFADD\`/\`PFCOUNT\` on the device key.
-- **One rule set.** \`VELOCITY_RULES\` holds the thresholds and both \`velocity_snapshot\` and
-  \`should_alert\` read it.`,
+- One Lua script (\`VELOCITY_LUA\`, run with \`EVAL\`) moves both windows and returns
+  \`[attempts, accounts]\`.
+- \`vel:card:{card_ref}\` counts attempts and expires \`ATTEMPT_WINDOW_S\` (3600 s) after its first
+  write; \`vel:device:{device_id}\` is a set of account refs (\`SADD\`/\`SCARD\`) that expires
+  \`DEVICE_WINDOW_S\` (86400 s) after its first write.
+- \`score_with_velocity\` records the attempt before the model is called.
+- \`VELOCITY_RULES\` (\`card_attempts_per_hour\` 5, \`device_accounts_per_day\` 3) is the one rule table:
+  \`velocity_snapshot\` lists the rules exceeded in \`flags\`, and \`should_alert\` reads the same table.`,
   sequence: {
-    participants: ['Fraud Scorer', 'Velocity store', 'Redis', 'Fraud model'],
+    participants: ['scorer', 'Redis', 'Fraud model'],
     messages: [
       {
-        from: 'Fraud Scorer',
-        to: 'Velocity store',
-        label: 'record_attempt(card_ref, device_id, account_ref)',
+        from: 'scorer',
+        to: 'Redis',
+        label: 'EVAL VELOCITY_LUA vel:card:{card} vel:device:{device} account',
         kind: 'sync',
       },
-      {from: 'Velocity store', to: 'Redis', label: 'EVAL · INCR + EXPIRE · PFADD · PFCOUNT', kind: 'sync'},
-      {from: 'Redis', to: 'Velocity store', label: '[attempts, distinct accounts]', kind: 'reply'},
-      {from: 'Velocity store', to: 'Fraud Scorer', label: 'attempt counted before the model', kind: 'reply'},
-      {from: 'Fraud Scorer', to: 'Fraud model', label: 'Score(features)', kind: 'sync'},
-      {from: 'Fraud model', to: 'Fraud Scorer', label: 'score / timeout', kind: 'reply'},
-      {
-        from: 'Fraud Scorer',
-        to: 'Velocity store',
-        label: 'velocity_snapshot · should_alert(VELOCITY_RULES)',
-        kind: 'sync',
-      },
+      {from: 'Redis', to: 'scorer', label: '[attempts, distinct accounts]', kind: 'reply'},
+      {from: 'scorer', to: 'Fraud model', label: 'Score(vector): counted already', kind: 'sync'},
+      {from: 'Fraud model', to: 'scorer', label: 'score / INVALID_ARGUMENT', kind: 'reply'},
+      {from: 'scorer', to: 'Redis', label: 'velocity_snapshot · flags from VELOCITY_RULES', kind: 'sync'},
+      {from: 'scorer', to: 'scorer', label: 'should_alert(snapshot) · same rules', kind: 'sync'},
     ],
   },
   checks: [
     {
       id: 'atomic-script',
-      title: 'One atomic Lua EVAL counts the attempt',
+      title: 'One Lua script moves both windows',
       detail:
-        'The counter update is a single script call, `redis.eval(VELOCITY_LUA, 2, …)` and its equivalents, not separate client-side writes. The starter issues two `INCR` calls from the client, so a crash or a concurrent attempt between them leaves the card and device windows disagreeing.',
+        'The card counter and the device set move in one `EVAL` of `VELOCITY_LUA`, so no reader or crash lands between them; the starter sends two `INCR`s from the client.',
       match: {
-        python: {all: [/VELOCITY_LUA/, /redis\.eval\(/]},
-        typescript: {all: [/VELOCITY_LUA/, /redis\.eval\(/]},
-        go: {all: [/velocityLua/, /\.Eval\(/]},
-        scala: {all: [/VelocityLua/, /jedis\s*\.eval\(/]},
-        cpp: {all: [/kVelocityLua/, /redis\.eval/]},
+        python: {
+          all: [/VELOCITY_LUA/, /\.eval\(|register_script\(/, /redis\.call\(\s*['"]SADD['"]/],
+          none: [/r\.incr\(/],
+        },
+        typescript: {
+          all: [/VELOCITY_LUA/, /\.eval\(|defineCommand\(/, /redis\.call\(\s*['"]SADD['"]/],
+          none: [/redis\.incr\(/],
+        },
+        go: {
+          all: [/velocityLua/, /redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]SADD['"]/],
+          none: [/rdb\.Incr\(/],
+        },
+        scala: {all: [/VelocityLua/, /jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]SADD['"]/], none: [/jedis\.incr\(/]},
+        cpp: {all: [/kVelocityLua/, /redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]SADD['"]/], none: [/redis\.incr\(/]},
       },
     },
     {
       id: 'window-expiry',
-      title: 'Window keys expire on their own boundary',
+      title: 'Each window expires after its first write',
       detail:
-        'The script sets an expiry on first write, `EXPIRE`/`PEXPIRE` with the `ATTEMPT_WINDOW_S`/`DEVICE_WINDOW_S` constant, so an hourly and a daily window reset on schedule. The starter sets no TTL at all, so a flagged device stays flagged forever.',
+        'The script sets `EXPIRE` on the card key (`ATTEMPT_WINDOW_S`) when it is created and on the device key (`DEVICE_WINDOW_S`) when it has no TTL yet, so an hour later the card starts from one again.',
       match: {
-        python: {all: [/ATTEMPT_WINDOW_S/, /EXPIRE/]},
-        typescript: {all: [/ATTEMPT_WINDOW_S/, /EXPIRE/]},
-        go: {all: [/attemptWindowSeconds/, /EXPIRE/]},
-        scala: {all: [/AttemptWindowSeconds/, /EXPIRE/]},
-        cpp: {all: [/kAttemptWindowSeconds/, /EXPIRE/]},
+        python: {all: [/ATTEMPT_WINDOW_S/, /DEVICE_WINDOW_S/, /redis\.call\(\s*['"]EXPIRE['"]/]},
+        typescript: {all: [/ATTEMPT_WINDOW_S/, /DEVICE_WINDOW_S/, /redis\.call\(\s*['"]EXPIRE['"]/]},
+        go: {all: [/attemptWindowSeconds/, /deviceWindowSeconds/, /redis\.call\(\s*['"]EXPIRE['"]/]},
+        scala: {all: [/AttemptWindowSeconds/, /DeviceWindowSeconds/, /redis\.call\(\s*['"]EXPIRE['"]/]},
+        cpp: {all: [/kAttemptWindowSeconds/, /kDeviceWindowSeconds/, /redis\.call\(\s*['"]EXPIRE['"]/]},
       },
     },
     {
       id: 'count-before-model',
-      title: 'The attempt is counted before the model is called',
+      title: 'The attempt is counted before the model is asked',
       detail:
-        'The script call happens before the model call, so a timeout, a retry or a terminal model error still counts the attempt. The starter calls the model first and counts afterwards, which makes every failed attempt invisible to velocity, the case fraud rings generate by the thousand.',
+        '`score_with_velocity` calls `record_attempt` first, so an attempt the model refuses or never answers still counts; the starter counts only after a successful score.',
       match: {
-        python: {order: [/redis\.eval\(/, /model\.score\(/]},
-        typescript: {order: [/redis\.eval\(/, /model\.score\(/]},
-        go: {order: [/\.Eval\(/, /model\.Score\(/]},
-        scala: {order: [/jedis\s*\.eval\(/, /model\.score\(/]},
-        cpp: {order: [/redis\.eval/, /model\.score\(/]},
+        python: {order: [/def score_with_velocity/, /record_attempt\(/, /model\.score_transaction\(/]},
+        typescript: {order: [/function scoreWithVelocity/, /recordAttempt\(/, /scoreTransaction\(/]},
+        go: {order: [/func scoreWithVelocity/, /recordAttempt\(/, /model\.ScoreTransaction\(/]},
+        scala: {order: [/def scoreWithVelocity/, /recordAttempt\(/, /Model\.scoreTransaction\(/]},
+        cpp: {order: [/scoreWithVelocity\(/, /recordAttempt\(/, /model::scoreTransaction\(/]},
       },
     },
     {
       id: 'distinct-accounts',
-      title: 'Distinct accounts per device, not raw attempts',
+      title: 'The device window counts distinct accounts',
       detail:
-        'The device window counts distinct account references with `PFADD`/`PFCOUNT` (or a set with `SADD`/`SCARD`) under the `vel:device:{device_id}:{day}` key. The starter increments the same key as the card counter, so twenty accounts from one device look like one account retrying.',
+        'The device key is a set of account refs (`SADD`, `SCARD`): three attempts by two accounts on one device count two; the starter counts attempts.',
       match: {
-        python: {all: [/vel:device/, /PFADD/, /PFCOUNT/]},
-        typescript: {all: [/vel:device/, /PFADD/, /PFCOUNT/]},
-        go: {all: [/vel:device/, /PFADD/, /PFCOUNT/]},
-        scala: {all: [/vel:device/, /PFADD/, /PFCOUNT/]},
-        cpp: {all: [/vel:device/, /PFADD/, /PFCOUNT/]},
+        python: {all: [/SADD/, /SCARD|scard\(/], none: [/incr\([^)\n]*vel:device/]},
+        typescript: {all: [/SADD/, /SCARD|scard\(/], none: [/incr\([^)\n]*vel:device/]},
+        go: {all: [/SADD/, /SCARD|SCard\(/], none: [/Incr\([^)\n]*vel:device/]},
+        scala: {all: [/SADD/, /SCARD|scard\(/], none: [/incr\([^)\n]*vel:device/]},
+        cpp: {all: [/SADD/, /SCARD|scard\(/], none: [/incr\([^)\n]*vel:device/]},
       },
     },
     {
       id: 'shared-rules',
-      title: 'Reads and alerting share one rule set',
+      title: 'The snapshot and the alert read one rule table',
       detail:
-        'Thresholds live in `VELOCITY_RULES`, and both `velocity_snapshot` (the read path) and `should_alert` (the alerting decision) consult it. The starter hardcodes the thresholds in the alerting call and reports raw counters from the read path, so the two drift apart with the first rule change.',
+        '`velocity_snapshot` flags every rule of `VELOCITY_RULES` the counts exceed, and `should_alert` compares against the same table, so a snapshot that flags a rule always alerts; the starter alerts on its own literals.',
       match: {
-        python: {all: [/VELOCITY_RULES/, /def velocity_snapshot\(/, /def should_alert\(/]},
-        typescript: {all: [/VELOCITY_RULES/, /function velocitySnapshot\(/, /shouldAlert\(snapshot/]},
-        go: {all: [/velocityRules/, /func velocitySnapshot\(/, /func shouldAlert\(/]},
-        scala: {all: [/VelocityRules/, /def velocitySnapshot\(/, /def shouldAlert\(/]},
-        cpp: {all: [/kVelocityRules/, /velocitySnapshot\(/, /shouldAlert\(/]},
+        python: {
+          all: [
+            /def velocity_snapshot(?:(?!\ndef )[\s\S])*?VELOCITY_RULES/,
+            /def should_alert(?:(?!\ndef )[\s\S])*?VELOCITY_RULES/,
+          ],
+          none: [/>\s*(10|5)\b/],
+        },
+        typescript: {
+          all: [
+            /function velocitySnapshot(?:(?!\nexport )[\s\S])*?VELOCITY_RULES/,
+            /function shouldAlert(?:(?!\nexport )[\s\S])*?VELOCITY_RULES/,
+          ],
+          none: [/>\s*(10|5)\b/],
+        },
+        go: {
+          all: [
+            /func velocitySnapshot(?:(?!\nfunc )[\s\S])*?velocityRules/,
+            /func shouldAlert(?:(?!\nfunc )[\s\S])*?velocityRules/,
+          ],
+          none: [/>\s*(10|5)\b/],
+        },
+        scala: {
+          all: [
+            /def velocitySnapshot(?:(?!\n {2}def )[\s\S])*?VelocityRules/,
+            /def shouldAlert(?:(?!\n {2}def )[\s\S])*?VelocityRules/,
+          ],
+          none: [/[^-]>\s*(10|5)L?\b/],
+        },
+        cpp: {
+          all: [
+            /Velocity velocitySnapshot(?:(?!\n\})[\s\S])*?kVelocityRules/,
+            /bool shouldAlert(?:(?!\n\})[\s\S])*?kVelocityRules/,
+          ],
+          none: [/>\s*(10|5)\b/],
+        },
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-import time
+      starter: `import redis
 
-from redis import Redis
+from fraud import model  # model.score_transaction(features) -> verdict; raises model.InvalidFeatures
 
-logger = logging.getLogger("velocity")
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-redis = Redis(host="redis", port=6379)
-
-
-def window_keys(card_ref: str, device_id: str, now: float | None = None) -> tuple[str, str]:
-    """The window keys for this card and device."""
-    moment = time.gmtime(now if now is not None else time.time())
-    day = time.strftime("%Y%m%d", moment)
-    return f"vel:card:{card_ref}:{day}", f"vel:device:{device_id}:{day}"
+VELOCITY_RULES = {"card_attempts_per_hour": 5, "device_accounts_per_day": 3}
 
 
-def record_attempt(card_ref: str, device_id: str, account_ref: str) -> tuple[int, int]:
-    """Count the attempt for the card and the device."""
-    card_key, device_key = window_keys(card_ref, device_id)
-    attempts = redis.incr(card_key)
-    accounts_seen = redis.incr(device_key)
-    return int(attempts), int(accounts_seen)
+def record_attempt(card_ref: str, device_id: str, account_ref: str) -> dict:
+    """Count one attempt on the card and the device; returns {card_attempts, device_accounts}."""
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+    attempts = r.incr(f"vel:card:{card_ref}")
+    accounts = r.incr(f"vel:device:{device_id}")
+    return {"card_attempts": attempts, "device_accounts": accounts}
 
 
 def velocity_snapshot(card_ref: str, device_id: str) -> dict:
-    """The counters alerting reads."""
-    card_key, device_key = window_keys(card_ref, device_id)
-    return {
-        "card_key": card_key,
-        "device_key": device_key,
-        "card_attempts": int(redis.get(card_key) or 0),
-        "device_accounts": int(redis.get(device_key) or 0),
-    }
+    """The card's and the device's windows as they stand: {card_attempts, device_accounts, flags}."""
+    attempts = int(r.get(f"vel:card:{card_ref}") or 0)
+    accounts = int(r.get(f"vel:device:{device_id}") or 0)
+    return {"card_attempts": attempts, "device_accounts": accounts, "flags": []}
 
 
 def should_alert(snapshot: dict) -> bool:
-    """Alert on a burst for this card or this device."""
-    return snapshot["card_attempts"] > 40 or snapshot["device_accounts"] > 5
+    return snapshot["card_attempts"] > 10 or snapshot["device_accounts"] > 5
 
 
-def score_with_velocity(model, features: dict, card_ref: str, device_id: str, account_ref: str) -> tuple[dict, dict]:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    scored = model.score(features)
+def score_with_velocity(features: dict, card_ref: str, device_id: str, account_ref: str) -> dict:
+    """The model's verdict for the vector, with the velocity snapshot after this attempt."""
+    verdict = model.score_transaction(features)
     record_attempt(card_ref, device_id, account_ref)
-    logger.info("velocity card=%s device=%s", card_ref, device_id)
-    return scored, velocity_snapshot(card_ref, device_id)
+    return {**verdict, "velocity": velocity_snapshot(card_ref, device_id)}
 `,
-      solution: `import logging
-import time
+      solution: `import redis
 
-from redis import Redis
+from fraud import model  # model.score_transaction(features) -> verdict; raises model.InvalidFeatures
 
-logger = logging.getLogger("velocity")
-
-redis = Redis(host="redis", port=6379)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 ATTEMPT_WINDOW_S = 3600
-DEVICE_WINDOW_S = 24 * 3600
-# One rule set: the scorer enforces it, alerting reads it, and the dashboard shows it.
-VELOCITY_RULES = {"card_attempts_per_hour": 20, "device_accounts_per_day": 5}
+DEVICE_WINDOW_S = 86400
+VELOCITY_RULES = {"card_attempts_per_hour": 5, "device_accounts_per_day": 3}
+
+# KEYS[1] the card's attempts, KEYS[2] the device's accounts; ARGV[1] the account, ARGV[2] and
+# ARGV[3] the windows. Each window starts with its first write and expires on its own.
 VELOCITY_LUA = """
 local attempts = redis.call('INCR', KEYS[1])
-if attempts == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-redis.call('PFADD', KEYS[2], ARGV[2])
-if redis.call('TTL', KEYS[2]) < 0 then
-  redis.call('EXPIRE', KEYS[2], ARGV[3])
-end
-return {attempts, redis.call('PFCOUNT', KEYS[2])}
+if attempts == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+redis.call('SADD', KEYS[2], ARGV[1])
+if redis.call('TTL', KEYS[2]) == -1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
+return {attempts, redis.call('SCARD', KEYS[2])}
 """
 
 
-def window_keys(card_ref: str, device_id: str, now: float | None = None) -> tuple[str, str]:
-    """The bucket lives in the key, so each hour and each day gets its own counter and its own TTL."""
-    moment = time.gmtime(now if now is not None else time.time())
-    hour = time.strftime("%Y%m%d%H", moment)
-    day = time.strftime("%Y%m%d", moment)
-    return f"vel:card:{card_ref}:{hour}", f"vel:device:{device_id}:{day}"
-
-
-def record_attempt(card_ref: str, device_id: str, account_ref: str) -> tuple[int, int]:
-    """Count the attempt and the account in one atomic step."""
-    card_key, device_key = window_keys(card_ref, device_id)
-    attempts, accounts_seen = redis.eval(
-        VELOCITY_LUA, 2, card_key, device_key, ATTEMPT_WINDOW_S, account_ref, DEVICE_WINDOW_S
-    )
-    return int(attempts), int(accounts_seen)
+def record_attempt(card_ref: str, device_id: str, account_ref: str) -> dict:
+    """Count one attempt on the card and the device; returns {card_attempts, device_accounts}."""
+    attempts, accounts = r.eval(VELOCITY_LUA, 2, f"vel:card:{card_ref}", f"vel:device:{device_id}", account_ref, ATTEMPT_WINDOW_S, DEVICE_WINDOW_S)
+    return {"card_attempts": int(attempts), "device_accounts": int(accounts)}
 
 
 def velocity_snapshot(card_ref: str, device_id: str) -> dict:
-    """The read path: same keys, same windows, same rules as the write path."""
-    card_key, device_key = window_keys(card_ref, device_id)
-    snapshot = {
-        "card_key": card_key,
-        "device_key": device_key,
-        "card_attempts": int(redis.get(card_key) or 0),
-        "device_accounts": int(redis.pfcount(device_key)),
-    }
-    snapshot.update(VELOCITY_RULES)
-    return snapshot
+    """The card's and the device's windows as they stand: {card_attempts, device_accounts, flags}."""
+    attempts = int(r.get(f"vel:card:{card_ref}") or 0)
+    accounts = r.scard(f"vel:device:{device_id}")
+    values = {"card_attempts_per_hour": attempts, "device_accounts_per_day": accounts}
+    flags = [rule for rule, limit in VELOCITY_RULES.items() if values[rule] > limit]
+    return {"card_attempts": attempts, "device_accounts": accounts, "flags": flags}
 
 
 def should_alert(snapshot: dict) -> bool:
-    """Alerting applies the thresholds the scorer enforces, never a second copy of them."""
     return (
         snapshot["card_attempts"] > VELOCITY_RULES["card_attempts_per_hour"]
         or snapshot["device_accounts"] > VELOCITY_RULES["device_accounts_per_day"]
     )
 
 
-def score_with_velocity(model, features: dict, card_ref: str, device_id: str, account_ref: str) -> tuple[dict, dict]:
-    attempts, accounts_seen = record_attempt(card_ref, device_id, account_ref)
-    logger.info("velocity card=%s attempts=%d accounts=%d", card_ref, attempts, accounts_seen)
-    # The attempt is already counted: if the model times out from here, the window still saw it,
-    # which is exactly the case the starter loses.
-    scored = model.score(features)
-    return scored, velocity_snapshot(card_ref, device_id)
+def score_with_velocity(features: dict, card_ref: str, device_id: str, account_ref: str) -> dict:
+    """The model's verdict for the vector, with the velocity snapshot after this attempt."""
+    record_attempt(card_ref, device_id, account_ref)  # counted first: a refused or failed call is still an attempt
+    verdict = model.score_transaction(features)
+    return {**verdict, "velocity": velocity_snapshot(card_ref, device_id)}
 `,
     },
     typescript: {
-      starter: `/** Velocity counters for the scorer. */
-import Redis from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const redis = new Redis({host: 'redis', port: 6379});
+import type {Features} from 'fraud/features';
+import {type Verdict, scoreTransaction} from 'fraud/model';
 
-function windowKeys(cardRef: string, deviceId: string, now = new Date()): [string, string] {
-  const day = now.toISOString().slice(0, 10).replaceAll('-', '');
-  return [\`vel:card:\${cardRef}:\${day}\`, \`vel:device:\${deviceId}:\${day}\`];
-}
+const redis = new Redis({host: 'redis', port: 6379});
 
-export async function recordAttempt(cardRef: string, deviceId: string, accountRef: string): Promise<[number, number]> {
-  const [cardKey, deviceKey] = windowKeys(cardRef, deviceId);
-  const attempts = await redis.incr(cardKey);
-  const accountsSeen = await redis.incr(deviceKey);
-  return [attempts, accountsSeen];
-}
+export const VELOCITY_RULES = {card_attempts_per_hour: 5, device_accounts_per_day: 3};
 
-export interface VelocitySnapshot {
-  card_key: string;
-  device_key: string;
+export interface Velocity {
   card_attempts: number;
   device_accounts: number;
+  flags: string[];
 }
 
-export async function velocitySnapshot(cardRef: string, deviceId: string): Promise<VelocitySnapshot> {
-  const [cardKey, deviceKey] = windowKeys(cardRef, deviceId);
-  return {
-    card_key: cardKey,
-    device_key: deviceKey,
-    card_attempts: Number((await redis.get(cardKey)) ?? 0),
-    device_accounts: Number((await redis.get(deviceKey)) ?? 0),
-  };
+/** Count one attempt on the card and the device. */
+export async function recordAttempt(cardRef: string, deviceId: string, accountRef: string): Promise<Velocity> {
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  const attempts = await redis.incr(\`vel:card:\${cardRef}\`);
+  const accounts = await redis.incr(\`vel:device:\${deviceId}\`);
+  return {card_attempts: attempts, device_accounts: accounts, flags: []};
 }
 
-export function shouldAlert(snapshot: VelocitySnapshot): boolean {
-  return snapshot.card_attempts > 40 || snapshot.device_accounts > 5;
+/** The card's and the device's windows as they stand. */
+export async function velocitySnapshot(cardRef: string, deviceId: string): Promise<Velocity> {
+  const attempts = Number((await redis.get(\`vel:card:\${cardRef}\`)) ?? 0);
+  const accounts = Number((await redis.get(\`vel:device:\${deviceId}\`)) ?? 0);
+  return {card_attempts: attempts, device_accounts: accounts, flags: []};
 }
 
-export async function scoreWithVelocity(
-  model: {score: (features: Record<string, unknown>) => Promise<Record<string, unknown>>},
-  features: Record<string, unknown>,
-  cardRef: string,
-  deviceId: string,
-  accountRef: string,
-): Promise<{scored: Record<string, unknown>; snapshot: VelocitySnapshot}> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const scored = await model.score(features);
+export function shouldAlert(snapshot: Velocity): boolean {
+  return snapshot.card_attempts > 10 || snapshot.device_accounts > 5;
+}
+
+/** The model's verdict for the vector, with the velocity snapshot after this attempt. */
+export async function scoreWithVelocity(features: Features, cardRef: string, deviceId: string, accountRef: string): Promise<Verdict & {velocity: Velocity}> {
+  const verdict = await scoreTransaction(features);
   await recordAttempt(cardRef, deviceId, accountRef);
-  return {scored, snapshot: await velocitySnapshot(cardRef, deviceId)};
+  return {...verdict, velocity: await velocitySnapshot(cardRef, deviceId)};
 }
 `,
-      solution: `/** Velocity windows: one atomic script per attempt, expiring on the window boundary. */
-import Redis from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const redis = new Redis({host: 'redis', port: 6379});
+import type {Features} from 'fraud/features';
+import {type Verdict, scoreTransaction} from 'fraud/model';
 
-const ATTEMPT_WINDOW_S = 3600;
-const DEVICE_WINDOW_S = 24 * 3600;
-// One rule set: the scorer enforces it, alerting reads it, and the dashboard shows it.
-const VELOCITY_RULES = {card_attempts_per_hour: 20, device_accounts_per_day: 5};
+const redis = new Redis({host: 'redis', port: 6379});
 
-const VELOCITY_LUA = \`
+export const ATTEMPT_WINDOW_S = 3600;
+export const DEVICE_WINDOW_S = 86400;
+export const VELOCITY_RULES = {card_attempts_per_hour: 5, device_accounts_per_day: 3};
+
+// KEYS[1] the card's attempts, KEYS[2] the device's accounts; ARGV[1] the account, ARGV[2] and
+// ARGV[3] the windows. Each window starts with its first write and expires on its own.
+export const VELOCITY_LUA = \`
 local attempts = redis.call('INCR', KEYS[1])
-if attempts == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-redis.call('PFADD', KEYS[2], ARGV[2])
-if redis.call('TTL', KEYS[2]) < 0 then
-  redis.call('EXPIRE', KEYS[2], ARGV[3])
-end
-return {attempts, redis.call('PFCOUNT', KEYS[2])}
+if attempts == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+redis.call('SADD', KEYS[2], ARGV[1])
+if redis.call('TTL', KEYS[2]) == -1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
+return {attempts, redis.call('SCARD', KEYS[2])}
 \`;
 
-export interface VelocitySnapshot {
-  card_key: string;
-  device_key: string;
+export interface Velocity {
   card_attempts: number;
   device_accounts: number;
-  rules: typeof VELOCITY_RULES;
+  flags: string[];
 }
 
-function windowKeys(cardRef: string, deviceId: string, now = new Date()): [string, string] {
-  const hour = now.toISOString().slice(0, 13).replaceAll(/[-:T]/g, '');
-  const day = now.toISOString().slice(0, 10).replaceAll('-', '');
-  return [\`vel:card:\${cardRef}:\${hour}\`, \`vel:device:\${deviceId}:\${day}\`];
-}
-
-export async function recordAttempt(cardRef: string, deviceId: string, accountRef: string): Promise<[number, number]> {
-  const [cardKey, deviceKey] = windowKeys(cardRef, deviceId);
-  const [attempts, accountsSeen] = (await redis.eval(
+/** Count one attempt on the card and the device. */
+export async function recordAttempt(cardRef: string, deviceId: string, accountRef: string): Promise<Velocity> {
+  const [attempts, accounts] = (await redis.eval(
     VELOCITY_LUA,
     2,
-    cardKey,
-    deviceKey,
-    String(ATTEMPT_WINDOW_S),
+    \`vel:card:\${cardRef}\`,
+    \`vel:device:\${deviceId}\`,
     accountRef,
-    String(DEVICE_WINDOW_S),
+    ATTEMPT_WINDOW_S,
+    DEVICE_WINDOW_S,
   )) as [number, number];
-  return [Number(attempts), Number(accountsSeen)];
+  return {card_attempts: attempts, device_accounts: accounts, flags: []};
 }
 
-export async function velocitySnapshot(cardRef: string, deviceId: string): Promise<VelocitySnapshot> {
-  const [cardKey, deviceKey] = windowKeys(cardRef, deviceId);
-  return {
-    card_key: cardKey,
-    device_key: deviceKey,
-    card_attempts: Number((await redis.get(cardKey)) ?? 0),
-    device_accounts: Number(await redis.pfcount(deviceKey)),
-    rules: VELOCITY_RULES,
-  };
+/** The card's and the device's windows as they stand. */
+export async function velocitySnapshot(cardRef: string, deviceId: string): Promise<Velocity> {
+  const attempts = Number((await redis.get(\`vel:card:\${cardRef}\`)) ?? 0);
+  const accounts = await redis.scard(\`vel:device:\${deviceId}\`);
+  const flags: string[] = [];
+  if (attempts > VELOCITY_RULES.card_attempts_per_hour) flags.push('card_attempts_per_hour');
+  if (accounts > VELOCITY_RULES.device_accounts_per_day) flags.push('device_accounts_per_day');
+  return {card_attempts: attempts, device_accounts: accounts, flags};
 }
 
-export function shouldAlert(snapshot: VelocitySnapshot): boolean {
-  return (
-    snapshot.card_attempts > VELOCITY_RULES.card_attempts_per_hour ||
-    snapshot.device_accounts > VELOCITY_RULES.device_accounts_per_day
-  );
+export function shouldAlert(snapshot: Velocity): boolean {
+  return snapshot.card_attempts > VELOCITY_RULES.card_attempts_per_hour || snapshot.device_accounts > VELOCITY_RULES.device_accounts_per_day;
 }
 
-export async function scoreWithVelocity(
-  model: {score: (features: Record<string, unknown>) => Promise<Record<string, unknown>>},
-  features: Record<string, unknown>,
-  cardRef: string,
-  deviceId: string,
-  accountRef: string,
-): Promise<{scored: Record<string, unknown>; snapshot: VelocitySnapshot}> {
-  const [attempts, accountsSeen] = await recordAttempt(cardRef, deviceId, accountRef);
-  // The attempt is already counted: a model timeout from here still shows up in the window.
-  const scored = await model.score(features);
-  const snapshot = await velocitySnapshot(cardRef, deviceId);
-  return {scored: {...scored, attempts, accounts_seen: accountsSeen}, snapshot};
+/** The model's verdict for the vector, with the velocity snapshot after this attempt. */
+export async function scoreWithVelocity(features: Features, cardRef: string, deviceId: string, accountRef: string): Promise<Verdict & {velocity: Velocity}> {
+  await recordAttempt(cardRef, deviceId, accountRef); // counted first: a refused or failed call is still an attempt
+  const verdict = await scoreTransaction(features);
+  return {...verdict, velocity: await velocitySnapshot(cardRef, deviceId)};
 }
 `,
     },
@@ -383,509 +346,710 @@ export async function scoreWithVelocity(
 
 import (
 	"context"
-	"log"
-	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"fraud/features" // features.Features
+	"fraud/model"    // model.ScoreTransaction(ctx, features) (model.Verdict, error); model.ErrInvalidFeatures
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type FeatureVector map[string]any
+var velocityRules = map[string]int64{"card_attempts_per_hour": 5, "device_accounts_per_day": 3}
 
-type ScoreVerdict struct {
-	Score    float64
-	Band     string
-	Fallback bool
+type velocity struct {
+	CardAttempts   int64    \`json:"card_attempts"\`
+	DeviceAccounts int64    \`json:"device_accounts"\`
+	Flags          []string \`json:"flags"\`
 }
 
-type ModelScorer interface {
-	Score(ctx context.Context, features FeatureVector) (ScoreVerdict, error)
-}
-
-func windowKeys(cardRef, deviceID string, now time.Time) (string, string) {
-	return "vel:card:" + cardRef + ":" + now.UTC().Format("20060102"),
-		"vel:device:" + deviceID + ":" + now.UTC().Format("20060102")
-}
-
-func recordAttempt(ctx context.Context, cardRef, deviceID, accountRef string) (int, int, error) {
-	cardKey, deviceKey := windowKeys(cardRef, deviceID, time.Now())
-	attempts, err := rdb.Incr(ctx, cardKey).Result()
+// recordAttempt counts one attempt on the card and the device.
+func recordAttempt(ctx context.Context, cardRef, deviceID, accountRef string) (velocity, error) {
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+	attempts, err := rdb.Incr(ctx, "vel:card:"+cardRef).Result()
 	if err != nil {
-		return 0, 0, err
+		return velocity{}, err
 	}
-	accountsSeen, err := rdb.Incr(ctx, deviceKey).Result()
+	accounts, err := rdb.Incr(ctx, "vel:device:"+deviceID).Result()
 	if err != nil {
-		return 0, 0, err
+		return velocity{}, err
 	}
-	return int(attempts), int(accountsSeen), nil
+	return velocity{CardAttempts: attempts, DeviceAccounts: accounts}, nil
 }
 
-type VelocitySnapshot struct {
-	CardKey        string
-	DeviceKey      string
-	CardAttempts   int
-	DeviceAccounts int
-}
-
-func velocitySnapshot(ctx context.Context, cardRef, deviceID string) (VelocitySnapshot, error) {
-	cardKey, deviceKey := windowKeys(cardRef, deviceID, time.Now())
-	attempts, err := rdb.Get(ctx, cardKey).Int()
+// velocitySnapshot is the card's and the device's windows as they stand.
+func velocitySnapshot(ctx context.Context, cardRef, deviceID string) (velocity, error) {
+	attempts, err := rdb.Get(ctx, "vel:card:"+cardRef).Int64()
 	if err != nil && err != redis.Nil {
-		return VelocitySnapshot{}, err
+		return velocity{}, err
 	}
-	accountsSeen, err := rdb.Get(ctx, deviceKey).Int()
+	accounts, err := rdb.Get(ctx, "vel:device:"+deviceID).Int64()
 	if err != nil && err != redis.Nil {
-		return VelocitySnapshot{}, err
+		return velocity{}, err
 	}
-	return VelocitySnapshot{CardKey: cardKey, DeviceKey: deviceKey, CardAttempts: attempts, DeviceAccounts: accountsSeen}, nil
+	return velocity{CardAttempts: attempts, DeviceAccounts: accounts}, nil
 }
 
-func shouldAlert(snapshot VelocitySnapshot) bool {
-	return snapshot.CardAttempts > 40 || snapshot.DeviceAccounts > 5
+func shouldAlert(v velocity) bool {
+	return v.CardAttempts > 10 || v.DeviceAccounts > 5
 }
 
-func scoreWithVelocity(
-	ctx context.Context,
-	model ModelScorer,
-	features FeatureVector,
-	cardRef, deviceID, accountRef string,
-) (ScoreVerdict, VelocitySnapshot, error) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	verdict, err := model.Score(ctx, features)
+// scoreWithVelocity is the model's verdict for the vector, with the velocity snapshot after this attempt.
+func scoreWithVelocity(ctx context.Context, f features.Features, cardRef, deviceID, accountRef string) (model.Verdict, velocity, error) {
+	verdict, err := model.ScoreTransaction(ctx, f)
 	if err != nil {
-		return ScoreVerdict{}, VelocitySnapshot{}, err
+		return model.Verdict{}, velocity{}, err
 	}
-	attempts, accountsSeen, err := recordAttempt(ctx, cardRef, deviceID, accountRef)
-	if err != nil {
-		return ScoreVerdict{}, VelocitySnapshot{}, err
+	if _, err := recordAttempt(ctx, cardRef, deviceID, accountRef); err != nil {
+		return model.Verdict{}, velocity{}, err
 	}
-	log.Printf("velocity card=%s attempts=%d accounts=%d", cardRef, attempts, accountsSeen)
-	snapshot, err := velocitySnapshot(ctx, cardRef, deviceID)
-	return verdict, snapshot, err
+	v, err := velocitySnapshot(ctx, cardRef, deviceID)
+	return verdict, v, err
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"fmt"
-	"log"
-	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"fraud/features" // features.Features
+	"fraud/model"    // model.ScoreTransaction(ctx, features) (model.Verdict, error); model.ErrInvalidFeatures
+)
+
+const (
+	attemptWindowSeconds = 3600
+	deviceWindowSeconds  = 86400
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const (
-	attemptWindowSeconds = 3600
-	deviceWindowSeconds  = 24 * 3600
-	cardKeyPrefix        = "vel:card"
-	deviceKeyPrefix      = "vel:device"
-)
+var velocityRules = map[string]int64{"card_attempts_per_hour": 5, "device_accounts_per_day": 3}
 
-// One rule set: the scorer enforces it, alerting reads it, and the dashboard shows it.
-var velocityRules = map[string]int{
-	"card_attempts_per_hour":  20,
-	"device_accounts_per_day": 5,
-}
-
+// KEYS[1] the card's attempts, KEYS[2] the device's accounts; ARGV[1] the account, ARGV[2] and
+// ARGV[3] the windows. Each window starts with its first write and expires on its own.
 const velocityLua = \`
 local attempts = redis.call('INCR', KEYS[1])
-if attempts == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-redis.call('PFADD', KEYS[2], ARGV[2])
-if redis.call('TTL', KEYS[2]) < 0 then
-  redis.call('EXPIRE', KEYS[2], ARGV[3])
-end
-return {attempts, redis.call('PFCOUNT', KEYS[2])}
+if attempts == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+redis.call('SADD', KEYS[2], ARGV[1])
+if redis.call('TTL', KEYS[2]) == -1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
+return {attempts, redis.call('SCARD', KEYS[2])}
 \`
 
-type FeatureVector map[string]any
+var velocityScript = redis.NewScript(velocityLua)
 
-type ScoreVerdict struct {
-	Score    float64
-	Band     string
-	Fallback bool
+type velocity struct {
+	CardAttempts   int64    \`json:"card_attempts"\`
+	DeviceAccounts int64    \`json:"device_accounts"\`
+	Flags          []string \`json:"flags"\`
 }
 
-type ModelScorer interface {
-	Score(ctx context.Context, features FeatureVector) (ScoreVerdict, error)
-}
-
-type VelocitySnapshot struct {
-	CardKey        string
-	DeviceKey      string
-	CardAttempts   int
-	DeviceAccounts int
-	Rules          map[string]int
-}
-
-// The bucket lives in the key, so each hour and each day gets its own counter and its own TTL.
-func windowKeys(cardRef, deviceID string, now time.Time) (string, string) {
-	return fmt.Sprintf("%s:%s:%s", cardKeyPrefix, cardRef, now.UTC().Format("2006010215")),
-		fmt.Sprintf("%s:%s:%s", deviceKeyPrefix, deviceID, now.UTC().Format("20060102"))
-}
-
-func recordAttempt(ctx context.Context, cardRef, deviceID, accountRef string) (int, int, error) {
-	cardKey, deviceKey := windowKeys(cardRef, deviceID, time.Now())
-	values, err := rdb.Eval(ctx, velocityLua, []string{cardKey, deviceKey}, attemptWindowSeconds, accountRef, deviceWindowSeconds).Slice()
+// recordAttempt counts one attempt on the card and the device.
+func recordAttempt(ctx context.Context, cardRef, deviceID, accountRef string) (velocity, error) {
+	keys := []string{"vel:card:" + cardRef, "vel:device:" + deviceID}
+	counts, err := velocityScript.Run(ctx, rdb, keys, accountRef, attemptWindowSeconds, deviceWindowSeconds).Int64Slice()
 	if err != nil {
-		return 0, 0, err
+		return velocity{}, err
 	}
-	attempts, _ := values[0].(int64)
-	accountsSeen, _ := values[1].(int64)
-	return int(attempts), int(accountsSeen), nil
+	return velocity{CardAttempts: counts[0], DeviceAccounts: counts[1]}, nil
 }
 
-func velocitySnapshot(ctx context.Context, cardRef, deviceID string) (VelocitySnapshot, error) {
-	cardKey, deviceKey := windowKeys(cardRef, deviceID, time.Now())
-	attempts, err := rdb.Get(ctx, cardKey).Int()
+// velocitySnapshot is the card's and the device's windows as they stand.
+func velocitySnapshot(ctx context.Context, cardRef, deviceID string) (velocity, error) {
+	attempts, err := rdb.Get(ctx, "vel:card:"+cardRef).Int64()
 	if err != nil && err != redis.Nil {
-		return VelocitySnapshot{}, err
+		return velocity{}, err
 	}
-	accountsSeen, err := rdb.PFCount(ctx, deviceKey).Result()
+	accounts, err := rdb.SCard(ctx, "vel:device:"+deviceID).Result()
 	if err != nil {
-		return VelocitySnapshot{}, err
+		return velocity{}, err
 	}
-	return VelocitySnapshot{
-		CardKey:        cardKey,
-		DeviceKey:      deviceKey,
-		CardAttempts:   attempts,
-		DeviceAccounts: int(accountsSeen),
-		Rules:          velocityRules,
-	}, nil
+	v := velocity{CardAttempts: attempts, DeviceAccounts: accounts, Flags: []string{}}
+	if attempts > velocityRules["card_attempts_per_hour"] {
+		v.Flags = append(v.Flags, "card_attempts_per_hour")
+	}
+	if accounts > velocityRules["device_accounts_per_day"] {
+		v.Flags = append(v.Flags, "device_accounts_per_day")
+	}
+	return v, nil
 }
 
-func shouldAlert(snapshot VelocitySnapshot) bool {
-	return snapshot.CardAttempts > velocityRules["card_attempts_per_hour"] ||
-		snapshot.DeviceAccounts > velocityRules["device_accounts_per_day"]
+func shouldAlert(v velocity) bool {
+	return v.CardAttempts > velocityRules["card_attempts_per_hour"] || v.DeviceAccounts > velocityRules["device_accounts_per_day"]
 }
 
-func scoreWithVelocity(
-	ctx context.Context,
-	model ModelScorer,
-	features FeatureVector,
-	cardRef, deviceID, accountRef string,
-) (ScoreVerdict, VelocitySnapshot, error) {
-	attempts, accountsSeen, err := recordAttempt(ctx, cardRef, deviceID, accountRef)
-	if err != nil {
-		return ScoreVerdict{}, VelocitySnapshot{}, err
+// scoreWithVelocity is the model's verdict for the vector, with the velocity snapshot after this attempt.
+func scoreWithVelocity(ctx context.Context, f features.Features, cardRef, deviceID, accountRef string) (model.Verdict, velocity, error) {
+	// Counted first: a refused or failed call is still an attempt.
+	if _, err := recordAttempt(ctx, cardRef, deviceID, accountRef); err != nil {
+		return model.Verdict{}, velocity{}, err
 	}
-	log.Printf("velocity card=%s attempts=%d accounts=%d", cardRef, attempts, accountsSeen)
-	// The attempt is already counted: a model timeout from here still shows up in the window.
-	verdict, err := model.Score(ctx, features)
+	verdict, err := model.ScoreTransaction(ctx, f)
 	if err != nil {
-		return ScoreVerdict{}, VelocitySnapshot{}, err
+		return model.Verdict{}, velocity{}, err
 	}
-	snapshot, err := velocitySnapshot(ctx, cardRef, deviceID)
-	return verdict, snapshot, err
+	v, err := velocitySnapshot(ctx, cardRef, deviceID)
+	return verdict, v, err
 }
 `,
     },
     scala: {
-      starter: `import java.text.SimpleDateFormat
-import java.util.Date
+      starter: `import redis.clients.jedis.JedisPooled
 
-import redis.clients.jedis.Jedis
+import fraud.{FeatureVector, Model, Verdict} // Model.scoreTransaction(vector): Verdict; throws fraud.InvalidFeatures
 
-object Velocity {
-  val jedis = new Jedis("redis", 6379)
+final case class VelocityCounts(cardAttempts: Long, deviceAccounts: Long, flags: Seq[String])
 
-  case class VelocitySnapshot(cardKey: String, deviceKey: String, cardAttempts: Long, deviceAccounts: Long)
+object VelocityStore {
+  val VelocityRules: Map[String, Long] = Map("card_attempts_per_hour" -> 5L, "device_accounts_per_day" -> 3L)
 
-  def windowKeys(cardRef: String, deviceId: String, now: Date = new Date()): (String, String) = {
-    val day = new SimpleDateFormat("yyyyMMdd").format(now)
-    (s"vel:card:$cardRef:$day", s"vel:device:$deviceId:$day")
+  private val jedis = new JedisPooled("redis", 6379)
+
+  /** Count one attempt on the card and the device. */
+  def recordAttempt(cardRef: String, deviceId: String, accountRef: String): VelocityCounts = {
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+    val attempts = jedis.incr(s"vel:card:$cardRef")
+    val accounts = jedis.incr(s"vel:device:$deviceId")
+    VelocityCounts(attempts, accounts, Seq.empty)
   }
 
-  def recordAttempt(cardRef: String, deviceId: String, accountRef: String): (Long, Long) = {
-    val (cardKey, deviceKey) = windowKeys(cardRef, deviceId)
-    val attempts = jedis.incr(cardKey)
-    val accountsSeen = jedis.incr(deviceKey)
-    (attempts, accountsSeen)
+  /** The card's and the device's windows as they stand. */
+  def velocitySnapshot(cardRef: String, deviceId: String): VelocityCounts = {
+    val attempts = Option(jedis.get(s"vel:card:$cardRef")).map(_.toLong).getOrElse(0L)
+    val accounts = Option(jedis.get(s"vel:device:$deviceId")).map(_.toLong).getOrElse(0L)
+    VelocityCounts(attempts, accounts, Seq.empty)
   }
 
-  def velocitySnapshot(cardRef: String, deviceId: String): VelocitySnapshot = {
-    val (cardKey, deviceKey) = windowKeys(cardRef, deviceId)
-    VelocitySnapshot(cardKey, deviceKey, counter(cardKey), counter(deviceKey))
-  }
+  def shouldAlert(v: VelocityCounts): Boolean = v.cardAttempts > 10 || v.deviceAccounts > 5
 
-  private def counter(key: String): Long = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-
-  def shouldAlert(snapshot: VelocitySnapshot): Boolean =
-    snapshot.cardAttempts > 40 || snapshot.deviceAccounts > 5
-
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def scoreWithVelocity(model: ModelClient, features: Map[String, Any], cardRef: String, deviceId: String, accountRef: String): (Map[String, Any], VelocitySnapshot) = {
-    val scored = model.score(features)
+  /** The model's verdict for the vector, with the velocity snapshot after this attempt. */
+  def scoreWithVelocity(vector: FeatureVector, cardRef: String, deviceId: String, accountRef: String): (Verdict, VelocityCounts) = {
+    val verdict = Model.scoreTransaction(vector)
     recordAttempt(cardRef, deviceId, accountRef)
-    (scored, velocitySnapshot(cardRef, deviceId))
-  }
-
-  class ModelClient {
-    def score(features: Map[String, Any]): Map[String, Any] = Map("score" -> 0.5)
+    (verdict, velocitySnapshot(cardRef, deviceId))
   }
 }
 `,
-      solution: `import java.text.SimpleDateFormat
-import java.util.Date
+      solution: `import redis.clients.jedis.JedisPooled
 
-import redis.clients.jedis.Jedis
+import scala.jdk.CollectionConverters._
 
-object Velocity {
+import fraud.{FeatureVector, Model, Verdict} // Model.scoreTransaction(vector): Verdict; throws fraud.InvalidFeatures
+
+final case class VelocityCounts(cardAttempts: Long, deviceAccounts: Long, flags: Seq[String])
+
+object VelocityStore {
   val AttemptWindowSeconds = 3600L
-  val DeviceWindowSeconds = 24L * 3600
-  val CardKeyPrefix = "vel:card"
-  val DeviceKeyPrefix = "vel:device"
-  // One rule set: the scorer enforces it, alerting reads it, and the dashboard shows it.
-  val VelocityRules = Map("card_attempts_per_hour" -> 20, "device_accounts_per_day" -> 5)
-  val jedis = new Jedis("redis", 6379)
+  val DeviceWindowSeconds = 86400L
+  val VelocityRules: Map[String, Long] = Map("card_attempts_per_hour" -> 5L, "device_accounts_per_day" -> 3L)
 
-  val VelocityLua =
-    """
-      |local attempts = redis.call('INCR', KEYS[1])
-      |if attempts == 1 then
-      |  redis.call('EXPIRE', KEYS[1], ARGV[1])
-      |end
-      |redis.call('PFADD', KEYS[2], ARGV[2])
-      |if redis.call('TTL', KEYS[2]) < 0 then
-      |  redis.call('EXPIRE', KEYS[2], ARGV[3])
-      |end
-      |return {attempts, redis.call('PFCOUNT', KEYS[2])}
+  /** KEYS[1] the card's attempts, KEYS[2] the device's accounts; ARGV[1] the account, ARGV[2] and ARGV[3] the windows. */
+  val VelocityLua: String =
+    """local attempts = redis.call('INCR', KEYS[1])
+      |if attempts == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+      |redis.call('SADD', KEYS[2], ARGV[1])
+      |if redis.call('TTL', KEYS[2]) == -1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
+      |return {attempts, redis.call('SCARD', KEYS[2])}
       |""".stripMargin
 
-  case class VelocitySnapshot(
-      cardKey: String,
-      deviceKey: String,
-      cardAttempts: Long,
-      deviceAccounts: Long,
-      rules: Map[String, Int],
-  )
+  private val jedis = new JedisPooled("redis", 6379)
 
-  class ModelClient {
-    def score(features: Map[String, Any]): Map[String, Any] = Map("score" -> 0.5)
+  /** Count one attempt on the card and the device. */
+  def recordAttempt(cardRef: String, deviceId: String, accountRef: String): VelocityCounts = {
+    val keys = List(s"vel:card:$cardRef", s"vel:device:$deviceId").asJava
+    val args = List(accountRef, AttemptWindowSeconds.toString, DeviceWindowSeconds.toString).asJava
+    val counts = jedis.eval(VelocityLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
+    VelocityCounts(counts(0), counts(1), Seq.empty)
   }
 
-  // The bucket lives in the key, so each hour and each day gets its own counter and its own TTL.
-  def windowKeys(cardRef: String, deviceId: String, now: Date = new Date()): (String, String) = {
-    val hour = new SimpleDateFormat("yyyyMMddHH").format(now)
-    val day = new SimpleDateFormat("yyyyMMdd").format(now)
-    (s"$CardKeyPrefix:$cardRef:$hour", s"$DeviceKeyPrefix:$deviceId:$day")
+  /** The card's and the device's windows as they stand. */
+  def velocitySnapshot(cardRef: String, deviceId: String): VelocityCounts = {
+    val attempts = Option(jedis.get(s"vel:card:$cardRef")).map(_.toLong).getOrElse(0L)
+    val accounts = jedis.scard(s"vel:device:$deviceId")
+    val flags = Seq("card_attempts_per_hour" -> attempts, "device_accounts_per_day" -> accounts).collect {
+      case (rule, value) if value > VelocityRules(rule) => rule
+    }
+    VelocityCounts(attempts, accounts, flags)
   }
 
-  def recordAttempt(cardRef: String, deviceId: String, accountRef: String): (Long, Long) = {
-    val (cardKey, deviceKey) = windowKeys(cardRef, deviceId)
-    val result = jedis
-      .eval(VelocityLua, 2, cardKey, deviceKey, AttemptWindowSeconds.toString, accountRef, DeviceWindowSeconds.toString)
-      .asInstanceOf[java.util.List[Long]]
-    (result.get(0), result.get(1))
-  }
+  def shouldAlert(v: VelocityCounts): Boolean =
+    v.cardAttempts > VelocityRules("card_attempts_per_hour") || v.deviceAccounts > VelocityRules("device_accounts_per_day")
 
-  def velocitySnapshot(cardRef: String, deviceId: String): VelocitySnapshot = {
-    val (cardKey, deviceKey) = windowKeys(cardRef, deviceId)
-    VelocitySnapshot(cardKey, deviceKey, counter(cardKey), jedis.pfcount(deviceKey), VelocityRules)
-  }
-
-  private def counter(key: String): Long = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-
-  def shouldAlert(snapshot: VelocitySnapshot): Boolean =
-    snapshot.cardAttempts > VelocityRules("card_attempts_per_hour") ||
-      snapshot.deviceAccounts > VelocityRules("device_accounts_per_day")
-
-  def scoreWithVelocity(
-      model: ModelClient,
-      features: Map[String, Any],
-      cardRef: String,
-      deviceId: String,
-      accountRef: String,
-  ): (Map[String, Any], VelocitySnapshot) = {
-    val (attempts, accountsSeen) = recordAttempt(cardRef, deviceId, accountRef)
-    // The attempt is already counted: a model timeout from here still shows up in the window.
-    val scored = model.score(features)
-    (scored ++ Map("attempts" -> attempts, "accounts_seen" -> accountsSeen), velocitySnapshot(cardRef, deviceId))
+  /** The model's verdict for the vector, with the velocity snapshot after this attempt. */
+  def scoreWithVelocity(vector: FeatureVector, cardRef: String, deviceId: String, accountRef: String): (Verdict, VelocityCounts) = {
+    recordAttempt(cardRef, deviceId, accountRef) // counted first: a refused or failed call is still an attempt
+    val verdict = Model.scoreTransaction(vector)
+    (verdict, velocitySnapshot(cardRef, deviceId))
   }
 }
 `,
     },
     cpp: {
-      starter: `// Velocity counters for the scorer.
-#include <ctime>
-#include <iomanip>
-#include <sstream>
+      starter: `#include <sw/redis++/redis++.h>
+
+#include <map>
 #include <string>
 #include <utility>
+#include <vector>
 
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+#include "fraud/features.h"  // features::Features
+#include "fraud/model.h"     // model::scoreTransaction(features) -> model::Verdict; throws model::InvalidFeatures
 
-using json = nlohmann::json;
+sw::redis::Redis redis("tcp://redis:6379");
 
-struct VelocitySnapshot {
-  std::string card_key;
-  std::string device_key;
+const std::map<std::string, long long> kVelocityRules = {{"card_attempts_per_hour", 5}, {"device_accounts_per_day", 3}};
+
+struct Velocity {
   long long card_attempts = 0;
   long long device_accounts = 0;
+  std::vector<std::string> flags;
 };
 
-class ModelClient {
- public:
-  json score(const json& features) { return json{{"score", 0.5}}; }
-};
-
-static ModelClient model;
-
-static std::pair<std::string, std::string> windowKeys(const std::string& card_ref, const std::string& device_id) {
-  const std::time_t now = std::time(nullptr);
-  std::ostringstream day;
-  day << std::put_time(std::gmtime(&now), "%Y%m%d");
-  return {"vel:card:" + card_ref + ":" + day.str(), "vel:device:" + device_id + ":" + day.str()};
+// Count one attempt on the card and the device.
+Velocity recordAttempt(const std::string& card_ref, const std::string& device_id, const std::string& account_ref) {
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  const long long attempts = redis.incr("vel:card:" + card_ref);
+  const long long accounts = redis.incr("vel:device:" + device_id);
+  return Velocity{attempts, accounts, {}};
 }
 
-static std::pair<long long, long long> recordAttempt(sw::redis::Redis& redis, const std::string& card_ref,
-                                                    const std::string& device_id) {
-  const auto keys = windowKeys(card_ref, device_id);
-  const auto attempts = redis.incr(keys.first);
-  const auto accounts_seen = redis.incr(keys.second);
-  return {attempts, accounts_seen};
+// The card's and the device's windows as they stand.
+Velocity velocitySnapshot(const std::string& card_ref, const std::string& device_id) {
+  const auto attempts = redis.get("vel:card:" + card_ref);
+  const auto accounts = redis.get("vel:device:" + device_id);
+  return Velocity{attempts ? std::stoll(*attempts) : 0, accounts ? std::stoll(*accounts) : 0, {}};
 }
 
-static VelocitySnapshot velocitySnapshot(sw::redis::Redis& redis, const std::string& card_ref,
-                                        const std::string& device_id) {
-  const auto keys = windowKeys(card_ref, device_id);
-  const auto card_raw = redis.get(keys.first);
-  const auto device_raw = redis.get(keys.second);
-  VelocitySnapshot snapshot;
-  snapshot.card_key = keys.first;
-  snapshot.device_key = keys.second;
-  snapshot.card_attempts = card_raw ? std::stoll(*card_raw) : 0;
-  snapshot.device_accounts = device_raw ? std::stoll(*device_raw) : 0;
-  return snapshot;
-}
+bool shouldAlert(const Velocity& v) { return v.card_attempts > 10 || v.device_accounts > 5; }
 
-static bool shouldAlert(const VelocitySnapshot& snapshot) {
-  return snapshot.card_attempts > 40 || snapshot.device_accounts > 5;
-}
-
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-static std::pair<json, VelocitySnapshot> scoreWithVelocity(sw::redis::Redis& redis, const json& features,
-                                                          const std::string& card_ref, const std::string& device_id) {
-  const json scored = model.score(features);
-  recordAttempt(redis, card_ref, device_id);
-  return {scored, velocitySnapshot(redis, card_ref, device_id)};
+// The model's verdict for the vector, with the velocity snapshot after this attempt.
+std::pair<model::Verdict, Velocity> scoreWithVelocity(const features::Features& fx, const std::string& card_ref, const std::string& device_id,
+                                                      const std::string& account_ref) {
+  const model::Verdict verdict = model::scoreTransaction(fx);
+  recordAttempt(card_ref, device_id, account_ref);
+  return {verdict, velocitySnapshot(card_ref, device_id)};
 }
 `,
-      solution: `// Velocity windows: one atomic script per attempt, expiring on the window boundary.
-#include <algorithm>
-#include <cstdio>
-#include <ctime>
-#include <iomanip>
+      solution: `#include <sw/redis++/redis++.h>
+
 #include <map>
-#include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+#include "fraud/features.h"  // features::Features
+#include "fraud/model.h"     // model::scoreTransaction(features) -> model::Verdict; throws model::InvalidFeatures
 
-using json = nlohmann::json;
+sw::redis::Redis redis("tcp://redis:6379");
 
 constexpr long long kAttemptWindowSeconds = 3600;
-constexpr long long kDeviceWindowSeconds = 24 * 3600;
+constexpr long long kDeviceWindowSeconds = 86400;
+const std::map<std::string, long long> kVelocityRules = {{"card_attempts_per_hour", 5}, {"device_accounts_per_day", 3}};
 
-// One rule set: the scorer enforces it, alerting reads it, and the dashboard shows it.
-static const std::map<std::string, int> kVelocityRules = {
-    {"card_attempts_per_hour", 20},
-    {"device_accounts_per_day", 5},
-};
-
-static const char* kVelocityLua = R"(
+// KEYS[1] the card's attempts, KEYS[2] the device's accounts; ARGV[1] the account, ARGV[2] and
+// ARGV[3] the windows. Each window starts with its first write and expires on its own.
+const std::string kVelocityLua = R"lua(
 local attempts = redis.call('INCR', KEYS[1])
-if attempts == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-redis.call('PFADD', KEYS[2], ARGV[2])
-if redis.call('TTL', KEYS[2]) < 0 then
-  redis.call('EXPIRE', KEYS[2], ARGV[3])
-end
-return tostring(attempts) .. ':' .. tostring(redis.call('PFCOUNT', KEYS[2]))
-)";
+if attempts == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+redis.call('SADD', KEYS[2], ARGV[1])
+if redis.call('TTL', KEYS[2]) == -1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
+return {attempts, redis.call('SCARD', KEYS[2])}
+)lua";
 
-struct VelocitySnapshot {
-  std::string card_key;
-  std::string device_key;
+struct Velocity {
   long long card_attempts = 0;
   long long device_accounts = 0;
+  std::vector<std::string> flags;
 };
 
-class ModelClient {
- public:
-  json score(const json& features) { return json{{"score", 0.5}, {"fallback", false}}; }
-};
-
-static ModelClient model;
-
-// The bucket lives in the key, so each hour and each day gets its own counter and its own TTL.
-static std::pair<std::string, std::string> windowKeys(const std::string& card_ref, const std::string& device_id) {
-  const std::time_t now = std::time(nullptr);
-  std::ostringstream hour;
-  hour << std::put_time(std::gmtime(&now), "%Y%m%d%H");
-  std::ostringstream day;
-  day << std::put_time(std::gmtime(&now), "%Y%m%d");
-  return {"vel:card:" + card_ref + ":" + hour.str(), "vel:device:" + device_id + ":" + day.str()};
+// Count one attempt on the card and the device.
+Velocity recordAttempt(const std::string& card_ref, const std::string& device_id, const std::string& account_ref) {
+  const std::vector<std::string> keys = {"vel:card:" + card_ref, "vel:device:" + device_id};
+  const std::vector<std::string> args = {account_ref, std::to_string(kAttemptWindowSeconds), std::to_string(kDeviceWindowSeconds)};
+  const auto counts = redis.eval<std::vector<long long>>(kVelocityLua, keys, args);
+  return Velocity{counts[0], counts[1], {}};
 }
 
-static std::pair<long long, long long> recordAttempt(sw::redis::Redis& redis, const std::string& card_ref,
-                                                    const std::string& device_id, const std::string& account_ref) {
-  const auto keys = windowKeys(card_ref, device_id);
-  const auto raw = redis.eval<std::string>(
-      kVelocityLua,
-      {keys.first, keys.second},
-      {std::to_string(kAttemptWindowSeconds), account_ref, std::to_string(kDeviceWindowSeconds)});
-  long long attempts = 0;
-  long long accounts_seen = 0;
-  std::sscanf(raw.c_str(), "%lld:%lld", &attempts, &accounts_seen);
-  return {attempts, accounts_seen};
+// The card's and the device's windows as they stand.
+Velocity velocitySnapshot(const std::string& card_ref, const std::string& device_id) {
+  const auto attempts = redis.get("vel:card:" + card_ref);
+  Velocity v{attempts ? std::stoll(*attempts) : 0, redis.scard("vel:device:" + device_id), {}};
+  if (v.card_attempts > kVelocityRules.at("card_attempts_per_hour")) v.flags.push_back("card_attempts_per_hour");
+  if (v.device_accounts > kVelocityRules.at("device_accounts_per_day")) v.flags.push_back("device_accounts_per_day");
+  return v;
 }
 
-static VelocitySnapshot velocitySnapshot(sw::redis::Redis& redis, const std::string& card_ref,
-                                        const std::string& device_id) {
-  const auto keys = windowKeys(card_ref, device_id);
-  const auto card_raw = redis.get(keys.first);
-  VelocitySnapshot snapshot;
-  snapshot.card_key = keys.first;
-  snapshot.device_key = keys.second;
-  snapshot.card_attempts = card_raw ? std::stoll(*card_raw) : 0;
-  snapshot.device_accounts = redis.pfcount(keys.second);
-  return snapshot;
+bool shouldAlert(const Velocity& v) {
+  return v.card_attempts > kVelocityRules.at("card_attempts_per_hour") || v.device_accounts > kVelocityRules.at("device_accounts_per_day");
 }
 
-static bool shouldAlert(const VelocitySnapshot& snapshot) {
-  return snapshot.card_attempts > kVelocityRules.at("card_attempts_per_hour") ||
-         snapshot.device_accounts > kVelocityRules.at("device_accounts_per_day");
-}
-
-static std::pair<json, VelocitySnapshot> scoreWithVelocity(sw::redis::Redis& redis, const json& features,
-                                                          const std::string& card_ref, const std::string& device_id,
-                                                          const std::string& account_ref) {
-  const auto counted = recordAttempt(redis, card_ref, device_id, account_ref);
-  // The attempt is already counted: a model timeout from here still shows up in the window.
-  const json scored = model.score(features);
-  json verdict = scored;
-  verdict["attempts"] = counted.first;
-  verdict["accounts_seen"] = counted.second;
-  return {verdict, velocitySnapshot(redis, card_ref, device_id)};
+// The model's verdict for the vector, with the velocity snapshot after this attempt.
+std::pair<model::Verdict, Velocity> scoreWithVelocity(const features::Features& fx, const std::string& card_ref, const std::string& device_id,
+                                                      const std::string& account_ref) {
+  recordAttempt(card_ref, device_id, account_ref);  // counted first: a refused or failed call is still an attempt
+  const model::Verdict verdict = model::scoreTransaction(fx);
+  return {verdict, velocitySnapshot(card_ref, device_id)};
 }
 `,
     },
   },
-  hints: [
-    'A device that cycled twenty accounts yesterday still shows as suspicious in a month, while the burst that timed out the model during the incident shows zero attempts on the dashboard.',
-    '`window_keys` buckets by day with no `EXPIRE`, `record_attempt` runs after `model.score` with two plain `INCR` calls, and `should_alert` compares against literals the snapshot does not report.',
-    'Move `record_attempt` above `model.score`; make it one `redis.eval(VELOCITY_LUA, …)` that does `INCR` + `EXPIRE` on the hour key and `PFADD`/`PFCOUNT` on the day key; read thresholds from `VELOCITY_RULES` in both `velocity_snapshot` and `should_alert`.',
-  ],
-  debrief: `The fix moves the count ahead of the model call because the counter exists for the attempts the model does not get to answer: a burst that times out the model is exactly the burst the window must see. Putting both keys in one Lua script keeps the card count and the device set consistent under concurrent attempts, and setting the TTL on the first write of a bucket turns a counter into a window that forgets on schedule. \`PFADD\`/\`PFCOUNT\` matches the rule being enforced, distinct accounts rather than attempts. Production velocity stores go further: a sorted set gives a sliding rather than a bucketed rate, hash tags keep the card and device keys in one cluster slot so the script stays atomic, and the snapshot is published with the decision so a case shows what the scorer saw.
+  harness: {
+    python: `import fraud_scoring_pb2_grpc
+from fraud.features import derive_features
+from fraud.risk_model import ModelPeer
+
+VECTOR = derive_features({"age_days": 400, "chargebacks": 0}, 4200)
+
+
+def _state(ctx):
+    ctx.grpc.serve(fraud_scoring_pb2_grpc.add_ModelServicer_to_server, ModelPeer())
+    return ctx.load("state")
+
+
+def check_atomic_script(ctx):
+    m = _state(ctx)
+    seen = ctx.redis_after("vel:card:c-1", lambda: (ctx.redis.get("vel:card:c-1"), ctx.redis.exists("vel:device:d-1")))
+    got = m.record_attempt("c-1", "d-1", "acct-1")
+    assert seen.fired, "record_attempt never touched vel:card:c-1"
+    assert seen.result in ((None, 0), ("1", 1)), f"right after vel:card:c-1 moved, a concurrent reader saw the card at {seen.result[0]!r} with vel:device:d-1 {'present' if seen.result[1] else 'absent'}: the two windows move in two commands, and a reader or a crash lands between them. Move both in one Lua script"
+    assert (got["card_attempts"], got["device_accounts"]) == (1, 1), f"the first attempt must count 1 on the card and 1 account on the device, got {got}"
+
+
+def check_window_expiry(ctx):
+    m = _state(ctx)
+    for _ in range(3):
+        m.record_attempt("c-1", "d-1", "acct-1")
+    ttl = ctx.redis.ttl("vel:card:c-1")
+    assert 0 < ttl <= 3600, f"vel:card:c-1 has TTL {ttl}: the card window must expire ATTEMPT_WINDOW_S (3600 s) after its first write"
+    ttl = ctx.redis.ttl("vel:device:d-1")
+    assert 3600 < ttl <= 86400, f"vel:device:d-1 has TTL {ttl}: the device window must expire DEVICE_WINDOW_S (86400 s) after its first write"
+    ctx.clock.advance(3601)
+    got = m.record_attempt("c-1", "d-1", "acct-2")
+    assert got["card_attempts"] == 1, f"an hour after its first attempt the card still counts {got['card_attempts']} attempts: the window never closes, so a busy card stays flagged"
+    assert got["device_accounts"] == 2, f"inside the day the device must count acct-1 and acct-2, got {got['device_accounts']}"
+    ctx.clock.advance(86400)
+    got = m.record_attempt("c-1", "d-1", "acct-3")
+    assert got["device_accounts"] == 1, f"a day later the device still counts {got['device_accounts']} accounts: its window must expire"
+
+
+def check_count_before_model(ctx):
+    m = _state(ctx)
+    scored = m.score_with_velocity(VECTOR, "c-1", "d-1", "acct-1")
+    assert scored.get("band") == "approve" and scored["velocity"]["card_attempts"] == 1, f"a first attempt must be scored and counted, got {scored}"
+    refused = {**VECTOR, "feature_version": "fx-2"}
+    try:
+        m.score_with_velocity(refused, "c-1", "d-1", "acct-1")
+    except m.model.InvalidFeatures:
+        pass
+    else:
+        raise AssertionError("the model refuses a vector at fx-2 with INVALID_ARGUMENT: score_with_velocity must let model.InvalidFeatures through")
+    attempts = ctx.redis.get("vel:card:c-1")
+    assert attempts == "2", f"after two attempts, one the model refused, vel:card:c-1 holds {attempts!r}: an attempt the model did not score must still be counted. Record it before calling the model"
+
+
+def check_distinct_accounts(ctx):
+    m = _state(ctx)
+    m.record_attempt("c-1", "d-1", "acct-1")
+    m.record_attempt("c-2", "d-1", "acct-1")
+    got = m.record_attempt("c-3", "d-1", "acct-2")
+    assert got["device_accounts"] == 2, f"three attempts by two accounts on device d-1 counted {got['device_accounts']}: the device window counts distinct accounts, not attempts"
+    snapshot = m.velocity_snapshot("c-3", "d-1")
+    assert snapshot["device_accounts"] == 2, f"velocity_snapshot reports {snapshot['device_accounts']} accounts on d-1, expected 2"
+
+
+def check_shared_rules(ctx):
+    m = _state(ctx)
+    for i in range(5):
+        m.record_attempt("c-1", f"d-{i}", "acct-1")
+    snapshot = m.velocity_snapshot("c-1", "d-0")
+    assert snapshot.get("flags") == [] and not m.should_alert(snapshot), f"five attempts is the limit, not over it: the snapshot {snapshot} and should_alert must both say no"
+    m.record_attempt("c-1", "d-0", "acct-1")
+    snapshot = m.velocity_snapshot("c-1", "d-0")
+    assert snapshot.get("flags") == ["card_attempts_per_hour"], f"six attempts on c-1 must flag card_attempts_per_hour (VELOCITY_RULES: 5), the snapshot is {snapshot}"
+    assert m.should_alert(snapshot), f"the snapshot flags card_attempts_per_hour but should_alert says no: the alert reads other thresholds than VELOCITY_RULES ({snapshot})"
+    for account in ("acct-2", "acct-3", "acct-4", "acct-5"):
+        m.record_attempt("c-9", "d-7", account)
+    snapshot = m.velocity_snapshot("c-9", "d-7")
+    assert snapshot.get("flags") == ["device_accounts_per_day"] and m.should_alert(snapshot), f"four accounts on d-7 must flag device_accounts_per_day (VELOCITY_RULES: 3) and alert, the snapshot is {snapshot}, should_alert {m.should_alert(snapshot)}"
 `,
+    typescript: `const VECTOR = {feature_version: 'fx-3', account_age_days: 400, prior_chargebacks: 0, amount_cents: 4200};
+
+function state(ctx) {
+  const {modelPeer} = ctx.load('/support/fraud/risk_model.ts');
+  ctx.grpc.serve(ctx.proto('fraud_scoring.proto').fraudscore.Model.service, modelPeer);
+  return ctx.load('state');
+}
+
+export async function check_atomic_script(ctx) {
+  const m = state(ctx);
+  const seen = ctx.redisAfter('vel:card:c-1', () => [ctx.redis.get('vel:card:c-1'), ctx.redis.exists('vel:device:d-1')]);
+  const got = await m.recordAttempt('c-1', 'd-1', 'acct-1');
+  assert(seen.fired, 'recordAttempt never touched vel:card:c-1');
+  const [card, device] = seen.result;
+  assert((card === null && device === 0) || (card === '1' && device === 1), \`right after vel:card:c-1 moved, a concurrent reader saw the card at \${JSON.stringify(card)} with vel:device:d-1 \${device ? 'present' : 'absent'}: the two windows move in two commands, and a reader or a crash lands between them. Move both in one Lua script\`);
+  assert(got.card_attempts === 1 && got.device_accounts === 1, \`the first attempt must count 1 on the card and 1 account on the device, got \${JSON.stringify(got)}\`);
+}
+
+export async function check_window_expiry(ctx) {
+  const m = state(ctx);
+  for (let i = 0; i < 3; i++) await m.recordAttempt('c-1', 'd-1', 'acct-1');
+  let ttl = ctx.redis.ttl('vel:card:c-1');
+  assert(0 < ttl && ttl <= 3600, \`vel:card:c-1 has TTL \${ttl}: the card window must expire ATTEMPT_WINDOW_S (3600 s) after its first write\`);
+  ttl = ctx.redis.ttl('vel:device:d-1');
+  assert(3600 < ttl && ttl <= 86400, \`vel:device:d-1 has TTL \${ttl}: the device window must expire DEVICE_WINDOW_S (86400 s) after its first write\`);
+  ctx.clock.advance(3601);
+  let got = await m.recordAttempt('c-1', 'd-1', 'acct-2');
+  assert.equal(got.card_attempts, 1, \`an hour after its first attempt the card still counts \${got.card_attempts} attempts: the window never closes, so a busy card stays flagged\`);
+  assert.equal(got.device_accounts, 2, \`inside the day the device must count acct-1 and acct-2, got \${got.device_accounts}\`);
+  ctx.clock.advance(86400);
+  got = await m.recordAttempt('c-1', 'd-1', 'acct-3');
+  assert.equal(got.device_accounts, 1, \`a day later the device still counts \${got.device_accounts} accounts: its window must expire\`);
+}
+
+export async function check_count_before_model(ctx) {
+  const m = state(ctx);
+  const scored = await m.scoreWithVelocity(VECTOR, 'c-1', 'd-1', 'acct-1');
+  assert(scored.band === 'approve' && scored.velocity.card_attempts === 1, \`a first attempt must be scored and counted, got \${JSON.stringify(scored)}\`);
+  let refused = false;
+  try {
+    await m.scoreWithVelocity({...VECTOR, feature_version: 'fx-2'}, 'c-1', 'd-1', 'acct-1');
+  } catch (e) {
+    refused = (e as Error).constructor.name === 'InvalidFeatures';
+  }
+  assert(refused, 'the model refuses a vector at fx-2 with INVALID_ARGUMENT: scoreWithVelocity must let InvalidFeatures through');
+  const attempts = ctx.redis.get('vel:card:c-1');
+  assert.equal(attempts, '2', \`after two attempts, one the model refused, vel:card:c-1 holds \${JSON.stringify(attempts)}: an attempt the model did not score must still be counted. Record it before calling the model\`);
+}
+
+export async function check_distinct_accounts(ctx) {
+  const m = state(ctx);
+  await m.recordAttempt('c-1', 'd-1', 'acct-1');
+  await m.recordAttempt('c-2', 'd-1', 'acct-1');
+  const got = await m.recordAttempt('c-3', 'd-1', 'acct-2');
+  assert.equal(got.device_accounts, 2, \`three attempts by two accounts on device d-1 counted \${got.device_accounts}: the device window counts distinct accounts, not attempts\`);
+  const snapshot = await m.velocitySnapshot('c-3', 'd-1');
+  assert.equal(snapshot.device_accounts, 2, \`velocitySnapshot reports \${snapshot.device_accounts} accounts on d-1, expected 2\`);
+}
+
+export async function check_shared_rules(ctx) {
+  const m = state(ctx);
+  for (let i = 0; i < 5; i++) await m.recordAttempt('c-1', \`d-\${i}\`, 'acct-1');
+  let snapshot = await m.velocitySnapshot('c-1', 'd-0');
+  assert((snapshot.flags ?? []).length === 0 && !m.shouldAlert(snapshot), \`five attempts is the limit, not over it: the snapshot \${JSON.stringify(snapshot)} and shouldAlert must both say no\`);
+  await m.recordAttempt('c-1', 'd-0', 'acct-1');
+  snapshot = await m.velocitySnapshot('c-1', 'd-0');
+  assert.deepStrictEqual(snapshot.flags, ['card_attempts_per_hour'], \`six attempts on c-1 must flag card_attempts_per_hour (VELOCITY_RULES: 5), the snapshot is \${JSON.stringify(snapshot)}\`);
+  assert(m.shouldAlert(snapshot), \`the snapshot flags card_attempts_per_hour but shouldAlert says no: the alert reads other thresholds than VELOCITY_RULES (\${JSON.stringify(snapshot)})\`);
+  for (const account of ['acct-2', 'acct-3', 'acct-4', 'acct-5']) await m.recordAttempt('c-9', 'd-7', account);
+  snapshot = await m.velocitySnapshot('c-9', 'd-7');
+  assert(JSON.stringify(snapshot.flags) === '["device_accounts_per_day"]' && m.shouldAlert(snapshot), \`four accounts on d-7 must flag device_accounts_per_day (VELOCITY_RULES: 3) and alert, the snapshot is \${JSON.stringify(snapshot)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"fraud/features"
+	pb "fraud/gen/fraud_scoring"
+	"fraud/model"
+	"fraud/riskmodel"
+
+	"leetbuild/harness"
+)
+
+var (
+	stateBg     = context.Background()
+	stateVector = features.Features{AccountAgeDays: 400, AmountCents: 4200, FeatureVersion: features.FeatureVersion, PriorChargebacks: 0}
+)
+
+func serveModel(ctx *harness.Ctx) {
+	pb.RegisterModelServer(ctx.GRPC.Server(""), riskmodel.Peer{})
+}
+
+func mustRecord(ctx *harness.Ctx, cardRef, deviceID, accountRef string) velocity {
+	v, err := recordAttempt(stateBg, cardRef, deviceID, accountRef)
+	ctx.NoError(err, "recordAttempt(%s, %s, %s) failed", cardRef, deviceID, accountRef)
+	return v
+}
+
+func mustSnapshot(ctx *harness.Ctx, cardRef, deviceID string) velocity {
+	v, err := velocitySnapshot(stateBg, cardRef, deviceID)
+	ctx.NoError(err, "velocitySnapshot(%s, %s) failed", cardRef, deviceID)
+	return v
+}
+
+func CheckAtomicScript(ctx *harness.Ctx) {
+	serveModel(ctx)
+	seen := ctx.Redis.After("vel:card:c-1", func() any {
+		card, _ := ctx.Redis.Get("vel:card:c-1")
+		return fmt.Sprintf("%s/%d", card, ctx.Redis.Exists("vel:device:d-1"))
+	})
+	got := mustRecord(ctx, "c-1", "d-1", "acct-1")
+	ctx.Assert(seen.Fired, "recordAttempt never touched vel:card:c-1")
+	ctx.Assert(seen.Result == "/0" || seen.Result == "1/1", "right after vel:card:c-1 moved, a concurrent reader saw card/device-exists %v: the two windows move in two commands, and a reader or a crash lands between them. Move both in one Lua script", seen.Result)
+	ctx.Assert(got.CardAttempts == 1 && got.DeviceAccounts == 1, "the first attempt must count 1 on the card and 1 account on the device, got %+v", got)
+}
+
+func CheckWindowExpiry(ctx *harness.Ctx) {
+	serveModel(ctx)
+	for i := 0; i < 3; i++ {
+		mustRecord(ctx, "c-1", "d-1", "acct-1")
+	}
+	ttl := ctx.Redis.TTL("vel:card:c-1")
+	ctx.Assert(0 < ttl && ttl <= 3600, "vel:card:c-1 has TTL %d: the card window must expire attemptWindowSeconds (3600 s) after its first write", ttl)
+	ttl = ctx.Redis.TTL("vel:device:d-1")
+	ctx.Assert(3600 < ttl && ttl <= 86400, "vel:device:d-1 has TTL %d: the device window must expire deviceWindowSeconds (86400 s) after its first write", ttl)
+	ctx.Clock.Advance(3601)
+	got := mustRecord(ctx, "c-1", "d-1", "acct-2")
+	ctx.Equal(got.CardAttempts, 1, "an hour after its first attempt the card window must start over (it never closes, so a busy card stays flagged); the attempts")
+	ctx.Equal(got.DeviceAccounts, 2, "inside the day the device must count acct-1 and acct-2; the accounts")
+	ctx.Clock.Advance(86400)
+	got = mustRecord(ctx, "c-1", "d-1", "acct-3")
+	ctx.Equal(got.DeviceAccounts, 1, "a day later the device window must start over; the accounts")
+}
+
+func CheckCountBeforeModel(ctx *harness.Ctx) {
+	serveModel(ctx)
+	verdict, v, err := scoreWithVelocity(stateBg, stateVector, "c-1", "d-1", "acct-1")
+	ctx.NoError(err, "a first attempt failed")
+	ctx.Assert(verdict.Band == "approve" && v.CardAttempts == 1, "a first attempt must be scored and counted, got %+v %+v", verdict, v)
+	refused := stateVector
+	refused.FeatureVersion = "fx-2"
+	_, _, err = scoreWithVelocity(stateBg, refused, "c-1", "d-1", "acct-1")
+	ctx.Assert(errors.Is(err, model.ErrInvalidFeatures), "the model refuses a vector at fx-2 with InvalidArgument: scoreWithVelocity must return model.ErrInvalidFeatures, got %v", err)
+	attempts, _ := ctx.Redis.Get("vel:card:c-1")
+	ctx.Equal(attempts, "2", "after two attempts, one the model refused, an attempt the model did not score must still be counted (record it before calling the model); vel:card:c-1")
+}
+
+func CheckDistinctAccounts(ctx *harness.Ctx) {
+	serveModel(ctx)
+	mustRecord(ctx, "c-1", "d-1", "acct-1")
+	mustRecord(ctx, "c-2", "d-1", "acct-1")
+	got := mustRecord(ctx, "c-3", "d-1", "acct-2")
+	ctx.Equal(got.DeviceAccounts, 2, "three attempts by two accounts on device d-1: the device window counts distinct accounts, not attempts; the accounts")
+	ctx.Equal(mustSnapshot(ctx, "c-3", "d-1").DeviceAccounts, 2, "velocitySnapshot's accounts on d-1")
+}
+
+func CheckSharedRules(ctx *harness.Ctx) {
+	serveModel(ctx)
+	for i := 0; i < 5; i++ {
+		mustRecord(ctx, "c-1", fmt.Sprintf("d-%d", i), "acct-1")
+	}
+	snapshot := mustSnapshot(ctx, "c-1", "d-0")
+	ctx.Assert(len(snapshot.Flags) == 0 && !shouldAlert(snapshot), "five attempts is the limit, not over it: the snapshot %+v and shouldAlert must both say no", snapshot)
+	mustRecord(ctx, "c-1", "d-0", "acct-1")
+	snapshot = mustSnapshot(ctx, "c-1", "d-0")
+	ctx.Assert(len(snapshot.Flags) == 1 && snapshot.Flags[0] == "card_attempts_per_hour", "six attempts on c-1 must flag card_attempts_per_hour (velocityRules: 5), the snapshot is %+v", snapshot)
+	ctx.Assert(shouldAlert(snapshot), "the snapshot flags card_attempts_per_hour but shouldAlert says no: the alert reads other thresholds than velocityRules (%+v)", snapshot)
+	for _, account := range []string{"acct-2", "acct-3", "acct-4", "acct-5"} {
+		mustRecord(ctx, "c-9", "d-7", account)
+	}
+	snapshot = mustSnapshot(ctx, "c-9", "d-7")
+	ctx.Assert(len(snapshot.Flags) == 1 && snapshot.Flags[0] == "device_accounts_per_day" && shouldAlert(snapshot), "four accounts on d-7 must flag device_accounts_per_day (velocityRules: 3) and alert, the snapshot is %+v", snapshot)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <optional>
+#include <string>
+
+#include "fraud/risk_model.h"
+#include "fraud_scoring.grpc.pb.h"
+
+namespace {
+
+const features::Features kVector{features::kFeatureVersion, 400, 0, 4200};
+
+void serveModel(harness::Ctx& ctx) {
+  static riskmodel::Peer* peer = nullptr;
+  delete peer;
+  peer = new riskmodel::Peer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+}
+
+}  // namespace
+
+void CheckAtomicScript(harness::Ctx& ctx) {
+  serveModel(ctx);
+  auto seen = std::make_shared<std::optional<std::string>>();
+  ctx.Redis.After("vel:card:c-1", [&ctx, seen] {
+    *seen = ctx.Redis.Get("vel:card:c-1").value_or("") + "/" + std::to_string(ctx.Redis.Exists("vel:device:d-1"));
+  });
+  const Velocity got = recordAttempt("c-1", "d-1", "acct-1");
+  ctx.Assert(seen->has_value(), "recordAttempt never touched vel:card:c-1");
+  ctx.Assert(**seen == "/0" || **seen == "1/1",
+             "right after vel:card:c-1 moved, a concurrent reader saw card/device-exists %s: the two windows move in two commands, and a reader or a crash lands between them. Move both in one Lua script",
+             **seen);
+  ctx.Assert(got.card_attempts == 1 && got.device_accounts == 1, "the first attempt must count 1 on the card and 1 account on the device, got %d and %d", got.card_attempts, got.device_accounts);
+}
+
+void CheckWindowExpiry(harness::Ctx& ctx) {
+  serveModel(ctx);
+  for (int i = 0; i < 3; i++) recordAttempt("c-1", "d-1", "acct-1");
+  long long ttl = ctx.Redis.TTL("vel:card:c-1");
+  ctx.Assert(0 < ttl && ttl <= 3600, "vel:card:c-1 has TTL %d: the card window must expire kAttemptWindowSeconds (3600 s) after its first write", ttl);
+  ttl = ctx.Redis.TTL("vel:device:d-1");
+  ctx.Assert(3600 < ttl && ttl <= 86400, "vel:device:d-1 has TTL %d: the device window must expire kDeviceWindowSeconds (86400 s) after its first write", ttl);
+  ctx.Clock.Advance(3601);
+  Velocity got = recordAttempt("c-1", "d-1", "acct-2");
+  ctx.Equal(got.card_attempts, 1, "an hour after its first attempt the card window must start over (it never closes, so a busy card stays flagged); the attempts");
+  ctx.Equal(got.device_accounts, 2, "inside the day the device must count acct-1 and acct-2; the accounts");
+  ctx.Clock.Advance(86400);
+  got = recordAttempt("c-1", "d-1", "acct-3");
+  ctx.Equal(got.device_accounts, 1, "a day later the device window must start over; the accounts");
+}
+
+void CheckCountBeforeModel(harness::Ctx& ctx) {
+  serveModel(ctx);
+  const auto [verdict, v] = scoreWithVelocity(kVector, "c-1", "d-1", "acct-1");
+  ctx.Assert(verdict.band == "approve" && v.card_attempts == 1, "a first attempt must be scored and counted, got band %s and %d attempts", verdict.band, v.card_attempts);
+  features::Features refused = kVector;
+  refused.feature_version = "fx-2";
+  bool threw = false;
+  try {
+    scoreWithVelocity(refused, "c-1", "d-1", "acct-1");
+  } catch (const model::InvalidFeatures&) {
+    threw = true;
+  }
+  ctx.Assert(threw, "the model refuses a vector at fx-2 with INVALID_ARGUMENT: scoreWithVelocity must let model::InvalidFeatures through");
+  ctx.Equal(ctx.Redis.Get("vel:card:c-1"), std::optional<std::string>("2"),
+            "after two attempts, one the model refused, an attempt the model did not score must still be counted (record it before calling the model); vel:card:c-1");
+}
+
+void CheckDistinctAccounts(harness::Ctx& ctx) {
+  serveModel(ctx);
+  recordAttempt("c-1", "d-1", "acct-1");
+  recordAttempt("c-2", "d-1", "acct-1");
+  const Velocity got = recordAttempt("c-3", "d-1", "acct-2");
+  ctx.Equal(got.device_accounts, 2, "three attempts by two accounts on device d-1: the device window counts distinct accounts, not attempts; the accounts");
+  ctx.Equal(velocitySnapshot("c-3", "d-1").device_accounts, 2, "velocitySnapshot's accounts on d-1");
+}
+
+void CheckSharedRules(harness::Ctx& ctx) {
+  serveModel(ctx);
+  for (int i = 0; i < 5; i++) recordAttempt("c-1", "d-" + std::to_string(i), "acct-1");
+  Velocity snapshot = velocitySnapshot("c-1", "d-0");
+  ctx.Assert(snapshot.flags.empty() && !shouldAlert(snapshot), "five attempts is the limit, not over it: the snapshot flags %q and shouldAlert must both say no", snapshot.flags);
+  recordAttempt("c-1", "d-0", "acct-1");
+  snapshot = velocitySnapshot("c-1", "d-0");
+  ctx.Equal(snapshot.flags, std::vector<std::string>{"card_attempts_per_hour"}, "six attempts on c-1 must flag card_attempts_per_hour (kVelocityRules: 5); the flags");
+  ctx.Assert(shouldAlert(snapshot), "the snapshot flags card_attempts_per_hour but shouldAlert says no: the alert reads other thresholds than kVelocityRules");
+  for (const std::string account : {"acct-2", "acct-3", "acct-4", "acct-5"}) recordAttempt("c-9", "d-7", account);
+  snapshot = velocitySnapshot("c-9", "d-7");
+  ctx.Assert(snapshot.flags == std::vector<std::string>{"device_accounts_per_day"} && shouldAlert(snapshot),
+             "four accounts on d-7 must flag device_accounts_per_day (kVelocityRules: 3) and alert, the flags are %q", snapshot.flags);
+}
+`,
+  },
+  hints: [
+    'Fail the model on purpose: the card counter does not move. Score three times from one device with two accounts: the device says three. Wait a day: the counts are still there, and six attempts never alert.',
+    '`score_with_velocity` counts after the model returns, so an exception skips the count. Both counters are plain `INCR`s with no expiry, sent as two commands, and `should_alert` keeps its own numbers.',
+    'One `EVAL`: `INCR` the card key (`EXPIRE` when it is 1), `SADD` the account to the device key (`EXPIRE` when `TTL` is -1), return both counts. Call `record_attempt` first; build `flags` and `should_alert` from `VELOCITY_RULES`.',
+  ],
+  debrief: `Counting before scoring is what makes velocity a defence: a card-testing script lives on failed attempts, so an attempt the model never answered is still an attempt. The script makes the two windows one fact, and the set makes the device rule about people rather than retries. Windows that open with the first attempt and expire on their own are the cheapest correct shape; their weak spot is the boundary, where a burst split across two windows reads as two half-bursts. Production velocity stores slide the window (a sorted set of timestamps, or two buckets weighted by overlap), count distinct accounts with HyperLogLog at scale, and version the rule table so a decision records which thresholds applied.`,
 };

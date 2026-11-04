@@ -1,68 +1,68 @@
 import type {Problem} from '@/lib/types';
 
-import {dependencyStep} from './steps/dependency';
-import {endpointStep} from './steps/endpoint';
-import {eventsStep} from './steps/events';
-import {readStep} from './steps/read';
-import {stateStep} from './steps/state';
+import {protoFiles, protoModules} from './proto';
+import {endpointStep} from './steps/1-endpoint';
+import {stateStep} from './steps/2-state';
+import {dependencyStep} from './steps/3-dependency';
+import {eventsStep} from './steps/4-events';
+import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * KYC verification: the course is not "call an identity vendor from an endpoint", it is the
  * debugging you owe a verification flow before it decides who gets an account. A submission
- * endpoint whose verdict is never the caller's → atomic attempt and case state in Redis → a vendor
- * call with a 10-second deadline whose only failure outcome is a human → applicant-keyed decision
- * events carrying digests instead of documents → a scoped status read that hands out short-lived
- * document links.
+ * endpoint whose verdict is never the caller's → one atomic attempt script and one SET NX case
+ * claim in Redis → a vendor call with a 10-second deadline whose only failure outcome is a person →
+ * applicant-keyed decision events carrying digests after the decision commits → a tenant-scoped
+ * status read that hands out expiring document links.
  */
 export const kycVerificationProblem: Problem = {
   id: 'kyc-verification',
   title: 'KYC Verification',
-  tagline: 'Identity verification where the service owns the verdict and document links expire.',
+  tagline: 'Identity cases with an attempt cap, a vendor deadline, decision events and expiring document links.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# KYC Verification
 
-KYC verification decides whether a person may be given an account: it collects documents, checks
-them against an identity vendor, records a decision, and keeps that decision auditable for years.
+KYC verification decides whether a person may be given an account: it collects identity documents,
+checks them with a vendor, records a decision and keeps it auditable. Most of its flaws raise
+conversion: a verdict the caller sets, an approval on a vendor timeout, a document link that never
+expires.
 
 ## The real system
 
-Stripe Identity models each check as a \`VerificationSession\` whose status moves asynchronously:
-the integrator receives an \`identity.verification_session.verified\` or
-\`identity.verification_session.requires_input\` webhook, and on a failure reads \`last_error.code\`
-(\`document_expired\`, \`selfie_face_mismatch\`) with a separate \`last_error.reason\` meant for the
-user. That split between a machine code and a customer-facing message, and a status the caller reads
-rather than sets, is the shape this course builds.
+Stripe Identity models each check as a \`VerificationSession\` whose \`status\` the integrator reads
+rather than sets (\`processing\`, \`verified\`, \`requires_input\`), announces changes as webhook
+events such as \`identity.verification_session.requires_input\`, and explains a failure in
+\`last_error.code\` (\`document_expired\`) separately from a message meant for the user. This course
+builds the same split: the service owns the status, and the caller sees codes it can act on.
 
 ## What you build here
 
-One service, **kycd**, with five pieces:
+One service, **kycd**, on the provided \`kyc\` package: \`kyc.cases\` (the case store: \`new_id\`,
+\`create\`, \`load\`, \`decide\`, \`lookup\`, \`lookup_any\`; hash \`kyc:case:{case_id}\`),
+\`kyc.storage\` (\`put\`, \`fetch\`, \`url\`, \`sign\`, \`resolve\`) and \`kyc.intake\` (step 2's two
+functions, provided to step 1):
 
-1. \`POST /v1/verifications\`: an authenticated tenant, an applicant reference, document references
-   from tenant storage and a document type from an allowlist. The caller submits; the service
-   decides: a \`status\` field in the body is ignored and the case opens \`pending\`. Attempts per
-   applicant are bounded, and a non-tenant document reference is refused **before** anything is
-   fetched.
-2. A **Redis** state layer: the attempt bucket and the single active case per applicant, both moved
-   by one atomic script each, so a burst cannot exceed the attempt cap or open two cases. The
-   refusal carries \`Retry-After\`.
-3. A **gRPC** vendor client: \`CheckDocument\` with a 10-second deadline. A timeout or an error routes
-   the case to **manual review** marked \`degraded\`; a rejection is terminal and carries the vendor's
-   reason. No path from a vendor failure to \`approved\` without a human.
-4. A **Kafka** decision path: one \`kyc.decided\` event per decision, keyed by the applicant reference
-   so their history stays ordered, carrying the decision, the reasons and document digests (no
-   document images, names or numbers), published only **after** the decision record commits.
-5. \`GET /v1/applicants/{id}/status\`: the decision, the reason codes and whether the case is
-   \`degraded\` or awaiting a human. A foreign applicant is **404**, refusal reasons are the
-   customer-facing set, and document images are reachable only through a short-lived signed link.
+1. \`POST /v1/verifications\` with \`X-Tenant-Id\` and \`{applicant, documents: [{type, ref}]}\`: an
+   allowlisted type, a \`ref\` under \`documents/{tenant}/\`, a case that opens \`pending\`.
+2. **Redis** intake state: \`reserve_attempt\` moves \`kyc:attempts:{tenant}:{applicant}\` in one Lua
+   script (4 per hour, the refusal carries the seconds left); \`open_case\` claims
+   \`kyc:active:{tenant}:{applicant}\` with \`SET NX\`.
+3. **gRPC** \`IdentityVendor.CheckDocument\` under a 10-second deadline: only \`APPROVED\` approves, a
+   rejection is final with the vendor's codes, a timeout or an error goes to \`manual_review\` marked
+   \`degraded\`.
+4. A **Kafka** \`kyc.decided\` event per decision, keyed by the applicant, carrying the decision, the
+   reason codes and document digests, produced after \`decide\` commits by an idempotent producer.
+5. \`GET /v1/applicants/{id}/status\`: the tenant's own applicant only, public reason codes,
+   \`degraded\` and \`awaiting_review\`, and document links that expire after 5 minutes.
 
 ## The debugging habit
 
-Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
-fix it, and prove the fix with checks that fail on the starter and pass on your version. Here the
-flaws often keep conversion up (approving on a timeout, a caller-set verdict, a URL that does not
-expire) and look like features until the regulator asks.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
@@ -72,26 +72,30 @@ retention schedules per jurisdiction.`,
     nodes: [
       {id: 'client', kind: 'client', label: 'Applicant app', sub: 'submit · status', x: 6, y: 50},
       {id: 'api', kind: 'http', label: 'KYC API', sub: 'POST /v1/verifications', x: 30, y: 50},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'attempts · active case', x: 56, y: 12},
-      {id: 'vendor', kind: 'grpc', label: 'Vendor', sub: 'CheckDocument · 10 s', x: 56, y: 44},
-      {id: 'review', kind: 'service', label: 'Review queue', sub: 'manual · degraded', x: 56, y: 76},
-      {id: 'kafka', kind: 'kafka', label: 'kyc.decided', sub: 'key = applicant', x: 80, y: 12},
-      {id: 'consumer', kind: 'service', label: 'Status consumer', sub: 'digests · counters', x: 80, y: 44},
-      {id: 'db', kind: 'db', label: 'Decision store', sub: 'cases · reasons', x: 80, y: 76},
-      {id: 'storage', kind: 'external', label: 'Document storage', sub: 'signed links', x: 30, y: 88},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'attempts · active case · cases', x: 56, y: 12},
+      {id: 'vendor', kind: 'grpc', label: 'Identity vendor', sub: 'CheckDocument · 10 s', x: 56, y: 44},
+      {id: 'review', kind: 'service', label: 'Manual review', sub: 'degraded · awaiting', x: 56, y: 76},
+      {id: 'kafka', kind: 'kafka', label: 'kyc.decided', sub: 'key = applicant', x: 80, y: 30},
+      {id: 'db', kind: 'db', label: 'Case store', sub: 'kyc:case:{id}', x: 80, y: 70},
+      {id: 'storage', kind: 'external', label: 'Document storage', sub: 'digests · signed links', x: 30, y: 88},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'POST /v1/verifications'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'atomic attempt + case'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'reserve_attempt · open_case'},
+      {from: 'api', to: 'storage', kind: 'http', label: 'fetch digest · sign link'},
       {from: 'api', to: 'vendor', kind: 'grpc', label: 'CheckDocument · deadline 10 s'},
-      {from: 'vendor', to: 'review', kind: 'plain', label: 'timeout / error → manual'},
-      {from: 'api', to: 'db', kind: 'plain', label: 'commit decision'},
-      {from: 'api', to: 'kafka', kind: 'kafka', label: 'publish kyc.decided after commit'},
-      {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'redis', kind: 'redis', label: 'HINCRBY counters'},
-      {from: 'api', to: 'storage', kind: 'http', label: 'signed URL'},
+      {from: 'vendor', to: 'review', kind: 'plain', label: 'timeout / error → manual_review'},
+      {from: 'api', to: 'db', kind: 'plain', label: 'decide'},
+      {from: 'api', to: 'kafka', kind: 'kafka', label: 'kyc.decided after decide'},
       {from: 'client', to: 'api', kind: 'http', label: 'GET /v1/applicants/{id}/status'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

@@ -5,833 +5,484 @@ export const dependencyStep: Step = {
   title: 'Worker calls with retry classification and a poison limit',
   concept: 'grpc',
   file: 'client',
-  focus: ['worker', 'effect', 'dlq', 'store'],
+  focus: ['worker', 'effect', 'dlq', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is the worker's execution path, \`execute_job(job)\`: it calls
-\`JobRunner.Execute\` with no deadline in a \`while True\` loop, counts attempts in a local variable,
-appends a \`job_attempts\` row after each failure, and after three failures moves the job to the
-dead-letter queue with the last error string. It compiles, serves the demo and hides four flaws.
+**Starting point.** The starter is \`run_attempt(job_id, worker)\`, one attempt of a job this worker
+claimed: it reads the job (\`store.get_job\`), takes \`attempts + 1\` as the attempt number and calls
+\`JobRunner.Execute\` with no deadline. On an error it records the attempt (\`store.record_attempt\`),
+buries the job once the number reaches \`MAX_ATTEMPTS\` (5) and otherwise schedules the retry for now
+(\`queue.retry_later\`). On success it counts the attempt (\`store.begin_attempt\`), records it and acks.
+It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A payload the executor rejects with \`INVALID_ARGUMENT\` is
-retried forever, and the worker slot never comes back. Every worker restart resets the count to
-zero, so a poison pill lives as long as the fleet keeps restarting. Failures are re-called
-immediately with no backoff and no recorded schedule. The dead-letter record carries one string, so
-the attempts that led there are lost to whoever has to fix the payload.
+**Failure mode the checks target.** A payload the executor rejects is retried as if the executor
+were down; a job that always fails never reaches the dead letter; retries hit an executor that is
+still restarting; a hung executor holds the worker past its claim, so a second worker runs the job.
 
-- Only the retryable statuses (\`RETRYABLE_STATUSES\`: \`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\`,
-  \`RESOURCE_EXHAUSTED\`, \`ABORTED\`) earn another attempt. A permanent status
-  (\`INVALID_ARGUMENT\`, \`FAILED_PRECONDITION\`, \`PERMISSION_DENIED\`, \`NOT_FOUND\`) is
-  dead-lettered on the spot.
-- Attempts are bounded by \`MAX_ATTEMPTS = 5\` and spaced by exponential backoff:
-  \`BACKOFF_BASE_MS = 1000\` doubling per attempt, capped at \`BACKOFF_CAP_MS = 30000\`, with the
-  next due time written to \`next_retry_at\`.
-- The attempt count is durable: every attempt is a row in \`job_attempts\` written before the call
-  (\`begin_attempt\`), and the count is read back from the store (\`attempts\`) when the worker picks
-  the job up.
-- The call carries the claim's visibility timeout as its deadline (\`VISIBILITY_TIMEOUT_S = 60\`).
-- When the attempts are spent, the job moves to \`job_dead_letter\` with reason
-  \`max_attempts_exceeded\` and every attempt's error.`,
+- Only \`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\`, \`RESOURCE_EXHAUSTED\` and \`ABORTED\` are retryable;
+  any other status buries the job at once with reason \`permanent_error\`.
+- \`store.begin_attempt\` counts the attempt on the job record **before** the call; its return is the
+  attempt number.
+- Retry after \`BACKOFF_BASE_MS\` (1 000) doubled per attempt: 1 s, 2 s, 4 s, 8 s.
+- \`Execute\` carries a deadline of \`EXECUTE_TIMEOUT_S\` (30 s), under the 60 s visibility timeout.`,
   sequence: {
-    participants: ['Worker pool', 'Executor service', 'Job store', 'Dead-letter'],
+    participants: ['Worker', 'Job store', 'JobRunner', 'Queue'],
     messages: [
-      {
-        from: 'Worker pool',
-        to: 'Executor service',
-        label: 'JobRunner.Execute · deadline = the claim’s visibility timeout',
-        kind: 'sync',
-      },
-      {from: 'Executor service', to: 'Worker pool', label: 'ABORTED · retryable', kind: 'reply'},
-      {
-        from: 'Worker pool',
-        to: 'Job store',
-        label: 'begin_attempt → job_attempts, then finish_attempt(attempt, error, next_retry_at)',
-        kind: 'async',
-      },
-      {
-        from: 'Worker pool',
-        to: 'Executor service',
-        label: 'retry after 1 s, 2 s, 4 s … capped at 30 s',
-        kind: 'sync',
-      },
-      {from: 'Executor service', to: 'Worker pool', label: 'INVALID_ARGUMENT · permanent', kind: 'reply'},
-      {
-        from: 'Worker pool',
-        to: 'Job store',
-        label: 'attempts(job_id) on resume — the stored count, never zero',
-        kind: 'sync',
-      },
-      {
-        from: 'Worker pool',
-        to: 'Dead-letter',
-        label: 'move(job_id, reason, every attempt’s error)',
-        kind: 'async',
-      },
-      {from: 'Job store', to: 'Worker pool', label: 'attempt rows · errors so far', kind: 'reply'},
+      {from: 'Worker', to: 'Job store', label: 'begin_attempt(job_id) → attempt n', kind: 'sync'},
+      {from: 'Worker', to: 'JobRunner', label: 'Execute(job, attempt n) · deadline 30 s', kind: 'sync'},
+      {from: 'JobRunner', to: 'Worker', label: 'OK → record_attempt · ack', kind: 'reply'},
+      {from: 'JobRunner', to: 'Worker', label: 'UNAVAILABLE · DEADLINE_EXCEEDED · … retryable', kind: 'reply'},
+      {from: 'Worker', to: 'Queue', label: 'retry_later(job_id, now + 1 s · 2^(n-1))', kind: 'sync'},
+      {from: 'JobRunner', to: 'Worker', label: 'INVALID_ARGUMENT · … permanent', kind: 'reply'},
+      {from: 'Worker', to: 'Queue', label: 'bury(job_id, permanent_error | max_attempts_exceeded)', kind: 'sync'},
     ],
   },
   checks: [
     {
       id: 'execute-call',
-      title: 'Drives the claimed job through JobRunner.Execute',
+      title: 'Runs the claimed job through JobRunner.Execute',
       detail:
-        'The worker client dials `jobrunner.JobRunner` and issues `Execute` for the claimed job — the one part of the shape the starter gets right. The deadline, the retry classification and the durable attempt count are what the rest of the checks cover.',
+        'With a healthy executor the attempt answers `completed`: one `Execute` call carries the job id, type, payload and attempt 1, the job is `completed` and out of `jobs:inflight`, and its history holds one successful attempt.',
       match: {
-        python: {all: [/JobRunner/, /\.Execute\(/]},
-        typescript: {all: [/JobRunner/, /\.Execute\(/]},
-        go: {all: [/JobRunner/, /\.Execute\(/]},
-        scala: {all: [/JobRunner/, /\.execute\(/]},
-        cpp: {all: [/JobRunner/, /->Execute\(/]},
+        python: {all: [/runner\.Execute\(/, /job_queue_pb2\.ExecuteRequest\(/]},
+        typescript: {all: [/runner\.Execute\(/]},
+        go: {all: [/runner\.Execute\(/, /pb\.ExecuteRequest\{/]},
+        scala: {all: [/\.execute\(/, /ExecuteRequest\(/]},
+        cpp: {all: [/runner->Execute\(/, /jobqueue::ExecuteRequest/]},
       },
     },
     {
-      id: 'retryable-statuses',
-      title: 'Retries only the retryable statuses; permanent errors bury on the spot',
+      id: 'retry-classes',
+      title: 'Retries only the retryable statuses; a permanent one buries at once',
       detail:
-        'A retryable set separates `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` and `ABORTED` from the permanent codes `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `PERMISSION_DENIED`, `NOT_FOUND`, and a permanent status dead-letters on the first attempt. The starter catches every error the same way and retries it, so a payload the executor rejects forever is retried forever.',
+        '`INVALID_ARGUMENT` buries the job on its first attempt with `dead_reason = permanent_error` and puts it on `jobs:dead`; `UNAVAILABLE` schedules a retry. The starter retries every status alike.',
       match: {
-        python: {
-          all: [
-            /RETRYABLE_STATUSES\s*=/,
-            /StatusCode\.UNAVAILABLE/,
-            /StatusCode\.DEADLINE_EXCEEDED/,
-            /StatusCode\.RESOURCE_EXHAUSTED/,
-            /StatusCode\.ABORTED/,
-            /PERMANENT_STATUSES\s*=/,
-            /StatusCode\.INVALID_ARGUMENT/,
-          ],
-        },
+        python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /RESOURCE_EXHAUSTED/, /ABORTED/, /permanent_error/]},
         typescript: {
           all: [
-            /const RETRYABLE_STATUSES\b/,
             /status\.UNAVAILABLE/,
             /status\.DEADLINE_EXCEEDED/,
             /status\.RESOURCE_EXHAUSTED/,
             /status\.ABORTED/,
-            /const PERMANENT_STATUSES\b/,
-            /status\.INVALID_ARGUMENT/,
+            /permanent_error/,
           ],
         },
         go: {
           all: [
-            /retryableStatuses\s*=/,
             /codes\.Unavailable/,
             /codes\.DeadlineExceeded/,
             /codes\.ResourceExhausted/,
             /codes\.Aborted/,
-            /permanentStatuses\s*=/,
-            /codes\.InvalidArgument/,
+            /permanent_error/,
           ],
         },
         scala: {
           all: [
-            /RetryableStatuses\s*=/,
-            /Status\.Code\.UNAVAILABLE/,
-            /Status\.Code\.DEADLINE_EXCEEDED/,
-            /Status\.Code\.RESOURCE_EXHAUSTED/,
-            /Status\.Code\.ABORTED/,
-            /PermanentStatuses\s*=/,
-            /Status\.Code\.INVALID_ARGUMENT/,
+            /Code\.UNAVAILABLE/,
+            /Code\.DEADLINE_EXCEEDED/,
+            /Code\.RESOURCE_EXHAUSTED/,
+            /Code\.ABORTED/,
+            /permanent_error/,
           ],
         },
         cpp: {
           all: [
-            /kRetryableStatuses\s*=/,
-            /grpc::StatusCode::UNAVAILABLE/,
-            /grpc::StatusCode::DEADLINE_EXCEEDED/,
-            /grpc::StatusCode::RESOURCE_EXHAUSTED/,
-            /grpc::StatusCode::ABORTED/,
-            /kPermanentStatuses\s*=/,
-            /grpc::StatusCode::INVALID_ARGUMENT/,
+            /StatusCode::UNAVAILABLE/,
+            /StatusCode::DEADLINE_EXCEEDED/,
+            /StatusCode::RESOURCE_EXHAUSTED/,
+            /StatusCode::ABORTED/,
+            /permanent_error/,
           ],
         },
       },
     },
     {
-      id: 'backoff-schedule',
-      title: 'Backs off exponentially from 1 s to a 30 s cap, recorded as next_retry_at',
+      id: 'attempts-durable',
+      title: 'Counts the attempt before the call, so a poison job reaches the dead letter',
       detail:
-        'The delay is `BACKOFF_BASE_MS = 1000` doubling per attempt and capped at `BACKOFF_CAP_MS = 30000`, and the moment the next attempt is due is written to `next_retry_at` so the schedule survives the crash too. The starter re-calls immediately and records no retry time.',
+        'Five `UNAVAILABLE` attempts end in `dead` with `max_attempts_exceeded`, the calls carry attempts 1 to 5, and the job record already holds the attempt when `Execute` arrives. The starter counts only attempts that succeeded, so a failing job is attempt 1 forever.',
       match: {
-        python: {
-          all: [
-            /BACKOFF_BASE_MS\s*=\s*1000/,
-            /BACKOFF_CAP_MS\s*=\s*30000/,
-            /2\s*\*\*\s*\(attempt\s*-\s*1\)/,
-            /next_retry_at/,
-          ],
-        },
+        python: {all: [/attempt\s*=\s*store\.begin_attempt\(/], order: [/store\.begin_attempt\(/, /runner\.Execute\(/]},
         typescript: {
-          all: [
-            /BACKOFF_BASE_MS\s*=\s*1000/,
-            /BACKOFF_CAP_MS\s*=\s*30000/,
-            /2\s*\*\*\s*\(attempt\s*-\s*1\)/,
-            /nextRetryAt/,
-          ],
-        },
-        go: {
-          all: [/backoffBaseMs\s*=\s*1000/, /backoffCapMs\s*=\s*30000/, /1\s*<<\s*\(attempt\s*-\s*1\)/, /nextRetryAt/],
-        },
-        scala: {
-          all: [/BackoffBaseMs\s*=\s*1000/, /BackoffCapMs\s*=\s*30000/, /1L\s*<<\s*\(attempt\s*-\s*1\)/, /nextRetryAt/],
-        },
-        cpp: {
-          all: [
-            /kBackoffBaseMs\s*=\s*1000/,
-            /kBackoffCapMs\s*=\s*30000/,
-            /1LL\s*<<\s*\(attempt\s*-\s*1\)/,
-            /next_retry_at/,
-          ],
-        },
-      },
-    },
-    {
-      id: 'attempt-durable',
-      title: 'The attempt row is written before the call; a restart resumes the count',
-      detail:
-        '`MAX_ATTEMPTS = 5` bounds the job, and each attempt is a row in `job_attempts` written before the call (`begin_attempt`) with the count read back from the store on entry (`attempts`). The starter keeps the count in a local variable and writes the row after the call, so a worker restart resets the count to zero and the fifth attempt is never reached.',
-      match: {
-        python: {
-          all: [/MAX_ATTEMPTS\s*=\s*5/, /store\.begin_attempt\(/, /store\.attempts\(/],
-          order: [/store\.begin_attempt\(/, /runner\.Execute\(/],
-          none: [/while\s+True/],
-        },
-        typescript: {
-          all: [/MAX_ATTEMPTS\s*=\s*5/, /store\.beginAttempt\(/, /store\.attempts\(/],
+          all: [/attempt\s*=\s*await store\.beginAttempt\(/],
           order: [/store\.beginAttempt\(/, /runner\.Execute\(/],
-          none: [/while\s*\(\s*true\s*\)/],
         },
         go: {
-          all: [/maxAttempts\s*=\s*5/, /store\.BeginAttempt\(/, /store\.Attempts\(/],
-          order: [/store\.BeginAttempt\(/, /\.Execute\(/],
-          none: [/for\s*\{/],
+          all: [/attempt,\s*err\s*:?=\s*store\.BeginAttempt\(/],
+          order: [/store\.BeginAttempt\(/, /runner\.Execute\(/],
         },
-        scala: {
-          all: [/MaxAttempts\s*=\s*5/, /store\.beginAttempt\(/, /store\.attempts\(/],
-          order: [/store\.beginAttempt\(/, /\.execute\(/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
-        cpp: {
-          all: [/kMaxAttempts\s*=\s*5/, /store->beginAttempt\(/, /store->attempts\(/],
-          order: [/store->beginAttempt\(/, /->Execute\(/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
+        scala: {all: [/attempt\s*=\s*Store\.beginAttempt\(/], order: [/Store\.beginAttempt\(/, /\.execute\(/]},
+        cpp: {all: [/attempt\s*=\s*store::beginAttempt\(/], order: [/store::beginAttempt\(/, /runner->Execute\(/]},
       },
     },
     {
-      id: 'dead-letter-history',
-      title: 'Attempt 5 dead-letters with the reason and every attempt’s error',
+      id: 'backoff',
+      title: 'Spaces retries 1 s, 2 s, 4 s apart',
       detail:
-        'When the attempts are spent the job moves to `job_dead_letter` with `max_attempts_exceeded` and the history of every attempt’s error, not just the last one. The starter’s dead letter carries a single `last_error` string, so the attempts that led there are lost.',
+        'After attempts 1, 2 and 3 fail, the retry is due 1 000, 2 000 and 4 000 ms later (`next_retry_at_ms` and the `jobs:inflight` score). The starter schedules every retry for now.',
       match: {
-        python: {
-          all: [/dlq\.move\(/, /history/, /max_attempts_exceeded/],
-          order: [/history\.append\(/, /dlq\.move\(/],
-          none: [/dlq\.move\([^)]*last_error/],
-        },
-        typescript: {
-          all: [/dlq\.move\(/, /history/, /max_attempts_exceeded/],
-          order: [/history\.push\(/, /dlq\.move\(/],
-          none: [/dlq\.move\([^)]*lastError/],
-        },
-        go: {
-          all: [/dlq\.Move\(/, /history/, /max_attempts_exceeded/],
-          order: [/history\s*=\s*append\(history/, /dlq\.Move\(/],
-          none: [/dlq\.Move\([^)]*lastErr/],
-        },
-        scala: {
-          all: [/dlq\.move\(/, /history/, /max_attempts_exceeded/],
-          order: [/history\s*\+=/, /dlq\.move\(/],
-          none: [/dlq\.move\([^)]*lastError/],
-        },
-        cpp: {
-          all: [/dlq->move\(/, /history/, /max_attempts_exceeded/],
-          order: [/history\.push_back\(/, /dlq->move\(/],
-          none: [/dlq->move\([^)]*last_error/],
-        },
+        python: {all: [/BACKOFF_BASE_MS\s*(\*|<<)/]},
+        typescript: {all: [/BACKOFF_BASE_MS\s*(\*|<<)/]},
+        go: {all: [/backoffBaseMs\s*(\*|<<)/]},
+        scala: {all: [/BackoffBaseMs\s*(\*|<<)/]},
+        cpp: {all: [/kBackoffBaseMs\s*(\*|<<)/]},
+      },
+    },
+    {
+      id: 'call-deadline',
+      title: 'Execute carries a deadline under the visibility timeout',
+      detail:
+        'With an executor that takes 120 s, the call carries a deadline of at most 30 s and the attempt answers `retry`. The starter waits as long as the executor takes, past the 60 s claim, while the reaper hands the job to another worker.',
+      match: {
+        python: {all: [/timeout\s*=\s*EXECUTE_TIMEOUT_S/]},
+        typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*EXECUTE_TIMEOUT_S/]},
+        go: {all: [/context\.WithTimeout\(\s*ctx,\s*executeTimeout\s*\)/]},
+        scala: {all: [/withDeadlineAfter\(\s*ExecuteTimeoutS/]},
+        cpp: {all: [/set_deadline\([^;]*kExecuteTimeout/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""Run a claimed job over gRPC: flawed code that retries every failure forever."""
-import logging
-
-import grpc
-
-import jobrunner_pb2
-import jobrunner_pb2_grpc
-
-logger = logging.getLogger("jobqd")
-
-channel = grpc.insecure_channel("workers:50051")
-runner = jobrunner_pb2_grpc.JobRunnerStub(channel)
-
-
-class JobStore:
-    def append_attempt(self, job_id: str, attempt: int, error: str) -> None:
-        """Append one row to job_attempts."""
-        raise NotImplementedError
-
-
-class DeadLetterQueue:
-    def move(self, job_id: str, reason: str, last_error: str) -> None:
-        """Move the job to job_dead_letter with the last error string."""
-        raise NotImplementedError
-
-
-store = JobStore()
-dlq = DeadLetterQueue()
-
-
-def execute_job(job: dict) -> str:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    attempts = 0
-    last_error = ""
-    while True:
-        attempts += 1
-        request = jobrunner_pb2.ExecuteRequest(job_id=job["job_id"], type=job["type"], payload=job["payload"])
-        try:
-            runner.Execute(request)
-            return "completed"
-        except grpc.RpcError as exc:
-            last_error = f"{exc.code().name}: {exc.details()}"
-            store.append_attempt(job["job_id"], attempts, last_error)
-            logger.info("attempt failed job_id=%s attempts=%d", job["job_id"], attempts)
-            if attempts >= 3:
-                dlq.move(job["job_id"], "too_many_attempts", last_error)
-                return "dead_lettered"
-`,
-      solution: `"""Run one claimed job over gRPC: retry only what is retryable, bury poison pills with their history."""
-import logging
+      starter: `import json
 import time
 
 import grpc
 
-import jobrunner_pb2
-import jobrunner_pb2_grpc
+import job_queue_pb2
+import job_queue_pb2_grpc
+from jobs import queue, store  # queue.ack, retry_later, bury · store.get_job, begin_attempt, record_attempt
 
-logger = logging.getLogger("jobqd")
+MAX_ATTEMPTS = 5
 
-VISIBILITY_TIMEOUT_S = 60
+runner = job_queue_pb2_grpc.JobRunnerStub(grpc.insecure_channel("jobrunner:9000"))
+
+
+def run_attempt(job_id: str, worker: str) -> str:
+    """Run one attempt of a job this worker claimed: "completed", "retry" or "dead"."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    job = store.get_job(job_id)
+    attempt = job["attempts"] + 1
+    request = job_queue_pb2.ExecuteRequest(job_id=job_id, job_type=job["type"], payload=json.dumps(job["payload"]), attempt=attempt)
+    try:
+        runner.Execute(request)
+    except grpc.RpcError as exc:
+        store.record_attempt(job_id, attempt, f"{exc.code().name}: {exc.details()}")
+        if attempt >= MAX_ATTEMPTS:
+            queue.bury(job_id, "max_attempts_exceeded")
+            return "dead"
+        queue.retry_later(job_id, int(time.time() * 1000))
+        return "retry"
+    store.begin_attempt(job_id)
+    store.record_attempt(job_id, attempt, "")
+    queue.ack(job_id, worker)
+    return "completed"
+`,
+      solution: `import json
+import time
+
+import grpc
+
+import job_queue_pb2
+import job_queue_pb2_grpc
+from jobs import queue, store  # queue.ack, retry_later, bury · store.get_job, begin_attempt, record_attempt
+
 MAX_ATTEMPTS = 5
 BACKOFF_BASE_MS = 1000
-BACKOFF_CAP_MS = 30000
-
-RETRYABLE_STATUSES = {
+EXECUTE_TIMEOUT_S = 30  # under the 60 s visibility timeout: the call ends before the claim does
+# The executor may answer differently later; any other status says the job as written will not succeed.
+RETRYABLE = {
     grpc.StatusCode.UNAVAILABLE,
     grpc.StatusCode.DEADLINE_EXCEEDED,
     grpc.StatusCode.RESOURCE_EXHAUSTED,
     grpc.StatusCode.ABORTED,
 }
-PERMANENT_STATUSES = {
-    grpc.StatusCode.INVALID_ARGUMENT,
-    grpc.StatusCode.FAILED_PRECONDITION,
-    grpc.StatusCode.PERMISSION_DENIED,
-    grpc.StatusCode.NOT_FOUND,
-}
 
-channel = grpc.insecure_channel("workers:50051")
-runner = jobrunner_pb2_grpc.JobRunnerStub(channel)
+runner = job_queue_pb2_grpc.JobRunnerStub(grpc.insecure_channel("jobrunner:9000"))
 
 
-class JobStore:
-    """job_attempts: one row per attempt, written before the call so a crash still counts it."""
-
-    def begin_attempt(self, job_id: str, attempt: int) -> None:
-        raise NotImplementedError
-
-    def finish_attempt(self, job_id: str, attempt: int, error: str, next_retry_at: int | None) -> None:
-        raise NotImplementedError
-
-    def attempts(self, job_id: str) -> list[dict]:
-        """The rows the store already holds: a restart resumes from this count, never from zero."""
-        raise NotImplementedError
-
-
-class DeadLetterQueue:
-    """job_dead_letter: the job, a reason, and every attempt's error."""
-
-    def move(self, job_id: str, reason: str, history: list[dict]) -> None:
-        raise NotImplementedError
-
-
-store = JobStore()
-dlq = DeadLetterQueue()
-
-
-def backoff_ms(attempt: int) -> int:
-    """1 s, 2 s, 4 s … doubling per attempt, capped at 30 s."""
-    return min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_CAP_MS)
-
-
-def execute_job(job: dict) -> str:
-    """Run one claimed job: only the retryable statuses earn another attempt."""
-    job_id = job["job_id"]
-    history = list(store.attempts(job_id))
-    attempt = len(history)
-    while attempt < MAX_ATTEMPTS:
-        attempt += 1
-        store.begin_attempt(job_id, attempt)
-        request = jobrunner_pb2.ExecuteRequest(job_id=job_id, type=job["type"], payload=job["payload"])
-        try:
-            runner.Execute(request, timeout=VISIBILITY_TIMEOUT_S)
-        except grpc.RpcError as exc:
-            error = f"{exc.code().name}: {exc.details()}"
-            history.append({"attempt": attempt, "error": error})
-            if exc.code() in PERMANENT_STATUSES or exc.code() not in RETRYABLE_STATUSES:
-                # A permanent error never earns another attempt: dead-letter it on the spot.
-                store.finish_attempt(job_id, attempt, error, None)
-                dlq.move(job_id, "permanent_error", history)
-                logger.info("dead-lettered job_id=%s status=%s", job_id, exc.code().name)
-                return "dead_lettered"
-            last = attempt >= MAX_ATTEMPTS
-            next_retry_at = None if last else int(time.time() * 1000) + backoff_ms(attempt)
-            store.finish_attempt(job_id, attempt, error, next_retry_at)
-            if last:
-                dlq.move(job_id, "max_attempts_exceeded", history)
-                logger.info("dead-lettered job_id=%s attempts=%d", job_id, attempt)
-                return "dead_lettered"
-            logger.info("retrying job_id=%s attempt=%d next_retry_at=%d", job_id, attempt, next_retry_at)
-            time.sleep(backoff_ms(attempt) / 1000)
-        else:
-            store.finish_attempt(job_id, attempt, "", None)
-            return "completed"
-    dlq.move(job_id, "max_attempts_exceeded", history)
-    return "dead_lettered"
+def run_attempt(job_id: str, worker: str) -> str:
+    """Run one attempt of a job this worker claimed: "completed", "retry" or "dead"."""
+    job = store.get_job(job_id)
+    # Counted on the job record before the call: a worker that dies mid-call has still used the attempt.
+    attempt = store.begin_attempt(job_id)
+    request = job_queue_pb2.ExecuteRequest(job_id=job_id, job_type=job["type"], payload=json.dumps(job["payload"]), attempt=attempt)
+    try:
+        runner.Execute(request, timeout=EXECUTE_TIMEOUT_S)
+    except grpc.RpcError as exc:
+        store.record_attempt(job_id, attempt, f"{exc.code().name}: {exc.details()}")
+        if exc.code() not in RETRYABLE:
+            queue.bury(job_id, "permanent_error")
+            return "dead"
+        if attempt >= MAX_ATTEMPTS:
+            queue.bury(job_id, "max_attempts_exceeded")
+            return "dead"
+        queue.retry_later(job_id, int(time.time() * 1000) + BACKOFF_BASE_MS * 2 ** (attempt - 1))
+        return "retry"
+    store.record_attempt(job_id, attempt, "")
+    queue.ack(job_id, worker)
+    return "completed"
 `,
     },
     typescript: {
-      starter: `/** Run a claimed job over gRPC: flawed code that retries every failure forever. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const log = {info: (fields: Record<string, unknown>): void => console.log(JSON.stringify(fields))};
+import * as queue from 'jobs/queue'; // ack, retryLater, bury
+import * as store from 'jobs/store'; // getJob, beginAttempt, recordAttempt
 
-interface RunnerClient {
-  Execute(
-    request: {job_id: string; type: string; payload: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, response: unknown) => void,
-  ): void;
+export const MAX_ATTEMPTS = 5;
+
+interface ExecuteRequest {
+  job_id: string;
+  job_type: string;
+  payload: string;
+  attempt: number;
 }
 
-const {jobrunner} = grpc.loadPackageDefinition(protoLoader.loadSync('jobrunner.proto')) as unknown as {
-  jobrunner: {JobRunner: new (target: string, credentials: grpc.ChannelCredentials) => RunnerClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('job_queue.proto')) as unknown as {
+  jobqueue: {JobRunner: grpc.ServiceClientConstructor};
 };
-const runner = new jobrunner.JobRunner('workers:50051', grpc.credentials.createInsecure());
+const runner = new pkg.jobqueue.JobRunner('jobrunner:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Execute(request: ExecuteRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{result: string}>;
+};
 
-class JobStore {
-  appendAttempt(jobId: string, attempt: number, error: string): void {
-    throw new Error('provided by the platform');
-  }
-}
-
-class DeadLetterQueue {
-  move(jobId: string, reason: string, lastError: string): void {
-    throw new Error('provided by the platform');
-  }
-}
-
-const store = new JobStore();
-const dlq = new DeadLetterQueue();
-
-export async function executeJob(job: {job_id: string; type: string; payload: string}): Promise<string> {
+/** Run one attempt of a job this worker claimed: "completed", "retry" or "dead". */
+export async function runAttempt(jobId: string, worker: string): Promise<string> {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  let attempts = 0;
-  let lastError = '';
-  for (;;) {
-    attempts += 1;
-    try {
-      const {promise, resolve, reject} = Promise.withResolvers<void>();
-      runner.Execute(
-        {job_id: job.job_id, type: job.type, payload: job.payload},
-        new grpc.Metadata(),
-        {},
-        error => (error === null ? resolve() : reject(error)),
-      );
-      await promise;
-      return 'completed';
-    } catch (error) {
-      lastError = (error as grpc.ServiceError).details;
-      store.appendAttempt(job.job_id, attempts, lastError);
-      log.info({job_id: job.job_id, attempts, error: lastError});
-      if (attempts >= 3) {
-        dlq.move(job.job_id, 'too_many_attempts', lastError);
-        return 'dead_lettered';
-      }
+  const job = (await store.getJob(jobId)) as store.Job;
+  const attempt = job.attempts + 1;
+  try {
+    await runner.Execute({job_id: jobId, job_type: job.type, payload: JSON.stringify(job.payload), attempt}, new grpc.Metadata(), {});
+  } catch (e) {
+    const {code, details} = e as grpc.ServiceError;
+    await store.recordAttempt(jobId, attempt, \`\${grpc.status[code]}: \${details}\`);
+    if (attempt >= MAX_ATTEMPTS) {
+      await queue.bury(jobId, 'max_attempts_exceeded');
+      return 'dead';
     }
+    await queue.retryLater(jobId, Date.now());
+    return 'retry';
   }
+  await store.beginAttempt(jobId);
+  await store.recordAttempt(jobId, attempt, '');
+  await queue.ack(jobId, worker);
+  return 'completed';
 }
 `,
-      solution: `/** Run one claimed job over gRPC: retry only the retryable statuses, bury poison pills with history. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const log = {info: (fields: Record<string, unknown>): void => console.log(JSON.stringify(fields))};
+import * as queue from 'jobs/queue'; // ack, retryLater, bury
+import * as store from 'jobs/store'; // getJob, beginAttempt, recordAttempt
 
-export const VISIBILITY_TIMEOUT_S = 60;
 export const MAX_ATTEMPTS = 5;
 export const BACKOFF_BASE_MS = 1000;
-export const BACKOFF_CAP_MS = 30000;
+export const EXECUTE_TIMEOUT_S = 30; // under the 60 s visibility timeout: the call ends before the claim does
+// The executor may answer differently later; any other status says the job as written will not succeed.
+const RETRYABLE = new Set<grpc.status>([
+  grpc.status.UNAVAILABLE,
+  grpc.status.DEADLINE_EXCEEDED,
+  grpc.status.RESOURCE_EXHAUSTED,
+  grpc.status.ABORTED,
+]);
 
-export const RETRYABLE_STATUSES: Record<number, true> = {
-  [grpc.status.UNAVAILABLE]: true,
-  [grpc.status.DEADLINE_EXCEEDED]: true,
-  [grpc.status.RESOURCE_EXHAUSTED]: true,
-  [grpc.status.ABORTED]: true,
-};
-export const PERMANENT_STATUSES: Record<number, true> = {
-  [grpc.status.INVALID_ARGUMENT]: true,
-  [grpc.status.FAILED_PRECONDITION]: true,
-  [grpc.status.PERMISSION_DENIED]: true,
-  [grpc.status.NOT_FOUND]: true,
-};
-
-export interface AttemptRow {
+interface ExecuteRequest {
+  job_id: string;
+  job_type: string;
+  payload: string;
   attempt: number;
-  error: string;
 }
 
-interface RunnerClient {
-  Execute(
-    request: {job_id: string; type: string; payload: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, response: unknown) => void,
-  ): void;
-}
-
-const {jobrunner} = grpc.loadPackageDefinition(protoLoader.loadSync('jobrunner.proto')) as unknown as {
-  jobrunner: {JobRunner: new (target: string, credentials: grpc.ChannelCredentials) => RunnerClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('job_queue.proto')) as unknown as {
+  jobqueue: {JobRunner: grpc.ServiceClientConstructor};
 };
-const runner = new jobrunner.JobRunner('workers:50051', grpc.credentials.createInsecure());
+const runner = new pkg.jobqueue.JobRunner('jobrunner:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Execute(request: ExecuteRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{result: string}>;
+};
 
-class JobStore {
-  /** job_attempts: a row per attempt, written before the call so a crash still counts it. */
-  beginAttempt(jobId: string, attempt: number): void {
-    throw new Error('provided by the platform');
-  }
-
-  finishAttempt(jobId: string, attempt: number, error: string, nextRetryAt: number | null): void {
-    throw new Error('provided by the platform');
-  }
-
-  /** The rows the store already holds: a restart resumes from this count, never from zero. */
-  attempts(jobId: string): AttemptRow[] {
-    throw new Error('provided by the platform');
-  }
-}
-
-class DeadLetterQueue {
-  move(jobId: string, reason: string, history: AttemptRow[]): void {
-    throw new Error('provided by the platform');
-  }
-}
-
-const store = new JobStore();
-const dlq = new DeadLetterQueue();
-
-export function backoffMs(attempt: number): number {
-  return Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_CAP_MS);
-}
-
-export async function executeJob(job: {job_id: string; type: string; payload: string}): Promise<string> {
-  const jobId = job.job_id;
-  const history: AttemptRow[] = [...store.attempts(jobId)];
-  let attempt = history.length;
-  while (attempt < MAX_ATTEMPTS) {
-    attempt += 1;
-    store.beginAttempt(jobId, attempt);
-    try {
-      const {promise, resolve, reject} = Promise.withResolvers<void>();
-      runner.Execute(
-        {job_id: jobId, type: job.type, payload: job.payload},
-        new grpc.Metadata(),
-        {deadline: Date.now() + VISIBILITY_TIMEOUT_S * 1_000},
-        error => (error === null ? resolve() : reject(error)),
-      );
-      await promise;
-      store.finishAttempt(jobId, attempt, '', null);
-      return 'completed';
-    } catch (error) {
-      const serviceError = error as grpc.ServiceError;
-      const message = serviceError.code + ': ' + serviceError.details;
-      history.push({attempt, error: message});
-      if (PERMANENT_STATUSES[serviceError.code] === true || RETRYABLE_STATUSES[serviceError.code] !== true) {
-        // A permanent error never earns another attempt: dead-letter it on the spot.
-        store.finishAttempt(jobId, attempt, message, null);
-        dlq.move(jobId, 'permanent_error', history);
-        log.info({job_id: jobId, code: serviceError.code});
-        return 'dead_lettered';
-      }
-      const last = attempt >= MAX_ATTEMPTS;
-      const nextRetryAt = last ? null : Date.now() + backoffMs(attempt);
-      store.finishAttempt(jobId, attempt, message, nextRetryAt);
-      if (last) {
-        dlq.move(jobId, 'max_attempts_exceeded', history);
-        log.info({job_id: jobId, attempts: attempt});
-        return 'dead_lettered';
-      }
-      log.info({job_id: jobId, attempt, next_retry_at: nextRetryAt});
-      const {promise: retry, resolve: resume} = Promise.withResolvers<void>();
-      setTimeout(resume, backoffMs(attempt));
-      await retry;
+/** Run one attempt of a job this worker claimed: "completed", "retry" or "dead". */
+export async function runAttempt(jobId: string, worker: string): Promise<string> {
+  const job = (await store.getJob(jobId)) as store.Job;
+  // Counted on the job record before the call: a worker that dies mid-call has still used the attempt.
+  const attempt = await store.beginAttempt(jobId);
+  try {
+    await runner.Execute(
+      {job_id: jobId, job_type: job.type, payload: JSON.stringify(job.payload), attempt},
+      new grpc.Metadata(),
+      {deadline: Date.now() + EXECUTE_TIMEOUT_S * 1000},
+    );
+  } catch (e) {
+    const {code, details} = e as grpc.ServiceError;
+    await store.recordAttempt(jobId, attempt, \`\${grpc.status[code]}: \${details}\`);
+    if (!RETRYABLE.has(code)) {
+      await queue.bury(jobId, 'permanent_error');
+      return 'dead';
     }
+    if (attempt >= MAX_ATTEMPTS) {
+      await queue.bury(jobId, 'max_attempts_exceeded');
+      return 'dead';
+    }
+    await queue.retryLater(jobId, Date.now() + BACKOFF_BASE_MS * 2 ** (attempt - 1));
+    return 'retry';
   }
-  dlq.move(jobId, 'max_attempts_exceeded', history);
-  return 'dead_lettered';
+  await store.recordAttempt(jobId, attempt, '');
+  await queue.ack(jobId, worker);
+  return 'completed';
 }
 `,
     },
     go: {
-      starter: `package client
+      starter: `package main
 
 import (
 	"context"
-	"log"
-
-	jobrunnerpb "jobqd/jobrunnerpb"
-)
-
-type AttemptRow struct {
-	Attempt int
-	Error   string
-}
-
-type Job struct {
-	ID      string
-	Type    string
-	Payload string
-}
-
-// JobStore and DeadLetterQueue are the platform's; this step only calls them.
-type JobStore struct{}
-
-func (s *JobStore) AppendAttempt(ctx context.Context, jobID string, attempt int, message string) error {
-	return nil
-}
-
-type DeadLetterQueue struct{}
-
-func (q *DeadLetterQueue) Move(ctx context.Context, jobID, reason, lastError string) error {
-	return nil
-}
-
-var (
-	store = &JobStore{}
-	dlq   = &DeadLetterQueue{}
-)
-
-// ExecuteJob drives one claimed job through the executor.
-func ExecuteJob(ctx context.Context, runner jobrunnerpb.JobRunnerClient, job Job) (string, error) {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	attempts := 0
-	lastError := ""
-	for {
-		attempts++
-		_, err := runner.Execute(ctx, &jobrunnerpb.ExecuteRequest{JobId: job.ID, Type: job.Type, Payload: job.Payload})
-		if err == nil {
-			return "completed", nil
-		}
-		lastError = err.Error()
-		if err := store.AppendAttempt(ctx, job.ID, attempts, lastError); err != nil {
-			return "", err
-		}
-		log.Printf("attempt failed job_id=%s attempts=%d", job.ID, attempts)
-		if attempts >= 3 {
-			if err := dlq.Move(ctx, job.ID, "too_many_attempts", lastError); err != nil {
-				return "", err
-			}
-			return "dead_lettered", nil
-		}
-	}
-}
-`,
-      solution: `package client
-
-import (
-	"context"
+	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
-	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	jobrunnerpb "jobqd/jobrunnerpb"
+	pb "jobs/gen/job_queue"
+	"jobs/queue" // queue.Ack, RetryLater, Bury
+	"jobs/store" // store.GetJob, BeginAttempt, RecordAttempt
+)
+
+const maxAttempts = 5
+
+var (
+	runnerConn, _ = grpc.NewClient("jobrunner:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	runner        = pb.NewJobRunnerClient(runnerConn)
+)
+
+// runAttempt runs one attempt of a job this worker claimed: "completed", "retry" or "dead".
+func runAttempt(ctx context.Context, jobID, worker string) (string, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	job := store.GetJob(ctx, jobID)
+	if job == nil {
+		return "", fmt.Errorf("no job %s", jobID)
+	}
+	attempt := job.Attempts + 1
+	payload, _ := json.Marshal(job.Payload)
+	_, err := runner.Execute(ctx, &pb.ExecuteRequest{JobId: jobID, JobType: job.Type, Payload: string(payload), Attempt: int32(attempt)})
+	if err != nil {
+		st := status.Convert(err)
+		store.RecordAttempt(ctx, jobID, attempt, st.Code().String()+": "+st.Message())
+		if attempt >= maxAttempts {
+			return "dead", queue.Bury(ctx, jobID, "max_attempts_exceeded")
+		}
+		return "retry", queue.RetryLater(ctx, jobID, time.Now().UnixMilli())
+	}
+	store.BeginAttempt(ctx, jobID)
+	store.RecordAttempt(ctx, jobID, attempt, "")
+	_, err = queue.Ack(ctx, jobID, worker)
+	return "completed", err
+}
+`,
+      solution: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	pb "jobs/gen/job_queue"
+	"jobs/queue" // queue.Ack, RetryLater, Bury
+	"jobs/store" // store.GetJob, BeginAttempt, RecordAttempt
 )
 
 const (
-	visibilityTimeoutS = 60
-	maxAttempts        = 5
-	backoffBaseMs      = 1000
-	backoffCapMs       = 30000
+	maxAttempts    = 5
+	backoffBaseMs  = int64(1000)
+	executeTimeout = 30 * time.Second // under the 60 s visibility timeout: the call ends before the claim does
 )
 
-var retryableStatuses = map[codes.Code]bool{
+// retryable: the executor may answer differently later; any other status says the job as written
+// will not succeed.
+var retryable = map[codes.Code]bool{
 	codes.Unavailable:       true,
 	codes.DeadlineExceeded:  true,
 	codes.ResourceExhausted: true,
 	codes.Aborted:           true,
 }
 
-var permanentStatuses = map[codes.Code]bool{
-	codes.InvalidArgument:    true,
-	codes.FailedPrecondition: true,
-	codes.PermissionDenied:   true,
-	codes.NotFound:           true,
-}
-
-type AttemptRow struct {
-	Attempt int
-	Error   string
-}
-
-type Job struct {
-	ID      string
-	Type    string
-	Payload string
-}
-
-// JobStore and DeadLetterQueue are the platform's; this step only calls them.
-type JobStore struct{}
-
-// BeginAttempt inserts the row before the call, so a crash mid-call still counts the attempt.
-func (s *JobStore) BeginAttempt(ctx context.Context, jobID string, attempt int) error { return nil }
-
-func (s *JobStore) FinishAttempt(ctx context.Context, jobID string, attempt int, message string, nextRetryAt int64) error {
-	return nil
-}
-
-// Attempts returns what job_attempts already holds: a restart resumes here, never from zero.
-func (s *JobStore) Attempts(ctx context.Context, jobID string) ([]AttemptRow, error) { return nil, nil }
-
-type DeadLetterQueue struct{}
-
-func (q *DeadLetterQueue) Move(ctx context.Context, jobID, reason string, history []AttemptRow) error {
-	return nil
-}
-
 var (
-	store = &JobStore{}
-	dlq   = &DeadLetterQueue{}
+	runnerConn, _ = grpc.NewClient("jobrunner:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	runner        = pb.NewJobRunnerClient(runnerConn)
 )
 
-// backoffMs doubles the delay from 1 s per attempt and stops at the 30 s cap.
-func backoffMs(attempt int) time.Duration {
-	delay := backoffBaseMs * (1 << (attempt - 1))
-	if delay > backoffCapMs {
-		delay = backoffCapMs
+// runAttempt runs one attempt of a job this worker claimed: "completed", "retry" or "dead".
+func runAttempt(ctx context.Context, jobID, worker string) (string, error) {
+	job := store.GetJob(ctx, jobID)
+	if job == nil {
+		return "", fmt.Errorf("no job %s", jobID)
 	}
-	return time.Duration(delay) * time.Millisecond
-}
-
-// ExecuteJob runs one claimed job: only the retryable statuses earn another attempt.
-func ExecuteJob(ctx context.Context, runner jobrunnerpb.JobRunnerClient, job Job) (string, error) {
-	history, err := store.Attempts(ctx, job.ID)
+	// Counted on the job record before the call: a worker that dies mid-call has still used the attempt.
+	attempt, err := store.BeginAttempt(ctx, jobID)
 	if err != nil {
 		return "", err
 	}
-	attempt := len(history)
-	for attempt < maxAttempts {
-		attempt++
-		if err := store.BeginAttempt(ctx, job.ID, attempt); err != nil {
-			return "", err
+	payload, _ := json.Marshal(job.Payload)
+	callCtx, cancel := context.WithTimeout(ctx, executeTimeout)
+	defer cancel()
+	_, err = runner.Execute(callCtx, &pb.ExecuteRequest{JobId: jobID, JobType: job.Type, Payload: string(payload), Attempt: int32(attempt)})
+	if err != nil {
+		st := status.Convert(err)
+		store.RecordAttempt(ctx, jobID, attempt, st.Code().String()+": "+st.Message())
+		if !retryable[st.Code()] {
+			return "dead", queue.Bury(ctx, jobID, "permanent_error")
 		}
-		callCtx, cancel := context.WithTimeout(ctx, visibilityTimeoutS*time.Second)
-		_, err := runner.Execute(callCtx, &jobrunnerpb.ExecuteRequest{JobId: job.ID, Type: job.Type, Payload: job.Payload})
-		cancel()
-		if err == nil {
-			if err := store.FinishAttempt(ctx, job.ID, attempt, "", 0); err != nil {
-				return "", err
-			}
-			return "completed", nil
+		if attempt >= maxAttempts {
+			return "dead", queue.Bury(ctx, jobID, "max_attempts_exceeded")
 		}
-		code := status.Code(err)
-		message := fmt.Sprintf("%s: %v", code, err)
-		history = append(history, AttemptRow{Attempt: attempt, Error: message})
-		if permanentStatuses[code] || !retryableStatuses[code] {
-			// A permanent error never earns another attempt: dead-letter it on the spot.
-			if err := store.FinishAttempt(ctx, job.ID, attempt, message, 0); err != nil {
-				return "", err
-			}
-			if err := dlq.Move(ctx, job.ID, "permanent_error", history); err != nil {
-				return "", err
-			}
-			log.Printf("dead-lettered job_id=%s status=%s", job.ID, code)
-			return "dead_lettered", nil
-		}
-		last := attempt >= maxAttempts
-		var nextRetryAt int64
-		if !last {
-			nextRetryAt = time.Now().Add(backoffMs(attempt)).UnixMilli()
-		}
-		if err := store.FinishAttempt(ctx, job.ID, attempt, message, nextRetryAt); err != nil {
-			return "", err
-		}
-		if last {
-			if err := dlq.Move(ctx, job.ID, "max_attempts_exceeded", history); err != nil {
-				return "", err
-			}
-			log.Printf("dead-lettered job_id=%s attempts=%d", job.ID, attempt)
-			return "dead_lettered", nil
-		}
-		log.Printf("retrying job_id=%s attempt=%d next_retry_at=%d", job.ID, attempt, nextRetryAt)
-		time.Sleep(backoffMs(attempt))
+		delay := backoffBaseMs << (attempt - 1)
+		return "retry", queue.RetryLater(ctx, jobID, time.Now().UnixMilli()+delay)
 	}
-	if err := dlq.Move(ctx, job.ID, "max_attempts_exceeded", history); err != nil {
-		return "", err
-	}
-	return "dead_lettered", nil
+	store.RecordAttempt(ctx, jobID, attempt, "")
+	_, err = queue.Ack(ctx, jobID, worker)
+	return "completed", err
 }
 `,
     },
     scala: {
       starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-object JobRunnerClient {
-  final case class Job(job_id: String, kind: String, payload: String)
+import jobqueue.job_queue.{ExecuteRequest, JobRunnerGrpc}
+import jobs.{Queue, Store} // Queue.ack, retryLater, bury · Store.getJob, beginAttempt, recordAttempt
 
-  val runner = JobRunnerGrpc.blockingStub(
-    ManagedChannelBuilder.forAddress("workers", 50051).usePlaintext().build()
-  )
+object Client {
+  val MaxAttempts = 5
 
-  // JobStore and DeadLetterQueue are the platform's; this step only calls them.
-  class JobStore {
-    def appendAttempt(jobId: String, attempt: Int, error: String): Unit = ???
-  }
+  private val runner = JobRunnerGrpc.blockingStub(ManagedChannelBuilder.forAddress("jobrunner", 9000).usePlaintext().build())
 
-  class DeadLetterQueue {
-    def move(jobId: String, reason: String, lastError: String): Unit = ???
-  }
-
-  val store = new JobStore
-  val dlq = new DeadLetterQueue
-
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  def executeJob(job: Job): String = {
-    var attempts = 0
-    var lastError = ""
-    while (true) {
-      attempts += 1
-      val request = ExecuteRequest(job_id = job.job_id, kind = job.kind, payload = job.payload)
-      try {
-        runner.execute(request)
-        return "completed"
-      } catch {
-        case exc: StatusRuntimeException =>
-          lastError = exc.getStatus.getCode.toString
-          store.appendAttempt(job.job_id, attempts, lastError)
-          println("attempt failed job_id=" + job.job_id + " attempts=" + attempts)
-          if (attempts >= 3) {
-            dlq.move(job.job_id, "too_many_attempts", lastError)
-            return "dead_lettered"
-          }
-      }
+  /** Run one attempt of a job this worker claimed: "completed", "retry" or "dead". */
+  def runAttempt(jobId: String, worker: String): String = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val job = Store.getJob(jobId).getOrElse(throw new NoSuchElementException(s"no job $jobId"))
+    val attempt = job.attempts + 1
+    try runner.execute(ExecuteRequest(jobId, job.jobType, job.payload.compactPrint, attempt))
+    catch {
+      case e: StatusRuntimeException =>
+        Store.recordAttempt(jobId, attempt, s"\${e.getStatus.getCode}: \${e.getStatus.getDescription}")
+        if (attempt >= MaxAttempts) {
+          Queue.bury(jobId, "max_attempts_exceeded")
+          return "dead"
+        }
+        Queue.retryLater(jobId, System.currentTimeMillis)
+        return "retry"
     }
-    "dead_lettered"
+    Store.beginAttempt(jobId)
+    Store.recordAttempt(jobId, attempt, "")
+    Queue.ack(jobId, worker)
+    "completed"
   }
 }
 `,
@@ -839,260 +490,631 @@ object JobRunnerClient {
 
 import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
 
-object JobRunnerClient {
-  val VisibilityTimeoutS = 60
+import jobqueue.job_queue.{ExecuteRequest, JobRunnerGrpc}
+import jobs.{Queue, Store} // Queue.ack, retryLater, bury · Store.getJob, beginAttempt, recordAttempt
+
+object Client {
   val MaxAttempts = 5
   val BackoffBaseMs = 1000L
-  val BackoffCapMs = 30000L
+  val ExecuteTimeoutS = 30L // under the 60 s visibility timeout: the call ends before the claim does
+  // The executor may answer differently later; any other status says the job as written will not succeed.
+  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED, Status.Code.RESOURCE_EXHAUSTED, Status.Code.ABORTED)
 
-  val RetryableStatuses = Set(
-    Status.Code.UNAVAILABLE,
-    Status.Code.DEADLINE_EXCEEDED,
-    Status.Code.RESOURCE_EXHAUSTED,
-    Status.Code.ABORTED,
-  )
-  val PermanentStatuses = Set(
-    Status.Code.INVALID_ARGUMENT,
-    Status.Code.FAILED_PRECONDITION,
-    Status.Code.PERMISSION_DENIED,
-    Status.Code.NOT_FOUND,
-  )
+  private val runner = JobRunnerGrpc.blockingStub(ManagedChannelBuilder.forAddress("jobrunner", 9000).usePlaintext().build())
 
-  final case class Job(job_id: String, kind: String, payload: String)
-  final case class AttemptRow(attempt: Int, error: String)
-
-  val runner = JobRunnerGrpc.blockingStub(
-    ManagedChannelBuilder.forAddress("workers", 50051).usePlaintext().build()
-  )
-
-  // JobStore and DeadLetterQueue are the platform's; this step only calls them.
-  class JobStore {
-    /** job_attempts: the row goes in before the call, so a crash mid-call still counts it. */
-    def beginAttempt(jobId: String, attempt: Int): Unit = ???
-
-    def finishAttempt(jobId: String, attempt: Int, error: String, nextRetryAt: Option[Long]): Unit = ???
-
-    /** What the store already holds: a restart resumes from this count, never from zero. */
-    def attempts(jobId: String): Seq[AttemptRow] = ???
-  }
-
-  class DeadLetterQueue {
-    def move(jobId: String, reason: String, history: Seq[AttemptRow]): Unit = ???
-  }
-
-  val store = new JobStore
-  val dlq = new DeadLetterQueue
-
-  /** 1 s, 2 s, 4 s … doubling per attempt, capped at 30 s. */
-  def backoffMs(attempt: Int): Long =
-    math.min(BackoffBaseMs * (1L << (attempt - 1)), BackoffCapMs)
-
-  def executeJob(job: Job): String = {
-    val history = scala.collection.mutable.ArrayBuffer.from(store.attempts(job.job_id))
-    var attempt = history.length
-    while (attempt < MaxAttempts) {
-      attempt += 1
-      store.beginAttempt(job.job_id, attempt)
-      val request = ExecuteRequest(job_id = job.job_id, kind = job.kind, payload = job.payload)
-      try {
-        runner.withDeadlineAfter(VisibilityTimeoutS, TimeUnit.SECONDS).execute(request)
-        store.finishAttempt(job.job_id, attempt, "", None)
-        return "completed"
-      } catch {
-        case exc: StatusRuntimeException =>
-          val message = exc.getStatus.getCode.toString + ": " + exc.getStatus.getDescription
-          history += AttemptRow(attempt, message)
-          if (PermanentStatuses.contains(exc.getStatus.getCode) || !RetryableStatuses.contains(exc.getStatus.getCode)) {
-            // A permanent error never earns another attempt: dead-letter it on the spot.
-            store.finishAttempt(job.job_id, attempt, message, None)
-            dlq.move(job.job_id, "permanent_error", history.toSeq)
-            return "dead_lettered"
-          }
-          val last = attempt >= MaxAttempts
-          val nextRetryAt = if (last) None else Some(System.currentTimeMillis() + backoffMs(attempt))
-          store.finishAttempt(job.job_id, attempt, message, nextRetryAt)
-          if (last) {
-            dlq.move(job.job_id, "max_attempts_exceeded", history.toSeq)
-            return "dead_lettered"
-          }
-          Thread.sleep(backoffMs(attempt))
-      }
+  /** Run one attempt of a job this worker claimed: "completed", "retry" or "dead". */
+  def runAttempt(jobId: String, worker: String): String = {
+    val job = Store.getJob(jobId).getOrElse(throw new NoSuchElementException(s"no job $jobId"))
+    // Counted on the job record before the call: a worker that dies mid-call has still used the attempt.
+    val attempt = Store.beginAttempt(jobId)
+    try runner.withDeadlineAfter(ExecuteTimeoutS, TimeUnit.SECONDS).execute(ExecuteRequest(jobId, job.jobType, job.payload.compactPrint, attempt.toInt))
+    catch {
+      case e: StatusRuntimeException =>
+        Store.recordAttempt(jobId, attempt, s"\${e.getStatus.getCode}: \${e.getStatus.getDescription}")
+        if (!Retryable.contains(e.getStatus.getCode)) {
+          Queue.bury(jobId, "permanent_error")
+          return "dead"
+        }
+        if (attempt >= MaxAttempts) {
+          Queue.bury(jobId, "max_attempts_exceeded")
+          return "dead"
+        }
+        Queue.retryLater(jobId, System.currentTimeMillis + (BackoffBaseMs << (attempt - 1)))
+        return "retry"
     }
-    dlq.move(job.job_id, "max_attempts_exceeded", history.toSeq)
-    "dead_lettered"
+    Store.recordAttempt(jobId, attempt, "")
+    Queue.ack(jobId, worker)
+    "completed"
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <string>
+      starter: `#include <grpcpp/grpcpp.h>
 
-#include "jobrunner.grpc.pb.h"
+#include <stdexcept>
+#include <string>
 
-struct Job {
-  std::string job_id;
-  std::string type;
-  std::string payload;
-};
+#include "job_queue.grpc.pb.h"
+#include "jobs/queue.h"  // queue::ack, retryLater, bury
+#include "jobs/store.h"  // store::getJob, beginAttempt, recordAttempt
 
-// JobStore and DeadLetterQueue are the platform's; this step only calls them.
-class JobStore {
- public:
-  void appendAttempt(const std::string& job_id, int attempt, const std::string& error) {}
-};
+constexpr long kMaxAttempts = 5;
 
-class DeadLetterQueue {
- public:
-  void move(const std::string& job_id, const std::string& reason, const std::string& last_error) {}
-};
+auto runner = jobqueue::JobRunner::NewStub(grpc::CreateChannel("jobrunner:9000", grpc::InsecureChannelCredentials()));
 
-// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-std::string executeJob(jobrunner::JobRunner::Stub* runner, JobStore* store, DeadLetterQueue* dlq, const Job& job) {
-  int attempts = 0;
-  std::string last_error;
-  while (true) {
-    attempts += 1;
-    grpc::ClientContext ctx;
-    jobrunner::ExecuteRequest request;
-    request.set_job_id(job.job_id);
-    request.set_type(job.type);
-    request.set_payload(job.payload);
-    jobrunner::ExecuteResponse reply;
-    const grpc::Status call = runner->Execute(&ctx, request, &reply);
-    if (call.ok()) return "completed";
-    last_error = call.error_message();
-    store->appendAttempt(job.job_id, attempts, last_error);
-    if (attempts >= 3) {
-      dlq->move(job.job_id, "too_many_attempts", last_error);
-      return "dead_lettered";
+// Run one attempt of a job this worker claimed: "completed", "retry" or "dead".
+std::string runAttempt(const std::string& job_id, const std::string& worker) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const auto job = store::getJob(job_id);
+  if (!job) throw std::out_of_range("no job " + job_id);
+  const long attempt = job->attempts + 1;
+  jobqueue::ExecuteRequest request;
+  request.set_job_id(job_id);
+  request.set_job_type(job->type);
+  request.set_payload(job->payload.dump());
+  request.set_attempt(static_cast<int>(attempt));
+  grpc::ClientContext ctx;
+  jobqueue::ExecuteReply reply;
+  const grpc::Status status = runner->Execute(&ctx, request, &reply);
+  if (!status.ok()) {
+    store::recordAttempt(job_id, attempt, "code " + std::to_string(status.error_code()) + ": " + status.error_message());
+    if (attempt >= kMaxAttempts) {
+      queue::bury(job_id, "max_attempts_exceeded");
+      return "dead";
     }
+    queue::retryLater(job_id, store::nowMs());
+    return "retry";
   }
+  store::beginAttempt(job_id);
+  store::recordAttempt(job_id, attempt, "");
+  queue::ack(job_id, worker);
+  return "completed";
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
 
-#include "jobrunner.grpc.pb.h"
-
-#include <algorithm>
 #include <chrono>
-#include <iostream>
-#include <optional>
+#include <set>
+#include <stdexcept>
 #include <string>
-#include <thread>
-#include <vector>
 
-constexpr int kVisibilityTimeoutS = 60;
-constexpr int kMaxAttempts = 5;
+#include "job_queue.grpc.pb.h"
+#include "jobs/queue.h"  // queue::ack, retryLater, bury
+#include "jobs/store.h"  // store::getJob, beginAttempt, recordAttempt
+
+constexpr long kMaxAttempts = 5;
 constexpr long long kBackoffBaseMs = 1000;
-constexpr long long kBackoffCapMs = 30000;
+constexpr std::chrono::seconds kExecuteTimeout{30};  // under the 60 s visibility timeout: the call ends before the claim does
+// The executor may answer differently later; any other status says the job as written will not succeed.
+const std::set<grpc::StatusCode> kRetryable = {grpc::StatusCode::UNAVAILABLE, grpc::StatusCode::DEADLINE_EXCEEDED,
+                                               grpc::StatusCode::RESOURCE_EXHAUSTED, grpc::StatusCode::ABORTED};
 
-const std::vector<grpc::StatusCode> kRetryableStatuses = {
-    grpc::StatusCode::UNAVAILABLE,
-    grpc::StatusCode::DEADLINE_EXCEEDED,
-    grpc::StatusCode::RESOURCE_EXHAUSTED,
-    grpc::StatusCode::ABORTED,
-};
-const std::vector<grpc::StatusCode> kPermanentStatuses = {
-    grpc::StatusCode::INVALID_ARGUMENT,
-    grpc::StatusCode::FAILED_PRECONDITION,
-    grpc::StatusCode::PERMISSION_DENIED,
-    grpc::StatusCode::NOT_FOUND,
-};
+auto runner = jobqueue::JobRunner::NewStub(grpc::CreateChannel("jobrunner:9000", grpc::InsecureChannelCredentials()));
 
-struct Job {
-  std::string job_id;
-  std::string type;
-  std::string payload;
-};
-
-struct AttemptRow {
-  int attempt = 0;
-  std::string error;
-};
-
-// JobStore and DeadLetterQueue are the platform's; this step only calls them.
-class JobStore {
- public:
-  // job_attempts: the row goes in before the call, so a crash mid-call still counts it.
-  void beginAttempt(const std::string& job_id, int attempt) {}
-
-  void finishAttempt(const std::string& job_id, int attempt, const std::string& error,
-                     const std::optional<long long>& next_retry_at) {}
-
-  // What the store already holds: a restart resumes from this count, never from zero.
-  std::vector<AttemptRow> attempts(const std::string& job_id) { return {}; }
-};
-
-class DeadLetterQueue {
- public:
-  void move(const std::string& job_id, const std::string& reason, const std::vector<AttemptRow>& history) {}
-};
-
-bool contains(const std::vector<grpc::StatusCode>& codes, grpc::StatusCode code) {
-  return std::find(codes.begin(), codes.end(), code) != codes.end();
-}
-
-// 1 s, 2 s, 4 s … doubling per attempt, capped at 30 s.
-long long backoffMs(int attempt) {
-  const long long delay = kBackoffBaseMs * (1LL << (attempt - 1));
-  return std::min(delay, kBackoffCapMs);
-}
-
-std::string executeJob(jobrunner::JobRunner::Stub* runner, JobStore* store, DeadLetterQueue* dlq, const Job& job) {
-  std::vector<AttemptRow> history = store->attempts(job.job_id);
-  int attempt = static_cast<int>(history.size());
-  while (attempt < kMaxAttempts) {
-    attempt += 1;
-    store->beginAttempt(job.job_id, attempt);
-    grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kVisibilityTimeoutS));
-    jobrunner::ExecuteRequest request;
-    request.set_job_id(job.job_id);
-    request.set_type(job.type);
-    request.set_payload(job.payload);
-    jobrunner::ExecuteResponse reply;
-    const grpc::Status call = runner->Execute(&ctx, request, &reply);
-    if (call.ok()) {
-      store->finishAttempt(job.job_id, attempt, "", std::nullopt);
-      return "completed";
+// Run one attempt of a job this worker claimed: "completed", "retry" or "dead".
+std::string runAttempt(const std::string& job_id, const std::string& worker) {
+  const auto job = store::getJob(job_id);
+  if (!job) throw std::out_of_range("no job " + job_id);
+  // Counted on the job record before the call: a worker that dies mid-call has still used the attempt.
+  const long attempt = store::beginAttempt(job_id);
+  jobqueue::ExecuteRequest request;
+  request.set_job_id(job_id);
+  request.set_job_type(job->type);
+  request.set_payload(job->payload.dump());
+  request.set_attempt(static_cast<int>(attempt));
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + kExecuteTimeout);
+  jobqueue::ExecuteReply reply;
+  const grpc::Status status = runner->Execute(&ctx, request, &reply);
+  if (!status.ok()) {
+    store::recordAttempt(job_id, attempt, "code " + std::to_string(status.error_code()) + ": " + status.error_message());
+    if (kRetryable.count(status.error_code()) == 0) {
+      queue::bury(job_id, "permanent_error");
+      return "dead";
     }
-    const std::string message = call.error_message();
-    history.push_back(AttemptRow{attempt, message});
-    if (contains(kPermanentStatuses, call.error_code()) || !contains(kRetryableStatuses, call.error_code())) {
-      // A permanent error never earns another attempt: dead-letter it on the spot.
-      store->finishAttempt(job.job_id, attempt, message, std::nullopt);
-      dlq->move(job.job_id, "permanent_error", history);
-      std::cerr << "dead-lettered job_id=" << job.job_id << " code=" << call.error_code() << "\\n";
-      return "dead_lettered";
+    if (attempt >= kMaxAttempts) {
+      queue::bury(job_id, "max_attempts_exceeded");
+      return "dead";
     }
-    const bool last = attempt >= kMaxAttempts;
-    std::optional<long long> next_retry_at;
-    if (!last) {
-      const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::system_clock::now().time_since_epoch())
-                           .count();
-      next_retry_at = now + backoffMs(attempt);
-    }
-    store->finishAttempt(job.job_id, attempt, message, next_retry_at);
-    if (last) {
-      dlq->move(job.job_id, "max_attempts_exceeded", history);
-      std::cerr << "dead-lettered job_id=" << job.job_id << " attempts=" << attempt << "\\n";
-      return "dead_lettered";
-    }
-    std::cerr << "retrying job_id=" << job.job_id << " attempt=" << attempt << " next_retry_at="
-              << next_retry_at.value_or(0) << "\\n";
-    std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs(attempt)));
+    queue::retryLater(job_id, store::nowMs() + (kBackoffBaseMs << (attempt - 1)));
+    return "retry";
   }
-  dlq->move(job.job_id, "max_attempts_exceeded", history);
-  return "dead_lettered";
+  store::recordAttempt(job_id, attempt, "");
+  queue::ack(job_id, worker);
+  return "completed";
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+import time
+
+import grpc
+
+import job_queue_pb2
+import job_queue_pb2_grpc
+from jobs import queue, store
+
+INVOICE = {"invoice_id": "inv-7", "amount_cents": 1200}
+
+
+class Runner(job_queue_pb2_grpc.JobRunnerServicer):
+    """Runs every job it is asked to; notes the attempt count the job record held when each call arrived."""
+
+    def __init__(self):
+        self.counted = []
+
+    def Execute(self, request, context):
+        self.counted.append(store.get_job(request.job_id)["attempts"])
+        return job_queue_pb2.ExecuteReply(result="ok")
+
+
+def _claimed(job_id):
+    store.create_job(job_id, "t-1", "invoice.charge", INVOICE)
+    assert queue.claim("w-1") == job_id, f"the harness could not claim {job_id}"
+
+
+def _setup(ctx):
+    runner = Runner()
+    ctx.grpc.serve(job_queue_pb2_grpc.add_JobRunnerServicer_to_server, runner)
+    _claimed("job-1")
+    return ctx.load("client"), runner
+
+
+def _reclaim(ctx, seconds=60):
+    ctx.clock.advance(seconds)
+    queue.return_expired()
+    assert queue.claim("w-1") == "job-1", "the retried job must be claimable once its retry is due"
+
+
+def check_execute_call(ctx):
+    m, _ = _setup(ctx)
+    outcome = m.run_attempt("job-1", "w-1")
+    assert outcome == "completed", f"with a healthy executor the attempt returned {outcome!r}"
+    calls = ctx.grpc.calls_to("Execute")
+    assert len(calls) == 1, f"one attempt made {len(calls)} Execute calls"
+    req = calls[0].request
+    assert req.job_id == "job-1" and req.job_type == "invoice.charge" and req.attempt == 1, f"the Execute request is {req}"
+    assert json.loads(req.payload) == INVOICE, f"the request carries payload {req.payload}"
+    job = store.get_job("job-1")
+    assert job["state"] == "completed", f"after a successful attempt the job is {job}"
+    assert ctx.redis.zscore("jobs:inflight", "job-1") is None, "a completed job must leave jobs:inflight"
+    history = store.attempt_history("job-1")
+    assert [h["error"] for h in history] == [""], f"the history must hold one successful attempt, got {history}"
+
+
+def check_retry_classes(ctx):
+    m, _ = _setup(ctx)
+    ctx.grpc.fail("Execute", grpc.StatusCode.INVALID_ARGUMENT, "template welcome-v9 does not exist", 1)
+    outcome = m.run_attempt("job-1", "w-1")
+    assert outcome == "dead", f"INVALID_ARGUMENT returned {outcome!r}: a job the executor rejects as written fails the same way on every retry, so bury it on the first attempt"
+    job = store.get_job("job-1")
+    assert job["state"] == "dead" and job["dead_reason"] == "permanent_error", f"the buried job is {job}, expected dead with dead_reason permanent_error"
+    assert ctx.redis.lrange("jobs:dead", 0, -1) == ["job-1"], f"jobs:dead holds {ctx.redis.lrange('jobs:dead', 0, -1)}"
+    _claimed("job-2")
+    ctx.grpc.fail("Execute", grpc.StatusCode.UNAVAILABLE, "executor restarting", 1)
+    outcome = m.run_attempt("job-2", "w-1")
+    assert outcome == "retry" and store.get_job("job-2")["state"] == "retrying", f"UNAVAILABLE returned {outcome!r} with the job {store.get_job('job-2')}: an executor that is down may be up later, so schedule a retry"
+
+
+def check_attempts_durable(ctx):
+    m, runner = _setup(ctx)
+    ctx.grpc.fail("Execute", grpc.StatusCode.UNAVAILABLE, "executor restarting", 5)
+    outcomes = []
+    while True:
+        outcomes.append(m.run_attempt("job-1", "w-1"))
+        if outcomes[-1] != "retry" or len(outcomes) == 6:
+            break
+        _reclaim(ctx)
+    assert outcomes == ["retry"] * 4 + ["dead"], f"five UNAVAILABLE attempts returned {outcomes}: the fifth must bury the job (MAX_ATTEMPTS = 5), which needs a count that grows on every attempt"
+    sent = [c.request.attempt for c in ctx.grpc.calls_to("Execute")]
+    assert sent == [1, 2, 3, 4, 5], f"the Execute calls carried attempts {sent}, expected 1 to 5"
+    job = store.get_job("job-1")
+    assert job["attempts"] == 5 and job["dead_reason"] == "max_attempts_exceeded", f"the job is {job}, expected 5 attempts and dead_reason max_attempts_exceeded"
+    assert len(store.attempt_history("job-1")) == 5, f"the history holds {store.attempt_history('job-1')}"
+    _claimed("job-2")
+    assert m.run_attempt("job-2", "w-1") == "completed"
+    assert runner.counted == [1], f"when Execute arrived the job record held attempts {runner.counted}: count the attempt before the call, or a worker that dies mid-call gives the job a free attempt"
+
+
+def check_backoff(ctx):
+    m, _ = _setup(ctx)
+    ctx.grpc.fail("Execute", grpc.StatusCode.UNAVAILABLE, "executor restarting", 3)
+    for attempt, delay in ((1, 1000), (2, 2000), (3, 4000)):
+        now = int(time.time() * 1000)
+        outcome = m.run_attempt("job-1", "w-1")
+        assert outcome == "retry", f"attempt {attempt} returned {outcome!r}"
+        due = ctx.redis.zscore("jobs:inflight", "job-1")
+        assert due == now + delay, f"after attempt {attempt} the retry is due {None if due is None else int(due) - now} ms from now, expected {delay} ms (BACKOFF_BASE_MS doubled per attempt): a retry at once hits an executor that is still down"
+        assert store.get_job("job-1")["next_retry_at_ms"] == now + delay, f"next_retry_at_ms is {store.get_job('job-1')['next_retry_at_ms']}, expected {now + delay}"
+        _reclaim(ctx, delay / 1000)
+
+
+def check_call_deadline(ctx):
+    m, _ = _setup(ctx)
+    ctx.grpc.set_latency("Execute", 120.0)
+    outcome = m.run_attempt("job-1", "w-1")
+    calls = ctx.grpc.calls_to("Execute")
+    assert calls, "no Execute call was made"
+    assert calls[0].timeout is not None, "the Execute call carries no deadline: an executor that hangs holds the worker past the 60 s visibility timeout, and the reaper hands the job to a second worker"
+    assert calls[0].timeout <= 30.5, f"the Execute call carries a {calls[0].timeout} s deadline, expected EXECUTE_TIMEOUT_S = 30, under the 60 s visibility timeout"
+    assert outcome == "retry", f"a call that hit its deadline returned {outcome!r}: DEADLINE_EXCEEDED is retryable"
+`,
+    typescript: `const INVOICE = {invoice_id: 'inv-7', amount_cents: 1200};
+
+async function claimed(queue, store, jobId: string): Promise<void> {
+  await store.createJob(jobId, 't-1', 'invoice.charge', INVOICE);
+  assert.equal(await queue.claim('w-1'), jobId, \`the harness could not claim \${jobId}\`);
+}
+
+/** The executor runs every job; counted notes the attempts the job record held when each call arrived. */
+async function setup(ctx) {
+  const pkg = ctx.proto('job_queue.proto');
+  const counted: number[] = [];
+  ctx.grpc.serve(pkg.jobqueue.JobRunner.service, {
+    Execute(call, callback) {
+      counted.push(Number(ctx.redis.hget(\`job:\${call.request.job_id}\`, 'attempts')));
+      callback(null, {result: 'ok'});
+    },
+  });
+  const queue = ctx.load('/support/jobs/queue.ts');
+  const store = ctx.load('/support/jobs/store.ts');
+  await claimed(queue, store, 'job-1');
+  return {m: ctx.load('client'), queue, store, counted};
+}
+
+async function reclaim(ctx, queue, seconds = 60): Promise<void> {
+  ctx.clock.advance(seconds);
+  await queue.returnExpired();
+  assert.equal(await queue.claim('w-1'), 'job-1', 'the retried job must be claimable once its retry is due');
+}
+
+export async function check_execute_call(ctx) {
+  const {m, store} = await setup(ctx);
+  const outcome = await m.runAttempt('job-1', 'w-1');
+  assert.equal(outcome, 'completed', \`with a healthy executor the attempt returned \${outcome}\`);
+  const calls = ctx.grpc.callsTo('Execute');
+  assert.equal(calls.length, 1, \`one attempt made \${calls.length} Execute calls\`);
+  const req = calls[0].request;
+  assert(req.job_id === 'job-1' && req.job_type === 'invoice.charge' && Number(req.attempt) === 1, \`the Execute request is \${JSON.stringify(req)}\`);
+  assert.deepEqual(JSON.parse(req.payload), INVOICE, \`the request carries payload \${req.payload}\`);
+  assert.equal((await store.getJob('job-1')).state, 'completed', 'after a successful attempt the job must be completed');
+  assert.equal(ctx.redis.zscore('jobs:inflight', 'job-1'), null, 'a completed job must leave jobs:inflight');
+  const history = await store.attemptHistory('job-1');
+  assert.deepEqual(history.map(h => h.error), [''], \`the history must hold one successful attempt, got \${JSON.stringify(history)}\`);
+}
+
+export async function check_retry_classes(ctx) {
+  const {m, queue, store} = await setup(ctx);
+  ctx.grpc.fail('Execute', ctx.grpc.status.INVALID_ARGUMENT, 'template welcome-v9 does not exist', 1);
+  let outcome = await m.runAttempt('job-1', 'w-1');
+  assert.equal(outcome, 'dead', \`INVALID_ARGUMENT returned \${outcome}: a job the executor rejects as written fails the same way on every retry, so bury it on the first attempt\`);
+  const job = await store.getJob('job-1');
+  assert(job.state === 'dead' && job.dead_reason === 'permanent_error', \`the buried job is \${JSON.stringify(job)}, expected dead with dead_reason permanent_error\`);
+  assert.deepEqual(ctx.redis.lrange('jobs:dead', 0, -1), ['job-1'], 'jobs:dead must hold the buried job');
+  await claimed(queue, store, 'job-2');
+  ctx.grpc.fail('Execute', ctx.grpc.status.UNAVAILABLE, 'executor restarting', 1);
+  outcome = await m.runAttempt('job-2', 'w-1');
+  const second = await store.getJob('job-2');
+  assert(outcome === 'retry' && second.state === 'retrying', \`UNAVAILABLE returned \${outcome} with the job \${JSON.stringify(second)}: an executor that is down may be up later, so schedule a retry\`);
+}
+
+export async function check_attempts_durable(ctx) {
+  const {m, queue, store, counted} = await setup(ctx);
+  ctx.grpc.fail('Execute', ctx.grpc.status.UNAVAILABLE, 'executor restarting', 5);
+  const outcomes: string[] = [];
+  for (;;) {
+    outcomes.push(await m.runAttempt('job-1', 'w-1'));
+    if (outcomes.at(-1) !== 'retry' || outcomes.length === 6) break;
+    await reclaim(ctx, queue);
+  }
+  assert.deepEqual(outcomes, ['retry', 'retry', 'retry', 'retry', 'dead'], \`five UNAVAILABLE attempts returned \${JSON.stringify(outcomes)}: the fifth must bury the job (MAX_ATTEMPTS = 5), which needs a count that grows on every attempt\`);
+  const sent = ctx.grpc.callsTo('Execute').map(c => Number(c.request.attempt));
+  assert.deepEqual(sent, [1, 2, 3, 4, 5], \`the Execute calls carried attempts \${JSON.stringify(sent)}, expected 1 to 5\`);
+  const job = await store.getJob('job-1');
+  assert(job.attempts === 5 && job.dead_reason === 'max_attempts_exceeded', \`the job is \${JSON.stringify(job)}, expected 5 attempts and dead_reason max_attempts_exceeded\`);
+  assert.equal((await store.attemptHistory('job-1')).length, 5, 'the history must hold five attempts');
+  await claimed(queue, store, 'job-2');
+  assert.equal(await m.runAttempt('job-2', 'w-1'), 'completed');
+  assert.deepEqual(counted, [1], \`when Execute arrived the job record held attempts \${JSON.stringify(counted)}: count the attempt before the call, or a worker that dies mid-call gives the job a free attempt\`);
+}
+
+export async function check_backoff(ctx) {
+  const {m, queue, store} = await setup(ctx);
+  ctx.grpc.fail('Execute', ctx.grpc.status.UNAVAILABLE, 'executor restarting', 3);
+  for (const [attempt, delay] of [[1, 1000], [2, 2000], [3, 4000]]) {
+    const now = Date.now();
+    const outcome = await m.runAttempt('job-1', 'w-1');
+    assert.equal(outcome, 'retry', \`attempt \${attempt} returned \${outcome}\`);
+    const due = Number(ctx.redis.zscore('jobs:inflight', 'job-1'));
+    assert.equal(due, now + delay, \`after attempt \${attempt} the retry is due \${due - now} ms from now, expected \${delay} ms (BACKOFF_BASE_MS doubled per attempt): a retry at once hits an executor that is still down\`);
+    assert.equal((await store.getJob('job-1')).next_retry_at_ms, now + delay, 'next_retry_at_ms must be the retry time');
+    await reclaim(ctx, queue, delay / 1000);
+  }
+}
+
+export async function check_call_deadline(ctx) {
+  const {m} = await setup(ctx);
+  ctx.grpc.setLatency('Execute', 120.0);
+  const outcome = await m.runAttempt('job-1', 'w-1');
+  const calls = ctx.grpc.callsTo('Execute');
+  assert(calls.length > 0, 'no Execute call was made');
+  assert(calls[0].timeout !== null, 'the Execute call carries no deadline: an executor that hangs holds the worker past the 60 s visibility timeout, and the reaper hands the job to a second worker');
+  assert(calls[0].timeout <= 30.5, \`the Execute call carries a \${calls[0].timeout} s deadline, expected EXECUTE_TIMEOUT_S = 30, under the 60 s visibility timeout\`);
+  assert.equal(outcome, 'retry', \`a call that hit its deadline returned \${outcome}: DEADLINE_EXCEEDED is retryable\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	pb "jobs/gen/job_queue"
+	"jobs/queue"
+	"jobs/store"
+
+	"leetbuild/harness"
+)
+
+var (
+	clientBg      = context.Background()
+	clientInvoice = map[string]any{"invoice_id": "inv-7", "amount_cents": 1200}
+)
+
+// runnerPeer runs every job; counted notes the attempts the job record held when each call arrived.
+type runnerPeer struct {
+	pb.UnimplementedJobRunnerServer
+	counted []int
+}
+
+func (p *runnerPeer) Execute(_ context.Context, req *pb.ExecuteRequest) (*pb.ExecuteReply, error) {
+	p.counted = append(p.counted, store.GetJob(clientBg, req.GetJobId()).Attempts)
+	return &pb.ExecuteReply{Result: "ok"}, nil
+}
+
+func clientClaimed(ctx *harness.Ctx, jobID string) {
+	ctx.NoError(store.CreateJob(clientBg, jobID, "t-1", "invoice.charge", clientInvoice), "CreateJob")
+	got, err := queue.Claim(clientBg, "w-1")
+	ctx.NoError(err, "Claim")
+	ctx.Equal(got, jobID, "the harness's claim")
+}
+
+func clientSetup(ctx *harness.Ctx) *runnerPeer {
+	peer := &runnerPeer{}
+	pb.RegisterJobRunnerServer(ctx.GRPC.Server(""), peer)
+	clientClaimed(ctx, "job-1")
+	return peer
+}
+
+func clientRun(ctx *harness.Ctx, jobID string) string {
+	outcome, err := runAttempt(clientBg, jobID, "w-1")
+	ctx.NoError(err, "runAttempt(%s)", jobID)
+	return outcome
+}
+
+func clientReclaim(ctx *harness.Ctx, seconds float64) {
+	ctx.Clock.Advance(seconds)
+	queue.ReturnExpired(clientBg)
+	got, _ := queue.Claim(clientBg, "w-1")
+	ctx.Equal(got, "job-1", "the retried job must be claimable once its retry is due; the claim")
+}
+
+func CheckExecuteCall(ctx *harness.Ctx) {
+	clientSetup(ctx)
+	ctx.Equal(clientRun(ctx, "job-1"), "completed", "with a healthy executor the attempt")
+	calls := ctx.GRPC.CallsTo("Execute", "")
+	ctx.Equal(len(calls), 1, "one attempt's Execute calls")
+	req := calls[0].Request.(*pb.ExecuteRequest)
+	ctx.Assert(req.GetJobId() == "job-1" && req.GetJobType() == "invoice.charge" && req.GetAttempt() == 1, "the Execute request is %v", req)
+	var payload map[string]any
+	json.Unmarshal([]byte(req.GetPayload()), &payload)
+	ctx.Assert(payload["invoice_id"] == "inv-7" && payload["amount_cents"] == float64(1200), "the request carries payload %s", req.GetPayload())
+	ctx.Equal(store.GetJob(clientBg, "job-1").State, "completed", "the job's state after a successful attempt")
+	_, inflight := ctx.Redis.ZScore("jobs:inflight", "job-1")
+	ctx.Assert(!inflight, "a completed job must leave jobs:inflight")
+	history := store.AttemptHistory(clientBg, "job-1")
+	ctx.Assert(len(history) == 1 && history[0].Error == "", "the history must hold one successful attempt, got %+v", history)
+}
+
+func CheckRetryClasses(ctx *harness.Ctx) {
+	clientSetup(ctx)
+	ctx.GRPC.Fail("Execute", codes.InvalidArgument, "template welcome-v9 does not exist", 1, "")
+	outcome := clientRun(ctx, "job-1")
+	ctx.Assert(outcome == "dead", "INVALID_ARGUMENT returned %q: a job the executor rejects as written fails the same way on every retry, so bury it on the first attempt", outcome)
+	job := store.GetJob(clientBg, "job-1")
+	ctx.Assert(job.State == "dead" && job.DeadReason == "permanent_error", "the buried job is %+v, expected dead with dead_reason permanent_error", job)
+	ctx.Equal(ctx.Redis.LRange("jobs:dead", 0, -1), []string{"job-1"}, "jobs:dead")
+	clientClaimed(ctx, "job-2")
+	ctx.GRPC.Fail("Execute", codes.Unavailable, "executor restarting", 1, "")
+	outcome = clientRun(ctx, "job-2")
+	second := store.GetJob(clientBg, "job-2")
+	ctx.Assert(outcome == "retry" && second.State == "retrying", "UNAVAILABLE returned %q with the job %+v: an executor that is down may be up later, so schedule a retry", outcome, second)
+}
+
+func CheckAttemptsDurable(ctx *harness.Ctx) {
+	peer := clientSetup(ctx)
+	ctx.GRPC.Fail("Execute", codes.Unavailable, "executor restarting", 5, "")
+	outcomes := []string{}
+	for {
+		outcomes = append(outcomes, clientRun(ctx, "job-1"))
+		if outcomes[len(outcomes)-1] != "retry" || len(outcomes) == 6 {
+			break
+		}
+		clientReclaim(ctx, 60)
+	}
+	ctx.Equal(outcomes, []string{"retry", "retry", "retry", "retry", "dead"}, "five UNAVAILABLE attempts: the fifth must bury the job (maxAttempts = 5), which needs a count that grows on every attempt; the outcomes")
+	sent := []int32{}
+	for _, c := range ctx.GRPC.CallsTo("Execute", "") {
+		sent = append(sent, c.Request.(*pb.ExecuteRequest).GetAttempt())
+	}
+	ctx.Equal(sent, []int32{1, 2, 3, 4, 5}, "the attempts the Execute calls carried")
+	job := store.GetJob(clientBg, "job-1")
+	ctx.Assert(job.Attempts == 5 && job.DeadReason == "max_attempts_exceeded", "the job is %+v, expected 5 attempts and dead_reason max_attempts_exceeded", job)
+	ctx.Equal(len(store.AttemptHistory(clientBg, "job-1")), 5, "the attempts in the history")
+	clientClaimed(ctx, "job-2")
+	ctx.Equal(clientRun(ctx, "job-2"), "completed", "a healthy attempt")
+	ctx.Equal(peer.counted, []int{1}, "when Execute arrived the job record must already count the attempt (counted after the call, a worker that dies mid-call gives the job a free attempt); the counts seen")
+}
+
+func CheckBackoff(ctx *harness.Ctx) {
+	clientSetup(ctx)
+	ctx.GRPC.Fail("Execute", codes.Unavailable, "executor restarting", 3, "")
+	for i, delay := range []int64{1000, 2000, 4000} {
+		now := ctx.Clock.Now()
+		ctx.Equal(clientRun(ctx, "job-1"), "retry", "attempt %d", i+1)
+		due, _ := ctx.Redis.ZScore("jobs:inflight", "job-1")
+		ctx.Assert(int64(due) == now+delay, "after attempt %d the retry is due %d ms from now, expected %d ms (backoffBaseMs doubled per attempt): a retry at once hits an executor that is still down", i+1, int64(due)-now, delay)
+		ctx.Equal(store.GetJob(clientBg, "job-1").NextRetryAtMs, now+delay, "next_retry_at_ms")
+		clientReclaim(ctx, float64(delay)/1000)
+	}
+}
+
+func CheckCallDeadline(ctx *harness.Ctx) {
+	clientSetup(ctx)
+	ctx.GRPC.SetLatency("Execute", 120.0, "")
+	outcome := clientRun(ctx, "job-1")
+	calls := ctx.GRPC.CallsTo("Execute", "")
+	ctx.Assert(len(calls) > 0, "no Execute call was made")
+	ctx.Assert(calls[0].HasDeadline(), "the Execute call carries no deadline: an executor that hangs holds the worker past the 60 s visibility timeout, and the reaper hands the job to a second worker")
+	ctx.Assert(calls[0].Timeout <= 30500*time.Millisecond, "the Execute call carries a %v deadline, expected executeTimeout = 30 s, under the 60 s visibility timeout", calls[0].Timeout)
+	ctx.Equal(outcome, "retry", "a call that hit its deadline (DEADLINE_EXCEEDED is retryable); the outcome")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "job_queue.grpc.pb.h"
+#include "jobs/queue.h"
+#include "jobs/store.h"
+
+namespace {
+
+// Runs every job; counted notes the attempts the job record held when each call arrived.
+class RunnerPeer final : public jobqueue::JobRunner::Service {
+ public:
+  std::vector<long> counted;
+  grpc::Status Execute(grpc::ServerContext*, const jobqueue::ExecuteRequest* req, jobqueue::ExecuteReply* out) override {
+    counted.push_back(store::getJob(req->job_id())->attempts);
+    out->set_result("ok");
+    return grpc::Status::OK;
+  }
+};
+
+void clientClaimed(harness::Ctx& ctx, const std::string& job_id) {
+  store::createJob(job_id, "t-1", "invoice.charge", nlohmann::json{{"invoice_id", "inv-7"}, {"amount_cents", 1200}});
+  ctx.Equal(queue::claim("w-1").value_or(""), job_id, "the harness's claim");
+}
+
+RunnerPeer& clientSetup(harness::Ctx& ctx) {
+  static RunnerPeer* peer = nullptr;
+  delete peer;
+  peer = new RunnerPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  clientClaimed(ctx, "job-1");
+  return *peer;
+}
+
+void clientReclaim(harness::Ctx& ctx, double seconds) {
+  ctx.Clock.Advance(seconds);
+  queue::returnExpired();
+  ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the retried job must be claimable once its retry is due; the claim");
+}
+
+}  // namespace
+
+void CheckExecuteCall(harness::Ctx& ctx) {
+  clientSetup(ctx);
+  ctx.Equal(runAttempt("job-1", "w-1"), "completed", "with a healthy executor the attempt");
+  const auto calls = ctx.GRPC.CallsTo("Execute");
+  ctx.Equal(calls.size(), 1, "one attempt's Execute calls");
+  const auto req = calls[0].Request<jobqueue::ExecuteRequest>();
+  ctx.Assert(req.job_id() == "job-1" && req.job_type() == "invoice.charge" && req.attempt() == 1, "the Execute request is %s %s attempt %d", req.job_id(), req.job_type(), req.attempt());
+  const auto payload = nlohmann::json::parse(req.payload(), nullptr, false);
+  ctx.Assert(payload == nlohmann::json{{"invoice_id", "inv-7"}, {"amount_cents", 1200}}, "the request carries payload %s", req.payload());
+  ctx.Equal(store::getJob("job-1")->state, "completed", "the job's state after a successful attempt");
+  ctx.Assert(!ctx.Redis.ZScore("jobs:inflight", "job-1"), "a completed job must leave jobs:inflight");
+  const auto history = store::attemptHistory("job-1");
+  ctx.Assert(history.size() == 1 && history[0].error.empty(), "the history must hold one successful attempt, got %d entries", history.size());
+}
+
+void CheckRetryClasses(harness::Ctx& ctx) {
+  clientSetup(ctx);
+  ctx.GRPC.Fail("Execute", grpc::StatusCode::INVALID_ARGUMENT, "template welcome-v9 does not exist", 1);
+  std::string outcome = runAttempt("job-1", "w-1");
+  ctx.Assert(outcome == "dead", "INVALID_ARGUMENT returned %q: a job the executor rejects as written fails the same way on every retry, so bury it on the first attempt", outcome);
+  const auto job = store::getJob("job-1");
+  ctx.Assert(job->state == "dead" && job->dead_reason == "permanent_error", "the buried job is %s with dead_reason %q, expected dead with permanent_error", job->state, job->dead_reason);
+  ctx.Equal(ctx.Redis.LRange("jobs:dead", 0, -1), std::vector<std::string>{"job-1"}, "jobs:dead");
+  clientClaimed(ctx, "job-2");
+  ctx.GRPC.Fail("Execute", grpc::StatusCode::UNAVAILABLE, "executor restarting", 1);
+  outcome = runAttempt("job-2", "w-1");
+  const auto second = store::getJob("job-2");
+  ctx.Assert(outcome == "retry" && second->state == "retrying", "UNAVAILABLE returned %q with the job %s: an executor that is down may be up later, so schedule a retry", outcome, second->state);
+}
+
+void CheckAttemptsDurable(harness::Ctx& ctx) {
+  RunnerPeer& peer = clientSetup(ctx);
+  ctx.GRPC.Fail("Execute", grpc::StatusCode::UNAVAILABLE, "executor restarting", 5);
+  std::vector<std::string> outcomes;
+  for (;;) {
+    outcomes.push_back(runAttempt("job-1", "w-1"));
+    if (outcomes.back() != "retry" || outcomes.size() == 6) break;
+    clientReclaim(ctx, 60);
+  }
+  ctx.Equal(outcomes, std::vector<std::string>{"retry", "retry", "retry", "retry", "dead"},
+            "five UNAVAILABLE attempts: the fifth must bury the job (kMaxAttempts = 5), which needs a count that grows on every attempt; the outcomes");
+  std::vector<int> sent;
+  for (const auto& c : ctx.GRPC.CallsTo("Execute")) sent.push_back(c.Request<jobqueue::ExecuteRequest>().attempt());
+  ctx.Equal(sent, std::vector<int>{1, 2, 3, 4, 5}, "the attempts the Execute calls carried");
+  const auto job = store::getJob("job-1");
+  ctx.Assert(job->attempts == 5 && job->dead_reason == "max_attempts_exceeded", "the job has %d attempts and dead_reason %q, expected 5 and max_attempts_exceeded", job->attempts, job->dead_reason);
+  ctx.Equal(store::attemptHistory("job-1").size(), 5, "the attempts in the history");
+  clientClaimed(ctx, "job-2");
+  ctx.Equal(runAttempt("job-2", "w-1"), "completed", "a healthy attempt");
+  ctx.Equal(peer.counted, std::vector<long>{1}, "when Execute arrived the job record must already count the attempt (counted after the call, a worker that dies mid-call gives the job a free attempt); the counts seen");
+}
+
+void CheckBackoff(harness::Ctx& ctx) {
+  clientSetup(ctx);
+  ctx.GRPC.Fail("Execute", grpc::StatusCode::UNAVAILABLE, "executor restarting", 3);
+  int attempt = 0;
+  for (const long long delay : {1000LL, 2000LL, 4000LL}) {
+    attempt++;
+    const long long now = ctx.Clock.Now();
+    ctx.Equal(runAttempt("job-1", "w-1"), "retry", "attempt %d", attempt);
+    const long long due = static_cast<long long>(ctx.Redis.ZScore("jobs:inflight", "job-1").value_or(0));
+    ctx.Assert(due == now + delay, "after attempt %d the retry is due %d ms from now, expected %d ms (kBackoffBaseMs doubled per attempt): a retry at once hits an executor that is still down", attempt, due - now, delay);
+    ctx.Equal(store::getJob("job-1")->next_retry_at_ms, now + delay, "next_retry_at_ms");
+    clientReclaim(ctx, static_cast<double>(delay) / 1000);
+  }
+}
+
+void CheckCallDeadline(harness::Ctx& ctx) {
+  clientSetup(ctx);
+  ctx.GRPC.SetLatency("Execute", 120.0);
+  const std::string outcome = runAttempt("job-1", "w-1");
+  const auto calls = ctx.GRPC.CallsTo("Execute");
+  ctx.Assert(!calls.empty(), "no Execute call was made");
+  ctx.Assert(calls[0].HasDeadline(), "the Execute call carries no deadline: an executor that hangs holds the worker past the 60 s visibility timeout, and the reaper hands the job to a second worker");
+  ctx.Assert(calls[0].TimeoutSeconds() <= 30.5, "the Execute call carries a %v s deadline, expected kExecuteTimeout = 30 s, under the 60 s visibility timeout", calls[0].TimeoutSeconds());
+  ctx.Equal(outcome, "retry", "a call that hit its deadline (DEADLINE_EXCEEDED is retryable); the outcome");
+}
+`,
+  },
   hints: [
-    'One malformed job has occupied a worker for two days, the executor rejects it the same way every second, and it has never appeared in the dead-letter table.',
-    '`except grpc.RpcError` treats every status alike, so `INVALID_ARGUMENT` is retried; `attempts` is a local that restarts at zero on every deploy; `append_attempt` runs after the call and `dlq.move` gets one string.',
-    'Classify `exc.code()` against `RETRYABLE_STATUSES`; read `attempts` from the store and `begin_attempt` before `Execute(..., timeout=VISIBILITY_TIMEOUT_S)`; sleep `BACKOFF_BASE_MS * 2 ** (n-1)` capped at `BACKOFF_CAP_MS`; dead-letter with the full history.',
+    'Send a job whose template does not exist: the executor says INVALID_ARGUMENT and the job is retried anyway. Fail the executor five times: the job is never buried, and every retry is due at once.',
+    'The attempt number is `attempts + 1`, but `attempts` only grows after a call that succeeded, so a failing job is attempt 1 forever. Every error takes the retry path, the retry time is now, and the call has no deadline.',
+    'Call `attempt = store.begin_attempt(job_id)` before `Execute`, pass `timeout=EXECUTE_TIMEOUT_S`, bury with `permanent_error` when `exc.code()` is not in `RETRYABLE`, and retry at `now + BACKOFF_BASE_MS * 2 ** (attempt - 1)`.',
   ],
-  debrief: `The fix answers one question under three names: which failures deserve another attempt, how many attempts is too many, and what the next engineer inherits when the job dies. Classification by status comes first, because retrying a permanent error is an unbounded loop against an executor that has already decided. The attempt count lives in \`job_attempts\` and is written before the call, so a worker that restarts mid-attempt resumes at three rather than one and the poison pill reaches five. Backoff with a recorded \`next_retry_at\` keeps a flapping executor from being hammered and survives a crash too. The dead-letter record carries every attempt's error because that history is the evidence needed to fix the payload. Production queues add an alert on dead-letter arrivals and a replay tool that re-enqueues a corrected payload under the same job id.`,
+  debrief: `The status code is the executor telling the worker whether time can help: an executor that is down or overloaded may answer later, a payload it rejects will be rejected again, so only the first kind earns a retry and the second goes to the dead letter while someone can still fix it. The count lives on the job record and grows before the call because the attempt that kills a worker is exactly the one a local counter forgets. The deadline sits under the visibility timeout so the worker gives up before the reaper hands the job to someone else. Production workers add jitter to the backoff so a thousand jobs failed by one outage do not retry in the same second.`,
 };

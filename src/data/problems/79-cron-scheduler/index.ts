@@ -1,88 +1,110 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {dependencyStep} from './steps/dependency';
 import {endpointStep} from './steps/endpoint';
 import {eventsStep} from './steps/events';
 import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
+import {supportModulesCpp, supportModulesGo, supportModulesPy, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * Cron scheduler: the course is not "call a function on a timer", it is the debugging you owe a
- * scheduler before it owns a shared job fleet. A bounded time spec whose timezone resolves → one
- * Redis lease per fire window so exactly one instance fires it → a gRPC trigger with a deadline
- * behind a misfire policy that will not storm the target → schedule events keyed by schedule id with
- * an outbox → a history read that shows pauses as misfires.
+ * Cron scheduler: the debugging a scheduler fleet needs before it owns other teams' jobs. A schedule
+ * evaluated on its owners' wall clock → one Redis lease per minute window → job triggers after a
+ * pause, bounded by a deadline and the misfire policy → run events keyed by schedule with an outbox →
+ * a history built from the windows the cron expected. The job service is a stand-in the harness
+ * serves over gRPC.
  */
 export const cronSchedulerProblem: Problem = {
   id: 'cron-scheduler',
   title: 'Cron Scheduler',
-  tagline: 'One Redis lease per fire window, and a misfire policy that decides what a scheduler pause owes.',
+  tagline: 'A scheduler fleet that fires each minute window once and shows the windows nobody ran.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Cron Scheduler
 
-A cron scheduler decides **when** work happens and **how many times** it happens, across a fleet
-that pauses, restarts and races.
+A cron scheduler promises that a job runs at certain minutes, once each, on a clock its owners chose.
+Small things break that promise: two instances whose tickers land in the same minute, a pause that
+leaves a pile of missed windows, a zone nobody checked, and a history that can only show what
+happened.
 
 ## The real system
 
-Quartz, the scheduler behind many Java platforms, keeps its triggers in a shared database and lets
-several instances run as a cluster (\`org.quartz.jobStore.isClustered\`): whichever node acquires a
-trigger row under the database lock fires it, and the others see it as taken. It also treats a
-missed fire as a first-class case: a trigger that passes its next fire time by more than
-\`misfireThreshold\` (60 seconds by default) is handled according to the misfire instruction on the
-trigger, and \`maxMisfiresToHandleAtATime\` bounds how many misfires one pass recovers so a long
-pause does not turn into one enormous transaction.
+A Kubernetes CronJob reads its schedule in the local time zone of kube-controller-manager unless
+\`.spec.timeZone\` names one (stable since v1.27). After an outage the controller counts the schedules
+it missed since the last one; with more than 100 it starts nothing and logs
+\`too many missed start times\`, and \`.spec.startingDeadlineSeconds\` decides how late a start may
+still be. Quartz makes the same decision per trigger, with misfire instructions and a
+\`misfireThreshold\`.
 
 ## What you build here
 
-One service, **cronsched**, with five pieces:
+One service, **cronsched**, on one \`cronsched\` support package every step imports:
+\`cronsched/cron\` (epoch seconds, ISO-8601 on the wire, one-minute fire windows with \`window_of\`, six
+zones with their daylight rules, \`parse\`, \`next_fire\`, \`fires_between\`, \`shortest_gap_s\`,
+\`MIN_INTERVAL_S = 300\`, \`MISFIRE_POLICIES\`) and \`cronsched/store\` (the hash \`schedule:{id}\`, the run
+ledger \`runs:{id}\` of window → \`outcome:reason\` written by \`record_run\`, \`lease_key\`, the outbox,
+\`new_id\`).
 
-1. \`POST /v1/schedules\`: a cron expression that fires no more often than once a minute, a timezone
-   from the IANA set the service can actually resolve, a validated job reference and a **required**
-   misfire policy.
-2. A **Redis** lease per \`(schedule, fire window)\`: acquired in one atomic \`SET ... NX EX\` round
-   trip, expiring shortly after the window it guards, with the outcome of every window recorded so a
-   crashed fire is not retried forever.
-3. A **gRPC** trigger with a 3-second deadline, where the misfire policy decides between skip,
-   fire-once-now and a rate-limited catch-up, and every decision is recorded with its reason.
-4. A **Kafka** \`schedule.fired\` topic keyed by schedule id: one event per attempt and outcome,
-   including skipped and missed windows, an idempotent producer with \`acks=all\`, and an outbox row
-   when the broker rejects the produce.
-5. \`GET /v1/schedules/{id}/history\`: fires, skips and misfires for the last 30 days, built from the
-   windows the cron should have fired, with a stall flag derived from that same expectation math.
+1. \`POST /v1/schedules\` \`{cron, timezone, job_ref, misfire_policy}\`: a zone the table knows, a
+   cadence of five minutes or more, a named policy, and \`next_fire\` on the schedule's wall clock.
+2. \`fire_window(schedule_id, tick, owner, trigger)\`: \`SET lease:{id}:{window} owner NX EX 300\` per
+   minute window, then \`fired\` or \`error:trigger_failed\` in the ledger.
+3. \`run_missed(schedule, windows, owner)\`: \`JobRunner.Trigger\` at \`jobs:9000\` with a 3 s deadline,
+   one attempt per window, and the misfire policy: \`skip\`, \`fire_once_now\`, or \`catch_up\` at most 5
+   per pass.
+4. \`publish_run(schedule, window, outcome, reason)\`: \`schedule.fired\` keyed by schedule id, every
+   outcome, an idempotent producer with \`acks=all\`, the outbox when no delivery report arrives in 2 s.
+5. \`GET /v1/schedules/{id}/history\`: the last 7 days built from the windows the cron expected,
+   misfires included, and a stall flag counted in windows.
+
+The ticker that calls steps 2 to 4 every minute is not part of the course; the checks call them
+directly.
 
 ## The debugging habit
 
-Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Cron parsing beyond the five-field form, clock synchronisation, the target job's own semantics,
-schedule quotas, alerting, and the authoring UI.`,
+Cron syntax beyond the five numeric fields (names, \`L\`, \`W\`, \`#\`), a tz database, the ticker loop,
+fencing tokens for a paused lease holder, schedule edits and quotas, and the job service's own
+semantics.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'schedules · history', x: 8, y: 50},
-      {id: 'api', kind: 'http', label: 'Scheduler API', sub: 'HTTPS :8443', x: 26, y: 50},
-      {id: 'clock', kind: 'service', label: 'Clock', sub: 'fire windows · NTP', x: 44, y: 12},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'leases · outcomes', x: 44, y: 50},
-      {id: 'db', kind: 'db', label: 'schedule store', sub: 'specs · outbox', x: 44, y: 88},
-      {id: 'job', kind: 'grpc', label: 'Job service', sub: 'Trigger · 3 s deadline', x: 68, y: 12},
-      {id: 'kafka', kind: 'kafka', label: 'schedule.fired', sub: 'key = schedule', x: 68, y: 50},
-      {id: 'consumer', kind: 'service', label: 'Ledger consumer', sub: 'group run-ledger', x: 88, y: 50},
+      {id: 'api', kind: 'http', label: 'cronsched', sub: 'HTTPS :8443 · ticker', x: 28, y: 50},
+      {id: 'clock', kind: 'service', label: 'Zone table', sub: 'fire windows · next_fire', x: 28, y: 12},
+      {
+        id: 'redis',
+        kind: 'redis',
+        label: 'Redis',
+        sub: 'schedule:{id} · lease:{id}:{window} · runs:{id} · outbox',
+        x: 52,
+        y: 20,
+      },
+      {id: 'job', kind: 'grpc', label: 'Job service', sub: 'JobRunner.Trigger · 3 s', x: 52, y: 80},
+      {id: 'kafka', kind: 'kafka', label: 'schedule.fired', sub: 'key = schedule id', x: 74, y: 50},
+      {id: 'consumer', kind: 'service', label: 'Ledger consumer', sub: 'group run-ledger', x: 93, y: 50},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
-      {from: 'api', to: 'db', kind: 'plain', label: 'specs · outbox'},
-      {from: 'api', to: 'clock', kind: 'plain', label: 'fire windows'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'SET NX lease'},
-      {from: 'api', to: 'job', kind: 'grpc', label: 'Trigger / CatchUp'},
-      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce schedule.fired'},
+      {from: 'api', to: 'clock', kind: 'plain', label: 'parse · fires_between'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'SET NX EX · HSET runs'},
+      {from: 'api', to: 'job', kind: 'grpc', label: 'Trigger(window)'},
+      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce every outcome'},
       {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'db', kind: 'plain', label: 'append run rows'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModulesPy},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

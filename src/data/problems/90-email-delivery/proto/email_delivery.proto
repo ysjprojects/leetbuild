@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package smtprelay;
+
+// The outbound relay step 3 hands a queued message to. SendMail answers the relay's verdict for a
+// message id; a resend of an id the relay already took answers that verdict and is not mailed
+// again. GetStatus answers what the relay holds for a message id: "unknown" when it never saw it.
+service Relay {
+  rpc SendMail(SendMailRequest) returns (Delivery);
+  rpc GetStatus(StatusRequest) returns (Delivery);
+}
+
+message SendMailRequest {
+  string message_id = 1;
+  string recipient = 2;
+  string template_id = 3;
+  string subject = 4;
+  map<string, string> variables = 5;
+}
+
+message StatusRequest {
+  string message_id = 1;
+}
+
+// outcome: accepted, soft_bounce, hard_bounce, suppressed (on the relay's own list) or unknown.
+// bounce_category names a bounce: mailbox_unknown, mailbox_full, ...
+message Delivery {
+  string outcome = 1;
+  string bounce_category = 2;
+}

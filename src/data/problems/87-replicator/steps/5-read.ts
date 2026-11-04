@@ -2,382 +2,278 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/replications/{id}/lag: divergence with teeth',
+  title: 'GET /v1/replications/{id}/lag: every shard, and the ones that diverged',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'api', 'redis', 'target'],
+  focus: ['client', 'api', 'redis', 'source', 'target'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/replications/{id}/lag\`: it looks up the
-replication, reads one offset from Redis, subtracts it from \`LAG_BUDGET_CHANGES\` and answers a
-single \`lag\` number with \`healthy: true\`. The number goes down over time, so the dashboard
-looks alive. It compiles, it serves the demo, and it hides 4 flaws.
+**Starting point.** The starter serves \`GET /v1/replications/{id}/lag\`: it loads the replication
+(\`store.get\`), takes the smallest confirmed offset (\`resume_offset\`) and the largest source head
+(\`regions.source_head_offset\`) across its shards, and answers \`{replication_id, lag_changes,
+healthy: true}\`. The number falls as shards catch up, and it hides three flaws.
 
-**Failure mode the checks target.** The starter reports one global lag computed from a configured
-budget, so an operator cannot see which shard is behind; it marks the replication healthy because
-nothing in it compares the two regions, so a divergent shard looks current; and it serves any
-replication to any caller, so one team can read another team's replica state by guessing an id.
+**Failure mode the checks target.** Any caller who guesses an id reads another team's replication;
+the one number mixes offsets of different shards, so nobody can tell which shard is behind; and a
+shard whose rows differ between the regions reports healthy, because nothing compares them.
 
-- The operator comes from \`X-Operator-Id\`; a replication the caller does **not** own is **404**.
-- Report **per shard**: shard id, confirmed applied \`offset\`, the source head from
-  \`source_head_offset\`, and \`lag_changes\` = head − applied, clamped at zero.
-- \`divergence_sample\` takes \`SAMPLE_KEYS\` (256) keys via \`sample_keys\`, digests each in both
-  regions with \`key_digest(region, key)\`, and collects mismatches. The response names the
-  \`divergent_shards\` and reports \`sampled_keys\`; a shard at zero lag can still be divergent.`,
+- \`X-Operator-Id\` is required (**401**); a replication the caller does not own is **404**.
+- \`shards\`: one entry per shard with \`shard\`, \`offset\`, \`source_head_offset\` and \`lag_changes\` =
+  head − offset, never below 0.
+- Per shard, take \`regions.sample_keys(source_region, shard, SAMPLE_KEYS)\` (256) and compare
+  \`regions.key_digest\` in both regions; list the differing keys as the shard's \`divergent_keys\`, name
+  the shard in \`divergent_shards\`, and report \`sampled_keys\`. A shard at zero lag can diverge.`,
   sequence: {
-    participants: ['Operator', 'Replicator API', 'Source region', 'Target region'],
+    participants: ['Operator', 'replicatord', 'Redis', 'Source region', 'Target region'],
     messages: [
-      {from: 'Operator', to: 'Replicator API', label: 'GET /v1/replications/{id}/lag', kind: 'sync'},
-      {from: 'Replicator API', to: 'Source region', label: 'head offset · digest sampled keys', kind: 'sync'},
-      {from: 'Replicator API', to: 'Target region', label: 'applied offset · digest sampled keys', kind: 'sync'},
-      {from: 'Target region', to: 'Replicator API', label: 'digests', kind: 'reply'},
-      {from: 'Replicator API', to: 'Operator', label: '200 {shards, lag_changes, divergent_shards}', kind: 'reply'},
+      {from: 'Operator', to: 'replicatord', label: 'GET /v1/replications/{id}/lag · X-Operator-Id', kind: 'sync'},
+      {from: 'replicatord', to: 'Redis', label: 'resume_offset per shard', kind: 'sync'},
+      {from: 'replicatord', to: 'Source region', label: 'source_head_offset · sample_keys · key_digest', kind: 'sync'},
+      {from: 'replicatord', to: 'Target region', label: 'key_digest of the sampled keys', kind: 'sync'},
+      {
+        from: 'replicatord',
+        to: 'Operator',
+        label: '200 {shards: [{lag_changes, divergent_keys}], divergent_shards}',
+        kind: 'reply',
+      },
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/replications/{id}/lag',
-      detail: 'Register the lag route on `GET /v1/replications/{id}/lag`.',
+      title: 'Registers the lag route',
+      detail: 'Register `GET /v1/replications/{id}/lag`.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/replications\/\{replication_id\}\/lag["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/replications\/:id\/lag['"]/]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/replications\/\{\w+\}\/lag["']/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/replications\/:\w+\/lag['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/replications\/\{id\}\/lag"/]},
         scala: {all: [/path\(\s*"v1"\s*\/\s*"replications"\s*\/\s*Segment\s*\/\s*"lag"\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/replications\//]},
       },
     },
     {
-      id: 'per-shard-lag',
-      title: 'Per-shard offsets and lag in changes',
-      detail:
-        'The response lists one entry per shard with its confirmed offset, the source head offset and `lag_changes` = head − applied, clamped at zero. The starter answers with one global lag number.',
-      match: {
-        python: {all: [/"shards"/, /"lag_changes"/, /source_head_offset\(/]},
-        typescript: {all: [/lag_changes: Math\.max\(/, /sourceHeadOffset\(/, /shards\.push\(/]},
-        go: {all: [/json:"shards"/, /json:"lag_changes"/, /sourceHeadOffset\(/]},
-        scala: {all: [/"shards"/, /"lag_changes"/, /sourceHeadOffset\(/]},
-        cpp: {all: [/"shards"/, /"lag_changes"/, /sourceHeadOffset\(/]},
-      },
-    },
-    {
-      id: 'sample-digests',
-      title: 'The divergence check samples 256 keys and compares digests',
-      detail:
-        'The endpoint samples `SAMPLE_KEYS` (256) keys of the shard, digests each one in both regions with `key_digest`, and compares them. The starter never compares the two regions at all.',
-      match: {
-        python: {all: [/SAMPLE_KEYS = 256/, /key_digest\(/, /sample_keys\(/]},
-        typescript: {all: [/SAMPLE_KEYS = 256/, /keyDigest\(/, /sampleKeys\(/]},
-        go: {all: [/sampleKeyCount = 256/, /keyDigest\(/, /sampleKeys\(/]},
-        scala: {all: [/SampleKeys = 256/, /keyDigest\(/, /sampleKeys\(/]},
-        cpp: {all: [/kSampleKeys = 256/, /keyDigest\(/, /sampleKeys\(/]},
-      },
-    },
-    {
       id: 'owner-404',
-      title: 'A replication the caller does not own is 404',
+      title: "Another operator's replication is 404",
       detail:
-        'The lookup compares the replication’s owner with the authenticated operator and answers **404** for a foreign replication, so an operator cannot read another team’s replica state by guessing an id. The starter serves any replication to any caller.',
+        "The read requires `X-Operator-Id` (401) and compares it with the replication's `owner`, answering **404** for a replication the caller does not own, the same as for one that does not exist.",
       match: {
-        python: {all: [/replication\["owner"\] != x_operator_id/, /status_code\s*=\s*404/]},
-        typescript: {all: [/replication\.owner !== operator/, /code\(404\)/]},
-        go: {all: [/replication\.Owner != operator/, /StatusNotFound/]},
-        scala: {all: [/operatorOpt\.contains\(replication\.owner\)/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/replication->owner != operatorId/, /\b404\b/]},
+        python: {all: [/x-operator-id/i, /\["owner"\]\s*!=/, /\b401\b/]},
+        typescript: {all: [/x-operator-id/i, /\.owner\s*!==/, /\b401\b/]},
+        go: {all: [/X-Operator-Id/i, /\.Owner\s*!=/, /StatusUnauthorized|\b401\b/]},
+        scala: {all: [/X-Operator-Id/i, /_\.owner\s*==|\.owner\s*!=/, /Unauthorized/]},
+        cpp: {all: [/X-Operator-Id/i, /->owner\s*!=/, /\b401\b/]},
+      },
+    },
+    {
+      id: 'per-shard-lag',
+      title: 'Reports offset, head and lag per shard',
+      detail:
+        'The response lists every shard with its confirmed `offset`, its `source_head_offset` and `lag_changes` clamped at zero; a minimum of offsets and a maximum of heads across shards compares numbers from different logs.',
+      match: {
+        python: {
+          all: [/["']lag_changes["']\s*:\s*max\(/, /["']source_head_offset["']/],
+          none: [/\bmin\(\s*resume_offset/],
+        },
+        typescript: {all: [/lag_changes:\s*Math\.max\(/, /source_head_offset/], none: [/Math\.min\(\s*\.\.\./]},
+        go: {all: [/json:"lag_changes"/, /json:"source_head_offset"/], none: [/applied\s*=\s*min\(|minOffset/]},
+        scala: {all: [/"lag_changes"/, /"source_head_offset"/], none: [/\.min\b/]},
+        cpp: {all: [/"lag_changes"/, /"source_head_offset"/], none: [/std::min_element|std::min\(/]},
       },
     },
     {
       id: 'divergent-shards',
-      title: 'Divergent shards are named, not hidden',
+      title: 'Samples digests in both regions and names the divergent shards',
       detail:
-        'The shards whose sampled digests differ are collected and returned as `divergent_shards`. The starter always reports the replication healthy.',
+        "Each shard's sampled keys (`SAMPLE_KEYS` = 256) are digested in the source and the target region; differing keys are listed and their shards named in `divergent_shards`, whatever the shard's lag. The starter reports `healthy: true` without looking.",
       match: {
-        python: {all: [/"divergent_shards"/, /divergence_sample\(/]},
-        typescript: {all: [/divergent_shards: divergentShards/, /divergenceSample\(/]},
-        go: {all: [/json:"divergent_shards"/, /divergenceSample\(/]},
-        scala: {all: [/"divergent_shards"/, /divergenceSample\(/]},
-        cpp: {all: [/divergent_shards/, /divergenceSample\(/]},
+        python: {
+          all: [/SAMPLE_KEYS\s*=\s*256/, /regions\.sample_keys\(/, /regions\.key_digest\(/, /divergent_shards/],
+          none: [/["']healthy["']\s*:\s*True/],
+        },
+        typescript: {
+          all: [/SAMPLE_KEYS\s*=\s*256/, /sampleKeys\(/, /keyDigest\(/, /divergent_shards/],
+          none: [/healthy:\s*true/],
+        },
+        go: {
+          all: [/sampleKeys\s*=\s*256/, /regions\.SampleKeys\(/, /regions\.KeyDigest\(/, /divergent_shards/],
+          none: [/"healthy":\s*true/],
+        },
+        scala: {
+          all: [/SampleKeys\s*=\s*256/, /Regions\.sampleKeys\(/, /Regions\.keyDigest\(/, /divergent_shards/],
+          none: [/"healthy"\s*->\s*JsTrue/],
+        },
+        cpp: {
+          all: [/kSampleKeys\s*=\s*256/, /regions::sampleKeys\(/, /regions::keyDigest\(/, /divergent_shards/],
+          none: [/\{"healthy",\s*true\}/],
+        },
       },
     },
   ],
   code: {
     python: {
-      starter: `import redis
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException, Request
+
+from replication import regions, store  # store.get · regions.source_head_offset, sample_keys, key_digest
+from replication.offsets import resume_offset
 
 app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-LAG_BUDGET_CHANGES = 10000
 
 
-class ReplicationStore:
-    def get(self, replication_id: str) -> dict | None:
-        """The stored replication, if any."""
-        raise NotImplementedError
-
-
-store = ReplicationStore()
-
-
-# TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 @app.get("/v1/replications/{replication_id}/lag")
-def lag(replication_id: str, x_operator_id: str | None = Header(default=None)):
+def lag(replication_id: str, request: Request) -> dict:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
     replication = store.get(replication_id)
     if replication is None:
-        return JSONResponse({"error": "unknown replication"}, status_code=404)
-    applied = int(r.get("offset") or 0)
-    return {
-        "replication_id": replication_id,
-        "lag": max(LAG_BUDGET_CHANGES - applied, 0),
-        "healthy": True,
-    }
+        raise HTTPException(status_code=404, detail="no such replication")
+    applied = min(resume_offset(replication_id, shard) for shard in replication["shards"])
+    head = max(regions.source_head_offset(replication_id, shard) for shard in replication["shards"])
+    return {"replication_id": replication_id, "lag_changes": max(head - applied, 0), "healthy": True}
 `,
-      solution: `import redis
-from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, HTTPException, Request
+
+from replication import regions, store  # store.get · regions.source_head_offset, sample_keys, key_digest
+from replication.offsets import resume_offset
 
 app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# How many keys of a shard the divergence check samples: enough to catch a diverge inside one batch,
-# cheap enough to run on every lag read.
+# Rows of a shard compared per read: enough to catch a shard that diverged, cheap enough to run on every read.
 SAMPLE_KEYS = 256
 
 
-class ReplicationStore:
-    def get(self, replication_id: str) -> dict | None:
-        """The stored replication, if any."""
-        raise NotImplementedError
-
-
-store = ReplicationStore()
-
-
-def resume_offset(replication_id: str, shard: int) -> int:
-    """The offset the shard has confirmed at the target."""
-    raw = r.get(f"offset:{replication_id}:{shard}")
-    return int(raw) if raw is not None else 0
-
-
-def source_head_offset(replication_id: str, shard: int) -> int:
-    """The newest change the source region holds for the shard."""
-    raise NotImplementedError
-
-
-def key_digest(region: str, key: str) -> str:
-    """A digest of one key's value in one region, for comparing the two regions."""
-    raise NotImplementedError
-
-
-def sample_keys(replication_id: str, shard: int, count: int) -> list[str]:
-    """The keys of the shard the divergence check inspects."""
-    raise NotImplementedError
-
-
-def divergence_sample(replication: dict, shard: int) -> list[dict]:
-    """Sample SAMPLE_KEYS keys of the shard and return the ones whose digests differ."""
-    divergences = []
-    for key in sample_keys(replication["id"], shard, SAMPLE_KEYS):
-        source_digest = key_digest(replication["source_region"], key)
-        target_digest = key_digest(replication["target_region"], key)
-        if source_digest != target_digest:
-            divergences.append({"key": key, "source_digest": source_digest, "target_digest": target_digest})
-    return divergences
+def divergent_keys(replication: dict, shard: int) -> list[str]:
+    """The sampled rows of the shard whose digests differ between the two regions."""
+    source, target = replication["source_region"], replication["target_region"]
+    keys = regions.sample_keys(source, shard, SAMPLE_KEYS)
+    return [key for key in keys if regions.key_digest(source, shard, key) != regions.key_digest(target, shard, key)]
 
 
 @app.get("/v1/replications/{replication_id}/lag")
-def lag(replication_id: str, x_operator_id: str | None = Header(default=None)):
+def lag(replication_id: str, request: Request) -> dict:
+    operator = request.headers.get("x-operator-id", "")
+    if not operator:
+        raise HTTPException(status_code=401, detail="X-Operator-Id is required")
     replication = store.get(replication_id)
-    if replication is None or replication["owner"] != x_operator_id:
-        raise HTTPException(status_code=404, detail="unknown replication")
-    shards = []
-    divergent_shards = []
+    # Another operator's replication is as absent as one that does not exist: the id reveals nothing.
+    if replication is None or replication["owner"] != operator:
+        raise HTTPException(status_code=404, detail="no such replication")
+    shards, divergent_shards = [], []
     for shard in replication["shards"]:
-        applied = resume_offset(replication_id, shard)
-        head = source_head_offset(replication_id, shard)
-        divergences = divergence_sample(replication, shard)
-        if divergences:
+        offset = resume_offset(replication_id, shard)
+        head = regions.source_head_offset(replication_id, shard)
+        diverged = divergent_keys(replication, shard)  # a shard at zero lag can still hold different rows
+        if diverged:
             divergent_shards.append(shard)
         shards.append(
-            {
-                "shard": shard,
-                "offset": applied,
-                "source_head_offset": head,
-                "lag_changes": max(head - applied, 0),
-                "divergences": divergences,
-            }
+            {"shard": shard, "offset": offset, "source_head_offset": head, "lag_changes": max(head - offset, 0), "divergent_keys": diverged}
         )
-    return {
-        "replication_id": replication_id,
-        "sampled_keys": SAMPLE_KEYS,
-        "shards": shards,
-        "divergent_shards": divergent_shards,
-    }
+    return {"replication_id": replication_id, "sampled_keys": SAMPLE_KEYS, "shards": shards, "divergent_shards": divergent_shards}
 `,
     },
     typescript: {
       starter: `import Fastify from 'fastify';
-import {Redis} from 'ioredis';
 
-const app = Fastify({logger: true});
-const r = new Redis('redis://redis:6379');
+import {resumeOffset} from 'replication/offsets';
+import * as regions from 'replication/regions'; // regions.sourceHeadOffset, sampleKeys, keyDigest
+import * as store from 'replication/store'; // store.get
 
-const LAG_BUDGET_CHANGES = 10_000;
+export const app = Fastify();
 
-interface Replication {
-  id: string;
-  owner: string;
-  source_region: string;
-  target_region: string;
-  shards: number[];
-  conflict_policy: string;
-}
-
-// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 app.get('/v1/replications/:id/lag', async (request, reply) => {
-  const replication = store.get((request.params as {id: string}).id);
-  if (replication === undefined) return reply.code(404).send({error: 'unknown replication'});
-  const applied = Number((await r.get('offset')) ?? 0);
-  return reply.code(200).send({replication_id: replication.id, lag: Math.max(LAG_BUDGET_CHANGES - applied, 0), healthy: true});
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const {id} = request.params as {id: string};
+  const replication = await store.get(id);
+  if (replication === null) return reply.code(404).send({error: 'no such replication'});
+  const offsets = await Promise.all(replication.shards.map(shard => resumeOffset(id, shard)));
+  const heads = await Promise.all(replication.shards.map(shard => regions.sourceHeadOffset(id, shard)));
+  const lag = Math.max(...heads) - Math.min(...offsets);
+  return {replication_id: id, lag_changes: Math.max(lag, 0), healthy: true};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
       solution: `import Fastify from 'fastify';
-import {Redis} from 'ioredis';
 
-const app = Fastify({logger: true});
-const r = new Redis('redis://redis:6379');
+import {resumeOffset} from 'replication/offsets';
+import * as regions from 'replication/regions'; // regions.sourceHeadOffset, sampleKeys, keyDigest
+import * as store from 'replication/store'; // store.get
 
-// How many keys of a shard the divergence check samples: enough to catch a diverge inside one batch,
-// cheap enough to run on every lag read.
-const SAMPLE_KEYS = 256;
+export const app = Fastify();
 
-interface Replication {
-  id: string;
-  owner: string;
-  source_region: string;
-  target_region: string;
-  shards: number[];
-  conflict_policy: string;
-}
+// Rows of a shard compared per read: enough to catch a shard that diverged, cheap enough to run on every read.
+export const SAMPLE_KEYS = 256;
 
-interface Divergence {
-  key: string;
-  source_digest: string;
-  target_digest: string;
-}
-
-function keyDigest(region: string, key: string): string {
-  throw new Error('digest one key in one region');
-}
-
-function sampleKeys(replicationId: string, shard: number, count: number): string[] {
-  throw new Error('sample the shard’s keys');
-}
-
-function sourceHeadOffset(replicationId: string, shard: number): number {
-  throw new Error('read the source head offset');
-}
-
-async function resumeOffset(replicationId: string, shard: number): Promise<number> {
-  const raw = await r.get(\`offset:\${replicationId}:\${shard}\`);
-  return raw === null ? 0 : Number(raw);
-}
-
-export function divergenceSample(replication: Replication, shard: number): Divergence[] {
-  const divergences: Divergence[] = [];
-  for (const key of sampleKeys(replication.id, shard, SAMPLE_KEYS)) {
-    const sourceDigest = keyDigest(replication.source_region, key);
-    const targetDigest = keyDigest(replication.target_region, key);
-    if (sourceDigest !== targetDigest) divergences.push({key, source_digest: sourceDigest, target_digest: targetDigest});
+/** The sampled rows of the shard whose digests differ between the two regions. */
+async function divergentKeys(replication: store.Replication, shard: number): Promise<string[]> {
+  const diverged: string[] = [];
+  for (const key of await regions.sampleKeys(replication.source_region, shard, SAMPLE_KEYS)) {
+    const source = await regions.keyDigest(replication.source_region, shard, key);
+    const target = await regions.keyDigest(replication.target_region, shard, key);
+    if (source !== target) diverged.push(key);
   }
-  return divergences;
+  return diverged;
 }
 
 app.get('/v1/replications/:id/lag', async (request, reply) => {
   const operator = request.headers['x-operator-id'];
-  const replication = store.get((request.params as {id: string}).id);
-  if (replication === undefined || replication.owner !== operator)
-    return reply.code(404).send({error: 'unknown replication'});
-
+  if (typeof operator !== 'string' || operator === '') return reply.code(401).send({error: 'X-Operator-Id is required'});
+  const {id} = request.params as {id: string};
+  const replication = await store.get(id);
+  // Another operator's replication is as absent as one that does not exist: the id reveals nothing.
+  if (replication === null || replication.owner !== operator) return reply.code(404).send({error: 'no such replication'});
   const shards = [];
   const divergentShards: number[] = [];
   for (const shard of replication.shards) {
-    const offset = await resumeOffset(replication.id, shard);
-    const head = sourceHeadOffset(replication.id, shard);
-    const divergences = divergenceSample(replication, shard);
-    if (divergences.length > 0) divergentShards.push(shard);
-    shards.push({
-      shard,
-      offset,
-      source_head_offset: head,
-      lag_changes: Math.max(head - offset, 0),
-      divergences,
-    });
+    const offset = await resumeOffset(id, shard);
+    const head = await regions.sourceHeadOffset(id, shard);
+    const diverged = await divergentKeys(replication, shard); // a shard at zero lag can still hold different rows
+    if (diverged.length > 0) divergentShards.push(shard);
+    shards.push({shard, offset, source_head_offset: head, lag_changes: Math.max(head - offset, 0), divergent_keys: diverged});
   }
-  return reply.code(200).send({
-    replication_id: replication.id,
-    sampled_keys: SAMPLE_KEYS,
-    shards,
-    divergent_shards: divergentShards,
-  });
+  return {replication_id: id, sampled_keys: SAMPLE_KEYS, shards, divergent_shards: divergentShards};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 
-	"github.com/redis/go-redis/v9"
+	"replication/offsets" // offsets.ResumeOffset
+	"replication/regions" // regions.SourceHeadOffset, SampleKeys, KeyDigest
+	"replication/store"   // store.Get
 )
 
-const lagBudgetChanges = 10000
-
-var rdb *redis.Client
-
-type Replication struct {
-	ID             string \`json:"id"\`
-	Owner          string \`json:"owner"\`
-	SourceRegion   string \`json:"source_region"\`
-	TargetRegion   string \`json:"target_region"\`
-	Shards         []int  \`json:"shards"\`
-	ConflictPolicy string \`json:"conflict_policy"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-func lag(rw http.ResponseWriter, r *http.Request) {
-	replication, err := store.Get(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown replication"})
+func readLag(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	id := r.PathValue("id")
+	replication, err := store.Get(r.Context(), id)
+	if err != nil || replication == nil {
+		http.Error(rw, "no such replication", http.StatusNotFound)
 		return
 	}
-	raw, _ := rdb.Get(r.Context(), "offset").Int64()
-	lag := lagBudgetChanges - int(raw)
-	if lag < 0 {
-		lag = 0
+	var applied, head int64 = -1, 0
+	for _, shard := range replication.Shards {
+		offset, err := offsets.ResumeOffset(r.Context(), id, shard)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if applied < 0 || offset < applied {
+			applied = offset
+		}
+		head = max(head, regions.SourceHeadOffset(r.Context(), id, shard))
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{"replication_id": replication.ID, "lag": lag, "healthy": true})
+	writeJSON(rw, http.StatusOK, map[string]any{"replication_id": id, "lag_changes": max(head-applied, 0), "healthy": true})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/replications/{id}/lag", lag)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/replications/{id}/lag", readLag)
 }
 `,
       solution: `package main
@@ -385,237 +281,159 @@ func main() {
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 
-	"github.com/redis/go-redis/v9"
+	"replication/offsets" // offsets.ResumeOffset
+	"replication/regions" // regions.SourceHeadOffset, SampleKeys, KeyDigest
+	"replication/store"   // store.Get
 )
 
-const sampleKeyCount = 256
+// sampleKeys is how many rows of a shard are compared per read: enough to catch a shard that diverged, cheap enough to run on every read.
+const sampleKeys = 256
 
-var rdb *redis.Client
-
-type Replication struct {
-	ID             string \`json:"id"\`
-	Owner          string \`json:"owner"\`
-	SourceRegion   string \`json:"source_region"\`
-	TargetRegion   string \`json:"target_region"\`
-	Shards         []int  \`json:"shards"\`
-	ConflictPolicy string \`json:"conflict_policy"\`
+type shardLag struct {
+	Shard            int      \`json:"shard"\`
+	Offset           int64    \`json:"offset"\`
+	SourceHeadOffset int64    \`json:"source_head_offset"\`
+	LagChanges       int64    \`json:"lag_changes"\`
+	DivergentKeys    []string \`json:"divergent_keys"\`
 }
 
-type Divergence struct {
-	Key          string \`json:"key"\`
-	SourceDigest string \`json:"source_digest"\`
-	TargetDigest string \`json:"target_digest"\`
-}
-
-type ShardLag struct {
-	Shard            int          \`json:"shard"\`
-	Offset           int64        \`json:"offset"\`
-	SourceHeadOffset int64        \`json:"source_head_offset"\`
-	LagChanges       int64        \`json:"lag_changes"\`
-	Divergences      []Divergence \`json:"divergences"\`
-}
-
-type LagResponse struct {
-	ReplicationID   string     \`json:"replication_id"\`
-	SampledKeys     int        \`json:"sampled_keys"\`
-	Shards          []ShardLag \`json:"shards"\`
-	DivergentShards []int      \`json:"divergent_shards"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func keyDigest(region, key string) string {
-	return ""
-}
-
-func sampleKeys(replicationID string, shard, count int) []string {
-	return nil
-}
-
-func sourceHeadOffset(ctx context.Context, replicationID string, shard int) int64 {
-	return 0
-}
-
-func resumeOffset(ctx context.Context, replicationID string, shard int) int64 {
-	raw, err := rdb.Get(ctx, offsetKey(replicationID, shard)).Result()
-	if err != nil {
-		return 0
-	}
-	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return value
-}
-
-func divergenceSample(ctx context.Context, replication Replication, shard int) []Divergence {
-	divergences := []Divergence{}
-	for _, key := range sampleKeys(replication.ID, shard, sampleKeyCount) {
-		sourceDigest := keyDigest(replication.SourceRegion, key)
-		targetDigest := keyDigest(replication.TargetRegion, key)
-		if sourceDigest != targetDigest {
-			divergences = append(divergences, Divergence{Key: key, SourceDigest: sourceDigest, TargetDigest: targetDigest})
+// divergentKeys is the sampled rows of the shard whose digests differ between the two regions.
+func divergentKeys(ctx context.Context, replication *store.Replication, shard int) []string {
+	diverged := []string{}
+	for _, key := range regions.SampleKeys(ctx, replication.SourceRegion, shard, sampleKeys) {
+		if regions.KeyDigest(ctx, replication.SourceRegion, shard, key) != regions.KeyDigest(ctx, replication.TargetRegion, shard, key) {
+			diverged = append(diverged, key)
 		}
 	}
-	return divergences
+	return diverged
 }
 
-func lag(rw http.ResponseWriter, r *http.Request) {
+func readLag(rw http.ResponseWriter, r *http.Request) {
 	operator := r.Header.Get("X-Operator-Id")
-	replication, err := store.Get(r.Context(), r.PathValue("id"))
-	if err != nil || replication.Owner != operator {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown replication"})
+	if operator == "" {
+		http.Error(rw, "X-Operator-Id is required", http.StatusUnauthorized)
 		return
 	}
-	shards := []ShardLag{}
+	id := r.PathValue("id")
+	replication, err := store.Get(r.Context(), id)
+	// Another operator's replication is as absent as one that does not exist: the id reveals nothing.
+	if err != nil || replication == nil || replication.Owner != operator {
+		http.Error(rw, "no such replication", http.StatusNotFound)
+		return
+	}
+	shards := []shardLag{}
 	divergentShards := []int{}
 	for _, shard := range replication.Shards {
-		offset := resumeOffset(r.Context(), replication.ID, shard)
-		head := sourceHeadOffset(r.Context(), replication.ID, shard)
-		divergences := divergenceSample(r.Context(), replication, shard)
-		if len(divergences) > 0 {
+		offset, err := offsets.ResumeOffset(r.Context(), id, shard)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		head := regions.SourceHeadOffset(r.Context(), id, shard)
+		diverged := divergentKeys(r.Context(), replication, shard) // a shard at zero lag can still hold different rows
+		if len(diverged) > 0 {
 			divergentShards = append(divergentShards, shard)
 		}
-		lagChanges := head - offset
-		if lagChanges < 0 {
-			lagChanges = 0
-		}
-		shards = append(shards, ShardLag{
-			Shard:            shard,
-			Offset:           offset,
-			SourceHeadOffset: head,
-			LagChanges:       lagChanges,
-			Divergences:      divergences,
-		})
+		shards = append(shards, shardLag{Shard: shard, Offset: offset, SourceHeadOffset: head, LagChanges: max(head-offset, 0), DivergentKeys: diverged})
 	}
-	writeJSON(rw, http.StatusOK, LagResponse{
-		ReplicationID:   replication.ID,
-		SampledKeys:     sampleKeyCount,
-		Shards:          shards,
-		DivergentShards: divergentShards,
-	})
+	writeJSON(rw, http.StatusOK, map[string]any{"replication_id": id, "sampled_keys": sampleKeys, "shards": shards, "divergent_shards": divergentShards})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/replications/{id}/lag", lag)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/replications/{id}/lag", readLag)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+import spray.json._
 
-final case class Replication(id: String, owner: String, source_region: String, target_region: String, shards: List[Int], conflict_policy: String)
+import replication.{Offsets, Regions, Store} // Store.get · Offsets.resumeOffset · Regions.sourceHeadOffset, sampleKeys, keyDigest
 
-object LagApi {
-  implicit val system: ActorSystem = ActorSystem("replicatord")
-  private val jedis = new Jedis("redis", 6379)
-  val LagBudgetChanges = 10000
-
-  val store = ReplicationStore.open()
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+object Read {
   val route: Route =
     path("v1" / "replications" / Segment / "lag") { replicationId =>
       get {
-        store.get(replicationId) match {
-          case None => complete(StatusCodes.NotFound, """{"error":"unknown replication"}""")
+        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+        Store.get(replicationId) match {
+          case None => complete(StatusCodes.NotFound -> "no such replication")
           case Some(replication) =>
-            val applied = Option(jedis.get("offset")).map(_.toLong).getOrElse(0L)
-            val lag = math.max(LagBudgetChanges - applied, 0L)
-            complete(StatusCodes.OK, s"""{"replication_id":"$replicationId","lag":$lag,"healthy":true}""")
+            val applied = replication.shards.map(Offsets.resumeOffset(replicationId, _)).min
+            val head = replication.shards.map(Regions.sourceHeadOffset(replicationId, _)).max
+            val body = JsObject(
+              "replication_id" -> JsString(replicationId),
+              "lag_changes" -> JsNumber(math.max(head - applied, 0L)),
+              "healthy" -> JsTrue
+            )
+            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+import spray.json._
 
-final case class Replication(id: String, owner: String, source_region: String, target_region: String, shards: List[Int], conflict_policy: String)
-final case class Divergence(key: String, source_digest: String, target_digest: String)
+import replication.{Offsets, Regions, Replication, Store} // Store.get · Offsets.resumeOffset · Regions.sourceHeadOffset, sampleKeys, keyDigest
 
-object LagApi {
-  implicit val system: ActorSystem = ActorSystem("replicatord")
-  private val jedis = new Jedis("redis", 6379)
-
-  // How many keys of a shard the divergence check samples: enough to catch a diverge inside one
-  // batch, cheap enough to run on every lag read.
+object Read {
+  /** Rows of a shard compared per read: enough to catch a shard that diverged, cheap enough to run on every read. */
   val SampleKeys = 256
 
-  val store = ReplicationStore.open()
-
-  def keyDigest(region: String, key: String): String = throw new UnsupportedOperationException("digest a key")
-
-  def sampleKeys(replicationId: String, shard: Int, count: Int): Seq[String] = Seq.empty
-
-  def sourceHeadOffset(replicationId: String, shard: Int): Long = 0L
-
-  def resumeOffset(replicationId: String, shard: Int): Long = {
-    val raw = jedis.get(s"offset:$replicationId:$shard")
-    if (raw == null) 0L else raw.toLong
-  }
-
-  def divergenceSample(replication: Replication, shard: Int): Seq[Divergence] = {
-    sampleKeys(replication.id, shard, SampleKeys).flatMap { key =>
-      val sourceDigest = keyDigest(replication.source_region, key)
-      val targetDigest = keyDigest(replication.target_region, key)
-      if (sourceDigest != targetDigest) Some(Divergence(key, sourceDigest, targetDigest)) else None
+  /** The sampled rows of the shard whose digests differ between the two regions. */
+  def divergentKeys(replication: Replication, shard: Int): Seq[String] =
+    Regions.sampleKeys(replication.sourceRegion, shard, SampleKeys).filter { key =>
+      Regions.keyDigest(replication.sourceRegion, shard, key) != Regions.keyDigest(replication.targetRegion, shard, key)
     }
+
+  private def shardLag(replicationId: String, replication: Replication, shard: Int): (JsObject, Boolean) = {
+    val offset = Offsets.resumeOffset(replicationId, shard)
+    val head = Regions.sourceHeadOffset(replicationId, shard)
+    val diverged = divergentKeys(replication, shard) // a shard at zero lag can still hold different rows
+    val entry = JsObject(
+      "shard" -> JsNumber(shard),
+      "offset" -> JsNumber(offset),
+      "source_head_offset" -> JsNumber(head),
+      "lag_changes" -> JsNumber(math.max(head - offset, 0L)),
+      "divergent_keys" -> JsArray(diverged.map(JsString(_)).toVector)
+    )
+    (entry, diverged.nonEmpty)
   }
 
   val route: Route =
     path("v1" / "replications" / Segment / "lag") { replicationId =>
       get {
-        optionalHeaderValueByName("X-Operator-Id") { operatorOpt =>
-          store.get(replicationId) match {
-            case Some(replication) if operatorOpt.contains(replication.owner) =>
-              val shards = replication.shards.map { shard =>
-                val offset = resumeOffset(replicationId, shard)
-                val head = sourceHeadOffset(replicationId, shard)
-                val divergences = divergenceSample(replication, shard)
-                val divergencesJson = divergences
-                  .map(d => s"""{"key":"\${d.key}","source_digest":"\${d.source_digest}","target_digest":"\${d.target_digest}"}""")
-                s"""{"shard":$shard,"offset":$offset,"source_head_offset":$head,"lag_changes":\${math.max(head - offset, 0L)},"divergences":[\${divergencesJson.mkString(",")}]}"""
-              }
-              val divergentShards =
-                replication.shards.filter(shard => divergenceSample(replication, shard).nonEmpty)
-              complete(
-                StatusCodes.OK,
-                s"""{"replication_id":"$replicationId","sampled_keys":$SampleKeys,"shards":[\${shards.mkString(",")}],"divergent_shards":[\${divergentShards.mkString(",")}]}""",
-              )
-            case _ => complete(StatusCodes.NotFound, """{"error":"unknown replication"}""")
-          }
+        optionalHeaderValueByName("X-Operator-Id") {
+          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Operator-Id is required")
+          case Some(operator) =>
+            // Another operator's replication is as absent as one that does not exist: the id reveals nothing.
+            Store.get(replicationId).filter(_.owner == operator) match {
+              case None => complete(StatusCodes.NotFound -> "no such replication")
+              case Some(replication) =>
+                val lags = replication.shards.map(shard => shard -> shardLag(replicationId, replication, shard))
+                val body = JsObject(
+                  "replication_id" -> JsString(replicationId),
+                  "sampled_keys" -> JsNumber(SampleKeys),
+                  "shards" -> JsArray(lags.map(_._2._1).toVector),
+                  "divergent_shards" -> JsArray(lags.collect { case (shard, (_, true)) => JsNumber(shard) }.toVector)
+                )
+                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
+            }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },
@@ -623,42 +441,36 @@ object LagApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <string>
-#include <vector>
+
+#include "replication/offsets.h"  // offsets::resumeOffset
+#include "replication/regions.h"  // regions::sourceHeadOffset, sampleKeys, keyDigest
+#include "replication/store.h"    // store::get
 
 using json = nlohmann::json;
 
-constexpr long long kLagBudgetChanges = 10000;
-
-struct Replication {
-  std::string id;
-  std::string owner;
-  std::string source_region;
-  std::string target_region;
-  std::vector<int> shards;
-  std::string conflict_policy;
-};
-
-int main() {
-  httplib::Server svr;
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  svr.Get(R"(/v1/replications/([^/]+)/lag)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto replicationId = req.matches[1].str();
-    const auto replication = store.get(replicationId);
-    if (!replication) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown replication"})", "application/json");
-      return;
-    }
-    const auto applied = std::stoll(redis.get("offset").value_or("0"));
-    const auto lag = std::max(kLagBudgetChanges - applied, 0LL);
-    res.status = 200;
-    res.set_content(json{{"replication_id", replicationId}, {"lag", lag}, {"healthy", true}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void read_lag(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const std::string id = req.matches[1];
+  const auto replication = store::get(id);
+  if (!replication) {
+    res.status = 404;
+    res.set_content("no such replication", "text/plain");
+    return;
+  }
+  long long applied = -1;
+  long long head = 0;
+  for (const int shard : replication->shards) {
+    const long long offset = offsets::resumeOffset(id, shard);
+    applied = applied < 0 ? offset : std::min(applied, offset);
+    head = std::max(head, regions::sourceHeadOffset(id, shard));
+  }
+  const json body = {{"replication_id", id}, {"lag_changes", std::max(head - applied, 0LL)}, {"healthy", true}};
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/replications/([\\w-]+)/lag)", read_lag); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -667,84 +479,432 @@ int main() {
 #include <string>
 #include <vector>
 
+#include "replication/offsets.h"  // offsets::resumeOffset
+#include "replication/regions.h"  // regions::sourceHeadOffset, sampleKeys, keyDigest
+#include "replication/store.h"    // store::get
+
 using json = nlohmann::json;
 
-// How many keys of a shard the divergence check samples: enough to catch a diverge inside one batch,
-// cheap enough to run on every lag read.
-constexpr int kSampleKeys = 256;
+// Rows of a shard compared per read: enough to catch a shard that diverged, cheap enough to run on every read.
+constexpr std::size_t kSampleKeys = 256;
 
-struct Replication {
-  std::string id;
-  std::string owner;
-  std::string source_region;
-  std::string target_region;
-  std::vector<int> shards;
-  std::string conflict_policy;
-};
-
-std::string keyDigest(const std::string& region, const std::string& key);
-std::vector<std::string> sampleKeys(const std::string& replicationId, int shard, int count);
-int64_t sourceHeadOffset(const std::string& replicationId, int shard);
-int64_t resumeOffset(const std::string& replicationId, int shard);
-
-json divergenceSample(const Replication& replication, int shard) {
-  json divergences = json::array();
-  for (const auto& key : sampleKeys(replication.id, shard, kSampleKeys)) {
-    const auto sourceDigest = keyDigest(replication.source_region, key);
-    const auto targetDigest = keyDigest(replication.target_region, key);
-    if (sourceDigest != targetDigest) {
-      divergences.push_back({{"key", key}, {"source_digest", sourceDigest}, {"target_digest", targetDigest}});
+// The sampled rows of the shard whose digests differ between the two regions.
+std::vector<std::string> divergentKeys(const store::Replication& replication, int shard) {
+  std::vector<std::string> diverged;
+  for (const std::string& key : regions::sampleKeys(replication.source_region, shard, kSampleKeys)) {
+    if (regions::keyDigest(replication.source_region, shard, key) != regions::keyDigest(replication.target_region, shard, key)) {
+      diverged.push_back(key);
     }
   }
-  return divergences;
+  return diverged;
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/replications/([^/]+)/lag)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto operatorId = req.get_header_value("X-Operator-Id");
-    const auto replicationId = req.matches[1].str();
-    const auto replication = store.get(replicationId);
-    if (!replication || replication->owner != operatorId) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown replication"})", "application/json");
-      return;
-    }
-    json shards = json::array();
-    std::vector<int> divergentShards;
-    for (int shard : replication->shards) {
-      const auto offset = resumeOffset(replicationId, shard);
-      const auto head = sourceHeadOffset(replicationId, shard);
-      const auto divergences = divergenceSample(*replication, shard);
-      if (!divergences.empty()) divergentShards.push_back(shard);
-      shards.push_back({
-          {"shard", shard},
-          {"offset", offset},
-          {"source_head_offset", head},
-          {"lag_changes", std::max<int64_t>(head - offset, 0)},
-          {"divergences", divergences},
-      });
-    }
-    res.status = 200;
-    res.set_content(
-        json{{"replication_id", replicationId},
-             {"sampled_keys", kSampleKeys},
-             {"shards", shards},
-             {"divergent_shards", divergentShards}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void read_lag(const httplib::Request& req, httplib::Response& res) {
+  const std::string op = req.get_header_value("X-Operator-Id");
+  if (op.empty()) {
+    res.status = 401;
+    res.set_content("X-Operator-Id is required", "text/plain");
+    return;
+  }
+  const std::string id = req.matches[1];
+  const auto replication = store::get(id);
+  // Another operator's replication is as absent as one that does not exist: the id reveals nothing.
+  if (!replication || replication->owner != op) {
+    res.status = 404;
+    res.set_content("no such replication", "text/plain");
+    return;
+  }
+  json shards = json::array();
+  json divergent_shards = json::array();
+  for (const int shard : replication->shards) {
+    const long long offset = offsets::resumeOffset(id, shard);
+    const long long head = regions::sourceHeadOffset(id, shard);
+    const auto diverged = divergentKeys(*replication, shard);  // a shard at zero lag can still hold different rows
+    if (!diverged.empty()) divergent_shards.push_back(shard);
+    shards.push_back({{"shard", shard},
+                      {"offset", offset},
+                      {"source_head_offset", head},
+                      {"lag_changes", std::max(head - offset, 0LL)},
+                      {"divergent_keys", diverged}});
+  }
+  const json body = {{"replication_id", id}, {"sampled_keys", kSampleKeys}, {"shards", shards}, {"divergent_shards", divergent_shards}};
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/replications/([\\w-]+)/lag)", read_lag); }
 `,
     },
   },
+  harness: {
+    python: `from replication import store
+
+
+def _replication(ctx, shards):
+    return store.create("ops-a", "us-east-1", "eu-west-1", shards, "source-wins")["id"]
+
+
+def _shard(ctx, rid, shard, offset, head):
+    ctx.redis.set(f"offset:{rid}:{shard}", offset)
+    ctx.redis.set(f"head:{rid}:{shard}", head)
+
+
+def _rows(ctx, region, shard, rows):
+    ctx.redis.hset(f"digest:{region}:{shard}", mapping=rows)
+
+
+async def _lag(ctx, rid, operator="ops-a"):
+    headers = {} if operator is None else {"X-Operator-Id": operator}
+    async with ctx.client(ctx.load("read").app) as c:
+        return await c.get(f"/v1/replications/{rid}/lag", headers=headers)
+
+
+async def check_route(ctx):
+    rid = _replication(ctx, [0])
+    _shard(ctx, rid, 0, 5, 5)
+    r = await _lag(ctx, rid)
+    assert r.status_code == 200, f"GET /v1/replications/{rid}/lag answered {r.status_code}: {r.text}"
+    assert r.json().get("replication_id") == rid, f"the lag read must name the replication, got {r.text}"
+
+
+async def check_owner_404(ctx):
+    rid = _replication(ctx, [0])
+    _shard(ctx, rid, 0, 5, 5)
+    r = await _lag(ctx, rid, "ops-b")
+    assert r.status_code == 404, f"another operator read {rid} and got {r.status_code}, expected 404: a guessed id must reveal nothing"
+    r = await _lag(ctx, rid, None)
+    assert r.status_code == 401, f"a read without X-Operator-Id answered {r.status_code}, expected 401"
+    r = await _lag(ctx, rid)
+    assert r.status_code == 200, f"the owner's read answered {r.status_code}: {r.text}"
+
+
+async def check_per_shard_lag(ctx):
+    rid = _replication(ctx, [0, 1, 2])
+    _shard(ctx, rid, 0, 90, 100)
+    _shard(ctx, rid, 1, 50, 50)
+    _shard(ctx, rid, 2, 70, 60)  # the head was sampled before the last confirmation
+    r = await _lag(ctx, rid)
+    assert r.status_code == 200, f"the lag read answered {r.status_code}: {r.text}"
+    shards = r.json().get("shards")
+    assert isinstance(shards, list), f"the response has no shards list: {r.text}. One number cannot say which shard is behind"
+    seen = [{k: s.get(k) for k in ("shard", "offset", "source_head_offset", "lag_changes")} for s in shards]
+    expected = [
+        {"shard": 0, "offset": 90, "source_head_offset": 100, "lag_changes": 10},
+        {"shard": 1, "offset": 50, "source_head_offset": 50, "lag_changes": 0},
+        {"shard": 2, "offset": 70, "source_head_offset": 60, "lag_changes": 0},
+    ]
+    assert seen == expected, f"the shards are {seen}, expected {expected} (lag_changes is head - offset, never below 0)"
+
+
+async def check_divergent_shards(ctx):
+    rid = _replication(ctx, [0, 1, 2])
+    for shard in (0, 1, 2):
+        _shard(ctx, rid, shard, 40, 40)
+    rows = {"orders/a": "d1", "orders/b": "d2", "orders/c": "d3"}
+    _rows(ctx, "us-east-1", 0, rows)
+    _rows(ctx, "eu-west-1", 0, {**rows, "orders/b": "d2-stale"})
+    _rows(ctx, "us-east-1", 1, rows)
+    _rows(ctx, "eu-west-1", 1, rows)
+    _rows(ctx, "us-east-1", 2, rows)
+    _rows(ctx, "eu-west-1", 2, {"orders/a": "d1", "orders/b": "d2"})
+    r = await _lag(ctx, rid)
+    body = r.json()
+    assert body.get("divergent_shards") == [0, 2], f"divergent_shards is {body.get('divergent_shards')!r}, expected [0, 2]: shard 0 holds a stale row and shard 2 misses one, both at zero lag ({r.text})"
+    assert body.get("sampled_keys") == 256, f"sampled_keys is {body.get('sampled_keys')!r}, expected SAMPLE_KEYS = 256"
+    by_shard = {s.get("shard"): s for s in body.get("shards") or []}
+    assert (by_shard.get(0) or {}).get("divergent_keys") == ["orders/b"], f"shard 0 must list orders/b as divergent, got {by_shard.get(0)}"
+    assert (by_shard.get(2) or {}).get("divergent_keys") == ["orders/c"], f"shard 2 must list orders/c (missing at the target), got {by_shard.get(2)}"
+    assert (by_shard.get(1) or {}).get("divergent_keys") == [], f"shard 1 is identical in both regions, got {by_shard.get(1)}"
+`,
+    typescript: `function setup(ctx, shards: number[]) {
+  return ctx.load('/support/replication/store.ts').create('ops-a', 'us-east-1', 'eu-west-1', shards, 'source-wins');
+}
+
+function shard(ctx, rid: string, n: number, offset: number, head: number) {
+  ctx.redis.set(\`offset:\${rid}:\${n}\`, String(offset));
+  ctx.redis.set(\`head:\${rid}:\${n}\`, String(head));
+}
+
+const lag = (ctx, rid: string, operator: string | null = 'ops-a') =>
+  ctx.client(ctx.load('read').app).get(\`/v1/replications/\${rid}/lag\`, {headers: operator === null ? {} : {'X-Operator-Id': operator}});
+
+export async function check_route(ctx) {
+  const {id} = await setup(ctx, [0]);
+  shard(ctx, id, 0, 5, 5);
+  const r = await lag(ctx, id);
+  assert.equal(r.status, 200, \`GET /v1/replications/\${id}/lag answered \${r.status}: \${r.text}\`);
+  assert.equal(r.json().replication_id, id, \`the lag read must name the replication, got \${r.text}\`);
+}
+
+export async function check_owner_404(ctx) {
+  const {id} = await setup(ctx, [0]);
+  shard(ctx, id, 0, 5, 5);
+  let r = await lag(ctx, id, 'ops-b');
+  assert.equal(r.status, 404, \`another operator read \${id} and got \${r.status}, expected 404: a guessed id must reveal nothing\`);
+  r = await lag(ctx, id, null);
+  assert.equal(r.status, 401, \`a read without X-Operator-Id answered \${r.status}, expected 401\`);
+  r = await lag(ctx, id);
+  assert.equal(r.status, 200, \`the owner's read answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_per_shard_lag(ctx) {
+  const {id} = await setup(ctx, [0, 1, 2]);
+  shard(ctx, id, 0, 90, 100);
+  shard(ctx, id, 1, 50, 50);
+  shard(ctx, id, 2, 70, 60); // the head was sampled before the last confirmation
+  const r = await lag(ctx, id);
+  assert.equal(r.status, 200, \`the lag read answered \${r.status}: \${r.text}\`);
+  const shards = r.json().shards;
+  assert(Array.isArray(shards), \`the response has no shards list: \${r.text}. One number cannot say which shard is behind\`);
+  const seen = shards.map(s => ({shard: s.shard, offset: s.offset, source_head_offset: s.source_head_offset, lag_changes: s.lag_changes}));
+  const expected = [
+    {shard: 0, offset: 90, source_head_offset: 100, lag_changes: 10},
+    {shard: 1, offset: 50, source_head_offset: 50, lag_changes: 0},
+    {shard: 2, offset: 70, source_head_offset: 60, lag_changes: 0},
+  ];
+  assert.deepStrictEqual(seen, expected, \`the shards are \${JSON.stringify(seen)}, expected \${JSON.stringify(expected)} (lag_changes is head - offset, never below 0)\`);
+}
+
+export async function check_divergent_shards(ctx) {
+  const {id} = await setup(ctx, [0, 1, 2]);
+  for (const n of [0, 1, 2]) shard(ctx, id, n, 40, 40);
+  const rows = {'orders/a': 'd1', 'orders/b': 'd2', 'orders/c': 'd3'};
+  ctx.redis.hset('digest:us-east-1:0', rows);
+  ctx.redis.hset('digest:eu-west-1:0', {...rows, 'orders/b': 'd2-stale'});
+  ctx.redis.hset('digest:us-east-1:1', rows);
+  ctx.redis.hset('digest:eu-west-1:1', rows);
+  ctx.redis.hset('digest:us-east-1:2', rows);
+  ctx.redis.hset('digest:eu-west-1:2', {'orders/a': 'd1', 'orders/b': 'd2'});
+  const r = await lag(ctx, id);
+  const body = r.json();
+  assert.deepStrictEqual(body.divergent_shards, [0, 2], \`divergent_shards is \${JSON.stringify(body.divergent_shards)}, expected [0, 2]: shard 0 holds a stale row and shard 2 misses one, both at zero lag (\${r.text})\`);
+  assert.equal(body.sampled_keys, 256, \`sampled_keys is \${JSON.stringify(body.sampled_keys)}, expected SAMPLE_KEYS = 256\`);
+  const byShard = Object.fromEntries((body.shards ?? []).map(s => [s.shard, s]));
+  assert.deepStrictEqual(byShard[0]?.divergent_keys, ['orders/b'], \`shard 0 must list orders/b as divergent, got \${JSON.stringify(byShard[0])}\`);
+  assert.deepStrictEqual(byShard[2]?.divergent_keys, ['orders/c'], \`shard 2 must list orders/c (missing at the target), got \${JSON.stringify(byShard[2])}\`);
+  assert.deepStrictEqual(byShard[1]?.divergent_keys, [], \`shard 1 is identical in both regions, got \${JSON.stringify(byShard[1])}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"replication/store"
+
+	"leetbuild/harness"
+)
+
+func setup(ctx *harness.Ctx, shards []int) string {
+	replication, err := store.Create(context.Background(), "ops-a", "us-east-1", "eu-west-1", shards, "source-wins")
+	ctx.NoError(err, "store.Create")
+	return replication.ID
+}
+
+func shardAt(ctx *harness.Ctx, rid string, shard int, offset, head int64) {
+	ctx.Redis.Set(fmt.Sprintf("offset:%s:%d", rid, shard), offset)
+	ctx.Redis.Set(fmt.Sprintf("head:%s:%d", rid, shard), head)
+}
+
+func rows(ctx *harness.Ctx, region string, shard int, kv ...string) {
+	args := []any{"HSET", fmt.Sprintf("digest:%s:%d", region, shard)}
+	for _, s := range kv {
+		args = append(args, s)
+	}
+	ctx.Redis.Do(args...)
+}
+
+func lag(ctx *harness.Ctx, rid string, header ...string) *harness.Response {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux).Get("/v1/replications/"+rid+"/lag", header...)
+}
+
+type lagBody struct {
+	ReplicationID   string \`json:"replication_id"\`
+	SampledKeys     int    \`json:"sampled_keys"\`
+	DivergentShards []int  \`json:"divergent_shards"\`
+	Shards          []struct {
+		Shard            int      \`json:"shard"\`
+		Offset           int64    \`json:"offset"\`
+		SourceHeadOffset int64    \`json:"source_head_offset"\`
+		LagChanges       int64    \`json:"lag_changes"\`
+		DivergentKeys    []string \`json:"divergent_keys"\`
+	} \`json:"shards"\`
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	rid := setup(ctx, []int{0})
+	shardAt(ctx, rid, 0, 5, 5)
+	r := lag(ctx, rid, "X-Operator-Id", "ops-a")
+	ctx.Equal(r.Status, 200, "GET /v1/replications/%s/lag (%s)", rid, r.Text())
+	var body lagBody
+	r.Decode(&body)
+	ctx.Equal(body.ReplicationID, rid, "the lag read must name the replication")
+}
+
+func CheckOwner404(ctx *harness.Ctx) {
+	rid := setup(ctx, []int{0})
+	shardAt(ctx, rid, 0, 5, 5)
+	r := lag(ctx, rid, "X-Operator-Id", "ops-b")
+	ctx.Equal(r.Status, 404, "another operator read %s: a guessed id must reveal nothing", rid)
+	r = lag(ctx, rid)
+	ctx.Equal(r.Status, 401, "a read without X-Operator-Id")
+	r = lag(ctx, rid, "X-Operator-Id", "ops-a")
+	ctx.Equal(r.Status, 200, "the owner's read (%s)", r.Text())
+}
+
+func CheckPerShardLag(ctx *harness.Ctx) {
+	rid := setup(ctx, []int{0, 1, 2})
+	shardAt(ctx, rid, 0, 90, 100)
+	shardAt(ctx, rid, 1, 50, 50)
+	shardAt(ctx, rid, 2, 70, 60) // the head was sampled before the last confirmation
+	r := lag(ctx, rid, "X-Operator-Id", "ops-a")
+	ctx.Equal(r.Status, 200, "the lag read (%s)", r.Text())
+	var body lagBody
+	r.Decode(&body)
+	ctx.Assert(len(body.Shards) == 3, "the response must list the three shards, got %s. One number cannot say which shard is behind", r.Text())
+	var seen [][4]int64
+	for _, s := range body.Shards {
+		seen = append(seen, [4]int64{int64(s.Shard), s.Offset, s.SourceHeadOffset, s.LagChanges})
+	}
+	ctx.Equal(seen, [][4]int64{{0, 90, 100, 10}, {1, 50, 50, 0}, {2, 70, 60, 0}}, "the shards as [shard, offset, source_head_offset, lag_changes] (lag_changes is head - offset, never below 0)")
+}
+
+func CheckDivergentShards(ctx *harness.Ctx) {
+	rid := setup(ctx, []int{0, 1, 2})
+	for _, shard := range []int{0, 1, 2} {
+		shardAt(ctx, rid, shard, 40, 40)
+	}
+	rows(ctx, "us-east-1", 0, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
+	rows(ctx, "eu-west-1", 0, "orders/a", "d1", "orders/b", "d2-stale", "orders/c", "d3")
+	rows(ctx, "us-east-1", 1, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
+	rows(ctx, "eu-west-1", 1, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
+	rows(ctx, "us-east-1", 2, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
+	rows(ctx, "eu-west-1", 2, "orders/a", "d1", "orders/b", "d2")
+	r := lag(ctx, rid, "X-Operator-Id", "ops-a")
+	var body lagBody
+	r.Decode(&body)
+	ctx.Equal(body.DivergentShards, []int{0, 2}, "shard 0 holds a stale row and shard 2 misses one, both at zero lag (%s); divergent_shards", r.Text())
+	ctx.Equal(body.SampledKeys, 256, "sampled_keys must be the sample size")
+	keys := map[int][]string{}
+	for _, s := range body.Shards {
+		keys[s.Shard] = s.DivergentKeys
+	}
+	ctx.Equal(keys[0], []string{"orders/b"}, "shard 0's divergent_keys")
+	ctx.Equal(keys[2], []string{"orders/c"}, "shard 2's divergent_keys (missing at the target)")
+	ctx.Equal(keys[1], []string{}, "shard 1 is identical in both regions; its divergent_keys")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "replication/store.h"
+
+namespace {
+
+std::string setup(const std::vector<int>& shards) { return store::create("ops-a", "us-east-1", "eu-west-1", shards, "source-wins").id; }
+
+void shardAt(harness::Ctx& ctx, const std::string& rid, int shard, long long offset, long long head) {
+  ctx.Redis.Set("offset:" + rid + ":" + std::to_string(shard), std::to_string(offset));
+  ctx.Redis.Set("head:" + rid + ":" + std::to_string(shard), std::to_string(head));
+}
+
+void rows(harness::Ctx& ctx, const std::string& region, int shard, const std::vector<std::string>& kv) {
+  std::vector<std::string> args = {"HSET", "digest:" + region + ":" + std::to_string(shard)};
+  args.insert(args.end(), kv.begin(), kv.end());
+  ctx.Redis.Must(args);
+}
+
+harness::Response lag(harness::Ctx& ctx, const std::string& rid, const std::string& op) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  auto c = ctx.HTTP(*svr);
+  if (op.empty()) return c.Get("/v1/replications/" + rid + "/lag");
+  return c.Get("/v1/replications/" + rid + "/lag", "X-Operator-Id", op);
+}
+
+nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+nlohmann::json shardEntry(const nlohmann::json& body, int shard) {
+  if (body.is_object() && body.contains("shards") && body["shards"].is_array()) {
+    for (const auto& s : body["shards"]) {
+      if (s.value("shard", -1) == shard) return s;
+    }
+  }
+  return nlohmann::json::object();
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  const std::string rid = setup({0});
+  shardAt(ctx, rid, 0, 5, 5);
+  const auto r = lag(ctx, rid, "ops-a");
+  ctx.Equal(r.Status, 200, "GET /v1/replications/%s/lag (%s)", rid, r.Text());
+  const auto body = bodyOf(r);
+  ctx.Assert(body.is_object() && body.value("replication_id", "") == rid, "the lag read must name the replication, got %s", r.Text());
+}
+
+void CheckOwner404(harness::Ctx& ctx) {
+  const std::string rid = setup({0});
+  shardAt(ctx, rid, 0, 5, 5);
+  ctx.Equal(lag(ctx, rid, "ops-b").Status, 404, "another operator read %s: a guessed id must reveal nothing", rid);
+  ctx.Equal(lag(ctx, rid, "").Status, 401, "a read without X-Operator-Id");
+  const auto r = lag(ctx, rid, "ops-a");
+  ctx.Equal(r.Status, 200, "the owner's read (%s)", r.Text());
+}
+
+void CheckPerShardLag(harness::Ctx& ctx) {
+  const std::string rid = setup({0, 1, 2});
+  shardAt(ctx, rid, 0, 90, 100);
+  shardAt(ctx, rid, 1, 50, 50);
+  shardAt(ctx, rid, 2, 70, 60);  // the head was sampled before the last confirmation
+  const auto r = lag(ctx, rid, "ops-a");
+  ctx.Equal(r.Status, 200, "the lag read (%s)", r.Text());
+  const auto body = bodyOf(r);
+  ctx.Assert(body.is_object() && body.contains("shards") && body["shards"].is_array() && body["shards"].size() == 3,
+             "the response must list the three shards, got %s. One number cannot say which shard is behind", r.Text());
+  std::vector<std::vector<long long>> seen;
+  for (const auto& s : body["shards"]) {
+    seen.push_back({s.value("shard", -1LL), s.value("offset", -1LL), s.value("source_head_offset", -1LL), s.value("lag_changes", -1LL)});
+  }
+  const std::vector<std::vector<long long>> expected = {{0, 90, 100, 10}, {1, 50, 50, 0}, {2, 70, 60, 0}};
+  ctx.Equal(seen, expected, "the shards as [shard, offset, source_head_offset, lag_changes] (lag_changes is head - offset, never below 0)");
+}
+
+void CheckDivergentShards(harness::Ctx& ctx) {
+  const std::string rid = setup({0, 1, 2});
+  for (const int shard : {0, 1, 2}) shardAt(ctx, rid, shard, 40, 40);
+  const std::vector<std::string> all = {"orders/a", "d1", "orders/b", "d2", "orders/c", "d3"};
+  rows(ctx, "us-east-1", 0, all);
+  rows(ctx, "eu-west-1", 0, {"orders/a", "d1", "orders/b", "d2-stale", "orders/c", "d3"});
+  rows(ctx, "us-east-1", 1, all);
+  rows(ctx, "eu-west-1", 1, all);
+  rows(ctx, "us-east-1", 2, all);
+  rows(ctx, "eu-west-1", 2, {"orders/a", "d1", "orders/b", "d2"});
+  const auto r = lag(ctx, rid, "ops-a");
+  const auto body = bodyOf(r);
+  ctx.Assert(body.is_object() && body.contains("divergent_shards") && body["divergent_shards"] == nlohmann::json::array({0, 2}),
+             "divergent_shards must be [0, 2]: shard 0 holds a stale row and shard 2 misses one, both at zero lag (%s)", r.Text());
+  ctx.Equal(body.value("sampled_keys", 0), 256, "sampled_keys must be the sample size");
+  ctx.Assert(shardEntry(body, 0).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/b"}), "shard 0 must list orders/b as divergent, got %s", shardEntry(body, 0).dump());
+  ctx.Assert(shardEntry(body, 2).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/c"}), "shard 2 must list orders/c (missing at the target), got %s", shardEntry(body, 2).dump());
+  ctx.Assert(shardEntry(body, 1).contains("divergent_keys") && shardEntry(body, 1)["divergent_keys"].empty(), "shard 1 is identical in both regions, got %s", shardEntry(body, 1).dump());
+}
+`,
+  },
   hints: [
-    'Stall one shard of a hundred, or apply a batch under the wrong policy: the lag read still reports a shrinking number and `healthy: true`. Any operator who guesses an id gets the same answer.',
-    'The handler reads one key, `offset`, subtracts it from a constant budget, and hard-codes `healthy`; it compares no digests and no owner, so nothing in it can distinguish shards, regions or callers.',
-    'Compare `replication["owner"]` with `x_operator_id` (404 on mismatch); loop the shards with `source_head_offset` and `lag_changes = max(head - applied, 0)`; run `divergence_sample` over `SAMPLE_KEYS` with `key_digest`; return `shards`, `divergent_shards`, `sampled_keys`.',
+    'Read the lag of a replication with another operator id: it answers 200. Put one shard behind and another ahead: the single number blends them. Make one row differ between the regions: the read still says healthy.',
+    'The handler never reads X-Operator-Id, takes a minimum of offsets and a maximum of heads that come from different shards, and hard-codes `healthy: True` instead of comparing the regions.',
+    '401 without the header, 404 when `owner` differs; per shard: `resume_offset`, `source_head_offset`, `max(head - offset, 0)`; `sample_keys(source, shard, SAMPLE_KEYS)`, compare `key_digest` in both regions, collect `divergent_keys` and `divergent_shards`.',
   ],
-  debrief: `The fix makes the read path answer a question it can settle. A lag number derived from a budget is not evidence: it cannot show which shard is behind, and it cannot detect divergence, because a change applied in the wrong order leaves both regions at the same offset with different rows. Per-shard offsets answer the first question; the digest sample answers the second, and reporting its size tells the caller how strong the claim is. The ownership check belongs in the same handler because a replication id is guessable, so a foreign replication has to look exactly like a missing one. Production platforms add a background reconciler that repairs the divergences this read names, and alert on the divergence count rather than on lag.`,
+  debrief: `Lag and divergence answer different questions, which is why the read reports both per shard. Lag says how far the target is behind the source's log; divergence says whether what the target applied matches, and a shard at zero lag can still be wrong after a lost write, a manual fix in one region or a conflict policy that resolved the other way. Sampling a bounded number of keys keeps the check cheap enough to run on every read. The 404 for another operator's replication keeps ids from becoming a lookup service. Real replicators compare Merkle trees of row hashes so a whole shard is checked without reading every row, run the comparison in the background, and repair a divergent range by re-copying it.`,
 };

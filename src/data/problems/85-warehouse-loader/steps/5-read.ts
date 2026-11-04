@@ -5,371 +5,305 @@ export const readStep: Step = {
   title: 'GET /v1/loads/{id}: counts that reconcile',
   concept: 'http',
   file: 'read',
-  focus: ['reader', 'api', 'db', 'warehouse'],
+  focus: ['reader', 'api', 'warehouse', 'redis'],
   task: `## Task
 
-**Starting point.** The starter registers \`GET /v1/loads/{load_id}\`, takes the tenant from
-\`X-Tenant-Id\`, fetches the load record and answers \`200\` with \`rows_read\` and \`rows_written\`
-both copied from the record's \`rows_planned\`, plus a \`freshness\` value read from
-\`freshness:{WORKER_ID}\` in Redis. It serves the demo, whose loads are clean, and hides 4 flaws.
+**Starting point.** The starter serves \`GET /v1/loads/{id}\`, the report finance reads before
+closing the books: it resolves the tenant's load with \`store.get_load\` (401 without
+\`X-Tenant-Id\`, 404 for no load or another tenant's) and answers \`load_id\`, \`status\`, \`target\`,
+\`rows_read\`, \`rows_written\` and \`freshness\`. It serves the demo, whose loads are clean, and hides
+four flaws.
 
-**Failure mode the checks target.** Planned counts make a half-loaded table look finished, hidden
-rejects erase why rows are missing, and per-process freshness makes a lagging table look fresh.
+**Failure mode the checks target.** Rows the warehouse never received are reported as written;
+rejected rows are invisible, so a gap looks like rounding; freshness comes from the shared source
+dataset, so another tenant's newer load makes a lagging table look fresh; and nothing says when the
+counts do not add up.
 
-- **401** without \`X-Tenant-Id\`, **404** for another tenant's load.
-- \`rows_read\`: source rows actually read; \`rows_written\`: rows read back from the warehouse.
-- \`rows_rejected\`: one entry per partition with \`partition_id\`, \`reason\` and \`rows\`.
-- \`freshness\`: the table's committed position (\`freshness:{target}\`).
-- \`delta\` is \`rows_read - rows_written - rows_rejected\`; \`flagged\` whenever it is not **0**.`,
+- \`rows_written\` is what the warehouse holds for the load, \`Warehouse.CountRows(target, load_id)\`,
+  not \`rows_planned\`.
+- \`rows_rejected\` is the sum of \`store.rejections(load_id)\`, listed under \`rejections\` with
+  \`partition_id\`, \`reason\` and \`rows\`.
+- \`freshness\` is \`store.table_freshness(target)\`.
+- \`delta\` is \`rows_read - rows_written - rows_rejected\`; \`flagged\` is true whenever it is not 0.`,
   sequence: {
-    participants: ['Downstream reader', 'Load API', 'loads store', 'Warehouse', 'Redis'],
+    participants: ['Finance reader', 'Load API', 'loads store', 'Warehouse'],
     messages: [
-      {from: 'Downstream reader', to: 'Load API', label: 'GET /v1/loads/{id} · X-Tenant-Id', kind: 'sync'},
-      {from: 'Load API', to: 'loads store', label: 'get(tenant, load_id)', kind: 'sync'},
-      {from: 'loads store', to: 'Load API', label: 'load record · rows_read', kind: 'reply'},
-      {from: 'Load API', to: 'Warehouse', label: 'rows_written(target, load_id)', kind: 'sync'},
-      {from: 'Warehouse', to: 'Load API', label: 'written count', kind: 'reply'},
-      {from: 'Load API', to: 'Redis', label: 'rejects(load_id) · freshness:{target}', kind: 'sync'},
-      {from: 'Redis', to: 'Load API', label: 'reasons · committed_at', kind: 'reply'},
+      {from: 'Finance reader', to: 'Load API', label: 'GET /v1/loads/ld-1 · X-Tenant-Id', kind: 'sync'},
       {
         from: 'Load API',
-        to: 'Downstream reader',
-        label: '200 {rows_read, rows_written, rows_rejected, delta, flagged}',
+        to: 'loads store',
+        label: 'get_load(tenant, ld-1) · rejections · table_freshness',
+        kind: 'sync',
+      },
+      {from: 'loads store', to: 'Load API', label: 'rows_read 1000 · 40 rejected · committed_at', kind: 'reply'},
+      {from: 'Load API', to: 'Warehouse', label: 'CountRows(wh_acme.orders, ld-1)', kind: 'sync'},
+      {from: 'Warehouse', to: 'Load API', label: 'rows 940', kind: 'reply'},
+      {
+        from: 'Load API',
+        to: 'Finance reader',
+        label: '200 {written 940, rejected 40, delta 20, flagged}',
         kind: 'reply',
       },
     ],
   },
-  hints: [
-    'Symptom: finance closes the month on a report that says 1,000,000 rows read and 1,000,000 written, while the table holds 940,000. The same load reports a different freshness depending on which replica answers.',
-    'Mechanism: both counts are `load["rows_planned"]`, so the delta is zero by construction; the reject log is not consulted; and `freshness:{WORKER_ID}` is a per-process key, not a property of the table.',
-    'Fix: `rows_written = warehouse.rows_written(load_id)`, map rejects to `{partition_id, reason, rows}` and sum `rows_rejected`, read `freshness.table_freshness(target)`, then `delta = rows_read - rows_written - rows_rejected` and `flagged = delta != 0`.',
-  ],
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/loads/{id}',
-      detail: 'Register the report route on `GET /v1/loads/{id}`.',
+      title: 'Serves the tenant’s own load report',
+      detail:
+        'Register `GET /v1/loads/{id}`: 401 without `X-Tenant-Id`, 404 for another tenant’s load, 200 with the load’s report.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/loads\/\{load_id\}["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/loads\/:loadId['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/loads\/\{load_id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"loads"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(/, /\/v1\/loads\//]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/loads\/\{load_id\}["']/, /store\.get_load\(/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/loads\/:loadId['"]/, /getLoad\(/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/loads\/\{id\}"/, /store\.GetLoad\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"loads"\s*\/\s*Segment\s*\)/, /Store\.getLoad\(/]},
+        cpp: {all: [/svr\.Get\(/, /store::getLoad\(/]},
       },
     },
     {
       id: 'written-from-warehouse',
       title: 'Reports rows written as the warehouse holds them',
       detail:
-        '`rows_written` comes from a warehouse query for this load (and the delta is measured against it). The starter reports the manifest’s planned count for both read and written.',
+        '`rows_written` is the warehouse’s `CountRows` for the load’s target and id; the starter copies the planned count, so a partial load reports every row written.',
       match: {
-        python: {all: [/warehouse\.rows_written\(/, /rows_written/], none: [/rows_planned/]},
-        typescript: {all: [/warehouse\.rowsWritten\(/, /rows_written/], none: [/rowsPlanned|rows_planned/]},
-        go: {all: [/warehouse\.RowsWritten\(/, /RowsWritten/], none: [/RowsPlanned|rows_planned/]},
-        scala: {all: [/Warehouse\.rowsWritten\(/, /rowsWritten/], none: [/rowsPlanned|rows_planned/]},
-        cpp: {all: [/warehouse\.rowsWritten\(/, /rows_written/], none: [/rows_planned/]},
+        python: {all: [/CountRows\(/], none: [/rows_planned/]},
+        typescript: {all: [/CountRows\(/], none: [/rows_planned/]},
+        go: {all: [/CountRows\(/], none: [/RowsPlanned/]},
+        scala: {all: [/countRows\(/], none: [/rowsPlanned/]},
+        cpp: {all: [/CountRows\(/], none: [/rows_planned/]},
       },
     },
     {
-      id: 'rejected-reasons',
+      id: 'rejections',
       title: 'Surfaces rejected rows with their reasons',
       detail:
-        'The report carries `rows_rejected` and the per-partition reasons (`partition_id`, `reason`, `rows`). The starter hides them, so missing rows look like a rounding difference.',
+        'The report carries `rows_rejected` (the sum) and `rejections` (`partition_id`, `reason`, `rows` per batch) from `store.rejections`; the starter never reads them.',
       match: {
-        python: {all: [/rows_rejected/, /reason/]},
-        typescript: {all: [/rows_rejected/, /reason/]},
-        go: {all: [/rows_rejected/, /Reason/]},
-        scala: {all: [/rowsRejected/, /reason/]},
-        cpp: {all: [/rows_rejected/, /reason/]},
+        python: {all: [/store\.rejections\(/, /rows_rejected/]},
+        typescript: {all: [/\brejections\(/, /rows_rejected/]},
+        go: {all: [/store\.Rejections\(/, /rows_rejected/]},
+        scala: {all: [/Store\.rejections\(/, /rows_rejected/]},
+        cpp: {all: [/store::rejections\(/, /rows_rejected/]},
       },
     },
     {
       id: 'freshness-scoped',
       title: 'Scopes freshness to the target table',
       detail:
-        'Freshness is the table’s committed position (`freshness:{target}`), so every replica reports the same number. The starter reads a per-worker key and a lagging table looks fresh.',
+        '`freshness` is the table’s newest commit (`table_freshness(target)`); the starter reads the shared source dataset’s, where another tenant’s newer load makes a lagging table look fresh.',
       match: {
-        python: {all: [/freshness\.table_freshness\(/, /table/], none: [/[Ww]orker/]},
-        typescript: {all: [/freshness\.forTable\(/, /table/], none: [/[Ww]orker/]},
-        go: {all: [/freshness\.Table\(/, /table/], none: [/[Ww]orker/]},
-        scala: {all: [/Freshness\.table\(/, /table/], none: [/[Ww]orker/]},
-        cpp: {all: [/freshness\.table\(/, /table/], none: [/[Ww]orker/]},
+        python: {all: [/table_freshness\(/], none: [/source_freshness\(/]},
+        typescript: {all: [/tableFreshness\(/], none: [/sourceFreshness\(/]},
+        go: {all: [/TableFreshness\(/], none: [/SourceFreshness\(/]},
+        scala: {all: [/tableFreshness\(/], none: [/sourceFreshness\(/]},
+        cpp: {all: [/tableFreshness\(/], none: [/sourceFreshness\(/]},
       },
     },
     {
       id: 'delta-flag',
-      title: 'Flags an unexplained read-write delta',
+      title: 'Flags counts that do not reconcile',
       detail:
-        '`delta = rows_read - rows_written - rows_rejected` and `flagged` is true whenever it is not 0. The starter reports planned counts, so its delta is always zero and nothing is ever flagged.',
+        '`delta` = `rows_read - rows_written - rows_rejected` and `flagged` is true whenever it is not 0; the starter reports neither, so a missing slice of a load reaches the books unnoticed.',
       match: {
-        python: {all: [/delta/, /flagged/]},
-        typescript: {all: [/delta/, /flagged/]},
-        go: {all: [/delta/, /flagged/]},
-        scala: {all: [/delta/, /flagged/]},
-        cpp: {all: [/delta/, /flagged/]},
+        python: {all: [/["']delta["']/, /["']flagged["']/]},
+        typescript: {all: [/\bdelta\b/, /\bflagged\b/]},
+        go: {all: [/json:"delta"/, /json:"flagged"/]},
+        scala: {all: [/"delta"/, /"flagged"/]},
+        cpp: {all: [/"delta"/, /"flagged"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import os
+      starter: `import grpc
+from fastapi import FastAPI, HTTPException, Request
 
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+import warehouse_loader_pb2
+import warehouse_loader_pb2_grpc
+from loader import store  # get_load, rejections, table_freshness, source_freshness
 
 app = FastAPI()
-
-
-class LoadStore:
-    def get(self, tenant: str, load_id: str) -> dict | None:
-        """The load record for (tenant, load_id), if any."""
-        raise NotImplementedError
-
-
-store = LoadStore()
-
-import redis
-
-r = redis.Redis(host="redis", port=6379)
+warehouse = warehouse_loader_pb2_grpc.WarehouseStub(grpc.insecure_channel("warehouse:9000"))
 
 
 @app.get("/v1/loads/{load_id}")
-def read_load(load_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    load = store.get(tenant, load_id)
-    return JSONResponse(
-        {
-            "load_id": load_id,
-            "rows_read": load["rows_planned"],
-            "rows_written": load["rows_planned"],
-            "freshness": r.get(f"freshness:{os.environ['WORKER_ID']}"),
-        },
-        status_code=200,
-    )
+def read_load(load_id: str, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    load = store.get_load(tenant, load_id)
+    if load is None:
+        raise HTTPException(status_code=404, detail="no such load")
+    return {
+        "load_id": load_id,
+        "status": load["status"],
+        "target": load["target"],
+        "rows_read": load["rows_read"],
+        "rows_written": load["rows_planned"],
+        "freshness": store.source_freshness(load["dataset"]),
+    }
 `,
-      solution: `from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+      solution: `import grpc
+from fastapi import FastAPI, HTTPException, Request
+
+import warehouse_loader_pb2
+import warehouse_loader_pb2_grpc
+from loader import store  # get_load, rejections, table_freshness, source_freshness
+
+DEADLINE_S = 5
 
 app = FastAPI()
-
-
-class LoadStore:
-    def get(self, tenant: str, load_id: str) -> dict | None:
-        """The load record for (tenant, load_id), if any."""
-        raise NotImplementedError
-
-
-class Warehouse:
-    def rows_written(self, table: str, load_id: str) -> int:
-        """How many rows the warehouse holds for this load; the authority for 'written'."""
-        raise NotImplementedError
-
-
-class Rejects:
-    def list_for(self, load_id: str) -> list[dict]:
-        """One {"partition_id", "reason", "rows"} per rejected batch."""
-        raise NotImplementedError
-
-
-class Freshness:
-    def table_freshness(self, table: str) -> dict:
-        """The table's newest committed partition: {"committed_at", "partition_id"}."""
-        raise NotImplementedError
-
-
-store = LoadStore()
-warehouse = Warehouse()
-rejects = Rejects()
-freshness = Freshness()
+warehouse = warehouse_loader_pb2_grpc.WarehouseStub(grpc.insecure_channel("warehouse:9000"))
 
 
 @app.get("/v1/loads/{load_id}")
-def read_load(
-    load_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    record = store.get(tenant, load_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="unknown load")
-
-    table = record["target"]
-    rows_read = record["rows_read"]
-    rows_written = warehouse.rows_written(table, load_id)  # the warehouse is the authority
-    rejected = rejects.list_for(load_id)
-    rows_rejected = sum(entry["rows"] for entry in rejected)
-    delta = rows_read - rows_written - rows_rejected
-    return JSONResponse(
-        {
-            "load_id": load_id,
-            "status": record["status"],
-            "rows_read": rows_read,
-            "rows_written": rows_written,
-            "rows_rejected": rows_rejected,
-            "rejections": [
-                {"partition_id": entry["partition_id"], "reason": entry["reason"], "rows": entry["rows"]}
-                for entry in rejected
-            ],
-            "freshness": freshness.table_freshness(table),
-            "delta": delta,
-            "flagged": delta != 0,
-        },
-        status_code=200,
-    )
+def read_load(load_id: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    load = store.get_load(tenant, load_id)
+    if load is None:
+        raise HTTPException(status_code=404, detail="no such load")
+    # Each number from the system that owns it: written from the warehouse, rejected from the reject log.
+    count = warehouse.CountRows(warehouse_loader_pb2.CountRequest(target=load["target"], load_id=load_id), timeout=DEADLINE_S)
+    rejections = store.rejections(load_id)
+    rows_rejected = sum(r["rows"] for r in rejections)
+    delta = load["rows_read"] - count.rows - rows_rejected
+    return {
+        "load_id": load_id,
+        "status": load["status"],
+        "target": load["target"],
+        "rows_read": load["rows_read"],
+        "rows_written": count.rows,
+        "rows_rejected": rows_rejected,
+        "rejections": rejections,
+        "freshness": store.table_freshness(load["target"]),
+        "delta": delta,
+        "flagged": delta != 0,  # read = written + rejected, or someone must look
+    }
 `,
     },
     typescript: {
-      starter: `/** GET /v1/loads/{id}. */
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 import Fastify from 'fastify';
-import Redis from 'ioredis';
 
-import {store} from './store';
+import {getLoad, rejections, sourceFreshness, tableFreshness} from 'loader/store';
 
 export const app = Fastify();
-export const redis = new Redis('redis://redis:6379');
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('warehouse_loader.proto')) as unknown as {
+  whloader: {Warehouse: grpc.ServiceClientConstructor};
+};
+const warehouse = new pkg.whloader.Warehouse('warehouse:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  CountRows(request: {target: string; load_id: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{rows: number | string}>;
+};
 
 app.get('/v1/loads/:loadId', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {loadId} = request.params as {loadId: string};
-  const record = await store.get(tenant, loadId);
-  return reply.code(200).send({
+  const load = await getLoad(tenant, loadId);
+  if (load === null) return reply.code(404).send({error: 'no such load'});
+  return {
     load_id: loadId,
-    rows_read: record?.load.rows_planned,
-    rows_written: record?.load.rows_planned,
-    freshness: await redis.get(\`freshness:\${process.env.WORKER_ID}\`),
-  });
+    status: load.status,
+    target: load.target,
+    rows_read: load.rows_read,
+    rows_written: load.rows_planned,
+    freshness: await sourceFreshness(load.dataset),
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/loads/{id}: counts that reconcile against the warehouse. */
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 import Fastify from 'fastify';
+
+import {getLoad, rejections, tableFreshness} from 'loader/store';
+
+export const DEADLINE_MS = 5000;
 
 export const app = Fastify();
 
-interface LoadRecord {
-  load: {target: string; status: string; rows_read: number};
-}
-
-interface Rejection {
-  partition_id: string;
-  reason: string;
-  rows: number;
-}
-
-export const store = {
-  async get(tenant: string, loadId: string): Promise<LoadRecord | null> {
-    throw new Error('not implemented');
-  },
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('warehouse_loader.proto')) as unknown as {
+  whloader: {Warehouse: grpc.ServiceClientConstructor};
 };
-
-export const warehouse = {
-  async rowsWritten(table: string, loadId: string): Promise<number> {
-    throw new Error('not implemented');
-  },
-};
-
-export const rejects = {
-  async listFor(loadId: string): Promise<Rejection[]> {
-    throw new Error('not implemented');
-  },
-};
-
-export const freshness = {
-  async forTable(table: string): Promise<{committed_at: string; partition_id: string}> {
-    throw new Error('not implemented');
-  },
+const warehouse = new pkg.whloader.Warehouse('warehouse:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  CountRows(request: {target: string; load_id: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{rows: number | string}>;
 };
 
 app.get('/v1/loads/:loadId', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {loadId} = request.params as {loadId: string};
-  const record = await store.get(tenant, loadId);
-  if (record === null) return reply.code(404).send({error: 'unknown load'});
-
-  const table = record.load.target;
-  const rowsRead = record.load.rows_read;
-  const rowsWritten = await warehouse.rowsWritten(table, loadId); // the warehouse is the authority
-  const rejected = await rejects.listFor(loadId);
-  let rowsRejected = 0;
-  for (const entry of rejected) rowsRejected += entry.rows;
-  const delta = rowsRead - rowsWritten - rowsRejected;
-  return reply.code(200).send({
+  const load = await getLoad(tenant, loadId);
+  if (load === null) return reply.code(404).send({error: 'no such load'});
+  // Each number from the system that owns it: written from the warehouse, rejected from the reject log.
+  const count = await warehouse.CountRows({target: load.target, load_id: loadId}, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+  const rowsWritten = Number(count.rows);
+  const rejected = await rejections(loadId);
+  const rowsRejected = rejected.reduce((sum, r) => sum + r.rows, 0);
+  const delta = load.rows_read - rowsWritten - rowsRejected;
+  return {
     load_id: loadId,
-    status: record.load.status,
-    rows_read: rowsRead,
+    status: load.status,
+    target: load.target,
+    rows_read: load.rows_read,
     rows_written: rowsWritten,
     rows_rejected: rowsRejected,
-    rejections: rejected.map(entry => ({partition_id: entry.partition_id, reason: entry.reason, rows: entry.rows})),
-    freshness: await freshness.forTable(table),
+    rejections: rejected,
+    freshness: await tableFreshness(load.target),
     delta,
-    flagged: delta !== 0,
-  });
+    flagged: delta !== 0, // read = written + rejected, or someone must look
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
-	"os"
+
+	"loader/store" // store.GetLoad, Rejections, TableFreshness, SourceFreshness
 )
 
-type LoadRecord struct {
-	Target      string \`json:"target"\`
-	Status      string \`json:"status"\`
-	RowsPlanned int64  \`json:"rows_planned"\`
+type report struct {
+	LoadID      string           \`json:"load_id"\`
+	Status      string           \`json:"status"\`
+	Target      string           \`json:"target"\`
+	RowsRead    int64            \`json:"rows_read"\`
+	RowsWritten int64            \`json:"rows_written"\`
+	Freshness   *store.Freshness \`json:"freshness"\`
 }
 
-type LoadStore struct{}
-
-func (s *LoadStore) Get(ctx context.Context, tenant, loadID string) (*LoadRecord, error) { return nil, nil }
-
-type Freshness struct{}
-
-func (f *Freshness) Worker(id string) map[string]any { return nil }
-
-var (
-	store     = &LoadStore{}
-	freshness = &Freshness{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readLoad(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	loadID := r.PathValue("load_id")
-	record, err := store.Get(r.Context(), tenant, loadID)
-	if err != nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown load"})
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"load_id":      loadID,
-		"rows_read":    record.RowsPlanned,
-		"rows_written": record.RowsPlanned,
-		"freshness":    freshness.Worker(os.Getenv("WORKER_ID")),
-	})
+	load := store.GetLoad(r.Context(), tenant, r.PathValue("id"))
+	if load == nil {
+		http.Error(rw, "no such load", http.StatusNotFound)
+		return
+	}
+	writeJSON(rw, http.StatusOK, report{LoadID: load.LoadID, Status: load.Status, Target: load.Target, RowsRead: load.RowsRead,
+		RowsWritten: load.RowsPlanned, Freshness: store.SourceFreshness(r.Context(), load.Dataset)})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/loads/{load_id}", readLoad)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/loads/{id}", readLoad)
 }
 `,
       solution: `package main
@@ -377,231 +311,154 @@ func main() {
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "loader/gen/warehouse_loader"
+	"loader/store" // store.GetLoad, Rejections, TableFreshness, SourceFreshness
 )
 
-type LoadRecord struct {
-	Target   string \`json:"target"\`
-	Status   string \`json:"status"\`
-	RowsRead int64  \`json:"rows_read"\`
-}
-
-type LoadStore struct{}
-
-func (s *LoadStore) Get(ctx context.Context, tenant, loadID string) (*LoadRecord, error) { return nil, nil }
-
-type Warehouse struct{}
-
-// RowsWritten is how many rows the warehouse holds for this load; the authority for "written".
-func (w *Warehouse) RowsWritten(ctx context.Context, table, loadID string) (int64, error) { return 0, nil }
-
-type Reject struct {
-	PartitionID string \`json:"partition_id"\`
-	Reason      string \`json:"reason"\`
-	Rows        int64  \`json:"rows"\`
-}
-
-type Rejects struct{}
-
-func (r *Rejects) ListFor(ctx context.Context, loadID string) ([]Reject, error) { return nil, nil }
-
-type Freshness struct{}
-
-// Table is the table's newest committed partition, so every replica reports the same number.
-func (f *Freshness) Table(ctx context.Context, table string) (map[string]any, error) { return nil, nil }
+const deadline = 5 * time.Second
 
 var (
-	store     = &LoadStore{}
-	warehouse = &Warehouse{}
-	rejects   = &Rejects{}
-	freshness = &Freshness{}
+	warehouseConn, _ = grpc.NewClient("warehouse:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	warehouse        = pb.NewWarehouseClient(warehouseConn)
 )
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+type report struct {
+	LoadID       string            \`json:"load_id"\`
+	Status       string            \`json:"status"\`
+	Target       string            \`json:"target"\`
+	RowsRead     int64             \`json:"rows_read"\`
+	RowsWritten  int64             \`json:"rows_written"\`
+	RowsRejected int64             \`json:"rows_rejected"\`
+	Rejections   []store.Rejection \`json:"rejections"\`
+	Freshness    *store.Freshness  \`json:"freshness"\`
+	Delta        int64             \`json:"delta"\`
+	Flagged      bool              \`json:"flagged"\`
+}
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readLoad(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	loadID := r.PathValue("load_id")
-	record, err := store.Get(r.Context(), tenant, loadID)
-	if err != nil || record == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown load"})
+	load := store.GetLoad(r.Context(), tenant, r.PathValue("id"))
+	if load == nil {
+		http.Error(rw, "no such load", http.StatusNotFound)
 		return
 	}
-
-	table := record.Target
-	rowsWritten, err := warehouse.RowsWritten(r.Context(), table, loadID)
+	// Each number from the system that owns it: written from the warehouse, rejected from the reject log.
+	callCtx, cancel := context.WithTimeout(r.Context(), deadline)
+	defer cancel()
+	count, err := warehouse.CountRows(callCtx, &pb.CountRequest{Target: load.Target, LoadId: load.LoadID})
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		http.Error(rw, "the warehouse did not answer: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	rejected, err := rejects.ListFor(r.Context(), loadID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
+	rejections := store.Rejections(r.Context(), load.LoadID)
 	var rowsRejected int64
-	reasons := make([]map[string]any, 0, len(rejected))
-	for _, entry := range rejected {
-		rowsRejected += entry.Rows
-		reasons = append(reasons, map[string]any{"partition_id": entry.PartitionID, "reason": entry.Reason, "rows": entry.Rows})
+	for _, rejection := range rejections {
+		rowsRejected += rejection.Rows
 	}
-	fresh, err := freshness.Table(r.Context(), table)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	delta := record.RowsRead - rowsWritten - rowsRejected
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"load_id":       loadID,
-		"status":        record.Status,
-		"rows_read":     record.RowsRead,
-		"rows_written":  rowsWritten,
-		"rows_rejected": rowsRejected,
-		"rejections":    reasons,
-		"freshness":     fresh,
-		"delta":         delta,
-		"flagged":       delta != 0,
-	})
+	delta := load.RowsRead - count.GetRows() - rowsRejected
+	writeJSON(rw, http.StatusOK, report{LoadID: load.LoadID, Status: load.Status, Target: load.Target, RowsRead: load.RowsRead,
+		RowsWritten: count.GetRows(), RowsRejected: rowsRejected, Rejections: rejections, Freshness: store.TableFreshness(r.Context(), load.Target),
+		Delta: delta, Flagged: delta != 0}) // read = written + rejected, or someone must look
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/loads/{load_id}", readLoad)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/loads/{id}", readLoad)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-final case class LoadRecord(target: String, status: String, rowsPlanned: Long)
+import loader.Store // Store.getLoad, rejections, tableFreshness, sourceFreshness
 
-object LoadStore {
-  def open(): LoadStore = new LoadStore
-  class LoadStore {
-    def get(tenant: String, loadId: String): Option[LoadRecord] = None
-  }
-}
+object LoadReport {
+  private def freshnessJson(freshness: Option[Store.Freshness]): JsValue =
+    freshness.map(f => JsObject("committed_at" -> JsNumber(f.committedAt), "load_id" -> JsString(f.loadId))).getOrElse(JsNull)
 
-object Freshness {
-  def worker(id: String): Map[String, String] = Map.empty
-}
-
-object LoadReportApi {
-  implicit val system: ActorSystem = ActorSystem("warehouse-loader")
-  val store = LoadStore.open()
-
-  val route: Route =
-    path("v1" / "loads" / Segment) { loadId =>
-      get {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val record = store.get(tenant, loadId)
-          complete(
-            StatusCodes.OK,
-            Map(
-              "load_id" -> loadId,
-              "rows_read" -> record.map(_.rowsPlanned).getOrElse(0L).toString,
-              "rows_written" -> record.map(_.rowsPlanned).getOrElse(0L).toString,
-              "freshness" -> Freshness.worker(sys.env("WORKER_ID")).toString
-            )
-          )
-        }
+  val route: Route = path("v1" / "loads" / Segment) { loadId =>
+    get {
+      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(tenant) =>
+          Store.getLoad(tenant, loadId) match {
+            case None => complete(StatusCodes.NotFound -> "no such load")
+            case Some(load) =>
+              val body = JsObject(
+                "load_id" -> JsString(loadId), "status" -> JsString(load.status), "target" -> JsString(load.target),
+                "rows_read" -> JsNumber(load.rowsRead), "rows_written" -> JsNumber(load.rowsPlanned),
+                "freshness" -> freshnessJson(Store.sourceFreshness(load.dataset)))
+              complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
+          }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import java.util.concurrent.TimeUnit
+
+import io.grpc.ManagedChannelBuilder
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-final case class LoadRecord(target: String, status: String, rowsRead: Long)
-final case class Reject(partition_id: String, reason: String, rows: Long)
+import loader.Store // Store.getLoad, rejections, tableFreshness, sourceFreshness
+import whloader.warehouse_loader.{CountRequest, WarehouseGrpc}
 
-object LoadStore {
-  def open(): LoadStore = new LoadStore
-  class LoadStore {
-    def get(tenant: String, loadId: String): Option[LoadRecord] = None
+object LoadReport {
+  val DeadlineSeconds = 5L
+
+  private val warehouse = WarehouseGrpc.blockingStub(ManagedChannelBuilder.forAddress("warehouse", 9000).usePlaintext().build())
+
+  private def freshnessJson(freshness: Option[Store.Freshness]): JsValue =
+    freshness.map(f => JsObject("committed_at" -> JsNumber(f.committedAt), "load_id" -> JsString(f.loadId))).getOrElse(JsNull)
+
+  private def report(load: Store.Load): JsObject = {
+    // Each number from the system that owns it: written from the warehouse, rejected from the reject log.
+    val rowsWritten = warehouse.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).countRows(CountRequest(target = load.target, loadId = load.loadId)).rows
+    val rejections = Store.rejections(load.loadId)
+    val rowsRejected = rejections.map(_.rows).sum
+    val delta = load.rowsRead - rowsWritten - rowsRejected
+    JsObject(
+      "load_id" -> JsString(load.loadId), "status" -> JsString(load.status), "target" -> JsString(load.target),
+      "rows_read" -> JsNumber(load.rowsRead), "rows_written" -> JsNumber(rowsWritten), "rows_rejected" -> JsNumber(rowsRejected),
+      "rejections" -> JsArray(rejections.map(r => JsObject("partition_id" -> JsString(r.partitionId), "reason" -> JsString(r.reason), "rows" -> JsNumber(r.rows))).toVector),
+      "freshness" -> freshnessJson(Store.tableFreshness(load.target)),
+      "delta" -> JsNumber(delta),
+      "flagged" -> JsBoolean(delta != 0)) // read = written + rejected, or someone must look
   }
-}
 
-object Warehouse {
-  /** How many rows the warehouse holds for this load; the authority for "written". */
-  def rowsWritten(table: String, loadId: String): Long = 0L
-}
-
-object Rejects {
-  def listFor(loadId: String): Vector[Reject] = Vector.empty
-}
-
-object Freshness {
-  /** The table's newest committed partition, so every replica reports the same number. */
-  def table(target: String): Map[String, String] = Map.empty
-}
-
-object LoadReportApi {
-  implicit val system: ActorSystem = ActorSystem("warehouse-loader")
-  val store = LoadStore.open()
-
-  val route: Route =
-    path("v1" / "loads" / Segment) { loadId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            store.get(tenantOpt.get, loadId) match {
-              case None =>
-                complete(StatusCodes.NotFound, """{"error":"unknown load"}""")
-              case Some(record) =>
-                val table = record.target
-                val rowsWritten = Warehouse.rowsWritten(table, loadId)
-                val rejected = Rejects.listFor(loadId)
-                val rowsRejected = rejected.map(_.rows).sum
-                val delta = record.rowsRead - rowsWritten - rowsRejected
-                complete(
-                  StatusCodes.OK,
-                  Map(
-                    "load_id" -> loadId,
-                    "status" -> record.status,
-                    "rows_read" -> record.rowsRead.toString,
-                    "rows_written" -> rowsWritten.toString,
-                    "rows_rejected" -> rowsRejected.toString,
-                    "rejections" -> rejected
-                      .map(r => Map("partition_id" -> r.partition_id, "reason" -> r.reason, "rows" -> r.rows.toString))
-                      .toString,
-                    "freshness" -> Freshness.table(table).toString,
-                    "delta" -> delta.toString,
-                    "flagged" -> (delta != 0).toString
-                  )
-                )
-            }
+  val route: Route = path("v1" / "loads" / Segment) { loadId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(tenant) =>
+          Store.getLoad(tenant, loadId) match {
+            case None => complete(StatusCodes.NotFound -> "no such load")
+            case Some(load) => complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, report(load).compactPrint)))
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -613,148 +470,560 @@ object LoadReportApi {
 #include <optional>
 #include <string>
 
+#include "loader/store.h"  // store::getLoad, rejections, tableFreshness, sourceFreshness
+
 using json = nlohmann::json;
 
-struct LoadRecord {
-  std::string target;
-  std::string status;
-  long rows_planned = 0;
-};
-
-struct LoadStore {
-  std::optional<LoadRecord> get(const std::string& tenant, const std::string& loadId);
-};
-
-LoadStore store;
-
-struct Freshness {
-  json worker(const std::string& id);
-};
-
-Freshness freshness;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/loads/([A-Za-z0-9-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto loadId = req.matches[1].str();
-    const auto record = store.get(tenant, loadId);
-    const json report = {
-        {"load_id", loadId},
-        {"rows_read", record ? record->rows_planned : 0},
-        {"rows_written", record ? record->rows_planned : 0},
-        {"freshness", freshness.worker(std::getenv("WORKER_ID"))},
-    };
-    res.status = 200;
-    res.set_content(report.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+json freshnessJson(const std::optional<store::Freshness>& freshness) {
+  if (!freshness) return nullptr;
+  return json{{"committed_at", freshness->committed_at}, {"load_id", freshness->load_id}};
 }
+
+void read_load(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const auto load = store::getLoad(tenant, req.matches[1]);
+  if (!load) {
+    res.status = 404;
+    res.set_content("no such load", "text/plain");
+    return;
+  }
+  const json body = {{"load_id", load->load_id},     {"status", load->status},           {"target", load->target},
+                     {"rows_read", load->rows_read}, {"rows_written", load->rows_planned}, {"freshness", freshnessJson(store::sourceFreshness(load->dataset))}};
+  res.set_content(body.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/loads/([\\w-]+))", read_load); }
 `,
-      solution: `#include <httplib.h>
+      solution: `#include <grpcpp/grpcpp.h>
+#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <optional>
 #include <string>
-#include <vector>
+
+#include "loader/store.h"  // store::getLoad, rejections, tableFreshness, sourceFreshness
+#include "warehouse_loader.grpc.pb.h"
 
 using json = nlohmann::json;
 
-struct LoadRecord {
-  std::string target;
-  std::string status;
-  long rows_read = 0;
-};
+constexpr std::chrono::seconds kDeadline{5};
 
-struct LoadStore {
-  std::optional<LoadRecord> get(const std::string& tenant, const std::string& loadId);
-};
+auto warehouse = whloader::Warehouse::NewStub(grpc::CreateChannel("warehouse:9000", grpc::InsecureChannelCredentials()));
 
-LoadStore store;
-
-struct Warehouse {
-  /** How many rows the warehouse holds for this load; the authority for "written". */
-  long rowsWritten(const std::string& table, const std::string& loadId);
-};
-
-Warehouse warehouse;
-
-struct Reject {
-  std::string partition_id;
-  std::string reason;
-  long rows = 0;
-};
-
-struct Rejects {
-  std::vector<Reject> listFor(const std::string& loadId);
-};
-
-Rejects rejects;
-
-struct Freshness {
-  /** The table's newest committed partition, so every replica reports the same number. */
-  json table(const std::string& target);
-};
-
-Freshness freshness;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/loads/([A-Za-z0-9-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto loadId = req.matches[1].str();
-    const auto record = store.get(tenant, loadId);
-    if (!record) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown load"})", "application/json");
-      return;
-    }
-
-    const auto table = record->target;
-    const long rowsWritten = warehouse.rowsWritten(table, loadId);  // the warehouse is the authority
-    const auto rejected = rejects.listFor(loadId);
-    long rowsRejected = 0;
-    json reasons = json::array();
-    for (const auto& entry : rejected) {
-      rowsRejected += entry.rows;
-      reasons.push_back({{"partition_id", entry.partition_id}, {"reason", entry.reason}, {"rows", entry.rows}});
-    }
-    const long delta = record->rows_read - rowsWritten - rowsRejected;
-    const json report = {
-        {"load_id", loadId},
-        {"status", record->status},
-        {"rows_read", record->rows_read},
-        {"rows_written", rowsWritten},
-        {"rows_rejected", rowsRejected},
-        {"rejections", reasons},
-        {"freshness", freshness.table(table)},
-        {"delta", delta},
-        {"flagged", delta != 0},
-    };
-    res.status = 200;
-    res.set_content(report.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+json freshnessJson(const std::optional<store::Freshness>& freshness) {
+  if (!freshness) return nullptr;
+  return json{{"committed_at", freshness->committed_at}, {"load_id", freshness->load_id}};
 }
+
+void read_load(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const auto load = store::getLoad(tenant, req.matches[1]);
+  if (!load) {
+    res.status = 404;
+    res.set_content("no such load", "text/plain");
+    return;
+  }
+  // Each number from the system that owns it: written from the warehouse, rejected from the reject log.
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+  whloader::CountRequest request;
+  request.set_target(load->target);
+  request.set_load_id(load->load_id);
+  whloader::CountReply count;
+  const grpc::Status status = warehouse->CountRows(&ctx, request, &count);
+  if (!status.ok()) {
+    res.status = 503;
+    res.set_content("the warehouse did not answer: " + status.error_message(), "text/plain");
+    return;
+  }
+  long rows_rejected = 0;
+  json rejections = json::array();
+  for (const store::Rejection& r : store::rejections(load->load_id)) {
+    rows_rejected += r.rows;
+    rejections.push_back({{"partition_id", r.partition_id}, {"reason", r.reason}, {"rows", r.rows}});
+  }
+  const long delta = load->rows_read - count.rows() - rows_rejected;
+  const json body = {{"load_id", load->load_id},
+                     {"status", load->status},
+                     {"target", load->target},
+                     {"rows_read", load->rows_read},
+                     {"rows_written", count.rows()},
+                     {"rows_rejected", rows_rejected},
+                     {"rejections", rejections},
+                     {"freshness", freshnessJson(store::tableFreshness(load->target))},
+                     {"delta", delta},
+                     {"flagged", delta != 0}};  // read = written + rejected, or someone must look
+  res.set_content(body.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/loads/([\\w-]+))", read_load); }
 `,
     },
   },
-  debrief: `The fix moves every field to the source that can contradict the plan. Written counts come back from
-the warehouse, because the plan was the loader's intention and the delta exists to compare the two.
-Rejected rows surface with their reasons, because the only way a reader can repair a feed is to see
-which partition refused which rows. Freshness belongs to the table, so a replica that touched nothing
-cannot report a fresher number than the data. And the delta is computed and flagged in the response,
-so an unexplained difference is the report's headline rather than something an analyst discovers three
-days later. Production reports also offer a per-partition drill-down, a diff against the previous
-manifest for the same table, and an alert when \`flagged\` stays true across consecutive loads.`,
+  harness: {
+    python: `import json
+
+import warehouse_loader_pb2
+import warehouse_loader_pb2_grpc
+
+
+class Warehouse(warehouse_loader_pb2_grpc.WarehouseServicer):
+    """held: (target, load_id) -> the rows the table holds for that load."""
+
+    def __init__(self):
+        self.held = {}
+
+    def CountRows(self, request, context):
+        return warehouse_loader_pb2.CountReply(rows=self.held.get((request.target, request.load_id), 0))
+
+
+def _seed(ctx, load_id="ld-1", tenant="acme", target="wh_acme.orders", planned=1000, read=1000):
+    ctx.redis.hset(f"load:{load_id}", mapping={
+        "load_id": load_id, "tenant": tenant, "dataset": "orders", "version": "2026-10-20", "target": target, "mode": "merge",
+        "transform": "dedupe", "sql": "SELECT DISTINCT * FROM source", "partitions": 4, "rows_planned": planned, "rows_read": read, "status": "complete",
+    })
+
+
+def _reject(ctx, load_id, partition_id, reason, rows):
+    ctx.redis.rpush(f"load:{load_id}:rejects", json.dumps({"partition_id": partition_id, "reason": reason, "rows": rows}))
+
+
+def _api(ctx):
+    warehouse = Warehouse()
+    ctx.grpc.serve(warehouse_loader_pb2_grpc.add_WarehouseServicer_to_server, warehouse)
+    return warehouse, ctx.client(ctx.load("read").app)
+
+
+async def _report(c, load_id="ld-1", tenant="acme"):
+    r = await c.get(f"/v1/loads/{load_id}", headers={"X-Tenant-Id": tenant} if tenant else {})
+    assert r.status_code == 200 or tenant != "acme", f"GET /v1/loads/{load_id} answered {r.status_code}: {r.text}"
+    return r
+
+
+async def check_route(ctx):
+    warehouse, client = _api(ctx)
+    _seed(ctx)
+    warehouse.held[("wh_acme.orders", "ld-1")] = 1000
+    async with client as c:
+        r = await _report(c)
+        theirs = await _report(c, tenant="globex")
+        anonymous = await _report(c, tenant=None)
+    body = r.json()
+    assert body.get("load_id") == "ld-1" and body.get("rows_read") == 1000 and body.get("target") == "wh_acme.orders", f"the report must carry load_id, target and rows_read, got {body}"
+    assert theirs.status_code == 404, f"tenant globex reading acme's load answered {theirs.status_code}, expected 404"
+    assert anonymous.status_code == 401, f"a report without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+
+
+async def check_written_from_warehouse(ctx):
+    warehouse, client = _api(ctx)
+    _seed(ctx, planned=1000, read=1000)
+    warehouse.held[("wh_acme.orders", "ld-1")] = 940
+    async with client as c:
+        body = (await _report(c)).json()
+    assert body.get("rows_written") == 940, f"the warehouse holds 940 rows of ld-1 and the report says rows_written={body.get('rows_written')}: written is what the warehouse holds, not the plan"
+    calls = ctx.grpc.calls_to("CountRows")
+    assert calls and (calls[0].request.target, calls[0].request.load_id) == ("wh_acme.orders", "ld-1"), "the report must ask the warehouse CountRows(wh_acme.orders, ld-1)"
+
+
+async def check_rejections(ctx):
+    warehouse, client = _api(ctx)
+    _seed(ctx)
+    warehouse.held[("wh_acme.orders", "ld-1")] = 960
+    _reject(ctx, "ld-1", "p-1", "amount is not a decimal", 30)
+    _reject(ctx, "ld-1", "p-3", "id is null", 10)
+    async with client as c:
+        body = (await _report(c)).json()
+    assert body.get("rows_rejected") == 40, f"two rejected batches of 30 and 10 rows, and the report says rows_rejected={body.get('rows_rejected')}"
+    want = [{"partition_id": "p-1", "reason": "amount is not a decimal", "rows": 30}, {"partition_id": "p-3", "reason": "id is null", "rows": 10}]
+    assert body.get("rejections") == want, f"the report must list each rejection with partition_id, reason and rows, got {body.get('rejections')}"
+
+
+async def check_freshness_scoped(ctx):
+    warehouse, client = _api(ctx)
+    _seed(ctx)
+    warehouse.held[("wh_acme.orders", "ld-1")] = 1000
+    ctx.redis.hset("freshness:wh_acme.orders", mapping={"committed_at": 100, "load_id": "ld-1"})
+    # globex loaded the same source into its own table later.
+    ctx.redis.hset("freshness:orders", mapping={"committed_at": 200, "load_id": "ld-9"})
+    ctx.redis.hset("freshness:wh_globex.orders", mapping={"committed_at": 200, "load_id": "ld-9"})
+    async with client as c:
+        body = (await _report(c)).json()
+    freshness = body.get("freshness") or {}
+    assert freshness.get("committed_at") == 100 and freshness.get("load_id") == "ld-1", f"wh_acme.orders last committed at 100 (ld-1) and the report says {freshness}: another tenant's load of the shared source is not this table's freshness"
+
+
+async def check_delta_flag(ctx):
+    warehouse, client = _api(ctx)
+    _seed(ctx, "ld-1", read=1000)
+    warehouse.held[("wh_acme.orders", "ld-1")] = 940
+    _reject(ctx, "ld-1", "p-1", "amount is not a decimal", 40)
+    _seed(ctx, "ld-2", planned=500, read=500)
+    warehouse.held[("wh_acme.orders", "ld-2")] = 500
+    async with client as c:
+        reports = [(await _report(c, load_id)).json() for load_id in ("ld-1", "ld-2")]
+    for body in reports:
+        assert "delta" in body and "flagged" in body, f"the report must carry delta and flagged, got {body}"
+        delta = body["rows_read"] - body["rows_written"] - body.get("rows_rejected", 0)
+        assert body["delta"] == delta, f"delta must be rows_read - rows_written - rows_rejected = {delta}, the report says {body['delta']} ({body})"
+        assert body["flagged"] is (delta != 0), f"flagged must be true exactly when delta is not 0; delta {delta}, flagged {body['flagged']}"
+    assert reports[1]["flagged"] is False, f"a load whose counts reconcile must not be flagged, got {reports[1]}"
+`,
+    typescript: `/** held: "target/load_id" -> the rows the table holds for that load. */
+function api(ctx) {
+  const pkg = ctx.proto('warehouse_loader.proto');
+  const held: Record<string, number> = {};
+  ctx.grpc.serve(pkg.whloader.Warehouse.service, {
+    CountRows(call, callback) {
+      callback(null, {rows: held[\`\${call.request.target}/\${call.request.load_id}\`] ?? 0});
+    },
+  });
+  return {held, c: ctx.client(ctx.load('read').app)};
+}
+
+function seed(ctx, loadId = 'ld-1', planned = 1000, read = 1000) {
+  ctx.redis.hset(\`load:\${loadId}\`, {
+    load_id: loadId, tenant: 'acme', dataset: 'orders', version: '2026-10-20', target: 'wh_acme.orders', mode: 'merge',
+    transform: 'dedupe', sql: 'SELECT DISTINCT * FROM source', partitions: '4', rows_planned: String(planned), rows_read: String(read), status: 'complete',
+  });
+}
+
+const reject = (ctx, loadId: string, partitionId: string, reason: string, rows: number) =>
+  ctx.redis.rpush(\`load:\${loadId}:rejects\`, JSON.stringify({partition_id: partitionId, reason, rows}));
+
+async function report(c, loadId = 'ld-1') {
+  const r = await c.get(\`/v1/loads/\${loadId}\`, {headers: {'X-Tenant-Id': 'acme'}});
+  assert.equal(r.status, 200, \`GET /v1/loads/\${loadId} answered \${r.status}: \${r.text}\`);
+  return r.json();
+}
+
+export async function check_route(ctx) {
+  const {held, c} = api(ctx);
+  seed(ctx);
+  held['wh_acme.orders/ld-1'] = 1000;
+  const body = await report(c);
+  assert(body.load_id === 'ld-1' && body.rows_read === 1000 && body.target === 'wh_acme.orders', \`the report must carry load_id, target and rows_read, got \${JSON.stringify(body)}\`);
+  const theirs = await c.get('/v1/loads/ld-1', {headers: {'X-Tenant-Id': 'globex'}});
+  assert.equal(theirs.status, 404, \`tenant globex reading acme's load answered \${theirs.status}, expected 404\`);
+  const anonymous = await c.get('/v1/loads/ld-1');
+  assert.equal(anonymous.status, 401, \`a report without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+}
+
+export async function check_written_from_warehouse(ctx) {
+  const {held, c} = api(ctx);
+  seed(ctx, 'ld-1', 1000, 1000);
+  held['wh_acme.orders/ld-1'] = 940;
+  const body = await report(c);
+  assert.equal(body.rows_written, 940, \`the warehouse holds 940 rows of ld-1 and the report says rows_written=\${body.rows_written}: written is what the warehouse holds, not the plan\`);
+  const calls = ctx.grpc.callsTo('CountRows');
+  assert(calls.length > 0 && calls[0].request.target === 'wh_acme.orders' && calls[0].request.load_id === 'ld-1', 'the report must ask the warehouse CountRows(wh_acme.orders, ld-1)');
+}
+
+export async function check_rejections(ctx) {
+  const {held, c} = api(ctx);
+  seed(ctx);
+  held['wh_acme.orders/ld-1'] = 960;
+  reject(ctx, 'ld-1', 'p-1', 'amount is not a decimal', 30);
+  reject(ctx, 'ld-1', 'p-3', 'id is null', 10);
+  const body = await report(c);
+  assert.equal(body.rows_rejected, 40, \`two rejected batches of 30 and 10 rows, and the report says rows_rejected=\${body.rows_rejected}\`);
+  const want = [{partition_id: 'p-1', reason: 'amount is not a decimal', rows: 30}, {partition_id: 'p-3', reason: 'id is null', rows: 10}];
+  assert.deepEqual(body.rejections, want, \`the report must list each rejection with partition_id, reason and rows, got \${JSON.stringify(body.rejections)}\`);
+}
+
+export async function check_freshness_scoped(ctx) {
+  const {held, c} = api(ctx);
+  seed(ctx);
+  held['wh_acme.orders/ld-1'] = 1000;
+  ctx.redis.hset('freshness:wh_acme.orders', {committed_at: '100', load_id: 'ld-1'});
+  // globex loaded the same source into its own table later.
+  ctx.redis.hset('freshness:orders', {committed_at: '200', load_id: 'ld-9'});
+  ctx.redis.hset('freshness:wh_globex.orders', {committed_at: '200', load_id: 'ld-9'});
+  const body = await report(c);
+  const freshness = body.freshness ?? {};
+  assert(freshness.committed_at === 100 && freshness.load_id === 'ld-1', \`wh_acme.orders last committed at 100 (ld-1) and the report says \${JSON.stringify(freshness)}: another tenant's load of the shared source is not this table's freshness\`);
+}
+
+export async function check_delta_flag(ctx) {
+  const {held, c} = api(ctx);
+  seed(ctx, 'ld-1', 1000, 1000);
+  held['wh_acme.orders/ld-1'] = 940;
+  reject(ctx, 'ld-1', 'p-1', 'amount is not a decimal', 40);
+  seed(ctx, 'ld-2', 500, 500);
+  held['wh_acme.orders/ld-2'] = 500;
+  const reports = [await report(c, 'ld-1'), await report(c, 'ld-2')];
+  for (const body of reports) {
+    assert('delta' in body && 'flagged' in body, \`the report must carry delta and flagged, got \${JSON.stringify(body)}\`);
+    const delta = body.rows_read - body.rows_written - (body.rows_rejected ?? 0);
+    assert.equal(body.delta, delta, \`delta must be rows_read - rows_written - rows_rejected = \${delta}, the report says \${body.delta}\`);
+    assert.equal(body.flagged, delta !== 0, \`flagged must be true exactly when delta is not 0; delta \${delta}, flagged \${body.flagged}\`);
+  }
+  assert.equal(reports[1].flagged, false, 'a load whose counts reconcile must not be flagged');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	pb "loader/gen/warehouse_loader"
+
+	"leetbuild/harness"
+)
+
+// readPeer holds, per "target/load_id", the rows the table holds for that load.
+type readPeer struct {
+	pb.UnimplementedWarehouseServer
+	held map[string]int64
+}
+
+func (p *readPeer) CountRows(_ context.Context, req *pb.CountRequest) (*pb.CountReply, error) {
+	return &pb.CountReply{Rows: p.held[req.GetTarget()+"/"+req.GetLoadId()]}, nil
+}
+
+func readAPI(ctx *harness.Ctx) (*readPeer, *harness.HTTP) {
+	peer := &readPeer{held: map[string]int64{}}
+	pb.RegisterWarehouseServer(ctx.GRPC.Server(""), peer)
+	mux := http.NewServeMux()
+	register(mux)
+	return peer, ctx.HTTP(mux)
+}
+
+func readSeed(ctx *harness.Ctx, loadID, planned, read string) {
+	ctx.Redis.Do("HSET", "load:"+loadID, "load_id", loadID, "tenant", "acme", "dataset", "orders", "version", "2026-10-20", "target", "wh_acme.orders",
+		"mode", "merge", "transform", "dedupe", "sql", "SELECT DISTINCT * FROM source", "partitions", "4", "rows_planned", planned, "rows_read", read, "status", "complete")
+}
+
+func readReject(ctx *harness.Ctx, loadID, partitionID, reason string, rows int) {
+	row, _ := json.Marshal(map[string]any{"partition_id": partitionID, "reason": reason, "rows": rows})
+	ctx.Redis.Do("RPUSH", "load:"+loadID+":rejects", string(row))
+}
+
+func readReport(ctx *harness.Ctx, c *harness.HTTP, loadID string) map[string]any {
+	r := c.Get("/v1/loads/"+loadID, "X-Tenant-Id", "acme")
+	ctx.Equal(r.Status, 200, "GET /v1/loads/%s (%s)", loadID, r.Text())
+	var body map[string]any
+	r.Decode(&body)
+	return body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	peer, c := readAPI(ctx)
+	readSeed(ctx, "ld-1", "1000", "1000")
+	peer.held["wh_acme.orders/ld-1"] = 1000
+	body := readReport(ctx, c, "ld-1")
+	ctx.Assert(body["load_id"] == "ld-1" && body["rows_read"] == float64(1000) && body["target"] == "wh_acme.orders", "the report must carry load_id, target and rows_read, got %v", body)
+	ctx.Equal(c.Get("/v1/loads/ld-1", "X-Tenant-Id", "globex").Status, 404, "tenant globex reading acme's load")
+	ctx.Equal(c.Get("/v1/loads/ld-1").Status, 401, "a report without X-Tenant-Id")
+}
+
+func CheckWrittenFromWarehouse(ctx *harness.Ctx) {
+	peer, c := readAPI(ctx)
+	readSeed(ctx, "ld-1", "1000", "1000")
+	peer.held["wh_acme.orders/ld-1"] = 940
+	body := readReport(ctx, c, "ld-1")
+	ctx.Equal(body["rows_written"], 940, "the warehouse holds 940 rows of ld-1: written is what the warehouse holds, not the plan; rows_written")
+	calls := ctx.GRPC.CallsTo("CountRows", "")
+	ctx.Assert(len(calls) > 0, "the report must ask the warehouse CountRows(wh_acme.orders, ld-1)")
+	req := calls[0].Request.(*pb.CountRequest)
+	ctx.Equal([]string{req.GetTarget(), req.GetLoadId()}, []string{"wh_acme.orders", "ld-1"}, "the CountRows request")
+}
+
+func CheckRejections(ctx *harness.Ctx) {
+	peer, c := readAPI(ctx)
+	readSeed(ctx, "ld-1", "1000", "1000")
+	peer.held["wh_acme.orders/ld-1"] = 960
+	readReject(ctx, "ld-1", "p-1", "amount is not a decimal", 30)
+	readReject(ctx, "ld-1", "p-3", "id is null", 10)
+	body := readReport(ctx, c, "ld-1")
+	ctx.Equal(body["rows_rejected"], 40, "two rejected batches of 30 and 10 rows; rows_rejected")
+	want := []any{
+		map[string]any{"partition_id": "p-1", "reason": "amount is not a decimal", "rows": 30},
+		map[string]any{"partition_id": "p-3", "reason": "id is null", "rows": 10},
+	}
+	ctx.Equal(body["rejections"], want, "the report must list each rejection with partition_id, reason and rows")
+}
+
+func CheckFreshnessScoped(ctx *harness.Ctx) {
+	peer, c := readAPI(ctx)
+	readSeed(ctx, "ld-1", "1000", "1000")
+	peer.held["wh_acme.orders/ld-1"] = 1000
+	ctx.Redis.Do("HSET", "freshness:wh_acme.orders", "committed_at", "100", "load_id", "ld-1")
+	// globex loaded the same source into its own table later.
+	ctx.Redis.Do("HSET", "freshness:orders", "committed_at", "200", "load_id", "ld-9")
+	ctx.Redis.Do("HSET", "freshness:wh_globex.orders", "committed_at", "200", "load_id", "ld-9")
+	body := readReport(ctx, c, "ld-1")
+	ctx.Equal(body["freshness"], map[string]any{"committed_at": 100, "load_id": "ld-1"}, "wh_acme.orders last committed at 100 (ld-1): another tenant's load of the shared source is not this table's freshness")
+}
+
+func CheckDeltaFlag(ctx *harness.Ctx) {
+	peer, c := readAPI(ctx)
+	readSeed(ctx, "ld-1", "1000", "1000")
+	peer.held["wh_acme.orders/ld-1"] = 940
+	readReject(ctx, "ld-1", "p-1", "amount is not a decimal", 40)
+	readSeed(ctx, "ld-2", "500", "500")
+	peer.held["wh_acme.orders/ld-2"] = 500
+	reports := []map[string]any{readReport(ctx, c, "ld-1"), readReport(ctx, c, "ld-2")}
+	for _, body := range reports {
+		_, hasDelta := body["delta"]
+		_, hasFlag := body["flagged"]
+		ctx.Assert(hasDelta && hasFlag, "the report must carry delta and flagged, got %v", body)
+		read, _ := body["rows_read"].(float64)
+		written, _ := body["rows_written"].(float64)
+		rejected, _ := body["rows_rejected"].(float64)
+		delta := read - written - rejected
+		ctx.Equal(body["delta"], delta, "delta must be rows_read - rows_written - rows_rejected")
+		ctx.Equal(body["flagged"], delta != 0, "flagged must be true exactly when delta (%v) is not 0", delta)
+	}
+	ctx.Equal(reports[1]["flagged"], false, "a load whose counts reconcile must not be flagged")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <map>
+#include <string>
+#include <vector>
+
+#include "warehouse_loader.grpc.pb.h"
+
+namespace {
+
+// held: "target/load_id" -> the rows the table holds for that load.
+class ReadPeer final : public whloader::Warehouse::Service {
+ public:
+  std::map<std::string, long> held;
+  grpc::Status CountRows(grpc::ServerContext*, const whloader::CountRequest* req, whloader::CountReply* out) override {
+    const auto found = held.find(req->target() + "/" + req->load_id());
+    out->set_rows(found == held.end() ? 0 : found->second);
+    return grpc::Status::OK;
+  }
+};
+
+struct World {
+  ReadPeer peer;
+  httplib::Server svr;
+};
+
+World& api(harness::Ctx& ctx, harness::HTTP*& c) {
+  static World* world = nullptr;
+  static harness::HTTP* http = nullptr;
+  delete world;
+  delete http;
+  world = new World;
+  ctx.GRPC.Server("")->RegisterService(&world->peer);
+  register_routes(world->svr);
+  http = new harness::HTTP(ctx.HTTP(world->svr));
+  c = http;
+  return *world;
+}
+
+void seed(harness::Ctx& ctx, const std::string& load_id, const std::string& planned, const std::string& read) {
+  ctx.Redis.Do("HSET", "load:" + load_id, "load_id", load_id, "tenant", "acme", "dataset", "orders", "version", "2026-10-20", "target", "wh_acme.orders",
+               "mode", "merge", "transform", "dedupe", "sql", "SELECT DISTINCT * FROM source", "partitions", "4", "rows_planned", planned, "rows_read", read, "status", "complete");
+}
+
+void reject(harness::Ctx& ctx, const std::string& load_id, const std::string& partition_id, const std::string& reason, long rows) {
+  ctx.Redis.Do("RPUSH", "load:" + load_id + ":rejects", nlohmann::json{{"partition_id", partition_id}, {"reason", reason}, {"rows", rows}}.dump());
+}
+
+nlohmann::json report(harness::Ctx& ctx, harness::HTTP& c, const std::string& load_id) {
+  const auto r = c.Get("/v1/loads/" + load_id, "X-Tenant-Id", "acme");
+  ctx.Equal(r.Status, 200, "GET /v1/loads/%s (%s)", load_id, r.Text());
+  return nlohmann::json::parse(r.Text(), nullptr, false);
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  harness::HTTP* c = nullptr;
+  World& world = api(ctx, c);
+  seed(ctx, "ld-1", "1000", "1000");
+  world.peer.held["wh_acme.orders/ld-1"] = 1000;
+  const auto body = report(ctx, *c, "ld-1");
+  ctx.Assert(body.value("load_id", "") == "ld-1" && body.value("rows_read", 0L) == 1000 && body.value("target", "") == "wh_acme.orders",
+             "the report must carry load_id, target and rows_read, got %s", body.dump());
+  ctx.Equal(c->Get("/v1/loads/ld-1", "X-Tenant-Id", "globex").Status, 404, "tenant globex reading acme's load");
+  ctx.Equal(c->Get("/v1/loads/ld-1").Status, 401, "a report without X-Tenant-Id");
+}
+
+void CheckWrittenFromWarehouse(harness::Ctx& ctx) {
+  harness::HTTP* c = nullptr;
+  World& world = api(ctx, c);
+  seed(ctx, "ld-1", "1000", "1000");
+  world.peer.held["wh_acme.orders/ld-1"] = 940;
+  const auto body = report(ctx, *c, "ld-1");
+  ctx.Equal(body.value("rows_written", 0L), 940, "the warehouse holds 940 rows of ld-1: written is what the warehouse holds, not the plan; rows_written");
+  const auto calls = ctx.GRPC.CallsTo("CountRows");
+  ctx.Assert(!calls.empty(), "the report must ask the warehouse CountRows(wh_acme.orders, ld-1)");
+  const auto& req = calls[0].Request<whloader::CountRequest>();
+  ctx.Equal(std::vector<std::string>{req.target(), req.load_id()}, std::vector<std::string>{"wh_acme.orders", "ld-1"}, "the CountRows request");
+}
+
+void CheckRejections(harness::Ctx& ctx) {
+  harness::HTTP* c = nullptr;
+  World& world = api(ctx, c);
+  seed(ctx, "ld-1", "1000", "1000");
+  world.peer.held["wh_acme.orders/ld-1"] = 960;
+  reject(ctx, "ld-1", "p-1", "amount is not a decimal", 30);
+  reject(ctx, "ld-1", "p-3", "id is null", 10);
+  const auto body = report(ctx, *c, "ld-1");
+  ctx.Equal(body.value("rows_rejected", 0L), 40, "two rejected batches of 30 and 10 rows; rows_rejected");
+  const nlohmann::json want = nlohmann::json::array({{{"partition_id", "p-1"}, {"reason", "amount is not a decimal"}, {"rows", 30}}, {{"partition_id", "p-3"}, {"reason", "id is null"}, {"rows", 10}}});
+  ctx.Equal(body.contains("rejections") ? body["rejections"] : nlohmann::json(), want, "the report must list each rejection with partition_id, reason and rows");
+}
+
+void CheckFreshnessScoped(harness::Ctx& ctx) {
+  harness::HTTP* c = nullptr;
+  World& world = api(ctx, c);
+  seed(ctx, "ld-1", "1000", "1000");
+  world.peer.held["wh_acme.orders/ld-1"] = 1000;
+  ctx.Redis.Do("HSET", "freshness:wh_acme.orders", "committed_at", "100", "load_id", "ld-1");
+  // globex loaded the same source into its own table later.
+  ctx.Redis.Do("HSET", "freshness:orders", "committed_at", "200", "load_id", "ld-9");
+  ctx.Redis.Do("HSET", "freshness:wh_globex.orders", "committed_at", "200", "load_id", "ld-9");
+  const auto body = report(ctx, *c, "ld-1");
+  ctx.Equal(body.contains("freshness") ? body["freshness"] : nlohmann::json(), nlohmann::json({{"committed_at", 100}, {"load_id", "ld-1"}}),
+            "wh_acme.orders last committed at 100 (ld-1): another tenant's load of the shared source is not this table's freshness");
+}
+
+void CheckDeltaFlag(harness::Ctx& ctx) {
+  harness::HTTP* c = nullptr;
+  World& world = api(ctx, c);
+  seed(ctx, "ld-1", "1000", "1000");
+  world.peer.held["wh_acme.orders/ld-1"] = 940;
+  reject(ctx, "ld-1", "p-1", "amount is not a decimal", 40);
+  seed(ctx, "ld-2", "500", "500");
+  world.peer.held["wh_acme.orders/ld-2"] = 500;
+  const std::vector<nlohmann::json> reports = {report(ctx, *c, "ld-1"), report(ctx, *c, "ld-2")};
+  for (const auto& body : reports) {
+    ctx.Assert(body.contains("delta") && body.contains("flagged"), "the report must carry delta and flagged, got %s", body.dump());
+    const long delta = body.value("rows_read", 0L) - body.value("rows_written", 0L) - body.value("rows_rejected", 0L);
+    ctx.Equal(body.value("delta", 0L), delta, "delta must be rows_read - rows_written - rows_rejected");
+    ctx.Equal(body.value("flagged", false), delta != 0, "flagged must be true exactly when delta (%d) is not 0", delta);
+  }
+  ctx.Equal(reports[1].value("flagged", true), false, "a load whose counts reconcile must not be flagged");
+}
+`,
+  },
+  hints: [
+    'Seed a load that read 1,000 rows, of which the warehouse holds 940 and 40 were rejected: the report says 1,000 written, shows no rejection and raises no flag. Another tenant’s newer load of `orders` moves this table’s freshness.',
+    '`rows_written` is copied from the plan, so the counts agree by construction; the reject log is never read; `source_freshness(dataset)` is the newest commit out of the shared source, any tenant’s, not this table’s.',
+    'Call `CountRows(target=load["target"], load_id=load_id)`, sum `store.rejections(load_id)` into `rows_rejected`, read `store.table_freshness(load["target"])`, then `delta = rows_read - rows_written - rows_rejected` and `flagged = delta != 0`.',
+  ],
+  debrief: `A report is as good as its least trusted number, so each number comes from the system that owns it: written from the warehouse, rejected from the reject log, freshness from the table itself. The delta makes the report checkable: read minus written minus rejected is zero for a sound load, and anything else is a bug upstream, so it is flagged rather than rounded away. Freshness is scoped to the table because the source is shared, and a busy tenant would otherwise vouch for a quiet one. Production reports reconcile per partition so the flag points at the slice that is missing, alert on a flagged load before anyone reads it, and freeze the report once the books close.`,
 };

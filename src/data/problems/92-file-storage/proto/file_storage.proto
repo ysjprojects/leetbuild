@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package stored;
+
+// The object store behind stored, served at objectstore:9000. A multipart upload is written part
+// by part with PutChunk; a part that arrives again with the same sha256 is acknowledged as deduped
+// and not stored twice. CommitMultipart assembles the parts in order into one object and answers
+// its key, its SHA-256 digest and its size; until it returns, the object does not exist.
+service ObjectStore {
+  rpc PutChunk(PutChunkRequest) returns (PutChunkReply);
+  rpc CommitMultipart(CommitRequest) returns (CommitReply);
+}
+
+message PutChunkRequest {
+  string upload_id = 1;
+  int32 part = 2;
+  bytes data = 3;
+  // Hex SHA-256 of data: the store verifies it and dedupes a retried part on it.
+  string sha256 = 4;
+}
+
+message PutChunkReply {
+  int32 part = 1;
+  bool deduped = 2;
+}
+
+message CommitRequest {
+  string upload_id = 1;
+  repeated int32 parts = 2;
+}
+
+message CommitReply {
+  string object_key = 1;
+  string digest = 2;
+  int64 size = 3;
+}

@@ -646,7 +646,8 @@ export class RuntimeProcess extends EventEmitter {
   exitCode: number | undefined = undefined;
   /** The code `exit()` was called with, or null while the process is running. */
   exited: number | null = null;
-  readonly pid = 4242;
+  /** Not 4242: pino writes the pid into every log line, and payment courses search logs for test cards. */
+  readonly pid = 18731;
   readonly platform = 'linux';
   readonly arch = 'x64';
   readonly version = 'v22.0.0';

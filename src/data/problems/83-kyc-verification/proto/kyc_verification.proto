@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package kycvendor;
+
+// The identity vendor step 3 asks about each document of a case. outcome is APPROVED, REJECTED or
+// MANUAL_REVIEW (the vendor could not decide and wants a person to look); reason_codes are the
+// vendor's own codes (DOC_EXPIRED, FACE_MISMATCH, ...). A vendor in trouble answers UNAVAILABLE, or
+// answers too late for the caller's deadline.
+service IdentityVendor {
+  rpc CheckDocument(CheckDocumentRequest) returns (CheckDocumentReply);
+}
+
+message CheckDocumentRequest {
+  string case_id = 1;
+  string applicant = 2;
+  string document_type = 3;
+  string ref = 4;
+}
+
+message CheckDocumentReply {
+  string outcome = 1;
+  repeated string reason_codes = 2;
+}

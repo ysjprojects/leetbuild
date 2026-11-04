@@ -2,132 +2,148 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/purges: patterns with a blast radius',
+  title: 'POST /v1/purges: a purge with a blast radius',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'purge', 'tenant'],
+  focus: ['client', 'purge', 'records'],
   task: `## Task
 
-**Starting point.** The starter serves \`POST /v1/purges\` with body \`{"domain": "shop.example.com", "paths": ["/pricing", "/img/*"], "reason": "…"}\`: it reads the body, hands the paths to the provider and answers \`200 queued\`. It purges the demo domain and hides five flaws.
+**Starting point.** The starter serves \`POST /v1/purges\` with body \`{"domain", "paths", "reason"}\`
+on the purge records (\`purge.records\`, provided): it reads the tenant from \`X-Tenant-Id\` (**401**
+when missing), creates the purge with \`records.create\` (every path pending, queued for the
+provider client) and answers \`202 {purge_id, status: "accepted", domain, paths}\`. It serves the
+demo and hides four flaws.
 
-**Failure mode the checks target.** Nothing stands between a caller and the provider. A wildcard from a normal token fans a domain-wide purge out to every edge POP and stamps the origin; one body can carry an unbounded path list; a client retrying after a timeout submits the same batch twice; and the response says done before anything reached an edge.
+**Failure mode the checks target.** Any tenant can purge any customer's domain; one body carries
+ten thousand paths or a path without its leading slash; a normal token sends \`/*\` and every edge
+misses at once against the origin; a deploy script that retries after a timeout queues the same
+purge twice.
 
-- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
-- \`domain\` must be one of the tenant's own domains (\`owns_domain\`); another tenant's domain is **403**.
-- \`paths\` is a non-empty list of at most **500** entries (\`MAX_PATHS\`), each starting with \`/\`; otherwise **400**. Duplicates are collapsed (\`dedupe_paths\`) and reported back.
-- A pattern containing \`*\` needs the scope \`purge:wildcard\`; \`/*\` needs \`purge:domain\`. Scopes arrive comma-separated in \`X-Purge-Scope\`; without the matching scope the request is **403** before any provider call.
-- \`Idempotency-Key\` is required (**400** when missing). A replay with the same \`(tenant, key)\` returns the **original** purge without a second submission.
-- A new purge answers **202** with \`{"purge_id", "status": "accepted", "domain", "paths", "wildcard", "duplicates"}\`.
+- \`domain\` must be the tenant's (\`records.owns_domain\`); another tenant's domain is **403**.
+- \`paths\` holds 1 to \`MAX_PATHS\` = 500 entries, each starting with \`/\`, else **400**; duplicates
+  collapse, first occurrence kept, before the record is created.
+- A path containing \`*\` needs the scope \`purge:wildcard\` (\`WILDCARD_SCOPE\`), and \`/*\` needs
+  \`purge:domain\` (\`DOMAIN_SCOPE\`). Scopes arrive comma-separated in \`X-Purge-Scope\`; without the
+  scope the request is **403**.
+- \`Idempotency-Key\` is required (**400**). Look up \`records.purge_for_key(tenant, key)\` before
+  creating and answer the recorded purge on a replay; \`records.remember_key\` after creating.
 
 :::widget idempotency {}`,
   sequence: {
-    participants: ['Client', 'Purge API', 'tenant registry', 'CDN provider'],
+    participants: ['Deploy script', 'Purge API', 'purge records'],
     messages: [
-      {from: 'Client', to: 'Purge API', label: 'POST /v1/purges · X-Tenant-Id · Idempotency-Key', kind: 'sync'},
-      {from: 'Purge API', to: 'Purge API', label: 'cap paths · dedupe · check wildcard scope', kind: 'sync'},
-      {from: 'Purge API', to: 'tenant registry', label: 'owns(tenant, domain)', kind: 'sync'},
-      {from: 'tenant registry', to: 'Purge API', label: 'true / false', kind: 'reply'},
-      {from: 'Purge API', to: 'Purge API', label: 'get(tenant, idem_key)', kind: 'sync'},
-      {from: 'Purge API', to: 'CDN provider', label: 'SubmitPurge(purge_id, domain, paths)', kind: 'async'},
-      {from: 'Purge API', to: 'Purge API', label: 'put(tenant, idem_key, purge)', kind: 'sync'},
-      {from: 'Purge API', to: 'Client', label: '202 {purge_id, status: accepted}', kind: 'reply'},
+      {from: 'Deploy script', to: 'Purge API', label: 'POST /v1/purges · X-Tenant-Id · Idempotency-Key', kind: 'sync'},
+      {from: 'Purge API', to: 'purge records', label: 'owns_domain(tenant, domain)', kind: 'sync'},
+      {from: 'Purge API', to: 'Purge API', label: '1..500 paths · leading / · dedupe · X-Purge-Scope', kind: 'sync'},
+      {from: 'Purge API', to: 'purge records', label: 'purge_for_key(tenant, key) → recorded / none', kind: 'sync'},
+      {from: 'Purge API', to: 'purge records', label: 'create(tenant, domain, paths) · remember_key', kind: 'sync'},
+      {from: 'Purge API', to: 'Deploy script', label: '202 {purge_id, status: "accepted"}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Accepts the batch and answers 202 accepted',
+      title: 'Accepts a purge with 202 and records it',
       detail:
-        'Register `POST /v1/purges` and answer **202** with `status: "accepted"`, the purge id, the accepted paths and the collapsed duplicates. The starter answers **200** with `status: "queued"`, which tells the caller the purge is done when nothing has reached an edge yet.',
+        'A purge of the tenant’s own domain answers **202** with `status: "accepted"` and the purge id, and the record holds the paths, queued for the provider client.',
       match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/purges["']/, /STATUS_ACCEPTED/, /status_code=202/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/purges['"]/, /STATUS_ACCEPTED/, /code\(202\)/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/purges"/, /statusAccepted/, /StatusAccepted/]},
-        scala: {
-          all: [/path\(\s*"v1"\s*\/\s*"purges"\s*\)/, /\bpost\s*\{/, /StatusAccepted/, /StatusCodes\.Accepted/],
-        },
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/purges"/, /kStatusAccepted/, /\b202\b/]},
+        python: {all: [/@app\.post\(\s*["']\/v1\/purges["']/, /records\.create\(/, /status_code=202/]},
+        typescript: {all: [/app\.post\(\s*['"]\/v1\/purges['"]/, /\bcreate\(/, /code\(202\)/]},
+        go: {all: [/HandleFunc\(\s*"POST \/v1\/purges"/, /records\.Create\(/, /StatusAccepted/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"purges"\s*\)/, /Records\.create\(/, /StatusCodes\.Accepted/]},
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/purges"/, /records::create\(/, /\b202\b/]},
       },
     },
     {
-      id: 'tenant-domain',
-      title: 'Authenticates the tenant and proves domain ownership',
+      id: 'domain-ownership',
+      title: 'Purges only a domain the tenant owns',
       detail:
-        'A missing `X-Tenant-Id` is **401**; a domain the tenant does not own (`owns_domain`) is **403** before any provider call. The starter trusts both, so any caller can purge any customer’s domain.',
+        'The domain is checked against the tenant’s (`owns_domain`/`ownsDomain`) before the purge is created; another tenant’s domain is **403** and nothing is queued. The starter queues a purge of any domain for any tenant.',
       match: {
-        python: {all: [/owns_domain\(/, /status_code=401/, /status_code=403/, /DOMAIN_NOT_OWNED/]},
-        typescript: {all: [/domains\.owns\(/, /code\(401\)/, /code\(403\)/, /DOMAIN_NOT_OWNED/]},
-        go: {all: [/ownsDomain\(/, /StatusUnauthorized/, /StatusForbidden/, /domainNotOwned/]},
-        scala: {all: [/ownsDomain\(/, /StatusCodes\.Unauthorized/, /StatusCodes\.Forbidden/, /DomainNotOwned/]},
-        cpp: {all: [/ownsDomain\(/, /\b401\b/, /\b403\b/, /kDomainNotOwned/]},
+        python: {all: [/status_code=403/], order: [/records\.owns_domain\(/, /records\.create\(/]},
+        typescript: {all: [/code\(403\)/], order: [/\bownsDomain\(/, /\bcreate\(/]},
+        go: {all: [/StatusForbidden/], order: [/records\.OwnsDomain\(/, /records\.Create\(/]},
+        scala: {all: [/StatusCodes\.Forbidden/], order: [/Records\.ownsDomain\(/, /Records\.create\(/]},
+        cpp: {all: [/\b403\b/], order: [/records::ownsDomain\(/, /records::create\(/]},
       },
     },
     {
       id: 'path-cap',
-      title: 'Caps the request at 500 paths and dedupes them',
+      title: 'Bounds a purge to 500 well-formed, deduplicated paths',
       detail:
-        '`paths` is bounded by `MAX_PATHS` = 500, every entry must start with `/`, and duplicates are collapsed by `dedupe_paths` before the provider sees them. The starter forwards whatever array it was handed, so one body can carry an unbounded purge.',
+        'An empty list, more than 500 paths (`MAX_PATHS`) or a path without a leading `/` is **400** and nothing is queued; repeated paths collapse to their first occurrence. The starter queues whatever list it is handed.',
       match: {
-        python: {all: [/MAX_PATHS/, /dedupe_paths\(/, /status_code=400/]},
-        typescript: {all: [/MAX_PATHS/, /dedupePaths\(/, /code\(400\)/]},
-        go: {all: [/maxPaths/, /dedupePaths\(/, /StatusBadRequest/]},
-        scala: {all: [/MaxPaths/, /dedupePaths\(/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kMaxPaths/, /dedupePaths\(/, /\b400\b/]},
+        python: {all: [/MAX_PATHS\s*=\s*500/, /startswith\(\s*["']\/["']\s*\)/]},
+        typescript: {all: [/MAX_PATHS\s*=\s*500/, /startsWith\(\s*['"]\/['"]\s*\)/]},
+        go: {all: [/maxPaths\s*=\s*500/, /strings\.HasPrefix\([^)]*"\/"\s*\)/]},
+        scala: {all: [/MaxPaths\s*=\s*500/, /startsWith\(\s*"\/"\s*\)/]},
+        cpp: {
+          all: [/kMaxPaths\s*=\s*500/, /starts_with\(\s*"\/"\s*\)|rfind\(\s*"\/"\s*,\s*0\s*\)|\[0\]\s*[!=]=\s*'\/'/],
+        },
       },
     },
     {
       id: 'blast-radius',
-      title: 'Gates wildcards behind an elevated scope',
+      title: 'Gates wildcards behind purge:wildcard and /* behind purge:domain',
       detail:
-        'A pattern with `*` requires `purge:wildcard`, a whole-domain pattern requires `purge:domain`, and a request without the matching scope is **403** (`has_wildcard`, `required_scope`). The starter accepts `/*` from any token, which is the origin stampede.',
+        'A pattern with `*` needs `purge:wildcard` in `X-Purge-Scope`, the whole-domain `/*` needs `purge:domain`, and a request without the scope is **403** before anything is queued. The starter queues `/*` from any token.',
       match: {
-        python: {all: [/WILDCARD_SCOPE/, /DOMAIN_SCOPE/, /has_wildcard\(/, /status_code=403/]},
-        typescript: {all: [/WILDCARD_SCOPE/, /DOMAIN_SCOPE/, /requiredScope\(/, /code\(403\)/]},
-        go: {all: [/wildcardScope/, /domainScope/, /hasWildcard\(/, /StatusForbidden/]},
-        scala: {all: [/WildcardScope/, /DomainScope/, /hasWildcard\(/, /StatusCodes\.Forbidden/]},
-        cpp: {all: [/kWildcardScope/, /kDomainScope/, /hasWildcard\(/, /\b403\b/]},
+        python: {
+          all: [
+            /WILDCARD_SCOPE\s*=\s*["']purge:wildcard["']/,
+            /DOMAIN_SCOPE\s*=\s*["']purge:domain["']/,
+            /x-purge-scope/i,
+          ],
+        },
+        typescript: {
+          all: [
+            /WILDCARD_SCOPE\s*=\s*['"]purge:wildcard['"]/,
+            /DOMAIN_SCOPE\s*=\s*['"]purge:domain['"]/,
+            /x-purge-scope/i,
+          ],
+        },
+        go: {all: [/wildcardScope\s*=\s*"purge:wildcard"/, /domainScope\s*=\s*"purge:domain"/, /X-Purge-Scope/i]},
+        scala: {all: [/WildcardScope\s*=\s*"purge:wildcard"/, /DomainScope\s*=\s*"purge:domain"/, /X-Purge-Scope/i]},
+        cpp: {all: [/kWildcardScope\s*=\s*"purge:wildcard"/, /kDomainScope\s*=\s*"purge:domain"/, /X-Purge-Scope/i]},
       },
     },
     {
       id: 'idempotent-replay',
-      title: 'Replays an Idempotency-Key without submitting twice',
+      title: 'A replayed Idempotency-Key answers the original purge',
       detail:
-        '`Idempotency-Key` is required, the recorded purge is looked up under `(tenant, key)` **before** the provider submission, and the stored record is returned on a replay. The starter has no lookup, so a retried deploy purge hits the provider twice.',
+        '`Idempotency-Key` is required (**400**), the purge recorded for `(tenant, key)` is looked up before a purge is created and answered on a replay, and a new purge remembers its key. The starter queues every retry as a new purge.',
       match: {
         python: {
-          all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/],
-          order: [/store\.get\(/, /providers\.SubmitPurge\(/],
+          all: [/idempotency-key/i, /records\.remember_key\(/, /status_code=400/],
+          order: [/records\.purge_for_key\(/, /records\.create\(/],
         },
         typescript: {
-          all: [/idempotency-key/, /store\.get\(/, /store\.put\(/],
-          order: [/store\.get\(/, /providers\.SubmitPurge\(/],
+          all: [/idempotency-key/i, /\brememberKey\(/, /code\(400\)/],
+          order: [/\bpurgeForKey\(/, /\bcreate\(/],
         },
         go: {
-          all: [/Idempotency-Key/, /store\.Get\(/, /store\.Put\(/],
-          order: [/store\.Get\(/, /provider\.SubmitPurge\(/],
+          all: [/Idempotency-Key/i, /records\.RememberKey\(/, /StatusBadRequest/],
+          order: [/records\.PurgeForKey\(/, /records\.Create\(/],
         },
         scala: {
-          all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/],
-          order: [/store\.get\(/, /provider\.submitPurge\(/],
+          all: [/Idempotency-Key/i, /Records\.rememberKey\(/, /StatusCodes\.BadRequest/],
+          order: [/Records\.purgeForKey\(/, /Records\.create\(/],
         },
         cpp: {
-          all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/],
-          order: [/store\.get\(/, /provider\.SubmitPurge\(/],
+          all: [/Idempotency-Key/i, /records::rememberKey\(/, /\b400\b/],
+          order: [/records::purgeForKey\(/, /records::create\(/],
         },
       },
     },
   ],
   code: {
     python: {
-      starter: `import uuid
-
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
-app = FastAPI()
+from purge import records  # owns_domain, create, get, purge_for_key, remember_key
 
-MAX_PATHS = 500
+app = FastAPI()
 
 
 class PurgeRequest(BaseModel):
@@ -136,59 +152,29 @@ class PurgeRequest(BaseModel):
     reason: str = ""
 
 
-class PurgeStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The purge recorded for (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, purge: dict) -> None:
-        """Record the purge under (tenant, idem_key)."""
-        raise NotImplementedError
+def accepted(purge: dict) -> dict:
+    return {"purge_id": purge["purge_id"], "status": "accepted", "domain": purge["domain"], "paths": purge["paths"]}
 
 
-class TenantDomains:
-    def owns(self, tenant: str, domain: str) -> bool:
-        """Whether \\\`domain\\\` is one of the tenant's domains."""
-        raise NotImplementedError
-
-
-class PurgeProvider:
-    def SubmitPurge(self, purge_id: str, domain: str, paths: list[str]) -> None:
-        """Hand the batch to the CDN provider."""
-        raise NotImplementedError
-
-
-store = PurgeStore()
-domains = TenantDomains()
-providers = PurgeProvider()
-
-
-@app.post("/v1/purges")
-def create_purge(body: PurgeRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    purge = {
-        "purge_id": str(uuid.uuid4()),
-        "status": "queued",
-        "domain": body.domain,
-        "paths": body.paths,
-    }
-    providers.SubmitPurge(purge["purge_id"], body.domain, body.paths)
-    return JSONResponse(purge, status_code=200)
+@app.post("/v1/purges", status_code=202)
+def create_purge(body: PurgeRequest, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    purge = records.create(tenant, body.domain, body.paths)
+    return accepted(purge)
 `,
-      solution: `import uuid
-from collections import Counter
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+      solution: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+
+from purge import records  # owns_domain, create, get, purge_for_key, remember_key
 
 app = FastAPI()
 
 MAX_PATHS = 500
-STATUS_ACCEPTED = "accepted"
 WILDCARD_SCOPE = "purge:wildcard"
 DOMAIN_SCOPE = "purge:domain"
-DOMAIN_NOT_OWNED = "domain is not owned by the tenant"
 
 
 class PurgeRequest(BaseModel):
@@ -197,706 +183,371 @@ class PurgeRequest(BaseModel):
     reason: str = ""
 
 
-class PurgeStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The purge recorded for (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, purge: dict) -> None:
-        """Record the purge under (tenant, idem_key)."""
-        raise NotImplementedError
-
-
-class TenantDomains:
-    def owns(self, tenant: str, domain: str) -> bool:
-        """Whether \\\`domain\\\` is one of the tenant's domains."""
-        raise NotImplementedError
-
-
-class PurgeProvider:
-    def SubmitPurge(self, purge_id: str, domain: str, paths: list[str]) -> None:
-        """Hand the batch to the CDN provider."""
-        raise NotImplementedError
-
-
-store = PurgeStore()
-domains = TenantDomains()
-providers = PurgeProvider()
-
-
-def owns_domain(tenant: str, domain: str) -> bool:
-    return domains.owns(tenant, domain)
-
-
-def has_wildcard(path: str) -> bool:
-    return "*" in path
-
-
-def is_whole_domain(path: str) -> bool:
-    return path.strip() == "/*"
-
-
-def dedupe_paths(paths: list[str]) -> list[str]:
-    """The paths in first-seen order, duplicates collapsed."""
-    return list(dict.fromkeys(paths))
+def accepted(purge: dict) -> dict:
+    return {"purge_id": purge["purge_id"], "status": "accepted", "domain": purge["domain"], "paths": purge["paths"]}
 
 
 def required_scope(paths: list[str]) -> str | None:
-    """The elevated scope a wildcard request needs, or None for literal paths."""
-    if any(is_whole_domain(path) for path in paths):
+    """The scope the request's patterns need: the whole domain, a wildcard, or none for literal paths."""
+    if "/*" in paths:
         return DOMAIN_SCOPE
-    if any(has_wildcard(path) for path in paths):
+    if any("*" in path for path in paths):
         return WILDCARD_SCOPE
     return None
 
 
-def parse_scopes(header: str | None) -> set[str]:
-    return {scope.strip() for scope in (header or "").split(",") if scope.strip()}
-
-
-@app.post("/v1/purges")
-def create_purge(
-    body: PurgeRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    scope_header: str | None = Header(default=None, alias="X-Purge-Scope"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if idem_key is None or idem_key == "":
+@app.post("/v1/purges", status_code=202)
+def create_purge(body: PurgeRequest, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    key = request.headers.get("idempotency-key", "")
+    if not key:
         raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-
-    domain = body.domain.strip()
-    if domain == "":
-        raise HTTPException(status_code=400, detail="domain is required")
-    if not owns_domain(tenant, domain):
-        raise HTTPException(status_code=403, detail=DOMAIN_NOT_OWNED)
-
-    if len(body.paths) == 0:
-        raise HTTPException(status_code=400, detail="at least one path is required")
-    if len(body.paths) > MAX_PATHS:
-        raise HTTPException(status_code=400, detail=f"at most {MAX_PATHS} paths per purge")
+    if not records.owns_domain(tenant, body.domain):
+        raise HTTPException(status_code=403, detail=f"{body.domain} is not one of your domains")
+    if not 1 <= len(body.paths) <= MAX_PATHS:
+        raise HTTPException(status_code=400, detail=f"a purge carries 1 to {MAX_PATHS} paths")
     if any(not path.startswith("/") for path in body.paths):
-        raise HTTPException(status_code=400, detail="every path must start with /")
-
-    paths = dedupe_paths(body.paths)
-    duplicates = sorted(path for path, count in Counter(body.paths).items() if count > 1)
-
+        raise HTTPException(status_code=400, detail="every path starts with /")
+    paths = list(dict.fromkeys(body.paths))  # duplicates collapse, first occurrence kept
     scope = required_scope(paths)
-    if scope is not None and scope not in parse_scopes(scope_header):
-        raise HTTPException(status_code=403, detail=f"{scope} scope is required for wildcard patterns")
-
-    stored = store.get(tenant, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=202)
-
-    purge = {
-        "purge_id": str(uuid.uuid4()),
-        "status": STATUS_ACCEPTED,
-        "domain": domain,
-        "paths": paths,
-        "wildcard": scope is not None,
-        "duplicates": duplicates,
-    }
-    providers.SubmitPurge(purge["purge_id"], domain, paths)
-    store.put(tenant, idem_key, purge)
-    return JSONResponse(purge, status_code=202)
+    granted = {s.strip() for s in request.headers.get("x-purge-scope", "").split(",")}
+    if scope is not None and scope not in granted:
+        raise HTTPException(status_code=403, detail=f"these patterns need the {scope} scope")
+    recorded = records.purge_for_key(tenant, key)
+    if recorded is not None:
+        return accepted(records.get(recorded))  # a replay answers the purge the first attempt created
+    purge = records.create(tenant, body.domain, paths)
+    records.remember_key(tenant, key, purge["purge_id"])
+    return accepted(purge)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/purges. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {type Purge, create, get, ownsDomain, purgeForKey, rememberKey} from 'purge/records';
 
 export const app = Fastify();
 
-const MAX_PATHS = 500;
-
-interface PurgeBody {
+interface PurgeRequest {
   domain: string;
   paths: string[];
   reason?: string;
 }
 
-interface Purge {
-  purge_id: string;
-  status: string;
-  domain: string;
-  paths: string[];
-}
-
-class PurgeStore {
-  async get(tenant: string, idemKey: string): Promise<Purge | null> {
-    throw new Error('not implemented');
-  }
-
-  async put(tenant: string, idemKey: string, purge: Purge): Promise<void> {
-    throw new Error('not implemented');
-  }
-}
-
-const store = new PurgeStore();
-
-const providers = {
-  async SubmitPurge(purgeId: string, domain: string, paths: string[]): Promise<void> {
-    throw new Error(\`not implemented: \${domain} \${paths.length} paths for \${purgeId}\`);
-  },
-};
+const accepted = (purge: Purge) => ({purge_id: purge.purge_id, status: 'accepted', domain: purge.domain, paths: purge.paths});
 
 app.post('/v1/purges', async (request, reply) => {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as PurgeBody;
-  const purge = {purge_id: randomUUID(), status: 'queued', domain: body.domain, paths: body.paths};
-  await providers.SubmitPurge(purge.purge_id, body.domain, body.paths);
-  return reply.code(200).send({...purge, requested_by: tenant});
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const body = request.body as PurgeRequest;
+  const purge = await create(tenant, body.domain, body.paths);
+  return reply.code(202).send(accepted(purge));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/purges: tenants purge only their own domains, inside the blast radius they may ask for. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {type Purge, create, get, ownsDomain, purgeForKey, rememberKey} from 'purge/records';
 
 export const app = Fastify();
 
-const MAX_PATHS = 500;
-const STATUS_ACCEPTED = 'accepted';
-const WILDCARD_SCOPE = 'purge:wildcard';
-const DOMAIN_SCOPE = 'purge:domain';
-const DOMAIN_NOT_OWNED = 'domain is not owned by the tenant';
+export const MAX_PATHS = 500;
+export const WILDCARD_SCOPE = 'purge:wildcard';
+export const DOMAIN_SCOPE = 'purge:domain';
 
-interface PurgeBody {
+interface PurgeRequest {
   domain: string;
   paths: string[];
   reason?: string;
 }
 
-interface Purge {
-  purge_id: string;
-  status: string;
-  domain: string;
-  paths: string[];
-  wildcard: boolean;
-  duplicates: string[];
-}
+const accepted = (purge: Purge) => ({purge_id: purge.purge_id, status: 'accepted', domain: purge.domain, paths: purge.paths});
 
-class PurgeStore {
-  async get(tenant: string, idemKey: string): Promise<Purge | null> {
-    throw new Error('not implemented');
-  }
-
-  async put(tenant: string, idemKey: string, purge: Purge): Promise<void> {
-    throw new Error('not implemented');
-  }
-}
-
-class TenantDomains {
-  owns(tenant: string, domain: string): boolean {
-    throw new Error(\`not implemented: \${tenant} owns \${domain}?\`);
-  }
-}
-
-const store = new PurgeStore();
-const domains = new TenantDomains();
-
-const providers = {
-  async SubmitPurge(purgeId: string, domain: string, paths: string[]): Promise<void> {
-    throw new Error(\`not implemented: \${domain} \${paths.length} paths for \${purgeId}\`);
-  },
-};
-
-/** The paths in first-seen order, duplicates collapsed. */
-function dedupePaths(paths: string[]): string[] {
-  const unique: string[] = [];
-  for (const path of paths) {
-    if (!unique.includes(path)) unique.push(path);
-  }
-  return unique;
-}
-
-/** The elevated scope a wildcard request needs, null when every pattern is a literal path. */
+/** The scope the request's patterns need: the whole domain, a wildcard, or none for literal paths. */
 function requiredScope(paths: string[]): string | null {
-  if (paths.some(path => path.trim() === '/*')) return DOMAIN_SCOPE;
+  if (paths.includes('/*')) return DOMAIN_SCOPE;
   if (paths.some(path => path.includes('*'))) return WILDCARD_SCOPE;
   return null;
 }
 
-const parseScopes = (header: string | undefined): Set<string> =>
-  new Set(
-    (header ?? '')
-      .split(',')
-      .map(scope => scope.trim())
-      .filter(scope => scope !== ''),
-  );
-
 app.post('/v1/purges', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<PurgeBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.domain !== 'string' || body.domain.trim() === '')
-    return reply.code(400).send({error: 'domain is required'});
-  const domain = body.domain.trim();
-  if (!domains.owns(tenant, domain)) return reply.code(403).send({error: DOMAIN_NOT_OWNED});
-
-  const requested = Array.isArray(body.paths) ? body.paths : null;
-  if (requested === null || requested.length === 0)
-    return reply.code(400).send({error: 'at least one path is required'});
-  if (requested.length > MAX_PATHS) return reply.code(400).send({error: \`at most \${MAX_PATHS} paths per purge\`});
-  if (requested.some(path => typeof path !== 'string' || !path.startsWith('/')))
-    return reply.code(400).send({error: 'every path must start with /'});
-
-  const paths = dedupePaths(requested);
-  const duplicates = [...new Set(requested.filter((path, index) => requested.indexOf(path) !== index))];
-
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const body = request.body as PurgeRequest;
+  if (!(await ownsDomain(tenant, body.domain))) return reply.code(403).send({error: \`\${body.domain} is not one of your domains\`});
+  if (!Array.isArray(body.paths) || body.paths.length < 1 || body.paths.length > MAX_PATHS) {
+    return reply.code(400).send({error: \`a purge carries 1 to \${MAX_PATHS} paths\`});
+  }
+  if (body.paths.some(path => !path.startsWith('/'))) return reply.code(400).send({error: 'every path starts with /'});
+  const paths = [...new Set(body.paths)]; // duplicates collapse, first occurrence kept
   const scope = requiredScope(paths);
-  if (scope !== null && !parseScopes(request.headers['x-purge-scope'] as string | undefined).has(scope))
-    return reply.code(403).send({error: \`\${scope} scope is required for wildcard patterns\`});
-
-  const stored = await store.get(tenant, idemKey);
-  if (stored !== null) return reply.code(202).send(stored);
-
-  const purge: Purge = {
-    purge_id: randomUUID(),
-    status: STATUS_ACCEPTED,
-    domain,
-    paths,
-    wildcard: scope !== null,
-    duplicates,
-  };
-  await providers.SubmitPurge(purge.purge_id, domain, paths);
-  await store.put(tenant, idemKey, purge);
-  return reply.code(202).send(purge);
+  const granted = String(request.headers['x-purge-scope'] ?? '').split(',').map(s => s.trim());
+  if (scope !== null && !granted.includes(scope)) return reply.code(403).send({error: \`these patterns need the \${scope} scope\`});
+  const recorded = await purgeForKey(tenant, key);
+  if (recorded !== null) return reply.code(202).send(accepted((await get(recorded)) as Purge)); // a replay answers the first purge
+  const purge = await create(tenant, body.domain, paths);
+  await rememberKey(tenant, key, purge.purge_id);
+  return reply.code(202).send(accepted(purge));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 
-	"github.com/google/uuid"
+	"purge/records" // records.OwnsDomain, Create, Get, PurgeForKey, RememberKey
 )
 
-const maxPaths = 500
-
-type PurgeRequest struct {
+type purgeRequest struct {
 	Domain string   \`json:"domain"\`
 	Paths  []string \`json:"paths"\`
 	Reason string   \`json:"reason"\`
 }
 
-type Purge struct {
-	PurgeID string   \`json:"purge_id"\`
-	Status  string   \`json:"status"\`
-	Domain  string   \`json:"domain"\`
-	Paths   []string \`json:"paths"\`
-}
-
-type PurgeStore struct{}
-
-func (s *PurgeStore) Get(ctx context.Context, tenant, idemKey string) (*Purge, error) { return nil, nil }
-
-func (s *PurgeStore) Put(ctx context.Context, tenant, idemKey string, purge *Purge) error { return nil }
-
-type TenantDomains struct{}
-
-func (d *TenantDomains) Owns(ctx context.Context, tenant, domain string) bool { return false }
-
-type PurgeProvider struct{}
-
-func (p *PurgeProvider) SubmitPurge(ctx context.Context, purgeID, domain string, paths []string) error {
-	return nil
-}
-
-var (
-	store   = &PurgeStore{}
-	domains = &TenantDomains{}
-	provider = &PurgeProvider{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func accepted(p *records.Purge) map[string]any {
+	return map[string]any{"purge_id": p.PurgeID, "status": "accepted", "domain": p.Domain, "paths": p.Paths}
 }
 
 func createPurge(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	var body PurgeRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	purge := Purge{PurgeID: uuid.NewString(), Status: "queued", Domain: body.Domain, Paths: body.Paths}
-	_ = provider.SubmitPurge(r.Context(), purge.PurgeID, body.Domain, body.Paths)
-	_ = tenant
-	writeJSON(rw, http.StatusOK, purge)
+	var body purgeRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, "the body is not JSON", http.StatusBadRequest)
+		return
+	}
+	purge := records.Create(r.Context(), tenant, body.Domain, body.Paths)
+	writeJSON(rw, http.StatusAccepted, accepted(purge))
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/purges", createPurge)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
-	"github.com/google/uuid"
+	"purge/records" // records.OwnsDomain, Create, Get, PurgeForKey, RememberKey
 )
 
 const (
-	maxPaths       = 500
-	statusAccepted = "accepted"
-	wildcardScope  = "purge:wildcard"
-	domainScope    = "purge:domain"
-	domainNotOwned = "domain is not owned by the tenant"
+	maxPaths      = 500
+	wildcardScope = "purge:wildcard"
+	domainScope   = "purge:domain"
 )
 
-type PurgeRequest struct {
+type purgeRequest struct {
 	Domain string   \`json:"domain"\`
 	Paths  []string \`json:"paths"\`
 	Reason string   \`json:"reason"\`
 }
 
-type Purge struct {
-	PurgeID    string   \`json:"purge_id"\`
-	Status     string   \`json:"status"\`
-	Domain     string   \`json:"domain"\`
-	Paths      []string \`json:"paths"\`
-	Wildcard   bool     \`json:"wildcard"\`
-	Duplicates []string \`json:"duplicates"\`
-}
-
-type PurgeStore struct{}
-
-func (s *PurgeStore) Get(ctx context.Context, tenant, idemKey string) (*Purge, error) { return nil, nil }
-
-func (s *PurgeStore) Put(ctx context.Context, tenant, idemKey string, purge *Purge) error { return nil }
-
-type TenantDomains struct{}
-
-func (d *TenantDomains) Owns(ctx context.Context, tenant, domain string) bool { return false }
-
-type PurgeProvider struct{}
-
-func (p *PurgeProvider) SubmitPurge(ctx context.Context, purgeID, domain string, paths []string) error {
-	return nil
-}
-
-var (
-	store    = &PurgeStore{}
-	domains  = &TenantDomains{}
-	provider = &PurgeProvider{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func ownsDomain(ctx context.Context, tenant, domain string) bool {
-	return domains.Owns(ctx, tenant, domain)
+func accepted(p *records.Purge) map[string]any {
+	return map[string]any{"purge_id": p.PurgeID, "status": "accepted", "domain": p.Domain, "paths": p.Paths}
 }
 
-func hasWildcard(path string) bool { return strings.Contains(path, "*") }
-
-func isWholeDomain(path string) bool { return strings.TrimSpace(path) == "/*" }
-
-func dedupePaths(paths []string) []string {
-	seen := make(map[string]bool, len(paths))
-	unique := make([]string, 0, len(paths))
-	for _, path := range paths {
-		if !seen[path] {
-			seen[path] = true
-			unique = append(unique, path)
-		}
-	}
-	return unique
-}
-
-// requiredScope is the elevated scope a wildcard request needs, empty for literal paths.
+// requiredScope is the scope the request's patterns need: the whole domain, a wildcard, or "" for literal paths.
 func requiredScope(paths []string) string {
-	for _, path := range paths {
-		if isWholeDomain(path) {
-			return domainScope
-		}
+	if slices.Contains(paths, "/*") {
+		return domainScope
 	}
 	for _, path := range paths {
-		if hasWildcard(path) {
+		if strings.Contains(path, "*") {
 			return wildcardScope
 		}
 	}
 	return ""
 }
 
-func parseScopes(header string) map[string]bool {
-	scopes := map[string]bool{}
-	for _, scope := range strings.Split(header, ",") {
-		if trimmed := strings.TrimSpace(scope); trimmed != "" {
-			scopes[trimmed] = true
-		}
-	}
-	return scopes
-}
-
 func createPurge(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		http.Error(rw, "Idempotency-Key is required", http.StatusBadRequest)
 		return
 	}
-	var body PurgeRequest
+	var body purgeRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "the body is not JSON", http.StatusBadRequest)
 		return
 	}
-	domain := strings.TrimSpace(body.Domain)
-	if domain == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "domain is required"})
+	if !records.OwnsDomain(r.Context(), tenant, body.Domain) {
+		http.Error(rw, body.Domain+" is not one of your domains", http.StatusForbidden)
 		return
 	}
-	if !ownsDomain(r.Context(), tenant, domain) {
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": domainNotOwned})
+	if len(body.Paths) < 1 || len(body.Paths) > maxPaths {
+		http.Error(rw, fmt.Sprintf("a purge carries 1 to %d paths", maxPaths), http.StatusBadRequest)
 		return
 	}
-	if len(body.Paths) == 0 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "at least one path is required"})
-		return
-	}
-	if len(body.Paths) > maxPaths {
-		writeJSON(rw, http.StatusBadRequest, map[string]any{"error": "too many paths", "max": maxPaths})
-		return
-	}
+	var paths []string
+	seen := map[string]bool{}
 	for _, path := range body.Paths {
 		if !strings.HasPrefix(path, "/") {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "every path must start with /"})
+			http.Error(rw, "every path starts with /", http.StatusBadRequest)
+			return
+		}
+		if !seen[path] { // duplicates collapse, first occurrence kept
+			seen[path] = true
+			paths = append(paths, path)
+		}
+	}
+	if scope := requiredScope(paths); scope != "" {
+		granted := strings.Split(r.Header.Get("X-Purge-Scope"), ",")
+		for i := range granted {
+			granted[i] = strings.TrimSpace(granted[i])
+		}
+		if !slices.Contains(granted, scope) {
+			http.Error(rw, "these patterns need the "+scope+" scope", http.StatusForbidden)
 			return
 		}
 	}
-	paths := dedupePaths(body.Paths)
-	duplicates := []string{}
-	seen := map[string]bool{}
-	for _, path := range body.Paths {
-		if seen[path] {
-			duplicates = append(duplicates, path)
-		}
-		seen[path] = true
-	}
-	scope := requiredScope(paths)
-	if scope != "" && !parseScopes(r.Header.Get("X-Purge-Scope"))[scope] {
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": scope + " scope is required for wildcard patterns"})
+	if recorded := records.PurgeForKey(r.Context(), tenant, key); recorded != "" {
+		writeJSON(rw, http.StatusAccepted, accepted(records.Get(r.Context(), recorded))) // a replay answers the first purge
 		return
 	}
-	stored, err := store.Get(r.Context(), tenant, idemKey)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if stored != nil {
-		writeJSON(rw, http.StatusAccepted, stored)
-		return
-	}
-	purge := &Purge{
-		PurgeID:    uuid.NewString(),
-		Status:     statusAccepted,
-		Domain:     domain,
-		Paths:      paths,
-		Wildcard:   scope != "",
-		Duplicates: duplicates,
-	}
-	if err := provider.SubmitPurge(r.Context(), purge.PurgeID, domain, paths); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "provider unavailable"})
-		return
-	}
-	if err := store.Put(r.Context(), tenant, idemKey, purge); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	writeJSON(rw, http.StatusAccepted, purge)
+	purge := records.Create(r.Context(), tenant, body.Domain, paths)
+	records.RememberKey(r.Context(), tenant, key, purge.PurgeID)
+	writeJSON(rw, http.StatusAccepted, accepted(purge))
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/purges", createPurge)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class PurgeRequest(domain: String, paths: List[String], reason: String = "")
-final case class Purge(purge_id: String, status: String, domain: String, paths: List[String])
+import purge.Records // Records.ownsDomain, create, get, purgeForKey, rememberKey
 
-object PurgeApi {
-  implicit val system: ActorSystem = ActorSystem("cdn-purge")
-  implicit val purgeRequestFormat: RootJsonFormat[PurgeRequest] = jsonFormat3(PurgeRequest)
-  implicit val purgeFormat: RootJsonFormat[Purge] = jsonFormat4(Purge)
+object Api {
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val MaxPaths = 500
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  val store = PurgeStore.open()
-  val provider = PurgeProvider.connect()
+  private def accepted(p: Records.Purge): JsObject = JsObject(
+    "purge_id" -> JsString(p.purgeId),
+    "status" -> JsString("accepted"),
+    "domain" -> JsString(p.domain),
+    "paths" -> JsArray(p.paths.map(JsString(_)).toVector)
+  )
 
-  val route: Route =
-    path("v1" / "purges") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-          entity(as[PurgeRequest]) { body =>
-            // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-            val purge = Purge(UUID.randomUUID().toString, "queued", body.domain, body.paths)
-            provider.submitPurge(purge.purge_id, body.domain, body.paths)
-            complete(StatusCodes.OK, purge)
-          }
-        }
+  def createPurge(tenant: String, raw: String): HttpResponse = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    if (tenant.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
+    val body = raw.parseJson.asJsObject
+    val domain = body.fields.get("domain").collect { case JsString(s) => s }.getOrElse("")
+    val paths = body.fields.get("paths").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
+    json(StatusCodes.Accepted, accepted(Records.create(tenant, domain, paths)))
+  }
+
+  val route: Route = path("v1" / "purges") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        entity(as[String]) { raw => complete(createPurge(tenant.getOrElse(""), raw)) }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class PurgeRequest(domain: String, paths: List[String], reason: String = "")
-final case class Purge(
-    purge_id: String,
-    status: String,
-    domain: String,
-    paths: List[String],
-    wildcard: Boolean,
-    duplicates: List[String])
+import purge.Records // Records.ownsDomain, create, get, purgeForKey, rememberKey
 
-object PurgeApi {
-  implicit val system: ActorSystem = ActorSystem("cdn-purge")
-  implicit val purgeRequestFormat: RootJsonFormat[PurgeRequest] = jsonFormat3(PurgeRequest)
-  implicit val purgeFormat: RootJsonFormat[Purge] = jsonFormat6(Purge)
-
+object Api {
   val MaxPaths = 500
-  val StatusAccepted = "accepted"
   val WildcardScope = "purge:wildcard"
   val DomainScope = "purge:domain"
-  val DomainNotOwned = "domain is not owned by the tenant"
 
-  val store = PurgeStore.open()
-  val provider = PurgeProvider.connect()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def ownsDomain(tenant: String, domain: String): Boolean = TenantDomains.owns(tenant, domain)
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  def hasWildcard(path: String): Boolean = path.contains("*")
+  private def accepted(p: Records.Purge): JsObject = JsObject(
+    "purge_id" -> JsString(p.purgeId),
+    "status" -> JsString("accepted"),
+    "domain" -> JsString(p.domain),
+    "paths" -> JsArray(p.paths.map(JsString(_)).toVector)
+  )
 
-  def isWholeDomain(path: String): Boolean = path.trim == "/*"
-
-  def dedupePaths(paths: List[String]): List[String] = paths.distinct
-
-  // requiredScope is the elevated scope a wildcard request needs, None for literal paths.
-  def requiredScope(paths: List[String]): Option[String] =
-    if (paths.exists(isWholeDomain)) Some(DomainScope)
-    else if (paths.exists(hasWildcard)) Some(WildcardScope)
+  /** The scope the request's patterns need: the whole domain, a wildcard, or none for literal paths. */
+  def requiredScope(paths: Seq[String]): Option[String] =
+    if (paths.contains("/*")) Some(DomainScope)
+    else if (paths.exists(_.contains("*"))) Some(WildcardScope)
     else None
 
-  def parseScopes(header: String): Set[String] =
-    header.split(",").map(_.trim).filter(_.nonEmpty).toSet
-
-  val route: Route =
-    path("v1" / "purges") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            optionalHeaderValueByName("X-Purge-Scope") { scopeHeader =>
-              entity(as[PurgeRequest]) { body =>
-                val domain = body.domain.trim
-                val scopes = parseScopes(scopeHeader.getOrElse(""))
-                if (!tenantOpt.exists(_.nonEmpty)) {
-                  complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-                } else if (!idemOpt.exists(_.nonEmpty)) {
-                  complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-                } else if (domain.isEmpty) {
-                  complete(StatusCodes.BadRequest, """{"error":"domain is required"}""")
-                } else if (!ownsDomain(tenantOpt.get, domain)) {
-                  complete(StatusCodes.Forbidden, s"""{"error":"$DomainNotOwned"}""")
-                } else if (body.paths.isEmpty) {
-                  complete(StatusCodes.BadRequest, """{"error":"at least one path is required"}""")
-                } else if (body.paths.length > MaxPaths) {
-                  complete(StatusCodes.BadRequest, s"""{"error":"at most $MaxPaths paths per purge"}""")
-                } else if (body.paths.exists(path => !path.startsWith("/"))) {
-                  complete(StatusCodes.BadRequest, """{"error":"every path must start with /"}""")
-                } else {
-                  val tenant = tenantOpt.get
-                  val idemKey = idemOpt.get
-                  val paths = dedupePaths(body.paths)
-                  val duplicates = body.paths.diff(paths).distinct
-                  requiredScope(paths) match {
-                    case Some(scope) if !scopes.contains(scope) =>
-                      complete(StatusCodes.Forbidden, s"""{"error":"$scope scope is required for wildcard patterns"}""")
-                    case scope =>
-                      store.get(tenant, idemKey) match {
-                        case Some(stored) =>
-                          complete(StatusCodes.Accepted, stored)
-                        case None =>
-                          val purge =
-                            Purge(UUID.randomUUID().toString, StatusAccepted, domain, paths, scope.isDefined, duplicates)
-                          provider.submitPurge(purge.purge_id, domain, paths)
-                          store.put(tenant, idemKey, purge)
-                          complete(StatusCodes.Accepted, purge)
-                      }
-                  }
-                }
-              }
-            }
-          }
+  def createPurge(tenant: String, key: String, scopes: String, raw: String): HttpResponse = {
+    if (tenant.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
+    if (key.isEmpty) return error(StatusCodes.BadRequest, "Idempotency-Key is required")
+    val body = raw.parseJson.asJsObject
+    val domain = body.fields.get("domain").collect { case JsString(s) => s }.getOrElse("")
+    val requested = body.fields.get("paths").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
+    if (!Records.ownsDomain(tenant, domain)) return error(StatusCodes.Forbidden, s"$domain is not one of your domains")
+    if (requested.isEmpty || requested.size > MaxPaths) return error(StatusCodes.BadRequest, s"a purge carries 1 to $MaxPaths paths")
+    if (requested.exists(path => !path.startsWith("/"))) return error(StatusCodes.BadRequest, "every path starts with /")
+    val paths = requested.distinct // duplicates collapse, first occurrence kept
+    val granted = scopes.split(",").map(_.trim).toSet
+    requiredScope(paths).filterNot(granted.contains) match {
+      case Some(scope) => error(StatusCodes.Forbidden, s"these patterns need the $scope scope")
+      case None =>
+        Records.purgeForKey(tenant, key).flatMap(Records.get) match {
+          case Some(recorded) => json(StatusCodes.Accepted, accepted(recorded)) // a replay answers the first purge
+          case None =>
+            val created = Records.create(tenant, domain, paths)
+            Records.rememberKey(tenant, key, created.purgeId)
+            json(StatusCodes.Accepted, accepted(created))
         }
+    }
+  }
+
+  val route: Route = path("v1" / "purges") {
+    post {
+      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key") & optionalHeaderValueByName("X-Purge-Scope")) {
+        (tenant, key, scopes) =>
+          entity(as[String]) { raw => complete(createPurge(tenant.getOrElse(""), key.getOrElse(""), scopes.getOrElse(""), raw)) }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -908,214 +559,505 @@ object PurgeApi {
 #include <string>
 #include <vector>
 
+#include "purge/records.h"  // records::ownsDomain, create, get, purgeForKey, rememberKey
+
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxPaths = 500;
-
-struct PurgeStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& purge);
-};
-
-struct PurgeProvider {
-  void SubmitPurge(const std::string& purgeId, const std::string& domain, const std::vector<std::string>& paths);
-};
-
-PurgeStore store;
-PurgeProvider provider;
-
-std::string uuidString();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/purges", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    const auto domain = body.value("domain", std::string());
-    const auto paths = body.value("paths", std::vector<std::string>());
-    const json purge = {{"purge_id", uuidString()}, {"status", "queued"}, {"domain", domain}, {"paths", paths}};
-    provider.SubmitPurge(purge["purge_id"], domain, paths);
-    res.status = 200;
-    res.set_content(purge.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+json accepted(const records::Purge& purge) {
+  return json{{"purge_id", purge.purge_id}, {"status", "accepted"}, {"domain", purge.domain}, {"paths", purge.paths}};
 }
+
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
+
+void create_purge(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, json{{"error", "X-Tenant-Id is required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object() || !body.contains("paths") || !body["paths"].is_array()) {
+    return reply(res, 400, json{{"error", "the body needs a domain and a paths list"}});
+  }
+  const auto paths = body["paths"].get<std::vector<std::string>>();
+  reply(res, 202, accepted(records::create(tenant, body.value("domain", ""), paths)));
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/purges", create_purge); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
+#include <algorithm>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include "purge/records.h"  // records::ownsDomain, create, get, purgeForKey, rememberKey
+
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxPaths = 500;
-const std::string kStatusAccepted = "accepted";
+constexpr size_t kMaxPaths = 500;
 const std::string kWildcardScope = "purge:wildcard";
 const std::string kDomainScope = "purge:domain";
-const std::string kDomainNotOwned = "domain is not owned by the tenant";
 
-struct PurgeStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& purge);
-};
-
-struct PurgeProvider {
-  void SubmitPurge(const std::string& purgeId, const std::string& domain, const std::vector<std::string>& paths);
-};
-
-struct TenantDomains {
-  bool owns(const std::string& tenant, const std::string& domain);
-};
-
-PurgeStore store;
-PurgeProvider provider;
-TenantDomains domains;
-
-std::string uuidString();
-
-bool ownsDomain(const std::string& tenant, const std::string& domain) { return domains.owns(tenant, domain); }
-
-bool hasWildcard(const std::string& path) { return path.find('*') != std::string::npos; }
-
-bool isWholeDomain(const std::string& path) { return path == "/*"; }
-
-std::vector<std::string> dedupePaths(const std::vector<std::string>& paths) {
-  std::vector<std::string> unique;
-  std::set<std::string> seen;
-  for (const auto& path : paths) {
-    if (seen.insert(path).second) unique.push_back(path);
-  }
-  return unique;
+json accepted(const records::Purge& purge) {
+  return json{{"purge_id", purge.purge_id}, {"status", "accepted"}, {"domain", purge.domain}, {"paths", purge.paths}};
 }
 
-// requiredScope is the elevated scope a wildcard request needs, empty for literal paths.
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
+
+// The scope the request's patterns need: the whole domain, a wildcard, or "" for literal paths.
 std::string requiredScope(const std::vector<std::string>& paths) {
+  if (std::find(paths.begin(), paths.end(), "/*") != paths.end()) return kDomainScope;
   for (const auto& path : paths) {
-    if (isWholeDomain(path)) return kDomainScope;
-  }
-  for (const auto& path : paths) {
-    if (hasWildcard(path)) return kWildcardScope;
+    if (path.find('*') != std::string::npos) return kWildcardScope;
   }
   return "";
 }
 
-std::set<std::string> parseScopes(const std::string& header) {
-  std::set<std::string> scopes;
-  std::string current;
-  std::string trimmed;
-  for (const char c : header + ",") {
-    if (c == ',') {
-      if (!trimmed.empty()) scopes.insert(trimmed);
-      trimmed.clear();
-      continue;
-    }
-    if (c != ' ' && c != '\\t') trimmed.push_back(c);
+std::set<std::string> grantedScopes(const std::string& header) {
+  std::set<std::string> out;
+  std::stringstream in(header);
+  std::string scope;
+  while (std::getline(in, scope, ',')) {
+    scope.erase(0, scope.find_first_not_of(' '));
+    scope.erase(scope.find_last_not_of(' ') + 1);
+    out.insert(scope);
   }
-  return scopes;
+  return out;
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/purges", [](const httplib::Request& req, httplib::Response& res) {
-    const auto reject = [&res](int status, const std::string& message) {
-      res.status = status;
-      res.set_content(json{{"error", message}}.dump(), "application/json");
-    };
-
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      reject(401, "missing X-Tenant-Id");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      reject(400, "Idempotency-Key is required");
-      return;
-    }
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("domain") || !body["domain"].is_string()) {
-      reject(400, "domain is required");
-      return;
-    }
-    const auto domain = body["domain"].get<std::string>();
-    if (domain.empty()) {
-      reject(400, "domain is required");
-      return;
-    }
-    if (!ownsDomain(tenant, domain)) {
-      reject(403, kDomainNotOwned);
-      return;
-    }
-    if (!body.contains("paths") || !body["paths"].is_array() || body["paths"].empty()) {
-      reject(400, "at least one path is required");
-      return;
-    }
-    const auto requested = body["paths"].get<std::vector<std::string>>();
-    if (requested.size() > kMaxPaths) {
-      reject(400, "at most 500 paths per purge");
-      return;
-    }
-    for (const auto& path : requested) {
-      if (path.empty() || path[0] != '/') {
-        reject(400, "every path must start with /");
-        return;
-      }
-    }
-    const auto paths = dedupePaths(requested);
-    std::set<std::string> seen;
-    std::set<std::string> duplicateSet;
-    for (const auto& path : requested) {
-      if (!seen.insert(path).second) duplicateSet.insert(path);
-    }
-    const std::vector<std::string> duplicates(duplicateSet.begin(), duplicateSet.end());
-    const auto scope = requiredScope(paths);
-    if (!scope.empty() && parseScopes(req.get_header_value("X-Purge-Scope")).count(scope) == 0) {
-      reject(403, scope + " scope is required for wildcard patterns");
-      return;
-    }
-    const auto stored = store.get(tenant, idemKey);
-    if (stored) {
-      res.status = 202;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    const json purge = {
-        {"purge_id", uuidString()},
-        {"status", kStatusAccepted},
-        {"domain", domain},
-        {"paths", paths},
-        {"wildcard", !scope.empty()},
-        {"duplicates", duplicates},
-    };
-    provider.SubmitPurge(purge["purge_id"].get<std::string>(), domain, paths);
-    store.put(tenant, idemKey, purge);
-    res.status = 202;
-    res.set_content(purge.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void create_purge(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, json{{"error", "X-Tenant-Id is required"}});
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return reply(res, 400, json{{"error", "Idempotency-Key is required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object() || !body.contains("paths") || !body["paths"].is_array()) {
+    return reply(res, 400, json{{"error", "the body needs a domain and a paths list"}});
+  }
+  const std::string domain = body.value("domain", "");
+  if (!records::ownsDomain(tenant, domain)) return reply(res, 403, json{{"error", domain + " is not one of your domains"}});
+  const auto requested = body["paths"].get<std::vector<std::string>>();
+  if (requested.empty() || requested.size() > kMaxPaths) return reply(res, 400, json{{"error", "a purge carries 1 to 500 paths"}});
+  std::vector<std::string> paths;
+  std::set<std::string> seen;
+  for (const auto& path : requested) {
+    if (!path.starts_with("/")) return reply(res, 400, json{{"error", "every path starts with /"}});
+    if (seen.insert(path).second) paths.push_back(path);  // duplicates collapse, first occurrence kept
+  }
+  const std::string scope = requiredScope(paths);
+  if (!scope.empty() && !grantedScopes(req.get_header_value("X-Purge-Scope")).count(scope)) {
+    return reply(res, 403, json{{"error", "these patterns need the " + scope + " scope"}});
+  }
+  if (const auto recorded = records::purgeForKey(tenant, key)) {
+    return reply(res, 202, accepted(*records::get(*recorded)));  // a replay answers the first purge
+  }
+  const records::Purge purge = records::create(tenant, domain, paths);
+  records::rememberKey(tenant, key, purge.purge_id);
+  reply(res, 202, accepted(purge));
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/purges", create_purge); }
 `,
     },
   },
-  hints: [
-    'A deploy script retries after a timeout and the provider receives the same batch twice; a normal token sends `/*` and every edge misses at once against the origin.',
-    'The handler builds the purge and calls `SubmitPurge` first; no guard runs before it. Tenant, ownership, `X-Purge-Scope`, the path cap and the `Idempotency-Key` lookup are all absent, and the response says `queued`.',
-    'Before `SubmitPurge`: `owns_domain` (403), `MAX_PATHS` plus `dedupe_paths` (400), `has_wildcard` against `WILDCARD_SCOPE`/`DOMAIN_SCOPE` (403), then `store.get` under `(tenant, key)`; answer `STATUS_ACCEPTED` with 202.',
-  ],
-  debrief: `The fix has its shape because a purge is a capability, not a parameter. Every guard sits in front of the provider call and runs in cost order: tenant, key, ownership, path shape, scope, then the idempotency lookup, so nothing irreversible happens for a request that was never allowed. The \`(tenant, key)\` lookup returns the stored purge, so a retry after a timeout is a read rather than a second batch. The \`202\` states only what is true: accepted and recorded.
+  harness: {
+    python: `from purge import records
 
-Production control planes go further. A wildcard grant is audited as its own row, ops can freeze a domain during a launch, and the per-domain budget that keeps a deploy loop off the origin lives in shared state. The next step builds that budget.`,
+DOMAIN = "shop.example.com"
+
+
+def _api(ctx):
+    records.add_domain("t1", DOMAIN)
+    records.add_domain("t2", "rival.example.com")
+    return ctx.client(ctx.load("api").app)
+
+
+def _headers(tenant="t1", key="k-1", scope=None):
+    headers = {"X-Tenant-Id": tenant, "Idempotency-Key": key}
+    if scope is not None:
+        headers["X-Purge-Scope"] = scope
+    return headers
+
+
+async def _purge(c, paths, key="k-1", tenant="t1", domain=DOMAIN, scope=None):
+    return await c.post("/v1/purges", json={"domain": domain, "paths": paths, "reason": "deploy 412"}, headers=_headers(tenant, key, scope))
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _purge(c, ["/pricing", "/img/logo.png"])
+    assert r.status_code == 202, f"POST /v1/purges answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("status") == "accepted" and body.get("domain") == DOMAIN, f"the 202 must say accepted for {DOMAIN}, got {body}"
+    purge = records.get(body.get("purge_id", ""))
+    assert purge is not None, f"the 202 names purge {body.get('purge_id')!r} but no record exists"
+    assert purge["paths"] == ["/pricing", "/img/logo.png"], f"the record holds paths {purge['paths']}"
+    assert records.queued() == [purge["purge_id"]], f"the purge must be queued for the provider client once, the queue holds {records.queued()}"
+
+
+async def check_domain_ownership(ctx):
+    async with _api(ctx) as c:
+        anonymous = await c.post("/v1/purges", json={"domain": DOMAIN, "paths": ["/pricing"]}, headers={"Idempotency-Key": "k-0"})
+        foreign = await _purge(c, ["/pricing"], domain="rival.example.com")
+    assert anonymous.status_code == 401, f"a purge without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert foreign.status_code == 403, f"tenant t1 purging rival.example.com (owned by t2) answered {foreign.status_code}, expected 403: any tenant can purge any customer's domain"
+    assert records.queued() == [], f"a purge of another tenant's domain was queued: {records.queued()}"
+
+
+async def check_path_cap(ctx):
+    async with _api(ctx) as c:
+        flood = await _purge(c, [f"/p/{i}" for i in range(501)], key="k-1")
+        empty = await _purge(c, [], key="k-2")
+        bare = await _purge(c, ["pricing"], key="k-3")
+        assert (flood.status_code, empty.status_code, bare.status_code) == (400, 400, 400), f"501 paths, no paths and a path without a leading / answered {flood.status_code}, {empty.status_code}, {bare.status_code}, expected 400 each"
+        assert records.queued() == [], f"a rejected purge was queued: {len(records.queued())} purges in the queue"
+        repeated = await _purge(c, ["/a", "/b", "/a"], key="k-4")
+        full = await _purge(c, [f"/p/{i}" for i in range(500)], key="k-5")
+    assert repeated.status_code == 202, f"a purge of /a, /b, /a answered {repeated.status_code}: {repeated.text}"
+    paths = records.get(repeated.json()["purge_id"])["paths"]
+    assert paths == ["/a", "/b"], f"a purge of /a, /b, /a recorded {paths}: duplicates collapse to their first occurrence"
+    assert full.status_code == 202, f"exactly 500 paths answered {full.status_code}, expected 202"
+
+
+async def check_blast_radius(ctx):
+    async with _api(ctx) as c:
+        plain = await _purge(c, ["/img/*"], key="k-1")
+        weak = await _purge(c, ["/*"], key="k-2", scope="purge:wildcard")
+        assert plain.status_code == 403, f"/img/* without X-Purge-Scope answered {plain.status_code}, expected 403: a normal token fans a wildcard out to every edge"
+        assert weak.status_code == 403, f"/* with only purge:wildcard answered {weak.status_code}, expected 403: the whole domain needs purge:domain"
+        assert records.queued() == [], f"a wildcard without its scope was queued: {records.queued()}"
+        scoped = await _purge(c, ["/img/*"], key="k-3", scope="purge:read, purge:wildcard")
+        domain = await _purge(c, ["/*"], key="k-4", scope="purge:domain")
+    assert scoped.status_code == 202, f"/img/* with purge:wildcard answered {scoped.status_code}: {scoped.text}"
+    assert domain.status_code == 202, f"/* with purge:domain answered {domain.status_code}: {domain.text}"
+
+
+async def check_idempotent_replay(ctx):
+    records.add_domain("t2", "rival.example.com")
+    async with _api(ctx) as c:
+        first = await _purge(c, ["/pricing"], key="k-1")
+        replay = await _purge(c, ["/pricing"], key="k-1")
+        assert first.status_code == 202 and replay.status_code == 202, f"the purge and its replay answered {first.status_code}, {replay.status_code}"
+        assert replay.json().get("purge_id") == first.json().get("purge_id"), f"the replay of Idempotency-Key k-1 created purge {replay.json().get('purge_id')}, the first attempt {first.json().get('purge_id')}: a retry after a timeout must answer the original purge"
+        assert len(records.queued()) == 1, f"one purge and its replay queued {len(records.queued())} purges for the provider"
+        other = await _purge(c, ["/pricing"], key="k-1", tenant="t2", domain="rival.example.com")
+        assert other.status_code == 202 and other.json().get("purge_id") != first.json().get("purge_id"), f"tenant t2's key k-1 answered t1's purge: keys belong to a tenant ({other.text})"
+        missing = await c.post("/v1/purges", json={"domain": DOMAIN, "paths": ["/pricing"]}, headers={"X-Tenant-Id": "t1"})
+    assert missing.status_code == 400, f"a purge without Idempotency-Key answered {missing.status_code}, expected 400"
+`,
+    typescript: `const DOMAIN = 'shop.example.com';
+
+async function api(ctx) {
+  const records = ctx.load('/support/purge/records.ts');
+  await records.addDomain('t1', DOMAIN);
+  await records.addDomain('t2', 'rival.example.com');
+  return {c: ctx.client(ctx.load('api').app), records};
+}
+
+function purge(c, paths: string[], key = 'k-1', opts: {tenant?: string; domain?: string; scope?: string} = {}) {
+  const headers: Record<string, string> = {'X-Tenant-Id': opts.tenant ?? 't1', 'Idempotency-Key': key};
+  if (opts.scope !== undefined) headers['X-Purge-Scope'] = opts.scope;
+  return c.post('/v1/purges', {json: {domain: opts.domain ?? DOMAIN, paths, reason: 'deploy 412'}, headers});
+}
+
+export async function check_route(ctx) {
+  const {c, records} = await api(ctx);
+  const r = await purge(c, ['/pricing', '/img/logo.png']);
+  assert.equal(r.status, 202, \`POST /v1/purges answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.status === 'accepted' && body.domain === DOMAIN, \`the 202 must say accepted for \${DOMAIN}, got \${r.text}\`);
+  const stored = await records.get(body.purge_id ?? '');
+  assert(stored !== null, \`the 202 names purge \${body.purge_id} but no record exists\`);
+  assert.deepEqual(stored.paths, ['/pricing', '/img/logo.png'], \`the record holds paths \${JSON.stringify(stored.paths)}\`);
+  assert.deepEqual(await records.queued(), [stored.purge_id], 'the purge must be queued for the provider client once');
+}
+
+export async function check_domain_ownership(ctx) {
+  const {c, records} = await api(ctx);
+  const anonymous = await c.post('/v1/purges', {json: {domain: DOMAIN, paths: ['/pricing']}, headers: {'Idempotency-Key': 'k-0'}});
+  const foreign = await purge(c, ['/pricing'], 'k-1', {domain: 'rival.example.com'});
+  assert.equal(anonymous.status, 401, \`a purge without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(foreign.status, 403, \`tenant t1 purging rival.example.com (owned by t2) answered \${foreign.status}, expected 403: any tenant can purge any customer's domain\`);
+  assert.deepEqual(await records.queued(), [], 'a purge of another tenant\\'s domain was queued');
+}
+
+export async function check_path_cap(ctx) {
+  const {c, records} = await api(ctx);
+  const flood = await purge(c, Array.from({length: 501}, (_, i) => \`/p/\${i}\`), 'k-1');
+  const empty = await purge(c, [], 'k-2');
+  const bare = await purge(c, ['pricing'], 'k-3');
+  assert.deepEqual([flood.status, empty.status, bare.status], [400, 400, 400], \`501 paths, no paths and a path without a leading / answered \${flood.status}, \${empty.status}, \${bare.status}, expected 400 each\`);
+  assert.deepEqual(await records.queued(), [], 'a rejected purge was queued');
+  const repeated = await purge(c, ['/a', '/b', '/a'], 'k-4');
+  const full = await purge(c, Array.from({length: 500}, (_, i) => \`/p/\${i}\`), 'k-5');
+  assert.equal(repeated.status, 202, \`a purge of /a, /b, /a answered \${repeated.status}: \${repeated.text}\`);
+  const paths = (await records.get(repeated.json().purge_id)).paths;
+  assert.deepEqual(paths, ['/a', '/b'], \`a purge of /a, /b, /a recorded \${JSON.stringify(paths)}: duplicates collapse to their first occurrence\`);
+  assert.equal(full.status, 202, \`exactly 500 paths answered \${full.status}, expected 202\`);
+}
+
+export async function check_blast_radius(ctx) {
+  const {c, records} = await api(ctx);
+  const plain = await purge(c, ['/img/*'], 'k-1');
+  const weak = await purge(c, ['/*'], 'k-2', {scope: 'purge:wildcard'});
+  assert.equal(plain.status, 403, \`/img/* without X-Purge-Scope answered \${plain.status}, expected 403: a normal token fans a wildcard out to every edge\`);
+  assert.equal(weak.status, 403, \`/* with only purge:wildcard answered \${weak.status}, expected 403: the whole domain needs purge:domain\`);
+  assert.deepEqual(await records.queued(), [], 'a wildcard without its scope was queued');
+  const scoped = await purge(c, ['/img/*'], 'k-3', {scope: 'purge:read, purge:wildcard'});
+  const domain = await purge(c, ['/*'], 'k-4', {scope: 'purge:domain'});
+  assert.equal(scoped.status, 202, \`/img/* with purge:wildcard answered \${scoped.status}: \${scoped.text}\`);
+  assert.equal(domain.status, 202, \`/* with purge:domain answered \${domain.status}: \${domain.text}\`);
+}
+
+export async function check_idempotent_replay(ctx) {
+  const {c, records} = await api(ctx);
+  const first = await purge(c, ['/pricing'], 'k-1');
+  const replay = await purge(c, ['/pricing'], 'k-1');
+  assert(first.status === 202 && replay.status === 202, \`the purge and its replay answered \${first.status}, \${replay.status}\`);
+  assert.equal(replay.json().purge_id, first.json().purge_id, \`the replay of Idempotency-Key k-1 created purge \${replay.json().purge_id}, the first attempt \${first.json().purge_id}: a retry after a timeout must answer the original purge\`);
+  assert.equal((await records.queued()).length, 1, 'one purge and its replay must queue one purge for the provider');
+  const other = await purge(c, ['/pricing'], 'k-1', {tenant: 't2', domain: 'rival.example.com'});
+  assert(other.status === 202 && other.json().purge_id !== first.json().purge_id, \`tenant t2's key k-1 answered t1's purge: keys belong to a tenant (\${other.text})\`);
+  const missing = await c.post('/v1/purges', {json: {domain: DOMAIN, paths: ['/pricing']}, headers: {'X-Tenant-Id': 't1'}});
+  assert.equal(missing.status, 400, \`a purge without Idempotency-Key answered \${missing.status}, expected 400\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"purge/records"
+
+	"leetbuild/harness"
+)
+
+const apiDomain = "shop.example.com"
+
+var apiBg = context.Background()
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	records.AddDomain(apiBg, "t1", apiDomain)
+	records.AddDomain(apiBg, "t2", "rival.example.com")
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func purgeReq(c *harness.HTTP, paths []string, key, tenant, domain, scope string) *harness.Response {
+	headers := []string{"X-Tenant-Id", tenant, "Idempotency-Key", key}
+	if scope != "" {
+		headers = append(headers, "X-Purge-Scope", scope)
+	}
+	return c.Post("/v1/purges", map[string]any{"domain": domain, "paths": paths, "reason": "deploy 412"}, headers...)
+}
+
+func numbered(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("/p/%d", i)
+	}
+	return out
+}
+
+type acceptedBody struct {
+	PurgeID string \`json:"purge_id"\`
+	Status  string \`json:"status"\`
+	Domain  string \`json:"domain"\`
+}
+
+func decodeAccepted(r *harness.Response) acceptedBody {
+	var body acceptedBody
+	if r.Status == 202 {
+		r.Decode(&body)
+	}
+	return body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := purgeReq(c, []string{"/pricing", "/img/logo.png"}, "k-1", "t1", apiDomain, "")
+	ctx.Equal(r.Status, 202, "POST /v1/purges (%s)", r.Text())
+	body := decodeAccepted(r)
+	ctx.Assert(body.Status == "accepted" && body.Domain == apiDomain, "the 202 must say accepted for %s, got %s", apiDomain, r.Text())
+	stored := records.Get(apiBg, body.PurgeID)
+	ctx.Assert(stored != nil, "the 202 names purge %q but no record exists", body.PurgeID)
+	ctx.Equal(stored.Paths, []string{"/pricing", "/img/logo.png"}, "the record's paths")
+	ctx.Equal(records.Queued(apiBg), []string{stored.PurgeID}, "the purge must be queued for the provider client once; the queue")
+}
+
+func CheckDomainOwnership(ctx *harness.Ctx) {
+	c := api(ctx)
+	anonymous := c.Post("/v1/purges", map[string]any{"domain": apiDomain, "paths": []string{"/pricing"}}, "Idempotency-Key", "k-0")
+	foreign := purgeReq(c, []string{"/pricing"}, "k-1", "t1", "rival.example.com", "")
+	ctx.Equal(anonymous.Status, 401, "a purge without X-Tenant-Id")
+	ctx.Equal(foreign.Status, 403, "tenant t1 purging rival.example.com (owned by t2): any tenant can purge any customer's domain")
+	ctx.Equal(len(records.Queued(apiBg)), 0, "a purge of another tenant's domain must not be queued; the queued purges")
+}
+
+func CheckPathCap(ctx *harness.Ctx) {
+	c := api(ctx)
+	flood := purgeReq(c, numbered(501), "k-1", "t1", apiDomain, "")
+	empty := purgeReq(c, []string{}, "k-2", "t1", apiDomain, "")
+	bare := purgeReq(c, []string{"pricing"}, "k-3", "t1", apiDomain, "")
+	ctx.Equal([]int{flood.Status, empty.Status, bare.Status}, []int{400, 400, 400}, "501 paths, no paths and a path without a leading / must each be 400; the statuses")
+	ctx.Equal(len(records.Queued(apiBg)), 0, "a rejected purge must not be queued; the queued purges")
+	repeated := purgeReq(c, []string{"/a", "/b", "/a"}, "k-4", "t1", apiDomain, "")
+	full := purgeReq(c, numbered(500), "k-5", "t1", apiDomain, "")
+	ctx.Equal(repeated.Status, 202, "a purge of /a, /b, /a (%s)", repeated.Text())
+	stored := records.Get(apiBg, decodeAccepted(repeated).PurgeID)
+	ctx.Assert(stored != nil, "the purge of /a, /b, /a has no record")
+	ctx.Equal(stored.Paths, []string{"/a", "/b"}, "a purge of /a, /b, /a: duplicates collapse to their first occurrence; the recorded paths")
+	ctx.Equal(full.Status, 202, "exactly 500 paths")
+}
+
+func CheckBlastRadius(ctx *harness.Ctx) {
+	c := api(ctx)
+	plain := purgeReq(c, []string{"/img/*"}, "k-1", "t1", apiDomain, "")
+	weak := purgeReq(c, []string{"/*"}, "k-2", "t1", apiDomain, "purge:wildcard")
+	ctx.Equal(plain.Status, 403, "/img/* without X-Purge-Scope: a normal token fans a wildcard out to every edge")
+	ctx.Equal(weak.Status, 403, "/* with only purge:wildcard: the whole domain needs purge:domain")
+	ctx.Equal(len(records.Queued(apiBg)), 0, "a wildcard without its scope must not be queued; the queued purges")
+	scoped := purgeReq(c, []string{"/img/*"}, "k-3", "t1", apiDomain, "purge:read, purge:wildcard")
+	domain := purgeReq(c, []string{"/*"}, "k-4", "t1", apiDomain, "purge:domain")
+	ctx.Equal(scoped.Status, 202, "/img/* with purge:wildcard (%s)", scoped.Text())
+	ctx.Equal(domain.Status, 202, "/* with purge:domain (%s)", domain.Text())
+}
+
+func CheckIdempotentReplay(ctx *harness.Ctx) {
+	c := api(ctx)
+	first := purgeReq(c, []string{"/pricing"}, "k-1", "t1", apiDomain, "")
+	replay := purgeReq(c, []string{"/pricing"}, "k-1", "t1", apiDomain, "")
+	ctx.Assert(first.Status == 202 && replay.Status == 202, "the purge and its replay answered %d, %d", first.Status, replay.Status)
+	ctx.Equal(decodeAccepted(replay).PurgeID, decodeAccepted(first).PurgeID, "the replay of Idempotency-Key k-1 must answer the original purge, not create one; the purge id")
+	ctx.Equal(len(records.Queued(apiBg)), 1, "one purge and its replay must queue one purge for the provider; the queued purges")
+	other := purgeReq(c, []string{"/pricing"}, "k-1", "t2", "rival.example.com", "")
+	ctx.Assert(other.Status == 202 && decodeAccepted(other).PurgeID != decodeAccepted(first).PurgeID, "tenant t2's key k-1 answered t1's purge: keys belong to a tenant (%s)", other.Text())
+	missing := c.Post("/v1/purges", map[string]any{"domain": apiDomain, "paths": []string{"/pricing"}}, "X-Tenant-Id", "t1")
+	ctx.Equal(missing.Status, 400, "a purge without Idempotency-Key")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "purge/records.h"
+
+namespace {
+
+const std::string kApiDomain = "shop.example.com";
+
+harness::HTTP api(harness::Ctx& ctx) {
+  records::addDomain("t1", kApiDomain);
+  records::addDomain("t2", "rival.example.com");
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response purgeReq(harness::HTTP& c, const std::vector<std::string>& paths, const std::string& key, const std::string& tenant = "t1",
+                           const std::string& domain = kApiDomain, const std::string& scope = "") {
+  const std::string body = nlohmann::json{{"domain", domain}, {"paths", paths}, {"reason", "deploy 412"}}.dump();
+  if (scope.empty()) return c.Post("/v1/purges", body, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
+  return c.Post("/v1/purges", body, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key, "X-Purge-Scope", scope);
+}
+
+std::vector<std::string> numbered(int n) {
+  std::vector<std::string> out;
+  for (int i = 0; i < n; i++) out.push_back("/p/" + std::to_string(i));
+  return out;
+}
+
+std::string field(const harness::Response& r, const std::string& name) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() && body.contains(name) && body[name].is_string() ? body[name].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = purgeReq(c, {"/pricing", "/img/logo.png"}, "k-1");
+  ctx.Equal(r.Status, 202, "POST /v1/purges (%s)", r.Text());
+  ctx.Assert(field(r, "status") == "accepted" && field(r, "domain") == kApiDomain, "the 202 must say accepted for %s, got %s", kApiDomain, r.Text());
+  const auto stored = records::get(field(r, "purge_id"));
+  ctx.Assert(stored.has_value(), "the 202 names purge %q but no record exists", field(r, "purge_id"));
+  ctx.Equal(stored->paths, std::vector<std::string>{"/pricing", "/img/logo.png"}, "the record's paths");
+  ctx.Equal(records::queued(), std::vector<std::string>{stored->purge_id}, "the purge must be queued for the provider client once; the queue");
+}
+
+void CheckDomainOwnership(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto anonymous = c.Post("/v1/purges", R"({"domain": "shop.example.com", "paths": ["/pricing"]})", "Content-Type", "application/json", "Idempotency-Key", "k-0");
+  const auto foreign = purgeReq(c, {"/pricing"}, "k-1", "t1", "rival.example.com");
+  ctx.Equal(anonymous.Status, 401, "a purge without X-Tenant-Id");
+  ctx.Equal(foreign.Status, 403, "tenant t1 purging rival.example.com (owned by t2): any tenant can purge any customer's domain");
+  ctx.Equal(records::queued().size(), 0, "a purge of another tenant's domain must not be queued; the queued purges");
+}
+
+void CheckPathCap(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto flood = purgeReq(c, numbered(501), "k-1");
+  const auto empty = purgeReq(c, {}, "k-2");
+  const auto bare = purgeReq(c, {"pricing"}, "k-3");
+  ctx.Equal(std::vector<int>{flood.Status, empty.Status, bare.Status}, std::vector<int>{400, 400, 400},
+            "501 paths, no paths and a path without a leading / must each be 400; the statuses");
+  ctx.Equal(records::queued().size(), 0, "a rejected purge must not be queued; the queued purges");
+  const auto repeated = purgeReq(c, {"/a", "/b", "/a"}, "k-4");
+  const auto full = purgeReq(c, numbered(500), "k-5");
+  ctx.Equal(repeated.Status, 202, "a purge of /a, /b, /a (%s)", repeated.Text());
+  const auto stored = records::get(field(repeated, "purge_id"));
+  ctx.Assert(stored.has_value(), "the purge of /a, /b, /a has no record");
+  ctx.Equal(stored->paths, std::vector<std::string>{"/a", "/b"}, "a purge of /a, /b, /a: duplicates collapse to their first occurrence; the recorded paths");
+  ctx.Equal(full.Status, 202, "exactly 500 paths");
+}
+
+void CheckBlastRadius(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto plain = purgeReq(c, {"/img/*"}, "k-1");
+  const auto weak = purgeReq(c, {"/*"}, "k-2", "t1", kApiDomain, "purge:wildcard");
+  ctx.Equal(plain.Status, 403, "/img/* without X-Purge-Scope: a normal token fans a wildcard out to every edge");
+  ctx.Equal(weak.Status, 403, "/* with only purge:wildcard: the whole domain needs purge:domain");
+  ctx.Equal(records::queued().size(), 0, "a wildcard without its scope must not be queued; the queued purges");
+  const auto scoped = purgeReq(c, {"/img/*"}, "k-3", "t1", kApiDomain, "purge:read, purge:wildcard");
+  const auto domain = purgeReq(c, {"/*"}, "k-4", "t1", kApiDomain, "purge:domain");
+  ctx.Equal(scoped.Status, 202, "/img/* with purge:wildcard (%s)", scoped.Text());
+  ctx.Equal(domain.Status, 202, "/* with purge:domain (%s)", domain.Text());
+}
+
+void CheckIdempotentReplay(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto first = purgeReq(c, {"/pricing"}, "k-1");
+  const auto replay = purgeReq(c, {"/pricing"}, "k-1");
+  ctx.Assert(first.Status == 202 && replay.Status == 202, "the purge and its replay answered %d, %d", first.Status, replay.Status);
+  ctx.Equal(field(replay, "purge_id"), field(first, "purge_id"), "the replay of Idempotency-Key k-1 must answer the original purge, not create one; the purge id");
+  ctx.Equal(records::queued().size(), 1, "one purge and its replay must queue one purge for the provider; the queued purges");
+  const auto other = purgeReq(c, {"/pricing"}, "k-1", "t2", "rival.example.com");
+  ctx.Assert(other.Status == 202 && field(other, "purge_id") != field(first, "purge_id"), "tenant t2's key k-1 answered t1's purge: keys belong to a tenant (%s)", other.Text());
+  const auto missing = c.Post("/v1/purges", R"({"domain": "shop.example.com", "paths": ["/pricing"]})", "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  ctx.Equal(missing.Status, 400, "a purge without Idempotency-Key");
+}
+`,
+  },
+  hints: [
+    'A tenant purges a competitor’s domain and gets a 202; a deploy script that retries after a timeout leaves two purges in the queue; a normal token’s `/*` is accepted.',
+    'The handler goes straight from the tenant header to `records.create`: nothing asks who owns the domain, how many paths arrived, which scope the patterns need, or whether this key already created a purge.',
+    'Before `create`: 400 without `Idempotency-Key`, 403 unless `owns_domain`, 400 outside 1..`MAX_PATHS` or without a leading `/`, dedupe, 403 without the scope `required_scope` names, answer `purge_for_key` when set; `remember_key` after.',
+  ],
+  debrief: `Every guard sits in front of \`records.create\` because creating the record is the point of no return: once a purge is queued, the provider client will send it. The checks run cheapest first, and the replay lookup comes after validation, so an invalid request can never be answered from a key. Keys are scoped by tenant, which keeps one customer's key from naming another's purge. The scope split mirrors CDN providers, whose purge-all is a separate permission from purging a URL. What this step leaves out: a replay with a different body under the same key should be refused rather than answered, and the key record should be written atomically with the purge (\`SET NX\`), so two concurrent first attempts cannot both create one.`,
 };

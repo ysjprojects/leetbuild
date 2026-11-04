@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package cdnpurge;
+
+// The CDN provider step 3 hands a batch to. Every result names one pattern of the request:
+// "accepted" (the edges will drop it), "invalid_pattern" (the provider refuses it, terminal) or
+// "throttled" (not taken this time, send it again). A batch_id the provider has seen before is the
+// same batch: it does not purge an accepted pattern twice.
+service CdnProvider {
+  rpc BatchPurge(BatchPurgeRequest) returns (BatchPurgeReply);
+}
+
+message BatchPurgeRequest {
+  string batch_id = 1;
+  string domain = 2;
+  repeated string patterns = 3;
+  int32 attempt = 4;
+}
+
+message PathResult {
+  string pattern = 1;
+  string result = 2;
+}
+
+message BatchPurgeReply {
+  repeated PathResult results = 1;
+}

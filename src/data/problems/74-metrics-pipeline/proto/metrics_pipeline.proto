@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package metricsd;
+
+// A shard writer: the durable store behind one shard of the series space. The rollup tick sends
+// every closed window to the shard its series hashes to (shard_for); the shard stores each window
+// once per window_id (a window it already holds is accepted again without being counted twice) and
+// answers the ids it accepted. A window it did not accept is absent from the reply.
+service MetricsWriter {
+  rpc WriteWindows(WriteRequest) returns (WriteReply);
+}
+
+// One closed aggregation window of one series of one tenant.
+message Window {
+  // "{tenant}/{series}@{start}": what the shard deduplicates by.
+  string window_id = 1;
+  string tenant = 2;
+  string series = 3;
+  int64 start = 4;
+  int64 count = 5;
+  double sum = 6;
+}
+
+message WriteRequest {
+  // The shard target the request is meant for ("shard-0:9000").
+  string shard = 1;
+  repeated Window windows = 2;
+}
+
+message WriteReply {
+  repeated string accepted = 1;
+}

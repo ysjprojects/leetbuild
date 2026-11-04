@@ -2,53 +2,46 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/calendars/{id}/events: ranges that bound expansion',
+  title: 'GET /v1/calendars/{id}/events: a bounded window over a calendar you may read',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'api', 'expander', 'redis'],
+  focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/calendars/{id}/events?from=<iso>&to=<iso>\`: it
-looks up the calendar (404 when unknown), defaults a missing window to a year and clamps a wider
-one, lists each event's rule with its instances, and appends overrides from the store. It
-compiles, serves the week view in the demo, and hides four flaws.
+**Starting point.** The starter serves \`GET /v1/calendars/{id}/events?from=&to=\` (ISO-8601
+instants): it fills a missing \`from\` with now and a missing \`to\` with a year later
+(\`DEFAULT_WINDOW_DAYS\`), refuses \`to <= from\` with **400** \`invalid_window\`, reads the occurrences
+through step 2's \`cached_expansion\` and answers \`{"calendar_id", "occurrences"}\` with
+\`Cache-Control: public, max-age=60\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The silent clamp is the subtle one: defaulting to a year and
-truncating a wider request look like resilience, but they turn a caller's bug into a year of
-expansion work for a window nobody asked for. Around it: instances without an occurrence id cannot
-be deduped client-side, an override listed beside its original double-books the slot, and a
-private calendar whose membership is not checked leaks its events to any authenticated caller.
+**Failure mode the checks target.** A client asking for a decade, a typo in a calendar id, a private
+calendar read by someone outside it, and a shared cache between the service and its clients.
 
-- The caller is the \`X-Tenant-Id\` header. An unknown calendar is **404**; a \`private\` calendar
-  is **403** for a non-member. Both checks run before any cache or expansion work.
-- \`from\` and \`to\` are required instants (**400** when missing or inverted) and the window spans
-  at most **90 days** (\`MAX_RANGE_DAYS\`); a wider range is **400**, not a clamp.
-- Expansion happens server-side, memoised under \`(calendar, window, generation)\`; every
-  occurrence carries \`occurrence_id = "<event_id>:<start_iso>"\` plus the \`revision\` it was
-  expanded from.
-- Overrides from the store are keyed by that same \`occurrence_id\`. A covered occurrence is
-  skipped by the expansion and emitted **once**, in its place, with the override's \`revision\`.
-- Respond with \`{"calendar_id": …, "events": [{"occurrence_id", "event_id", "start", "revision"}, …]}\`,
-  ordered by \`start\`.`,
+Rules, in this order:
+
+- An unknown calendar (\`store.get_calendar\`) is **404** \`calendar_not_found\`, before anything is
+  expanded or cached.
+- A \`private\` calendar is **403** \`not_a_member\` unless \`store.is_member(calendar, X-Tenant-Id)\`.
+- \`from\` and \`to\` are required, \`to\` is after \`from\`, and they are at most \`MAX_RANGE_DAYS\` (90)
+  apart: otherwise **400** \`invalid_window\`.
+- A private calendar answers \`Cache-Control: private, max-age=60\`; a public one keeps
+  \`public, max-age=60\`.`,
   sequence: {
-    participants: ['Calendar client', 'Calendar API', 'Expansion worker', 'Redis'],
+    participants: ['Calendar client', 'Calendar API', 'Redis'],
     messages: [
-      {from: 'Calendar client', to: 'Calendar API', label: 'GET /v1/calendars/cal_7/events?from=…&to=…', kind: 'sync'},
       {
-        from: 'Calendar API',
+        from: 'Calendar client',
         to: 'Calendar API',
-        label: '404 unknown · 403 non-member · 400 window > 90 days',
+        label: 'GET /v1/calendars/{id}/events?from&to · X-Tenant-Id',
         kind: 'sync',
       },
-      {from: 'Calendar API', to: 'Redis', label: 'GET expansion:cal_7:2026-03-01/2026-05-30:gen7', kind: 'sync'},
-      {from: 'Redis', to: 'Calendar API', label: 'slice / miss', kind: 'reply'},
-      {from: 'Calendar API', to: 'Expansion worker', label: 'expand(rrule, window) · only on a miss', kind: 'sync'},
-      {from: 'Expansion worker', to: 'Calendar API', label: 'instances · occurrence_id · revision', kind: 'reply'},
-      {from: 'Calendar API', to: 'Redis', label: 'SET slice · generation-stamped', kind: 'async'},
+      {from: 'Calendar API', to: 'Redis', label: 'calendar:{id} · calendar:{id}:members', kind: 'sync'},
+      {from: 'Calendar API', to: 'Calendar API', label: '404 · 403 · window ≤ 90 days', kind: 'sync'},
+      {from: 'Calendar API', to: 'Redis', label: 'cached_expansion(calendar, from, to)', kind: 'sync'},
       {
         from: 'Calendar API',
         to: 'Calendar client',
-        label: '200 {events} · each override once, in place',
+        label: '200 occurrences · Cache-Control private|public',
         kind: 'reply',
       },
     ],
@@ -57,509 +50,187 @@ private calendar whose membership is not checked leaks its events to any authent
     {
       id: 'route',
       title: 'Serves GET /v1/calendars/{id}/events',
-      detail: 'Register the range read on `GET /v1/calendars/{id}/events`.',
+      detail:
+        'A week of a public calendar answers 200 with the seven daily standups of that week, each with its occurrence id.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/calendars\/\{id\}\/events["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/calendars\/:id\/events['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/calendars\/\{id\}\/events"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"calendars"\s*\/\s*Segment\s*\/\s*"events"\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/calendars\/[^"]*\/events/]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/calendars\/\{calendar_id\}\/events["']/, /cached_expansion\(/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/calendars\/:calendarId\/events['"]/, /cachedExpansion\(/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/calendars\/\{id\}\/events"/, /cachedExpansion\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"calendars"\s*\/\s*Segment\s*\/\s*"events"\s*\)/, /cachedExpansion\(/]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/calendars\/\(\[\^\/\]\+\)\/events\)"/, /cachedExpansion\(/]},
       },
     },
     {
       id: 'range-cap',
-      title: 'Rejects a window over 90 days with 400',
+      title: 'Refuses a missing bound or a window over 90 days with 400',
       detail:
-        'Both bounds are required, `to` must be after `from`, and the window may span at most **90 days** (`MAX_RANGE_DAYS`); every violation answers **400** before the expansion runs. The starter defaults to a year, swaps inverted bounds and clamps anything wider instead of failing the request.',
+        'A 120-day window, a missing `to` and a missing `from` are **400** `invalid_window`; exactly 90 days is served. The starter fills a missing bound with a year and expands any window it is given.',
       match: {
-        python: {all: [/MAX_RANGE_DAYS/, /timedelta\(\s*days\s*=\s*MAX_RANGE_DAYS\s*\)/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_RANGE_DAYS/, /MAX_RANGE_MS/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxRangeDays/, /maxRange\b/, /http\.StatusBadRequest/]},
-        scala: {all: [/MaxRangeDays/, /MaxRange\b/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kMaxRangeDays/, /kMaxRangeSeconds/, /\b400\b/]},
+        python: {all: [/MAX_RANGE_DAYS/], none: [/DEFAULT_WINDOW_DAYS/]},
+        typescript: {all: [/MAX_RANGE_DAYS/], none: [/DEFAULT_WINDOW_DAYS/]},
+        go: {all: [/rrule\.MaxRangeDays/], none: [/defaultWindowDays/]},
+        scala: {all: [/Rrule\.MaxRangeDays/], none: [/DefaultWindowDays/]},
+        cpp: {all: [/kMaxRangeDays/], none: [/kDefaultWindowDays/]},
       },
     },
     {
-      id: 'occurrence-ids',
-      title: 'Expands server-side with a per-occurrence id and revision',
+      id: 'unknown-calendar',
+      title: 'Answers 404 for a calendar that does not exist',
       detail:
-        'The read path expands the rules itself and memoises the slice under `(calendar, window, generation)`; every occurrence carries `occurrence_id` (`event_id:start`) plus the `revision` it was expanded from, so a client can dedupe across refreshes. The starter returns the raw RRULE and no per-occurrence id.',
+        'An unknown calendar id is **404** `calendar_not_found`, and no slice is cached for it. The starter answers 200 with an empty week, so a typo looks like a free calendar and costs an expansion.',
       match: {
-        python: {
-          all: [
-            /f"\{event_id\}:\{start_iso\}"/,
-            /"revision": event\["revision"\]/,
-            /cache\.get_slice\(/,
-            /cache\.put_slice\(/,
-          ],
-        },
-        typescript: {
-          all: [
-            /\$\{event\.id\}:\$\{startIso\}/,
-            /revision: event\.revision/,
-            /cache\.getSlice\(/,
-            /cache\.putSlice\(/,
-          ],
-        },
-        go: {
-          all: [
-            /event\.ID \+ ":" \+ startISO/,
-            /Revision:\s+event\.Revision/,
-            /cache\.GetSlice\(/,
-            /cache\.PutSlice\(/,
-          ],
-        },
-        scala: {
-          all: [/s"\$eventId:\$startIso"/, /startIso, event\.revision/, /cache\.getSlice\(/, /cache\.putSlice\(/],
-        },
-        cpp: {
-          all: [
-            /event\.id \+ ":" \+ startIso/,
-            /startIso, event\.revision\}/,
-            /cache\.getSlice\(/,
-            /cache\.putSlice\(/,
-          ],
-        },
-      },
-    },
-    {
-      id: 'instance-once',
-      title: 'Emits an overridden instance once, in place',
-      detail:
-        'An occurrence the override table already covers is skipped by the expansion — keyed by `occurrence_id`, the same key the store uses — and the override is appended instead, with its own revision. The starter lists the original and the override side by side, so the slot is booked twice.',
-      match: {
-        python: {
-          all: [/overrides\.get\(/, /overrides\.items\(\)/, /override\["revision"\]/],
-          order: [/cache\.get_slice\(/, /overrides\.get\(/],
-        },
-        typescript: {
-          all: [/overrides\.has\(/, /for \(const \[oid, override\] of overrides\)/, /override\.revision/],
-          order: [/cache\.getSlice\(/, /overrides\.has\(/],
-        },
-        go: {
-          all: [/overrides\[instance\.OccurrenceID\]/, /for oid, override := range overrides/, /override\.Revision/],
-          order: [/cache\.GetSlice\(/, /overrides\[instance\.OccurrenceID\]/],
-        },
-        scala: {
-          all: [/filterNot\(/, /overrides\.contains\(/, /exception\.revision/],
-          order: [/cache\.getSlice\(/, /filterNot\(/],
-        },
-        cpp: {
-          all: [/overrides\.count\(/, /for \(const auto& \[oid, override\] : overrides\)/, /override\.revision/],
-          order: [/cache\.getSlice\(/, /overrides\.count\(/],
-        },
+        python: {all: [/calendar_not_found/, /store\.get_calendar\(/]},
+        typescript: {all: [/calendar_not_found/, /store\.getCalendar\(/]},
+        go: {all: [/calendar_not_found/, /store\.GetCalendar\(/]},
+        scala: {all: [/calendar_not_found/, /Store\.getCalendar\(/]},
+        cpp: {all: [/calendar_not_found/, /store::GetCalendar\(/]},
       },
     },
     {
       id: 'private-calendars',
-      title: 'Refuses non-members on private calendars with 403',
+      title: 'Refuses a private calendar to a tenant outside it with 403',
       detail:
-        'An unknown calendar is **404** and a `private` calendar is **403** for a caller whose tenant is not a member — both before any expansion or cache work. The starter serves private calendars to every caller that gets past the 404.',
+        'A `private` calendar is **403** `not_a_member` for a tenant that is not a member and for a request with no tenant, and served to a member. The starter serves it to anyone who knows the id.',
       match: {
-        python: {
-          all: [/PRIVATE/, /store\.is_member\(/, /status_code\s*=\s*403/, /status_code\s*=\s*404/],
-          order: [/store\.is_member\(/, /cache\.get_slice\(/],
-        },
-        typescript: {
-          all: [/PRIVATE/, /store\.isMember\(/, /code\(\s*403\s*\)/, /code\(\s*404\s*\)/],
-          order: [/store\.isMember\(/, /cache\.getSlice\(/],
-        },
-        go: {
-          all: [/privateVisibility/, /store\.IsMember\(/, /http\.StatusForbidden/, /http\.StatusNotFound/],
-          order: [/store\.IsMember\(/, /cache\.GetSlice\(/],
-        },
-        scala: {
-          all: [/PrivateVisibility/, /store\.isMember\(/, /StatusCodes\.Forbidden/, /StatusCodes\.NotFound/],
-          order: [/store\.isMember\(/, /cache\.getSlice\(/],
-        },
-        cpp: {
-          all: [/kPrivateVisibility/, /store\.isMember\(/, /\b403\b/, /\b404\b/],
-          order: [/store\.isMember\(/, /cache\.getSlice\(/],
-        },
+        python: {all: [/not_a_member/, /store\.is_member\(/]},
+        typescript: {all: [/not_a_member/, /store\.isMember\(/]},
+        go: {all: [/not_a_member/, /store\.IsMember\(/]},
+        scala: {all: [/not_a_member/, /Store\.isMember\(/]},
+        cpp: {all: [/not_a_member/, /store::IsMember\(/]},
+      },
+    },
+    {
+      id: 'cache-control',
+      title: 'Keeps a private calendar out of shared caches',
+      detail:
+        'A member reading a private calendar gets `Cache-Control: private, max-age=60`; a public calendar keeps `public`. The starter marks every answer `public`, so a proxy can hand one member’s private week to the next caller without asking the service.',
+      match: {
+        python: {all: [/["']private, max-age=60["']/]},
+        typescript: {all: [/['"]private, max-age=60['"]/]},
+        go: {all: [/"private, max-age=60"/]},
+        scala: {all: [/"private, max-age=60"/]},
+        cpp: {all: [/"private, max-age=60"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-from datetime import datetime, timedelta
+      starter: `import time
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
-logger = logging.getLogger("calendar")
+from calendard.rrule import parse_instant
+from state import cached_expansion  # step 2: the occurrences of a window, exceptions applied
 
 DEFAULT_WINDOW_DAYS = 365
 
-
-class CalendarStore:
-    def get_calendar(self, calendar_id: str) -> dict | None:
-        """The calendar row: id, visibility, generation."""
-        raise NotImplementedError
-
-    def is_member(self, calendar_id: str, tenant: str) -> bool:
-        """True when the tenant may read this calendar's events."""
-        raise NotImplementedError
-
-    def list_events(self, calendar_id: str) -> list[dict]:
-        """The calendar's events: id, revision, rrule."""
-        raise NotImplementedError
-
-    def list_overrides(self, calendar_id: str) -> list[dict]:
-        """Instance exceptions: occurrence_id, event_id, start, revision."""
-        raise NotImplementedError
+app = FastAPI()
 
 
-class ExpansionCache:
-    def get_slice(self, calendar_id: str, window: str, generation: int) -> list[dict] | None:
-        """The expansion cached for (calendar, window, generation), if any."""
-        raise NotImplementedError
-
-    def put_slice(self, calendar_id: str, window: str, generation: int, instances: list[dict]) -> None:
-        """Cache a raw expansion under the calendar's current generation."""
-        raise NotImplementedError
+def _error(status: int, code: str) -> JSONResponse:
+    return JSONResponse({"error": code}, status_code=status)
 
 
-store = CalendarStore()
-cache = ExpansionCache()
-
-
-def expand(event: dict, start: datetime, end: datetime) -> list[str]:
-    """Start timestamps of the event's RRULE instances inside [start, end)."""
-    raise NotImplementedError
-
-
-def parse_window(from_raw: str | None, to_raw: str | None) -> tuple[datetime, datetime]:
-    start = datetime.fromisoformat(from_raw) if from_raw else datetime.now()
-    end = datetime.fromisoformat(to_raw) if to_raw else start + timedelta(days=DEFAULT_WINDOW_DAYS)
+@app.get("/v1/calendars/{calendar_id}/events")
+def list_events(calendar_id: str, request: Request) -> JSONResponse:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    start = parse_instant(request.query_params.get("from")) or int(time.time())
+    end = parse_instant(request.query_params.get("to")) or start + DEFAULT_WINDOW_DAYS * 86400
     if end <= start:
-        start, end = end, start
-    if end - start > timedelta(days=DEFAULT_WINDOW_DAYS):
-        end = start + timedelta(days=DEFAULT_WINDOW_DAYS)
-    return start, end
-
-
-@app.get("/v1/calendars/{id}/events")
-def read_events(
-    id: str,
-    from_: str | None = Query(default=None, alias="from"),
-    to_: str | None = Query(default=None, alias="to"),
-) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    calendar = store.get_calendar(id)
-    if calendar is None:
-        raise HTTPException(status_code=404, detail="unknown calendar")
-    start, end = parse_window(from_, to_)
-    events = []
-    for event in store.list_events(id):
-        for start_iso in expand(event, start, end):
-            events.append({"event_id": event["id"], "rrule": event["rrule"], "start": start_iso})
-    for override in store.list_overrides(id):
-        events.append(override)
-    logger.info("read calendar=%s events=%d", id, len(events))
-    return JSONResponse({"calendar_id": id, "events": events}, status_code=200)
+        return _error(400, "invalid_window")
+    occurrences = cached_expansion(calendar_id, start, end)
+    return JSONResponse(
+        {"calendar_id": calendar_id, "occurrences": occurrences},
+        headers={"Cache-Control": "public, max-age=60"},
+    )
 `,
-      solution: `import logging
-from datetime import datetime, timedelta
-
-from fastapi import FastAPI, Header, HTTPException, Query
+      solution: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from calendard.rrule import MAX_RANGE_DAYS, parse_instant
+from calendard.store import store
+from state import cached_expansion  # step 2: the occurrences of a window, exceptions applied
+
 app = FastAPI()
-logger = logging.getLogger("calendar")
-
-MAX_RANGE_DAYS = 90
-PRIVATE = "private"
 
 
-class CalendarStore:
-    def get_calendar(self, calendar_id: str) -> dict | None:
-        """The calendar row: id, visibility, generation."""
-        raise NotImplementedError
-
-    def is_member(self, calendar_id: str, tenant: str) -> bool:
-        """True when the tenant may read this calendar's events."""
-        raise NotImplementedError
-
-    def list_events(self, calendar_id: str) -> list[dict]:
-        """The calendar's events: id, revision, rrule."""
-        raise NotImplementedError
-
-    def list_overrides(self, calendar_id: str) -> dict[str, dict]:
-        """Instance exceptions keyed by occurrence id: event_id, start, revision."""
-        raise NotImplementedError
+def _error(status: int, code: str) -> JSONResponse:
+    return JSONResponse({"error": code}, status_code=status)
 
 
-class ExpansionCache:
-    def get_slice(self, calendar_id: str, window: str, generation: int) -> list[dict] | None:
-        """The expansion cached for (calendar, window, generation), if any."""
-        raise NotImplementedError
-
-    def put_slice(self, calendar_id: str, window: str, generation: int, instances: list[dict]) -> None:
-        """Cache a raw expansion under the calendar's current generation."""
-        raise NotImplementedError
-
-
-store = CalendarStore()
-cache = ExpansionCache()
-
-
-def expand(event: dict, start: datetime, end: datetime) -> list[str]:
-    """Start timestamps of the event's RRULE instances inside [start, end)."""
-    raise NotImplementedError
-
-
-def parse_window(from_raw: str | None, to_raw: str | None) -> tuple[datetime, datetime]:
-    if from_raw is None or to_raw is None:
-        raise HTTPException(status_code=400, detail="from and to are required")
-    try:
-        start = datetime.fromisoformat(from_raw)
-        end = datetime.fromisoformat(to_raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="from and to must be ISO-8601") from exc
-    if end <= start:
-        raise HTTPException(status_code=400, detail="to must be after from")
-    if end - start > timedelta(days=MAX_RANGE_DAYS):
-        raise HTTPException(status_code=400, detail="range exceeds 90 days")
-    return start, end
-
-
-@app.get("/v1/calendars/{id}/events")
-def read_events(
-    id: str,
-    from_: str | None = Query(default=None, alias="from"),
-    to_: str | None = Query(default=None, alias="to"),
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    calendar = store.get_calendar(id)
+@app.get("/v1/calendars/{calendar_id}/events")
+def list_events(calendar_id: str, request: Request) -> JSONResponse:
+    # The cheap refusals first: an unknown calendar and a stranger cost no expansion and leave no slice.
+    calendar = store.get_calendar(calendar_id)
     if calendar is None:
-        raise HTTPException(status_code=404, detail="unknown calendar")
-    if calendar["visibility"] == PRIVATE and not store.is_member(id, tenant or ""):
-        raise HTTPException(status_code=403, detail="not a member of this calendar")
-    start, end = parse_window(from_, to_)
-
-    generation = calendar["generation"]
-    window = f"{start.isoformat()}/{end.isoformat()}"
-    expansion = cache.get_slice(id, window, generation)
-    if expansion is None:
-        expansion = []
-        for event in store.list_events(id):
-            event_id = event["id"]
-            for start_iso in expand(event, start, end):
-                expansion.append(
-                    {
-                        "occurrence_id": f"{event_id}:{start_iso}",
-                        "event_id": event_id,
-                        "start": start_iso,
-                        "revision": event["revision"],
-                    }
-                )
-        cache.put_slice(id, window, generation, expansion)
-
-    overrides = store.list_overrides(id)
-    events = []
-    for instance in expansion:
-        if overrides.get(instance["occurrence_id"]) is not None:
-            continue  # emitted once, in place, by the overlay below
-        events.append(instance)
-    for oid, override in overrides.items():
-        override_start = datetime.fromisoformat(override["start"])
-        if not start <= override_start < end:
-            continue
-        events.append(
-            {
-                "occurrence_id": oid,
-                "event_id": override["event_id"],
-                "start": override["start"],
-                "revision": override["revision"],
-            }
-        )
-    events.sort(key=lambda item: item["start"])
-    logger.info("read calendar=%s generation=%s events=%d", id, generation, len(events))
-    return JSONResponse({"calendar_id": id, "events": events}, status_code=200)
+        return _error(404, "calendar_not_found")
+    private = calendar["visibility"] == "private"
+    if private and not store.is_member(calendar_id, request.headers.get("X-Tenant-Id", "")):
+        return _error(403, "not_a_member")
+    start = parse_instant(request.query_params.get("from"))
+    end = parse_instant(request.query_params.get("to"))
+    if start is None or end is None or end <= start or end - start > MAX_RANGE_DAYS * 86400:
+        return _error(400, "invalid_window")
+    occurrences = cached_expansion(calendar_id, start, end)
+    # A shared cache that stores a private answer serves it without asking who is reading.
+    cache_control = "private, max-age=60" if private else "public, max-age=60"
+    return JSONResponse(
+        {"calendar_id": calendar_id, "occurrences": occurrences},
+        headers={"Cache-Control": cache_control},
+    )
 `,
     },
     typescript: {
-      starter: `/** GET /v1/calendars/:id/events: range read for calendard. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {parseInstant} from 'calendard/rrule';
+import {cachedExpansion} from './state'; // step 2: the occurrences of a window, exceptions applied
+
+export const DEFAULT_WINDOW_DAYS = 365;
 
 export const app = Fastify();
 
-const DEFAULT_WINDOW_DAYS = 365;
-const DEFAULT_WINDOW_MS = DEFAULT_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-
-interface CalendarRow {
-  id: string;
-  visibility: string;
-  generation: number;
-}
-
-interface EventRow {
-  id: string;
-  revision: number;
-  rrule: string;
-}
-
-interface OverrideRow {
-  event_id: string;
-  start: string;
-  revision: number;
-}
-
-interface InstanceRow {
-  occurrence_id: string;
-  event_id: string;
-  start: string;
-  revision: number;
-}
-
-interface CalendarStore {
-  getCalendar(id: string): Promise<CalendarRow | null>;
-  isMember(calendarId: string, tenant: string): Promise<boolean>;
-  listEvents(calendarId: string): Promise<EventRow[]>;
-  listOverrides(calendarId: string): Promise<Map<string, OverrideRow>>;
-}
-
-interface ExpansionCache {
-  getSlice(calendarId: string, window: string, generation: number): Promise<InstanceRow[] | null>;
-  putSlice(calendarId: string, window: string, generation: number, instances: InstanceRow[]): Promise<void>;
-}
-
-declare const store: CalendarStore;
-declare const cache: ExpansionCache;
-declare function expand(event: EventRow, fromMs: number, toMs: number): string[];
-
-app.get('/v1/calendars/:id/events', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const calendar = await store.getCalendar(request.params.id);
-  if (calendar === null) return reply.code(404).send({error: 'unknown calendar'});
-
+app.get('/v1/calendars/:calendarId/events', async (request, reply) => {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const {calendarId} = request.params as {calendarId: string};
   const query = request.query as {from?: string; to?: string};
-  const requestedFrom = query.from === undefined ? Date.now() : Date.parse(query.from);
-  const requestedTo = query.to === undefined ? requestedFrom + DEFAULT_WINDOW_MS : Date.parse(query.to);
-  const fromMs = Math.min(requestedFrom, requestedTo);
-  const toMs = Math.min(Math.max(requestedFrom, requestedTo), fromMs + DEFAULT_WINDOW_MS);
-
-  const rows: Array<Partial<InstanceRow> & {rrule?: string}> = [];
-  for (const event of await store.listEvents(calendar.id)) {
-    for (const startIso of expand(event, fromMs, toMs))
-      rows.push({event_id: event.id, rrule: event.rrule, start: startIso});
-  }
-  for (const [oid, override] of await store.listOverrides(calendar.id)) {
-    rows.push({occurrence_id: oid, event_id: override.event_id, start: override.start});
-  }
-  request.log.info({calendar: calendar.id, events: rows.length}, 'read');
-  return reply.code(200).send({calendar_id: calendar.id, events: rows});
+  const start = parseInstant(query.from) ?? Math.floor(Date.now() / 1000);
+  const end = parseInstant(query.to) ?? start + DEFAULT_WINDOW_DAYS * 86400;
+  if (end <= start) return reply.code(400).send({error: 'invalid_window'});
+  const occurrences = await cachedExpansion(calendarId, start, end);
+  return reply.header('Cache-Control', 'public, max-age=60').send({calendar_id: calendarId, occurrences});
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/calendars/:id/events: bounded windows, expanded server-side, overrides in place. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {MAX_RANGE_DAYS, parseInstant} from 'calendard/rrule';
+import {store} from 'calendard/store';
+import {cachedExpansion} from './state'; // step 2: the occurrences of a window, exceptions applied
 
 export const app = Fastify();
 
-const MAX_RANGE_DAYS = 90;
-const MAX_RANGE_MS = MAX_RANGE_DAYS * 24 * 60 * 60 * 1000;
-const PRIVATE = 'private';
-
-interface CalendarRow {
-  id: string;
-  visibility: string;
-  generation: number;
-}
-
-interface EventRow {
-  id: string;
-  revision: number;
-  rrule: string;
-}
-
-interface OverrideRow {
-  event_id: string;
-  start: string;
-  revision: number;
-}
-
-interface InstanceRow {
-  occurrence_id: string;
-  event_id: string;
-  start: string;
-  revision: number;
-}
-
-interface CalendarStore {
-  getCalendar(id: string): Promise<CalendarRow | null>;
-  isMember(calendarId: string, tenant: string): Promise<boolean>;
-  listEvents(calendarId: string): Promise<EventRow[]>;
-  listOverrides(calendarId: string): Promise<Map<string, OverrideRow>>;
-}
-
-interface ExpansionCache {
-  getSlice(calendarId: string, window: string, generation: number): Promise<InstanceRow[] | null>;
-  putSlice(calendarId: string, window: string, generation: number, instances: InstanceRow[]): Promise<void>;
-}
-
-declare const store: CalendarStore;
-declare const cache: ExpansionCache;
-declare function expand(event: EventRow, fromMs: number, toMs: number): string[];
-
-app.get('/v1/calendars/:id/events', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  const calendar = await store.getCalendar(request.params.id);
-  if (calendar === null) return reply.code(404).send({error: 'unknown calendar'});
-  const member = typeof tenant === 'string' && (await store.isMember(calendar.id, tenant));
-  if (calendar.visibility === PRIVATE && !member)
-    return reply.code(403).send({error: 'not a member of this calendar'});
-
+app.get('/v1/calendars/:calendarId/events', async (request, reply) => {
+  const {calendarId} = request.params as {calendarId: string};
   const query = request.query as {from?: string; to?: string};
-  const fromMs = query.from === undefined ? Number.NaN : Date.parse(query.from);
-  const toMs = query.to === undefined ? Number.NaN : Date.parse(query.to);
-  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs))
-    return reply.code(400).send({error: 'from and to are required'});
-  if (toMs <= fromMs) return reply.code(400).send({error: 'to must be after from'});
-  if (toMs - fromMs > MAX_RANGE_MS) return reply.code(400).send({error: 'range exceeds 90 days'});
-
-  const window = \`\${query.from}/\${query.to}\`;
-  let expansion = await cache.getSlice(calendar.id, window, calendar.generation);
-  if (expansion === null) {
-    expansion = [];
-    for (const event of await store.listEvents(calendar.id)) {
-      for (const startIso of expand(event, fromMs, toMs)) {
-        expansion.push({
-          occurrence_id: \`\${event.id}:\${startIso}\`,
-          event_id: event.id,
-          start: startIso,
-          revision: event.revision,
-        });
-      }
-    }
-    await cache.putSlice(calendar.id, window, calendar.generation, expansion);
+  // The cheap refusals first: an unknown calendar and a stranger cost no expansion and leave no slice.
+  const calendar = await store.getCalendar(calendarId);
+  if (calendar === null) return reply.code(404).send({error: 'calendar_not_found'});
+  const isPrivate = calendar.visibility === 'private';
+  const tenant = request.headers['x-tenant-id'];
+  if (isPrivate && !(typeof tenant === 'string' && (await store.isMember(calendarId, tenant)))) {
+    return reply.code(403).send({error: 'not_a_member'});
   }
-
-  const overrides = await store.listOverrides(calendar.id);
-  const events: InstanceRow[] = [];
-  for (const instance of expansion) {
-    if (overrides.has(instance.occurrence_id)) continue; // emitted once, in place, by the overlay below
-    events.push(instance);
+  const start = parseInstant(query.from);
+  const end = parseInstant(query.to);
+  if (start === null || end === null || end <= start || end - start > MAX_RANGE_DAYS * 86400) {
+    return reply.code(400).send({error: 'invalid_window'});
   }
-  for (const [oid, override] of overrides) {
-    const overrideMs = Date.parse(override.start);
-    if (overrideMs < fromMs || overrideMs >= toMs) continue;
-    events.push({
-      occurrence_id: oid,
-      event_id: override.event_id,
-      start: override.start,
-      revision: override.revision,
-    });
-  }
-  events.sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
-  request.log.info({calendar: calendar.id, generation: calendar.generation, events: events.length}, 'read');
-  return reply.code(200).send({calendar_id: calendar.id, events});
+  const occurrences = await cachedExpansion(calendarId, start, end);
+  // A shared cache that stores a private answer serves it without asking who is reading.
+  const cacheControl = isPrivate ? 'private, max-age=60' : 'public, max-age=60';
+  return reply.header('Cache-Control', cacheControl).send({calendar_id: calendarId, occurrences});
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -568,132 +239,51 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
+
+	"calendard/rrule"
 )
 
-const (
-	defaultWindowDays = 365
-	defaultWindow     = time.Duration(defaultWindowDays) * 24 * time.Hour
-)
+const defaultWindowDays = 365
 
-type Calendar struct {
-	ID         string \`json:"id"\`
-	Visibility string \`json:"visibility"\`
-	Generation int    \`json:"generation"\`
-}
-
-type Event struct {
-	ID       string \`json:"id"\`
-	Revision int    \`json:"revision"\`
-	RRule    string \`json:"rrule"\`
-}
-
-type Override struct {
-	EventID  string \`json:"event_id"\`
-	Start    string \`json:"start"\`
-	Revision int    \`json:"revision"\`
-}
-
-type Instance struct {
-	OccurrenceID string \`json:"occurrence_id"\`
-	EventID      string \`json:"event_id"\`
-	Start        string \`json:"start"\`
-	Revision     int    \`json:"revision"\`
-}
-
-type CalendarStore struct{}
-
-func (s *CalendarStore) GetCalendar(ctx context.Context, id string) (*Calendar, error) { return nil, nil }
-func (s *CalendarStore) IsMember(ctx context.Context, id, tenant string) (bool, error) { return false, nil }
-func (s *CalendarStore) ListEvents(ctx context.Context, id string) ([]Event, error)    { return nil, nil }
-
-func (s *CalendarStore) ListOverrides(ctx context.Context, id string) (map[string]Override, error) {
-	return nil, nil
-}
-
-type ExpansionCache struct{}
-
-func (c *ExpansionCache) GetSlice(ctx context.Context, id, window string, generation int) ([]Instance, error) {
-	return nil, nil
-}
-
-func (c *ExpansionCache) PutSlice(ctx context.Context, id, window string, generation int, instances []Instance) error {
-	return nil
-}
-
-var (
-	store = &CalendarStore{}
-	cache = &ExpansionCache{}
-)
-
-// expand returns the start instants (RFC 3339) of the event's RRULE instances inside the window.
-func expand(event Event, from, to time.Time) []string {
-	panic("expansion lives in the expansion worker")
-}
-
-func readEvents(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	id := r.PathValue("id")
-	calendar, err := store.GetCalendar(r.Context(), id)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if calendar == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown calendar"})
-		return
-	}
-
-	from := time.Now().UTC()
-	if parsed, err := time.Parse(time.RFC3339, r.URL.Query().Get("from")); err == nil {
-		from = parsed
-	}
-	to := from.Add(defaultWindow)
-	if parsed, err := time.Parse(time.RFC3339, r.URL.Query().Get("to")); err == nil {
-		to = parsed
-	}
-	if !to.After(from) {
-		from, to = to, from
-	}
-	if to.Sub(from) > defaultWindow {
-		to = from.Add(defaultWindow)
-	}
-
-	rows := []map[string]any{}
-	events, err := store.ListEvents(r.Context(), id)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	for _, event := range events {
-		for _, startISO := range expand(event, from, to) {
-			rows = append(rows, map[string]any{"event_id": event.ID, "rrule": event.RRule, "start": startISO})
-		}
-	}
-	overrides, err := store.ListOverrides(r.Context(), id)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	for oid, override := range overrides {
-		rows = append(rows, map[string]any{"occurrence_id": oid, "event_id": override.EventID, "start": override.Start})
-	}
-	log.Printf("read calendar=%s events=%d", id, len(rows))
-	writeJSON(rw, http.StatusOK, map[string]any{"calendar_id": id, "events": rows})
+// Built in step 2 (state.go): the occurrences of a window, exceptions applied.
+var cachedExpansion = func(ctx context.Context, calendarID string, start, end int64) ([]rrule.Occurrence, error) {
+	panic("not implemented")
 }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	_ = json.NewEncoder(rw).Encode(body)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/calendars/{id}/events", readEvents)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func listEvents(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	calendarID := r.PathValue("id")
+	start, ok := rrule.ParseInstant(r.URL.Query().Get("from"))
+	if !ok {
+		start = time.Now().Unix()
+	}
+	end, ok := rrule.ParseInstant(r.URL.Query().Get("to"))
+	if !ok {
+		end = start + defaultWindowDays*86400
+	}
+	if end <= start {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid_window"})
+		return
+	}
+	occurrences, err := cachedExpansion(r.Context(), calendarID, start, end)
+	if err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try_again"})
+		return
+	}
+	rw.Header().Set("Cache-Control", "public, max-age=60")
+	writeJSON(rw, http.StatusOK, map[string]any{"calendar_id": calendarID, "occurrences": occurrences})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/calendars/{id}/events", listEvents)
 }
 `,
       solution: `package main
@@ -701,194 +291,69 @@ func main() {
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
-	"sort"
-	"time"
+
+	"calendard/rrule"
+	"calendard/store"
 )
 
-const (
-	maxRangeDays      = 90
-	maxRange          = time.Duration(maxRangeDays) * 24 * time.Hour
-	privateVisibility = "private"
-)
-
-type Calendar struct {
-	ID         string \`json:"id"\`
-	Visibility string \`json:"visibility"\`
-	Generation int    \`json:"generation"\`
-}
-
-type Event struct {
-	ID       string \`json:"id"\`
-	Revision int    \`json:"revision"\`
-	RRule    string \`json:"rrule"\`
-}
-
-type Override struct {
-	EventID  string \`json:"event_id"\`
-	Start    string \`json:"start"\`
-	Revision int    \`json:"revision"\`
-}
-
-type Instance struct {
-	OccurrenceID string \`json:"occurrence_id"\`
-	EventID      string \`json:"event_id"\`
-	Start        string \`json:"start"\`
-	Revision     int    \`json:"revision"\`
-}
-
-type CalendarStore struct{}
-
-func (s *CalendarStore) GetCalendar(ctx context.Context, id string) (*Calendar, error) { return nil, nil }
-func (s *CalendarStore) IsMember(ctx context.Context, id, tenant string) (bool, error) { return false, nil }
-func (s *CalendarStore) ListEvents(ctx context.Context, id string) ([]Event, error)    { return nil, nil }
-
-// ListOverrides returns the instance exceptions keyed by occurrence id.
-func (s *CalendarStore) ListOverrides(ctx context.Context, id string) (map[string]Override, error) {
-	return nil, nil
-}
-
-type ExpansionCache struct{}
-
-func (c *ExpansionCache) GetSlice(ctx context.Context, id, window string, generation int) ([]Instance, error) {
-	return nil, nil
-}
-
-func (c *ExpansionCache) PutSlice(ctx context.Context, id, window string, generation int, instances []Instance) error {
-	return nil
-}
-
-var (
-	store = &CalendarStore{}
-	cache = &ExpansionCache{}
-)
-
-// expand returns the start instants (RFC 3339) of the event's RRULE instances inside the window.
-func expand(event Event, from, to time.Time) []string {
-	panic("expansion lives in the expansion worker")
-}
-
-// parseWindow returns the request's window, or the reason it is not served.
-func parseWindow(fromRaw, toRaw string) (time.Time, time.Time, string) {
-	if fromRaw == "" || toRaw == "" {
-		return time.Time{}, time.Time{}, "from and to are required"
-	}
-	from, err := time.Parse(time.RFC3339, fromRaw)
-	if err != nil {
-		return time.Time{}, time.Time{}, "from must be RFC 3339"
-	}
-	to, err := time.Parse(time.RFC3339, toRaw)
-	if err != nil {
-		return time.Time{}, time.Time{}, "to must be RFC 3339"
-	}
-	if !to.After(from) {
-		return time.Time{}, time.Time{}, "to must be after from"
-	}
-	if to.Sub(from) > maxRange {
-		return time.Time{}, time.Time{}, "range exceeds 90 days"
-	}
-	return from, to, ""
-}
-
-func readEvents(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	id := r.PathValue("id")
-	calendar, err := store.GetCalendar(r.Context(), id)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if calendar == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown calendar"})
-		return
-	}
-	if calendar.Visibility == privateVisibility {
-		member, err := store.IsMember(r.Context(), id, tenant)
-		if err != nil {
-			writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-			return
-		}
-		if !member {
-			writeJSON(rw, http.StatusForbidden, map[string]string{"error": "not a member of this calendar"})
-			return
-		}
-	}
-
-	fromRaw, toRaw := r.URL.Query().Get("from"), r.URL.Query().Get("to")
-	from, to, invalid := parseWindow(fromRaw, toRaw)
-	if invalid != "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": invalid})
-		return
-	}
-
-	window := fromRaw + "/" + toRaw
-	expansion, err := cache.GetSlice(r.Context(), id, window, calendar.Generation)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if expansion == nil {
-		events, err := store.ListEvents(r.Context(), id)
-		if err != nil {
-			writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-			return
-		}
-		for _, event := range events {
-			for _, startISO := range expand(event, from, to) {
-				expansion = append(expansion, Instance{
-					OccurrenceID: event.ID + ":" + startISO,
-					EventID:      event.ID,
-					Start:        startISO,
-					Revision:     event.Revision,
-				})
-			}
-		}
-		if err := cache.PutSlice(r.Context(), id, window, calendar.Generation, expansion); err != nil {
-			writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-			return
-		}
-	}
-
-	overrides, err := store.ListOverrides(r.Context(), id)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	out := make([]Instance, 0, len(expansion))
-	for _, instance := range expansion {
-		if _, ok := overrides[instance.OccurrenceID]; ok {
-			continue // emitted once, in place, by the overlay below
-		}
-		out = append(out, instance)
-	}
-	for oid, override := range overrides {
-		start, err := time.Parse(time.RFC3339, override.Start)
-		if err != nil || start.Before(from) || !start.Before(to) {
-			continue
-		}
-		out = append(out, Instance{
-			OccurrenceID: oid,
-			EventID:      override.EventID,
-			Start:        override.Start,
-			Revision:     override.Revision,
-		})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Start < out[j].Start })
-	log.Printf("read calendar=%s generation=%d events=%d", id, calendar.Generation, len(out))
-	writeJSON(rw, http.StatusOK, map[string]any{"calendar_id": id, "events": out})
+// Built in step 2 (state.go): the occurrences of a window, exceptions applied.
+var cachedExpansion = func(ctx context.Context, calendarID string, start, end int64) ([]rrule.Occurrence, error) {
+	panic("not implemented")
 }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	_ = json.NewEncoder(rw).Encode(body)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/calendars/{id}/events", readEvents)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func listEvents(rw http.ResponseWriter, r *http.Request) {
+	calendarID := r.PathValue("id")
+	// The cheap refusals first: an unknown calendar and a stranger cost no expansion and leave no slice.
+	calendar, err := store.GetCalendar(r.Context(), calendarID)
+	if err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try_again"})
+		return
+	}
+	if calendar == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "calendar_not_found"})
+		return
+	}
+	private := calendar.Visibility == "private"
+	if private {
+		member, err := store.IsMember(r.Context(), calendarID, r.Header.Get("X-Tenant-Id"))
+		if err != nil {
+			writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try_again"})
+			return
+		}
+		if !member {
+			writeJSON(rw, http.StatusForbidden, map[string]string{"error": "not_a_member"})
+			return
+		}
+	}
+	start, okStart := rrule.ParseInstant(r.URL.Query().Get("from"))
+	end, okEnd := rrule.ParseInstant(r.URL.Query().Get("to"))
+	if !okStart || !okEnd || end <= start || end-start > rrule.MaxRangeDays*86400 {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid_window"})
+		return
+	}
+	occurrences, err := cachedExpansion(r.Context(), calendarID, start, end)
+	if err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try_again"})
+		return
+	}
+	// A shared cache that stores a private answer serves it without asking who is reading.
+	if private {
+		rw.Header().Set("Cache-Control", "private, max-age=60")
+	} else {
+		rw.Header().Set("Cache-Control", "public, max-age=60")
+	}
+	writeJSON(rw, http.StatusOK, map[string]any{"calendar_id": calendarID, "occurrences": occurrences})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/calendars/{id}/events", listEvents)
 }
 `,
     },
@@ -899,77 +364,36 @@ import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import org.apache.pekko.http.scaladsl.model._
+import org.apache.pekko.http.scaladsl.model.headers.RawHeader
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class Calendar(id: String, visibility: String, generation: Int)
-final case class Event(id: String, revision: Int, rrule: String)
-final case class Override(event_id: String, start: String, revision: Int)
-final case class Row(event_id: String, start: String, rrule: String)
+import calendard.Rrule
 
-class CalendarStore {
-  def getCalendar(id: String): Option[Calendar] = None
-  def isMember(id: String, tenant: String): Boolean = false
-  def listEvents(id: String): List[Event] = Nil
-  def listOverrides(id: String): Map[String, Override] = Map.empty
-}
+object RangeRead {
+  implicit val system: ActorSystem = ActorSystem("calendar-read")
 
-class ExpansionCache {
-  def getSlice(id: String, window: String, generation: Int): Option[List[Row]] = None
-  def putSlice(id: String, window: String, generation: Int, rows: List[Row]): Unit = ()
-}
+  val DefaultWindowDays = 365L
 
-object Expander {
-  /** Start instants (ISO-8601) of the event's RRULE instances inside the window. */
-  def expand(event: Event, fromMs: Long, toMs: Long): List[String] =
-    throw new UnsupportedOperationException("expansion lives in the expansion worker")
-}
-
-object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("calendar")
-  implicit val rowFormat: RootJsonFormat[Row] = jsonFormat3(Row)
-
-  val DefaultWindowDays = 365
-  val DefaultWindow = DefaultWindowDays.toLong * 24 * 60 * 60 * 1000
-
-  val store = new CalendarStore
-  val cache = new ExpansionCache
-
-  def parseWindow(fromRaw: Option[String], toRaw: Option[String]): (Long, Long) = {
-    val start = fromRaw.map(Instant.parse(_).toEpochMilli).getOrElse(System.currentTimeMillis())
-    val asked = toRaw.map(Instant.parse(_).toEpochMilli).getOrElse(start + DefaultWindow)
-    val end = if (asked <= start) start + DefaultWindow else asked
-    (start, math.min(end, start + DefaultWindow))
-  }
-
-  def readEvents(id: String, fromRaw: Option[String], toRaw: Option[String]): (StatusCode, String) = {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    store.getCalendar(id) match {
-      case None => (StatusCodes.NotFound, """{"error":"unknown calendar"}""")
-      case Some(_) =>
-        val (fromMs, toMs) = parseWindow(fromRaw, toRaw)
-        val rows = scala.collection.mutable.ArrayBuffer.empty[Row]
-        store.listEvents(id).foreach { event =>
-          Expander.expand(event, fromMs, toMs).foreach { startIso =>
-            rows += Row(event.id, startIso, event.rrule)
-          }
-        }
-        store.listOverrides(id).foreach { case (_, exception) =>
-          rows += Row(exception.event_id, exception.start, "")
-        }
-        system.log.info(s"read calendar=$id events=\${rows.size}")
-        (StatusCodes.OK, s"""{"calendar_id":"$id","events":\${rows.toJson.compactPrint}}""")
-    }
-  }
+  private def error(status: StatusCode, code: String): Route =
+    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
 
   val route: Route =
-    path("v1" / "calendars" / Segment / "events") { id =>
+    path("v1" / "calendars" / Segment / "events") { calendarId =>
       get {
-        parameters("from".?, "to".?) { (fromOpt, toOpt) =>
-          val (status, body) = readEvents(id, fromOpt, toOpt)
-          complete(status, HttpEntity(ContentTypes.\`application/json\`, body))
+        parameters("from".optional, "to".optional) { (from, to) =>
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+          val start = from.flatMap(Rrule.parseInstant).getOrElse(Instant.now().getEpochSecond)
+          val end = to.flatMap(Rrule.parseInstant).getOrElse(start + DefaultWindowDays * 86400)
+          if (end <= start) error(StatusCodes.BadRequest, "invalid_window")
+          else {
+            val occurrences = ExpansionCache.cachedExpansion(calendarId, start, end) // step 2
+            respondWithHeader(RawHeader("Cache-Control", "public, max-age=60")) {
+              complete(JsObject("calendar_id" -> JsString(calendarId), "occurrences" -> occurrences.toJson))
+            }
+          }
         }
       }
     }
@@ -979,114 +403,47 @@ object ReadApi {
   }
 }
 `,
-      solution: `import java.time.Instant
-
-import org.apache.pekko.actor.ActorSystem
+      solution: `import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import org.apache.pekko.http.scaladsl.model._
+import org.apache.pekko.http.scaladsl.model.headers.RawHeader
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class Calendar(id: String, visibility: String, generation: Int)
-final case class Event(id: String, revision: Int, rrule: String)
-final case class Override(event_id: String, start: String, revision: Int)
-final case class Instance(occurrence_id: String, event_id: String, start: String, revision: Int)
+import calendard.{Rrule, Store}
 
-class CalendarStore {
-  def getCalendar(id: String): Option[Calendar] = None
-  def isMember(id: String, tenant: String): Boolean = false
-  def listEvents(id: String): List[Event] = Nil
-  def listOverrides(id: String): Map[String, Override] = Map.empty
-}
+object RangeRead {
+  implicit val system: ActorSystem = ActorSystem("calendar-read")
 
-class ExpansionCache {
-  def getSlice(id: String, window: String, generation: Int): Option[List[Instance]] = None
-  def putSlice(id: String, window: String, generation: Int, instances: List[Instance]): Unit = ()
-}
-
-object Expander {
-  /** Start instants (ISO-8601) of the event's RRULE instances inside the window. */
-  def expand(event: Event, fromMs: Long, toMs: Long): List[String] =
-    throw new UnsupportedOperationException("expansion lives in the expansion worker")
-}
-
-object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("calendar")
-  implicit val instanceFormat: RootJsonFormat[Instance] = jsonFormat4(Instance)
-
-  val MaxRangeDays = 90
-  val MaxRange = MaxRangeDays.toLong * 24 * 60 * 60 * 1000
-  val PrivateVisibility = "private"
-
-  val store = new CalendarStore
-  val cache = new ExpansionCache
-
-  def parseWindow(fromRaw: Option[String], toRaw: Option[String]): Either[String, (Long, Long)] = {
-    (fromRaw, toRaw) match {
-      case (Some(from), Some(to)) =>
-        try {
-          val fromMs = Instant.parse(from).toEpochMilli
-          val toMs = Instant.parse(to).toEpochMilli
-          if (toMs <= fromMs) Left("to must be after from")
-          else if (toMs - fromMs > MaxRange) Left("range exceeds 90 days")
-          else Right((fromMs, toMs))
-        } catch {
-          case _: Exception => Left("from and to must be ISO-8601")
-        }
-      case _ => Left("from and to are required")
-    }
-  }
-
-  def withinWindow(startIso: String, fromMs: Long, toMs: Long): Boolean = {
-    val at = Instant.parse(startIso).toEpochMilli
-    at >= fromMs && at < toMs
-  }
-
-  def readEvents(id: String, tenant: String, fromRaw: Option[String], toRaw: Option[String]): (StatusCode, String) = {
-    store.getCalendar(id) match {
-      case None => (StatusCodes.NotFound, """{"error":"unknown calendar"}""")
-      case Some(calendar) =>
-        if (calendar.visibility == PrivateVisibility && !store.isMember(id, tenant)) {
-          (StatusCodes.Forbidden, """{"error":"not a member of this calendar"}""")
-        } else parseWindow(fromRaw, toRaw) match {
-          case Left(reason) => (StatusCodes.BadRequest, s"""{"error":"$reason"}""")
-          case Right((fromMs, toMs)) =>
-            val generation = calendar.generation
-            val window = fromRaw.get + "/" + toRaw.get
-            val expansion = cache.getSlice(id, window, generation).getOrElse {
-              val built = scala.collection.mutable.ArrayBuffer.empty[Instance]
-              store.listEvents(id).foreach { event =>
-                val eventId = event.id
-                Expander.expand(event, fromMs, toMs).foreach { startIso =>
-                  built += Instance(s"$eventId:$startIso", eventId, startIso, event.revision)
-                }
-              }
-              cache.putSlice(id, window, generation, built.toList)
-              built.toList
-            }
-            val overrides = store.listOverrides(id)
-            val kept = expansion.filterNot(instance => overrides.contains(instance.occurrence_id))
-            val overlaid = overrides.collect {
-              case (oid, exception) if withinWindow(exception.start, fromMs, toMs) =>
-                Instance(oid, exception.event_id, exception.start, exception.revision)
-            }
-            val events = (kept ++ overlaid).sortBy(_.start)
-            system.log.info(s"read calendar=$id generation=$generation events=\${events.size}")
-            (StatusCodes.OK, s"""{"calendar_id":"$id","events":\${events.toJson.compactPrint}}""")
-        }
-    }
-  }
+  private def error(status: StatusCode, code: String): Route =
+    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
 
   val route: Route =
-    path("v1" / "calendars" / Segment / "events") { id =>
+    path("v1" / "calendars" / Segment / "events") { calendarId =>
       get {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          parameters("from".?, "to".?) { (fromOpt, toOpt) =>
-            val (status, body) = readEvents(id, tenantOpt.getOrElse(""), fromOpt, toOpt)
-            complete(status, HttpEntity(ContentTypes.\`application/json\`, body))
+          parameters("from".optional, "to".optional) { (from, to) =>
+            // The cheap refusals first: an unknown calendar and a stranger cost no expansion and leave no slice.
+            Store.getCalendar(calendarId) match {
+              case None => error(StatusCodes.NotFound, "calendar_not_found")
+              case Some(calendar) =>
+                val isPrivate = calendar.visibility == "private"
+                if (isPrivate && !Store.isMember(calendarId, tenantOpt.getOrElse(""))) error(StatusCodes.Forbidden, "not_a_member")
+                else
+                  (from.flatMap(Rrule.parseInstant), to.flatMap(Rrule.parseInstant)) match {
+                    case (Some(start), Some(end)) if end > start && end - start <= Rrule.MaxRangeDays * 86400L =>
+                      val occurrences = ExpansionCache.cachedExpansion(calendarId, start, end) // step 2
+                      // A shared cache that stores a private answer serves it without asking who is reading.
+                      val cacheControl = if (isPrivate) "private, max-age=60" else "public, max-age=60"
+                      respondWithHeader(RawHeader("Cache-Control", cacheControl)) {
+                        complete(JsObject("calendar_id" -> JsString(calendarId), "occurrences" -> occurrences.toJson))
+                      }
+                    case _ => error(StatusCodes.BadRequest, "invalid_window")
+                  }
+            }
           }
         }
       }
@@ -1102,254 +459,493 @@ object ReadApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
-#include <ctime>
-#include <iostream>
-#include <map>
-#include <optional>
+#include <chrono>
+#include <cstdint>
 #include <string>
 #include <vector>
 
+#include "calendard/rrule.h"
+
 using json = nlohmann::json;
 
-constexpr int kDefaultWindowDays = 365;
-constexpr long long kDefaultWindowSeconds = static_cast<long long>(kDefaultWindowDays) * 24 * 3600;
+constexpr int64_t kDefaultWindowDays = 365;
 
-struct Calendar {
-  std::string id;
-  std::string visibility;
-  int generation = 0;
-};
+// Built in step 2 (state.cpp): the occurrences of a window, exceptions applied.
+std::vector<calendard::Occurrence> cachedExpansion(const std::string& calendar_id, int64_t start, int64_t end);
 
-struct Event {
-  std::string id;
-  int revision = 0;
-  std::string rrule;
-};
+static void fail(httplib::Response& res, int status, const std::string& code) {
+  res.status = status;
+  res.set_content(json{{"error", code}}.dump(), "application/json");
+}
 
-struct Instance {
-  std::string occurrence_id;
-  std::string event_id;
-  std::string start;
-  int revision = 0;
-};
+void listEvents(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string calendar_id = req.matches[1].str();
+  const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const int64_t start = calendard::rrule::ParseInstant(req.get_param_value("from")).value_or(now);
+  const int64_t end = calendard::rrule::ParseInstant(req.get_param_value("to")).value_or(start + kDefaultWindowDays * 86400);
+  if (end <= start) return fail(res, 400, "invalid_window");
+  const auto occurrences = cachedExpansion(calendar_id, start, end);
+  res.status = 200;
+  res.set_header("Cache-Control", "public, max-age=60");
+  res.set_content(json{{"calendar_id", calendar_id}, {"occurrences", occurrences}}.dump(), "application/json");
+}
 
-struct Override {
-  std::string event_id;
-  std::string start;
-  int revision = 0;
-};
-
-struct CalendarStore {
-  std::optional<Calendar> getCalendar(const std::string& id);
-  bool isMember(const std::string& calendarId, const std::string& tenant);
-  std::vector<Event> listEvents(const std::string& calendarId);
-  std::map<std::string, Override> listOverrides(const std::string& calendarId);
-};
-
-struct ExpansionCache {
-  std::optional<std::vector<Instance>> getSlice(const std::string& calendarId, const std::string& window, int generation);
-  void putSlice(const std::string& calendarId, const std::string& window, int generation,
-                const std::vector<Instance>& instances);
-};
-
-CalendarStore store;
-ExpansionCache cache;
-
-// Seconds since the epoch for an ISO-8601 instant; 0 when the string does not parse.
-long long epochSeconds(const std::string& iso);
-
-// Start instants (ISO-8601) of the event's RRULE instances inside the window.
-std::vector<std::string> expand(const Event& event, long long fromSeconds, long long toSeconds);
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/calendars/([^/]+)/events)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const std::string id = req.matches[1];
-    const auto calendar = store.getCalendar(id);
-    if (!calendar) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown calendar"})", "application/json");
-      return;
-    }
-
-    const auto fromRaw = req.get_param_value("from");
-    const auto toRaw = req.get_param_value("to");
-    long long fromSeconds = fromRaw.empty() ? static_cast<long long>(std::time(nullptr)) : epochSeconds(fromRaw);
-    long long toSeconds = toRaw.empty() ? fromSeconds + kDefaultWindowSeconds : epochSeconds(toRaw);
-    if (toSeconds <= fromSeconds) std::swap(fromSeconds, toSeconds);
-    if (toSeconds - fromSeconds > kDefaultWindowSeconds) toSeconds = fromSeconds + kDefaultWindowSeconds;
-
-    json events = json::array();
-    for (const auto& event : store.listEvents(id)) {
-      for (const auto& startIso : expand(event, fromSeconds, toSeconds)) {
-        events.push_back({{"event_id", event.id}, {"rrule", event.rrule}, {"start", startIso}});
-      }
-    }
-    for (const auto& [oid, override] : store.listOverrides(id)) {
-      events.push_back({{"occurrence_id", oid}, {"event_id", override.event_id}, {"start", override.start}});
-    }
-    std::cerr << "read calendar=" << id << " events=" << events.size() << "\\n";
-    res.status = 200;
-    res.set_content(json{{"calendar_id", id}, {"events", events}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/calendars/([^/]+)/events)", listEvents);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
-#include <iostream>
-#include <map>
-#include <optional>
+#include <cstdint>
 #include <string>
 #include <vector>
 
+#include "calendard/rrule.h"
+#include "calendard/store.h"
+
 using json = nlohmann::json;
 
-constexpr int kMaxRangeDays = 90;
-constexpr long long kMaxRangeSeconds = static_cast<long long>(kMaxRangeDays) * 24 * 3600;
-const std::string kPrivateVisibility = "private";
+// Built in step 2 (state.cpp): the occurrences of a window, exceptions applied.
+std::vector<calendard::Occurrence> cachedExpansion(const std::string& calendar_id, int64_t start, int64_t end);
 
-struct Calendar {
-  std::string id;
-  std::string visibility;
-  int generation = 0;
-};
+static void fail(httplib::Response& res, int status, const std::string& code) {
+  res.status = status;
+  res.set_content(json{{"error", code}}.dump(), "application/json");
+}
 
-struct Event {
-  std::string id;
-  int revision = 0;
-  std::string rrule;
-};
+void listEvents(const httplib::Request& req, httplib::Response& res) {
+  const std::string calendar_id = req.matches[1].str();
+  // The cheap refusals first: an unknown calendar and a stranger cost no expansion and leave no slice.
+  const auto calendar = calendard::store::GetCalendar(calendar_id);
+  if (!calendar) return fail(res, 404, "calendar_not_found");
+  const bool is_private = calendar->visibility == "private";
+  if (is_private && !calendard::store::IsMember(calendar_id, req.get_header_value("X-Tenant-Id"))) return fail(res, 403, "not_a_member");
+  const auto start = calendard::rrule::ParseInstant(req.get_param_value("from"));
+  const auto end = calendard::rrule::ParseInstant(req.get_param_value("to"));
+  if (!start || !end || *end <= *start || *end - *start > static_cast<int64_t>(calendard::rrule::kMaxRangeDays) * 86400) {
+    return fail(res, 400, "invalid_window");
+  }
+  const auto occurrences = cachedExpansion(calendar_id, *start, *end);
+  res.status = 200;
+  // A shared cache that stores a private answer serves it without asking who is reading.
+  res.set_header("Cache-Control", is_private ? "private, max-age=60" : "public, max-age=60");
+  res.set_content(json{{"calendar_id", calendar_id}, {"occurrences", occurrences}}.dump(), "application/json");
+}
 
-struct Instance {
-  std::string occurrence_id;
-  std::string event_id;
-  std::string start;
-  int revision = 0;
-};
-
-struct Override {
-  std::string event_id;
-  std::string start;
-  int revision = 0;
-};
-
-struct CalendarStore {
-  std::optional<Calendar> getCalendar(const std::string& id);
-  bool isMember(const std::string& calendarId, const std::string& tenant);
-  std::vector<Event> listEvents(const std::string& calendarId);
-  std::map<std::string, Override> listOverrides(const std::string& calendarId);
-};
-
-struct ExpansionCache {
-  std::optional<std::vector<Instance>> getSlice(const std::string& calendarId, const std::string& window, int generation);
-  void putSlice(const std::string& calendarId, const std::string& window, int generation,
-                const std::vector<Instance>& instances);
-};
-
-CalendarStore store;
-ExpansionCache cache;
-
-// Seconds since the epoch for an ISO-8601 instant; 0 when the string does not parse.
-long long epochSeconds(const std::string& iso);
-
-// Start instants (ISO-8601) of the event's RRULE instances inside the window.
-std::vector<std::string> expand(const Event& event, long long fromSeconds, long long toSeconds);
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/calendars/([^/]+)/events)", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string id = req.matches[1];
-    const auto calendar = store.getCalendar(id);
-    if (!calendar) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown calendar"})", "application/json");
-      return;
-    }
-    const std::string tenant = req.get_header_value("X-Tenant-Id");
-    if (calendar->visibility == kPrivateVisibility && !store.isMember(id, tenant)) {
-      res.status = 403;
-      res.set_content(R"({"error":"not a member of this calendar"})", "application/json");
-      return;
-    }
-
-    const auto fromRaw = req.get_param_value("from");
-    const auto toRaw = req.get_param_value("to");
-    const long long fromSeconds = epochSeconds(fromRaw);
-    const long long toSeconds = epochSeconds(toRaw);
-    if (fromRaw.empty() || toRaw.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"from and to are required"})", "application/json");
-      return;
-    }
-    if (toSeconds <= fromSeconds) {
-      res.status = 400;
-      res.set_content(R"({"error":"to must be after from"})", "application/json");
-      return;
-    }
-    if (toSeconds - fromSeconds > kMaxRangeSeconds) {
-      res.status = 400;
-      res.set_content(R"({"error":"range exceeds 90 days"})", "application/json");
-      return;
-    }
-
-    const std::string window = fromRaw + "/" + toRaw;
-    auto expansion = cache.getSlice(id, window, calendar->generation);
-    if (!expansion) {
-      std::vector<Instance> built;
-      for (const auto& event : store.listEvents(id)) {
-        for (const auto& startIso : expand(event, fromSeconds, toSeconds)) {
-          built.push_back(Instance{event.id + ":" + startIso, event.id, startIso, event.revision});
-        }
-      }
-      cache.putSlice(id, window, calendar->generation, built);
-      expansion = built;
-    }
-
-    const auto overrides = store.listOverrides(id);
-    std::vector<Instance> events;
-    for (const auto& instance : *expansion) {
-      if (overrides.count(instance.occurrence_id) > 0) continue;  // emitted once, in place, below
-      events.push_back(instance);
-    }
-    for (const auto& [oid, override] : overrides) {
-      const long long at = epochSeconds(override.start);
-      if (at < fromSeconds || at >= toSeconds) continue;
-      events.push_back(Instance{oid, override.event_id, override.start, override.revision});
-    }
-    std::sort(events.begin(), events.end(), [](const Instance& a, const Instance& b) { return a.start < b.start; });
-
-    json body;
-    body["calendar_id"] = id;
-    body["events"] = json::array();
-    for (const auto& instance : events) {
-      body["events"].push_back({{"occurrence_id", instance.occurrence_id},
-                                {"event_id", instance.event_id},
-                                {"start", instance.start},
-                                {"revision", instance.revision}});
-    }
-    std::cerr << "read calendar=" << id << " generation=" << calendar->generation << " events=" << events.size()
-              << "\\n";
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/calendars/([^/]+)/events)", listEvents);
 }
 `,
     },
   },
+  harness: {
+    python: `from calendard.rrule import parse_instant
+from calendard.store import store
+
+WEEK = "from=2026-03-02T00:00:00Z&to=2026-03-09T00:00:00Z"
+# A 30-minute daily standup, ten times from Monday 2 March 2026.
+EVENT = {
+    "event_id": "e-1",
+    "calendar_id": "c1",
+    "tenant": "t1",
+    "title": "Standup",
+    "rrule": "FREQ=DAILY;COUNT=10",
+    "dtstart": "2026-03-02T09:00:00Z",
+    "dtend": "2026-03-02T09:30:00Z",
+    "revision": 1,
+    "attendees": ["ana@example.com"],
+}
+
+
+def _world(ctx):
+    """c1 is public, c2 private; t1 is a member of both."""
+    store.put_calendar("c1", "public", ["t1"])
+    store.put_calendar("c2", "private", ["t1"])
+    store.put_event(dict(EVENT))
+    store.put_event({**EVENT, "event_id": "e-2", "calendar_id": "c2", "title": "Offsite planning"})
+    return ctx.load("read")
+
+
+async def _get(ctx, m, path, tenant="t1"):
+    headers = {"X-Tenant-Id": tenant} if tenant else {}
+    async with ctx.client(m.app) as c:
+        return await c.get(path, headers=headers)
+
+
+def _error(r):
+    try:
+        return r.json().get("error")
+    except ValueError:
+        return None
+
+
+async def check_route(ctx):
+    m = _world(ctx)
+    r = await _get(ctx, m, f"/v1/calendars/c1/events?{WEEK}")
+    assert r.status_code == 200, f"GET a week of the public calendar c1 answered {r.status_code}: {r.text}"
+    occurrences = r.json().get("occurrences", [])
+    assert len(occurrences) == 7, f"the week answered {len(occurrences)} occurrences, expected the 7 daily standups"
+    first = occurrences[0]
+    assert first.get("occurrence_id") == f"e-1:{parse_instant('2026-03-02T09:00:00Z')}" and first.get("start") == "2026-03-02T09:00:00Z", f"the first occurrence is {first}"
+
+
+async def check_range_cap(ctx):
+    m = _world(ctx)
+    for query, what in (
+        ("from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z", "a 120-day window"),
+        ("from=2026-03-02T00:00:00Z", "a window without to"),
+        ("to=2026-03-09T00:00:00Z", "a window without from"),
+    ):
+        r = await _get(ctx, m, f"/v1/calendars/c1/events?{query}")
+        assert r.status_code == 400 and _error(r) == "invalid_window", f"{what} answered {r.status_code} {r.text[:200]}, expected 400 invalid_window: a read bounds what one request may expand"
+    r = await _get(ctx, m, "/v1/calendars/c1/events?from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:00Z")
+    assert r.status_code == 200, f"a window of exactly 90 days answered {r.status_code}: {r.text[:200]}"
+
+
+async def check_unknown_calendar(ctx):
+    m = _world(ctx)
+    r = await _get(ctx, m, f"/v1/calendars/nope/events?{WEEK}")
+    assert r.status_code == 404 and _error(r) == "calendar_not_found", f"an unknown calendar answered {r.status_code} {r.text}, expected 404 calendar_not_found: an empty week is a different answer"
+    assert ctx.redis.keys("exp:nope*") == [], f"an unknown calendar left {ctx.redis.keys('exp:nope*')} in the cache"
+
+
+async def check_private_calendars(ctx):
+    m = _world(ctx)
+    for tenant, what in (("t2", "a tenant outside the calendar"), ("", "a request without X-Tenant-Id")):
+        r = await _get(ctx, m, f"/v1/calendars/c2/events?{WEEK}", tenant=tenant)
+        assert r.status_code == 403 and _error(r) == "not_a_member", f"{what} reading the private calendar c2 answered {r.status_code} {r.text[:200]}, expected 403 not_a_member"
+    r = await _get(ctx, m, f"/v1/calendars/c2/events?{WEEK}", tenant="t1")
+    assert r.status_code == 200 and len(r.json().get("occurrences", [])) == 7, f"the member t1 reading c2 answered {r.status_code} {r.text[:200]}"
+
+
+async def check_cache_control(ctx):
+    m = _world(ctx)
+    r = await _get(ctx, m, f"/v1/calendars/c2/events?{WEEK}", tenant="t1")
+    assert r.status_code == 200, f"the member t1 reading the private calendar c2 answered {r.status_code}: {r.text[:200]}"
+    cache_control = r.headers.get("cache-control", "")
+    assert "private" in cache_control and "public" not in cache_control, f"the private calendar answered Cache-Control {cache_control!r}: a shared cache may store it and hand it to the next caller without asking the service"
+    r = await _get(ctx, m, f"/v1/calendars/c1/events?{WEEK}")
+    assert "public" in r.headers.get("cache-control", ""), f"the public calendar answered Cache-Control {r.headers.get('cache-control')!r}, expected public, max-age=60"
+`,
+    typescript: `import {store} from 'calendard/store';
+
+const WEEK = 'from=2026-03-02T00:00:00Z&to=2026-03-09T00:00:00Z';
+// A 30-minute daily standup, ten times from Monday 2 March 2026.
+const EVENT = {
+  event_id: 'e-1',
+  calendar_id: 'c1',
+  tenant: 't1',
+  title: 'Standup',
+  rrule: 'FREQ=DAILY;COUNT=10',
+  dtstart: '2026-03-02T09:00:00Z',
+  dtend: '2026-03-02T09:30:00Z',
+  revision: 1,
+  attendees: ['ana@example.com'],
+};
+
+/** c1 is public, c2 private; t1 is a member of both. */
+async function world(ctx) {
+  await store.putCalendar('c1', 'public', ['t1']);
+  await store.putCalendar('c2', 'private', ['t1']);
+  await store.putEvent({...EVENT});
+  await store.putEvent({...EVENT, event_id: 'e-2', calendar_id: 'c2', title: 'Offsite planning'});
+  return ctx.load('read');
+}
+
+const get = (ctx, m, path: string, tenant = 't1') => ctx.client(m.app).get(path, {headers: tenant === '' ? {} : {'X-Tenant-Id': tenant}});
+
+const errorOf = (r): string | undefined => {
+  try {
+    return r.json().error;
+  } catch {
+    return undefined;
+  }
+};
+
+export async function check_route(ctx) {
+  const m = await world(ctx);
+  const r = await get(ctx, m, \`/v1/calendars/c1/events?\${WEEK}\`);
+  assert.equal(r.status, 200, \`GET a week of the public calendar c1 answered \${r.status}: \${r.text}\`);
+  const occurrences = r.json().occurrences ?? [];
+  assert.equal(occurrences.length, 7, \`the week answered \${occurrences.length} occurrences, expected the 7 daily standups\`);
+  const first = occurrences[0];
+  assert(first.occurrence_id === 'e-1:' + Date.UTC(2026, 2, 2, 9) / 1000 && first.start === '2026-03-02T09:00:00Z', \`the first occurrence is \${JSON.stringify(first)}\`);
+}
+
+export async function check_range_cap(ctx) {
+  const m = await world(ctx);
+  for (const [query, what] of [
+    ['from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z', 'a 120-day window'],
+    ['from=2026-03-02T00:00:00Z', 'a window without to'],
+    ['to=2026-03-09T00:00:00Z', 'a window without from'],
+  ]) {
+    const r = await get(ctx, m, \`/v1/calendars/c1/events?\${query}\`);
+    assert(r.status === 400 && errorOf(r) === 'invalid_window', \`\${what} answered \${r.status} \${r.text.slice(0, 200)}, expected 400 invalid_window: a read bounds what one request may expand\`);
+  }
+  const r = await get(ctx, m, '/v1/calendars/c1/events?from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:00Z');
+  assert.equal(r.status, 200, \`a window of exactly 90 days answered \${r.status}: \${r.text.slice(0, 200)}\`);
+}
+
+export async function check_unknown_calendar(ctx) {
+  const m = await world(ctx);
+  const r = await get(ctx, m, \`/v1/calendars/nope/events?\${WEEK}\`);
+  assert(r.status === 404 && errorOf(r) === 'calendar_not_found', \`an unknown calendar answered \${r.status} \${r.text}, expected 404 calendar_not_found: an empty week is a different answer\`);
+  assert.deepEqual(ctx.redis.keys('exp:nope*'), [], \`an unknown calendar left \${JSON.stringify(ctx.redis.keys('exp:nope*'))} in the cache\`);
+}
+
+export async function check_private_calendars(ctx) {
+  const m = await world(ctx);
+  for (const [tenant, what] of [
+    ['t2', 'a tenant outside the calendar'],
+    ['', 'a request without X-Tenant-Id'],
+  ]) {
+    const r = await get(ctx, m, \`/v1/calendars/c2/events?\${WEEK}\`, tenant);
+    assert(r.status === 403 && errorOf(r) === 'not_a_member', \`\${what} reading the private calendar c2 answered \${r.status} \${r.text.slice(0, 200)}, expected 403 not_a_member\`);
+  }
+  const r = await get(ctx, m, \`/v1/calendars/c2/events?\${WEEK}\`, 't1');
+  assert(r.status === 200 && (r.json().occurrences ?? []).length === 7, \`the member t1 reading c2 answered \${r.status} \${r.text.slice(0, 200)}\`);
+}
+
+export async function check_cache_control(ctx) {
+  const m = await world(ctx);
+  let r = await get(ctx, m, \`/v1/calendars/c2/events?\${WEEK}\`, 't1');
+  assert.equal(r.status, 200, \`the member t1 reading the private calendar c2 answered \${r.status}: \${r.text.slice(0, 200)}\`);
+  const cacheControl = String(r.headers['cache-control'] ?? '');
+  assert(cacheControl.includes('private') && !cacheControl.includes('public'), \`the private calendar answered Cache-Control \${JSON.stringify(cacheControl)}: a shared cache may store it and hand it to the next caller without asking the service\`);
+  r = await get(ctx, m, \`/v1/calendars/c1/events?\${WEEK}\`);
+  assert(String(r.headers['cache-control'] ?? '').includes('public'), \`the public calendar answered Cache-Control \${JSON.stringify(r.headers['cache-control'])}, expected public, max-age=60\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+
+	"leetbuild/harness"
+
+	"calendard/rrule"
+	"calendard/store"
+)
+
+const rdWeek = "from=2026-03-02T00:00:00Z&to=2026-03-09T00:00:00Z"
+
+// rdClient seeds c1 (public) and c2 (private), t1 a member of both, each with a 30-minute daily
+// standup ten times from Monday 2 March 2026, and serves the learner's route over step 2's cache,
+// which the harness stands in for: every event expanded, sorted, the slice written for 300 s.
+func rdClient(ctx *harness.Ctx) *harness.HTTP {
+	bg := context.Background()
+	ctx.NoError(store.PutCalendar(bg, "c1", "public", "t1"), "seeding c1")
+	ctx.NoError(store.PutCalendar(bg, "c2", "private", "t1"), "seeding c2")
+	for _, e := range []store.Event{
+		{EventID: "e-1", CalendarID: "c1", Tenant: "t1", Title: "Standup", Rrule: "FREQ=DAILY;COUNT=10", Dtstart: "2026-03-02T09:00:00Z", Dtend: "2026-03-02T09:30:00Z", Revision: 1, Attendees: []string{"ana@example.com"}},
+		{EventID: "e-2", CalendarID: "c2", Tenant: "t1", Title: "Offsite planning", Rrule: "FREQ=DAILY;COUNT=10", Dtstart: "2026-03-02T09:00:00Z", Dtend: "2026-03-02T09:30:00Z", Revision: 1, Attendees: []string{"ana@example.com"}},
+	} {
+		event := e
+		ctx.NoError(store.PutEvent(bg, &event), "seeding an event")
+	}
+	cachedExpansion = func(c context.Context, calendarID string, start, end int64) ([]rrule.Occurrence, error) {
+		events, err := store.ListEvents(c, calendarID)
+		if err != nil {
+			return nil, err
+		}
+		occurrences := []rrule.Occurrence{}
+		for _, e := range events {
+			occurrences = append(occurrences, rrule.Expand(e, start, end)...)
+		}
+		sort.Slice(occurrences, func(i, j int) bool { return occurrences[i].Start < occurrences[j].Start })
+		value, _ := json.Marshal(occurrences)
+		ctx.Redis.Set("exp:"+calendarID+":0:"+strconv.FormatInt(start, 10)+":"+strconv.FormatInt(end, 10), string(value), "EX", 300)
+		return occurrences, nil
+	}
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func rdGet(c *harness.HTTP, path, tenant string) *harness.Response {
+	if tenant == "" {
+		return c.Get(path)
+	}
+	return c.Get(path, "X-Tenant-Id", tenant)
+}
+
+type rdBody struct {
+	Error       string             \`json:"error"\`
+	Occurrences []rrule.Occurrence \`json:"occurrences"\`
+}
+
+func rdDecode(r *harness.Response) rdBody {
+	var body rdBody
+	_ = json.Unmarshal(r.Body, &body)
+	return body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := rdClient(ctx)
+	r := rdGet(c, "/v1/calendars/c1/events?"+rdWeek, "t1")
+	ctx.Equal(r.Status, 200, "GET a week of the public calendar c1 (%s)", r.Text())
+	occurrences := rdDecode(r).Occurrences
+	ctx.Equal(len(occurrences), 7, "the week must answer the 7 daily standups; the occurrences")
+	first, _ := rrule.ParseInstant("2026-03-02T09:00:00Z")
+	ctx.Assert(occurrences[0].OccurrenceID == "e-1:"+strconv.FormatInt(first, 10) && occurrences[0].Start == "2026-03-02T09:00:00Z", "the first occurrence is %v", occurrences[0])
+}
+
+func CheckRangeCap(ctx *harness.Ctx) {
+	c := rdClient(ctx)
+	for _, tc := range [][2]string{
+		{"from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z", "a 120-day window"},
+		{"from=2026-03-02T00:00:00Z", "a window without to"},
+		{"to=2026-03-09T00:00:00Z", "a window without from"},
+	} {
+		r := rdGet(c, "/v1/calendars/c1/events?"+tc[0], "t1")
+		ctx.Assert(r.Status == 400 && rdDecode(r).Error == "invalid_window", "%s answered %d, expected 400 invalid_window: a read bounds what one request may expand", tc[1], r.Status)
+	}
+	r := rdGet(c, "/v1/calendars/c1/events?from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:00Z", "t1")
+	ctx.Equal(r.Status, 200, "a window of exactly 90 days")
+}
+
+func CheckUnknownCalendar(ctx *harness.Ctx) {
+	c := rdClient(ctx)
+	r := rdGet(c, "/v1/calendars/nope/events?"+rdWeek, "t1")
+	ctx.Assert(r.Status == 404 && rdDecode(r).Error == "calendar_not_found", "an unknown calendar answered %d %s, expected 404 calendar_not_found: an empty week is a different answer", r.Status, r.Text())
+	ctx.Equal(ctx.Redis.Keys("exp:nope*"), []string{}, "the slices an unknown calendar left in the cache")
+}
+
+func CheckPrivateCalendars(ctx *harness.Ctx) {
+	c := rdClient(ctx)
+	for _, tc := range [][2]string{{"t2", "a tenant outside the calendar"}, {"", "a request without X-Tenant-Id"}} {
+		r := rdGet(c, "/v1/calendars/c2/events?"+rdWeek, tc[0])
+		ctx.Assert(r.Status == 403 && rdDecode(r).Error == "not_a_member", "%s reading the private calendar c2 answered %d, expected 403 not_a_member", tc[1], r.Status)
+	}
+	r := rdGet(c, "/v1/calendars/c2/events?"+rdWeek, "t1")
+	ctx.Assert(r.Status == 200 && len(rdDecode(r).Occurrences) == 7, "the member t1 reading c2 answered %d %s", r.Status, r.Text())
+}
+
+func CheckCacheControl(ctx *harness.Ctx) {
+	c := rdClient(ctx)
+	r := rdGet(c, "/v1/calendars/c2/events?"+rdWeek, "t1")
+	ctx.Equal(r.Status, 200, "the member t1 reading the private calendar c2 (%s)", r.Text())
+	cacheControl := r.Header.Get("Cache-Control")
+	ctx.Assert(strings.Contains(cacheControl, "private") && !strings.Contains(cacheControl, "public"), "the private calendar answered Cache-Control %q: a shared cache may store it and hand it to the next caller without asking the service", cacheControl)
+	r = rdGet(c, "/v1/calendars/c1/events?"+rdWeek, "t1")
+	ctx.Assert(strings.Contains(r.Header.Get("Cache-Control"), "public"), "the public calendar answered Cache-Control %q, expected public, max-age=60", r.Header.Get("Cache-Control"))
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "state.cpp"
+
+namespace {
+
+const std::string kRdWeek = "from=2026-03-02T00:00:00Z&to=2026-03-09T00:00:00Z";
+
+// c1 is public, c2 private, t1 a member of both, each with a 30-minute daily standup ten times from
+// Monday 2 March 2026; the route runs over step 2's cache.
+harness::HTTP rdClient(harness::Ctx& ctx) {
+  calendard::store::PutCalendar("c1", "public", {"t1"});
+  calendard::store::PutCalendar("c2", "private", {"t1"});
+  calendard::store::PutEvent({"e-1", "c1", "t1", "Standup", "FREQ=DAILY;COUNT=10", "2026-03-02T09:00:00Z", "2026-03-02T09:30:00Z", 1, {"ana@example.com"}});
+  calendard::store::PutEvent({"e-2", "c2", "t1", "Offsite planning", "FREQ=DAILY;COUNT=10", "2026-03-02T09:00:00Z", "2026-03-02T09:30:00Z", 1, {"ana@example.com"}});
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response rdGet(harness::HTTP& c, const std::string& path, const std::string& tenant = "t1") {
+  if (tenant.empty()) return c.Get(path);
+  return c.Get(path, "X-Tenant-Id", tenant);
+}
+
+nlohmann::json rdBody(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : nlohmann::json::object();
+}
+
+size_t rdCount(const harness::Response& r) {
+  const auto body = rdBody(r);
+  return body.contains("occurrences") && body["occurrences"].is_array() ? body["occurrences"].size() : 0;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = rdClient(ctx);
+  const auto r = rdGet(c, "/v1/calendars/c1/events?" + kRdWeek);
+  ctx.Equal(r.Status, 200, "GET a week of the public calendar c1 (%s)", r.Text());
+  ctx.Equal(rdCount(r), 7, "the week must answer the 7 daily standups; the occurrences");
+  const auto first = rdBody(r)["occurrences"][0];
+  const std::string expected_id = "e-1:" + std::to_string(calendard::rrule::ParseInstant("2026-03-02T09:00:00Z").value_or(0));
+  ctx.Assert(first.value("occurrence_id", "") == expected_id && first.value("start", "") == "2026-03-02T09:00:00Z", "the first occurrence is %s", first.dump());
+}
+
+void CheckRangeCap(harness::Ctx& ctx) {
+  auto c = rdClient(ctx);
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z", "a 120-day window"},
+      {"from=2026-03-02T00:00:00Z", "a window without to"},
+      {"to=2026-03-09T00:00:00Z", "a window without from"},
+  };
+  for (const auto& [query, what] : cases) {
+    const auto r = rdGet(c, "/v1/calendars/c1/events?" + query);
+    ctx.Assert(r.Status == 400 && rdBody(r).value("error", "") == "invalid_window",
+               "%s answered %d, expected 400 invalid_window: a read bounds what one request may expand", what, r.Status);
+  }
+  const auto r = rdGet(c, "/v1/calendars/c1/events?from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:00Z");
+  ctx.Equal(r.Status, 200, "a window of exactly 90 days");
+}
+
+void CheckUnknownCalendar(harness::Ctx& ctx) {
+  auto c = rdClient(ctx);
+  const auto r = rdGet(c, "/v1/calendars/nope/events?" + kRdWeek);
+  ctx.Assert(r.Status == 404 && rdBody(r).value("error", "") == "calendar_not_found",
+             "an unknown calendar answered %d %s, expected 404 calendar_not_found: an empty week is a different answer", r.Status, r.Text());
+  ctx.Equal(ctx.Redis.Keys("exp:nope*"), std::vector<std::string>{}, "the slices an unknown calendar left in the cache");
+}
+
+void CheckPrivateCalendars(harness::Ctx& ctx) {
+  auto c = rdClient(ctx);
+  const std::vector<std::pair<std::string, std::string>> cases = {{"t2", "a tenant outside the calendar"}, {"", "a request without X-Tenant-Id"}};
+  for (const auto& [tenant, what] : cases) {
+    const auto r = rdGet(c, "/v1/calendars/c2/events?" + kRdWeek, tenant);
+    ctx.Assert(r.Status == 403 && rdBody(r).value("error", "") == "not_a_member",
+               "%s reading the private calendar c2 answered %d, expected 403 not_a_member", what, r.Status);
+  }
+  const auto r = rdGet(c, "/v1/calendars/c2/events?" + kRdWeek, "t1");
+  ctx.Assert(r.Status == 200 && rdCount(r) == 7, "the member t1 reading c2 answered %d %s", r.Status, r.Text());
+}
+
+void CheckCacheControl(harness::Ctx& ctx) {
+  auto c = rdClient(ctx);
+  auto r = rdGet(c, "/v1/calendars/c2/events?" + kRdWeek, "t1");
+  ctx.Equal(r.Status, 200, "the member t1 reading the private calendar c2 (%s)", r.Text());
+  const std::string cache_control = r.HeaderValue("Cache-Control");
+  ctx.Assert(cache_control.find("private") != std::string::npos && cache_control.find("public") == std::string::npos,
+             "the private calendar answered Cache-Control %q: a shared cache may store it and hand it to the next caller without asking the service",
+             cache_control);
+  r = rdGet(c, "/v1/calendars/c1/events?" + kRdWeek);
+  ctx.Assert(r.HeaderValue("Cache-Control").find("public") != std::string::npos, "the public calendar answered Cache-Control %q, expected public, max-age=60",
+             r.HeaderValue("Cache-Control"));
+}
+`,
+  },
   hints: [
-    'A week view shows a moved standup at both its old and new time, a request with no window takes seconds to answer, and a private calendar opens for anyone who guesses its id.',
-    'The starter substitutes a year for a missing window and clamps a wide one, returns raw rules without an occurrence id, appends overrides without removing the originals, and skips the membership check after the 404.',
-    'Return 400 beyond `MAX_RANGE_DAYS`, expand server-side with `occurrence_id = "<event_id>:<start_iso>"` and revision, skip instances the override table covers, and answer 403 to non-members of private calendars before expanding.',
+    'A client asking for ten years waits a minute for a megabyte, a typo in a calendar id shows an empty week, someone outside a team reads its private calendar, and a proxy serves one member’s private week to the next caller.',
+    'The starter never looks the calendar up, so nothing separates unknown from empty or private from public; it fills and stretches the window instead of refusing it; `public` lets every shared cache on the way keep the answer.',
+    'Look the calendar up first: `None` is 404 `calendar_not_found`, `private` without `store.is_member` is 403 `not_a_member`; require `from` and `to`, `to > from`, at most 90 days apart; send `private, max-age=60` for a private calendar.',
   ],
-  debrief: `The read path is the most expensive path in a calendar service, and the starter looks calm only because the demo asks for one week of a public calendar. The window cap is a budget: a range is paid for in occurrences and an infinite rule has no upper bound of its own, so "default to a year and clamp the rest" spends that budget on the caller's behalf. Occurrence ids exist because a client cannot dedupe what the server does not name. The overlay skips the original because an override is a replacement, not an addition. Membership is checked apart from existence because a private calendar is not a URL secret. Production calendars add expansion budgets per calendar, ETag/If-None-Match so an unchanged week is a 304, paged windows, and a worker that precomputes popular ranges.`,
+  debrief: `The read refuses in order of cost: an unknown calendar and a stranger are answered before anything is expanded, so neither costs an expansion or leaves a slice behind. The window cap is the read side of step 1's termination rule, since a rule can end and still produce more occurrences than one request should carry. \`Cache-Control\` is part of the authorization: a \`public\` answer may be stored by any shared cache between the service and the client, and the next request through that cache never reaches the membership check. Production calendar APIs page their results and hand out sync tokens, so a client asks for what changed since its last read instead of re-reading windows.`,
 };

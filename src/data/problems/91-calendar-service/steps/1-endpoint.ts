@@ -2,174 +2,109 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/events: recurrence that terminates',
+  title: 'POST /v1/events: a rule that ends, instants with an offset',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'api', 'store'],
+  focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/events\` (body: \`calendar_id\`, \`title\`,
-\`rrule\`, \`dtstart\`, \`dtend\`, \`timezone\`), keeps the rule parts it recognizes, logs the create
-and answers 200 with the body it received. It compiles, serves the demo with a weekly standup
-rule, and hides four flaws.
+**Starting point.** The starter serves \`POST /v1/events\` with body \`{"calendar_id", "title", "rrule",
+"dtstart", "dtend", "attendees"}\`: it reads the tenant from \`X-Tenant-Id\` (**401** when missing),
+splits the rule with \`rule_parts\`, reads \`dtstart\` and \`dtend\` with \`parse_instant\` (**422**
+\`invalid_instant\`), stores the event at revision 1 with \`store.put_event\` and the rule as
+\`format_rule\` writes it, calls step 2's \`bump_generation\` and answers **201** with the event. It
+serves the demo and hides four flaws.
 
-**Failure mode the checks target.** \`FREQ=SECONDLY\` with no \`UNTIL\` and no \`COUNT\` is a legal
-iCalendar rule, so the starter stores it and hands the expander a rule that does not return.
-Dropped parts such as \`BYSECOND=30\` mean the stored rule is not the rule the user wrote. Naked
-local datetimes break across a DST boundary, and echoing the request body hides that no
-\`event_id\` and no \`revision\` were assigned.
+**Failure mode the checks target.** A rule that never ends, a rule part the expander would quietly
+ignore, a wall-clock time without an offset, and a meeting that ends before it starts.
 
-- The rule is \`KEY=VALUE\` parts separated by \`;\`, at most \`MAX_RRULE_LENGTH\` (512) characters.
-  Every key must be in \`SUPPORTED_RRULE_PARTS\` with a non-empty value; anything else is **422**
-  \`UNSUPPORTED_RRULE_PART\`, refused rather than trimmed.
-- \`FREQ\` must be present and not in \`UNBOUNDED_FREQUENCIES\`, and the rule must carry \`UNTIL\` or
-  a \`COUNT\` between **1** and \`MAX_COUNT\` (5000); otherwise **422** before the store is touched.
-- \`dtstart\`, \`dtend\` and any \`UNTIL\` must carry an explicit offset (\`TZ_SUFFIX_RE\`); a naive
-  string is **422** \`MISSING_TZ\`. \`timezone\` must name a zone the runtime knows.
-- \`calendar_id\` and \`title\` are required, \`title\` at most \`MAX_TITLE_LENGTH\` (200); a malformed
-  body is **400**, a missing tenant **401**.
-- Store the event and respond **201** \`{"event_id", "revision", "calendar_id"}\` from the stored
-  event. Log tenant, calendar id and revision, not the title or the rule text.`,
+Rules, in this order, before anything is stored:
+
+- Every part's key is in \`SUPPORTED_PARTS\` with a non-empty value, and \`FREQ\` is in \`FREQUENCIES\`
+  (DAILY, WEEKLY): otherwise **422** \`unsupported_rrule_part\`. An empty rule is one occurrence.
+- The rule ends: it has \`UNTIL\` or a \`COUNT\` from 1 to \`MAX_COUNT\` (5000), and an \`INTERVAL\` is a
+  positive integer: otherwise **422** \`rule_not_terminating\`.
+- \`dtstart\`, \`dtend\` and \`UNTIL\` carry \`Z\` or an offset: otherwise **422** \`invalid_instant\`.
+  Stored instants are UTC.
+- \`dtend\` is after \`dtstart\`: otherwise **422** \`invalid_range\`.`,
   sequence: {
-    participants: ['Calendar client', 'Calendar API', 'Postgres'],
+    participants: ['Calendar client', 'Calendar API', 'Redis'],
     messages: [
+      {from: 'Calendar client', to: 'Calendar API', label: 'POST /v1/events · X-Tenant-Id', kind: 'sync'},
       {
-        from: 'Calendar client',
+        from: 'Calendar API',
         to: 'Calendar API',
-        label: 'POST /v1/events · X-Tenant-Id · rrule · dtstart · timezone',
+        label: 'parts known · rule ends · offsets · dtend > dtstart',
         kind: 'sync',
       },
-      {from: 'Calendar API', to: 'Calendar API', label: 'parse parts · reject UNSUPPORTED_RRULE_PART', kind: 'sync'},
-      {from: 'Calendar API', to: 'Calendar API', label: 'require UNTIL/COUNT · bounded FREQ', kind: 'sync'},
-      {from: 'Calendar API', to: 'Calendar API', label: 'require offset on dtstart · dtend · UNTIL', kind: 'sync'},
-      {from: 'Calendar API', to: 'Postgres', label: 'INSERT event · revision 1', kind: 'sync'},
-      {from: 'Postgres', to: 'Calendar API', label: '{event_id, revision}', kind: 'reply'},
-      {from: 'Calendar API', to: 'Calendar client', label: '201 {event_id, revision, calendar_id}', kind: 'reply'},
+      {from: 'Calendar API', to: 'Redis', label: 'put_event · INCR gen:{cal}', kind: 'async'},
+      {from: 'Calendar API', to: 'Calendar client', label: '201 event · 422 with the reason', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
       title: 'Handles POST /v1/events',
-      detail: 'Register the create route on `POST /v1/events`.',
-      match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/events["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/events['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/events"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"events"\s*\)/, /\bpost\s*\{/]},
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/events"/]},
-      },
-    },
-    {
-      id: 'rrule-terminates',
-      title: 'Refuses rules that cannot terminate with 422',
       detail:
-        '`FREQ=SECONDLY`, `MINUTELY` and `HOURLY` (`UNBOUNDED_FREQUENCIES`) are refused, and so is any rule with neither an `UNTIL` nor a `COUNT` within `MAX_COUNT` — **422** before the store sees the event. The starter accepts `FREQ=SECONDLY` with no end, so one create request hands the expander a rule that never returns.',
+        'A weekly rule with a count answers 201 with the event at revision 1, stored in `event:{id}`, indexed under the calendar, and `gen:{calendar}` bumped.',
       match: {
-        python: {all: [/UNBOUNDED_FREQUENCIES/, /MAX_COUNT/, /"UNTIL" not in parts/, /status_code\s*=\s*422/]},
-        typescript: {all: [/UNBOUNDED_FREQUENCIES/, /MAX_COUNT/, /parts\.UNTIL === undefined/, /code\(\s*422\s*\)/]},
-        go: {all: [/unboundedFrequencies/, /maxCount/, /parts\["UNTIL"\]/, /StatusUnprocessableEntity/]},
-        scala: {
-          all: [/UnboundedFrequencies/, /MaxCount/, /parts\.contains\("UNTIL"\)/, /StatusCodes\.UnprocessableEntity/],
-        },
-        cpp: {all: [/kUnboundedFrequencies/, /kMaxCount/, /parts\.count\("UNTIL"\)/, /res\.status\s*=\s*422/]},
-      },
-    },
-    {
-      id: 'tz-aware',
-      title: 'Requires an explicit timezone on every datetime',
-      detail:
-        '`dtstart`, `dtend` and the rule’s `UNTIL` each have to carry an explicit offset or `Z` (`TZ_SUFFIX_RE`), and `timezone` has to name a zone the runtime knows; a naive local string is **422** `MISSING_TZ`. The starter passes the datetimes through as naked wall-clock strings, so the stored event has no instant at all.',
-      match: {
-        python: {
-          all: [
-            /MISSING_TZ/,
-            /TZ_SUFFIX_RE/,
-            /tzinfo is None/,
-            /status_code\s*=\s*422/,
-            /require_aware\(parts\["UNTIL"\]/,
-          ],
-        },
-        typescript: {
-          all: [/MISSING_TZ/, /TZ_SUFFIX_RE/, /code\(\s*422\s*\)/, /awareMs\(/, /parts\.UNTIL !== undefined/],
-        },
-        go: {all: [/missingTZ/, /tzSuffixRe/, /time\.LoadLocation\(/, /awareOffset\(/, /StatusUnprocessableEntity/]},
-        scala: {
-          all: [/MissingTz/, /TzSuffixRe/, /knownZone\(/, /aware\(body\.dtstart\)/, /StatusCodes\.UnprocessableEntity/],
-        },
-        cpp: {all: [/kMissingTz/, /kTzSuffixRe/, /knownZone\(/, /tzAware\(/, /res\.status\s*=\s*422/]},
+        python: {all: [/@app\.post\(\s*["']\/v1\/events["']/, /bump_generation\(/]},
+        typescript: {all: [/app\.post\(\s*['"]\/v1\/events['"]/, /bumpGeneration\(/]},
+        go: {all: [/HandleFunc\(\s*"POST \/v1\/events"/, /bumpGeneration\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"events"\s*\)/, /\bpost\s*\{/, /bumpGeneration\(/]},
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/events"/, /bumpGeneration\(/]},
       },
     },
     {
       id: 'unknown-parts',
-      title: 'Rejects unknown RRULE parts instead of dropping them',
+      title: 'Refuses rule parts the expander does not know',
       detail:
-        'The key of every part is checked against `SUPPORTED_RRULE_PARTS`; anything outside it — including a part with no `=` or an empty value — is **422** `UNSUPPORTED_RRULE_PART`, and the parts that pass are the parts that get stored. The starter keeps only the four parts it recognizes and drops the rest, so the stored rule is not the rule the user wrote.',
+        '`BYSECOND=30`, `BYDAY=MO,WE`, `FREQ=SECONDLY` and a part without a value are **422** `unsupported_rrule_part`, and nothing is stored. The starter stores the rule with the unknown parts trimmed, so the meeting repeats on days nobody chose.',
       match: {
-        python: {
-          all: [/SUPPORTED_RRULE_PARTS/, /UNSUPPORTED_RRULE_PART/, /parts\[key\] = value/, /status_code\s*=\s*422/],
-        },
-        typescript: {
-          all: [/SUPPORTED_RRULE_PARTS/, /UNSUPPORTED_RRULE_PART/, /parts\[key\] = value/, /code\(\s*422\s*\)/],
-        },
-        go: {all: [/supportedRruleParts/, /unsupportedRRulePart/, /parts\[key\] = value/, /StatusUnprocessableEntity/]},
-        scala: {
-          all: [
-            /SupportedRruleParts/,
-            /UnsupportedRrulePart/,
-            /parts\(key\) = value/,
-            /StatusCodes\.UnprocessableEntity/,
-          ],
-        },
-        cpp: {all: [/kSupportedRruleParts/, /kUnsupportedRrulePart/, /parts\[key\] = value/, /res\.status\s*=\s*422/]},
+        python: {all: [/unsupported_rrule_part/, /not in SUPPORTED_PARTS/, /not in FREQUENCIES/]},
+        typescript: {all: [/unsupported_rrule_part/, /SUPPORTED_PARTS\.includes\(/, /FREQUENCIES/]},
+        go: {all: [/unsupported_rrule_part/, /rrule\.SupportedParts/, /rrule\.Frequencies/]},
+        scala: {all: [/unsupported_rrule_part/, /SupportedParts\.contains/, /Frequencies\.contains/]},
+        cpp: {all: [/unsupported_rrule_part/, /kSupportedParts/, /kFrequencies/]},
       },
     },
     {
-      id: 'revision-echo',
-      title: 'Answers with the event id and revision the store assigned',
+      id: 'rule-terminates',
+      title: 'Refuses a rule that never ends',
       detail:
-        'A valid create is **201** and the response carries `event_id`, `revision` and `calendar_id` read back from the stored event (`store.create_event`), so the later steps have a revision to invalidate. The starter answers **200** with the request body: no id, no revision, nothing downstream can key on.',
+        'A rule without `UNTIL` or `COUNT`, a `COUNT` of 0 or 6000 and `INTERVAL=0` are **422** `rule_not_terminating`, and nothing is stored; `COUNT=5000` and an `UNTIL` are accepted. The starter stores `FREQ=DAILY`, which every unbounded reader of the rule walks forever.',
       match: {
-        python: {
-          all: [
-            /stored = store\.create_event\(/,
-            /"event_id": stored\["event_id"\]/,
-            /"revision": stored\["revision"\]/,
-            /status_code\s*=\s*201/,
-          ],
-          none: [/return JSONResponse\(\s*body\.model_dump\(\)/],
-        },
-        typescript: {
-          all: [
-            /stored = await store\.createEvent\(/,
-            /event_id: stored\.event_id/,
-            /revision: stored\.revision/,
-            /code\(\s*201\s*\)/,
-          ],
-          none: [/code\(\s*200\s*\)\.send\(\s*body\s*\)/],
-        },
-        go: {
-          all: [
-            /store\.CreateEvent\(/,
-            /"event_id":\s+stored\.EventID/,
-            /"revision":\s+stored\.Revision/,
-            /http\.StatusCreated/,
-          ],
-          none: [/writeJSON\(\s*rw\s*,\s*http\.StatusOK\s*,\s*body\s*\)/],
-        },
-        scala: {
-          all: [/store\.createEvent\(/, /stored\.event_id/, /stored\.revision/, /StatusCodes\.Created/],
-          none: [/complete\(\s*StatusCodes\.OK\s*,\s*body\s*\)/],
-        },
-        cpp: {
-          all: [
-            /store\.create_event\(/,
-            /"event_id", stored\.event_id/,
-            /"revision", stored\.revision/,
-            /res\.status\s*=\s*201/,
-          ],
-          none: [/set_content\(\s*body\.dump\(\)/],
-        },
+        python: {all: [/rule_not_terminating/, /MAX_COUNT/]},
+        typescript: {all: [/rule_not_terminating/, /MAX_COUNT/]},
+        go: {all: [/rule_not_terminating/, /rrule\.MaxCount/]},
+        scala: {all: [/rule_not_terminating/, /Rrule\.MaxCount/]},
+        cpp: {all: [/rule_not_terminating/, /kMaxCount/]},
+      },
+    },
+    {
+      id: 'tz-aware',
+      title: 'Refuses instants without an offset',
+      detail:
+        'A `dtstart`, `dtend` or `UNTIL` without `Z` or an offset is **422** `invalid_instant`; `10:00+01:00` is stored as `09:00Z`. The starter appends `Z` to a time without an offset, which moves a Berlin meeting by an hour for every attendee.',
+      match: {
+        python: {all: [/parse_instant\(\s*parts\[["']UNTIL["']\]\s*\)/], none: [/\+\s*["']Z["']/]},
+        typescript: {all: [/parseInstant\(\s*parts\.UNTIL\s*\)/], none: [/\+\s*['"]Z['"]/]},
+        go: {all: [/rrule\.ParseInstant\(\s*parts\["UNTIL"\]\s*\)/], none: [/\+\s*"Z"/]},
+        scala: {all: [/parts\.get\("UNTIL"\)[^\n]*parseInstant/], none: [/\+\s*"Z"/]},
+        cpp: {all: [/ParseInstant\(\s*parts\.at\("UNTIL"\)\s*\)/], none: [/\+\s*"Z"/]},
+      },
+    },
+    {
+      id: 'range-order',
+      title: 'Refuses an event that ends before it starts',
+      detail:
+        'A `dtend` equal to or before `dtstart` is **422** `invalid_range`, and nothing is stored. The starter stores it, and every occurrence the expander derives has a negative length.',
+      match: {
+        python: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
+        typescript: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
+        go: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
+        scala: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
+        cpp: {all: [/invalid_range/, /\*?end\s*<=\s*\*?start\b|\*?start\s*>=\s*\*?end\b/]},
       },
     },
   ],
@@ -177,354 +112,340 @@ local datetimes break across a DST boundary, and echoing the request body hides 
     python: {
       starter: `import logging
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from calendard.rrule import format_instant, format_rule, parse_instant, rule_parts
+from calendard.store import new_id, store
+from state import bump_generation  # step 2: retires the calendar's cached slices
+
 app = FastAPI()
-logger = logging.getLogger("calendar")
+log = logging.getLogger("calendar")
 
 
 class EventRequest(BaseModel):
     calendar_id: str
     title: str
-    rrule: str
+    rrule: str = ""
     dtstart: str
     dtend: str
-    timezone: str
+    attendees: list[str] = []
 
 
-class EventStore:
-    def create_event(self, calendar_id: str, event: dict) -> dict:
-        """Insert the event with revision 1 and return {event_id, revision}."""
-        raise NotImplementedError
+def _error(status: int, code: str) -> JSONResponse:
+    return JSONResponse({"error": code}, status_code=status)
 
 
-store = EventStore()
+def assume_utc(text: str) -> str:
+    """An instant written without an offset is read as UTC."""
+    if text.endswith("Z") or text[-6:-5] in ("+", "-"):
+        return text
+    return text + "Z"
 
 
 @app.post("/v1/events")
-def create_event(body: EventRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    recognized = {"FREQ", "INTERVAL", "COUNT", "UNTIL"}
-    chunks = [chunk.split("=", 1) for chunk in body.rrule.split(";") if "=" in chunk]
-    rule = ";".join(f"{key}={value}" for key, value in chunks if key in recognized)
-    logger.info("event created tenant=%s calendar=%s rrule=%s", tenant, body.calendar_id, rule)
-    return JSONResponse(body.model_dump(), status_code=200)
+def create_event(body: EventRequest, request: Request) -> JSONResponse:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("X-Tenant-Id")
+    if not tenant:
+        return _error(401, "missing_tenant")
+    parts = rule_parts(body.rrule)
+    start = parse_instant(assume_utc(body.dtstart))
+    end = parse_instant(assume_utc(body.dtend))
+    if start is None or end is None:
+        return _error(422, "invalid_instant")
+    event = {
+        "event_id": new_id(),
+        "calendar_id": body.calendar_id,
+        "tenant": tenant,
+        "title": body.title,
+        "rrule": format_rule(parts),
+        "dtstart": format_instant(start),
+        "dtend": format_instant(end),
+        "revision": 1,
+        "attendees": body.attendees,
+    }
+    store.put_event(event)
+    bump_generation(body.calendar_id)
+    log.info("event=%s calendar=%s tenant=%s", event["event_id"], body.calendar_id, tenant)
+    return JSONResponse(event, status_code=201)
 `,
       solution: `import logging
-import re
-from datetime import datetime
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("calendar")
+from calendard.rrule import FREQUENCIES, MAX_COUNT, SUPPORTED_PARTS, format_instant, format_rule, parse_instant, rule_parts
+from calendard.store import new_id, store
+from state import bump_generation  # step 2: retires the calendar's cached slices
 
-SUPPORTED_RRULE_PARTS = {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "BYMONTH", "WKST"}
-UNBOUNDED_FREQUENCIES = {"SECONDLY", "MINUTELY", "HOURLY"}
-MAX_RRULE_LENGTH = 512
-MAX_TITLE_LENGTH = 200
-MAX_COUNT = 5000
-MISSING_TZ = "MISSING_TZ"
-UNSUPPORTED_RRULE_PART = "UNSUPPORTED_RRULE_PART"
-RULE_NOT_TERMINATING = "RULE_NOT_TERMINATING"
-TZ_SUFFIX_RE = re.compile(r"(Z|[+-]\\d{2}:?\\d{2})$")
+app = FastAPI()
+log = logging.getLogger("calendar")
 
 
 class EventRequest(BaseModel):
     calendar_id: str
     title: str
-    rrule: str
+    rrule: str = ""
     dtstart: str
     dtend: str
-    timezone: str
+    attendees: list[str] = []
 
 
-class EventStore:
-    def create_event(self, calendar_id: str, event: dict) -> dict:
-        """Insert the event with revision 1 and return {event_id, revision}."""
-        raise NotImplementedError
+def _error(status: int, code: str) -> JSONResponse:
+    return JSONResponse({"error": code}, status_code=status)
 
 
-store = EventStore()
-
-
-def require_aware(value: str, field: str) -> datetime:
-    if TZ_SUFFIX_RE.search(value) is None:
-        raise HTTPException(status_code=422, detail=f"{MISSING_TZ}:{field}")
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        raise HTTPException(status_code=422, detail=f"{MISSING_TZ}:{field}") from None
-    if parsed.tzinfo is None:
-        raise HTTPException(status_code=422, detail=f"{MISSING_TZ}:{field}")
-    return parsed
-
-
-def parse_rrule(raw: str) -> dict[str, str]:
-    if len(raw) > MAX_RRULE_LENGTH:
-        raise HTTPException(status_code=422, detail="RRULE_TOO_LONG")
-    parts: dict[str, str] = {}
-    for chunk in raw.split(";"):
-        key, sep, value = chunk.partition("=")
-        if sep == "" or key not in SUPPORTED_RRULE_PARTS or value == "":
-            raise HTTPException(status_code=422, detail=f"{UNSUPPORTED_RRULE_PART}:{key}")
-        parts[key] = value
-    freq = parts.get("FREQ")
-    if freq is None or freq in UNBOUNDED_FREQUENCIES:
-        raise HTTPException(status_code=422, detail=RULE_NOT_TERMINATING)
+def rule_error(parts: dict[str, str]) -> str | None:
+    """Why the rule cannot be stored, or None. Refused, never trimmed: the stored rule is the rule the user wrote."""
+    for key, value in parts.items():
+        if key not in SUPPORTED_PARTS or value == "":
+            return "unsupported_rrule_part"
+    if not parts:
+        return None  # one occurrence
+    if parts.get("FREQ") not in FREQUENCIES:
+        return "unsupported_rrule_part"
+    # The expander walks the rule until it ends: it must end, and each step must move forward.
+    interval = parts.get("INTERVAL", "1")
+    if not interval.isdigit() or int(interval) < 1:
+        return "rule_not_terminating"
     count = parts.get("COUNT")
+    if count is None and "UNTIL" not in parts:
+        return "rule_not_terminating"
     if count is not None and (not count.isdigit() or not 1 <= int(count) <= MAX_COUNT):
-        raise HTTPException(status_code=422, detail="COUNT must be 1..MAX_COUNT")
-    if "UNTIL" not in parts and count is None:
-        raise HTTPException(status_code=422, detail=RULE_NOT_TERMINATING)
-    if "UNTIL" in parts:
-        require_aware(parts["UNTIL"], "UNTIL")
-    return parts
+        return "rule_not_terminating"
+    return None
 
 
 @app.post("/v1/events")
-def create_event(body: EventRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    if body.calendar_id == "":
-        raise HTTPException(status_code=400, detail="calendar_id is required")
-    if body.title == "" or len(body.title) > MAX_TITLE_LENGTH:
-        raise HTTPException(status_code=400, detail="title must be 1..MAX_TITLE_LENGTH characters")
-    try:
-        ZoneInfo(body.timezone)
-    except (ZoneInfoNotFoundError, ValueError):
-        raise HTTPException(status_code=422, detail=f"{MISSING_TZ}:timezone") from None
-    parts = parse_rrule(body.rrule)
-    start = require_aware(body.dtstart, "dtstart")
-    end = require_aware(body.dtend, "dtend")
-    record = {
+def create_event(body: EventRequest, request: Request) -> JSONResponse:
+    tenant = request.headers.get("X-Tenant-Id")
+    if not tenant:
+        return _error(401, "missing_tenant")
+    parts = rule_parts(body.rrule)
+    problem = rule_error(parts)
+    if problem is not None:
+        return _error(422, problem)
+    # An instant without an offset names no instant: refuse it rather than guess a zone.
+    start = parse_instant(body.dtstart)
+    end = parse_instant(body.dtend)
+    if start is None or end is None or ("UNTIL" in parts and parse_instant(parts["UNTIL"]) is None):
+        return _error(422, "invalid_instant")
+    if end <= start:
+        return _error(422, "invalid_range")
+    event = {
+        "event_id": new_id(),
         "calendar_id": body.calendar_id,
+        "tenant": tenant,
         "title": body.title,
-        "rrule": ";".join(f"{key}={value}" for key, value in parts.items()),
-        "dtstart": start.isoformat(),
-        "dtend": end.isoformat(),
-        "timezone": body.timezone,
+        "rrule": format_rule(parts),
+        "dtstart": format_instant(start),
+        "dtend": format_instant(end),
+        "revision": 1,
+        "attendees": body.attendees,
     }
-    stored = store.create_event(body.calendar_id, record)
-    logger.info("event created tenant=%s calendar=%s revision=%d", tenant, body.calendar_id, stored["revision"])
-    return JSONResponse(
-        {"event_id": stored["event_id"], "revision": stored["revision"], "calendar_id": body.calendar_id},
-        status_code=201,
-    )
+    store.put_event(event)
+    bump_generation(body.calendar_id)
+    log.info("event=%s calendar=%s tenant=%s", event["event_id"], body.calendar_id, tenant)
+    return JSONResponse(event, status_code=201)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/events: create handler for calendard. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {formatInstant, formatRule, parseInstant, ruleParts} from 'calendard/rrule';
+import {type Event, newId, store} from 'calendard/store';
+import {bumpGeneration} from './state'; // step 2: retires the calendar's cached slices
 
 export const app = Fastify();
 
 interface EventBody {
   calendar_id: string;
   title: string;
-  rrule: string;
+  rrule?: string;
   dtstart: string;
   dtend: string;
-  timezone: string;
+  attendees?: string[];
 }
 
-const RECOGNIZED_PARTS = new Set(['FREQ', 'INTERVAL', 'COUNT', 'UNTIL']);
+/** An instant written without an offset is read as UTC. */
+function assumeUtc(text: string): string {
+  if (/(Z|[+-]\\d{2}:\\d{2})$/.test(text)) return text;
+  return text + 'Z';
+}
 
 app.post('/v1/events', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing_tenant'});
   const body = request.body as EventBody;
-  const kept: string[] = [];
-  for (const chunk of body.rrule.split(';')) {
-    const eq = chunk.indexOf('=');
-    if (eq !== -1 && RECOGNIZED_PARTS.has(chunk.slice(0, eq))) kept.push(chunk);
-  }
-  request.log.info({tenant, calendar: body.calendar_id, rrule: kept.join(';')}, 'event created');
-  return reply.code(200).send(body);
+  const parts = ruleParts(body.rrule ?? '');
+  const start = parseInstant(assumeUtc(body.dtstart));
+  const end = parseInstant(assumeUtc(body.dtend));
+  if (start === null || end === null) return reply.code(422).send({error: 'invalid_instant'});
+  const event: Event = {
+    event_id: newId(),
+    calendar_id: body.calendar_id,
+    tenant,
+    title: body.title,
+    rrule: formatRule(parts),
+    dtstart: formatInstant(start),
+    dtend: formatInstant(end),
+    revision: 1,
+    attendees: body.attendees ?? [],
+  };
+  await store.putEvent(event);
+  await bumpGeneration(body.calendar_id);
+  app.log.info({event: event.event_id, calendar: body.calendar_id, tenant}, 'event created');
+  return reply.code(201).send(event);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/events: a create whose rule terminates and whose datetimes carry a zone. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {FREQUENCIES, MAX_COUNT, SUPPORTED_PARTS, formatInstant, formatRule, parseInstant, ruleParts} from 'calendard/rrule';
+import {type Event, newId, store} from 'calendard/store';
+import {bumpGeneration} from './state'; // step 2: retires the calendar's cached slices
 
 export const app = Fastify();
-
-const SUPPORTED_RRULE_PARTS: Record<string, true> = {
-  FREQ: true,
-  INTERVAL: true,
-  COUNT: true,
-  UNTIL: true,
-  BYDAY: true,
-  BYMONTHDAY: true,
-  BYMONTH: true,
-  WKST: true,
-};
-const UNBOUNDED_FREQUENCIES: Record<string, true> = {SECONDLY: true, MINUTELY: true, HOURLY: true};
-const MAX_RRULE_LENGTH = 512;
-const MAX_TITLE_LENGTH = 200;
-const MAX_COUNT = 5000;
-const MISSING_TZ = 'MISSING_TZ';
-const UNSUPPORTED_RRULE_PART = 'UNSUPPORTED_RRULE_PART';
-const RULE_NOT_TERMINATING = 'RULE_NOT_TERMINATING';
-const TZ_SUFFIX_RE = /(Z|[+-]\\d{2}:?\\d{2})$/;
 
 interface EventBody {
   calendar_id: string;
   title: string;
-  rrule: string;
+  rrule?: string;
   dtstart: string;
   dtend: string;
-  timezone: string;
+  attendees?: string[];
 }
 
-interface EventStore {
-  createEvent(calendarId: string, record: EventBody): Promise<{event_id: string; revision: number}>;
-}
-
-const store: EventStore = {
-  async createEvent() {
-    throw new Error('wired to Postgres in the service');
-  },
-};
-
-type RuleResult = {ok: true; parts: Record<string, string>} | {ok: false; error: string};
-
-function parseRrule(raw: string): RuleResult {
-  if (raw.length > MAX_RRULE_LENGTH) return {ok: false, error: 'RRULE_TOO_LONG'};
-  const parts: Record<string, string> = {};
-  for (const chunk of raw.split(';')) {
-    const eq = chunk.indexOf('=');
-    const key = eq === -1 ? chunk : chunk.slice(0, eq);
-    const value = eq === -1 ? '' : chunk.slice(eq + 1);
-    if (eq === -1 || SUPPORTED_RRULE_PARTS[key] !== true || value === '')
-      return {ok: false, error: \`\${UNSUPPORTED_RRULE_PART}:\${key}\`};
-    parts[key] = value;
+/** Why the rule cannot be stored, or null. Refused, never trimmed: the stored rule is the rule the user wrote. */
+function ruleError(parts: Record<string, string>): string | null {
+  for (const [key, value] of Object.entries(parts)) {
+    if (!SUPPORTED_PARTS.includes(key) || value === '') return 'unsupported_rrule_part';
   }
-  const freq = parts.FREQ;
-  if (freq === undefined || UNBOUNDED_FREQUENCIES[freq] === true) return {ok: false, error: RULE_NOT_TERMINATING};
-  if (parts.UNTIL === undefined && parts.COUNT === undefined) return {ok: false, error: RULE_NOT_TERMINATING};
+  if (Object.keys(parts).length === 0) return null; // one occurrence
+  if (!(parts.FREQ in FREQUENCIES)) return 'unsupported_rrule_part';
+  // The expander walks the rule until it ends: it must end, and each step must move forward.
+  const interval = parts.INTERVAL ?? '1';
+  if (!/^\\d+$/.test(interval) || Number(interval) < 1) return 'rule_not_terminating';
   const count = parts.COUNT;
-  if (count !== undefined && (!/^[0-9]+$/.test(count) || Number(count) < 1 || Number(count) > MAX_COUNT))
-    return {ok: false, error: \`COUNT must be 1..\${MAX_COUNT}\`};
-  if (parts.UNTIL !== undefined && !TZ_SUFFIX_RE.test(parts.UNTIL))
-    return {ok: false, error: \`\${MISSING_TZ}:UNTIL\`};
-  return {ok: true, parts};
-}
-
-function awareMs(value: string): number | null {
-  if (!TZ_SUFFIX_RE.test(value)) return null;
-  const ms = Date.parse(value);
-  return Number.isNaN(ms) ? null : ms;
-}
-
-function knownZone(zone: string): boolean {
-  if (TZ_SUFFIX_RE.test(zone)) return true;
-  try {
-    new Intl.DateTimeFormat('en-US', {timeZone: zone});
-    return true;
-  } catch {
-    return false;
-  }
+  if (count === undefined && parts.UNTIL === undefined) return 'rule_not_terminating';
+  if (count !== undefined && (!/^\\d+$/.test(count) || Number(count) < 1 || Number(count) > MAX_COUNT)) return 'rule_not_terminating';
+  return null;
 }
 
 app.post('/v1/events', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const body = request.body as Partial<EventBody> | null;
-  if (body === null || typeof body !== 'object') return reply.code(400).send({error: 'invalid json'});
-  if (typeof body.calendar_id !== 'string' || body.calendar_id === '')
-    return reply.code(400).send({error: 'calendar_id is required'});
-  if (typeof body.title !== 'string' || body.title === '' || body.title.length > MAX_TITLE_LENGTH)
-    return reply.code(400).send({error: 'title must be 1..MAX_TITLE_LENGTH characters'});
-  if (typeof body.timezone !== 'string' || !knownZone(body.timezone))
-    return reply.code(422).send({error: \`\${MISSING_TZ}:timezone\`});
-  if (typeof body.dtstart !== 'string' || typeof body.dtend !== 'string')
-    return reply.code(400).send({error: 'dtstart and dtend are required'});
-  const startMs = awareMs(body.dtstart);
-  if (startMs === null) return reply.code(422).send({error: \`\${MISSING_TZ}:dtstart\`});
-  const endMs = awareMs(body.dtend);
-  if (endMs === null) return reply.code(422).send({error: \`\${MISSING_TZ}:dtend\`});
-  if (endMs <= startMs) return reply.code(422).send({error: 'dtend must be after dtstart'});
-  const rule = typeof body.rrule === 'string' ? parseRrule(body.rrule) : null;
-  if (rule === null || !rule.ok)
-    return reply.code(422).send({error: rule === null ? 'rrule is required' : rule.error});
-
-  const record: EventBody = {
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing_tenant'});
+  const body = request.body as EventBody;
+  const parts = ruleParts(body.rrule ?? '');
+  const problem = ruleError(parts);
+  if (problem !== null) return reply.code(422).send({error: problem});
+  // An instant without an offset names no instant: refuse it rather than guess a zone.
+  const start = parseInstant(body.dtstart);
+  const end = parseInstant(body.dtend);
+  if (start === null || end === null || (parts.UNTIL !== undefined && parseInstant(parts.UNTIL) === null)) {
+    return reply.code(422).send({error: 'invalid_instant'});
+  }
+  if (end <= start) return reply.code(422).send({error: 'invalid_range'});
+  const event: Event = {
+    event_id: newId(),
     calendar_id: body.calendar_id,
+    tenant,
     title: body.title,
-    rrule: Object.entries(rule.parts)
-      .map(([key, value]) => \`\${key}=\${value}\`)
-      .join(';'),
-    dtstart: body.dtstart,
-    dtend: body.dtend,
-    timezone: body.timezone,
+    rrule: formatRule(parts),
+    dtstart: formatInstant(start),
+    dtend: formatInstant(end),
+    revision: 1,
+    attendees: body.attendees ?? [],
   };
-  const stored = await store.createEvent(body.calendar_id, record);
-  request.log.info({tenant, calendar: body.calendar_id, revision: stored.revision}, 'event created');
-  return reply.code(201).send({
-    event_id: stored.event_id,
-    revision: stored.revision,
-    calendar_id: body.calendar_id,
-  });
+  await store.putEvent(event);
+  await bumpGeneration(body.calendar_id);
+  app.log.info({event: event.event_id, calendar: body.calendar_id, tenant}, 'event created');
+  return reply.code(201).send(event);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
+
+	"calendard/rrule"
+	"calendard/store"
 )
 
+// Built in step 2 (state.go): retires the calendar's cached slices.
+var bumpGeneration = func(ctx context.Context, calendarID string) (int64, error) {
+	panic("not implemented")
+}
+
 type EventRequest struct {
-	CalendarID string \`json:"calendar_id"\`
-	Title      string \`json:"title"\`
-	RRule      string \`json:"rrule"\`
-	DtStart    string \`json:"dtstart"\`
-	DtEnd      string \`json:"dtend"\`
-	Timezone   string \`json:"timezone"\`
+	CalendarID string   \`json:"calendar_id"\`
+	Title      string   \`json:"title"\`
+	Rrule      string   \`json:"rrule"\`
+	Dtstart    string   \`json:"dtstart"\`
+	Dtend      string   \`json:"dtend"\`
+	Attendees  []string \`json:"attendees"\`
 }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	_ = json.NewEncoder(rw).Encode(body)
+}
+
+// assumeUTC reads an instant written without an offset as UTC.
+func assumeUTC(text string) string {
+	if strings.HasSuffix(text, "Z") || (len(text) > 6 && strings.ContainsAny(text[len(text)-6:len(text)-5], "+-")) {
+		return text
+	}
+	return text + "Z"
 }
 
 func createEvent(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	var body EventRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing_tenant"})
 		return
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	recognized := map[string]bool{"FREQ": true, "INTERVAL": true, "COUNT": true, "UNTIL": true}
-	kept := make([]string, 0, 4)
-	for _, chunk := range strings.Split(body.RRule, ";") {
-		key, _, found := strings.Cut(chunk, "=")
-		if found && recognized[key] {
-			kept = append(kept, chunk)
-		}
+	var body EventRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
 	}
-	log.Printf("event created tenant=%s calendar=%s rrule=%s", tenant, body.CalendarID, strings.Join(kept, ";"))
-	writeJSON(rw, http.StatusOK, body)
+	parts := rrule.RuleParts(body.Rrule)
+	start, okStart := rrule.ParseInstant(assumeUTC(body.Dtstart))
+	end, okEnd := rrule.ParseInstant(assumeUTC(body.Dtend))
+	if !okStart || !okEnd {
+		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_instant"})
+		return
+	}
+	event := &store.Event{
+		EventID: store.NewID(), CalendarID: body.CalendarID, Tenant: tenant, Title: body.Title, Rrule: rrule.FormatRule(parts),
+		Dtstart: rrule.FormatInstant(start), Dtend: rrule.FormatInstant(end), Revision: 1, Attendees: append([]string{}, body.Attendees...),
+	}
+	if err := store.PutEvent(r.Context(), event); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try_again"})
+		return
+	}
+	if _, err := bumpGeneration(r.Context(), body.CalendarID); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try_again"})
+		return
+	}
+	log.Printf("event=%s calendar=%s tenant=%s", event.EventID, body.CalendarID, tenant)
+	writeJSON(rw, http.StatusCreated, event)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/events", createEvent)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
@@ -534,157 +455,123 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"regexp"
-	"sort"
 	"strconv"
-	"strings"
-	"time"
+
+	"calendard/rrule"
+	"calendard/store"
 )
 
-const (
-	maxRruleLength       = 512
-	maxTitleLength       = 200
-	maxCount             = 5000
-	missingTZ            = "MISSING_TZ"
-	unsupportedRRulePart = "UNSUPPORTED_RRULE_PART"
-	ruleNotTerminating   = "RULE_NOT_TERMINATING"
-)
-
-var (
-	supportedRruleParts = map[string]bool{
-		"FREQ": true, "INTERVAL": true, "COUNT": true, "UNTIL": true,
-		"BYDAY": true, "BYMONTHDAY": true, "BYMONTH": true, "WKST": true,
-	}
-	unboundedFrequencies = map[string]bool{"SECONDLY": true, "MINUTELY": true, "HOURLY": true}
-	tzSuffixRe           = regexp.MustCompile(\`(Z|[+-]\\d{2}:?\\d{2})$\`)
-)
+// Built in step 2 (state.go): retires the calendar's cached slices.
+var bumpGeneration = func(ctx context.Context, calendarID string) (int64, error) {
+	panic("not implemented")
+}
 
 type EventRequest struct {
-	CalendarID string \`json:"calendar_id"\`
-	Title      string \`json:"title"\`
-	RRule      string \`json:"rrule"\`
-	DtStart    string \`json:"dtstart"\`
-	DtEnd      string \`json:"dtend"\`
-	Timezone   string \`json:"timezone"\`
+	CalendarID string   \`json:"calendar_id"\`
+	Title      string   \`json:"title"\`
+	Rrule      string   \`json:"rrule"\`
+	Dtstart    string   \`json:"dtstart"\`
+	Dtend      string   \`json:"dtend"\`
+	Attendees  []string \`json:"attendees"\`
 }
-
-type StoredEvent struct {
-	EventID  string \`json:"event_id"\`
-	Revision int    \`json:"revision"\`
-}
-
-type EventStore struct{}
-
-func (s *EventStore) CreateEvent(ctx context.Context, calendarID string, record map[string]any) (StoredEvent, error) {
-	return StoredEvent{}, nil
-}
-
-var store = &EventStore{}
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	_ = json.NewEncoder(rw).Encode(body)
 }
 
-func awareOffset(value string) bool {
-	if !tzSuffixRe.MatchString(value) {
-		return false
+// positive reads a positive integer; 0 for anything else.
+func positive(text string) int {
+	n, err := strconv.Atoi(text)
+	if err != nil || n < 1 {
+		return 0
 	}
-	_, err := time.Parse(time.RFC3339, value)
-	return err == nil
+	return n
 }
 
-func parseRrule(raw string) (map[string]string, string) {
-	if len(raw) > maxRruleLength {
-		return nil, "RRULE_TOO_LONG"
-	}
-	parts := map[string]string{}
-	for _, chunk := range strings.Split(raw, ";") {
-		key, value, found := strings.Cut(chunk, "=")
-		if !found || !supportedRruleParts[key] || value == "" {
-			return nil, unsupportedRRulePart + ":" + key
-		}
-		parts[key] = value
-	}
-	freq, ok := parts["FREQ"]
-	if !ok || unboundedFrequencies[freq] {
-		return nil, ruleNotTerminating
-	}
-	until, hasUntil := parts["UNTIL"]
-	count, hasCount := parts["COUNT"]
-	if !hasUntil && !hasCount {
-		return nil, ruleNotTerminating
-	}
-	if hasCount {
-		n, err := strconv.Atoi(count)
-		if err != nil || n < 1 || n > maxCount {
-			return nil, "COUNT must be 1..maxCount"
-		}
-	}
-	if hasUntil && !tzSuffixRe.MatchString(until) {
-		return nil, missingTZ + ":UNTIL"
-	}
-	return parts, ""
-}
-
-func normalizeRrule(parts map[string]string) string {
-	chunks := make([]string, 0, len(parts))
+// ruleError says why the rule cannot be stored, or "". Refused, never trimmed: the stored rule is the
+// rule the user wrote.
+func ruleError(parts map[string]string) string {
 	for key, value := range parts {
-		chunks = append(chunks, key+"="+value)
+		known := false
+		for _, supported := range rrule.SupportedParts {
+			known = known || key == supported
+		}
+		if !known || value == "" {
+			return "unsupported_rrule_part"
+		}
 	}
-	sort.Strings(chunks)
-	return strings.Join(chunks, ";")
+	if len(parts) == 0 {
+		return "" // one occurrence
+	}
+	if _, ok := rrule.Frequencies[parts["FREQ"]]; !ok {
+		return "unsupported_rrule_part"
+	}
+	// The expander walks the rule until it ends: it must end, and each step must move forward.
+	if interval, ok := parts["INTERVAL"]; ok && positive(interval) == 0 {
+		return "rule_not_terminating"
+	}
+	count, hasCount := parts["COUNT"]
+	_, hasUntil := parts["UNTIL"]
+	if !hasCount && !hasUntil {
+		return "rule_not_terminating"
+	}
+	if hasCount && (positive(count) == 0 || positive(count) > rrule.MaxCount) {
+		return "rule_not_terminating"
+	}
+	return ""
 }
 
-func createEventHandler(rw http.ResponseWriter, r *http.Request) {
+func createEvent(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing_tenant"})
 		return
 	}
 	var body EventRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
-	if body.CalendarID == "" || body.Title == "" || len(body.Title) > maxTitleLength {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid calendar_id or title"})
-		return
-	}
-	if _, err := time.LoadLocation(body.Timezone); err != nil && !awareOffset(body.Timezone) {
-		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": missingTZ + ":timezone"})
-		return
-	}
-	if !awareOffset(body.DtStart) || !awareOffset(body.DtEnd) {
-		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": missingTZ + ":dtstart or dtend"})
-		return
-	}
-	parts, problem := parseRrule(body.RRule)
-	if problem != "" {
+	parts := rrule.RuleParts(body.Rrule)
+	if problem := ruleError(parts); problem != "" {
 		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": problem})
 		return
 	}
-	stored, _ := store.CreateEvent(r.Context(), body.CalendarID, map[string]any{
-		"calendar_id": body.CalendarID,
-		"title":       body.Title,
-		"rrule":       normalizeRrule(parts),
-		"dtstart":     body.DtStart,
-		"dtend":       body.DtEnd,
-		"timezone":    body.Timezone,
-	})
-	log.Printf("event created tenant=%s calendar=%s revision=%d", tenant, body.CalendarID, stored.Revision)
-	writeJSON(rw, http.StatusCreated, map[string]any{
-		"event_id":    stored.EventID,
-		"revision":    stored.Revision,
-		"calendar_id": body.CalendarID,
-	})
+	// An instant without an offset names no instant: refuse it rather than guess a zone.
+	start, okStart := rrule.ParseInstant(body.Dtstart)
+	end, okEnd := rrule.ParseInstant(body.Dtend)
+	okUntil := true
+	if _, has := parts["UNTIL"]; has {
+		_, okUntil = rrule.ParseInstant(parts["UNTIL"])
+	}
+	if !okStart || !okEnd || !okUntil {
+		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_instant"})
+		return
+	}
+	if end <= start {
+		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_range"})
+		return
+	}
+	event := &store.Event{
+		EventID: store.NewID(), CalendarID: body.CalendarID, Tenant: tenant, Title: body.Title, Rrule: rrule.FormatRule(parts),
+		Dtstart: rrule.FormatInstant(start), Dtend: rrule.FormatInstant(end), Revision: 1, Attendees: append([]string{}, body.Attendees...),
+	}
+	if err := store.PutEvent(r.Context(), event); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try_again"})
+		return
+	}
+	if _, err := bumpGeneration(r.Context(), body.CalendarID); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try_again"})
+		return
+	}
+	log.Printf("event=%s calendar=%s tenant=%s", event.EventID, body.CalendarID, tenant)
+	writeJSON(rw, http.StatusCreated, event)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/events", createEventHandler)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/events", createEvent)
 }
 `,
     },
@@ -698,38 +585,58 @@ import org.apache.pekko.http.scaladsl.server.Route
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
 
+import calendard.{Event, Rrule, Store}
+
 final case class EventRequest(
     calendar_id: String,
     title: String,
-    rrule: String,
+    rrule: Option[String],
     dtstart: String,
     dtend: String,
-    timezone: String,
+    attendees: Option[Seq[String]]
 )
 
-class EventStore {
-  def createEvent(calendarId: String, record: EventRequest): StoredEvent =
-    throw new UnsupportedOperationException("wired to Postgres in the service")
-}
-
-final case class StoredEvent(event_id: String, revision: Int)
-
-object EventApi {
+object CalendarApi {
   implicit val system: ActorSystem = ActorSystem("calendar")
   implicit val requestFormat: RootJsonFormat[EventRequest] = jsonFormat6(EventRequest)
 
-  val RecognizedParts = Set("FREQ", "INTERVAL", "COUNT", "UNTIL")
-  val store = new EventStore
+  private def error(status: StatusCode, code: String): Route =
+    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
+
+  /** An instant written without an offset is read as UTC. */
+  def assumeUtc(text: String): String =
+    if (text.endsWith("Z") || text.matches(".*[+-]\\\\d{2}:\\\\d{2}$")) text else text + "Z"
 
   val route: Route =
     path("v1" / "events") {
       post {
-        headerValueByName("X-Tenant-Id") { tenant =>
+        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
           entity(as[EventRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val kept = body.rrule.split(";").filter(chunk => RecognizedParts.contains(chunk.takeWhile(_ != '=')))
-            system.log.info(s"event created tenant=$tenant calendar=\${body.calendar_id}")
-            complete(StatusCodes.OK, body)
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+            val tenant = tenantOpt.getOrElse("")
+            if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
+            else {
+              val parts = Rrule.ruleParts(body.rrule.getOrElse(""))
+              (Rrule.parseInstant(assumeUtc(body.dtstart)), Rrule.parseInstant(assumeUtc(body.dtend))) match {
+                case (Some(start), Some(end)) =>
+                  val event = Event(
+                    Store.newId(),
+                    body.calendar_id,
+                    tenant,
+                    body.title,
+                    Rrule.formatRule(parts),
+                    Rrule.formatInstant(start),
+                    Rrule.formatInstant(end),
+                    1L,
+                    body.attendees.getOrElse(Seq.empty)
+                  )
+                  Store.putEvent(event)
+                  ExpansionCache.bumpGeneration(body.calendar_id) // step 2
+                  system.log.info(s"event=\${event.event_id} calendar=\${body.calendar_id} tenant=$tenant")
+                  complete(StatusCodes.Created, event)
+                case _ => error(StatusCodes.UnprocessableEntity, "invalid_instant")
+              }
+            }
           }
         }
       }
@@ -740,12 +647,7 @@ object EventApi {
   }
 }
 `,
-      solution: `import java.time.{OffsetDateTime, ZoneId}
-import java.time.format.DateTimeParseException
-
-import scala.collection.mutable
-
-import org.apache.pekko.actor.ActorSystem
+      solution: `import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import org.apache.pekko.http.scaladsl.model._
@@ -754,107 +656,73 @@ import org.apache.pekko.http.scaladsl.server.Route
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
 
+import calendard.{Event, Rrule, Store}
+
 final case class EventRequest(
     calendar_id: String,
     title: String,
-    rrule: String,
+    rrule: Option[String],
     dtstart: String,
     dtend: String,
-    timezone: String,
+    attendees: Option[Seq[String]]
 )
-final case class StoredEvent(event_id: String, revision: Int)
-final case class CreatedEvent(event_id: String, revision: Int, calendar_id: String)
 
-class EventStore {
-  def createEvent(calendarId: String, record: EventRequest): StoredEvent =
-    throw new UnsupportedOperationException("wired to Postgres in the service")
-}
-
-object EventApi {
+object CalendarApi {
   implicit val system: ActorSystem = ActorSystem("calendar")
   implicit val requestFormat: RootJsonFormat[EventRequest] = jsonFormat6(EventRequest)
-  implicit val createdFormat: RootJsonFormat[CreatedEvent] = jsonFormat3(CreatedEvent)
 
-  val SupportedRruleParts = Set("FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "BYMONTH", "WKST")
-  val UnboundedFrequencies = Set("SECONDLY", "MINUTELY", "HOURLY")
-  val MaxRruleLength = 512
-  val MaxTitleLength = 200
-  val MaxCount = 5000
-  val MissingTz = "MISSING_TZ"
-  val UnsupportedRrulePart = "UNSUPPORTED_RRULE_PART"
-  val RuleNotTerminating = "RULE_NOT_TERMINATING"
-  val TzSuffixRe = "(Z|[+-][0-9]{2}:?[0-9]{2})$".r
+  private def error(status: StatusCode, code: String): Route =
+    complete(status, HttpEntity(ContentTypes.\`application/json\`, s"""{"error":"$code"}"""))
 
-  val store = new EventStore
+  private def positive(text: String): Long = text.toLongOption.filter(_ >= 1).getOrElse(0L)
 
-  def knownZone(zone: String): Boolean =
-    TzSuffixRe.findFirstIn(zone).isDefined || ZoneId.getAvailableZoneIds.contains(zone)
-
-  def aware(value: String): Option[OffsetDateTime] =
-    TzSuffixRe.findFirstIn(value).flatMap { _ =>
-      try Some(OffsetDateTime.parse(value))
-      catch { case _: DateTimeParseException => None }
-    }
-
-  def parseRrule(raw: String): Either[String, Map[String, String]] = {
-    if (raw.length > MaxRruleLength) return Left("RRULE_TOO_LONG")
-    val parts = mutable.Map.empty[String, String]
-    for (chunk <- raw.split(";")) {
-      val eq = chunk.indexOf('=')
-      val key = if (eq < 0) chunk else chunk.substring(0, eq)
-      val value = if (eq < 0) "" else chunk.substring(eq + 1)
-      if (eq < 0 || !SupportedRruleParts.contains(key) || value.isEmpty)
-        return Left(s"$UnsupportedRrulePart:$key")
-      parts(key) = value
-    }
-    val freq = parts.getOrElse("FREQ", "")
-    if (freq.isEmpty || UnboundedFrequencies.contains(freq)) return Left(RuleNotTerminating)
-    if (!parts.contains("UNTIL") && !parts.contains("COUNT")) return Left(RuleNotTerminating)
-    val countOk = parts.get("COUNT") match {
-      case None => true
-      case Some(count) => count.toIntOption.exists(n => n >= 1 && n <= MaxCount)
-    }
-    if (!countOk) return Left(s"COUNT must be 1..$MaxCount")
-    val untilOk = parts.get("UNTIL") match {
-      case None => true
-      case Some(until) => aware(until).isDefined
-    }
-    if (!untilOk) return Left(s"$MissingTz:UNTIL")
-    Right(parts.toMap)
-  }
-
-  def normalizeRrule(parts: Map[String, String]): String =
-    parts.toSeq.sortBy(_._1).map { case (key, value) => s"$key=$value" }.mkString(";")
+  /** Why the rule cannot be stored, or None. Refused, never trimmed: the stored rule is the rule the user wrote. */
+  def ruleError(parts: Map[String, String]): Option[String] =
+    if (parts.exists { case (key, value) => !Rrule.SupportedParts.contains(key) || value.isEmpty }) Some("unsupported_rrule_part")
+    else if (parts.isEmpty) None // one occurrence
+    else if (!Rrule.Frequencies.contains(parts.getOrElse("FREQ", ""))) Some("unsupported_rrule_part")
+    // The expander walks the rule until it ends: it must end, and each step must move forward.
+    else if (parts.get("INTERVAL").exists(positive(_) == 0)) Some("rule_not_terminating")
+    else if (!parts.contains("COUNT") && !parts.contains("UNTIL")) Some("rule_not_terminating")
+    else if (parts.get("COUNT").exists(c => positive(c) == 0 || positive(c) > Rrule.MaxCount)) Some("rule_not_terminating")
+    else None
 
   val route: Route =
     path("v1" / "events") {
       post {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
           entity(as[EventRequest]) { body =>
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else if (body.calendar_id.isEmpty) {
-              complete(StatusCodes.BadRequest, """{"error":"calendar_id is required"}""")
-            } else if (body.title.isEmpty || body.title.length > MaxTitleLength) {
-              complete(StatusCodes.BadRequest, """{"error":"title must be 1..MaxTitleLength characters"}""")
-            } else if (!knownZone(body.timezone)) {
-              complete(StatusCodes.UnprocessableEntity, s"""{"error":"$MissingTz:timezone"}""")
-            } else if (aware(body.dtstart).isEmpty) {
-              complete(StatusCodes.UnprocessableEntity, s"""{"error":"$MissingTz:dtstart"}""")
-            } else if (aware(body.dtend).isEmpty) {
-              complete(StatusCodes.UnprocessableEntity, s"""{"error":"$MissingTz:dtend"}""")
-            } else {
-              parseRrule(body.rrule) match {
-                case Left(problem) =>
-                  complete(StatusCodes.UnprocessableEntity, s"""{"error":"$problem"}""")
-                case Right(parts) =>
-                  val record =
-                    EventRequest(body.calendar_id, body.title, normalizeRrule(parts), body.dtstart, body.dtend, body.timezone)
-                  val stored = store.createEvent(body.calendar_id, record)
-                  system.log.info(
-                    s"event created tenant=\${tenantOpt.get} calendar=\${body.calendar_id} revision=\${stored.revision}",
-                  )
-                  complete(StatusCodes.Created, CreatedEvent(stored.event_id, stored.revision, body.calendar_id))
+            val tenant = tenantOpt.getOrElse("")
+            if (tenant.isEmpty) error(StatusCodes.Unauthorized, "missing_tenant")
+            else {
+              val parts = Rrule.ruleParts(body.rrule.getOrElse(""))
+              // An instant without an offset names no instant: refuse it rather than guess a zone.
+              val untilKnown = parts.get("UNTIL").forall(until => Rrule.parseInstant(until).isDefined)
+              ruleError(parts) match {
+                case Some(problem) => error(StatusCodes.UnprocessableEntity, problem)
+                case None =>
+                  (Rrule.parseInstant(body.dtstart), Rrule.parseInstant(body.dtend)) match {
+                    case (Some(start), Some(end)) if untilKnown =>
+                      if (end <= start) error(StatusCodes.UnprocessableEntity, "invalid_range")
+                      else {
+                        val event = Event(
+                          Store.newId(),
+                          body.calendar_id,
+                          tenant,
+                          body.title,
+                          Rrule.formatRule(parts),
+                          Rrule.formatInstant(start),
+                          Rrule.formatInstant(end),
+                          1L,
+                          body.attendees.getOrElse(Seq.empty)
+                        )
+                        Store.putEvent(event)
+                        ExpansionCache.bumpGeneration(body.calendar_id) // step 2
+                        system.log.info(s"event=\${event.event_id} calendar=\${body.calendar_id} tenant=$tenant")
+                        complete(StatusCodes.Created, event)
+                      }
+                    case _ => error(StatusCodes.UnprocessableEntity, "invalid_instant")
+                  }
               }
             }
           }
@@ -873,213 +741,508 @@ object EventApi {
 #include <nlohmann/json.hpp>
 
 #include <iostream>
-#include <set>
 #include <string>
+#include <vector>
+
+#include "calendard/rrule.h"
+#include "calendard/store.h"
 
 using json = nlohmann::json;
 
-int main() {
-  httplib::Server svr;
+// Built in step 2 (state.cpp): retires the calendar's cached slices.
+long long bumpGeneration(const std::string& calendar_id);
 
-  svr.Post("/v1/events", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const std::set<std::string> recognized = {"FREQ", "INTERVAL", "COUNT", "UNTIL"};
-    const auto raw = body.value("rrule", std::string());
-    std::string kept;
-    std::size_t start = 0;
-    while (start <= raw.size()) {
-      const auto end = raw.find(';', start);
-      const auto chunk = raw.substr(start, end == std::string::npos ? std::string::npos : end - start);
-      const auto key = chunk.substr(0, chunk.find('='));
-      if (recognized.count(key) > 0) kept += (kept.empty() ? "" : ";") + chunk;
-      if (end == std::string::npos) break;
-      start = end + 1;
-    }
-    std::clog << "event created tenant=" << tenant << " calendar=" << body.value("calendar_id", std::string())
-              << " rrule=" << kept << "\\n";
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
+static void fail(httplib::Response& res, int status, const std::string& code) {
+  res.status = status;
+  res.set_content(json{{"error", code}}.dump(), "application/json");
+}
 
-  svr.listen("0.0.0.0", 8443);
+// An instant written without an offset is read as UTC.
+static std::string assumeUtc(const std::string& text) {
+  if (!text.empty() && text.back() == 'Z') return text;
+  if (text.size() > 6 && (text[text.size() - 6] == '+' || text[text.size() - 6] == '-')) return text;
+  return text + "Z";
+}
+
+void createEvent(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, "missing_tenant");
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return fail(res, 400, "invalid_json");
+  const std::string calendar_id = body.value("calendar_id", "");
+  const auto parts = calendard::rrule::RuleParts(body.value("rrule", ""));
+  const auto start = calendard::rrule::ParseInstant(assumeUtc(body.value("dtstart", "")));
+  const auto end = calendard::rrule::ParseInstant(assumeUtc(body.value("dtend", "")));
+  if (!start || !end) return fail(res, 422, "invalid_instant");
+  const calendard::Event event{calendard::NewId(),
+                               calendar_id,
+                               tenant,
+                               body.value("title", ""),
+                               calendard::rrule::FormatRule(parts),
+                               calendard::rrule::FormatInstant(*start),
+                               calendard::rrule::FormatInstant(*end),
+                               1,
+                               body.value("attendees", std::vector<std::string>{})};
+  calendard::store::PutEvent(event);
+  bumpGeneration(calendar_id);
+  std::clog << "event=" << event.event_id << " calendar=" << calendar_id << " tenant=" << tenant << "\\n";
+  res.status = 201;
+  res.set_content(json(event).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/events", createEvent);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <chrono>
-#include <cstdlib>
+#include <algorithm>
 #include <iostream>
 #include <map>
-#include <optional>
-#include <regex>
-#include <set>
 #include <string>
+#include <vector>
+
+#include "calendard/rrule.h"
+#include "calendard/store.h"
 
 using json = nlohmann::json;
 
-const std::set<std::string> kSupportedRruleParts = {
-    "FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "BYMONTH", "WKST"};
-const std::set<std::string> kUnboundedFrequencies = {"SECONDLY", "MINUTELY", "HOURLY"};
-constexpr std::size_t kMaxRruleLength = 512;
-constexpr std::size_t kMaxTitleLength = 200;
-constexpr long kMaxCount = 5000;
-const std::string kMissingTz = "MISSING_TZ";
-const std::string kUnsupportedRrulePart = "UNSUPPORTED_RRULE_PART";
-const std::string kRuleNotTerminating = "RULE_NOT_TERMINATING";
-const std::regex kTzSuffixRe(R"((Z|[+-]\\d{2}:?\\d{2})$)", std::regex::ECMAScript);
+// Built in step 2 (state.cpp): retires the calendar's cached slices.
+long long bumpGeneration(const std::string& calendar_id);
 
-struct StoredEvent {
-  std::string event_id;
-  int revision = 0;
-};
-
-struct EventRecord {
-  std::string calendar_id;
-  std::string title;
-  std::string rrule;
-  std::string dtstart;
-  std::string dtend;
-  std::string timezone;
-};
-
-struct EventStore {
-  StoredEvent create_event(const std::string& calendarId, const EventRecord& record);
-};
-
-EventStore store;
-
-bool tzAware(const std::string& value) { return std::regex_search(value, kTzSuffixRe); }
-
-bool knownZone(const std::string& zone) {
-  if (tzAware(zone)) return true;
-  try {
-    std::chrono::locate_zone(zone);
-    return true;
-  } catch (const std::exception&) {
-    return false;
-  }
+static void fail(httplib::Response& res, int status, const std::string& code) {
+  res.status = status;
+  res.set_content(json{{"error", code}}.dump(), "application/json");
 }
 
-std::optional<std::map<std::string, std::string>> parseRrule(const std::string& raw, std::string& problem) {
-  if (raw.size() > kMaxRruleLength) {
-    problem = "RRULE_TOO_LONG";
-    return std::nullopt;
-  }
-  std::map<std::string, std::string> parts;
-  std::size_t start = 0;
-  while (start <= raw.size()) {
-    const auto end = raw.find(';', start);
-    const auto chunk = raw.substr(start, end);
-    const auto eq = chunk.find('=');
-    const auto key = eq == std::string::npos ? chunk : chunk.substr(0, eq);
-    const auto value = eq == std::string::npos ? std::string() : chunk.substr(eq + 1);
-    if (eq == std::string::npos || kSupportedRruleParts.count(key) == 0 || value.empty()) {
-      problem = kUnsupportedRrulePart + ":" + key;
-      return std::nullopt;
-    }
-    parts[key] = value;
-    if (end == std::string::npos) break;
-    start = end + 1;
-  }
-  const auto freq = parts.find("FREQ");
-  if (freq == parts.end() || kUnboundedFrequencies.count(freq->second) > 0) {
-    problem = kRuleNotTerminating;
-    return std::nullopt;
-  }
-  if (parts.count("UNTIL") == 0 && parts.count("COUNT") == 0) {
-    problem = kRuleNotTerminating;
-    return std::nullopt;
-  }
-  if (parts.count("COUNT") > 0) {
-    const auto& count = parts["COUNT"];
-    char* stop = nullptr;
-    const long parsed = std::strtol(count.c_str(), &stop, 10);
-    if (stop != count.c_str() + count.size() || parsed < 1 || parsed > kMaxCount) {
-      problem = "COUNT must be 1..kMaxCount";
-      return std::nullopt;
-    }
-  }
-  if (parts.count("UNTIL") > 0 && !tzAware(parts["UNTIL"])) {
-    problem = kMissingTz + ":UNTIL";
-    return std::nullopt;
-  }
-  return parts;
+// A positive integer; 0 for anything else.
+static long long positive(const std::string& text) {
+  if (text.empty() || text.size() > 9 || !std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; })) return 0;
+  return std::stoll(text);
 }
 
-std::string normalizeRrule(const std::map<std::string, std::string>& parts) {
-  std::string joined;
-  for (const auto& [key, value] : parts) joined += (joined.empty() ? "" : ";") + key + "=" + value;
-  return joined;
+// Why the rule cannot be stored, or "". Refused, never trimmed: the stored rule is the rule the user wrote.
+static std::string ruleError(const std::map<std::string, std::string>& parts) {
+  const auto& supported = calendard::rrule::kSupportedParts;
+  for (const auto& [key, value] : parts) {
+    if (std::find(supported.begin(), supported.end(), key) == supported.end() || value.empty()) return "unsupported_rrule_part";
+  }
+  if (parts.empty()) return "";  // one occurrence
+  if (!parts.count("FREQ") || !calendard::rrule::kFrequencies.count(parts.at("FREQ"))) return "unsupported_rrule_part";
+  // The expander walks the rule until it ends: it must end, and each step must move forward.
+  if (parts.count("INTERVAL") && positive(parts.at("INTERVAL")) == 0) return "rule_not_terminating";
+  if (!parts.count("COUNT") && !parts.count("UNTIL")) return "rule_not_terminating";
+  if (parts.count("COUNT")) {
+    const long long count = positive(parts.at("COUNT"));
+    if (count == 0 || count > calendard::rrule::kMaxCount) return "rule_not_terminating";
+  }
+  return "";
 }
 
-int main() {
-  httplib::Server svr;
+void createEvent(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, "missing_tenant");
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return fail(res, 400, "invalid_json");
+  const std::string calendar_id = body.value("calendar_id", "");
+  const auto parts = calendard::rrule::RuleParts(body.value("rrule", ""));
+  const std::string problem = ruleError(parts);
+  if (!problem.empty()) return fail(res, 422, problem);
+  // An instant without an offset names no instant: refuse it rather than guess a zone.
+  const auto start = calendard::rrule::ParseInstant(body.value("dtstart", ""));
+  const auto end = calendard::rrule::ParseInstant(body.value("dtend", ""));
+  const bool until_ok = !parts.count("UNTIL") || calendard::rrule::ParseInstant(parts.at("UNTIL")).has_value();
+  if (!start || !end || !until_ok) return fail(res, 422, "invalid_instant");
+  if (*end <= *start) return fail(res, 422, "invalid_range");
+  const calendard::Event event{calendard::NewId(),
+                               calendar_id,
+                               tenant,
+                               body.value("title", ""),
+                               calendard::rrule::FormatRule(parts),
+                               calendard::rrule::FormatInstant(*start),
+                               calendard::rrule::FormatInstant(*end),
+                               1,
+                               body.value("attendees", std::vector<std::string>{})};
+  calendard::store::PutEvent(event);
+  bumpGeneration(calendar_id);
+  std::clog << "event=" << event.event_id << " calendar=" << calendar_id << " tenant=" << tenant << "\\n";
+  res.status = 201;
+  res.set_content(json(event).dump(), "application/json");
+}
 
-  svr.Post("/v1/events", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto calendarId = body.value("calendar_id", std::string());
-    const auto title = body.value("title", std::string());
-    if (calendarId.empty() || title.empty() || title.size() > kMaxTitleLength) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid calendar_id or title"})", "application/json");
-      return;
-    }
-    const auto timezone = body.value("timezone", std::string());
-    if (!knownZone(timezone)) {
-      res.status = 422;
-      res.set_content(json{{"error", kMissingTz + ":timezone"}}.dump(), "application/json");
-      return;
-    }
-    const auto dtStart = body.value("dtstart", std::string());
-    const auto dtEnd = body.value("dtend", std::string());
-    if (!tzAware(dtStart) || !tzAware(dtEnd)) {
-      res.status = 422;
-      res.set_content(json{{"error", kMissingTz + ":dtstart or dtend"}}.dump(), "application/json");
-      return;
-    }
-    std::string problem;
-    const auto parts = parseRrule(body.value("rrule", std::string()), problem);
-    if (!parts) {
-      res.status = 422;
-      res.set_content(json{{"error", problem}}.dump(), "application/json");
-      return;
-    }
-    const EventRecord record{calendarId, title, normalizeRrule(*parts), dtStart, dtEnd, timezone};
-    const auto stored = store.create_event(calendarId, record);
-    std::clog << "event created tenant=" << tenant << " calendar=" << calendarId
-              << " revision=" << stored.revision << "\\n";
-    res.status = 201;
-    res.set_content(json{{"event_id", stored.event_id}, {"revision", stored.revision}, {"calendar_id", calendarId}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/events", createEvent);
 }
 `,
     },
   },
+  harness: {
+    python: `H = {"X-Tenant-Id": "t1"}
+# A weekly 30-minute standup, four times from Monday 2 March 2026.
+BODY = {
+    "calendar_id": "c1",
+    "title": "Standup",
+    "rrule": "FREQ=WEEKLY;COUNT=4",
+    "dtstart": "2026-03-02T09:00:00Z",
+    "dtend": "2026-03-02T09:30:00Z",
+    "attendees": ["ana@example.com", "bo@example.com"],
+}
+
+
+async def _post(ctx, m, **changes):
+    async with ctx.client(m.app) as c:
+        return await c.post("/v1/events", json={**BODY, **changes}, headers=H)
+
+
+def _error(r):
+    try:
+        return r.json().get("error")
+    except ValueError:
+        return None
+
+
+def _nothing_stored(ctx, what):
+    keys = ctx.redis.keys("event:*")
+    assert keys == [], f"{what} was stored anyway: Redis holds {keys}"
+
+
+async def _refused(ctx, m, status, code, what, **changes):
+    r = await _post(ctx, m, **changes)
+    assert r.status_code == status and _error(r) == code, f"{what} answered {r.status_code} {r.text}, expected {status} {code}"
+    _nothing_stored(ctx, what)
+
+
+async def check_route(ctx):
+    m = ctx.load("api")
+    r = await _post(ctx, m)
+    assert r.status_code == 201, f"POST /v1/events for a weekly rule with COUNT=4 answered {r.status_code}: {r.text}"
+    event = r.json()
+    assert event.get("event_id") and event.get("revision") == 1, f"the answer must carry event_id and revision 1: {event}"
+    stored = ctx.redis.hgetall(f"event:{event['event_id']}")
+    assert stored.get("rrule") == "FREQ=WEEKLY;COUNT=4" and stored.get("calendar_id") == "c1", f"event:{event['event_id']} holds {stored}"
+    assert ctx.redis.sismember("calendar:c1:events", event["event_id"]), "the event is not indexed in calendar:c1:events"
+    assert ctx.redis.get("gen:c1") == "1", f"gen:c1 is {ctx.redis.get('gen:c1')!r} after the create: bump_generation retires the calendar's cached weeks"
+
+
+async def check_unknown_parts(ctx):
+    m = ctx.load("api")
+    for rule in ("FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT"):
+        await _refused(ctx, m, 422, "unsupported_rrule_part", f"the rule {rule!r}", rrule=rule)
+    r = await _post(ctx, m, rrule="")
+    assert r.status_code == 201, f"an empty rule (one occurrence) answered {r.status_code}: {r.text}"
+
+
+async def check_rule_terminates(ctx):
+    m = ctx.load("api")
+    for rule in ("FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z"):
+        await _refused(ctx, m, 422, "rule_not_terminating", f"the rule {rule!r}", rrule=rule)
+    for rule in ("FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000"):
+        r = await _post(ctx, m, rrule=rule)
+        assert r.status_code == 201, f"the rule {rule!r} ends and answered {r.status_code}: {r.text}"
+
+
+async def check_tz_aware(ctx):
+    m = ctx.load("api")
+    await _refused(ctx, m, 422, "invalid_instant", "a dtstart without an offset", dtstart="2026-03-02T09:00:00")
+    await _refused(ctx, m, 422, "invalid_instant", "a dtend without an offset", dtend="2026-03-02T09:30:00")
+    await _refused(ctx, m, 422, "invalid_instant", "an UNTIL without an offset", rrule="FREQ=DAILY;UNTIL=2026-06-01T00:00:00")
+    r = await _post(ctx, m, dtstart="2026-03-02T10:00:00+01:00", dtend="2026-03-02T10:30:00+01:00")
+    assert r.status_code == 201, f"instants with a +01:00 offset answered {r.status_code}: {r.text}"
+    stored = ctx.redis.hgetall(f"event:{r.json()['event_id']}")
+    assert stored.get("dtstart") == "2026-03-02T09:00:00Z", f"10:00+01:00 was stored as {stored.get('dtstart')!r}, expected 2026-03-02T09:00:00Z"
+
+
+async def check_range_order(ctx):
+    m = ctx.load("api")
+    await _refused(ctx, m, 422, "invalid_range", "an event that ends when it starts", dtend=BODY["dtstart"])
+    await _refused(ctx, m, 422, "invalid_range", "an event that ends before it starts", dtend="2026-03-02T08:00:00Z")
+`,
+    typescript: `const H = {'X-Tenant-Id': 't1'};
+// A weekly 30-minute standup, four times from Monday 2 March 2026.
+const BODY = {
+  calendar_id: 'c1',
+  title: 'Standup',
+  rrule: 'FREQ=WEEKLY;COUNT=4',
+  dtstart: '2026-03-02T09:00:00Z',
+  dtend: '2026-03-02T09:30:00Z',
+  attendees: ['ana@example.com', 'bo@example.com'],
+};
+
+const post = (ctx, m, changes: Record<string, unknown> = {}) =>
+  ctx.client(m.app).post('/v1/events', {json: {...BODY, ...changes}, headers: H});
+
+const errorOf = (r): string | undefined => {
+  try {
+    return r.json().error;
+  } catch {
+    return undefined;
+  }
+};
+
+async function refused(ctx, m, status: number, code: string, what: string, changes: Record<string, unknown>) {
+  const r = await post(ctx, m, changes);
+  assert(r.status === status && errorOf(r) === code, \`\${what} answered \${r.status} \${r.text}, expected \${status} \${code}\`);
+  const keys = ctx.redis.keys('event:*');
+  assert.deepEqual(keys, [], \`\${what} was stored anyway: Redis holds \${JSON.stringify(keys)}\`);
+}
+
+export async function check_route(ctx) {
+  const m = ctx.load('api');
+  const r = await post(ctx, m);
+  assert.equal(r.status, 201, \`POST /v1/events for a weekly rule with COUNT=4 answered \${r.status}: \${r.text}\`);
+  const event = r.json();
+  assert(event.event_id && event.revision === 1, \`the answer must carry event_id and revision 1: \${r.text}\`);
+  const stored = ctx.redis.hgetall(\`event:\${event.event_id}\`);
+  assert(stored.rrule === 'FREQ=WEEKLY;COUNT=4' && stored.calendar_id === 'c1', \`event:\${event.event_id} holds \${JSON.stringify(stored)}\`);
+  assert(ctx.redis.smembers('calendar:c1:events').includes(event.event_id), 'the event is not indexed in calendar:c1:events');
+  assert.equal(ctx.redis.get('gen:c1'), '1', \`gen:c1 is \${JSON.stringify(ctx.redis.get('gen:c1'))} after the create: bumpGeneration retires the calendar's cached weeks\`);
+}
+
+export async function check_unknown_parts(ctx) {
+  const m = ctx.load('api');
+  for (const rule of ['FREQ=WEEKLY;COUNT=4;BYSECOND=30', 'FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE', 'FREQ=SECONDLY;COUNT=10', 'FREQ=WEEKLY;COUNT']) {
+    await refused(ctx, m, 422, 'unsupported_rrule_part', \`the rule \${JSON.stringify(rule)}\`, {rrule: rule});
+  }
+  const r = await post(ctx, m, {rrule: ''});
+  assert.equal(r.status, 201, \`an empty rule (one occurrence) answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_rule_terminates(ctx) {
+  const m = ctx.load('api');
+  for (const rule of ['FREQ=DAILY', 'FREQ=DAILY;COUNT=6000', 'FREQ=DAILY;COUNT=0', 'FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z']) {
+    await refused(ctx, m, 422, 'rule_not_terminating', \`the rule \${JSON.stringify(rule)}\`, {rrule: rule});
+  }
+  for (const rule of ['FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z', 'FREQ=DAILY;INTERVAL=2;COUNT=5000']) {
+    const r = await post(ctx, m, {rrule: rule});
+    assert.equal(r.status, 201, \`the rule \${JSON.stringify(rule)} ends and answered \${r.status}: \${r.text}\`);
+  }
+}
+
+export async function check_tz_aware(ctx) {
+  const m = ctx.load('api');
+  await refused(ctx, m, 422, 'invalid_instant', 'a dtstart without an offset', {dtstart: '2026-03-02T09:00:00'});
+  await refused(ctx, m, 422, 'invalid_instant', 'a dtend without an offset', {dtend: '2026-03-02T09:30:00'});
+  await refused(ctx, m, 422, 'invalid_instant', 'an UNTIL without an offset', {rrule: 'FREQ=DAILY;UNTIL=2026-06-01T00:00:00'});
+  const r = await post(ctx, m, {dtstart: '2026-03-02T10:00:00+01:00', dtend: '2026-03-02T10:30:00+01:00'});
+  assert.equal(r.status, 201, \`instants with a +01:00 offset answered \${r.status}: \${r.text}\`);
+  const stored = ctx.redis.hgetall(\`event:\${r.json().event_id}\`);
+  assert.equal(stored.dtstart, '2026-03-02T09:00:00Z', \`10:00+01:00 was stored as \${JSON.stringify(stored.dtstart)}, expected 2026-03-02T09:00:00Z\`);
+}
+
+export async function check_range_order(ctx) {
+  const m = ctx.load('api');
+  await refused(ctx, m, 422, 'invalid_range', 'an event that ends when it starts', {dtend: BODY.dtstart});
+  await refused(ctx, m, 422, 'invalid_range', 'an event that ends before it starts', {dtend: '2026-03-02T08:00:00Z'});
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	"leetbuild/harness"
+)
+
+// apiClient serves the learner's route over step 2's bumpGeneration, which the harness stands in for.
+func apiClient(ctx *harness.Ctx) *harness.HTTP {
+	bumpGeneration = func(_ context.Context, calendarID string) (int64, error) {
+		generation, _ := ctx.Redis.Do("INCR", "gen:"+calendarID).(int64)
+		return generation, nil
+	}
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+// apiPost sends a weekly 30-minute standup, four times from Monday 2 March 2026, with changes applied.
+func apiPost(c *harness.HTTP, changes map[string]any) *harness.Response {
+	body := map[string]any{
+		"calendar_id": "c1", "title": "Standup", "rrule": "FREQ=WEEKLY;COUNT=4",
+		"dtstart": "2026-03-02T09:00:00Z", "dtend": "2026-03-02T09:30:00Z", "attendees": []string{"ana@example.com", "bo@example.com"},
+	}
+	for k, v := range changes {
+		body[k] = v
+	}
+	return c.Post("/v1/events", body, "X-Tenant-Id", "t1")
+}
+
+func apiBody(r *harness.Response) map[string]any {
+	var body map[string]any
+	if err := json.Unmarshal(r.Body, &body); err != nil {
+		return map[string]any{}
+	}
+	return body
+}
+
+func apiRefused(ctx *harness.Ctx, c *harness.HTTP, status int, code, what string, changes map[string]any) {
+	r := apiPost(c, changes)
+	ctx.Assert(r.Status == status && apiBody(r)["error"] == code, "%s answered %d %s, expected %d %s", what, r.Status, r.Text(), status, code)
+	keys := ctx.Redis.Keys("event:*")
+	ctx.Assert(len(keys) == 0, "%s was stored anyway: Redis holds %q", what, keys)
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	r := apiPost(c, nil)
+	ctx.Equal(r.Status, 201, "POST /v1/events for a weekly rule with COUNT=4 (%s)", r.Text())
+	event := apiBody(r)
+	eventID, _ := event["event_id"].(string)
+	ctx.Assert(eventID != "" && event["revision"] == float64(1), "the answer must carry event_id and revision 1: %s", r.Text())
+	stored := ctx.Redis.HGetAll("event:" + eventID)
+	ctx.Assert(stored["rrule"] == "FREQ=WEEKLY;COUNT=4" && stored["calendar_id"] == "c1", "event:%s holds %v", eventID, stored)
+	ctx.Assert(ctx.Redis.SIsMember("calendar:c1:events", eventID), "the event is not indexed in calendar:c1:events")
+	generation, _ := ctx.Redis.Get("gen:c1")
+	ctx.Equal(generation, "1", "gen:c1 after the create (bumpGeneration retires the calendar's cached weeks)")
+}
+
+func CheckUnknownParts(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	for _, rule := range []string{"FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT"} {
+		apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule "+rule, map[string]any{"rrule": rule})
+	}
+	r := apiPost(c, map[string]any{"rrule": ""})
+	ctx.Equal(r.Status, 201, "an empty rule, one occurrence (%s)", r.Text())
+}
+
+func CheckRuleTerminates(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	for _, rule := range []string{"FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z"} {
+		apiRefused(ctx, c, 422, "rule_not_terminating", "the rule "+rule, map[string]any{"rrule": rule})
+	}
+	for _, rule := range []string{"FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000"} {
+		r := apiPost(c, map[string]any{"rrule": rule})
+		ctx.Equal(r.Status, 201, "the rule %s ends (%s)", rule, r.Text())
+	}
+}
+
+func CheckTzAware(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset", map[string]any{"dtstart": "2026-03-02T09:00:00"})
+	apiRefused(ctx, c, 422, "invalid_instant", "a dtend without an offset", map[string]any{"dtend": "2026-03-02T09:30:00"})
+	apiRefused(ctx, c, 422, "invalid_instant", "an UNTIL without an offset", map[string]any{"rrule": "FREQ=DAILY;UNTIL=2026-06-01T00:00:00"})
+	r := apiPost(c, map[string]any{"dtstart": "2026-03-02T10:00:00+01:00", "dtend": "2026-03-02T10:30:00+01:00"})
+	ctx.Equal(r.Status, 201, "instants with a +01:00 offset (%s)", r.Text())
+	eventID, _ := apiBody(r)["event_id"].(string)
+	ctx.Equal(ctx.Redis.HGetAll("event:" + eventID)["dtstart"], "2026-03-02T09:00:00Z", "the stored dtstart of 10:00+01:00")
+}
+
+func CheckRangeOrder(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	apiRefused(ctx, c, 422, "invalid_range", "an event that ends when it starts", map[string]any{"dtend": "2026-03-02T09:00:00Z"})
+	apiRefused(ctx, c, 422, "invalid_range", "an event that ends before it starts", map[string]any{"dtend": "2026-03-02T08:00:00Z"})
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "state.cpp"
+
+namespace {
+
+harness::HTTP apiClient(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+// A weekly 30-minute standup, four times from Monday 2 March 2026, with one field changed.
+harness::Response apiPost(harness::HTTP& c, const std::string& field = "", const std::string& value = "") {
+  nlohmann::json body = {{"calendar_id", "c1"},
+                         {"title", "Standup"},
+                         {"rrule", "FREQ=WEEKLY;COUNT=4"},
+                         {"dtstart", "2026-03-02T09:00:00Z"},
+                         {"dtend", "2026-03-02T09:30:00Z"},
+                         {"attendees", {"ana@example.com", "bo@example.com"}}};
+  if (!field.empty()) body[field] = value;
+  return c.Post("/v1/events", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+}
+
+nlohmann::json apiBody(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : nlohmann::json::object();
+}
+
+void apiRefused(harness::Ctx& ctx, harness::HTTP& c, int status, const std::string& code, const std::string& what,
+                const std::string& field, const std::string& value) {
+  const auto r = apiPost(c, field, value);
+  ctx.Assert(r.Status == status && apiBody(r).value("error", "") == code, "%s answered %d %s, expected %d %s", what, r.Status,
+             r.Text(), status, code);
+  const auto keys = ctx.Redis.Keys("event:*");
+  ctx.Assert(keys.empty(), "%s was stored anyway: Redis holds %q", what, keys);
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  const auto r = apiPost(c);
+  ctx.Equal(r.Status, 201, "POST /v1/events for a weekly rule with COUNT=4 (%s)", r.Text());
+  const auto event = apiBody(r);
+  const std::string event_id = event.value("event_id", "");
+  ctx.Assert(!event_id.empty() && event.value("revision", 0) == 1, "the answer must carry event_id and revision 1: %s", r.Text());
+  auto stored = ctx.Redis.HGetAll("event:" + event_id);
+  ctx.Assert(stored["rrule"] == "FREQ=WEEKLY;COUNT=4" && stored["calendar_id"] == "c1", "event:%s holds %v", event_id, stored);
+  ctx.Assert(ctx.Redis.SIsMember("calendar:c1:events", event_id), "the event is not indexed in calendar:c1:events");
+  ctx.Equal(ctx.Redis.Get("gen:c1").value_or(""), "1", "gen:c1 after the create (bumpGeneration retires the calendar's cached weeks)");
+}
+
+void CheckUnknownParts(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  for (const std::string rule : {"FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT"}) {
+    apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule " + rule, "rrule", rule);
+  }
+  const auto r = apiPost(c, "rrule", "");
+  ctx.Equal(r.Status, 201, "an empty rule, one occurrence (%s)", r.Text());
+}
+
+void CheckRuleTerminates(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  for (const std::string rule : {"FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z"}) {
+    apiRefused(ctx, c, 422, "rule_not_terminating", "the rule " + rule, "rrule", rule);
+  }
+  for (const std::string rule : {"FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000"}) {
+    const auto r = apiPost(c, "rrule", rule);
+    ctx.Equal(r.Status, 201, "the rule %s ends (%s)", rule, r.Text());
+  }
+}
+
+void CheckTzAware(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset", "dtstart", "2026-03-02T09:00:00");
+  apiRefused(ctx, c, 422, "invalid_instant", "a dtend without an offset", "dtend", "2026-03-02T09:30:00");
+  apiRefused(ctx, c, 422, "invalid_instant", "an UNTIL without an offset", "rrule", "FREQ=DAILY;UNTIL=2026-06-01T00:00:00");
+  nlohmann::json body = {{"calendar_id", "c1"},
+                         {"title", "Standup"},
+                         {"rrule", "FREQ=WEEKLY;COUNT=4"},
+                         {"dtstart", "2026-03-02T10:00:00+01:00"},
+                         {"dtend", "2026-03-02T10:30:00+01:00"}};
+  const auto r = c.Post("/v1/events", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  ctx.Equal(r.Status, 201, "instants with a +01:00 offset (%s)", r.Text());
+  auto stored = ctx.Redis.HGetAll("event:" + apiBody(r).value("event_id", ""));
+  ctx.Equal(stored["dtstart"], "2026-03-02T09:00:00Z", "the stored dtstart of 10:00+01:00");
+}
+
+void CheckRangeOrder(harness::Ctx& ctx) {
+  auto c = apiClient(ctx);
+  apiRefused(ctx, c, 422, "invalid_range", "an event that ends when it starts", "dtend", "2026-03-02T09:00:00Z");
+  apiRefused(ctx, c, 422, "invalid_range", "an event that ends before it starts", "dtend", "2026-03-02T08:00:00Z");
+}
+`,
+  },
   hints: [
-    'A user posts `FREQ=SECONDLY` with no end and gets a 200 with their own body back; an hour later the expansion worker is still running and no event_id exists anywhere.',
-    'The starter only reads the four parts it knows, checks nothing about FREQ or an end, trusts naked datetimes, and returns the request instead of calling the store.',
-    'Whitelist every key against `SUPPORTED_RRULE_PARTS`, require `UNTIL` or a capped `COUNT` with a bounded `FREQ`, enforce `TZ_SUFFIX_RE`, then answer 201 with `store.create_event` output.',
+    'A daily rule with no end makes every reminder sweep slower, `BYDAY=MO,WE` lands every day, a 10:00 Berlin standup shows at 11:00, and one meeting ends half an hour before it starts.',
+    '`format_rule` writes only the parts it knows, so the trim hides what should be a refusal; nothing compares `COUNT`, `UNTIL` or `INTERVAL` with an end; `assume_utc` invents an offset; nothing compares `dtend` with `dtstart`.',
+    'Before `put_event`: a key outside `SUPPORTED_PARTS`, an empty value or an unknown `FREQ` is `unsupported_rrule_part`; require `UNTIL` or `COUNT` 1..5000 and `INTERVAL` ≥ 1; parse every instant with `parse_instant` alone; then `dtend > dtstart`.',
   ],
-  debrief: `Termination is two conditions, a frequency that can end and an explicit end, with a \`COUNT\` cap so "bounded" is still a budget the expander can pay. The part whitelist is a contract rather than a filter: unknown parts are a **422** because the rule the user wrote has to be the rule that expands, and a dropped \`BYSECOND\` moves a meeting without anyone noticing. Timezones belong to the parse because \`dtstart\`, \`dtend\` and \`UNTIL\` are instants, not wall-clock strings. The response carries the \`event_id\` and \`revision\` the store assigned because the cache, the notifier and the change stream key on that revision. Production calendars go further with a full RFC 5545 grammar, an expansion horizon for open-ended rules, and the original rule text kept beside the normalized form.`,
+  debrief: `A rule is a program every reader of the calendar runs, so the create is where it is proven to halt: it has an end, the count is bounded, and each step moves forward. Refusing an unknown part instead of trimming it keeps the stored rule equal to the rule the user wrote; a calendar that drops \`BYDAY\` shows the meeting on the wrong days and tells nobody. An instant without an offset is not an instant, and guessing UTC moves the meeting by the writer's offset for every attendee at once. Production calendars accept the whole RFC 5545 grammar and store the zone name beside each instant, so a rule keeps its wall-clock time across daylight-saving changes.`,
 };

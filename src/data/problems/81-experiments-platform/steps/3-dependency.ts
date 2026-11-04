@@ -1,80 +1,61 @@
 import type {Step} from '@/lib/types';
 
-export const experimentClientStep: Step = {
+export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Guardrail checks before traffic increases',
+  title: 'Guardrail checks before every ramp',
   concept: 'grpc',
-  file: 'client',
+  file: 'ramp',
   focus: ['api', 'stats'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/experiments/{id}/ramp\` with body
-\`{"to_percent": 60}\`, validates the target, and asks the stats service before the percentage moves.
-It works on a demo whose metrics are green. It serves the demo and hides 5 flaws.
+**Starting point.** The starter serves \`POST /v1/experiments/{id}/ramp\` with \`{"to_percent": 50}\`:
+it checks that the target is above the current percentage and at most 100, asks the stats service
+\`Guardrails.CheckGuardrails\` over gRPC (\`stats:50051\`) and, on a clean verdict, moves the traffic
+with \`store.set_percent\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The gate disappears exactly when it matters: a breached metric
-is retried until it clears, a stuck stats service holds the request open, the body can switch the
-check off, and a paused experiment is ramped without earning a fresh pass.
+**Failure mode the checks target.** The gate is open exactly when it matters: a stuck stats service
+holds every ramp request open, a stats outage ramps without a check, a breached guardrail answers 409
+but leaves the experiment running for the next scheduled ramp, and \`skip_guardrails\` in the body
+bypasses the check.
 
-- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**. \`to_percent\` must be an
-  integer, greater than the experiment's current percentage and at most **100**; anything else is
-  **400**.
-- Before the percentage is applied, call \`CheckGuardrails(experiment_id, metric_bounds)\` over gRPC
-  with a **2 000 ms deadline** (\`timeout=2.0\` / \`{deadline: Date.now() + 2000}\` /
-  \`context.WithTimeout(..., 2*time.Second)\` / a Scala 2-second deadline /
-  \`ClientContext.set_deadline(..., milliseconds(2000))\`).
-- A breached bound **pauses** the ramp: persist \`paused\`, do **not** apply the percentage, and
-  answer **409** with \`{"status": "paused", "metric": "error_rate", "limit": 0.05, "observed": 0.12}\`.
-- \`PAUSED\` is terminal for the request. Only \`UNAVAILABLE\` or \`DEADLINE_EXCEEDED\` may be retried,
-  at most once (\`MAX_GUARDRAIL_ATTEMPTS\` = 2), and a check that does not succeed applies nothing.
-- \`skip_guardrails\`, \`override\` or \`force\` in the body is **400**; bounds come from
-  \`GUARDRAIL_BOUNDS\` config.
-- A \`paused\` experiment re-runs the check on every ramp request; only a fresh pass lifts the pause.
-- Log the experiment id, the metric and the observed value, not the raw request body.`,
+- Every \`CheckGuardrails\` call carries a **2-second** deadline (\`GUARDRAIL_DEADLINE_S\`).
+- No verdict is not a pass: an error status (deadline, unavailable) answers **503** and moves nothing.
+- A breach pauses: \`store.set_status(id, "paused")\`, no traffic change, **409**
+  \`{"status": "paused", "metric", "limit", "observed"}\`. A clean verdict sets the percentage and
+  \`running\` again.
+- A body naming any of \`OVERRIDE_FIELDS\` (\`skip_guardrails\`, \`override\`, \`force\`) is **400**.`,
   sequence: {
-    participants: ['Ramp caller', 'Experiment API', 'Stats service'],
+    participants: ['Ramp scheduler', 'Experiment API', 'Stats service', 'experiment store'],
     messages: [
       {
-        from: 'Ramp caller',
+        from: 'Ramp scheduler',
         to: 'Experiment API',
-        label: 'POST /v1/experiments/{id}/ramp · {"to_percent": 60} · X-Tenant-Id',
+        label: 'POST /v1/experiments/{id}/ramp {"to_percent": 50}',
         kind: 'sync',
       },
       {
         from: 'Experiment API',
         to: 'Stats service',
-        label: 'CheckGuardrails(experiment_id, metric_bounds) · deadline 2 s',
+        label: 'CheckGuardrails(experiment_id, to_percent) · deadline 2 s',
+        kind: 'sync',
+      },
+      {from: 'Stats service', to: 'Experiment API', label: 'breached · error_rate 0.12 > 0.05', kind: 'reply'},
+      {
+        from: 'Experiment API',
+        to: 'experiment store',
+        label: 'set_status(id, "paused") · percent unchanged',
         kind: 'sync',
       },
       {
-        from: 'Stats service',
-        to: 'Experiment API',
-        label: 'PAUSED · metric=error_rate limit=0.05 observed=0.12',
+        from: 'Experiment API',
+        to: 'Ramp scheduler',
+        label: '409 {status: "paused", metric, limit, observed}',
         kind: 'reply',
       },
       {
         from: 'Experiment API',
-        to: 'Experiment API',
-        label: 'persist paused · a PAUSED verdict is never retried',
-        kind: 'sync',
-      },
-      {
-        from: 'Experiment API',
-        to: 'Ramp caller',
-        label: '409 {"status":"paused","metric":"error_rate","limit":0.05,"observed":0.12}',
-        kind: 'reply',
-      },
-      {from: 'Stats service', to: 'Experiment API', label: 'UNAVAILABLE / DEADLINE_EXCEEDED', kind: 'reply'},
-      {
-        from: 'Experiment API',
-        to: 'Experiment API',
-        label: 'retry once inside the 2 s budget · a failed check never applies the ramp',
-        kind: 'sync',
-      },
-      {
-        from: 'Experiment API',
-        to: 'Ramp caller',
-        label: 'the next ramp re-runs the check: a fresh pass lifts the pause, a breach keeps it 409',
+        to: 'Ramp scheduler',
+        label: 'deadline / unavailable → 503, nothing moved',
         kind: 'reply',
       },
     ],
@@ -82,469 +63,242 @@ check off, and a paused experiment is ramped without earning a fresh pass.
   checks: [
     {
       id: 'deadline',
-      title: 'Guardrail RPC carries a 2 s deadline',
+      title: 'CheckGuardrails carries a 2-second deadline',
       detail:
-        'Every `CheckGuardrails` attempt is created with an explicit 2 000 ms deadline: `timeout=GUARDRAIL_DEADLINE_S`, `{deadline: Date.now() + GUARDRAIL_DEADLINE_MS}`, `context.WithTimeout(ctx, guardrailDeadline)` with `2 * time.Second`, `withDeadlineAfter(GuardrailDeadlineS, SECONDS)` or `ctx.set_deadline(..., milliseconds(kGuardrailDeadlineMs))`. The starter gives the call five seconds, so a stuck stats service holds the ramp request past the budget the platform promised.',
+        'Every guardrail call is made with a deadline of `GUARDRAIL_DEADLINE_S` (2 s); the starter sets none, so a stats service that hangs holds the ramp request for as long as it hangs.',
       match: {
-        python: {all: [/GUARDRAIL_DEADLINE_S\s*=\s*2\.0/, /timeout\s*=\s*GUARDRAIL_DEADLINE_S/]},
-        typescript: {
-          all: [/GUARDRAIL_DEADLINE_MS\s*=\s*2000/, /deadline\s*:\s*Date\.now\(\)\s*\+\s*GUARDRAIL_DEADLINE_MS/],
-        },
-        go: {all: [/guardrailDeadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout/]},
-        scala: {all: [/GuardrailDeadlineS\s*=\s*2/, /withDeadlineAfter\(\s*GuardrailDeadlineS/]},
-        cpp: {all: [/kGuardrailDeadlineMs\s*=\s*2000/, /set_deadline\(/]},
+        python: {all: [/CheckGuardrails\([\s\S]{0,200}?timeout\s*=/]},
+        typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/]},
+        go: {all: [/context\.WithTimeout\(/]},
+        scala: {all: [/withDeadlineAfter\(/]},
+        cpp: {all: [/set_deadline\(/]},
+      },
+    },
+    {
+      id: 'fail-closed',
+      title: 'No verdict answers 503 and moves nothing',
+      detail:
+        'A `CheckGuardrails` error (deadline, unavailable) answers **503** and leaves the percentage; the starter logs it and ramps as if the check had passed.',
+      match: {
+        python: {all: [/\b503\b/], none: [/verdict\s*=\s*None/]},
+        typescript: {all: [/\b503\b/], none: [/verdict\s*=\s*null/]},
+        go: {all: [/StatusServiceUnavailable|\b503\b/], none: [/verdict\s*=\s*nil/]},
+        scala: {all: [/ServiceUnavailable|\b503\b/]},
+        cpp: {all: [/\b503\b/]},
       },
     },
     {
       id: 'pause-on-breach',
-      title: 'A breached bound pauses the ramp and names the metric',
+      title: 'A breach pauses the experiment and names the metric',
       detail:
-        'A `PAUSED` verdict persists the experiment as `paused` and answers **409** with the offending `metric`, its `limit` and the `observed` value; the percentage is never applied. The order matcher holds the guardrail call before the ramp write, so a breach cannot slip through to `applyPercent`. The starter retries the verdict and ramps a metric that is still breached.',
+        'A breached verdict writes `paused` to the store, leaves the percentage, and answers **409** with the metric, its limit and the observed value.',
       match: {
-        python: {
-          all: [/\bpaused\b/, /\bmetric\b/, /CheckGuardrails\(/],
-          order: [/stats\.CheckGuardrails\(/, /store\.apply_percent\(/],
-        },
-        typescript: {
-          all: [/\bpaused\b/, /\bmetric\b/, /CheckGuardrails\(/],
-          order: [/stats\.CheckGuardrails\(/, /store\.applyPercent\(/],
-        },
-        go: {
-          all: [/paused/, /(GetMetric\(|\bMetric\b)/, /CheckGuardrails\(/],
-          order: [/stats\.CheckGuardrails\(/, /store\.ApplyPercent\(/],
-        },
-        scala: {
-          all: [/paused/, /\bmetric\b/, /[Cc]heckGuardrails\(/],
-          order: [/[Cc]heckGuardrails\(\s*CheckGuardrailsRequest/, /store\.applyPercent\(/],
-        },
-        cpp: {
-          all: [/paused/, /\bmetric\b/, /CheckGuardrails\(/],
-          order: [/stats->CheckGuardrails\(/, /store\.apply_percent\(/],
-        },
+        python: {all: [/set_status\([^\n]*["']paused["']/, /observed/]},
+        typescript: {all: [/setStatus\([^\n]*['"]paused['"]/, /observed/]},
+        go: {all: [/SetStatus\([^\n]*"paused"/, /observed/]},
+        scala: {all: [/setStatus\([^\n]*"paused"/, /observed/]},
+        cpp: {all: [/setStatus\([^\n]*"paused"/, /observed/]},
       },
     },
     {
       id: 'no-override',
-      title: 'A caller-supplied override is rejected',
+      title: 'The body cannot switch the check off',
       detail:
-        'A body field such as `skip_guardrails`, `override` or `force` is a **400**, and the guardrail input (the bounds and the verdict) does not come from the request. The starter reads `skip_guardrails` from the body and skips the check, which turns the gate into a suggestion.',
+        'A body naming any of `OVERRIDE_FIELDS` (`skip_guardrails`, `override`, `force`) answers **400** before anything else happens.',
       match: {
-        python: {
-          all: [/skip_guardrails/, /OVERRIDE_FIELDS/, /status_code\s*=\s*400/],
-          none: [
-            /body\.get\(\s*["']skip_guardrails["']/,
-            /body\[\s*["']skip_guardrails["']\s*\]/,
-            /body\.get\(\s*["']metric_bounds["']/,
-          ],
-        },
-        typescript: {
-          all: [/skip_guardrails/, /OVERRIDE_FIELDS/, /code\(\s*400\s*\)/],
-          none: [/body\.skip_guardrails/, /body\[['"]skip_guardrails['"]\]/, /body\.metricBounds/],
-        },
-        go: {
-          all: [/skip_guardrails/, /overrideFields/, /StatusBadRequest/],
-          none: [/body\.SkipGuardrails/, /body\["skip_guardrails"\]/],
-        },
-        scala: {
-          all: [/skip_guardrails/, /OverrideFields/, /StatusCodes\.BadRequest/],
-          none: [/fields\.get\(\s*"skip_guardrails"\)/, /body\.skipGuardrails/],
-        },
-        cpp: {
-          all: [/skip_guardrails/, /kOverrideFields/, /\b400\b/],
-          none: [/body\.value\(\s*"skip_guardrails"/, /body\[\s*"skip_guardrails"\s*\]/],
-        },
-      },
-    },
-    {
-      id: 'no-retry-paused',
-      title: 'A PAUSED verdict is terminal',
-      detail:
-        'The verdict is read once: a `PAUSED` answer ends the request, and only `UNAVAILABLE` / `DEADLINE_EXCEEDED` are retried, at most `MAX_GUARDRAIL_ATTEMPTS = 2` attempts, with no unbounded `while`/`for` around the check. The starter loops until the check passes, holding the request open and ramping on a metric that is still breached.',
-      match: {
-        python: {
-          all: [/VERDICT_PAUSED/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_GUARDRAIL_ATTEMPTS/],
-          none: [/while\s+True/, /itertools\.count\(\)/],
-        },
-        typescript: {
-          all: [/VERDICT_PAUSED/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_GUARDRAIL_ATTEMPTS/],
-          none: [/while\s*\(\s*true\s*\)/, /for\s*\(\s*;\s*;\s*\)/],
-        },
-        go: {
-          all: [/verdictPaused/, /codes\.Unavailable/, /codes\.DeadlineExceeded/, /maxGuardrailAttempts/],
-          none: [/for\s*\{/],
-        },
-        scala: {
-          all: [/VerdictPaused/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MaxGuardrailAttempts/],
-          none: [/while\s*\(\s*true\s*\)/, /Iterator\.continually/],
-        },
-        cpp: {
-          all: [/kVerdictPaused/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /kMaxGuardrailAttempts/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
-      },
-    },
-    {
-      id: 'fresh-check',
-      title: 'A paused experiment needs a fresh pass',
-      detail:
-        'The stored `paused` status is consulted for this request but does not substitute for the check: the ramp re-runs the guardrail call, stays `paused` and answers **409** while the breach is present, and only a fresh passing check lifts the pause and applies the percentage. The order matcher keeps the status ahead of the percentage. The starter does not read the stored status at all.',
-      match: {
-        python: {
-          all: [/experiment\[["']status["']\]\s*==\s*["']paused["']/, /status_code\s*=\s*409/],
-          order: [/experiment\[["']status["']\]\s*==\s*["']paused["']/, /store\.apply_percent\(/],
-        },
-        typescript: {
-          all: [/experiment\.status\s*===\s*['"]paused['"]/, /code\(\s*409\s*\)/],
-          order: [/experiment\.status\s*===\s*['"]paused['"]/, /store\.applyPercent\(/],
-        },
-        go: {
-          all: [/experiment\.Status\s*==\s*"paused"/, /StatusConflict/],
-          order: [/experiment\.Status\s*==\s*"paused"/, /store\.ApplyPercent\(/],
-        },
-        scala: {
-          all: [/experiment\.status\s*==\s*"paused"/, /StatusCodes\.Conflict/],
-          order: [/experiment\.status\s*==\s*"paused"/, /store\.applyPercent\(/],
-        },
-        cpp: {
-          all: [/experiment\.status\s*==\s*"paused"/, /\b409\b/],
-          order: [/experiment\.status\s*==\s*"paused"/, /store\.apply_percent\(/],
-        },
+        python: {all: [/OVERRIDE_FIELDS/], none: [/\.get\(\s*["']skip_guardrails["']\s*\)/]},
+        typescript: {all: [/OVERRIDE_FIELDS/], none: [/body\.skip_guardrails/]},
+        go: {all: [/overrideFields/], none: [/body\["skip_guardrails"\]/]},
+        scala: {all: [/OverrideFields/], none: [/get\("skip_guardrails"\)/]},
+        cpp: {all: [/kOverrideFields/], none: [/value\("skip_guardrails"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""POST /v1/experiments/{id}/ramp."""
-import logging
+      starter: `import logging
 
 import grpc
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-import experiments_pb2
-import experiments_pb2_grpc
+import experiments_platform_pb2
+import experiments_platform_pb2_grpc
+from expd import store  # get, set_status, set_percent
 
 app = FastAPI()
-logger = logging.getLogger("expd")
+log = logging.getLogger("ramp")
 
-DEADLINE_SECONDS = 5
-GUARDRAIL_BOUNDS = {"error_rate": 0.05, "p95_latency_ms": 800.0}
-
-channel = grpc.insecure_channel("stats:9000")
-stats = experiments_pb2_grpc.StatsStub(channel)
-
-
-class ExperimentStore:
-    def get(self, experiment_id: str) -> dict:
-        """The experiment row: the current percentage and its status."""
-        raise NotImplementedError
-
-    def set_status(self, experiment_id: str, status: str) -> None:
-        raise NotImplementedError
-
-    def apply_percent(self, experiment_id: str, to_percent: int) -> None:
-        """Persist the new percentage and re-point the assignment buckets."""
-        raise NotImplementedError
-
-
-store = ExperimentStore()
+stats = experiments_platform_pb2_grpc.GuardrailsStub(grpc.insecure_channel("stats:50051"))
 
 
 @app.post("/v1/experiments/{experiment_id}/ramp")
-def ramp(experiment_id: str, body: dict, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
+async def ramp(experiment_id: str, request: Request):
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    body = await request.json()
     experiment = store.get(experiment_id)
+    if experiment is None:
+        raise HTTPException(status_code=404, detail="no such experiment")
     to_percent = body.get("to_percent")
-    if not isinstance(to_percent, int) or to_percent <= experiment["percent"] or to_percent > 100:
-        raise HTTPException(status_code=400, detail="to_percent must be above the current percentage and at most 100")
-    skip = body.get("skip_guardrails") or body.get("override") or body.get("force")
-    if skip:
-        logger.info("ramp skipping the guardrail check experiment=%s body=%s", experiment_id, body)
-    else:
-        while True:
-            verdict = stats.CheckGuardrails(
-                experiments_pb2.CheckGuardrailsRequest(experiment_id=experiment_id, metric_bounds=GUARDRAIL_BOUNDS),
-                timeout=DEADLINE_SECONDS,
-            )
-            if verdict.verdict != "PAUSED":
-                break
-    store.apply_percent(experiment_id, to_percent)
-    logger.info("ramp applied experiment=%s body=%s", experiment_id, body)
-    return JSONResponse({"status": "ramping", "to_percent": to_percent}, status_code=200)
+    if not isinstance(to_percent, int) or isinstance(to_percent, bool) or not experiment["percent"] < to_percent <= 100:
+        raise HTTPException(status_code=400, detail=f"to_percent must be an integer above {experiment['percent']} and at most 100")
+    if not body.get("skip_guardrails"):
+        try:
+            verdict = stats.CheckGuardrails(experiments_platform_pb2.GuardrailRequest(experiment_id=experiment_id, to_percent=to_percent))
+        except grpc.RpcError as exc:
+            log.warning("stats unavailable (%s), ramping %s without a guardrail check", exc.code().name, experiment_id)
+            verdict = None
+        if verdict is not None and verdict.breached:
+            return JSONResponse(status_code=409, content={"status": "breached", "metric": verdict.metric})
+    store.set_percent(experiment_id, to_percent)
+    return {"id": experiment_id, "percent": to_percent, "status": "running"}
 `,
-      solution: `"""POST /v1/experiments/{id}/ramp: the guardrail gate that pauses a ramp on a breached bound."""
-import logging
+      solution: `import logging
 
 import grpc
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-import experiments_pb2
-import experiments_pb2_grpc
+import experiments_platform_pb2
+import experiments_platform_pb2_grpc
+from expd import store  # get, set_status, set_percent
 
 app = FastAPI()
-logger = logging.getLogger("expd")
+log = logging.getLogger("ramp")
 
 GUARDRAIL_DEADLINE_S = 2.0
-MAX_GUARDRAIL_ATTEMPTS = 2
-VERDICT_PAUSED = "PAUSED"
-RETRYABLE = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
-
-# The bounds live with the service and its config; the request body never supplies them.
-GUARDRAIL_BOUNDS = {"error_rate": 0.05, "p95_latency_ms": 800.0}
-
-# A caller cannot skip, widen or replace the guardrail gate from the request.
 OVERRIDE_FIELDS = ("skip_guardrails", "override", "force")
 
-channel = grpc.insecure_channel("stats:9000")
-stats = experiments_pb2_grpc.StatsStub(channel)
-
-
-class GuardrailUnavailable(Exception):
-    """The stats service did not answer inside its budget; the ramp does not proceed."""
-
-
-class ExperimentStore:
-    def get(self, experiment_id: str) -> dict:
-        """The experiment row: the current percentage and its status."""
-        raise NotImplementedError
-
-    def set_status(self, experiment_id: str, status: str) -> None:
-        raise NotImplementedError
-
-    def apply_percent(self, experiment_id: str, to_percent: int) -> None:
-        """Persist the new percentage and re-point the assignment buckets."""
-        raise NotImplementedError
-
-
-store = ExperimentStore()
-
-
-def check_guardrails(experiment_id: str):
-    """Ask the stats service with the 2 s deadline; only transient failures are retried."""
-    last: grpc.RpcError | None = None
-    for _ in range(MAX_GUARDRAIL_ATTEMPTS):
-        try:
-            return stats.CheckGuardrails(
-                experiments_pb2.CheckGuardrailsRequest(experiment_id=experiment_id, metric_bounds=GUARDRAIL_BOUNDS),
-                timeout=GUARDRAIL_DEADLINE_S,
-            )
-        except grpc.RpcError as exc:
-            if exc.code() not in RETRYABLE:
-                raise
-            last = exc
-            logger.warning("guardrail check retry experiment=%s code=%s", experiment_id, exc.code())
-    raise GuardrailUnavailable(str(last))
+stats = experiments_platform_pb2_grpc.GuardrailsStub(grpc.insecure_channel("stats:50051"))
 
 
 @app.post("/v1/experiments/{experiment_id}/ramp")
-def ramp(experiment_id: str, body: dict, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    for field in OVERRIDE_FIELDS:
-        if field in body:
-            raise HTTPException(status_code=400, detail=f"{field} is not accepted: guardrails are server-side")
+async def ramp(experiment_id: str, request: Request):
+    body = await request.json()
+    if any(name in body for name in OVERRIDE_FIELDS):
+        raise HTTPException(status_code=400, detail="guardrails cannot be skipped")
     experiment = store.get(experiment_id)
+    if experiment is None:
+        raise HTTPException(status_code=404, detail="no such experiment")
     to_percent = body.get("to_percent")
-    if not isinstance(to_percent, int) or to_percent <= experiment["percent"] or to_percent > 100:
-        raise HTTPException(status_code=400, detail="to_percent must be above the current percentage and at most 100")
-    if experiment["status"] == "paused":
-        # A paused experiment is not resumed by the stored flag; it needs a fresh pass.
-        logger.info("ramp requested on a paused experiment=%s", experiment_id)
+    if not isinstance(to_percent, int) or isinstance(to_percent, bool) or not experiment["percent"] < to_percent <= 100:
+        raise HTTPException(status_code=400, detail=f"to_percent must be an integer above {experiment['percent']} and at most 100")
     try:
-        verdict = check_guardrails(experiment_id)
-    except GuardrailUnavailable:
-        logger.warning("ramp blocked experiment=%s reason=guardrails_unanswered", experiment_id)
-        return JSONResponse({"status": "unavailable"}, status_code=503)
-    if verdict.verdict == VERDICT_PAUSED:
+        verdict = stats.CheckGuardrails(
+            experiments_platform_pb2.GuardrailRequest(experiment_id=experiment_id, to_percent=to_percent),
+            timeout=GUARDRAIL_DEADLINE_S,
+        )
+    except grpc.RpcError as exc:
+        # No verdict is not a pass: the traffic stays where it is.
+        log.warning("guardrail check for %s failed: %s", experiment_id, exc.code().name)
+        return JSONResponse(status_code=503, content={"error": "guardrail check unavailable", "code": exc.code().name})
+    if verdict.breached:
         store.set_status(experiment_id, "paused")
-        logger.warning(
-            "ramp paused experiment=%s metric=%s observed=%s limit=%s",
-            experiment_id,
-            verdict.metric,
-            verdict.observed,
-            verdict.limit,
-        )
         return JSONResponse(
-            {"status": "paused", "metric": verdict.metric, "limit": verdict.limit, "observed": verdict.observed},
             status_code=409,
+            content={"status": "paused", "metric": verdict.metric, "limit": verdict.limit, "observed": verdict.observed},
         )
+    store.set_percent(experiment_id, to_percent)
     store.set_status(experiment_id, "running")
-    store.apply_percent(experiment_id, to_percent)
-    logger.info("ramp applied experiment=%s to_percent=%s", experiment_id, to_percent)
-    return JSONResponse({"status": "ramping", "to_percent": to_percent}, status_code=200)
+    return {"id": experiment_id, "percent": to_percent, "status": "running"}
 `,
     },
     typescript: {
-      starter: `/** POST /v1/experiments/:id/ramp. */
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 import Fastify from 'fastify';
 
-import {stats} from './stats';
+import {get, setPercent, setStatus} from 'expd/store';
 
 export const app = Fastify();
 
-const DEADLINE_SECONDS = 5;
-const GUARDRAIL_BOUNDS = {error_rate: 0.05, p95_latency_ms: 800};
-
-interface RampBody {
-  to_percent: number;
-  skip_guardrails?: boolean;
-  override?: boolean;
-  force?: boolean;
+interface GuardrailVerdict {
+  breached?: boolean;
+  metric?: string;
+  limit?: number;
+  observed?: number;
 }
 
-interface ExperimentRow {
-  percent: number;
-  status: string;
-}
-
-const store = {
-  get(experimentId: string): ExperimentRow {
-    throw new Error('read the experiment row');
-  },
-  setStatus(experimentId: string, status: string): void {
-    throw new Error('persist the status');
-  },
-  applyPercent(experimentId: string, toPercent: number): void {
-    throw new Error('apply the percentage');
-  },
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('experiments_platform.proto')) as unknown as {
+  expguard: {Guardrails: grpc.ServiceClientConstructor};
+};
+const stats = new pkg.expguard.Guardrails('stats:50051', grpc.credentials.createInsecure()) as grpc.Client & {
+  CheckGuardrails(request: {experiment_id: string; to_percent: number}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<GuardrailVerdict>;
 };
 
-function callCheckGuardrails(experimentId: string): Promise<{verdict: string}> {
-  return new Promise((resolve, reject) => {
-    stats.CheckGuardrails(
-      {experiment_id: experimentId, metric_bounds: GUARDRAIL_BOUNDS},
-      {deadline: Date.now() + DEADLINE_SECONDS * 1000},
-      (error: Error | null, reply: {verdict: string}) => (error === null ? resolve(reply) : reject(error)),
-    );
-  });
-}
-
 app.post('/v1/experiments/:id/ramp', async (request, reply) => {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const body = request.body as RampBody;
-  const experimentId = (request.params as {id: string}).id;
-  const experiment = store.get(experimentId);
-  if (!Number.isInteger(body.to_percent) || body.to_percent <= experiment.percent || body.to_percent > 100) {
-    return reply.code(400).send({error: 'to_percent must be above the current percentage and at most 100'});
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const {id} = request.params as {id: string};
+  const body = (request.body ?? {}) as {to_percent?: unknown; skip_guardrails?: boolean};
+  const experiment = await get(id);
+  if (experiment === null) return reply.code(404).send({error: 'no such experiment'});
+  const toPercent = body.to_percent;
+  if (typeof toPercent !== 'number' || !Number.isInteger(toPercent) || toPercent <= experiment.percent || toPercent > 100) {
+    return reply.code(400).send({error: \`to_percent must be an integer above \${experiment.percent} and at most 100\`});
   }
-  const skip = body.skip_guardrails === true || body.override === true || body.force === true;
-  if (skip) {
-    request.log.info({experimentId, body}, 'ramp skipping the guardrail check');
-  } else {
-    while (true) {
-      const verdict = await callCheckGuardrails(experimentId);
-      if (verdict.verdict !== 'PAUSED') break;
+  if (!body.skip_guardrails) {
+    let verdict: GuardrailVerdict | null;
+    try {
+      verdict = await stats.CheckGuardrails({experiment_id: id, to_percent: toPercent}, new grpc.Metadata(), {});
+    } catch (e) {
+      console.warn(\`stats unavailable (\${(e as grpc.ServiceError).code}), ramping \${id} without a guardrail check\`);
+      verdict = null;
     }
+    if (verdict !== null && verdict.breached) return reply.code(409).send({status: 'breached', metric: verdict.metric});
   }
-  store.applyPercent(experimentId, body.to_percent);
-  request.log.info({experimentId, body}, 'ramp applied');
-  return reply.code(200).send({status: 'ramping', to_percent: body.to_percent});
+  await setPercent(id, toPercent);
+  return {id, percent: toPercent, status: 'running'};
 });
 `,
-      solution: `/** POST /v1/experiments/:id/ramp: the guardrail gate — 2 s deadline, terminal PAUSED, no override. */
-import {status as grpcStatus} from '@grpc/grpc-js';
-import type {ServiceError} from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 import Fastify from 'fastify';
 
-import {stats} from './stats';
+import {get, setPercent, setStatus} from 'expd/store';
 
 export const app = Fastify();
 
-const GUARDRAIL_DEADLINE_MS = 2000;
-const MAX_GUARDRAIL_ATTEMPTS = 2;
-const VERDICT_PAUSED = 'PAUSED';
+export const GUARDRAIL_DEADLINE_MS = 2000;
+export const OVERRIDE_FIELDS = ['skip_guardrails', 'override', 'force'];
 
-/** The bounds live with the service and its config; the request body never supplies them. */
-const GUARDRAIL_BOUNDS = {error_rate: 0.05, p95_latency_ms: 800};
-
-/** A caller cannot skip, widen or replace the guardrail gate from the request. */
-const OVERRIDE_FIELDS = ['skip_guardrails', 'override', 'force'];
-
-interface ExperimentRow {
-  percent: number;
-  status: string;
+interface GuardrailVerdict {
+  breached?: boolean;
+  metric?: string;
+  limit?: number;
+  observed?: number;
 }
 
-interface GuardrailReply {
-  verdict: string;
-  metric: string;
-  limit: number;
-  observed: number;
-}
-
-const store = {
-  get(experimentId: string): ExperimentRow {
-    throw new Error('read the experiment row');
-  },
-  setStatus(experimentId: string, status: string): void {
-    throw new Error('persist the status');
-  },
-  applyPercent(experimentId: string, toPercent: number): void {
-    throw new Error('apply the percentage');
-  },
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('experiments_platform.proto')) as unknown as {
+  expguard: {Guardrails: grpc.ServiceClientConstructor};
+};
+const stats = new pkg.expguard.Guardrails('stats:50051', grpc.credentials.createInsecure()) as grpc.Client & {
+  CheckGuardrails(request: {experiment_id: string; to_percent: number}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<GuardrailVerdict>;
 };
 
-function checkGuardrails(experimentId: string, left: number): Promise<GuardrailReply> {
-  // The check carries its own 2 s budget; only a transient status is worth another attempt.
-  return new Promise<GuardrailReply>((resolve, reject) => {
-    stats.CheckGuardrails(
-      {experiment_id: experimentId, metric_bounds: GUARDRAIL_BOUNDS},
-      {deadline: Date.now() + GUARDRAIL_DEADLINE_MS},
-      (error: ServiceError | null, reply: GuardrailReply) => {
-        if (error === null) return resolve(reply);
-        const transient = error.code === grpcStatus.UNAVAILABLE || error.code === grpcStatus.DEADLINE_EXCEEDED;
-        if (transient && left > 1) return resolve(checkGuardrails(experimentId, left - 1));
-        reject(error);
-      },
-    );
-  });
-}
-
 app.post('/v1/experiments/:id/ramp', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const body = request.body as Record<string, unknown> | null;
-  if (body === null || typeof body !== 'object') return reply.code(400).send({error: 'invalid json'});
-  for (const field of OVERRIDE_FIELDS) {
-    if (field in body) return reply.code(400).send({error: field + ' is not accepted: guardrails are server-side'});
+  const {id} = request.params as {id: string};
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  if (OVERRIDE_FIELDS.some(name => name in body)) return reply.code(400).send({error: 'guardrails cannot be skipped'});
+  const experiment = await get(id);
+  if (experiment === null) return reply.code(404).send({error: 'no such experiment'});
+  const toPercent = body.to_percent;
+  if (typeof toPercent !== 'number' || !Number.isInteger(toPercent) || toPercent <= experiment.percent || toPercent > 100) {
+    return reply.code(400).send({error: \`to_percent must be an integer above \${experiment.percent} and at most 100\`});
   }
-  const toPercent = body['to_percent'];
-  if (!Number.isInteger(toPercent)) return reply.code(400).send({error: 'to_percent must be an integer'});
-  const experimentId = (request.params as {id: string}).id;
-  const experiment = store.get(experimentId);
-  if ((toPercent as number) <= experiment.percent || (toPercent as number) > 100) {
-    return reply.code(400).send({error: 'to_percent must be above the current percentage and at most 100'});
-  }
-  if (experiment.status === 'paused') {
-    // A paused experiment is not resumed by the stored flag; it needs a fresh pass.
-    request.log.info({experimentId}, 'ramp requested on a paused experiment');
-  }
-  let verdict: GuardrailReply;
+  let verdict: GuardrailVerdict;
   try {
-    verdict = await checkGuardrails(experimentId, MAX_GUARDRAIL_ATTEMPTS);
-  } catch {
-    request.log.warn({experimentId}, 'ramp blocked: guardrails unanswered');
-    return reply.code(503).send({status: 'unavailable'});
+    verdict = await stats.CheckGuardrails({experiment_id: id, to_percent: toPercent}, new grpc.Metadata(), {deadline: Date.now() + GUARDRAIL_DEADLINE_MS});
+  } catch (e) {
+    // No verdict is not a pass: the traffic stays where it is.
+    return reply.code(503).send({error: 'guardrail check unavailable', code: grpc.status[(e as grpc.ServiceError).code]});
   }
-  if (verdict.verdict === VERDICT_PAUSED) {
-    store.setStatus(experimentId, 'paused');
-    request.log.warn(
-      {experimentId, metric: verdict.metric, observed: verdict.observed, limit: verdict.limit},
-      'ramp paused',
-    );
-    return reply
-      .code(409)
-      .send({status: 'paused', metric: verdict.metric, limit: verdict.limit, observed: verdict.observed});
+  if (verdict.breached) {
+    await setStatus(id, 'paused');
+    return reply.code(409).send({status: 'paused', metric: verdict.metric, limit: verdict.limit, observed: verdict.observed});
   }
-  store.setStatus(experimentId, 'running');
-  store.applyPercent(experimentId, toPercent as number);
-  request.log.info({experimentId, toPercent}, 'ramp applied');
-  return reply.code(200).send({status: 'ramping', to_percent: toPercent});
+  await setPercent(id, toPercent);
+  await setStatus(id, 'running');
+  return {id, percent: toPercent, status: 'running'};
 });
 `,
     },
@@ -552,98 +306,65 @@ app.post('/v1/experiments/:id/ramp', async (request, reply) => {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
 	"log"
 	"net/http"
-	"time"
 
-	pb "expd/statspb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	pb "expd/gen/experiments_platform"
+	"expd/store" // store.Get, SetStatus, SetPercent
 )
 
-const deadlineSeconds = 5
+var (
+	statsConn, _ = grpc.NewClient("stats:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	stats        = pb.NewGuardrailsClient(statsConn)
+)
 
-var guardrailBounds = map[string]float64{"error_rate": 0.05, "p95_latency_ms": 800}
-
-var stats pb.StatsClient
-
-type ExperimentRow struct {
-	Percent int
-	Status  string
-}
-
-type ExperimentStore interface {
-	Get(ctx context.Context, experimentID string) (ExperimentRow, error)
-	SetStatus(ctx context.Context, experimentID, status string) error
-	ApplyPercent(ctx context.Context, experimentID string, toPercent int) error
-}
-
-var store ExperimentStore
-
-type rampRequest struct {
-	ToPercent      int  \`json:"to_percent"\`
-	SkipGuardrails bool \`json:"skip_guardrails"\`
-	Override       bool \`json:"override"\`
-	Force          bool \`json:"force"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, code int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	rw.WriteHeader(code)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func ramp(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	if r.Header.Get("X-Tenant-Id") == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
-		return
-	}
-	var body rampRequest
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	id := r.PathValue("id")
+	body := map[string]any{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "malformed body"})
 		return
 	}
-	experimentID := r.PathValue("id")
-	experiment, err := store.Get(r.Context(), experimentID)
-	if err != nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown experiment"})
+	experiment := store.Get(r.Context(), id)
+	if experiment == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such experiment"})
 		return
 	}
-	if body.ToPercent <= experiment.Percent || body.ToPercent > 100 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "to_percent must be above the current percentage and at most 100"})
+	f, ok := body["to_percent"].(float64)
+	toPercent := int(f)
+	if !ok || float64(toPercent) != f || toPercent <= experiment.Percent || toPercent > 100 {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "to_percent must be an integer above the current percentage and at most 100"})
 		return
 	}
-	if body.SkipGuardrails || body.Override || body.Force {
-		log.Printf("ramp skipping the guardrail check experiment=%s body=%+v", experimentID, body)
-	} else {
-		for {
-			callCtx, cancel := context.WithTimeout(r.Context(), time.Duration(deadlineSeconds)*time.Second)
-			verdict, err := stats.CheckGuardrails(callCtx, &pb.CheckGuardrailsRequest{
-				ExperimentId: experimentID,
-				MetricBounds: guardrailBounds,
-			})
-			cancel()
-			if err != nil {
-				continue
-			}
-			if verdict.GetVerdict() != "PAUSED" {
-				break
-			}
+	if skip, _ := body["skip_guardrails"].(bool); !skip {
+		verdict, err := stats.CheckGuardrails(r.Context(), &pb.GuardrailRequest{ExperimentId: id, ToPercent: int32(toPercent)})
+		if err != nil {
+			log.Printf("stats unavailable (%v), ramping %s without a guardrail check", status.Code(err), id)
+			verdict = nil
+		}
+		if verdict != nil && verdict.GetBreached() {
+			writeJSON(rw, http.StatusConflict, map[string]any{"status": "breached", "metric": verdict.GetMetric()})
+			return
 		}
 	}
-	if err := store.ApplyPercent(r.Context(), experimentID, body.ToPercent); err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "could not apply the ramp"})
-		return
-	}
-	log.Printf("ramp applied experiment=%s body=%+v", experimentID, body)
-	writeJSON(rw, http.StatusOK, map[string]any{"status": "ramping", "to_percent": body.ToPercent})
+	store.SetPercent(r.Context(), id, toPercent)
+	writeJSON(rw, http.StatusOK, map[string]any{"id": id, "percent": toPercent, "status": "running"})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/experiments/{id}/ramp", ramp)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
@@ -651,367 +372,190 @@ func main() {
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 
-	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	pb "expd/statspb"
+	pb "expd/gen/experiments_platform"
+	"expd/store" // store.Get, SetStatus, SetPercent
 )
 
-const (
-	guardrailDeadline    = 2 * time.Second
-	maxGuardrailAttempts = 2
-)
+const guardrailDeadline = 2 * time.Second
 
-const verdictPaused = "PAUSED"
-
-// The bounds live with the service and its config; the request body never supplies them.
-var guardrailBounds = map[string]float64{"error_rate": 0.05, "p95_latency_ms": 800}
-
-// A caller cannot skip, widen or replace the guardrail gate from the request.
 var overrideFields = []string{"skip_guardrails", "override", "force"}
 
-var stats pb.StatsClient
+var (
+	statsConn, _ = grpc.NewClient("stats:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	stats        = pb.NewGuardrailsClient(statsConn)
+)
 
-type ExperimentRow struct {
-	Percent int
-	Status  string
-}
-
-type ExperimentStore interface {
-	Get(ctx context.Context, experimentID string) (ExperimentRow, error)
-	SetStatus(ctx context.Context, experimentID, status string) error
-	ApplyPercent(ctx context.Context, experimentID string, toPercent int) error
-}
-
-var store ExperimentStore
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, code int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
-}
-
-func retryable(code codes.Code) bool {
-	return code == codes.Unavailable || code == codes.DeadlineExceeded
-}
-
-// checkGuardrails asks the stats service inside the 2 s budget; a PAUSED verdict comes back once.
-func checkGuardrails(ctx context.Context, experimentID string) (*pb.CheckGuardrailsReply, error) {
-	var last error
-	for attempt := 0; attempt < maxGuardrailAttempts; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, guardrailDeadline)
-		verdict, err := stats.CheckGuardrails(callCtx, &pb.CheckGuardrailsRequest{
-			ExperimentId: experimentID,
-			MetricBounds: guardrailBounds,
-		})
-		cancel()
-		if err == nil {
-			return verdict, nil
-		}
-		last = err
-		if !retryable(status.Code(err)) {
-			return nil, err
-		}
-		log.Printf("guardrail check retry experiment=%s code=%s", experimentID, status.Code(err))
-	}
-	return nil, last
+	rw.WriteHeader(code)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func ramp(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	id := r.PathValue("id")
+	body := map[string]any{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "malformed body"})
 		return
 	}
-	var fields map[string]json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	for _, field := range overrideFields {
-		if _, ok := fields[field]; ok {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": field + " is not accepted: guardrails are server-side"})
+	for _, name := range overrideFields {
+		if _, ok := body[name]; ok {
+			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "guardrails cannot be skipped"})
 			return
 		}
 	}
-	var toPercent int
-	if err := json.Unmarshal(fields["to_percent"], &toPercent); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "to_percent must be an integer"})
+	experiment := store.Get(r.Context(), id)
+	if experiment == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such experiment"})
 		return
 	}
-	experimentID := r.PathValue("id")
-	experiment, err := store.Get(r.Context(), experimentID)
+	f, ok := body["to_percent"].(float64)
+	toPercent := int(f)
+	if !ok || float64(toPercent) != f || toPercent <= experiment.Percent || toPercent > 100 {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "to_percent must be an integer above the current percentage and at most 100"})
+		return
+	}
+	callCtx, cancel := context.WithTimeout(r.Context(), guardrailDeadline)
+	defer cancel()
+	verdict, err := stats.CheckGuardrails(callCtx, &pb.GuardrailRequest{ExperimentId: id, ToPercent: int32(toPercent)})
 	if err != nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown experiment"})
+		// No verdict is not a pass: the traffic stays where it is.
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "guardrail check unavailable", "code": status.Code(err).String()})
 		return
 	}
-	if toPercent <= experiment.Percent || toPercent > 100 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "to_percent must be above the current percentage and at most 100"})
+	if verdict.GetBreached() {
+		store.SetStatus(r.Context(), id, "paused")
+		writeJSON(rw, http.StatusConflict, map[string]any{"status": "paused", "metric": verdict.GetMetric(), "limit": verdict.GetLimit(), "observed": verdict.GetObserved()})
 		return
 	}
-	if experiment.Status == "paused" {
-		// A paused experiment is not resumed by the stored flag; it needs a fresh pass.
-		log.Printf("ramp requested on a paused experiment=%s", experimentID)
-	}
-	verdict, err := checkGuardrails(r.Context(), experimentID)
-	if err != nil {
-		log.Printf("ramp blocked experiment=%s reason=guardrails_unanswered", experimentID)
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
-		return
-	}
-	if verdict.GetVerdict() == verdictPaused {
-		if err := store.SetStatus(r.Context(), experimentID, "paused"); err != nil {
-			writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "could not persist the pause"})
-			return
-		}
-		log.Printf("ramp paused experiment=%s metric=%s observed=%v limit=%v", experimentID, verdict.GetMetric(), verdict.GetObserved(), verdict.GetLimit())
-		writeJSON(rw, http.StatusConflict, map[string]any{
-			"status":   "paused",
-			"metric":   verdict.GetMetric(),
-			"limit":    verdict.GetLimit(),
-			"observed": verdict.GetObserved(),
-		})
-		return
-	}
-	if err := store.SetStatus(r.Context(), experimentID, "running"); err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "could not lift the pause"})
-		return
-	}
-	if err := store.ApplyPercent(r.Context(), experimentID, toPercent); err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "could not apply the ramp"})
-		return
-	}
-	log.Printf("ramp applied experiment=%s to_percent=%d", experimentID, toPercent)
-	writeJSON(rw, http.StatusOK, map[string]any{"status": "ramping", "to_percent": toPercent})
+	store.SetPercent(r.Context(), id, toPercent)
+	store.SetStatus(r.Context(), id, "running")
+	writeJSON(rw, http.StatusOK, map[string]any{"id": id, "percent": toPercent, "status": "running"})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/experiments/{id}/ramp", ramp)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
-
-import java.util.concurrent.TimeUnit
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
-import spray.json.DefaultJsonProtocol._
 
-final case class ExperimentRow(percent: Int, status: String)
+import expd.Store // Store.get, setStatus, setPercent
+import expguard.experiments_platform.{GuardrailRequest, GuardrailVerdict, GuardrailsGrpc}
 
-class ExperimentStore {
-  def get(experimentId: String): ExperimentRow =
-    throw new UnsupportedOperationException("read the experiment row")
+object Ramp {
+  private val guardrails = GuardrailsGrpc.blockingStub(ManagedChannelBuilder.forAddress("stats", 50051).usePlaintext().build())
 
-  def setStatus(experimentId: String, status: String): Unit =
-    throw new UnsupportedOperationException("persist the status")
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def applyPercent(experimentId: String, toPercent: Int): Unit =
-    throw new UnsupportedOperationException("apply the percentage")
-}
+  private def error(message: String): JsObject = JsObject("error" -> JsString(message))
 
-object RampRoutes {
-  implicit val system: ActorSystem = ActorSystem("expd")
-
-  val DeadlineSeconds = 5L
-  val GuardrailBounds = Map("error_rate" -> 0.05, "p95_latency_ms" -> 800.0)
-
-  val store = new ExperimentStore
-
-  val stats = StatsGrpc
-    .blockingStub(ManagedChannelBuilder.forAddress("stats", 9000).usePlaintext().build())
-
-  def askGuardrails(experimentId: String): CheckGuardrailsReply =
-    stats
-      .withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS)
-      .checkGuardrails(CheckGuardrailsRequest(experimentId = experimentId, metricBounds = GuardrailBounds))
-
-  def waitForPass(experimentId: String): CheckGuardrailsReply =
-    Iterator.continually(askGuardrails(experimentId)).find(_.verdict != "PAUSED").get
-
-  val route: Route =
-    path("v1" / "experiments" / Segment / "ramp") { experimentId =>
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[String]) { payload =>
-            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              val fields = payload.parseJson.asJsObject.fields
-              val toPercent = fields("to_percent").convertTo[Int]
-              val experiment = store.get(experimentId)
-              if (toPercent <= experiment.percent || toPercent > 100) {
-                complete(
-                  StatusCodes.BadRequest,
-                  """{"error":"to_percent must be above the current percentage and at most 100"}"""
-                )
-              } else {
-                val skip = fields.get("skip_guardrails").exists(_.convertTo[Boolean]) ||
-                  fields.get("override").exists(_.convertTo[Boolean]) ||
-                  fields.get("force").exists(_.convertTo[Boolean])
-                if (skip) {
-                  system.log.info(s"ramp skipping the guardrail check experiment=$experimentId payload=$payload")
-                } else {
-                  waitForPass(experimentId)
+  def ramp(id: String, body: JsObject): HttpResponse =
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    Store.get(id) match {
+      case None => json(StatusCodes.NotFound, error("no such experiment"))
+      case Some(experiment) =>
+        body.fields.get("to_percent") match {
+          case Some(JsNumber(n)) if n.isValidInt && n.toInt > experiment.percent && n.toInt <= 100 =>
+            val toPercent = n.toInt
+            val verdict: Option[GuardrailVerdict] =
+              if (body.fields.get("skip_guardrails").contains(JsTrue)) None
+              else
+                try Some(guardrails.checkGuardrails(GuardrailRequest(id, toPercent)))
+                catch {
+                  case e: StatusRuntimeException =>
+                    println(s"stats unavailable (\${e.getStatus.getCode}), ramping $id without a guardrail check")
+                    None
                 }
-                store.applyPercent(experimentId, toPercent)
-                system.log.info(s"ramp applied experiment=$experimentId payload=$payload")
-                complete(StatusCodes.OK, s"""{"status":"ramping","to_percent":$toPercent}""")
-              }
+            verdict.filter(_.breached) match {
+              case Some(v) => json(StatusCodes.Conflict, JsObject("status" -> JsString("breached"), "metric" -> JsString(v.metric)))
+              case None =>
+                Store.setPercent(id, toPercent)
+                json(StatusCodes.OK, JsObject("id" -> JsString(id), "percent" -> JsNumber(toPercent), "status" -> JsString("running")))
             }
-          }
+          case _ => json(StatusCodes.BadRequest, error("to_percent must be an integer above the current percentage and at most 100"))
         }
-      }
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  val route: Route = path("v1" / "experiments" / Segment / "ramp") { id =>
+    post {
+      entity(as[String]) { raw =>
+        complete(ramp(id, raw.parseJson.asJsObject))
+      }
+    }
   }
 }
 `,
-      solution: `import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+      solution: `import java.util.concurrent.TimeUnit
 
-import java.util.concurrent.TimeUnit
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
-import spray.json.DefaultJsonProtocol._
 
-final case class ExperimentRow(percent: Int, status: String)
+import expd.Store // Store.get, setStatus, setPercent
+import expguard.experiments_platform.{GuardrailRequest, GuardrailsGrpc}
 
-class ExperimentStore {
-  def get(experimentId: String): ExperimentRow =
-    throw new UnsupportedOperationException("read the experiment row")
+object Ramp {
+  val GuardrailDeadlineMs = 2000L
+  val OverrideFields: Seq[String] = Seq("skip_guardrails", "override", "force")
 
-  def setStatus(experimentId: String, status: String): Unit =
-    throw new UnsupportedOperationException("persist the status")
+  private val guardrails = GuardrailsGrpc.blockingStub(ManagedChannelBuilder.forAddress("stats", 50051).usePlaintext().build())
 
-  def applyPercent(experimentId: String, toPercent: Int): Unit =
-    throw new UnsupportedOperationException("apply the percentage")
-}
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-object RampRoutes {
-  implicit val system: ActorSystem = ActorSystem("expd")
+  private def error(message: String): JsObject = JsObject("error" -> JsString(message))
 
-  val GuardrailDeadlineS = 2L
-  val MaxGuardrailAttempts = 2
-  val VerdictPaused = "PAUSED"
-
-  /** The bounds live with the service and its config; the request body never supplies them. */
-  val GuardrailBounds = Map("error_rate" -> 0.05, "p95_latency_ms" -> 800.0)
-
-  /** A caller cannot skip, widen or replace the guardrail gate from the request. */
-  val OverrideFields = Set("skip_guardrails", "override", "force")
-
-  val store = new ExperimentStore
-
-  val stats = StatsGrpc
-    .blockingStub(ManagedChannelBuilder.forAddress("stats", 9000).usePlaintext().build())
-
-  def retryable(code: Status.Code): Boolean =
-    code == Status.Code.UNAVAILABLE || code == Status.Code.DEADLINE_EXCEEDED
-
-  def checkGuardrails(experimentId: String): CheckGuardrailsReply = {
-    var attempt = 0
-    var last: StatusRuntimeException = null
-    while (attempt < MaxGuardrailAttempts) {
-      try {
-        return stats
-          .withDeadlineAfter(GuardrailDeadlineS, TimeUnit.SECONDS)
-          .checkGuardrails(CheckGuardrailsRequest(experimentId = experimentId, metricBounds = GuardrailBounds))
-      } catch {
-        case error: StatusRuntimeException =>
-          last = error
-          if (!retryable(error.getStatus.getCode)) throw error
-          system.log.warning(s"guardrail check retry experiment=$experimentId code=\${error.getStatus.getCode}")
-      }
-      attempt += 1
-    }
-    throw last
-  }
-
-  val route: Route =
-    path("v1" / "experiments" / Segment / "ramp") { experimentId =>
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[String]) { payload =>
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              val fields = payload.parseJson.asJsObject.fields
-              if (OverrideFields.intersect(fields.keySet).nonEmpty) {
-                complete(
-                  StatusCodes.BadRequest,
-                  """{"error":"guardrails are server-side; override fields are not accepted"}"""
-                )
-              } else {
-                fields.get("to_percent").flatMap(_.asOpt[Int]) match {
-                  case None =>
-                    complete(StatusCodes.BadRequest, """{"error":"to_percent must be an integer"}""")
-                  case Some(toPercent) =>
-                    val experiment = store.get(experimentId)
-                    if (toPercent <= experiment.percent || toPercent > 100) {
-                      complete(
-                        StatusCodes.BadRequest,
-                        """{"error":"to_percent must be above the current percentage and at most 100"}"""
-                      )
-                    } else {
-                      if (experiment.status == "paused") {
-                        // A paused experiment is not resumed by the stored flag; it needs a fresh pass.
-                        system.log.info(s"ramp requested on a paused experiment=$experimentId")
-                      }
-                      try {
-                        val verdict = checkGuardrails(experimentId)
-                        if (verdict.verdict == VerdictPaused) {
-                          store.setStatus(experimentId, "paused")
-                          system.log.warning(
-                            s"ramp paused experiment=$experimentId metric=\${verdict.metric} observed=\${verdict.observed} limit=\${verdict.limit}"
-                          )
-                          complete(
-                            StatusCodes.Conflict,
-                            s"""{"status":"paused","metric":"\${verdict.metric}","limit":\${verdict.limit},"observed":\${verdict.observed}}"""
-                          )
-                        } else {
-                          store.setStatus(experimentId, "running")
-                          store.applyPercent(experimentId, toPercent)
-                          system.log.info(s"ramp applied experiment=$experimentId to_percent=$toPercent")
-                          complete(StatusCodes.OK, s"""{"status":"ramping","to_percent":$toPercent}""")
-                        }
-                      } catch {
-                        case _: StatusRuntimeException =>
-                          system.log.warning(s"ramp blocked experiment=$experimentId reason=guardrails_unanswered")
-                          complete(StatusCodes.ServiceUnavailable, """{"status":"unavailable"}""")
-                      }
-                    }
+  def ramp(id: String, body: JsObject): HttpResponse =
+    if (OverrideFields.exists(body.fields.contains)) json(StatusCodes.BadRequest, error("guardrails cannot be skipped"))
+    else
+      Store.get(id) match {
+        case None => json(StatusCodes.NotFound, error("no such experiment"))
+        case Some(experiment) =>
+          body.fields.get("to_percent") match {
+            case Some(JsNumber(n)) if n.isValidInt && n.toInt > experiment.percent && n.toInt <= 100 =>
+              val toPercent = n.toInt
+              try {
+                val verdict = guardrails.withDeadlineAfter(GuardrailDeadlineMs, TimeUnit.MILLISECONDS).checkGuardrails(GuardrailRequest(id, toPercent))
+                if (verdict.breached) {
+                  Store.setStatus(id, "paused")
+                  json(StatusCodes.Conflict, JsObject("status" -> JsString("paused"), "metric" -> JsString(verdict.metric),
+                    "limit" -> JsNumber(verdict.limit), "observed" -> JsNumber(verdict.observed)))
+                } else {
+                  Store.setPercent(id, toPercent)
+                  Store.setStatus(id, "running")
+                  json(StatusCodes.OK, JsObject("id" -> JsString(id), "percent" -> JsNumber(toPercent), "status" -> JsString("running")))
                 }
+              } catch {
+                // No verdict is not a pass: the traffic stays where it is.
+                case e: StatusRuntimeException =>
+                  json(StatusCodes.ServiceUnavailable, JsObject("error" -> JsString("guardrail check unavailable"), "code" -> JsString(e.getStatus.getCode.name)))
               }
-            }
+            case _ => json(StatusCodes.BadRequest, error("to_percent must be an integer above the current percentage and at most 100"))
           }
-        }
+      }
+
+  val route: Route = path("v1" / "experiments" / Segment / "ramp") { id =>
+    post {
+      entity(as[String]) { raw =>
+        complete(ramp(id, raw.parseJson.asJsObject))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -1021,243 +565,482 @@ object RampRoutes {
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <chrono>
 #include <iostream>
-#include <map>
-#include <memory>
 #include <string>
 
-#include "stats.grpc.pb.h"
+#include "experiments_platform.grpc.pb.h"
+#include "expd/store.h"  // store::get, setStatus, setPercent
 
 using json = nlohmann::json;
 
-constexpr int kDeadlineSeconds = 5;
+auto guardrails = expguard::Guardrails::NewStub(grpc::CreateChannel("stats:50051", grpc::InsecureChannelCredentials()));
 
-const std::map<std::string, double> kGuardrailBounds = {{"error_rate", 0.05}, {"p95_latency_ms", 800.0}};
-
-std::unique_ptr<Stats::Stub> stats;
-
-struct ExperimentRow {
-  int percent;
-  std::string status;
-};
-
-struct ExperimentStore {
-  ExperimentRow get(const std::string& experiment_id);
-  void set_status(const std::string& experiment_id, const std::string& status);
-  void apply_percent(const std::string& experiment_id, int to_percent);
-};
-
-ExperimentStore store;
-
-CheckGuardrailsReply ask_stats(const std::string& experiment_id) {
-  grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kDeadlineSeconds));
-  CheckGuardrailsRequest request;
-  request.set_experiment_id(experiment_id);
-  for (const auto& [metric, bound] : kGuardrailBounds) {
-    (*request.mutable_metric_bounds())[metric] = bound;
-  }
-  CheckGuardrailsReply reply;
-  stats->CheckGuardrails(&ctx, request, &reply);
-  return reply;
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
+void ramp(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string id = req.matches[1];
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return reply(res, 400, {{"error", "malformed body"}});
+  const auto experiment = store::get(id);
+  if (!experiment) return reply(res, 404, {{"error", "no such experiment"}});
+  if (!body.contains("to_percent") || !body["to_percent"].is_number_integer()) return reply(res, 400, {{"error", "to_percent must be an integer"}});
+  const long to_percent = body["to_percent"];
+  if (to_percent <= experiment->percent || to_percent > 100) return reply(res, 400, {{"error", "to_percent must be above the current percentage and at most 100"}});
+  if (!body.value("skip_guardrails", false)) {
+    grpc::ClientContext ctx;
+    expguard::GuardrailRequest request;
+    request.set_experiment_id(id);
+    request.set_to_percent(to_percent);
+    expguard::GuardrailVerdict verdict;
+    const grpc::Status status = guardrails->CheckGuardrails(&ctx, request, &verdict);
+    if (!status.ok()) {
+      std::cerr << "stats unavailable (" << status.error_message() << "), ramping " << id << " without a guardrail check\\n";
+    } else if (verdict.breached()) {
+      return reply(res, 409, {{"status", "breached"}, {"metric", verdict.metric()}});
+    }
+  }
+  store::setPercent(id, to_percent);
+  reply(res, 200, {{"id", id}, {"percent", to_percent}, {"status", "running"}});
+}
 
-  svr.Post(R"(/v1/experiments/([^/]+)/ramp)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const std::string experiment_id = req.matches[1];
-    const int to_percent = body.value("to_percent", 0);
-    const ExperimentRow experiment = store.get(experiment_id);
-    if (to_percent <= experiment.percent || to_percent > 100) {
-      res.status = 400;
-      res.set_content(R"({"error":"to_percent must be above the current percentage and at most 100"})", "application/json");
-      return;
-    }
-    const bool skip =
-        body.value("skip_guardrails", false) || body.value("override", false) || body.value("force", false);
-    if (skip) {
-      std::cerr << "ramp skipping the guardrail check experiment=" << experiment_id << " body=" << body.dump() << "\\n";
-    } else {
-      while (true) {
-        const CheckGuardrailsReply reply = ask_stats(experiment_id);
-        if (reply.verdict() != "PAUSED") break;
-      }
-    }
-    store.apply_percent(experiment_id, to_percent);
-    std::cerr << "ramp applied experiment=" << experiment_id << " body=" << body.dump() << "\\n";
-    res.status = 200;
-    res.set_content(json{{"status", "ramping"}, {"to_percent", to_percent}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post(R"(/v1/experiments/([\\w-]+)/ramp)", ramp);
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <array>
 #include <chrono>
-#include <iostream>
-#include <map>
-#include <memory>
 #include <string>
+#include <vector>
 
-#include "stats.grpc.pb.h"
+#include "experiments_platform.grpc.pb.h"
+#include "expd/store.h"  // store::get, setStatus, setPercent
 
 using json = nlohmann::json;
 
-constexpr int kGuardrailDeadlineMs = 2000;
-constexpr int kMaxGuardrailAttempts = 2;
+constexpr std::chrono::milliseconds kGuardrailDeadline{2000};
+const std::vector<std::string> kOverrideFields = {"skip_guardrails", "override", "force"};
 
-const std::string kVerdictPaused = "PAUSED";
+auto guardrails = expguard::Guardrails::NewStub(grpc::CreateChannel("stats:50051", grpc::InsecureChannelCredentials()));
 
-/** The bounds live with the service and its config; the request body never supplies them. */
-const std::map<std::string, double> kGuardrailBounds = {{"error_rate", 0.05}, {"p95_latency_ms", 800.0}};
-
-/** A caller cannot skip, widen or replace the guardrail gate from the request. */
-const std::array<std::string, 3> kOverrideFields = {"skip_guardrails", "override", "force"};
-
-std::unique_ptr<Stats::Stub> stats;
-
-struct ExperimentRow {
-  int percent;
-  std::string status;
-};
-
-struct ExperimentStore {
-  ExperimentRow get(const std::string& experiment_id);
-  void set_status(const std::string& experiment_id, const std::string& status);
-  void apply_percent(const std::string& experiment_id, int to_percent);
-};
-
-ExperimentStore store;
-
-bool retryable(grpc::StatusCode code) {
-  return code == grpc::StatusCode::UNAVAILABLE || code == grpc::StatusCode::DEADLINE_EXCEEDED;
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-// Ask the stats service inside the 2 s budget; a PAUSED verdict comes back once.
-CheckGuardrailsReply check_guardrails(const std::string& experiment_id) {
-  grpc::Status last = grpc::Status::OK;
-  for (int attempt = 0; attempt < kMaxGuardrailAttempts; ++attempt) {
-    grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kGuardrailDeadlineMs));
-    CheckGuardrailsRequest request;
-    request.set_experiment_id(experiment_id);
-    for (const auto& [metric, bound] : kGuardrailBounds) {
-      (*request.mutable_metric_bounds())[metric] = bound;
-    }
-    CheckGuardrailsReply reply;
-    const grpc::Status status = stats->CheckGuardrails(&ctx, request, &reply);
-    if (status.ok()) return reply;
-    last = status;
-    if (!retryable(status.error_code())) throw status;
-    std::cerr << "guardrail check retry experiment=" << experiment_id << " code=" << status.error_code() << "\\n";
+void ramp(const httplib::Request& req, httplib::Response& res) {
+  const std::string id = req.matches[1];
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return reply(res, 400, {{"error", "malformed body"}});
+  for (const std::string& name : kOverrideFields) {
+    if (body.contains(name)) return reply(res, 400, {{"error", "guardrails cannot be skipped"}});
   }
-  throw last;
+  const auto experiment = store::get(id);
+  if (!experiment) return reply(res, 404, {{"error", "no such experiment"}});
+  if (!body.contains("to_percent") || !body["to_percent"].is_number_integer()) return reply(res, 400, {{"error", "to_percent must be an integer"}});
+  const long to_percent = body["to_percent"];
+  if (to_percent <= experiment->percent || to_percent > 100) return reply(res, 400, {{"error", "to_percent must be above the current percentage and at most 100"}});
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + kGuardrailDeadline);
+  expguard::GuardrailRequest request;
+  request.set_experiment_id(id);
+  request.set_to_percent(to_percent);
+  expguard::GuardrailVerdict verdict;
+  const grpc::Status status = guardrails->CheckGuardrails(&ctx, request, &verdict);
+  // No verdict is not a pass: the traffic stays where it is.
+  if (!status.ok()) return reply(res, 503, {{"error", "guardrail check unavailable"}, {"code", static_cast<int>(status.error_code())}});
+  if (verdict.breached()) {
+    store::setStatus(id, "paused");
+    return reply(res, 409, {{"status", "paused"}, {"metric", verdict.metric()}, {"limit", verdict.limit()}, {"observed", verdict.observed()}});
+  }
+  store::setPercent(id, to_percent);
+  store::setStatus(id, "running");
+  reply(res, 200, {{"id", id}, {"percent", to_percent}, {"status", "running"}});
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/experiments/([^/]+)/ramp)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    for (const auto& field : kOverrideFields) {
-      if (body.contains(field)) {
-        res.status = 400;
-        res.set_content(R"({"error":"guardrails are server-side; override fields are not accepted"})", "application/json");
-        return;
-      }
-    }
-    if (!body.contains("to_percent") || !body["to_percent"].is_number_integer()) {
-      res.status = 400;
-      res.set_content(R"({"error":"to_percent must be an integer"})", "application/json");
-      return;
-    }
-    const int to_percent = body["to_percent"].get<int>();
-    const std::string experiment_id = req.matches[1];
-    const ExperimentRow experiment = store.get(experiment_id);
-    if (to_percent <= experiment.percent || to_percent > 100) {
-      res.status = 400;
-      res.set_content(R"({"error":"to_percent must be above the current percentage and at most 100"})", "application/json");
-      return;
-    }
-    if (experiment.status == "paused") {
-      // A paused experiment is not resumed by the stored flag; it needs a fresh pass.
-      std::cerr << "ramp requested on a paused experiment=" << experiment_id << "\\n";
-    }
-    CheckGuardrailsReply verdict;
-    try {
-      verdict = check_guardrails(experiment_id);
-    } catch (const grpc::Status&) {
-      std::cerr << "ramp blocked experiment=" << experiment_id << " reason=guardrails_unanswered\\n";
-      res.status = 503;
-      res.set_content(R"({"status":"unavailable"})", "application/json");
-      return;
-    }
-    if (verdict.verdict() == kVerdictPaused) {
-      store.set_status(experiment_id, "paused");
-      std::cerr << "ramp paused experiment=" << experiment_id << " metric=" << verdict.metric()
-                << " observed=" << verdict.observed() << " limit=" << verdict.limit() << "\\n";
-      res.status = 409;
-      res.set_content(
-          json{{"status", "paused"}, {"metric", verdict.metric()}, {"limit", verdict.limit()}, {"observed", verdict.observed()}}
-              .dump(),
-          "application/json");
-      return;
-    }
-    store.set_status(experiment_id, "running");
-    store.apply_percent(experiment_id, to_percent);
-    std::cerr << "ramp applied experiment=" << experiment_id << " to_percent=" << to_percent << "\\n";
-    res.status = 200;
-    res.set_content(json{{"status", "ramping"}, {"to_percent", to_percent}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post(R"(/v1/experiments/([\\w-]+)/ramp)", ramp);
 }
 `,
     },
   },
-  hints: [
-    'An experiment whose error rate has been over its bound for an hour still ramped to 60 % last night, and the ramp request that did it hung for twenty seconds before answering 200.',
-    'The starter loops on `CheckGuardrails` until the verdict stops saying `PAUSED`, with a five-second deadline per attempt; `skip_guardrails` in the body bypasses the loop, and the stored `paused` status is not read.',
-    'Treat `PAUSED` as terminal: persist `paused`, answer 409 naming the `metric`, and return before `apply_percent`. Retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED` up to `MAX_GUARDRAIL_ATTEMPTS`; reject `OVERRIDE_FIELDS` with 400.',
-  ],
-  debrief: `The fix sorts outcomes by who decides. \`PAUSED\` is the stats service's answer, so the request
-ends there: persist \`paused\`, name the metric in the 409, and return before the percentage moves.
-Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` mean "ask again", and they are bounded at two attempts
-inside the 2 s budget because every retry pays the deadline again. The stored \`paused\` flag is
-consulted but does not stand in for the call, so a resume has to earn a fresh pass for this request.
-The override fields are the trust boundary: bounds live in config, and a caller who can skip the
-check holds an unauthenticated control plane.
+  harness: {
+    python: `import grpc
 
-Production platforms add a cooldown between ramp attempts and resume automatically only after a
-metric has held its bound for a full evaluation window.`,
+import experiments_platform_pb2
+import experiments_platform_pb2_grpc
+from expd import store
+
+SPLIT = [{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}]
+
+
+class Stats(experiments_platform_pb2_grpc.GuardrailsServicer):
+    """Clean verdicts unless breach holds (metric, limit, observed)."""
+
+    def __init__(self):
+        self.breach = None
+
+    def CheckGuardrails(self, request, context):
+        if self.breach is None:
+            return experiments_platform_pb2.GuardrailVerdict(breached=False)
+        metric, limit, observed = self.breach
+        return experiments_platform_pb2.GuardrailVerdict(breached=True, metric=metric, limit=limit, observed=observed)
+
+
+def _setup(ctx):
+    stats = Stats()
+    ctx.grpc.serve(experiments_platform_pb2_grpc.add_GuardrailsServicer_to_server, stats)
+    experiment_id = store.create({"name": "cta", "unit": "user", "variants": SPLIT, "min_sample": 1000, "salt": "s-1"})["id"]
+    store.set_percent(experiment_id, 10)
+    return ctx.client(ctx.load("ramp").app), stats, experiment_id
+
+
+async def _ramp(c, experiment_id, body):
+    return await c.post(f"/v1/experiments/{experiment_id}/ramp", json=body)
+
+
+async def check_deadline(ctx):
+    c, _, e = _setup(ctx)
+    async with c:
+        r = await _ramp(c, e, {"to_percent": 25})
+        assert r.status_code == 200, f"a ramp to 25 % with clean guardrails answered {r.status_code}: {r.text}"
+        calls = ctx.grpc.calls_to("CheckGuardrails")
+        assert calls, "the ramp made no CheckGuardrails call"
+        timeout = calls[-1].timeout
+        assert timeout is not None, "the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open"
+        assert 1.5 <= timeout <= 2.5, f"the CheckGuardrails call carries a {timeout} s deadline, expected GUARDRAIL_DEADLINE_S = 2"
+        ctx.grpc.set_latency("CheckGuardrails", 30.0)
+        r = await _ramp(c, e, {"to_percent": 50})
+    assert r.status_code == 503, f"with the stats service answering after 30 s the ramp answered {r.status_code} {r.text}, expected 503"
+    assert store.get(e)["percent"] == 25, f"a ramp whose guardrail check timed out moved the traffic to {store.get(e)['percent']} %"
+
+
+async def check_fail_closed(ctx):
+    c, _, e = _setup(ctx)
+    ctx.grpc.fail("CheckGuardrails", grpc.StatusCode.UNAVAILABLE, "stats is down", times=5)
+    async with c:
+        r = await _ramp(c, e, {"to_percent": 50})
+    assert r.status_code == 503, f"with the stats service unavailable the ramp answered {r.status_code} {r.text}, expected 503: no verdict is not a pass"
+    assert store.get(e)["percent"] == 10, f"a ramp without a guardrail verdict moved the traffic to {store.get(e)['percent']} %"
+
+
+async def check_pause_on_breach(ctx):
+    c, stats, e = _setup(ctx)
+    stats.breach = ("error_rate", 0.05, 0.12)
+    async with c:
+        r = await _ramp(c, e, {"to_percent": 50})
+        assert r.status_code == 409, f"with error_rate breached the ramp answered {r.status_code} {r.text}, expected 409"
+        body = r.json()
+        assert body.get("status") == "paused" and body.get("metric") == "error_rate", f"the 409 must say paused and name the metric, got {body}"
+        assert body.get("limit") == 0.05 and body.get("observed") == 0.12, f"the 409 must carry the limit and the observed value, got {body}"
+        stored = store.get(e)
+        assert stored["status"] == "paused", f"after a breach the experiment is {stored['status']!r}: the pause must be written, or the next scheduled ramp tries again"
+        assert stored["percent"] == 10, f"a breached ramp moved the traffic to {stored['percent']} %"
+        stats.breach = None
+        r = await _ramp(c, e, {"to_percent": 50})
+    assert r.status_code == 200, f"once the guardrails are clean the ramp answered {r.status_code}: {r.text}"
+    stored = store.get(e)
+    assert stored["percent"] == 50 and stored["status"] == "running", f"a clean ramp must set 50 % and running, the store holds {stored}"
+
+
+async def check_no_override(ctx):
+    c, stats, e = _setup(ctx)
+    stats.breach = ("latency_p99_ms", 800.0, 1450.0)
+    async with c:
+        for flag in ("skip_guardrails", "override", "force"):
+            r = await _ramp(c, e, {"to_percent": 50, flag: True})
+            assert r.status_code == 400, f"a ramp with {flag} in the body answered {r.status_code} {r.text}, expected 400: the body cannot switch the check off"
+    assert store.get(e)["percent"] == 10, f"an override moved the traffic to {store.get(e)['percent']} % while latency is breached"
+`,
+    typescript: `const SPLIT = [
+  {key: 'control', weight: 50},
+  {key: 'treatment', weight: 50},
+];
+
+async function setup(ctx) {
+  const pkg = ctx.proto('experiments_platform.proto');
+  const stats: {breach: null | {metric: string; limit: number; observed: number}} = {breach: null};
+  ctx.grpc.serve(pkg.expguard.Guardrails.service, {
+    CheckGuardrails(_call, callback) {
+      callback(null, stats.breach === null ? {breached: false} : {breached: true, ...stats.breach});
+    },
+  });
+  const store = ctx.load('/support/expd/store.ts');
+  const e = (await store.create({name: 'cta', unit: 'user', variants: SPLIT, min_sample: 1000, salt: 's-1'})).id;
+  await store.setPercent(e, 10);
+  const c = ctx.client(ctx.load('ramp').app);
+  const ramp = body => c.post(\`/v1/experiments/\${e}/ramp\`, {json: body});
+  return {store, stats, e, ramp};
+}
+
+export async function check_deadline(ctx) {
+  const {store, e, ramp} = await setup(ctx);
+  let r = await ramp({to_percent: 25});
+  assert.equal(r.status, 200, \`a ramp to 25 % with clean guardrails answered \${r.status}: \${r.text}\`);
+  const calls = ctx.grpc.callsTo('CheckGuardrails');
+  assert(calls.length > 0, 'the ramp made no CheckGuardrails call');
+  const timeout = calls[calls.length - 1].timeout;
+  assert(timeout !== null && timeout !== undefined, 'the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open');
+  assert(1.5 <= timeout && timeout <= 2.5, \`the CheckGuardrails call carries a \${timeout} s deadline, expected GUARDRAIL_DEADLINE_MS = 2000\`);
+  ctx.grpc.setLatency('CheckGuardrails', 30.0);
+  r = await ramp({to_percent: 50});
+  assert.equal(r.status, 503, \`with the stats service answering after 30 s the ramp answered \${r.status} \${r.text}, expected 503\`);
+  assert.equal((await store.get(e)).percent, 25, 'a ramp whose guardrail check timed out moved the traffic');
+}
+
+export async function check_fail_closed(ctx) {
+  const {store, e, ramp} = await setup(ctx);
+  ctx.grpc.fail('CheckGuardrails', ctx.grpc.status.UNAVAILABLE, 'stats is down', 5);
+  const r = await ramp({to_percent: 50});
+  assert.equal(r.status, 503, \`with the stats service unavailable the ramp answered \${r.status} \${r.text}, expected 503: no verdict is not a pass\`);
+  assert.equal((await store.get(e)).percent, 10, 'a ramp without a guardrail verdict moved the traffic');
+}
+
+export async function check_pause_on_breach(ctx) {
+  const {store, stats, e, ramp} = await setup(ctx);
+  stats.breach = {metric: 'error_rate', limit: 0.05, observed: 0.12};
+  let r = await ramp({to_percent: 50});
+  assert.equal(r.status, 409, \`with error_rate breached the ramp answered \${r.status} \${r.text}, expected 409\`);
+  const body = r.json();
+  assert(body.status === 'paused' && body.metric === 'error_rate', \`the 409 must say paused and name the metric, got \${r.text}\`);
+  assert(body.limit === 0.05 && body.observed === 0.12, \`the 409 must carry the limit and the observed value, got \${r.text}\`);
+  let stored = await store.get(e);
+  assert.equal(stored.status, 'paused', \`after a breach the experiment is \${stored.status}: the pause must be written, or the next scheduled ramp tries again\`);
+  assert.equal(stored.percent, 10, 'a breached ramp moved the traffic');
+  stats.breach = null;
+  r = await ramp({to_percent: 50});
+  assert.equal(r.status, 200, \`once the guardrails are clean the ramp answered \${r.status}: \${r.text}\`);
+  stored = await store.get(e);
+  assert(stored.percent === 50 && stored.status === 'running', \`a clean ramp must set 50 % and running, the store holds \${JSON.stringify(stored)}\`);
+}
+
+export async function check_no_override(ctx) {
+  const {store, stats, e, ramp} = await setup(ctx);
+  stats.breach = {metric: 'latency_p99_ms', limit: 800, observed: 1450};
+  for (const flag of ['skip_guardrails', 'override', 'force']) {
+    const r = await ramp({to_percent: 50, [flag]: true});
+    assert.equal(r.status, 400, \`a ramp with \${flag} in the body answered \${r.status} \${r.text}, expected 400: the body cannot switch the check off\`);
+  }
+  assert.equal((await store.get(e)).percent, 10, 'an override moved the traffic while latency is breached');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	pb "expd/gen/experiments_platform"
+	"expd/store"
+
+	"leetbuild/harness"
+)
+
+var rampBg = context.Background()
+
+// statsPeer answers clean verdicts unless breach is set.
+type statsPeer struct {
+	pb.UnimplementedGuardrailsServer
+	breach *pb.GuardrailVerdict
+}
+
+func (s *statsPeer) CheckGuardrails(_ context.Context, _ *pb.GuardrailRequest) (*pb.GuardrailVerdict, error) {
+	if s.breach != nil {
+		return s.breach, nil
+	}
+	return &pb.GuardrailVerdict{}, nil
+}
+
+func setup(ctx *harness.Ctx) (*harness.HTTP, *statsPeer, string) {
+	peer := &statsPeer{}
+	pb.RegisterGuardrailsServer(ctx.GRPC.Server(""), peer)
+	e := store.Create(rampBg, store.Design{Name: "cta", Unit: "user", Variants: []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}}, MinSample: 1000, Salt: "s-1"}).ID
+	store.SetPercent(rampBg, e, 10)
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux), peer, e
+}
+
+func rampTo(c *harness.HTTP, e string, body map[string]any) *harness.Response {
+	return c.Post("/v1/experiments/"+e+"/ramp", body)
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	c, _, e := setup(ctx)
+	r := rampTo(c, e, map[string]any{"to_percent": 25})
+	ctx.Equal(r.Status, 200, "a ramp to 25 %% with clean guardrails (%s)", r.Text())
+	calls := ctx.GRPC.CallsTo("CheckGuardrails", "")
+	ctx.Assert(len(calls) > 0, "the ramp made no CheckGuardrails call")
+	call := calls[len(calls)-1]
+	ctx.Assert(call.HasDeadline(), "the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open")
+	ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "the CheckGuardrails call carries a %v deadline, expected 2 s", call.Timeout)
+	ctx.GRPC.SetLatency("CheckGuardrails", 30.0, "")
+	r = rampTo(c, e, map[string]any{"to_percent": 50})
+	ctx.Equal(r.Status, 503, "with the stats service answering after 30 s the ramp (%s)", r.Text())
+	ctx.Equal(store.Get(rampBg, e).Percent, 25, "a ramp whose guardrail check timed out must not move the traffic; the percent")
+}
+
+func CheckFailClosed(ctx *harness.Ctx) {
+	c, _, e := setup(ctx)
+	ctx.GRPC.Fail("CheckGuardrails", codes.Unavailable, "stats is down", 5, "")
+	r := rampTo(c, e, map[string]any{"to_percent": 50})
+	ctx.Assert(r.Status == 503, "with the stats service unavailable the ramp answered %d %s, expected 503: no verdict is not a pass", r.Status, r.Text())
+	ctx.Equal(store.Get(rampBg, e).Percent, 10, "a ramp without a guardrail verdict must not move the traffic; the percent")
+}
+
+func CheckPauseOnBreach(ctx *harness.Ctx) {
+	c, peer, e := setup(ctx)
+	peer.breach = &pb.GuardrailVerdict{Breached: true, Metric: "error_rate", Limit: 0.05, Observed: 0.12}
+	r := rampTo(c, e, map[string]any{"to_percent": 50})
+	ctx.Equal(r.Status, 409, "with error_rate breached the ramp (%s)", r.Text())
+	var body map[string]any
+	r.Decode(&body)
+	ctx.Assert(body["status"] == "paused" && body["metric"] == "error_rate", "the 409 must say paused and name the metric, got %s", r.Text())
+	ctx.Assert(body["limit"] == 0.05 && body["observed"] == 0.12, "the 409 must carry the limit and the observed value, got %s", r.Text())
+	stored := store.Get(rampBg, e)
+	ctx.Assert(stored.Status == "paused", "after a breach the experiment is %q: the pause must be written, or the next scheduled ramp tries again", stored.Status)
+	ctx.Equal(stored.Percent, 10, "a breached ramp must not move the traffic; the percent")
+	peer.breach = nil
+	r = rampTo(c, e, map[string]any{"to_percent": 50})
+	ctx.Equal(r.Status, 200, "once the guardrails are clean the ramp (%s)", r.Text())
+	stored = store.Get(rampBg, e)
+	ctx.Assert(stored.Percent == 50 && stored.Status == "running", "a clean ramp must set 50 %% and running, the store holds %+v", stored)
+}
+
+func CheckNoOverride(ctx *harness.Ctx) {
+	c, peer, e := setup(ctx)
+	peer.breach = &pb.GuardrailVerdict{Breached: true, Metric: "latency_p99_ms", Limit: 800, Observed: 1450}
+	for _, flag := range []string{"skip_guardrails", "override", "force"} {
+		r := rampTo(c, e, map[string]any{"to_percent": 50, flag: true})
+		ctx.Assert(r.Status == 400, "a ramp with %s in the body answered %d %s, expected 400: the body cannot switch the check off", flag, r.Status, strings.TrimSpace(r.Text()))
+	}
+	ctx.Equal(store.Get(rampBg, e).Percent, 10, "an override must not move the traffic while latency is breached; the percent")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <optional>
+#include <string>
+
+#include "experiments_platform.grpc.pb.h"
+#include "expd/store.h"
+
+namespace {
+
+// Clean verdicts unless breach is set.
+class StatsPeer final : public expguard::Guardrails::Service {
+ public:
+  std::optional<expguard::GuardrailVerdict> breach;
+  grpc::Status CheckGuardrails(grpc::ServerContext*, const expguard::GuardrailRequest*, expguard::GuardrailVerdict* out) override {
+    if (breach) *out = *breach;
+    return grpc::Status::OK;
+  }
+};
+
+expguard::GuardrailVerdict breached(const std::string& metric, double limit, double observed) {
+  expguard::GuardrailVerdict v;
+  v.set_breached(true);
+  v.set_metric(metric);
+  v.set_limit(limit);
+  v.set_observed(observed);
+  return v;
+}
+
+struct World {
+  StatsPeer stats;
+  httplib::Server svr;
+};
+
+struct Setup {
+  harness::HTTP c;
+  StatsPeer& stats;
+  std::string e;
+};
+
+Setup setup(harness::Ctx& ctx) {
+  static World* world = nullptr;
+  delete world;
+  world = new World;
+  ctx.GRPC.Server("")->RegisterService(&world->stats);
+  const std::string e = store::create(store::Design{"cta", "user", {{"control", 50}, {"treatment", 50}}, 1000, "s-1"}).id;
+  store::setPercent(e, 10);
+  register_routes(world->svr);
+  return Setup{ctx.HTTP(world->svr), world->stats, e};
+}
+
+harness::Response rampTo(Setup& s, const nlohmann::json& body) {
+  return s.c.Post("/v1/experiments/" + s.e + "/ramp", body.dump(), "Content-Type", "application/json");
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  Setup s = setup(ctx);
+  auto r = rampTo(s, {{"to_percent", 25}});
+  ctx.Equal(r.Status, 200, "a ramp to 25 %% with clean guardrails (%s)", r.Text());
+  const auto calls = ctx.GRPC.CallsTo("CheckGuardrails");
+  ctx.Assert(!calls.empty(), "the ramp made no CheckGuardrails call");
+  ctx.Assert(calls.back().HasDeadline(), "the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open");
+  ctx.Assert(1.5 <= calls.back().TimeoutSeconds() && calls.back().TimeoutSeconds() <= 2.5, "the CheckGuardrails call carries a %v s deadline, expected kGuardrailDeadline = 2 s", calls.back().TimeoutSeconds());
+  ctx.GRPC.SetLatency("CheckGuardrails", 30.0);
+  r = rampTo(s, {{"to_percent", 50}});
+  ctx.Equal(r.Status, 503, "with the stats service answering after 30 s the ramp (%s)", r.Text());
+  ctx.Equal(store::get(s.e)->percent, 25, "a ramp whose guardrail check timed out must not move the traffic; the percent");
+}
+
+void CheckFailClosed(harness::Ctx& ctx) {
+  Setup s = setup(ctx);
+  ctx.GRPC.Fail("CheckGuardrails", grpc::StatusCode::UNAVAILABLE, "stats is down", 5);
+  const auto r = rampTo(s, {{"to_percent", 50}});
+  ctx.Assert(r.Status == 503, "with the stats service unavailable the ramp answered %d %s, expected 503: no verdict is not a pass", r.Status, r.Text());
+  ctx.Equal(store::get(s.e)->percent, 10, "a ramp without a guardrail verdict must not move the traffic; the percent");
+}
+
+void CheckPauseOnBreach(harness::Ctx& ctx) {
+  Setup s = setup(ctx);
+  s.stats.breach = breached("error_rate", 0.05, 0.12);
+  auto r = rampTo(s, {{"to_percent", 50}});
+  ctx.Equal(r.Status, 409, "with error_rate breached the ramp (%s)", r.Text());
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(body.is_object() && body.value("status", "") == "paused" && body.value("metric", "") == "error_rate", "the 409 must say paused and name the metric, got %s", r.Text());
+  ctx.Assert(body.value("limit", 0.0) == 0.05 && body.value("observed", 0.0) == 0.12, "the 409 must carry the limit and the observed value, got %s", r.Text());
+  auto stored = store::get(s.e);
+  ctx.Assert(stored->status == "paused", "after a breach the experiment is %q: the pause must be written, or the next scheduled ramp tries again", stored->status);
+  ctx.Equal(stored->percent, 10, "a breached ramp must not move the traffic; the percent");
+  s.stats.breach.reset();
+  r = rampTo(s, {{"to_percent", 50}});
+  ctx.Equal(r.Status, 200, "once the guardrails are clean the ramp (%s)", r.Text());
+  stored = store::get(s.e);
+  ctx.Assert(stored->percent == 50 && stored->status == "running", "a clean ramp must set 50 %% and running, the store holds %s", store::toJson(*stored).dump());
+}
+
+void CheckNoOverride(harness::Ctx& ctx) {
+  Setup s = setup(ctx);
+  s.stats.breach = breached("latency_p99_ms", 800, 1450);
+  for (const std::string flag : {"skip_guardrails", "override", "force"}) {
+    const auto r = rampTo(s, {{"to_percent", 50}, {flag, true}});
+    ctx.Assert(r.Status == 400, "a ramp with %s in the body answered %d %s, expected 400: the body cannot switch the check off", flag, r.Status, r.Text());
+  }
+  ctx.Equal(store::get(s.e)->percent, 10, "an override must not move the traffic while latency is breached; the percent");
+}
+`,
+  },
+  hints: [
+    'Make the stats service hang and fire a ramp: the request waits as long as it does. Take the service down: the ramp succeeds. Breach a guardrail: the experiment still says running, and the next scheduled ramp tries again.',
+    'The call has no deadline, the `except` turns an error into "no verdict" and carries on, the breach branch answers without writing the pause, and `skip_guardrails` jumps straight to `set_percent`.',
+    'Pass `timeout=GUARDRAIL_DEADLINE_S` (2.0); on `grpc.RpcError` answer 503; on a breach call `store.set_status(id, "paused")` and answer 409 with metric, limit and observed; answer 400 when the body names any of `OVERRIDE_FIELDS`.',
+  ],
+  debrief: `A guardrail is only a gate if every path that does not end in a clean verdict leaves the traffic where it was. That is why an RPC error answers 503 instead of falling through: the stats service being down says nothing about the metrics, and ramping blind is how one bad build reaches every user. The deadline bounds how long the scheduler waits, and the pause is written to the store because ramps are driven by a scheduler that will try again; the stored state is what stops it and tells a person which metric breached. Production platforms evaluate guardrails with sequential tests, so a check can run every few minutes without piling up false alarms, and page the experiment owner when a pause lands.`,
 };

@@ -5,963 +5,784 @@ export const endpointStep: Step = {
   title: 'POST /v1/scores: features from the server, not the caller',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'scorer', 'accounts', 'model'],
+  focus: ['client', 'scorer', 'redis', 'model'],
   task: `## Task
 
 **Starting point.** The starter serves \`POST /v1/scores\` with body
-\`{"transaction_id": "tx-…", "account_ref": "acct-…"}\`: it parses the body, reads
-\`body.features["declared_risk"]\`, calls the model, writes the result with \`scores.put\` and returns a
-band. It serves the demo and hides four flaws.
+\`{"transaction_id", "account_ref", "amount_cents"}\`: it builds the feature vector from the body's
+optional \`features\` object (defaulting to \`FEATURE_VERSION\` and zeros), scores it with
+\`model.score_transaction\`, stores the decision with \`store.save_decision\` and answers it. It
+serves the demo and hides three flaws.
 
-**Failure mode the checks target.** Caller-supplied features let the entity being scored write its
-own risk: a probe account declares itself low-risk and gets approved. The same handler scores accounts
-that do not exist and scores every retry again, which inflates the velocity counters the next step
-builds on and bills a model call each time.
+**Failure mode the checks target.** A probe account sends \`features\` describing itself as ten years
+old with no chargebacks and is approved; an account the scorer has never seen is scored and costs a
+model call; and a client that retries after a timeout gets a second, fresh decision for the same
+transaction.
 
-- \`account_ref\` must resolve in the server's own account store (\`accounts.get(account_ref)\`). An
-  unknown account is **404** (\`UNKNOWN_ACCOUNT\`), refused before any feature derivation or model
-  work.
-- Features are derived server-side by \`derive_features(account, transaction_id)\` and carry a pinned
-  \`FEATURE_VERSION\`, so a decision can be replayed later. Anything the caller sends under
-  \`features\` or \`declared_risk\` is ignored.
-- \`transaction_id\` is the dedupe key: \`scores.get(transaction_id)\` answers a replay with the
-  stored decision; only a first sighting is scored and written with
-  \`scores.put(transaction_id, result)\`.
-- The stored decision carries the score, the band, the feature version and the fallback marker. The
-  log line carries ids and the band, not the feature vector, which describes a person.`,
+- Look the account up first (\`store.get_account\`): an unknown one is **404**, before any model call
+  and without a stored decision.
+- The vector is \`features.derive_features(account, amount_cents)\`; nothing else the caller sends is
+  read.
+- \`transaction_id\` is the dedupe key: \`store.get_decision\` answers a replay with the stored
+  decision; only a first sighting calls the model and is saved.
+- The decision is \`{transaction_id, account_ref, score, band, fallback, model_version,
+  feature_version}\`.`,
   sequence: {
-    participants: ['Merchant client', 'Fraud Scorer', 'Accounts', 'Fraud model'],
+    participants: ['Merchant client', 'scorer', 'Redis', 'Fraud model'],
     messages: [
-      {
-        from: 'Merchant client',
-        to: 'Fraud Scorer',
-        label: 'POST /v1/scores · transaction_id · account_ref',
-        kind: 'sync',
-      },
-      {from: 'Fraud Scorer', to: 'Accounts', label: 'accounts.get(account_ref)', kind: 'sync'},
-      {from: 'Accounts', to: 'Fraud Scorer', label: 'account / none', kind: 'reply'},
-      {from: 'Fraud Scorer', to: 'Fraud Scorer', label: '404 unknown account', kind: 'sync'},
-      {from: 'Fraud Scorer', to: 'Fraud Scorer', label: 'scores.get(transaction_id) → stored', kind: 'sync'},
-      {from: 'Fraud Scorer', to: 'Fraud Scorer', label: 'derive_features(account, transaction_id)', kind: 'sync'},
-      {from: 'Fraud Scorer', to: 'Fraud model', label: 'Score(features) · 300 ms', kind: 'sync'},
-      {from: 'Fraud model', to: 'Fraud Scorer', label: 'score · model version', kind: 'reply'},
-      {from: 'Fraud Scorer', to: 'Merchant client', label: '200 {score, band, feature_version}', kind: 'reply'},
+      {from: 'Merchant client', to: 'scorer', label: 'POST /v1/scores · transaction_id · account_ref', kind: 'sync'},
+      {from: 'scorer', to: 'Redis', label: 'get_account(account_ref) → none: 404', kind: 'sync'},
+      {from: 'scorer', to: 'Redis', label: 'get_decision(transaction_id) → stored: answer it', kind: 'sync'},
+      {from: 'scorer', to: 'scorer', label: 'derive_features(account, amount_cents)', kind: 'sync'},
+      {from: 'scorer', to: 'Fraud model', label: 'Score(vector) · 300 ms', kind: 'sync'},
+      {from: 'Fraud model', to: 'scorer', label: 'score · model_version', kind: 'reply'},
+      {from: 'scorer', to: 'Redis', label: 'save_decision(decision)', kind: 'sync'},
+      {from: 'scorer', to: 'Merchant client', label: '200 {score, band, feature_version}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/scores',
-      detail: 'Register the scoring route on `POST /v1/scores`.',
+      title: 'Scores a transaction on POST /v1/scores',
+      detail: 'Register `POST /v1/scores`; a known account gets a decision with its transaction id, score and band.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/scores["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/scores['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/scores"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"scores"\s*\)/, /\bpost\s*\{/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"scores"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/scores"/]},
       },
     },
     {
       id: 'server-features',
-      title: 'Features are derived server-side, at a pinned version',
+      title: 'The feature vector comes from the account store',
       detail:
-        'The feature vector comes from `derive_features(account, transaction_id)` and carries `FEATURE_VERSION`; nothing the caller sends under `features`/`declared_risk` is read. The starter builds the score from the request body, so the entity being scored grades its own exam.',
+        "The vector the model sees is `derive_features(account, amount_cents)` at `FEATURE_VERSION`; the body's `features` object is not read, so an account cannot describe its own age or chargeback history.",
       match: {
-        python: {all: [/def derive_features\(/, /FEATURE_VERSION/], none: [/body\.features/]},
-        typescript: {all: [/function deriveFeatures\(/, /FEATURE_VERSION/], none: [/body\.features/]},
-        go: {all: [/func deriveFeatures\(/, /featureVersion/], none: [/body\.Features/]},
-        scala: {all: [/def deriveFeatures\(/, /FeatureVersion/], none: [/body\.features/]},
-        cpp: {all: [/deriveFeatures\(/, /kFeatureVersion/], none: [/body\.value\(\s*"features"|body\["features"\]/]},
+        python: {all: [/features\.derive_features\(/], none: [/body\.features/]},
+        typescript: {all: [/deriveFeatures\(/], none: [/body\.features/]},
+        go: {all: [/features\.DeriveFeatures\(/], none: [/body\.Features/]},
+        scala: {all: [/Features\.deriveFeatures\(/], none: [/"features"/]},
+        cpp: {all: [/features::deriveFeatures\(/], none: [/"features"/]},
       },
     },
     {
       id: 'account-404',
-      title: 'Refuses an unknown account with 404',
+      title: 'An unknown account is 404 before any model call',
       detail:
-        'An `account_ref` that does not resolve is **404** and the request stops there: no features, no model call. The starter never looks the account up, so a probe account is scored like a real one.',
+        'The account is read (`store.get_account`) before anything else; a miss answers **404**, calls no model and stores no decision.',
       match: {
-        python: {all: [/UNKNOWN_ACCOUNT/, /status_code\s*=\s*404/]},
-        typescript: {all: [/UNKNOWN_ACCOUNT/, /code\(\s*404\s*\)/]},
-        go: {all: [/unknownAccount/, /StatusNotFound/]},
-        scala: {all: [/UnknownAccount/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/kUnknownAccount/, /status\s*=\s*404/]},
+        python: {
+          all: [/store\.get_account\(/, /\b404\b/],
+          order: [/store\.get_account\(/, /model\.score_transaction\(/],
+        },
+        typescript: {all: [/getAccount\(/, /\b404\b/], order: [/getAccount\(body/, /scoreTransaction\(/]},
+        go: {
+          all: [/store\.GetAccount\(/, /StatusNotFound|\b404\b/],
+          order: [/store\.GetAccount\(/, /model\.ScoreTransaction\(/],
+        },
+        scala: {all: [/Store\.getAccount\(/, /NotFound/], order: [/Store\.getAccount\(/, /Model\.scoreTransaction\(/]},
+        cpp: {all: [/store::getAccount\(/, /\b404\b/], order: [/store::getAccount\(/, /model::scoreTransaction\(/]},
       },
     },
     {
       id: 'replay-dedupe',
-      title: 'A replayed transaction id returns the stored score',
+      title: 'A replayed transaction id answers the stored decision',
       detail:
-        'The decision is read back with `scores.get(transaction_id)` before any model work and written with `scores.put(transaction_id, result)` only for a first sighting. The starter writes every decision but reads none back, so each retry is scored as a new decision.',
+        '`store.get_decision(transaction_id)` is read before the model is called and answers a replay; only a first sighting is scored and saved.',
       match: {
-        python: {all: [/scores\.get\(/, /scores\.put\(/]},
-        typescript: {all: [/scores\.get\(/, /scores\.put\(/]},
-        go: {all: [/scores\.Get\(/, /scores\.Put\(/]},
-        scala: {all: [/scores\.get\(/, /scores\.put\(/]},
-        cpp: {all: [/scores\.get\(/, /scores\.put\(/]},
-      },
-    },
-    {
-      id: 'account-before-model',
-      title: 'The account lookup happens before the model call',
-      detail:
-        'The account is resolved before the model is asked anything, so an unknown account never reaches the model. A lookup that runs after the call has already spent the deadline, the money and the velocity write on a request that had to be refused.',
-      match: {
-        python: {order: [/accounts\.get\(/, /model\.score\(/]},
-        typescript: {order: [/accounts\.get\(/, /model\.score\(/]},
-        go: {order: [/accounts\.Get\(/, /model\.Score\(/]},
-        scala: {order: [/accounts\.get\(/, /model\.score\(/]},
-        cpp: {order: [/accounts\.get\(/, /model\.score\(/]},
+        python: {all: [/store\.get_decision\(/], order: [/store\.get_decision\(/, /model\.score_transaction\(/]},
+        typescript: {all: [/getDecision\(body/], order: [/getDecision\(body/, /scoreTransaction\(/]},
+        go: {all: [/store\.GetDecision\(/], order: [/store\.GetDecision\(/, /model\.ScoreTransaction\(/]},
+        scala: {all: [/Store\.getDecision\(/], order: [/Store\.getDecision\(/, /Model\.scoreTransaction\(/]},
+        cpp: {all: [/store::getDecision\(/], order: [/store::getDecision\(/, /model::scoreTransaction\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI
 from pydantic import BaseModel
 
+from fraud import features, model, store  # features.derive_features; model.score_transaction; store.get_account, get_decision, save_decision
+
 app = FastAPI()
-logger = logging.getLogger("scoring")
 
 
-class ScoreRequest(BaseModel):
+class ScoreBody(BaseModel):
     transaction_id: str
     account_ref: str
+    amount_cents: int
     features: dict = {}
 
 
-class AccountStore:
-    def get(self, ref: str) -> dict | None:
-        """The account record for \`ref\`, or None when the scorer has never seen it."""
-        raise NotImplementedError
-
-
-class ScoreStore:
-    def put(self, transaction_id: str, decision: dict) -> None:
-        """Store the decision under the transaction id."""
-        raise NotImplementedError
-
-
-class ModelClient:
-    def score(self, features: dict) -> dict:
-        """The fraud model over gRPC (see the client step for the deadline and the fallback)."""
-        raise NotImplementedError
-
-
-accounts = AccountStore()
-scores = ScoreStore()
-model = ModelClient()
-
-
 @app.post("/v1/scores")
-def score(body: ScoreRequest) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    declared = body.features
-    declared_risk = float(declared.get("declared_risk", 0.0))
-    scored = model.score(declared)
-    result = {
-        "transaction_id": body.transaction_id,
-        "account_ref": body.account_ref,
-        "score": round(1.0 - declared_risk, 4),
-        "band": "approve" if declared_risk < 0.30 else "review",
-        "feature_version": "caller",
+def score(body: ScoreBody) -> dict:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    vector = {
+        "feature_version": body.features.get("feature_version", features.FEATURE_VERSION),
+        "account_age_days": int(body.features.get("account_age_days", 0)),
+        "prior_chargebacks": int(body.features.get("prior_chargebacks", 0)),
+        "amount_cents": body.amount_cents,
     }
-    scores.put(body.transaction_id, result)
-    logger.info("scored tx=%s account=%s band=%s", body.transaction_id, body.account_ref, result["band"])
-    return JSONResponse(result, status_code=200)
+    verdict = model.score_transaction(vector)
+    decision = {"transaction_id": body.transaction_id, "account_ref": body.account_ref, **verdict, "feature_version": vector["feature_version"]}
+    store.save_decision(decision)
+    return decision
 `,
-      solution: `import hashlib
-import logging
+      solution: `from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from fraud import features, model, store  # features.derive_features; model.score_transaction; store.get_account, get_decision, save_decision
 
 app = FastAPI()
-logger = logging.getLogger("scoring")
-
-FEATURE_VERSION = "fx-3"
-APPROVE_BAND_MAX = 0.30
-REVIEW_BAND_MAX = 0.70
-UNKNOWN_ACCOUNT = "unknown_account"
 
 
-class ScoreRequest(BaseModel):
-    # A caller may send features, declared_risk, score — none of them is part of the contract, and
-    # the model drops every field it does not declare.
-    model_config = ConfigDict(extra="ignore")
-
+class ScoreBody(BaseModel):
+    # Anything else in the body is ignored: the entity being scored does not describe itself.
     transaction_id: str
     account_ref: str
-
-
-class AccountStore:
-    def get(self, ref: str) -> dict | None:
-        """The account record for \`ref\`, or None when the scorer has never seen it."""
-        raise NotImplementedError
-
-
-class ScoreStore:
-    def get(self, transaction_id: str) -> dict | None:
-        """The decision already stored for this transaction, if any."""
-        raise NotImplementedError
-
-    def put(self, transaction_id: str, decision: dict) -> None:
-        """Store the decision under the transaction id."""
-        raise NotImplementedError
-
-
-class ModelClient:
-    def score(self, features: dict) -> dict:
-        """The fraud model over gRPC (see the client step for the deadline and the fallback)."""
-        raise NotImplementedError
-
-
-accounts = AccountStore()
-scores = ScoreStore()
-model = ModelClient()
-
-
-def band_for(score: float) -> str:
-    if score <= APPROVE_BAND_MAX:
-        return "approve"
-    if score <= REVIEW_BAND_MAX:
-        return "review"
-    return "decline"
-
-
-def derive_features(account: dict, transaction_id: str) -> dict:
-    """The server's own view of the transaction: tenure, history, amount band and a tx handle."""
-    tx_ref = hashlib.sha256(transaction_id.encode("utf-8")).hexdigest()[:16]
-    return {
-        "version": FEATURE_VERSION,
-        "account_age_days": int(account.get("age_days", 0)),
-        "prior_chargebacks": int(account.get("chargebacks", 0)),
-        "amount_band": str(account.get("amount_band", "unknown")),
-        "tx_ref": tx_ref,
-    }
+    amount_cents: int
 
 
 @app.post("/v1/scores")
-def score(body: ScoreRequest) -> JSONResponse:
-    account = accounts.get(body.account_ref)
+def score(body: ScoreBody) -> dict:
+    account = store.get_account(body.account_ref)
     if account is None:
-        raise HTTPException(status_code=404, detail=UNKNOWN_ACCOUNT)
-
-    stored = scores.get(body.transaction_id)
+        raise HTTPException(status_code=404, detail="unknown account")
+    stored = store.get_decision(body.transaction_id)
     if stored is not None:
-        return JSONResponse(stored, status_code=200)
-
-    features = derive_features(account, body.transaction_id)
-    scored = model.score(features)
-    result = {
-        "transaction_id": body.transaction_id,
-        "account_ref": body.account_ref,
-        "score": scored["score"],
-        "band": band_for(scored["score"]),
-        "feature_version": features["version"],
-        "fallback": scored.get("fallback", False),
-    }
-    scores.put(body.transaction_id, result)
-    logger.info("scored tx=%s account=%s band=%s", body.transaction_id, body.account_ref, result["band"])
-    return JSONResponse(result, status_code=200)
+        return stored  # a retry answers the first decision
+    vector = features.derive_features(account, body.amount_cents)
+    verdict = model.score_transaction(vector)
+    decision = {"transaction_id": body.transaction_id, "account_ref": body.account_ref, **verdict, "feature_version": vector["feature_version"]}
+    store.save_decision(decision)
+    return decision
 `,
     },
     typescript: {
-      starter: `/** POST /v1/scores. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {FEATURE_VERSION, type Features, deriveFeatures} from 'fraud/features';
+import {scoreTransaction} from 'fraud/model';
+import {type Decision, getAccount, getDecision, saveDecision} from 'fraud/store';
 
 export const app = Fastify();
 
 interface ScoreBody {
   transaction_id: string;
   account_ref: string;
-  features?: Record<string, number>;
+  amount_cents: number;
+  features?: Partial<Features>;
 }
 
-interface ScoreDecision {
-  transaction_id: string;
-  account_ref: string;
-  score: number;
-  band: string;
-  feature_version: string;
-}
-
-class AccountStore {
-  async get(ref: string): Promise<Record<string, unknown> | null> {
-    return null;
-  }
-}
-
-class ScoreStore {
-  async put(transactionId: string, decision: ScoreDecision): Promise<void> {}
-}
-
-class ModelClient {
-  async score(features: Record<string, number>): Promise<{score: number; fallback: boolean}> {
-    return {score: 0.5, fallback: false};
-  }
-}
-
-const accounts = new AccountStore();
-const scores = new ScoreStore();
-const model = new ModelClient();
-
-function bandFor(score: number): string {
-  if (score <= 0.3) return 'approve';
-  if (score <= 0.7) return 'review';
-  return 'decline';
-}
-
-app.post('/v1/scores', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+app.post('/v1/scores', async request => {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
   const body = request.body as ScoreBody;
   const declared = body.features ?? {};
-  await model.score(declared);
-  const result: ScoreDecision = {
-    transaction_id: body.transaction_id,
-    account_ref: body.account_ref,
-    score: Math.round((1 - (declared.declared_risk ?? 0)) * 10000) / 10000,
-    band: bandFor(declared.declared_risk ?? 0),
-    feature_version: 'caller',
+  const vector: Features = {
+    feature_version: declared.feature_version ?? FEATURE_VERSION,
+    account_age_days: Number(declared.account_age_days ?? 0),
+    prior_chargebacks: Number(declared.prior_chargebacks ?? 0),
+    amount_cents: body.amount_cents,
   };
-  await scores.put(body.transaction_id, result);
-  request.log.info({tx: body.transaction_id, account: body.account_ref, band: result.band}, 'scored');
-  return reply.code(200).send(result);
+  const verdict = await scoreTransaction(vector);
+  const decision: Decision = {transaction_id: body.transaction_id, account_ref: body.account_ref, ...verdict, feature_version: vector.feature_version};
+  await saveDecision(decision);
+  return decision;
 });
-
-await app.listen({host: '0.0.0.0', port: 8443});
 `,
-      solution: `/** POST /v1/scores: server-derived features, a required account, and a dedupe key. */
-import {createHash} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {type Features, deriveFeatures} from 'fraud/features';
+import {scoreTransaction} from 'fraud/model';
+import {type Decision, getAccount, getDecision, saveDecision} from 'fraud/store';
 
 export const app = Fastify();
 
-const FEATURE_VERSION = 'fx-3';
-const APPROVE_BAND_MAX = 0.3;
-const REVIEW_BAND_MAX = 0.7;
-const UNKNOWN_ACCOUNT = 'unknown_account';
-
+// Anything else in the body is ignored: the entity being scored does not describe itself.
 interface ScoreBody {
   transaction_id: string;
   account_ref: string;
-}
-
-interface FeatureVector {
-  version: string;
-  account_age_days: number;
-  prior_chargebacks: number;
-  amount_band: string;
-  tx_ref: string;
-}
-
-interface ScoreDecision {
-  transaction_id: string;
-  account_ref: string;
-  score: number;
-  band: string;
-  feature_version: string;
-  fallback: boolean;
-}
-
-class AccountStore {
-  async get(ref: string): Promise<Record<string, unknown> | null> {
-    return null;
-  }
-}
-
-class ScoreStore {
-  async get(transactionId: string): Promise<ScoreDecision | null> {
-    return null;
-  }
-
-  async put(transactionId: string, decision: ScoreDecision): Promise<void> {}
-}
-
-class ModelClient {
-  async score(features: FeatureVector): Promise<{score: number; fallback: boolean}> {
-    return {score: 0.5, fallback: false};
-  }
-}
-
-const accounts = new AccountStore();
-const scores = new ScoreStore();
-const model = new ModelClient();
-
-function bandFor(score: number): string {
-  if (score <= APPROVE_BAND_MAX) return 'approve';
-  if (score <= REVIEW_BAND_MAX) return 'review';
-  return 'decline';
-}
-
-function deriveFeatures(account: Record<string, unknown>, transactionId: string): FeatureVector {
-  return {
-    version: FEATURE_VERSION,
-    account_age_days: Number(account.age_days ?? 0),
-    prior_chargebacks: Number(account.chargebacks ?? 0),
-    amount_band: String(account.amount_band ?? 'unknown'),
-    tx_ref: createHash('sha256').update(transactionId).digest('hex').slice(0, 16),
-  };
+  amount_cents: number;
 }
 
 app.post('/v1/scores', async (request, reply) => {
-  const body = request.body as Partial<ScoreBody> | null;
-  if (body === null || typeof body !== 'object') return reply.code(400).send({error: 'invalid body'});
-  if (typeof body.transaction_id !== 'string' || typeof body.account_ref !== 'string')
-    return reply.code(400).send({error: 'transaction_id and account_ref are required'});
-
-  const account = await accounts.get(body.account_ref);
-  if (account === null) return reply.code(404).send({error: UNKNOWN_ACCOUNT});
-
-  const stored = await scores.get(body.transaction_id);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  const features = deriveFeatures(account, body.transaction_id);
-  const scored = await model.score(features);
-  const decision: ScoreDecision = {
-    transaction_id: body.transaction_id,
-    account_ref: body.account_ref,
-    score: scored.score,
-    band: bandFor(scored.score),
-    feature_version: features.version,
-    fallback: scored.fallback,
-  };
-  await scores.put(body.transaction_id, decision);
-  request.log.info({tx: body.transaction_id, account: body.account_ref, band: decision.band}, 'scored');
-  return reply.code(200).send(decision);
+  const body = request.body as ScoreBody;
+  const account = await getAccount(body.account_ref);
+  if (account === null) return reply.code(404).send({error: 'unknown account'});
+  const stored = await getDecision(body.transaction_id);
+  if (stored !== null) return stored; // a retry answers the first decision
+  const vector: Features = deriveFeatures(account, body.amount_cents);
+  const verdict = await scoreTransaction(vector);
+  const decision: Decision = {transaction_id: body.transaction_id, account_ref: body.account_ref, ...verdict, feature_version: vector.feature_version};
+  await saveDecision(decision);
+  return decision;
 });
-
-await app.listen({host: '0.0.0.0', port: 8443});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"fraud/features" // features.DeriveFeatures, FeatureVersion
+	"fraud/model"    // model.ScoreTransaction
+	"fraud/store"    // store.GetAccount, GetDecision, SaveDecision
 )
 
-type ScoreRequest struct {
-	TransactionID string             \`json:"transaction_id"\`
-	AccountRef    string             \`json:"account_ref"\`
-	Features      map[string]float64 \`json:"features"\`
+type scoreBody struct {
+	TransactionID string            \`json:"transaction_id"\`
+	AccountRef    string            \`json:"account_ref"\`
+	AmountCents   int64             \`json:"amount_cents"\`
+	Features      features.Features \`json:"features"\`
 }
 
-type AccountStore struct{}
-
-func (s *AccountStore) Get(ctx context.Context, ref string) (map[string]any, error) {
-	return nil, nil
-}
-
-type ScoreStore struct{}
-
-func (s *ScoreStore) Put(ctx context.Context, transactionID string, decision map[string]any) error {
-	return nil
-}
-
-type ModelClient interface {
-	Score(ctx context.Context, features map[string]float64) (map[string]any, error)
-}
-
-var accounts = &AccountStore{}
-var scores = &ScoreStore{}
-var model ModelClient
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func score(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	var body ScoreRequest
+func postScore(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	var body scoreBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "malformed body", http.StatusBadRequest)
 		return
 	}
-	scored, err := model.Score(r.Context(), body.Features)
+	vector := body.Features
+	vector.AmountCents = body.AmountCents
+	if vector.FeatureVersion == "" {
+		vector.FeatureVersion = features.FeatureVersion
+	}
+	verdict, err := model.ScoreTransaction(r.Context(), vector)
 	if err != nil {
-		writeJSON(rw, http.StatusBadGateway, map[string]string{"error": "model unavailable"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	decision := map[string]any{
-		"transaction_id":  body.TransactionID,
-		"account_ref":     body.AccountRef,
-		"score":           1 - body.Features["declared_risk"],
-		"feature_version": "caller",
-		"model_score":     scored["score"],
-	}
-	_ = scores.Put(r.Context(), body.TransactionID, decision)
-	log.Printf("scored tx=%s account=%s", body.TransactionID, body.AccountRef)
+	decision := store.Decision{TransactionID: body.TransactionID, AccountRef: body.AccountRef, Score: verdict.Score, Band: verdict.Band, Fallback: verdict.Fallback, ModelVersion: verdict.ModelVersion, FeatureVersion: vector.FeatureVersion}
+	store.SaveDecision(r.Context(), decision)
 	writeJSON(rw, http.StatusOK, decision)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/scores", score)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/scores", postScore)
 }
 `,
       solution: `package main
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"fraud/features" // features.DeriveFeatures, FeatureVersion
+	"fraud/model"    // model.ScoreTransaction
+	"fraud/store"    // store.GetAccount, GetDecision, SaveDecision
 )
 
-const (
-	featureVersion = "fx-3"
-	approveBandMax = 0.30
-	reviewBandMax  = 0.70
-	unknownAccount = "unknown_account"
-)
-
-// The body names the transaction and the account: every risk opinion a caller adds to it is
-// dropped by the decoder, so the caller cannot write its own risk.
-type ScoreRequest struct {
+// Anything else in the body is ignored: the entity being scored does not describe itself.
+type scoreBody struct {
 	TransactionID string \`json:"transaction_id"\`
 	AccountRef    string \`json:"account_ref"\`
+	AmountCents   int64  \`json:"amount_cents"\`
 }
 
-type FeatureVector struct {
-	Version          string \`json:"version"\`
-	AccountAgeDays   int    \`json:"account_age_days"\`
-	PriorChargebacks int    \`json:"prior_chargebacks"\`
-	AmountBand       string \`json:"amount_band"\`
-	TxRef            string \`json:"tx_ref"\`
-}
-
-type AccountStore struct{}
-
-func (s *AccountStore) Get(ctx context.Context, ref string) (map[string]any, error) {
-	return nil, nil
-}
-
-type ScoreStore struct{}
-
-func (s *ScoreStore) Get(ctx context.Context, transactionID string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *ScoreStore) Put(ctx context.Context, transactionID string, decision map[string]any) error {
-	return nil
-}
-
-type ModelClient interface {
-	Score(ctx context.Context, features FeatureVector) (map[string]any, error)
-}
-
-var accounts = &AccountStore{}
-var scores = &ScoreStore{}
-var model ModelClient
-
-func bandFor(score float64) string {
-	switch {
-	case score <= approveBandMax:
-		return "approve"
-	case score <= reviewBandMax:
-		return "review"
-	default:
-		return "decline"
-	}
-}
-
-func deriveFeatures(account map[string]any, transactionID string) FeatureVector {
-	sum := sha256.Sum256([]byte(transactionID))
-	age, _ := account["age_days"].(int)
-	chargebacks, _ := account["chargebacks"].(int)
-	band, _ := account["amount_band"].(string)
-	return FeatureVector{
-		Version:          featureVersion,
-		AccountAgeDays:   age,
-		PriorChargebacks: chargebacks,
-		AmountBand:       band,
-		TxRef:            hex.EncodeToString(sum[:])[:16],
-	}
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func score(rw http.ResponseWriter, r *http.Request) {
-	var body ScoreRequest
+func postScore(rw http.ResponseWriter, r *http.Request) {
+	var body scoreBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "malformed body", http.StatusBadRequest)
 		return
 	}
-	account, err := accounts.Get(r.Context(), body.AccountRef)
-	if err != nil || account == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": unknownAccount})
+	account := store.GetAccount(r.Context(), body.AccountRef)
+	if account == nil {
+		http.Error(rw, "unknown account", http.StatusNotFound)
 		return
 	}
-	stored, err := scores.Get(r.Context(), body.TransactionID)
+	if stored := store.GetDecision(r.Context(), body.TransactionID); stored != nil {
+		writeJSON(rw, http.StatusOK, stored) // a retry answers the first decision
+		return
+	}
+	vector := features.DeriveFeatures(*account, body.AmountCents)
+	verdict, err := model.ScoreTransaction(r.Context(), vector)
 	if err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "store unavailable"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
-		return
-	}
-	features := deriveFeatures(account, body.TransactionID)
-	scored, err := model.Score(r.Context(), features)
-	if err != nil {
-		writeJSON(rw, http.StatusBadGateway, map[string]string{"error": "model unavailable"})
-		return
-	}
-	value, _ := scored["score"].(float64)
-	decision := map[string]any{
-		"transaction_id":  body.TransactionID,
-		"account_ref":     body.AccountRef,
-		"score":           value,
-		"band":            bandFor(value),
-		"feature_version": features.Version,
-		"fallback":        scored["fallback"],
-	}
-	if err := scores.Put(r.Context(), body.TransactionID, decision); err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "store unavailable"})
-		return
-	}
-	log.Printf("scored tx=%s account=%s band=%s", body.TransactionID, body.AccountRef, bandFor(value))
+	decision := store.Decision{TransactionID: body.TransactionID, AccountRef: body.AccountRef, Score: verdict.Score, Band: verdict.Band, Fallback: verdict.Fallback, ModelVersion: verdict.ModelVersion, FeatureVersion: vector.FeatureVersion}
+	store.SaveDecision(r.Context(), decision)
 	writeJSON(rw, http.StatusOK, decision)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/scores", score)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/scores", postScore)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
+import spray.json.DefaultJsonProtocol._
+
+import fraud.{FeatureVector, Features, Model, Store, Verdict} // Features.deriveFeatures; Model.scoreTransaction; Store.getAccount, getDecision, saveDecision
 
 object Api {
-  case class ScoreRequest(transactionId: String, accountRef: String, features: Map[String, Double] = Map.empty)
+  private def ok(body: JsObject): HttpResponse =
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val scores = new ScoreStore
+  private def decisionOf(transactionId: String, accountRef: String, verdict: Verdict, featureVersion: String): JsObject = JsObject(
+    "transaction_id" -> JsString(transactionId), "account_ref" -> JsString(accountRef), "score" -> JsNumber(verdict.score),
+    "band" -> JsString(verdict.band), "fallback" -> JsBoolean(verdict.fallback), "model_version" -> JsString(verdict.modelVersion),
+    "feature_version" -> JsString(featureVersion))
 
-  class AccountStore {
-    def get(ref: String): Option[JsObject] = None
-  }
-
-  class ScoreStore {
-    def put(transactionId: String, decision: JsObject): Unit = ()
-  }
-
-  class ModelClient {
-    def score(features: Map[String, Double]): JsObject = JsObject("score" -> JsNumber(0.5))
-  }
-
-  val accounts = new AccountStore
-  val model = new ModelClient
-
-  def bandFor(score: Double): String =
-    if (score <= 0.3) "approve" else if (score <= 0.7) "review" else "decline"
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  def score(request: ScoreRequest): JsObject = {
-    val declared = request.features.getOrElse("declared_risk", 0.0)
-    model.score(request.features)
-    val decision = JsObject(
-      "transaction_id" -> JsString(request.transactionId),
-      "account_ref" -> JsString(request.accountRef),
-      "score" -> JsNumber(1.0 - declared),
-      "band" -> JsString(bandFor(declared)),
-      "feature_version" -> JsString("caller"),
-    )
-    scores.put(request.transactionId, decision)
-    decision
-  }
-
-  val route: Route =
-    path("v1" / "scores") {
-      post {
-        entity(as[String]) { raw =>
-          complete(score(raw.parseJson.convertTo[ScoreRequest]).compactPrint)
-        }
+  val route: Route = path("v1" / "scores") {
+    post {
+      entity(as[String]) { raw =>
+        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+        val body = raw.parseJson.asJsObject.fields
+        val declared = body.get("features").map(_.asJsObject.fields).getOrElse(Map.empty[String, JsValue])
+        def number(name: String): Long = declared.get(name).map(_.convertTo[Long]).getOrElse(0L)
+        val vector = FeatureVector(
+          declared.get("feature_version").map(_.convertTo[String]).getOrElse(Features.FeatureVersion),
+          number("account_age_days"), number("prior_chargebacks"), body("amount_cents").convertTo[Long])
+        val verdict = Model.scoreTransaction(vector)
+        val decision = decisionOf(body("transaction_id").convertTo[String], body("account_ref").convertTo[String], verdict, vector.featureVersion)
+        Store.saveDecision(decision)
+        complete(ok(decision))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("scoring")
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.security.MessageDigest
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
+import spray.json.DefaultJsonProtocol._
+
+import fraud.{Features, Model, Store, Verdict} // Features.deriveFeatures; Model.scoreTransaction; Store.getAccount, getDecision, saveDecision
 
 object Api {
-  val FeatureVersion = "fx-3"
-  val ApproveBandMax = 0.30
-  val ReviewBandMax = 0.70
-  val UnknownAccount = "unknown_account"
+  private def ok(body: JsObject): HttpResponse =
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  case class ScoreRequest(transactionId: String, accountRef: String)
+  private def decisionOf(transactionId: String, accountRef: String, verdict: Verdict, featureVersion: String): JsObject = JsObject(
+    "transaction_id" -> JsString(transactionId), "account_ref" -> JsString(accountRef), "score" -> JsNumber(verdict.score),
+    "band" -> JsString(verdict.band), "fallback" -> JsBoolean(verdict.fallback), "model_version" -> JsString(verdict.modelVersion),
+    "feature_version" -> JsString(featureVersion))
 
-  class AccountStore {
-    def get(ref: String): Option[JsObject] = None
-  }
-
-  class ScoreStore {
-    def get(transactionId: String): Option[JsObject] = None
-    def put(transactionId: String, decision: JsObject): Unit = ()
-  }
-
-  class ModelClient {
-    def score(features: JsObject): JsObject = JsObject("score" -> JsNumber(0.5), "fallback" -> JsBoolean(false))
-  }
-
-  val accounts = new AccountStore
-  val scores = new ScoreStore
-  val model = new ModelClient
-
-  def bandFor(score: Double): String =
-    if (score <= ApproveBandMax) "approve" else if (score <= ReviewBandMax) "review" else "decline"
-
-  def deriveFeatures(account: JsObject, transactionId: String): JsObject = {
-    val digest = MessageDigest.getInstance("SHA-256").digest(transactionId.getBytes("UTF-8"))
-    JsObject(
-      "version" -> JsString(FeatureVersion),
-      "account_age_days" -> JsNumber(account.fields.getOrElse("age_days", JsNumber(0)).convertTo[Int]),
-      "prior_chargebacks" -> JsNumber(account.fields.getOrElse("chargebacks", JsNumber(0)).convertTo[Int]),
-      "amount_band" -> JsString(account.fields.getOrElse("amount_band", JsString("unknown")).convertTo[String]),
-      "tx_ref" -> JsString(digest.take(8).map("%02x".format(_)).mkString),
-    )
-  }
-
-  def score(request: ScoreRequest): Either[(StatusCode, String), JsObject] = {
-    accounts.get(request.accountRef) match {
-      case None => Left((StatusCodes.NotFound, s"""{"error":"$UnknownAccount"}"""))
-      case Some(account) =>
-        scores.get(request.transactionId) match {
-          case Some(stored) => Right(stored)
-          case None =>
-            val features = deriveFeatures(account, request.transactionId)
-            val scored = model.score(features)
-            val value = scored.fields("score").convertTo[Double]
-            val decision = JsObject(
-              "transaction_id" -> JsString(request.transactionId),
-              "account_ref" -> JsString(request.accountRef),
-              "score" -> JsNumber(value),
-              "band" -> JsString(bandFor(value)),
-              "feature_version" -> JsString(FeatureVersion),
-              "fallback" -> scored.fields.getOrElse("fallback", JsBoolean(false)),
-            )
-            scores.put(request.transactionId, decision)
-            Right(decision)
-        }
-    }
-  }
-
-  val route: Route =
-    path("v1" / "scores") {
-      post {
-        entity(as[String]) { raw =>
-          score(raw.parseJson.convertTo[ScoreRequest]) match {
-            case Left((status, body)) => complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
-            case Right(decision) => complete(HttpEntity(ContentTypes.\`application/json\`, decision.compactPrint))
-          }
+  val route: Route = path("v1" / "scores") {
+    post {
+      entity(as[String]) { raw =>
+        // Only these three fields are read: the entity being scored does not describe itself.
+        val body = raw.parseJson.asJsObject.fields
+        val transactionId = body("transaction_id").convertTo[String]
+        val accountRef = body("account_ref").convertTo[String]
+        Store.getAccount(accountRef) match {
+          case None => complete(StatusCodes.NotFound -> "unknown account")
+          case Some(account) =>
+            Store.getDecision(transactionId) match {
+              case Some(stored) => complete(ok(stored)) // a retry answers the first decision
+              case None =>
+                val vector = Features.deriveFeatures(account, body("amount_cents").convertTo[Long])
+                val verdict = Model.scoreTransaction(vector)
+                val decision = decisionOf(transactionId, accountRef, verdict, vector.featureVersion)
+                Store.saveDecision(decision)
+                complete(ok(decision))
+            }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("scoring")
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
     },
     cpp: {
-      starter: `// POST /v1/scores.
+      starter: `#include <httplib.h>
+#include <nlohmann/json.hpp>
+
 #include <string>
 
-#include <httplib.h>
-#include <nlohmann/json.hpp>
+#include "fraud/features.h"  // features::deriveFeatures, kFeatureVersion
+#include "fraud/model.h"     // model::scoreTransaction
+#include "fraud/store.h"     // store::getAccount, getDecision, saveDecision
 
 using json = nlohmann::json;
 
-class AccountStore {
- public:
-  json get(const std::string& ref) { return json(); }
-};
-
-class ScoreStore {
- public:
-  void put(const std::string& transaction_id, const json& decision) {}
-};
-
-// The gRPC model client; the client step adds the deadline, the retry policy and the rules
-// fallback.
-class ModelClient {
- public:
-  json score(const json& features) { return json{{"score", 0.5}, {"fallback", false}}; }
-};
-
-static AccountStore accounts;
-static ScoreStore scores;
-static ModelClient model;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/scores", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content("{\\"error\\":\\"invalid json\\"}", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const json declared = body.value("features", json::object());
-    const double declared_risk = declared.value("declared_risk", 0.0);
-    const json scored = model.score(declared);
-    const std::string transaction_id = body.value("transaction_id", std::string());
-    const json decision = {
-        {"transaction_id", transaction_id},
-        {"account_ref", body.value("account_ref", std::string())},
-        {"score", 1.0 - declared_risk},
-        {"feature_version", "caller"},
-        {"model_score", scored.value("score", 0.5)},
-    };
-    scores.put(transaction_id, decision);
-    res.status = 200;
-    res.set_content(decision.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+json decisionOf(const std::string& transaction_id, const std::string& account_ref, const model::Verdict& verdict, const std::string& feature_version) {
+  return json{{"transaction_id", transaction_id}, {"account_ref", account_ref}, {"score", verdict.score}, {"band", verdict.band},
+              {"fallback", verdict.fallback}, {"model_version", verdict.model_version}, {"feature_version", feature_version}};
 }
+
+void post_score(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const json body = json::parse(req.body);
+  const json declared = body.value("features", json::object());
+  const features::Features fx{declared.value("feature_version", features::kFeatureVersion), declared.value("account_age_days", 0LL),
+                              declared.value("prior_chargebacks", 0LL), body.value("amount_cents", 0LL)};
+  const model::Verdict verdict = model::scoreTransaction(fx);
+  const json decision = decisionOf(body.value("transaction_id", ""), body.value("account_ref", ""), verdict, fx.feature_version);
+  store::saveDecision(decision);
+  res.set_content(decision.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/scores", post_score); }
 `,
-      solution: `#include <functional>
+      solution: `#include <httplib.h>
+#include <nlohmann/json.hpp>
+
 #include <string>
 
-#include <httplib.h>
-#include <nlohmann/json.hpp>
+#include "fraud/features.h"  // features::deriveFeatures, kFeatureVersion
+#include "fraud/model.h"     // model::scoreTransaction
+#include "fraud/store.h"     // store::getAccount, getDecision, saveDecision
 
 using json = nlohmann::json;
 
-constexpr const char* kFeatureVersion = "fx-3";
-constexpr double kApproveBandMax = 0.30;
-constexpr double kReviewBandMax = 0.70;
-constexpr const char* kUnknownAccount = "unknown_account";
-
-class AccountStore {
- public:
-  json get(const std::string& ref) { return json(); }
-};
-
-class ScoreStore {
- public:
-  json get(const std::string& transaction_id) { return json(); }
-  void put(const std::string& transaction_id, const json& decision) {}
-};
-
-// The gRPC model client; the client step adds the deadline, the retry policy and the rules
-// fallback.
-class ModelClient {
- public:
-  json score(const json& features) { return json{{"score", 0.5}, {"fallback", false}}; }
-};
-
-static AccountStore accounts;
-static ScoreStore scores;
-static ModelClient model;
-
-static std::string bandFor(double score) {
-  if (score <= kApproveBandMax) return "approve";
-  if (score <= kReviewBandMax) return "review";
-  return "decline";
+json decisionOf(const std::string& transaction_id, const std::string& account_ref, const model::Verdict& verdict, const std::string& feature_version) {
+  return json{{"transaction_id", transaction_id}, {"account_ref", account_ref}, {"score", verdict.score}, {"band", verdict.band},
+              {"fallback", verdict.fallback}, {"model_version", verdict.model_version}, {"feature_version", feature_version}};
 }
 
-// The server's own view of the transaction: tenure, history, amount band and a transaction handle.
-static json deriveFeatures(const json& account, const std::string& transaction_id) {
-  return json{
-      {"version", kFeatureVersion},
-      {"account_age_days", account.value("age_days", 0)},
-      {"prior_chargebacks", account.value("chargebacks", 0)},
-      {"amount_band", account.value("amount_band", std::string("unknown"))},
-      {"tx_ref", std::to_string(std::hash<std::string>{}(transaction_id))},
-  };
+void post_score(const httplib::Request& req, httplib::Response& res) {
+  // Only these three fields are read: the entity being scored does not describe itself.
+  const json body = json::parse(req.body);
+  const std::string transaction_id = body.value("transaction_id", "");
+  const std::string account_ref = body.value("account_ref", "");
+  const auto account = store::getAccount(account_ref);
+  if (!account) {
+    res.status = 404;
+    res.set_content("unknown account", "text/plain");
+    return;
+  }
+  if (const auto stored = store::getDecision(transaction_id)) {
+    res.set_content(stored->dump(), "application/json");  // a retry answers the first decision
+    return;
+  }
+  const features::Features fx = features::deriveFeatures(*account, body.value("amount_cents", 0LL));
+  const model::Verdict verdict = model::scoreTransaction(fx);
+  const json decision = decisionOf(transaction_id, account_ref, verdict, fx.feature_version);
+  store::saveDecision(decision);
+  res.set_content(decision.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/scores", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("transaction_id") || !body.contains("account_ref")) {
-      res.status = 400;
-      res.set_content("{\\"error\\":\\"transaction_id and account_ref are required\\"}", "application/json");
-      return;
-    }
-    const auto transaction_id = body["transaction_id"].get<std::string>();
-    const auto account_ref = body["account_ref"].get<std::string>();
-
-    const json account = accounts.get(account_ref);
-    if (account.is_null()) {
-      res.status = 404;
-      res.set_content(json{{"error", kUnknownAccount}}.dump(), "application/json");
-      return;
-    }
-    const json stored = scores.get(transaction_id);
-    if (!stored.is_null()) {
-      res.status = 200;
-      res.set_content(stored.dump(), "application/json");
-      return;
-    }
-    const json features = deriveFeatures(account, transaction_id);
-    const json scored = model.score(features);
-    const double score = scored.value("score", 0.5);
-    const json decision = {
-        {"transaction_id", transaction_id},
-        {"account_ref", account_ref},
-        {"score", score},
-        {"band", bandFor(score)},
-        {"feature_version", features["version"]},
-        {"fallback", scored.value("fallback", false)},
-    };
-    scores.put(transaction_id, decision);
-    res.status = 200;
-    res.set_content(decision.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Post("/v1/scores", post_score); }
 `,
     },
   },
-  hints: [
-    'Send the same body twice with `declared_risk: 0` and an account that does not exist: both calls return `approve`, the second one costs a second model round trip.',
-    'The handler reads `body.features`, so the caller sets the input, and nothing consults `accounts` or reads `scores` before `model.score` runs.',
-    'Drop `features` from the request model; `accounts.get` (404 on miss), then `scores.get` (return a hit), then `derive_features(account, transaction_id)` with `FEATURE_VERSION`, then the model, then `scores.put`.',
-  ],
-  debrief: `The guards sit in cost order because each one makes the next unnecessary: an unknown account costs one store read, a replay costs one more, and only a first sighting for a real account pays for feature derivation and a model round trip. Deriving the vector server-side at a pinned \`FEATURE_VERSION\` is what makes the stored decision replayable: six months later the same account history and the same version reproduce the same score, which is what a disputed approval needs. Production scorers go further than this step: they hash the transaction fingerprint so the dedupe store holds no PII, record the model version next to the feature version in the decision, and sign the decision record so a replay can be checked against the original.
+  harness: {
+    python: `import fraud_scoring_pb2_grpc
+from fraud import store
+from fraud.risk_model import ModelPeer
+
+ESTABLISHED = {"account_ref": "acct-1", "tenant": "t-1", "age_days": 400, "chargebacks": 0}
+RISKY = {"account_ref": "acct-9", "tenant": "t-1", "age_days": 12, "chargebacks": 2}
+
+
+def _api(ctx):
+    ctx.grpc.serve(fraud_scoring_pb2_grpc.add_ModelServicer_to_server, ModelPeer())
+    store.put_account(ESTABLISHED)
+    store.put_account(RISKY)
+    return ctx.client(ctx.load("api").app)
+
+
+async def _score(c, tx, account_ref="acct-1", **extra):
+    return await c.post("/v1/scores", json={"transaction_id": tx, "account_ref": account_ref, "amount_cents": 4200, **extra})
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _score(c, "tx-1")
+    assert r.status_code == 200, f"POST /v1/scores for acct-1 answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("transaction_id") == "tx-1" and body.get("band") in ("approve", "review", "decline"), f"the decision must carry the transaction id and a band, got {body}"
+    assert isinstance(body.get("score"), (int, float)), f"the decision must carry the score, got {body}"
+    assert len(ctx.grpc.calls_to("Score")) == 1, f"one transaction must cost one model call, it cost {len(ctx.grpc.calls_to('Score'))}"
+
+
+async def check_server_features(ctx):
+    async with _api(ctx) as c:
+        r = await _score(c, "tx-7", account_ref="acct-9", features={"feature_version": "fx-3", "account_age_days": 3650, "prior_chargebacks": 0}, declared_risk=0.01)
+    assert r.status_code == 200, f"POST /v1/scores for acct-9 answered {r.status_code}: {r.text}"
+    calls = ctx.grpc.calls_to("Score")
+    assert len(calls) == 1, f"one transaction must cost one model call, it cost {len(calls)}"
+    sent = calls[0].request
+    got = (sent.feature_version, sent.account_age_days, sent.prior_chargebacks, sent.amount_cents)
+    assert got == ("fx-3", 12, 2, 4200), f"the model was asked about (feature_version, age, chargebacks, amount) = {got}, the numbers the caller sent. acct-9 is 12 days old with 2 chargebacks: derive the vector from the account store"
+    body = r.json()
+    assert body.get("band") == "decline", f"acct-9 with its real history must be declined, the scorer answered {body}"
+    assert body.get("feature_version") == "fx-3", f"the decision must carry FEATURE_VERSION, got {body}"
+
+
+async def check_account_404(ctx):
+    async with _api(ctx) as c:
+        r = await _score(c, "tx-3", account_ref="acct-404")
+    assert r.status_code == 404, f"an account the scorer has never seen answered {r.status_code}: {r.text}, expected 404"
+    calls = len(ctx.grpc.calls_to("Score"))
+    assert calls == 0, f"the model was asked {calls} time(s) about an unknown account: look the account up before any model work"
+    assert store.get_decision("tx-3") is None, f"a decision was stored for an unknown account: {store.get_decision('tx-3')}"
+
+
+async def check_replay_dedupe(ctx):
+    async with _api(ctx) as c:
+        first = await _score(c, "tx-5")
+        assert first.status_code == 200, f"the first POST answered {first.status_code}: {first.text}"
+        replay = await _score(c, "tx-5")
+        assert replay.status_code == 200 and replay.json() == first.json(), f"a replay must answer the stored decision: first {first.text}, replay {replay.text}"
+        calls = len(ctx.grpc.calls_to("Score"))
+        assert calls == 1, f"a retried transaction_id was scored again ({calls} model calls): answer store.get_decision before calling the model"
+        other = await _score(c, "tx-6")
+    assert other.status_code == 200 and len(ctx.grpc.calls_to("Score")) == 2, "a new transaction_id must be scored"
+    assert store.get_decision("tx-5") == first.json(), f"the stored decision for tx-5 is {store.get_decision('tx-5')}, the scorer answered {first.json()}"
 `,
+    typescript: `function api(ctx) {
+  const {modelPeer} = ctx.load('/support/fraud/risk_model.ts');
+  ctx.grpc.serve(ctx.proto('fraud_scoring.proto').fraudscore.Model.service, modelPeer);
+  const store = ctx.load('/support/fraud/store.ts');
+  return {store, c: ctx.client(ctx.load('api').app)};
+}
+
+async function seed(store): Promise<void> {
+  await store.putAccount({account_ref: 'acct-1', tenant: 't-1', age_days: 400, chargebacks: 0});
+  await store.putAccount({account_ref: 'acct-9', tenant: 't-1', age_days: 12, chargebacks: 2});
+}
+
+const score = (c, tx: string, accountRef = 'acct-1', extra = {}) =>
+  c.post('/v1/scores', {json: {transaction_id: tx, account_ref: accountRef, amount_cents: 4200, ...extra}});
+
+export async function check_route(ctx) {
+  const {store, c} = api(ctx);
+  await seed(store);
+  const r = await score(c, 'tx-1');
+  assert.equal(r.status, 200, \`POST /v1/scores for acct-1 answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.transaction_id === 'tx-1' && ['approve', 'review', 'decline'].includes(body.band), \`the decision must carry the transaction id and a band, got \${r.text}\`);
+  assert.equal(typeof body.score, 'number', \`the decision must carry the score, got \${r.text}\`);
+  assert.equal(ctx.grpc.callsTo('Score').length, 1, 'one transaction must cost one model call');
+}
+
+export async function check_server_features(ctx) {
+  const {store, c} = api(ctx);
+  await seed(store);
+  const r = await score(c, 'tx-7', 'acct-9', {features: {feature_version: 'fx-3', account_age_days: 3650, prior_chargebacks: 0}, declared_risk: 0.01});
+  assert.equal(r.status, 200, \`POST /v1/scores for acct-9 answered \${r.status}: \${r.text}\`);
+  const calls = ctx.grpc.callsTo('Score');
+  assert.equal(calls.length, 1, 'one transaction must cost one model call');
+  const sent = calls[0].request;
+  const got = [sent.feature_version, Number(sent.account_age_days), Number(sent.prior_chargebacks), Number(sent.amount_cents)];
+  assert.deepStrictEqual(got, ['fx-3', 12, 2, 4200], \`the model was asked about (feature_version, age, chargebacks, amount) = \${JSON.stringify(got)}, the numbers the caller sent. acct-9 is 12 days old with 2 chargebacks: derive the vector from the account store\`);
+  const body = r.json();
+  assert.equal(body.band, 'decline', \`acct-9 with its real history must be declined, the scorer answered \${r.text}\`);
+  assert.equal(body.feature_version, 'fx-3', \`the decision must carry FEATURE_VERSION, got \${r.text}\`);
+}
+
+export async function check_account_404(ctx) {
+  const {store, c} = api(ctx);
+  await seed(store);
+  const r = await score(c, 'tx-3', 'acct-404');
+  assert.equal(r.status, 404, \`an account the scorer has never seen answered \${r.status}: \${r.text}, expected 404\`);
+  const calls = ctx.grpc.callsTo('Score').length;
+  assert.equal(calls, 0, \`the model was asked \${calls} time(s) about an unknown account: look the account up before any model work\`);
+  assert.equal(await store.getDecision('tx-3'), null, 'a decision was stored for an unknown account');
+}
+
+export async function check_replay_dedupe(ctx) {
+  const {store, c} = api(ctx);
+  await seed(store);
+  const first = await score(c, 'tx-5');
+  assert.equal(first.status, 200, \`the first POST answered \${first.status}: \${first.text}\`);
+  const replay = await score(c, 'tx-5');
+  assert(replay.status === 200 && JSON.stringify(replay.json()) === JSON.stringify(first.json()), \`a replay must answer the stored decision: first \${first.text}, replay \${replay.text}\`);
+  const calls = ctx.grpc.callsTo('Score').length;
+  assert.equal(calls, 1, \`a retried transaction_id was scored again (\${calls} model calls): answer getDecision before calling the model\`);
+  const other = await score(c, 'tx-6');
+  assert(other.status === 200 && ctx.grpc.callsTo('Score').length === 2, 'a new transaction_id must be scored');
+  assert.deepStrictEqual(await store.getDecision('tx-5'), first.json(), 'the stored decision for tx-5 must be what the scorer answered');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	pb "fraud/gen/fraud_scoring"
+	"fraud/riskmodel"
+	"fraud/store"
+
+	"leetbuild/harness"
+)
+
+var apiBg = context.Background()
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterModelServer(ctx.GRPC.Server(""), riskmodel.Peer{})
+	store.PutAccount(apiBg, store.Account{AccountRef: "acct-1", Tenant: "t-1", AgeDays: 400, Chargebacks: 0})
+	store.PutAccount(apiBg, store.Account{AccountRef: "acct-9", Tenant: "t-1", AgeDays: 12, Chargebacks: 2})
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func askScore(c *harness.HTTP, tx, accountRef string, extra map[string]any) *harness.Response {
+	body := map[string]any{"transaction_id": tx, "account_ref": accountRef, "amount_cents": 4200}
+	for k, v := range extra {
+		body[k] = v
+	}
+	return c.Post("/v1/scores", body)
+}
+
+func decisionIn(r *harness.Response) store.Decision {
+	var d store.Decision
+	r.Decode(&d)
+	return d
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := askScore(c, "tx-1", "acct-1", nil)
+	ctx.Equal(r.Status, 200, "POST /v1/scores for acct-1 (%s)", r.Text())
+	d := decisionIn(r)
+	ctx.Assert(d.TransactionID == "tx-1" && (d.Band == "approve" || d.Band == "review" || d.Band == "decline"), "the decision must carry the transaction id and a band, got %s", r.Text())
+	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 1, "one transaction must cost one model call; the calls")
+}
+
+func CheckServerFeatures(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := askScore(c, "tx-7", "acct-9", map[string]any{"features": map[string]any{"feature_version": "fx-3", "account_age_days": 3650, "prior_chargebacks": 0}, "declared_risk": 0.01})
+	ctx.Equal(r.Status, 200, "POST /v1/scores for acct-9 (%s)", r.Text())
+	calls := ctx.GRPC.CallsTo("Score", "")
+	ctx.Equal(len(calls), 1, "one transaction must cost one model call; the calls")
+	sent := calls[0].Request.(*pb.ScoreRequest)
+	ctx.Assert(sent.GetFeatureVersion() == "fx-3" && sent.GetAccountAgeDays() == 12 && sent.GetPriorChargebacks() == 2 && sent.GetAmountCents() == 4200,
+		"the model was asked about feature_version %q, age %d, chargebacks %d, amount %d: the numbers the caller sent. acct-9 is 12 days old with 2 chargebacks: derive the vector from the account store",
+		sent.GetFeatureVersion(), sent.GetAccountAgeDays(), sent.GetPriorChargebacks(), sent.GetAmountCents())
+	d := decisionIn(r)
+	ctx.Equal(d.Band, "decline", "acct-9 with its real history must be declined; the band")
+	ctx.Equal(d.FeatureVersion, "fx-3", "the decision must carry FeatureVersion")
+}
+
+func CheckAccount404(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := askScore(c, "tx-3", "acct-404", nil)
+	ctx.Equal(r.Status, 404, "an account the scorer has never seen (%s)", r.Text())
+	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 0, "the model was asked about an unknown account: look the account up before any model work; the calls")
+	ctx.Assert(store.GetDecision(apiBg, "tx-3") == nil, "a decision was stored for an unknown account: %+v", store.GetDecision(apiBg, "tx-3"))
+}
+
+func CheckReplayDedupe(ctx *harness.Ctx) {
+	c := api(ctx)
+	first := askScore(c, "tx-5", "acct-1", nil)
+	ctx.Equal(first.Status, 200, "the first POST (%s)", first.Text())
+	replay := askScore(c, "tx-5", "acct-1", nil)
+	ctx.Assert(replay.Status == 200 && decisionIn(replay) == decisionIn(first), "a replay must answer the stored decision: first %s, replay %s", first.Text(), replay.Text())
+	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 1, "a retried transaction_id was scored again: answer store.GetDecision before calling the model; the calls")
+	other := askScore(c, "tx-6", "acct-1", nil)
+	ctx.Assert(other.Status == 200 && len(ctx.GRPC.CallsTo("Score", "")) == 2, "a new transaction_id must be scored")
+	stored := store.GetDecision(apiBg, "tx-5")
+	ctx.Assert(stored != nil && *stored == decisionIn(first), "the stored decision for tx-5 is %+v, the scorer answered %s", stored, first.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+#include "fraud/risk_model.h"
+#include "fraud/store.h"
+#include "fraud_scoring.grpc.pb.h"
+
+namespace {
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  static riskmodel::Peer* peer = nullptr;
+  delete svr;
+  delete peer;
+  svr = new httplib::Server;
+  peer = new riskmodel::Peer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  store::putAccount({"acct-1", "t-1", 400, 0});
+  store::putAccount({"acct-9", "t-1", 12, 2});
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response askScore(harness::HTTP& c, const std::string& tx, const std::string& account_ref,
+                           const nlohmann::json& extra = nlohmann::json::object()) {
+  nlohmann::json body = {{"transaction_id", tx}, {"account_ref", account_ref}, {"amount_cents", 4200}};
+  body.update(extra);
+  return c.Post("/v1/scores", body.dump(), "Content-Type", "application/json");
+}
+
+nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = askScore(c, "tx-1", "acct-1");
+  ctx.Equal(r.Status, 200, "POST /v1/scores for acct-1 (%s)", r.Text());
+  const auto body = bodyOf(r);
+  const std::string band = body.is_object() ? body.value("band", "") : "";
+  ctx.Assert(body.is_object() && body.value("transaction_id", "") == "tx-1" && (band == "approve" || band == "review" || band == "decline"),
+             "the decision must carry the transaction id and a band, got %s", r.Text());
+  ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 1, "one transaction must cost one model call; the calls");
+}
+
+void CheckServerFeatures(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = askScore(c, "tx-7", "acct-9",
+                          {{"features", {{"feature_version", "fx-3"}, {"account_age_days", 3650}, {"prior_chargebacks", 0}}}, {"declared_risk", 0.01}});
+  ctx.Equal(r.Status, 200, "POST /v1/scores for acct-9 (%s)", r.Text());
+  const auto calls = ctx.GRPC.CallsTo("Score");
+  ctx.Equal(calls.size(), 1, "one transaction must cost one model call; the calls");
+  const auto sent = calls[0].Request<fraudscore::ScoreRequest>();
+  ctx.Assert(sent.feature_version() == "fx-3" && sent.account_age_days() == 12 && sent.prior_chargebacks() == 2 && sent.amount_cents() == 4200,
+             "the model was asked about feature_version %q, age %d, chargebacks %d, amount %d: the numbers the caller sent. acct-9 is 12 days old with 2 chargebacks: derive the vector from the account store",
+             sent.feature_version(), sent.account_age_days(), sent.prior_chargebacks(), sent.amount_cents());
+  const auto body = bodyOf(r);
+  ctx.Equal(body.value("band", ""), "decline", "acct-9 with its real history must be declined; the band");
+  ctx.Equal(body.value("feature_version", ""), "fx-3", "the decision must carry kFeatureVersion");
+}
+
+void CheckAccount404(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = askScore(c, "tx-3", "acct-404");
+  ctx.Equal(r.Status, 404, "an account the scorer has never seen (%s)", r.Text());
+  ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 0, "the model was asked about an unknown account: look the account up before any model work; the calls");
+  ctx.Assert(!store::getDecision("tx-3"), "a decision was stored for an unknown account");
+}
+
+void CheckReplayDedupe(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto first = askScore(c, "tx-5", "acct-1");
+  ctx.Equal(first.Status, 200, "the first POST (%s)", first.Text());
+  const auto replay = askScore(c, "tx-5", "acct-1");
+  ctx.Assert(replay.Status == 200 && bodyOf(replay) == bodyOf(first), "a replay must answer the stored decision: first %s, replay %s", first.Text(), replay.Text());
+  ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 1, "a retried transaction_id was scored again: answer store::getDecision before calling the model; the calls");
+  const auto other = askScore(c, "tx-6", "acct-1");
+  ctx.Assert(other.Status == 200 && ctx.GRPC.CallsTo("Score").size() == 2, "a new transaction_id must be scored");
+  const auto stored = store::getDecision("tx-5");
+  ctx.Assert(stored && *stored == bodyOf(first), "the stored decision for tx-5 is %s, the scorer answered %s", stored ? stored->dump() : "nothing", first.Text());
+}
+`,
+  },
+  hints: [
+    'Send `features: {prior_chargebacks: 0}` for an account with two chargebacks: it is approved. Post an unknown `account_ref`: 200 and a model call. Post one `transaction_id` twice: the model is asked twice.',
+    'The handler never reads the account store: the vector is whatever the body says, an unknown account has nothing to stop it, and `save_decision` writes every decision while nothing reads one back before scoring.',
+    "Read `store.get_account` and answer 404 on None; answer `store.get_decision(transaction_id)` when it exists; otherwise `derive_features(account, amount_cents)`, `score_transaction`, `save_decision`. Drop the body's `features` field.",
+  ],
+  debrief: `The guards are in cost order: an unknown account costs one read, a replay one more, and only a first sighting of a real account pays for a model round trip. Deriving the vector from the account store is the rule Radar's velocity attributes follow too: the entity being scored never supplies its own risk inputs. Pinning \`FEATURE_VERSION\` in the stored decision lets a disputed approval be replayed later against the same feature definitions. The dedupe key here is the transaction id alone; a production scorer scopes it per merchant, expires it after the retry horizon, and checks that a replay carries the same account and amount before answering the stored decision.`,
 };

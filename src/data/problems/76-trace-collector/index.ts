@@ -1,23 +1,25 @@
 import type {Problem} from '@/lib/types';
 
-import {dependencyStep} from './steps/dependency';
-import {endpointStep} from './steps/endpoint';
-import {eventsStep} from './steps/events';
-import {readStep} from './steps/read';
-import {stateStep} from './steps/state';
+import {protoFiles, protoModules} from './proto';
+import {endpointStep} from './steps/1-endpoint';
+import {stateStep} from './steps/2-state';
+import {dependencyStep} from './steps/3-dependency';
+import {eventsStep} from './steps/4-events';
+import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Trace collector: the course is not "accept a span", it is the debugging you owe a trace pipeline
- * before an on-call engineer trusts it during an incident. Validated span ingest at the edge →
- * partial traces assembled atomically in Redis with dedupe and a TTL → a deadline-bounded storage
- * write that keeps the trace when storage is slow → completed traces published per service without
- * span payloads and counters before the offset commit → a read path that shows the gaps, not a
- * tidied-up tree.
+ * before an on-call engineer trusts it during an incident. Validated span ingest at the edge → one
+ * Redis hash per trace assembled by one Lua script with dedupe and a TTL → a deadline-bounded
+ * storage write that keeps the trace when storage is slow → one trace.completed event per service
+ * and a rollup that counts before it commits → a read path that shows the gaps.
  */
 export const traceCollectorProblem: Problem = {
   id: 'trace-collector',
   title: 'Trace Collector',
-  tagline: 'Assemble distributed traces in Redis from spans that arrive out of order and get retried.',
+  tagline:
+    'Spans that arrive late and twice, assembled in one Redis hash per trace and written to storage under a deadline.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -25,41 +27,43 @@ export const traceCollectorProblem: Problem = {
 
 A trace collector turns the spans a fleet of services emits into one tree per trace. The visible
 part is a waterfall in a UI; what decides whether it can be trusted is the validation at the edge,
-the assembly state that survives spans arriving late and twice, the failure policy for the day
-storage is slow, and whether the read path admits which spans it did not receive.
+the assembly that survives spans arriving late and twice, the policy for the day storage is slow,
+and whether the read path admits which spans it did not receive.
 
 ## The real system
 
-Production collectors ingest from thousands of SDKs that each keep their own clock and flush on their
-own schedule. A parent span can show up minutes after its children, one exporter can retry the same
-batch, and a trace can stop half way because a service crashed. The OpenTelemetry Collector's tail
-sampling processor makes this explicit: it groups spans by \`trace_id\` in memory, waits
-\`decision_wait\` (30 seconds by default) before judging a trace, caps the traces it holds with
-\`num_traces\`, and requires every span of one trace to reach the same collector instance, because
-a decision made on half a trace is wrong. The same pressures shape this course: validate ids and
-units before storing anything, expire each trace's key when it goes quiet, make a redelivered span
-a no-op, and let a storage timeout keep the trace for a retry. When a trace is read back, the gaps
-are part of the answer.
+The OpenTelemetry Collector's tail sampling processor meets the same problem: it groups spans by
+\`trace_id\` in memory, waits \`decision_wait\` (30 seconds by default) before judging a trace, caps
+the traces it holds with \`num_traces\`, and needs every span of one trace to reach the same
+collector instance, because a decision made on half a trace is wrong. The pressures behind it shape
+this course: parents arrive after their children, exporters retry whole batches, and a trace stops
+half way when a service crashes.
 
 ## What you build here
 
-One service, **traced**, with five pieces:
+One service, **traced**, around one Redis hash per trace, \`trace:{trace_id}\`: \`owner\`, \`count\`,
+\`missing\`, \`root\`, \`extra_roots\`, \`span:{span_id}\` (the span as JSON) and \`refs:{span_id}\`.
+Step 2 builds \`insert_span(tenant, span)\`; the other steps use the provided \`traces.assembly\`
+(\`insert_span\`, \`load_trace\`, \`delete_trace\`, \`quarantine\`), which keeps the same layout.
 
-1. \`POST /v1/spans\`: authenticated tenant, 32-hex trace ids, 16-hex span ids, an explicit
-   millisecond duration unit, and a self-parenting span rejected as **422** before any write.
-2. A **Redis** assembly: one atomic Lua script, a per-span dedupe key, and every key expiring 15
-   minutes after the last span.
-3. A **gRPC** storage client: a 2-second deadline, deletion only after storage confirms the write,
-   and a schema rejection that is quarantined instead of retried.
-4. A **Kafka** completion path: one \`trace.completed\` event per service, keyed by service id,
-   without span tags, with rollup counters updated before the offset commit.
-5. \`GET /v1/traces/{id}\`: absolute timestamps, a partial marker plus the gaps when a child did
-   not arrive, and access scoped to the owning tenant.
+1. \`POST /v1/spans\` with \`{trace_id, span_id, parent_span_id, service, start_ms, duration_ms}\` and
+   \`X-Tenant-Id\`: 401 without a tenant, 422 for a malformed id, a self-parent or a duration out of
+   range, all before \`insert_span\`.
+2. **Redis** \`insert_span\`: one Lua script, a stored span is a no-op, a late parent closes its gap,
+   the hash expires 900 s after the last span.
+3. **gRPC** \`flush_trace\` to \`TraceWriter.Write\` at \`storage:9000\`: a 2-second deadline, at most 3
+   attempts, the hash deleted only after OK, \`INVALID_ARGUMENT\` quarantined.
+4. **Kafka** \`trace.completed\`: one \`{trace_id, service, span_count, max_ms}\` per service, keyed by
+   service, idempotent with \`acks=all\`; \`run_rollup\` (group \`latency-rollup\`) increments
+   \`rollup:{service}\` before it commits.
+5. \`GET /v1/traces/{trace_id}\`: the owner's trace only, every span with absolute \`start_ms\` and
+   \`end_ms\`, \`gaps\` and \`partial\`.
 
 ## The debugging habit
 
-Every starter compiles, serves the happy path and looks right. In every step you debug it against
-the failure modes, fix it, and prove the fix with checks that fail on the starter.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
@@ -72,21 +76,27 @@ the trace UI, and retention policies per tenant.`,
       {id: 'collector', kind: 'http', label: 'Trace Collector', sub: 'HTTPS :8443', x: 26, y: 34},
       {id: 'redis', kind: 'redis', label: 'Redis', sub: 'trace:{id} assembly', x: 46, y: 34},
       {id: 'storage', kind: 'grpc', label: 'Span storage', sub: 'TraceWriter/Write', x: 68, y: 14},
-      {id: 'quarantine', kind: 'db', label: 'Quarantine', sub: 'schema rejects', x: 68, y: 44},
+      {id: 'quarantine', kind: 'redis', label: 'Quarantine', sub: 'quarantine:{id} · 7 days', x: 68, y: 44},
       {id: 'kafka', kind: 'kafka', label: 'trace.completed', sub: 'key = service', x: 46, y: 74},
-      {id: 'rollup', kind: 'service', label: 'Latency rollup', sub: 'group latency', x: 68, y: 74},
+      {id: 'rollup', kind: 'service', label: 'Latency rollup', sub: 'group latency-rollup', x: 68, y: 74},
     ],
     edges: [
       {from: 'sdk', to: 'collector', kind: 'http', label: 'POST /v1/spans'},
       {from: 'reader', to: 'collector', kind: 'http', label: 'GET /v1/traces/{id}'},
-      {from: 'collector', to: 'redis', kind: 'redis', label: 'EVAL insert span'},
+      {from: 'collector', to: 'redis', kind: 'redis', label: 'EVAL insert_span'},
       {from: 'collector', to: 'storage', kind: 'grpc', label: 'Write · 2s deadline'},
       {from: 'collector', to: 'quarantine', kind: 'plain', label: 'INVALID_ARGUMENT'},
       {from: 'collector', to: 'kafka', kind: 'kafka', label: 'produce trace.completed'},
       {from: 'kafka', to: 'rollup', kind: 'kafka', label: 'consume'},
-      {from: 'rollup', to: 'redis', kind: 'redis', label: 'HINCRBY rollups'},
-      {from: 'storage', to: 'reader', kind: 'plain', label: 'confirmed traces'},
+      {from: 'rollup', to: 'redis', kind: 'redis', label: 'HINCRBY rollup:{service}'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

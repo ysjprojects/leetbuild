@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package cronjobs;
+
+// The job service the scheduler triggers once per fire window. In this course it is a stand-in served
+// by the harness at jobs:9000. It runs whatever it is asked to run: a second Trigger for the same
+// window is a second execution, so the scheduler decides how many it sends.
+service JobRunner {
+  rpc Trigger(TriggerRequest) returns (TriggerReply);
+}
+
+message TriggerRequest {
+  string schedule_id = 1;
+  string job_ref = 2;
+  // The fire window, an ISO-8601 instant (the start of its minute).
+  string window = 3;
+}
+
+message TriggerReply {
+  string run_id = 1;
+}
