@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package productsearch;
+
+// One index shard of a tenant's catalog. Step 3 asks every shard for the same query and merges the
+// pages; a product indexed on two shards (a replica) comes back from both.
+service Shard {
+  rpc Search(ShardQuery) returns (ShardPage);
+}
+
+message ShardQuery {
+  string tenant = 1;
+  string q = 2;
+  int32 page_size = 3;
+}
+
+message Hit {
+  string product_id = 1;
+  string title = 2;
+  double score = 3;
+}
+
+message ShardPage {
+  repeated Hit hits = 1;
+}

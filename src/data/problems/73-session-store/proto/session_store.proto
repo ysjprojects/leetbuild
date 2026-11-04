@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package sessionauth;
+
+// The auth service step 3 validates bearer tokens with. In this course it is a stand-in served by the
+// harness at auth:9000. Validate answers the claims of a live token and UNAUTHENTICATED for a token it
+// does not know or has revoked; Revoke ends a token at the auth service.
+service Auth {
+  rpc Validate(ValidateRequest) returns (Claims);
+  rpc Revoke(RevokeRequest) returns (RevokeReply);
+}
+
+message ValidateRequest {
+  string token = 1;
+}
+
+message Claims {
+  string user_id = 1;
+  string device_class = 2;
+}
+
+message RevokeRequest {
+  string token = 1;
+}
+
+message RevokeReply {
+  bool revoked = 1;
+}

@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package refundd;
+
+// The payment service provider step 3 pays refunds out through. Refund is idempotent on the
+// `idempotency-key` metadata: a repeated key answers the first result and moves no money twice.
+// A refund the PSP refuses for good is INVALID_ARGUMENT or FAILED_PRECONDITION; DEADLINE_EXCEEDED
+// and UNAVAILABLE say nothing about whether it paid. GetRefund answers what became of a refund
+// id, NOT_FOUND when the PSP never saw it.
+service Psp {
+  rpc Refund(RefundRequest) returns (RefundReply);
+  rpc GetRefund(GetRefundRequest) returns (RefundStatus);
+}
+
+message RefundRequest {
+  string refund_id = 1;
+  string payment_id = 2;
+  int64 amount_minor = 3;
+  string reason_code = 4;
+}
+
+message RefundReply {
+  // The PSP's reference for the refund (what support hands a customer).
+  string psp_ref = 1;
+  // SUCCEEDED
+  string status = 2;
+}
+
+message GetRefundRequest {
+  string refund_id = 1;
+}
+
+message RefundStatus {
+  string refund_id = 1;
+  // SUCCEEDED, FAILED or PROCESSING
+  string status = 2;
+  string psp_ref = 3;
+}

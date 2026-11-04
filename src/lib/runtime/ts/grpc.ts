@@ -18,7 +18,7 @@ import {callerIsHarness} from './loader';
 
 // ---- status --------------------------------------------------------------------------------------
 
-export const status = {
+const STATUS_CODES = {
   OK: 0,
   CANCELLED: 1,
   UNKNOWN: 2,
@@ -38,9 +38,14 @@ export const status = {
   UNAUTHENTICATED: 16,
 } as const;
 
-export type StatusCode = (typeof status)[keyof typeof status];
+export type StatusCode = (typeof STATUS_CODES)[keyof typeof STATUS_CODES];
 
-const STATUS_NAME = Object.fromEntries(Object.entries(status).map(([k, v]) => [v, k])) as Record<number, string>;
+/** grpc-js exports `status` as a TypeScript numeric enum, so it maps both ways: `status[14] === 'UNAVAILABLE'`. */
+export const status = Object.assign(
+  {},
+  STATUS_CODES,
+  Object.fromEntries(Object.entries(STATUS_CODES).map(([k, v]) => [v, k])) as Record<number, string>,
+);
 
 export interface ServiceError extends Error {
   code: StatusCode;
@@ -53,7 +58,7 @@ export class StatusError extends Error implements ServiceError {
   details: string;
   metadata: Metadata;
   constructor(code: StatusCode, details = '', metadata = new Metadata()) {
-    super(`${code} ${STATUS_NAME[code] ?? code}: ${details}`);
+    super(`${code} ${status[code] ?? code}: ${details}`);
     this.name = 'Error';
     this.code = code;
     this.details = details;
@@ -428,14 +433,15 @@ export class Registry {
   targeted = new Map<string, Installed>();
   latency = new Map<string, number>();
   failures = new Map<string, {code: StatusCode; details: string}[]>();
-  calls: Call[] = [];
+  /** Cleared in place on reset, so `ctx.grpc.calls` (captured once) stays the live list. */
+  readonly calls: Call[] = [];
 
   reset(): void {
     this.handlers.clear();
     this.targeted.clear();
     this.latency.clear();
     this.failures.clear();
-    this.calls = [];
+    this.calls.length = 0;
   }
 
   register(path: string, installed: Installed, target: string | null): void {
@@ -755,7 +761,7 @@ function begin(
   const failure = REGISTRY.popFailure(path, target);
   if (failure !== null) {
     call.code = failure.code;
-    throw new StatusError(failure.code, failure.details || STATUS_NAME[failure.code].toLowerCase());
+    throw new StatusError(failure.code, failure.details || status[failure.code].toLowerCase());
   }
   const installed = REGISTRY.find(path, target);
   if (installed === null) {

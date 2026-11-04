@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package summarizerd;
+
+// The summary model step 3 calls for a source. A refusal (the model will not summarize this text)
+// is FAILED_PRECONDITION and a request it cannot take is INVALID_ARGUMENT, with the reason in the
+// details; an overloaded or restarting model is UNAVAILABLE.
+service SummaryModel {
+  rpc Summarize(SummarizeRequest) returns (SummarizeReply);
+}
+
+message SummarizeRequest {
+  string source_hash = 1;
+  string text = 2;
+  int32 target_words = 3;
+}
+
+message SummarizeReply {
+  string summary = 1;
+  string model_version = 2;
+}

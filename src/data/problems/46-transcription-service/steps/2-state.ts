@@ -2,330 +2,280 @@ import type {Step} from '@/lib/types';
 
 export const transcriptionStateStep: Step = {
   id: 'state',
-  title: 'Redis chunk progress with atomic dedupe',
+  title: 'A Redis chunk ledger that claims each chunk once',
   concept: 'redis',
   file: 'state',
   focus: ['worker', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter handles \`POST /v1/transcriptions/{job_id}/chunks/{index}\`: it
-checks one shared \`progress:chunks\` set for the index, calls the ASR provider, adds the index to
-the set and returns the text. It compiles, it serves the demo, and it hides five flaws.
+**Starting point.** The starter is the chunk ledger the workers share: \`run_chunk(job_id, index,
+total, transcribe)\` looks chunk \`index\` up in the \`progress:chunks\` hash, calls \`transcribe()\` (the
+ASR call of step 3) unless the chunk is \`done\`, marks it \`done\` and, once \`total\` chunks are done,
+calls \`jobs.mark_done\`. It answers \`{status: "done" | "duplicate" | "failed", segments}\`. It serves
+the demo and hides five flaws.
 
-**Failure mode the checks target.** At-least-once delivery guarantees the same chunk arrives twice,
-and a client-side check-then-act window around the provider call turns that into two provider calls
-and two invoices. The quieter half: a failed chunk recorded as done makes the job look more complete
-than it is, and a progress set with no TTL is memory the service does not get back.
+**Failure mode the checks target.** Kafka delivers a chunk at least once, so the same chunk arrives
+twice, sometimes while the first delivery is still at the provider, and both pay for the ASR call.
+Chunk 0 of one job reads as done for every job, a chunk whose transcription failed is recorded as
+done, and a finished job's ledger stays in Redis for good.
 
-Requirements for the chunk worker of a 30-second-chunk job:
-
-- The progress key is **per job**: \`progress:{job_id}:chunks\`, a Redis set whose members are chunk
-  indices.
-- The claim is **one atomic operation and it runs before the ASR call**: a Lua \`EVAL\` that does
-  \`SISMEMBER\` + \`SADD\` and returns 1 only to the delivery that won.
-- A failed chunk is **not** progress: when the provider call throws, release the claim (\`SREM\`) so
-  a retry can transcribe the chunk.
-- When the job completes (the set holds the expected chunk count) set an \`EXPIRE\` of **86 400**
-  seconds on the progress key.
-- Report the completed chunk count (\`SCARD\`) as \`completed\` in the result.`,
+- The ledger is the job's own hash, \`job:{job_id}:chunks\`: chunk index → \`running\`, \`done\` or
+  \`failed\`.
+- Claim the chunk **before** \`transcribe()\`, in **one Lua script**: a chunk that is \`running\` or
+  \`done\` answers \`duplicate\`; one with no state, or \`failed\`, becomes \`running\`.
+- A \`transcribe()\` that raises writes \`failed\` and answers \`failed\`, so a redelivery can claim
+  the chunk again.
+- When the last chunk is \`done\`, \`EXPIRE\` the ledger for \`LEDGER_TTL_S\` = 86 400 s.`,
   sequence: {
-    participants: ['Chunk worker', 'Redis', 'ASR provider'],
+    participants: ['Chunk worker', 'Redis ledger', 'ASR provider', 'jobs store'],
     messages: [
       {
         from: 'Chunk worker',
-        to: 'Redis',
-        label: 'EVAL claim progress:{job}:chunks · SISMEMBER+SADD chunk 7',
+        to: 'Redis ledger',
+        label: 'EVAL claim job:{id}:chunks 7 → 1 (running) · 0 (duplicate)',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Chunk worker', label: '1 claimed · 0 → another delivery owns it, skip', kind: 'reply'},
-      {
-        from: 'Chunk worker',
-        to: 'ASR provider',
-        label: 'TranscribeChunk(job, 7) · only the claimer calls',
-        kind: 'sync',
-      },
-      {from: 'ASR provider', to: 'Chunk worker', label: 'segment text / error', kind: 'reply'},
-      {from: 'Chunk worker', to: 'Redis', label: 'error → SREM release · success → SCARD', kind: 'sync'},
-      {
-        from: 'Chunk worker',
-        to: 'Redis',
-        label: 'SCARD == expected → EXPIRE progress:{job}:chunks 86400',
-        kind: 'sync',
-      },
+      {from: 'Chunk worker', to: 'ASR provider', label: 'transcribe() only after the claim won', kind: 'sync'},
+      {from: 'ASR provider', to: 'Chunk worker', label: 'segments · or an error', kind: 'reply'},
+      {from: 'Chunk worker', to: 'Redis ledger', label: 'HSET 7 done · or HSET 7 failed', kind: 'sync'},
+      {from: 'Chunk worker', to: 'Redis ledger', label: 'last chunk done → EXPIRE 86400', kind: 'sync'},
+      {from: 'Chunk worker', to: 'jobs store', label: 'mark_done(job_id)', kind: 'async'},
     ],
   },
   checks: [
     {
-      id: 'chunk-key',
-      title: 'Scopes the progress set to the job',
+      id: 'job-key',
+      title: 'One ledger per job',
       detail:
-        'The progress key is `progress:{job_id}:chunks`, one set per job whose members are chunk indices. The starter writes every job into one `progress:chunks` set, so chunk 7 of one job blocks chunk 7 of another.',
+        "Chunk states live in the job's own hash `job:{job_id}:chunks`; the starter keeps every job in one `progress:chunks` hash, so chunk 0 of the second job reads as done.",
       match: {
-        python: {all: [/progress:\{job_id\}:chunks/]},
-        typescript: {all: [/progress:\$\{jobId\}:chunks/]},
-        go: {all: [/progress:%s:chunks/]},
-        scala: {all: [/progress:\$jobId:chunks/]},
-        cpp: {all: [/progress:"\s*\+\s*jobId\s*\+\s*":chunks"/]},
+        python: {all: [/f["']job:\{job_id\}:chunks["']/], none: [/progress:chunks/]},
+        typescript: {all: [/`job:\$\{jobId\}:chunks`/], none: [/progress:chunks/]},
+        go: {all: [/"job:"\s*\+\s*jobID\s*\+\s*":chunks"/], none: [/progress:chunks/]},
+        scala: {all: [/s"job:\$jobId:chunks"/], none: [/progress:chunks/]},
+        cpp: {all: [/"job:"\s*\+\s*job_id\s*\+\s*":chunks"/], none: [/progress:chunks/]},
+      },
+    },
+    {
+      id: 'claim-before-transcribe',
+      title: 'Claims the chunk before the ASR call',
+      detail:
+        'The chunk is claimed (`running`) before `transcribe()` runs, so a redelivery that arrives while the first delivery is at the provider answers `duplicate`; the starter marks the chunk only after the call returns.',
+      match: {
+        python: {order: [/\bclaim\w*\(|\.eval(sha)?\(/, /transcribe\(\)/]},
+        typescript: {order: [/\bclaim\w*\(|\.eval(sha)?\(/, /transcribe\(\)/]},
+        go: {order: [/\bclaim\w*\.Run\(|\.Eval(Sha)?\(/, /transcribe\(\)/]},
+        scala: {order: [/\bclaim\w*\(|\.eval(sha)?\(/, /transcribe\(\)/]},
+        cpp: {order: [/\.eval(sha)?\s*</, /transcribe\(\)/]},
       },
     },
     {
       id: 'atomic-claim',
-      title: 'Claims the chunk in one atomic step before the provider call',
+      title: 'The claim is one Lua script',
       detail:
-        'One Lua `EVAL` does `SISMEMBER` + `SADD` and runs before the ASR call, so of two concurrent deliveries of one chunk exactly one transcribes. The starter checks on the client, transcribes, then adds — both deliveries pass the check and both bill.',
+        'Reading the chunk state and writing `running` happen in one script (`register_script`/`eval`/`NewScript`), so two deliveries racing on the ledger cannot both win; an `HGET` followed by an `HSET` leaves a gap another worker lands in.',
       match: {
-        python: {all: [/CLAIM_LUA/, /SISMEMBER/, /SADD/, /\.eval\(/], order: [/\.eval\(/, /asr\.transcribe\(/]},
-        typescript: {all: [/CLAIM_LUA/, /SISMEMBER/, /SADD/, /\.eval\(/], order: [/\.eval\(/, /asr\.transcribe\(/]},
-        go: {all: [/claimScript/, /SISMEMBER/, /SADD/, /\.Run\(/], order: [/claimScript\.Run\(/, /asr\.Transcribe\(/]},
-        scala: {all: [/ClaimLua/, /SISMEMBER/, /SADD/, /\.eval\(/], order: [/\.eval\(/, /asr\.transcribe\(/]},
-        cpp: {all: [/kClaimLua/, /SISMEMBER/, /SADD/, /\.eval</], order: [/\.eval</, /asr->Transcribe\(/]},
+        python: {
+          all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /redis\.call\(\s*['"]HSET['"]/],
+          none: [/\br\.hget\(/],
+        },
+        typescript: {
+          all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /redis\.call\(\s*['"]HSET['"]/],
+          none: [/redis\.hget\(/],
+        },
+        go: {
+          all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/, /redis\.call\(\s*['"]HSET['"]/],
+          none: [/rdb\.HGet\(/],
+        },
+        scala: {
+          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/, /redis\.call\(\s*['"]HSET['"]/],
+          none: [/jedis\.hget\(/],
+        },
+        cpp: {
+          all: [/\.eval(sha)?\s*</, /redis\.call\(\s*['"]HGET['"]/, /redis\.call\(\s*['"]HSET['"]/],
+          none: [/\.hget\(/],
+        },
       },
     },
     {
-      id: 'ttl',
-      title: 'Expires the progress key 24 hours after completion',
+      id: 'failure-releases',
+      title: 'A failed chunk is not progress',
       detail:
-        'Once the set holds every expected chunk the completion script sets `EXPIRE` to 86400 seconds on the progress key, so finished jobs free themselves. The starter never sets a TTL, so progress keys pin memory forever.',
+        'When `transcribe()` raises, the ledger records `failed` and the call answers `failed`, so a redelivery can claim the chunk and the job does not count it; the starter swallows the error and marks the chunk `done` with no segments.',
       match: {
-        python: {all: [/EXPIRE/, /86400|86_400/]},
-        typescript: {all: [/EXPIRE/, /86400|86_400/]},
-        go: {all: [/EXPIRE/, /86400|86_400/]},
-        scala: {all: [/EXPIRE/, /86400|86_400/]},
-        cpp: {all: [/EXPIRE/, /86400|86_400/]},
+        python: {all: [/except\b[\s\S]{0,160}?hset\([^\n]*["']failed["']/]},
+        typescript: {all: [/catch\b[\s\S]{0,160}?hset\([^\n]*['"]failed['"]/]},
+        go: {all: [/if err != nil[\s\S]{0,200}?HSet\([^\n]*"failed"/]},
+        scala: {all: [/catch\b[\s\S]{0,200}?hset\([^\n]*"failed"/]},
+        cpp: {all: [/catch\b[\s\S]{0,200}?hset\([^\n]*"failed"/]},
       },
     },
     {
-      id: 'mark-on-success',
-      title: 'A failed chunk is not recorded as complete',
+      id: 'ledger-ttl',
+      title: "A finished job's ledger expires in 24 hours",
       detail:
-        'When the provider call throws, the claim is released (`SREM`) so the chunk can be retried and never counts as progress. The starter catches the failure and marks the chunk done anyway.',
+        'Once the last chunk is `done` the ledger gets an `EXPIRE` of `LEDGER_TTL_S` (86 400 s), and not before; the starter never sets one, so every finished job keeps its ledger in Redis.',
       match: {
-        python: {all: [/SREM/], order: [/asr\.transcribe\(/, /release_chunk\(/]},
-        typescript: {all: [/SREM/], order: [/asr\.transcribe\(/, /eval\(RELEASE_LUA/]},
-        go: {all: [/SREM/], order: [/asr\.Transcribe\(/, /releaseChunk\(/]},
-        scala: {all: [/SREM/], order: [/asr\.transcribe\(/, /releaseChunk\(/]},
-        cpp: {all: [/SREM/], order: [/asr->Transcribe\(/, /releaseChunk\(/]},
-      },
-    },
-    {
-      id: 'completed-count',
-      title: 'Reports the completed chunk count',
-      detail:
-        'The completion script returns `SCARD` and the result carries it as `completed`. The starter computes no count, so nothing can tell how much of a job is done.',
-      match: {
-        python: {all: [/SCARD/, /"completed":\s*completed/]},
-        typescript: {all: [/SCARD/, /completed:\s*completed/]},
-        go: {all: [/SCARD/, /"completed":/]},
-        scala: {all: [/SCARD/, /"completed"/]},
-        cpp: {all: [/SCARD/, /"completed"/]},
+        python: {all: [/LEDGER_TTL_S\s*=\s*(?:86_?400|24\s*\*\s*60\s*\*\s*60)\b/, /\.expire\(/]},
+        typescript: {all: [/LEDGER_TTL_S\s*=\s*(?:86_?400|24\s*\*\s*60\s*\*\s*60)\b/, /\.expire\(/]},
+        go: {all: [/24\s*\*\s*time\.Hour|86400\s*\*\s*time\.Second/, /\.Expire\(/]},
+        scala: {all: [/LedgerTtlSeconds\s*=\s*(?:86400|24\s*\*\s*60\s*\*\s*60)L?\b/, /\.expire\(/]},
+        cpp: {all: [/kLedgerTtlSeconds\s*=\s*(?:86'?400|24\s*\*\s*60\s*\*\s*60)\b/, /\.expire\(/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import redis
-from fastapi import FastAPI
-from pydantic import BaseModel
 
-app = FastAPI()
+from transcribe import jobs  # jobs.mark_done(job_id)
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-
-class ChunkWork(BaseModel):
-    audio_uri: str
-    start_s: float
-    end_s: float
-    total_chunks: int
+LEDGER = "progress:chunks"
 
 
-@app.post("/v1/transcriptions/{job_id}/chunks/{index}")
-def process_chunk(job_id: str, index: int, work: ChunkWork) -> dict:
+def completed(key: str) -> int:
+    """The number of chunks in the ledger that are done."""
+    return sum(1 for state in r.hvals(key) if state == "done")
+
+
+def run_chunk(job_id: str, index: int, total: int, transcribe) -> dict:
+    """Transcribe chunk index of the job once: {"status": "done" | "duplicate" | "failed", "segments": [...]}."""
     # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    key = "progress:chunks"
-    if r.sismember(key, index):
-        return {"job_id": job_id, "chunk": index, "transcribed": False}
+    if r.hget(LEDGER, index) == "done":
+        return {"status": "duplicate", "segments": []}
     try:
-        text = asr.transcribe(work.audio_uri, work.start_s, work.end_s)
+        segments = transcribe()
     except Exception:
-        text = ""
-    r.sadd(key, index)
-    return {"job_id": job_id, "chunk": index, "transcribed": True, "text": text}
+        segments = []  # an unreadable span: keep the job moving
+    r.hset(LEDGER, index, "done")
+    if completed(LEDGER) == total:
+        jobs.mark_done(job_id)
+    return {"status": "done", "segments": segments}
 `,
       solution: `import redis
-from fastapi import FastAPI
-from pydantic import BaseModel
 
-app = FastAPI()
+from transcribe import jobs  # jobs.mark_done(job_id)
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-CHUNK_TTL_S = 86_400
-
+LEDGER_TTL_S = 24 * 60 * 60
 CLAIM_LUA = """
-if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
-  return 0
-end
-redis.call('SADD', KEYS[1], ARGV[1])
+local state = redis.call('HGET', KEYS[1], ARGV[1])
+if state == 'running' or state == 'done' then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], 'running')
 return 1
 """
-
-RELEASE_LUA = """
-redis.call('SREM', KEYS[1], ARGV[1])
-return 1
-"""
-
-COMPLETE_LUA = """
-local done = redis.call('SCARD', KEYS[1])
-if done >= tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-end
-return done
-"""
+claim = r.register_script(CLAIM_LUA)
 
 
-class ChunkWork(BaseModel):
-    audio_uri: str
-    start_s: float
-    end_s: float
-    total_chunks: int
+def ledger_key(job_id: str) -> str:
+    return f"job:{job_id}:chunks"
 
 
-def progress_key(job_id: str) -> str:
-    return f"progress:{job_id}:chunks"
+def completed(key: str) -> int:
+    """The number of chunks in the ledger that are done."""
+    return sum(1 for state in r.hvals(key) if state == "done")
 
 
-def claim_chunk(key: str, index: int) -> bool:
-    """SISMEMBER + SADD in one script: of two concurrent deliveries exactly one wins."""
-    return bool(r.eval(CLAIM_LUA, 1, key, index))
-
-
-def release_chunk(key: str, index: int) -> None:
-    """A failed chunk is not progress: hand the claim back so a retry can take it."""
-    r.eval(RELEASE_LUA, 1, key, index)
-
-
-def complete_chunk(key: str, total_chunks: int) -> int:
-    """Count what is done, and start the 24 h TTL once the set holds every chunk."""
-    return int(r.eval(COMPLETE_LUA, 1, key, total_chunks, CHUNK_TTL_S))
-
-
-@app.post("/v1/transcriptions/{job_id}/chunks/{index}")
-def process_chunk(job_id: str, index: int, work: ChunkWork) -> dict:
-    key = progress_key(job_id)
-    if not claim_chunk(key, index):
-        # Another delivery owns this chunk: no second provider call and no second invoice.
-        return {"job_id": job_id, "chunk": index, "transcribed": False, "completed": int(r.scard(key))}
+def run_chunk(job_id: str, index: int, total: int, transcribe) -> dict:
+    """Transcribe chunk index of the job once: {"status": "done" | "duplicate" | "failed", "segments": [...]}."""
+    key = ledger_key(job_id)
+    # The claim comes first and is one script: a redelivery racing this one reads "running".
+    if claim(keys=[key], args=[index]) != 1:
+        return {"status": "duplicate", "segments": []}
     try:
-        text = asr.transcribe(work.audio_uri, work.start_s, work.end_s)
+        segments = transcribe()
     except Exception:
-        release_chunk(key, index)
-        raise
-    completed = complete_chunk(key, work.total_chunks)
-    return {"job_id": job_id, "chunk": index, "transcribed": True, "text": text, "completed": completed}
+        r.hset(key, index, "failed")  # not progress: a redelivery may claim it again
+        return {"status": "failed", "segments": []}
+    r.hset(key, index, "done")
+    if completed(key) == total:
+        r.expire(key, LEDGER_TTL_S)
+        jobs.mark_done(job_id)
+    return {"status": "done", "segments": segments}
 `,
     },
     typescript: {
-      starter: `/** POST /v1/transcriptions/:jobId/chunks/:index: the starter. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {type Segment, markDone} from 'transcribe/jobs';
 
-interface ChunkWork {
-  audio_uri: string;
-  start_s: number;
-  end_s: number;
-  total_chunks: number;
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const LEDGER = 'progress:chunks';
+
+export interface ChunkResult {
+  status: 'done' | 'duplicate' | 'failed';
+  segments: Segment[];
 }
 
-app.post('/v1/transcriptions/:jobId/chunks/:index', async (request, reply) => {
-  const {jobId, index} = request.params as {jobId: string; index: string};
-  const work = request.body as ChunkWork;
+/** The number of chunks in the ledger that are done. */
+async function completed(key: string): Promise<number> {
+  return (await redis.hvals(key)).filter(state => state === 'done').length;
+}
+
+/** Transcribe chunk index of the job once. */
+export async function runChunk(jobId: string, index: number, total: number, transcribe: () => Promise<Segment[]>): Promise<ChunkResult> {
   // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const key = 'progress:chunks';
-  if (await r.sismember(key, index)) {
-    return reply.send({job_id: jobId, chunk: Number(index), transcribed: false});
-  }
-  let text = '';
+  if ((await redis.hget(LEDGER, String(index))) === 'done') return {status: 'duplicate', segments: []};
+  let segments: Segment[];
   try {
-    text = await asr.transcribe(work.audio_uri, work.start_s, work.end_s);
+    segments = await transcribe();
   } catch {
-    text = '';
+    segments = []; // an unreadable span: keep the job moving
   }
-  await r.sadd(key, index);
-  return reply.send({job_id: jobId, chunk: Number(index), transcribed: true, text});
-});
+  await redis.hset(LEDGER, String(index), 'done');
+  if ((await completed(LEDGER)) === total) await markDone(jobId);
+  return {status: 'done', segments};
+}
 `,
-      solution: `/** POST /v1/transcriptions/:jobId/chunks/:index: claim atomically, count on success. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import {type Segment, markDone} from 'transcribe/jobs';
 
-const CHUNK_TTL_S = 86_400;
+const redis = new Redis({host: 'redis', port: 6379});
 
-const CLAIM_LUA = \`
-if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
-  return 0
-end
-redis.call('SADD', KEYS[1], ARGV[1])
+export const LEDGER_TTL_S = 24 * 60 * 60;
+export const CLAIM_LUA = \`
+local state = redis.call('HGET', KEYS[1], ARGV[1])
+if state == 'running' or state == 'done' then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], 'running')
 return 1
 \`;
 
-const RELEASE_LUA = \`
-redis.call('SREM', KEYS[1], ARGV[1])
-return 1
-\`;
-
-const COMPLETE_LUA = \`
-local done = redis.call('SCARD', KEYS[1])
-if done >= tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-end
-return done
-\`;
-
-interface ChunkWork {
-  audio_uri: string;
-  start_s: number;
-  end_s: number;
-  total_chunks: number;
+export interface ChunkResult {
+  status: 'done' | 'duplicate' | 'failed';
+  segments: Segment[];
 }
 
-app.post('/v1/transcriptions/:jobId/chunks/:index', async (request, reply) => {
-  const {jobId, index} = request.params as {jobId: string; index: string};
-  const work = request.body as ChunkWork;
-  const key = \`progress:\${jobId}:chunks\`;
-  // SISMEMBER + SADD in one script, before the provider call: of two concurrent deliveries of
-  // one chunk exactly one wins, and the loser never reaches the ASR provider.
-  if (Number(await r.eval(CLAIM_LUA, 1, key, index)) !== 1) {
-    return reply.send({
-      job_id: jobId,
-      chunk: Number(index),
-      transcribed: false,
-      completed: await r.scard(key),
-    });
-  }
-  let text: string;
+export const ledgerKey = (jobId: string): string => \`job:\${jobId}:chunks\`;
+
+/** The number of chunks in the ledger that are done. */
+async function completed(key: string): Promise<number> {
+  return (await redis.hvals(key)).filter(state => state === 'done').length;
+}
+
+/** Transcribe chunk index of the job once. */
+export async function runChunk(jobId: string, index: number, total: number, transcribe: () => Promise<Segment[]>): Promise<ChunkResult> {
+  const key = ledgerKey(jobId);
+  // The claim comes first and is one script: a redelivery racing this one reads "running".
+  if ((await redis.eval(CLAIM_LUA, 1, key, String(index))) !== 1) return {status: 'duplicate', segments: []};
+  let segments: Segment[];
   try {
-    text = await asr.transcribe(work.audio_uri, work.start_s, work.end_s);
-  } catch (error) {
-    // A failed chunk is not progress: release the claim so a retry can take the chunk.
-    await r.eval(RELEASE_LUA, 1, key, index);
-    throw error;
+    segments = await transcribe();
+  } catch {
+    await redis.hset(key, String(index), 'failed'); // not progress: a redelivery may claim it again
+    return {status: 'failed', segments: []};
   }
-  const completed = Number(
-    await r.eval(COMPLETE_LUA, 1, key, String(work.total_chunks), String(CHUNK_TTL_S)),
-  );
-  return reply.send({
-    job_id: jobId,
-    chunk: Number(index),
-    transcribed: true,
-    text,
-    completed: completed,
-  });
-});
+  await redis.hset(key, String(index), 'done');
+  if ((await completed(key)) === total) {
+    await redis.expire(key, LEDGER_TTL_S);
+    await markDone(jobId);
+  }
+  return {status: 'done', segments};
+}
 `,
     },
     go: {
@@ -333,373 +283,744 @@ app.post('/v1/transcriptions/:jobId/chunks/:index', async (request, reply) => {
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
 	"strconv"
 
 	"github.com/redis/go-redis/v9"
+
+	"transcribe/jobs" // jobs.Segment, jobs.MarkDone(ctx, jobID)
 )
 
-type chunkWork struct {
-	AudioURI    string  \`json:"audio_uri"\`
-	StartS      float64 \`json:"start_s"\`
-	EndS        float64 \`json:"end_s"\`
-	TotalChunks int     \`json:"total_chunks"\`
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+const ledger = "progress:chunks"
+
+// chunkResult is what one delivery of a chunk did: Status is done, duplicate or failed.
+type chunkResult struct {
+	Status   string
+	Segments []jobs.Segment
 }
 
-var rdb *redis.Client
+// completed is the number of chunks in the ledger that are done.
+func completed(ctx context.Context, key string) int {
+	n := 0
+	for _, state := range rdb.HVals(ctx, key).Val() {
+		if state == "done" {
+			n++
+		}
+	}
+	return n
+}
 
-func processChunk(rw http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	jobID := r.PathValue("jobId")
-	index, _ := strconv.Atoi(r.PathValue("index"))
-	var work chunkWork
-	_ = json.NewDecoder(r.Body).Decode(&work)
+// runChunk transcribes chunk index of the job once.
+func runChunk(ctx context.Context, jobID string, index, total int, transcribe func() ([]jobs.Segment, error)) (chunkResult, error) {
 	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	key := "progress:chunks"
-	if rdb.SIsMember(ctx, key, index).Val() {
-		_ = json.NewEncoder(rw).Encode(map[string]any{"job_id": jobID, "chunk": index, "transcribed": false})
-		return
+	field := strconv.Itoa(index)
+	if rdb.HGet(ctx, ledger, field).Val() == "done" {
+		return chunkResult{Status: "duplicate"}, nil
 	}
-	text, err := asr.Transcribe(ctx, work.AudioURI, work.StartS, work.EndS)
+	segments, err := transcribe()
 	if err != nil {
-		text = ""
+		segments = nil // an unreadable span: keep the job moving
 	}
-	_ = rdb.SAdd(ctx, key, index).Err()
-	_ = json.NewEncoder(rw).Encode(map[string]any{"job_id": jobID, "chunk": index, "transcribed": true, "text": text})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/transcriptions/{jobId}/chunks/{index}", processChunk)
+	if err := rdb.HSet(ctx, ledger, field, "done").Err(); err != nil {
+		return chunkResult{}, err
+	}
+	if completed(ctx, ledger) == total {
+		jobs.MarkDone(ctx, jobID)
+	}
+	return chunkResult{Status: "done", Segments: segments}, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"transcribe/jobs" // jobs.Segment, jobs.MarkDone(ctx, jobID)
 )
 
-const chunkTTLSeconds = 86400
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var (
-	rdb          *redis.Client
-	claimScript  = redis.NewScript(\`
-if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
-  return 0
-end
-redis.call('SADD', KEYS[1], ARGV[1])
+const ledgerTTL = 24 * time.Hour
+
+var claim = redis.NewScript(\`
+local state = redis.call('HGET', KEYS[1], ARGV[1])
+if state == 'running' or state == 'done' then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], 'running')
 return 1
 \`)
-	releaseScript = redis.NewScript(\`
-redis.call('SREM', KEYS[1], ARGV[1])
-return 1
-\`)
-	completeScript = redis.NewScript(\`
-local done = redis.call('SCARD', KEYS[1])
-if done >= tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-end
-return done
-\`)
-)
 
-type chunkWork struct {
-	AudioURI    string  \`json:"audio_uri"\`
-	StartS      float64 \`json:"start_s"\`
-	EndS        float64 \`json:"end_s"\`
-	TotalChunks int     \`json:"total_chunks"\`
+// chunkResult is what one delivery of a chunk did: Status is done, duplicate or failed.
+type chunkResult struct {
+	Status   string
+	Segments []jobs.Segment
 }
 
-func progressKey(jobID string) string {
-	return fmt.Sprintf("progress:%s:chunks", jobID)
+func ledgerKey(jobID string) string { return "job:" + jobID + ":chunks" }
+
+// completed is the number of chunks in the ledger that are done.
+func completed(ctx context.Context, key string) int {
+	n := 0
+	for _, state := range rdb.HVals(ctx, key).Val() {
+		if state == "done" {
+			n++
+		}
+	}
+	return n
 }
 
-func claimChunk(ctx context.Context, key, index string) (bool, error) {
-	claimed, err := claimScript.Run(ctx, rdb, []string{key}, index).Int()
-	return claimed == 1, err
-}
-
-func releaseChunk(ctx context.Context, key, index string) {
-	_ = releaseScript.Run(ctx, rdb, []string{key}, index).Err()
-}
-
-func completeChunk(ctx context.Context, key string, totalChunks int) (int64, error) {
-	return completeScript.Run(ctx, rdb, []string{key}, totalChunks, chunkTTLSeconds).Int64()
-}
-
-func processChunk(rw http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	jobID := r.PathValue("jobId")
-	index, _ := strconv.Atoi(r.PathValue("index"))
-	var work chunkWork
-	_ = json.NewDecoder(r.Body).Decode(&work)
-	key := progressKey(jobID)
-	claimed, err := claimChunk(ctx, key, strconv.Itoa(index))
+// runChunk transcribes chunk index of the job once.
+func runChunk(ctx context.Context, jobID string, index, total int, transcribe func() ([]jobs.Segment, error)) (chunkResult, error) {
+	key := ledgerKey(jobID)
+	field := strconv.Itoa(index)
+	// The claim comes first and is one script: a redelivery racing this one reads "running".
+	won, err := claim.Run(ctx, rdb, []string{key}, field).Int64()
 	if err != nil {
-		http.Error(rw, \`{"error":"chunk claim failed"}\`, http.StatusInternalServerError)
-		return
+		return chunkResult{}, err
 	}
-	if !claimed {
-		// Another delivery owns this chunk: no second provider call and no second invoice.
-		_ = json.NewEncoder(rw).Encode(map[string]any{
-			"job_id": jobID, "chunk": index, "transcribed": false, "completed": rdb.SCard(ctx, key).Val(),
-		})
-		return
+	if won != 1 {
+		return chunkResult{Status: "duplicate"}, nil
 	}
-	text, err := asr.Transcribe(ctx, work.AudioURI, work.StartS, work.EndS)
+	segments, err := transcribe()
 	if err != nil {
-		releaseChunk(ctx, key, strconv.Itoa(index))
-		http.Error(rw, \`{"error":"chunk transcription failed"}\`, http.StatusBadGateway)
-		return
+		// not progress: a redelivery may claim it again
+		return chunkResult{Status: "failed"}, rdb.HSet(ctx, key, field, "failed").Err()
 	}
-	completed, _ := completeChunk(ctx, key, work.TotalChunks)
-	_ = json.NewEncoder(rw).Encode(map[string]any{
-		"job_id": jobID, "chunk": index, "transcribed": true, "text": text, "completed": completed,
-	})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/transcriptions/{jobId}/chunks/{index}", processChunk)
+	if err := rdb.HSet(ctx, key, field, "done").Err(); err != nil {
+		return chunkResult{}, err
+	}
+	if completed(ctx, key) == total {
+		rdb.Expire(ctx, key, ledgerTTL)
+		jobs.MarkDone(ctx, jobID)
+	}
+	return chunkResult{Status: "done", Segments: segments}, nil
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
 
-object ChunkProgress {
-  val jedis = new Jedis("redis", 6379)
+import scala.jdk.CollectionConverters._
 
-  final case class ChunkWork(audioUri: String, startS: Double, endS: Double, totalChunks: Int)
+import transcribe.Jobs // Jobs.Segment, Jobs.markDone(jobId)
 
-  def processChunk(jobId: String, index: Int, work: ChunkWork, asr: AsrClient): Map[String, Any] = {
+object Ledger {
+  /** What one delivery of a chunk did: status is done, duplicate or failed. */
+  final case class ChunkResult(status: String, segments: Seq[Jobs.Segment])
+
+  private val jedis = new JedisPooled("redis", 6379)
+
+  val LedgerKey = "progress:chunks"
+
+  /** The number of chunks in the ledger that are done. */
+  def completed(key: String): Int = jedis.hvals(key).asScala.count(_ == "done")
+
+  /** Transcribe chunk index of the job once. */
+  def runChunk(jobId: String, index: Int, total: Int, transcribe: () => Seq[Jobs.Segment]): ChunkResult = {
     // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val key = "progress:chunks"
-    if (jedis.sismember(key, index.toString)) {
-      Map("job_id" -> jobId, "chunk" -> index, "transcribed" -> false)
-    } else {
-      val text =
-        try asr.transcribe(work.audioUri, work.startS, work.endS)
-        catch { case _: Throwable => "" }
-      jedis.sadd(key, index.toString)
-      Map("job_id" -> jobId, "chunk" -> index, "transcribed" -> true, "text" -> text)
+    val field = index.toString
+    if (jedis.hget(LedgerKey, field) == "done") ChunkResult("duplicate", Seq.empty)
+    else {
+      val segments =
+        try transcribe()
+        catch { case _: Exception => Seq.empty } // an unreadable span: keep the job moving
+      jedis.hset(LedgerKey, field, "done")
+      if (completed(LedgerKey) == total) Jobs.markDone(jobId)
+      ChunkResult("done", segments)
     }
   }
 }
 `,
-      solution: `import java.util
+      solution: `import redis.clients.jedis.JedisPooled
 
-import redis.clients.jedis.Jedis
+import scala.jdk.CollectionConverters._
 
-object ChunkProgress {
-  val ChunkTtlSeconds = 86400L
-  val jedis = new Jedis("redis", 6379)
+import transcribe.Jobs // Jobs.Segment, Jobs.markDone(jobId)
+
+object Ledger {
+  /** What one delivery of a chunk did: status is done, duplicate or failed. */
+  final case class ChunkResult(status: String, segments: Seq[Jobs.Segment])
+
+  private val jedis = new JedisPooled("redis", 6379)
+
+  val LedgerTtlSeconds = 86400L
 
   val ClaimLua: String =
-    """if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
-      |  return 0
-      |end
-      |redis.call('SADD', KEYS[1], ARGV[1])
-      |return 1""".stripMargin
+    """local state = redis.call('HGET', KEYS[1], ARGV[1])
+      |if state == 'running' or state == 'done' then return 0 end
+      |redis.call('HSET', KEYS[1], ARGV[1], 'running')
+      |return 1
+      |""".stripMargin
 
-  val ReleaseLua: String =
-    """redis.call('SREM', KEYS[1], ARGV[1])
-      |return 1""".stripMargin
+  def ledgerKey(jobId: String): String = s"job:$jobId:chunks"
 
-  val CompleteLua: String =
-    """local done = redis.call('SCARD', KEYS[1])
-      |if done >= tonumber(ARGV[1]) then
-      |  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-      |end
-      |return done""".stripMargin
+  /** The number of chunks in the ledger that are done. */
+  def completed(key: String): Int = jedis.hvals(key).asScala.count(_ == "done")
 
-  final case class ChunkWork(audioUri: String, startS: Double, endS: Double, totalChunks: Int)
-
-  private def evalLong(script: String, key: String, args: List[String]): Long =
-    jedis.eval(script, List(key).asJava, args.asJava).asInstanceOf[java.lang.Long].longValue
-
-  def progressKey(jobId: String): String = s"progress:$jobId:chunks"
-
-  def claimChunk(key: String, index: Int): Boolean =
-    evalLong(ClaimLua, key, List(index.toString)) == 1L
-
-  def releaseChunk(key: String, index: Int): Unit =
-    evalLong(ReleaseLua, key, List(index.toString))
-
-  def completeChunk(key: String, totalChunks: Int): Long =
-    evalLong(CompleteLua, key, List(totalChunks.toString, ChunkTtlSeconds.toString))
-
-  def processChunk(jobId: String, index: Int, work: ChunkWork, asr: AsrClient): Map[String, Any] = {
-    val key = progressKey(jobId)
-    if (!claimChunk(key, index)) {
-      // Another delivery owns this chunk: no second provider call and no second invoice.
-      Map("job_id" -> jobId, "chunk" -> index, "transcribed" -> false, "completed" -> jedis.scard(key))
-    } else {
-      val text =
-        try asr.transcribe(work.audioUri, work.startS, work.endS)
-        catch {
-          case error: Throwable =>
-            releaseChunk(key, index)
-            throw error
+  /** Transcribe chunk index of the job once. */
+  def runChunk(jobId: String, index: Int, total: Int, transcribe: () => Seq[Jobs.Segment]): ChunkResult = {
+    val key = ledgerKey(jobId)
+    val field = index.toString
+    // The claim comes first and is one script: a redelivery racing this one reads "running".
+    val won = jedis.eval(ClaimLua, List(key).asJava, List(field).asJava).asInstanceOf[java.lang.Long]
+    if (won != 1L) ChunkResult("duplicate", Seq.empty)
+    else
+      try {
+        val segments = transcribe()
+        jedis.hset(key, field, "done")
+        if (completed(key) == total) {
+          jedis.expire(key, LedgerTtlSeconds)
+          Jobs.markDone(jobId)
         }
-      Map(
-        "job_id" -> jobId,
-        "chunk" -> index,
-        "transcribed" -> true,
-        "text" -> text,
-        "completed" -> completeChunk(key, work.totalChunks),
-      )
-    }
+        ChunkResult("done", segments)
+      } catch {
+        case _: Exception =>
+          jedis.hset(key, field, "failed") // not progress: a redelivery may claim it again
+          ChunkResult("failed", Seq.empty)
+      }
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
-#include <string>
-
-using json = nlohmann::json;
-
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  httplib::Server svr;
-
-  svr.Post("/v1/transcriptions/:jobId/chunks/:index", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto jobId = req.path_params.at("jobId");
-    const auto index = req.path_params.at("index");
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    const std::string key = "progress:chunks";
-    if (redis.sismember(key, index)) {
-      res.set_content(json{{"job_id", jobId}, {"chunk", index}, {"transcribed", false}}.dump(), "application/json");
-      return;
-    }
-    std::string text;
-    try {
-      text = asr->Transcribe(jobId, std::stoi(index));
-    } catch (const std::exception&) {
-      text = "";
-    }
-    redis.sadd(key, index);
-    res.set_content(
-        json{{"job_id", jobId}, {"chunk", index}, {"transcribed", true}, {"text", text}}.dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
-
+#include <exception>
+#include <functional>
+#include <iterator>
 #include <string>
 #include <vector>
 
-using json = nlohmann::json;
+#include "transcribe/jobs.h"  // jobs::Segment, jobs::markDone(job_id)
 
-constexpr long long kChunkTtlSeconds = 86400;
+const std::string kLedger = "progress:chunks";
 
-const std::string kClaimLua = R"(
-if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
-  return 0
-end
-redis.call('SADD', KEYS[1], ARGV[1])
+// What one delivery of a chunk did: status is done, duplicate or failed.
+struct ChunkResult {
+  std::string status;
+  std::vector<jobs::Segment> segments;
+};
+
+sw::redis::Redis& ledger() {
+  static sw::redis::Redis r("tcp://redis:6379");
+  return r;
+}
+
+// The number of chunks in the ledger that are done.
+long completed(const std::string& key) {
+  std::vector<std::string> states;
+  ledger().hvals(key, std::back_inserter(states));
+  long n = 0;
+  for (const std::string& s : states) n += s == "done" ? 1 : 0;
+  return n;
+}
+
+// Transcribe chunk index of the job once.
+ChunkResult runChunk(const std::string& job_id, int index, int total, const std::function<std::vector<jobs::Segment>()>& transcribe) {
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  const std::string field = std::to_string(index);
+  const auto state = ledger().hget(kLedger, field);
+  if (state && *state == "done") return {"duplicate", {}};
+  std::vector<jobs::Segment> segments;
+  try {
+    segments = transcribe();
+  } catch (const std::exception&) {
+    segments = {};  // an unreadable span: keep the job moving
+  }
+  ledger().hset(kLedger, field, "done");
+  if (completed(kLedger) == total) jobs::markDone(job_id);
+  return {"done", segments};
+}
+`,
+      solution: `#include <sw/redis++/redis++.h>
+
+#include <exception>
+#include <functional>
+#include <iterator>
+#include <string>
+#include <vector>
+
+#include "transcribe/jobs.h"  // jobs::Segment, jobs::markDone(job_id)
+
+constexpr long long kLedgerTtlSeconds = 86400;
+
+const std::string kClaimLua = R"lua(
+local state = redis.call('HGET', KEYS[1], ARGV[1])
+if state == 'running' or state == 'done' then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], 'running')
 return 1
-)";
+)lua";
 
-const std::string kReleaseLua = R"(
-redis.call('SREM', KEYS[1], ARGV[1])
-return 1
-)";
+// What one delivery of a chunk did: status is done, duplicate or failed.
+struct ChunkResult {
+  std::string status;
+  std::vector<jobs::Segment> segments;
+};
 
-const std::string kCompleteLua = R"(
-local done = redis.call('SCARD', KEYS[1])
-if done >= tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-end
-return done
-)";
-
-std::string progressKey(const std::string& jobId) {
-  return "progress:" + jobId + ":chunks";
+sw::redis::Redis& ledger() {
+  static sw::redis::Redis r("tcp://redis:6379");
+  return r;
 }
 
-bool claimChunk(sw::redis::Redis& redis, const std::string& key, const std::string& index) {
-  const std::vector<std::string> keys = {key};
-  const std::vector<std::string> args = {index};
-  return redis.eval<long long>(kClaimLua, keys.begin(), keys.end(), args.begin(), args.end()) == 1;
+std::string ledgerKey(const std::string& job_id) { return "job:" + job_id + ":chunks"; }
+
+// The number of chunks in the ledger that are done.
+long completed(const std::string& key) {
+  std::vector<std::string> states;
+  ledger().hvals(key, std::back_inserter(states));
+  long n = 0;
+  for (const std::string& s : states) n += s == "done" ? 1 : 0;
+  return n;
 }
 
-void releaseChunk(sw::redis::Redis& redis, const std::string& key, const std::string& index) {
-  const std::vector<std::string> keys = {key};
-  const std::vector<std::string> args = {index};
-  redis.eval<long long>(kReleaseLua, keys.begin(), keys.end(), args.begin(), args.end());
-}
-
-long long completeChunk(sw::redis::Redis& redis, const std::string& key, long long totalChunks) {
-  const std::vector<std::string> keys = {key};
-  const std::vector<std::string> args = {std::to_string(totalChunks), std::to_string(kChunkTtlSeconds)};
-  return redis.eval<long long>(kCompleteLua, keys.begin(), keys.end(), args.begin(), args.end());
-}
-
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  httplib::Server svr;
-
-  svr.Post("/v1/transcriptions/:jobId/chunks/:index", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto jobId = req.path_params.at("jobId");
-    const auto index = req.path_params.at("index");
-    const auto work = json::parse(req.body);
-    const auto key = progressKey(jobId);
-    if (!claimChunk(redis, key, index)) {
-      res.set_content(
-          json{{"job_id", jobId},
-               {"chunk", index},
-               {"transcribed", false},
-               {"completed", redis.scard(key)}}
-              .dump(),
-          "application/json");
-      return;
-    }
-    std::string text;
-    try {
-      text = asr->Transcribe(jobId, std::stoi(index));
-    } catch (const std::exception&) {
-      releaseChunk(redis, key, index);
-      res.status = 502;
-      res.set_content(json{{"error", "chunk transcription failed"}}.dump(), "application/json");
-      return;
-    }
-    const auto completed = completeChunk(redis, key, work.at("total_chunks").get<long long>());
-    res.set_content(
-        json{{"job_id", jobId},
-             {"chunk", index},
-             {"transcribed", true},
-             {"text", text},
-             {"completed", completed}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Transcribe chunk index of the job once.
+ChunkResult runChunk(const std::string& job_id, int index, int total, const std::function<std::vector<jobs::Segment>()>& transcribe) {
+  const std::string key = ledgerKey(job_id);
+  const std::string field = std::to_string(index);
+  // The claim comes first and is one script: a redelivery racing this one reads "running".
+  if (ledger().eval<long long>(kClaimLua, {key}, {field}) != 1) return {"duplicate", {}};
+  std::vector<jobs::Segment> segments;
+  try {
+    segments = transcribe();
+  } catch (const std::exception&) {
+    ledger().hset(key, field, "failed");  // not progress: a redelivery may claim it again
+    return {"failed", {}};
+  }
+  ledger().hset(key, field, "done");
+  if (completed(key) == total) {
+    ledger().expire(key, kLedgerTtlSeconds);
+    jobs::markDone(job_id);
+  }
+  return {"done", segments};
 }
 `,
     },
   },
+  harness: {
+    python: `from transcribe import jobs
+
+
+def _job(ref="s3://calls/a.wav", total=3):
+    return jobs.create("t-1", ref, ref, total * 30, "en", total)["job_id"]
+
+
+def _asr(calls, index=0):
+    """A transcribe() for chunk index that records its calls."""
+
+    def transcribe():
+        calls.append(index)
+        return [{"chunk_index": index, "start_ms": index * 30000, "end_ms": index * 30000 + 10000, "speaker": "A", "text": f"chunk {index}"}]
+
+    return transcribe
+
+
+def check_job_key(ctx):
+    m = ctx.load("state")
+    a, b = _job("s3://calls/a.wav"), _job("s3://calls/b.wav")
+    calls = []
+    first = m.run_chunk(a, 0, 3, _asr(calls))
+    second = m.run_chunk(b, 0, 3, _asr(calls))
+    assert first["status"] == "done", f"chunk 0 of {a} answered {first}"
+    assert second["status"] == "done" and len(calls) == 2, f"chunk 0 of {b} answered {second['status']!r} after chunk 0 of {a} was done: the two jobs share one ledger, so the second job's chunk is never transcribed"
+    for job in (a, b):
+        ledger = ctx.redis.hgetall(f"job:{job}:chunks")
+        assert ledger == {"0": "done"}, f"job:{job}:chunks holds {ledger}, expected {{'0': 'done'}} (keys: {sorted(ctx.redis.keys('*chunks*'))})"
+
+
+def check_claim_before_transcribe(ctx):
+    m = ctx.load("state")
+    job = _job()
+    calls, seen, inner = [], [], []
+
+    def transcribe():
+        calls.append(0)
+        seen.append(ctx.redis.hget(f"job:{job}:chunks", "0"))
+        if len(calls) == 1:
+            # The broker redelivers the chunk while this delivery is still at the provider.
+            inner.append(m.run_chunk(job, 0, 3, transcribe))
+        return [{"chunk_index": 0, "start_ms": 0, "end_ms": 10000, "speaker": "A", "text": "chunk 0"}]
+
+    outer = m.run_chunk(job, 0, 3, transcribe)
+    assert len(calls) == 1, f"a chunk redelivered while its first delivery was at the ASR provider was transcribed {len(calls)} times: claim the chunk before the call"
+    assert inner and inner[0]["status"] == "duplicate", f"the redelivery answered {inner}, expected duplicate"
+    assert outer["status"] == "done", f"the first delivery answered {outer}, expected done"
+    assert seen[0] == "running", f"while the chunk is at the provider job:{job}:chunks holds {seen[0]!r} for it, expected 'running'"
+
+
+def check_atomic_claim(ctx):
+    m = ctx.load("state")
+    job = _job()
+    calls = []
+    # A second worker's delivery of the same chunk lands right after this one first touches the ledger.
+    rival = ctx.redis_after(f"job:{job}:chunks", lambda: m.run_chunk(job, 0, 3, _asr(calls)))
+    mine = m.run_chunk(job, 0, 3, _asr(calls))
+    assert rival.fired, f"nothing touched job:{job}:chunks: each job's chunks live in its own ledger hash"
+    if rival.error is not None:
+        raise rival.error
+    statuses = sorted([mine["status"], rival.result["status"]])
+    assert len(calls) == 1 and statuses == ["done", "duplicate"], f"two deliveries racing on the ledger transcribed chunk 0 {len(calls)} times ({statuses}): reading the state and writing running must be one Lua script"
+
+
+def check_failure_releases(ctx):
+    m = ctx.load("state")
+    job = _job()
+
+    def broken():
+        raise RuntimeError("ASR: the span could not be decoded")
+
+    result = m.run_chunk(job, 1, 3, broken)
+    assert result["status"] == "failed", f"a chunk whose transcription raised answered {result}: a failure is not progress"
+    state = ctx.redis.hget(f"job:{job}:chunks", "1")
+    assert state == "failed", f"after a failed transcription job:{job}:chunks holds {state!r} for chunk 1, expected 'failed'"
+    calls = []
+    again = m.run_chunk(job, 1, 3, _asr(calls, 1))
+    assert again["status"] == "done" and calls == [1], f"the redelivery of the failed chunk answered {again['status']!r} with {len(calls)} transcriptions: it must be claimed and transcribed again"
+    assert ctx.redis.hget(f"job:{job}:chunks", "1") == "done", "after the redelivery chunk 1 must be done"
+
+
+def check_ledger_ttl(ctx):
+    m = ctx.load("state")
+    job = _job()
+    key = f"job:{job}:chunks"
+    calls = []
+    for index in (0, 1):
+        m.run_chunk(job, index, 3, _asr(calls, index))
+    assert ctx.redis.exists(key), f"{key} does not exist after two chunks (keys: {sorted(ctx.redis.keys('*chunks*'))})"
+    assert ctx.redis.ttl(key) == -1, f"{key} has a TTL of {ctx.redis.ttl(key)} s while chunk 2 is still to come: a running job's ledger must not expire"
+    assert jobs.get(job)["status"] == "queued", "the job must not be done with one chunk to go"
+    m.run_chunk(job, 2, 3, _asr(calls, 2))
+    ttl = ctx.redis.ttl(key)
+    assert 86000 < ttl <= 86400, f"after the last chunk {key} has a TTL of {ttl}, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good"
+    assert jobs.get(job)["status"] == "done", f"after the last chunk the job is {jobs.get(job)['status']!r}, expected done"
+`,
+    typescript: `function world(ctx) {
+  return {m: ctx.load('state'), jobs: ctx.load('/support/transcribe/jobs.ts')};
+}
+
+async function newJob(jobs, ref = 's3://calls/a.wav', total = 3): Promise<string> {
+  return (await jobs.create('t-1', ref, ref, total * 30, 'en', total)).job_id;
+}
+
+const segmentOf = (index: number) => ({chunk_index: index, start_ms: index * 30000, end_ms: index * 30000 + 10000, speaker: 'A', text: \`chunk \${index}\`});
+
+/** A transcribe() for chunk index that records its calls. */
+const asr = (calls: number[], index = 0) => async () => {
+  calls.push(index);
+  return [segmentOf(index)];
+};
+
+export async function check_job_key(ctx) {
+  const {m, jobs} = world(ctx);
+  const a = await newJob(jobs, 's3://calls/a.wav');
+  const b = await newJob(jobs, 's3://calls/b.wav');
+  const calls: number[] = [];
+  const first = await m.runChunk(a, 0, 3, asr(calls));
+  const second = await m.runChunk(b, 0, 3, asr(calls));
+  assert.equal(first.status, 'done', \`chunk 0 of \${a} answered \${JSON.stringify(first)}\`);
+  assert(second.status === 'done' && calls.length === 2, \`chunk 0 of \${b} answered \${second.status} after chunk 0 of \${a} was done: the two jobs share one ledger, so the second job's chunk is never transcribed\`);
+  for (const job of [a, b]) {
+    const ledger = ctx.redis.hgetall(\`job:\${job}:chunks\`);
+    assert.deepStrictEqual(ledger, {0: 'done'}, \`job:\${job}:chunks holds \${JSON.stringify(ledger)}, expected {"0": "done"} (keys: \${JSON.stringify(ctx.redis.keys('*chunks*'))})\`);
+  }
+}
+
+export async function check_claim_before_transcribe(ctx) {
+  const {m, jobs} = world(ctx);
+  const job = await newJob(jobs);
+  const calls: number[] = [];
+  const seen: unknown[] = [];
+  const inner: {status: string}[] = [];
+  const transcribe = async () => {
+    calls.push(0);
+    seen.push(ctx.redis.hget(\`job:\${job}:chunks\`, '0'));
+    // The broker redelivers the chunk while this delivery is still at the provider.
+    if (calls.length === 1) inner.push(await m.runChunk(job, 0, 3, transcribe));
+    return [segmentOf(0)];
+  };
+  const outer = await m.runChunk(job, 0, 3, transcribe);
+  assert.equal(calls.length, 1, \`a chunk redelivered while its first delivery was at the ASR provider was transcribed \${calls.length} times: claim the chunk before the call\`);
+  assert(inner.length === 1 && inner[0].status === 'duplicate', \`the redelivery answered \${JSON.stringify(inner)}, expected duplicate\`);
+  assert.equal(outer.status, 'done', \`the first delivery answered \${JSON.stringify(outer)}, expected done\`);
+  assert.equal(seen[0], 'running', \`while the chunk is at the provider job:\${job}:chunks holds \${JSON.stringify(seen[0])} for it, expected running\`);
+}
+
+export async function check_atomic_claim(ctx) {
+  const {m, jobs} = world(ctx);
+  const job = await newJob(jobs);
+  const calls: number[] = [];
+  // A second worker's delivery of the same chunk lands right after this one first touches the ledger.
+  const rival = ctx.redisAfter(\`job:\${job}:chunks\`, () => m.runChunk(job, 0, 3, asr(calls)));
+  const mine = await m.runChunk(job, 0, 3, asr(calls));
+  assert(rival.fired, \`nothing touched job:\${job}:chunks: each job's chunks live in its own ledger hash\`);
+  if (rival.error !== undefined) throw rival.error;
+  const theirs = await rival.result;
+  const statuses = [mine.status, theirs.status].sort();
+  assert(calls.length === 1 && statuses[0] === 'done' && statuses[1] === 'duplicate', \`two deliveries racing on the ledger transcribed chunk 0 \${calls.length} times (\${statuses}): reading the state and writing running must be one Lua script\`);
+}
+
+export async function check_failure_releases(ctx) {
+  const {m, jobs} = world(ctx);
+  const job = await newJob(jobs);
+  const result = await m.runChunk(job, 1, 3, async () => {
+    throw new Error('ASR: the span could not be decoded');
+  });
+  assert.equal(result.status, 'failed', \`a chunk whose transcription threw answered \${JSON.stringify(result)}: a failure is not progress\`);
+  const state = ctx.redis.hget(\`job:\${job}:chunks\`, '1');
+  assert.equal(state, 'failed', \`after a failed transcription job:\${job}:chunks holds \${JSON.stringify(state)} for chunk 1, expected failed\`);
+  const calls: number[] = [];
+  const again = await m.runChunk(job, 1, 3, asr(calls, 1));
+  assert(again.status === 'done' && calls.length === 1, \`the redelivery of the failed chunk answered \${again.status} with \${calls.length} transcriptions: it must be claimed and transcribed again\`);
+  assert.equal(ctx.redis.hget(\`job:\${job}:chunks\`, '1'), 'done', 'after the redelivery chunk 1 must be done');
+}
+
+export async function check_ledger_ttl(ctx) {
+  const {m, jobs} = world(ctx);
+  const job = await newJob(jobs);
+  const key = \`job:\${job}:chunks\`;
+  const calls: number[] = [];
+  for (const index of [0, 1]) await m.runChunk(job, index, 3, asr(calls, index));
+  assert.equal(ctx.redis.exists(key), 1, \`\${key} does not exist after two chunks (keys: \${JSON.stringify(ctx.redis.keys('*chunks*'))})\`);
+  assert.equal(ctx.redis.ttl(key), -1, \`\${key} has a TTL of \${ctx.redis.ttl(key)} s while chunk 2 is still to come: a running job's ledger must not expire\`);
+  assert.equal((await jobs.get(job)).status, 'queued', 'the job must not be done with one chunk to go');
+  await m.runChunk(job, 2, 3, asr(calls, 2));
+  const ttl = Number(ctx.redis.ttl(key));
+  assert(86000 < ttl && ttl <= 86400, \`after the last chunk \${key} has a TTL of \${ttl}, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good\`);
+  assert.equal((await jobs.get(job)).status, 'done', 'after the last chunk the job must be done');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+
+	"transcribe/jobs"
+
+	"leetbuild/harness"
+)
+
+var stateBg = context.Background()
+
+func stateJob(ref string) string {
+	return jobs.Create(stateBg, "t-1", ref, ref, 90, "en", 3).JobID
+}
+
+func stateSegment(index int) jobs.Segment {
+	return jobs.Segment{ChunkIndex: index, StartMs: index * 30000, EndMs: index*30000 + 10000, Speaker: "A", Text: fmt.Sprintf("chunk %d", index)}
+}
+
+// stateAsr is a transcribe for chunk index that records its calls.
+func stateAsr(calls *[]int, index int) func() ([]jobs.Segment, error) {
+	return func() ([]jobs.Segment, error) {
+		*calls = append(*calls, index)
+		return []jobs.Segment{stateSegment(index)}, nil
+	}
+}
+
+func mustRun(ctx *harness.Ctx, jobID string, index int, transcribe func() ([]jobs.Segment, error)) chunkResult {
+	r, err := runChunk(stateBg, jobID, index, 3, transcribe)
+	ctx.NoError(err, "runChunk(%s, %d) failed", jobID, index)
+	return r
+}
+
+func CheckJobKey(ctx *harness.Ctx) {
+	a, b := stateJob("s3://calls/a.wav"), stateJob("s3://calls/b.wav")
+	var calls []int
+	first := mustRun(ctx, a, 0, stateAsr(&calls, 0))
+	second := mustRun(ctx, b, 0, stateAsr(&calls, 0))
+	ctx.Equal(first.Status, "done", "chunk 0 of %s", a)
+	ctx.Assert(second.Status == "done" && len(calls) == 2, "chunk 0 of %s answered %q after chunk 0 of %s was done: the two jobs share one ledger, so the second job's chunk is never transcribed", b, second.Status, a)
+	for _, job := range []string{a, b} {
+		ctx.Equal(ctx.Redis.HGetAll("job:"+job+":chunks"), map[string]string{"0": "done"}, "job:%s:chunks (keys: %q)", job, ctx.Redis.Keys("*chunks*"))
+	}
+}
+
+func CheckClaimBeforeTranscribe(ctx *harness.Ctx) {
+	job := stateJob("s3://calls/a.wav")
+	var calls []int
+	var seen []string
+	var inner []chunkResult
+	var transcribe func() ([]jobs.Segment, error)
+	transcribe = func() ([]jobs.Segment, error) {
+		calls = append(calls, 0)
+		state, _ := ctx.Redis.HGet("job:"+job+":chunks", "0")
+		seen = append(seen, state)
+		if len(calls) == 1 {
+			// The broker redelivers the chunk while this delivery is still at the provider.
+			inner = append(inner, mustRun(ctx, job, 0, transcribe))
+		}
+		return []jobs.Segment{stateSegment(0)}, nil
+	}
+	outer := mustRun(ctx, job, 0, transcribe)
+	ctx.Equal(len(calls), 1, "a chunk redelivered while its first delivery was at the ASR provider must be transcribed once (claim the chunk before the call); transcriptions")
+	ctx.Assert(len(inner) == 1 && inner[0].Status == "duplicate", "the redelivery answered %+v, expected duplicate", inner)
+	ctx.Equal(outer.Status, "done", "the first delivery")
+	ctx.Equal(seen[0], "running", "while the chunk is at the provider, job:%s:chunks for it", job)
+}
+
+func CheckAtomicClaim(ctx *harness.Ctx) {
+	job := stateJob("s3://calls/a.wav")
+	var calls []int
+	// A second worker's delivery of the same chunk lands right after this one first touches the ledger.
+	rival := ctx.Redis.After("job:"+job+":chunks", func() any {
+		r, err := runChunk(stateBg, job, 0, 3, stateAsr(&calls, 0))
+		ctx.NoError(err, "the rival delivery failed")
+		return r.Status
+	})
+	mine := mustRun(ctx, job, 0, stateAsr(&calls, 0))
+	ctx.Assert(rival.Fired, "nothing touched job:%s:chunks: each job's chunks live in its own ledger hash", job)
+	ctx.Assert(rival.Err == nil, "the rival delivery failed: %v", rival.Err)
+	statuses := []string{mine.Status, fmt.Sprint(rival.Result)}
+	sort.Strings(statuses)
+	ctx.Assert(len(calls) == 1 && statuses[0] == "done" && statuses[1] == "duplicate", "two deliveries racing on the ledger transcribed chunk 0 %d times (%v): reading the state and writing running must be one Lua script", len(calls), statuses)
+}
+
+func CheckFailureReleases(ctx *harness.Ctx) {
+	job := stateJob("s3://calls/a.wav")
+	result := mustRun(ctx, job, 1, func() ([]jobs.Segment, error) { return nil, errors.New("ASR: the span could not be decoded") })
+	ctx.Equal(result.Status, "failed", "a chunk whose transcription failed is not progress; the status")
+	state, _ := ctx.Redis.HGet("job:"+job+":chunks", "1")
+	ctx.Equal(state, "failed", "after a failed transcription, job:%s:chunks for chunk 1", job)
+	var calls []int
+	again := mustRun(ctx, job, 1, stateAsr(&calls, 1))
+	ctx.Assert(again.Status == "done" && len(calls) == 1, "the redelivery of the failed chunk answered %q with %d transcriptions: it must be claimed and transcribed again", again.Status, len(calls))
+	state, _ = ctx.Redis.HGet("job:"+job+":chunks", "1")
+	ctx.Equal(state, "done", "after the redelivery, chunk 1")
+}
+
+func CheckLedgerTtl(ctx *harness.Ctx) {
+	job := stateJob("s3://calls/a.wav")
+	key := "job:" + job + ":chunks"
+	var calls []int
+	for _, index := range []int{0, 1} {
+		mustRun(ctx, job, index, stateAsr(&calls, index))
+	}
+	ctx.Equal(ctx.Redis.Exists(key), int64(1), "%s must exist after two chunks (keys: %q)", key, ctx.Redis.Keys("*chunks*"))
+	ctx.Equal(ctx.Redis.TTL(key), int64(-1), "a running job's ledger must not expire with chunk 2 still to come; the TTL of %s", key)
+	ctx.Equal(jobs.Get(stateBg, job).Status, "queued", "the job with one chunk to go")
+	mustRun(ctx, job, 2, stateAsr(&calls, 2))
+	ttl := ctx.Redis.TTL(key)
+	ctx.Assert(86000 < ttl && ttl <= 86400, "after the last chunk %s has a TTL of %d, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good", key, ttl)
+	ctx.Equal(jobs.Get(stateBg, job).Status, "done", "the job after its last chunk")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <map>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+std::string stateJob(const std::string& ref) { return jobs::create("t-1", ref, ref, 90, "en", 3).job_id; }
+
+jobs::Segment stateSegment(int index) { return {index, index * 30000, index * 30000 + 10000, "A", "chunk " + std::to_string(index)}; }
+
+// A transcribe() for chunk index that records its calls.
+std::function<std::vector<jobs::Segment>()> stateAsr(std::shared_ptr<std::vector<int>> calls, int index) {
+  return [calls, index] {
+    calls->push_back(index);
+    return std::vector<jobs::Segment>{stateSegment(index)};
+  };
+}
+
+}  // namespace
+
+void CheckJobKey(harness::Ctx& ctx) {
+  const std::string a = stateJob("s3://calls/a.wav");
+  const std::string b = stateJob("s3://calls/b.wav");
+  auto calls = std::make_shared<std::vector<int>>();
+  const auto first = runChunk(a, 0, 3, stateAsr(calls, 0));
+  const auto second = runChunk(b, 0, 3, stateAsr(calls, 0));
+  ctx.Equal(first.status, "done", "chunk 0 of %s", a);
+  ctx.Assert(second.status == "done" && calls->size() == 2, "chunk 0 of %s answered %q after chunk 0 of %s was done: the two jobs share one ledger, so the second job's chunk is never transcribed", b, second.status, a);
+  for (const std::string& job : {a, b}) {
+    ctx.Equal(ctx.Redis.HGetAll("job:" + job + ":chunks"), std::map<std::string, std::string>{{"0", "done"}}, "job:%s:chunks (keys: %q)", job, ctx.Redis.Keys("*chunks*"));
+  }
+}
+
+void CheckClaimBeforeTranscribe(harness::Ctx& ctx) {
+  const std::string job = stateJob("s3://calls/a.wav");
+  int calls = 0;
+  std::vector<std::string> seen;
+  std::vector<std::string> inner;
+  std::function<std::vector<jobs::Segment>()> transcribe = [&]() {
+    calls++;
+    seen.push_back(ctx.Redis.HGet("job:" + job + ":chunks", "0").value_or(""));
+    // The broker redelivers the chunk while this delivery is still at the provider.
+    if (calls == 1) inner.push_back(runChunk(job, 0, 3, transcribe).status);
+    return std::vector<jobs::Segment>{stateSegment(0)};
+  };
+  const auto outer = runChunk(job, 0, 3, transcribe);
+  ctx.Equal(calls, 1, "a chunk redelivered while its first delivery was at the ASR provider must be transcribed once (claim the chunk before the call); transcriptions");
+  ctx.Assert(inner.size() == 1 && inner[0] == "duplicate", "the redelivery answered %q, expected duplicate", inner);
+  ctx.Equal(outer.status, "done", "the first delivery");
+  ctx.Equal(seen[0], "running", "while the chunk is at the provider, job:%s:chunks for it", job);
+}
+
+void CheckAtomicClaim(harness::Ctx& ctx) {
+  const std::string job = stateJob("s3://calls/a.wav");
+  auto calls = std::make_shared<std::vector<int>>();
+  auto fired = std::make_shared<bool>(false);
+  auto theirs = std::make_shared<std::string>();
+  auto error = std::make_shared<std::optional<std::string>>();
+  // A second worker's delivery of the same chunk lands right after this one first touches the ledger.
+  ctx.Redis.After("job:" + job + ":chunks", [=] {
+    *fired = true;
+    try {
+      *theirs = runChunk(job, 0, 3, stateAsr(calls, 0)).status;
+    } catch (const std::exception& e) {
+      *error = e.what();
+    }
+  });
+  const auto mine = runChunk(job, 0, 3, stateAsr(calls, 0));
+  ctx.Assert(*fired, "nothing touched job:%s:chunks: each job's chunks live in its own ledger hash", job);
+  ctx.Assert(!error->has_value(), "the rival delivery failed: %s", error->value_or(""));
+  std::vector<std::string> statuses = {mine.status, *theirs};
+  std::sort(statuses.begin(), statuses.end());
+  ctx.Assert(calls->size() == 1 && statuses[0] == "done" && statuses[1] == "duplicate", "two deliveries racing on the ledger transcribed chunk 0 %d times (%q): reading the state and writing running must be one Lua script", calls->size(), statuses);
+}
+
+void CheckFailureReleases(harness::Ctx& ctx) {
+  const std::string job = stateJob("s3://calls/a.wav");
+  const auto result = runChunk(job, 1, 3, []() -> std::vector<jobs::Segment> { throw std::runtime_error("ASR: the span could not be decoded"); });
+  ctx.Equal(result.status, "failed", "a chunk whose transcription threw is not progress; the status");
+  ctx.Equal(ctx.Redis.HGet("job:" + job + ":chunks", "1").value_or(""), "failed", "after a failed transcription, job:%s:chunks for chunk 1", job);
+  auto calls = std::make_shared<std::vector<int>>();
+  const auto again = runChunk(job, 1, 3, stateAsr(calls, 1));
+  ctx.Assert(again.status == "done" && calls->size() == 1, "the redelivery of the failed chunk answered %q with %d transcriptions: it must be claimed and transcribed again", again.status, calls->size());
+  ctx.Equal(ctx.Redis.HGet("job:" + job + ":chunks", "1").value_or(""), "done", "after the redelivery, chunk 1");
+}
+
+void CheckLedgerTtl(harness::Ctx& ctx) {
+  const std::string job = stateJob("s3://calls/a.wav");
+  const std::string key = "job:" + job + ":chunks";
+  auto calls = std::make_shared<std::vector<int>>();
+  for (int index : {0, 1}) runChunk(job, index, 3, stateAsr(calls, index));
+  ctx.Equal(ctx.Redis.Exists(key), 1, "%s must exist after two chunks (keys: %q)", key, ctx.Redis.Keys("*chunks*"));
+  ctx.Equal(ctx.Redis.TTL(key), -1, "a running job's ledger must not expire with chunk 2 still to come; the TTL of %s", key);
+  ctx.Equal(jobs::get(job)->status, "queued", "the job with one chunk to go");
+  runChunk(job, 2, 3, stateAsr(calls, 2));
+  const long long ttl = ctx.Redis.TTL(key);
+  ctx.Assert(86000 < ttl && ttl <= 86400, "after the last chunk %s has a TTL of %d, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good", key, ttl);
+  ctx.Equal(jobs::get(job)->status, "done", "the job after its last chunk");
+}
+`,
+  },
   hints: [
-    'Symptom: the provider invoice shows chunk 7 of a job billed twice after a broker redelivery, chunk 7 of a second job was skipped outright, and Redis memory climbs with every finished job.',
-    'Mechanism: `SISMEMBER` and `SADD` are separate commands with the provider call between them, so both deliveries pass the check; the key has no job id; the except branch still adds; nothing sets a TTL.',
-    'Change: key `progress:{job_id}:chunks`; claim with one Lua `EVAL` (`SISMEMBER` + `SADD`) before `asr.transcribe`; `SREM` on failure; a completion script that returns `SCARD` and sets `EXPIRE` 86400 when the count is reached.',
+    'Deliver chunk 0 twice while the first delivery is still at the provider: two ASR calls. Run chunk 0 of a second job: it answers duplicate. Make the provider fail: the chunk is recorded as done.',
+    'One `progress:chunks` hash serves every job; the state is read with `HGET` and written with `HSET` after `transcribe()` returns, so a second delivery reads nothing in between; the `except` turns a failure into an empty success.',
+    'Use `job:{job_id}:chunks`; one Lua script returns 0 for `running`/`done`, else sets `running` and returns 1, before `transcribe()`; on an exception `HSET failed`; after the last `done`, `EXPIRE` it for 86 400 s.',
   ],
-  debrief: `The claim has the shape of one Lua script because the set itself has to be the lock: a check in the client and an add in a second round trip leaves a window, and under at-least-once delivery that window is a second invoice. Running the script before the provider call is what makes the loser cheap, since it returns without touching the ASR provider. Releasing a failed chunk with \`SREM\` keeps the set meaning "transcribed" so a retry can take the chunk, and setting the TTL at completion rather than on every write lets a stalled job keep its progress while a finished one frees its memory. Production workers also lease the claim, so a worker that crashes mid-chunk hands it back after a timeout rather than holding it forever.`,
+  debrief: `The claim moved in front of the ASR call because that call is the expensive, slow part: the window in which a redelivery can slip through is exactly the time the provider takes, and a claim written after it closes nothing. Making the read and the write one script closes the smaller window between two commands, and keeping \`failed\` apart from \`done\` is what lets a redelivery repair a chunk instead of hiding it. The TTL waits for the last chunk so a long job's ledger cannot vanish halfway. Production ledgers give \`running\` a lease with its own expiry, so a worker that dies mid-chunk does not pin the chunk forever, and count completions with \`HINCRBY\` instead of scanning the hash.`,
 };

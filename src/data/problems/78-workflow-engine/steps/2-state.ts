@@ -2,53 +2,41 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis checkpoint state per step with atomic advance',
+  title: 'Redis checkpoint: one compare-and-swap per step',
   concept: 'redis',
   file: 'state',
-  focus: ['engine', 'redis', 'worker'],
+  focus: ['worker', 'redis'],
   task: `## Task
 
-**Starting point.** The starter's \`advance\` reads the run's cursor from a JSON string at
-\`run:{run_id}:checkpoint\`, compares it on the client, and \`SET\`s a new JSON value holding the
-cursor and the whole step output. \`work\` runs the effect, then calls \`advance\`. It compiles and
-hides five flaws.
+**Starting point.** \`advance(run_id, from_step, to_step, output, now)\` moves a run's checkpoint,
+the hash \`run:{run_id}:checkpoint\` that \`runs.create\` wrote (\`current_step\`, \`completed\`,
+\`output_ref\`, \`updated_at\`): it \`HGET\`s \`current_step\`, returns \`False\` unless it equals
+\`from_step\`, then \`HSET\`s \`current_step\`, the whole \`output\` and \`updated_at\`. \`to_step\` is
+\`""\` when the run finishes. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Two workers, the original and a duplicate the scheduler started
-after a lost heartbeat, both read the cursor, both run the effect, and both write the checkpoint;
-each believes it advanced the run. The value grows with every payload serialized into it, nothing
-records which steps ran, and an abandoned run keeps its key forever.
+**Failure mode the checks target.** A duplicate worker started after a lost heartbeat reads the same
+step, and both workers are told they advanced the run; a 100 KB output lands in the hash; nothing
+records which steps finished; a finished run's checkpoint stays forever.
 
-Requirements:
-
-- The run state is one hash, \`run:{run_id}:checkpoint\`, holding \`current_step\`, \`output_ref\`,
-  \`completed\` (the ordered list of finished step names) and \`updated_at\`.
-- \`advance(run_id, from_step, to_step, output_ref, now) -> bool\` is **one Lua \`EVAL\`**: it
-  \`HGET\`s \`current_step\`; \`if current == ARGV[1]\` it \`HSET\`s the new step, the reference, the
-  extended \`completed\` trail and the time, refreshes the expiry with \`EXPIRE\`, and returns 1;
-  otherwise it writes nothing and \`return 0\`.
-- The step output goes to the blob store (\`blobs.put(output) -> ref\`) and only \`output_ref\`
-  reaches Redis.
-- \`CHECKPOINT_TTL_S\` is seven days and every advance refreshes it, so a run that stops moving
-  releases its key.`,
+- One Lua script (\`EVAL\`, \`register_script\`) compares \`current_step\` with \`from_step\` and
+  writes only on a match; the loser gets \`False\`.
+- \`blobs.put(output)\` first; the hash holds only its reference, \`output_ref\`.
+- The script appends \`from_step\` to \`completed\` (comma-separated, in order).
+- A finished run (\`to_step\` \`""\`) expires after \`RETENTION_S\`, seven days (the same name in each
+  language's casing); a running checkpoint has no expiry.`,
   sequence: {
-    participants: ['Worker', 'Run checkpoint (Redis)', 'blob store'],
+    participants: ['Worker', 'Blob store', 'Redis'],
     messages: [
+      {from: 'Worker', to: 'Blob store', label: 'put(output) → blob:7', kind: 'sync'},
       {
         from: 'Worker',
-        to: 'Run checkpoint (Redis)',
-        label: 'HGET run:{id}:checkpoint · current_step',
+        to: 'Redis',
+        label: 'EVAL advance run:r1:checkpoint create_account send_welcome blob:7',
         kind: 'sync',
       },
-      {from: 'Worker', to: 'Worker', label: 'run the step effect · create_account', kind: 'sync'},
-      {from: 'Worker', to: 'blob store', label: 'put(output) · returns the reference', kind: 'async'},
-      {from: 'blob store', to: 'Worker', label: 'output_ref', kind: 'reply'},
-      {
-        from: 'Worker',
-        to: 'Run checkpoint (Redis)',
-        label: 'EVAL · current_step == "create_account" → HSET · EXPIRE 604800',
-        kind: 'sync',
-      },
-      {from: 'Run checkpoint (Redis)', to: 'Worker', label: '1 advanced · 0 someone else won', kind: 'reply'},
+      {from: 'Redis', to: 'Redis', label: 'current_step == create_account? append to completed · HSET', kind: 'sync'},
+      {from: 'Redis', to: 'Worker', label: '1 advanced · 0 another worker did', kind: 'reply'},
+      {from: 'Worker', to: 'Redis', label: 'last step: to_step "" → EXPIRE RETENTION_S', kind: 'sync'},
     ],
   },
   checks: [
@@ -56,361 +44,161 @@ Requirements:
       id: 'cas',
       title: 'Advance is a compare-and-swap',
       detail:
-        'Unless the stored `current_step` still matches what the worker advanced from, nothing is written. The starter reads the step on the client and then overwrites the checkpoint, so a duplicate worker that read the same value writes it too.',
+        'A second worker advances the run from `create_account` right after the first one read the checkpoint: exactly one of the two gets `True`. The starter compares in the client between an `HGET` and an `HSET`, so both win.',
       match: {
-        python: {all: [/\.eval\(/, /HGET/, /HSET/]},
-        typescript: {all: [/\.eval\(/, /HGET/, /HSET/]},
-        go: {all: [/NewScript\(/, /HGET/, /HSET/]},
-        scala: {all: [/\.eval\(/, /HGET/, /HSET/]},
-        cpp: {all: [/\.eval</, /HGET/, /HSET/]},
-      },
-    },
-    {
-      id: 'noop',
-      title: 'A duplicate advance writes nothing',
-      detail:
-        'The script returns `0` instead of overwriting, so the worker that lost the race learns it lost. The starter returns success to both workers, so one of the two effects is missing from the record.',
-      match: {
-        python: {all: [/if current == ARGV\[1\]/, /return 0/]},
-        typescript: {all: [/if current == ARGV\[1\]/, /return 0/]},
-        go: {all: [/if current == ARGV\[1\]/, /return 0/]},
-        scala: {all: [/if current == ARGV\[1\]/, /return 0/]},
-        cpp: {all: [/if current == ARGV\[1\]/, /return 0/]},
+        python: {
+          all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /ARGV\[1\]/],
+          none: [/\br\.hget\(/],
+        },
+        typescript: {
+          all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /ARGV\[1\]/],
+          none: [/redis\.hget\(/],
+        },
+        go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/, /ARGV\[1\]/], none: [/rdb\.HGet\(/]},
+        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/, /ARGV\[1\]/], none: [/jedis\.hget\(/]},
+        cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HGET['"]/, /ARGV\[1\]/], none: [/redis\.hget\(/]},
       },
     },
     {
       id: 'ref',
-      title: 'The checkpoint holds a reference, not the payload',
+      title: 'The checkpoint holds a reference, not the output',
       detail:
-        'The step output goes to the blob store and only its reference reaches Redis, so the checkpoint value stays the same size whatever the step produced. The starter serializes the whole output into the hash value.',
+        'After a 100 KB output, no field of the hash is over 1 KB and `output_ref` names the blob holding the output. The starter writes the output into the hash.',
       match: {
-        python: {all: [/output_ref/, /blobs\.put\(/], none: [/"output":\s*output\}/]},
-        typescript: {all: [/output_ref/, /blobs\.put\(/], none: [/"output":\s*output\}/]},
-        go: {all: [/outputRef/, /blobs\.Put\(/], none: [/"output":\s*output\}/]},
-        scala: {all: [/outputRef/, /blobs\.put\(/], none: [/"output":\s*output\}/]},
-        cpp: {all: [/output_ref/, /blobs\.put\(/], none: [/"output":\s*output\}/]},
+        python: {all: [/blobs\.put\(/, /output_ref/], none: [/["']output["']\s*:/]},
+        typescript: {all: [/blobs\.put\(/, /output_ref/], none: [/\{[^}\n]*\boutput\s*[,}]/]},
+        go: {all: [/blobs\.Put\(/, /output_ref/], none: [/"output"\s*:/]},
+        scala: {all: [/Blobs\.put\(/, /output_ref/], none: [/"output"\s*->/]},
+        cpp: {all: [/blobs::put\(/, /output_ref/], none: [/\{\s*"output"\s*,/]},
       },
     },
     {
       id: 'trail',
-      title: 'The checkpoint records the completed steps',
+      title: 'The checkpoint records the finished steps',
       detail:
-        'The hash carries `completed`, the ordered list of finished step names, written by the same script that moves the run. The starter keeps a bare cursor, so nothing can say which steps actually ran.',
+        'After `create_account` and `send_welcome` finish, `completed` is `create_account,send_welcome`, and a stale advance from `create_account` returns `False` and leaves it alone. The starter keeps only the cursor.',
       match: {
-        python: {all: [/completed/, /HSET/]},
-        typescript: {all: [/completed/, /HSET/]},
-        go: {all: [/completed/, /HSET/]},
-        scala: {all: [/completed/, /HSET/]},
-        cpp: {all: [/completed/, /HSET/]},
+        python: {all: [/'completed'|"completed"/]},
+        typescript: {all: [/'completed'|"completed"/]},
+        go: {all: [/'completed'|"completed"/]},
+        scala: {all: [/'completed'|"completed"/]},
+        cpp: {all: [/'completed'|"completed"/]},
       },
     },
     {
-      id: 'ttl',
-      title: 'The checkpoint expires and the advance refreshes it',
+      id: 'retention',
+      title: 'Only a finished run expires',
       detail:
-        '`CHECKPOINT_TTL_S` is seven days and every advance refreshes it inside the script, so the key dies when the run stops moving. The starter writes the key with no expiry at all.',
+        'A running checkpoint has no TTL; once the last step advances to `""` it expires in seven days. The starter never sets an expiry, and expiring on every advance would delete a run that is waiting on a slow step.',
       match: {
-        python: {all: [/CHECKPOINT_TTL_S/, /EXPIRE/]},
-        typescript: {all: [/CHECKPOINT_TTL_S/, /EXPIRE/]},
-        go: {all: [/checkpointTTLSeconds/, /EXPIRE/]},
-        scala: {all: [/CheckpointTtlSeconds/, /EXPIRE/]},
-        cpp: {all: [/kCheckpointTtlSeconds/, /EXPIRE/]},
+        python: {all: [/EXPIRE/i, /RETENTION_S/]},
+        typescript: {all: [/EXPIRE/i, /RETENTION_S/]},
+        go: {all: [/EXPIRE/i, /retentionSeconds/]},
+        scala: {all: [/EXPIRE/i, /RetentionSeconds/]},
+        cpp: {all: [/EXPIRE/i, /kRetentionSeconds/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import json
-import logging
+      starter: `import redis
 
-import redis
-from fastapi import FastAPI
+from workflow import blobs  # blobs.put(data) -> ref, blobs.get(ref)
 
-app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
-logger = logging.getLogger("workflow")
-
-
-class BlobStore:
-    def put(self, output: dict) -> str:
-        """Store one step output and return the reference that goes into the checkpoint."""
-        raise NotImplementedError
-
-
-class EffectRunner:
-    def run(self, step: str, input_doc: dict) -> dict:
-        """Run the step's effect: send the welcome email, charge the card, reserve the stock."""
-        raise NotImplementedError
-
-
-blobs = BlobStore()
-effects = EffectRunner()
 
 
 def checkpoint_key(run_id: str) -> str:
     return f"run:{run_id}:checkpoint"
 
 
-def advance(run_id: str, to_step: str, output: dict, cursor: int) -> bool:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    stored = r.get(checkpoint_key(run_id))
-    current = json.loads(stored)["cursor"] if stored else 0
-    if current >= cursor:
+def advance(run_id: str, from_step: str, to_step: str, output: str, now: int) -> bool:
+    """Move the run from from_step to to_step ("" when from_step was the last); False when the run is not at from_step."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    key = checkpoint_key(run_id)
+    if r.hget(key, "current_step") != from_step:
         return False
-    r.set(checkpoint_key(run_id), json.dumps({"cursor": cursor, "output": output}))
+    r.hset(key, mapping={"current_step": to_step, "output": output, "updated_at": now})
     return True
-
-
-def work(run_id: str, from_step: str, to_step: str, input_doc: dict) -> bool:
-    output = effects.run(from_step, input_doc)
-    if not advance(run_id, to_step, output, 1):
-        logger.info("advance skipped run=%s step=%s", run_id, from_step)
-        return False
-    return True
-
-
-@app.get("/v1/runs/{run_id}/checkpoint")
-def checkpoint(run_id: str) -> dict:
-    stored = r.get(checkpoint_key(run_id))
-    return json.loads(stored) if stored else {}
 `,
-      solution: `import json
-import logging
-import time
+      solution: `import redis
 
-import redis
-from fastapi import FastAPI
+from workflow import blobs  # blobs.put(data) -> ref, blobs.get(ref)
 
-app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
-logger = logging.getLogger("workflow")
 
-CHECKPOINT_TTL_S = 7 * 24 * 3600
+RETENTION_S = 7 * 24 * 3600
 
+# Moves the run only if current_step is still ARGV[1]; a finished run (ARGV[2] == '') starts its retention.
 ADVANCE_LUA = """
 local current = redis.call('HGET', KEYS[1], 'current_step')
-if current == ARGV[1] then
-  redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'output_ref', ARGV[3], 'completed', ARGV[4], 'updated_at', ARGV[5])
-  redis.call('EXPIRE', KEYS[1], ARGV[6])
-  return 1
-end
-return 0
+if current ~= ARGV[1] then return 0 end
+local completed = redis.call('HGET', KEYS[1], 'completed')
+if not completed or completed == '' then completed = ARGV[1] else completed = completed .. ',' .. ARGV[1] end
+redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'completed', completed, 'output_ref', ARGV[3], 'updated_at', ARGV[4])
+if ARGV[2] == '' then redis.call('EXPIRE', KEYS[1], ARGV[5]) end
+return 1
 """
-
-
-class BlobStore:
-    def put(self, output: dict) -> str:
-        """Store one step output and return the reference that goes into the checkpoint."""
-        raise NotImplementedError
-
-
-class EffectRunner:
-    def run(self, step: str, input_doc: dict) -> dict:
-        """Run the step's effect: send the welcome email, charge the card, reserve the stock."""
-        raise NotImplementedError
-
-
-blobs = BlobStore()
-effects = EffectRunner()
+advance_script = r.register_script(ADVANCE_LUA)
 
 
 def checkpoint_key(run_id: str) -> str:
     return f"run:{run_id}:checkpoint"
 
 
-def advance(
-    run_id: str,
-    from_step: str,
-    to_step: str,
-    output_ref: str,
-    completed: list[str],
-    now: float,
-) -> bool:
-    # One EVAL holds the whole decision: the stored current_step must still be the step the worker
-    # advanced from, and only then does the hash move, the trail grow and the TTL refresh. The loser
-    # of the race gets 0 and has written nothing.
-    advanced = r.eval(
-        ADVANCE_LUA,
-        1,
-        checkpoint_key(run_id),
-        from_step,
-        to_step,
-        output_ref,
-        json.dumps(completed),
-        str(now),
-        CHECKPOINT_TTL_S,
-    )
-    return bool(advanced)
-
-
-def work(run_id: str, from_step: str, to_step: str, completed: list[str], input_doc: dict) -> bool:
-    output = effects.run(from_step, input_doc)
-    output_ref = blobs.put(output)
-    advanced = advance(run_id, from_step, to_step, output_ref, completed + [from_step], time.time())
-    if not advanced:
-        logger.info("advance lost the race run=%s step=%s", run_id, from_step)
-    return advanced
-
-
-@app.get("/v1/runs/{run_id}/checkpoint")
-def checkpoint(run_id: str) -> dict:
-    return r.hgetall(checkpoint_key(run_id)) or {}
+def advance(run_id: str, from_step: str, to_step: str, output: str, now: int) -> bool:
+    """Move the run from from_step to to_step ("" when from_step was the last); False when the run is not at from_step."""
+    # The output is stored first: a worker that loses the swap leaves an orphan blob, never a dangling reference.
+    ref = blobs.put(output)
+    return advance_script(keys=[checkpoint_key(run_id)], args=[from_step, to_step, ref, now, RETENTION_S]) == 1
 `,
     },
     typescript: {
-      starter: `/** Run checkpoint: the worker advances a run's cursor in Redis after each step. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import * as blobs from 'workflow/blobs'; // put(data) → ref, get(ref)
 
-export interface BlobStore {
-  put(output: Record<string, unknown>): Promise<string>;
-}
-
-export interface EffectRunner {
-  run(step: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
-}
-
-export const blobs: BlobStore = {
-  put: async () => {
-    throw new Error('not implemented');
-  },
-};
-
-export const effects: EffectRunner = {
-  run: async () => {
-    throw new Error('not implemented');
-  },
-};
+const redis = new Redis({host: 'redis', port: 6379});
 
 export const checkpointKey = (runId: string): string => \`run:\${runId}:checkpoint\`;
 
-export async function advance(
-  runId: string,
-  toStep: string,
-  output: Record<string, unknown>,
-  cursor: number,
-): Promise<boolean> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const stored = await r.get(checkpointKey(runId));
-  const current = stored === null ? 0 : (JSON.parse(stored) as {cursor: number}).cursor;
-  if (current >= cursor) return false;
-  await r.set(checkpointKey(runId), JSON.stringify({cursor: cursor, "output": output}));
+/** Move the run from fromStep to toStep ("" when fromStep was the last); false when the run is not at fromStep. */
+export async function advance(runId: string, fromStep: string, toStep: string, output: string, now: number): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const key = checkpointKey(runId);
+  if ((await redis.hget(key, 'current_step')) !== fromStep) return false;
+  await redis.hset(key, {current_step: toStep, output, updated_at: String(now)});
   return true;
 }
-
-export async function work(
-  runId: string,
-  fromStep: string,
-  toStep: string,
-  input: Record<string, unknown>,
-): Promise<boolean> {
-  const output = await effects.run(fromStep, input);
-  return advance(runId, toStep, output, 1);
-}
-
-app.get('/v1/runs/:runId/checkpoint', async (request, reply) => {
-  const stored = await r.get(checkpointKey((request.params as {runId: string}).runId));
-  return reply.code(200).send(stored === null ? {} : JSON.parse(stored));
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** Run checkpoint: one compare-and-swap advance that keeps a reference, never the payload. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+import * as blobs from 'workflow/blobs'; // put(data) → ref, get(ref)
 
-const CHECKPOINT_TTL_S = 7 * 24 * 3600;
+const redis = new Redis({host: 'redis', port: 6379});
 
-const ADVANCE_LUA = \`
+export const RETENTION_S = 7 * 24 * 3600;
+
+// Moves the run only if current_step is still ARGV[1]; a finished run (ARGV[2] == '') starts its retention.
+export const ADVANCE_LUA = \`
 local current = redis.call('HGET', KEYS[1], 'current_step')
-if current == ARGV[1] then
-  redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'output_ref', ARGV[3], 'completed', ARGV[4], 'updated_at', ARGV[5])
-  redis.call('EXPIRE', KEYS[1], ARGV[6])
-  return 1
-end
-return 0
+if current ~= ARGV[1] then return 0 end
+local completed = redis.call('HGET', KEYS[1], 'completed')
+if not completed or completed == '' then completed = ARGV[1] else completed = completed .. ',' .. ARGV[1] end
+redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'completed', completed, 'output_ref', ARGV[3], 'updated_at', ARGV[4])
+if ARGV[2] == '' then redis.call('EXPIRE', KEYS[1], ARGV[5]) end
+return 1
 \`;
-
-export interface BlobStore {
-  put(output: Record<string, unknown>): Promise<string>;
-}
-
-export interface EffectRunner {
-  run(step: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
-}
-
-export const blobs: BlobStore = {
-  put: async () => {
-    throw new Error('not implemented');
-  },
-};
-
-export const effects: EffectRunner = {
-  run: async () => {
-    throw new Error('not implemented');
-  },
-};
 
 export const checkpointKey = (runId: string): string => \`run:\${runId}:checkpoint\`;
 
-export async function advance(
-  runId: string,
-  fromStep: string,
-  toStep: string,
-  outputRef: string,
-  completed: string[],
-  now: number,
-): Promise<boolean> {
-  // One EVAL holds the whole decision: the stored current_step must still be the step the worker
-  // advanced from, and only then does the hash move, the trail grow and the TTL refresh. The
-  // worker that loses the race gets 0 and has written nothing.
-  const advanced = await r.eval(
-    ADVANCE_LUA,
-    1,
-    checkpointKey(runId),
-    fromStep,
-    toStep,
-    outputRef,
-    JSON.stringify(completed),
-    String(now),
-    String(CHECKPOINT_TTL_S),
-  );
-  return Number(advanced) === 1;
+/** Move the run from fromStep to toStep ("" when fromStep was the last); false when the run is not at fromStep. */
+export async function advance(runId: string, fromStep: string, toStep: string, output: string, now: number): Promise<boolean> {
+  // The output is stored first: a worker that loses the swap leaves an orphan blob, never a dangling reference.
+  const ref = await blobs.put(output);
+  const moved = await redis.eval(ADVANCE_LUA, 1, checkpointKey(runId), fromStep, toStep, ref, String(now), String(RETENTION_S));
+  return moved === 1;
 }
-
-export async function work(
-  runId: string,
-  fromStep: string,
-  toStep: string,
-  completed: string[],
-  input: Record<string, unknown>,
-): Promise<boolean> {
-  const output = await effects.run(fromStep, input);
-  const outputRef = await blobs.put(output);
-  const advanced = await advance(
-    runId,
-    fromStep,
-    toStep,
-    outputRef,
-    [...completed, fromStep],
-    Math.floor(Date.now() / 1000),
-  );
-  if (!advanced) app.log.info(\`advance lost the race \${runId} \${fromStep}\`);
-  return advanced;
-}
-
-app.get('/v1/runs/:runId/checkpoint', async (request, reply) => {
-  const checkpoint = await r.hgetall(checkpointKey((request.params as {runId: string}).runId));
-  return reply.code(200).send(checkpoint);
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -418,506 +206,463 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
 
 	"github.com/redis/go-redis/v9"
 )
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type BlobStore struct{}
+func checkpointKey(runID string) string { return "run:" + runID + ":checkpoint" }
 
-func (b *BlobStore) Put(ctx context.Context, output map[string]any) (string, error) {
-	panic("blob store is wired up by the platform")
-}
-
-type EffectRunner struct{}
-
-func (e *EffectRunner) Run(ctx context.Context, step string, input map[string]any) (map[string]any, error) {
-	panic("effect runner is wired up by the platform")
-}
-
-var (
-	blobs   = &BlobStore{}
-	effects = &EffectRunner{}
-)
-
-func checkpointKey(runID string) string {
-	return fmt.Sprintf("run:%s:checkpoint", runID)
-}
-
-// advance moves the run forward: read the cursor, compare it with the one the worker believes it
-// holds, then write the new value back.
-func advance(ctx context.Context, runID string, toStep string, output map[string]any, cursor int) bool {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+// advance moves the run from fromStep to toStep ("" when fromStep was the last); false when the run
+// is not at fromStep. The blob store is the package workflow/blobs: blobs.Put(ctx, data) (ref, error).
+func advance(ctx context.Context, runID, fromStep, toStep, output string, now int64) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	key := checkpointKey(runID)
-	raw, _ := rdb.Get(ctx, key).Result()
-	current := 0
-	if raw != "" {
-		var stored map[string]any
-		if err := json.Unmarshal([]byte(raw), &stored); err == nil {
-			if value, ok := stored["cursor"].(float64); ok {
-				current = int(value)
-			}
-		}
+	current, err := rdb.HGet(ctx, key, "current_step").Result()
+	if err != nil && err != redis.Nil {
+		return false, err
 	}
-	if current >= cursor {
-		return false
+	if current != fromStep {
+		return false, nil
 	}
-	payload, err := json.Marshal(map[string]any{"cursor": cursor, "output": output})
-	if err != nil {
-		return false
-	}
-	rdb.Set(ctx, key, payload, 0)
-	return true
-}
-
-func work(ctx context.Context, runID, fromStep, toStep string, input map[string]any) bool {
-	output, err := effects.Run(ctx, fromStep, input)
-	if err != nil {
-		log.Printf("effect failed run=%s step=%s", runID, fromStep)
-		return false
-	}
-	return advance(ctx, runID, toStep, output, 1)
-}
-
-func checkpointHandler(rw http.ResponseWriter, r *http.Request) {
-	raw, _ := rdb.Get(r.Context(), checkpointKey(r.PathValue("run_id"))).Result()
-	if raw == "" {
-		raw = "{}"
-	}
-	rw.Header().Set("Content-Type", "application/json")
-	_, _ = rw.Write([]byte(raw))
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/runs/{run_id}/checkpoint", checkpointHandler)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	return true, rdb.HSet(ctx, key, map[string]any{"current_step": toStep, "output": output, "updated_at": now}).Err()
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"workflow/blobs" // blobs.Put(ctx, data) (ref, error), blobs.Get(ctx, ref)
 )
 
-const checkpointTTLSeconds = 7 * 24 * 60 * 60
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var rdb *redis.Client
+const retentionSeconds = 7 * 24 * 3600
 
-// The whole advance is one script: compare the stored step, then move the run, extend the trail
-// and refresh the TTL, or refuse and write nothing.
+// advanceScript moves the run only if current_step is still ARGV[1]; a finished run (ARGV[2] == '')
+// starts its retention.
 var advanceScript = redis.NewScript(\`
 local current = redis.call('HGET', KEYS[1], 'current_step')
-if current == ARGV[1] then
-  redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'output_ref', ARGV[3], 'completed', ARGV[4], 'updated_at', ARGV[5])
-  redis.call('EXPIRE', KEYS[1], ARGV[6])
-  return 1
-end
-return 0
+if current ~= ARGV[1] then return 0 end
+local completed = redis.call('HGET', KEYS[1], 'completed')
+if not completed or completed == '' then completed = ARGV[1] else completed = completed .. ',' .. ARGV[1] end
+redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'completed', completed, 'output_ref', ARGV[3], 'updated_at', ARGV[4])
+if ARGV[2] == '' then redis.call('EXPIRE', KEYS[1], ARGV[5]) end
+return 1
 \`)
 
-type BlobStore struct{}
+func checkpointKey(runID string) string { return "run:" + runID + ":checkpoint" }
 
-func (b *BlobStore) Put(ctx context.Context, output map[string]any) (string, error) {
-	panic("blob store is wired up by the platform")
-}
-
-type EffectRunner struct{}
-
-func (e *EffectRunner) Run(ctx context.Context, step string, input map[string]any) (map[string]any, error) {
-	panic("effect runner is wired up by the platform")
-}
-
-var (
-	blobs   = &BlobStore{}
-	effects = &EffectRunner{}
-)
-
-func checkpointKey(runID string) string {
-	return fmt.Sprintf("run:%s:checkpoint", runID)
-}
-
-// advance is the only writer of the checkpoint. The script compares first, so a duplicate worker
-// that still believes it holds fromStep loses and writes nothing at all.
-func advance(ctx context.Context, runID, fromStep, toStep, outputRef string, completed []string, now time.Time) (bool, error) {
-	trail, err := json.Marshal(completed)
+// advance moves the run from fromStep to toStep ("" when fromStep was the last); false when the run
+// is not at fromStep.
+func advance(ctx context.Context, runID, fromStep, toStep, output string, now int64) (bool, error) {
+	// The output is stored first: a worker that loses the swap leaves an orphan blob, never a dangling reference.
+	ref, err := blobs.Put(ctx, output)
 	if err != nil {
 		return false, err
 	}
-	moved, err := advanceScript.Run(
-		ctx,
-		rdb,
-		[]string{checkpointKey(runID)},
-		fromStep,
-		toStep,
-		outputRef,
-		string(trail),
-		now.UTC().Format(time.RFC3339),
-		checkpointTTLSeconds,
-	).Int()
-	if err != nil {
-		return false, err
-	}
-	return moved == 1, nil
-}
-
-func work(ctx context.Context, runID, fromStep, toStep string, completed []string, input map[string]any) (bool, error) {
-	output, err := effects.Run(ctx, fromStep, input)
-	if err != nil {
-		return false, err
-	}
-	outputRef, err := blobs.Put(ctx, output)
-	if err != nil {
-		return false, err
-	}
-	advanced, err := advance(ctx, runID, fromStep, toStep, outputRef, append(completed, fromStep), time.Now())
-	if err != nil {
-		return false, err
-	}
-	if !advanced {
-		log.Printf("advance lost the race run=%s step=%s", runID, fromStep)
-	}
-	return advanced, nil
-}
-
-func checkpointHandler(rw http.ResponseWriter, r *http.Request) {
-	fields, err := rdb.HGetAll(r.Context(), checkpointKey(r.PathValue("run_id"))).Result()
-	if err != nil {
-		http.Error(rw, "checkpoint unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	rw.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(rw).Encode(fields)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/runs/{run_id}/checkpoint", checkpointHandler)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	moved, err := advanceScript.Run(ctx, rdb, []string{checkpointKey(runID)}, fromStep, toStep, ref, now, retentionSeconds).Int()
+	return moved == 1, err
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
 
-trait BlobStore {
-  def put(output: String): String
-}
+import scala.jdk.CollectionConverters._
 
-object BlobStore {
-  def open(): BlobStore = new BlobStore {
-    def put(output: String): String = throw new NotImplementedError("blob store")
-  }
-}
+import workflow.Blobs // Blobs.put(data): ref, Blobs.get(ref)
 
-trait EffectRunner {
-  def run(step: String, input: String): String
-}
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-object EffectRunner {
-  def open(): EffectRunner = new EffectRunner {
-    def run(step: String, input: String): String = throw new NotImplementedError("effect runner")
-  }
-}
+  def checkpointKey(runId: String): String = s"run:$runId:checkpoint"
 
-object Checkpoint {
-  val jedis = new Jedis("redis", 6379)
-  val blobs: BlobStore = BlobStore.open()
-  val effects: EffectRunner = EffectRunner.open()
-
-  def key(runId: String): String = s"run:$runId:checkpoint"
-
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def advance(runId: String, toStep: String, output: String, cursor: Int): Boolean = {
-    val stored = Option(jedis.get(key(runId))).flatMap(_.toIntOption).getOrElse(0)
-    if (stored >= cursor) {
-      false
-    } else {
-      jedis.set(key(runId), s"""{"cursor":$cursor,"output":$output}""")
+  /** Move the run from fromStep to toStep ("" when fromStep was the last); false when the run is not at fromStep. */
+  def advance(runId: String, fromStep: String, toStep: String, output: String, now: Long): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val key = checkpointKey(runId)
+    if (jedis.hget(key, "current_step") != fromStep) false
+    else {
+      jedis.hset(key, Map("current_step" -> toStep, "output" -> output, "updated_at" -> now.toString).asJava)
       true
     }
   }
-
-  def work(runId: String, fromStep: String, toStep: String, input: String): Boolean = {
-    val output = effects.run(fromStep, input)
-    advance(runId, toStep, output, 1)
-  }
-
-  def checkpointJson(runId: String): String = Option(jedis.get(key(runId))).getOrElse("{}")
-
-  val route: Route =
-    path("v1" / "runs" / Segment / "checkpoint") { runId =>
-      get {
-        complete(StatusCodes.OK, checkpointJson(runId))
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("workflow")
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+      solution: `import redis.clients.jedis.JedisPooled
 
-trait BlobStore {
-  def put(output: String): String
-}
+import scala.jdk.CollectionConverters._
 
-object BlobStore {
-  def open(): BlobStore = new BlobStore {
-    def put(output: String): String = throw new NotImplementedError("blob store")
-  }
-}
+import workflow.Blobs // Blobs.put(data): ref, Blobs.get(ref)
 
-trait EffectRunner {
-  def run(step: String, input: String): String
-}
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-object EffectRunner {
-  def open(): EffectRunner = new EffectRunner {
-    def run(step: String, input: String): String = throw new NotImplementedError("effect runner")
-  }
-}
+  val RetentionSeconds: Long = 7L * 24 * 3600
 
-object Checkpoint {
-  val CheckpointTtlSeconds = 7L * 24L * 60L * 60L
-
-  val jedis = new Jedis("redis", 6379)
-  val blobs: BlobStore = BlobStore.open()
-  val effects: EffectRunner = EffectRunner.open()
-
-  // The whole advance is one script: compare the stored step, then move the run, extend the trail
-  // and refresh the TTL, or refuse and write nothing.
-  val AdvanceLua =
-    """
-      |local current = redis.call('HGET', KEYS[1], 'current_step')
-      |if current == ARGV[1] then
-      |  redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'output_ref', ARGV[3], 'completed', ARGV[4], 'updated_at', ARGV[5])
-      |  redis.call('EXPIRE', KEYS[1], ARGV[6])
-      |  return 1
-      |end
-      |return 0
+  /** Moves the run only if current_step is still ARGV[1]; a finished run (ARGV[2] == '') starts its retention. */
+  val AdvanceLua: String =
+    """local current = redis.call('HGET', KEYS[1], 'current_step')
+      |if current ~= ARGV[1] then return 0 end
+      |local completed = redis.call('HGET', KEYS[1], 'completed')
+      |if not completed or completed == '' then completed = ARGV[1] else completed = completed .. ',' .. ARGV[1] end
+      |redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'completed', completed, 'output_ref', ARGV[3], 'updated_at', ARGV[4])
+      |if ARGV[2] == '' then redis.call('EXPIRE', KEYS[1], ARGV[5]) end
+      |return 1
       |""".stripMargin
 
-  def key(runId: String): String = s"run:$runId:checkpoint"
+  def checkpointKey(runId: String): String = s"run:$runId:checkpoint"
 
-  def advance(
-      runId: String,
-      fromStep: String,
-      toStep: String,
-      outputRef: String,
-      completed: List[String],
-      now: Long
-  ): Boolean = {
-    val advanced = jedis.eval(
-      AdvanceLua,
-      1,
-      key(runId),
-      fromStep,
-      toStep,
-      outputRef,
-      completed.mkString("[", ",", "]"),
-      now.toString,
-      CheckpointTtlSeconds.toString
-    )
-    advanced == 1L
-  }
-
-  def work(runId: String, fromStep: String, toStep: String, completed: List[String], input: String): Boolean = {
-    val output = effects.run(fromStep, input)
-    val outputRef = blobs.put(output)
-    advance(runId, fromStep, toStep, outputRef, completed :+ fromStep, System.currentTimeMillis() / 1000)
-  }
-
-  def checkpointJson(runId: String): String = {
-    val fields = jedis.hgetAll(key(runId))
-    val step = Option(fields.get("current_step")).getOrElse("")
-    val ref = Option(fields.get("output_ref")).getOrElse("")
-    val trail = Option(fields.get("completed")).getOrElse("[]")
-    val updated = Option(fields.get("updated_at")).getOrElse("")
-    s"""{"current_step":"$step","output_ref":"$ref","completed":$trail,"updated_at":"$updated"}"""
-  }
-
-  val route: Route =
-    path("v1" / "runs" / Segment / "checkpoint") { runId =>
-      get {
-        complete(StatusCodes.OK, checkpointJson(runId))
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("workflow")
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Move the run from fromStep to toStep ("" when fromStep was the last); false when the run is not at fromStep. */
+  def advance(runId: String, fromStep: String, toStep: String, output: String, now: Long): Boolean = {
+    // The output is stored first: a worker that loses the swap leaves an orphan blob, never a dangling reference.
+    val ref = Blobs.put(output)
+    val args = List(fromStep, toStep, ref, now.toString, RetentionSeconds.toString).asJava
+    jedis.eval(AdvanceLua, List(checkpointKey(runId)).asJava, args).asInstanceOf[java.lang.Long] == 1L
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
 #include <string>
 
-using json = nlohmann::json;
-using Redis = sw::redis::Redis;
+#include "workflow/blobs.h"  // blobs::put(data) -> ref, blobs::get(ref)
 
-struct BlobStore {
-  std::string put(const std::string& output);
-};
+sw::redis::Redis redis("tcp://redis:6379");
 
-struct EffectRunner {
-  std::string run(const std::string& step, const std::string& input);
-};
+std::string checkpointKey(const std::string& run_id) { return "run:" + run_id + ":checkpoint"; }
 
-BlobStore blobs;
-EffectRunner effects;
-
-std::string checkpointKey(const std::string& runId) {
-  return "run:" + runId + ":checkpoint";
-}
-
-// advance moves the run forward: read the cursor, compare it with the one the worker believes it
-// holds, then write the new value back.
-bool advance(Redis& redis, const std::string& runId, const std::string& toStep, const std::string& output,
-             long long cursor) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const auto stored = redis.get(checkpointKey(runId));
-  long long current = 0;
-  if (stored) {
-    const json parsed = json::parse(*stored, nullptr, false);
-    if (parsed.is_object()) current = parsed.value("cursor", 0LL);
-  }
-  if (current >= cursor) return false;
-  redis.set(checkpointKey(runId), json{{"cursor", cursor}, {"output", output}}.dump());
+// Move the run from from_step to to_step ("" when from_step was the last); false when the run is not at from_step.
+bool advance(const std::string& run_id, const std::string& from_step, const std::string& to_step, const std::string& output, long long now) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string key = checkpointKey(run_id);
+  if (redis.hget(key, "current_step").value_or("") != from_step) return false;
+  redis.hset(key, {{"current_step", to_step}, {"output", output}, {"updated_at", std::to_string(now)}});
   return true;
 }
-
-bool work(Redis& redis, const std::string& runId, const std::string& fromStep, const std::string& toStep,
-          const std::string& input) {
-  const auto output = effects.run(fromStep, input);
-  return advance(redis, runId, toStep, output, 1);
-}
-
-int main() {
-  Redis redis("tcp://redis:6379");
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/runs/(.*)/checkpoint)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    res.set_content(redis.get(checkpointKey(req.matches[1].str())).value_or("{}"), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
 `,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
-#include <chrono>
 #include <string>
-#include <vector>
 
-using json = nlohmann::json;
-using Redis = sw::redis::Redis;
+#include "workflow/blobs.h"  // blobs::put(data) -> ref, blobs::get(ref)
 
-constexpr long long kCheckpointTtlSeconds = 7 * 24 * 60 * 60;
+sw::redis::Redis redis("tcp://redis:6379");
 
-// The whole advance is one script: compare the stored step, then move the run, extend the trail and
-// refresh the TTL, or refuse and write nothing.
-const char* kAdvanceLua = R"LUA(
+constexpr long kRetentionSeconds = 7 * 24 * 3600;
+
+// Moves the run only if current_step is still ARGV[1]; a finished run (ARGV[2] == '') starts its retention.
+const std::string kAdvanceLua = R"lua(
 local current = redis.call('HGET', KEYS[1], 'current_step')
-if current == ARGV[1] then
-  redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'output_ref', ARGV[3], 'completed', ARGV[4], 'updated_at', ARGV[5])
-  redis.call('EXPIRE', KEYS[1], ARGV[6])
-  return 1
-end
-return 0
-)LUA";
+if current ~= ARGV[1] then return 0 end
+local completed = redis.call('HGET', KEYS[1], 'completed')
+if not completed or completed == '' then completed = ARGV[1] else completed = completed .. ',' .. ARGV[1] end
+redis.call('HSET', KEYS[1], 'current_step', ARGV[2], 'completed', completed, 'output_ref', ARGV[3], 'updated_at', ARGV[4])
+if ARGV[2] == '' then redis.call('EXPIRE', KEYS[1], ARGV[5]) end
+return 1
+)lua";
 
-struct BlobStore {
-  std::string put(const std::string& output);
-};
+std::string checkpointKey(const std::string& run_id) { return "run:" + run_id + ":checkpoint"; }
 
-struct EffectRunner {
-  std::string run(const std::string& step, const std::string& input);
-};
-
-BlobStore blobs;
-EffectRunner effects;
-
-std::string checkpointKey(const std::string& runId) {
-  return "run:" + runId + ":checkpoint";
-}
-
-long long nowSeconds() {
-  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-// advance is the only writer of the checkpoint. The script compares first, so a duplicate worker
-// that still believes it holds fromStep loses and writes nothing at all.
-bool advance(Redis& redis, const std::string& runId, const std::string& fromStep, const std::string& toStep,
-             const std::string& outputRef, const std::vector<std::string>& completed) {
-  const json trail = completed;
-  const auto advanced = redis.eval<long long>(
-      kAdvanceLua, {checkpointKey(runId)},
-      {fromStep, toStep, outputRef, trail.dump(), std::to_string(nowSeconds()),
-       std::to_string(kCheckpointTtlSeconds)});
-  return advanced == 1;
-}
-
-bool work(Redis& redis, const std::string& runId, const std::string& fromStep, const std::string& toStep,
-          std::vector<std::string> completed, const std::string& input) {
-  const auto output = effects.run(fromStep, input);
-  const auto outputRef = blobs.put(output);
-  completed.push_back(fromStep);
-  return advance(redis, runId, fromStep, toStep, outputRef, completed);
-}
-
-int main() {
-  Redis redis("tcp://redis:6379");
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/runs/(.*)/checkpoint)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto fields = redis.hgetall(checkpointKey(req.matches[1].str()));
-    json body = json::object();
-    for (const auto& [field, value] : fields) body[field] = value;
-    res.set_content(body.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Move the run from from_step to to_step ("" when from_step was the last); false when the run is not at from_step.
+bool advance(const std::string& run_id, const std::string& from_step, const std::string& to_step, const std::string& output, long long now) {
+  // The output is stored first: a worker that loses the swap leaves an orphan blob, never a dangling reference.
+  const std::string ref = blobs::put(output);
+  return redis.eval<long long>(kAdvanceLua, {checkpointKey(run_id)}, {from_step, to_step, ref, std::to_string(now), std::to_string(kRetentionSeconds)}) == 1;
 }
 `,
     },
   },
+  harness: {
+    python: `KEY = "run:r1:checkpoint"
+RETENTION = 7 * 24 * 3600
+
+
+def _start(ctx):
+    ctx.redis.hset(KEY, mapping={"current_step": "create_account", "completed": "", "output_ref": "", "updated_at": 1000})
+
+
+def check_cas(ctx):
+    m = ctx.load("state")
+    _start(ctx)
+    # A duplicate worker advances the run right after the first worker touched the checkpoint.
+    rival = ctx.redis_after(KEY, lambda: m.advance("r1", "create_account", "send_welcome", '{"worker": "w2"}', 2000))
+    mine = m.advance("r1", "create_account", "send_welcome", '{"worker": "w1"}', 2000)
+    assert rival.fired, "advance never touched run:r1:checkpoint"
+    if rival.error is not None:
+        raise rival.error
+    winners = [mine, rival.result].count(True)
+    assert winners == 1, f"two workers advanced r1 from create_account at the same moment and {winners} were told they won (first: {mine}, second: {rival.result}): both go on to run send_welcome. Compare and write in one script"
+    step = ctx.redis.hget(KEY, "current_step")
+    assert step == "send_welcome", f"after the race current_step is {step!r}, expected send_welcome"
+
+
+def check_ref(ctx):
+    m = ctx.load("state")
+    _start(ctx)
+    output = '{"account": "' + "a" * 100_000 + '"}'
+    assert m.advance("r1", "create_account", "send_welcome", output, 2000) is True, "advancing a run at create_account must return True"
+    fields = ctx.redis.hgetall(KEY)
+    big = {name: len(value) for name, value in fields.items() if len(value) > 1024}
+    assert not big, f"the checkpoint hash holds {big} bytes: the 100 KB output belongs in the blob store, the hash holds its reference"
+    ref = fields.get("output_ref", "")
+    assert ref and ctx.redis.get(ref) == output, f"output_ref is {ref!r}: it must name the blob holding the output (blobs.put returns it)"
+
+
+def check_trail(ctx):
+    m = ctx.load("state")
+    _start(ctx)
+    assert m.advance("r1", "create_account", "send_welcome", "{}", 2000) is True, "advancing from create_account must return True"
+    assert m.advance("r1", "send_welcome", "notify_sales", "{}", 2100) is True, "advancing from send_welcome must return True"
+    assert m.advance("r1", "create_account", "send_welcome", "{}", 2200) is False, "a stale advance from create_account, two steps later, must return False"
+    completed = ctx.redis.hget(KEY, "completed")
+    assert completed == "create_account,send_welcome", f"completed is {completed!r} after create_account and send_welcome finished, expected 'create_account,send_welcome': nothing says which steps ran"
+    step = ctx.redis.hget(KEY, "current_step")
+    assert step == "notify_sales", f"current_step is {step!r}, expected notify_sales"
+
+
+def check_retention(ctx):
+    m = ctx.load("state")
+    _start(ctx)
+    m.advance("r1", "create_account", "send_welcome", "{}", 2000)
+    ttl = ctx.redis.ttl(KEY)
+    assert ttl == -1, f"a running checkpoint has a TTL of {ttl} s: a run waiting on a slow step would lose its state. Only a finished run expires"
+    assert m.advance("r1", "send_welcome", "", "{}", 2100) is True, "advancing the last step to '' must return True"
+    assert ctx.redis.hget(KEY, "current_step") == "", f"a finished run's current_step is {ctx.redis.hget(KEY, 'current_step')!r}, expected ''"
+    ttl = ctx.redis.ttl(KEY)
+    assert RETENTION - 60 <= ttl <= RETENTION, f"the finished run's checkpoint has a TTL of {ttl} s, expected seven days (RETENTION_S = {RETENTION})"
+`,
+    typescript: `const KEY = 'run:r1:checkpoint';
+const RETENTION = 7 * 24 * 3600;
+
+function start(ctx): void {
+  ctx.redis.hset(KEY, 'current_step', 'create_account', 'completed', '', 'output_ref', '', 'updated_at', '1000');
+}
+
+export async function check_cas(ctx) {
+  const m = ctx.load('state');
+  start(ctx);
+  // A duplicate worker advances the run right after the first worker touched the checkpoint.
+  const rival = ctx.redisAfter(KEY, () => m.advance('r1', 'create_account', 'send_welcome', '{"worker": "w2"}', 2000));
+  const mine = await m.advance('r1', 'create_account', 'send_welcome', '{"worker": "w1"}', 2000);
+  assert(rival.fired, 'advance never touched run:r1:checkpoint');
+  if (rival.error !== undefined) throw rival.error;
+  const theirs = await rival.result;
+  const winners = [mine, theirs].filter(won => won === true).length;
+  assert.equal(winners, 1, \`two workers advanced r1 from create_account at the same moment and \${winners} were told they won (first: \${mine}, second: \${theirs}): both go on to run send_welcome. Compare and write in one script\`);
+  assert.equal(ctx.redis.hget(KEY, 'current_step'), 'send_welcome', 'after the race current_step must be send_welcome');
+}
+
+export async function check_ref(ctx) {
+  const m = ctx.load('state');
+  start(ctx);
+  const output = \`{"account": "\${'a'.repeat(100_000)}"}\`;
+  assert.equal(await m.advance('r1', 'create_account', 'send_welcome', output, 2000), true, 'advancing a run at create_account must return true');
+  const fields = ctx.redis.hgetall(KEY);
+  const big = Object.entries(fields).filter(([, value]) => String(value).length > 1024).map(([name]) => name);
+  assert.deepStrictEqual(big, [], \`the checkpoint hash holds the field(s) \${JSON.stringify(big)} over 1 KB: the 100 KB output belongs in the blob store, the hash holds its reference\`);
+  const ref = fields.output_ref ?? '';
+  assert(ref !== '' && ctx.redis.get(ref) === output, \`output_ref is \${JSON.stringify(ref)}: it must name the blob holding the output (blobs.put returns it)\`);
+}
+
+export async function check_trail(ctx) {
+  const m = ctx.load('state');
+  start(ctx);
+  assert.equal(await m.advance('r1', 'create_account', 'send_welcome', '{}', 2000), true, 'advancing from create_account must return true');
+  assert.equal(await m.advance('r1', 'send_welcome', 'notify_sales', '{}', 2100), true, 'advancing from send_welcome must return true');
+  assert.equal(await m.advance('r1', 'create_account', 'send_welcome', '{}', 2200), false, 'a stale advance from create_account, two steps later, must return false');
+  const completed = ctx.redis.hget(KEY, 'completed');
+  assert.equal(completed, 'create_account,send_welcome', \`completed is \${JSON.stringify(completed)} after create_account and send_welcome finished: nothing says which steps ran\`);
+  assert.equal(ctx.redis.hget(KEY, 'current_step'), 'notify_sales', 'current_step must be notify_sales');
+}
+
+export async function check_retention(ctx) {
+  const m = ctx.load('state');
+  start(ctx);
+  await m.advance('r1', 'create_account', 'send_welcome', '{}', 2000);
+  let ttl = ctx.redis.ttl(KEY);
+  assert.equal(ttl, -1, \`a running checkpoint has a TTL of \${ttl} s: a run waiting on a slow step would lose its state. Only a finished run expires\`);
+  assert.equal(await m.advance('r1', 'send_welcome', '', '{}', 2100), true, "advancing the last step to '' must return true");
+  assert.equal(ctx.redis.hget(KEY, 'current_step'), '', "a finished run's current_step must be ''");
+  ttl = ctx.redis.ttl(KEY);
+  assert(RETENTION - 60 <= ttl && ttl <= RETENTION, \`the finished run's checkpoint has a TTL of \${ttl} s, expected seven days (RETENTION_S = \${RETENTION})\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const (
+	stateKey       = "run:r1:checkpoint"
+	stateRetention = 7 * 24 * 3600
+)
+
+var stateBg = context.Background()
+
+func stateStart(ctx *harness.Ctx) {
+	ctx.Redis.Do("HSET", stateKey, "current_step", "create_account", "completed", "", "output_ref", "", "updated_at", "1000")
+}
+
+func mustAdvance(ctx *harness.Ctx, from, to, output string, now int64) bool {
+	moved, err := advance(stateBg, "r1", from, to, output, now)
+	ctx.NoError(err, "advance(r1, %q, %q) failed", from, to)
+	return moved
+}
+
+func hget(ctx *harness.Ctx, field string) string {
+	value, _ := ctx.Redis.HGet(stateKey, field)
+	return value
+}
+
+func CheckCas(ctx *harness.Ctx) {
+	stateStart(ctx)
+	// A duplicate worker advances the run right after the first worker touched the checkpoint.
+	rival := ctx.Redis.After(stateKey, func() any {
+		moved, err := advance(stateBg, "r1", "create_account", "send_welcome", \`{"worker": "w2"}\`, 2000)
+		ctx.NoError(err, "the second worker's advance failed")
+		return moved
+	})
+	mine := mustAdvance(ctx, "create_account", "send_welcome", \`{"worker": "w1"}\`, 2000)
+	ctx.Assert(rival.Fired, "advance never touched run:r1:checkpoint")
+	ctx.Assert(rival.Err == nil, "the second worker's advance failed: %v", rival.Err)
+	winners := 0
+	for _, won := range []any{mine, rival.Result} {
+		if won == true {
+			winners++
+		}
+	}
+	ctx.Assert(winners == 1, "two workers advanced r1 from create_account at the same moment and %d were told they won (first: %v, second: %v): both go on to run send_welcome. Compare and write in one script", winners, mine, rival.Result)
+	ctx.Equal(hget(ctx, "current_step"), "send_welcome", "after the race, current_step")
+}
+
+func CheckRef(ctx *harness.Ctx) {
+	stateStart(ctx)
+	output := \`{"account": "\` + strings.Repeat("a", 100000) + \`"}\`
+	ctx.Equal(mustAdvance(ctx, "create_account", "send_welcome", output, 2000), true, "advancing a run at create_account; moved")
+	var big []string
+	for name, value := range ctx.Redis.HGetAll(stateKey) {
+		if len(value) > 1024 {
+			big = append(big, name)
+		}
+	}
+	ctx.Assert(len(big) == 0, "the checkpoint hash holds the field(s) %q over 1 KB: the 100 KB output belongs in the blob store, the hash holds its reference", big)
+	ref := hget(ctx, "output_ref")
+	stored, ok := ctx.Redis.Get(ref)
+	ctx.Assert(ref != "" && ok && stored == output, "output_ref is %q: it must name the blob holding the output (blobs.Put returns it)", ref)
+}
+
+func CheckTrail(ctx *harness.Ctx) {
+	stateStart(ctx)
+	ctx.Equal(mustAdvance(ctx, "create_account", "send_welcome", "{}", 2000), true, "advancing from create_account; moved")
+	ctx.Equal(mustAdvance(ctx, "send_welcome", "notify_sales", "{}", 2100), true, "advancing from send_welcome; moved")
+	ctx.Equal(mustAdvance(ctx, "create_account", "send_welcome", "{}", 2200), false, "a stale advance from create_account, two steps later; moved")
+	ctx.Equal(hget(ctx, "completed"), "create_account,send_welcome", "after create_account and send_welcome finished (otherwise nothing says which steps ran), completed")
+	ctx.Equal(hget(ctx, "current_step"), "notify_sales", "current_step")
+}
+
+func CheckRetention(ctx *harness.Ctx) {
+	stateStart(ctx)
+	mustAdvance(ctx, "create_account", "send_welcome", "{}", 2000)
+	ctx.Equal(ctx.Redis.TTL(stateKey), int64(-1), "a running checkpoint must not expire (a run waiting on a slow step would lose its state); its TTL")
+	ctx.Equal(mustAdvance(ctx, "send_welcome", "", "{}", 2100), true, "advancing the last step to ''; moved")
+	ctx.Equal(hget(ctx, "current_step"), "", "a finished run's current_step")
+	ttl := ctx.Redis.TTL(stateKey)
+	ctx.Assert(stateRetention-60 <= ttl && ttl <= stateRetention, "the finished run's checkpoint has a TTL of %d s, expected seven days (retentionSeconds = %d)", ttl, stateRetention)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kKey = "run:r1:checkpoint";
+constexpr long long kRetention = 7 * 24 * 3600;
+
+void start(harness::Ctx& ctx) { ctx.Redis.Do("HSET", kKey, "current_step", "create_account", "completed", "", "output_ref", "", "updated_at", "1000"); }
+
+std::string field(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kKey, name).value_or(""); }
+
+struct Rival {
+  bool fired = false;
+  bool moved = false;
+  std::optional<std::string> err;
+};
+
+}  // namespace
+
+void CheckCas(harness::Ctx& ctx) {
+  start(ctx);
+  // A duplicate worker advances the run right after the first worker touched the checkpoint.
+  auto rival = std::make_shared<Rival>();
+  ctx.Redis.After(kKey, [rival] {
+    rival->fired = true;
+    try {
+      rival->moved = advance("r1", "create_account", "send_welcome", R"({"worker": "w2"})", 2000);
+    } catch (const std::exception& e) {
+      rival->err = e.what();
+    }
+  });
+  const bool mine = advance("r1", "create_account", "send_welcome", R"({"worker": "w1"})", 2000);
+  ctx.Assert(rival->fired, "advance never touched run:r1:checkpoint");
+  ctx.Assert(!rival->err, "the second worker's advance failed: %s", rival->err.value_or(""));
+  const int winners = (mine ? 1 : 0) + (rival->moved ? 1 : 0);
+  ctx.Assert(winners == 1, "two workers advanced r1 from create_account at the same moment and %d were told they won (first: %t, second: %t): both go on to run send_welcome. Compare and write in one script", winners, mine, rival->moved);
+  ctx.Equal(field(ctx, "current_step"), "send_welcome", "after the race, current_step");
+}
+
+void CheckRef(harness::Ctx& ctx) {
+  start(ctx);
+  const std::string output = R"({"account": ")" + std::string(100000, 'a') + R"("})";
+  ctx.Equal(advance("r1", "create_account", "send_welcome", output, 2000), true, "advancing a run at create_account; moved");
+  std::vector<std::string> big;
+  for (const auto& [name, value] : ctx.Redis.HGetAll(kKey)) {
+    if (value.size() > 1024) big.push_back(name);
+  }
+  ctx.Assert(big.empty(), "the checkpoint hash holds the field(s) %q over 1 KB: the 100 KB output belongs in the blob store, the hash holds its reference", big);
+  const std::string ref = field(ctx, "output_ref");
+  ctx.Assert(!ref.empty() && ctx.Redis.Get(ref).value_or("") == output, "output_ref is %q: it must name the blob holding the output (blobs::put returns it)", ref);
+}
+
+void CheckTrail(harness::Ctx& ctx) {
+  start(ctx);
+  ctx.Equal(advance("r1", "create_account", "send_welcome", "{}", 2000), true, "advancing from create_account; moved");
+  ctx.Equal(advance("r1", "send_welcome", "notify_sales", "{}", 2100), true, "advancing from send_welcome; moved");
+  ctx.Equal(advance("r1", "create_account", "send_welcome", "{}", 2200), false, "a stale advance from create_account, two steps later; moved");
+  ctx.Equal(field(ctx, "completed"), "create_account,send_welcome", "after create_account and send_welcome finished (otherwise nothing says which steps ran), completed");
+  ctx.Equal(field(ctx, "current_step"), "notify_sales", "current_step");
+}
+
+void CheckRetention(harness::Ctx& ctx) {
+  start(ctx);
+  advance("r1", "create_account", "send_welcome", "{}", 2000);
+  ctx.Equal(ctx.Redis.TTL(kKey), -1LL, "a running checkpoint must not expire (a run waiting on a slow step would lose its state); its TTL");
+  ctx.Equal(advance("r1", "send_welcome", "", "{}", 2100), true, "advancing the last step to ''; moved");
+  ctx.Equal(field(ctx, "current_step"), "", "a finished run's current_step");
+  const long long ttl = ctx.Redis.TTL(kKey);
+  ctx.Assert(kRetention - 60 <= ttl && ttl <= kRetention, "the finished run's checkpoint has a TTL of %d s, expected seven days (kRetentionSeconds = %d)", ttl, kRetention);
+}
+`,
+  },
   hints: [
-    'Symptom: after a worker restart two workers pick up the same run, both report success, and the run record shows one step fewer than the effects that actually happened.',
-    'Mechanism: `advance` reads the cursor with `GET`, compares it on the client, then `SET`s a JSON blob holding the whole output. Two readers see the same cursor and both write.',
-    'Fix: one `r.eval` script: `HGET current_step`, `if current == ARGV[1]` then `HSET` step, `output_ref` (from `blobs.put`), `completed`, `EXPIRE CHECKPOINT_TTL_S`, else `return 0`.',
+    'Two workers advance one run from `create_account` at the same moment: both get `True` and both go on to send the welcome email. A 100 KB output makes the checkpoint 100 KB, and a finished run never goes away.',
+    "The `HGET` and the `HSET` are two commands, and another client's write fits between them; the compare runs in your process on a value that may already be stale. The hash gets the output itself, no trail and no expiry.",
+    "`ref = blobs.put(output)`, then one script: `HGET current_step`, `return 0` unless it equals `ARGV[1]`, append `ARGV[1]` to `completed`, `HSET` the step, ref and time, `EXPIRE` with `RETENTION_S` when `ARGV[2] == ''`, `return 1`.",
   ],
-  debrief: `The advance is a compare-and-swap on the step the worker advanced from, and one Lua script makes the read, the compare and the write a single server-side operation, so a duplicate worker that read the same value loses instead of moving the run past an effect that did not run. Running the effect before the swap is what makes that safe: the output is already in the blob store when the script decides, so a loser leaves an orphan blob, not a missing effect. The value carries a reference because step outputs are unbounded and Redis has a memory budget; the TTL refreshed on every advance keeps abandoned runs from leaking keys. Production checkpoints also carry a lease owner and expiry so a stalled run can be taken over.`,
+  debrief: `The compare and the write must be one server-side step, because a duplicate worker exists precisely when two processes believe they own the run: the script makes the loser's write impossible instead of unlikely, and its \`0\` tells the loser to stop. Storing the output first and swapping in only its reference means a loser leaves an orphan blob, never a checkpoint naming a missing output. Expiry waits for the finish because a run blocked on a month-long approval is still alive; Temporal applies its namespace retention period the same way, to closed executions only. Production engines also fence the effect itself, passing an attempt number the target checks so a late call from a superseded worker is refused there too.`,
 };

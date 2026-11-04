@@ -1140,7 +1140,7 @@ export const SERVER = new RedisServer();
 
 // ---- the ioredis surface -------------------------------------------------------------------------
 
-type Arg =
+export type Arg =
   | string
   | number
   | Uint8Array
@@ -1151,7 +1151,7 @@ type Arg =
   | {[field: string]: string | number | boolean | null | undefined};
 
 /** ioredis flattens arguments: arrays inline, plain objects become field/value pairs (`hset('h', {a: 1})`); text and Buffers become byte strings. */
-const flatten = (args: Arg[]): string[] => {
+export const flatten = (args: Arg[]): string[] => {
   const out: string[] = [];
   for (const arg of args) {
     if (arg === undefined || arg === null) continue;

@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package inventoryd;
+
+// The warehouse step 3 confirms a reservation with. In this course it is a stand-in served by the
+// harness at warehouse:9000. ConfirmReservation is idempotent on reservation_id: a retried
+// confirmation with the same id answers the same confirmation instead of allocating twice. A
+// reservation the warehouse cannot fill is FAILED_PRECONDITION, a verdict for that reservation.
+service Warehouse {
+  rpc ConfirmReservation(ConfirmRequest) returns (ConfirmReply);
+}
+
+message ConfirmRequest {
+  // The idempotency id: the warehouse keeps one allocation per reservation id.
+  string reservation_id = 1;
+  string sku = 2;
+  int32 quantity = 3;
+}
+
+message ConfirmReply {
+  string confirmation_id = 1;
+}

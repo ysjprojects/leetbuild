@@ -2,10 +2,16 @@
  * HTTP for the TypeScript runtime, shaped like Fastify: `const app = Fastify(); app.get('/x/:id',
  * async (request, reply) => …)`, `reply.code(201).header(…).send(…)`, returned values serialised as
  * JSON, thrown errors with a `statusCode` answered with it, hooks (`onRequest`, `preHandler`,
- * `onSend`, `onResponse`, `onError`), encapsulated `register(plugin, {prefix})`, decorators and
+ * `onSend`, `onResponse`, `onError`), encapsulated `register(plugin, {prefix})`, decorators,
+ * content-type parsers (`addContentTypeParser('application/octet-stream', {parseAs: 'buffer'}, …)`,
+ * the body arriving as the exact bytes sent), pino's logger for `Fastify({logger: true})` (JSON lines
+ * on stdout, `request.log` a child carrying `reqId`, the automatic request lines) and
  * `app.inject(…)` — Fastify's own in-process request, which is also how the harness's `ctx.client`
  * drives the app. No sockets: `listen()` resolves with an address and nothing else happens.
  */
+import {type Bytes, Buffer} from './buffer';
+import {CLOCK} from './clock';
+import {os, PROCESS} from './node';
 
 export const STATUS_TEXT: Record<number, string> = {
   200: 'OK',
@@ -107,7 +113,7 @@ export interface Logger {
   debug: (...args: unknown[]) => void;
   trace: (...args: unknown[]) => void;
   fatal: (...args: unknown[]) => void;
-  child: () => Logger;
+  child: (bindings?: Record<string, unknown>) => Logger;
   level: string;
 }
 
@@ -122,6 +128,104 @@ export const silentLogger: Logger = {
   child: (): Logger => silentLogger,
   level: 'silent',
 };
+
+const LEVELS: Record<string, number> = {
+  trace: 10,
+  debug: 20,
+  info: 30,
+  warn: 40,
+  error: 50,
+  fatal: 60,
+  silent: Infinity,
+};
+
+/** pino's `err` serializer: type, message, stack, then the error's own fields (`code`, `statusCode`). */
+const serializeError = (error: Error): Record<string, unknown> => {
+  const serialized: Record<string, unknown> = {
+    type: error.constructor.name,
+    message: error.message,
+    stack: error.stack,
+  };
+  return Object.assign(serialized, error);
+};
+
+/** pino's printf: `%s %d %i %f %j %o %O %%`; arguments past the placeholders are dropped, as pino drops them. */
+const formatMessage = (format: string, args: unknown[]): string => {
+  let next = 0;
+  return format.replace(/%[sdifjoO%]/g, token => {
+    if (token === '%%') return '%';
+    if (next >= args.length) return token;
+    const value = args[next++];
+    if (token === '%d' || token === '%f') return String(Number(value));
+    if (token === '%i') return String(Math.floor(Number(value)));
+    if (token === '%s' && (typeof value !== 'object' || value === null)) return String(value);
+    return JSON.stringify(value) ?? String(value);
+  });
+};
+
+/**
+ * pino as Fastify configures it for `logger: true` (or `{level}`): one JSON line per call on stdout —
+ * level, time on the virtual clock, pid, hostname, the child bindings, the merging object, `msg`.
+ */
+class PinoLogger implements Logger {
+  level: string;
+
+  constructor(level: string, private readonly bindings: Record<string, unknown>) {
+    this.level = level;
+  }
+
+  trace(...args: unknown[]): void {
+    this.write(10, args);
+  }
+  debug(...args: unknown[]): void {
+    this.write(20, args);
+  }
+  info(...args: unknown[]): void {
+    this.write(30, args);
+  }
+  warn(...args: unknown[]): void {
+    this.write(40, args);
+  }
+  error(...args: unknown[]): void {
+    this.write(50, args);
+  }
+  fatal(...args: unknown[]): void {
+    this.write(60, args);
+  }
+
+  child(bindings: Record<string, unknown> = {}): Logger {
+    return new PinoLogger(this.level, {...this.bindings, ...bindings});
+  }
+
+  private write(level: number, args: unknown[]): void {
+    if (level < (LEVELS[this.level] ?? LEVELS.info)) return;
+    const [first, ...rest] = args;
+    let merging: Record<string, unknown> = {};
+    let message: unknown[] = args;
+    if (first instanceof Error) {
+      merging = {err: serializeError(first)};
+      message = rest.length > 0 ? rest : [first.message];
+    } else if (typeof first === 'object' && first !== null) {
+      merging = {...first};
+      if (merging.err instanceof Error) merging.err = serializeError(merging.err);
+      message = rest;
+    }
+    const [format, ...params] = message;
+    const msg = format === undefined ? undefined : typeof format === 'string' ? formatMessage(format, params) : format;
+    // `console.log` looked up at each call: the runtime's stdout while a check runs, or a harness's capture.
+    console.log(
+      JSON.stringify({
+        level,
+        time: CLOCK.now(),
+        pid: PROCESS.pid,
+        hostname: os.hostname(),
+        ...this.bindings,
+        ...merging,
+        ...(msg === undefined ? {} : {msg}),
+      }),
+    );
+  }
+}
 
 /** Fastify answers a thrown error with its `statusCode` (or `status`) when it carries one. */
 const statusOf = (error: Error): number | null => {
@@ -144,8 +248,16 @@ export interface FastifyRequest<P = Record<string, string>, Q = Record<string, s
   ip: string;
   hostname: string;
   protocol: string;
-  log: typeof silentLogger;
+  log: Logger;
 }
+
+/** Fastify's `req` log serializer; light-my-request's socket has no remote port, so `remotePort` is left out. */
+const serializeRequest = (request: FastifyRequest): Record<string, string> => ({
+  method: request.method,
+  url: request.url,
+  hostname: request.hostname,
+  remoteAddress: request.ip,
+});
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -155,7 +267,7 @@ export class FastifyReply {
   statusCode = 200;
   sent = false;
   readonly request: FastifyRequest;
-  readonly log = silentLogger;
+  readonly log: Logger;
   /** @internal resolves once `send()` has been called. */
   readonly done: Promise<void>;
   private readonly responseHeaders = new Map<string, string>();
@@ -166,6 +278,7 @@ export class FastifyReply {
 
   constructor(request: FastifyRequest) {
     this.request = request;
+    this.log = request.log;
     this.done = new Promise<void>(resolve => (this.resolveSent = resolve));
   }
 
@@ -265,6 +378,41 @@ export type ErrorHandler = (
   reply: FastifyReply,
 ) => unknown;
 
+export type ContentTypeParserDone = (error: Error | null, body?: unknown) => void;
+/** `(request, body, done)`, or async `(request, body) => value`; `body` is text or a Buffer per `parseAs`. */
+export type ContentTypeParser = (request: FastifyRequest, body: string | Bytes, done: ContentTypeParserDone) => unknown;
+export interface ContentTypeParserOptions {
+  parseAs?: 'string' | 'buffer';
+  bodyLimit?: number;
+}
+
+interface Parser {
+  /** A lower-cased media type (`'*'` is the catch-all) or a RegExp tested against the media type. */
+  type: string | RegExp;
+  parseAs: 'string' | 'buffer';
+  bodyLimit: number | undefined;
+  fn: ContentTypeParser;
+  /** Fastify's own JSON and text parsers, which one registration may replace without removing them first. */
+  builtin: boolean;
+}
+
+const jsonParser: ContentTypeParser = (_request, body) => {
+  if (body === '') throw new HttpError(400, "Body cannot be empty when content-type is set to 'application/json'");
+  try {
+    return JSON.parse(body as string) as unknown;
+  } catch {
+    throw new HttpError(400, `Unexpected token in JSON at position 0`);
+  }
+};
+const textParser: ContentTypeParser = (_request, body) => body;
+
+const sameType = (a: string | RegExp, b: string | RegExp): boolean =>
+  typeof a === 'string' ? a === b : b instanceof RegExp && a.toString() === b.toString();
+
+/** Fastify's FST_ERR_CTP_* errors: an Error with a `code`. */
+const ctpError = (code: string, message: string, statusCode = 500): HttpError =>
+  Object.assign(new HttpError(statusCode, message), {code});
+
 export interface RouteOptions {
   method: string | string[];
   url: string;
@@ -330,7 +478,7 @@ export interface FastifyInstance {
 
 export class FastifyInstance {
   readonly initialConfig: FastifyOptions;
-  readonly log = silentLogger;
+  readonly log: Logger;
   readonly httpErrors = httpErrors;
   readonly server = {
     address: (): {address: string; port: number; family: string} => ({
@@ -348,6 +496,7 @@ export class FastifyInstance {
   private readonly requestDecorations: Record<string, unknown>;
   private readonly replyDecorations: Record<string, unknown>;
   private readonly plugins: Promise<void>[] = [];
+  private readonly parsers: Parser[];
   private lastParams: Record<string, string> = {};
 
   constructor(options: FastifyOptions = {}, parent: FastifyInstance | null = null, prefix = '') {
@@ -363,6 +512,22 @@ export class FastifyInstance {
     this.replyDecorations = parent === null ? {} : {...parent.replyDecorations};
     this.errorHandler = parent?.errorHandler ?? null;
     this.notFoundHandler = parent?.notFoundHandler ?? null;
+    const logger = options.logger;
+    this.log =
+      parent?.log ??
+      (logger === true || (typeof logger === 'object' && logger !== null)
+        ? new PinoLogger(
+            typeof logger === 'object' && 'level' in logger && typeof logger.level === 'string' ? logger.level : 'info',
+            {},
+          )
+        : silentLogger);
+    this.parsers =
+      parent === null
+        ? [
+            {type: 'application/json', parseAs: 'string', bodyLimit: undefined, fn: jsonParser, builtin: true},
+            {type: 'text/plain', parseAs: 'string', bodyLimit: undefined, fn: textParser, builtin: true},
+          ]
+        : [...parent.parsers];
   }
 
   // ---- routes ------------------------------------------------------------------------------------
@@ -461,7 +626,55 @@ export class FastifyInstance {
     return name in this;
   }
 
-  addContentTypeParser(): this {
+  /**
+   * `addContentTypeParser(type | types[] | RegExp, [{parseAs, bodyLimit}], parser)`. Without `parseAs`
+   * Fastify hands the parser the raw request stream; with no stream here it gets the whole body as a
+   * Buffer, as `parseAs: 'buffer'` would.
+   */
+  addContentTypeParser(
+    contentType: string | string[] | RegExp,
+    a: ContentTypeParserOptions | ContentTypeParser,
+    b?: ContentTypeParser,
+  ): this {
+    const fn = typeof a === 'function' ? a : b;
+    const options = typeof a === 'function' ? {} : a;
+    if (fn === undefined)
+      throw ctpError('FST_ERR_CTP_INVALID_HANDLER', 'The content type handler param must be a function');
+    for (const raw of Array.isArray(contentType) ? contentType : [contentType]) {
+      if (typeof raw === 'string' && raw.trim() === '')
+        throw ctpError('FST_ERR_CTP_EMPTY_TYPE', 'The content type cannot be an empty string');
+      const type = typeof raw === 'string' ? raw.trim().toLowerCase() : raw;
+      const existing = this.parsers.findIndex(p => sameType(p.type, type));
+      if (existing >= 0 && !this.parsers[existing].builtin)
+        throw ctpError('FST_ERR_CTP_ALREADY_PRESENT', `Content type parser '${String(type)}' already present.`);
+      if (existing >= 0) this.parsers.splice(existing, 1);
+      this.parsers.push({
+        type,
+        parseAs: options.parseAs ?? 'buffer',
+        bodyLimit: options.bodyLimit,
+        fn,
+        builtin: false,
+      });
+    }
+    return this;
+  }
+
+  hasContentTypeParser(contentType: string | RegExp): boolean {
+    const type = typeof contentType === 'string' ? contentType.trim().toLowerCase() : contentType;
+    return this.parsers.some(p => sameType(p.type, type));
+  }
+
+  removeContentTypeParser(contentType: string | RegExp | (string | RegExp)[]): this {
+    for (const raw of Array.isArray(contentType) ? contentType : [contentType]) {
+      const type = typeof raw === 'string' ? raw.trim().toLowerCase() : raw;
+      const at = this.parsers.findIndex(p => sameType(p.type, type));
+      if (at >= 0) this.parsers.splice(at, 1);
+    }
+    return this;
+  }
+
+  removeAllContentTypeParser(): this {
+    this.parsers.length = 0;
     return this;
   }
 
@@ -530,25 +743,28 @@ export class FastifyInstance {
     for (const [k, v] of Object.entries(opts.headers ?? {}))
       if (v !== undefined) headers[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : String(v);
     const rawPayload = opts.payload ?? opts.body;
-    let bodyText: string | undefined;
+    let bodyBytes: Uint8Array | undefined;
     if (rawPayload !== undefined && rawPayload !== null) {
-      if (typeof rawPayload === 'string') bodyText = rawPayload;
-      else if (rawPayload instanceof Uint8Array) bodyText = decoder.decode(rawPayload);
+      if (typeof rawPayload === 'string') bodyBytes = encoder.encode(rawPayload);
+      else if (rawPayload instanceof Uint8Array) bodyBytes = rawPayload;
       else {
-        bodyText = JSON.stringify(rawPayload);
+        bodyBytes = encoder.encode(JSON.stringify(rawPayload));
         headers['content-type'] ??= 'application/json';
       }
-      headers['content-length'] ??= String(encoder.encode(bodyText).length);
+      headers['content-length'] ??= String(bodyBytes.length);
     }
     headers.host ??= 'localhost:80';
     headers['user-agent'] ??= 'lightMyRequest';
-    const request = this.buildRequest(method, parsed, headers, bodyText, opts.remoteAddress);
+    const request = this.buildRequest(method, parsed, headers, opts.remoteAddress);
+    const started = CLOCK.now();
+    if (this.initialConfig.disableRequestLogging !== true)
+      request.log.info({req: serializeRequest(request)}, 'incoming request');
     const reply = new FastifyReply(request);
     Object.assign(reply, this.replyDecorations);
     const route = this.match(method, parsed.pathname);
     if (route !== null) request.routeOptions = {url: route.pattern, method: route.method};
-    await this.dispatch(route, request, reply, bodyText, headers);
-    return this.finish(reply, route?.owner ?? this, request);
+    await this.dispatch(route, request, reply, bodyBytes);
+    return this.finish(reply, route?.owner ?? this, request, started);
   }
 
   private shorthand(method: string, url: string, a: Partial<RouteOptions> | RouteHandler, b?: RouteHandler): this {
@@ -558,13 +774,7 @@ export class FastifyInstance {
     return this.route({...options, method, url, handler});
   }
 
-  private buildRequest(
-    method: string,
-    url: URL,
-    headers: Headers,
-    bodyText: string | undefined,
-    remoteAddress: string | undefined,
-  ): FastifyRequest {
+  private buildRequest(method: string, url: URL, headers: Headers, remoteAddress: string | undefined): FastifyRequest {
     const query: Record<string, string | string[]> = {};
     for (const [k, v] of url.searchParams) {
       const current = query[k];
@@ -577,9 +787,10 @@ export class FastifyInstance {
       typeof this.initialConfig.trustProxy === 'number';
     const ip = trustProxy && forwarded !== undefined ? forwarded.split(',')[0].trim() : remoteAddress ?? '127.0.0.1';
     requestCounter += 1;
+    const id = `req-${requestCounter}`;
     const request: FastifyRequest = {
       ...this.requestDecorations,
-      id: `req-${requestCounter}`,
+      id,
       method,
       url: url.pathname + url.search,
       routeOptions: {url: url.pathname, method},
@@ -591,9 +802,8 @@ export class FastifyInstance {
       ip,
       hostname: headers.host ?? 'localhost',
       protocol: 'http',
-      log: silentLogger,
+      log: this.log.child({reqId: id}),
     };
-    void bodyText;
     return request;
   }
 
@@ -619,8 +829,7 @@ export class FastifyInstance {
     route: Route | null,
     request: FastifyRequest,
     reply: FastifyReply,
-    bodyText: string | undefined,
-    headers: Headers,
+    bodyBytes: Uint8Array | undefined,
   ): Promise<void> {
     const owner = route?.owner ?? this;
     try {
@@ -636,6 +845,7 @@ export class FastifyInstance {
                 .filter(s => s !== ''),
             ) !== null,
         );
+        if (owner.notFoundHandler === null) request.log.info(`Route ${request.method}:${request.url} not found`);
         if (owner.notFoundHandler !== null) await this.runHandler(owner.notFoundHandler, request, reply);
         else if (allowed && !this.routes.some(r => r.pattern === '*'))
           reply.code(404).send({
@@ -653,7 +863,7 @@ export class FastifyInstance {
       }
       request.params = {...this.lastParams};
       if (await this.runHooks([...owner.hooks.onRequest, ...route.hooks.onRequest], request, reply)) return;
-      request.body = parseBody(request.method, bodyText, headers);
+      request.body = await parseBody(request, bodyBytes, owner.parsers);
       if (await this.runHooks([...owner.hooks.preValidation, ...route.hooks.preValidation], request, reply)) return;
       if (await this.runHooks([...owner.hooks.preHandler, ...route.hooks.preHandler], request, reply)) return;
       await this.runHandler(route.handler, request, reply);
@@ -711,10 +921,19 @@ export class FastifyInstance {
         return;
       }
     }
+    // Fastify's default error handler logs what it answers: 5xx at error, 4xx at info.
+    if (!reply.sent && statusCode >= 500)
+      reply.log.error({req: serializeRequest(request), res: {statusCode}, err: error}, error.message);
+    else if (!reply.sent) reply.log.info({res: {statusCode}, err: error}, error.message);
     if (!reply.sent) reply.send({statusCode, error: STATUS_TEXT[statusCode] ?? 'Error', message: error.message});
   }
 
-  private async finish(reply: FastifyReply, owner: FastifyInstance, request: FastifyRequest): Promise<InjectResponse> {
+  private async finish(
+    reply: FastifyReply,
+    owner: FastifyInstance,
+    request: FastifyRequest,
+    started: number,
+  ): Promise<InjectResponse> {
     let payload = reply._payload();
     if (payload instanceof Error) {
       const error = payload as Error & {statusCode?: number};
@@ -747,6 +966,8 @@ export class FastifyInstance {
     if (!reply.hasHeader('content-length')) reply.header('content-length', String(body.length));
     if (body.length === 0 && !reply._typeExplicit()) reply.removeHeader('content-type');
     reply.header('date', new Date(Date.now()).toUTCString());
+    if (this.initialConfig.disableRequestLogging !== true)
+      reply.log.info({res: {statusCode: reply.statusCode}, responseTime: CLOCK.now() - started}, 'request completed');
     reply.header('connection', 'keep-alive');
     for (const hook of owner.hooks.onResponse) await runHook(hook, request, reply);
     const text = decoder.decode(body);
@@ -800,19 +1021,39 @@ const matchSegments = (route: string[], path: string[]): Record<string, string> 
   return route.length === path.length ? params : null;
 };
 
-const parseBody = (method: string, text: string | undefined, headers: Headers): unknown => {
-  if (text === undefined || method === 'GET' || method === 'HEAD') return undefined;
-  const type = (headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
-  if (type === 'application/json' || type.endsWith('+json')) {
-    if (text === '') throw new HttpError(400, "Body cannot be empty when content-type is set to 'application/json'");
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new HttpError(400, `Unexpected token in JSON at position 0`);
-    }
+/**
+ * Picks the parser as Fastify does — the exact media type, then RegExp parsers in registration
+ * order, then the `'*'` catch-all — and lets `+json` types and a body without a content type fall
+ * back to the JSON and text parsers. No parser: 415. A parser's error answers with its statusCode, 400 by default.
+ */
+const parseBody = async (
+  request: FastifyRequest,
+  bytes: Uint8Array | undefined,
+  parsers: Parser[],
+): Promise<unknown> => {
+  if (bytes === undefined || request.method === 'GET' || request.method === 'HEAD') return undefined;
+  const type = (request.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  const parser =
+    parsers.find(p => p.type === type) ??
+    parsers.find(p => p.type instanceof RegExp && p.type.test(type)) ??
+    parsers.find(p => p.type === '*') ??
+    (type.endsWith('+json') ? parsers.find(p => p.type === 'application/json') : undefined) ??
+    (type === '' ? parsers.find(p => p.type === 'text/plain') : undefined);
+  if (parser === undefined) throw ctpError('FST_ERR_CTP_INVALID_MEDIA_TYPE', `Unsupported Media Type: ${type}`, 415);
+  if (parser.bodyLimit !== undefined && bytes.length > parser.bodyLimit)
+    throw ctpError('FST_ERR_CTP_BODY_TOO_LARGE', 'Request body is too large', 413);
+  const body = parser.parseAs === 'string' ? decoder.decode(bytes) : Buffer.from(bytes);
+  try {
+    return await new Promise<unknown>((resolve, reject) => {
+      const out = parser.fn(request, body, (error, value) => (error ? reject(error) : resolve(value)));
+      if (out instanceof Promise) out.then(resolve, reject);
+      else if (parser.fn.length < 3) resolve(out);
+    });
+  } catch (e) {
+    const error = e instanceof Error ? e : new Error(String(e));
+    if (statusOf(error) === null) Object.assign(error, {statusCode: 400});
+    throw error;
   }
-  if (type === 'text/plain' || type === '') return text;
-  throw new HttpError(415, `Unsupported Media Type: ${type}`);
 };
 
 /** `import Fastify from 'fastify'; const app = Fastify({…})`. */

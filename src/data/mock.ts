@@ -853,22 +853,22 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'feature-store-the-feature-that-looked-into-the-future',
     problemId: 'feature-store',
-    stepId: 'state',
+    stepId: 'dependency',
     title: 'The feature that looked into the future',
-    blurb: 'As-of reads served newer values and leaked into training.',
+    blurb: 'A backfill scanned past the training cutoff, and its gaps looked like empty partitions.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A model scored suspiciously well offline and poorly in production, because the online store served values computed after the training cutoff. The starter writes each value under feature:{name}:{entity} with one fixed TTL and the read returns whatever is there. Debug it, fix it, and prove point-in-time correctness.',
+      'A model scored suspiciously well offline and poorly in production: its training set held values computed after the training cutoff. The starter backfills a feature version by calling Scan on the offline store once per partition over gRPC, with no deadline and no as_of in the request, and turns any failed call into an empty partition. Debug it, fix it, and prove the backfill is point-in-time correct and honest about its gaps.',
     signals: ['Evaluate', 'Specify', 'Verify'],
     aiNote:
-      'The starter reads the latest value with no as-of guard, so a backfill against a past cutoff receives features computed later, inflating offline scores; its key omits the version, so a bump reads the previous version, and a missing entity comes back as a null body instead of 404.',
+      'The Scan request never sets as_of, so the offline store answers its newest values and the training set sees the future; the call has no deadline, so one slow partition holds the backfill for minutes; a timed-out or unreachable partition is recorded as scanned and empty instead of missing; and PERMISSION_DENIED is treated like any failure, so a refused job goes on scanning every partition.',
     testIdea:
-      'Write a value with a timestamp after the cutoff and assert an as-of read answers 404 or the older value with its event_ts and age_s; bump a version and assert the old keys are not read for the new version and are not deleted; register a 300 s SLO and assert the TTL matches it.',
+      'Serve an offline store whose entities have a value an hour before and an hour after the cutoff and assert every scanned row is at or before it; make Scan take 600 s and assert the call carries a 60 s deadline; fail two partitions with DEADLINE_EXCEEDED and UNAVAILABLE and assert they are in missing, not scanned; deny the second partition and assert BackfillAborted after two calls.',
     followUps: [
-      'What is the right unit of versioning for a feature?',
+      'Why is a missing partition safer for training than an empty one?',
       'How would you prove training and serving read identical definitions?',
-      'What drift signal would page an engineer versus open a ticket?',
+      'When should a backfill retry a missing partition, and when should it stop?',
     ],
     defaultLanguage: 'python',
   },
@@ -947,12 +947,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Retrieval quality dropped without an alarm: during a model brownout, failed rerank batches came back as rows of 0.5 and low-value passages climbed above scored ones, while a malformed batch kept a worker in a retry loop. Debug the gRPC client starter, fix it, and prove unscored is not a score.',
+      'Retrieval quality dropped without an alarm: during a model brownout, failed rerank batches came back as rows of 0.5 and low-value passages climbed above scored ones, while a batch the model rejected as malformed was sent three times. Debug the gRPC client starter, fix it, and prove unscored is not a score.',
     signals: ['Evaluate', 'Specify', 'Verify'],
     aiNote:
-      'The starter calls the reranker in batches of 128 with a 5-second timeout, retries a deadline without limit, pads any other failed batch with NEUTRAL_SCORE so an infrastructure failure reads as mid-tier relevance, and then returns an empty list, discarding the batches that already succeeded.',
+      'The starter calls the reranker in batches of 128 with a 5-second timeout, retries a failed batch up to three times whatever the status (INVALID_ARGUMENT included), then fills it with NEUTRAL_SCORE, so an infrastructure failure reads as mid-tier relevance.',
     testIdea:
-      'Fail one batch of 64 and assert those passages come back unscored in retrieval order while the successful batches keep their scores; send a malformed batch and assert the client gives up after a bounded number of attempts instead of looping.',
+      'Make one batch of 64 fail on every attempt and assert those passages come back unscored after one call while the other batches keep their scores; send a malformed batch and assert one call and an error.',
     followUps: [
       'When should reranking fail the whole request?',
       'How would you validate reranking lift offline?',
@@ -965,16 +965,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'summarizer-service',
     stepId: 'state',
     title: 'The summary that invented a quarter',
-    blurb: 'Chunk counters could commit without their summaries.',
+    blurb: 'A chunk counted twice, and an edited source that resumed the old summary.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A board summary invented a revenue decline because the starter wrote a rolling summary that claimed chunks it had not processed, and a source edit reused the old summary line. Debug it, fix it, and prove progress is atomic and bound to the content hash.',
+      'A board summary read a revenue line twice and kept text from a version of the filing that had since been edited: two workers had appended the same chunk, and the edited source resumed the old record. Debug it, fix it, and prove progress is applied once per chunk and bound to the content hash.',
     signals: ['Evaluate', 'Operate', 'Verify'],
     aiNote:
-      'The starter writes the rolling summary with HSET and bumps the chunk counter with a second HINCRBY, so a crash between them leaves a summary that claims coverage it does not have, and its Redis key is built from the source id with no content hash, so an edited source resumes and extends the previous summary.',
+      'The starter keys progress by summary:progress:{tenant}:{source_ref}, reads the rolling summary with HGET, writes it back appended with HSET and bumps chunks_done with HINCRBY: an edited source extends the previous version, a second worker landing between the commands appends the same chunk again, a redelivered chunk is counted, and the record never expires.',
     testIdea:
-      'Crash between counter and summary writes and assert the reopened summary lists only completed chunks; edit the source and assert a new summary line starts; request a summary for a foreign tenant and assert 404.',
+      'Apply chunk 0 of an edited source and assert it starts its own record under the new hash; land a second delivery of chunk 0 right after the first command and assert it is applied once; redeliver chunk 1 and send chunk 3 early and assert neither is applied; assert the TTL.',
     followUps: [
       'How would you structure summaries so citations survive edits?',
       'What compression ratio warns you a summary is probably extractive?',
@@ -1031,16 +1031,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'fine-tune-orchestrator',
     stepId: 'endpoint',
     title: 'The fine-tune that trained on the wrong data',
-    blurb: 'Caller-supplied data files and un-keyed retries launched unreproducible twin jobs.',
+    blurb: 'A retired dataset version and un-keyed retries launched unreproducible twin jobs.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A fine-tune trained on an unregistered s3 export, and a client that timed out and retried now owns two jobs, each reserving GPU budget. The starter stores whatever dataset_file the caller sends, accepts any hyperparameter key, trusts a zero budget and ignores Idempotency-Key. Debug it, fix it, and prove submissions are versioned and replay-safe.',
+      'A fine-tune trained on support-tickets@v2, a dataset version retired for holding customer e-mail addresses, and a client that timed out and retried now owns two jobs. The starter checks only that the registry knows the version, validates hyperparameters against one fixed list, bounds the budget from above only and stores each job under its fresh id. Debug it, fix it, and prove submissions are registered and replay-safe.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter copies the request body straight into the job record: a caller-supplied dataset_file bypasses registry provenance, unknown hyperparameter keys are accepted, a non-positive compute_budget passes, and the Idempotency-Key header is read by nobody, so a retried submit launches a twin job.',
+      'The starter accepts any dataset version the registry knows, retired ones included; checks hyperparameter names against a fixed list, so mistral-7b-v0.3 accepts lora_rank; accepts a compute_budget of 0; and ignores Idempotency-Key, so a retried submit creates a second job.',
     testIdea:
-      'Submit a raw dataset_file and assert 400; submit an unknown hyperparameter key and a compute_budget of 0 and assert 400 for each; replay the same Idempotency-Key and assert the original job id comes back.',
+      'Submit support-tickets@v2 and assert 400; submit lora_rank for mistral-7b-v0.3 and a compute_budget of 0 and assert 400 for each; replay the same Idempotency-Key and assert the original job id comes back with 200.',
     followUps: [
       'What hyperparameters must stay fixed for reproducibility?',
       "How do you price a job's budget before it runs?",
@@ -1057,12 +1057,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A probe set corrupted a shadow database, an operator hit the kill switch, and two other runners kept sending the rest of the set for twenty minutes while a dead target was retried without end. The starter for run_probes reads a process-local KILL_SWITCH, calls the target with no deadline, retries every RpcError forever and reports the run complete. Debug it, fix it, and prove the switch stops every runner before its next probe and an aborted run says where it stopped.',
+      'A probe set corrupted a shadow database, an operator hit the kill switch, and two other runners kept sending the rest of the set while a dead sandbox was retried without end. The starter for run_probes reads a process-local KILL_SWITCH, calls Sandbox.Probe with no deadline, retries every RpcError until it answers and closes the run as complete. Debug it, fix it, and prove the switch stops every runner before its next probe and an aborted run says where it stopped.',
     signals: ['Secure', 'Evaluate', 'Verify'],
     aiNote:
-      'The starter keeps the kill switch as a module-level boolean, so only the runner that flipped it stops; it calls the system under test with no deadline and retries every failure in a while True loop; and it returns status complete after a break, so an aborted run looks finished and the next run repeats probes that already succeeded.',
+      'The starter keeps the kill switch as a module-level boolean, so only the runner that flipped it stops; it calls the sandbox with no deadline and retries every failure in a while True loop, a timed-out probe included; and it closes every run as complete after a break, so an aborted run looks finished and its report hides the categories it never reached.',
     testIdea:
-      'Set redteam:kill:{target} in Redis from another process mid-run and assert the next probe is not sent; stub a stalled target and assert the call times out at 5 s and is retried once; abort a run and assert status aborted with resume_at naming the first unsent probe.',
+      'Set redteam:kill:{target} in Redis from the sandbox stand-in while p-2 is in flight and assert p-3 is never sent; hang the sandbox and assert the call is cut at 5 s and counted as timeout, not retried; fail it UNAVAILABLE twice and assert two calls; abort a run and assert status aborted with resume_at naming the first unsent probe.',
     followUps: [
       'How would you scope a probe category before it runs?',
       'What evidence bundle should a finding carry to be reproducible?',
@@ -1082,7 +1082,7 @@ export const mockScenarios: readonly MockScenario[] = [
       'A model-authored job reached the metadata service from the sandbox, because the starter treated a declared network need as granted and stored whatever profile string the caller sent. The same starter queued the job body again on every client retry. Debug it, fix it, and prove capabilities are default-deny and a replay returns the original job id.',
     signals: ['Secure', 'Operate', 'Verify'],
     aiNote:
-      'The starter copies the profile and needs from the request straight into the response, enforces no size cap on the code, and derives the job id from a hash of the code instead of looking it up under the Idempotency-Key, so an undeclared capability is allowed and a retried submit runs twice.',
+      'The starter files a submit without X-Tenant-Id under `anonymous`, stores the profile string and the declared needs exactly as they arrive, never measures the code, and never reads the Idempotency-Key, so a need the profile does not grant is accepted and a retried submit queues a second job.',
     testIdea:
       'Submit code under `runc` with `needs: ["network"]` and assert 400; submit `profile: "host"` and assert 400; send 300 KiB of code and assert 413; replay a submit with the same Idempotency-Key and assert the original job id comes back.',
     followUps: [
@@ -1097,16 +1097,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'synthetic-data',
     stepId: 'state',
     title: 'The synthetic set that memorized one entity',
-    blurb: 'A per-job total hid entity collapse and lost increments.',
+    blurb: 'Throttled claims spent the record cap and two workers shared one slot.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A synthetic dataset passed review on its total count while containing ten thousand variants of one seed entity. The starter moves one records field per job with a client-side read and a second write, has no per-entity window, no limit and no TTL. Debug it, fix it, and prove diversity is measured per entity inside one atomic script.',
+      'A synthetic dataset passed review on its total count while one seed entity filled most of it. The starter claims a slot by bumping generated first, then reads the per-entity window counter with GET and writes it back with SET, with no expiry and no per-entity coverage. Debug it, fix it, and prove the claim is one atomic script that spares the cap.',
     signals: ['Evaluate', 'Specify', 'Verify'],
     aiNote:
-      'The starter counts records in one hash field per job, so a recipe can collapse onto one prolific seed without any metric noticing; the HGET-then-HINCRBY pair loses increments when two workers land together, and no key carries a window or a TTL, so the throttle cannot reset and finished jobs stay in Redis.',
+      'The starter increments generated before it tests the window, so throttled repeats of one entity spend the record cap; the GET-then-SET pair lets two workers take the same fifth slot; nothing expires the window counter or the job keys; and settle counts outcomes per job only, so no report can see that one entity dominates.',
     testIdea:
-      'Generate with a single dominant seed entity and assert the sixth record in a window comes back throttled and uncounted; run two workers against one entity and assert no increment is lost; wait past the window and assert the counter key has expired.',
+      'Claim one entity five times and assert the sixth is throttled without moving generated; land a second worker between the read and the write and assert exactly one gets the last slot; settle admitted records for two entities and assert the coverage hash counts each.',
     followUps: [
       'What diversity metric actually predicts utility?',
       'How do license flags classify derivative synthetic data?',
@@ -1117,18 +1117,18 @@ export const mockScenarios: readonly MockScenario[] = [
   {
     id: 'browser-agent-the-agent-that-walked-into-the-intranet',
     problemId: 'browser-agent',
-    stepId: 'endpoint',
+    stepId: 'dependency',
     title: 'The agent that walked into the intranet',
-    blurb: 'Redirects were not re-validated against the egress profile.',
+    blurb: 'Redirect hops were not authorized against the egress profile.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A compromised page redirected the agent to an internal address and the patch followed it, because only the initial URL was checked. The same patch retried clicks and double-submitted a form. Debug it, fix it, and prove every navigation is re-validated and actions are idempotent.',
+      'A page the profile allows answered 302 to the cloud metadata address and the worker followed it, because run_action authorizes only the URL it was asked for. The same worker resent a click whose reply was lost and a form was submitted twice, and a hung page held it with no deadline. Debug it, fix it, and prove every hop is authorized and a lost click is checked before any replay.',
     signals: ['Secure', 'Operate', 'Verify'],
     aiNote:
-      "The patch validates only the session's start URL and then follows any redirect or subresource the page requests, so a hostile page can reach internal services, and it retries click actions blindly, turning a timeout into a duplicate submission.",
+      "The starter's run_action calls authorize_navigation once, before the redirect loop, then follows every Location the driver answers; it sends Act through the same three-attempt retry loop as Navigate, so a click whose reply was lost is clicked again; and no driver call carries a deadline.",
     testIdea:
-      'Serve a redirect to an off-profile address and assert the navigation is blocked and recorded; time out a click and assert the agent checks page state before deciding to retry; inspect an event for typed values.',
+      'Have the driver answer 302 to http://169.254.169.254/ and assert the browser is never sent there and the step ends blocked; lose a click reply after the page applied it and assert the click lands once; hang Navigate for 60 s and assert the step fails within its 15 s deadline.',
     followUps: [
       'How would you let a session log in without storing credentials in the session state?',
       'What page-state checks make a click safe to retry?',
@@ -1167,12 +1167,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Flash sale traffic sold the last unit three times over, because the starter read the stock counter with GET, compared in the handler, and ran DECRBY after. It also mirrored the hold with a hardcoded 3600-second TTL instead of the reservation’s 900. Debug it, fix it, and prove the counter transition is one atomic script with a floor at zero.',
+      'Flash sale traffic sold the last unit twice, because the starter reads stock:{sku} with GET, compares in Python and runs DECRBY after. Its holds also last 3600 seconds instead of the reservation’s 900, and expired holds never give their units back. Debug it, fix it, and prove each stock transition is one Lua script.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter reads available stock and then decrements in a second step, so concurrent buyers all spot the same free unit and the counter goes negative; it returns a boolean instead of an outcome the API can map to 409, and the hold outlives the reservation by 45 minutes.',
+      'The starter reads available stock and then decrements in a second command, so two buyers both see the last unit and the counter goes to -1; it writes the hold with HOLD_TTL_S = 3600, never credits holds whose key expired, and its release and confirm read the hold before acting on it, so a release racing a confirmation both sells the units and puts them back.',
     testIdea:
-      'Race two reservations against the last unit and assert one RESERVED, one INSUFFICIENT_STOCK and a non-negative counter; reserve once and assert the hold key’s TTL equals RESERVATION_TTL_S.',
+      'Land a second buyer between the first command on stock:sku-1 and the next and assert one winner and a non-negative counter; assert hold:{id} has a TTL near 900; expire a hold and assert the next reserve gets its units; race a release with a confirmation and assert the units are sold or returned, not both.',
     followUps: [
       'How would you model multi-warehouse allocation?',
       'What TTL should a reservation have versus a warehouse confirmation window?',
@@ -1189,10 +1189,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Payments engineer · 20 min',
     minutes: 20,
     prompt:
-      'A customer received two refunds for one return: the starter sends a fresh idempotency key on every PSP call, has no deadline, and on a timeout marks the refund rejected and releases the whole payment while the provider may have paid. Debug it, fix it, and prove retries share one key and a timeout ends as a reconciled PENDING refund.',
+      'A customer received two refunds for one return: the starter sends a fresh idempotency key on every PSP call, has no deadline, makes one attempt, and writes any error off as a rejection while the provider may have paid. Debug it, fix it, and prove retries share one key and an unanswered call ends as a reconciled refund.',
     signals: ['Verify', 'Specify', 'Operate'],
     aiNote:
-      'The starter calls `psp.Refund` once with `idempotency-key = uuid4()` and no timeout, so a retry by any layer is an independent refund at the provider; its single `except grpc.RpcError` treats a timeout as a rejection and calls `ledger.release_payment`, handing back a balance the PSP may already have paid out.',
+      'The starter calls `psp.Refund` once with `idempotency-key = uuid4()` and no timeout, so a retry by any layer is an independent refund at the provider; its single `except grpc.RpcError` marks the refund REJECTED whether the PSP refused it or only lost the answer, and a real refusal never gives its reservation back to the ledger.',
     testIdea:
       'Time out the PSP call and assert every attempt carries the refund id as its key and the provider records one refund; exhaust the attempts and assert the refund is PENDING and then reconciled through GetRefund; reject with INVALID_ARGUMENT and assert only the reservation is released.',
     followUps: [
@@ -1207,16 +1207,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'product-search',
     stepId: 'endpoint',
     title: 'The search that leaked filters',
-    blurb: 'Raw filter text reached the engine, and a page size of 10000 reached the index.',
+    blurb: 'A filter on cost_cents answered, and a page size of 10000 reached the index.',
     role: 'Search engineer · 20 min',
     minutes: 20,
     prompt:
-      "A crafted filter string surfaced unpublished products, and one request with page_size=10000 pulled a tenant's whole catalog. The starter hands the caller's filter string, query text and page size straight to the engine. Debug it, fix it, and prove the filters are allowlisted and the inputs are capped.",
+      "A shopper filtered search results on cost_cents and learned the wholesale cost of a kettle; another request with page_size=10000 read a tenant's whole catalog. The starter hands q, page_size and the parsed filters straight to the engine. Debug it, fix it, and prove the inputs are capped and the filter fields allowlisted.",
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      "The starter parses the caller's filter string and passes it to the query engine unchecked, so any index field is addressable, and it caps neither the query bytes nor the page size; the engine query is built from raw request values rather than validated fields plus the tenant.",
+      'The starter passes q, page_size and json.loads(filters) to run_query unchecked: the engine filters on any stored field, cost_cents included; neither the query bytes nor the page size is capped; and a malformed filters value crashes the handler instead of answering 400.',
     testIdea:
-      'Send a filter naming a forbidden field and assert 400 with the allowed set in the body; send page_size=10000 and a 300-byte query and assert 400 for each; assert the engine query helper receives only validated fields and the tenant.',
+      'Send filters={"cost_cents":"1200"} and assert 400 naming the field with the allowed list; send page_size=10000 and a 300-byte query and assert 400 for each; send filters=brand=acme and assert 400, not 500.',
     followUps: [
       'What belongs in a query cache key versus a cache eviction signal?',
       'How would you rank results so a partial merge stays stable?',
@@ -1233,10 +1233,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'A user logged out but their token kept working for an hour, because the starter validated sessions against an hourly cache, answered from that cache when the auth service failed, and its revoke was a no-op. Debug it, fix it, and prove a timeout denies the request and a revocation is visible immediately.',
+      'A user logged out but their token kept working for an hour, because the starter validated tokens against an hourly cache, answered from that cache when the auth service failed, and its revoke left the cached copy in place. Fix it, and prove a timeout denies the request and a revocation is visible immediately.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The starter caches validation for an hour, calls the auth service with a 5-second timeout and no deadline, retries every gRPC status three times including rejections, returns the stale cached claims when every attempt fails, and its revoke does not touch the cache, so a revoked session keeps working.',
+      'The starter caches validation for an hour, calls the auth service with a 5-second timeout, retries every gRPC error three times including rejections, returns the stale cached claims when every attempt fails, and its revoke tells the auth service but does not touch the cache, so a revoked token keeps working.',
     testIdea:
       'Revoke a token and assert the next request re-validates; stall the auth service past 150 ms and assert the request is denied; return UNAUTHENTICATED and assert the stub is called once.',
     followUps: [
@@ -1255,12 +1255,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Observability engineer · 20 min',
     minutes: 20,
     prompt:
-      'Dashboards showed traffic dipping every night around deploys, because the starter merges a batch with one INCRBY per sample and a worker crash applied half of it, while a broker redelivery the next minute added the same batch again. Debug the starter, fix it, and prove a merge is whole, expires at its window boundary and is applied once per batch id.',
+      'Dashboards showed traffic dipping every night around deploys, because the starter merges a batch with client-side HINCRBY calls per sample and a worker crash applied half of it, while a sender retry after a timeout added the same batch again. Debug the starter, fix it, and prove a merge is whole, scoped to its tenant, expires a day after its window closes and is applied once per batch id.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The starter increments each sample with its own client-side INCRBY, so a crash between two calls leaves a silently partial window; it sets no expiry at write time, so a closed window outlives its minute; and it keeps no batch-id key, so a redelivered batch is counted twice.',
+      'The starter keys windows win:{series}:{start} without the tenant, so two tenants share a counter; it sends HINCRBY, HINCRBYFLOAT and ZADD per sample from the client, so a crash between two calls leaves a partial window; it sets no expiry, so closed windows stay in Redis; and it keeps no batch-id key, so a redelivered batch is counted twice.',
     testIdea:
-      'Crash mid-batch and assert the window contains either all deltas or none; check the key TTL equals the time left in its window; redeliver the same batch id and assert the counters do not move.',
+      'Probe the index key mid-merge and assert the windows hold none or all of the batch; check the window TTL equals start + 10 s + one day - now, and that a later write does not move it; redeliver the same batch id and assert the counters do not move.',
     followUps: [
       'How do you bound label cardinality without breaking useful dimensions?',
       'What downsampling policy keeps dashboards honest?',
@@ -1344,12 +1344,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A customer got two welcome emails, and another customer whose run shows send_welcome as done got none. The starter marks the step done, then calls SendWelcome, and on a deadline calls it again with no ledger in between. Debug it, fix it, and prove a replay skips the effect.',
+      'A customer got two welcome emails, and another customer whose run shows send_welcome as done got none. The starter advances the checkpoint, then calls SendWelcome with a fresh UUID as the effect id, and on a deadline sends again with no ledger in between. Debug it, fix it, and prove a replay skips the effect.',
     signals: ['Verify', 'Operate', 'Specify'],
     aiNote:
-      'The starter calls runs.mark_done before SendWelcome, so a crash in between leaves a step marked done with no email, and it retries DEADLINE_EXCEEDED on the spot with no effect id and no ledger read, so a timeout whose request arrived sends the email twice.',
+      'The starter calls checkpoint.advance before SendWelcome, so a crash in between leaves a step marked done with no email; it sends a random effect id and reads no ledger, so a replay sends again; and it resends on DEADLINE_EXCEEDED, so a timeout whose request arrived sends the email twice.',
     testIdea:
-      'Crash after SendWelcome returns but before mark_done and assert the replay returns the recorded outcome without calling; inject a deadline on a request that arrived and assert the second ledger read resolves it instead of a second send.',
+      'Fail the mailer and assert the checkpoint did not move; run the step twice and assert one email; have the mailer send and then answer DEADLINE_EXCEEDED, and assert GetDelivery resolves it with one email sent.',
     followUps: [
       'What goes in a checkpoint versus the event log?',
       'How would you version a definition without stranding in-flight runs?',
@@ -1366,12 +1366,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'After a ten-minute scheduler pause, a minutely job fired 200 catch-up executions in seconds and took down its downstream database. The starter retries each missed window until it succeeds, with no deadline and no misfire policy. Debug it, fix it, and prove a pause produces a decision, not a burst.',
+      'After a three-hour scheduler pause, a five-minute job fired 36 catch-up executions in seconds and took down its downstream database. The starter fires every missed window and sends each Trigger again until one succeeds, with no deadline and no look at the misfire policy. Debug it, fix it, and prove a pause produces a decision, not a burst.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter treats every missed window as owed: it loops over all of them and retries each gRPC trigger in a while-true with no deadline, so a scheduler pause converts into a burst against the target, and it records no decision, so the skipped and failed windows leave no trace.',
+      'The starter treats every missed window as owed: run_missed fires all of them through fire_window, and trigger_job repeats JobRunner.Trigger in a while-true with no deadline, so a pause becomes a burst against the job service; nothing reads misfire_policy, so no window is skipped or coalesced and a catch-up has no cap.',
     testIdea:
-      'Pause the scheduler for ten windows and assert at most one catch-up fire under fire-once; deploy two instances simultaneously and assert one fire per window; assert skipped windows appear in history with their policy.',
+      'Hand run_missed eight missed windows and assert five Triggers under catch_up, one for the newest under fire_once_now and none under skip; fail Trigger with UNAVAILABLE and assert one call and an error row in the ledger.',
     followUps: [
       'Which jobs deserve catch-up versus skip?',
       'How do you cap a catch-up burst?',
@@ -1388,12 +1388,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A ten-flag rollout showed users the new checkout with the old payment rules, and the same users sat in the 25% tail of every flag. The starter caches each flag under its own Redis key and buckets with a hash of user id and salt only. Debug it, fix it, and prove one snapshot is read per evaluation and each flag splits users on its own.',
+      "A ten-flag rollout showed users the new checkout with the old payment rules, a slow publisher put last week's rollout back, and the same users sat in the 25% tail of every flag. The starter writes each flag under its own Redis key with no version check and buckets with a hash of salt and user id only. Debug it, fix it, and prove one whole snapshot is read per evaluation, only a newer version replaces it, and each flag splits users on its own.",
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter writes flag:{key}:rules per flag with a separate redis.set, so a reader between two writes sees a torn rule set; its bucket(user_id, salt) omits the flag key, so every flag applies the identical split; and evaluate returns no snapshot version, so a flip cannot be attributed to a rule change.',
+      'The starter writes flags:rule:{key} per flag with a separate SET and flags:version last, so a reader between two writes sees new rules stamped with the old version; publish_snapshot never compares versions, so a late publisher overwrites a newer snapshot; and bucket hashes "{salt}.{user_id}" without the flag key, so flags with equal salts apply the identical split.',
     testIdea:
-      'Evaluate one user ten times across a version change and assert no flip without a rule change; swap a snapshot mid-read and assert every evaluation used one full version; bucket the same user for two flags with equal salts and assert the buckets differ.',
+      "Evaluate two flags from inside the publish of version 2 and assert both answers carry one version and that version's rollout; publish version 2 then version 1 and assert the second is refused; bucket 400 users for two flags with equal salts and assert the 50% sets mostly differ.",
     followUps: [
       'How do you make bucketing stable across flag renames?',
       'What staleness bound is acceptable for a kill switch versus a rollout?',
@@ -1406,16 +1406,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'experiments-platform',
     stepId: 'state',
     title: 'The experiment that re-randomized users',
-    blurb: 'Editable splits re-bucketed users mid-flight and reports peeked.',
+    blurb: 'A bulk edit of the split re-bucketed users mid-flight, and a stop flipped everyone to control.',
     role: 'Experimentation platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A rollout looked great because an operator adjusted the split mid-experiment and users quietly changed arms. The starter hashes the unit with the live salt before it reads the cache, keys the cached assignment by unit alone, and returns control for everyone once the experiment is stopped. Debug it, fix it, and prove that an assignment stays frozen for the life of the experiment.',
+      'A rollout looked great because a bulk edit changed the split mid-experiment and users quietly changed arms. The starter hashes the unit on every request and only writes the cache, under a key without the experiment id, with a plain SET, and answers control for everyone once the experiment is stopped. Make an assignment stay put for the life of the experiment, and prove it with the checks.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The starter computes the bucket from the current salt and the first weight of the split on every request and only then consults a cache keyed `assign:{unit}`, so a split or salt edit moves users between variants, two experiments share one cached row, and a stopped experiment flips everyone to control instead of serving the assignment it already wrote.',
+      'The starter computes the bucket from the current split and salt on every request and writes it to `assign:{unit}` with a plain SET without ever reading it back, so an edit behind the API moves users between variants, two experiments share one row, two replicas can serve one new unit two variants, and a stopped experiment answers control instead of the assignment it already wrote.',
     testIdea:
-      'Edit the split mid-experiment and assert the request is rejected; evaluate one unit before and after a salt change and assert the variant is unchanged; feed 70/30 traffic and assert the winner call is blocked with an SRM caveat.',
+      "Assign a unit, rewrite the split and salt through the store, and assert the unit keeps its variant; land a second replica's SET NX between the GET and the write and assert both serve the same variant; stop the experiment and assert old units keep their variant and new ones get none.",
     followUps: [
       'Which unit is right for which experiment?',
       'How do sequential tests change the peek problem?',
@@ -1538,16 +1538,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'replicator',
     stepId: 'state',
     title: 'The replica that replayed history',
-    blurb: 'Offsets expired, stalled at ten and advanced before the target confirmed.',
+    blurb: 'Offsets expired, stalled at ten and lost a race to an older confirmation.',
     role: 'Infrastructure engineer · 20 min',
     minutes: 20,
     prompt:
-      'A target region re-applied three months of changes after a quiet period, and another shard stopped advancing at offset 10, because the starter stores each shard offset with a one-hour TTL, compares offsets as strings and advances them before the target confirms. Debug it, fix it, and prove offsets are durable and monotonic.',
+      'A target region re-applied three months of changes after a quiet period, and another shard stopped advancing at offset 10, because the starter stores one offset per replication with a one-hour TTL, compares offsets as strings and moves them with a GET then a SET. Debug it, fix it, and prove offsets are durable and only move forward.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The starter writes each shard offset with `SET ... ex=3600`, so an idle shard forgets its checkpoint and restarts from zero; it compares `str(offset) > current` lexicographically, so the shard stalls once offsets reach two digits; it writes the offset before `apply_to_target` returns; and `resume_offset` returns 0 unconditionally.',
+      'The starter keys the offset `offset:{replication_id}` for every shard and writes it with `SET ... ex=3600`, so an idle shard forgets its checkpoint and two shards overwrite each other; it compares `str(offset) > current` lexicographically, so the shard stalls once offsets reach two digits; and the GET and SET are two round trips, so a confirmation that lands between them is overwritten by an older one.',
     testIdea:
-      'Let the offset key age past an hour and assert a restart resumes from the confirmed offset, not zero; confirm offsets 9 then 10 then 11 and assert each advance lands; return a failed confirmation and assert the offset did not move; confirm 10 after 11 and assert it stays at 11.',
+      'Let two hours pass and assert a restart resumes from the confirmed offset, not zero; confirm 9 then 10 and assert the advance lands; land a rival confirmation of 20 between the read and the write of a confirmation of 15 and assert the shard ends at 20; confirm two shards and assert each keeps its own offset.',
     followUps: [
       'What clock assumptions does last-write-wins make?',
       'When is manual conflict resolution the right policy?',

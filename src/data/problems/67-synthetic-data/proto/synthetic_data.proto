@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package synthd;
+
+// The judge step 3 calls for every generated record before it can be admitted: one unary RPC per
+// attempt, with a deadline. The harness serves a deterministic stand-in at judge:9000 (synth/judge in
+// the support modules).
+service Judge {
+  rpc Score(ScoreRequest) returns (ScoreReply);
+}
+
+message ScoreRequest {
+  string record_id = 1;
+  string recipe_id = 2;
+  string text = 3;
+}
+
+message ScoreReply {
+  double score = 1;
+  bool refused = 2;
+  string judge_version = 3;
+}

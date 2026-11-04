@@ -8,54 +8,38 @@ export const dependencyStep: Step = {
   focus: ['classifier', 'model', 'rules'],
   task: `## Task
 
-**Starting point.** \`classify(text, taxonomy_version)\` calls the model's \`Classify\` RPC inside a
-\`while True\` loop with no deadline and returns its labels with provenance \`model\`; on any gRPC
-error it answers \`["safe"]\`, also marked \`model\`. When the model is healthy it serves the demo.
-It hides 5 flaws.
+**Starting point.** \`classify(text, taxonomy_id, taxonomy_version)\` calls \`Model.Classify\`
+(\`content_classifier.proto\`, a stand-in served at \`classifier.config\`'s \`MODEL\`) in a loop until a
+reply that is not a refusal comes back or \`MAX_WAIT_S\` (10 s) has passed, sleeping \`BACKOFF_S\`
+between tries. It answers \`{labels, provenance, model_version}\` with provenance \`model\`, and
+\`["safe"]\` when the time runs out. Against a healthy model it answers in one call. It hides 5 flaws.
 
-**Failure mode the checks target.** Catching every failure and answering \`safe\` launders an outage
-past review: nothing downstream can tell a real classification from a shrug. A loop with no attempt
-cap and no status check wastes the deadline on a refusal that will not change. And a fallback
-without provenance makes a rules guess indistinguishable from a model answer in the data, so nobody
-can measure whether the fallback is any good.
+**Failure mode the checks target.** A call with no deadline holds the request as long as a hung
+model does; retrying every status, refusals included, spends ten seconds on an answer that will not
+change; and \`safe\` marked as the model's launders an outage past review, uncounted.
 
-Requirements:
+\`\`\`proto
+service Model { rpc Classify(ClassifyRequest) returns (ClassifyReply); }
+message ClassifyRequest { string text = 1; string taxonomy_id = 2; int64 taxonomy_version = 3; }
+message ClassifyReply { repeated string labels = 1; bool refused = 2; string model_version = 3; }
+\`\`\`
 
-- Each model call carries a **700 ms** deadline on the call itself (\`timeout=\`, a context with
-  timeout, \`withDeadlineAfter\`, \`set_deadline\`, \`deadline: Date.now() + DEADLINE_MS\`).
-- At most **3 attempts** (\`MAX_ATTEMPTS = 3\`), and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  retried. A **refusal** is a decision, not a failure: it is terminal.
-- When the model cannot answer, classify with the **deterministic keyword rules** and mark the
-  result's **provenance** (\`model\` or \`fallback\`).
-- No safe label without evidence: a rules pass that matches nothing produces the **review** bucket.
-- The fallback path is counted separately (\`classifier_fallback_total\`), so an outage shows as a
-  spike rather than a quiet drop in quality.`,
+- Each call carries a **700 ms** deadline (\`DEADLINE_S\`).
+- At most \`MAX_ATTEMPTS\` = 3 calls; only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried. A
+  refusal or any other status ends the attempts.
+- Without a model answer, \`rules_classify(text)\` labels the text from \`KEYWORD_RULES\`; no match
+  is \`REVIEW_LABEL\`, never \`safe\`.
+- A rules result has provenance \`fallback\`, model_version \`rules\`, and adds one to \`FALLBACK_KEY\`.`,
   sequence: {
-    participants: ['Content Classifier', 'Model', 'Rules fallback', 'metrics'],
+    participants: ['Content Classifier', 'Model', 'Rules fallback', 'Redis'],
     messages: [
-      {
-        from: 'Content Classifier',
-        to: 'Content Classifier',
-        label: 'bounded attempts · only UNAVAILABLE / DEADLINE_EXCEEDED retried',
-        kind: 'sync',
-      },
-      {from: 'Content Classifier', to: 'Model', label: 'Classify(text) · deadline 700 ms · attempt ≤ 3', kind: 'sync'},
-      {from: 'Model', to: 'Content Classifier', label: 'labels / REFUSED / UNAVAILABLE', kind: 'reply'},
-      {
-        from: 'Content Classifier',
-        to: 'Content Classifier',
-        label: 'refusal is terminal → fallback now, do not retry',
-        kind: 'sync',
-      },
-      {from: 'Content Classifier', to: 'Rules fallback', label: 'rulesClassify(text) · deterministic', kind: 'sync'},
-      {from: 'Rules fallback', to: 'Content Classifier', label: 'keyword labels or review bucket', kind: 'reply'},
-      {from: 'Content Classifier', to: 'metrics', label: 'classifier_fallback_total + 1', kind: 'async'},
-      {
-        from: 'Content Classifier',
-        to: 'Content Classifier',
-        label: 'result carries provenance: model / fallback',
-        kind: 'sync',
-      },
+      {from: 'Content Classifier', to: 'Model', label: 'Classify · deadline 700 ms', kind: 'sync'},
+      {from: 'Model', to: 'Content Classifier', label: 'UNAVAILABLE', kind: 'reply'},
+      {from: 'Content Classifier', to: 'Model', label: 'attempt 2 of 3 after a backoff', kind: 'sync'},
+      {from: 'Model', to: 'Content Classifier', label: '{refused: true}', kind: 'reply'},
+      {from: 'Content Classifier', to: 'Rules fallback', label: 'rules_classify(text)', kind: 'sync'},
+      {from: 'Rules fallback', to: 'Content Classifier', label: 'keyword labels or review', kind: 'reply'},
+      {from: 'Content Classifier', to: 'Redis', label: 'INCR metrics:classifier_fallback_total', kind: 'sync'},
     ],
   },
   checks: [
@@ -63,426 +47,519 @@ Requirements:
       id: 'deadline',
       title: 'Every model call carries a 700 ms deadline',
       detail:
-        'The call is created with a 700 ms deadline — `timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`. Without it a stuck model holds the request open indefinitely.',
+        'Each Classify call carries a deadline of 0.7 s (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), so a model that hangs costs three short attempts, not the hang. The starter sends no deadline.',
       match: {
-        python: {all: [/DEADLINE_S\s*=\s*0\.7/, /timeout=DEADLINE_S/, /\.Classify\(/]},
-        typescript: {all: [/DEADLINE_MS\s*=\s*700/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /\.Classify\(/]},
-        go: {all: [/deadlineMS\s*=\s*700/, /context\.WithTimeout/, /\.Classify\(/]},
-        scala: {all: [/DeadlineMs\s*=\s*700/, /withDeadlineAfter/, /\.classify\(/]},
-        cpp: {all: [/kDeadlineMs\s*=\s*700/, /set_deadline\(/, /->Classify\(/]},
-      },
-    },
-    {
-      id: 'provenance',
-      title: 'Fallback results carry their provenance and count separately',
-      detail:
-        'A result is labelled `model` or `fallback`, and the fallback path increments `classifier_fallback_total`. Without the marker a rules guess is indistinguishable from a model answer; without the counter the outage is invisible.',
-      match: {
-        python: {all: [/PROVENANCE_MODEL/, /PROVENANCE_FALLBACK/, /FALLBACK_METRIC/]},
-        typescript: {all: [/PROVENANCE_MODEL/, /PROVENANCE_FALLBACK/, /FALLBACK_METRIC/]},
-        go: {all: [/provenanceModel/, /provenanceFallback/, /fallbackMetric/]},
-        scala: {all: [/ProvenanceModel/, /ProvenanceFallback/, /FallbackMetric/]},
-        cpp: {all: [/kProvenanceModel/, /kProvenanceFallback/, /kFallbackMetric/]},
-      },
-    },
-    {
-      id: 'rules-fallback',
-      title: 'Falls back to the deterministic keyword rules',
-      detail:
-        'When the model cannot answer, a keyword rules pass produces the labels instead of the failure propagating. The starter has nothing to fall back to and answers a constant.',
-      match: {
-        python: {all: [/def rules_classify\(/, /KEYWORD_RULES/]},
-        typescript: {all: [/function rulesClassify\(/, /KEYWORD_RULES/]},
-        go: {all: [/func rulesClassify\(/, /keywordRules/]},
-        scala: {all: [/def rulesClassify\(/, /KeywordRules/]},
-        cpp: {all: [/rulesClassify\(/, /kKeywordRules/]},
+        python: {all: [/DEADLINE_S\s*=\s*0\.7\b/, /timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/DEADLINE_MS\s*=\s*700\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
+        go: {all: [/deadline\s*=\s*700\s*\*\s*time\.Millisecond/, /context\.WithTimeout\(/]},
+        scala: {all: [/DeadlineMs\s*=\s*700L?\b/, /withDeadlineAfter\(/]},
+        cpp: {all: [/kDeadline\{700\}/, /set_deadline\(/]},
       },
     },
     {
       id: 'refusal-terminal',
       title: 'A refusal is terminal, attempts are bounded',
       detail:
-        'A refusal stops the retry loop immediately and only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are attempted again, bounded by `MAX_ATTEMPTS = 3`. The starter retries a refusal until the deadline.',
+        'A refusal ends the attempts after one call; `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried up to `MAX_ATTEMPTS` = 3 calls in all; any other status is not retried. The starter asks again on every failure and every refusal until ten seconds pass.',
       match: {
-        python: {all: [/REFUSAL/, /MAX_ATTEMPTS\s*=\s*3/], none: [/while\s+True/]},
-        typescript: {all: [/REFUSAL/, /MAX_ATTEMPTS\s*=\s*3/], none: [/while\s*\(\s*true\s*\)/]},
-        go: {all: [/refusal/, /maxAttempts\s*=\s*3/, /status\.FromError\(/], none: [/for\s*\{/]},
-        scala: {all: [/Refusal/, /MaxAttempts\s*=\s*3/], none: [/while\s*\(/]},
-        cpp: {all: [/kRefusal/, /kMaxAttempts\s*=\s*3/], none: [/while\s*\(true\)/]},
+        python: {
+          all: [/MAX_ATTEMPTS\s*=\s*3\b/, /grpc\.StatusCode\.UNAVAILABLE/, /reply\.refused/],
+          none: [/MAX_WAIT_S/],
+        },
+        typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /status\.UNAVAILABLE/, /reply\.refused/], none: [/MAX_WAIT_MS/]},
+        go: {all: [/maxAttempts\s*=\s*3\b/, /codes\.Unavailable/, /GetRefused\(\)/], none: [/maxWait\b/]},
+        scala: {all: [/MaxAttempts\s*=\s*3\b/, /Status\.Code\.UNAVAILABLE/, /\.refused\b/], none: [/MaxWaitMs/]},
+        cpp: {all: [/kMaxAttempts\s*=\s*3\b/, /grpc::StatusCode::UNAVAILABLE/, /\.refused\(\)/], none: [/kMaxWait\b/]},
+      },
+    },
+    {
+      id: 'rules-fallback',
+      title: 'Falls back to the deterministic keyword rules',
+      detail:
+        'When the model does not answer, `rules_classify`/`rulesClassify` labels the text from `KEYWORD_RULES`: a refund question is `billing` during an outage. The starter has no fallback.',
+      match: {
+        python: {all: [/def rules_classify\(/, /KEYWORD_RULES/, /rules_classify\(\s*text\s*\)/]},
+        typescript: {all: [/function rulesClassify\(/, /KEYWORD_RULES/, /rulesClassify\(\s*text\s*\)/]},
+        go: {all: [/func rulesClassify\(/, /keywordRules/, /rulesClassify\(\s*text\s*\)/]},
+        scala: {all: [/def rulesClassify\(/, /KeywordRules/, /rulesClassify\(\s*text\s*\)/]},
+        cpp: {all: [/rulesClassify\(const std::string& text\)/, /kKeywordRules/, /rulesClassify\(\s*text\s*\)/]},
       },
     },
     {
       id: 'no-safe-default',
       title: 'Never answers a safe label with no evidence',
       detail:
-        'A failure never produces an unevidenced constant: the rules pass returns real keyword labels or the review bucket. The starter answers `safe` and the pipeline treats it as a real classification.',
+        'A text the rules cannot place is `REVIEW_LABEL` (`review`); no code path returns `safe`. The starter answers `["safe"]` whenever the model does not.',
       match: {
         python: {all: [/REVIEW_LABEL/], none: [/["']safe["']/]},
         typescript: {all: [/REVIEW_LABEL/], none: [/['"]safe['"]/]},
-        go: {all: [/reviewLabel/], none: [/"safe"/]},
-        scala: {all: [/ReviewLabel/], none: [/"safe"/]},
-        cpp: {all: [/kReviewLabel/], none: [/"safe"/]},
+        go: {all: [/config\.ReviewLabel/], none: [/"safe"/]},
+        scala: {all: [/Config\.ReviewLabel/], none: [/"safe"/]},
+        cpp: {all: [/config::kReviewLabel/], none: [/"safe"/]},
+      },
+    },
+    {
+      id: 'provenance',
+      title: 'Fallback results carry their provenance and count separately',
+      detail:
+        'A rules answer has provenance `fallback` and model_version `rules`, and each one adds one to `FALLBACK_KEY` (`metrics:classifier_fallback_total`), so an outage shows as a spike. The starter marks everything `model` and counts nothing.',
+      match: {
+        python: {all: [/["']fallback["']/, /["']rules["']/, /\.incr\(\s*FALLBACK_KEY\s*\)/]},
+        typescript: {all: [/['"]fallback['"]/, /['"]rules['"]/, /\.incr\(\s*FALLBACK_KEY\s*\)/]},
+        go: {all: [/"fallback"/, /"rules"/, /\.Incr\(ctx,\s*config\.FallbackKey\)/]},
+        scala: {all: [/"fallback"/, /"rules"/, /\.incr\(\s*Config\.FallbackKey\s*\)/]},
+        cpp: {all: [/"fallback"/, /"rules"/, /\.incr\(\s*config::kFallbackKey\s*\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import grpc
+      starter: `import logging
+import time
 
-import providers_pb2
-import providers_pb2_grpc
+import grpc
 
-channel = grpc.insecure_channel("models:9000")
-models = providers_pb2_grpc.ClassifierStub(channel)
+import content_classifier_pb2
+import content_classifier_pb2_grpc
+from classifier.config import MODEL
+
+logger = logging.getLogger("classifier.model")
+
+MAX_WAIT_S = 10.0
+BACKOFF_S = 0.1
+
+stub = content_classifier_pb2_grpc.ModelStub(grpc.insecure_channel(MODEL))
 
 
-def classify(text: str, taxonomy_version: str) -> dict:
+def classify(text: str, taxonomy_id: str, taxonomy_version: int) -> dict:
+    """Labels for the text: ask the model until it answers."""
     # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    while True:
+    request = content_classifier_pb2.ClassifyRequest(text=text, taxonomy_id=taxonomy_id, taxonomy_version=taxonomy_version)
+    until = time.monotonic() + MAX_WAIT_S
+    while time.monotonic() < until:
         try:
-            reply = models.Classify(providers_pb2.ClassifyRequest(text=text))
-            return {"labels": list(reply.labels), "provenance": "model", "model_version": reply.model_version}
-        except grpc.RpcError:
-            return {"labels": ["safe"], "provenance": "model", "model_version": "none"}
+            reply = stub.Classify(request)
+        except grpc.RpcError as err:
+            logger.warning("model call failed code=%s", err.code())
+            time.sleep(BACKOFF_S)
+            continue
+        if reply.refused:
+            time.sleep(BACKOFF_S)
+            continue
+        return {"labels": list(reply.labels), "provenance": "model", "model_version": reply.model_version}
+    return {"labels": ["safe"], "provenance": "model", "model_version": ""}
 `,
-      solution: `import grpc
+      solution: `import logging
+import time
 
-import providers_pb2
-import providers_pb2_grpc
+import grpc
+import redis
 
-channel = grpc.insecure_channel("models:9000")
-models = providers_pb2_grpc.ClassifierStub(channel)
+import content_classifier_pb2
+import content_classifier_pb2_grpc
+from classifier.config import FALLBACK_KEY, MODEL, REVIEW_LABEL
+
+logger = logging.getLogger("classifier.model")
 
 DEADLINE_S = 0.7
 MAX_ATTEMPTS = 3
-REFUSAL = "REFUSED"
-RETRYABLE = ("UNAVAILABLE", "DEADLINE_EXCEEDED")
-PROVENANCE_MODEL = "model"
-PROVENANCE_FALLBACK = "fallback"
-FALLBACK_METRIC = "classifier_fallback_total"
-REVIEW_LABEL = "review"
+BACKOFF_S = 0.05
+RETRYABLE = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+KEYWORD_RULES = (
+    ("billing", ("invoice", "refund", "charge")),
+    ("support", ("broken", "error", "crash")),
+    ("security", ("password", "breach", "phishing")),
+)
 
-KEYWORD_RULES = {
-    "billing": ("invoice", "refund", "charge"),
-    "support": ("broken", "error", "crash"),
-    "security": ("password", "breach", "phishing"),
-}
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+stub = content_classifier_pb2_grpc.ModelStub(grpc.insecure_channel(MODEL))
 
 
 def rules_classify(text: str) -> list[str]:
-    """Deterministic fallback: keyword evidence only, never a label without support behind it."""
+    """Keyword evidence only: a text no rule matches goes to review, never to a safe label."""
     lowered = text.lower()
-    labels = [label for label, keywords in KEYWORD_RULES.items() if any(word in lowered for word in keywords)]
+    labels = [label for label, words in KEYWORD_RULES if any(word in lowered for word in words)]
     return labels or [REVIEW_LABEL]
 
 
-def classify(text: str, taxonomy_version: str) -> dict:
-    for _ in range(MAX_ATTEMPTS):
+def classify(text: str, taxonomy_id: str, taxonomy_version: int) -> dict:
+    """Labels for the text from the model, or from the keyword rules when the model cannot answer."""
+    request = content_classifier_pb2.ClassifyRequest(text=text, taxonomy_id=taxonomy_id, taxonomy_version=taxonomy_version)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            reply = models.Classify(providers_pb2.ClassifyRequest(text=text), timeout=DEADLINE_S)
-            return {
-                "labels": list(reply.labels),
-                "provenance": PROVENANCE_MODEL,
-                "model_version": reply.model_version,
-                "taxonomy_version": taxonomy_version,
-            }
+            reply = stub.Classify(request, timeout=DEADLINE_S)
         except grpc.RpcError as err:
-            status = err.code().name if err.code() is not None else "UNKNOWN"
-            if status == REFUSAL:
-                break  # terminal: a refusal is the model's answer, retrying it only burns the deadline
-            if status not in RETRYABLE:
-                break
-    metrics.inc(FALLBACK_METRIC)
-    return {
-        "labels": rules_classify(text),
-        "provenance": PROVENANCE_FALLBACK,
-        "model_version": "rules",
-        "taxonomy_version": taxonomy_version,
-    }
+            logger.warning("model call failed attempt=%d code=%s", attempt, err.code())
+            if err.code() in RETRYABLE and attempt < MAX_ATTEMPTS:
+                time.sleep(BACKOFF_S * attempt)
+                continue
+            break
+        if reply.refused:
+            break  # the model's decision: asking again gets the same answer
+        return {"labels": list(reply.labels), "provenance": "model", "model_version": reply.model_version}
+    r.incr(FALLBACK_KEY)
+    return {"labels": rules_classify(text), "provenance": "fallback", "model_version": "rules"}
 `,
     },
     typescript: {
-      starter: `/** gRPC model client. */
+      starter: `import {setTimeout as sleep} from 'node:timers/promises';
+
 import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-import {ClassifierClient} from './gen/classifier_grpc_pb';
-import {ClassifyRequest} from './gen/classifier_pb';
+import {MODEL} from 'classifier/config';
 
-const client = new ClassifierClient('models:9000', grpc.credentials.createInsecure());
+export const MAX_WAIT_MS = 10_000;
+export const BACKOFF_MS = 100;
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-export async function classify(text: string, taxonomyVersion: string): Promise<Result> {
-  while (true) {
+interface ClassifyRequest {
+  text: string;
+  taxonomy_id: string;
+  taxonomy_version: number;
+}
+interface ClassifyReply {
+  labels: string[];
+  refused: boolean;
+  model_version: string;
+}
+interface ModelClient {
+  Classify(request: ClassifyRequest, options?: {deadline: number}): Promise<ClassifyReply>;
+}
+
+const {contentclassifier} = grpc.loadPackageDefinition(protoLoader.loadSync('content_classifier.proto')) as unknown as {
+  contentclassifier: {Model: new (target: string, credentials: grpc.ChannelCredentials) => ModelClient};
+};
+const stub = new contentclassifier.Model(MODEL, grpc.credentials.createInsecure());
+
+export interface Result {
+  labels: string[];
+  provenance: string;
+  model_version: string;
+}
+
+/** Labels for the text: ask the model until it answers. */
+export async function classify(text: string, taxonomyId: string, taxonomyVersion: number): Promise<Result> {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  const request = {text, taxonomy_id: taxonomyId, taxonomy_version: taxonomyVersion};
+  const until = Date.now() + MAX_WAIT_MS;
+  while (Date.now() < until) {
+    let reply: ClassifyReply;
     try {
-      const reply = await new Promise<ClassifyReply>((resolve, reject) => {
-        client.Classify(new ClassifyRequest().setText(text), (err, value) => (err ? reject(err) : resolve(value)));
-      });
-      return {labels: reply.getLabelsList(), provenance: 'model', modelVersion: reply.getModelVersion()};
+      reply = await stub.Classify(request);
     } catch (err) {
-      return {labels: ['safe'], provenance: 'model', modelVersion: 'none'};
+      console.warn(\`model call failed code=\${(err as grpc.ServiceError).code}\`);
+      await sleep(BACKOFF_MS);
+      continue;
     }
+    if (reply.refused) {
+      await sleep(BACKOFF_MS);
+      continue;
+    }
+    return {labels: [...(reply.labels ?? [])], provenance: 'model', model_version: reply.model_version};
   }
+  return {labels: ['safe'], provenance: 'model', model_version: ''};
 }
 `,
-      solution: `/** gRPC model client: a 700 ms deadline, a terminal refusal and a deterministic rules fallback. */
+      solution: `import {setTimeout as sleep} from 'node:timers/promises';
+
 import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
 
-import {ClassifierClient} from './gen/classifier_grpc_pb';
-import {ClassifyRequest} from './gen/classifier_pb';
-import {metrics} from './metrics';
+import {FALLBACK_KEY, MODEL, REVIEW_LABEL} from 'classifier/config';
 
-const client = new ClassifierClient('models:9000', grpc.credentials.createInsecure());
+export const DEADLINE_MS = 700;
+export const MAX_ATTEMPTS = 3;
+export const BACKOFF_MS = 50;
+const RETRYABLE = [grpc.status.UNAVAILABLE, grpc.status.DEADLINE_EXCEEDED];
+const KEYWORD_RULES: [string, string[]][] = [
+  ['billing', ['invoice', 'refund', 'charge']],
+  ['support', ['broken', 'error', 'crash']],
+  ['security', ['password', 'breach', 'phishing']],
+];
 
-const DEADLINE_MS = 700;
-const MAX_ATTEMPTS = 3;
-const REFUSAL = 'REFUSED';
-const PROVENANCE_MODEL = 'model';
-const PROVENANCE_FALLBACK = 'fallback';
-const FALLBACK_METRIC = 'classifier_fallback_total';
-const REVIEW_LABEL = 'review';
-const RETRYABLE = new Set(['UNAVAILABLE', 'DEADLINE_EXCEEDED']);
+interface ClassifyRequest {
+  text: string;
+  taxonomy_id: string;
+  taxonomy_version: number;
+}
+interface ClassifyReply {
+  labels: string[];
+  refused: boolean;
+  model_version: string;
+}
+interface ModelClient {
+  Classify(request: ClassifyRequest, options?: {deadline: number}): Promise<ClassifyReply>;
+}
 
-const KEYWORD_RULES: Record<string, string[]> = {
-  billing: ['invoice', 'refund', 'charge'],
-  support: ['broken', 'error', 'crash'],
-  security: ['password', 'breach', 'phishing'],
+const {contentclassifier} = grpc.loadPackageDefinition(protoLoader.loadSync('content_classifier.proto')) as unknown as {
+  contentclassifier: {Model: new (target: string, credentials: grpc.ChannelCredentials) => ModelClient};
 };
+const stub = new contentclassifier.Model(MODEL, grpc.credentials.createInsecure());
+const redis = new Redis({host: 'redis', port: 6379});
 
-/** Deterministic fallback: keyword evidence only, never a label without support behind it. */
+export interface Result {
+  labels: string[];
+  provenance: string;
+  model_version: string;
+}
+
+/** Keyword evidence only: a text no rule matches goes to review, never to a safe label. */
 export function rulesClassify(text: string): string[] {
   const lowered = text.toLowerCase();
-  const labels = Object.entries(KEYWORD_RULES)
-    .filter(([, keywords]) => keywords.some(word => lowered.includes(word)))
-    .map(([label]) => label);
+  const labels = KEYWORD_RULES.filter(([, words]) => words.some(word => lowered.includes(word))).map(([label]) => label);
   return labels.length > 0 ? labels : [REVIEW_LABEL];
 }
 
-export async function classify(text: string, taxonomyVersion: string): Promise<Result> {
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+/** Labels for the text from the model, or from the keyword rules when the model cannot answer. */
+export async function classify(text: string, taxonomyId: string, taxonomyVersion: number): Promise<Result> {
+  const request = {text, taxonomy_id: taxonomyId, taxonomy_version: taxonomyVersion};
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let reply: ClassifyReply;
     try {
-      const reply = await new Promise<ClassifyReply>((resolve, reject) => {
-        client.Classify(
-          new ClassifyRequest().setText(text),
-          new grpc.Metadata(),
-          {deadline: Date.now() + DEADLINE_MS},
-          (err, value) => (err ? reject(err) : resolve(value)),
-        );
-      });
-      return {
-        labels: reply.getLabelsList(),
-        provenance: PROVENANCE_MODEL,
-        modelVersion: reply.getModelVersion(),
-        taxonomyVersion,
-      };
+      reply = await stub.Classify(request, {deadline: Date.now() + DEADLINE_MS});
     } catch (err) {
-      const code = (err as grpc.ServiceError).code;
-      const status = grpc.status[code] as string;
-      // A refusal is the model's answer, and a permanent error will not change: both are terminal.
-      if (status === REFUSAL || !RETRYABLE.has(status)) break;
+      const {code} = err as grpc.ServiceError;
+      console.warn(\`model call failed attempt=\${attempt} code=\${code}\`);
+      if (RETRYABLE.includes(code) && attempt < MAX_ATTEMPTS) {
+        await sleep(BACKOFF_MS * attempt);
+        continue;
+      }
+      break;
     }
+    if (reply.refused) break; // the model's decision: asking again gets the same answer
+    return {labels: [...(reply.labels ?? [])], provenance: 'model', model_version: reply.model_version};
   }
-  metrics.increment(FALLBACK_METRIC);
-  return {
-    labels: rulesClassify(text),
-    provenance: PROVENANCE_FALLBACK,
-    modelVersion: 'rules',
-    taxonomyVersion,
-  };
+  await redis.incr(FALLBACK_KEY);
+  return {labels: rulesClassify(text), provenance: 'fallback', model_version: 'rules'};
 }
 `,
     },
     go: {
-      starter: `package classification
+      starter: `package main
 
 import (
 	"context"
-
-	"google.golang.org/grpc"
-
-	classifierv1 "example.com/gen/classifierv1"
-)
-
-var conn, _ = grpc.Dial("models:9000", grpc.WithInsecure())
-
-var models = classifierv1.NewClassifierClient(conn)
-
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-func Classify(ctx context.Context, text, taxonomyVersion string) (Result, error) {
-	for {
-		reply, err := models.Classify(ctx, &classifierv1.ClassifyRequest{Text: text})
-		if err != nil {
-			return Result{Labels: []string{"safe"}, Provenance: "model", ModelVersion: "none"}, nil
-		}
-		return Result{Labels: reply.Labels, Provenance: "model", ModelVersion: reply.ModelVersion}, nil
-	}
-}
-`,
-      solution: `package classification
-
-import (
-	"context"
-	"strings"
+	"log"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	classifierv1 "example.com/gen/classifierv1"
+	"classifier/config" // config.Model, config.ReviewLabel, config.FallbackKey
+	pb "classifier/gen/content_classifier"
 )
 
 const (
-	deadlineMS  = 700
-	maxAttempts = 3
-	refusal     = "REFUSED"
+	maxWait = 10 * time.Second
+	backoff = 100 * time.Millisecond
 )
 
-const (
-	provenanceModel    = "model"
-	provenanceFallback = "fallback"
-	fallbackMetric     = "classifier_fallback_total"
-	reviewLabel        = "review"
-)
+var conn, _ = grpc.NewClient(config.Model, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var stub = pb.NewModelClient(conn)
 
-var retryable = map[codes.Code]bool{codes.Unavailable: true, codes.DeadlineExceeded: true}
-
-var keywordRules = map[string][]string{
-	"billing":  {"invoice", "refund", "charge"},
-	"support":  {"broken", "error", "crash"},
-	"security": {"password", "breach", "phishing"},
+// Result is one classification: the labels, where they came from, and the model that produced them.
+type Result struct {
+	Labels       []string
+	Provenance   string
+	ModelVersion string
 }
 
-var conn, _ = grpc.Dial("models:9000", grpc.WithInsecure())
+// classify labels the text: it asks the model until it answers.
+func classify(ctx context.Context, text, taxonomyID string, taxonomyVersion int) (Result, error) {
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+	request := &pb.ClassifyRequest{Text: text, TaxonomyId: taxonomyID, TaxonomyVersion: int64(taxonomyVersion)}
+	until := time.Now().Add(maxWait)
+	for time.Now().Before(until) {
+		reply, err := stub.Classify(ctx, request)
+		if err != nil {
+			log.Printf("model call failed code=%s", status.Code(err))
+			time.Sleep(backoff)
+			continue
+		}
+		if reply.GetRefused() {
+			time.Sleep(backoff)
+			continue
+		}
+		return Result{Labels: append([]string{}, reply.GetLabels()...), Provenance: "model", ModelVersion: reply.GetModelVersion()}, nil
+	}
+	return Result{Labels: []string{"safe"}, Provenance: "model"}, nil
+}
+`,
+      solution: `package main
 
-var models = classifierv1.NewClassifierClient(conn)
+import (
+	"context"
+	"log"
+	"strings"
+	"time"
 
-// rulesClassify is deterministic: keyword evidence only, never a label without support behind it.
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	"classifier/config" // config.Model, config.ReviewLabel, config.FallbackKey
+	pb "classifier/gen/content_classifier"
+)
+
+const (
+	deadline    = 700 * time.Millisecond
+	maxAttempts = 3
+	backoff     = 50 * time.Millisecond
+)
+
+var conn, _ = grpc.NewClient(config.Model, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var stub = pb.NewModelClient(conn)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+// Result is one classification: the labels, where they came from, and the model that produced them.
+type Result struct {
+	Labels       []string
+	Provenance   string
+	ModelVersion string
+}
+
+type rule struct {
+	label string
+	words []string
+}
+
+var keywordRules = []rule{
+	{"billing", []string{"invoice", "refund", "charge"}},
+	{"support", []string{"broken", "error", "crash"}},
+	{"security", []string{"password", "breach", "phishing"}},
+}
+
+// rulesClassify is keyword evidence only: a text no rule matches goes to review, never to a safe label.
 func rulesClassify(text string) []string {
 	lowered := strings.ToLower(text)
 	labels := []string{}
-	for label, keywords := range keywordRules {
-		for _, word := range keywords {
+	for _, r := range keywordRules {
+		for _, word := range r.words {
 			if strings.Contains(lowered, word) {
-				labels = append(labels, label)
+				labels = append(labels, r.label)
 				break
 			}
 		}
 	}
 	if len(labels) == 0 {
-		return []string{reviewLabel}
+		return []string{config.ReviewLabel}
 	}
 	return labels
 }
 
-func Classify(ctx context.Context, text, taxonomyVersion string) (Result, error) {
-	callCtx, cancel := context.WithTimeout(ctx, deadlineMS*time.Millisecond)
-	defer cancel()
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		reply, err := models.Classify(callCtx, &classifierv1.ClassifyRequest{Text: text})
-		if err == nil {
-			return Result{
-				Labels:          reply.Labels,
-				Provenance:      provenanceModel,
-				ModelVersion:    reply.ModelVersion,
-				TaxonomyVersion: taxonomyVersion,
-			}, nil
+// classify labels the text with the model, or with the keyword rules when the model cannot answer.
+func classify(ctx context.Context, text, taxonomyID string, taxonomyVersion int) (Result, error) {
+	request := &pb.ClassifyRequest{Text: text, TaxonomyId: taxonomyID, TaxonomyVersion: int64(taxonomyVersion)}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, deadline)
+		reply, err := stub.Classify(callCtx, request)
+		cancel()
+		if err != nil {
+			code := status.Code(err)
+			log.Printf("model call failed attempt=%d code=%s", attempt, code)
+			if (code == codes.Unavailable || code == codes.DeadlineExceeded) && attempt < maxAttempts {
+				time.Sleep(backoff * time.Duration(attempt))
+				continue
+			}
+			break
 		}
-		st, _ := status.FromError(err)
-		if st.Message() == refusal || !retryable[st.Code()] {
-			break // a refusal is the model's answer, and a permanent error is terminal
+		if reply.GetRefused() {
+			break // the model's decision: asking again gets the same answer
 		}
+		return Result{Labels: append([]string{}, reply.GetLabels()...), Provenance: "model", ModelVersion: reply.GetModelVersion()}, nil
 	}
-	metrics.Incr(fallbackMetric)
-	return Result{
-		Labels:          rulesClassify(text),
-		Provenance:      provenanceFallback,
-		ModelVersion:    "rules",
-		TaxonomyVersion: taxonomyVersion,
-	}, nil
+	if err := rdb.Incr(ctx, config.FallbackKey).Err(); err != nil {
+		return Result{}, err
+	}
+	return Result{Labels: rulesClassify(text), Provenance: "fallback", ModelVersion: "rules"}, nil
 }
 `,
     },
     scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-import classifierv1.classifier.{ClassifyRequest, ClassifierGrpc}
+import classifier.{Config, Result}
+import contentclassifier.content_classifier.{ClassifyRequest, ModelGrpc}
 
 object ModelClient {
-  val channel = ManagedChannelBuilder.forAddress("models", 9000).usePlaintext().build()
-  val models: ClassifierGrpc.ClassifierBlockingStub = ClassifierGrpc.blockingStub(channel)
+  val MaxWaitMs = 10000L
+  val BackoffMs = 100L
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def classify(text: String, taxonomyVersion: String): Result = {
-    var done = false
-    var result: Result = null
-    while (!done) {
+  private val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build())
+
+  /** Labels for the text: ask the model until it answers. */
+  def classify(text: String, taxonomyId: String, taxonomyVersion: Long): Result = {
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    val request = ClassifyRequest(text = text, taxonomyId = taxonomyId, taxonomyVersion = taxonomyVersion)
+    val until = System.currentTimeMillis() + MaxWaitMs
+    while (System.currentTimeMillis() < until) {
       try {
-        val reply = models.classify(ClassifyRequest(text = text))
-        result = Result(labels = reply.labels, provenance = "model", modelVersion = reply.modelVersion)
-        done = true
+        val reply = stub.classify(request)
+        if (!reply.refused) return Result(reply.labels, "model", reply.modelVersion)
+        Thread.sleep(BackoffMs)
       } catch {
-        case _: io.grpc.StatusRuntimeException =>
-          result = Result(labels = Seq("safe"), provenance = "model", modelVersion = "none")
-          done = true
+        case e: StatusRuntimeException =>
+          System.err.println(s"model call failed code=\${e.getStatus.getCode}")
+          Thread.sleep(BackoffMs)
       }
     }
-    result
+    Result(Seq("safe"), "model", "")
   }
 }
 `,
       solution: `import java.util.concurrent.TimeUnit
 
-import io.grpc.ManagedChannelBuilder
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+import redis.clients.jedis.JedisPooled
 
-import classifierv1.classifier.{ClassifyRequest, ClassifierGrpc}
+import classifier.{Config, Result}
+import contentclassifier.content_classifier.{ClassifyRequest, ModelGrpc}
 
 object ModelClient {
-  val channel = ManagedChannelBuilder.forAddress("models", 9000).usePlaintext().build()
-  val models: ClassifierGrpc.ClassifierBlockingStub = ClassifierGrpc.blockingStub(channel)
-
-  val DeadlineMs = 700
+  val DeadlineMs = 700L
   val MaxAttempts = 3
-  val Refusal = "REFUSED"
-  val Retryable = Set("UNAVAILABLE", "DEADLINE_EXCEEDED")
-  val ProvenanceModel = "model"
-  val ProvenanceFallback = "fallback"
-  val FallbackMetric = "classifier_fallback_total"
-  val ReviewLabel = "review"
-
-  val KeywordRules = Map(
+  val BackoffMs = 50L
+  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
+  private val KeywordRules = Seq(
     "billing" -> Seq("invoice", "refund", "charge"),
     "support" -> Seq("broken", "error", "crash"),
     "security" -> Seq("password", "breach", "phishing")
   )
 
-  /** Deterministic fallback: keyword evidence only, never a label without support behind it. */
+  private val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.Model).usePlaintext().build())
+  private val jedis = new JedisPooled("redis", 6379)
+
+  /** Keyword evidence only: a text no rule matches goes to review, never to a safe label. */
   def rulesClassify(text: String): Seq[String] = {
     val lowered = text.toLowerCase
-    val labels = KeywordRules.collect { case (label, keywords) if keywords.exists(lowered.contains) => label }.toSeq
-    if (labels.isEmpty) Seq(ReviewLabel) else labels
+    val labels = KeywordRules.collect { case (label, words) if words.exists(lowered.contains) => label }
+    if (labels.isEmpty) Seq(Config.ReviewLabel) else labels
   }
 
-  def classify(text: String, taxonomyVersion: String): Result = {
-    val stub = models.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS)
-    for (_ <- 0 until MaxAttempts) {
+  /** Labels for the text from the model, or from the keyword rules when the model cannot answer. */
+  def classify(text: String, taxonomyId: String, taxonomyVersion: Long): Result = {
+    val request = ClassifyRequest(text = text, taxonomyId = taxonomyId, taxonomyVersion = taxonomyVersion)
+    var attempt = 1
+    while (attempt <= MaxAttempts) {
       try {
-        val reply = stub.classify(ClassifyRequest(text = text))
-        return Result(labels = reply.labels, provenance = ProvenanceModel, modelVersion = reply.modelVersion)
+        val reply = stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).classify(request)
+        if (!reply.refused) return Result(reply.labels, "model", reply.modelVersion)
+        attempt = MaxAttempts + 1 // the model's decision: asking again gets the same answer
       } catch {
-        case e: io.grpc.StatusRuntimeException =>
-          val code = e.getStatus.getCode.name()
-          // A refusal is the model's answer, and a permanent code will not change: both are terminal.
-          if (code == Refusal || !Retryable.contains(code)) {
-            return fallback(text, taxonomyVersion)
-          }
+        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) && attempt < MaxAttempts =>
+          Thread.sleep(BackoffMs * attempt)
+          attempt += 1
+        case e: StatusRuntimeException =>
+          System.err.println(s"model call failed attempt=$attempt code=\${e.getStatus.getCode}")
+          attempt = MaxAttempts + 1
       }
     }
-    fallback(text, taxonomyVersion)
-  }
-
-  private def fallback(text: String, taxonomyVersion: String): Result = {
-    Metrics.counter(FallbackMetric).inc()
-    Result(labels = rulesClassify(text), provenance = ProvenanceFallback, modelVersion = "rules")
+    jedis.incr(Config.FallbackKey)
+    Result(rulesClassify(text), "fallback", "rules")
   }
 }
 `,
@@ -490,24 +567,51 @@ object ModelClient {
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
 
+#include <chrono>
+#include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include "classifier.grpc.pb.h"
+#include "classifier/config.h"  // config::kModel, kReviewLabel, kFallbackKey, redis()
+#include "content_classifier.grpc.pb.h"
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-Result Classify(const std::string& text, const std::string& taxonomyVersion) {
-  while (true) {
+constexpr std::chrono::seconds kMaxWait{10};
+constexpr std::chrono::milliseconds kBackoff{100};
+
+auto stub = contentclassifier::Model::NewStub(grpc::CreateChannel(config::kModel, grpc::InsecureChannelCredentials()));
+
+// One classification: the labels, where they came from, and the model that produced them.
+struct Result {
+  std::vector<std::string> labels;
+  std::string provenance;
+  std::string model_version;
+};
+
+// Labels for the text: ask the model until it answers.
+Result classify(const std::string& text, const std::string& taxonomy_id, long taxonomy_version) {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  contentclassifier::ClassifyRequest request;
+  request.set_text(text);
+  request.set_taxonomy_id(taxonomy_id);
+  request.set_taxonomy_version(taxonomy_version);
+  const auto until = std::chrono::steady_clock::now() + kMaxWait;
+  while (std::chrono::steady_clock::now() < until) {
     grpc::ClientContext ctx;
-    classifierv1::ClassifyRequest request;
-    request.set_text(text);
-    classifierv1::ClassifyReply reply;
-    const auto status = models->Classify(&ctx, request, &reply);
-    if (status.ok()) {
-      return {std::vector<std::string>(reply.labels().begin(), reply.labels().end()), "model", reply.model_version()};
+    contentclassifier::ClassifyReply reply;
+    const grpc::Status status = stub->Classify(&ctx, request, &reply);
+    if (!status.ok()) {
+      std::cerr << "model call failed code=" << status.error_code() << "\\n";
+      std::this_thread::sleep_for(kBackoff);
+      continue;
     }
-    return {std::vector<std::string>{"safe"}, "model", "none"};
+    if (reply.refused()) {
+      std::this_thread::sleep_for(kBackoff);
+      continue;
+    }
+    return Result{std::vector<std::string>(reply.labels().begin(), reply.labels().end()), "model", reply.model_version()};
   }
+  return Result{{"safe"}, "model", ""};
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
@@ -515,73 +619,514 @@ Result Classify(const std::string& text, const std::string& taxonomyVersion) {
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <iostream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
-#include "classifier.grpc.pb.h"
+#include "classifier/config.h"  // config::kModel, kReviewLabel, kFallbackKey, redis()
+#include "content_classifier.grpc.pb.h"
 
-namespace {
-constexpr int kDeadlineMs = 700;
+constexpr std::chrono::milliseconds kDeadline{700};
 constexpr int kMaxAttempts = 3;
-const std::string kRefusal = "REFUSED";
-const std::string kProvenanceModel = "model";
-const std::string kProvenanceFallback = "fallback";
-const std::string kFallbackMetric = "classifier_fallback_total";
-const std::string kReviewLabel = "review";
-
+constexpr std::chrono::milliseconds kBackoff{50};
 const std::vector<std::pair<std::string, std::vector<std::string>>> kKeywordRules = {
     {"billing", {"invoice", "refund", "charge"}},
     {"support", {"broken", "error", "crash"}},
     {"security", {"password", "breach", "phishing"}},
 };
-}  // namespace
 
-// Deterministic fallback: keyword evidence only, never a label without support behind it.
+auto stub = contentclassifier::Model::NewStub(grpc::CreateChannel(config::kModel, grpc::InsecureChannelCredentials()));
+
+// One classification: the labels, where they came from, and the model that produced them.
+struct Result {
+  std::vector<std::string> labels;
+  std::string provenance;
+  std::string model_version;
+};
+
+// Keyword evidence only: a text no rule matches goes to review, never to a safe label.
 std::vector<std::string> rulesClassify(const std::string& text) {
   std::string lowered = text;
-  std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) { return std::tolower(c); });
   std::vector<std::string> labels;
-  for (const auto& [label, keywords] : kKeywordRules) {
-    for (const auto& word : keywords) {
+  for (const auto& [label, words] : kKeywordRules)
+    for (const auto& word : words)
       if (lowered.find(word) != std::string::npos) {
         labels.push_back(label);
         break;
       }
-    }
-  }
-  if (labels.empty()) labels.push_back(kReviewLabel);
+  if (labels.empty()) labels.push_back(config::kReviewLabel);
   return labels;
 }
 
-Result Classify(const std::string& text, const std::string& taxonomyVersion) {
-  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+// Labels for the text from the model, or from the keyword rules when the model cannot answer.
+Result classify(const std::string& text, const std::string& taxonomy_id, long taxonomy_version) {
+  contentclassifier::ClassifyRequest request;
+  request.set_text(text);
+  request.set_taxonomy_id(taxonomy_id);
+  request.set_taxonomy_version(taxonomy_version);
+  for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
     grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kDeadlineMs));
-    classifierv1::ClassifyRequest request;
-    request.set_text(text);
-    classifierv1::ClassifyReply reply;
-    const auto status = models->Classify(&ctx, request, &reply);
-    if (status.ok()) {
-      return {std::vector<std::string>(reply.labels().begin(), reply.labels().end()), kProvenanceModel,
-              reply.model_version()};
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    contentclassifier::ClassifyReply reply;
+    const grpc::Status status = stub->Classify(&ctx, request, &reply);
+    if (!status.ok()) {
+      const auto code = status.error_code();
+      std::cerr << "model call failed attempt=" << attempt << " code=" << code << "\\n";
+      if ((code == grpc::StatusCode::UNAVAILABLE || code == grpc::StatusCode::DEADLINE_EXCEEDED) && attempt < kMaxAttempts) {
+        std::this_thread::sleep_for(kBackoff * attempt);
+        continue;
+      }
+      break;
     }
-    const std::string code = grpcStatusCodeName(status.error_code());
-    // A refusal is the model's answer, and a permanent code will not change: both are terminal.
-    if (code == kRefusal || (code != "UNAVAILABLE" && code != "DEADLINE_EXCEEDED")) break;
+    if (reply.refused()) break;  // the model's decision: asking again gets the same answer
+    return Result{std::vector<std::string>(reply.labels().begin(), reply.labels().end()), "model", reply.model_version()};
   }
-  Metrics::Incr(kFallbackMetric);
-  return {rulesClassify(text), kProvenanceFallback, "rules"};
+  config::redis().incr(config::kFallbackKey);
+  return Result{rulesClassify(text), "fallback", "rules"};
 }
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import content_classifier_pb2
+import content_classifier_pb2_grpc
+from classifier import config, labeler
+
+BROKEN = "my screen is broken"
+
+
+class ModelServicer(content_classifier_pb2_grpc.ModelServicer):
+    """The stand-in model: answers from classifier.labeler."""
+
+    def Classify(self, request, context):
+        labels, refused = labeler.classify(request.text)
+        return content_classifier_pb2.ClassifyReply(labels=labels, refused=refused, model_version=labeler.MODEL_VERSION)
+
+
+def _world(ctx):
+    ctx.grpc.serve(content_classifier_pb2_grpc.add_ModelServicer_to_server, ModelServicer(), config.MODEL)
+    return ctx.load("client")
+
+
+def _calls(ctx):
+    return ctx.grpc.calls_to("Classify")
+
+
+def _fallbacks(ctx):
+    return int(ctx.redis.get(config.FALLBACK_KEY) or 0)
+
+
+def _outage(ctx, times=1000):
+    ctx.grpc.fail("Classify", grpc.StatusCode.UNAVAILABLE, "model down", times=times, target=config.MODEL)
+
+
+def check_deadline(ctx):
+    m = _world(ctx)
+    result = m.classify(BROKEN, "tx-support", 1)
+    assert result.get("labels") == ["support"] and result.get("provenance") == "model", f"a healthy model must answer, got {result}"
+    calls = _calls(ctx)
+    assert len(calls) == 1, f"a healthy model must be called once, saw {len(calls)} calls"
+    assert calls[0].timeout is not None, "the Classify call carries no deadline: a hung model holds the request for as long as it hangs"
+    assert 0.6 <= calls[0].timeout <= 0.8, f"the deadline must be DEADLINE_S = 0.7 s, got {calls[0].timeout} s"
+    ctx.grpc.set_latency("Classify", 5.0, config.MODEL)
+    started = ctx.clock.time()
+    result = m.classify(BROKEN, "tx-support", 1)
+    waited = ctx.clock.time() - started
+    assert waited <= 2.6, f"classify waited {waited:.1f} s on a model that hangs: three attempts of 0.7 s, then the fallback"
+    assert result.get("provenance") == "fallback" and result.get("labels") == ["support"], f"a hung model must end in the rules fallback, got {result}"
+
+
+def check_refusal_terminal(ctx):
+    m = _world(ctx)
+    result = m.classify("refuse: what is my password", "tx-support", 1)
+    assert len(_calls(ctx)) == 1, f"a refusal is the model's answer and must end the attempts: saw {len(_calls(ctx))} calls"
+    assert result.get("provenance") == "fallback" and result.get("labels") == ["security"], f"a refused text goes to the rules, got {result}"
+    _outage(ctx, times=1)
+    result = m.classify(BROKEN, "tx-support", 1)
+    assert len(_calls(ctx)) == 3 and result.get("provenance") == "model", f"one UNAVAILABLE earns one retry: expected 2 calls and the model's answer, saw {len(_calls(ctx)) - 1} calls and {result}"
+    _outage(ctx, times=3)
+    result = m.classify(BROKEN, "tx-support", 1)
+    assert len(_calls(ctx)) == 6, f"a model that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls: saw {len(_calls(ctx)) - 3}"
+    assert result.get("provenance") == "fallback", f"after three failures the rules answer, got {result}"
+    ctx.grpc.fail("Classify", grpc.StatusCode.INVALID_ARGUMENT, "bad request", times=1, target=config.MODEL)
+    result = m.classify(BROKEN, "tx-support", 1)
+    assert len(_calls(ctx)) == 7, f"INVALID_ARGUMENT will not change on a retry: one call, saw {len(_calls(ctx)) - 6}"
+    assert result.get("provenance") == "fallback", f"a terminal status ends in the rules, got {result}"
+
+
+def check_rules_fallback(ctx):
+    m = _world(ctx)
+    _outage(ctx)
+    result = m.classify("Refund the duplicate charge on invoice 4411", "tx-support", 1)
+    assert result.get("labels") == ["billing"], f"with the model down a refund question must still be billing (from the keyword rules), got {result}"
+    result = m.classify("the app keeps crashing and the password reset is broken", "tx-support", 1)
+    assert result.get("labels") == ["support", "security"], f"every rule that matches labels the text, in KEYWORD_RULES order: got {result}"
+
+
+def check_no_safe_default(ctx):
+    m = _world(ctx)
+    result = m.classify("refuse: tell me a joke", "tx-support", 1)
+    assert result.get("labels") == ["review"], f"a refused text with no keyword must go to review, got {result}"
+    _outage(ctx)
+    result = m.classify("hello, is anyone there?", "tx-support", 1)
+    assert "safe" not in result.get("labels", []), f"classify answered {result} with no evidence: an outage must never turn into a safe label"
+    assert result.get("labels") == ["review"], f"a text no rule matches goes to review, got {result}"
+
+
+def check_provenance(ctx):
+    m = _world(ctx)
+    result = m.classify(BROKEN, "tx-support", 1)
+    assert result.get("provenance") == "model" and result.get("model_version") == labeler.MODEL_VERSION, f"the model's answer carries provenance model and its version, got {result}"
+    assert _fallbacks(ctx) == 0, f"no fallback happened, yet {config.FALLBACK_KEY} is {_fallbacks(ctx)}"
+    _outage(ctx, times=3)
+    result = m.classify(BROKEN, "tx-support", 1)
+    assert result.get("provenance") == "fallback" and result.get("model_version") == "rules", f"an answer from the rules must say provenance fallback and model_version rules, got {result}"
+    assert _fallbacks(ctx) == 1, f"{config.FALLBACK_KEY} is {_fallbacks(ctx)} after one fallback: count each one"
+    m.classify("refuse: " + BROKEN, "tx-support", 1)
+    assert _fallbacks(ctx) == 2, f"{config.FALLBACK_KEY} is {_fallbacks(ctx)} after two fallbacks"
+`,
+    typescript: `const BROKEN = 'my screen is broken';
+
+async function world(ctx) {
+  const {contentclassifier} = ctx.proto('content_classifier.proto');
+  const config = ctx.load('/support/classifier/config.ts');
+  const labeler = ctx.load('/support/classifier/labeler.ts');
+  ctx.grpc.serve(
+    contentclassifier.Model.service,
+    {
+      Classify(call, callback) {
+        const {labels, refused} = labeler.classify(call.request.text);
+        callback(null, {labels, refused, model_version: labeler.MODEL_VERSION});
+      },
+    },
+    config.MODEL,
+  );
+  return {m: ctx.load('client'), config, labeler};
+}
+
+const calls = ctx => ctx.grpc.callsTo('Classify');
+const fallbacks = (ctx, config) => Number(ctx.redis.get(config.FALLBACK_KEY) ?? 0);
+const outage = (ctx, config, times = 1000) => ctx.grpc.fail('Classify', ctx.grpc.status.UNAVAILABLE, 'model down', times, config.MODEL);
+const same = (labels, expected: string[]) => JSON.stringify(labels) === JSON.stringify(expected);
+
+export async function check_deadline(ctx) {
+  const {m, config} = await world(ctx);
+  let result = await m.classify(BROKEN, 'tx-support', 1);
+  assert(same(result.labels, ['support']) && result.provenance === 'model', \`a healthy model must answer, got \${JSON.stringify(result)}\`);
+  assert.equal(calls(ctx).length, 1, \`a healthy model must be called once, saw \${calls(ctx).length} calls\`);
+  const call = calls(ctx)[0];
+  assert(call.timeout !== null && call.timeout !== undefined, 'the Classify call carries no deadline: a hung model holds the request for as long as it hangs');
+  assert(0.6 <= call.timeout && call.timeout <= 0.8, \`the deadline must be DEADLINE_MS = 700 ms, got \${call.timeout} s\`);
+  ctx.grpc.setLatency('Classify', 5.0, config.MODEL);
+  const started = ctx.clock.now();
+  result = await m.classify(BROKEN, 'tx-support', 1);
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert(waited <= 2.6, \`classify waited \${waited.toFixed(1)} s on a model that hangs: three attempts of 0.7 s, then the fallback\`);
+  assert(result.provenance === 'fallback' && same(result.labels, ['support']), \`a hung model must end in the rules fallback, got \${JSON.stringify(result)}\`);
+}
+
+export async function check_refusal_terminal(ctx) {
+  const {m, config} = await world(ctx);
+  let result = await m.classify('refuse: what is my password', 'tx-support', 1);
+  assert.equal(calls(ctx).length, 1, \`a refusal is the model's answer and must end the attempts: saw \${calls(ctx).length} calls\`);
+  assert(result.provenance === 'fallback' && same(result.labels, ['security']), \`a refused text goes to the rules, got \${JSON.stringify(result)}\`);
+  outage(ctx, config, 1);
+  result = await m.classify(BROKEN, 'tx-support', 1);
+  assert(calls(ctx).length === 3 && result.provenance === 'model', \`one UNAVAILABLE earns one retry: expected 2 calls and the model's answer, saw \${calls(ctx).length - 1} calls and \${JSON.stringify(result)}\`);
+  outage(ctx, config, 3);
+  result = await m.classify(BROKEN, 'tx-support', 1);
+  assert.equal(calls(ctx).length, 6, \`a model that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls: saw \${calls(ctx).length - 3}\`);
+  assert.equal(result.provenance, 'fallback', \`after three failures the rules answer, got \${JSON.stringify(result)}\`);
+  ctx.grpc.fail('Classify', ctx.grpc.status.INVALID_ARGUMENT, 'bad request', 1, config.MODEL);
+  result = await m.classify(BROKEN, 'tx-support', 1);
+  assert.equal(calls(ctx).length, 7, \`INVALID_ARGUMENT will not change on a retry: one call, saw \${calls(ctx).length - 6}\`);
+  assert.equal(result.provenance, 'fallback', \`a terminal status ends in the rules, got \${JSON.stringify(result)}\`);
+}
+
+export async function check_rules_fallback(ctx) {
+  const {m, config} = await world(ctx);
+  outage(ctx, config);
+  let result = await m.classify('Refund the duplicate charge on invoice 4411', 'tx-support', 1);
+  assert(same(result.labels, ['billing']), \`with the model down a refund question must still be billing (from the keyword rules), got \${JSON.stringify(result)}\`);
+  result = await m.classify('the app keeps crashing and the password reset is broken', 'tx-support', 1);
+  assert(same(result.labels, ['support', 'security']), \`every rule that matches labels the text, in KEYWORD_RULES order: got \${JSON.stringify(result)}\`);
+}
+
+export async function check_no_safe_default(ctx) {
+  const {m, config} = await world(ctx);
+  let result = await m.classify('refuse: tell me a joke', 'tx-support', 1);
+  assert(same(result.labels, ['review']), \`a refused text with no keyword must go to review, got \${JSON.stringify(result)}\`);
+  outage(ctx, config);
+  result = await m.classify('hello, is anyone there?', 'tx-support', 1);
+  assert(!(result.labels ?? []).includes('safe'), \`classify answered \${JSON.stringify(result)} with no evidence: an outage must never turn into a safe label\`);
+  assert(same(result.labels, ['review']), \`a text no rule matches goes to review, got \${JSON.stringify(result)}\`);
+}
+
+export async function check_provenance(ctx) {
+  const {m, config, labeler} = await world(ctx);
+  let result = await m.classify(BROKEN, 'tx-support', 1);
+  assert(result.provenance === 'model' && result.model_version === labeler.MODEL_VERSION, \`the model's answer carries provenance model and its version, got \${JSON.stringify(result)}\`);
+  assert.equal(fallbacks(ctx, config), 0, \`no fallback happened, yet \${config.FALLBACK_KEY} is \${fallbacks(ctx, config)}\`);
+  outage(ctx, config, 3);
+  result = await m.classify(BROKEN, 'tx-support', 1);
+  assert(result.provenance === 'fallback' && result.model_version === 'rules', \`an answer from the rules must say provenance fallback and model_version rules, got \${JSON.stringify(result)}\`);
+  assert.equal(fallbacks(ctx, config), 1, \`\${config.FALLBACK_KEY} is \${fallbacks(ctx, config)} after one fallback: count each one\`);
+  await m.classify('refuse: ' + BROKEN, 'tx-support', 1);
+  assert.equal(fallbacks(ctx, config), 2, \`\${config.FALLBACK_KEY} is \${fallbacks(ctx, config)} after two fallbacks\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strconv"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	"classifier/config"
+	pb "classifier/gen/content_classifier"
+	"classifier/labeler"
+
+	"leetbuild/harness"
+)
+
+const clientBroken = "my screen is broken"
+
+// clientPeer is the stand-in model: answers from classifier/labeler.
+type clientPeer struct {
+	pb.UnimplementedModelServer
+}
+
+func (clientPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+	labels, refused := labeler.Classify(req.GetText())
+	return &pb.ClassifyReply{Labels: labels, Refused: refused, ModelVersion: labeler.Version}, nil
+}
+
+func clientWorld(ctx *harness.Ctx) {
+	pb.RegisterModelServer(ctx.GRPC.Server(config.Model), &clientPeer{})
+}
+
+func clientClassify(ctx *harness.Ctx, text string) Result {
+	result, err := classify(context.Background(), text, "tx-support", 1)
+	ctx.NoError(err, "classify(%q)", text)
+	return result
+}
+
+func clientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Classify", "") }
+
+func clientFallbacks(ctx *harness.Ctx) int {
+	raw, _ := ctx.Redis.Get(config.FallbackKey)
+	n, _ := strconv.Atoi(raw)
+	return n
+}
+
+func clientOutage(ctx *harness.Ctx, times int) {
+	ctx.GRPC.Fail("Classify", codes.Unavailable, "model down", times, config.Model)
+}
+
+func clientIs(labels []string, expected ...string) bool {
+	if len(labels) != len(expected) {
+		return false
+	}
+	for i := range labels {
+		if labels[i] != expected[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	result := clientClassify(ctx, clientBroken)
+	ctx.Assert(clientIs(result.Labels, "support") && result.Provenance == "model", "a healthy model must answer, got %+v", result)
+	calls := clientCalls(ctx)
+	ctx.Equal(len(calls), 1, "a healthy model must be called once; calls")
+	ctx.Assert(calls[0].HasDeadline(), "the Classify call carries no deadline: a hung model holds the request for as long as it hangs")
+	ctx.Assert(600*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 800*time.Millisecond, "the deadline must be 700 ms, got %v", calls[0].Timeout)
+	ctx.GRPC.SetLatency("Classify", 5.0, config.Model)
+	started := ctx.Clock.Now()
+	result = clientClassify(ctx, clientBroken)
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(waited <= 2.6, "classify waited %.1f s on a model that hangs: three attempts of 0.7 s, then the fallback", waited)
+	ctx.Assert(result.Provenance == "fallback" && clientIs(result.Labels, "support"), "a hung model must end in the rules fallback, got %+v", result)
+}
+
+func CheckRefusalTerminal(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	result := clientClassify(ctx, "refuse: what is my password")
+	ctx.Equal(len(clientCalls(ctx)), 1, "a refusal is the model's answer and must end the attempts; calls")
+	ctx.Assert(result.Provenance == "fallback" && clientIs(result.Labels, "security"), "a refused text goes to the rules, got %+v", result)
+	clientOutage(ctx, 1)
+	result = clientClassify(ctx, clientBroken)
+	ctx.Assert(len(clientCalls(ctx)) == 3 && result.Provenance == "model", "one UNAVAILABLE earns one retry: expected 2 calls and the model's answer, saw %d calls and %+v", len(clientCalls(ctx))-1, result)
+	clientOutage(ctx, 3)
+	result = clientClassify(ctx, clientBroken)
+	ctx.Equal(len(clientCalls(ctx)), 6, "a model that stays UNAVAILABLE gets maxAttempts = 3 calls; calls so far")
+	ctx.Equal(result.Provenance, "fallback", "after three failures the rules answer; the provenance")
+	ctx.GRPC.Fail("Classify", codes.InvalidArgument, "bad request", 1, config.Model)
+	result = clientClassify(ctx, clientBroken)
+	ctx.Equal(len(clientCalls(ctx)), 7, "INVALID_ARGUMENT will not change on a retry: one call; calls so far")
+	ctx.Equal(result.Provenance, "fallback", "a terminal status ends in the rules; the provenance")
+}
+
+func CheckRulesFallback(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	clientOutage(ctx, 1000)
+	result := clientClassify(ctx, "Refund the duplicate charge on invoice 4411")
+	ctx.Assert(clientIs(result.Labels, "billing"), "with the model down a refund question must still be billing (from the keyword rules), got %+v", result)
+	result = clientClassify(ctx, "the app keeps crashing and the password reset is broken")
+	ctx.Assert(clientIs(result.Labels, "support", "security"), "every rule that matches labels the text, in keywordRules order: got %+v", result)
+}
+
+func CheckNoSafeDefault(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	result := clientClassify(ctx, "refuse: tell me a joke")
+	ctx.Assert(clientIs(result.Labels, "review"), "a refused text with no keyword must go to review, got %+v", result)
+	clientOutage(ctx, 1000)
+	result = clientClassify(ctx, "hello, is anyone there?")
+	for _, label := range result.Labels {
+		ctx.Assert(label != "safe", "classify answered %+v with no evidence: an outage must never turn into a safe label", result)
+	}
+	ctx.Assert(clientIs(result.Labels, "review"), "a text no rule matches goes to review, got %+v", result)
+}
+
+func CheckProvenance(ctx *harness.Ctx) {
+	clientWorld(ctx)
+	result := clientClassify(ctx, clientBroken)
+	ctx.Assert(result.Provenance == "model" && result.ModelVersion == labeler.Version, "the model's answer carries provenance model and its version, got %+v", result)
+	ctx.Equal(clientFallbacks(ctx), 0, "no fallback happened; %s", config.FallbackKey)
+	clientOutage(ctx, 3)
+	result = clientClassify(ctx, clientBroken)
+	ctx.Assert(result.Provenance == "fallback" && result.ModelVersion == "rules", "an answer from the rules must say provenance fallback and ModelVersion rules, got %+v", result)
+	ctx.Equal(clientFallbacks(ctx), 1, "after one fallback (count each one); %s", config.FallbackKey)
+	clientClassify(ctx, "refuse: "+clientBroken)
+	ctx.Equal(clientFallbacks(ctx), 2, "after two fallbacks; %s", config.FallbackKey)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "classifier/labeler.h"
+
+namespace {
+
+const std::string kBroken = "my screen is broken";
+
+// The stand-in model: answers from classifier/labeler.h.
+class ClientPeer final : public contentclassifier::Model::Service {
+ public:
+  grpc::Status Classify(grpc::ServerContext*, const contentclassifier::ClassifyRequest* req, contentclassifier::ClassifyReply* reply) override {
+    const auto verdict = labeler::classify(req->text());
+    for (const auto& label : verdict.labels) reply->add_labels(label);
+    reply->set_refused(verdict.refused);
+    reply->set_model_version(labeler::kVersion);
+    return grpc::Status::OK;
+  }
+};
+
+void clientWorld(harness::Ctx& ctx) {
+  static ClientPeer* peer = nullptr;
+  delete peer;
+  peer = new ClientPeer;
+  ctx.GRPC.Server(config::kModel)->RegisterService(peer);
+}
+
+size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
+
+long fallbacks(harness::Ctx& ctx) {
+  const auto raw = ctx.Redis.Get(config::kFallbackKey);
+  return raw ? std::strtol(raw->c_str(), nullptr, 10) : 0;
+}
+
+void outage(harness::Ctx& ctx, int times) { ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "model down", times, config::kModel); }
+
+bool is(const std::vector<std::string>& labels, const std::vector<std::string>& expected) { return labels == expected; }
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  Result result = classify(kBroken, "tx-support", 1);
+  ctx.Assert(is(result.labels, {"support"}) && result.provenance == "model", "a healthy model must answer, got %v from %q", result.labels, result.provenance);
+  const auto all = ctx.GRPC.CallsTo("Classify");
+  ctx.Equal(all.size(), 1, "a healthy model must be called once; calls");
+  ctx.Assert(all[0].HasDeadline(), "the Classify call carries no deadline: a hung model holds the request for as long as it hangs");
+  ctx.Assert(0.6 <= all[0].TimeoutSeconds() && all[0].TimeoutSeconds() <= 0.8, "the deadline must be 700 ms, got %vs", all[0].TimeoutSeconds());
+  ctx.GRPC.SetLatency("Classify", 5.0, config::kModel);
+  const int64_t started = ctx.Clock.Now();
+  result = classify(kBroken, "tx-support", 1);
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Assert(waited <= 2.6, "classify waited %.1f s on a model that hangs: three attempts of 0.7 s, then the fallback", waited);
+  ctx.Assert(result.provenance == "fallback" && is(result.labels, {"support"}), "a hung model must end in the rules fallback, got %v from %q", result.labels, result.provenance);
+}
+
+void CheckRefusalTerminal(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  Result result = classify("refuse: what is my password", "tx-support", 1);
+  ctx.Equal(calls(ctx), 1, "a refusal is the model's answer and must end the attempts; calls");
+  ctx.Assert(result.provenance == "fallback" && is(result.labels, {"security"}), "a refused text goes to the rules, got %v from %q", result.labels, result.provenance);
+  outage(ctx, 1);
+  result = classify(kBroken, "tx-support", 1);
+  ctx.Assert(calls(ctx) == 3 && result.provenance == "model", "one UNAVAILABLE earns one retry: expected 2 calls and the model's answer, saw %d calls and %q", calls(ctx) - 1, result.provenance);
+  outage(ctx, 3);
+  result = classify(kBroken, "tx-support", 1);
+  ctx.Equal(calls(ctx), 6, "a model that stays UNAVAILABLE gets kMaxAttempts = 3 calls; calls so far");
+  ctx.Equal(result.provenance, "fallback", "after three failures the rules answer; the provenance");
+  ctx.GRPC.Fail("Classify", grpc::StatusCode::INVALID_ARGUMENT, "bad request", 1, config::kModel);
+  result = classify(kBroken, "tx-support", 1);
+  ctx.Equal(calls(ctx), 7, "INVALID_ARGUMENT will not change on a retry: one call; calls so far");
+  ctx.Equal(result.provenance, "fallback", "a terminal status ends in the rules; the provenance");
+}
+
+void CheckRulesFallback(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  outage(ctx, 1000);
+  Result result = classify("Refund the duplicate charge on invoice 4411", "tx-support", 1);
+  ctx.Assert(is(result.labels, {"billing"}), "with the model down a refund question must still be billing (from the keyword rules), got %v", result.labels);
+  result = classify("the app keeps crashing and the password reset is broken", "tx-support", 1);
+  ctx.Assert(is(result.labels, {"support", "security"}), "every rule that matches labels the text, in kKeywordRules order: got %v", result.labels);
+}
+
+void CheckNoSafeDefault(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  Result result = classify("refuse: tell me a joke", "tx-support", 1);
+  ctx.Assert(is(result.labels, {"review"}), "a refused text with no keyword must go to review, got %v", result.labels);
+  outage(ctx, 1000);
+  result = classify("hello, is anyone there?", "tx-support", 1);
+  ctx.Assert(std::find(result.labels.begin(), result.labels.end(), "safe") == result.labels.end(),
+             "classify answered %v with no evidence: an outage must never turn into a safe label", result.labels);
+  ctx.Assert(is(result.labels, {"review"}), "a text no rule matches goes to review, got %v", result.labels);
+}
+
+void CheckProvenance(harness::Ctx& ctx) {
+  clientWorld(ctx);
+  Result result = classify(kBroken, "tx-support", 1);
+  ctx.Assert(result.provenance == "model" && result.model_version == labeler::kVersion, "the model's answer carries provenance model and its version, got %q %q", result.provenance, result.model_version);
+  ctx.Equal(fallbacks(ctx), 0, "no fallback happened; %s", config::kFallbackKey);
+  outage(ctx, 3);
+  result = classify(kBroken, "tx-support", 1);
+  ctx.Assert(result.provenance == "fallback" && result.model_version == "rules", "an answer from the rules must say provenance fallback and model_version rules, got %q %q", result.provenance, result.model_version);
+  ctx.Equal(fallbacks(ctx), 1, "after one fallback (count each one); %s", config::kFallbackKey);
+  classify("refuse: " + kBroken, "tx-support", 1);
+  ctx.Equal(fallbacks(ctx), 2, "after two fallbacks; %s", config::kFallbackKey);
+}
+`,
+  },
   hints: [
-    'During a model outage every document comes back `safe`, the fallback dashboard stays flat, and when the model hangs the worker hangs with it.',
-    'The call has no deadline, the loop has no attempt cap and reads no status code, and the `except` turns every error into the same constant with the same provenance as a real answer.',
-    'Pass `timeout=DEADLINE_S` on the call; loop to `MAX_ATTEMPTS`, retry only UNAVAILABLE/DEADLINE_EXCEEDED, return a REFUSAL at once; otherwise `rules_classify` with `PROVENANCE_FALLBACK`, `REVIEW_LABEL` when nothing matches, and bump `FALLBACK_METRIC`.',
+    'A model that hangs for five seconds holds the request for five seconds, a text the model refuses is asked again a hundred times, and during an outage every document comes back `safe` as if the model had said so.',
+    'The call has no deadline, and the loop retries every failure and every refusal until ten seconds pass; then it answers a fixed label with provenance `model` and counts nothing.',
+    '`timeout=DEADLINE_S` on each call; loop over `range(1, MAX_ATTEMPTS + 1)` retrying only `UNAVAILABLE`/`DEADLINE_EXCEEDED`; on a refusal or anything else, `rules_classify(text)` with provenance `fallback`, model_version `rules`, and `INCR FALLBACK_KEY`.',
   ],
-  debrief: `The deadline sits on the RPC because that is the only place it reaches the wire; a timeout wrapper around a blocking stub leaves the connection open. Retry decisions read the status code because retryability belongs to the failure, not to the fact that something threw: UNAVAILABLE may clear, a refusal is the model's answer and will repeat. The fallback is a real classifier with its own provenance and counter because the alternative, a constant labelled as a model answer, is a data-quality bug nobody can see until the outage shows up as a quality dip weeks later. Production clients go further: a circuit breaker stops attempts while the model is known down, and fallback results are sampled into review so the rules get measured against the model they stand in for.`,
+  debrief: `The loop sorts what the model can say into kinds. A transient status is worth a bounded retry; any other status, and a refusal, will say the same thing next time, so it ends the attempts. The deadline sits on the call because a sleep between calls does nothing about a call that never returns, and three 700 ms attempts keep the worst case near two seconds. The fallback trades quality for availability, which is only acceptable when it is visible: provenance lets downstream code treat a rules answer differently, and the counter turns an outage into a spike someone can alert on. The rules cannot invent evidence, so a text they cannot place goes to review. Production clients add a circuit breaker that skips the model while it fails, and one budget for the whole request instead of one per call.`,
 };

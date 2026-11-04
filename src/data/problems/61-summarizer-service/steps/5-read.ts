@@ -2,325 +2,206 @@ import type {Step} from '@/lib/types';
 
 export const summarizerReadStep: Step = {
   id: 'read',
-  title: 'GET /v1/summaries/{id}: citations into the source',
+  title: 'GET /v1/summaries/{id}: scoped to the tenant, citations that know when they are stale',
   concept: 'http',
   file: 'read',
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/summaries/{summary_id}\`: it loads the record from
-\`store.get(summary_id)\`, answers **404** when there is none, logs the id and returns the stored
-summary as is. It compiles, it serves the demo, and it hides four flaws.
+**Starting point.** The starter serves \`GET /v1/summaries/{summary_id}\`: it loads the record with
+\`store.find_summary(summary_id)\` (**404** when there is none), reads the source as it is now
+(\`store.current_source\`), and answers the summary with each citation's \`quote\` sliced from the
+current chunk at the stored offsets. It serves the demo and hides three flaws.
 
-**Failure mode the checks target.** The response carries no citations, so a reader has no way to check
-a claim against the document. The handler compares no hashes, so after an edit it serves a summary of
-text that no longer exists. And it loads by id alone, so any caller with a guessed or leaked id reads
-another tenant's document.
+**Failure mode the checks target.** Any caller with a guessed id reads another tenant's summary;
+after the source is edited the response still presents the summary as current; and a citation into
+an edited chunk quotes text the summary never saw.
 
-Requirements:
-
-- The tenant comes from \`X-Tenant-Id\` (**401** when missing) and the id is resolved within the
-  tenant. Another tenant's id is **404**, the same answer as a missing id, so the endpoint does not
-  confirm that someone else's summary exists.
-- Return \`citations\`: one entry per sentence carrying \`sentence\`, \`chunk_index\`, \`char_start\`,
-  \`char_end\` and the \`source_hash\` the pointer was written against. \`resolve_citation\` refuses a
-  pointer whose \`source_hash\` differs from the summary's.
-- Compare the stored \`source_hash\` with the current one, and each citation's \`chunk_hash\` with the
-  current hash of that chunk. Citations into changed chunks are marked stale per citation, and the
-  response reports \`stale: true\` plus the invalidated \`chunk_index\`es in \`stale_chunks\`.`,
+- \`X-Tenant-Id\` is required (**401**) and the record is loaded with
+  \`store.load_summary(tenant, summary_id)\`: another tenant's id is **404**, the same as an unknown
+  one. \`find_summary\` is the support console's lookup.
+- \`stale\` is true when the current \`source_hash\` differs from the summary's; \`stale_chunks\` lists,
+  sorted, the cited chunks whose current hash differs from the citation's \`chunk_hash\`.
+- Each citation carries \`stale\` and a \`quote\`: the cited text when its chunk is unchanged, \`null\`
+  when it changed.`,
   sequence: {
-    participants: ['Reader', 'Summarizer', 'Summary store', 'Source index'],
+    participants: ['Reader', 'Summarizer', 'Summary store'],
     messages: [
       {from: 'Reader', to: 'Summarizer', label: 'GET /v1/summaries/{id} · X-Tenant-Id', kind: 'sync'},
-      {from: 'Summarizer', to: 'Summary store', label: 'get(tenant, summary_id)', kind: 'sync'},
-      {from: 'Summary store', to: 'Summarizer', label: 'summary · source_hash · citations', kind: 'reply'},
-      {from: 'Summarizer', to: 'Source index', label: 'current source_hash · chunk hashes', kind: 'sync'},
-      {from: 'Summarizer', to: 'Summarizer', label: 'resolve citations · mark changed chunks stale', kind: 'sync'},
-      {from: 'Summarizer', to: 'Reader', label: '200 {summary, citations, stale, stale_chunks}', kind: 'reply'},
+      {from: 'Summarizer', to: 'Summary store', label: 'load_summary(tenant, id) → record · or 404', kind: 'sync'},
+      {from: 'Summarizer', to: 'Summary store', label: 'current_source(tenant, source_ref)', kind: 'sync'},
+      {from: 'Summarizer', to: 'Summarizer', label: 'chunk_hash per citation → quote · or stale', kind: 'sync'},
+      {from: 'Summarizer', to: 'Reader', label: '200 {summary, stale, stale_chunks, citations}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/summaries/{id}',
-      detail: 'Register the read route on `GET /v1/summaries/{summary_id}`.',
+      title: 'Handles GET /v1/summaries/{id} with quoted citations',
+      detail:
+        'Register `GET /v1/summaries/{summary_id}`; each citation of an unchanged source quotes the sentence it points at, and an unknown id is **404**.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/summaries\/\{summary_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/summaries\/:summary_id['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/summaries\/\{summary_id\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"summaries"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(R"\(\/v1\/summaries\//]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"summaries"\s*\/\s*Segment\s*\)/, /\bget\b/]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/summaries\//]},
       },
     },
     {
-      id: 'citations',
-      title: 'Returns sentence-level citations into source chunks',
+      id: 'tenant-scope',
+      title: "Another tenant's id is 404",
       detail:
-        'The response carries `citations` built from the summary’s sentences, each with `chunk_index`, `char_start` and `char_end` so a reader can open the exact text a sentence came from. The starter returns the summary with no pointers.',
+        "`X-Tenant-Id` is required and the record is loaded with `load_summary(tenant, id)`, so a foreign id answers **404** like a missing one; the starter's `find_summary` finds it whoever owns it.",
       match: {
-        python: {all: [/citations/, /chunk_index/, /char_start/, /char_end/]},
-        typescript: {all: [/citations/, /chunk_index/, /char_start/, /char_end/]},
-        go: {all: [/citations/, /chunk_index/, /char_start/, /char_end/]},
-        scala: {all: [/citations/, /chunkIndex/, /charStart/, /charEnd/]},
-        cpp: {all: [/citations/, /chunk_index/, /char_start/, /char_end/]},
+        python: {all: [/x-tenant-id/i, /store\.load_summary\(\s*tenant/], none: [/find_summary\(/]},
+        typescript: {all: [/x-tenant-id/i, /loadSummary\(\s*tenant/], none: [/findSummary\(/]},
+        go: {all: [/X-Tenant-Id/i, /store\.LoadSummary\([^\n]*\btenant\b/], none: [/FindSummary\(/]},
+        scala: {all: [/X-Tenant-Id/i, /Store\.loadSummary\(\s*tenant/], none: [/findSummary\(/]},
+        cpp: {all: [/X-Tenant-Id/i, /store::loadSummary\(\s*tenant/], none: [/findSummary\(/]},
       },
     },
     {
-      id: 'stale-marking',
-      title: 'A source edit marks citations into changed chunks stale',
+      id: 'stale-flag',
+      title: 'Marks a summary of an edited source stale',
       detail:
-        'The stored `source_hash` (and each citation’s `chunk_hash`) is compared with the current hashes, and the changed chunks are reported: `stale` plus `stale_chunks`. The starter never compares hashes, so it serves a summary of text that no longer exists.',
+        "The response compares the current `source_hash` with the summary's (`stale`) and lists the cited chunks that changed (`stale_chunks`); the starter compares nothing.",
       match: {
-        python: {all: [/stale/, /source_hash/, /stale_chunks/]},
-        typescript: {all: [/stale/, /source_hash/, /stale_chunks/]},
-        go: {all: [/stale_chunks/, /source_hash/, /stale/]},
-        scala: {all: [/stale/, /sourceHash/, /staleChunks/]},
-        cpp: {all: [/stale/, /source_hash/, /stale_chunks/]},
+        python: {all: [/stale_chunks/, /source_hash["']\]\s*!=/]},
+        typescript: {all: [/stale_chunks/, /source_hash\s*!==/]},
+        go: {all: [/stale_chunks/, /SourceHash\s*!=/]},
+        scala: {all: [/stale_chunks/, /sourceHash\s*!=/]},
+        cpp: {all: [/stale_chunks/, /at\("source_hash"\)\s*!=/]},
       },
     },
     {
-      id: 'tenant-scoped-404',
-      title: 'Another tenant’s id is 404',
+      id: 'citation-quotes',
+      title: 'Quotes a citation only while its chunk is unchanged',
       detail:
-        'The tenant header is required and the lookup is scoped to it, so a foreign or unknown id answers **404** — not another tenant’s summary and not a **403** that confirms the id exists. The starter loads the summary by id alone.',
+        "Each citation compares its `chunk_hash` with the chunk's current hash: unchanged, it quotes the text at its offsets; changed, `quote` is null and `stale` true. The starter slices the current chunk at the old offsets, which quotes text the summary never saw.",
       match: {
-        python: {all: [/X-Tenant-Id/, /status_code\s*=\s*404/]},
-        typescript: {all: [/X-Tenant-Id/, /code\(\s*404\s*\)/]},
-        go: {all: [/X-Tenant-Id/, /StatusNotFound/]},
-        scala: {all: [/X-Tenant-Id/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/X-Tenant-Id/, /\b404\b/]},
-      },
-    },
-    {
-      id: 'sentence-pointers',
-      title: 'Every pointer names the source hash it resolves into',
-      detail:
-        'Each citation carries its `sentence` index and the `source_hash` it was written against, and `resolve_citation` refuses a pointer whose hash does not match the summary’s, so a citation that no longer resolves is never returned as one. The starter has no resolver.',
-      match: {
-        python: {all: [/resolve_citation\(/, /sentence/, /source_hash/]},
-        typescript: {all: [/resolveCitation\(/, /sentence/, /source_hash/]},
-        go: {all: [/resolveCitation\(/, /sentence/, /source_hash/]},
-        scala: {all: [/resolveCitation\(/, /sentence/, /sourceHash/]},
-        cpp: {all: [/resolve_citation\(/, /sentence/, /source_hash/]},
+        python: {all: [/chunk_hashes/, /["']chunk_hash["']\]/, /["']quote["']/]},
+        typescript: {all: [/chunk_hashes/, /\.chunk_hash\b/, /quote/]},
+        go: {all: [/ChunkHashes/, /\.ChunkHash\b/, /"quote"/]},
+        scala: {all: [/chunkHashes/, /\.chunkHash\b/, /"quote"/]},
+        cpp: {all: [/chunk_hashes/, /"chunk_hash"/, /"quote"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI
+      starter: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from summarizer import store  # load_summary, find_summary, current_source
+
 app = FastAPI()
-logger = logging.getLogger("summarizer")
-
-
-class SummaryStore:
-    def get(self, summary_id: str) -> dict | None:
-        """The summary stored under this id, whoever owns it."""
-        raise NotImplementedError
-
-
-store = SummaryStore()
 
 
 @app.get("/v1/summaries/{summary_id}")
-def read_summary(summary_id: str) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    summary = store.get(summary_id)
-    if summary is None:
+def read_summary(summary_id: str, request: Request) -> JSONResponse:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    record = store.find_summary(summary_id)
+    if record is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    logger.info("read summary_id=%s", summary_id)
-    return JSONResponse(summary, status_code=200)
+    current = store.current_source(record["tenant"], record["source_ref"])
+    chunks = current["chunks"] if current else []
+    citations = []
+    for c in record["citations"]:
+        chunk = chunks[c["chunk_index"]] if c["chunk_index"] < len(chunks) else ""
+        citations.append({**c, "quote": chunk[c["char_start"] : c["char_end"]]})
+    fields = ("summary_id", "source_ref", "source_hash", "band", "kind", "summary")
+    return JSONResponse({**{name: record[name] for name in fields}, "citations": citations})
 `,
-      solution: `import logging
-
-from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from summarizer import store  # load_summary, find_summary, current_source
+
 app = FastAPI()
-logger = logging.getLogger("summarizer")
-
-
-class SummaryStore:
-    def get(self, tenant: str, summary_id: str) -> dict | None:
-        """The summary with this id, if the tenant owns it."""
-        raise NotImplementedError
-
-    def source_hash(self, source_ref: str) -> str | None:
-        """The content hash of the source as it is now."""
-        raise NotImplementedError
-
-    def chunk_hashes(self, source_ref: str) -> dict[int, str]:
-        """The current content hash of every chunk of the source."""
-        raise NotImplementedError
-
-
-store = SummaryStore()
-
-
-def resolve_citation(citation: dict, source_hash: str) -> dict | None:
-    """A citation only points into the source hash it was written against."""
-    if citation["source_hash"] != source_hash:
-        return None
-    return {
-        "sentence": citation["sentence"],
-        "chunk_index": citation["chunk_index"],
-        "char_start": citation["char_start"],
-        "char_end": citation["char_end"],
-        "source_hash": source_hash,
-    }
 
 
 @app.get("/v1/summaries/{summary_id}")
-def read_summary(
-    summary_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-
-    summary = store.get(tenant, summary_id)
-    if summary is None:
-        # Another tenant's id is indistinguishable from an id that does not exist.
-        raise HTTPException(status_code=404, detail="summary not found")
-
-    current_hash = store.source_hash(summary["source_ref"])
-    current_chunks = store.chunk_hashes(summary["source_ref"])
-    stale_chunks: list[int] = []
-    citations = []
-    for citation in summary["citations"]:
-        stale = (
-            citation["source_hash"] != current_hash
-            or current_chunks.get(citation["chunk_index"]) != citation["chunk_hash"]
-        )
-        if stale:
-            stale_chunks.append(citation["chunk_index"])
-        citations.append(
-            {
-                **citation,
-                "resolved": resolve_citation(citation, summary["source_hash"]) is not None,
-                "stale": stale,
-            }
-        )
-
-    logger.info("read tenant=%s summary_id=%s stale_chunks=%s", tenant, summary_id, stale_chunks)
-    return JSONResponse(
-        {
-            "summary_id": summary_id,
-            "source_ref": summary["source_ref"],
-            "source_hash": summary["source_hash"],
-            "summary": summary["summary"],
-            "kind": summary["kind"],
-            "citations": citations,
-            "stale": len(stale_chunks) > 0,
-            "stale_chunks": stale_chunks,
-        },
-        status_code=200,
-    )
+def read_summary(summary_id: str, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "X-Tenant-Id is required"}, status_code=401)
+    # Scoped to the caller: another tenant's id is as absent as an id nobody minted.
+    record = store.load_summary(tenant, summary_id)
+    if record is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    current = store.current_source(tenant, record["source_ref"])
+    chunks = current["chunks"] if current else []
+    hashes = current["chunk_hashes"] if current else []
+    citations, stale_chunks = [], set()
+    for c in record["citations"]:
+        i = c["chunk_index"]
+        fresh = i < len(hashes) and hashes[i] == c["chunk_hash"]
+        if not fresh:
+            stale_chunks.add(i)  # the text this citation points at is gone
+        citations.append({**c, "stale": not fresh, "quote": chunks[i][c["char_start"] : c["char_end"]] if fresh else None})
+    fields = ("summary_id", "source_ref", "source_hash", "band", "kind", "summary")
+    return JSONResponse({
+        **{name: record[name] for name in fields},
+        "stale": current is None or current["source_hash"] != record["source_hash"],
+        "stale_chunks": sorted(stale_chunks),
+        "citations": citations,
+    })
 `,
     },
     typescript: {
-      starter: `/** GET /v1/summaries/{id}: the starter returns whatever it loads. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {currentSource, findSummary, loadSummary} from 'summarizer/store';
 
 export const app = Fastify();
-
-interface Summary {
-  summary_id: string;
-  source_ref: string;
-  source_hash: string;
-  summary: string;
-  kind: string;
-  citations: unknown[];
-}
-
-const store = {
-  async get(_summaryId: string): Promise<Summary | null> {
-    throw new Error('summary store not wired');
-  },
-};
 
 app.get('/v1/summaries/:summary_id', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const {summary_id: summaryId} = request.params as {summary_id: string};
-  const summary = await store.get(summaryId);
-  if (summary === null) return reply.code(404).send({error: 'not found'});
-  request.log.info({summary_id: summaryId}, 'read summary');
-  return reply.code(200).send(summary);
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const {summary_id} = request.params as {summary_id: string};
+  const record = await findSummary(summary_id);
+  if (record === null) return reply.code(404).send({error: 'not found'});
+  const current = await currentSource(record.tenant, record.source_ref);
+  const chunks = current?.chunks ?? [];
+  const citations = record.citations.map(c => ({...c, quote: (chunks[c.chunk_index] ?? '').slice(c.char_start, c.char_end)}));
+  const {source_ref, source_hash, band, kind, summary} = record;
+  return {summary_id, source_ref, source_hash, band, kind, summary, citations};
 });
 `,
-      solution: `/** GET /v1/summaries/{id}: the summary with citations into the source it came from. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {currentSource, findSummary, loadSummary} from 'summarizer/store';
 
 export const app = Fastify();
-
-interface Citation {
-  sentence: number;
-  chunk_index: number;
-  char_start: number;
-  char_end: number;
-  source_hash: string;
-  chunk_hash: string;
-}
-
-interface Summary {
-  summary_id: string;
-  source_ref: string;
-  source_hash: string;
-  summary: string;
-  kind: string;
-  citations: Citation[];
-}
-
-const store = {
-  async get(_tenant: string, _summaryId: string): Promise<Summary | null> {
-    throw new Error('summary store not wired');
-  },
-  async sourceHash(_sourceRef: string): Promise<string | null> {
-    throw new Error('source index not wired');
-  },
-  async chunkHashes(_sourceRef: string): Promise<Record<number, string>> {
-    throw new Error('source index not wired');
-  },
-};
-
-/** A citation only points into the source hash it was written against. */
-function resolveCitation(citation: Citation, source_hash: string): Citation | null {
-  return citation.source_hash === source_hash ? citation : null;
-}
 
 app.get('/v1/summaries/:summary_id', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-
-  const {summary_id: summaryId} = request.params as {summary_id: string};
-  const summary = await store.get(tenant, summaryId);
-  // Another tenant's id is indistinguishable from an id that does not exist.
-  if (summary === null) return reply.code(404).send({error: 'summary not found'});
-
-  const currentHash = await store.sourceHash(summary.source_ref);
-  const currentChunks = await store.chunkHashes(summary.source_ref);
-  const staleChunks: number[] = [];
-  const citations = summary.citations.map(citation => {
-    const stale =
-      citation.source_hash !== currentHash || currentChunks[citation.chunk_index] !== citation.chunk_hash;
-    if (stale) staleChunks.push(citation.chunk_index);
-    return {...citation, resolved: resolveCitation(citation, summary.source_hash) !== null, stale};
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const {summary_id} = request.params as {summary_id: string};
+  // Scoped to the caller: another tenant's id is as absent as an id nobody minted.
+  const record = await loadSummary(tenant, summary_id);
+  if (record === null) return reply.code(404).send({error: 'not found'});
+  const current = await currentSource(tenant, record.source_ref);
+  const chunks = current?.chunks ?? [];
+  const hashes = current?.chunk_hashes ?? [];
+  const staleChunks = new Set<number>();
+  const citations = record.citations.map(c => {
+    const fresh = hashes[c.chunk_index] === c.chunk_hash;
+    if (!fresh) staleChunks.add(c.chunk_index); // the text this citation points at is gone
+    return {...c, stale: !fresh, quote: fresh ? chunks[c.chunk_index].slice(c.char_start, c.char_end) : null};
   });
-
-  request.log.info({tenant, summary_id: summaryId, stale_chunks: staleChunks}, 'read summary');
-  return reply.code(200).send({
-    summary_id: summaryId,
-    source_ref: summary.source_ref,
-    source_hash: summary.source_hash,
-    summary: summary.summary,
-    kind: summary.kind,
+  const {source_ref, source_hash, band, kind, summary} = record;
+  return {
+    summary_id,
+    source_ref,
+    source_hash,
+    band,
+    kind,
+    summary,
+    stale: current === null || current.source_hash !== record.source_hash,
+    stale_chunks: [...staleChunks].sort((a, b) => a - b),
     citations,
-    stale: staleChunks.length > 0,
-    stale_chunks: staleChunks,
-  });
+  };
 });
 `,
     },
@@ -329,266 +210,189 @@ app.get('/v1/summaries/:summary_id', async (request, reply) => {
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"summarizer/store" // store.LoadSummary, FindSummary, CurrentSource
 )
 
-type Summary struct {
-	SummaryID  string \`json:"summary_id"\`
-	SourceRef  string \`json:"source_ref"\`
-	SourceHash string \`json:"source_hash"\`
-	Summary    string \`json:"summary"\`
-	Kind       string \`json:"kind"\`
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
-type SummaryStore interface {
-	Get(summaryID string) *Summary
-}
-
-type unimplementedStore struct{}
-
-func newSummaryStore() SummaryStore { return unimplementedStore{} }
-
-func (unimplementedStore) Get(summaryID string) *Summary { panic("summary store not wired") }
-
-func handleReadSummary(store SummaryStore) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-		summary := store.Get(r.PathValue("summary_id"))
-		if summary == nil {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
-			return
-		}
-		log.Printf("read summary_id=%s", summary.SummaryID)
-		writeJSON(w, http.StatusOK, summary)
+func readSummary(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	record := store.FindSummary(r.Context(), r.PathValue("summary_id"))
+	if record == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
 	}
+	var chunks []string
+	if current := store.CurrentSource(r.Context(), record.Tenant, record.SourceRef); current != nil {
+		chunks = current.Chunks
+	}
+	citations := []map[string]any{}
+	for _, c := range record.Citations {
+		quote := ""
+		if c.ChunkIndex < len(chunks) && c.CharEnd <= len(chunks[c.ChunkIndex]) {
+			quote = chunks[c.ChunkIndex][c.CharStart:c.CharEnd]
+		}
+		citations = append(citations, map[string]any{
+			"sentence": c.Sentence, "chunk_index": c.ChunkIndex, "char_start": c.CharStart, "char_end": c.CharEnd, "chunk_hash": c.ChunkHash, "quote": quote,
+		})
+	}
+	writeJSON(rw, http.StatusOK, map[string]any{
+		"summary_id": record.SummaryID, "source_ref": record.SourceRef, "source_hash": record.SourceHash, "band": record.Band,
+		"kind": record.Kind, "summary": record.Summary, "citations": citations,
+	})
 }
 
-func main() {
-	store := newSummaryStore()
-	http.HandleFunc("GET /v1/summaries/{summary_id}", handleReadSummary(store))
-	log.Fatal(http.ListenAndServe(":8443", nil))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/summaries/{summary_id}", readSummary)
 }
 `,
       solution: `package main
 
 import (
-	"log"
+	"encoding/json"
 	"net/http"
+	"sort"
+
+	"summarizer/store" // store.LoadSummary, FindSummary, CurrentSource
 )
 
-type Citation struct {
-	Sentence   int    \`json:"sentence"\`
-	ChunkIndex int    \`json:"chunk_index"\`
-	CharStart  int    \`json:"char_start"\`
-	CharEnd    int    \`json:"char_end"\`
-	SourceHash string \`json:"source_hash"\`
-	ChunkHash  string \`json:"chunk_hash"\`
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
-type Summary struct {
-	SummaryID  string     \`json:"summary_id"\`
-	SourceRef  string     \`json:"source_ref"\`
-	SourceHash string     \`json:"source_hash"\`
-	Summary    string     \`json:"summary"\`
-	Kind       string     \`json:"kind"\`
-	Citations  []Citation \`json:"citations"\`
-}
-
-type SummaryStore interface {
-	Get(tenant, summaryID string) *Summary
-	SourceHash(sourceRef string) (string, bool)
-	ChunkHashes(sourceRef string) map[int]string
-}
-
-// resolveCitation: a citation only points into the source hash it was written against.
-func resolveCitation(citation Citation, sourceHash string) *Citation {
-	if citation.SourceHash != sourceHash {
-		return nil
+func readSummary(rw http.ResponseWriter, r *http.Request) {
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
+		return
 	}
-	return &citation
-}
-
-func handleReadSummary(store SummaryStore) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tenant := r.Header.Get("X-Tenant-Id")
-		if tenant == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "missing X-Tenant-Id"})
-			return
+	// Scoped to the caller: another tenant's id is as absent as an id nobody minted.
+	record := store.LoadSummary(r.Context(), tenant, r.PathValue("summary_id"))
+	if record == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	current := store.CurrentSource(r.Context(), tenant, record.SourceRef)
+	var chunks, hashes []string
+	if current != nil {
+		chunks = current.Chunks
+		hashes = current.ChunkHashes
+	}
+	citations := []map[string]any{}
+	staleChunks := []int{}
+	seen := map[int]bool{}
+	for _, c := range record.Citations {
+		fresh := c.ChunkIndex < len(hashes) && hashes[c.ChunkIndex] == c.ChunkHash
+		var quote any
+		if fresh {
+			quote = chunks[c.ChunkIndex][c.CharStart:c.CharEnd]
+		} else if !seen[c.ChunkIndex] {
+			seen[c.ChunkIndex] = true // the text this citation points at is gone
+			staleChunks = append(staleChunks, c.ChunkIndex)
 		}
-		summaryID := r.PathValue("summary_id")
-		summary := store.Get(tenant, summaryID)
-		// Another tenant's id is indistinguishable from an id that does not exist.
-		if summary == nil {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "summary not found"})
-			return
-		}
-		currentHash, current := store.SourceHash(summary.SourceRef)
-		currentChunks := store.ChunkHashes(summary.SourceRef)
-		staleChunks := []int{}
-		citations := make([]map[string]any, 0, len(summary.Citations))
-		for _, citation := range summary.Citations {
-			stale := !current || citation.SourceHash != currentHash || currentChunks[citation.ChunkIndex] != citation.ChunkHash
-			if stale {
-				staleChunks = append(staleChunks, citation.ChunkIndex)
-			}
-			citations = append(citations, map[string]any{
-				"sentence":    citation.Sentence,
-				"chunk_index": citation.ChunkIndex,
-				"char_start":  citation.CharStart,
-				"char_end":    citation.CharEnd,
-				"source_hash": citation.SourceHash,
-				"resolved":    resolveCitation(citation, summary.SourceHash) != nil,
-				"stale":       stale,
-			})
-		}
-		log.Printf("read tenant=%s summary_id=%s stale_chunks=%d", tenant, summaryID, len(staleChunks))
-		writeJSON(w, http.StatusOK, map[string]any{
-			"summary_id":   summaryID,
-			"source_ref":   summary.SourceRef,
-			"source_hash":  summary.SourceHash,
-			"summary":      summary.Summary,
-			"kind":         summary.Kind,
-			"citations":    citations,
-			"stale":        len(staleChunks) > 0,
-			"stale_chunks": staleChunks,
+		citations = append(citations, map[string]any{
+			"sentence": c.Sentence, "chunk_index": c.ChunkIndex, "char_start": c.CharStart, "char_end": c.CharEnd, "chunk_hash": c.ChunkHash,
+			"stale": !fresh, "quote": quote,
 		})
 	}
+	sort.Ints(staleChunks)
+	writeJSON(rw, http.StatusOK, map[string]any{
+		"summary_id": record.SummaryID, "source_ref": record.SourceRef, "source_hash": record.SourceHash, "band": record.Band,
+		"kind": record.Kind, "summary": record.Summary,
+		"stale":        current == nil || current.SourceHash != record.SourceHash,
+		"stale_chunks": staleChunks,
+		"citations":    citations,
+	})
 }
 
-func main() {
-	store := newSummaryStore()
-	http.HandleFunc("GET /v1/summaries/{summary_id}", handleReadSummary(store))
-	log.Fatal(http.ListenAndServe(":8443", nil))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/summaries/{summary_id}", readSummary)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-case class Summary(summaryId: String, sourceRef: String, sourceHash: String, summary: String, kind: String)
+import summarizer.Store // Store.loadSummary, findSummary, currentSource
 
-trait SummaryStore {
-  def get(summaryId: String): Option[Summary]
-}
+object Read {
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-object SummaryReadApi extends DefaultJsonProtocol {
-  implicit val summaryFormat: RootJsonFormat[Summary] = jsonFormat5(Summary)
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("summarizer")
-    val store: SummaryStore = new SummaryStore {
-      def get(summaryId: String): Option[Summary] = throw new NotImplementedError("store")
-    }
-
-    val route =
-      path("v1" / "summaries" / Segment) { summaryId =>
-        get {
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          store.get(summaryId) match {
-            case None        => complete(StatusCodes.NotFound, "not found")
-            case Some(value) => complete(StatusCodes.OK, value.toJson.compactPrint)
-          }
+  private def respond(summaryId: String): HttpResponse = {
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    Store.findSummary(summaryId) match {
+      case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("not found")))
+      case Some(record) =>
+        val chunks = Store.currentSource(record.tenant, record.sourceRef).map(_.chunks).getOrElse(Vector.empty)
+        val citations = record.citations.map { c =>
+          val chunk = chunks.lift(c.chunkIndex).getOrElse("")
+          JsObject(Store.citationJson(c).fields + ("quote" -> JsString(chunk.slice(c.charStart, c.charEnd))))
         }
-      }
+        val view = Store.toJson(record).fields.filter { case (name, _) => Set("summary_id", "source_ref", "source_hash", "band", "kind", "summary")(name) }
+        json(StatusCodes.OK, JsObject(view + ("citations" -> JsArray(citations))))
+    }
+  }
 
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  val route: Route = path("v1" / "summaries" / Segment) { summaryId =>
+    get {
+      complete(respond(summaryId))
+    }
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-case class Citation(sentence: Int, chunkIndex: Int, charStart: Int, charEnd: Int, sourceHash: String, chunkHash: String)
-case class Summary(
-    summaryId: String,
-    sourceRef: String,
-    sourceHash: String,
-    summary: String,
-    kind: String,
-    citations: List[Citation]
-)
+import summarizer.Store // Store.loadSummary, findSummary, currentSource
 
-trait SummaryStore {
-  def get(tenant: String, summaryId: String): Option[Summary]
-  def sourceHash(sourceRef: String): Option[String]
-  def chunkHashes(sourceRef: String): Map[Int, String]
-}
+object Read {
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-object SummaryReadApi extends DefaultJsonProtocol {
-  implicit val citationFormat: RootJsonFormat[Citation] = jsonFormat6(Citation)
-  implicit val summaryFormat: RootJsonFormat[Summary] = jsonFormat6(Summary)
-
-  /** A citation only points into the source hash it was written against. */
-  def resolveCitation(citation: Citation, sourceHash: String): Option[Citation] =
-    if (citation.sourceHash == sourceHash) Some(citation) else None
-
-  def main(args: Array[String]): Unit = {
-    implicit val system: ActorSystem = ActorSystem("summarizer")
-    val store: SummaryStore = new SummaryStore {
-      def get(tenant: String, summaryId: String): Option[Summary] = throw new NotImplementedError("store")
-      def sourceHash(sourceRef: String): Option[String] = throw new NotImplementedError("source index")
-      def chunkHashes(sourceRef: String): Map[Int, String] = throw new NotImplementedError("source index")
-    }
-
-    val route =
-      path("v1" / "summaries" / Segment) { summaryId =>
-        get {
-          optionalHeaderValueByName("X-Tenant-Id") { tenant =>
-            tenant match {
-              case None => complete(StatusCodes.Unauthorized, "missing X-Tenant-Id")
-              case Some(id) =>
-                store.get(id, summaryId) match {
-                  case None =>
-                    // Another tenant's id is indistinguishable from an id that does not exist.
-                    complete(StatusCodes.NotFound, "summary not found")
-                  case Some(summary) =>
-                    val currentHash = store.sourceHash(summary.sourceRef)
-                    val currentChunks = store.chunkHashes(summary.sourceRef)
-                    val staleChunks = summary.citations
-                      .filter { citation =>
-                        !currentHash.contains(citation.sourceHash) ||
-                        !currentChunks.get(citation.chunkIndex).contains(citation.chunkHash)
-                      }
-                      .map(_.chunkIndex)
-                    val citations = summary.citations.map { citation =>
-                      JsObject(
-                        "sentence" -> JsNumber(citation.sentence),
-                        "chunk_index" -> JsNumber(citation.chunkIndex),
-                        "char_start" -> JsNumber(citation.charStart),
-                        "char_end" -> JsNumber(citation.charEnd),
-                        "source_hash" -> JsString(citation.sourceHash),
-                        "resolved" -> JsBoolean(resolveCitation(citation, summary.sourceHash).isDefined),
-                        "stale" -> JsBoolean(staleChunks.contains(citation.chunkIndex))
-                      )
-                    }
-                    complete(
-                      StatusCodes.OK,
-                      JsObject(
-                        "summary_id" -> JsString(summaryId),
-                        "source_ref" -> JsString(summary.sourceRef),
-                        "source_hash" -> JsString(summary.sourceHash),
-                        "summary" -> JsString(summary.summary),
-                        "kind" -> JsString(summary.kind),
-                        "citations" -> JsArray(citations.toVector),
-                        "stale" -> JsBoolean(staleChunks.nonEmpty),
-                        "stale_chunks" -> JsArray(staleChunks.distinct.sorted.map(JsNumber(_)).toVector)
-                      ).compactPrint
-                    )
-                }
-            }
+  private def respond(tenant: String, summaryId: String): HttpResponse =
+    if (tenant.isEmpty) json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required")))
+    else
+      // Scoped to the caller: another tenant's id is as absent as an id nobody minted.
+      Store.loadSummary(tenant, summaryId) match {
+        case None => json(StatusCodes.NotFound, JsObject("error" -> JsString("not found")))
+        case Some(record) =>
+          val current = Store.currentSource(tenant, record.sourceRef)
+          val chunks = current.map(_.chunks).getOrElse(Vector.empty)
+          val hashes = current.map(_.chunkHashes).getOrElse(Vector.empty)
+          val fresh = record.citations.map(c => hashes.lift(c.chunkIndex).contains(c.chunkHash))
+          val citations = record.citations.zip(fresh).map { case (c, ok) =>
+            val quote = if (ok) JsString(chunks(c.chunkIndex).substring(c.charStart, c.charEnd)) else JsNull
+            JsObject(Store.citationJson(c).fields ++ Map("stale" -> JsBoolean(!ok), "quote" -> quote))
           }
-        }
+          // The cited chunks whose text is gone.
+          val staleChunks = record.citations.zip(fresh).collect { case (c, false) => c.chunkIndex }.distinct.sorted
+          val view = Store.toJson(record).fields.filter { case (name, _) => Set("summary_id", "source_ref", "source_hash", "band", "kind", "summary")(name) }
+          json(StatusCodes.OK, JsObject(view ++ Map(
+            "stale" -> JsBoolean(current.forall(_.sourceHash != record.sourceHash)),
+            "stale_chunks" -> JsArray(staleChunks.map(i => JsNumber(i))),
+            "citations" -> JsArray(citations))))
       }
 
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  val route: Route = path("v1" / "summaries" / Segment) { summaryId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        complete(respond(tenant.getOrElse(""), summaryId))
+      }
+    }
   }
 }
 `,
@@ -599,151 +403,431 @@ object SummaryReadApi extends DefaultJsonProtocol {
 
 #include <string>
 
+#include "summarizer/store.h"  // summarizer::store::loadSummary, findSummary, currentSource
+
 using json = nlohmann::json;
+namespace store = summarizer::store;
 
-struct SummaryStore {
-  virtual json get(const std::string& summary_id) = 0;
-};
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/summaries/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    static SummaryStore& store = *static_cast<SummaryStore*>(nullptr);
-    const json summary = store.get(req.matches[1]);
-    if (summary.is_null()) {
-      res.status = 404;
-      res.set_content(json{{"error", "not found"}}.dump(), "application/json");
-      return;
-    }
-    res.status = 200;
-    res.set_content(summary.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+void read_summary(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const std::string summary_id = req.matches[1];
+  const auto record = store::findSummary(summary_id);
+  if (!record) return reply(res, 404, {{"error", "not found"}});
+  const auto current = store::currentSource(record->at("tenant").get<std::string>(), record->at("source_ref").get<std::string>());
+  const json chunks = current ? current->at("chunks") : json::array();
+  json citations = json::array();
+  for (json c : record->at("citations")) {
+    const size_t i = c.at("chunk_index").get<size_t>();
+    const std::string chunk = i < chunks.size() ? chunks[i].get<std::string>() : "";
+    const size_t start = c.at("char_start").get<size_t>();
+    c["quote"] = start < chunk.size() ? chunk.substr(start, c.at("char_end").get<size_t>() - start) : "";
+    citations.push_back(c);
+  }
+  json body = json::object();
+  for (const char* name : {"summary_id", "source_ref", "source_hash", "band", "kind", "summary"}) body[name] = record->at(name);
+  body["citations"] = citations;
+  reply(res, 200, body);
+}
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/summaries/([\\w-]+))", read_summary); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
-#include <map>
-#include <stdexcept>
+#include <set>
 #include <string>
-#include <vector>
+
+#include "summarizer/store.h"  // summarizer::store::loadSummary, findSummary, currentSource
 
 using json = nlohmann::json;
+namespace store = summarizer::store;
 
-struct Citation {
-  int sentence = 0;
-  int chunk_index = 0;
-  int char_start = 0;
-  int char_end = 0;
-  std::string source_hash;
-  std::string chunk_hash;
-};
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-struct Summary {
-  std::string summary_id;
-  std::string source_ref;
-  std::string source_hash;
-  std::string summary;
-  std::string kind;
-  std::vector<Citation> citations;
-};
-
-/// The summary store, scoped by tenant; the source index answers what the source looks like now.
-struct SummaryStore {
-  virtual json get(const std::string& tenant, const std::string& summary_id) = 0;
-  virtual std::string source_hash(const std::string& source_ref) = 0;
-  virtual std::map<int, std::string> chunk_hashes(const std::string& source_ref) = 0;
-};
-
-/** Placeholder for the store the service is started with. */
-struct PostgresSummaryStore : SummaryStore {
-  json get(const std::string&, const std::string&) override { throw std::logic_error("summary store not wired"); }
-  std::string source_hash(const std::string&) override { throw std::logic_error("source index not wired"); }
-  std::map<int, std::string> chunk_hashes(const std::string&) override {
-    throw std::logic_error("source index not wired");
+void read_summary(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "X-Tenant-Id is required"}});
+  const std::string summary_id = req.matches[1];
+  // Scoped to the caller: another tenant's id is as absent as an id nobody minted.
+  const auto record = store::loadSummary(tenant, summary_id);
+  if (!record) return reply(res, 404, {{"error", "not found"}});
+  const auto current = store::currentSource(tenant, record->at("source_ref").get<std::string>());
+  const json chunks = current ? current->at("chunks") : json::array();
+  const json chunk_hashes = current ? current->at("chunk_hashes") : json::array();
+  json citations = json::array();
+  std::set<long> stale_chunks;
+  for (json c : record->at("citations")) {
+    const size_t i = c.at("chunk_index").get<size_t>();
+    const bool fresh = i < chunk_hashes.size() && chunk_hashes[i] == c.at("chunk_hash");
+    if (!fresh) stale_chunks.insert(static_cast<long>(i));  // the text this citation points at is gone
+    const size_t start = c.at("char_start").get<size_t>();
+    c["stale"] = !fresh;
+    c["quote"] = fresh ? json(chunks[i].get<std::string>().substr(start, c.at("char_end").get<size_t>() - start)) : json(nullptr);
+    citations.push_back(c);
   }
-};
-
-static PostgresSummaryStore store;
-
-/// A citation only points into the source hash it was written against.
-static bool resolve_citation(const Citation& citation, const std::string& source_hash) {
-  return citation.source_hash == source_hash;
+  json body = json::object();
+  for (const char* name : {"summary_id", "source_ref", "source_hash", "band", "kind", "summary"}) body[name] = record->at(name);
+  body["stale"] = !current || current->at("source_hash") != record->at("source_hash");
+  body["stale_chunks"] = stale_chunks;
+  body["citations"] = citations;
+  reply(res, 200, body);
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/summaries/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(json{{"error", "missing X-Tenant-Id"}}.dump(), "application/json");
-      return;
-    }
-    const auto summary_id = req.matches[1];
-    const json summary = store.get(tenant, summary_id);
-    // Another tenant's id is indistinguishable from an id that does not exist.
-    if (summary.is_null()) {
-      res.status = 404;
-      res.set_content(json{{"error", "summary not found"}}.dump(), "application/json");
-      return;
-    }
-    const auto source_ref = summary.value("source_ref", std::string());
-    const auto current_hash = store.source_hash(source_ref);
-    const auto current_chunks = store.chunk_hashes(source_ref);
-    std::vector<int> stale_chunks;
-    json citations = json::array();
-    for (const auto& item : summary.value("citations", json::array())) {
-      const Citation citation{item.value("sentence", 0),   item.value("chunk_index", 0), item.value("char_start", 0),
-                              item.value("char_end", 0),   item.value("source_hash", std::string()),
-                              item.value("chunk_hash", std::string())};
-      const auto current = current_chunks.find(citation.chunk_index);
-      const bool stale = citation.source_hash != current_hash ||
-                         current == current_chunks.end() || current->second != citation.chunk_hash;
-      if (stale) stale_chunks.push_back(citation.chunk_index);
-      citations.push_back(json{{"sentence", citation.sentence},
-                               {"chunk_index", citation.chunk_index},
-                               {"char_start", citation.char_start},
-                               {"char_end", citation.char_end},
-                               {"source_hash", citation.source_hash},
-                               {"resolved", resolve_citation(citation, summary.value("source_hash", std::string()))},
-                               {"stale", stale}});
-    }
-    res.status = 200;
-    res.set_content(json{{"summary_id", summary_id},
-                         {"source_ref", source_ref},
-                         {"source_hash", summary.value("source_hash", std::string())},
-                         {"summary", summary.value("summary", std::string())},
-                         {"kind", summary.value("kind", std::string())},
-                         {"citations", citations},
-                         {"stale", !stale_chunks.empty()},
-                         {"stale_chunks", stale_chunks}}
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/summaries/([\\w-]+))", read_summary); }
 `,
     },
   },
+  harness: {
+    python: `from summarizer import store
+
+DOC = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down."
+EDITED = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned."
+SENTENCES = ["The board met on 3 March.", "Revenue rose four percent in the quarter.", "The audit committee approved the accounts.", "Two directors stepped down."]
+
+
+def _seed():
+    return store.create_summary("t1", "doc-1", DOC, "medium", 250)["summary_id"]
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+async def _get(c, summary_id, tenant="t1"):
+    return await c.get(f"/v1/summaries/{summary_id}", headers={"X-Tenant-Id": tenant} if tenant else {})
+
+
+async def check_route(ctx):
+    summary_id = _seed()
+    async with _api(ctx) as c:
+        r = await _get(c, summary_id)
+        assert r.status_code == 200, f"GET /v1/summaries/{summary_id} answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("summary") == " ".join(SENTENCES), f"the response must carry the stored summary, got {body.get('summary')!r}"
+        quotes = [c.get("quote") for c in body.get("citations", [])]
+        assert quotes == SENTENCES, f"each citation must quote the sentence it points at, got {quotes}"
+        missing = await _get(c, "s-99")
+    assert missing.status_code == 404, f"an unknown id answered {missing.status_code}, expected 404"
+
+
+async def check_tenant_scope(ctx):
+    summary_id = _seed()
+    async with _api(ctx) as c:
+        foreign = await _get(c, summary_id, tenant="t2")
+        assert foreign.status_code == 404, f"tenant t2 reading t1's summary {summary_id} answered {foreign.status_code}: the lookup must be scoped to the caller's tenant, expected 404"
+        assert "board" not in foreign.text, f"the answer to t2 carries t1's text: {foreign.text[:200]}"
+        anon = await _get(c, summary_id, tenant=None)
+    assert anon.status_code == 401, f"a read without X-Tenant-Id answered {anon.status_code}, expected 401"
+
+
+async def check_stale_flag(ctx):
+    summary_id = _seed()
+    async with _api(ctx) as c:
+        fresh = (await _get(c, summary_id)).json()
+        assert fresh.get("stale") is False and fresh.get("stale_chunks") == [], f"before any edit the summary must be stale false with no stale_chunks, got stale={fresh.get('stale')!r} stale_chunks={fresh.get('stale_chunks')!r}"
+        store.put_source("t1", "doc-1", EDITED)
+        edited = (await _get(c, summary_id)).json()
+    assert edited.get("stale") is True, f"after the source was edited the summary answered stale={edited.get('stale')!r}: a reader takes a summary of text that no longer exists for the current one"
+    assert edited.get("stale_chunks") == [1], f"only chunk 1 changed, stale_chunks is {edited.get('stale_chunks')!r}"
+
+
+async def check_citation_quotes(ctx):
+    summary_id = _seed()
+    store.put_source("t1", "doc-1", EDITED)
+    async with _api(ctx) as c:
+        body = (await _get(c, summary_id)).json()
+    citations = body.get("citations", [])
+    assert len(citations) == 4, f"the summary has four cited sentences, the response carries {len(citations)} citations"
+    for cite, sentence in zip(citations, SENTENCES):
+        if cite.get("chunk_index") == 0:
+            assert cite.get("quote") == sentence and cite.get("stale") is False, f"a citation into the unchanged chunk 0 must quote {sentence!r} and be stale false, got {cite}"
+        else:
+            assert cite.get("quote") is None and cite.get("stale") is True, f"a citation into the edited chunk 1 answered quote {cite.get('quote')!r}, stale {cite.get('stale')!r}: the old offsets now slice text the summary never saw. Expected quote null, stale true"
+`,
+    typescript: `const DOC = 'The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down.';
+const EDITED = 'The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned.';
+const SENTENCES = ['The board met on 3 March.', 'Revenue rose four percent in the quarter.', 'The audit committee approved the accounts.', 'Two directors stepped down.'];
+
+async function read(ctx) {
+  const store = ctx.load('/support/summarizer/store.ts');
+  const {summary_id} = await store.createSummary('t1', 'doc-1', DOC, 'medium', 250);
+  const c = ctx.client(ctx.load('read').app);
+  const get = (id: string, tenant: string | null = 't1') => c.get(\`/v1/summaries/\${id}\`, {headers: tenant === null ? {} : {'X-Tenant-Id': tenant}});
+  return {store, summaryId: summary_id as string, get};
+}
+
+export async function check_route(ctx) {
+  const {summaryId, get} = await read(ctx);
+  const r = await get(summaryId);
+  assert.equal(r.status, 200, \`GET /v1/summaries/\${summaryId} answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert.equal(body.summary, SENTENCES.join(' '), \`the response must carry the stored summary, got \${JSON.stringify(body.summary)}\`);
+  const quotes = (body.citations ?? []).map(c => c.quote);
+  assert.deepStrictEqual(quotes, SENTENCES, \`each citation must quote the sentence it points at, got \${JSON.stringify(quotes)}\`);
+  const missing = await get('s-99');
+  assert.equal(missing.status, 404, \`an unknown id answered \${missing.status}, expected 404\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {summaryId, get} = await read(ctx);
+  const foreign = await get(summaryId, 't2');
+  assert.equal(foreign.status, 404, \`tenant t2 reading t1's summary \${summaryId} answered \${foreign.status}: the lookup must be scoped to the caller's tenant, expected 404\`);
+  assert(!foreign.text.includes('board'), \`the answer to t2 carries t1's text: \${foreign.text.slice(0, 200)}\`);
+  const anon = await get(summaryId, null);
+  assert.equal(anon.status, 401, \`a read without X-Tenant-Id answered \${anon.status}, expected 401\`);
+}
+
+export async function check_stale_flag(ctx) {
+  const {store, summaryId, get} = await read(ctx);
+  const fresh = (await get(summaryId)).json();
+  assert(fresh.stale === false && JSON.stringify(fresh.stale_chunks) === '[]', \`before any edit the summary must be stale false with no stale_chunks, got stale=\${JSON.stringify(fresh.stale)} stale_chunks=\${JSON.stringify(fresh.stale_chunks)}\`);
+  await store.putSource('t1', 'doc-1', EDITED);
+  const edited = (await get(summaryId)).json();
+  assert.equal(edited.stale, true, \`after the source was edited the summary answered stale=\${JSON.stringify(edited.stale)}: a reader takes a summary of text that no longer exists for the current one\`);
+  assert.deepStrictEqual(edited.stale_chunks, [1], \`only chunk 1 changed, stale_chunks is \${JSON.stringify(edited.stale_chunks)}\`);
+}
+
+export async function check_citation_quotes(ctx) {
+  const {store, summaryId, get} = await read(ctx);
+  await store.putSource('t1', 'doc-1', EDITED);
+  const citations = (await get(summaryId)).json().citations ?? [];
+  assert.equal(citations.length, 4, \`the summary has four cited sentences, the response carries \${citations.length} citations\`);
+  citations.forEach((cite, i) => {
+    if (cite.chunk_index === 0) {
+      assert(cite.quote === SENTENCES[i] && cite.stale === false, \`a citation into the unchanged chunk 0 must quote \${JSON.stringify(SENTENCES[i])} and be stale false, got \${JSON.stringify(cite)}\`);
+    } else {
+      assert(cite.quote === null && cite.stale === true, \`a citation into the edited chunk 1 answered quote \${JSON.stringify(cite.quote)}, stale \${JSON.stringify(cite.stale)}: the old offsets now slice text the summary never saw. Expected quote null, stale true\`);
+    }
+  });
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"summarizer/store"
+
+	"leetbuild/harness"
+)
+
+const (
+	readDoc    = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down."
+	readEdited = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned."
+)
+
+var readSentences = []string{"The board met on 3 March.", "Revenue rose four percent in the quarter.", "The audit committee approved the accounts.", "Two directors stepped down."}
+
+type readCitation struct {
+	ChunkIndex int     \`json:"chunk_index"\`
+	Stale      *bool   \`json:"stale"\`
+	Quote      *string \`json:"quote"\`
+}
+
+type readBody struct {
+	Summary     string         \`json:"summary"\`
+	Stale       *bool          \`json:"stale"\`
+	StaleChunks []int          \`json:"stale_chunks"\`
+	Citations   []readCitation \`json:"citations"\`
+}
+
+func readSetup(ctx *harness.Ctx) (*harness.HTTP, string) {
+	record := store.CreateSummary(context.Background(), "t1", "doc-1", readDoc, "medium", 250)
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux), record.SummaryID
+}
+
+func readGet(c *harness.HTTP, summaryID, tenant string) *harness.Response {
+	if tenant == "" {
+		return c.Get("/v1/summaries/" + summaryID)
+	}
+	return c.Get("/v1/summaries/"+summaryID, "X-Tenant-Id", tenant)
+}
+
+func readDecode(r *harness.Response) readBody {
+	var b readBody
+	r.Decode(&b)
+	return b
+}
+
+func show(p any) string {
+	switch v := p.(type) {
+	case *bool:
+		if v != nil {
+			if *v {
+				return "true"
+			}
+			return "false"
+		}
+	case *string:
+		if v != nil {
+			return "\\"" + *v + "\\""
+		}
+	}
+	return "null"
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c, summaryID := readSetup(ctx)
+	r := readGet(c, summaryID, "t1")
+	ctx.Equal(r.Status, 200, "GET /v1/summaries/%s (%s)", summaryID, r.Text())
+	body := readDecode(r)
+	ctx.Equal(body.Summary, strings.Join(readSentences, " "), "the response must carry the stored summary")
+	var quotes []string
+	for _, cite := range body.Citations {
+		if cite.Quote != nil {
+			quotes = append(quotes, *cite.Quote)
+		}
+	}
+	ctx.Equal(quotes, readSentences, "each citation must quote the sentence it points at")
+	ctx.Equal(readGet(c, "s-99", "t1").Status, 404, "an unknown id")
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	c, summaryID := readSetup(ctx)
+	foreign := readGet(c, summaryID, "t2")
+	ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's summary %s (the lookup must be scoped to the caller's tenant)", summaryID)
+	ctx.Assert(!strings.Contains(foreign.Text(), "board"), "the answer to t2 carries t1's text: %.200s", foreign.Text())
+	ctx.Equal(readGet(c, summaryID, "").Status, 401, "a read without X-Tenant-Id")
+}
+
+func CheckStaleFlag(ctx *harness.Ctx) {
+	c, summaryID := readSetup(ctx)
+	fresh := readDecode(readGet(c, summaryID, "t1"))
+	ctx.Assert(fresh.Stale != nil && !*fresh.Stale && fresh.StaleChunks != nil && len(fresh.StaleChunks) == 0, "before any edit the summary must be stale false with no stale_chunks, got stale=%s stale_chunks=%v", show(fresh.Stale), fresh.StaleChunks)
+	store.PutSource(context.Background(), "t1", "doc-1", readEdited)
+	edited := readDecode(readGet(c, summaryID, "t1"))
+	ctx.Assert(edited.Stale != nil && *edited.Stale, "after the source was edited the summary answered stale=%s: a reader takes a summary of text that no longer exists for the current one", show(edited.Stale))
+	ctx.Equal(edited.StaleChunks, []int{1}, "only chunk 1 changed; stale_chunks")
+}
+
+func CheckCitationQuotes(ctx *harness.Ctx) {
+	c, summaryID := readSetup(ctx)
+	store.PutSource(context.Background(), "t1", "doc-1", readEdited)
+	citations := readDecode(readGet(c, summaryID, "t1")).Citations
+	ctx.Equal(len(citations), 4, "the summary has four cited sentences; the citations")
+	for i, cite := range citations {
+		if cite.ChunkIndex == 0 {
+			ctx.Assert(cite.Quote != nil && *cite.Quote == readSentences[i] && cite.Stale != nil && !*cite.Stale, "a citation into the unchanged chunk 0 must quote %q and be stale false, got quote %s stale %s", readSentences[i], show(cite.Quote), show(cite.Stale))
+		} else {
+			ctx.Assert(cite.Quote == nil && cite.Stale != nil && *cite.Stale, "a citation into the edited chunk 1 answered quote %s, stale %s: the old offsets now slice text the summary never saw. Expected quote null, stale true", show(cite.Quote), show(cite.Stale))
+		}
+	}
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "summarizer/store.h"
+
+namespace {
+
+const std::string kReadDoc =
+    "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down.";
+const std::string kReadEdited =
+    "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned.";
+const std::vector<std::string> kSentences = {"The board met on 3 March.", "Revenue rose four percent in the quarter.", "The audit committee approved the accounts.",
+                                             "Two directors stepped down."};
+
+struct ReadSetup {
+  harness::HTTP c;
+  std::string summary_id;
+};
+
+ReadSetup readSetup(harness::Ctx& ctx) {
+  const auto record = summarizer::store::createSummary("t1", "doc-1", kReadDoc, "medium", 250);
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return {ctx.HTTP(*svr), record.at("summary_id").get<std::string>()};
+}
+
+harness::Response readGet(harness::HTTP& c, const std::string& summary_id, const std::string& tenant) {
+  if (tenant.empty()) return c.Get("/v1/summaries/" + summary_id);
+  return c.Get("/v1/summaries/" + summary_id, "X-Tenant-Id", tenant);
+}
+
+nlohmann::json readBody(harness::Ctx& ctx, const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(body.is_object(), "the response is not a JSON object: %d %.200s", r.Status, r.Text());
+  return body;
+}
+
+std::string show(const nlohmann::json& body, const char* name) { return body.contains(name) ? body[name].dump() : "absent"; }
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto [c, summary_id] = readSetup(ctx);
+  const auto r = readGet(c, summary_id, "t1");
+  ctx.Equal(r.Status, 200, "GET /v1/summaries/%s (%s)", summary_id, r.Text());
+  const auto body = readBody(ctx, r);
+  ctx.Equal(body.value("summary", ""), kSentences[0] + " " + kSentences[1] + " " + kSentences[2] + " " + kSentences[3], "the response must carry the stored summary");
+  std::vector<std::string> quotes;
+  for (const auto& cite : body.value("citations", nlohmann::json::array())) {
+    if (cite.contains("quote") && cite["quote"].is_string()) quotes.push_back(cite["quote"].get<std::string>());
+  }
+  ctx.Equal(quotes, kSentences, "each citation must quote the sentence it points at");
+  ctx.Equal(readGet(c, "s-99", "t1").Status, 404, "an unknown id");
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  auto [c, summary_id] = readSetup(ctx);
+  const auto foreign = readGet(c, summary_id, "t2");
+  ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's summary %s (the lookup must be scoped to the caller's tenant)", summary_id);
+  ctx.Assert(foreign.Text().find("board") == std::string::npos, "the answer to t2 carries t1's text: %.200s", foreign.Text());
+  ctx.Equal(readGet(c, summary_id, "").Status, 401, "a read without X-Tenant-Id");
+}
+
+void CheckStaleFlag(harness::Ctx& ctx) {
+  auto [c, summary_id] = readSetup(ctx);
+  const auto fresh = readBody(ctx, readGet(c, summary_id, "t1"));
+  ctx.Assert(fresh.value("stale", nlohmann::json()) == false && fresh.value("stale_chunks", nlohmann::json()) == nlohmann::json::array(),
+             "before any edit the summary must be stale false with no stale_chunks, got stale=%s stale_chunks=%s", show(fresh, "stale"), show(fresh, "stale_chunks"));
+  summarizer::store::putSource("t1", "doc-1", kReadEdited);
+  const auto edited = readBody(ctx, readGet(c, summary_id, "t1"));
+  ctx.Assert(edited.value("stale", nlohmann::json()) == true, "after the source was edited the summary answered stale=%s: a reader takes a summary of text that no longer exists for the current one", show(edited, "stale"));
+  ctx.Equal(edited.value("stale_chunks", nlohmann::json()), nlohmann::json::array({1}), "only chunk 1 changed; stale_chunks");
+}
+
+void CheckCitationQuotes(harness::Ctx& ctx) {
+  auto [c, summary_id] = readSetup(ctx);
+  summarizer::store::putSource("t1", "doc-1", kReadEdited);
+  const auto citations = readBody(ctx, readGet(c, summary_id, "t1")).value("citations", nlohmann::json::array());
+  ctx.Equal(citations.size(), 4, "the summary has four cited sentences; the citations");
+  for (size_t i = 0; i < citations.size(); i++) {
+    const auto& cite = citations[i];
+    if (cite.value("chunk_index", -1L) == 0) {
+      ctx.Assert(cite.value("quote", nlohmann::json()) == kSentences[i] && cite.value("stale", nlohmann::json()) == false,
+                 "a citation into the unchanged chunk 0 must quote %q and be stale false, got %s", kSentences[i], cite.dump());
+    } else {
+      ctx.Assert(cite.value("quote", nlohmann::json(0)).is_null() && cite.value("stale", nlohmann::json()) == true,
+                 "a citation into the edited chunk 1 answered quote %s, stale %s: the old offsets now slice text the summary never saw. Expected quote null, stale true", show(cite, "quote"), show(cite, "stale"));
+    }
+  }
+}
+`,
+  },
   hints: [
-    'A reader asks which paragraph a sentence came from; the response cannot say. After an author rewrites section 3, its old summary still reads as current. A leaked id works across tenants.',
-    '`read_summary` takes no tenant header and calls `store.get(summary_id)`, so the id is the whole lookup. The stored record carries `source_hash` and `citations` that the handler drops and compares against nothing.',
-    'Read `X-Tenant-Id` (401 if absent) and call `store.get(tenant, summary_id)`. Map each citation through `resolve_citation`; compare `source_hash` and `chunk_hash` with the current ones and fill `stale` and `stale_chunks`.',
+    "Read a summary with another tenant's header and it comes back in full; edit the source and the summary still reads as current, with a citation quoting words the summary never used.",
+    'The lookup is `find_summary`, which ignores the tenant. Nothing compares the stored hashes with the current source, and the quote slices whatever text now sits at the old offsets.',
+    'Require `X-Tenant-Id`, load with `store.load_summary(tenant, id)`, compare `current["source_hash"]` for `stale`, and per citation compare `chunk_hashes[i]` with `chunk_hash`: quote when equal, `None` plus `stale` and an entry in `stale_chunks` otherwise.',
   ],
-  debrief: `Citations make a summary auditable: sentence to chunk, with character offsets and the hash the
-pointer was written against. The hash is also what lets them survive edits: an edit produces a new
-content hash, so pointers into the chunks that changed are known to be stale and get marked instead
-of quietly misleading a reader, and a timestamp could not say which chunks moved. Tenant scoping is
-the security half of the same idea: a summary is derived from someone's document, so an id alone is
-not enough to read it, and a foreign id answers like a missing one so the endpoint cannot be used to
-enumerate ids. Production services add a re-summarization job for stale summaries, and an audit log
-of who read which summary.`,
+  debrief: `Scoping the lookup to the tenant and answering 404 for a foreign id means the endpoint never confirms that someone else's summary exists. The chunk hash stored with each citation is what lets the read tell an unchanged sentence from one whose text moved: offsets alone point at bytes, the hash says whether they are still the bytes the summary was written from. Marking stale per citation keeps the parts that still hold usable instead of discarding the whole summary. A production read also re-summarizes stale chunks in the background, records which summary version a reader saw, and lets the console's cross-tenant lookup exist only behind an audited support role.`,
 };

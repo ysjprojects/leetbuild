@@ -2,126 +2,83 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Session events keyed by session with redacted traces',
+  title: 'browser.step events keyed by session, redacted, appended before the commit',
   concept: 'kafka',
   file: 'events',
   focus: ['worker', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Starting point.** The starter's \`POST /internal/sessions/{id}/steps\` builds a \`browser.step\` event from the request body, logs it and produces it keyed by \`step_index\` on a default producer; its \`trace-store\` consumer commits the offset before appending the record. It serves the demo and hides five flaws.
+**Starting point.** The starter is the event path of the steps \`run_action\` makes:
+\`publish_step(step)\` produces \`step_event(step)\` to \`browser.step\` on an idempotent producer
+with \`acks=all\`, keyed by the step index, and \`run_trace_consumer()\` reads the topic in group
+\`trace-store\`, commits each record and appends it to the trace with \`trace.append_step\`. It
+serves the demo and hides three flaws.
 
-**Failure mode the checks target.** Keyed by \`step_index\`, one session's trace spreads across partitions and lands out of order. The payload carries \`typed_values\` and is logged, so a typed password reaches the topic and the log aggregator. Committing before the append drops a step on crash. With no dedupe key, a retry duplicates a step and a rejected produce vanishes.
+**Failure mode the checks target.** One session's steps spread across partitions and reach the
+trace out of order; the record is the whole step, so the password a \`type\` action typed and every
+URL the browser visited sit in a retained topic; a consumer that dies between its commit and its
+append loses that step for good.
 
-Every completed driver action produces **exactly one** \`browser.step\` record; the \`trace-store\` consumer builds the trace.
-
-- The record's **key is the session id**: one session, one partition, ordered steps.
-- The payload carries \`session_id\`, \`step_index\`, \`action\`, \`target_digest\`, \`outcome\`, \`redacted_fields\`, nothing else; typed values stay out of topic and logs.
-- Redaction is a helper: \`REDACTED_FIELDS\` plus \`redact(typed_input)\` keep only field **names**; the target is a sha256 digest.
-- The producer is **idempotent with \`acks=all\`**; each record carries an \`idempotency_key\` of \`{session_id}:{step_index}\`.
-- The consumer **appends to the trace store first and commits the offset last**.
-- A rejected produce leaves a \`record_pending_step(...)\` on \`session:{id}\` for a relay; the session does not fail.`,
+- The record key is the **session id**.
+- \`step_event\` carries \`session_id\`, \`step_index\`, \`action\`, \`outcome\`, \`reason\` and
+  \`target_digest\` (\`trace.digest(target)\`), nothing else: no \`text\`, \`target\` or \`url\`.
+- The consumer **appends first and commits after**; a redelivered step overwrites itself in the
+  trace.`,
   sequence: {
-    participants: ['Worker', 'Session state', 'browser.step', 'Trace consumer', 'Trace store'],
+    participants: ['Worker', 'browser.step', 'Trace consumer', 'Trace store'],
     messages: [
-      {from: 'Worker', to: 'Session state', label: 'CLAIM · RENEW lease (session:{id})', kind: 'sync'},
-      {from: 'Session state', to: 'Worker', label: 'lease + steps left', kind: 'reply'},
-      {from: 'Worker', to: 'browser.step', label: 'produce · key = session id · acks = all', kind: 'sync'},
-      {from: 'browser.step', to: 'Worker', label: 'ack / broker error', kind: 'reply'},
       {
         from: 'Worker',
-        to: 'Session state',
-        label: 'record_pending_step(session:{id}) when the broker rejects',
+        to: 'browser.step',
+        label: 'produce · key = session id · {action, outcome, target_digest}',
         kind: 'sync',
       },
-      {from: 'browser.step', to: 'Trace consumer', label: 'consume · group trace-store', kind: 'async'},
-      {from: 'Trace consumer', to: 'Trace consumer', label: 'redact typed input → field names', kind: 'sync'},
-      {from: 'Trace consumer', to: 'Trace store', label: 'append step (session_id, step_index)', kind: 'sync'},
-      {from: 'Trace store', to: 'Trace consumer', label: 'step persisted', kind: 'reply'},
-      {from: 'Trace consumer', to: 'browser.step', label: 'commit offset after the append', kind: 'async'},
+      {from: 'browser.step', to: 'Trace consumer', label: 'poll · group trace-store', kind: 'async'},
+      {from: 'Trace consumer', to: 'Trace store', label: 'append_step(session_id, event)', kind: 'sync'},
+      {from: 'Trace consumer', to: 'browser.step', label: 'commit offset', kind: 'sync'},
     ],
   },
   checks: [
     {
       id: 'session-key',
-      title: 'Keys every event by the session id',
+      title: 'Keyed by session id',
       detail:
-        'The produced record is keyed by the **session id** — one session, one partition, so its steps are consumed in order. The starter keys by the step index, so two steps of the same session land in different partitions and the trace is written out of order.',
+        'The record key is the session id, so one session’s steps share a partition and stay in order; the starter keys by the step index, which spreads a session over every partition.',
       match: {
-        python: {all: [/key=session_id/], none: [/key=step_index/]},
-        typescript: {all: [/key:\s*sessionId\b/], none: [/key:\s*stepIndex\b/]},
-        go: {all: [/Key:\s*\[\]byte\(sessionID\)/], none: [/Key:\s*\[\]byte\(stepKey\)/]},
+        python: {all: [/key=step\[["']session_id["']\]/], none: [/key=str\(step\[["']step_index/]},
+        typescript: {all: [/key:\s*step\.session_id/], none: [/key:\s*String\(step\.step_index\)/]},
+        go: {all: [/Key:\s*\[\]byte\(step\.SessionID\)/], none: [/strconv\.Itoa\(step\.StepIndex\)/]},
         scala: {
-          all: [/ProducerRecord\("browser\.step",\s*sessionId/],
-          none: [/ProducerRecord\("browser\.step",\s*stepIndex/],
+          all: [/ProducerRecord\[String, String\]\(Topic,\s*step\.sessionId/],
+          none: [/step\.stepIndex\.toString/],
         },
-        cpp: {all: [/produce\([^;\n]*sessionId\.data\(\)/], none: [/produce\([^;\n]*stepKey\.data\(\)/]},
+        cpp: {all: [/step\.session_id\.c_str\(\)/], none: [/std::to_string\(step\.step_index\)/]},
       },
     },
     {
       id: 'no-typed-values',
-      title: 'Never publishes the typed values',
+      title: 'Carries a target digest, never typed text, targets or URLs',
       detail:
-        'Typed input is reduced by the compile-time `redact(...)` helper before the record is built: the payload carries field names and a digest, never the values the agent typed into the page. The starter adds `typed_values` "for debugging" and logs the whole event.',
+        'The event is built from `session_id`, `step_index`, `action`, `outcome`, `reason` and `target_digest` (the provided digest of the target); the starter copies the whole step, typed text and URL included.',
       match: {
-        python: {all: [/def redact\(/], none: [/typed_values/]},
-        typescript: {all: [/function redact\(/], none: [/typed_values/]},
-        go: {all: [/func redact\(/], none: [/typed_values/]},
-        scala: {all: [/def redact\(/], none: [/typed_values/]},
-        cpp: {all: [/redact\(typedInput\)/], none: [/typed_values/]},
+        python: {all: [/trace\.digest\(/, /target_digest/], none: [/dict\(step\)|\*\*step\b/]},
+        typescript: {all: [/digest\(step\.target\)/, /target_digest/], none: [/\.\.\.step\b/]},
+        go: {all: [/trace\.Digest\(/, /target_digest/], none: [/json\.Marshal\(step\)/]},
+        scala: {all: [/Trace\.digest\(/, /target_digest/], none: [/"text"\s*->/]},
+        cpp: {all: [/trace::digest\(/, /target_digest/], none: [/\{"text",/]},
       },
     },
     {
-      id: 'redacted-fields',
-      title: 'Reduces typed input to field names and the target to a digest',
+      id: 'append-before-commit',
+      title: 'Appends to the trace before committing the offset',
       detail:
-        'A `REDACTED_FIELDS` constant names the sensitive fields and a `redact(...)` helper returns the **names** of the fields the agent filled; the target is published as a digest. A payload built straight from the request body carries the password itself into the topic.',
+        'The consumer calls `append_step`/`appendStep` and only then commits, so a crash between the two redelivers the step instead of losing it.',
       match: {
-        python: {all: [/REDACTED_FIELDS/, /def redact\(/, /sha256/]},
-        typescript: {all: [/REDACTED_FIELDS/, /function redact\(/, /createHash\(\s*'sha256'\s*\)/]},
-        go: {all: [/redactedFields/, /func redact\(/, /sha256\.Sum256/]},
-        scala: {all: [/RedactedFields/, /def redact\(/, /MessageDigest/]},
-        cpp: {all: [/kRedactedFields/, /redact\(typedInput\)/, /targetDigest/]},
-      },
-    },
-    {
-      id: 'store-before-commit',
-      title: 'Appends the trace before committing the offset',
-      detail:
-        'The consumer appends the step to the trace store **before** it commits the offset, so a crash between the two replays the record instead of losing it. The starter commits first: the offset then claims a step the trace never received.',
-      match: {
-        python: {order: [/store\.append_step\(/, /consumer\.commit\(/]},
-        typescript: {order: [/store\.appendStep\(/, /commitOffsets\(/]},
-        go: {order: [/store\.AppendStep\(/, /CommitMessages\(/]},
-        scala: {order: [/TraceStore\.appendStep\(/, /commitSync\(/]},
-        cpp: {order: [/store\.appendStep\(/, /commitSync\(/]},
-      },
-    },
-    {
-      id: 'producer-durability',
-      title: 'Produces idempotently, deduped per (session, step)',
-      detail:
-        'The producer is configured for idempotence and `acks=all` and each record carries an `idempotency_key` of `{session_id}:{step_index}`, so a retry cannot duplicate a step. A produce the broker rejects records a pending step on `session:{id}` instead of being dropped. The starter ships a default producer with no dedupe key and ignores the produce result.',
-      match: {
-        python: {
-          all: [/enable\.idempotence/, /"acks":\s*"all"/, /idempotency_key/, /store\.record_pending_step\(/],
-        },
-        typescript: {
-          all: [/idempotent:\s*true/, /acks:\s*-1/, /idempotency_key/, /store\.recordPendingStep\(/],
-        },
-        go: {
-          all: [
-            /RequiredAcks:\s*kafka\.RequireAll/,
-            /Balancer:\s*&kafka\.Hash\{\}/,
-            /idempotency_key/,
-            /store\.RecordPendingStep\(/,
-          ],
-        },
-        scala: {
-          all: [/enable\.idempotence/, /"acks"/, /idempotency_key/, /TraceStore\.recordPendingStep\(/],
-        },
-        cpp: {
-          all: [/enable\.idempotence/, /set\("acks",\s*"all"/, /idempotency_key/, /store\.recordPendingStep\(/],
-        },
+        python: {order: [/trace\.append_step\(/, /consumer\.commit\(/]},
+        typescript: {order: [/appendStep\(/, /commitOffsets\(/]},
+        go: {order: [/trace\.AppendStep\(/, /CommitMessages\(/]},
+        scala: {order: [/Trace\.appendStep\(/, /commitSync\(/]},
+        cpp: {order: [/trace::appendStep\(/, /commitSync\(/]},
       },
     },
   ],
@@ -131,309 +88,174 @@ Every completed driver action produces **exactly one** \`browser.step\` record; 
 import logging
 
 from confluent_kafka import Consumer, Producer
-from fastapi import FastAPI
-from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("browser-worker")
-
-producer = Producer({"bootstrap.servers": "kafka:9092"})
+from browser import trace  # digest, append_step
 
 TOPIC = "browser.step"
+GROUP = "trace-store"
+log = logging.getLogger("browser.events")
+
+producer = Producer({"bootstrap.servers": "kafka:9092", "enable.idempotence": True, "acks": "all"})
 
 
-class StepEvent(BaseModel):
-    step_index: int
-    action: str
-    target: str
-    typed_input: dict[str, str]
-    outcome: str
+def on_delivery(err, msg) -> None:
+    if err is not None:
+        log.warning("browser.step not delivered: %s", err)
 
 
-class SessionStore:
-    def append_step(self, session_id: str, step_index: int, event: dict) -> None:
-        """Append one redacted step to the session trace."""
-        raise NotImplementedError
-
-    def record_pending_step(self, session_id: str, step_index: int, event: dict) -> None:
-        """Durable pending step on session:{id}; a relay republishes it."""
-        raise NotImplementedError
+def step_event(step: dict) -> dict:
+    """The browser.step record of one step run_action made."""
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    return dict(step)
 
 
-store = SessionStore()
+def publish_step(step: dict) -> None:
+    producer.produce(TOPIC, key=str(step["step_index"]), value=json.dumps(step_event(step)), on_delivery=on_delivery)
+    producer.flush(5.0)
 
 
-@app.post("/internal/sessions/{session_id}/steps")
-def publish_step(session_id: str, body: StepEvent) -> dict:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    event = {
-        "session_id": session_id,
-        "step_index": body.step_index,
-        "action": body.action,
-        "target_digest": body.target,
-        "outcome": body.outcome,
-        "typed_values": body.typed_input,
-    }
-    logger.info("browser.step %s", event)
-    producer.produce(TOPIC, key=body.step_index, value=json.dumps(event))
-    producer.flush()
-    return {"accepted": True}
-
-
-def consume() -> None:
-    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "trace-store"})
+def run_trace_consumer() -> None:
+    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": GROUP, "enable.auto.commit": False, "auto.offset.reset": "earliest"})
     consumer.subscribe([TOPIC])
     while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
+        record = consumer.poll(1.0)
+        if record is None or record.error():
             continue
-        event = json.loads(msg.value())
-        consumer.commit(msg)
-        store.append_step(event["session_id"], event["step_index"], event)
+        consumer.commit(record, asynchronous=False)
+        event = json.loads(record.value())
+        trace.append_step(event["session_id"], event)
 `,
-      solution: `import hashlib
-import json
+      solution: `import json
+import logging
 
-from confluent_kafka import Consumer, KafkaException, Producer
-from fastapi import FastAPI
-from pydantic import BaseModel
+from confluent_kafka import Consumer, Producer
 
-app = FastAPI()
-
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
-        "max.in.flight.requests.per.connection": 1,
-    }
-)
+from browser import trace  # digest, append_step
 
 TOPIC = "browser.step"
-REDACTED_FIELDS = ("password", "card", "token")
+GROUP = "trace-store"
+EVENT_FIELDS = ("session_id", "step_index", "action", "outcome", "reason")
+log = logging.getLogger("browser.events")
+
+producer = Producer({"bootstrap.servers": "kafka:9092", "enable.idempotence": True, "acks": "all"})
 
 
-class StepEvent(BaseModel):
-    step_index: int
-    action: str
-    target: str
-    typed_input: dict[str, str]
-    outcome: str
+def on_delivery(err, msg) -> None:
+    if err is not None:
+        log.warning("browser.step not delivered: %s", err)
 
 
-class SessionStore:
-    def append_step(self, session_id: str, step_index: int, event: dict) -> None:
-        """Append one redacted step to the session trace."""
-        raise NotImplementedError
-
-    def record_pending_step(self, session_id: str, step_index: int, event: dict) -> None:
-        """Durable pending step on session:{id}; a relay republishes it."""
-        raise NotImplementedError
+def step_event(step: dict) -> dict:
+    """The browser.step record of one step run_action made."""
+    # What happened, not what the browser saw: no typed text, no selector, no URL.
+    event = {name: step[name] for name in EVENT_FIELDS}
+    event["target_digest"] = trace.digest(step["target"])
+    return event
 
 
-store = SessionStore()
+def publish_step(step: dict) -> None:
+    producer.produce(TOPIC, key=step["session_id"], value=json.dumps(step_event(step)), on_delivery=on_delivery)
+    producer.flush(5.0)
 
 
-def redact(typed_input: dict[str, str]) -> list[str]:
-    """Typed input never leaves the worker: only the names of the filled fields travel."""
-    return sorted(name for name in typed_input if name.lower() in REDACTED_FIELDS)
-
-
-def target_digest(target: str) -> str:
-    return hashlib.sha256(target.encode("utf-8")).hexdigest()
-
-
-@app.post("/internal/sessions/{session_id}/steps")
-def publish_step(session_id: str, body: StepEvent) -> dict:
-    event = {
-        "session_id": session_id,
-        "step_index": body.step_index,
-        "action": body.action,
-        "target_digest": target_digest(body.target),
-        "outcome": body.outcome,
-        "redacted_fields": redact(body.typed_input),
-        "idempotency_key": f"{session_id}:{body.step_index}",
-    }
-    payload = json.dumps(event)
-    try:
-        producer.produce(TOPIC, key=session_id, value=payload)
-        producer.flush(2.0)
-    except KafkaException:
-        # The broker refused the record: keep it on the state key so the relay republishes it
-        # instead of losing a step the page really took.
-        store.record_pending_step(session_id, body.step_index, event)
-    return {"accepted": True}
-
-
-def consume() -> None:
-    consumer = Consumer(
-        {"bootstrap.servers": "kafka:9092", "group.id": "trace-store", "enable.auto.commit": False}
-    )
+def run_trace_consumer() -> None:
+    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": GROUP, "enable.auto.commit": False, "auto.offset.reset": "earliest"})
     consumer.subscribe([TOPIC])
     while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
+        record = consumer.poll(1.0)
+        if record is None or record.error():
             continue
-        event = json.loads(msg.value())
-        # Trace first, offset last: a crash in between replays the record into an idempotent append.
-        store.append_step(event["session_id"], event["step_index"], event)
-        consumer.commit(msg)
+        event = json.loads(record.value())
+        trace.append_step(event["session_id"], event)
+        consumer.commit(record, asynchronous=False)  # after the append: a crash in between redelivers
 `,
     },
     typescript: {
-      starter: `/** browser.step. */
-import Fastify from 'fastify';
-import {Kafka} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
 
-export const app = Fastify();
-const kafka = new Kafka({clientId: 'browser-worker', brokers: ['kafka:9092']});
-const producer = kafka.producer();
+import {type Step, type StepEvent, appendStep, digest} from 'browser/trace';
+
+export const TOPIC = 'browser.step';
+export const GROUP = 'trace-store';
+
+const kafka = new Kafka({clientId: 'browserd', brokers: ['kafka:9092']});
+export const producer = kafka.producer({idempotent: true}); // idempotent implies acks: -1 (all)
 void producer.connect();
 
-const TOPIC = 'browser.step';
-
-interface StepBody {
-  step_index: number;
-  action: string;
-  target: string;
-  typed_input: Record<string, string>;
-  outcome: string;
+/** The browser.step record of one step runAction made. */
+export function stepEvent(step: Step): StepEvent {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  return {...step};
 }
 
-interface SessionStore {
-  /** Append one redacted step to the session trace. */
-  appendStep(sessionId: string, stepIndex: number, event: unknown): Promise<void>;
-  /** Durable pending step on session:{id}; a relay republishes it. */
-  recordPendingStep(sessionId: string, stepIndex: number, event: unknown): Promise<void>;
-}
-
-declare const store: SessionStore;
-
-app.post('/internal/sessions/:sessionId/steps', async (request, reply) => {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const {sessionId} = request.params as {sessionId: string};
-  const body = request.body as StepBody;
-  const event = {
-    session_id: sessionId,
-    step_index: body.step_index,
-    action: body.action,
-    target_digest: body.target,
-    outcome: body.outcome,
-    typed_values: body.typed_input,
-  };
-  await producer.send({
-    topic: TOPIC,
-    messages: [{key: body.step_index, value: JSON.stringify(event)}],
-  });
-  return reply.code(202).send({accepted: true});
-});
-
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'trace-store'});
-  await consumer.connect();
-  await consumer.subscribe({topic: TOPIC});
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {
-        session_id: string;
-        step_index: number;
-      };
-      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-      await store.appendStep(event.session_id, event.step_index, event);
-    },
-  });
-}
-
-void app.listen({port: 9090, host: '0.0.0.0'});
-`,
-      solution: `/** browser.step: session-keyed, redacted and idempotent; trace appended before the commit. */
-import {createHash} from 'node:crypto';
-
-import Fastify from 'fastify';
-import {Kafka} from 'kafkajs';
-
-export const app = Fastify();
-const kafka = new Kafka({clientId: 'browser-worker', brokers: ['kafka:9092']});
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
-void producer.connect();
-
-const TOPIC = 'browser.step';
-const REDACTED_FIELDS = ['password', 'card', 'token'];
-
-interface StepBody {
-  step_index: number;
-  action: string;
-  target: string;
-  typed_input: Record<string, string>;
-  outcome: string;
-}
-
-interface SessionStore {
-  /** Append one redacted step to the session trace. */
-  appendStep(sessionId: string, stepIndex: number, event: unknown): Promise<void>;
-  /** Durable pending step on session:{id}; a relay republishes it. */
-  recordPendingStep(sessionId: string, stepIndex: number, event: unknown): Promise<void>;
-}
-
-declare const store: SessionStore;
-
-/** Typed input never leaves the worker: only the names of the filled fields travel. */
-function redact(typedInput: Record<string, string>): string[] {
-  return Object.keys(typedInput)
-    .filter(name => REDACTED_FIELDS.includes(name))
-    .sort();
-}
-
-function targetDigest(target: string): string {
-  return createHash('sha256').update(target).digest('hex');
-}
-
-app.post('/internal/sessions/:sessionId/steps', async (request, reply) => {
-  const {sessionId} = request.params as {sessionId: string};
-  const body = request.body as StepBody;
-  const event = {
-    session_id: sessionId,
-    step_index: body.step_index,
-    action: body.action,
-    target_digest: targetDigest(body.target),
-    outcome: body.outcome,
-    redacted_fields: redact(body.typed_input),
-    idempotency_key: \`\${sessionId}:\${body.step_index}\`,
-  };
+export async function publishStep(step: Step): Promise<void> {
   try {
-    await producer.send({
-      topic: TOPIC,
-      acks: -1,
-      messages: [{key: sessionId, value: JSON.stringify(event)}],
-    });
-  } catch (error) {
-    // The broker refused the record: keep it on the state key so the relay republishes it instead
-    // of losing a step the page really took.
-    await store.recordPendingStep(sessionId, body.step_index, event);
+    await producer.send({topic: TOPIC, messages: [{key: String(step.step_index), value: JSON.stringify(stepEvent(step))}], acks: -1});
+  } catch (err) {
+    console.warn(\`browser.step not delivered: \${(err as Error).message}\`);
   }
-  return reply.code(202).send({accepted: true});
-});
+}
 
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'trace-store'});
+export async function runTraceConsumer(): Promise<void> {
+  const consumer = kafka.consumer({groupId: GROUP});
   await consumer.connect();
-  await consumer.subscribe({topic: TOPIC});
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
   await consumer.run({
     autoCommit: false,
     eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {
-        session_id: string;
-        step_index: number;
-      };
-      // Trace first, offset last: a crash in between replays the record into an idempotent append.
-      await store.appendStep(event.session_id, event.step_index, event);
+      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
+      const event = JSON.parse(message.value?.toString() ?? '{}') as StepEvent;
+      await appendStep(event.session_id, event);
+    },
+  });
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+import {type Step, type StepEvent, appendStep, digest} from 'browser/trace';
+
+export const TOPIC = 'browser.step';
+export const GROUP = 'trace-store';
+
+const kafka = new Kafka({clientId: 'browserd', brokers: ['kafka:9092']});
+export const producer = kafka.producer({idempotent: true}); // idempotent implies acks: -1 (all)
+void producer.connect();
+
+/** The browser.step record of one step runAction made. */
+export function stepEvent(step: Step): StepEvent {
+  // What happened, not what the browser saw: no typed text, no selector, no URL.
+  return {
+    session_id: step.session_id,
+    step_index: step.step_index,
+    action: step.action,
+    outcome: step.outcome,
+    reason: step.reason,
+    target_digest: digest(step.target),
+  };
+}
+
+export async function publishStep(step: Step): Promise<void> {
+  try {
+    await producer.send({topic: TOPIC, messages: [{key: step.session_id, value: JSON.stringify(stepEvent(step))}], acks: -1});
+  } catch (err) {
+    console.warn(\`browser.step not delivered: \${(err as Error).message}\`);
+  }
+}
+
+export async function runTraceConsumer(): Promise<void> {
+  const consumer = kafka.consumer({groupId: GROUP});
+  await consumer.connect();
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const event = JSON.parse(message.value?.toString() ?? '{}') as StepEvent;
+      await appendStep(event.session_id, event);
+      // After the append: a crash in between redelivers.
       await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
     },
   });
 }
-
-void app.listen({port: 9090, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -442,73 +264,61 @@ void app.listen({port: 9090, host: '0.0.0.0'});
 import (
 	"context"
 	"encoding/json"
-	"net/http"
+	"log"
 	"strconv"
 
 	"github.com/segmentio/kafka-go"
+
+	"browser/trace" // trace.Step, Digest, AppendStep
 )
 
-const stepTopic = "browser.step"
+const (
+	topic = "browser.step"
+	group = "trace-store"
+)
 
-var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: stepTopic}
+// kafka-go has no idempotent mode: RequireAll is what it can promise.
+var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: topic, Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll}
 
-type SessionStore struct{}
-
-// AppendStep appends one redacted step to the session trace.
-func (s *SessionStore) AppendStep(ctx context.Context, sessionID string, stepIndex int, event map[string]any) error {
-	return nil
+// stepEvent is the browser.step record of one step runAction made.
+func stepEvent(step trace.Step) map[string]any {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	raw, _ := json.Marshal(step)
+	event := map[string]any{}
+	json.Unmarshal(raw, &event)
+	return event
 }
 
-// RecordPendingStep keeps the event on session:{id} when the broker rejects the produce.
-func (s *SessionStore) RecordPendingStep(ctx context.Context, sessionID string, stepIndex int, event map[string]any) error {
-	return nil
-}
-
-var store = &SessionStore{}
-
-func publishStep(rw http.ResponseWriter, r *http.Request) {
-	sessionID := r.PathValue("session_id")
-	body := struct {
-		StepIndex  int            \`json:"step_index"\`
-		Action     string         \`json:"action"\`
-		Target     string         \`json:"target"\`
-		TypedInput map[string]any \`json:"typed_input"\`
-		Outcome    string         \`json:"outcome"\`
-	}{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	event := map[string]any{
-		"session_id":    sessionID,
-		"step_index":    body.StepIndex,
-		"action":        body.Action,
-		"target_digest": body.Target,
-		"outcome":       body.Outcome,
-		"typed_values":  body.TypedInput,
+func publishStep(ctx context.Context, step trace.Step) error {
+	value, err := json.Marshal(stepEvent(step))
+	if err != nil {
+		return err
 	}
-	payload, _ := json.Marshal(event)
-	stepKey := strconv.Itoa(body.StepIndex)
-	_ = writer.WriteMessages(r.Context(), kafka.Message{Key: []byte(stepKey), Value: payload})
-	rw.WriteHeader(http.StatusAccepted)
+	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(strconv.Itoa(step.StepIndex)), Value: value}); err != nil {
+		log.Printf("browser.step not delivered: %v", err)
+		return err
+	}
+	return nil
 }
 
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   stepTopic,
-		GroupID: "trace-store",
-	})
+func runTraceConsumer(ctx context.Context) error {
+	reader := kafka.NewReader(kafka.ReaderConfig{Brokers: []string{"kafka:9092"}, GroupID: group, Topic: topic})
 	for {
 		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
+			return err
+		}
+		if err := reader.CommitMessages(ctx, msg); err != nil {
+			return err
+		}
+		event := map[string]any{}
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
 			continue
 		}
-		var event struct {
-			SessionID string \`json:"session_id"\`
-			StepIndex int    \`json:"step_index"\`
+		sessionID, _ := event["session_id"].(string)
+		if err := trace.AppendStep(ctx, sessionID, event); err != nil {
+			return err
 		}
-		_ = json.Unmarshal(msg.Value, &event)
-		_ = reader.CommitMessages(ctx, msg)
-		_ = store.AppendStep(ctx, event.SessionID, event.StepIndex, map[string]any{"payload": string(msg.Value)})
 	}
 }
 `,
@@ -516,108 +326,66 @@ func consume(ctx context.Context) {
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"net/http"
-	"strconv"
+	"log"
 
 	"github.com/segmentio/kafka-go"
+
+	"browser/trace" // trace.Step, Digest, AppendStep
 )
 
-const stepTopic = "browser.step"
+const (
+	topic = "browser.step"
+	group = "trace-store"
+)
 
-// RequiredAcks=RequireAll with a stable hash balancer is the kafka-go equivalent of an idempotent
-// producer: the record is acknowledged only once replicated, and a retry of the same key lands on
-// the same partition instead of duplicating across them.
-var writer = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        stepTopic,
-	RequiredAcks: kafka.RequireAll,
-	Balancer:     &kafka.Hash{},
-	Async:        false,
+// kafka-go has no idempotent mode: RequireAll is what it can promise.
+var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: topic, Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll}
+
+// stepEvent is the browser.step record of one step runAction made.
+func stepEvent(step trace.Step) map[string]any {
+	// What happened, not what the browser saw: no typed text, no selector, no URL.
+	return map[string]any{
+		"session_id":    step.SessionID,
+		"step_index":    step.StepIndex,
+		"action":        step.Action,
+		"outcome":       step.Outcome,
+		"reason":        step.Reason,
+		"target_digest": trace.Digest(step.Target),
+	}
 }
 
-var redactedFields = map[string]bool{"password": true, "card": true, "token": true}
-
-type SessionStore struct{}
-
-// AppendStep appends one redacted step to the session trace.
-func (s *SessionStore) AppendStep(ctx context.Context, sessionID string, stepIndex int, event map[string]any) error {
+func publishStep(ctx context.Context, step trace.Step) error {
+	value, err := json.Marshal(stepEvent(step))
+	if err != nil {
+		return err
+	}
+	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(step.SessionID), Value: value}); err != nil {
+		log.Printf("browser.step not delivered: %v", err)
+		return err
+	}
 	return nil
 }
 
-// RecordPendingStep keeps the event on session:{id} when the broker rejects the produce.
-func (s *SessionStore) RecordPendingStep(ctx context.Context, sessionID string, stepIndex int, event map[string]any) error {
-	return nil
-}
-
-var store = &SessionStore{}
-
-// redact turns typed input into the names of the filled fields; the values never leave the worker.
-func redact(typedInput map[string]any) []string {
-	names := make([]string, 0, len(typedInput))
-	for name := range typedInput {
-		if redactedFields[name] {
-			names = append(names, name)
-		}
-	}
-	return names
-}
-
-func targetDigest(target string) string {
-	sum := sha256.Sum256([]byte(target))
-	return hex.EncodeToString(sum[:])
-}
-
-func publishStep(rw http.ResponseWriter, r *http.Request) {
-	sessionID := r.PathValue("session_id")
-	body := struct {
-		StepIndex  int            \`json:"step_index"\`
-		Action     string         \`json:"action"\`
-		Target     string         \`json:"target"\`
-		TypedInput map[string]any \`json:"typed_input"\`
-		Outcome    string         \`json:"outcome"\`
-	}{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	event := map[string]any{
-		"session_id":      sessionID,
-		"step_index":      body.StepIndex,
-		"action":          body.Action,
-		"target_digest":   targetDigest(body.Target),
-		"outcome":         body.Outcome,
-		"redacted_fields": redact(body.TypedInput),
-		"idempotency_key": sessionID + ":" + strconv.Itoa(body.StepIndex),
-	}
-	payload, _ := json.Marshal(event)
-	if err := writer.WriteMessages(r.Context(), kafka.Message{Key: []byte(sessionID), Value: payload}); err != nil {
-		// The broker refused the record: keep it on the state key so the relay republishes it.
-		_ = store.RecordPendingStep(r.Context(), sessionID, body.StepIndex, event)
-	}
-	rw.WriteHeader(http.StatusAccepted)
-}
-
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   stepTopic,
-		GroupID: "trace-store",
-	})
+func runTraceConsumer(ctx context.Context) error {
+	reader := kafka.NewReader(kafka.ReaderConfig{Brokers: []string{"kafka:9092"}, GroupID: group, Topic: topic})
 	for {
 		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
+			return err
+		}
+		event := map[string]any{}
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			reader.CommitMessages(ctx, msg) // malformed: skip it rather than replay it forever
 			continue
 		}
-		var event struct {
-			SessionID string \`json:"session_id"\`
-			StepIndex int    \`json:"step_index"\`
+		sessionID, _ := event["session_id"].(string)
+		if err := trace.AppendStep(ctx, sessionID, event); err != nil {
+			return err // not committed: the record is redelivered
 		}
-		_ = json.Unmarshal(msg.Value, &event)
-		// Trace first, offset last: a crash in between replays the record into an idempotent append.
-		if err := store.AppendStep(ctx, event.SessionID, event.StepIndex, map[string]any{"payload": string(msg.Value)}); err != nil {
-			continue
+		if err := reader.CommitMessages(ctx, msg); err != nil {
+			return err
 		}
-		_ = reader.CommitMessages(ctx, msg)
 	}
 }
 `,
@@ -626,266 +394,595 @@ func consume(ctx context.Context) {
       starter: `import java.time.Duration
 import java.util.Properties
 
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import redis.clients.jedis.Jedis
+import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
+import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
+import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import spray.json._
 
-object BrowserEvents {
-  val producer = new KafkaProducer[String, String](new Properties())
-  val jedis = new Jedis("redis", 6379)
+import scala.jdk.CollectionConverters._
 
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def publishStep(sessionId: String, stepIndex: Int, action: String, target: String, typedInput: Map[String, String], outcome: String): Unit = {
-    val payload = Map(
-      "session_id" -> sessionId,
-      "step_index" -> stepIndex,
-      "action" -> action,
-      "target_digest" -> target,
-      "outcome" -> outcome,
-      "typed_values" -> typedInput.toJson
-    ).toJson.compactPrint
-    producer.send(new ProducerRecord("browser.step", stepIndex.toString, payload))
+import browser.Trace // Trace.Step, digest, appendStep
+
+object Events {
+  val Topic = "browser.step"
+  val Group = "trace-store"
+
+  private val props = new Properties()
+  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
+  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
+  props.put(ProducerConfig.ACKS_CONFIG, "all")
+  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+
+  /** The browser.step record of one step runAction made. */
+  def stepEvent(step: Trace.Step): JsObject = {
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    JsObject(
+      "session_id" -> JsString(step.sessionId), "step_index" -> JsNumber(step.stepIndex), "action" -> JsString(step.action),
+      "target" -> JsString(step.target), "text" -> JsString(step.text), "outcome" -> JsString(step.outcome),
+      "url" -> JsString(step.url), "digest" -> JsString(step.digest), "reason" -> JsString(step.reason),
+    )
   }
 
-  def consume(): Unit = {
-    val consumer = new KafkaConsumer[String, String](new Properties())
-    consumer.subscribe(java.util.List.of("browser.step"))
+  def publishStep(step: Trace.Step): Unit = {
+    val onDelivery: Callback = new Callback {
+      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
+        if (exception != null) System.err.println(s"browser.step not delivered: \${exception.getMessage}")
+    }
+    producer.send(new ProducerRecord[String, String](Topic, step.stepIndex.toString, stepEvent(step).compactPrint), onDelivery)
+    producer.flush()
+  }
+
+  def runTraceConsumer(): Unit = {
+    val cprops = new Properties()
+    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
+    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
+    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
+    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
+    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
+    consumer.subscribe(List(Topic).asJava)
     while (true) {
-      val records = consumer.poll(Duration.ofMillis(200))
-      records.forEach { record =>
-        val event = record.value().parseJson.asJsObject.fields
-        val sessionId = event("session_id").convertTo[String]
-        val stepIndex = event("step_index").convertTo[Int]
+      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
         consumer.commitSync()
-        TraceStore.appendStep(sessionId, stepIndex, record.value())
+        val event = record.value().parseJson.asJsObject
+        Trace.appendStep(event.fields("session_id").convertTo[String](DefaultJsonProtocol.StringJsonFormat), event)
       }
     }
   }
 }
-
-object TraceStore {
-  def appendStep(sessionId: String, stepIndex: Int, payload: String): Unit =
-    throw new UnsupportedOperationException
-
-  def recordPendingStep(sessionId: String, stepIndex: Int, payload: String): Unit =
-    throw new UnsupportedOperationException
-}
 `,
-      solution: `import java.security.MessageDigest
-import java.time.Duration
+      solution: `import java.time.Duration
 import java.util.Properties
 
 import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import redis.clients.jedis.Jedis
+import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
+import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import spray.json._
 
-object BrowserEvents {
-  val producer = new KafkaProducer[String, String]({
-    val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put("enable.idempotence", "true")
-    props.put("acks", "all")
-    props
-  })
-  val jedis = new Jedis("redis", 6379)
+import scala.jdk.CollectionConverters._
 
-  val RedactedFields = Set("password", "card", "token")
+import browser.Trace // Trace.Step, digest, appendStep
 
-  /** Typed input never leaves the worker: only the names of the filled fields travel. */
-  def redact(typedInput: Map[String, String]): List[String] =
-    typedInput.keySet.filter(RedactedFields.contains).toList.sorted
+object Events {
+  val Topic = "browser.step"
+  val Group = "trace-store"
 
-  def targetDigest(target: String): String =
-    MessageDigest.getInstance("SHA-256").digest(target.getBytes("UTF-8")).map("%02x".format(_)).mkString
+  private val props = new Properties()
+  props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
+  props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
+  props.put(ProducerConfig.ACKS_CONFIG, "all")
+  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
-  def publishStep(sessionId: String, stepIndex: Int, action: String, target: String, typedInput: Map[String, String], outcome: String): Unit = {
-    val payload = Map(
-      "session_id" -> sessionId,
-      "step_index" -> stepIndex,
-      "action" -> action,
-      "target_digest" -> targetDigest(target),
-      "outcome" -> outcome,
-      "redacted_fields" -> redact(typedInput),
-      "idempotency_key" -> s"$sessionId:$stepIndex"
-    ).toJson.compactPrint
-    try {
-      producer.send(new ProducerRecord("browser.step", sessionId, payload))
-    } catch {
-      case _: org.apache.kafka.common.KafkaException =>
-        // The broker refused the record: keep it on the state key so the relay republishes it.
-        TraceStore.recordPendingStep(sessionId, stepIndex, payload)
+  /** The browser.step record of one step runAction made. */
+  def stepEvent(step: Trace.Step): JsObject =
+    // What happened, not what the browser saw: no typed text, no selector, no URL.
+    JsObject(
+      "session_id" -> JsString(step.sessionId), "step_index" -> JsNumber(step.stepIndex), "action" -> JsString(step.action),
+      "outcome" -> JsString(step.outcome), "reason" -> JsString(step.reason), "target_digest" -> JsString(Trace.digest(step.target)),
+    )
+
+  def publishStep(step: Trace.Step): Unit = {
+    val onDelivery: Callback = new Callback {
+      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
+        if (exception != null) System.err.println(s"browser.step not delivered: \${exception.getMessage}")
     }
+    producer.send(new ProducerRecord[String, String](Topic, step.sessionId, stepEvent(step).compactPrint), onDelivery)
+    producer.flush()
   }
 
-  def consume(): Unit = {
-    val props = new Properties()
-    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, "trace-store")
-    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    val consumer = new KafkaConsumer[String, String](props)
-    consumer.subscribe(java.util.List.of("browser.step"))
+  def runTraceConsumer(): Unit = {
+    val cprops = new Properties()
+    cprops.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
+    cprops.put(ConsumerConfig.GROUP_ID_CONFIG, Group)
+    cprops.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
+    cprops.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
+    val consumer = new KafkaConsumer[String, String](cprops, new StringDeserializer, new StringDeserializer)
+    consumer.subscribe(List(Topic).asJava)
     while (true) {
-      val records = consumer.poll(Duration.ofMillis(200))
-      records.forEach { record =>
-        val event = record.value().parseJson.asJsObject.fields
-        val sessionId = event("session_id").convertTo[String]
-        val stepIndex = event("step_index").convertTo[Int]
-        // Trace first, offset last: a crash in between replays the record into an idempotent append.
-        TraceStore.appendStep(sessionId, stepIndex, record.value())
-        consumer.commitSync()
+      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
+        val event = record.value().parseJson.asJsObject
+        Trace.appendStep(event.fields("session_id").convertTo[String](DefaultJsonProtocol.StringJsonFormat), event)
+        consumer.commitSync() // after the append: a crash in between redelivers
       }
     }
   }
-}
-
-object TraceStore {
-  def appendStep(sessionId: String, stepIndex: Int, payload: String): Unit =
-    throw new UnsupportedOperationException
-
-  def recordPendingStep(sessionId: String, stepIndex: Int, payload: String): Unit =
-    throw new UnsupportedOperationException
 }
 `,
     },
     cpp: {
       starter: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
 
 #include <iostream>
 #include <memory>
-#include <nlohmann/json.hpp>
 #include <string>
 
-using json = nlohmann::json;
+#include "browser/trace.h"  // trace::Step, digest, appendStep
 
-const std::string kStepTopic = "browser.step";
+const std::string kTopic = "browser.step";
+const std::string kGroup = "trace-store";
 
-std::unique_ptr<RdKafka::Producer> producer;
-
-struct SessionStore {
-  // Append one redacted step to the session trace.
-  void appendStep(const std::string& sessionId, int stepIndex, const json& event);
-  // Durable pending step on session:{id}; a relay republishes it.
-  void recordPendingStep(const std::string& sessionId, int stepIndex, const json& event);
+class LogDelivery : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override {
+    if (message.err() != RdKafka::ERR_NO_ERROR) std::cerr << "browser.step not delivered: " << message.errstr() << "\\n";
+  }
 };
 
-SessionStore store;
+LogDelivery delivery_report;
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-void publishStep(const std::string& sessionId, int stepIndex, const std::string& action, const std::string& target, const json& typedInput, const std::string& outcome) {
-  const json event = {{"session_id", sessionId}, {"step_index", stepIndex}, {"action", action}, {"target_digest", target}, {"outcome", outcome}, {"typed_values", typedInput}};
-  const auto payload = event.dump();
-  const auto stepKey = std::to_string(stepIndex);
-  producer->produce(kStepTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()), payload.size(), stepKey.data(), stepKey.size(), 0, nullptr);
-  producer->flush(2000);
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("enable.idempotence", "true", err);
+  conf->set("acks", "all", err);
+  conf->set("dr_cb", &delivery_report, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-void consume() {
+auto producer = make_producer();
+
+// The browser.step record of one step runAction made.
+nlohmann::json stepEvent(const trace::Step& step) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  return nlohmann::json{{"session_id", step.session_id}, {"step_index", step.step_index}, {"action", step.action},
+                        {"target", step.target},         {"text", step.text},             {"outcome", step.outcome},
+                        {"url", step.url},               {"digest", step.digest},         {"reason", step.reason}};
+}
+
+void publishStep(const trace::Step& step) {
+  const std::string value = stepEvent(step).dump();
+  const std::string key = std::to_string(step.step_index);
+  producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()), value.size(),
+                    key.c_str(), key.size(), 0, nullptr);
+  producer->flush(5000);
+}
+
+std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("group.id", "trace-store", err);
+  conf->set("group.id", kGroup, err);
+  conf->set("auto.offset.reset", "earliest", err);
   conf->set("enable.auto.commit", "false", err);
-  std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({"browser.step"});
+  auto consumer = std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
+  consumer->subscribe({kTopic});
+  return consumer;
+}
+
+void runTraceConsumer() {
+  auto consumer = make_consumer();
   while (true) {
-    std::unique_ptr<RdKafka::Message> msg(consumer->consume(200));
+    std::unique_ptr<RdKafka::Message> msg(consumer->consume(1000));
     if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
-    const json event = json::parse(static_cast<const char*>(msg->payload()), static_cast<const char*>(msg->payload()) + msg->len());
     consumer->commitSync(msg.get());
-    store.appendStep(event["session_id"].get<std::string>(), event["step_index"].get<int>(), event);
+    const auto event = nlohmann::json::parse(std::string(static_cast<const char*>(msg->payload()), msg->len()), nullptr, false);
+    if (!event.is_object()) continue;
+    trace::appendStep(event.value("session_id", ""), event);
   }
 }
 `,
       solution: `#include <librdkafka/rdkafkacpp.h>
-#include <sw/redis++/redis++.h>
-
-#include <algorithm>
-#include <functional>
-#include <memory>
 #include <nlohmann/json.hpp>
-#include <sstream>
+
+#include <iostream>
+#include <memory>
 #include <string>
-#include <vector>
 
-using json = nlohmann::json;
+#include "browser/trace.h"  // trace::Step, digest, appendStep
 
-const std::string kStepTopic = "browser.step";
-const std::vector<std::string> kRedactedFields = {"password", "card", "token"};
+const std::string kTopic = "browser.step";
+const std::string kGroup = "trace-store";
 
-struct SessionStore {
-  // Append one redacted step to the session trace.
-  void appendStep(const std::string& sessionId, int stepIndex, const json& event);
-  // Durable pending step on session:{id}; a relay republishes it.
-  void recordPendingStep(const std::string& sessionId, int stepIndex, const json& event);
+class LogDelivery : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override {
+    if (message.err() != RdKafka::ERR_NO_ERROR) std::cerr << "browser.step not delivered: " << message.errstr() << "\\n";
+  }
 };
 
-SessionStore store;
+LogDelivery delivery_report;
 
-std::unique_ptr<RdKafka::Producer> makeProducer() {
+std::unique_ptr<RdKafka::Producer> make_producer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
   conf->set("enable.idempotence", "true", err);
   conf->set("acks", "all", err);
+  conf->set("dr_cb", &delivery_report, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
+auto producer = make_producer();
 
-// Typed input never leaves the worker: only the names of the filled fields travel.
-std::vector<std::string> redact(const json& typedInput) {
-  std::vector<std::string> names;
-  for (const auto& field : typedInput.items()) {
-    if (std::find(kRedactedFields.begin(), kRedactedFields.end(), field.key()) != kRedactedFields.end()) {
-      names.push_back(field.key());
-    }
-  }
-  return names;
+// The browser.step record of one step runAction made.
+nlohmann::json stepEvent(const trace::Step& step) {
+  // What happened, not what the browser saw: no typed text, no selector, no URL.
+  return nlohmann::json{{"session_id", step.session_id}, {"step_index", step.step_index}, {"action", step.action},
+                        {"outcome", step.outcome},       {"reason", step.reason},         {"target_digest", trace::digest(step.target)}};
 }
 
-std::string targetDigest(const std::string& target) {
-  std::ostringstream out;
-  out << std::hex << std::hash<std::string>{}(target);
-  return out.str();
+void publishStep(const trace::Step& step) {
+  const std::string value = stepEvent(step).dump();
+  producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()), value.size(),
+                    step.session_id.c_str(), step.session_id.size(), 0, nullptr);
+  producer->flush(5000);
 }
 
-void publishStep(const std::string& sessionId, int stepIndex, const std::string& action, const std::string& target, const json& typedInput, const std::string& outcome) {
-  const json event = {{"session_id", sessionId}, {"step_index", stepIndex}, {"action", action}, {"target_digest", targetDigest(target)}, {"outcome", outcome}, {"redacted_fields", redact(typedInput)}, {"idempotency_key", sessionId + ":" + std::to_string(stepIndex)}};
-  const auto payload = event.dump();
-  const auto err = producer->produce(kStepTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()), payload.size(), sessionId.data(), sessionId.size(), 0, nullptr);
-  if (err != RdKafka::ERR_NO_ERROR) {
-    // The broker refused the record: keep it on the state key so the relay republishes it.
-    store.recordPendingStep(sessionId, stepIndex, event);
-  }
-  producer->flush(2000);
-}
-
-void consume() {
+std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("group.id", "trace-store", err);
+  conf->set("group.id", kGroup, err);
+  conf->set("auto.offset.reset", "earliest", err);
   conf->set("enable.auto.commit", "false", err);
-  std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({"browser.step"});
+  auto consumer = std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
+  consumer->subscribe({kTopic});
+  return consumer;
+}
+
+void runTraceConsumer() {
+  auto consumer = make_consumer();
   while (true) {
-    std::unique_ptr<RdKafka::Message> msg(consumer->consume(200));
+    std::unique_ptr<RdKafka::Message> msg(consumer->consume(1000));
     if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
-    const json event = json::parse(static_cast<const char*>(msg->payload()), static_cast<const char*>(msg->payload()) + msg->len());
-    // Trace first, offset last: a crash in between replays the record into an idempotent append.
-    store.appendStep(event["session_id"].get<std::string>(), event["step_index"].get<int>(), event);
-    consumer->commitSync(msg.get());
+    const auto event = nlohmann::json::parse(std::string(static_cast<const char*>(msg->payload()), msg->len()), nullptr, false);
+    if (!event.is_object()) {
+      consumer->commitSync(msg.get());  // malformed: skip it rather than replay it forever
+      continue;
+    }
+    trace::appendStep(event.value("session_id", ""), event);
+    consumer->commitSync(msg.get());  // after the append: a crash in between redelivers
   }
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+from browser import trace
+
+TOPIC = "browser.step"
+EVENT_KEYS = {"session_id", "step_index", "action", "outcome", "reason", "target_digest"}
+CANARY = "hunter2-CANARY-7731"
+
+
+def _step(session_id, index, action="click", target="#buy", text=""):
+    return {"session_id": session_id, "step_index": index, "action": action, "target": target, "text": text,
+            "outcome": "ok", "url": f"https://www.example.com/{session_id}/{index}", "digest": f"page#{index}", "reason": ""}
+
+
+def check_session_key(ctx):
+    m = ctx.load("events")
+    for index in range(1, 5):
+        m.publish_step(_step("s-1", index))
+        if index < 4:
+            m.publish_step(_step("s-2", index))
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 7, f"7 published steps put {len(records)} records on {TOPIC}"
+    for r in records:
+        session = json.loads(r.value)["session_id"]
+        assert r.key == session.encode(), f"a step of {session} was keyed {r.key!r}: key every record by its session id, so one session's steps share a partition"
+    for session in ("s-1", "s-2"):
+        mine = [r for r in records if json.loads(r.value)["session_id"] == session]
+        assert len({r.partition for r in mine}) == 1, f"the steps of {session} landed on partitions {sorted({r.partition for r in mine})}"
+        order = [json.loads(r.value)["step_index"] for r in mine]
+        assert order == sorted(order), f"the steps of {session} are on the topic in the order {order}"
+
+
+def check_no_typed_values(ctx):
+    m = ctx.load("events")
+    m.publish_step(_step("s-1", 3, action="type", target="#password", text=CANARY))
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one published step put {len(records)} records on {TOPIC}"
+    raw = records[0].value.decode()
+    assert CANARY not in raw, f"the typed password is on the topic: {raw}. The event must not carry text"
+    assert "#password" not in raw and "https://www.example.com/" not in raw, f"the event carries the selector or the URL: {raw}. Carry target_digest instead"
+    event = json.loads(raw)
+    assert set(event) == EVENT_KEYS, f"the event has the fields {sorted(event)}, expected exactly {sorted(EVENT_KEYS)}"
+    assert event["target_digest"] == trace.digest("#password"), f"target_digest is {event['target_digest']!r}, expected trace.digest('#password') = {trace.digest('#password')!r}"
+    assert event["action"] == "type" and event["step_index"] == 3 and event["outcome"] == "ok", f"the event lost what happened: {event}"
+
+
+def check_append_before_commit(ctx):
+    for index in (1, 2, 3):
+        event = {"session_id": "s-1", "step_index": index, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.digest(f"#b{index}")}
+        ctx.kafka.seed(TOPIC, key="s-1", value=json.dumps(event))
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(len(trace.read_trace("s-1"))))
+    m = ctx.load("events")
+    ctx.drain(m.run_trace_consumer)
+    assert at_commit, "the consumer never committed an offset"
+    assert at_commit[0] >= 1, f"at the first commit the trace of s-1 held {at_commit[0]} steps: the offset was committed before the step was appended, so a crash in between loses it"
+    assert at_commit == sorted(at_commit) and all(n >= i + 1 for i, n in enumerate(at_commit)), f"the trace lengths at each commit were {at_commit}: every commit must follow its append"
+    steps = [e["step_index"] for e in trace.read_trace("s-1")]
+    assert steps == [1, 2, 3], f"the trace of s-1 holds steps {steps}, expected [1, 2, 3]"
+    assert ctx.kafka.lag("trace-store", TOPIC) == 0, "every appended step must be committed"
+`,
+    typescript: `const TOPIC = 'browser.step';
+const EVENT_KEYS = ['action', 'outcome', 'reason', 'session_id', 'step_index', 'target_digest'];
+const CANARY = 'hunter2-CANARY-7731';
+
+const step = (sessionId: string, index: number, action = 'click', target = '#buy', text = '') => ({
+  session_id: sessionId,
+  step_index: index,
+  action,
+  target,
+  text,
+  outcome: 'ok',
+  url: \`https://www.example.com/\${sessionId}/\${index}\`,
+  digest: \`page#\${index}\`,
+  reason: '',
+});
+
+export async function check_session_key(ctx) {
+  const m = ctx.load('events');
+  for (let index = 1; index <= 4; index++) {
+    await m.publishStep(step('s-1', index));
+    if (index < 4) await m.publishStep(step('s-2', index));
+  }
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 7, \`7 published steps put \${records.length} records on \${TOPIC}\`);
+  for (const r of records) {
+    const session = JSON.parse(r.value.toString()).session_id;
+    assert.equal(r.key?.toString(), session, \`a step of \${session} was keyed \${r.key?.toString()}: key every record by its session id, so one session's steps share a partition\`);
+  }
+  for (const session of ['s-1', 's-2']) {
+    const mine = records.filter(r => JSON.parse(r.value.toString()).session_id === session);
+    assert.equal(new Set(mine.map(r => r.partition)).size, 1, \`the steps of \${session} landed on several partitions\`);
+    const order = mine.map(r => JSON.parse(r.value.toString()).step_index);
+    assert.deepStrictEqual(order, [...order].sort((a, b) => a - b), \`the steps of \${session} are on the topic in the order \${JSON.stringify(order)}\`);
+  }
+}
+
+export async function check_no_typed_values(ctx) {
+  const m = ctx.load('events');
+  const {digest} = ctx.load('/support/browser/trace.ts');
+  await m.publishStep(step('s-1', 3, 'type', '#password', CANARY));
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 1, \`one published step put \${records.length} records on \${TOPIC}\`);
+  const raw = records[0].value.toString();
+  assert(!raw.includes(CANARY), \`the typed password is on the topic: \${raw}. The event must not carry text\`);
+  assert(!raw.includes('#password') && !raw.includes('https://www.example.com/'), \`the event carries the selector or the URL: \${raw}. Carry target_digest instead\`);
+  const event = JSON.parse(raw);
+  assert.deepStrictEqual(Object.keys(event).sort(), EVENT_KEYS, \`the event has the fields \${JSON.stringify(Object.keys(event).sort())}, expected exactly \${JSON.stringify(EVENT_KEYS)}\`);
+  assert.equal(event.target_digest, digest('#password'), \`target_digest is \${event.target_digest}, expected digest('#password') = \${digest('#password')}\`);
+  assert(event.action === 'type' && event.step_index === 3 && event.outcome === 'ok', \`the event lost what happened: \${raw}\`);
+}
+
+export async function check_append_before_commit(ctx) {
+  const trace = ctx.load('/support/browser/trace.ts');
+  for (const index of [1, 2, 3]) {
+    const event = {session_id: 's-1', step_index: index, action: 'click', outcome: 'ok', reason: '', target_digest: trace.digest(\`#b\${index}\`)};
+    ctx.kafka.seed(TOPIC, {key: 's-1', value: JSON.stringify(event)});
+  }
+  const atCommit: number[] = [];
+  ctx.kafka.onCommit(() => atCommit.push(ctx.redis.hlen('browser:trace:s-1')));
+  const m = ctx.load('events');
+  await ctx.drain(m.runTraceConsumer());
+  assert(atCommit.length > 0, 'the consumer never committed an offset');
+  assert(atCommit[0] >= 1, \`at the first commit the trace of s-1 held \${atCommit[0]} steps: the offset was committed before the step was appended, so a crash in between loses it\`);
+  assert(atCommit.every((n, i) => n >= i + 1), \`the trace lengths at each commit were \${JSON.stringify(atCommit)}: every commit must follow its append\`);
+  const steps = (await trace.readTrace('s-1')).map(e => e.step_index);
+  assert.deepStrictEqual(steps, [1, 2, 3], \`the trace of s-1 holds steps \${JSON.stringify(steps)}, expected [1, 2, 3]\`);
+  assert.equal(ctx.kafka.lag('trace-store', TOPIC), 0, 'every appended step must be committed');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+
+	"browser/trace"
+
+	"leetbuild/harness"
+)
+
+const (
+	stepTopic = "browser.step"
+	canary    = "hunter2-CANARY-7731"
+)
+
+var eventsBg = context.Background()
+
+func testStep(sessionID string, index int, action, target, text string) trace.Step {
+	return trace.Step{SessionID: sessionID, StepIndex: index, Action: action, Target: target, Text: text, Outcome: "ok",
+		URL: fmt.Sprintf("https://www.example.com/%s/%d", sessionID, index), Digest: fmt.Sprintf("page#%d", index)}
+}
+
+func decode(raw []byte) map[string]any {
+	event := map[string]any{}
+	json.Unmarshal(raw, &event)
+	return event
+}
+
+func CheckSessionKey(ctx *harness.Ctx) {
+	for index := 1; index <= 4; index++ {
+		ctx.NoError(publishStep(eventsBg, testStep("s-1", index, "click", "#buy", "")), "publishStep(s-1, %d)", index)
+		if index < 4 {
+			ctx.NoError(publishStep(eventsBg, testStep("s-2", index, "click", "#buy", "")), "publishStep(s-2, %d)", index)
+		}
+	}
+	records := ctx.Kafka.Records(stepTopic)
+	ctx.Equal(len(records), 7, "7 published steps; records on %s", stepTopic)
+	partitions := map[string]map[int]bool{}
+	order := map[string][]int{}
+	for _, r := range records {
+		event := decode(r.Value)
+		session := fmt.Sprint(event["session_id"])
+		ctx.Equal(string(r.Key), session, "a step of %s must be keyed by its session id, so one session's steps share a partition; the key", session)
+		if partitions[session] == nil {
+			partitions[session] = map[int]bool{}
+		}
+		partitions[session][r.Partition] = true
+		order[session] = append(order[session], trace.StepIndex(event))
+	}
+	for _, session := range []string{"s-1", "s-2"} {
+		ctx.Equal(len(partitions[session]), 1, "the steps of %s must share one partition; partitions", session)
+		ctx.Assert(sort.IntsAreSorted(order[session]), "the steps of %s are on the topic in the order %v", session, order[session])
+	}
+}
+
+func CheckNoTypedValues(ctx *harness.Ctx) {
+	ctx.NoError(publishStep(eventsBg, testStep("s-1", 3, "type", "#password", canary)), "publishStep")
+	records := ctx.Kafka.Records(stepTopic)
+	ctx.Equal(len(records), 1, "one published step; records on %s", stepTopic)
+	raw := string(records[0].Value)
+	ctx.Assert(!strings.Contains(raw, canary), "the typed password is on the topic: %s. The event must not carry text", raw)
+	ctx.Assert(!strings.Contains(raw, "#password") && !strings.Contains(raw, "https://www.example.com/"), "the event carries the selector or the URL: %s. Carry target_digest instead", raw)
+	event := decode(records[0].Value)
+	keys := make([]string, 0, len(event))
+	for k := range event {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	ctx.Equal(keys, []string{"action", "outcome", "reason", "session_id", "step_index", "target_digest"}, "the event's fields")
+	ctx.Equal(event["target_digest"], trace.Digest("#password"), "target_digest must be trace.Digest of the target")
+	ctx.Assert(event["action"] == "type" && trace.StepIndex(event) == 3 && event["outcome"] == "ok", "the event lost what happened: %s", raw)
+}
+
+func CheckAppendBeforeCommit(ctx *harness.Ctx) {
+	for index := 1; index <= 3; index++ {
+		value, _ := json.Marshal(map[string]any{"session_id": "s-1", "step_index": index, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.Digest(fmt.Sprintf("#b%d", index))})
+		ctx.Kafka.Seed(stepTopic, "s-1", string(value))
+	}
+	var atCommit []int64
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		atCommit = append(atCommit, ctx.Redis.HLen("browser:trace:s-1"))
+	})
+	ctx.Drain(func() { runTraceConsumer(eventsBg) })
+	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
+	ctx.Assert(atCommit[0] >= 1, "at the first commit the trace of s-1 held %d steps: the offset was committed before the step was appended, so a crash in between loses it", atCommit[0])
+	for i, n := range atCommit {
+		ctx.Assert(n >= int64(i+1), "the trace lengths at each commit were %v: every commit must follow its append", atCommit)
+	}
+	events, err := trace.ReadTrace(eventsBg, "s-1")
+	ctx.NoError(err, "ReadTrace(s-1)")
+	steps := []int{}
+	for _, e := range events {
+		steps = append(steps, trace.StepIndex(e))
+	}
+	ctx.Equal(steps, []int{1, 2, 3}, "the trace of s-1")
+	ctx.Equal(ctx.Kafka.Lag("trace-store", stepTopic), 0, "every appended step must be committed; the lag")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "browser/trace.h"
+
+namespace {
+
+const std::string kStepTopic = "browser.step";
+const std::string kCanary = "hunter2-CANARY-7731";
+
+trace::Step testStep(const std::string& session_id, long index, const std::string& action = "click", const std::string& target = "#buy",
+                     const std::string& text = "") {
+  return trace::Step{session_id, index, action, target, text, "ok", "https://www.example.com/" + session_id + "/" + std::to_string(index),
+                     "page#" + std::to_string(index), ""};
+}
+
+nlohmann::json decode(const std::optional<std::string>& raw) {
+  const auto v = nlohmann::json::parse(raw.value_or(""), nullptr, false);
+  return v.is_object() ? v : nlohmann::json::object();
+}
+
+}  // namespace
+
+void CheckSessionKey(harness::Ctx& ctx) {
+  for (long index = 1; index <= 4; index++) {
+    publishStep(testStep("s-1", index));
+    if (index < 4) publishStep(testStep("s-2", index));
+  }
+  const auto records = ctx.Kafka.Records(kStepTopic);
+  ctx.Equal(records.size(), 7, "7 published steps; records on %s", kStepTopic);
+  std::map<std::string, std::set<int>> partitions;
+  std::map<std::string, std::vector<long>> order;
+  for (const auto& r : records) {
+    const auto event = decode(r.Value);
+    const std::string session = event.value("session_id", "");
+    ctx.Equal(r.Key.value_or(""), session, "a step of %s must be keyed by its session id, so one session's steps share a partition; the key", session);
+    partitions[session].insert(r.Partition);
+    order[session].push_back(event.value("step_index", 0L));
+  }
+  for (const std::string session : {"s-1", "s-2"}) {
+    ctx.Equal(partitions[session].size(), 1, "the steps of %s must share one partition; partitions", session);
+    ctx.Assert(std::is_sorted(order[session].begin(), order[session].end()), "the steps of %s are on the topic in the order %v", session, order[session]);
+  }
+}
+
+void CheckNoTypedValues(harness::Ctx& ctx) {
+  publishStep(testStep("s-1", 3, "type", "#password", kCanary));
+  const auto records = ctx.Kafka.Records(kStepTopic);
+  ctx.Equal(records.size(), 1, "one published step; records on %s", kStepTopic);
+  const std::string raw = records[0].Value.value_or("");
+  ctx.Assert(raw.find(kCanary) == std::string::npos, "the typed password is on the topic: %s. The event must not carry text", raw);
+  ctx.Assert(raw.find("#password") == std::string::npos && raw.find("https://www.example.com/") == std::string::npos, "the event carries the selector or the URL: %s. Carry target_digest instead", raw);
+  const auto event = decode(records[0].Value);
+  std::vector<std::string> keys;
+  for (const auto& item : event.items()) keys.push_back(item.key());
+  std::sort(keys.begin(), keys.end());
+  ctx.Equal(keys, {"action", "outcome", "reason", "session_id", "step_index", "target_digest"}, "the event's fields");
+  ctx.Equal(event.value("target_digest", ""), trace::digest("#password"), "target_digest must be trace::digest of the target");
+  ctx.Assert(event.value("action", "") == "type" && event.value("step_index", 0L) == 3 && event.value("outcome", "") == "ok", "the event lost what happened: %s", raw);
+}
+
+void CheckAppendBeforeCommit(harness::Ctx& ctx) {
+  for (long index = 1; index <= 3; index++) {
+    const nlohmann::json event = {{"session_id", "s-1"}, {"step_index", index}, {"action", "click"}, {"outcome", "ok"}, {"reason", ""}, {"target_digest", trace::digest("#b" + std::to_string(index))}};
+    ctx.Kafka.Seed(kStepTopic, "s-1", event.dump());
+  }
+  std::vector<long long> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.HLen("browser:trace:s-1")); });
+  ctx.Drain([] { runTraceConsumer(); });
+  ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
+  ctx.Assert(atCommit[0] >= 1, "at the first commit the trace of s-1 held %d steps: the offset was committed before the step was appended, so a crash in between loses it", atCommit[0]);
+  for (size_t i = 0; i < atCommit.size(); i++) {
+    ctx.Assert(atCommit[i] >= static_cast<long long>(i + 1), "the trace lengths at each commit were %v: every commit must follow its append", atCommit);
+  }
+  std::vector<long> steps;
+  for (const auto& e : trace::readTrace("s-1")) steps.push_back(e.value("step_index", 0L));
+  ctx.Equal(steps, std::vector<long>{1, 2, 3}, "the trace of s-1");
+  ctx.Equal(ctx.Kafka.Lag("trace-store", kStepTopic), 0, "every appended step must be committed; the lag");
+}
+`,
+  },
   hints: [
-    'A customer reads a trace with steps out of order, a password the agent typed appears in the log aggregator, and after a consumer crash one step is missing although its offset was committed.',
-    'publish_step builds the event straight from the body (typed_values included), logs it, produces with key=step_index on a default producer, and consume() commits the offset before store.append_step runs.',
-    'Produce with key=session_id, enable.idempotence and acks=all plus an idempotency_key; replace typed_values with redact() and a sha256 target_digest; append_step before consumer.commit; record_pending_step on a rejected produce.',
+    'Run two sessions at once and read the trace: the steps of one session arrive out of order. Type a password in a session and read the topic: the password is there, next to the URL.',
+    'The key is the step index, which spreads one session over every partition; `step_event` copies the whole step; the consumer commits the offset before `append_step` runs, so a crash in between skips the step.',
+    'Key by `step["session_id"]`; build the event from `session_id`, `step_index`, `action`, `outcome`, `reason` and `target_digest = trace.digest(step["target"])`; call `trace.append_step` before `consumer.commit`.',
   ],
-  debrief: `Each fix answers a different contract. Keying by session id is the ordering contract: one session, one partition, so its steps arrive in the order the page took them. \`redact(...)\` plus a target digest is the privacy contract, and it lives in a helper because a field nobody meant to publish only surfaces in an incident review, not in a test. Append-then-commit is the completeness contract: a crash between the two replays onto an idempotent \`(session_id, step_index)\` append instead of losing the step. The idempotent producer with \`acks=all\` and \`record_pending_step\` is the retry contract, so a broker hiccup duplicates nothing and drops nothing. Production pipelines usually put a schema registry in front of the topic so a payload carrying an unknown field such as \`typed_values\` is refused at produce time.`,
+  debrief: `Kafka orders records per partition only, so the key is whatever must stay in order, and for a trace that is the session. The event records what happened rather than what the browser saw: an action, an outcome and a digest that lets an operator match a step to a selector without the topic holding the selector, the URL or the typed text, because a topic is retained, replicated and read by more teams than the session ever was. Append-then-commit turns a crash into a duplicate, and a trace keyed by step index absorbs duplicates for free. Production pipelines encrypt the few fields an investigation needs under a per-tenant key and expire traces with the session.`,
 };

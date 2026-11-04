@@ -2,298 +2,270 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Search events keyed by tenant with the query hashed',
+  title: 'search.event: keyed by tenant, without what the shopper typed',
   concept: 'kafka',
-  file: 'events',
-  focus: ['search', 'kafka', 'consumer', 'redis'],
+  file: 'telemetry',
+  focus: ['api', 'kafka', 'analytics'],
   task: `## Task
 
-**Starting point.** The starter is the telemetry path for \`search.event\`: the producer builds a
-payload from a \`SearchEvent\`, keys the record by a hash of the query, and produces it with a
-default-configured producer; the consumer polls the topic, commits the offset, and increments a
-per-tenant Redis counter. It compiles, the analytics demo shows data, and it hides five flaws.
+**Starting point.** The starter is the telemetry an answered search leaves behind:
+\`record_search(tenant, q, filters, result_count, partial, latency_ms)\` produces one
+\`search.event\` keyed by the query, carrying the query text, the filters and the counts, waits for
+the delivery report, and logs a failed delivery. Searches show up on the analytics dashboard, and it
+hides four flaws.
 
-**Failure mode the checks target.** The raw query is the most dangerous field to retain; keying by
-query hash destroys per-tenant order; committing before the counter update loses that update on the
-first crash.
+**Failure mode the checks target.** One tenant's events scatter across partitions, so the
+per-tenant consumer counts them out of order; the retained topic keeps what shoppers typed; a lost
+acknowledgement writes an event twice and a leader failover loses one; and a dropped event leaves no
+trace, so a dashboard cannot tell a quiet hour from a broken pipe.
 
-- The message **key is the tenant** (\`key=tenant\` / \`key: tenant\` / \`Key: []byte(tenant)\` /
-  \`ProducerRecord("search.event", tenant, …)\`), so one tenant's events share a partition and keep
-  their order.
-- The payload carries a **query hash**, the **result count** and the **latency**. The raw query text
-  stays out of the event and out of the log line; the topic is retained and replicated.
-- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`, KafkaJS's
-  \`idempotent: true\`, or \`RequiredAcks: kafka.RequireAll\` with a hash balancer), so a produce retry
-  cannot duplicate the event.
-- The consumer updates the Redis counters (\`INCR\` / \`HINCRBY\`) **and only then** commits the
-  offset. Commit first and one crash loses the counter update for good, because the offset already
-  moved past the unprocessed record.`,
+- The record key is the **tenant**.
+- The payload is \`type\` (\`search.query\`), \`tenant\`, \`query_hash\`
+  (\`digest(normalize_query(q))\`), \`filter_fields\` (sorted names), \`result_count\`, \`partial\` and
+  \`latency_ms\`: no query text, no filter value.
+- The producer is idempotent with \`acks=all\` (kafkajs \`idempotent: true\` with \`acks: -1\`; the Go
+  starter uses confluent-kafka-go, because kafka-go has no idempotent producer).
+- A failed delivery (the delivery report's error, a rejected \`send\`) increments
+  \`telemetry:dropped:{tenant}\` in Redis.`,
   sequence: {
-    participants: ['Search API', 'search.event', 'Telemetry consumer', 'Redis'],
+    participants: ['searchd', 'search.event', 'Redis', 'Search analytics'],
     messages: [
       {
-        from: 'Search API',
+        from: 'searchd',
         to: 'search.event',
-        label: 'produce · key = tenant · {query_hash, result_count, latency_ms}',
+        label: 'produce · key = tenant · {query_hash, filter_fields, counts}',
         kind: 'sync',
       },
-      {from: 'search.event', to: 'Search API', label: 'ack / broker error', kind: 'reply'},
-      {from: 'search.event', to: 'Telemetry consumer', label: 'consume · group search-telemetry', kind: 'async'},
-      {from: 'Telemetry consumer', to: 'Redis', label: 'INCR search:count:{tenant}', kind: 'sync'},
-      {from: 'Redis', to: 'Telemetry consumer', label: 'new counter value', kind: 'reply'},
-      {from: 'Telemetry consumer', to: 'search.event', label: 'commit offset after the counters', kind: 'async'},
+      {from: 'search.event', to: 'searchd', label: 'delivery report (idempotent, acks=all)', kind: 'reply'},
+      {from: 'searchd', to: 'Redis', label: 'INCR telemetry:dropped:{tenant} on a failed delivery', kind: 'sync'},
+      {from: 'search.event', to: 'Search analytics', label: 'consume · one partition per tenant', kind: 'async'},
     ],
   },
   checks: [
     {
       id: 'tenant-key',
-      title: 'Keyed by tenant, query travels as a hash',
+      title: 'Keyed by tenant',
       detail:
-        "The message key is the tenant, so one tenant's events share a partition and keep their order, and the event carries the query hash. The starter keys by the query hash, which interleaves tenant streams.",
+        'The record key is the tenant, so one tenant’s events share a partition and keep their order; the starter keys by the query text, which scatters a tenant across partitions and copies the query into the key.',
       match: {
-        python: {all: [/key=[^,\n]*tenant/, /query_hash/]},
-        typescript: {all: [/key:\s*tenant\b/, /queryHash/]},
-        go: {all: [/Key:\s*\[\]byte\(tenant\)/, /query_hash/]},
-        scala: {all: [/ProducerRecord\("search\.event",\s*tenant/, /queryHash/]},
-        cpp: {all: [/produce\([^;\n]*tenant/, /query_hash/]},
+        python: {all: [/key\s*=\s*tenant\b/], none: [/key\s*=\s*q\b/]},
+        typescript: {all: [/key:\s*tenant\b/], none: [/key:\s*q\b/]},
+        go: {all: [/Key:\s*\[\]byte\(tenant\)/], none: [/Key:\s*\[\]byte\(q\)/]},
+        scala: {all: [/ProducerRecord\[String, String\]\(EventTopic,\s*tenant\b/], none: [/EventTopic,\s*q\b/]},
+        cpp: {all: [/tenant\.c_str\(\),\s*tenant\.size\(\)/], none: [/q\.c_str\(\)/]},
       },
     },
     {
       id: 'no-raw-query',
-      title: 'No raw query in the event payload',
+      title: 'Carries a query digest and filter names, not what was typed',
       detail:
-        'The event and the log lines carry a query hash, never `query` text. The starter publishes the raw query into a topic that is retained and replicated: a leak with a long tail.',
+        'The payload carries `query_hash` = `digest(normalize_query(q))` and the sorted `filter_fields`; the query text and the filter values stay out of a retained, replicated topic.',
       match: {
-        python: {none: [/raw_query/, /["']?query["']?\s*:/]},
-        typescript: {none: [/raw_query/, /["']?query["']?\s*:/]},
-        go: {none: [/raw_query/, /["']?query["']?\s*:/]},
-        scala: {none: [/raw_query/, /["']?query["']?\s*:/]},
-        cpp: {none: [/raw_query/, /["']?query["']?\s*:/]},
+        python: {
+          all: [/digest\(\s*catalog\.normalize_query\(\s*q\s*\)\s*\)/, /sorted\(\s*filters\s*\)/],
+          none: [/["']q["']\s*:\s*q\b/, /["']filters["']\s*:\s*filters\b/],
+        },
+        typescript: {
+          all: [/digest\(\s*normalizeQuery\(\s*q\s*\)\s*\)/, /Object\.keys\(\s*filters\s*\)\.sort\(\)/],
+          none: [/^\s+q,\s*$/m, /^\s+filters,\s*$/m],
+        },
+        go: {
+          all: [/catalog\.Digest\(\s*catalog\.NormalizeQuery\(\s*q\s*\)\s*\)/, /sort\.Strings\(/],
+          none: [/"q":\s*q\b/, /"filters":\s*filters\b/],
+        },
+        scala: {
+          all: [/Catalog\.digest\(\s*Catalog\.normalizeQuery\(\s*q\s*\)\s*\)/, /filters\.keys\.toSeq\.sorted/],
+          none: [/"q"\s*->\s*JsString\(\s*q\s*\)/],
+        },
+        cpp: {
+          all: [/catalog::digest\(\s*catalog::normalizeQuery\(\s*q\s*\)\s*\)/, /"filter_fields"/],
+          none: [/\{"q",\s*q\}/, /\{"filters",\s*filters\}/],
+        },
       },
     },
     {
-      id: 'counters-before-commit',
-      title: 'Updates the counters before committing the offset',
-      detail:
-        'The consumer increments the Redis counters and only then commits the offset. Committing first means a crash between the two loses the counter update forever, because the offset already moved past the record.',
-      match: {
-        python: {order: [/incr\(/, /\.commit\(/]},
-        typescript: {order: [/\.incr\(/, /commitOffsets\(/]},
-        go: {order: [/\.Incr\(/, /CommitMessages\(/]},
-        scala: {order: [/\.incr\(/, /commitSync\(/]},
-        cpp: {order: [/\.incr\(/, /commitSync\(/]},
-      },
-    },
-    {
-      id: 'idempotent-acks',
+      id: 'idempotent-producer',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all`, so a retried produce cannot duplicate the record. The starter sets neither and relies on the broker defaults.',
+        'The producer sets idempotence and `acks=all` (kafkajs `idempotent: true` with `acks: -1`), so a retry after a lost acknowledgement writes the event once and a leader failover loses nothing that was acknowledged.',
       match: {
-        python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
+        python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
-        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
-        scala: {all: [/enable\.idempotence/, /"acks"/]},
-        cpp: {all: [/enable\.idempotence/, /set\("acks",\s*"all"/]},
+        go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"all"/]},
+        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
+        cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"all"/]},
       },
     },
     {
-      id: 'latency-and-count',
-      title: 'Carries the result count and the latency',
+      id: 'dropped-count',
+      title: 'A lost event is counted per tenant',
       detail:
-        'The payload includes the number of results and the query latency, which is what the telemetry is for. The starter sends the query text and a count, so the p99 cannot be reconstructed.',
+        'When the delivery fails (the delivery report carries an error, `send` rejects), `telemetry:dropped:{tenant}` is incremented, so the dashboard knows its counts are a lower bound; the starter only logs it.',
       match: {
-        python: {all: [/result_count/, /latency_ms/]},
-        typescript: {all: [/resultCount/, /latencyMs/]},
-        go: {all: [/ResultCount/, /LatencyMs/]},
-        scala: {all: [/resultCount/, /latencyMs/]},
-        cpp: {all: [/result_count/, /latency_ms/]},
+        python: {all: [/incr\(\s*f["']telemetry:dropped:\{tenant\}/]},
+        typescript: {all: [/incr\(\s*`telemetry:dropped:\$\{tenant\}`/]},
+        go: {all: [/Incr\(\s*ctx,\s*"telemetry:dropped:"\s*\+\s*tenant/]},
+        scala: {all: [/incr\(\s*s"telemetry:dropped:\$tenant"/]},
+        cpp: {all: [/incr\(\s*"telemetry:dropped:"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import hashlib
-import json
+      starter: `import json
 import logging
 
 import redis
-from confluent_kafka import Consumer, Producer
-from pydantic import BaseModel
+from confluent_kafka import Producer
 
-logger = logging.getLogger("search-events")
-producer = Producer({"bootstrap.servers": "kafka:9092"})
+from search import catalog  # normalize_query, digest
+
+EVENT_TOPIC = "search.event"
+log = logging.getLogger("telemetry")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-
-class SearchEvent(BaseModel):
-    tenant: str
-    query: str
-    results: int
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 
 
-def publish_search(event: SearchEvent) -> None:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    key = hashlib.sha256(event.query.encode("utf-8")).hexdigest()
-    payload = {"query": event.query, "results": event.results}
-    logger.info("search tenant=%s query=%r", event.tenant, event.query)
-    producer.produce("search.event", value=json.dumps(payload).encode("utf-8"), key=key)
-
-
-def consume_search_events() -> None:
-    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "search-telemetry"})
-    consumer.subscribe(["search.event"])
-    while True:
-        message = consumer.poll(1.0)
-        if message is None:
-            continue
-        event = json.loads(message.value())
-        consumer.commit(message)
-        r.incr(f"search:count:{event['tenant']}")
-`,
-      solution: `import hashlib
-import json
-import logging
-
-import redis
-from confluent_kafka import Consumer, Producer
-from pydantic import BaseModel
-
-logger = logging.getLogger("search-events")
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
-    }
-)
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-
-class SearchEvent(BaseModel):
-    tenant: str
-    text: str
-    result_count: int
-    latency_ms: int
-    partial: bool = False
-
-
-def query_hash(text: str) -> str:
-    return hashlib.sha256(" ".join(text.strip().lower().split()).encode("utf-8")).hexdigest()
-
-
-def publish_search(event: SearchEvent) -> None:
-    tenant = event.tenant
+def record_search(tenant: str, q: str, filters: dict[str, str], result_count: int, partial: bool, latency_ms: int) -> dict:
+    """One search.event for an answered search; returns the payload."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     payload = {
+        "type": "search.query",
         "tenant": tenant,
-        "query_hash": query_hash(event.text),
-        "result_count": event.result_count,
-        "latency_ms": event.latency_ms,
-        "partial": event.partial,
+        "q": q,
+        "filters": filters,
+        "result_count": result_count,
+        "partial": partial,
+        "latency_ms": latency_ms,
     }
-    logger.info("search_event tenant=%s partial=%s", tenant, event.partial)
-    producer.produce("search.event", value=json.dumps(payload).encode("utf-8"), key=tenant)
-    producer.poll(0)
+
+    def on_delivery(err, msg) -> None:
+        if err is not None:
+            log.warning("search event not delivered: %s", err)
+
+    producer.produce(EVENT_TOPIC, key=q, value=json.dumps(payload), on_delivery=on_delivery)
+    producer.flush(2.0)
+    return payload
+`,
+      solution: `import json
+import logging
+
+import redis
+from confluent_kafka import Producer
+
+from search import catalog  # normalize_query, digest
+
+EVENT_TOPIC = "search.event"
+log = logging.getLogger("telemetry")
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+# Idempotent with acks=all: a retry after a lost acknowledgement writes the event once, on every replica.
+producer = Producer({"bootstrap.servers": "kafka:9092", "enable.idempotence": True, "acks": "all"})
 
 
-def consume_search_events() -> None:
-    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "search-telemetry"})
-    consumer.subscribe(["search.event"])
-    while True:
-        message = consumer.poll(1.0)
-        if message is None:
-            continue
-        event = json.loads(message.value())
-        r.incr(f"search:count:{event['tenant']}")
-        r.incr(f"search:results:{event['tenant']}", event["result_count"])
-        consumer.commit(message)
+def record_search(tenant: str, q: str, filters: dict[str, str], result_count: int, partial: bool, latency_ms: int) -> dict:
+    """One search.event for an answered search; returns the payload."""
+    payload = {
+        "type": "search.query",
+        "tenant": tenant,
+        # The topic is retained and replicated: a digest of the query and the names of the filters, never what was typed.
+        "query_hash": catalog.digest(catalog.normalize_query(q)),
+        "filter_fields": sorted(filters),
+        "result_count": result_count,
+        "partial": partial,
+        "latency_ms": latency_ms,
+    }
+
+    def on_delivery(err, msg) -> None:
+        if err is not None:
+            r.incr(f"telemetry:dropped:{tenant}")  # the dashboard's counts are a lower bound, and it knows by how much
+            log.warning("search event not delivered: %s", err)
+
+    producer.produce(EVENT_TOPIC, key=tenant, value=json.dumps(payload), on_delivery=on_delivery)
+    producer.flush(2.0)
+    return payload
 `,
     },
     typescript: {
-      starter: `/** search.event producer: the starter. */
-import {createHash} from 'node:crypto';
-
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 import {Kafka} from 'kafkajs';
 
-const kafka = new Kafka({clientId: 'search', brokers: ['kafka:9092']});
-const producer = kafka.producer();
+import {digest, normalizeQuery} from 'search/catalog';
+
+export const EVENT_TOPIC = 'search.event';
+
 const redis = new Redis({host: 'redis', port: 6379});
+const kafka = new Kafka({clientId: 'searchd', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect();
 
-interface SearchEvent {
-  tenant: string;
-  query: string;
-  results: number;
-}
-
-export async function publishSearch(event: SearchEvent): Promise<void> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const key = createHash('sha256').update(event.query).digest('hex');
-  const payload = {query: event.query, results: event.results};
-  await producer.send({topic: 'search.event', messages: [{key, value: JSON.stringify(payload)}]});
-}
-
-export async function consumeSearchEvents(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'search-telemetry'});
-  await consumer.subscribe({topic: 'search.event'});
-  await consumer.run({
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as SearchEvent;
-      await consumer.commitOffsets([{topic, partition, offset: (Number(message.offset) + 1).toString()}]);
-      await redis.incr(\`search:count:\${event.tenant}\`);
-    },
-  });
+/** One search.event for an answered search; resolves the payload. */
+export async function recordSearch(
+  tenant: string,
+  q: string,
+  filters: Record<string, string>,
+  resultCount: number,
+  partial: boolean,
+  latencyMs: number,
+): Promise<Record<string, unknown>> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const payload = {
+    type: 'search.query',
+    tenant,
+    q,
+    filters,
+    result_count: resultCount,
+    partial,
+    latency_ms: latencyMs,
+  };
+  try {
+    await producer.send({topic: EVENT_TOPIC, messages: [{key: q, value: JSON.stringify(payload)}], acks: 1});
+  } catch (err) {
+    console.warn('search event not delivered', err);
+  }
+  return payload;
 }
 `,
-      solution: `/** search.event producer: tenant-keyed, query hashed, and honest about counters. */
-import {createHash} from 'node:crypto';
-
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 import {Kafka} from 'kafkajs';
 
-const kafka = new Kafka({clientId: 'search', brokers: ['kafka:9092']});
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+import {digest, normalizeQuery} from 'search/catalog';
+
+export const EVENT_TOPIC = 'search.event';
+
 const redis = new Redis({host: 'redis', port: 6379});
+const kafka = new Kafka({clientId: 'searchd', brokers: ['kafka:9092']});
+// Idempotent with acks -1 (all): a retry after a lost acknowledgement writes the event once, on every replica.
+const producer = kafka.producer({idempotent: true});
+void producer.connect();
 
-interface SearchEvent {
-  tenant: string;
-  text: string;
-  resultCount: number;
-  latencyMs: number;
-  partial: boolean;
-}
-
-function queryHash(text: string): string {
-  return createHash('sha256').update(text.trim().toLowerCase()).digest('hex');
-}
-
-export async function publishSearch(event: SearchEvent): Promise<void> {
-  const tenant = event.tenant;
+/** One search.event for an answered search; resolves the payload. */
+export async function recordSearch(
+  tenant: string,
+  q: string,
+  filters: Record<string, string>,
+  resultCount: number,
+  partial: boolean,
+  latencyMs: number,
+): Promise<Record<string, unknown>> {
   const payload = {
+    type: 'search.query',
     tenant,
-    query_hash: queryHash(event.text),
-    result_count: event.resultCount,
-    latency_ms: event.latencyMs,
-    partial: event.partial,
+    // The topic is retained and replicated: a digest of the query and the names of the filters, never what was typed.
+    query_hash: digest(normalizeQuery(q)),
+    filter_fields: Object.keys(filters).sort(),
+    result_count: resultCount,
+    partial,
+    latency_ms: latencyMs,
   };
-  await producer.send({
-    topic: 'search.event',
-    acks: -1,
-    messages: [{key: tenant, value: JSON.stringify(payload)}],
-  });
-}
-
-export async function consumeSearchEvents(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'search-telemetry'});
-  await consumer.subscribe({topic: 'search.event'});
-  await consumer.run({
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {tenant: string; result_count: number};
-      await redis.incr(\`search:count:\${event.tenant}\`);
-      await redis.incr(\`search:results:\${event.tenant}\`, event.result_count);
-      await consumer.commitOffsets([{topic, partition, offset: (Number(message.offset) + 1).toString()}]);
-    },
-  });
+  try {
+    await producer.send({topic: EVENT_TOPIC, messages: [{key: tenant, value: JSON.stringify(payload)}], acks: -1});
+  } catch (err) {
+    await redis.incr(\`telemetry:dropped:\${tenant}\`); // the dashboard's counts are a lower bound, and it knows by how much
+    console.warn('search event not delivered', err);
+  }
+  return payload;
 }
 `,
     },
@@ -302,271 +274,610 @@ export async function consumeSearchEvents(): Promise<void> {
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"log"
+	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
 )
 
-var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "search.event"}
-var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+// search/catalog provides catalog.NormalizeQuery and catalog.Digest.
 
-type SearchEvent struct {
-	Tenant  string
-	Query   string
-	Results int
-}
+const (
+	eventTopic = "search.event"
+	ackTimeout = 2 * time.Second
+)
 
-func publishSearch(ctx context.Context, event SearchEvent) error {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	sum := sha256.Sum256([]byte(event.Query))
-	payload, _ := json.Marshal(map[string]any{"query": event.Query, "results": event.Results})
-	return writer.WriteMessages(ctx, kafka.Message{Key: []byte(hex.EncodeToString(sum[:])), Value: payload})
-}
+var (
+	rdb      = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	producer = newProducer()
+)
 
-func consumeSearchEvents(ctx context.Context, reader *kafka.Reader) error {
-	for {
-		message, err := reader.FetchMessage(ctx)
-		if err != nil {
-			return err
-		}
-		var event SearchEvent
-		json.Unmarshal(message.Value, &event)
-		reader.CommitMessages(ctx, message)
-		rdb.Incr(ctx, "search:count:"+event.Tenant)
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
 	}
+	return p
+}
+
+// recordSearch produces one search.event for an answered search and returns the payload.
+func recordSearch(ctx context.Context, tenant, q string, filters map[string]string, resultCount int, partial bool, latencyMs int64) map[string]any {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	payload := map[string]any{
+		"type":         "search.query",
+		"tenant":       tenant,
+		"q":            q,
+		"filters":      filters,
+		"result_count": resultCount,
+		"partial":      partial,
+		"latency_ms":   latencyMs,
+	}
+	value, _ := json.Marshal(payload)
+	topic := eventTopic
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(&kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny}, Key: []byte(q), Value: value}, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded
+		}
+	}
+	if err != nil {
+		log.Printf("search event not delivered: %v", err)
+	}
+	return payload
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"log"
+	"sort"
+	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
+
+	"search/catalog" // NormalizeQuery, Digest
 )
 
-var writer = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        "search.event",
-	RequiredAcks: kafka.RequireAll,
-	Balancer:     &kafka.Hash{},
-}
-var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+const (
+	eventTopic = "search.event"
+	ackTimeout = 2 * time.Second
+)
 
-type SearchEvent struct {
-	Tenant      string
-	Query       string
-	ResultCount int
-	LatencyMs   int
-	Partial     bool
-}
+var (
+	rdb      = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	producer = newProducer()
+)
 
-func queryHash(query string) string {
-	sum := sha256.Sum256([]byte(query))
-	return hex.EncodeToString(sum[:])
-}
-
-func publishSearch(ctx context.Context, event SearchEvent) error {
-	tenant := event.Tenant
-	payload, _ := json.Marshal(map[string]any{
-		"tenant":       tenant,
-		"query_hash":   queryHash(event.Query),
-		"result_count": event.ResultCount,
-		"latency_ms":   event.LatencyMs,
-		"partial":      event.Partial,
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the event before the broker answers
+		"enable.idempotence": true,  // a write retried after a lost acknowledgement lands once
 	})
-	return writer.WriteMessages(ctx, kafka.Message{Key: []byte(tenant), Value: payload})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
-func consumeSearchEvents(ctx context.Context, reader *kafka.Reader) error {
-	for {
-		message, err := reader.FetchMessage(ctx)
-		if err != nil {
-			return err
-		}
-		var event SearchEvent
-		json.Unmarshal(message.Value, &event)
-		rdb.Incr(ctx, "search:count:"+event.Tenant)
-		rdb.IncrBy(ctx, "search:results:"+event.Tenant, int64(event.ResultCount))
-		reader.CommitMessages(ctx, message)
+// recordSearch produces one search.event for an answered search and returns the payload.
+func recordSearch(ctx context.Context, tenant, q string, filters map[string]string, resultCount int, partial bool, latencyMs int64) map[string]any {
+	fields := make([]string, 0, len(filters))
+	for field := range filters {
+		fields = append(fields, field)
 	}
+	sort.Strings(fields)
+	payload := map[string]any{
+		"type":   "search.query",
+		"tenant": tenant,
+		// The topic is retained and replicated: a digest of the query and the names of the filters, never what was typed.
+		"query_hash":    catalog.Digest(catalog.NormalizeQuery(q)),
+		"filter_fields": fields,
+		"result_count":  resultCount,
+		"partial":       partial,
+		"latency_ms":    latencyMs,
+	}
+	value, _ := json.Marshal(payload)
+	topic := eventTopic
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(&kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny}, Key: []byte(tenant), Value: value}, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded
+		}
+	}
+	if err != nil {
+		rdb.Incr(ctx, "telemetry:dropped:"+tenant) // the dashboard's counts are a lower bound, and it knows by how much
+		log.Printf("search event not delivered: %v", err)
+	}
+	return payload
 }
 `,
     },
     scala: {
       starter: `import java.util.Properties
 
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
+import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
+import org.apache.kafka.common.serialization.StringSerializer
+import redis.clients.jedis.JedisPooled
+import spray.json._
 
-import scala.jdk.CollectionConverters._
+import search.Catalog // normalizeQuery, digest
 
-import redis.clients.jedis.Jedis
+object Telemetry {
+  val EventTopic = "search.event"
 
-final case class SearchEvent(tenant: String, query: String, results: Int)
+  val jedis = new JedisPooled("redis", 6379)
 
-object SearchEvents {
-  val producerProps = new Properties()
-  producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  val producer = new KafkaProducer[String, String](producerProps)
-  val jedis = new Jedis("redis", 6379)
-
-  def publishSearch(event: SearchEvent): Unit = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val key = Integer.toHexString(event.query.hashCode)
-    val payload = s"""{"query":"\${event.query}","results":\${event.results}}"""
-    producer.send(new ProducerRecord("search.event", key, payload))
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  def consumeSearchEvents(): Unit = {
-    val consumerProps = new Properties()
-    consumerProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG, "search-telemetry")
-    val consumer = new KafkaConsumer[String, String](consumerProps)
-    consumer.subscribe(List("search.event").asJava)
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(1000))
-      records.forEach { record =>
-        val tenant = record.key()
-        consumer.commitSync()
-        jedis.incr(s"search:count:$tenant")
-      }
-    }
+  /** One search.event for an answered search; returns the payload. */
+  def recordSearch(tenant: String, q: String, filters: Map[String, String], resultCount: Int, partial: Boolean, latencyMs: Long): JsObject = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val payload = JsObject(
+      "type" -> JsString("search.query"),
+      "tenant" -> JsString(tenant),
+      "q" -> JsString(q),
+      "filters" -> JsObject(filters.map { case (field, value) => field -> JsString(value) }),
+      "result_count" -> JsNumber(resultCount),
+      "partial" -> JsBoolean(partial),
+      "latency_ms" -> JsNumber(latencyMs))
+    producer.send(new ProducerRecord[String, String](EventTopic, q, payload.compactPrint), new Callback {
+      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
+        if (exception != null) System.err.println(s"search event not delivered: $exception")
+    })
+    producer.flush()
+    payload
   }
 }
 `,
       solution: `import java.util.Properties
 
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
+import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
+import org.apache.kafka.common.serialization.StringSerializer
+import redis.clients.jedis.JedisPooled
+import spray.json._
 
-import scala.jdk.CollectionConverters._
+import search.Catalog // normalizeQuery, digest
 
-import redis.clients.jedis.Jedis
+object Telemetry {
+  val EventTopic = "search.event"
 
-final case class SearchEvent(tenant: String, text: String, resultCount: Int, latencyMs: Int, partial: Boolean)
+  val jedis = new JedisPooled("redis", 6379)
 
-object SearchEvents {
-  val producerProps = new Properties()
-  producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-  producerProps.put("enable.idempotence", "true")
-  producerProps.put("acks", "all")
-  val producer = new KafkaProducer[String, String](producerProps)
-  val jedis = new Jedis("redis", 6379)
-
-  def queryHash(text: String): String = Integer.toHexString(text.trim.toLowerCase.hashCode)
-
-  def publishSearch(event: SearchEvent): Unit = {
-    val tenant = event.tenant
-    val payload =
-      s"""{"tenant":"$tenant","query_hash":"\${queryHash(event.text)}","result_count":\${event.resultCount},"latency_ms":\${event.latencyMs},"partial":\${event.partial}}"""
-    producer.send(new ProducerRecord("search.event", tenant, payload))
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "all") // every in-sync replica has the event before the broker answers
+    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  def consumeSearchEvents(): Unit = {
-    val consumerProps = new Properties()
-    consumerProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG, "search-telemetry")
-    val consumer = new KafkaConsumer[String, String](consumerProps)
-    consumer.subscribe(List("search.event").asJava)
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(1000))
-      records.forEach { record =>
-        val tenant = record.key()
-        jedis.incr(s"search:count:$tenant")
-        consumer.commitSync()
-      }
-    }
+  /** One search.event for an answered search; returns the payload. */
+  def recordSearch(tenant: String, q: String, filters: Map[String, String], resultCount: Int, partial: Boolean, latencyMs: Long): JsObject = {
+    // The topic is retained and replicated: a digest of the query and the names of the filters, never what was typed.
+    val payload = JsObject(
+      "type" -> JsString("search.query"),
+      "tenant" -> JsString(tenant),
+      "query_hash" -> JsString(Catalog.digest(Catalog.normalizeQuery(q))),
+      "filter_fields" -> JsArray(filters.keys.toSeq.sorted.map(JsString(_)).toVector),
+      "result_count" -> JsNumber(resultCount),
+      "partial" -> JsBoolean(partial),
+      "latency_ms" -> JsNumber(latencyMs))
+    producer.send(new ProducerRecord[String, String](EventTopic, tenant, payload.compactPrint), new Callback {
+      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit =
+        if (exception != null) {
+          jedis.incr(s"telemetry:dropped:$tenant") // the dashboard's counts are a lower bound, and it knows by how much
+          System.err.println(s"search event not delivered: $exception")
+        }
+    })
+    producer.flush()
+    payload
   }
 }
 `,
     },
     cpp: {
       starter: `#include <librdkafka/rdkafkacpp.h>
-#include <sw/redis++/redis++.h>
-
-#include <functional>
-#include <string>
-
-void publishSearch(RdKafka::Producer* producer, const std::string& tenant, const std::string& query, int results) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const std::string key = std::to_string(std::hash<std::string>{}(query));
-  const std::string text = R"({"query":")" + query + R"(","results":)" + std::to_string(results) + "}";
-  producer->produce("search.event", RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                    const_cast<char*>(text.c_str()), text.size(), key.c_str(), key.size(), 0, nullptr);
-}
-
-void consumeSearchEvents(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
-  while (true) {
-    RdKafka::Message* message = consumer->consume(1000);
-    if (message->err() == RdKafka::ERR_NO_ERROR) {
-      consumer->commitSync(message);
-      redis.incr("search:count:" + std::string(static_cast<const char*>(message->key_pointer()), message->key_len()));
-    } else if (message->err() == RdKafka::ERR__PARTITION_EOF) {
-      continue;
-    }
-    delete message;
-  }
-}
-`,
-      solution: `#include <librdkafka/rdkafkacpp.h>
-#include <sw/redis++/redis++.h>
-
-#include <functional>
-#include <string>
-
 #include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
+
+#include <iostream>
+#include <map>
+#include <memory>
+#include <string>
+
+#include "search/catalog.h"  // catalog::normalizeQuery, catalog::digest
 
 using json = nlohmann::json;
 
-std::string queryHash(const std::string& query) { return std::to_string(std::hash<std::string>{}(query)); }
+const std::string kEventTopic = "search.event";
 
-RdKafka::Producer* makeProducer(std::string& error) {
-  auto* conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
-  conf->set("bootstrap.servers", "kafka:9092", error);
-  conf->set("enable.idempotence", "true", error);
-  conf->set("acks", "all", error);
-  return RdKafka::Producer::create(conf, error);
+sw::redis::Redis& redis() {
+  static sw::redis::Redis r("tcp://redis:6379");
+  return r;
 }
 
-void publishSearch(RdKafka::Producer* producer, const std::string& tenant, const std::string& query, int result_count,
-                   int latency_ms) {
-  const std::string query_hash = queryHash(query);
-  const json payload = {
-      {"tenant", tenant},
-      {"query_hash", query_hash},
-      {"result_count", result_count},
-      {"latency_ms", latency_ms},
-  };
-  const std::string text = payload.dump();
-  producer->produce("search.event", RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(text.c_str()), text.size(), tenant.c_str(), tenant.size(), 0, nullptr);
-}
-
-void consumeSearchEvents(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
-  while (true) {
-    RdKafka::Message* message = consumer->consume(1000);
-    if (message->err() == RdKafka::ERR_NO_ERROR) {
-      const json event = json::parse(std::string(static_cast<const char*>(message->payload()), message->len()));
-      const auto tenant = event.value("tenant", std::string());
-      redis.incr("search:count:" + tenant);
-      consumer->commitSync(message);
-    }
-    delete message;
+class LogFailures : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override {
+    if (message.err() != RdKafka::ERR_NO_ERROR) std::cerr << "search event not delivered: " << message.errstr() << "\\n";
   }
+};
+
+LogFailures delivery_reports;
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
+  conf->set("dr_cb", &delivery_reports, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
+
+auto producer = make_producer();
+
+// One search.event for an answered search; returns the payload.
+json recordSearch(const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters, int result_count,
+                  bool partial, long latency_ms) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const json payload = {{"type", "search.query"},          {"tenant", tenant},   {"q", q},
+                        {"filters", filters},              {"result_count", result_count},
+                        {"partial", partial},              {"latency_ms", latency_ms}};
+  const std::string value = payload.dump();
+  producer->produce(kEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                    value.size(), q.c_str(), q.size(), 0, nullptr);
+  producer->flush(2000);
+  return payload;
+}
+`,
+      solution: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
+
+#include <iostream>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "search/catalog.h"  // catalog::normalizeQuery, catalog::digest
+
+using json = nlohmann::json;
+
+const std::string kEventTopic = "search.event";
+
+sw::redis::Redis& redis() {
+  static sw::redis::Redis r("tcp://redis:6379");
+  return r;
+}
+
+class CountDrops : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override {
+    if (message.err() == RdKafka::ERR_NO_ERROR) return;
+    // The record's key is the tenant: the dashboard's counts are a lower bound, and it knows by how much.
+    redis().incr("telemetry:dropped:" + (message.key() ? *message.key() : std::string("unknown")));
+    std::cerr << "search event not delivered: " << message.errstr() << "\\n";
+  }
+};
+
+CountDrops delivery_reports;
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the event before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a write retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery_reports, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
+
+auto producer = make_producer();
+
+// One search.event for an answered search; returns the payload.
+json recordSearch(const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters, int result_count,
+                  bool partial, long latency_ms) {
+  std::vector<std::string> fields;
+  for (const auto& entry : filters) fields.push_back(entry.first);  // a std::map iterates sorted
+  // The topic is retained and replicated: a digest of the query and the names of the filters, never what was typed.
+  const json payload = {{"type", "search.query"},
+                        {"tenant", tenant},
+                        {"query_hash", catalog::digest(catalog::normalizeQuery(q))},
+                        {"filter_fields", fields},
+                        {"result_count", result_count},
+                        {"partial", partial},
+                        {"latency_ms", latency_ms}};
+  const std::string value = payload.dump();
+  producer->produce(kEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                    value.size(), tenant.c_str(), tenant.size(), 0, nullptr);
+  producer->flush(2000);
+  return payload;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+from search import catalog
+
+TOPIC = "search.event"
+
+
+def _payload(record):
+    try:
+        return json.loads(record.value)
+    except Exception as exc:
+        raise AssertionError(f"the record's value is not JSON: {record.value!r} ({exc})")
+
+
+def check_tenant_key(ctx):
+    m = ctx.load("telemetry")
+    m.record_search("t-1", "kettle", {}, 3, False, 12)
+    m.record_search("t-2", "kettle", {}, 1, False, 9)
+    m.record_search("t-1", "steel kettle", {"brand": "acme"}, 1, False, 11)
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three searches produced {len(records)} records on {TOPIC}"
+    keys = [r.key for r in records]
+    assert keys == [b"t-1", b"t-2", b"t-1"], f"the records are keyed {keys}, expected the tenants [t-1, t-2, t-1]: keyed by anything else, one tenant's events scatter across partitions"
+    assert records[0].partition == records[2].partition, f"t-1's events landed on partitions {records[0].partition} and {records[2].partition}: one tenant's events must stay on one partition, in order"
+
+
+def check_no_raw_query(ctx):
+    m = ctx.load("telemetry")
+    m.record_search("t-1", "  Steel KETTLE ", {"brand": "acme", "max_price": "5000"}, 2, True, 41)
+    record = ctx.kafka.records(TOPIC)[0]
+    text = record.value.decode().lower()
+    for leaked in ("steel", "kettle", "acme", "5000"):
+        assert leaked not in text, f"the event carries {leaked!r}: {record.value.decode()}. The topic is retained and replicated; carry query_hash and the filter names"
+    p = _payload(record)
+    assert p.get("query_hash") == catalog.digest("steel kettle"), f"query_hash is {p.get('query_hash')!r}, expected digest(normalize_query(q)) = {catalog.digest('steel kettle')!r}"
+    assert p.get("filter_fields") == ["brand", "max_price"], f"filter_fields is {p.get('filter_fields')!r}, expected the sorted names ['brand', 'max_price']"
+    expected = {"type": "search.query", "tenant": "t-1", "result_count": 2, "partial": True, "latency_ms": 41}
+    assert all(p.get(k) == v for k, v in expected.items()), f"the event is {p}, expected {expected} beside query_hash and filter_fields"
+
+
+def check_idempotent_producer(ctx):
+    m = ctx.load("telemetry")
+    ctx.kafka.lose_acks(TOPIC, 1)
+    m.record_search("t-1", "kettle", {}, 3, False, 12)
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one search whose acknowledgement was lost left {len(records)} records: the producer's retry wrote the event twice. Enable idempotence (with acks=all)"
+    m.record_search("t-1", "kettle", {}, 3, False, 12)
+    ctx.kafka.failover(TOPIC)
+    assert len(ctx.kafka.records(TOPIC)) == 2, f"after a leader failover the topic holds {len(ctx.kafka.records(TOPIC))} records, expected 2: with acks=1 the leader alone acknowledged the event and lost it. Use acks=all"
+
+
+def check_dropped_count(ctx):
+    m = ctx.load("telemetry")
+    ctx.kafka.fail_next(TOPIC, 1)
+    m.record_search("t-1", "kettle", {}, 3, False, 12)
+    dropped = ctx.redis.get("telemetry:dropped:t-1")
+    assert dropped == "1", f"a search event the broker refused left telemetry:dropped:t-1 = {dropped!r}, expected '1': count a failed delivery in the delivery callback"
+    m.record_search("t-1", "kettle", {}, 3, False, 12)
+    assert ctx.redis.get("telemetry:dropped:t-1") == "1", "a delivered event must not be counted as dropped"
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"after one refused and one delivered event the topic holds {len(ctx.kafka.records(TOPIC))} records, expected 1"
+`,
+    typescript: `const TOPIC = 'search.event';
+
+function payload(record) {
+  try {
+    return JSON.parse(record.value.toString());
+  } catch (e) {
+    assert.fail(\`the record's value is not JSON: \${record.value} (\${e})\`);
+  }
+}
+
+export async function check_tenant_key(ctx) {
+  const m = ctx.load('telemetry');
+  await m.recordSearch('t-1', 'kettle', {}, 3, false, 12);
+  await m.recordSearch('t-2', 'kettle', {}, 1, false, 9);
+  await m.recordSearch('t-1', 'steel kettle', {brand: 'acme'}, 1, false, 11);
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three searches produced \${records.length} records on \${TOPIC}\`);
+  const keys = records.map(r => r.key?.toString() ?? null);
+  assert.deepStrictEqual(keys, ['t-1', 't-2', 't-1'], \`the records are keyed \${JSON.stringify(keys)}, expected the tenants: keyed by anything else, one tenant's events scatter across partitions\`);
+  assert.equal(records[0].partition, records[2].partition, "t-1's events must stay on one partition, in order");
+}
+
+export async function check_no_raw_query(ctx) {
+  const m = ctx.load('telemetry');
+  const {digest} = ctx.load('/support/search/catalog.ts');
+  await m.recordSearch('t-1', '  Steel KETTLE ', {brand: 'acme', max_price: '5000'}, 2, true, 41);
+  const record = ctx.kafka.records(TOPIC)[0];
+  const text = record.value.toString().toLowerCase();
+  for (const leaked of ['steel', 'kettle', 'acme', '5000']) {
+    assert(!text.includes(leaked), \`the event carries "\${leaked}": \${record.value}. The topic is retained and replicated; carry query_hash and the filter names\`);
+  }
+  const p = payload(record);
+  assert.equal(p.query_hash, digest('steel kettle'), \`query_hash is \${JSON.stringify(p.query_hash)}, expected digest(normalizeQuery(q))\`);
+  assert.deepStrictEqual(p.filter_fields, ['brand', 'max_price'], \`filter_fields is \${JSON.stringify(p.filter_fields)}, expected the sorted names\`);
+  assert(p.type === 'search.query' && p.tenant === 't-1' && p.result_count === 2 && p.partial === true && p.latency_ms === 41, \`the event is \${JSON.stringify(p)}, expected type, tenant, result_count, partial and latency_ms beside query_hash\`);
+}
+
+export async function check_idempotent_producer(ctx) {
+  const m = ctx.load('telemetry');
+  ctx.kafka.loseAcks(TOPIC, 1);
+  await m.recordSearch('t-1', 'kettle', {}, 3, false, 12);
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 1, \`one search whose acknowledgement was lost left \${records.length} records: the producer's retry wrote the event twice. Make the producer idempotent\`);
+  await m.recordSearch('t-1', 'kettle', {}, 3, false, 12);
+  ctx.kafka.failover(TOPIC);
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, \`after a leader failover the topic holds \${ctx.kafka.records(TOPIC).length} records, expected 2: with acks 1 the leader alone acknowledged the event and lost it. Use acks -1 (all)\`);
+}
+
+export async function check_dropped_count(ctx) {
+  const m = ctx.load('telemetry');
+  ctx.kafka.failNext(TOPIC, 1);
+  await m.recordSearch('t-1', 'kettle', {}, 3, false, 12);
+  const dropped = ctx.redis.get('telemetry:dropped:t-1');
+  assert.equal(dropped, '1', \`a search event the broker refused left telemetry:dropped:t-1 = \${JSON.stringify(dropped)}, expected "1": count a rejected send\`);
+  await m.recordSearch('t-1', 'kettle', {}, 3, false, 12);
+  assert.equal(ctx.redis.get('telemetry:dropped:t-1'), '1', 'a delivered event must not be counted as dropped');
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'after one refused and one delivered event the topic must hold 1 record');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+
+	"search/catalog"
+
+	"leetbuild/harness"
+)
+
+const telemetryTopic = "search.event"
+
+var telemetryBg = context.Background()
+
+func record(ctx *harness.Ctx, tenant, q string, filters map[string]string) {
+	recordSearch(telemetryBg, tenant, q, filters, 3, false, 12)
+	ctx.Settle()
+}
+
+func CheckTenantKey(ctx *harness.Ctx) {
+	record(ctx, "t-1", "kettle", nil)
+	record(ctx, "t-2", "kettle", nil)
+	record(ctx, "t-1", "steel kettle", map[string]string{"brand": "acme"})
+	records := ctx.Kafka.Records(telemetryTopic)
+	ctx.Equal(len(records), 3, "three searches must produce three records on %s; the records", telemetryTopic)
+	ctx.Equal(ctx.Kafka.Keys(telemetryTopic), []string{"t-1", "t-2", "t-1"}, "the records must be keyed by tenant (keyed by anything else, one tenant's events scatter across partitions)")
+	ctx.Equal(records[0].Partition, records[2].Partition, "t-1's events must stay on one partition, in order; the partitions")
+}
+
+func CheckNoRawQuery(ctx *harness.Ctx) {
+	recordSearch(telemetryBg, "t-1", "  Steel KETTLE ", map[string]string{"brand": "acme", "max_price": "5000"}, 2, true, 41)
+	ctx.Settle()
+	values := ctx.Kafka.Values(telemetryTopic)
+	ctx.Equal(len(values), 1, "one search must produce one record; the records")
+	text := strings.ToLower(values[0])
+	for _, leaked := range []string{"steel", "kettle", "acme", "5000"} {
+		ctx.Assert(!strings.Contains(text, leaked), "the event carries %q: %s. The topic is retained and replicated; carry query_hash and the filter names", leaked, values[0])
+	}
+	var p map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[0]), &p), "the record's value must be JSON: %s", values[0])
+	ctx.Equal(p["query_hash"], catalog.Digest("steel kettle"), "query_hash must be catalog.Digest(catalog.NormalizeQuery(q))")
+	ctx.Equal(p["filter_fields"], []any{"brand", "max_price"}, "filter_fields must be the sorted names")
+	ctx.Assert(p["type"] == "search.query" && p["tenant"] == "t-1" && p["result_count"] == float64(2) && p["partial"] == true && p["latency_ms"] == float64(41), "the event is %s, expected type, tenant, result_count, partial and latency_ms beside query_hash", values[0])
+}
+
+func CheckIdempotentProducer(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(telemetryTopic, 1)
+	record(ctx, "t-1", "kettle", nil)
+	ctx.Equal(len(ctx.Kafka.Records(telemetryTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	record(ctx, "t-1", "kettle", nil)
+	ctx.Kafka.Failover(telemetryTopic)
+	ctx.Equal(len(ctx.Kafka.Records(telemetryTopic)), 2, "a leader failover must not lose an acknowledged event (acks=all); the records")
+}
+
+func CheckDroppedCount(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext(telemetryTopic, 1)
+	record(ctx, "t-1", "kettle", nil)
+	dropped, _ := ctx.Redis.Get("telemetry:dropped:t-1")
+	ctx.Equal(dropped, "1", "a search event the broker refused must be counted in telemetry:dropped:t-1 (the delivery report's error)")
+	record(ctx, "t-1", "kettle", nil)
+	dropped, _ = ctx.Redis.Get("telemetry:dropped:t-1")
+	ctx.Equal(dropped, "1", "a delivered event must not be counted as dropped; telemetry:dropped:t-1")
+	ctx.Equal(len(ctx.Kafka.Records(telemetryTopic)), 1, "after one refused and one delivered event, the records")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <optional>
+#include <string>
+
+#include "search/catalog.h"
+
+namespace {
+
+const std::string kTopic = "search.event";
+
+void record(harness::Ctx& ctx, const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters) {
+  recordSearch(tenant, q, filters, 3, false, 12);
+  ctx.Settle();
+}
+
+}  // namespace
+
+void CheckTenantKey(harness::Ctx& ctx) {
+  record(ctx, "t-1", "kettle", {});
+  record(ctx, "t-2", "kettle", {});
+  record(ctx, "t-1", "steel kettle", {{"brand", "acme"}});
+  const auto records = ctx.Kafka.Records(kTopic);
+  ctx.Equal(records.size(), 3, "three searches must produce three records on %s; the records", kTopic);
+  ctx.Equal(ctx.Kafka.Keys(kTopic), {"t-1", "t-2", "t-1"}, "the records must be keyed by tenant (keyed by anything else, one tenant's events scatter across partitions)");
+  ctx.Equal(records[0].Partition, records[2].Partition, "t-1's events must stay on one partition, in order; the partitions");
+}
+
+void CheckNoRawQuery(harness::Ctx& ctx) {
+  recordSearch("t-1", "  Steel KETTLE ", {{"brand", "acme"}, {"max_price", "5000"}}, 2, true, 41);
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kTopic);
+  ctx.Equal(values.size(), 1, "one search must produce one record; the records");
+  std::string text = values[0];
+  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  for (const std::string leaked : {"steel", "kettle", "acme", "5000"}) {
+    ctx.Assert(text.find(leaked) == std::string::npos, "the event carries %q: %s. The topic is retained and replicated; carry query_hash and the filter names", leaked, values[0]);
+  }
+  const auto p = nlohmann::json::parse(values[0], nullptr, false);
+  ctx.Assert(p.is_object(), "the record's value must be JSON: %s", values[0]);
+  ctx.Equal(p.value("query_hash", ""), catalog::digest("steel kettle"), "query_hash must be catalog::digest(catalog::normalizeQuery(q))");
+  ctx.Equal(p.value("filter_fields", std::vector<std::string>{}), {"brand", "max_price"}, "filter_fields must be the sorted names");
+  ctx.Assert(p.value("type", "") == "search.query" && p.value("tenant", "") == "t-1" && p.value("result_count", 0) == 2 && p.value("partial", false) && p.value("latency_ms", 0) == 41,
+             "the event is %s, expected type, tenant, result_count, partial and latency_ms beside query_hash", values[0]);
+}
+
+void CheckIdempotentProducer(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kTopic, 1);
+  record(ctx, "t-1", "kettle", {});
+  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  record(ctx, "t-1", "kettle", {});
+  ctx.Kafka.Failover(kTopic);
+  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "a leader failover must not lose an acknowledged event (acks=all); the records");
+}
+
+void CheckDroppedCount(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(kTopic, 1);
+  record(ctx, "t-1", "kettle", {});
+  ctx.Equal(ctx.Redis.Get("telemetry:dropped:t-1"), std::optional<std::string>("1"), "a search event the broker refused must be counted in telemetry:dropped:t-1 (dr_cb)");
+  record(ctx, "t-1", "kettle", {});
+  ctx.Equal(ctx.Redis.Get("telemetry:dropped:t-1"), std::optional<std::string>("1"), "a delivered event must not be counted as dropped; telemetry:dropped:t-1");
+  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one refused and one delivered event, the records");
+}
+`,
+  },
   hints: [
-    "The analytics dashboard shows one tenant's searches out of order, the topic holds shoppers' raw search text, a producer retry during a broker failover doubles a count, and a consumer crash drops counts.",
-    'The record key is a hash of the query, so tenant events scatter across partitions; the payload copies the text; the producer runs on broker defaults; the consumer commits before it touches Redis.',
-    'Key by `tenant`, send `{tenant, query_hash, result_count, latency_ms}`, configure `enable.idempotence` with `acks=all` (or the client equivalent), and in the consumer call `INCR` before `commit`.',
+    'Search as one tenant twice and watch the partitions: the two events sit apart, keyed by what the shopper typed, and the payload repeats the query and the filter values. Make the broker refuse one event: nothing counts it.',
+    'The key and the payload are built from `q` and `filters` as they arrived. The producer uses `acks=1` without idempotence, and the delivery callback only logs its error.',
+    'Key by `tenant`; send `query_hash = digest(normalize_query(q))` and `filter_fields = sorted(filters)` instead of `q` and `filters`; set `enable.idempotence` with `acks=all`; `INCR telemetry:dropped:{tenant}` in the delivery callback on an error.',
   ],
-  debrief: `The starter is useful, and that is the trap: the raw query is the field the analytics team wants most, and it is the field that must not leave the service. The fix has one shape throughout: decide the contract at the producer. The tenant is the partition key because per-tenant order is a feature; the query travels as a hash because a retained topic is a long-lived copy; idempotence with acks=all is producer configuration rather than application logic; and the consumer increments before it commits so a crash replays one record instead of losing it. Production telemetry pipelines also register a schema so a future producer cannot reintroduce a text field, buffer produce failures in an outbox, and keep billing-grade counts on a separate topic from sampled relevance data.`,
+  debrief: `Telemetry is a second copy of every search, kept longer and read by more people than the search itself, so it carries what analytics needs and nothing a shopper typed: a digest groups identical queries, the filter names show how people narrow results, and the counts carry the rest. The tenant key gives each tenant one ordered stream, which is what a per-tenant counter consumes. Telemetry may drop an event; it may not drop one silently, which is why the delivery report feeds a counter. In production the produce is handed to a background queue so a slow broker cannot slow a search, and query digests are salted per tenant so a common query cannot be recovered by hashing a dictionary.`,
 };

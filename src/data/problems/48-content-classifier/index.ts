@@ -1,10 +1,12 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Content classifier: the course is not "call a model and return its labels", it
@@ -25,48 +27,52 @@ export const contentClassifierProblem: Problem = {
   statement: `# Content Classifier
 
 A content classifier turns a document into labels other systems act on: routing, moderation queues,
-billing categories, retrieval filters. The visible part is a list of label strings; the parts that
-decide whether the platform is safe are the binding between those strings and a tenant's taxonomy,
-the cache around it, the failure policy of the model call, the event that reports what happened,
-and the version record that makes yesterday's decision explainable today.
+billing categories, retrieval filters. The visible part is a list of label strings; what decides
+whether the platform is safe is the binding between those strings and a tenant's taxonomy, the cache
+around it, the failure policy of the model call, the event that reports what happened, and the
+version record that makes yesterday's decision explainable today.
 
 ## The real system
 
-Google's Cloud Natural Language API exposes \`documents:classifyText\`, which returns categories from
-a fixed taxonomy with a confidence per category, and the caller pins that taxonomy with
-\`classificationModelOptions.v2Model.contentCategoriesVersion\` (\`V1\` or \`V2\`): the label set is
-versioned, and a response only means something against the version that produced it. A platform
-that routes on labels needs the same discipline one level down, because a language model asked for
-a category that does not exist will invent a plausible one.
+Google's Cloud Natural Language API classifies text with \`documents:classifyText\` into a fixed
+category set, and the caller pins that set with
+\`classificationModelOptions.v2Model.contentCategoriesVersion\`: \`V1\` is the legacy categories of
+the 2017 launch, \`V2\` the categories updated in 2022. The label set is versioned, and an answer only
+means something against the version that produced it. A platform that routes on labels needs the
+same discipline one level down, because a language model asked for a category will sometimes invent
+a plausible one.
 
 ## What you build here
 
-One service, **classifierd**, with five pieces:
+One service, **classifierd**, on one contract: the \`classifier\` support package (\`config\` for the
+model address, topic and keys; \`taxonomies\`, the store of immutable taxonomy versions per tenant;
+\`outbox\`), one proto (\`content_classifier.proto\`, \`Model.Classify\`), and two step functions
+provided to the other steps as built: \`inference.classify\` (step 3, used by step 1) and
+\`counters.bump_counter\` (step 2, used by step 4's consumer).
 
-1. \`POST /v1/classify\`: authenticated tenant, \`Content-Type: text/*\` only, text capped at 64 KiB
-   and rejected when empty after normalization, labels bound to the tenant's taxonomy version
-   (invented labels route to review), a taxonomy the tenant does not own answering \`404\`.
-2. A **Redis** layer: taxonomy definitions cached per \`(tenant, taxonomy_id, version)\` for ten
-   minutes as a full replacement, and per-tenant counters in hourly keys that expire with their
-   window.
-3. A **gRPC** model client: a 700 ms deadline, at most three attempts, a terminal refusal, a
-   deterministic keyword fallback with provenance, and a fallback counter so an outage is visible.
-4. A **Kafka** path: one \`classify.result\` event per classification keyed by tenant, carrying the
-   request id, taxonomy version, labels, provenance and a text hash in place of the text, with an
-   idempotent producer and a consumer that updates counters before it commits.
-5. \`GET /v1/taxonomies/{id}\`: an immutable version with its changelog, scoped to the tenant, and a
-   classification record that names the exact version it used.
+1. \`POST /v1/classify\` with \`X-Tenant-Id\` and \`{taxonomy_id, taxonomy_version?, mime_type,
+   text}\`: \`text/*\` only, trimmed text up to 64 KiB, the tenant's taxonomy version or \`404\`, and
+   labels bound to that version (invented ones go to \`review\` and \`unknown_labels\`).
+2. **Redis**: taxonomy versions cached under \`taxonomy:{tenant}:{taxonomy_id}:{version}\` for ten
+   minutes as one \`SET\`, and label counters in \`counters:{tenant}:{hour}\` that expire with their hour.
+3. **gRPC** \`Model.Classify\`: a 700 ms deadline, at most three attempts, a refusal that ends them, and
+   a keyword fallback marked \`fallback\` and counted in \`metrics:classifier_fallback_total\`.
+4. **Kafka** \`classify.result\`: one event per classification keyed by tenant, with a text hash in
+   place of the text, from an idempotent producer with an outbox; a consumer in
+   \`classifier-metrics\` that counts before it commits.
+5. \`GET /v1/taxonomies/{taxonomy_id}\`: a tenant's version with its changelog; edits publish new
+   versions, and \`classifications:{tenant}\` records name the version they used.
 
 ## The debugging habit
 
-Every starter in this course compiles, serves the happy path, and looks right. In each step you
-debug it against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks
-that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Taxonomy authoring UIs, confidence calibration, per-label precision reporting, active learning,
-zero-shot fallback, regional model routing, and billing.`,
+regional model routing, and billing.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'classify · taxonomies', x: 8, y: 50},
@@ -90,4 +96,11 @@ zero-shot fallback, regional model routing, and billing.`,
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

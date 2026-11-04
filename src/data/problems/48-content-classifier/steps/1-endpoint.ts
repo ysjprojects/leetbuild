@@ -8,52 +8,46 @@ export const endpointStep: Step = {
   focus: ['client', 'classifier', 'taxonomy'],
   task: `## Task
 
-**Starting point.** \`POST /v1/classify\` takes \`{"text": "…", "taxonomy_id": "…", "taxonomy_version": "…"}\`,
-reads the tenant from \`X-Tenant-Id\`, loads the taxonomy by id, sends the text to the model and
-answers with the model's labels and the taxonomy version. It serves the demo and hides 4 flaws.
+**Starting point.** \`POST /v1/classify\` reads the tenant from \`X-Tenant-Id\` and a JSON body
+\`{taxonomy_id, taxonomy_version?, mime_type, text}\`, looks the taxonomy up with
+\`taxonomies.by_id\`, classifies the text through \`inference.classify\` (provided; step 3 builds it)
+and answers \`{taxonomy_id, taxonomy_version, labels, unknown_labels, provenance, model_version}\`
+with the model's labels. It serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** Trusting the model's label strings lets a category the taxonomy
-does not contain flow downstream as real; resolving the taxonomy by id alone lets one tenant classify
-against another tenant's taxonomy; classifying raw upload bytes turns a screenshot into garbage
-labels; and skipping the size and normalization checks lets an empty or unbounded document reach an
-expensive model call.
+**Failure mode the checks target.** An image upload goes through the model as if it were text; an
+empty or unbounded document reaches an expensive call; one tenant classifies against another
+tenant's taxonomy; and a label the model invented flows downstream as if the taxonomy contained it.
 
-Requirements:
-
-- A missing \`X-Tenant-Id\` is **401**.
-- The request must be \`Content-Type: text/*\`; an image or octet-stream upload is **415** and its
-  bytes do not reach the model.
-- \`text\` is normalized (unicode fold + trim) and then checked: empty after normalization is **400**,
-  more than **64 KiB** (\`1 << 16\` bytes) of UTF-8 is **413**.
-- The taxonomy is resolved **for this tenant** at the requested version; a taxonomy the tenant does
-  not own is **404**, not a fallback to the latest.
-- Labels are **bound to the taxonomy version**: only labels the version contains are returned. An
-  invented label routes the result to the review bucket and the unknowns are reported so review can
-  act on them.
-- The response names the taxonomy version that classified the text.`,
+- A \`mime_type\` that is not \`text/*\` is **415**, and nothing reaches the model.
+- The text is trimmed: empty is **400**, more than \`MAX_TEXT_BYTES\` (64 KiB) of UTF-8 is **413**.
+- A missing \`X-Tenant-Id\` is **401**. The taxonomy comes from \`taxonomies.load(tenant,
+  taxonomy_id, version)\` at the requested version (the latest when absent); one the tenant does
+  not own is **404**.
+- \`bind_labels\` keeps the labels the version contains; the rest go to \`unknown_labels\` and add
+  \`REVIEW_LABEL\` (\`review\`), which is also the answer when no label survives.`,
   sequence: {
     participants: ['Client', 'Content Classifier', 'taxonomy store', 'Model'],
     messages: [
       {
         from: 'Client',
         to: 'Content Classifier',
-        label: 'POST /v1/classify · X-Tenant-Id · taxonomy_id · text/*',
+        label: 'POST /v1/classify · X-Tenant-Id · {taxonomy_id, mime_type, text}',
         kind: 'sync',
       },
       {
         from: 'Content Classifier',
         to: 'Content Classifier',
-        label: 'normalize · empty 400 · 64 KiB 413 · non-text 415',
+        label: '401 · 415 unless text/* · trim · 400 empty · 413 over 64 KiB',
         kind: 'sync',
       },
       {from: 'Content Classifier', to: 'taxonomy store', label: 'load(tenant, taxonomy_id, version)', kind: 'sync'},
-      {from: 'taxonomy store', to: 'Content Classifier', label: 'version + labels / 404', kind: 'reply'},
-      {from: 'Content Classifier', to: 'Model', label: 'Classify(text, taxonomy_version)', kind: 'sync'},
-      {from: 'Model', to: 'Content Classifier', label: 'labels (may include inventions)', kind: 'reply'},
+      {from: 'taxonomy store', to: 'Content Classifier', label: 'version + labels / none → 404', kind: 'reply'},
+      {from: 'Content Classifier', to: 'Model', label: 'Classify(text, taxonomy version)', kind: 'sync'},
+      {from: 'Model', to: 'Content Classifier', label: 'labels (some invented)', kind: 'reply'},
       {
         from: 'Content Classifier',
         to: 'Client',
-        label: '200 {labels, taxonomy_version} · invented → review bucket',
+        label: '200 {labels ∩ version, unknown_labels, review}',
         kind: 'reply',
       },
     ],
@@ -72,57 +66,73 @@ Requirements:
       },
     },
     {
-      id: 'size-and-empty',
-      title: 'Normalizes then enforces the 64 KiB cap and the empty rejection',
+      id: 'content-type',
+      title: 'Rejects a document that is not text with 415',
       detail:
-        'Text is normalized first; empty after normalization is **400** and more than `1 << 16` bytes of UTF-8 is **413**. The starter checks neither, so an empty or unbounded document reaches the model.',
+        'A `mime_type` outside `text/*` (an image, an octet stream) is **415** and never reaches the model; `text/markdown` is classified. The starter sends whatever bytes it gets.',
       match: {
-        python: {all: [/MAX_TEXT_BYTES/, /normalize_text/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_TEXT_BYTES/, /normalizeText/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxTextBytes/, /normalizeText/, /StatusRequestEntityTooLarge/, /StatusBadRequest/]},
-        scala: {
-          all: [/MaxTextBytes/, /normalizeText/, /StatusCodes\.RequestEntityTooLarge/, /StatusCodes\.BadRequest/],
+        python: {all: [/\.startswith\(\s*["']text\/["']\s*\)/, /\b415\b/]},
+        typescript: {all: [/\.startsWith\(\s*['"]text\/['"]\s*\)/, /\b415\b/]},
+        go: {all: [/strings\.HasPrefix\([^)]*"text\/"\s*\)/, /StatusUnsupportedMediaType|\b415\b/]},
+        scala: {all: [/\.startsWith\(\s*"text\/"\s*\)/, /UnsupportedMediaType|\b415\b/]},
+        cpp: {all: [/rfind\(\s*"text\/",\s*0\s*\)|starts_with\(\s*"text\/"\s*\)/, /\b415\b/]},
+      },
+    },
+    {
+      id: 'size-and-empty',
+      title: 'Trims, then rejects empty text (400) and more than 64 KiB (413)',
+      detail:
+        'The trimmed text is **400** when empty and **413** when its UTF-8 encoding exceeds `MAX_TEXT_BYTES` (`1 << 16`), both before any model call. The starter checks neither.',
+      match: {
+        python: {all: [/MAX_TEXT_BYTES\s*=/, /\b413\b/, /\b400\b/, /\.strip\(\)/]},
+        typescript: {all: [/MAX_TEXT_BYTES\s*=/, /\b413\b/, /\b400\b/, /\.trim\(\)/]},
+        go: {all: [/maxTextBytes\s*=/, /StatusRequestEntityTooLarge|\b413\b/, /strings\.TrimSpace\(/]},
+        scala: {all: [/MaxTextBytes\b/, /RequestEntityTooLarge|\b413\b/, /\.trim\b/]},
+        cpp: {all: [/kMaxTextBytes\s*=/, /\b413\b/, /find_first_not_of\(/]},
+      },
+    },
+    {
+      id: 'tenant-scope',
+      title: 'Resolves the taxonomy for this tenant at the requested version',
+      detail:
+        'A missing `X-Tenant-Id` is **401**; the taxonomy comes from `taxonomies.load(tenant, …)` at the requested version, so another tenant’s taxonomy is **404**. The starter uses `by_id`, which finds any tenant’s taxonomy and only its latest version.',
+      match: {
+        python: {all: [/taxonomies\.load\(\s*tenant/, /\b401\b/], none: [/taxonomies\.by_id\(/]},
+        typescript: {all: [/taxonomies\.load\(\s*tenant/, /\b401\b/], none: [/taxonomies\.byId\(/]},
+        scala: {all: [/Taxonomies\.load\(\s*tenant/, /Unauthorized|\b401\b/], none: [/Taxonomies\.byId\(/]},
+        cpp: {all: [/taxonomies::load\(\s*tenant/, /\b401\b/], none: [/taxonomies::byId\(/]},
+        go: {
+          all: [/taxonomies\.Load\(r\.Context\(\),\s*tenant/, /StatusUnauthorized|\b401\b/],
+          none: [/taxonomies\.ByID\(/],
         },
-        cpp: {all: [/kMaxTextBytes/, /normalizeText/, /\b413\b/, /\b400\b/]},
       },
     },
     {
       id: 'taxonomy-binding',
       title: 'Binds labels to the taxonomy version, invented labels to review',
       detail:
-        'Only labels present in the taxonomy version are returned; the rest are reported as unknown and the response carries the review bucket. The starter returns the model’s label strings unchecked.',
+        'The response’s `labels` come from `bind_labels`/`bindLabels` over the model’s labels: only labels the version contains, plus `REVIEW_LABEL` when one was unknown or none survived, and the unknown ones in `unknown_labels`. The starter returns the model’s strings unchecked.',
       match: {
-        python: {all: [/REVIEW_LABEL/, /bind_labels\(/, /unknown_labels/]},
-        typescript: {all: [/REVIEW_LABEL/, /bindLabels\(/, /unknown/]},
-        go: {all: [/reviewLabel/, /bindLabels\(/, /unknown/]},
-        scala: {all: [/ReviewLabel/, /bindLabels\(/, /unknown/]},
-        cpp: {all: [/kReviewLabel/, /bindLabels\(/, /unknown/]},
-      },
-    },
-    {
-      id: 'tenant-scope',
-      title: 'Resolves the taxonomy for this tenant, foreign is 404',
-      detail:
-        'The taxonomy is loaded with the authenticated tenant, so a taxonomy the tenant does not own is **404**. The starter looks it up by id alone and treats any tenant’s taxonomy as local.',
-      match: {
-        python: {all: [/status_code\s*=\s*404/, /load\(tenant/]},
-        typescript: {all: [/code\(\s*404\s*\)/, /load\(tenant/]},
-        go: {all: [/StatusNotFound/, /Load\(r\.Context\(\), tenant/]},
-        scala: {all: [/StatusCodes\.NotFound/, /load\(tenant/]},
-        cpp: {all: [/\b404\b/, /load\(tenant/]},
-      },
-    },
-    {
-      id: 'content-type',
-      title: 'Rejects non-text content with 415',
-      detail:
-        'Anything that is not `text/*` is **415** and never classified. The starter pushes the raw bytes of an upload to the model and returns whatever labels come back.',
-      match: {
-        python: {all: [/status_code\s*=\s*415/, /text\//, /Content-Type/]},
-        typescript: {all: [/code\(\s*415\s*\)/, /text\//, /content-type/]},
-        go: {all: [/StatusUnsupportedMediaType/, /text\//, /Content-Type/]},
-        scala: {all: [/StatusCodes\.UnsupportedMediaType/, /text\//, /Content-Type/]},
-        cpp: {all: [/\b415\b/, /text\//, /Content-Type/]},
+        python: {
+          all: [/def bind_labels\(/, /REVIEW_LABEL/, /bind_labels\(\s*result\[/],
+          none: [/["']labels["']\s*:\s*result\[["']labels["']\]/],
+        },
+        typescript: {
+          all: [/function bindLabels\(/, /REVIEW_LABEL/, /bindLabels\(\s*result\.labels/],
+          none: [/labels:\s*result\.labels/],
+        },
+        go: {
+          all: [/func bindLabels\(/, /config\.ReviewLabel/, /bindLabels\(\s*result\.Labels/],
+          none: [/Labels:\s*result\.Labels/],
+        },
+        scala: {
+          all: [/def bindLabels\(/, /Config\.ReviewLabel/, /bindLabels\(\s*result\.labels/],
+          none: [/"labels"\s*->\s*strings\(result\.labels\)/],
+        },
+        cpp: {
+          all: [/bind_labels\(/, /config::kReviewLabel/, /bind_labels\(\s*result\.labels/],
+          none: [/\{"labels",\s*result\.labels\}/],
+        },
       },
     },
   ],
@@ -130,215 +140,183 @@ Requirements:
     python: {
       starter: `import logging
 
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from classifier import inference, taxonomies
+from classifier.config import REVIEW_LABEL
+
 app = FastAPI()
-logger = logging.getLogger("classifier")
+logger = logging.getLogger("classifier.api")
 
 
 class ClassifyRequest(BaseModel):
-    text: str
     taxonomy_id: str
-    taxonomy_version: str | None = None
-
-
-class TaxonomyStore:
-    def get(self, taxonomy_id: str) -> dict:
-        """The latest taxonomy for this id, whatever tenant owns it."""
-        raise NotImplementedError
-
-
-taxonomy_store = TaxonomyStore()
-model = None
+    taxonomy_version: int | None = None
+    mime_type: str
+    text: str
 
 
 @app.post("/v1/classify")
-def classify(body: ClassifyRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
+def classify(body: ClassifyRequest, request: Request) -> dict:
     # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    taxonomy = taxonomy_store.get(body.taxonomy_id)
-    labels = model.classify(body.text, taxonomy_id=taxonomy["version"])
-    logger.info("classify tenant=%s taxonomy=%s labels=%s", tenant, body.taxonomy_id, labels)
-    return JSONResponse(
-        {"labels": labels, "taxonomy_version": taxonomy["version"], "provenance": "model"},
-        status_code=200,
-    )
+    tenant = request.headers.get("x-tenant-id", "")
+    taxonomy = taxonomies.by_id(body.taxonomy_id)
+    if taxonomy is None:
+        raise HTTPException(status_code=404, detail="unknown taxonomy")
+    result = inference.classify(body.text, taxonomy["taxonomy_id"], taxonomy["version"])
+    logger.info("classify tenant=%s taxonomy=%s version=%s", tenant, taxonomy["taxonomy_id"], taxonomy["version"])
+    return {
+        "taxonomy_id": taxonomy["taxonomy_id"],
+        "taxonomy_version": taxonomy["version"],
+        "labels": result["labels"],
+        "unknown_labels": [],
+        "provenance": result["provenance"],
+        "model_version": result["model_version"],
+    }
 `,
       solution: `import logging
-import unicodedata
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from classifier import inference, taxonomies
+from classifier.config import REVIEW_LABEL
+
 app = FastAPI()
-logger = logging.getLogger("classifier")
+logger = logging.getLogger("classifier.api")
 
 MAX_TEXT_BYTES = 1 << 16
-REVIEW_LABEL = "review"
 
 
 class ClassifyRequest(BaseModel):
-    text: str
     taxonomy_id: str
-    taxonomy_version: str | None = None
-
-
-class TaxonomyStore:
-    def load(self, tenant: str, taxonomy_id: str, version: str | None) -> dict | None:
-        """The taxonomy version visible to this tenant, or None when it is not the tenant's."""
-        raise NotImplementedError
-
-
-taxonomy_store = TaxonomyStore()
-model = None
-
-
-def normalize_text(text: str) -> str:
-    """Fold unicode and trim; text that is empty afterwards carries no classification."""
-    return unicodedata.normalize("NFKC", text).strip()
+    taxonomy_version: int | None = None
+    mime_type: str
+    text: str
 
 
 def bind_labels(raw_labels: list[str], taxonomy: dict) -> tuple[list[str], list[str]]:
-    """Keep only labels the taxonomy version contains; an invented label goes to review."""
+    """Keep the labels the taxonomy version contains; an invented one is reported and routes to review."""
     allowed = set(taxonomy["labels"])
-    bound = [label for label in raw_labels if label in allowed]
-    unknown_labels = [label for label in raw_labels if label not in allowed]
-    if not bound:
-        return [REVIEW_LABEL], unknown_labels
-    return bound + ([REVIEW_LABEL] if unknown_labels else []), unknown_labels
+    labels = [label for label in raw_labels if label in allowed]
+    unknown = [label for label in raw_labels if label not in allowed and label != REVIEW_LABEL]
+    if unknown or not labels:
+        labels.append(REVIEW_LABEL)
+    return labels, unknown
 
 
 @app.post("/v1/classify")
-def classify(
-    body: ClassifyRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    content_type: str | None = Header(default=None, alias="Content-Type"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
+def classify(body: ClassifyRequest, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
         raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    media_type = (content_type or "").split(";")[0].strip().lower()
-    if not media_type.startswith("text/"):
-        raise HTTPException(status_code=415, detail="only text content can be classified")
-    text = normalize_text(body.text)
+    # Every guard is cheaper than the model call it protects.
+    if not body.mime_type.startswith("text/"):
+        raise HTTPException(status_code=415, detail="only text/* documents can be classified")
+    text = body.text.strip()
     if text == "":
-        raise HTTPException(status_code=400, detail="text is empty after normalization")
+        raise HTTPException(status_code=400, detail="text is empty")
     if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
         raise HTTPException(status_code=413, detail="text exceeds 64 KiB")
-
-    taxonomy = taxonomy_store.load(tenant, body.taxonomy_id, body.taxonomy_version)
+    taxonomy = taxonomies.load(tenant, body.taxonomy_id, body.taxonomy_version)
     if taxonomy is None:
-        raise HTTPException(status_code=404, detail="unknown taxonomy for this tenant")
-
-    raw_labels = model.classify(text, taxonomy_id=taxonomy["version"])
-    labels, unknown_labels = bind_labels(raw_labels, taxonomy)
-    logger.info(
-        "classify tenant=%s taxonomy=%s version=%s labels=%s review=%d",
-        tenant,
-        body.taxonomy_id,
-        taxonomy["version"],
-        labels,
-        len(unknown_labels),
-    )
-    return JSONResponse(
-        {
-            "labels": labels,
-            "unknown_labels": unknown_labels,
-            "taxonomy_version": taxonomy["version"],
-            "provenance": "model",
-        },
-        status_code=200,
-    )
+        raise HTTPException(status_code=404, detail="unknown taxonomy")
+    result = inference.classify(text, taxonomy["taxonomy_id"], taxonomy["version"])
+    labels, unknown = bind_labels(result["labels"], taxonomy)
+    logger.info("classify tenant=%s taxonomy=%s version=%s unknown=%d", tenant, taxonomy["taxonomy_id"], taxonomy["version"], len(unknown))
+    return {
+        "taxonomy_id": taxonomy["taxonomy_id"],
+        "taxonomy_version": taxonomy["version"],
+        "labels": labels,
+        "unknown_labels": unknown,
+        "provenance": result["provenance"],
+        "model_version": result["model_version"],
+    }
 `,
     },
     typescript: {
-      starter: `/** POST /v1/classify. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {REVIEW_LABEL} from 'classifier/config';
+import {classify} from 'classifier/inference';
+import * as taxonomies from 'classifier/taxonomies';
 
 export const app = Fastify();
 
 interface ClassifyBody {
-  text: string;
   taxonomy_id: string;
-  taxonomy_version?: string;
+  taxonomy_version?: number | null;
+  mime_type: string;
+  text: string;
 }
 
 app.post('/v1/classify', async (request, reply) => {
   // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
+  const tenant = String(request.headers['x-tenant-id'] ?? '');
   const body = request.body as ClassifyBody;
-  const taxonomy = await taxonomyStore.get(body.taxonomy_id);
-  const labels = await model.classify(body.text, {taxonomyId: taxonomy.id});
-  request.log.info({tenant, taxonomy: body.taxonomy_id, labels}, 'classified');
-  return reply.code(200).send({labels, taxonomy_version: taxonomy.version, provenance: 'model'});
+  const taxonomy = await taxonomies.byId(body.taxonomy_id);
+  if (taxonomy === null) return reply.code(404).send({error: 'unknown taxonomy'});
+  const result = await classify(body.text, taxonomy.taxonomy_id, taxonomy.version);
+  console.info(\`classify tenant=\${tenant} taxonomy=\${taxonomy.taxonomy_id} version=\${taxonomy.version}\`);
+  return {
+    taxonomy_id: taxonomy.taxonomy_id,
+    taxonomy_version: taxonomy.version,
+    labels: result.labels,
+    unknown_labels: [],
+    provenance: result.provenance,
+    model_version: result.model_version,
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/classify: labels bound to the tenant's taxonomy version. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 
-import {model} from './model';
-import {taxonomyStore} from './taxonomy_store';
+import {REVIEW_LABEL} from 'classifier/config';
+import {classify} from 'classifier/inference';
+import * as taxonomies from 'classifier/taxonomies';
 
 export const app = Fastify();
 
-const MAX_TEXT_BYTES = 1 << 16;
-const REVIEW_LABEL = 'review';
+export const MAX_TEXT_BYTES = 1 << 16;
 
 interface ClassifyBody {
-  text: string;
   taxonomy_id: string;
-  taxonomy_version?: string;
+  taxonomy_version?: number | null;
+  mime_type: string;
+  text: string;
 }
 
-interface Taxonomy {
-  version: string;
-  labels: string[];
-}
-
-function normalizeText(text: string): string {
-  return text.normalize('NFKC').trim();
-}
-
-function bindLabels(rawLabels: string[], taxonomy: Taxonomy): {labels: string[]; unknown: string[]} {
-  const allowed = new Set(taxonomy.labels);
-  const bound = rawLabels.filter(label => allowed.has(label));
-  const unknown = rawLabels.filter(label => !allowed.has(label));
-  const labels = bound.length === 0 ? [REVIEW_LABEL] : [...bound, ...(unknown.length > 0 ? [REVIEW_LABEL] : [])];
+/** Keep the labels the taxonomy version contains; an invented one is reported and routes to review. */
+export function bindLabels(rawLabels: string[], taxonomy: taxonomies.Taxonomy): {labels: string[]; unknown: string[]} {
+  const labels = rawLabels.filter(label => taxonomy.labels.includes(label));
+  const unknown = rawLabels.filter(label => !taxonomy.labels.includes(label) && label !== REVIEW_LABEL);
+  if (unknown.length > 0 || labels.length === 0) labels.push(REVIEW_LABEL);
   return {labels, unknown};
 }
 
 app.post('/v1/classify', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const contentType = request.headers['content-type'];
-  const mediaType = typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase() : '';
-  if (!mediaType.startsWith('text/')) return reply.code(415).send({error: 'only text content can be classified'});
-
-  const body = request.body as Partial<ClassifyBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.text !== 'string')
-    return reply.code(400).send({error: 'text must be a string'});
-  const text = normalizeText(body.text);
-  if (text === '') return reply.code(400).send({error: 'text is empty after normalization'});
-  if (Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES) return reply.code(413).send({error: 'text exceeds 64 KiB'});
-
-  const taxonomy = await taxonomyStore.load(tenant, body.taxonomy_id as string, body.taxonomy_version ?? null);
-  if (taxonomy === null) return reply.code(404).send({error: 'unknown taxonomy for this tenant'});
-
-  const rawLabels = await model.classify(text, {taxonomyId: taxonomy.version});
-  const {labels, unknown} = bindLabels(rawLabels, taxonomy);
-  request.log.info(
-    {tenant, taxonomy: body.taxonomy_id, version: taxonomy.version, labels, unknown: unknown.length},
-    'classified',
-  );
-  return reply
-    .code(200)
-    .send({labels, unknown_labels: unknown, taxonomy_version: taxonomy.version, provenance: 'model'});
+  const tenant = String(request.headers['x-tenant-id'] ?? '');
+  if (tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  const body = request.body as ClassifyBody;
+  // Every guard is cheaper than the model call it protects.
+  if (!String(body.mime_type ?? '').startsWith('text/')) return reply.code(415).send({error: 'only text/* documents can be classified'});
+  const text = String(body.text ?? '').trim();
+  if (text === '') return reply.code(400).send({error: 'text is empty'});
+  if (new TextEncoder().encode(text).length > MAX_TEXT_BYTES) return reply.code(413).send({error: 'text exceeds 64 KiB'});
+  const taxonomy = await taxonomies.load(tenant, body.taxonomy_id, body.taxonomy_version ?? null);
+  if (taxonomy === null) return reply.code(404).send({error: 'unknown taxonomy'});
+  const result = await classify(text, taxonomy.taxonomy_id, taxonomy.version);
+  const {labels, unknown} = bindLabels(result.labels, taxonomy);
+  console.info(\`classify tenant=\${tenant} taxonomy=\${taxonomy.taxonomy_id} version=\${taxonomy.version} unknown=\${unknown.length}\`);
+  return {
+    taxonomy_id: taxonomy.taxonomy_id,
+    taxonomy_version: taxonomy.version,
+    labels,
+    unknown_labels: unknown,
+    provenance: result.provenance,
+    model_version: result.model_version,
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -348,42 +326,68 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+
+	"classifier/inference"  // inference.Classify(ctx, text, taxonomyID, version) (inference.Result, error)
+	"classifier/taxonomies" // taxonomies.Load, ByID
 )
 
-type ClassifyRequest struct {
-	Text            string \`json:"text"\`
+type classifyRequest struct {
 	TaxonomyID      string \`json:"taxonomy_id"\`
-	TaxonomyVersion string \`json:"taxonomy_version"\`
+	TaxonomyVersion int    \`json:"taxonomy_version"\`
+	MimeType        string \`json:"mime_type"\`
+	Text            string \`json:"text"\`
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+type classifyResponse struct {
+	TaxonomyID      string   \`json:"taxonomy_id"\`
+	TaxonomyVersion int      \`json:"taxonomy_version"\`
+	Labels          []string \`json:"labels"\`
+	UnknownLabels   []string \`json:"unknown_labels"\`
+	Provenance      string   \`json:"provenance"\`
+	ModelVersion    string   \`json:"model_version"\`
+}
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func classify(rw http.ResponseWriter, r *http.Request) {
+func classifyDocument(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	var body ClassifyRequest
+	var body classifyRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "malformed body", http.StatusBadRequest)
 		return
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	taxonomy, _ := taxonomyStore.Get(body.TaxonomyID, body.TaxonomyVersion)
-	labels, _ := model.Classify(r.Context(), body.Text, taxonomy.Version)
-	log.Printf("classify tenant=%s taxonomy=%s labels=%v", tenant, body.TaxonomyID, labels)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"labels":           labels,
-		"taxonomy_version": taxonomy.Version,
-		"provenance":       "model",
+	taxonomy, err := taxonomies.ByID(r.Context(), body.TaxonomyID)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if taxonomy == nil {
+		http.Error(rw, "unknown taxonomy", http.StatusNotFound)
+		return
+	}
+	result, err := inference.Classify(r.Context(), body.Text, taxonomy.TaxonomyID, taxonomy.Version)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusBadGateway)
+		return
+	}
+	log.Printf("classify tenant=%s taxonomy=%s version=%d", tenant, taxonomy.TaxonomyID, taxonomy.Version)
+	writeJSON(rw, http.StatusOK, classifyResponse{
+		TaxonomyID:      taxonomy.TaxonomyID,
+		TaxonomyVersion: taxonomy.Version,
+		Labels:          result.Labels,
+		UnknownLabels:   []string{},
+		Provenance:      result.Provenance,
+		ModelVersion:    result.ModelVersion,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/classify", classify)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/classify", classifyDocument)
 }
 `,
       solution: `package main
@@ -393,227 +397,224 @@ import (
 	"log"
 	"net/http"
 	"strings"
+
+	"classifier/config"
+	"classifier/inference"  // inference.Classify(ctx, text, taxonomyID, version) (inference.Result, error)
+	"classifier/taxonomies" // taxonomies.Load, ByID
 )
 
-const (
-	maxTextBytes = 1 << 16
-	reviewLabel  = "review"
-)
+const maxTextBytes = 1 << 16
 
-type ClassifyRequest struct {
-	Text            string \`json:"text"\`
+type classifyRequest struct {
 	TaxonomyID      string \`json:"taxonomy_id"\`
-	TaxonomyVersion string \`json:"taxonomy_version"\`
+	TaxonomyVersion int    \`json:"taxonomy_version"\`
+	MimeType        string \`json:"mime_type"\`
+	Text            string \`json:"text"\`
 }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+type classifyResponse struct {
+	TaxonomyID      string   \`json:"taxonomy_id"\`
+	TaxonomyVersion int      \`json:"taxonomy_version"\`
+	Labels          []string \`json:"labels"\`
+	UnknownLabels   []string \`json:"unknown_labels"\`
+	Provenance      string   \`json:"provenance"\`
+	ModelVersion    string   \`json:"model_version"\`
+}
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func normalizeText(text string) string {
-	return strings.TrimSpace(text)
-}
-
-// bindLabels keeps only labels the taxonomy version contains; an invented label goes to review.
-func bindLabels(rawLabels []string, taxonomy Taxonomy) (labels []string, unknown []string) {
-	allowed := make(map[string]bool, len(taxonomy.Labels))
+// bindLabels keeps the labels the taxonomy version contains; an invented one is reported and routes to review.
+func bindLabels(raw []string, taxonomy *taxonomies.Taxonomy) ([]string, []string) {
+	allowed := map[string]bool{}
 	for _, label := range taxonomy.Labels {
 		allowed[label] = true
 	}
-	for _, label := range rawLabels {
+	labels, unknown := []string{}, []string{}
+	for _, label := range raw {
 		if allowed[label] {
 			labels = append(labels, label)
-		} else {
+		} else if label != config.ReviewLabel {
 			unknown = append(unknown, label)
 		}
 	}
-	if len(labels) == 0 || len(unknown) > 0 {
-		labels = append(labels, reviewLabel)
+	if len(unknown) > 0 || len(labels) == 0 {
+		labels = append(labels, config.ReviewLabel)
 	}
 	return labels, unknown
 }
 
-func classify(rw http.ResponseWriter, r *http.Request) {
+func classifyDocument(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "missing X-Tenant-Id", http.StatusUnauthorized)
 		return
 	}
-	rawContentType := r.Header.Get("Content-Type")
-	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(rawContentType, ";")[0]))
-	if !strings.HasPrefix(mediaType, "text/") {
-		writeJSON(rw, http.StatusUnsupportedMediaType, map[string]string{"error": "only text content can be classified"})
-		return
-	}
-	var body ClassifyRequest
+	var body classifyRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "malformed body", http.StatusBadRequest)
 		return
 	}
-	text := normalizeText(body.Text)
+	// Every guard is cheaper than the model call it protects.
+	if !strings.HasPrefix(body.MimeType, "text/") {
+		http.Error(rw, "only text/* documents can be classified", http.StatusUnsupportedMediaType)
+		return
+	}
+	text := strings.TrimSpace(body.Text)
 	if text == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "text is empty after normalization"})
+		http.Error(rw, "text is empty", http.StatusBadRequest)
 		return
 	}
-	if len([]byte(text)) > maxTextBytes {
-		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "text exceeds 64 KiB"})
+	if len(text) > maxTextBytes {
+		http.Error(rw, "text exceeds 64 KiB", http.StatusRequestEntityTooLarge)
 		return
 	}
-	taxonomy, err := taxonomyStore.Load(r.Context(), tenant, body.TaxonomyID, body.TaxonomyVersion)
+	taxonomy, err := taxonomies.Load(r.Context(), tenant, body.TaxonomyID, body.TaxonomyVersion)
 	if err != nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown taxonomy for this tenant"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	rawLabels, err := model.Classify(r.Context(), text, taxonomy.Version)
+	if taxonomy == nil {
+		http.Error(rw, "unknown taxonomy", http.StatusNotFound)
+		return
+	}
+	result, err := inference.Classify(r.Context(), text, taxonomy.TaxonomyID, taxonomy.Version)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		http.Error(rw, err.Error(), http.StatusBadGateway)
 		return
 	}
-	labels, unknown := bindLabels(rawLabels, taxonomy)
-	log.Printf("classify tenant=%s taxonomy=%s version=%s labels=%v unknown=%d",
-		tenant, body.TaxonomyID, taxonomy.Version, labels, len(unknown))
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"labels":           labels,
-		"unknown_labels":   unknown,
-		"taxonomy_version": taxonomy.Version,
-		"provenance":       "model",
+	labels, unknown := bindLabels(result.Labels, taxonomy)
+	log.Printf("classify tenant=%s taxonomy=%s version=%d unknown=%d", tenant, taxonomy.TaxonomyID, taxonomy.Version, len(unknown))
+	writeJSON(rw, http.StatusOK, classifyResponse{
+		TaxonomyID:      taxonomy.TaxonomyID,
+		TaxonomyVersion: taxonomy.Version,
+		Labels:          labels,
+		UnknownLabels:   unknown,
+		Provenance:      result.Provenance,
+		ModelVersion:    result.ModelVersion,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/classify", classify)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/classify", classifyDocument)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class ClassifyRequest(text: String, taxonomy_id: String, taxonomy_version: Option[String])
+import classifier.{Config, Inference, Taxonomies}
 
 object ClassifyApi {
-  implicit val system: ActorSystem = ActorSystem("content-classifier")
-  implicit val requestFormat: RootJsonFormat[ClassifyRequest] = jsonFormat3(ClassifyRequest)
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val model = ModelClient.open()
+  private def strings(values: Seq[String]): JsArray = JsArray(values.map(JsString(_)).toVector)
 
-  val route: Route =
-    path("v1" / "classify") {
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[ClassifyRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val taxonomy = TaxonomyStore.get(body.taxonomy_id, body.taxonomy_version)
-            val labels = model.classify(body.text, taxonomy.version)
-            val taxonomyId = body.taxonomy_id
-            system.log.info(s"classify tenant=$tenant taxonomy=$taxonomyId labels=$labels")
-            complete(StatusCodes.OK, s"""{"taxonomy_version":"\${taxonomy.version}"}""")
+  private def text(fields: Map[String, JsValue], name: String): String =
+    fields.get(name).collect { case JsString(s) => s }.getOrElse("")
+
+  val route: Route = path("v1" / "classify") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        entity(as[String]) { raw =>
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+          val body = raw.parseJson.asJsObject.fields
+          Taxonomies.byId(text(body, "taxonomy_id")) match {
+            case None => complete(StatusCodes.NotFound -> "unknown taxonomy")
+            case Some(taxonomy) =>
+              val result = Inference.classify(text(body, "text"), taxonomy.taxonomyId, taxonomy.version)
+              System.err.println(s"classify tenant=\${tenant.getOrElse("")} taxonomy=\${taxonomy.taxonomyId} version=\${taxonomy.version}")
+              complete(
+                json(
+                  StatusCodes.OK,
+                  JsObject(
+                    "taxonomy_id" -> JsString(taxonomy.taxonomyId),
+                    "taxonomy_version" -> JsNumber(taxonomy.version),
+                    "labels" -> strings(result.labels),
+                    "unknown_labels" -> strings(Seq.empty),
+                    "provenance" -> JsString(result.provenance),
+                    "model_version" -> JsString(result.modelVersion)
+                  )
+                )
+              )
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.nio.charset.StandardCharsets
+      solution: `import java.nio.charset.StandardCharsets.UTF_8
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class ClassifyRequest(text: String, taxonomy_id: String, taxonomy_version: Option[String])
-final case class Taxonomy(version: String, labels: List[String])
-final case class ClassifyResponse(
-    labels: List[String],
-    unknown_labels: List[String],
-    taxonomy_version: String,
-    provenance: String
-)
+import classifier.{Config, Inference, Taxonomies, Taxonomy}
 
 object ClassifyApi {
-  implicit val system: ActorSystem = ActorSystem("content-classifier")
-  implicit val requestFormat: RootJsonFormat[ClassifyRequest] = jsonFormat3(ClassifyRequest)
-  implicit val responseFormat: RootJsonFormat[ClassifyResponse] = jsonFormat4(ClassifyResponse)
+  val MaxTextBytes: Int = 1 << 16
 
-  val MaxTextBytes = 1 << 16
-  val ReviewLabel = "review"
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val model = ModelClient.open()
+  private def strings(values: Seq[String]): JsArray = JsArray(values.map(JsString(_)).toVector)
 
-  def normalizeText(text: String): String = text.trim
+  private def text(fields: Map[String, JsValue], name: String): String =
+    fields.get(name).collect { case JsString(s) => s }.getOrElse("")
 
-  /** Keep only labels the taxonomy version contains; an invented label goes to review. */
-  def bindLabels(rawLabels: List[String], taxonomy: Taxonomy): (List[String], List[String]) = {
-    val (bound, unknown) = rawLabels.partition(taxonomy.labels.contains)
-    val labels =
-      if (bound.isEmpty) List(ReviewLabel)
-      else if (unknown.nonEmpty) bound :+ ReviewLabel
-      else bound
-    (labels, unknown)
+  /** Keep the labels the taxonomy version contains; an invented one is reported and routes to review. */
+  def bindLabels(raw: Seq[String], taxonomy: Taxonomy): (Seq[String], Seq[String]) = {
+    val known = raw.filter(taxonomy.labels.contains)
+    val unknown = raw.filterNot(label => taxonomy.labels.contains(label) || label == Config.ReviewLabel)
+    (if (unknown.nonEmpty || known.isEmpty) known :+ Config.ReviewLabel else known, unknown)
   }
 
-  val route: Route =
-    path("v1" / "classify") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Content-Type") { contentTypeOpt =>
-            entity(as[ClassifyRequest]) { body =>
-              val mediaType = contentTypeOpt.map(_.split(";")(0).trim.toLowerCase).getOrElse("")
-              val tenant = tenantOpt.getOrElse("")
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!mediaType.startsWith("text/")) {
-                complete(StatusCodes.UnsupportedMediaType, """{"error":"only text content can be classified"}""")
-              } else {
-                val text = normalizeText(body.text)
-                if (text.isEmpty) {
-                  complete(StatusCodes.BadRequest, """{"error":"text is empty after normalization"}""")
-                } else if (text.getBytes(StandardCharsets.UTF_8).length > MaxTextBytes) {
-                  complete(StatusCodes.RequestEntityTooLarge, """{"error":"text exceeds 64 KiB"}""")
-                } else {
-                  TaxonomyStore.load(tenant, body.taxonomy_id, body.taxonomy_version) match {
-                    case None =>
-                      complete(StatusCodes.NotFound, """{"error":"unknown taxonomy for this tenant"}""")
-                    case Some(taxonomy) =>
-                      val rawLabels = model.classify(text, taxonomy.version)
-                      val (labels, unknown) = bindLabels(rawLabels, taxonomy)
-                      val taxonomyId = body.taxonomy_id
-                      system.log.info(
-                        s"classify tenant=$tenant taxonomy=$taxonomyId version=\${taxonomy.version} unknown=\${unknown.size}"
+  val route: Route = path("v1" / "classify") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "missing X-Tenant-Id")
+        case Some(tenant) =>
+          entity(as[String]) { raw =>
+            val body = raw.parseJson.asJsObject.fields
+            val document = text(body, "text").trim
+            val version = body.get("taxonomy_version").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
+            // Every guard is cheaper than the model call it protects.
+            if (!text(body, "mime_type").startsWith("text/"))
+              complete(StatusCodes.UnsupportedMediaType -> "only text/* documents can be classified")
+            else if (document.isEmpty) complete(StatusCodes.BadRequest -> "text is empty")
+            else if (document.getBytes(UTF_8).length > MaxTextBytes) complete(StatusCodes.RequestEntityTooLarge -> "text exceeds 64 KiB")
+            else
+              Taxonomies.load(tenant, text(body, "taxonomy_id"), version) match {
+                case None => complete(StatusCodes.NotFound -> "unknown taxonomy")
+                case Some(taxonomy) =>
+                  val result = Inference.classify(document, taxonomy.taxonomyId, taxonomy.version)
+                  val (labels, unknown) = bindLabels(result.labels, taxonomy)
+                  complete(
+                    json(
+                      StatusCodes.OK,
+                      JsObject(
+                        "taxonomy_id" -> JsString(taxonomy.taxonomyId),
+                        "taxonomy_version" -> JsNumber(taxonomy.version),
+                        "labels" -> strings(labels),
+                        "unknown_labels" -> strings(unknown),
+                        "provenance" -> JsString(result.provenance),
+                        "model_version" -> JsString(result.modelVersion)
                       )
-                      complete(
-                        StatusCodes.OK,
-                        ClassifyResponse(labels, unknown, taxonomy.version, "model")
-                      )
-                  }
-                }
+                    )
+                  )
               }
-            }
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -625,154 +626,579 @@ object ClassifyApi {
 #include <iostream>
 #include <string>
 
+#include "classifier/config.h"
+#include "classifier/inference.h"   // inference::classify(text, taxonomy_id, version) -> inference::Result
+#include "classifier/taxonomies.h"  // taxonomies::load, byId
+
 using json = nlohmann::json;
 
-struct TaxonomyStore {
-  json get(const std::string& taxonomyId, const std::string& version);
-};
-
-TaxonomyStore taxonomyStore;
-ModelClient model;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/classify", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto taxonomyId = body.value("taxonomy_id", std::string());
-    const auto taxonomy = taxonomyStore.get(taxonomyId, body.value("taxonomy_version", std::string()));
-    const auto labels = model.classify(body.value("text", std::string()), taxonomy["version"].get<std::string>());
-    std::cerr << "classify tenant=" << tenant << " taxonomy=" << taxonomyId << "\\n";
-    res.status = 200;
-    res.set_content(
-        json{{"labels", labels}, {"taxonomy_version", taxonomy["version"]}, {"provenance", "model"}}.dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void classify_document(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) {
+    res.status = 400;
+    res.set_content("malformed body", "text/plain");
+    return;
+  }
+  const auto taxonomy = taxonomies::byId(body.value("taxonomy_id", ""));
+  if (!taxonomy) {
+    res.status = 404;
+    res.set_content("unknown taxonomy", "text/plain");
+    return;
+  }
+  const inference::Result result = inference::classify(body.value("text", ""), taxonomy->taxonomy_id, taxonomy->version);
+  std::cerr << "classify tenant=" << tenant << " taxonomy=" << taxonomy->taxonomy_id << " version=" << taxonomy->version << "\\n";
+  res.set_content(json{{"taxonomy_id", taxonomy->taxonomy_id},
+                       {"taxonomy_version", taxonomy->version},
+                       {"labels", result.labels},
+                       {"unknown_labels", json::array()},
+                       {"provenance", result.provenance},
+                       {"model_version", result.model_version}}
+                      .dump(),
+                  "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/classify", classify_document); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cctype>
-#include <set>
+#include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "classifier/config.h"
+#include "classifier/inference.h"   // inference::classify(text, taxonomy_id, version) -> inference::Result
+#include "classifier/taxonomies.h"  // taxonomies::load, byId
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxTextBytes = 1 << 16;
-const std::string kReviewLabel = "review";
+constexpr size_t kMaxTextBytes = 1 << 16;
 
-struct TaxonomyStore {
-  std::optional<json> load(const std::string& tenant, const std::string& taxonomyId, const std::string& version);
-};
-
-TaxonomyStore taxonomyStore;
-ModelClient model;
-
-std::string normalizeText(const std::string& text) {
-  const auto begin = text.find_first_not_of(" \\t\\r\\n");
-  if (begin == std::string::npos) return "";
-  const auto end = text.find_last_not_of(" \\t\\r\\n");
-  return text.substr(begin, end - begin + 1);
+std::string trim(const std::string& s) {
+  const auto first = s.find_first_not_of(" \\t\\r\\n\\f\\v");
+  if (first == std::string::npos) return "";
+  return s.substr(first, s.find_last_not_of(" \\t\\r\\n\\f\\v") - first + 1);
 }
 
-// Keeps only labels the taxonomy version contains; an invented label goes to review.
-std::vector<std::string> bindLabels(const std::vector<std::string>& rawLabels, const json& taxonomy,
-                                   std::vector<std::string>& unknown) {
-  const std::set<std::string> allowed(taxonomy["labels"].begin(), taxonomy["labels"].end());
-  std::vector<std::string> labels;
-  for (const auto& label : rawLabels) {
-    if (allowed.count(label) > 0) {
+// Keep the labels the taxonomy version contains; an invented one is reported and routes to review.
+std::pair<std::vector<std::string>, std::vector<std::string>> bind_labels(const std::vector<std::string>& raw,
+                                                                         const taxonomies::Taxonomy& taxonomy) {
+  std::vector<std::string> labels, unknown;
+  for (const auto& label : raw) {
+    if (std::find(taxonomy.labels.begin(), taxonomy.labels.end(), label) != taxonomy.labels.end())
       labels.push_back(label);
-    } else {
+    else if (label != config::kReviewLabel)
       unknown.push_back(label);
-    }
   }
-  if (labels.empty() || !unknown.empty()) labels.push_back(kReviewLabel);
-  return labels;
+  if (!unknown.empty() || labels.empty()) labels.push_back(config::kReviewLabel);
+  return {labels, unknown};
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/classify", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto contentType = req.get_header_value("Content-Type");
-    const auto semi = contentType.find(';');
-    std::string mediaType = semi == std::string::npos ? contentType : contentType.substr(0, semi);
-    mediaType.erase(std::remove_if(mediaType.begin(), mediaType.end(), [](unsigned char c) { return std::isspace(c); }),
-                    mediaType.end());
-    std::transform(mediaType.begin(), mediaType.end(), mediaType.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (mediaType.rfind("text/", 0) != 0) {
-      res.status = 415;
-      res.set_content(R"({"error":"only text content can be classified"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("text") || !body["text"].is_string()) {
-      res.status = 400;
-      res.set_content(R"({"error":"text must be a string"})", "application/json");
-      return;
-    }
-    const auto text = normalizeText(body["text"].get<std::string>());
-    if (text.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"text is empty after normalization"})", "application/json");
-      return;
-    }
-    if (text.size() > kMaxTextBytes) {
-      res.status = 413;
-      res.set_content(R"({"error":"text exceeds 64 KiB"})", "application/json");
-      return;
-    }
-    const auto taxonomyId = body.value("taxonomy_id", std::string());
-    const auto taxonomy = taxonomyStore.load(tenant, taxonomyId, body.value("taxonomy_version", std::string()));
-    if (!taxonomy) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown taxonomy for this tenant"})", "application/json");
-      return;
-    }
-    const auto version = (*taxonomy)["version"].get<std::string>();
-    const auto rawLabels = model.classify(text, version);
-    std::vector<std::string> unknown;
-    const auto labels = bindLabels(rawLabels, *taxonomy, unknown);
-    std::cerr << "classify tenant=" << tenant << " taxonomy=" << taxonomyId << " version=" << version
-              << " unknown=" << unknown.size() << "\\n";
-    res.status = 200;
-    res.set_content(json{{"labels", labels},
-                         {"unknown_labels", unknown},
-                         {"taxonomy_version", version},
-                         {"provenance", "model"}}
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void reject(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(message, "text/plain");
 }
+
+void classify_document(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reject(res, 401, "missing X-Tenant-Id");
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return reject(res, 400, "malformed body");
+  // Every guard is cheaper than the model call it protects.
+  if (body.value("mime_type", "").rfind("text/", 0) != 0) return reject(res, 415, "only text/* documents can be classified");
+  const std::string text = trim(body.value("text", ""));
+  if (text.empty()) return reject(res, 400, "text is empty");
+  if (text.size() > kMaxTextBytes) return reject(res, 413, "text exceeds 64 KiB");
+  const long version = body.contains("taxonomy_version") && body["taxonomy_version"].is_number() ? body["taxonomy_version"].get<long>() : 0;
+  const auto taxonomy = taxonomies::load(tenant, body.value("taxonomy_id", ""), version);
+  if (!taxonomy) return reject(res, 404, "unknown taxonomy");
+  const inference::Result result = inference::classify(text, taxonomy->taxonomy_id, taxonomy->version);
+  const auto [labels, unknown] = bind_labels(result.labels, *taxonomy);
+  std::cerr << "classify tenant=" << tenant << " taxonomy=" << taxonomy->taxonomy_id << " version=" << taxonomy->version
+            << " unknown=" << unknown.size() << "\\n";
+  res.set_content(json{{"taxonomy_id", taxonomy->taxonomy_id},
+                       {"taxonomy_version", taxonomy->version},
+                       {"labels", labels},
+                       {"unknown_labels", unknown},
+                       {"provenance", result.provenance},
+                       {"model_version", result.model_version}}
+                      .dump(),
+                  "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/classify", classify_document); }
 `,
     },
   },
+  harness: {
+    python: `import content_classifier_pb2
+import content_classifier_pb2_grpc
+from classifier import config, labeler, taxonomies
+
+TEXT = "I was charged twice, please refund"
+PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg=="
+
+
+class ModelServicer(content_classifier_pb2_grpc.ModelServicer):
+    """The stand-in model: answers from classifier.labeler."""
+
+    def Classify(self, request, context):
+        labels, refused = labeler.classify(request.text)
+        return content_classifier_pb2.ClassifyReply(labels=labels, refused=refused, model_version=labeler.MODEL_VERSION)
+
+
+def _api(ctx):
+    ctx.grpc.serve(content_classifier_pb2_grpc.add_ModelServicer_to_server, ModelServicer(), config.MODEL)
+    taxonomies.put_version("acme", "tx-support", ["billing", "support", "security"])
+    taxonomies.put_version("globex", "tx-legal", ["billing", "legal"])
+    return ctx.client(ctx.load("api").app)
+
+
+async def _classify(c, text=TEXT, tenant="acme", taxonomy_id="tx-support", mime_type="text/plain", version=None):
+    body = {"taxonomy_id": taxonomy_id, "mime_type": mime_type, "text": text}
+    if version is not None:
+        body["taxonomy_version"] = version
+    headers = {"X-Tenant-Id": tenant} if tenant else {}
+    return await c.post("/v1/classify", json=body, headers=headers)
+
+
+def _calls(ctx):
+    return len(ctx.grpc.calls_to("Classify"))
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _classify(c)
+    assert r.status_code == 200, f"POST /v1/classify answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("labels") == ["billing"], f"a refund question must be labeled billing, got {body}"
+    assert body.get("taxonomy_id") == "tx-support" and body.get("taxonomy_version") == 1, f"the response must name taxonomy tx-support version 1, got {body}"
+    assert body.get("provenance") == "model" and body.get("model_version") == labeler.MODEL_VERSION, f"the response must carry the model's provenance and version, got {body}"
+    assert _calls(ctx) == 1, f"one document must cost one model call, saw {_calls(ctx)}"
+
+
+async def check_content_type(ctx):
+    async with _api(ctx) as c:
+        r = await _classify(c, text=PNG, mime_type="image/png")
+        assert r.status_code == 415, f"a document of type image/png answered {r.status_code}, expected 415: {r.text}"
+        assert _calls(ctx) == 0, f"the image's bytes reached the model ({_calls(ctx)} Classify calls): only text/* may be classified"
+        r = await _classify(c, mime_type="application/octet-stream")
+        assert r.status_code == 415, f"a document of type application/octet-stream answered {r.status_code}, expected 415"
+        assert _calls(ctx) == 0, "an octet stream reached the model"
+        r = await _classify(c, mime_type="text/markdown")
+    assert r.status_code == 200, f"a text/markdown document is text and must be classified, got {r.status_code}: {r.text}"
+
+
+async def check_size_and_empty(ctx):
+    async with _api(ctx) as c:
+        r = await _classify(c, text="   \\n\\t  ")
+        assert r.status_code == 400, f"a document of whitespace answered {r.status_code}, expected 400"
+        assert _calls(ctx) == 0, "an empty document reached the model"
+        r = await _classify(c, text="a" * (64 * 1024 + 1))
+        assert r.status_code == 413, f"a document of 64 KiB + 1 byte answered {r.status_code}, expected 413"
+        r = await _classify(c, text="é" * 40000)
+        assert r.status_code == 413, f"40000 accented letters are 80000 bytes of UTF-8 and answered {r.status_code}, expected 413: the cap counts bytes, not characters"
+        assert _calls(ctx) == 0, f"an oversized document reached the model ({_calls(ctx)} Classify calls)"
+        r = await _classify(c, text="  " + "a" * (64 * 1024) + "  ")
+    assert r.status_code == 200, f"64 KiB of text with surrounding spaces answered {r.status_code}: the cap applies to the trimmed text"
+
+
+async def check_tenant_scope(ctx):
+    async with _api(ctx) as c:
+        r = await _classify(c, tenant="")
+        assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}, expected 401"
+        r = await _classify(c, tenant="globex")
+        assert r.status_code == 404, f"tenant globex classified against acme's taxonomy tx-support and got {r.status_code}, expected 404"
+        assert _calls(ctx) == 0, "a request for another tenant's taxonomy reached the model"
+        taxonomies.put_version("acme", "tx-support", ["billing", "support", "security", "abuse"])
+        r = await _classify(c, version=1)
+        assert r.status_code == 200 and r.json().get("taxonomy_version") == 1, f"a request for version 1 must be classified against version 1, got {r.status_code} {r.text}"
+        r = await _classify(c)
+    assert r.status_code == 200 and r.json().get("taxonomy_version") == 2, f"without a version the latest (2) applies, got {r.status_code} {r.text}"
+
+
+async def check_taxonomy_binding(ctx):
+    async with _api(ctx) as c:
+        r = await _classify(c, text="refund my invoice #urgent")
+        body = r.json()
+        assert r.status_code == 200, f"POST /v1/classify answered {r.status_code}: {r.text}"
+        assert body.get("labels") == ["billing", "review"], f"the model invented 'urgent', which tx-support does not contain: labels must be ['billing', 'review'], got {body.get('labels')}"
+        assert body.get("unknown_labels") == ["urgent"], f"the invented label must be reported in unknown_labels, got {body.get('unknown_labels')}"
+        body = (await _classify(c, text="hello there #weather")).json()
+        assert body.get("labels") == ["review"] and body.get("unknown_labels") == ["weather"], f"with no known label the document goes to review alone, got {body}"
+        body = (await _classify(c, text="my screen is broken")).json()
+    assert body.get("labels") == ["support"] and body.get("unknown_labels") == [], f"known labels pass through unchanged, got {body}"
+`,
+    typescript: `const TEXT = 'I was charged twice, please refund';
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==';
+
+/** The stand-in model at MODEL, two tenants' taxonomies, and an HTTP client of the learner's app. */
+async function api(ctx) {
+  const {contentclassifier} = ctx.proto('content_classifier.proto');
+  const config = ctx.load('/support/classifier/config.ts');
+  const labeler = ctx.load('/support/classifier/labeler.ts');
+  const taxonomies = ctx.load('/support/classifier/taxonomies.ts');
+  ctx.grpc.serve(
+    contentclassifier.Model.service,
+    {
+      Classify(call, callback) {
+        const {labels, refused} = labeler.classify(call.request.text);
+        callback(null, {labels, refused, model_version: labeler.MODEL_VERSION});
+      },
+    },
+    config.MODEL,
+  );
+  await taxonomies.putVersion('acme', 'tx-support', ['billing', 'support', 'security']);
+  await taxonomies.putVersion('globex', 'tx-legal', ['billing', 'legal']);
+  return {c: ctx.client(ctx.load('api').app), labeler, taxonomies};
+}
+
+function post(c, {text = TEXT, tenant = 'acme', taxonomyId = 'tx-support', mimeType = 'text/plain', version = undefined as number | undefined} = {}) {
+  const json: Record<string, unknown> = {taxonomy_id: taxonomyId, mime_type: mimeType, text};
+  if (version !== undefined) json.taxonomy_version = version;
+  return c.post('/v1/classify', {json, headers: tenant ? {'X-Tenant-Id': tenant} : {}});
+}
+
+const calls = ctx => ctx.grpc.callsTo('Classify').length;
+
+export async function check_route(ctx) {
+  const {c, labeler} = await api(ctx);
+  const r = await post(c);
+  assert.equal(r.status, 200, \`POST /v1/classify answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert.deepEqual(body.labels, ['billing'], \`a refund question must be labeled billing, got \${r.text}\`);
+  assert(body.taxonomy_id === 'tx-support' && body.taxonomy_version === 1, \`the response must name taxonomy tx-support version 1, got \${r.text}\`);
+  assert(body.provenance === 'model' && body.model_version === labeler.MODEL_VERSION, \`the response must carry the model's provenance and version, got \${r.text}\`);
+  assert.equal(calls(ctx), 1, \`one document must cost one model call, saw \${calls(ctx)}\`);
+}
+
+export async function check_content_type(ctx) {
+  const {c} = await api(ctx);
+  let r = await post(c, {text: PNG, mimeType: 'image/png'});
+  assert.equal(r.status, 415, \`a document of type image/png answered \${r.status}, expected 415: \${r.text}\`);
+  assert.equal(calls(ctx), 0, \`the image's bytes reached the model (\${calls(ctx)} Classify calls): only text/* may be classified\`);
+  r = await post(c, {mimeType: 'application/octet-stream'});
+  assert.equal(r.status, 415, \`a document of type application/octet-stream answered \${r.status}, expected 415\`);
+  assert.equal(calls(ctx), 0, 'an octet stream reached the model');
+  r = await post(c, {mimeType: 'text/markdown'});
+  assert.equal(r.status, 200, \`a text/markdown document is text and must be classified, got \${r.status}: \${r.text}\`);
+}
+
+export async function check_size_and_empty(ctx) {
+  const {c} = await api(ctx);
+  let r = await post(c, {text: '   \\n\\t  '});
+  assert.equal(r.status, 400, \`a document of whitespace answered \${r.status}, expected 400\`);
+  assert.equal(calls(ctx), 0, 'an empty document reached the model');
+  r = await post(c, {text: 'a'.repeat(64 * 1024 + 1)});
+  assert.equal(r.status, 413, \`a document of 64 KiB + 1 byte answered \${r.status}, expected 413\`);
+  r = await post(c, {text: 'é'.repeat(40000)});
+  assert.equal(r.status, 413, \`40000 accented letters are 80000 bytes of UTF-8 and answered \${r.status}, expected 413: the cap counts bytes, not characters\`);
+  assert.equal(calls(ctx), 0, \`an oversized document reached the model (\${calls(ctx)} Classify calls)\`);
+  r = await post(c, {text: '  ' + 'a'.repeat(64 * 1024) + '  '});
+  assert.equal(r.status, 200, \`64 KiB of text with surrounding spaces answered \${r.status}: the cap applies to the trimmed text\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c, taxonomies} = await api(ctx);
+  let r = await post(c, {tenant: ''});
+  assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}, expected 401\`);
+  r = await post(c, {tenant: 'globex'});
+  assert.equal(r.status, 404, \`tenant globex classified against acme's taxonomy tx-support and got \${r.status}, expected 404\`);
+  assert.equal(calls(ctx), 0, "a request for another tenant's taxonomy reached the model");
+  await taxonomies.putVersion('acme', 'tx-support', ['billing', 'support', 'security', 'abuse']);
+  r = await post(c, {version: 1});
+  assert(r.status === 200 && r.json().taxonomy_version === 1, \`a request for version 1 must be classified against version 1, got \${r.status} \${r.text}\`);
+  r = await post(c);
+  assert(r.status === 200 && r.json().taxonomy_version === 2, \`without a version the latest (2) applies, got \${r.status} \${r.text}\`);
+}
+
+export async function check_taxonomy_binding(ctx) {
+  const {c} = await api(ctx);
+  let r = await post(c, {text: 'refund my invoice #urgent'});
+  assert.equal(r.status, 200, \`POST /v1/classify answered \${r.status}: \${r.text}\`);
+  let body = r.json();
+  assert.deepEqual(body.labels, ['billing', 'review'], \`the model invented 'urgent', which tx-support does not contain: labels must be ['billing', 'review'], got \${JSON.stringify(body.labels)}\`);
+  assert.deepEqual(body.unknown_labels, ['urgent'], \`the invented label must be reported in unknown_labels, got \${JSON.stringify(body.unknown_labels)}\`);
+  r = await post(c, {text: 'hello there #weather'});
+  body = r.json();
+  assert(JSON.stringify(body.labels) === '["review"]' && JSON.stringify(body.unknown_labels) === '["weather"]', \`with no known label the document goes to review alone, got \${r.text}\`);
+  r = await post(c, {text: 'my screen is broken'});
+  body = r.json();
+  assert(JSON.stringify(body.labels) === '["support"]' && JSON.stringify(body.unknown_labels) === '[]', \`known labels pass through unchanged, got \${r.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"classifier/config"
+	pb "classifier/gen/content_classifier"
+	"classifier/labeler"
+	"classifier/taxonomies"
+
+	"leetbuild/harness"
+)
+
+const apiText = "I was charged twice, please refund"
+
+// modelPeer is the stand-in model: answers from classifier/labeler.
+type modelPeer struct {
+	pb.UnimplementedModelServer
+}
+
+func (modelPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+	labels, refused := labeler.Classify(req.GetText())
+	return &pb.ClassifyReply{Labels: labels, Refused: refused, ModelVersion: labeler.Version}, nil
+}
+
+type apiReply struct {
+	TaxonomyID      string   \`json:"taxonomy_id"\`
+	TaxonomyVersion int      \`json:"taxonomy_version"\`
+	Labels          []string \`json:"labels"\`
+	UnknownLabels   []string \`json:"unknown_labels"\`
+	Provenance      string   \`json:"provenance"\`
+	ModelVersion    string   \`json:"model_version"\`
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterModelServer(ctx.GRPC.Server(config.Model), &modelPeer{})
+	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", []string{"billing", "support", "security"})
+	ctx.NoError(err, "seeding tx-support")
+	_, err = taxonomies.PutVersion(context.Background(), "globex", "tx-legal", []string{"billing", "legal"})
+	ctx.NoError(err, "seeding tx-legal")
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func apiPost(c *harness.HTTP, tenant, mimeType, text string, version int) *harness.Response {
+	body := map[string]any{"taxonomy_id": "tx-support", "mime_type": mimeType, "text": text}
+	if version > 0 {
+		body["taxonomy_version"] = version
+	}
+	if tenant == "" {
+		return c.Post("/v1/classify", body)
+	}
+	return c.Post("/v1/classify", body, "X-Tenant-Id", tenant)
+}
+
+func apiDecode(r *harness.Response) apiReply {
+	var reply apiReply
+	r.Decode(&reply)
+	return reply
+}
+
+func apiCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Classify", "")) }
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := apiPost(c, "acme", "text/plain", apiText, 0)
+	ctx.Equal(r.Status, 200, "POST /v1/classify (%s)", r.Text())
+	reply := apiDecode(r)
+	ctx.Equal(reply.Labels, []string{"billing"}, "a refund question must be labeled billing (%s)", r.Text())
+	ctx.Assert(reply.TaxonomyID == "tx-support" && reply.TaxonomyVersion == 1, "the response must name taxonomy tx-support version 1, got %s", r.Text())
+	ctx.Assert(reply.Provenance == "model" && reply.ModelVersion == labeler.Version, "the response must carry the model's provenance and version, got %s", r.Text())
+	ctx.Equal(apiCalls(ctx), 1, "one document must cost one model call; Classify calls")
+}
+
+func CheckContentType(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := apiPost(c, "acme", "image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ", 0)
+	ctx.Equal(r.Status, 415, "a document of type image/png (%s)", r.Text())
+	ctx.Equal(apiCalls(ctx), 0, "the image's bytes reached the model: only text/* may be classified; Classify calls")
+	r = apiPost(c, "acme", "application/octet-stream", apiText, 0)
+	ctx.Equal(r.Status, 415, "a document of type application/octet-stream")
+	ctx.Equal(apiCalls(ctx), 0, "an octet stream reached the model; Classify calls")
+	r = apiPost(c, "acme", "text/markdown", apiText, 0)
+	ctx.Equal(r.Status, 200, "a text/markdown document is text and must be classified (%s)", r.Text())
+}
+
+func CheckSizeAndEmpty(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := apiPost(c, "acme", "text/plain", "   \\n\\t  ", 0)
+	ctx.Equal(r.Status, 400, "a document of whitespace")
+	ctx.Equal(apiCalls(ctx), 0, "an empty document reached the model; Classify calls")
+	r = apiPost(c, "acme", "text/plain", strings.Repeat("a", 64*1024+1), 0)
+	ctx.Equal(r.Status, 413, "a document of 64 KiB + 1 byte")
+	r = apiPost(c, "acme", "text/plain", strings.Repeat("é", 40000), 0)
+	ctx.Equal(r.Status, 413, "40000 accented letters are 80000 bytes of UTF-8: the cap counts bytes, not characters")
+	ctx.Equal(apiCalls(ctx), 0, "an oversized document reached the model; Classify calls")
+	r = apiPost(c, "acme", "text/plain", "  "+strings.Repeat("a", 64*1024)+"  ", 0)
+	ctx.Equal(r.Status, 200, "64 KiB of text with surrounding spaces: the cap applies to the trimmed text")
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := apiPost(c, "", "text/plain", apiText, 0)
+	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
+	r = apiPost(c, "globex", "text/plain", apiText, 0)
+	ctx.Equal(r.Status, 404, "tenant globex classified against acme's taxonomy tx-support")
+	ctx.Equal(apiCalls(ctx), 0, "a request for another tenant's taxonomy reached the model; Classify calls")
+	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", []string{"billing", "support", "security", "abuse"})
+	ctx.NoError(err, "publishing version 2")
+	r = apiPost(c, "acme", "text/plain", apiText, 1)
+	ctx.Assert(r.Status == 200 && apiDecode(r).TaxonomyVersion == 1, "a request for version 1 must be classified against version 1, got %d %s", r.Status, r.Text())
+	r = apiPost(c, "acme", "text/plain", apiText, 0)
+	ctx.Assert(r.Status == 200 && apiDecode(r).TaxonomyVersion == 2, "without a version the latest (2) applies, got %d %s", r.Status, r.Text())
+}
+
+func CheckTaxonomyBinding(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := apiPost(c, "acme", "text/plain", "refund my invoice #urgent", 0)
+	ctx.Equal(r.Status, 200, "POST /v1/classify (%s)", r.Text())
+	reply := apiDecode(r)
+	ctx.Equal(reply.Labels, []string{"billing", "review"}, "the model invented 'urgent', which tx-support does not contain; the labels")
+	ctx.Equal(reply.UnknownLabels, []string{"urgent"}, "the invented label must be reported in unknown_labels")
+	r = apiPost(c, "acme", "text/plain", "hello there #weather", 0)
+	reply = apiDecode(r)
+	ctx.Assert(len(reply.Labels) == 1 && reply.Labels[0] == "review" && len(reply.UnknownLabels) == 1 && reply.UnknownLabels[0] == "weather", "with no known label the document goes to review alone, got %s", r.Text())
+	r = apiPost(c, "acme", "text/plain", "my screen is broken", 0)
+	reply = apiDecode(r)
+	ctx.Assert(len(reply.Labels) == 1 && reply.Labels[0] == "support" && len(reply.UnknownLabels) == 0, "known labels pass through unchanged, got %s", r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "classifier/labeler.h"
+
+namespace {
+
+const std::string kText = "I was charged twice, please refund";
+
+// The stand-in model: answers from classifier/labeler.h.
+class ModelPeer final : public contentclassifier::Model::Service {
+ public:
+  grpc::Status Classify(grpc::ServerContext*, const contentclassifier::ClassifyRequest* req, contentclassifier::ClassifyReply* reply) override {
+    const auto verdict = labeler::classify(req->text());
+    for (const auto& label : verdict.labels) reply->add_labels(label);
+    reply->set_refused(verdict.refused);
+    reply->set_model_version(labeler::kVersion);
+    return grpc::Status::OK;
+  }
+};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static ModelPeer* peer = nullptr;
+  delete peer;
+  peer = new ModelPeer;
+  ctx.GRPC.Server(config::kModel)->RegisterService(peer);
+  taxonomies::putVersion("acme", "tx-support", {"billing", "support", "security"});
+  taxonomies::putVersion("globex", "tx-legal", {"billing", "legal"});
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response post(harness::HTTP& c, const std::string& tenant, const std::string& mime_type, const std::string& text, long version = 0) {
+  nlohmann::json body = {{"taxonomy_id", "tx-support"}, {"mime_type", mime_type}, {"text", text}};
+  if (version > 0) body["taxonomy_version"] = version;
+  if (tenant.empty()) return c.Post("/v1/classify", body.dump(), "Content-Type", "application/json");
+  return c.Post("/v1/classify", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
+}
+
+nlohmann::json decode(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+std::vector<std::string> strings(const nlohmann::json& body, const std::string& field) {
+  return body.is_object() && body.contains(field) && body[field].is_array() ? body[field].get<std::vector<std::string>>() : std::vector<std::string>{"<missing>"};
+}
+
+long versionOf(const harness::Response& r) {
+  const auto body = decode(r);
+  return body.is_object() ? body.value("taxonomy_version", 0L) : 0L;
+}
+
+size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = post(c, "acme", "text/plain", kText);
+  ctx.Equal(r.Status, 200, "POST /v1/classify (%s)", r.Text());
+  const auto body = decode(r);
+  ctx.Equal(strings(body, "labels"), {"billing"}, "a refund question must be labeled billing (%s)", r.Text());
+  ctx.Assert(body.value("taxonomy_id", "") == "tx-support" && versionOf(r) == 1, "the response must name taxonomy tx-support version 1, got %s", r.Text());
+  ctx.Assert(body.value("provenance", "") == "model" && body.value("model_version", "") == labeler::kVersion, "the response must carry the model's provenance and version, got %s", r.Text());
+  ctx.Equal(calls(ctx), 1, "one document must cost one model call; Classify calls");
+}
+
+void CheckContentType(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "acme", "image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ");
+  ctx.Equal(r.Status, 415, "a document of type image/png (%s)", r.Text());
+  ctx.Equal(calls(ctx), 0, "the image's bytes reached the model: only text/* may be classified; Classify calls");
+  r = post(c, "acme", "application/octet-stream", kText);
+  ctx.Equal(r.Status, 415, "a document of type application/octet-stream");
+  ctx.Equal(calls(ctx), 0, "an octet stream reached the model; Classify calls");
+  r = post(c, "acme", "text/markdown", kText);
+  ctx.Equal(r.Status, 200, "a text/markdown document is text and must be classified (%s)", r.Text());
+}
+
+void CheckSizeAndEmpty(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "acme", "text/plain", "   \\n\\t  ");
+  ctx.Equal(r.Status, 400, "a document of whitespace");
+  ctx.Equal(calls(ctx), 0, "an empty document reached the model; Classify calls");
+  r = post(c, "acme", "text/plain", std::string(64 * 1024 + 1, 'a'));
+  ctx.Equal(r.Status, 413, "a document of 64 KiB + 1 byte");
+  std::string accented;
+  for (int i = 0; i < 40000; i++) accented += "é";
+  r = post(c, "acme", "text/plain", accented);
+  ctx.Equal(r.Status, 413, "40000 accented letters are 80000 bytes of UTF-8: the cap counts bytes, not characters");
+  ctx.Equal(calls(ctx), 0, "an oversized document reached the model; Classify calls");
+  r = post(c, "acme", "text/plain", "  " + std::string(64 * 1024, 'a') + "  ");
+  ctx.Equal(r.Status, 200, "64 KiB of text with surrounding spaces: the cap applies to the trimmed text");
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "", "text/plain", kText);
+  ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
+  r = post(c, "globex", "text/plain", kText);
+  ctx.Equal(r.Status, 404, "tenant globex classified against acme's taxonomy tx-support");
+  ctx.Equal(calls(ctx), 0, "a request for another tenant's taxonomy reached the model; Classify calls");
+  taxonomies::putVersion("acme", "tx-support", {"billing", "support", "security", "abuse"});
+  r = post(c, "acme", "text/plain", kText, 1);
+  ctx.Assert(r.Status == 200 && versionOf(r) == 1, "a request for version 1 must be classified against version 1, got %d %s", r.Status, r.Text());
+  r = post(c, "acme", "text/plain", kText);
+  ctx.Assert(r.Status == 200 && versionOf(r) == 2, "without a version the latest (2) applies, got %d %s", r.Status, r.Text());
+}
+
+void CheckTaxonomyBinding(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "acme", "text/plain", "refund my invoice #urgent");
+  ctx.Equal(r.Status, 200, "POST /v1/classify (%s)", r.Text());
+  auto body = decode(r);
+  ctx.Equal(strings(body, "labels"), {"billing", "review"}, "the model invented 'urgent', which tx-support does not contain; the labels");
+  ctx.Equal(strings(body, "unknown_labels"), {"urgent"}, "the invented label must be reported in unknown_labels");
+  r = post(c, "acme", "text/plain", "hello there #weather");
+  body = decode(r);
+  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"review"} && strings(body, "unknown_labels") == std::vector<std::string>{"weather"},
+             "with no known label the document goes to review alone, got %s", r.Text());
+  r = post(c, "acme", "text/plain", "my screen is broken");
+  body = decode(r);
+  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"support"} && strings(body, "unknown_labels").empty(),
+             "known labels pass through unchanged, got %s", r.Text());
+}
+`,
+  },
   hints: [
-    'A tenant posts a PNG and gets labels back; another tenant classifies against a taxonomy it does not own; routing drops documents whose label exists in no taxonomy.',
-    'The handler trusts every input: `taxonomy_store.get(id)` ignores the tenant, nothing checks `Content-Type`, size or emptiness, and the model’s label strings go straight into the response.',
-    'Guard in cost order (tenant 401, media type 415, normalize then 400/413, `load(tenant, id, version)` or 404), then `bind_labels`: keep known labels, collect `unknown_labels`, route the rest to `REVIEW_LABEL`.',
+    'A screenshot posted as `image/png` comes back with labels, a blank document still costs a model call, tenant globex gets 200 for acme’s taxonomy, and a hashtag the model made up shows as a label.',
+    'The handler never looks at `mime_type` or the text’s size; `by_id` finds a taxonomy whoever owns it and ignores the requested version; and the response copies the model’s labels without asking the version which of them exist.',
+    '401 without a tenant; 415 unless `mime_type` starts with `text/`; trim, then 400 when empty and 413 over `MAX_TEXT_BYTES` in UTF-8 bytes; `taxonomies.load(tenant, taxonomy_id, version)` or 404; then `bind_labels(result["labels"], taxonomy)`.',
   ],
-  debrief: `The guards come before the model call because every one of them is cheaper than the call they protect, and the taxonomy lookup carries the tenant because a taxonomy is tenant data, not a global id. Binding is an intersection: the model proposes strings, the taxonomy version decides which ones exist, and whatever is left over goes to review with the unknowns listed so somebody can act on them. The demo passed because one tenant, one taxonomy and clean text never exercised any of those paths. Production classifiers go further: a confidence threshold decides when a known label still deserves review, and an invented-label rate per taxonomy tells its owners when the taxonomy itself needs work.`,
+  debrief: `The guards run before the model call because each one is cheaper than the call it protects, and they measure what the model would see: the trimmed text in UTF-8 bytes, since a character count lets 40,000 accented letters past a 64 KiB cap. The lookup carries the tenant because a taxonomy is tenant data; the store answers nothing for a foreign id, so the 404 does not even confirm the id exists. Binding is an intersection: the model proposes strings, the version decides which exist, and the leftovers go to review by name so someone can act on them. Production classifiers add a confidence threshold below which a known label still goes to review, and track the invented-label rate per taxonomy so its owners learn when the label set needs work.`,
 };

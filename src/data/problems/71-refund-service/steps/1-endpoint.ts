@@ -2,68 +2,55 @@ import type {Step} from '@/lib/types';
 
 export const refundEndpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/refunds: never more than was paid',
+  title: 'POST /v1/refunds: no more than was paid, once per key',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'api', 'ledger', 'records', 'psp'],
+  focus: ['client', 'api', 'ledger', 'records'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/refunds\` with body
-\`{"payment_id": "pay_8d1", "amount_minor": 2500, "reason_code": "damaged"}\`, reads the tenant
-header, logs the request and answers **200** with a \`PENDING\` refund for whatever amount and
-payment the client named. It compiles and hides four flaws.
+**Starting point.** The starter serves \`POST /v1/refunds\` with body
+\`{"payment_id": "pay_1", "amount_minor": 2500, "reason_code": "damaged"}\` on the refund records
+(\`refunds.records\`, provided): it reads \`X-Tenant-Id\`, looks the payment up with
+\`find_payment\`, writes a \`PENDING\` row with \`insert_refund\` and answers **201** with the row and
+\`remaining_minor = paid_minor - amount_minor\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The handler trusts the body: no balance check, so a payment
-can refund more than it collected; no \`Idempotency-Key\`, so every client retry is a second refund;
-no ownership check, so any tenant can refund another tenant's charge; and no \`remaining_minor\`
-in the response.
+**Failure mode the checks target.** A caller with no tenant, or with another merchant's payment id,
+gets a refund; a negative amount goes through; a payment refunds more than it collected; and a
+client that retries after a timeout is refunded twice.
 
-Requirements:
-
-- Tenant from \`X-Tenant-Id\` (**401** when missing). A payment owned by another tenant answers
+- Tenant from \`X-Tenant-Id\` (**401** when missing); a payment owned by another tenant answers
   **404**, the same as a missing one.
-- \`amount_minor\` is an integer of at least **1** and \`reason_code\` is one of \`damaged\`,
-  \`not_received\`, \`duplicate\`, \`goodwill\` (**400** otherwise).
-- An amount above \`paid_minor - refunded_minor\` is **422** with the remaining balance in the body.
-  The amount is claimed through the ledger's atomic check-and-add with \`paid_minor\` as the cap,
-  not by reading a balance here, so two concurrent partial refunds leave exactly one accepted.
-- \`Idempotency-Key\` is required (**400** when missing); the refund is stored under
-  \`(tenant, key)\` and a replay returns the first refund with the same \`refund_id\`.
-- The accepted response carries the new \`remaining_minor\`.
-- Log tenant, payment and amount; never the reason text, card data or customer name.`,
+- \`amount_minor\` is at least **1** and \`reason_code\` one of \`REASON_CODES\` (\`damaged\`,
+  \`not_received\`, \`duplicate\`, \`goodwill\`): **400** otherwise.
+- The amount is claimed with \`ledger.claim(payment_id, refund_id, amount_minor, paid_minor)\`
+  (step 2, provided as \`refunds.ledger\`); a refused claim is **422** with \`remaining_minor\` and
+  writes no row.
+- \`Idempotency-Key\` is required (**400**). Look \`(tenant, key)\` up with \`refund_for_key\` before
+  claiming, answer the first refund on a replay, and pass the key to \`insert_refund\`.`,
   sequence: {
-    participants: ['Client', 'Refund API', 'Redis ledger', 'refund records'],
+    participants: ['Merchant client', 'Refund API', 'refund records', 'Redis ledger'],
     messages: [
-      {from: 'Client', to: 'Refund API', label: 'POST /v1/refunds · X-Tenant-Id · Idempotency-Key', kind: 'sync'},
-      {from: 'Refund API', to: 'Refund API', label: 'guards: tenant · key · amount · reason_code', kind: 'sync'},
-      {from: 'Refund API', to: 'refund records', label: 'replay? (tenant, idem_key) · payment owner', kind: 'sync'},
-      {from: 'refund records', to: 'Refund API', label: 'stored refund / tenant · paid_minor', kind: 'reply'},
       {
-        from: 'Refund API',
-        to: 'Redis ledger',
-        label: 'EVAL check-and-add(amount ≤ paid_minor − refunded)',
+        from: 'Merchant client',
+        to: 'Refund API',
+        label: 'POST /v1/refunds · X-Tenant-Id · Idempotency-Key',
         kind: 'sync',
       },
-      {
-        from: 'Redis ledger',
-        to: 'Refund API',
-        label: '{accepted, refunded_minor, remaining_minor} | refused',
-        kind: 'reply',
-      },
-      {from: 'Refund API', to: 'refund records', label: 'insert refund row · store (tenant, key)', kind: 'async'},
-      {
-        from: 'Refund API',
-        to: 'Client',
-        label: '201 {refund_id, remaining_minor} · 422 over the balance',
-        kind: 'reply',
-      },
+      {from: 'Refund API', to: 'Refund API', label: '401 · 400 key, amount, reason_code', kind: 'sync'},
+      {from: 'Refund API', to: 'refund records', label: 'refund_for_key(tenant, key) · find_payment', kind: 'sync'},
+      {from: 'refund records', to: 'Refund API', label: 'first refund (replay) · owner, paid_minor', kind: 'reply'},
+      {from: 'Refund API', to: 'Redis ledger', label: 'claim(payment, refund_id, amount, paid_minor)', kind: 'sync'},
+      {from: 'Redis ledger', to: 'Refund API', label: 'accepted · remaining_minor | refused → 422', kind: 'reply'},
+      {from: 'Refund API', to: 'refund records', label: 'insert_refund(…, key) · PENDING', kind: 'sync'},
+      {from: 'Refund API', to: 'Merchant client', label: '201 {refund_id, status, remaining_minor}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
       title: 'Handles POST /v1/refunds',
-      detail: 'Register the refund route on `POST /v1/refunds`.',
+      detail:
+        'A valid request answers **201** with the refund id, `PENDING` and `remaining_minor`, and the row is in the records.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/refunds["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/refunds['"]/]},
@@ -73,68 +60,70 @@ Requirements:
       },
     },
     {
-      id: 'cap',
-      title: 'Refuses an amount above the remaining balance with 422',
-      detail:
-        'An amount larger than `paid_minor` minus the refunded total is answered **422** with the remaining balance in the body; the starter refunds whatever the caller asks for. The cap is `paid_minor`, enforced at the claim.',
-      match: {
-        python: {all: [/status_code\s*=\s*422/, /paid_minor/]},
-        typescript: {all: [/\.code\(\s*422\s*\)/, /paid_minor/]},
-        go: {all: [/StatusUnprocessableEntity/, /paidMinor/]},
-        scala: {all: [/StatusCodes\.UnprocessableEntity/, /paidMinor/]},
-        cpp: {all: [/\b422\b/, /paid_minor/]},
-      },
-    },
-    {
       id: 'tenant-scope',
       title: 'Authenticates the tenant and 404s a foreign payment',
       detail:
-        'A missing `X-Tenant-Id` is **401** and a payment owned by another tenant is **404**, checked before the ledger is touched. The starter refunds whatever payment id the path or body names.',
+        'No `X-Tenant-Id` is **401**; a payment of another tenant is **404** like a missing one; neither writes a row or touches the ledger. The starter refunds any payment for anyone.',
       match: {
-        python: {all: [/status_code\s*=\s*401/, /status_code\s*=\s*404/]},
-        typescript: {all: [/\.code\(\s*401\s*\)/, /\.code\(\s*404\s*\)/]},
-        go: {all: [/StatusUnauthorized/, /StatusNotFound/]},
-        scala: {all: [/StatusCodes\.Unauthorized/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/\b401\b/, /\b404\b/]},
+        python: {
+          all: [/\b401\b/, /payment\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*payment\[["']tenant["']\]/],
+        },
+        typescript: {all: [/\b401\b/, /payment\.tenant\s*!==?\s*tenant|tenant\s*!==?\s*payment\.tenant/]},
+        go: {all: [/StatusUnauthorized|\b401\b/, /payment\.Tenant\s*!=\s*tenant|tenant\s*!=\s*payment\.Tenant/]},
+        scala: {
+          all: [/Unauthorized|\b401\b/, /\.tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.tenant|\.tenant\s*==\s*tenant/],
+        },
+        cpp: {all: [/\b401\b/, /payment->tenant\s*!=\s*tenant|tenant\s*!=\s*payment->tenant/]},
+      },
+    },
+    {
+      id: 'amount-valid',
+      title: 'Refuses a zero or negative amount and an unknown reason with 400',
+      detail:
+        '`amount_minor` below 1, or a `reason_code` outside `REASON_CODES`, answers **400** and writes nothing. The starter takes -2500 as a refund that grows the balance.',
+      match: {
+        python: {all: [/amount_minor\s*<\s*1|amount_minor\s*<=\s*0/, /REASON_CODES/]},
+        typescript: {all: [/amount_minor\s*<\s*1|amount_minor\s*<=\s*0/, /REASON_CODES/]},
+        go: {all: [/AmountMinor\s*<\s*1|AmountMinor\s*<=\s*0/, /reasonCodes/]},
+        scala: {all: [/amountMinor\s*<\s*1|amountMinor\s*<=\s*0/, /ReasonCodes/]},
+        cpp: {all: [/amount_minor\s*<\s*1|amount_minor\s*<=\s*0/, /kReasonCodes/]},
+      },
+    },
+    {
+      id: 'cap',
+      title: 'Claims the amount against the payment total, 422 above it',
+      detail:
+        'The amount is claimed through `ledger.claim` with `paid_minor` as the cap; a refused claim answers **422** with `remaining_minor` and writes no row. The starter does not ask the ledger.',
+      match: {
+        python: {all: [/ledger\.claim\(/, /\b422\b/]},
+        typescript: {all: [/\bclaim\(/, /\b422\b/]},
+        go: {all: [/ledger\.Claim\(/, /StatusUnprocessableEntity|\b422\b/]},
+        scala: {all: [/Ledger\.claim\(/, /UnprocessableEntity|\b422\b/]},
+        cpp: {all: [/ledger::claim\(/, /\b422\b/]},
       },
     },
     {
       id: 'idempotency-key',
-      title: 'Requires Idempotency-Key and replays the first refund',
+      title: 'Requires Idempotency-Key and answers the first refund on a replay',
       detail:
-        '`Idempotency-Key` is required (**400** when absent) and the refund is stored under `(tenant, key)`; a replay returns the stored refund instead of refunding again. The starter never reads the header.',
+        'A request without `Idempotency-Key` is **400**; `refund_for_key(tenant, key)` is read before the claim and a replay answers the first refund without claiming again. The starter ignores the header.',
       match: {
-        python: {all: [/Idempotency-Key/, /status_code\s*=\s*400/, /refunds\.get\(/, /refunds\.put\(/]},
-        typescript: {all: [/'idempotency-key'/, /\.code\(\s*400\s*\)/, /refunds\.get\(/, /refunds\.put\(/]},
-        go: {all: [/Idempotency-Key/, /StatusBadRequest/, /refunds\.Get\(/, /refunds\.Put\(/]},
-        scala: {all: [/Idempotency-Key/, /StatusCodes\.BadRequest/, /refunds\.get\(/, /refunds\.put\(/]},
-        cpp: {all: [/Idempotency-Key/, /\b400\b/, /refunds\.get\(/, /refunds\.put\(/]},
-      },
-    },
-    {
-      id: 'remaining-balance',
-      title: 'Leaves the reduced balance visible immediately',
-      detail:
-        'The accepted response carries the new `remaining_minor` computed from the payment total and the refunded amount, so a partial refund shows the reduced balance at once. The starter returns no balance at all.',
-      match: {
-        python: {all: [/remaining_minor/, /paid_minor/]},
-        typescript: {all: [/remaining_minor/, /paid_minor/]},
-        go: {all: [/remainingMinor/, /paidMinor/]},
-        scala: {all: [/remainingMinor/, /paidMinor/]},
-        cpp: {all: [/remaining_minor/, /paid_minor/]},
+        python: {all: [/idempotency-key/i], order: [/records\.refund_for_key\(/, /ledger\.claim\(/]},
+        typescript: {all: [/idempotency-key/i], order: [/refundForKey\(/, /\bclaim\(/]},
+        go: {all: [/Idempotency-Key/i], order: [/records\.RefundForKey\(/, /ledger\.Claim\(/]},
+        scala: {all: [/Idempotency-Key/i], order: [/Records\.refundForKey\(/, /Ledger\.claim\(/]},
+        cpp: {all: [/Idempotency-Key/i], order: [/records::refundForKey\(/, /ledger::claim\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from refunds import ledger, records  # records.find_payment, new_refund_id, insert_refund, refund_for_key; ledger.claim, refunded_total
+
 app = FastAPI()
-logger = logging.getLogger("refunds")
 
 
 class RefundRequest(BaseModel):
@@ -143,562 +132,391 @@ class RefundRequest(BaseModel):
     reason_code: str
 
 
-class RefundStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The refund stored for (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, refund: dict) -> None:
-        """Store the refund under (tenant, idem_key)."""
-        raise NotImplementedError
-
-
-refunds = RefundStore()
-
-
-@app.post("/v1/refunds")
-def create_refund(body: RefundRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    logger.info("refund tenant=%s payment=%s amount=%d", tenant, body.payment_id, body.amount_minor)
-    return JSONResponse(
-        {
-            "payment_id": body.payment_id,
-            "amount_minor": body.amount_minor,
-            "reason_code": body.reason_code,
-            "status": "PENDING",
-        },
-        status_code=200,
-    )
-`,
-      solution: `import logging
-import uuid
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-app = FastAPI()
-logger = logging.getLogger("refunds")
-
-REASON_CODES = {"damaged", "not_received", "duplicate", "goodwill"}
-
-
-class RefundRequest(BaseModel):
-    payment_id: str
-    amount_minor: int
-    reason_code: str
-
-
-class RefundStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The refund stored for (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, refund: dict) -> None:
-        """Store the refund under (tenant, idem_key)."""
-        raise NotImplementedError
-
-
-class Payments:
-    def get(self, payment_id: str) -> dict | None:
-        """{"tenant": ..., "paid_minor": ...} for the payment, or None."""
-        raise NotImplementedError
-
-    def insert_refund(self, refund: dict) -> None:
-        """Append the durable refund row."""
-        raise NotImplementedError
-
-
-class Ledger:
-    def check_and_add_refund(
-        self, payment_id: str, amount_minor: int, cap_minor: int
-    ) -> tuple[bool, int, int]:
-        """(accepted, refunded_minor, remaining_minor) — one atomic check-and-add capped at cap_minor."""
-        raise NotImplementedError
-
-
-refunds = RefundStore()
-payments = Payments()
-ledger = Ledger()
-
-
-@app.post("/v1/refunds")
-def create_refund(
-    body: RefundRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if idem_key is None or idem_key == "":
-        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if body.amount_minor < 1:
-        raise HTTPException(status_code=400, detail="amount_minor must be at least 1")
-    if body.reason_code not in REASON_CODES:
-        raise HTTPException(status_code=400, detail="unknown reason_code")
-
-    stored = refunds.get(tenant, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=200)
-
-    payment = payments.get(body.payment_id)
-    if payment is None or payment["tenant"] != tenant:
-        raise HTTPException(status_code=404, detail="payment not found")
-
-    ok, refunded_total, remaining_minor = ledger.check_and_add_refund(
-        body.payment_id, body.amount_minor, payment["paid_minor"]
-    )
-    if not ok:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "amount exceeds the remaining refundable balance",
-                "remaining_minor": remaining_minor,
-            },
-        )
-
-    refund = {
-        "refund_id": str(uuid.uuid4()),
-        "payment_id": body.payment_id,
-        "amount_minor": body.amount_minor,
-        "reason_code": body.reason_code,
-        "status": "PENDING",
-        "refunded_minor": refunded_total,
+def refund_body(refund: dict, remaining_minor: int) -> dict:
+    return {
+        "refund_id": refund["refund_id"],
+        "payment_id": refund["payment_id"],
+        "amount_minor": refund["amount_minor"],
+        "reason_code": refund["reason_code"],
+        "status": refund["status"],
         "remaining_minor": remaining_minor,
     }
-    payments.insert_refund(refund)
-    refunds.put(tenant, idem_key, refund)
-    logger.info(
-        "refund tenant=%s payment=%s amount=%d remaining=%d",
-        tenant,
-        body.payment_id,
-        body.amount_minor,
-        remaining_minor,
-    )
-    return JSONResponse(refund, status_code=201)
+
+
+@app.post("/v1/refunds", status_code=201)
+def create_refund(body: RefundRequest, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    payment = records.find_payment(body.payment_id)
+    if payment is None:
+        raise HTTPException(status_code=404, detail="no such payment")
+    refund_id = records.new_refund_id()
+    refund = records.insert_refund(refund_id, tenant, body.payment_id, body.amount_minor, body.reason_code, "")
+    return refund_body(refund, payment["paid_minor"] - body.amount_minor)
+`,
+      solution: `from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from refunds import ledger, records  # records.find_payment, new_refund_id, insert_refund, refund_for_key; ledger.claim, refunded_total
+
+app = FastAPI()
+
+REASON_CODES = ("damaged", "not_received", "duplicate", "goodwill")
+
+
+class RefundRequest(BaseModel):
+    payment_id: str
+    amount_minor: int
+    reason_code: str
+
+
+def refund_body(refund: dict, remaining_minor: int) -> dict:
+    return {
+        "refund_id": refund["refund_id"],
+        "payment_id": refund["payment_id"],
+        "amount_minor": refund["amount_minor"],
+        "reason_code": refund["reason_code"],
+        "status": refund["status"],
+        "remaining_minor": remaining_minor,
+    }
+
+
+@app.post("/v1/refunds", status_code=201)
+def create_refund(body: RefundRequest, request: Request):
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    idem_key = request.headers.get("idempotency-key", "")
+    if not idem_key:
+        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
+    if body.amount_minor < 1 or body.reason_code not in REASON_CODES:
+        raise HTTPException(status_code=400, detail=f"amount_minor must be at least 1 and reason_code one of {', '.join(REASON_CODES)}")
+    first = records.refund_for_key(tenant, idem_key)
+    if first is not None:
+        # A retry: answer the refund this key created, without a second claim.
+        paid = records.find_payment(first["payment_id"])["paid_minor"]
+        return refund_body(first, paid - ledger.refunded_total(first["payment_id"]))
+    payment = records.find_payment(body.payment_id)
+    if payment is None or payment["tenant"] != tenant:
+        raise HTTPException(status_code=404, detail="no such payment")  # another tenant's payment looks missing
+    refund_id = records.new_refund_id()
+    accepted, _refunded, remaining = ledger.claim(body.payment_id, refund_id, body.amount_minor, payment["paid_minor"])
+    if not accepted:
+        return JSONResponse({"error": "amount exceeds the remaining balance", "remaining_minor": remaining}, status_code=422)
+    refund = records.insert_refund(refund_id, tenant, body.payment_id, body.amount_minor, body.reason_code, idem_key)
+    return refund_body(refund, remaining)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/refunds. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {claim, refundedTotal} from 'refunds/ledger';
+import {type Refund, findPayment, insertRefund, newRefundId, refundForKey} from 'refunds/records';
 
 export const app = Fastify();
 
-interface RefundBody {
+interface RefundRequest {
   payment_id: string;
   amount_minor: number;
   reason_code: string;
+}
+
+function refundBody(refund: Refund, remainingMinor: number) {
+  const {refund_id, payment_id, amount_minor, reason_code, status} = refund;
+  return {refund_id, payment_id, amount_minor, reason_code, status, remaining_minor: remainingMinor};
 }
 
 app.post('/v1/refunds', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as RefundBody;
-  request.log.info({tenant, payment_id: body.payment_id, amount_minor: body.amount_minor}, 'refund accepted');
-  return reply.code(200).send({
-    payment_id: body.payment_id,
-    amount_minor: body.amount_minor,
-    reason_code: body.reason_code,
-    status: 'PENDING',
-  });
+  const tenant = (request.headers['x-tenant-id'] as string | undefined) ?? '';
+  const body = request.body as RefundRequest;
+  const payment = await findPayment(body.payment_id);
+  if (payment === null) return reply.code(404).send({error: 'no such payment'});
+  const refundId = await newRefundId();
+  const refund = await insertRefund(refundId, tenant, body.payment_id, body.amount_minor, body.reason_code, '');
+  return reply.code(201).send(refundBody(refund, payment.paid_minor - body.amount_minor));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/refunds: capped by what was paid, keyed by (tenant, Idempotency-Key). */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
-
-import {ledger} from './state';
-import {payments, refunds} from './store';
+import {claim, refundedTotal} from 'refunds/ledger';
+import {type Refund, findPayment, insertRefund, newRefundId, refundForKey} from 'refunds/records';
 
 export const app = Fastify();
 
-const REASON_CODES: Record<string, true> = {
-  damaged: true,
-  not_received: true,
-  duplicate: true,
-  goodwill: true,
-};
+export const REASON_CODES = ['damaged', 'not_received', 'duplicate', 'goodwill'];
 
-interface RefundBody {
+interface RefundRequest {
   payment_id: string;
   amount_minor: number;
   reason_code: string;
 }
 
+function refundBody(refund: Refund, remainingMinor: number) {
+  const {refund_id, payment_id, amount_minor, reason_code, status} = refund;
+  return {refund_id, payment_id, amount_minor, reason_code, status, remaining_minor: remainingMinor};
+}
+
 app.post('/v1/refunds', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<RefundBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.payment_id !== 'string')
-    return reply.code(400).send({error: 'payment_id must be a string'});
-  const amountMinor = body.amount_minor;
-  if (typeof amountMinor !== 'number' || !Number.isInteger(amountMinor) || amountMinor < 1)
-    return reply.code(400).send({error: 'amount_minor must be at least 1'});
-  const reasonCode = body.reason_code ?? '';
-  if (REASON_CODES[reasonCode] !== true) return reply.code(400).send({error: 'unknown reason_code'});
-
-  const stored = await refunds.get(tenant, idemKey);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  const payment = await payments.get(body.payment_id);
-  if (payment === null || payment.tenant !== tenant) return reply.code(404).send({error: 'payment not found'});
-
-  const claim = await ledger.checkAndAddRefund(body.payment_id, amountMinor, payment.paid_minor);
-  if (!claim.accepted)
-    return reply
-      .code(422)
-      .send({error: 'amount exceeds the remaining refundable balance', remaining_minor: claim.remaining_minor});
-
-  const refund = {
-    refund_id: randomUUID(),
-    payment_id: body.payment_id,
-    amount_minor: amountMinor,
-    reason_code: reasonCode,
-    status: 'PENDING',
-    refunded_minor: claim.refunded_minor,
-    remaining_minor: claim.remaining_minor,
-  };
-  await payments.insertRefund(refund);
-  await refunds.put(tenant, idemKey, refund);
-  request.log.info(
-    {tenant, payment_id: body.payment_id, amount_minor: amountMinor, remaining_minor: claim.remaining_minor},
-    'refund accepted',
-  );
-  return reply.code(201).send(refund);
+  const tenant = (request.headers['x-tenant-id'] as string | undefined) ?? '';
+  if (tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const idemKey = (request.headers['idempotency-key'] as string | undefined) ?? '';
+  if (idemKey === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const body = request.body as RefundRequest;
+  if (!Number.isInteger(body.amount_minor) || body.amount_minor < 1 || !REASON_CODES.includes(body.reason_code)) {
+    return reply.code(400).send({error: \`amount_minor must be at least 1 and reason_code one of \${REASON_CODES.join(', ')}\`});
+  }
+  const first = await refundForKey(tenant, idemKey);
+  if (first !== null) {
+    // A retry: answer the refund this key created, without a second claim.
+    const paid = (await findPayment(first.payment_id))?.paid_minor ?? 0;
+    return reply.code(201).send(refundBody(first, paid - (await refundedTotal(first.payment_id))));
+  }
+  const payment = await findPayment(body.payment_id);
+  // Another tenant's payment looks missing.
+  if (payment === null || payment.tenant !== tenant) return reply.code(404).send({error: 'no such payment'});
+  const refundId = await newRefundId();
+  const claimed = await claim(body.payment_id, refundId, body.amount_minor, payment.paid_minor);
+  if (!claimed.accepted) {
+    return reply.code(422).send({error: 'amount exceeds the remaining balance', remaining_minor: claimed.remaining_minor});
+  }
+  const refund = await insertRefund(refundId, tenant, body.payment_id, body.amount_minor, body.reason_code, idemKey);
+  return reply.code(201).send(refundBody(refund, claimed.remaining_minor));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"refunds/records" // records.FindPayment, NewRefundID, InsertRefund, RefundForKey
 )
 
-type RefundRequest struct {
+type refundRequest struct {
 	PaymentID   string \`json:"payment_id"\`
 	AmountMinor int64  \`json:"amount_minor"\`
 	ReasonCode  string \`json:"reason_code"\`
 }
 
-type RefundStore struct{}
-
-func (s *RefundStore) Get(ctx context.Context, tenant, idemKey string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *RefundStore) Put(ctx context.Context, tenant, idemKey string, refund map[string]any) error {
-	return nil
-}
-
-var refunds = &RefundStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func refundBody(refund *records.Refund, remainingMinor int64) map[string]any {
+	return map[string]any{
+		"refund_id": refund.RefundID, "payment_id": refund.PaymentID, "amount_minor": refund.AmountMinor,
+		"reason_code": refund.ReasonCode, "status": refund.Status, "remaining_minor": remainingMinor,
+	}
 }
 
 func createRefund(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	body := RefundRequest{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	log.Printf("refund tenant=%s payment=%s amount=%d", tenant, body.PaymentID, body.AmountMinor)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"payment_id":   body.PaymentID,
-		"amount_minor": body.AmountMinor,
-		"reason_code":  body.ReasonCode,
-		"status":       "PENDING",
-	})
+	tenant := r.Header.Get("X-Tenant-Id")
+	var body refundRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, "the body must be JSON", http.StatusBadRequest)
+		return
+	}
+	payment := records.FindPayment(r.Context(), body.PaymentID)
+	if payment == nil {
+		http.Error(rw, "no such payment", http.StatusNotFound)
+		return
+	}
+	refundID := records.NewRefundID(r.Context())
+	refund := records.InsertRefund(r.Context(), refundID, tenant, body.PaymentID, body.AmountMinor, body.ReasonCode, "")
+	writeJSON(rw, http.StatusCreated, refundBody(refund, payment.PaidMinor-body.AmountMinor))
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/refunds", createRefund)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 
-	"github.com/google/uuid"
+	"refunds/ledger"  // ledger.Claim, RefundedTotal
+	"refunds/records" // records.FindPayment, NewRefundID, InsertRefund, RefundForKey
 )
 
 var reasonCodes = map[string]bool{"damaged": true, "not_received": true, "duplicate": true, "goodwill": true}
 
-type RefundRequest struct {
+type refundRequest struct {
 	PaymentID   string \`json:"payment_id"\`
 	AmountMinor int64  \`json:"amount_minor"\`
 	ReasonCode  string \`json:"reason_code"\`
 }
 
-type Payment struct {
-	Tenant    string \`json:"tenant"\`
-	PaidMinor int64  \`json:"paid_minor"\`
-}
-
-type RefundStore struct{}
-
-func (s *RefundStore) Get(ctx context.Context, tenant, idemKey string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *RefundStore) Put(ctx context.Context, tenant, idemKey string, refund map[string]any) error {
-	return nil
-}
-
-type Payments struct{}
-
-func (p *Payments) Get(ctx context.Context, paymentID string) (*Payment, error) {
-	return nil, nil
-}
-
-func (p *Payments) InsertRefund(ctx context.Context, refund map[string]any) error {
-	return nil
-}
-
-type Ledger struct{}
-
-func (l *Ledger) CheckAndAddRefund(
-	ctx context.Context,
-	paymentID string,
-	amountMinor, capMinor int64,
-) (bool, int64, int64) {
-	return true, amountMinor, capMinor - amountMinor
-}
-
-var (
-	refunds  = &RefundStore{}
-	payments = &Payments{}
-	ledger   = &Ledger{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func refundBody(refund *records.Refund, remainingMinor int64) map[string]any {
+	return map[string]any{
+		"refund_id": refund.RefundID, "payment_id": refund.PaymentID, "amount_minor": refund.AmountMinor,
+		"reason_code": refund.ReasonCode, "status": refund.Status, "remaining_minor": remainingMinor,
+	}
 }
 
 func createRefund(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
 	idemKey := r.Header.Get("Idempotency-Key")
 	if idemKey == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
+		http.Error(rw, "Idempotency-Key is required", http.StatusBadRequest)
 		return
 	}
-	body := RefundRequest{}
+	var body refundRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "the body must be JSON", http.StatusBadRequest)
 		return
 	}
-	if body.AmountMinor < 1 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "amount_minor must be at least 1"})
+	if body.AmountMinor < 1 || !reasonCodes[body.ReasonCode] {
+		http.Error(rw, "amount_minor must be at least 1 and reason_code one of damaged, not_received, duplicate, goodwill", http.StatusBadRequest)
 		return
 	}
-	if !reasonCodes[body.ReasonCode] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown reason_code"})
+	if first := records.RefundForKey(r.Context(), tenant, idemKey); first != nil {
+		// A retry: answer the refund this key created, without a second claim.
+		paid := records.FindPayment(r.Context(), first.PaymentID).PaidMinor
+		writeJSON(rw, http.StatusCreated, refundBody(first, paid-ledger.RefundedTotal(r.Context(), first.PaymentID)))
 		return
 	}
-	if stored, err := refunds.Get(r.Context(), tenant, idemKey); err == nil && stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
+	payment := records.FindPayment(r.Context(), body.PaymentID)
+	if payment == nil || payment.Tenant != tenant {
+		http.Error(rw, "no such payment", http.StatusNotFound) // another tenant's payment looks missing
 		return
 	}
-	payment, err := payments.Get(r.Context(), body.PaymentID)
-	if err != nil || payment == nil || payment.Tenant != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "payment not found"})
+	refundID := records.NewRefundID(r.Context())
+	claimed, err := ledger.Claim(r.Context(), body.PaymentID, refundID, body.AmountMinor, payment.PaidMinor)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	paidMinor := payment.PaidMinor
-	accepted, refundedTotal, remainingMinor := ledger.CheckAndAddRefund(r.Context(), body.PaymentID, body.AmountMinor, paidMinor)
-	if !accepted {
-		writeJSON(rw, http.StatusUnprocessableEntity, map[string]any{
-			"error":           "amount exceeds the remaining refundable balance",
-			"remaining_minor": remainingMinor,
-		})
+	if !claimed.Accepted {
+		writeJSON(rw, http.StatusUnprocessableEntity, map[string]any{"error": "amount exceeds the remaining balance", "remaining_minor": claimed.RemainingMinor})
 		return
 	}
-	refund := map[string]any{
-		"refund_id":      uuid.NewString(),
-		"payment_id":     body.PaymentID,
-		"amount_minor":   body.AmountMinor,
-		"reason_code":    body.ReasonCode,
-		"status":         "PENDING",
-		"refunded_minor": refundedTotal,
-		"remaining_minor": remainingMinor,
-	}
-	if err := payments.InsertRefund(r.Context(), refund); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if err := refunds.Put(r.Context(), tenant, idemKey, refund); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("refund tenant=%s payment=%s amount=%d remaining=%d", tenant, body.PaymentID, body.AmountMinor, remainingMinor)
-	writeJSON(rw, http.StatusCreated, refund)
+	refund := records.InsertRefund(r.Context(), refundID, tenant, body.PaymentID, body.AmountMinor, body.ReasonCode, idemKey)
+	writeJSON(rw, http.StatusCreated, refundBody(refund, claimed.RemainingMinor))
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/refunds", createRefund)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class RefundRequest(payment_id: String, amount_minor: Long, reason_code: String)
+import refunds.{Ledger, Records} // Records.findPayment, newRefundId, insertRefund, refundForKey; Ledger.claim, refundedTotal
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("refunds")
-  implicit val refundFormat: RootJsonFormat[RefundRequest] = jsonFormat3(RefundRequest)
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val refunds = RefundStore.open()
+  private def refundBody(refund: Records.Refund, remainingMinor: Long): JsObject = JsObject(
+    "refund_id" -> JsString(refund.refundId), "payment_id" -> JsString(refund.paymentId),
+    "amount_minor" -> JsNumber(refund.amountMinor), "reason_code" -> JsString(refund.reasonCode),
+    "status" -> JsString(refund.status), "remaining_minor" -> JsNumber(remainingMinor))
 
-  val route: Route =
-    path("v1" / "refunds") {
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[RefundRequest]) { body =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            system.log.info(s"refund tenant=$tenant payment=\${body.payment_id} amount=\${body.amount_minor}")
-            complete(
-              StatusCodes.OK,
-              s"""{"payment_id":"\${body.payment_id}","amount_minor":\${body.amount_minor},"status":"PENDING"}"""
-            )
+  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
+  private def number(body: Map[String, JsValue], name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
+
+  val route: Route = path("v1" / "refunds") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
+        entity(as[String]) { raw =>
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+          val tenant = tenantHeader.getOrElse("")
+          val body = raw.parseJson.asJsObject.fields
+          val paymentId = text(body, "payment_id")
+          val amountMinor = number(body, "amount_minor")
+          Records.findPayment(paymentId) match {
+            case None => complete(StatusCodes.NotFound -> "no such payment")
+            case Some(payment) =>
+              val refund = Records.insertRefund(Records.newRefundId(), tenant, paymentId, amountMinor, text(body, "reason_code"), "")
+              complete(json(StatusCodes.Created, refundBody(refund, payment.paidMinor - amountMinor)))
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class RefundRequest(payment_id: String, amount_minor: Long, reason_code: String)
-final case class Refund(
-    refund_id: String,
-    payment_id: String,
-    amount_minor: Long,
-    reason_code: String,
-    status: String,
-    refunded_minor: Long,
-    remaining_minor: Long
-)
+import refunds.{Ledger, Records} // Records.findPayment, newRefundId, insertRefund, refundForKey; Ledger.claim, refundedTotal
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("refunds")
-  implicit val refundRequestFormat: RootJsonFormat[RefundRequest] = jsonFormat3(RefundRequest)
-  implicit val refundFormat: RootJsonFormat[Refund] = jsonFormat7(Refund)
+  val ReasonCodes: Set[String] = Set("damaged", "not_received", "duplicate", "goodwill")
 
-  val ReasonCodes = Set("damaged", "not_received", "duplicate", "goodwill")
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val refunds = RefundStore.open()
-  val payments = Payments.open()
-  val ledger = Ledger.open()
+  private def refundBody(refund: Records.Refund, remainingMinor: Long): JsObject = JsObject(
+    "refund_id" -> JsString(refund.refundId), "payment_id" -> JsString(refund.paymentId),
+    "amount_minor" -> JsNumber(refund.amountMinor), "reason_code" -> JsString(refund.reasonCode),
+    "status" -> JsString(refund.status), "remaining_minor" -> JsNumber(remainingMinor))
 
-  val route: Route =
-    path("v1" / "refunds") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[RefundRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.amount_minor < 1) {
-                complete(StatusCodes.BadRequest, """{"error":"amount_minor must be at least 1"}""")
-              } else if (!ReasonCodes.contains(body.reason_code)) {
-                complete(StatusCodes.BadRequest, """{"error":"unknown reason_code"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                refunds.get(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
-                  case None =>
-                    payments.get(body.payment_id) match {
-                      case Some(payment) if payment.tenant == tenant =>
-                        val (accepted, refundedTotal, remainingMinor) =
-                          ledger.checkAndAddRefund(body.payment_id, body.amount_minor, payment.paidMinor)
-                        if (!accepted) {
-                          complete(
-                            StatusCodes.UnprocessableEntity,
-                            s"""{"error":"amount exceeds the remaining refundable balance","remaining_minor":$remainingMinor}"""
-                          )
-                        } else {
-                          val refund = Refund(
-                            UUID.randomUUID().toString,
-                            body.payment_id,
-                            body.amount_minor,
-                            body.reason_code,
-                            "PENDING",
-                            refundedTotal,
-                            remainingMinor
-                          )
-                          payments.insertRefund(refund)
-                          refunds.put(tenant, idemKey, refund)
-                          system.log.info(
-                            s"refund tenant=$tenant payment=\${body.payment_id} amount=\${body.amount_minor} remaining=$remainingMinor"
-                          )
-                          complete(StatusCodes.Created, refund)
-                        }
-                      case _ =>
-                        complete(StatusCodes.NotFound, """{"error":"payment not found"}""")
-                    }
-                }
-              }
-            }
-          }
+  private def text(body: Map[String, JsValue], name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
+  private def number(body: Map[String, JsValue], name: String): Long = body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
+
+  private def create(tenant: String, idemKey: String, raw: String): HttpResponse = {
+    val body = raw.parseJson.asJsObject.fields
+    val paymentId = text(body, "payment_id")
+    val amountMinor = number(body, "amount_minor")
+    val reasonCode = text(body, "reason_code")
+    if (amountMinor < 1 || !ReasonCodes.contains(reasonCode))
+      return json(StatusCodes.BadRequest, JsObject("error" -> JsString("amount_minor must be at least 1 and reason_code one of " + ReasonCodes.mkString(", "))))
+    Records.refundForKey(tenant, idemKey) match {
+      case Some(first) =>
+        // A retry: answer the refund this key created, without a second claim.
+        val paid = Records.findPayment(first.paymentId).map(_.paidMinor).getOrElse(0L)
+        json(StatusCodes.Created, refundBody(first, paid - Ledger.refundedTotal(first.paymentId)))
+      case None =>
+        Records.findPayment(paymentId) match {
+          // Another tenant's payment looks missing.
+          case Some(payment) if payment.tenant == tenant =>
+            val refundId = Records.newRefundId()
+            val claimed = Ledger.claim(paymentId, refundId, amountMinor, payment.paidMinor)
+            if (!claimed.accepted)
+              json(StatusCodes.UnprocessableEntity, JsObject("error" -> JsString("amount exceeds the remaining balance"), "remaining_minor" -> JsNumber(claimed.remainingMinor)))
+            else json(StatusCodes.Created, refundBody(Records.insertRefund(refundId, tenant, paymentId, amountMinor, reasonCode, idemKey), claimed.remainingMinor))
+          case _ => json(StatusCodes.NotFound, JsObject("error" -> JsString("no such payment")))
         }
+    }
+  }
+
+  val route: Route = path("v1" / "refunds") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(tenant) =>
+          optionalHeaderValueByName("Idempotency-Key") {
+            case None | Some("") => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
+            case Some(idemKey) => entity(as[String]) { raw => complete(create(tenant, idemKey, raw)) }
+          }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -707,162 +525,507 @@ object Api {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <string>
+
+#include "refunds/ledger.h"   // ledger::claim, refundedTotal
+#include "refunds/records.h"  // records::findPayment, newRefundId, insertRefund, refundForKey
 
 using json = nlohmann::json;
 
-struct RefundStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& refund);
-};
-
-RefundStore refunds;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/refunds", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    std::cerr << "refund tenant=" << tenant << " payment=" << body.value("payment_id", std::string()) << "\\n";
-    res.status = 200;
-    res.set_content(
-        json{{"payment_id", body.value("payment_id", std::string())},
-             {"amount_minor", body.value("amount_minor", 0)},
-             {"status", "PENDING"}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+json refundBody(const records::Refund& refund, long long remaining_minor) {
+  return json{{"refund_id", refund.refund_id},     {"payment_id", refund.payment_id}, {"amount_minor", refund.amount_minor},
+              {"reason_code", refund.reason_code}, {"status", refund.status},         {"remaining_minor", remaining_minor}};
 }
+
+void create_refund(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const json body = json::parse(req.body);
+  const std::string payment_id = body.value("payment_id", "");
+  const long long amount_minor = body.value("amount_minor", 0LL);
+  const auto payment = records::findPayment(payment_id);
+  if (!payment) {
+    res.status = 404;
+    res.set_content("no such payment", "text/plain");
+    return;
+  }
+  const records::Refund refund =
+      records::insertRefund(records::newRefundId(), tenant, payment_id, amount_minor, body.value("reason_code", ""), "");
+  res.status = 201;
+  res.set_content(refundBody(refund, payment->paid_minor - amount_minor).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/refunds", create_refund); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <optional>
 #include <set>
 #include <string>
+
+#include "refunds/ledger.h"   // ledger::claim, refundedTotal
+#include "refunds/records.h"  // records::findPayment, newRefundId, insertRefund, refundForKey
 
 using json = nlohmann::json;
 
 const std::set<std::string> kReasonCodes = {"damaged", "not_received", "duplicate", "goodwill"};
 
-struct RefundStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& refund);
-};
-
-struct Payment {
-  std::string tenant;
-  long long paid_minor;
-};
-
-struct Payments {
-  std::optional<Payment> get(const std::string& paymentId);
-  void insertRefund(const json& refund);
-};
-
-struct Ledger {
-  std::tuple<bool, long long, long long> checkAndAddRefund(
-      const std::string& paymentId,
-      long long amountMinor,
-      long long capMinor);
-};
-
-RefundStore refunds;
-Payments payments;
-Ledger ledger;
-std::string uuidString();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/refunds", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("payment_id")) {
-      res.status = 400;
-      res.set_content(R"({"error":"payment_id is required"})", "application/json");
-      return;
-    }
-    const auto paymentId = body["payment_id"].get<std::string>();
-    const long long amountMinor = body.value("amount_minor", 0LL);
-    if (amountMinor < 1) {
-      res.status = 400;
-      res.set_content(R"({"error":"amount_minor must be at least 1"})", "application/json");
-      return;
-    }
-    const auto reasonCode = body.value("reason_code", std::string());
-    if (kReasonCodes.count(reasonCode) == 0) {
-      res.status = 400;
-      res.set_content(R"({"error":"unknown reason_code"})", "application/json");
-      return;
-    }
-    if (const auto stored = refunds.get(tenant, idemKey)) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    const auto payment = payments.get(paymentId);
-    if (!payment || payment->tenant != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"payment not found"})", "application/json");
-      return;
-    }
-    const auto paid_minor = payment->paid_minor;
-    const auto [accepted, refundedTotal, remaining_minor] = ledger.checkAndAddRefund(paymentId, amountMinor, paid_minor);
-    if (!accepted) {
-      res.status = 422;
-      res.set_content(
-          json{{"error", "amount exceeds the remaining refundable balance"}, {"remaining_minor", remaining_minor}}.dump(),
-          "application/json");
-      return;
-    }
-    const json refund = {
-        {"refund_id", uuidString()},
-        {"payment_id", paymentId},
-        {"amount_minor", amountMinor},
-        {"reason_code", reasonCode},
-        {"status", "PENDING"},
-        {"refunded_minor", refundedTotal},
-        {"remaining_minor", remaining_minor},
-    };
-    payments.insertRefund(refund);
-    refunds.put(tenant, idemKey, refund);
-    std::cerr << "refund tenant=" << tenant << " payment=" << paymentId << " amount=" << amountMinor << "\\n";
-    res.status = 201;
-    res.set_content(refund.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+json refundBody(const records::Refund& refund, long long remaining_minor) {
+  return json{{"refund_id", refund.refund_id},     {"payment_id", refund.payment_id}, {"amount_minor", refund.amount_minor},
+              {"reason_code", refund.reason_code}, {"status", refund.status},         {"remaining_minor", remaining_minor}};
 }
+
+void answer(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
+
+void create_refund(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return answer(res, 401, json{{"error", "X-Tenant-Id is required"}});
+  const std::string idem_key = req.get_header_value("Idempotency-Key");
+  if (idem_key.empty()) return answer(res, 400, json{{"error", "Idempotency-Key is required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object() || !body.contains("amount_minor") || !body["amount_minor"].is_number_integer()) {
+    return answer(res, 400, json{{"error", "amount_minor must be an integer"}});
+  }
+  const std::string payment_id = body.value("payment_id", "");
+  const long long amount_minor = body["amount_minor"].get<long long>();
+  const std::string reason_code = body.value("reason_code", "");
+  if (amount_minor < 1 || !kReasonCodes.count(reason_code)) {
+    return answer(res, 400, json{{"error", "amount_minor must be at least 1 and reason_code one of damaged, not_received, duplicate, goodwill"}});
+  }
+  if (const auto first = records::refundForKey(tenant, idem_key)) {
+    // A retry: answer the refund this key created, without a second claim.
+    const long long paid = records::findPayment(first->payment_id)->paid_minor;
+    return answer(res, 201, refundBody(*first, paid - ledger::refundedTotal(first->payment_id)));
+  }
+  const auto payment = records::findPayment(payment_id);
+  // Another tenant's payment looks missing.
+  if (!payment || payment->tenant != tenant) return answer(res, 404, json{{"error", "no such payment"}});
+  const std::string refund_id = records::newRefundId();
+  const ledger::ClaimResult claimed = ledger::claim(payment_id, refund_id, amount_minor, payment->paid_minor);
+  if (!claimed.accepted) {
+    return answer(res, 422, json{{"error", "amount exceeds the remaining balance"}, {"remaining_minor", claimed.remaining_minor}});
+  }
+  const records::Refund refund = records::insertRefund(refund_id, tenant, payment_id, amount_minor, reason_code, idem_key);
+  answer(res, 201, refundBody(refund, claimed.remaining_minor));
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/refunds", create_refund); }
 `,
     },
   },
+  harness: {
+    python: `from refunds import ledger, records
+
+
+def _api(ctx):
+    records.add_payment("pay_1", "t1", 10000)
+    records.add_payment("pay_2", "t2", 8000)
+    return ctx.client(ctx.load("api").app)
+
+
+async def _post(c, amount=2500, payment="pay_1", reason="damaged", tenant="t1", key="k-1"):
+    headers = {}
+    if tenant:
+        headers["X-Tenant-Id"] = tenant
+    if key:
+        headers["Idempotency-Key"] = key
+    return await c.post("/v1/refunds", json={"payment_id": payment, "amount_minor": amount, "reason_code": reason}, headers=headers)
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, 2500)
+    assert r.status_code == 201, f"POST /v1/refunds answered {r.status_code}: {r.text}, expected 201"
+    body = r.json()
+    assert body.get("status") == "PENDING" and body.get("amount_minor") == 2500 and body.get("payment_id") == "pay_1", f"the refund answered {body}, expected pay_1, 2500, PENDING"
+    assert body.get("remaining_minor") == 7500, f"remaining_minor is {body.get('remaining_minor')!r} after 2500 of a 10000 payment, expected 7500"
+    rows = records.list_refunds("pay_1")
+    assert len(rows) == 1 and rows[0]["refund_id"] == body.get("refund_id"), f"the records of pay_1 hold {rows}, expected the refund {body.get('refund_id')}"
+
+
+async def check_tenant_scope(ctx):
+    async with _api(ctx) as c:
+        anonymous = await _post(c, tenant="", key="k-1")
+        foreign = await _post(c, payment="pay_2", key="k-2")
+        missing = await _post(c, payment="pay_404", key="k-3")
+    assert anonymous.status_code == 401, f"a refund without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert foreign.status_code == 404, f"tenant t1 refunding t2's payment pay_2 answered {foreign.status_code}, expected 404 (a foreign payment looks missing)"
+    assert missing.status_code == 404, f"a missing payment answered {missing.status_code}, expected 404"
+    assert records.list_refunds("pay_2") == [] and ledger.refunded_total("pay_2") == 0, f"t1's request wrote {records.list_refunds('pay_2')} against t2's payment"
+    assert records.list_refunds("pay_1") == [], f"a request without a tenant wrote {records.list_refunds('pay_1')}"
+
+
+async def check_amount_valid(ctx):
+    async with _api(ctx) as c:
+        for n, (amount, reason) in enumerate([(0, "damaged"), (-2500, "damaged"), (2500, "because")]):
+            r = await _post(c, amount=amount, reason=reason, key=f"k-{n}")
+            assert r.status_code == 400, f"amount_minor={amount}, reason_code={reason!r} answered {r.status_code}, expected 400"
+        assert records.list_refunds("pay_1") == [], f"refused requests wrote {records.list_refunds('pay_1')}"
+        assert ledger.refunded_total("pay_1") == 0, f"refused requests moved the ledger to {ledger.refunded_total('pay_1')}"
+        r = await _post(c, amount=1, reason="goodwill", key="k-9")
+    assert r.status_code == 201, f"amount_minor=1 with reason goodwill answered {r.status_code}: {r.text}, expected 201"
+
+
+async def check_cap(ctx):
+    async with _api(ctx) as c:
+        first = await _post(c, 6000, key="k-1")
+        over = await _post(c, 5000, key="k-2")
+        rest = await _post(c, 4000, key="k-3")
+    assert first.status_code == 201 and first.json().get("remaining_minor") == 4000, f"6000 of a 10000 payment answered {first.status_code} {first.text}, expected 201 with remaining_minor 4000"
+    assert over.status_code == 422, f"5000 more on a 10000 payment with 6000 refunded answered {over.status_code} {over.text}, expected 422: the payment would refund 11000"
+    assert over.json().get("remaining_minor") == 4000, f"the 422 must carry remaining_minor 4000, got {over.text}"
+    assert rest.status_code == 201 and rest.json().get("remaining_minor") == 0, f"the last 4000 answered {rest.status_code} {rest.text}, expected 201 with remaining_minor 0"
+    assert ledger.refunded_total("pay_1") == 10000, f"the ledger of pay_1 holds {ledger.refunded_total('pay_1')} after 6000 and 4000 were accepted: claim each amount with ledger.claim"
+    assert len(records.list_refunds("pay_1")) == 2, f"the records hold {len(records.list_refunds('pay_1'))} refunds, expected 2: a refused claim writes no row"
+
+
+async def check_idempotency_key(ctx):
+    async with _api(ctx) as c:
+        none = await _post(c, key="")
+        assert none.status_code == 400, f"a refund without Idempotency-Key answered {none.status_code}, expected 400"
+        first = await _post(c, 2500, key="k-1")
+        retry = await _post(c, 2500, key="k-1")
+        other = await _post(c, 2500, key="k-2")
+        t2 = await _post(c, 2500, payment="pay_2", tenant="t2", key="k-1")
+    assert first.status_code == 201, f"the first refund answered {first.status_code}: {first.text}"
+    assert retry.status_code in (200, 201) and retry.json().get("refund_id") == first.json().get("refund_id"), f"a retry with the same key answered {retry.text}, expected the first refund {first.json().get('refund_id')}"
+    rows = records.list_refunds("pay_1")
+    assert len(rows) == 2 and ledger.refunded_total("pay_1") == 5000, f"keys k-1 (twice) and k-2 left {len(rows)} refunds and a ledger of {ledger.refunded_total('pay_1')}, expected 2 refunds and 5000: a replay is not a second refund"
+    assert other.json().get("refund_id") != first.json().get("refund_id"), "a new key must create a new refund"
+    assert t2.status_code == 201 and t2.json().get("refund_id") not in (first.json().get("refund_id"), other.json().get("refund_id")), f"tenant t2 using key k-1 answered {t2.text}: keys belong to a tenant"
+`,
+    typescript: `function api(ctx) {
+  const records = ctx.load('/support/refunds/records.ts');
+  const ledger = ctx.load('/support/refunds/ledger.ts');
+  const c = ctx.client(ctx.load('api').app);
+  return {c, records, ledger};
+}
+
+async function seed(records) {
+  await records.addPayment('pay_1', 't1', 10000);
+  await records.addPayment('pay_2', 't2', 8000);
+}
+
+function post(c, amount = 2500, payment = 'pay_1', reason = 'damaged', tenant = 't1', key = 'k-1') {
+  const headers: Record<string, string> = {};
+  if (tenant !== '') headers['X-Tenant-Id'] = tenant;
+  if (key !== '') headers['Idempotency-Key'] = key;
+  return c.post('/v1/refunds', {json: {payment_id: payment, amount_minor: amount, reason_code: reason}, headers});
+}
+
+export async function check_route(ctx) {
+  const {c, records} = api(ctx);
+  await seed(records);
+  const r = await post(c, 2500);
+  assert.equal(r.status, 201, \`POST /v1/refunds answered \${r.status}: \${r.text}, expected 201\`);
+  const body = r.json();
+  assert(body.status === 'PENDING' && body.amount_minor === 2500 && body.payment_id === 'pay_1', \`the refund answered \${r.text}, expected pay_1, 2500, PENDING\`);
+  assert.equal(body.remaining_minor, 7500, \`remaining_minor is \${body.remaining_minor} after 2500 of a 10000 payment, expected 7500\`);
+  const rows = await records.listRefunds('pay_1');
+  assert(rows.length === 1 && rows[0].refund_id === body.refund_id, \`the records of pay_1 hold \${JSON.stringify(rows)}, expected the refund \${body.refund_id}\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c, records, ledger} = api(ctx);
+  await seed(records);
+  const anonymous = await post(c, 2500, 'pay_1', 'damaged', '', 'k-1');
+  const foreign = await post(c, 2500, 'pay_2', 'damaged', 't1', 'k-2');
+  const missing = await post(c, 2500, 'pay_404', 'damaged', 't1', 'k-3');
+  assert.equal(anonymous.status, 401, \`a refund without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(foreign.status, 404, \`tenant t1 refunding t2's payment pay_2 answered \${foreign.status}, expected 404 (a foreign payment looks missing)\`);
+  assert.equal(missing.status, 404, \`a missing payment answered \${missing.status}, expected 404\`);
+  assert((await records.listRefunds('pay_2')).length === 0 && (await ledger.refundedTotal('pay_2')) === 0, "t1's request wrote a refund against t2's payment");
+  assert.equal((await records.listRefunds('pay_1')).length, 0, 'a request without a tenant wrote a refund');
+}
+
+export async function check_amount_valid(ctx) {
+  const {c, records, ledger} = api(ctx);
+  await seed(records);
+  const cases: [number, string][] = [[0, 'damaged'], [-2500, 'damaged'], [2500, 'because']];
+  for (const [n, [amount, reason]] of cases.entries()) {
+    const r = await post(c, amount, 'pay_1', reason, 't1', \`k-\${n}\`);
+    assert.equal(r.status, 400, \`amount_minor=\${amount}, reason_code=\${reason} answered \${r.status}, expected 400\`);
+  }
+  assert.equal((await records.listRefunds('pay_1')).length, 0, 'refused requests wrote refunds');
+  assert.equal(await ledger.refundedTotal('pay_1'), 0, 'refused requests moved the ledger');
+  const r = await post(c, 1, 'pay_1', 'goodwill', 't1', 'k-9');
+  assert.equal(r.status, 201, \`amount_minor=1 with reason goodwill answered \${r.status}: \${r.text}, expected 201\`);
+}
+
+export async function check_cap(ctx) {
+  const {c, records, ledger} = api(ctx);
+  await seed(records);
+  const first = await post(c, 6000, 'pay_1', 'damaged', 't1', 'k-1');
+  const over = await post(c, 5000, 'pay_1', 'damaged', 't1', 'k-2');
+  const rest = await post(c, 4000, 'pay_1', 'damaged', 't1', 'k-3');
+  assert(first.status === 201 && first.json().remaining_minor === 4000, \`6000 of a 10000 payment answered \${first.status} \${first.text}, expected 201 with remaining_minor 4000\`);
+  assert.equal(over.status, 422, \`5000 more on a 10000 payment with 6000 refunded answered \${over.status} \${over.text}, expected 422: the payment would refund 11000\`);
+  assert.equal(over.json().remaining_minor, 4000, \`the 422 must carry remaining_minor 4000, got \${over.text}\`);
+  assert(rest.status === 201 && rest.json().remaining_minor === 0, \`the last 4000 answered \${rest.status} \${rest.text}, expected 201 with remaining_minor 0\`);
+  const total = await ledger.refundedTotal('pay_1');
+  assert.equal(total, 10000, \`the ledger of pay_1 holds \${total} after 6000 and 4000 were accepted: claim each amount with claim()\`);
+  assert.equal((await records.listRefunds('pay_1')).length, 2, 'a refused claim writes no row: expected 2 refunds');
+}
+
+export async function check_idempotency_key(ctx) {
+  const {c, records, ledger} = api(ctx);
+  await seed(records);
+  const none = await post(c, 2500, 'pay_1', 'damaged', 't1', '');
+  assert.equal(none.status, 400, \`a refund without Idempotency-Key answered \${none.status}, expected 400\`);
+  const first = await post(c, 2500, 'pay_1', 'damaged', 't1', 'k-1');
+  const retry = await post(c, 2500, 'pay_1', 'damaged', 't1', 'k-1');
+  const other = await post(c, 2500, 'pay_1', 'damaged', 't1', 'k-2');
+  const t2 = await post(c, 2500, 'pay_2', 'damaged', 't2', 'k-1');
+  assert.equal(first.status, 201, \`the first refund answered \${first.status}: \${first.text}\`);
+  assert((retry.status === 200 || retry.status === 201) && retry.json().refund_id === first.json().refund_id, \`a retry with the same key answered \${retry.text}, expected the first refund \${first.json().refund_id}\`);
+  const rows = await records.listRefunds('pay_1');
+  const total = await ledger.refundedTotal('pay_1');
+  assert(rows.length === 2 && total === 5000, \`keys k-1 (twice) and k-2 left \${rows.length} refunds and a ledger of \${total}, expected 2 refunds and 5000: a replay is not a second refund\`);
+  assert.notEqual(other.json().refund_id, first.json().refund_id, 'a new key must create a new refund');
+  assert(t2.status === 201 && ![first.json().refund_id, other.json().refund_id].includes(t2.json().refund_id), \`tenant t2 using key k-1 answered \${t2.text}: keys belong to a tenant\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"refunds/ledger"
+	"refunds/records"
+
+	"leetbuild/harness"
+)
+
+var apiBg = context.Background()
+
+type apiReply struct {
+	RefundID       string \`json:"refund_id"\`
+	PaymentID      string \`json:"payment_id"\`
+	AmountMinor    int64  \`json:"amount_minor"\`
+	Status         string \`json:"status"\`
+	RemainingMinor int64  \`json:"remaining_minor"\`
+}
+
+func apiServer(ctx *harness.Ctx) *harness.HTTP {
+	records.AddPayment(apiBg, "pay_1", "t1", 10000)
+	records.AddPayment(apiBg, "pay_2", "t2", 8000)
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func apiPost(c *harness.HTTP, amount int64, paymentID, reason, tenant, key string) *harness.Response {
+	headers := []string{"Content-Type", "application/json"}
+	if tenant != "" {
+		headers = append(headers, "X-Tenant-Id", tenant)
+	}
+	if key != "" {
+		headers = append(headers, "Idempotency-Key", key)
+	}
+	return c.Post("/v1/refunds", map[string]any{"payment_id": paymentID, "amount_minor": amount, "reason_code": reason}, headers...)
+}
+
+func apiDecode(r *harness.Response) apiReply {
+	var body apiReply
+	json.Unmarshal([]byte(r.Text()), &body)
+	return body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := apiServer(ctx)
+	r := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
+	ctx.Equal(r.Status, 201, "POST /v1/refunds (%s)", r.Text())
+	body := apiDecode(r)
+	ctx.Assert(body.Status == "PENDING" && body.AmountMinor == 2500 && body.PaymentID == "pay_1", "the refund answered %s, expected pay_1, 2500, PENDING", r.Text())
+	ctx.Equal(body.RemainingMinor, 7500, "remaining_minor after 2500 of a 10000 payment")
+	rows := records.ListRefunds(apiBg, "pay_1")
+	ctx.Assert(len(rows) == 1 && rows[0].RefundID == body.RefundID, "the records of pay_1 hold %v, expected the refund %s", rows, body.RefundID)
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	c := apiServer(ctx)
+	anonymous := apiPost(c, 2500, "pay_1", "damaged", "", "k-1")
+	foreign := apiPost(c, 2500, "pay_2", "damaged", "t1", "k-2")
+	missing := apiPost(c, 2500, "pay_404", "damaged", "t1", "k-3")
+	ctx.Equal(anonymous.Status, 401, "a refund without X-Tenant-Id")
+	ctx.Equal(foreign.Status, 404, "tenant t1 refunding t2's payment pay_2 (a foreign payment looks missing)")
+	ctx.Equal(missing.Status, 404, "a missing payment")
+	ctx.Assert(len(records.ListRefunds(apiBg, "pay_2")) == 0 && ledger.RefundedTotal(apiBg, "pay_2") == 0, "t1's request wrote %v against t2's payment", records.ListRefunds(apiBg, "pay_2"))
+	ctx.Equal(len(records.ListRefunds(apiBg, "pay_1")), 0, "a request without a tenant must write no refund; the refunds")
+}
+
+func CheckAmountValid(ctx *harness.Ctx) {
+	c := apiServer(ctx)
+	cases := []struct {
+		amount int64
+		reason string
+	}{{0, "damaged"}, {-2500, "damaged"}, {2500, "because"}}
+	for n, tc := range cases {
+		r := apiPost(c, tc.amount, "pay_1", tc.reason, "t1", fmt.Sprintf("k-%d", n))
+		ctx.Equal(r.Status, 400, "amount_minor=%d, reason_code=%q", tc.amount, tc.reason)
+	}
+	ctx.Equal(len(records.ListRefunds(apiBg, "pay_1")), 0, "refused requests must write no refund; the refunds")
+	ctx.Equal(ledger.RefundedTotal(apiBg, "pay_1"), 0, "refused requests must leave the ledger; its total")
+	r := apiPost(c, 1, "pay_1", "goodwill", "t1", "k-9")
+	ctx.Equal(r.Status, 201, "amount_minor=1 with reason goodwill (%s)", r.Text())
+}
+
+func CheckCap(ctx *harness.Ctx) {
+	c := apiServer(ctx)
+	first := apiPost(c, 6000, "pay_1", "damaged", "t1", "k-1")
+	over := apiPost(c, 5000, "pay_1", "damaged", "t1", "k-2")
+	rest := apiPost(c, 4000, "pay_1", "damaged", "t1", "k-3")
+	ctx.Assert(first.Status == 201 && apiDecode(first).RemainingMinor == 4000, "6000 of a 10000 payment answered %d %s, expected 201 with remaining_minor 4000", first.Status, first.Text())
+	ctx.Equal(over.Status, 422, "5000 more on a 10000 payment with 6000 refunded (the payment would refund 11000; %s)", over.Text())
+	ctx.Equal(apiDecode(over).RemainingMinor, 4000, "the 422's remaining_minor (%s)", over.Text())
+	ctx.Assert(rest.Status == 201 && apiDecode(rest).RemainingMinor == 0, "the last 4000 answered %d %s, expected 201 with remaining_minor 0", rest.Status, rest.Text())
+	ctx.Equal(ledger.RefundedTotal(apiBg, "pay_1"), 10000, "after 6000 and 4000 were accepted the ledger of pay_1 must hold both (claim each amount with ledger.Claim)")
+	ctx.Equal(len(records.ListRefunds(apiBg, "pay_1")), 2, "a refused claim writes no row; the refunds")
+}
+
+func CheckIdempotencyKey(ctx *harness.Ctx) {
+	c := apiServer(ctx)
+	none := apiPost(c, 2500, "pay_1", "damaged", "t1", "")
+	ctx.Equal(none.Status, 400, "a refund without Idempotency-Key")
+	first := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
+	retry := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
+	other := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-2")
+	t2 := apiPost(c, 2500, "pay_2", "damaged", "t2", "k-1")
+	ctx.Equal(first.Status, 201, "the first refund (%s)", first.Text())
+	ctx.Assert((retry.Status == 200 || retry.Status == 201) && apiDecode(retry).RefundID == apiDecode(first).RefundID, "a retry with the same key answered %s, expected the first refund %s", retry.Text(), apiDecode(first).RefundID)
+	rows := records.ListRefunds(apiBg, "pay_1")
+	total := ledger.RefundedTotal(apiBg, "pay_1")
+	ctx.Assert(len(rows) == 2 && total == 5000, "keys k-1 (twice) and k-2 left %d refunds and a ledger of %d, expected 2 refunds and 5000: a replay is not a second refund", len(rows), total)
+	ctx.Assert(apiDecode(other).RefundID != apiDecode(first).RefundID, "a new key must create a new refund")
+	id := apiDecode(t2).RefundID
+	ctx.Assert(t2.Status == 201 && id != apiDecode(first).RefundID && id != apiDecode(other).RefundID, "tenant t2 using key k-1 answered %s: keys belong to a tenant", t2.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "refunds/ledger.h"
+#include "refunds/records.h"
+
+namespace {
+
+harness::HTTP apiServer(harness::Ctx& ctx) {
+  records::addPayment("pay_1", "t1", 10000);
+  records::addPayment("pay_2", "t2", 8000);
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response apiPost(harness::HTTP& c, long long amount, const std::string& payment_id, const std::string& reason,
+                          const std::string& tenant, const std::string& key) {
+  std::vector<std::string> headers = {"Content-Type", "application/json"};
+  if (!tenant.empty()) headers.insert(headers.end(), {"X-Tenant-Id", tenant});
+  if (!key.empty()) headers.insert(headers.end(), {"Idempotency-Key", key});
+  const nlohmann::json body{{"payment_id", payment_id}, {"amount_minor", amount}, {"reason_code", reason}};
+  return c.Send("POST", "/v1/refunds", body.dump(), headers);
+}
+
+nlohmann::json apiBody(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : nlohmann::json::object();
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = apiServer(ctx);
+  const auto r = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
+  ctx.Equal(r.Status, 201, "POST /v1/refunds (%s)", r.Text());
+  const auto body = apiBody(r);
+  ctx.Assert(body.value("status", "") == "PENDING" && body.value("amount_minor", 0LL) == 2500 && body.value("payment_id", "") == "pay_1",
+             "the refund answered %s, expected pay_1, 2500, PENDING", r.Text());
+  ctx.Equal(body.value("remaining_minor", -1LL), 7500, "remaining_minor after 2500 of a 10000 payment");
+  const auto rows = records::listRefunds("pay_1");
+  ctx.Assert(rows.size() == 1 && rows[0].refund_id == body.value("refund_id", ""), "the records of pay_1 hold %d refunds, expected the refund %s",
+             rows.size(), body.value("refund_id", ""));
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  auto c = apiServer(ctx);
+  const auto anonymous = apiPost(c, 2500, "pay_1", "damaged", "", "k-1");
+  const auto foreign = apiPost(c, 2500, "pay_2", "damaged", "t1", "k-2");
+  const auto missing = apiPost(c, 2500, "pay_404", "damaged", "t1", "k-3");
+  ctx.Equal(anonymous.Status, 401, "a refund without X-Tenant-Id");
+  ctx.Equal(foreign.Status, 404, "tenant t1 refunding t2's payment pay_2 (a foreign payment looks missing)");
+  ctx.Equal(missing.Status, 404, "a missing payment");
+  ctx.Assert(records::listRefunds("pay_2").empty() && ledger::refundedTotal("pay_2") == 0, "t1's request wrote a refund against t2's payment");
+  ctx.Equal(records::listRefunds("pay_1").size(), 0, "a request without a tenant must write no refund; the refunds");
+}
+
+void CheckAmountValid(harness::Ctx& ctx) {
+  auto c = apiServer(ctx);
+  const std::vector<std::pair<long long, std::string>> cases = {{0, "damaged"}, {-2500, "damaged"}, {2500, "because"}};
+  for (size_t n = 0; n < cases.size(); n++) {
+    const auto r = apiPost(c, cases[n].first, "pay_1", cases[n].second, "t1", "k-" + std::to_string(n));
+    ctx.Equal(r.Status, 400, "amount_minor=%d, reason_code=%q", cases[n].first, cases[n].second);
+  }
+  ctx.Equal(records::listRefunds("pay_1").size(), 0, "refused requests must write no refund; the refunds");
+  ctx.Equal(ledger::refundedTotal("pay_1"), 0, "refused requests must leave the ledger; its total");
+  const auto r = apiPost(c, 1, "pay_1", "goodwill", "t1", "k-9");
+  ctx.Equal(r.Status, 201, "amount_minor=1 with reason goodwill (%s)", r.Text());
+}
+
+void CheckCap(harness::Ctx& ctx) {
+  auto c = apiServer(ctx);
+  const auto first = apiPost(c, 6000, "pay_1", "damaged", "t1", "k-1");
+  const auto over = apiPost(c, 5000, "pay_1", "damaged", "t1", "k-2");
+  const auto rest = apiPost(c, 4000, "pay_1", "damaged", "t1", "k-3");
+  ctx.Assert(first.Status == 201 && apiBody(first).value("remaining_minor", -1LL) == 4000,
+             "6000 of a 10000 payment answered %d %s, expected 201 with remaining_minor 4000", first.Status, first.Text());
+  ctx.Equal(over.Status, 422, "5000 more on a 10000 payment with 6000 refunded (the payment would refund 11000; %s)", over.Text());
+  ctx.Equal(apiBody(over).value("remaining_minor", -1LL), 4000, "the 422's remaining_minor (%s)", over.Text());
+  ctx.Assert(rest.Status == 201 && apiBody(rest).value("remaining_minor", -1LL) == 0,
+             "the last 4000 answered %d %s, expected 201 with remaining_minor 0", rest.Status, rest.Text());
+  ctx.Equal(ledger::refundedTotal("pay_1"), 10000,
+            "after 6000 and 4000 were accepted the ledger of pay_1 must hold both (claim each amount with ledger::claim)");
+  ctx.Equal(records::listRefunds("pay_1").size(), 2, "a refused claim writes no row; the refunds");
+}
+
+void CheckIdempotencyKey(harness::Ctx& ctx) {
+  auto c = apiServer(ctx);
+  const auto none = apiPost(c, 2500, "pay_1", "damaged", "t1", "");
+  ctx.Equal(none.Status, 400, "a refund without Idempotency-Key");
+  const auto first = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
+  const auto retry = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
+  const auto other = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-2");
+  const auto t2 = apiPost(c, 2500, "pay_2", "damaged", "t2", "k-1");
+  const std::string first_id = apiBody(first).value("refund_id", "");
+  const std::string other_id = apiBody(other).value("refund_id", "");
+  ctx.Equal(first.Status, 201, "the first refund (%s)", first.Text());
+  ctx.Assert((retry.Status == 200 || retry.Status == 201) && apiBody(retry).value("refund_id", "") == first_id,
+             "a retry with the same key answered %s, expected the first refund %s", retry.Text(), first_id);
+  const size_t rows = records::listRefunds("pay_1").size();
+  const long long total = ledger::refundedTotal("pay_1");
+  ctx.Assert(rows == 2 && total == 5000,
+             "keys k-1 (twice) and k-2 left %d refunds and a ledger of %d, expected 2 refunds and 5000: a replay is not a second refund", rows, total);
+  ctx.Assert(other_id != first_id, "a new key must create a new refund");
+  const std::string t2_id = apiBody(t2).value("refund_id", "");
+  ctx.Assert(t2.Status == 201 && t2_id != first_id && t2_id != other_id, "tenant t2 using key k-1 answered %s: keys belong to a tenant", t2.Text());
+}
+`,
+  },
   hints: [
-    'Symptom: a merchant clicks "Refund" twice on a flaky connection and the customer is credited twice; a second merchant can refund a payment it does not own; the response shows no balance.',
-    'Mechanism: the handler acts on the body alone. It reads no `Idempotency-Key`, loads no payment row to compare owners, and computes nothing from `paid_minor` before answering 200.',
-    'Change: guard in order (401 tenant, 400 key and fields, 404 owner), look up `refunds.get(tenant, key)`, claim through the ledger with `paid_minor` as cap (422 on refusal), `refunds.put`, return `remaining_minor`.',
+    'Post 12000 against a 10000 payment, or -2500 against any payment: both answer 201. Retry a request with the same Idempotency-Key and the customer gets two refunds; leave out X-Tenant-Id and it still goes through.',
+    "The handler trusts the request: it skips comparing the payment's tenant with the caller's, checks no amount, asks no ledger, and writes a new row per call because nothing binds the key to the first refund.",
+    '401 without a tenant, 400 without a key or with a bad amount or reason; answer `refund_for_key(tenant, key)` when it exists; 404 unless the tenants match; `ledger.claim(..., paid_minor)`, 422 with `remaining_minor` when refused; then `insert_refund(..., key)`.',
   ],
-  debrief: `The guards are ordered by cost and authority: the tenant and the key come from headers, the fields from the body, and only then is the payment row loaded and its owner compared. The ownership failure is 404 rather than 403 so a foreign id is indistinguishable from a missing one. The cap is not decided here: the handler passes \`paid_minor\` into the ledger's atomic claim and turns a refusal into 422, because a balance read in the handler is check-then-act and two concurrent requests would both see room for one. The idempotency lookup runs before the claim and the write right after it, so one client intent keeps one \`refund_id\`. Production endpoints also enforce a refund window after capture and route large amounts to manual approval.`,
+  debrief: `The order of the guards is the design. The replay lookup comes before the claim, so a retry never reserves twice; the ownership check comes before anything is written, so a foreign payment id costs nothing and reveals nothing; and the claim is the only place the cap is enforced, so two handlers on two servers cannot both see room that only one of them may spend. Answering a foreign payment exactly like a missing one keeps payment ids from being probed. A production refund API also stores the first response under the key with an expiry and refuses a replay whose body differs, and it checks the payment's state (captured, not disputed) before it reserves anything.`,
 };

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package driftmon;
+
+// The alerting service step 3 pages through: Raise opens a page for one window of one monitor, with
+// the evidence an on-call needs to judge it. It answers UNAVAILABLE while it is down.
+service Alerting {
+  rpc Raise(AlertRequest) returns (AlertReply);
+}
+
+message AlertRequest {
+  string monitor_id = 1;
+  string metric = 2;
+  double distance = 3;
+  double threshold = 4;
+  int64 window_start = 5;
+  int64 window_end = 6;
+  int64 sample_count = 7;
+  int64 baseline_sample_count = 8;
+}
+
+message AlertReply {
+  string alert_id = 1;
+}

@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package contentclassifier;
+
+// The classification model step 3 calls for every document: one unary RPC per attempt, with a
+// deadline. The harness serves a deterministic stand-in at model:9000 (classifier/labeler in the
+// support modules). A refusal is an answer (refused = true, no labels), not an error status.
+service Model {
+  rpc Classify(ClassifyRequest) returns (ClassifyReply);
+}
+
+message ClassifyRequest {
+  string text = 1;
+  string taxonomy_id = 2;
+  int64 taxonomy_version = 3;
+}
+
+message ClassifyReply {
+  repeated string labels = 1;
+  bool refused = 2;
+  string model_version = 3;
+}

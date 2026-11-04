@@ -2,69 +2,45 @@ import type {Step} from '@/lib/types';
 
 export const transcriptionReadStep: Step = {
   id: 'read',
-  title: 'GET /v1/transcriptions/{id}: finished only when it is finished',
+  title: 'GET /v1/transcriptions/{id}: done only when it is done',
   concept: 'http',
   file: 'read',
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/transcriptions/{job_id}\`: it looks the job up by
-id alone, reads the first 1000 segments with no ordering, pulls a completed count from Redis, and
-answers \`done\` whenever any segment exists, returning raw rows instead of a transcript. It
-compiles, it serves the demo, and it hides four flaws.
+**Starting point.** The starter serves \`GET /v1/transcriptions/{job_id}\` for the tenant in
+\`X-Tenant-Id\` (401 without it): it loads the job (\`jobs.get\`), its saved segments (\`jobs.segments\`)
+and the done count (\`progress.completed\`, the ledger of step 2), and answers \`{job_id, status,
+completed_chunks, total_chunks, segments, next_cursor}\` with the first \`PAGE_SIZE\` (100) segments.
+It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Three ways a read endpoint can lie. About identity: a lookup by
-id alone is an IDOR, and a 403 for a foreign id leaks that another tenant's job exists. About
-completion: the presence of segments is not proof the work finished, and a \`done\` that arrives with
-a failed chunk will bill, notify and archive an unfinished transcript. About reachability: a fixed
-\`LIMIT 1000\` looks bounded and silently truncates a four-hour recording, because no cursor is
-returned to walk past it.
+**Failure mode the checks target.** Any tenant reads any job by its id; a job with a failed chunk
+reads \`done\` because some segments exist, and a finished job reports 0 completed chunks once its
+ledger has expired; segments come back in the order chunks finished, not the order they were
+spoken; and a four-hour recording stops at the 100th segment.
 
-Requirements:
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header and the job is resolved **scoped to
-  it**: a missing id and an id that belongs to another tenant are both **404**, not 403, because 403
-  confirms that the job exists.
-- The response reports \`status\`, \`completed_chunks\`, \`total_chunks\` and the \`transcript\`
-  assembled from the stored segments **in order** (\`ORDER BY seq\`).
-- \`status\` is \`"done"\` **only** when no chunk is failed and none is pending; otherwise it is
-  \`"partial"\`, served with the segments already produced.
-- The transcript is **cursor-paginated**: a \`cursor\` query parameter selects the page
-  (\`seq > cursor\`), and the response carries \`next_cursor\` when the page came back full.`,
+- Another tenant's job is **404**, the same answer as a missing id (a 403 would confirm it exists).
+- \`status\` is \`done\` only when the job record says so (\`jobs.mark_done\`, step 2), and then
+  \`completed_chunks\` is \`total_chunks\`; otherwise it is \`partial\`, with the ledger's count.
+- \`segments\` are ordered by \`start_ms\`.
+- \`?cursor=N\` starts the page at segment N; \`next_cursor\` is the next page's cursor while segments
+  remain and \`null\` on the last page.`,
   sequence: {
-    participants: ['Client', 'Transcription API', 'jobs store', 'Redis'],
+    participants: ['Client', 'Transcription API', 'jobs store', 'Redis ledger'],
     messages: [
       {
         from: 'Client',
         to: 'Transcription API',
-        label: 'GET /v1/transcriptions/{id}?cursor=… · X-Tenant-Id',
+        label: 'GET /v1/transcriptions/tr-7?cursor=100 · X-Tenant-Id',
         kind: 'sync',
       },
-      {
-        from: 'Transcription API',
-        to: 'jobs store',
-        label: 'SELECT total_chunks FROM jobs WHERE id = $1 AND tenant_id = $2',
-        kind: 'sync',
-      },
-      {from: 'jobs store', to: 'Transcription API', label: 'job row / no row → 404, never 403', kind: 'reply'},
-      {
-        from: 'Transcription API',
-        to: 'Redis',
-        label: 'HMGET transcription:{id}:chunks completed failed',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Transcription API', label: 'completed and failed chunk counts', kind: 'reply'},
-      {
-        from: 'Transcription API',
-        to: 'jobs store',
-        label: 'SELECT seq, text FROM segments WHERE job_id = $1 AND seq > $2 ORDER BY seq LIMIT $3',
-        kind: 'sync',
-      },
-      {from: 'jobs store', to: 'Transcription API', label: 'the page of segments, in seq order', kind: 'reply'},
+      {from: 'Transcription API', to: 'jobs store', label: "get(tr-7) → another tenant's → 404", kind: 'sync'},
+      {from: 'Transcription API', to: 'Redis ledger', label: 'completed(tr-7), unless the job is done', kind: 'sync'},
+      {from: 'Transcription API', to: 'jobs store', label: 'segments(tr-7) → sort by start_ms', kind: 'sync'},
       {
         from: 'Transcription API',
         to: 'Client',
-        label: '200 {status: done | partial, completed_chunks, total_chunks, transcript, next_cursor}',
+        label: '200 {status: partial, completed_chunks, segments[100..199], next_cursor: "200"}',
         kind: 'reply',
       },
     ],
@@ -72,267 +48,195 @@ Requirements:
   checks: [
     {
       id: 'route',
-      title: 'Serves GET /v1/transcriptions/{id}',
-      detail: 'Register the read on `GET /v1/transcriptions/{id}` with the job id read from the path.',
+      title: 'Serves GET /v1/transcriptions/{job_id}',
+      detail:
+        "Register the read: the tenant's job answers **200** with its id and chunk count, a missing id is **404** and a request without `X-Tenant-Id` is **401**.",
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/transcriptions\/\{job_id\}["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/transcriptions\/:id['"]/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/transcriptions\/:jobId['"]/]},
         go: {all: [/HandleFunc\(\s*"GET \/v1\/transcriptions\/\{id\}"/]},
         scala: {all: [/path\(\s*"v1"\s*\/\s*"transcriptions"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/transcriptions\//, /req\.matches\[1\]/]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/transcriptions\//]},
       },
     },
     {
       id: 'tenant-scope',
-      title: 'A missing or foreign job is 404, never another tenant’s transcript',
+      title: "Another tenant's job is 404",
       detail:
-        'The tenant comes from `X-Tenant-Id` and the job is resolved with `WHERE id = $1 AND tenant_id = $2`; a foreign id answers **404**, exactly like an id that does not exist — never 403, which would confirm the job exists. The starter resolves by id alone, so any caller reads any tenant’s transcript.',
+        'The job is resolved for the authenticated tenant: an id that belongs to someone else answers **404**, exactly like a missing one, and never 403, which would confirm the job exists. The starter serves any job to anyone who knows its id.',
       match: {
-        python: {
-          all: [/WHERE id = %s AND tenant_id = %s/, /X-Tenant-Id/, /status_code\s*=\s*404/],
-          none: [/status_code\s*=\s*403/],
-        },
-        typescript: {
-          all: [/WHERE id = \$1 AND tenant_id = \$2/, /x-tenant-id/, /code\(\s*404\s*\)/],
-          none: [/code\(\s*403\s*\)/],
-        },
-        go: {all: [/WHERE id = \$1 AND tenant_id = \$2/, /X-Tenant-Id/, /StatusNotFound/], none: [/StatusForbidden/]},
-        scala: {
-          all: [/WHERE id = \? AND tenant_id = \?/, /X-Tenant-Id/, /StatusCodes\.NotFound/],
-          none: [/StatusCodes\.Forbidden/],
-        },
-        cpp: {all: [/WHERE id = \$1 AND tenant_id = \$2/, /X-Tenant-Id/, /\b404\b/], none: [/\b403\b/]},
+        python: {all: [/job\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*job\[["']tenant["']\]/], none: [/\b403\b/]},
+        typescript: {all: [/job\.tenant\s*!==\s*tenant|tenant\s*!==\s*job\.tenant/], none: [/\b403\b/]},
+        go: {all: [/job\.Tenant\s*!=\s*tenant|tenant\s*!=\s*job\.Tenant/], none: [/StatusForbidden|\b403\b/]},
+        scala: {all: [/\.tenant\s*[!=]=\s*tenant|tenant\s*[!=]=\s*\w+\.tenant/], none: [/Forbidden|\b403\b/]},
+        cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*\w+->tenant/], none: [/\b403\b/]},
       },
     },
     {
       id: 'honest-status',
-      title: 'Certifies done only when no chunk is failed or pending',
+      title: 'done comes from the job record, not from the segments',
       detail:
-        '`status` is `done` only when the chunk-progress set reports nothing failed and nothing pending; a job that stalled answers `partial` with the segments it already has. The starter answers `done` as soon as any segment exists, so a half-transcribed file is certified finished.',
+        "`status` is `done` only when the job record is (every chunk finished, step 2), with `completed_chunks` equal to `total_chunks`; otherwise `partial` with the ledger's count. The starter answers `done` whenever a segment exists and reads the count from a ledger that expires.",
       match: {
-        python: {all: [/["']partial["']/, /failed/, /pending/]},
-        typescript: {all: [/['"]partial['"]/, /failed/, /pending/]},
-        go: {all: [/"partial"/, /failed/, /pending/]},
-        scala: {all: [/"partial"/, /failed/, /pending/]},
-        cpp: {all: [/"partial"/, /failed/, /pending/]},
+        python: {all: [/job\[["']status["']\]\s*==\s*["']done["']/], none: [/["']done["']\s+if\s+segments\b/]},
+        typescript: {all: [/job\.status\s*===\s*['"]done['"]/], none: [/segments\.length\s*>\s*0\s*\?\s*['"]done['"]/]},
+        go: {all: [/job\.Status\s*==\s*"done"/], none: [/len\(segments\)\s*>\s*0/]},
+        scala: {all: [/\.status\s*==\s*"done"/], none: [/segments\.nonEmpty/]},
+        cpp: {all: [/->status\s*==\s*"done"/], none: [/segments\.empty\(\)\s*\?/]},
       },
     },
     {
-      id: 'segment-assembly',
-      title: 'Assembles the transcript from the stored segments in order',
+      id: 'segment-order',
+      title: 'Segments in the order they were spoken',
       detail:
-        'The segments are read `ORDER BY seq` and concatenated into `transcript`, so the caller receives a transcript rather than an unordered page of rows. The starter returns raw rows with no ordering and no assembled text.',
+        'The segments are ordered by `start_ms` before the page is cut; chunks finish in any order, and the starter returns them in the order they were saved.',
       match: {
-        python: {all: [/ORDER BY seq/, /"transcript"\s*:/, /join\(/]},
-        typescript: {all: [/ORDER BY seq/, /transcript\s*:/, /join\(/]},
-        go: {all: [/ORDER BY seq/, /"transcript":/, /strings\.Join/]},
-        scala: {all: [/ORDER BY seq/, /"transcript"/, /mkString/]},
-        cpp: {all: [/ORDER BY seq/, /"transcript"/, /transcript \+=/]},
+        python: {all: [/sorted\([^\n]*start_ms|\.sort\([^\n]*start_ms/]},
+        typescript: {all: [/\.sort\([^\n]*start_ms/]},
+        go: {all: [/sort\.(?:Slice|SliceStable)\([^\n]*StartMs/]},
+        scala: {all: [/sortBy\(\s*_\.startMs\s*\)/]},
+        cpp: {all: [/std::(?:stable_)?sort\([\s\S]{0,200}?start_ms/]},
       },
     },
     {
       id: 'cursor-pagination',
-      title: 'Pages segments with a cursor instead of a fixed 1000 cap',
+      title: 'A cursor walks past the first page',
       detail:
-        'A `cursor` query parameter seeks with `seq > cursor` and the response carries `next_cursor` built from the last segment of a full page, so a long transcript is reachable past the first page. The starter caps the read at the first 1000 segments and returns no way to continue.',
+        '`?cursor=N` starts the page at segment N and `next_cursor` names the next page while segments remain; the starter always answers the first 100 with `next_cursor: null`, so a long recording is cut off.',
       match: {
-        python: {all: [/next_cursor/, /\bcursor\b/, /seq > %s/], none: [/LIMIT 1000/]},
-        typescript: {all: [/next_cursor/, /\bcursor\b/, /seq > \$2/], none: [/LIMIT 1000/]},
-        go: {all: [/next_cursor/, /\bcursor\b/, /seq > \$2/], none: [/LIMIT 1000/]},
-        scala: {all: [/next_cursor/, /\bcursor\b/, /seq > \?/], none: [/LIMIT 1000/]},
-        cpp: {all: [/next_cursor/, /\bcursor\b/, /seq > \$2/], none: [/LIMIT 1000/]},
+        python: {all: [/query_params\.get\(\s*["']cursor["']/], none: [/["']next_cursor["']\s*:\s*None/]},
+        typescript: {all: [/cursor\?*\s*:\s*string|query[^\n]*cursor/], none: [/next_cursor:\s*null\b/]},
+        go: {all: [/Query\(\)\.Get\(\s*"cursor"\s*\)/], none: [/NextCursor:\s*nil/]},
+        scala: {all: [/parameter\(\s*"cursor"/], none: [/"next_cursor"\s*->\s*JsNull/]},
+        cpp: {all: [/get_param_value\(\s*"cursor"\s*\)/], none: [/\{"next_cursor",\s*nullptr\}/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import redis
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException, Request
+
+from transcribe import jobs, progress  # jobs.get, jobs.segments; progress.completed
 
 app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+PAGE_SIZE = 100
 
 
 @app.get("/v1/transcriptions/{job_id}")
-def read_transcription(job_id: str, cur=None) -> JSONResponse:
+def read_transcription(job_id: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    cur.execute("SELECT total_chunks FROM jobs WHERE id = %s", (job_id,))
-    row = cur.fetchone()
-    cur.execute("SELECT seq, text FROM segments WHERE job_id = %s LIMIT 1000", (job_id,))
-    segments = cur.fetchall()
-    completed = int(r.hget(f"transcription:{job_id}:chunks", "completed") or 0)
-    return JSONResponse(
-        {
-            "id": job_id,
-            "status": "done" if segments else "processing",
-            "completed_chunks": completed,
-            "total_chunks": row[0] if row else 0,
-            "segments": [{"seq": segment["seq"], "text": segment["text"]} for segment in segments],
-        },
-        status_code=200,
-    )
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="no such transcription")
+    segments = jobs.segments(job_id)
+    return {
+        "job_id": job_id,
+        "status": "done" if segments else "partial",
+        "completed_chunks": progress.completed(job_id),
+        "total_chunks": job["total_chunks"],
+        "segments": segments[:PAGE_SIZE],
+        "next_cursor": None,
+    }
 `,
-      solution: `import redis
-from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse
+      solution: `from fastapi import FastAPI, HTTPException, Request
+
+from transcribe import jobs, progress  # jobs.get, jobs.segments; progress.completed
 
 app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-PAGE_SIZE = 200
-
-
-def progress_key(job_id: str) -> str:
-    """The hash the chunk workers write: one field per completed and failed chunk count."""
-    return f"transcription:{job_id}:chunks"
-
-
-def chunk_counters(job_id: str) -> tuple[int, int]:
-    key = progress_key(job_id)
-    completed = int(r.hget(key, "completed") or 0)
-    failed = int(r.hget(key, "failed") or 0)
-    return completed, failed
+PAGE_SIZE = 100
 
 
 @app.get("/v1/transcriptions/{job_id}")
-def read_transcription(
-    job_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    cursor: str | None = Query(default=None),
-    cur=None,
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail={"error": "missing X-Tenant-Id"})
-    cur.execute(
-        "SELECT total_chunks FROM jobs WHERE id = %s AND tenant_id = %s",
-        (job_id, tenant),
-    )
-    row = cur.fetchone()
-    # 404, not 403: a foreign job must be indistinguishable from one that never existed.
-    if row is None:
-        raise HTTPException(status_code=404, detail={"error": "not found"})
-    total_chunks = row[0]
-
-    completed_chunks, failed_chunks = chunk_counters(job_id)
-    pending_chunks = total_chunks - completed_chunks - failed_chunks
-    # A stalled job keeps the segments it produced, but it is never certified done.
-    if completed_chunks == total_chunks and failed_chunks == 0 and pending_chunks == 0:
-        status = "done"
-    else:
-        status = "partial"
-
-    after = int(cursor) if cursor else 0
-    cur.execute(
-        "SELECT seq, speaker, text FROM segments"
-        " WHERE job_id = %s AND seq > %s ORDER BY seq LIMIT %s",
-        (job_id, after, PAGE_SIZE),
-    )
-    segments = cur.fetchall()
-    transcript = "".join(segment["text"] for segment in segments)
-    next_cursor = str(segments[-1]["seq"]) if len(segments) == PAGE_SIZE else None
-    return JSONResponse(
-        {
-            "id": job_id,
-            "status": status,
-            "completed_chunks": completed_chunks,
-            "total_chunks": total_chunks,
-            "transcript": transcript,
-            "next_cursor": next_cursor,
-        },
-        status_code=200,
-    )
+def read_transcription(job_id: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    cursor = request.query_params.get("cursor", "0")
+    if not cursor.isdigit():
+        raise HTTPException(status_code=400, detail="cursor must be a segment offset")
+    job = jobs.get(job_id)
+    # Another tenant's job answers exactly like a missing one: a 403 would confirm it exists.
+    if job is None or job["tenant"] != tenant:
+        raise HTTPException(status_code=404, detail="no such transcription")
+    # The job record is the one place that says every chunk finished; the ledger expires after that.
+    done = job["status"] == "done"
+    segments = sorted(jobs.segments(job_id), key=lambda s: s["start_ms"])
+    start = int(cursor)
+    end = start + PAGE_SIZE
+    return {
+        "job_id": job_id,
+        "status": "done" if done else "partial",
+        "completed_chunks": job["total_chunks"] if done else progress.completed(job_id),
+        "total_chunks": job["total_chunks"],
+        "segments": segments[start:end],
+        "next_cursor": str(end) if end < len(segments) else None,
+    }
 `,
     },
     typescript: {
-      starter: `/** GET /v1/transcriptions/:id: the starter. */
-import Fastify from 'fastify';
-import Redis from 'ioredis';
+      starter: `import Fastify from 'fastify';
+
+import {get, segments as savedSegments} from 'transcribe/jobs';
+import {completed} from 'transcribe/progress';
 
 export const app = Fastify();
-export const redis = new Redis({host: 'redis', port: 6379});
 
-app.get('/v1/transcriptions/:id', async (request, reply) => {
+export const PAGE_SIZE = 100;
+
+app.get('/v1/transcriptions/:jobId', async (request, reply) => {
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const {id} = request.params as {id: string};
-  const {rows: jobs} = await db.query('SELECT total_chunks FROM jobs WHERE id = $1', [id]);
-  const completed = Number((await redis.hget(\`transcription:\${id}:chunks\`, 'completed')) ?? 0);
-  const {rows: segments} = await db.query(
-    'SELECT seq, text FROM segments WHERE job_id = $1 LIMIT 1000',
-    [id],
-  );
-  return reply.code(200).send({
-    id,
-    status: segments.length > 0 ? 'done' : 'processing',
-    completed_chunks: completed,
-    total_chunks: jobs[0]?.total_chunks ?? 0,
-    segments,
-  });
+  const {jobId} = request.params as {jobId: string};
+  const job = await get(jobId);
+  if (job === null) return reply.code(404).send({error: 'no such transcription'});
+  const segments = await savedSegments(jobId);
+  return {
+    job_id: jobId,
+    status: segments.length > 0 ? 'done' : 'partial',
+    completed_chunks: await completed(jobId),
+    total_chunks: job.total_chunks,
+    segments: segments.slice(0, PAGE_SIZE),
+    next_cursor: null,
+  };
 });
 `,
-      solution: `/** GET /v1/transcriptions/:id: tenant-scoped, honest about partial work, cursor-paginated. */
-import Fastify from 'fastify';
-import Redis from 'ioredis';
+      solution: `import Fastify from 'fastify';
+
+import {get, segments as savedSegments} from 'transcribe/jobs';
+import {completed} from 'transcribe/progress';
 
 export const app = Fastify();
-export const redis = new Redis({host: 'redis', port: 6379});
 
-const PAGE_SIZE = 200;
+export const PAGE_SIZE = 100;
 
-interface ChunkProgress {
-  completed_chunks: number;
-  failed_chunks: number;
-  pending_chunks: number;
-}
-
-/** The hash the chunk workers write: completed and failed counts, the remainder is still pending. */
-async function chunkProgress(id: string, totalChunks: number): Promise<ChunkProgress> {
-  const [completed, failed] = await redis.hmget(\`transcription:\${id}:chunks\`, 'completed', 'failed');
-  const completedChunks = Number(completed ?? 0);
-  const failedChunks = Number(failed ?? 0);
-  return {
-    completed_chunks: completedChunks,
-    failed_chunks: failedChunks,
-    pending_chunks: totalChunks - completedChunks - failedChunks,
-  };
-}
-
-app.get('/v1/transcriptions/:id', async (request, reply) => {
+app.get('/v1/transcriptions/:jobId', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
-
-  const {id} = request.params as {id: string};
-  const {cursor} = request.query as {cursor?: string};
-
-  const {rows: jobs} = await db.query('SELECT total_chunks FROM jobs WHERE id = $1 AND tenant_id = $2', [
-    id,
-    tenant,
-  ]);
-  const job = jobs[0];
-  // 404, not 403: a foreign job must be indistinguishable from one that never existed.
-  if (job === undefined) return reply.code(404).send({error: 'not found'});
-
-  const chunks = await chunkProgress(id, job.total_chunks);
-  // A stalled job keeps the segments it produced, but it is never certified done.
-  const status = chunks.failed_chunks === 0 && chunks.pending_chunks === 0 ? 'done' : 'partial';
-
-  const after = cursor === undefined || cursor === '' ? 0 : Number(cursor);
-  const {rows: segments} = await db.query(
-    'SELECT seq, speaker, text FROM segments WHERE job_id = $1 AND seq > $2 ORDER BY seq LIMIT $3',
-    [id, after, PAGE_SIZE],
-  );
-  const transcript = segments.map(segment => segment.text).join('');
-  const next_cursor =
-    segments.length === PAGE_SIZE ? String(segments[segments.length - 1].seq) : null;
-  return reply.code(200).send({
-    id,
-    status,
-    completed_chunks: chunks.completed_chunks,
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const {cursor = '0'} = request.query as {cursor?: string};
+  if (!/^\\d+$/.test(cursor)) return reply.code(400).send({error: 'cursor must be a segment offset'});
+  const {jobId} = request.params as {jobId: string};
+  const job = await get(jobId);
+  // Another tenant's job answers exactly like a missing one: a 403 would confirm it exists.
+  if (job === null || job.tenant !== tenant) return reply.code(404).send({error: 'no such transcription'});
+  // The job record is the one place that says every chunk finished; the ledger expires after that.
+  const done = job.status === 'done';
+  const segments = (await savedSegments(jobId)).sort((a, b) => a.start_ms - b.start_ms);
+  const start = Number(cursor);
+  const end = start + PAGE_SIZE;
+  return {
+    job_id: jobId,
+    status: done ? 'done' : 'partial',
+    completed_chunks: done ? job.total_chunks : await completed(jobId),
     total_chunks: job.total_chunks,
-    transcript: transcript,
-    next_cursor: next_cursor,
-  });
+    segments: segments.slice(start, end),
+    next_cursor: end < segments.length ? String(end) : null,
+  };
 });
 `,
     },
@@ -342,308 +246,195 @@ app.get('/v1/transcriptions/:id', async (request, reply) => {
 import (
 	"encoding/json"
 	"net/http"
+
+	"transcribe/jobs"     // jobs.Get, jobs.Segments
+	"transcribe/progress" // progress.Completed(ctx, jobID)
 )
 
-func writeJSON(rw http.ResponseWriter, status int, payload map[string]any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(payload)
-}
+const pageSize = 100
 
-func readTranscription(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	jobID := r.PathValue("id")
-
-	var totalChunks int64
-	_ = db.QueryRowContext(r.Context(), "SELECT total_chunks FROM jobs WHERE id = $1", jobID).Scan(&totalChunks)
-	completed, _ := rdb.HGet(r.Context(), "transcription:"+jobID+":chunks", "completed").Int64()
-
-	rows, _ := db.QueryContext(r.Context(), "SELECT seq, text FROM segments WHERE job_id = $1 LIMIT 1000", jobID)
-	var segments []map[string]any
-	if rows != nil {
-		defer rows.Close()
-		for rows.Next() {
-			var seq int64
-			var text string
-			_ = rows.Scan(&seq, &text)
-			segments = append(segments, map[string]any{"seq": seq, "text": text})
-		}
-	}
-	status := "processing"
-	if len(segments) > 0 {
-		status = "done"
-	}
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"id":               jobID,
-		"status":           status,
-		"completed_chunks": completed,
-		"total_chunks":     totalChunks,
-		"segments":         segments,
-	})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/transcriptions/{id}", readTranscription)
-	_ = http.ListenAndServe("0.0.0.0:8443", mux)
-}
-`,
-      solution: `package main
-
-import (
-	"database/sql"
-	"encoding/json"
-	"errors"
-	"net/http"
-	"strconv"
-	"strings"
-)
-
-const pageSize = 200
-
-// ChunkProgress is what the workers recorded for the job: completed and failed spans, and the rest.
-type ChunkProgress struct {
-	completed int64
-	failed    int64
-	pending   int64
-}
-
-// chunkProgress reads the hash the chunk workers write and derives the still-pending span.
-func chunkProgress(r *http.Request, jobID string, totalChunks int64) (ChunkProgress, error) {
-	fields, err := rdb.HMGet(r.Context(), "transcription:"+jobID+":chunks", "completed", "failed").Result()
-	if err != nil {
-		return ChunkProgress{}, err
-	}
-	completed := int64(0)
-	if raw, ok := fields[0].(string); ok {
-		completed, _ = strconv.ParseInt(raw, 10, 64)
-	}
-	failed := int64(0)
-	if raw, ok := fields[1].(string); ok {
-		failed, _ = strconv.ParseInt(raw, 10, 64)
-	}
-	return ChunkProgress{completed: completed, failed: failed, pending: totalChunks - completed - failed}, nil
-}
-
-// SegmentRow is one stored transcript segment.
-type SegmentRow struct {
-	Seq     int64  \`json:"seq"\`
-	Speaker string \`json:"speaker"\`
-	Text    string \`json:"text"\`
+type transcriptView struct {
+	JobID           string         \`json:"job_id"\`
+	Status          string         \`json:"status"\`
+	CompletedChunks int            \`json:"completed_chunks"\`
+	TotalChunks     int            \`json:"total_chunks"\`
+	Segments        []jobs.Segment \`json:"segments"\`
+	NextCursor      *string        \`json:"next_cursor"\`
 }
 
 func readTranscription(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	jobID := r.PathValue("id")
-
-	var totalChunks int64
-	err := db.QueryRowContext(
-		r.Context(),
-		"SELECT total_chunks FROM jobs WHERE id = $1 AND tenant_id = $2",
-		jobID, tenant,
-	).Scan(&totalChunks)
-	// 404, not 403: a foreign job must be indistinguishable from one that never existed.
-	if errors.Is(err, sql.ErrNoRows) {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "not found"})
+	job := jobs.Get(r.Context(), jobID)
+	if job == nil {
+		http.Error(rw, "no such transcription", http.StatusNotFound)
 		return
 	}
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "lookup failed"})
-		return
-	}
-
-	progress, err := chunkProgress(r, jobID, totalChunks)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "progress unavailable"})
-		return
-	}
-	// A stalled job keeps the segments it produced, but it is never certified done.
+	segments := jobs.Segments(r.Context(), jobID)
 	status := "partial"
-	if progress.failed == 0 && progress.pending == 0 {
+	if len(segments) > 0 {
 		status = "done"
 	}
-
-	after := int64(0)
-	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
-		after, _ = strconv.ParseInt(cursor, 10, 64)
-	}
-	rows, err := db.QueryContext(
-		r.Context(),
-		"SELECT seq, speaker, text FROM segments WHERE job_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
-		jobID, after, pageSize,
-	)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "transcript unavailable"})
-		return
-	}
-	defer rows.Close()
-
-	var segments []SegmentRow
-	var texts []string
-	for rows.Next() {
-		var segment SegmentRow
-		if scanErr := rows.Scan(&segment.Seq, &segment.Speaker, &segment.Text); scanErr != nil {
-			writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "corrupt segment"})
-			return
-		}
-		texts = append(texts, segment.Text)
-		segments = append(segments, segment)
-	}
-	transcript := strings.Join(texts, "")
-
-	var nextCursor any
-	if len(segments) == pageSize {
-		nextCursor = strconv.FormatInt(segments[len(segments)-1].Seq, 10)
-	}
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"id":               jobID,
-		"status":           status,
-		"completed_chunks": progress.completed,
-		"total_chunks":     totalChunks,
-		"transcript":       transcript,
-		"next_cursor":      nextCursor,
-	})
+	page := segments[:min(pageSize, len(segments))]
+	view := transcriptView{JobID: jobID, Status: status, CompletedChunks: progress.Completed(r.Context(), jobID), TotalChunks: job.TotalChunks, Segments: page, NextCursor: nil}
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(view)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/transcriptions/{id}", readTranscription)
-	_ = http.ListenAndServe("0.0.0.0:8443", mux)
+}
+`,
+      solution: `package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"sort"
+	"strconv"
+
+	"transcribe/jobs"     // jobs.Get, jobs.Segments
+	"transcribe/progress" // progress.Completed(ctx, jobID)
+)
+
+const pageSize = 100
+
+type transcriptView struct {
+	JobID           string         \`json:"job_id"\`
+	Status          string         \`json:"status"\`
+	CompletedChunks int            \`json:"completed_chunks"\`
+	TotalChunks     int            \`json:"total_chunks"\`
+	Segments        []jobs.Segment \`json:"segments"\`
+	NextCursor      *string        \`json:"next_cursor"\`
+}
+
+func readTranscription(rw http.ResponseWriter, r *http.Request) {
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
+		return
+	}
+	start := 0
+	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
+		n, err := strconv.Atoi(cursor)
+		if err != nil || n < 0 {
+			http.Error(rw, "cursor must be a segment offset", http.StatusBadRequest)
+			return
+		}
+		start = n
+	}
+	jobID := r.PathValue("id")
+	job := jobs.Get(r.Context(), jobID)
+	// Another tenant's job answers exactly like a missing one: a 403 would confirm it exists.
+	if job == nil || job.Tenant != tenant {
+		http.Error(rw, "no such transcription", http.StatusNotFound)
+		return
+	}
+	// The job record is the one place that says every chunk finished; the ledger expires after that.
+	view := transcriptView{JobID: jobID, Status: "partial", TotalChunks: job.TotalChunks}
+	if job.Status == "done" {
+		view.Status = "done"
+		view.CompletedChunks = job.TotalChunks
+	} else {
+		view.CompletedChunks = progress.Completed(r.Context(), jobID)
+	}
+	segments := jobs.Segments(r.Context(), jobID)
+	sort.SliceStable(segments, func(i, j int) bool { return segments[i].StartMs < segments[j].StartMs })
+	end := start + pageSize
+	view.Segments = segments[min(start, len(segments)):min(end, len(segments))]
+	if end < len(segments) {
+		next := strconv.Itoa(end)
+		view.NextCursor = &next
+	}
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(view)
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/transcriptions/{id}", readTranscription)
 }
 `,
     },
     scala: {
-      starter: `import java.sql.Connection
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-object TranscriptionRead {
-  implicit val system: ActorSystem = ActorSystem("transcription-api")
+import transcribe.{Jobs, Progress} // Jobs.get, Jobs.segments; Progress.completed
 
-  def jsonEntity(body: String): ResponseEntity =
-    HttpEntity(ContentTypes.\`application/json\`, body)
+object Read {
+  val PageSize = 100
 
-  val route: Route =
-    path("v1" / "transcriptions" / Segment) { jobId =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val job = conn.prepareStatement("SELECT total_chunks FROM jobs WHERE id = ?")
-        job.setString(1, jobId)
-        val jobRow = job.executeQuery()
-        val totalChunks = if (jobRow.next()) jobRow.getLong("total_chunks") else 0L
-
-        val stored = conn.prepareStatement("SELECT text FROM segments WHERE job_id = ? LIMIT 1000")
-        stored.setString(1, jobId)
-        val rows = stored.executeQuery()
-        val texts = List.newBuilder[String]
-        while (rows.next()) texts += rows.getString("text")
-
-        val response = JsObject(
-          "id" -> JsString(jobId),
-          "status" -> JsString(if (texts.result().nonEmpty) "done" else "processing"),
-          "total_chunks" -> JsNumber(totalChunks),
-          "segments" -> JsArray(texts.result().map(JsString(_)).toVector)
-        )
-        complete(StatusCodes.OK, jsonEntity(response.compactPrint))
+  val route: Route = path("v1" / "transcriptions" / Segment) { jobId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(tenant) =>
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+          Jobs.get(jobId) match {
+            case None => complete(StatusCodes.NotFound -> "no such transcription")
+            case Some(job) =>
+              val segments = Jobs.segments(jobId)
+              val body = JsObject(
+                "job_id" -> JsString(jobId),
+                "status" -> JsString(if (segments.nonEmpty) "done" else "partial"),
+                "completed_chunks" -> JsNumber(Progress.completed(jobId)),
+                "total_chunks" -> JsNumber(job.totalChunks),
+                "segments" -> JsArray(segments.take(PageSize).map(Jobs.segmentJson).toVector),
+                "next_cursor" -> JsNull)
+              complete(HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+          }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.sql.Connection
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-final case class SegmentRow(seq: Long, speaker: String, text: String)
+import transcribe.{Jobs, Progress} // Jobs.get, Jobs.segments; Progress.completed
 
-object TranscriptionRead {
-  implicit val system: ActorSystem = ActorSystem("transcription-api")
+object Read {
+  val PageSize = 100
 
-  val PageSize = 200
-
-  def jsonEntity(body: String): ResponseEntity =
-    HttpEntity(ContentTypes.\`application/json\`, body)
-
-  /** Completed and failed counts as the workers recorded them; the remainder is still pending. */
-  def chunkProgress(jobId: String, totalChunks: Long): (Long, Long, Long) = {
-    val key = s"transcription:$jobId:chunks"
-    val completed = Option(jedis.hget(key, "completed")).map(_.toLong).getOrElse(0L)
-    val failed = Option(jedis.hget(key, "failed")).map(_.toLong).getOrElse(0L)
-    (completed, failed, totalChunks - completed - failed)
-  }
-
-  def segments(conn: Connection, jobId: String, after: Long, limit: Int): List[SegmentRow] = {
-    val stmt = conn.prepareStatement(
-      "SELECT seq, speaker, text FROM segments WHERE job_id = ? AND seq > ? ORDER BY seq LIMIT ?"
-    )
-    stmt.setString(1, jobId)
-    stmt.setLong(2, after)
-    stmt.setInt(3, limit)
-    val rows = stmt.executeQuery()
-    val page = List.newBuilder[SegmentRow]
-    while (rows.next()) page += SegmentRow(rows.getLong("seq"), rows.getString("speaker"), rows.getString("text"))
-    page.result()
-  }
-
-  val route: Route =
-    path("v1" / "transcriptions" / Segment) { jobId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          parameters("cursor".?) { cursorOpt =>
-            val tenant = tenantOpt.filter(_.nonEmpty)
-            if (tenant.isEmpty) complete(StatusCodes.Unauthorized, jsonEntity("""{"error":"missing X-Tenant-Id"}"""))
-            else {
-              val job = conn.prepareStatement("SELECT total_chunks FROM jobs WHERE id = ? AND tenant_id = ?")
-              job.setString(1, jobId)
-              job.setString(2, tenant.get)
-              val jobRow = job.executeQuery()
-              // 404, not 403: a foreign job must be indistinguishable from one that never existed.
-              if (!jobRow.next()) complete(StatusCodes.NotFound, jsonEntity("""{"error":"not found"}"""))
-              else {
-                val totalChunks = jobRow.getLong("total_chunks")
-                val (completedChunks, failedChunks, pendingChunks) = chunkProgress(jobId, totalChunks)
-                // A stalled job keeps the segments it produced, but it is never certified done.
-                val status = if (failedChunks == 0 && pendingChunks == 0) "done" else "partial"
-
-                val after = cursorOpt.flatMap(_.toLongOption).getOrElse(0L)
-                val page = segments(conn, jobId, after, PageSize)
-                val transcript = page.map(_.text).mkString
-                val nextCursor = if (page.length == PageSize) Some(page.last.seq.toString) else None
-                val response = JsObject(
-                  "id" -> JsString(jobId),
-                  "status" -> JsString(status),
-                  "completed_chunks" -> JsNumber(completedChunks),
-                  "total_chunks" -> JsNumber(totalChunks),
-                  "transcript" -> JsString(transcript),
-                  "next_cursor" -> nextCursor.map(JsString(_)).getOrElse(JsNull)
-                )
-                complete(StatusCodes.OK, jsonEntity(response.compactPrint))
+  val route: Route = path("v1" / "transcriptions" / Segment) { jobId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(tenant) =>
+          parameter("cursor".optional) { cursor =>
+            val start = cursor.getOrElse("0")
+            if (!start.forall(_.isDigit) || start.isEmpty) complete(StatusCodes.BadRequest -> "cursor must be a segment offset")
+            else
+              // Another tenant's job answers exactly like a missing one: a 403 would confirm it exists.
+              Jobs.get(jobId).filter(_.tenant == tenant) match {
+                case None => complete(StatusCodes.NotFound -> "no such transcription")
+                case Some(job) =>
+                  // The job record is the one place that says every chunk finished; the ledger expires after that.
+                  val done = job.status == "done"
+                  val segments = Jobs.segments(jobId).sortBy(_.startMs)
+                  val from = start.toInt
+                  val end = from + PageSize
+                  val body = JsObject(
+                    "job_id" -> JsString(jobId),
+                    "status" -> JsString(if (done) "done" else "partial"),
+                    "completed_chunks" -> JsNumber(if (done) job.totalChunks else Progress.completed(jobId)),
+                    "total_chunks" -> JsNumber(job.totalChunks),
+                    "segments" -> JsArray(segments.slice(from, end).map(Jobs.segmentJson).toVector),
+                    "next_cursor" -> (if (end < segments.size) JsString(end.toString) else JsNull))
+                  complete(HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
               }
-            }
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -652,121 +443,512 @@ object TranscriptionRead {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <string>
+#include <vector>
+
+#include "transcribe/jobs.h"      // jobs::get, jobs::segments
+#include "transcribe/progress.h"  // progress::completed(job_id)
 
 using json = nlohmann::json;
 
-int main() {
-  httplib::Server svr;
+constexpr size_t kPageSize = 100;
 
-  svr.Get(R"(/v1/transcriptions/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string job_id = req.matches[1];
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    pqxx::work tx(db_pool());
-    const auto job = tx.exec_params("SELECT total_chunks FROM jobs WHERE id = $1", job_id);
-    const auto rows = tx.exec_params("SELECT seq, text FROM segments WHERE job_id = $1 LIMIT 1000", job_id);
-
-    json segments = json::array();
-    for (const auto& row : rows)
-      segments.push_back(json{{"seq", row["seq"].as<long long>()}, {"text", row["text"].as<std::string>()}});
-
-    res.status = 200;
-    res.set_content(
-        json{{"id", job_id},
-             {"status", segments.empty() ? "processing" : "done"},
-             {"total_chunks", job.empty() ? 0 : job[0]["total_chunks"].as<long long>()},
-             {"segments", segments}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void read_transcription(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string job_id = req.matches[1];
+  const auto job = jobs::get(job_id);
+  if (!job) {
+    res.status = 404;
+    res.set_content("no such transcription", "text/plain");
+    return;
+  }
+  const std::vector<jobs::Segment> segments = jobs::segments(job_id);
+  json page = json::array();
+  for (size_t i = 0; i < std::min(kPageSize, segments.size()); i++) page.push_back(jobs::toJson(segments[i]));
+  const json body = {{"job_id", job_id}, {"status", segments.empty() ? "partial" : "done"}, {"completed_chunks", progress::completed(job_id)},
+                     {"total_chunks", job->total_chunks}, {"segments", page}, {"next_cursor", nullptr}};
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/transcriptions/([\\w-]+))", read_transcription); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <string>
+#include <vector>
+
+#include "transcribe/jobs.h"      // jobs::get, jobs::segments
+#include "transcribe/progress.h"  // progress::completed(job_id)
 
 using json = nlohmann::json;
 
-constexpr int kPageSize = 200;
+constexpr size_t kPageSize = 100;
 
-// Chunk progress as the workers recorded it: completed and failed spans, and the rest.
-struct ChunkProgress {
-  long long completed = 0;
-  long long failed = 0;
-  long long pending = 0;
-};
-
-ChunkProgress chunk_progress(const std::string& job_id, long long total_chunks) {
-  const auto key = "transcription:" + job_id + ":chunks";
-  ChunkProgress progress;
-  if (const auto completed = redis.hget(key, "completed")) progress.completed = std::stoll(*completed);
-  if (const auto failed = redis.hget(key, "failed")) progress.failed = std::stoll(*failed);
-  progress.pending = total_chunks - progress.completed - progress.failed;
-  return progress;
+void read_transcription(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const std::string cursor = req.has_param("cursor") ? req.get_param_value("cursor") : "0";
+  if (cursor.empty() || !std::all_of(cursor.begin(), cursor.end(), ::isdigit)) {
+    res.status = 400;
+    res.set_content("cursor must be a segment offset", "text/plain");
+    return;
+  }
+  const std::string job_id = req.matches[1];
+  const auto job = jobs::get(job_id);
+  // Another tenant's job answers exactly like a missing one: a 403 would confirm it exists.
+  if (!job || job->tenant != tenant) {
+    res.status = 404;
+    res.set_content("no such transcription", "text/plain");
+    return;
+  }
+  // The job record is the one place that says every chunk finished; the ledger expires after that.
+  const bool done = job->status == "done";
+  std::vector<jobs::Segment> segments = jobs::segments(job_id);
+  std::stable_sort(segments.begin(), segments.end(), [](const jobs::Segment& a, const jobs::Segment& b) { return a.start_ms < b.start_ms; });
+  const size_t start = std::stoul(cursor);
+  const size_t end = start + kPageSize;
+  json page = json::array();
+  for (size_t i = start; i < std::min(end, segments.size()); i++) page.push_back(jobs::toJson(segments[i]));
+  const json next = end < segments.size() ? json(std::to_string(end)) : json(nullptr);
+  const json body = {{"job_id", job_id}, {"status", done ? "done" : "partial"}, {"completed_chunks", done ? job->total_chunks : progress::completed(job_id)},
+                     {"total_chunks", job->total_chunks}, {"segments", page}, {"next_cursor", next}};
+  res.set_content(body.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/transcriptions/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const std::string job_id = req.matches[1];
-
-    pqxx::work tx(db_pool());
-    const auto jobs = tx.exec_params(
-        "SELECT total_chunks FROM jobs WHERE id = $1 AND tenant_id = $2", job_id, tenant);
-    // 404, not 403: a foreign job must be indistinguishable from one that never existed.
-    if (jobs.empty()) {
-      res.status = 404;
-      res.set_content(R"({"error":"not found"})", "application/json");
-      return;
-    }
-    const long long total_chunks = jobs[0]["total_chunks"].as<long long>();
-
-    const ChunkProgress progress = chunk_progress(job_id, total_chunks);
-    // A stalled job keeps the segments it produced, but it is never certified done.
-    const std::string status = progress.failed == 0 && progress.pending == 0 ? "done" : "partial";
-
-    long long after = 0;
-    if (const auto cursor = req.get_param_value("cursor"); !cursor.empty()) after = std::stoll(cursor);
-    const auto rows = tx.exec_params(
-        "SELECT seq, speaker, text FROM segments WHERE job_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
-        job_id, after, kPageSize);
-
-    std::string transcript;
-    for (const auto& row : rows) transcript += row["text"].as<std::string>();
-    const bool full_page = static_cast<int>(rows.size()) == kPageSize;
-    const json next_cursor = full_page ? json(rows[rows.size() - 1]["seq"].as<long long>()) : json(nullptr);
-
-    res.status = 200;
-    res.set_content(
-        json{{"id", job_id},
-             {"status", status},
-             {"completed_chunks", progress.completed},
-             {"total_chunks", total_chunks},
-             {"transcript", transcript},
-             {"next_cursor", next_cursor}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/transcriptions/([\\w-]+))", read_transcription); }
 `,
     },
   },
+  harness: {
+    python: `from transcribe import jobs
+
+T1 = {"X-Tenant-Id": "t-1"}
+
+
+def _segment(index, start_ms, text="words"):
+    return {"chunk_index": index, "start_ms": start_ms, "end_ms": start_ms + 10000, "speaker": "A", "text": text}
+
+
+def _job(tenant="t-1", ref="s3://calls/a.wav", total=3):
+    return jobs.create(tenant, ref, ref, total * 30, "en", total)["job_id"]
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+async def _read(c, job_id, tenant="t-1", cursor=None):
+    url = f"/v1/transcriptions/{job_id}" + ("" if cursor is None else f"?cursor={cursor}")
+    return await c.get(url, headers={"X-Tenant-Id": tenant})
+
+
+async def check_route(ctx):
+    job = _job()
+    jobs.save_segments(job, [_segment(0, 0), _segment(0, 10000)])
+    async with _api(ctx) as c:
+        r = await _read(c, job)
+        missing = await _read(c, "tr-404")
+        anonymous = await c.get(f"/v1/transcriptions/{job}")
+    assert r.status_code == 200, f"GET /v1/transcriptions/{job} answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("job_id") == job and body.get("total_chunks") == 3 and len(body.get("segments", [])) == 2, f"the read must answer the job, its chunk count and its segments, got {body}"
+    assert missing.status_code == 404, f"a missing job answered {missing.status_code}, expected 404"
+    assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+
+
+async def check_tenant_scope(ctx):
+    job = _job(tenant="t-1")
+    jobs.save_segments(job, [_segment(0, 0, "the account number is on the letter")])
+    async with _api(ctx) as c:
+        foreign = await _read(c, job, tenant="t-2")
+        missing = await _read(c, "tr-404", tenant="t-2")
+    assert foreign.status_code == 404, f"tenant t-2 reading t-1's job answered {foreign.status_code}, expected 404 (the same answer as a missing id): {foreign.text}"
+    assert "account number" not in foreign.text, "the foreign read leaked the transcript"
+    assert missing.status_code == 404, f"a missing job answered {missing.status_code}"
+
+
+async def check_honest_status(ctx):
+    job = _job(total=3)
+    jobs.save_segments(job, [_segment(0, 0), _segment(0, 10000)])
+    ctx.redis.hset(f"job:{job}:chunks", mapping={"0": "done", "1": "failed"})
+    async with _api(ctx) as c:
+        partial = (await _read(c, job)).json()
+        assert partial.get("status") == "partial" and partial.get("completed_chunks") == 1, f"a job with chunk 1 failed and chunk 2 pending reads {partial.get('status')!r} with {partial.get('completed_chunks')} chunks completed, expected partial with 1"
+        # Every chunk finished, and 24 hours later the ledger has expired.
+        jobs.mark_done(job)
+        ctx.redis.delete(f"job:{job}:chunks")
+        done = (await _read(c, job)).json()
+    assert done.get("status") == "done" and done.get("completed_chunks") == 3, f"a finished job whose ledger expired reads {done.get('status')!r} with {done.get('completed_chunks')} of 3 chunks completed, expected done with 3: the job record is what says it finished"
+
+
+async def check_segment_order(ctx):
+    job = _job(total=3)
+    # Chunks finish out of order: chunk 2, then chunk 0, then chunk 1.
+    jobs.save_segments(job, [_segment(2, 60000), _segment(2, 70000)])
+    jobs.save_segments(job, [_segment(0, 0), _segment(0, 10000)])
+    jobs.save_segments(job, [_segment(1, 30000)])
+    async with _api(ctx) as c:
+        body = (await _read(c, job)).json()
+    starts = [s["start_ms"] for s in body.get("segments", [])]
+    assert starts == [0, 10000, 30000, 60000, 70000], f"the transcript must read in the order it was spoken, got segments starting at {starts}"
+
+
+async def check_cursor_pagination(ctx):
+    job = _job(total=84)
+    jobs.save_segments(job, [_segment(i // 3, i * 10000) for i in range(250)])
+    seen, cursor, pages = [], None, 0
+    async with _api(ctx) as c:
+        while pages < 5:
+            body = (await _read(c, job, cursor=cursor)).json()
+            pages += 1
+            seen += [s["start_ms"] for s in body.get("segments", [])]
+            cursor = body.get("next_cursor")
+            if cursor is None:
+                break
+    assert seen == [i * 10000 for i in range(250)], f"walking next_cursor returned {len(seen)} of 250 segments in {pages} pages: a long recording must be readable past the first page"
+    assert pages == 3, f"250 segments at 100 a page are 3 pages, the walk took {pages}"
+`,
+    typescript: `const T1 = {'X-Tenant-Id': 't-1'};
+
+const segmentOf = (index: number, startMs: number, text = 'words') => ({chunk_index: index, start_ms: startMs, end_ms: startMs + 10000, speaker: 'A', text});
+
+function world(ctx) {
+  return {c: ctx.client(ctx.load('read').app), jobs: ctx.load('/support/transcribe/jobs.ts')};
+}
+
+async function newJob(jobs, tenant = 't-1', ref = 's3://calls/a.wav', total = 3): Promise<string> {
+  return (await jobs.create(tenant, ref, ref, total * 30, 'en', total)).job_id;
+}
+
+const read = (c, jobId: string, tenant = 't-1', cursor: string | null = null) =>
+  c.get(\`/v1/transcriptions/\${jobId}\${cursor === null ? '' : \`?cursor=\${cursor}\`}\`, {headers: {'X-Tenant-Id': tenant}});
+
+export async function check_route(ctx) {
+  const {c, jobs} = world(ctx);
+  const job = await newJob(jobs);
+  await jobs.saveSegments(job, [segmentOf(0, 0), segmentOf(0, 10000)]);
+  const r = await read(c, job);
+  const missing = await read(c, 'tr-404');
+  const anonymous = await c.get(\`/v1/transcriptions/\${job}\`, {headers: {}});
+  assert.equal(r.status, 200, \`GET /v1/transcriptions/\${job} answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.job_id === job && body.total_chunks === 3 && (body.segments ?? []).length === 2, \`the read must answer the job, its chunk count and its segments, got \${r.text}\`);
+  assert.equal(missing.status, 404, \`a missing job answered \${missing.status}, expected 404\`);
+  assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  void T1;
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c, jobs} = world(ctx);
+  const job = await newJob(jobs, 't-1');
+  await jobs.saveSegments(job, [segmentOf(0, 0, 'the account number is on the letter')]);
+  const foreign = await read(c, job, 't-2');
+  const missing = await read(c, 'tr-404', 't-2');
+  assert.equal(foreign.status, 404, \`tenant t-2 reading t-1's job answered \${foreign.status}, expected 404 (the same answer as a missing id): \${foreign.text}\`);
+  assert(!foreign.text.includes('account number'), 'the foreign read leaked the transcript');
+  assert.equal(missing.status, 404, \`a missing job answered \${missing.status}\`);
+}
+
+export async function check_honest_status(ctx) {
+  const {c, jobs} = world(ctx);
+  const job = await newJob(jobs);
+  await jobs.saveSegments(job, [segmentOf(0, 0), segmentOf(0, 10000)]);
+  ctx.redis.hset(\`job:\${job}:chunks\`, '0', 'done', '1', 'failed');
+  const partial = (await read(c, job)).json();
+  assert(partial.status === 'partial' && partial.completed_chunks === 1, \`a job with chunk 1 failed and chunk 2 pending reads \${partial.status} with \${partial.completed_chunks} chunks completed, expected partial with 1\`);
+  // Every chunk finished, and 24 hours later the ledger has expired.
+  await jobs.markDone(job);
+  ctx.redis.del(\`job:\${job}:chunks\`);
+  const done = (await read(c, job)).json();
+  assert(done.status === 'done' && done.completed_chunks === 3, \`a finished job whose ledger expired reads \${done.status} with \${done.completed_chunks} of 3 chunks completed, expected done with 3: the job record is what says it finished\`);
+}
+
+export async function check_segment_order(ctx) {
+  const {c, jobs} = world(ctx);
+  const job = await newJob(jobs);
+  // Chunks finish out of order: chunk 2, then chunk 0, then chunk 1.
+  await jobs.saveSegments(job, [segmentOf(2, 60000), segmentOf(2, 70000)]);
+  await jobs.saveSegments(job, [segmentOf(0, 0), segmentOf(0, 10000)]);
+  await jobs.saveSegments(job, [segmentOf(1, 30000)]);
+  const body = (await read(c, job)).json();
+  const starts = (body.segments ?? []).map(s => s.start_ms);
+  assert.deepStrictEqual(starts, [0, 10000, 30000, 60000, 70000], \`the transcript must read in the order it was spoken, got segments starting at \${JSON.stringify(starts)}\`);
+}
+
+export async function check_cursor_pagination(ctx) {
+  const {c, jobs} = world(ctx);
+  const job = await newJob(jobs, 't-1', 's3://calls/a.wav', 84);
+  await jobs.saveSegments(job, Array.from({length: 250}, (_, i) => segmentOf(Math.floor(i / 3), i * 10000)));
+  const seen: number[] = [];
+  let cursor: string | null = null;
+  let pages = 0;
+  while (pages < 5) {
+    const body = (await read(c, job, 't-1', cursor)).json();
+    pages += 1;
+    seen.push(...(body.segments ?? []).map(s => s.start_ms));
+    cursor = body.next_cursor ?? null;
+    if (cursor === null) break;
+  }
+  assert.deepStrictEqual(seen, Array.from({length: 250}, (_, i) => i * 10000), \`walking next_cursor returned \${seen.length} of 250 segments in \${pages} pages: a long recording must be readable past the first page\`);
+  assert.equal(pages, 3, \`250 segments at 100 a page are 3 pages, the walk took \${pages}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"transcribe/jobs"
+
+	"leetbuild/harness"
+)
+
+var readBg = context.Background()
+
+type readView struct {
+	JobID           string         \`json:"job_id"\`
+	Status          string         \`json:"status"\`
+	CompletedChunks int            \`json:"completed_chunks"\`
+	TotalChunks     int            \`json:"total_chunks"\`
+	Segments        []jobs.Segment \`json:"segments"\`
+	NextCursor      *string        \`json:"next_cursor"\`
+}
+
+func readSegment(index, startMs int, text string) jobs.Segment {
+	return jobs.Segment{ChunkIndex: index, StartMs: startMs, EndMs: startMs + 10000, Speaker: "A", Text: text}
+}
+
+func readJob(tenant string, total int) string {
+	return jobs.Create(readBg, tenant, "s3://calls/a.wav", "s3://calls/a.wav", total*30, "en", total).JobID
+}
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readOne(c *harness.HTTP, jobID, tenant, cursor string) (*harness.Response, readView) {
+	path := "/v1/transcriptions/" + jobID
+	if cursor != "" {
+		path += "?cursor=" + cursor
+	}
+	r := c.Get(path, "X-Tenant-Id", tenant)
+	var v readView
+	if r.Status == 200 {
+		r.Decode(&v)
+	}
+	return r, v
+}
+
+func startsIn(segments []jobs.Segment) []int {
+	out := []int{}
+	for _, s := range segments {
+		out = append(out, s.StartMs)
+	}
+	return out
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	job := readJob("t-1", 3)
+	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "words"), readSegment(0, 10000, "words")})
+	r, v := readOne(c, job, "t-1", "")
+	ctx.Equal(r.Status, 200, "GET /v1/transcriptions/%s (%s)", job, r.Text())
+	ctx.Assert(v.JobID == job && v.TotalChunks == 3 && len(v.Segments) == 2, "the read must answer the job, its chunk count and its segments, got %s", r.Text())
+	missing, _ := readOne(c, "tr-404", "t-1", "")
+	ctx.Equal(missing.Status, 404, "a missing job")
+	ctx.Equal(c.Get("/v1/transcriptions/"+job).Status, 401, "a read without X-Tenant-Id")
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	job := readJob("t-1", 3)
+	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "the account number is on the letter")})
+	foreign, _ := readOne(c, job, "t-2", "")
+	ctx.Equal(foreign.Status, 404, "tenant t-2 reading t-1's job must get the same answer as a missing id (%s)", foreign.Text())
+	missing, _ := readOne(c, "tr-404", "t-2", "")
+	ctx.Equal(missing.Status, 404, "a missing job")
+}
+
+func CheckHonestStatus(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	job := readJob("t-1", 3)
+	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "words"), readSegment(0, 10000, "words")})
+	ctx.Redis.Do("HSET", "job:"+job+":chunks", "0", "done", "1", "failed")
+	_, partial := readOne(c, job, "t-1", "")
+	ctx.Assert(partial.Status == "partial" && partial.CompletedChunks == 1, "a job with chunk 1 failed and chunk 2 pending reads %q with %d chunks completed, expected partial with 1", partial.Status, partial.CompletedChunks)
+	// Every chunk finished, and 24 hours later the ledger has expired.
+	jobs.MarkDone(readBg, job)
+	ctx.Redis.Del("job:" + job + ":chunks")
+	_, done := readOne(c, job, "t-1", "")
+	ctx.Assert(done.Status == "done" && done.CompletedChunks == 3, "a finished job whose ledger expired reads %q with %d of 3 chunks completed, expected done with 3: the job record is what says it finished", done.Status, done.CompletedChunks)
+}
+
+func CheckSegmentOrder(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	job := readJob("t-1", 3)
+	// Chunks finish out of order: chunk 2, then chunk 0, then chunk 1.
+	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(2, 60000, "words"), readSegment(2, 70000, "words")})
+	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "words"), readSegment(0, 10000, "words")})
+	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(1, 30000, "words")})
+	_, v := readOne(c, job, "t-1", "")
+	ctx.Equal(startsIn(v.Segments), []int{0, 10000, 30000, 60000, 70000}, "the transcript must read in the order it was spoken; the segment starts")
+}
+
+func CheckCursorPagination(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	job := readJob("t-1", 84)
+	all := make([]jobs.Segment, 0, 250)
+	want := make([]int, 0, 250)
+	for i := 0; i < 250; i++ {
+		all = append(all, readSegment(i/3, i*10000, "words"))
+		want = append(want, i*10000)
+	}
+	jobs.SaveSegments(readBg, job, all)
+	seen := []int{}
+	cursor := ""
+	pages := 0
+	for pages < 5 {
+		_, v := readOne(c, job, "t-1", cursor)
+		pages++
+		seen = append(seen, startsIn(v.Segments)...)
+		if v.NextCursor == nil {
+			break
+		}
+		cursor = *v.NextCursor
+	}
+	ctx.Assert(len(seen) == 250, "walking next_cursor returned %d of 250 segments in %d pages: a long recording must be readable past the first page", len(seen), pages)
+	ctx.Equal(seen, want, "every segment once, in order, across the pages")
+	ctx.Equal(pages, 3, "250 segments at 100 a page; pages")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+jobs::Segment readSegment(int index, int start_ms, const std::string& text = "words") { return {index, start_ms, start_ms + 10000, "A", text}; }
+
+std::string readJob(const std::string& tenant, long total) { return jobs::create(tenant, "s3://calls/a.wav", "s3://calls/a.wav", total * 30, "en", total).job_id; }
+
+harness::HTTP readAPI(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response readOne(harness::HTTP& c, const std::string& job_id, const std::string& tenant, const std::string& cursor = "") {
+  return c.Get("/v1/transcriptions/" + job_id + (cursor.empty() ? "" : "?cursor=" + cursor), "X-Tenant-Id", tenant);
+}
+
+nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+std::vector<int> startsIn(const nlohmann::json& body) {
+  std::vector<int> out;
+  if (body.is_object() && body.contains("segments")) {
+    for (const auto& s : body["segments"]) out.push_back(s.value("start_ms", 0));
+  }
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  const std::string job = readJob("t-1", 3);
+  jobs::saveSegments(job, {readSegment(0, 0), readSegment(0, 10000)});
+  const auto r = readOne(c, job, "t-1");
+  ctx.Equal(r.Status, 200, "GET /v1/transcriptions/%s (%s)", job, r.Text());
+  const auto body = bodyOf(r);
+  ctx.Assert(body.is_object() && body.value("job_id", "") == job && body.value("total_chunks", 0) == 3 && startsIn(body).size() == 2, "the read must answer the job, its chunk count and its segments, got %s", r.Text());
+  ctx.Equal(readOne(c, "tr-404", "t-1").Status, 404, "a missing job");
+  ctx.Equal(c.Get("/v1/transcriptions/" + job).Status, 401, "a read without X-Tenant-Id");
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  const std::string job = readJob("t-1", 3);
+  jobs::saveSegments(job, {readSegment(0, 0, "the account number is on the letter")});
+  const auto foreign = readOne(c, job, "t-2");
+  ctx.Equal(foreign.Status, 404, "tenant t-2 reading t-1's job must get the same answer as a missing id (%s)", foreign.Text());
+  ctx.Equal(readOne(c, "tr-404", "t-2").Status, 404, "a missing job");
+}
+
+void CheckHonestStatus(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  const std::string job = readJob("t-1", 3);
+  jobs::saveSegments(job, {readSegment(0, 0), readSegment(0, 10000)});
+  ctx.Redis.Do("HSET", "job:" + job + ":chunks", "0", "done", "1", "failed");
+  const auto partial = bodyOf(readOne(c, job, "t-1"));
+  ctx.Assert(partial.is_object() && partial.value("status", "") == "partial" && partial.value("completed_chunks", -1) == 1, "a job with chunk 1 failed and chunk 2 pending must read partial with 1 chunk completed, got %s", partial.dump());
+  // Every chunk finished, and 24 hours later the ledger has expired.
+  jobs::markDone(job);
+  ctx.Redis.Del("job:" + job + ":chunks");
+  const auto done = bodyOf(readOne(c, job, "t-1"));
+  ctx.Assert(done.is_object() && done.value("status", "") == "done" && done.value("completed_chunks", -1) == 3, "a finished job whose ledger expired must read done with 3 of 3 chunks completed (the job record is what says it finished), got %s", done.dump());
+}
+
+void CheckSegmentOrder(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  const std::string job = readJob("t-1", 3);
+  // Chunks finish out of order: chunk 2, then chunk 0, then chunk 1.
+  jobs::saveSegments(job, {readSegment(2, 60000), readSegment(2, 70000)});
+  jobs::saveSegments(job, {readSegment(0, 0), readSegment(0, 10000)});
+  jobs::saveSegments(job, {readSegment(1, 30000)});
+  ctx.Equal(startsIn(bodyOf(readOne(c, job, "t-1"))), {0, 10000, 30000, 60000, 70000}, "the transcript must read in the order it was spoken; the segment starts");
+}
+
+void CheckCursorPagination(harness::Ctx& ctx) {
+  auto c = readAPI(ctx);
+  const std::string job = readJob("t-1", 84);
+  std::vector<jobs::Segment> all;
+  std::vector<int> want;
+  for (int i = 0; i < 250; i++) {
+    all.push_back(readSegment(i / 3, i * 10000));
+    want.push_back(i * 10000);
+  }
+  jobs::saveSegments(job, all);
+  std::vector<int> seen;
+  std::string cursor;
+  int pages = 0;
+  while (pages < 5) {
+    const auto body = bodyOf(readOne(c, job, "t-1", cursor));
+    pages++;
+    for (int s : startsIn(body)) seen.push_back(s);
+    if (!body.is_object() || !body.contains("next_cursor") || !body["next_cursor"].is_string()) break;
+    cursor = body["next_cursor"].get<std::string>();
+  }
+  ctx.Assert(seen.size() == 250, "walking next_cursor returned %d of 250 segments in %d pages: a long recording must be readable past the first page", seen.size(), pages);
+  ctx.Equal(seen, want, "every segment once, in order, across the pages");
+  ctx.Equal(pages, 3, "250 segments at 100 a page; pages");
+}
+`,
+  },
   hints: [
-    "Symptom: a tenant reads another tenant's transcript by guessing an id, a job whose chunk 40 failed is billed and archived as done, and a four-hour recording ends mid-sentence at segment 1000.",
-    'Mechanism: the job query has no tenant predicate; `status` is `"done" if segments`, so one row certifies the file; the segment query has no `ORDER BY` and a fixed `LIMIT 1000` with no cursor.',
-    'Change: add `AND tenant_id = %s`, 404 on miss; `partial` unless failed and pending (from the progress hash) are zero; `seq > cursor ORDER BY seq`, join the texts, `next_cursor` on a full page.',
+    "Read a job with another tenant's header: it comes back. Read a job with a failed chunk: it says done. Read a two-hour recording: segments stop at 100, out of order, and `next_cursor` is always null.",
+    'The lookup is by id alone; `status` tests whether any segment exists; the segments are served in the order chunks were saved; the page is always the first `PAGE_SIZE`, and the completed count comes from a ledger that expires.',
+    'Answer 404 when `job["tenant"] != tenant`; take `done` from `job["status"] == "done"` (then `completed_chunks = total_chunks`); sort by `start_ms`; slice from `?cursor=` and return `str(end)` as `next_cursor` while segments remain.',
   ],
-  debrief: `Each fix is a proof the endpoint can make. Identity: the tenant predicate in the query means a foreign id and a missing id take the same path and get the same 404, so the response carries no information about jobs the caller does not own. Completion: status is derived from the chunk-progress counters rather than from the rows, because rows only prove that some chunks finished; \`partial\` with the segments so far is the truthful answer for a stalled job. Reachability: a keyset cursor over \`seq\` costs one indexed seek per page, is stable under concurrent writes, and says \`next_cursor\` only while rows remain. Production read paths sign the cursor so callers cannot forge positions, and reconcile the chunk counters against provider usage before certifying \`done\`.`,
+  debrief: `Each flaw is the read claiming more than it knows. A segment proves that some chunk finished, not that all of them did, so \`done\` comes from the one record step 2 writes when the last chunk lands, which also outlives the ledger's 24 hours. The tenant check returns the same 404 as a missing id, because a different answer would let anyone probe which job ids exist. Sorting by \`start_ms\` puts back the order the speakers used, since chunks finish in whatever order the workers free up, and the cursor makes four hours of audio reachable a page at a time. Production read paths encode the cursor as an opaque token, list failed chunk indexes for a retry button, and cache a finished transcript, since it no longer changes.`,
 };

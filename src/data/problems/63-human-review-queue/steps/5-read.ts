@@ -2,231 +2,199 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/review/queues/{p}: depth and age that an operator can act on',
+  title: 'GET /v1/review/queues/{tenant}/{priority}: numbers an operator can staff from',
   concept: 'http',
   file: 'read',
-  focus: ['console', 'queue', 'items'],
+  focus: ['console', 'queue', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/review/queues/{priority}\`: it reads the tenant
-header, looks the priority up in an in-process \`depth_cache\` dict and returns \`priority\`,
-\`depth\` and a constant \`sla_breaches: 0\`. It compiles, serves the demo and hides 5 flaws.
+**Starting point.** The starter serves \`GET /v1/review/queues/{tenant}/{priority}\` from the review
+store (\`review.store\`, provided): \`depth\` is \`store.enqueued_total(tenant, priority)\`,
+\`oldest_age_seconds\` is the age of the last item in \`store.queued(tenant, priority)\`, and
+\`sla_breaches\` counts the queued items whose \`breached\` field is \`"1"\`. It answers any caller.
+The dashboard renders; it hides 4 flaws.
 
-**Failure mode the checks target.** After a batch of lease expiries the sweeper returns items to the
-store that the cache does not count, so the operator staffing the queue under-counts exactly when it
-is under stress; nobody sees how long the oldest item has waited or how much work is stuck assigned;
-and one tenant can read another's review backlog.
+**Failure mode the checks target.** The queue drains and the depth keeps climbing; the oldest item
+has waited an hour and the age says a minute; a p1 item that sat untouched past its SLA is not a
+breach because nobody reclaimed it; one tenant reads another's backlog.
 
-- **Depth per priority, from the item store.** \`queue_depth(tenant, priority)\` asks
-  \`store.count(tenant, priority, "queued")\`, which includes items the sweeper returned.
-- **Oldest age, always reported.** \`oldest_age(tenant, priority)\` returns the oldest queued item's
-  age in seconds, or \`null\` when empty; never omitted, never \`-1\`.
-- **SLA breach count** as \`breach_count\`.
-- **Assignment state distribution** as \`assignment_states\`: counts of \`queued\`, \`assigned\` and
-  \`breached\`.
-- **Tenant scope.** The caller's \`X-Tenant-Id\` owns the queue; asking for another tenant's queue
-  (\`?tenant=…\` different from the header) is **403**. A missing header is **401**.`,
+- \`depth\` is the number of items in the queue now.
+- \`oldest_age_seconds\` is now minus the smallest \`enqueued_at\` in the queue (\`null\` when empty);
+  a reclaimed item can sit behind newer ones.
+- \`sla_breaches\` counts queued items whose \`sla_deadline\` has passed.
+- \`X-Tenant-Id\` must name the path's tenant: missing is **401**, another tenant **403**.`,
   sequence: {
-    participants: ['Operator', 'Review Queue', 'Item store'],
+    participants: ['Operator', 'Review Queue', 'Review store'],
     messages: [
-      {from: 'Operator', to: 'Review Queue', label: 'GET /v1/review/queues/{p} · X-Tenant-Id', kind: 'sync'},
-      {from: 'Review Queue', to: 'Review Queue', label: 'tenant owns the queue? else 403', kind: 'sync'},
-      {from: 'Review Queue', to: 'Item store', label: 'count(tenant, priority, "queued")', kind: 'sync'},
-      {from: 'Review Queue', to: 'Item store', label: 'oldest · breach count · states', kind: 'sync'},
-      {from: 'Item store', to: 'Review Queue', label: 'depth · age · breaches · states', kind: 'reply'},
-      {
-        from: 'Review Queue',
-        to: 'Operator',
-        label: '200 {depth, oldest_age_seconds, breach_count, assignment_states}',
-        kind: 'reply',
-      },
+      {from: 'Operator', to: 'Review Queue', label: 'GET /v1/review/queues/t1/p1 · X-Tenant-Id', kind: 'sync'},
+      {from: 'Review Queue', to: 'Review Queue', label: 'caller owns t1? else 401 / 403', kind: 'sync'},
+      {from: 'Review Queue', to: 'Review store', label: 'queued(t1, p1)', kind: 'sync'},
+      {from: 'Review store', to: 'Review Queue', label: 'items · enqueued_at · sla_deadline', kind: 'reply'},
+      {from: 'Review Queue', to: 'Operator', label: '200 {depth, oldest_age_seconds, sla_breaches}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'depth',
-      title: 'Depth comes from the item store',
+      title: 'Depth is what is in the queue now',
       detail:
-        '`queue_depth` counts queued items through `store.count(tenant, priority, "queued")`, so lease-expiry returns are included. The starter reads a cached counter.',
+        '`depth` counts the items `queued` returns; the starter reports the billing counter `enqueued_total`, which only ever grows.',
       match: {
-        python: {all: [/def queue_depth\(/, /store\.count\(/]},
-        typescript: {all: [/function queueDepth\(/, /store\.count\(/]},
-        go: {all: [/func queueDepth\(/, /store\.Count\(/]},
-        scala: {all: [/def queueDepth\(/, /store\.count\(/]},
-        cpp: {all: [/queueDepth\(/, /store\.count\(/]},
+        python: {all: [/len\(items\)/], none: [/enqueued_total/]},
+        typescript: {all: [/items\.length/], none: [/enqueuedTotal/]},
+        go: {all: [/len\(items\)/], none: [/EnqueuedTotal/]},
+        scala: {all: [/items\.(size|length)/], none: [/enqueuedTotal/]},
+        cpp: {all: [/items\.size\(\)/], none: [/enqueuedTotal/]},
       },
     },
     {
       id: 'oldest-age',
-      title: 'The oldest age is always reported',
+      title: 'The oldest age is the oldest item',
       detail:
-        '`oldest_age` reports the age of the oldest queued item (or `null` for an empty queue) in the response. The starter hides it.',
+        '`oldest_age_seconds` is measured from the smallest `enqueued_at` in the queue, `null` when it is empty; the starter measures the last item in the list, the newest.',
       match: {
-        python: {all: [/def oldest_age\(/]},
-        typescript: {all: [/function oldestAge\(/]},
-        go: {all: [/func oldestAge\(/]},
-        scala: {all: [/def oldestAge\(/]},
-        cpp: {all: [/oldestAge\(/]},
+        python: {all: [/min\(/, /enqueued_at/], none: [/items\[-1\]/]},
+        typescript: {
+          all: [/Math\.min\(|\.reduce\(/, /enqueued_at/],
+          none: [/items\[items\.length - 1\]|items\.at\(-1\)/],
+        },
+        go: {all: [/enqueued_at/, /<\s*oldest|oldest\s*>/], none: [/items\[len\(items\)\s*-\s*1\]/]},
+        scala: {all: [/\.min\b|minOption/, /enqueued_at/], none: [/items\.last/]},
+        cpp: {all: [/std::min/, /enqueued_at/], none: [/items\.back\(\)/]},
       },
     },
     {
-      id: 'breach-count',
-      title: 'Reports the SLA breach count',
-      detail: 'The response carries `breach_count` for the queue. The starter reports zero always.',
-      match: {
-        python: {all: [/breach_count/]},
-        typescript: {all: [/breachCount/]},
-        go: {all: [/BreachCount/]},
-        scala: {all: [/breachCount/]},
-        cpp: {all: [/breach_count/]},
-      },
-    },
-    {
-      id: 'distribution',
-      title: 'Reports the assignment state distribution',
+      id: 'sla-breaches',
+      title: 'A breach is a deadline passed, marked or not',
       detail:
-        'The response carries `assignment_states` (queued / assigned / breached). The starter reports nothing about assignment.',
+        '`sla_breaches` counts queued items whose `sla_deadline` is past; the starter counts only items `reclaim_expired` marked, missing every item that breached while waiting.',
       match: {
-        python: {all: [/assignment_states/]},
-        typescript: {all: [/assignmentStates/]},
-        go: {all: [/AssignmentStates/]},
-        scala: {all: [/assignmentStates/]},
-        cpp: {all: [/assignment_states/]},
+        python: {all: [/sla_deadline/], none: [/\[["']breached["']\]\s*==/]},
+        typescript: {all: [/sla_deadline/], none: [/\.breached\s*===/]},
+        go: {all: [/sla_deadline/], none: [/\["breached"\]\s*==/]},
+        scala: {all: [/sla_deadline/], none: [/\("breached"\)\s*==/]},
+        cpp: {all: [/sla_deadline/], none: [/at\("breached"\)\s*==/]},
       },
     },
     {
       id: 'tenant-scope',
-      title: 'Foreign queues are forbidden',
-      detail: 'A queue read for another tenant is **403**. The starter serves any tenant’s queue.',
+      title: 'Only the tenant reads its queue',
+      detail:
+        "A missing `X-Tenant-Id` is **401** and one that does not name the path's tenant **403**; the starter serves any caller.",
       match: {
-        python: {all: [/status_code\s*=\s*403/]},
-        typescript: {all: [/code\(\s*403\s*\)/]},
-        go: {all: [/StatusForbidden/]},
-        scala: {all: [/StatusCodes\.Forbidden/]},
-        cpp: {all: [/\b403\b/]},
+        python: {all: [/x-tenant-id/i, /\b401\b/, /\b403\b/]},
+        typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
+        go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/]},
+        scala: {all: [/X-Tenant-Id/i, /Unauthorized/, /Forbidden/]},
+        cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /\b403\b/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `from fastapi import FastAPI, Header
+      starter: `import time
+
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from review import store  # queued, enqueued_total
 
 app = FastAPI()
 
-depth_cache = {"p1": 12, "p2": 40, "p3": 3}
 
-
-@app.get("/v1/review/queues/{priority}")
-def read_queue(
-    priority: str,
-    tenant: str = Header(alias="X-Tenant-Id"),
-) -> JSONResponse:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+@app.get("/v1/review/queues/{tenant}/{priority}")
+def queue_stats(tenant: str, priority: str, request: Request) -> JSONResponse:
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    now = int(time.time())
+    items = store.queued(tenant, priority)
     return JSONResponse(
         {
+            "tenant": tenant,
             "priority": priority,
-            "depth": depth_cache.get(priority, 0),
-            "sla_breaches": 0,
+            "depth": store.enqueued_total(tenant, priority),
+            "oldest_age_seconds": now - int(items[-1]["enqueued_at"]) if items else None,
+            "sla_breaches": sum(1 for item in items if item["breached"] == "1"),
         }
     )
 `,
       solution: `import time
 
-from fastapi import FastAPI, Header, Query
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from review import store  # queued, enqueued_total
 
 app = FastAPI()
 
-PRIORITIES = ["p1", "p2", "p3"]
 
-
-def queue_depth(tenant: str, priority: str) -> int:
-    """Queued items for this tenant and priority, straight from the item store."""
-    return store.count(tenant, priority, "queued")
-
-
-def oldest_age(tenant: str, priority: str):
-    """Age in seconds of the oldest queued item, or None when the queue is empty."""
-    oldest = store.oldest_queued_at(tenant, priority)
-    if oldest is None:
-        return None
-    return max(0, int(time.time() - oldest))
-
-
-@app.get("/v1/review/queues/{priority}")
-def read_queue(
-    priority: str,
-    tenant: str = Header(alias="X-Tenant-Id"),
-    requested: str | None = Query(default=None, alias="tenant"),
-) -> JSONResponse:
-    if requested is not None and requested != tenant:
-        return JSONResponse({"error": "forbidden"}, status_code=403)
-    if priority not in PRIORITIES:
-        return JSONResponse({"error": "unknown priority"}, status_code=400)
+@app.get("/v1/review/queues/{tenant}/{priority}")
+def queue_stats(tenant: str, priority: str, request: Request) -> JSONResponse:
+    caller = request.headers.get("x-tenant-id", "")
+    if not caller:
+        return JSONResponse({"error": "X-Tenant-Id is required"}, status_code=401)
+    if caller != tenant:
+        return JSONResponse({"error": "not your queue"}, status_code=403)
+    now = int(time.time())
+    # Everything comes from the queue as it is now.
+    items = store.queued(tenant, priority)
+    oldest = min((int(item["enqueued_at"]) for item in items), default=None)
     return JSONResponse(
         {
+            "tenant": tenant,
             "priority": priority,
-            "depth": queue_depth(tenant, priority),
-            "oldest_age_seconds": oldest_age(tenant, priority),
-            "breach_count": store.count(tenant, priority, "breached"),
-            "assignment_states": store.assignment_states(tenant, priority),
+            "depth": len(items),
+            "oldest_age_seconds": None if oldest is None else now - oldest,
+            # A breach is a deadline that passed, whether or not a sweep has marked it yet.
+            "sla_breaches": sum(1 for item in items if now >= int(item["sla_deadline"])),
         }
     )
 `,
     },
     typescript: {
-      starter: `/** GET /v1/review/queues/{p}. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {enqueuedTotal, queued} from 'review/store';
 
 export const app = Fastify();
 
-const depthCache: Record<string, number> = {p1: 12, p2: 40, p3: 3};
-
-app.get('/v1/review/queues/:priority', async (request, reply) => {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const priority = request.params['priority'];
-  return reply.code(200).send({priority, depth: depthCache[priority] ?? 0, sla_breaches: 0});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** GET /v1/review/queues/{p}: depth, oldest age, breaches and states, scoped to the tenant. */
-import Fastify from 'fastify';
-
-export const app = Fastify();
-
-const PRIORITIES = ['p1', 'p2', 'p3'];
-
-function queueDepth(tenant: string, priority: string): number {
-  const queued = store.count(tenant, priority, 'queued');
-  return queued;
-}
-
-function oldestAge(tenant: string, priority: string): number | null {
-  const oldest = store.oldestQueuedAt(tenant, priority);
-  if (oldest === null) return null;
-  return Math.max(0, Math.round(Date.now() / 1000 - oldest));
-}
-
-app.get('/v1/review/queues/:priority', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const requested = request.query['tenant'];
-  if (typeof requested === 'string' && requested !== tenant)
-    return reply.code(403).send({error: 'forbidden'});
-  const priority = request.params['priority'];
-  if (!PRIORITIES.includes(priority)) return reply.code(400).send({error: 'unknown priority'});
-  return reply.code(200).send({
+app.get('/v1/review/queues/:tenant/:priority', async request => {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const {tenant, priority} = request.params as {tenant: string; priority: string};
+  const now = Math.floor(Date.now() / 1000);
+  const items = await queued(tenant, priority);
+  return {
+    tenant,
     priority,
-    depth: queueDepth(tenant, priority),
-    oldest_age_seconds: oldestAge(tenant, priority),
-    breachCount: store.count(tenant, priority, 'breached'),
-    assignmentStates: store.assignmentStates(tenant, priority),
-  });
+    depth: await enqueuedTotal(tenant, priority),
+    oldest_age_seconds: items.length > 0 ? now - Number(items[items.length - 1].enqueued_at) : null,
+    sla_breaches: items.filter(item => item.breached === '1').length,
+  };
 });
+`,
+      solution: `import Fastify from 'fastify';
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+import {queued} from 'review/store';
+
+export const app = Fastify();
+
+app.get('/v1/review/queues/:tenant/:priority', async (request, reply) => {
+  const {tenant, priority} = request.params as {tenant: string; priority: string};
+  const caller = request.headers['x-tenant-id'];
+  if (typeof caller !== 'string' || caller === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  if (caller !== tenant) return reply.code(403).send({error: 'not your queue'});
+  const now = Math.floor(Date.now() / 1000);
+  // Everything comes from the queue as it is now.
+  const items = await queued(tenant, priority);
+  const oldest = items.length > 0 ? Math.min(...items.map(item => Number(item.enqueued_at))) : null;
+  return {
+    tenant,
+    priority,
+    depth: items.length,
+    oldest_age_seconds: oldest === null ? null : now - oldest,
+    // A breach is a deadline that passed, whether or not a sweep has marked it yet.
+    sla_breaches: items.filter(item => now >= Number(item.sla_deadline)).length,
+  };
+});
 `,
     },
     go: {
@@ -234,149 +202,152 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+	"strconv"
+	"time"
+
+	"review/store" // store.Queued, EnqueuedTotal
 )
 
-var depthCache = map[string]int{"p1": 12, "p2": 40, "p3": 3}
-
-func readQueue(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	priority := r.PathValue("priority")
-	body := map[string]any{
-		"priority":     priority,
-		"depth":        depthCache[priority],
-		"sla_breaches": 0,
-		"tenant":       tenant,
-	}
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(body)
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/review/queues/{priority}", readQueue)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func queueStats(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	tenant, priority := r.PathValue("tenant"), r.PathValue("priority")
+	now := time.Now().Unix()
+	items := store.Queued(r.Context(), tenant, priority)
+	stats := map[string]any{"tenant": tenant, "priority": priority, "depth": store.EnqueuedTotal(r.Context(), tenant, priority), "oldest_age_seconds": nil}
+	if len(items) > 0 {
+		newest, _ := strconv.ParseInt(items[len(items)-1]["enqueued_at"], 10, 64)
+		stats["oldest_age_seconds"] = now - newest
+	}
+	breaches := 0
+	for _, item := range items {
+		if item["breached"] == "1" {
+			breaches++
+		}
+	}
+	stats["sla_breaches"] = breaches
+	writeJSON(rw, http.StatusOK, stats)
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/review/queues/{tenant}/{priority}", queueStats)
 }
 `,
       solution: `package main
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+	"strconv"
 	"time"
+
+	"review/store" // store.Queued, EnqueuedTotal
 )
 
-var priorities = map[string]bool{"p1": true, "p2": true, "p3": true}
-
-func queueDepth(tenant, priority string) int {
-	depth, _ := store.Count(tenant, priority, "queued")
-	return depth
-}
-
-func oldestAge(tenant, priority string) any {
-	oldest, ok := store.OldestQueuedAt(tenant, priority)
-	if !ok {
-		return nil
-	}
-	age := time.Now().Unix() - oldest
-	if age < 0 {
-		age = 0
-	}
-	return age
-}
-
-func readQueue(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		rw.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-	requested := r.URL.Query().Get("tenant")
-	if requested != "" && requested != tenant {
-		rw.WriteHeader(http.StatusForbidden)
-		return
-	}
-	priority := r.PathValue("priority")
-	if !priorities[priority] {
-		rw.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	breaches, _ := store.Count(tenant, priority, "breached")
-	states, _ := store.AssignmentStates(tenant, priority)
-	body := map[string]any{
-		"priority":           priority,
-		"depth":              queueDepth(tenant, priority),
-		"oldest_age_seconds": oldestAge(tenant, priority),
-		"BreachCount":        breaches,
-		"AssignmentStates":   states,
-	}
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(body)
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/review/queues/{priority}", readQueue)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func queueStats(rw http.ResponseWriter, r *http.Request) {
+	tenant, priority := r.PathValue("tenant"), r.PathValue("priority")
+	caller := r.Header.Get("X-Tenant-Id")
+	if caller == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
+		return
+	}
+	if caller != tenant {
+		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "not your queue"})
+		return
+	}
+	now := time.Now().Unix()
+	// Everything comes from the queue as it is now.
+	items := store.Queued(r.Context(), tenant, priority)
+	stats := map[string]any{"tenant": tenant, "priority": priority, "depth": len(items), "oldest_age_seconds": nil}
+	breaches := 0
+	var oldest int64
+	for i, item := range items {
+		enqueuedAt, _ := strconv.ParseInt(item["enqueued_at"], 10, 64)
+		if i == 0 || enqueuedAt < oldest {
+			oldest = enqueuedAt
+		}
+		// A breach is a deadline that passed, whether or not a sweep has marked it yet.
+		if deadline, _ := strconv.ParseInt(item["sla_deadline"], 10, 64); now >= deadline {
+			breaches++
+		}
+	}
+	if len(items) > 0 {
+		stats["oldest_age_seconds"] = now - oldest
+	}
+	stats["sla_breaches"] = breaches
+	writeJSON(rw, http.StatusOK, stats)
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/review/queues/{tenant}/{priority}", queueStats)
 }
 `,
     },
     scala: {
-      starter: `import akka.http.scaladsl.model.StatusCodes
-import akka.http.scaladsl.server.Route
-import akka.http.scaladsl.server.Directives._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
+import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-object Api {
-  val DepthCache: Map[String, Int] = Map("p1" -> 12, "p2" -> 40, "p3" -> 3)
+import review.Store // Store.queued, enqueuedTotal
 
-  def route: Route =
-    path("v1" / "review" / "queues" / Segment) { priority =>
+object Read {
+  val route: Route =
+    path("v1" / "review" / "queues" / Segment / Segment) { (tenant, priority) =>
       get {
-        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-        headerValueByName("X-Tenant-Id") { _ =>
-          val body = s"""{"priority":"$priority","depth":\${DepthCache.getOrElse(priority, 0)},"sla_breaches":0}"""
-          complete(StatusCodes.OK, body)
-        }
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+        val now = java.time.Instant.now.getEpochSecond
+        val items = Store.queued(tenant, priority)
+        val stats = JsObject(
+          "tenant" -> JsString(tenant),
+          "priority" -> JsString(priority),
+          "depth" -> JsNumber(Store.enqueuedTotal(tenant, priority)),
+          "oldest_age_seconds" -> (if (items.isEmpty) JsNull else JsNumber(now - items.last("enqueued_at").toLong)),
+          "sla_breaches" -> JsNumber(items.count(item => item("breached") == "1")))
+        complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, stats.compactPrint)))
       }
     }
 }
 `,
-      solution: `import akka.http.scaladsl.model.StatusCodes
-import akka.http.scaladsl.server.Route
-import akka.http.scaladsl.server.Directives._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
+import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-object Api {
-  val Priorities: Seq[String] = Seq("p1", "p2", "p3")
+import review.Store // Store.queued, enqueuedTotal
 
-  def queueDepth(tenant: String, priority: String): Int = {
-    store.count(tenant, priority, "queued")
-  }
-
-  def oldestAge(tenant: String, priority: String): String = {
-    store.oldestQueuedAt(tenant, priority) match {
-      case None      => "null"
-      case Some(ts)  => math.max(0L, System.currentTimeMillis() / 1000 - ts).toString
-    }
-  }
-
-  def route: Route =
-    path("v1" / "review" / "queues" / Segment) { priority =>
+object Read {
+  val route: Route =
+    path("v1" / "review" / "queues" / Segment / Segment) { (tenant, priority) =>
       get {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          parameter("tenant".?) { requested =>
-            if (requested.exists(_ != tenant)) {
-              complete(StatusCodes.Forbidden, "forbidden")
-            } else if (!Priorities.contains(priority)) {
-              complete(StatusCodes.BadRequest, "unknown priority")
-            } else {
-              val body =
-                s"""{"priority":"$priority","depth":\${queueDepth(tenant, priority)},"oldest_age_seconds":\${oldestAge(tenant, priority)},"breachCount":\${store.count(tenant, priority, "breached")},"assignmentStates":\${store.assignmentStates(tenant, priority)}}"""
-              complete(StatusCodes.OK, body)
-            }
-          }
+        optionalHeaderValueByName("X-Tenant-Id") {
+          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+          case Some(caller) if caller != tenant => complete(StatusCodes.Forbidden -> "not your queue")
+          case Some(_) =>
+            val now = java.time.Instant.now.getEpochSecond
+            // Everything comes from the queue as it is now.
+            val items = Store.queued(tenant, priority)
+            val oldest = items.map(_("enqueued_at").toLong).minOption
+            val stats = JsObject(
+              "tenant" -> JsString(tenant),
+              "priority" -> JsString(priority),
+              "depth" -> JsNumber(items.size),
+              "oldest_age_seconds" -> oldest.map(at => JsNumber(now - at)).getOrElse(JsNull),
+              // A breach is a deadline that passed, whether or not a sweep has marked it yet.
+              "sla_breaches" -> JsNumber(items.count(item => now >= item("sla_deadline").toLong)))
+            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, stats.compactPrint)))
         }
       }
     }
@@ -384,88 +355,376 @@ object Api {
 `,
     },
     cpp: {
-      starter: `#include <string>
-#include <map>
+      starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
+
+#include <string>
+
+#include "review/store.h"  // store::queued, enqueuedTotal, nowSeconds
 
 using json = nlohmann::json;
 
-const std::map<std::string, int> depth_cache = {{"p1", 12}, {"p2", 40}, {"p3", 3}};
+void queue_stats(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.matches[1];
+  const std::string priority = req.matches[2];
+  const long long now = store::nowSeconds();
+  const auto items = store::queued(tenant, priority);
+  int breaches = 0;
+  for (const auto& item : items) {
+    if (item.at("breached") == "1") breaches++;
+  }
+  const json stats = {{"tenant", tenant},
+                      {"priority", priority},
+                      {"depth", store::enqueuedTotal(tenant, priority)},
+                      {"oldest_age_seconds", items.empty() ? json(nullptr) : json(now - std::stoll(items.back().at("enqueued_at")))},
+                      {"sla_breaches", breaches}};
+  res.set_content(stats.dump(), "application/json");
+}
 
-int main() {
-  httplib::Server svr;
-  svr.Get("/v1/review/queues/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    auto priority = req.matches[1].str();
-    auto it = depth_cache.find(priority);
-    json body = {
-        {"priority", priority},
-        {"depth", it == depth_cache.end() ? 0 : it->second},
-        {"sla_breaches", 0},
-    };
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/review/queues/([\\w-]+)/([\\w-]+))", queue_stats);
 }
 `,
-      solution: `#include <string>
-#include <vector>
-#include <algorithm>
-#include <chrono>
+      solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <string>
+
+#include "review/store.h"  // store::queued, enqueuedTotal, nowSeconds
 
 using json = nlohmann::json;
 
-const std::vector<std::string> kPriorities = {"p1", "p2", "p3"};
-
-int queueDepth(const std::string& tenant, const std::string& priority) {
-  auto depth = store.count(tenant, priority, "queued");
-  return depth;
+void queue_stats(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.matches[1];
+  const std::string priority = req.matches[2];
+  const std::string caller = req.get_header_value("X-Tenant-Id");
+  if (caller.empty() || caller != tenant) {
+    res.status = caller.empty() ? 401 : 403;
+    res.set_content(json{{"error", caller.empty() ? "X-Tenant-Id is required" : "not your queue"}}.dump(), "application/json");
+    return;
+  }
+  const long long now = store::nowSeconds();
+  // Everything comes from the queue as it is now.
+  const auto items = store::queued(tenant, priority);
+  int breaches = 0;
+  long long oldest = now;
+  for (const auto& item : items) {
+    oldest = std::min(oldest, std::stoll(item.at("enqueued_at")));
+    // A breach is a deadline that passed, whether or not a sweep has marked it yet.
+    if (now >= std::stoll(item.at("sla_deadline"))) breaches++;
+  }
+  const json stats = {{"tenant", tenant},
+                      {"priority", priority},
+                      {"depth", items.size()},
+                      {"oldest_age_seconds", items.empty() ? json(nullptr) : json(now - oldest)},
+                      {"sla_breaches", breaches}};
+  res.set_content(stats.dump(), "application/json");
 }
 
-json oldestAge(const std::string& tenant, const std::string& priority) {
-  long oldest = store.oldestQueuedAt(tenant, priority);
-  if (oldest < 0) return json(nullptr);
-  long now = std::chrono::system_clock::now().time_since_epoch().count() / 1000000000;
-  return json(std::max(0L, now - oldest));
-}
-
-int main() {
-  httplib::Server svr;
-  svr.Get("/v1/review/queues/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
-    auto tenant = req.get_header_value("X-Tenant-Id");
-    auto requested = req.get_param_value("tenant");
-    if (!requested.empty() && requested != tenant) {
-      res.status = 403;
-      res.set_content(R"({"error":"forbidden"})", "application/json");
-      return;
-    }
-    auto priority = req.matches[1].str();
-    if (std::find(kPriorities.begin(), kPriorities.end(), priority) == kPriorities.end()) {
-      res.status = 400;
-      res.set_content(R"({"error":"unknown priority"})", "application/json");
-      return;
-    }
-    json body = {
-        {"priority", priority},
-        {"depth", queueDepth(tenant, priority)},
-        {"oldest_age_seconds", oldestAge(tenant, priority)},
-        {"breach_count", store.count(tenant, priority, "breached")},
-        {"assignment_states", store.assignmentStates(tenant, priority)},
-    };
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/review/queues/([\\w-]+)/([\\w-]+))", queue_stats);
 }
 `,
     },
   },
+  harness: {
+    python: `from review import store
+
+QUEUE = "review:queue:t1:p1"
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+def _enqueue(tenant, n, priority="p1"):
+    store.create_item({"item_id": f"r-{n}", "tenant": tenant, "source_type": "guardrail_block", "source_id": f"s-{n}", "priority": priority, "payload_ref": f"blob://{n}"})
+
+
+async def _stats(c, tenant="t1", priority="p1", caller="t1"):
+    headers = {} if caller is None else {"X-Tenant-Id": caller}
+    r = await c.get(f"/v1/review/queues/{tenant}/{priority}", headers=headers)
+    return r
+
+
+async def _ok(c, priority="p1"):
+    r = await _stats(c, priority=priority)
+    assert r.status_code == 200, f"GET /v1/review/queues/t1/{priority} as t1 answered {r.status_code}: {r.text}"
+    return r.json()
+
+
+async def check_depth(ctx):
+    for n in (1, 2, 3):
+        _enqueue("t1", n)
+    ctx.redis.lpop(QUEUE)  # a reviewer took r-1
+    async with _api(ctx) as c:
+        body = await _ok(c)
+        assert body.get("depth") == 2, f"three items were enqueued and a reviewer took one, yet depth is {body.get('depth')}: depth is what is in the queue now, not every enqueue since the start"
+        empty = await _ok(c, "p2")
+    assert empty.get("depth") == 0, f"an empty p2 queue reports depth {empty.get('depth')}"
+
+
+async def check_oldest_age(ctx):
+    _enqueue("t1", 1)
+    ctx.clock.advance(100)
+    _enqueue("t1", 2)
+    ctx.clock.advance(150)
+    async with _api(ctx) as c:
+        body = await _ok(c)
+        assert body.get("oldest_age_seconds") == 250, f"r-1 has waited 250 s and r-2 150 s, yet oldest_age_seconds is {body.get('oldest_age_seconds')}: measure the oldest item, not the newest"
+        ctx.redis.lpop(QUEUE)
+        ctx.redis.rpush(QUEUE, "r-1")  # r-1 was taken, abandoned and reclaimed behind r-2
+        body = await _ok(c)
+        assert body.get("oldest_age_seconds") == 250, f"r-1 came back behind r-2 and has still waited 250 s, yet oldest_age_seconds is {body.get('oldest_age_seconds')}: the oldest item is not always at either end of the list"
+        empty = await _ok(c, "p2")
+    assert "oldest_age_seconds" in empty and empty["oldest_age_seconds"] is None, f"an empty queue must report oldest_age_seconds null, got {empty}"
+
+
+async def check_sla_breaches(ctx):
+    _enqueue("t1", 1)
+    ctx.clock.advance(400)  # r-1 sat untouched past its 300 s SLA; no sweep marked it
+    _enqueue("t1", 2)
+    async with _api(ctx) as c:
+        body = await _ok(c)
+    assert body.get("sla_breaches") == 1, f"r-1 has waited 400 s against a 300 s SLA, yet sla_breaches is {body.get('sla_breaches')}: a breach is a deadline passed, whether or not reclaim_expired marked it"
+
+
+async def check_tenant_scope(ctx):
+    _enqueue("t2", 1)
+    async with _api(ctx) as c:
+        foreign = await _stats(c, tenant="t2", caller="t1")
+        assert foreign.status_code == 403, f"tenant t1 read t2's queue and got {foreign.status_code}: {foreign.text}. Another tenant's backlog is 403"
+        anonymous = await _stats(c, tenant="t2", caller=None)
+        assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+        own = await _stats(c, tenant="t2", caller="t2")
+    assert own.status_code == 200, f"t2 reading its own queue answered {own.status_code}: {own.text}"
+`,
+    typescript: `const QUEUE = 'review:queue:t1:p1';
+
+function api(ctx) {
+  return {c: ctx.client(ctx.load('read').app), store: ctx.load('/support/review/store.ts')};
+}
+
+const enqueue = (store, tenant: string, n: number, priority = 'p1') =>
+  store.createItem({item_id: \`r-\${n}\`, tenant, source_type: 'guardrail_block', source_id: \`s-\${n}\`, priority, payload_ref: \`blob://\${n}\`});
+
+function stats(c, tenant = 't1', priority = 'p1', caller: string | null = 't1') {
+  return c.get(\`/v1/review/queues/\${tenant}/\${priority}\`, {headers: caller === null ? {} : {'X-Tenant-Id': caller}});
+}
+
+async function ok(c, priority = 'p1') {
+  const r = await stats(c, 't1', priority);
+  assert.equal(r.status, 200, \`GET /v1/review/queues/t1/\${priority} as t1 answered \${r.status}: \${r.text}\`);
+  return r.json();
+}
+
+export async function check_depth(ctx) {
+  const {c, store} = api(ctx);
+  for (const n of [1, 2, 3]) await enqueue(store, 't1', n);
+  ctx.redis.lpop(QUEUE); // a reviewer took r-1
+  const body = await ok(c);
+  assert.equal(body.depth, 2, \`three items were enqueued and a reviewer took one, yet depth is \${body.depth}: depth is what is in the queue now, not every enqueue since the start\`);
+  assert.equal((await ok(c, 'p2')).depth, 0, 'an empty p2 queue must report depth 0');
+}
+
+export async function check_oldest_age(ctx) {
+  const {c, store} = api(ctx);
+  await enqueue(store, 't1', 1);
+  ctx.clock.advance(100);
+  await enqueue(store, 't1', 2);
+  ctx.clock.advance(150);
+  let body = await ok(c);
+  assert.equal(body.oldest_age_seconds, 250, \`r-1 has waited 250 s and r-2 150 s, yet oldest_age_seconds is \${body.oldest_age_seconds}: measure the oldest item, not the newest\`);
+  ctx.redis.lpop(QUEUE);
+  ctx.redis.rpush(QUEUE, 'r-1'); // r-1 was taken, abandoned and reclaimed behind r-2
+  body = await ok(c);
+  assert.equal(body.oldest_age_seconds, 250, \`r-1 came back behind r-2 and has still waited 250 s, yet oldest_age_seconds is \${body.oldest_age_seconds}: the oldest item is not always at either end of the list\`);
+  const empty = await ok(c, 'p2');
+  assert('oldest_age_seconds' in empty && empty.oldest_age_seconds === null, \`an empty queue must report oldest_age_seconds null, got \${JSON.stringify(empty)}\`);
+}
+
+export async function check_sla_breaches(ctx) {
+  const {c, store} = api(ctx);
+  await enqueue(store, 't1', 1);
+  ctx.clock.advance(400); // r-1 sat untouched past its 300 s SLA; no sweep marked it
+  await enqueue(store, 't1', 2);
+  const body = await ok(c);
+  assert.equal(body.sla_breaches, 1, \`r-1 has waited 400 s against a 300 s SLA, yet sla_breaches is \${body.sla_breaches}: a breach is a deadline passed, whether or not reclaimExpired marked it\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c, store} = api(ctx);
+  await enqueue(store, 't2', 1);
+  const foreign = await stats(c, 't2', 'p1', 't1');
+  assert.equal(foreign.status, 403, \`tenant t1 read t2's queue and got \${foreign.status}: \${foreign.text}. Another tenant's backlog is 403\`);
+  const anonymous = await stats(c, 't2', 'p1', null);
+  assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  const own = await stats(c, 't2', 'p1', 't2');
+  assert.equal(own.status, 200, \`t2 reading its own queue answered \${own.status}: \${own.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"review/store"
+
+	"leetbuild/harness"
+)
+
+const queue = "review:queue:t1:p1"
+
+var readBg = context.Background()
+
+func enqueueItem(tenant string, n int) {
+	store.CreateItem(readBg, map[string]string{
+		"item_id": fmt.Sprintf("r-%d", n), "tenant": tenant, "source_type": "guardrail_block",
+		"source_id": fmt.Sprintf("s-%d", n), "priority": "p1", "payload_ref": fmt.Sprintf("blob://%d", n),
+	})
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func ok(ctx *harness.Ctx, c *harness.HTTP, priority string) map[string]any {
+	r := c.Get("/v1/review/queues/t1/"+priority, "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 200, "GET /v1/review/queues/t1/%s as t1 (%s)", priority, r.Text())
+	var body map[string]any
+	r.Decode(&body)
+	return body
+}
+
+func CheckDepth(ctx *harness.Ctx) {
+	for _, n := range []int{1, 2, 3} {
+		enqueueItem("t1", n)
+	}
+	ctx.Redis.Do("LPOP", queue) // a reviewer took r-1
+	c := api(ctx)
+	ctx.Equal(ok(ctx, c, "p1")["depth"], 2, "three items were enqueued and a reviewer took one: depth is what is in the queue now, not every enqueue since the start; the depth")
+	ctx.Equal(ok(ctx, c, "p2")["depth"], 0, "an empty p2 queue's depth")
+}
+
+func CheckOldestAge(ctx *harness.Ctx) {
+	enqueueItem("t1", 1)
+	ctx.Clock.Advance(100)
+	enqueueItem("t1", 2)
+	ctx.Clock.Advance(150)
+	c := api(ctx)
+	ctx.Equal(ok(ctx, c, "p1")["oldest_age_seconds"], 250, "r-1 has waited 250 s and r-2 150 s: measure the oldest item, not the newest; oldest_age_seconds")
+	ctx.Redis.Do("LPOP", queue)
+	ctx.Redis.Do("RPUSH", queue, "r-1") // r-1 was taken, abandoned and reclaimed behind r-2
+	ctx.Equal(ok(ctx, c, "p1")["oldest_age_seconds"], 250, "r-1 came back behind r-2 and has still waited 250 s: the oldest item is not always at either end of the list; oldest_age_seconds")
+	empty := ok(ctx, c, "p2")
+	age, present := empty["oldest_age_seconds"]
+	ctx.Assert(present && age == nil, "an empty queue must report oldest_age_seconds null, got %v", empty)
+}
+
+func CheckSlaBreaches(ctx *harness.Ctx) {
+	enqueueItem("t1", 1)
+	ctx.Clock.Advance(400) // r-1 sat untouched past its 300 s SLA; no sweep marked it
+	enqueueItem("t1", 2)
+	ctx.Equal(ok(ctx, api(ctx), "p1")["sla_breaches"], 1, "r-1 has waited 400 s against a 300 s SLA: a breach is a deadline passed, whether or not reclaimExpired marked it; sla_breaches")
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	enqueueItem("t2", 1)
+	c := api(ctx)
+	foreign := c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "t1")
+	ctx.Equal(foreign.Status, 403, "tenant t1 reading t2's queue (%s)", foreign.Text())
+	ctx.Equal(c.Get("/v1/review/queues/t2/p1").Status, 401, "a read without X-Tenant-Id")
+	own := c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "t2")
+	ctx.Equal(own.Status, 200, "t2 reading its own queue (%s)", own.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+#include "review/store.h"
+
+using json = nlohmann::json;
+
+namespace {
+
+const std::string kQueue = "review:queue:t1:p1";
+
+void enqueueItem(const std::string& tenant, int n) {
+  const std::string id = std::to_string(n);
+  store::createItem({{"item_id", "r-" + id}, {"tenant", tenant}, {"source_type", "guardrail_block"}, {"source_id", "s-" + id}, {"priority", "p1"}, {"payload_ref", "blob://" + id}});
+}
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+json ok(harness::Ctx& ctx, harness::HTTP& c, const std::string& priority) {
+  const auto r = c.Get("/v1/review/queues/t1/" + priority, "X-Tenant-Id", "t1");
+  ctx.Equal(r.Status, 200, "GET /v1/review/queues/t1/%s as t1 (%s)", priority, r.Text());
+  const json body = json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : json::object();
+}
+
+}  // namespace
+
+void CheckDepth(harness::Ctx& ctx) {
+  for (int n : {1, 2, 3}) enqueueItem("t1", n);
+  ctx.Redis.Do("LPOP", kQueue);  // a reviewer took r-1
+  auto c = api(ctx);
+  ctx.Equal(ok(ctx, c, "p1").value("depth", -1), 2, "three items were enqueued and a reviewer took one: depth is what is in the queue now, not every enqueue since the start; the depth");
+  ctx.Equal(ok(ctx, c, "p2").value("depth", -1), 0, "an empty p2 queue's depth");
+}
+
+void CheckOldestAge(harness::Ctx& ctx) {
+  enqueueItem("t1", 1);
+  ctx.Clock.Advance(100);
+  enqueueItem("t1", 2);
+  ctx.Clock.Advance(150);
+  auto c = api(ctx);
+  ctx.Equal(ok(ctx, c, "p1").value("oldest_age_seconds", json(nullptr)), json(250), "r-1 has waited 250 s and r-2 150 s: measure the oldest item, not the newest; oldest_age_seconds");
+  ctx.Redis.Do("LPOP", kQueue);
+  ctx.Redis.Do("RPUSH", kQueue, "r-1");  // r-1 was taken, abandoned and reclaimed behind r-2
+  ctx.Equal(ok(ctx, c, "p1").value("oldest_age_seconds", json(nullptr)), json(250), "r-1 came back behind r-2 and has still waited 250 s: the oldest item is not always at either end of the list; oldest_age_seconds");
+  const json empty = ok(ctx, c, "p2");
+  ctx.Assert(empty.contains("oldest_age_seconds") && empty["oldest_age_seconds"].is_null(), "an empty queue must report oldest_age_seconds null, got %s", empty.dump());
+}
+
+void CheckSlaBreaches(harness::Ctx& ctx) {
+  enqueueItem("t1", 1);
+  ctx.Clock.Advance(400);  // r-1 sat untouched past its 300 s SLA; no sweep marked it
+  enqueueItem("t1", 2);
+  auto c = api(ctx);
+  ctx.Equal(ok(ctx, c, "p1").value("sla_breaches", -1), 1, "r-1 has waited 400 s against a 300 s SLA: a breach is a deadline passed, whether or not reclaimExpired marked it; sla_breaches");
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  enqueueItem("t2", 1);
+  auto c = api(ctx);
+  const auto foreign = c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "t1");
+  ctx.Equal(foreign.Status, 403, "tenant t1 reading t2's queue (%s)", foreign.Text());
+  ctx.Equal(c.Get("/v1/review/queues/t2/p1").Status, 401, "a read without X-Tenant-Id");
+  const auto own = c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "t2");
+  ctx.Equal(own.Status, 200, "t2 reading its own queue (%s)", own.Text());
+}
+`,
+  },
   hints: [
-    "Symptoms: after the sweeper runs, the console shows 12 queued while reviewers see 30; breaches read 0 during an incident; a tenant pastes another tenant's id into `?tenant=` and gets numbers back.",
-    'Nothing in the handler touches the item store: depth is a dict literal, breaches are a constant, there is no age and no state breakdown, and the tenant header is read but compared to nothing.',
-    'Add `queue_depth` over `store.count(tenant, priority, "queued")`, `oldest_age` returning seconds or `null`, `breach_count` and `assignment_states` from the same store, and return 403 when `?tenant=` differs from the header.',
+    "Enqueue three items, take one, and read the queue: depth says 3. Leave a p1 item alone past five minutes: the dashboard shows no breach, and the oldest age is the newest item's.",
+    "`enqueued_total` is a lifetime counter for billing, never decremented. The list's last item is the newest one, and `breached` is only written when `reclaim_expired` returns an item. Nothing compares the header to the path.",
+    'Answer 401/403 unless `X-Tenant-Id` equals the path tenant; from `store.queued` take `len(items)`, now minus `min(enqueued_at)` (`None` when empty), and the count of items with now at or past `sla_deadline`.',
   ],
-  debrief: `Every number on this page is a fact about the item store, so every number is read from it in one pass; a cached counter goes stale at the exact moment lease expiry returns items, which is when the operator most needs the real figure. The oldest age is the single most actionable value on the page, which is why it is always present rather than hidden behind a placeholder. Depth, breach count and assignment distribution come from the same read so the summary cannot disagree with itself. Tenant scope is enforced on a read path because a summary of another tenant's backlog is still a leak. Production consoles go further: per-priority SLA targets beside the age, a depth trend over time, and a drill-down that lists the items behind each number.`,
+  debrief: `An operator staffs from these three numbers, so each one has to be computed from the queue as it stands, not from something that happens to be nearby: a counter that only grows, the end of a list whose order reclaims reshuffle, a flag a sweep writes when it gets around to it. Deriving breaches from the deadline means the read and the take agree on what late means. The tenant check sits before any Redis read because a backlog's size is itself information about another customer. At scale this read uses a sorted set of queued items scored by \`enqueued_at\`, so the oldest item and the breach count are range queries instead of a scan.`,
 };

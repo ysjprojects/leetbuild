@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package sandboxd;
+
+// The container service on a sandbox node (step 3). Start runs the job's image under the isolation
+// profile the request names and answers the profile the node actually started; Kill stops a
+// container. An image the node refuses is FAILED_PRECONDITION or INVALID_ARGUMENT; a node that is
+// not there is UNAVAILABLE.
+service Containers {
+  rpc Start(StartRequest) returns (StartReply);
+  rpc Kill(KillRequest) returns (KillReply);
+}
+
+message StartRequest {
+  string job_id = 1;
+  string image = 2;
+  string profile = 3;
+}
+
+message StartReply {
+  string container_id = 1;
+  string profile = 2;
+}
+
+message KillRequest {
+  string job_id = 1;
+  string container_id = 2;
+}
+
+message KillReply {}

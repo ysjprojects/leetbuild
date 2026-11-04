@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package rerankd;
+
+// The cross-encoder step 3 calls: one unary RPC per batch of passages, with a deadline. The harness
+// serves a deterministic stand-in at reranker:9000 (rerank/model in the support modules): it scores
+// a passage by the share of the query's words it contains, answers UNAVAILABLE for a batch holding
+// a passage that starts with "brownout:", and INVALID_ARGUMENT for a batch holding an empty passage.
+service Reranker {
+  rpc Score(ScoreRequest) returns (ScoreReply);
+}
+
+message ScoreRequest {
+  string query = 1;
+  repeated string passages = 2;
+}
+
+message ScoreReply {
+  // One score per passage, in request order.
+  repeated double scores = 1;
+  string model_version = 2;
+}

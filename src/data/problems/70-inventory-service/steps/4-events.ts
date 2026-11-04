@@ -2,317 +2,271 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Stock events keyed by sku for inventory ledgers',
+  title: 'Stock movements keyed by sku, with a signed delta and an outbox',
   concept: 'kafka',
   file: 'events',
   focus: ['api', 'kafka', 'ledger', 'db'],
   task: `## Task
 
-**Starting point.** The starter publishes one event to \`inventory.event\` for every reserve,
-confirm and release: the topic, the producer and the flush are there and the demo's ledger fills up.
-It compiles, serves the demo and hides five flaws.
+**Starting point.** The starter is \`publish_movement(reservation, reason)\`, called after each reserve,
+confirm and release: it produces \`{sku, reservation_id, reason, quantity, delta}\` to
+\`inventory.event\`, keyed by the reservation id, from a producer with \`acks=1\`, with \`delta\` set to
+the quantity, and writes an outbox row if \`produce\` raises. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Keyed by order id, two orders touching one sku land on different
-partitions and the ledger consumer folds deltas out of order. A release published before the hold
-clears shows stock free while it is still blocked. A default producer can ack before replication and
-duplicate on retry, and a failed produce with no outbox is lost.
+**Failure mode the checks target.** Two reservations of one sku landing on two partitions, a ledger
+that adds the units a reservation took away, a broker that lost an acknowledgement or its leader,
+and a delivery that fails after \`produce\` returned.
 
-- The **record key is the sku** (\`key=sku\`, \`key: sku\`, \`Key: []byte(sku)\`,
-  \`ProducerRecord(topic, sku, …)\`).
-- The payload carries \`{event_id, sku, delta, reservation_id, reason, available}\` with \`reason\`
-  in \`reserved\` / \`confirmed\` / \`released\`: the signed delta and the reservation id travel
-  together, so a rebuild can attribute every movement to its reservation.
-- The producer is **durable**: \`acks=all\` (\`acks: -1\`, \`RequireAll\`) plus idempotence where the
-  stack has it (\`enable.idempotence\`, \`idempotent: true\`, or the \`kafka.Hash\` balancer for
-  kafka-go), so an ack means replicated and a retry does not duplicate a movement.
-- On the **release path** the Redis hold is cleared **first** and the \`released\` event is produced
-  **after** it.
-- When the broker rejects the produce (an exception, an error code, a flush that leaves the record
-  pending) insert the event into an **outbox** store declared in the file (an in-memory stub is
-  fine). A broker outage must leave the ledger rebuildable.`,
+- The record key is the **sku**: Kafka orders per partition, so one sku's movements must share one.
+- \`delta\` is the signed change to the sku's available units: \`DELTA_SIGN\` maps \`reserved\` to -1,
+  \`confirmed\` to 0 and \`released\` to +1, times the quantity.
+- The producer is **idempotent** with **\`acks=all\`**.
+- **Wait for the delivery report**, at most 2 s. When it fails or does not come, insert an **outbox**
+  row (\`outbox.insert(topic, key, payload)\`) and return \`False\`; \`produce\` raising covers only the
+  local queue.`,
   sequence: {
-    participants: ['Inventory API', 'Redis holds', 'inventory.event', 'outbox'],
+    participants: ['Inventory API', 'Kafka inventory.event', 'Outbox', 'Ledger consumer'],
     messages: [
-      {from: 'Inventory API', to: 'Redis holds', label: 'INCRBY stock:{sku} · DEL hold:{reservation_id}', kind: 'sync'},
-      {from: 'Redis holds', to: 'Inventory API', label: 'hold cleared', kind: 'reply'},
-      {from: 'Inventory API', to: 'inventory.event', label: 'produce · key = sku · acks = all', kind: 'async'},
-      {from: 'inventory.event', to: 'Inventory API', label: 'ack / broker error', kind: 'reply'},
-      {from: 'Inventory API', to: 'outbox', label: 'INSERT INTO outbox on failure', kind: 'sync'},
+      {
+        from: 'Inventory API',
+        to: 'Kafka inventory.event',
+        label: 'produce key = sku · {reason, quantity, delta} · acks=all',
+        kind: 'sync',
+      },
+      {from: 'Kafka inventory.event', to: 'Inventory API', label: 'delivery report within 2 s → True', kind: 'reply'},
+      {from: 'Kafka inventory.event', to: 'Inventory API', label: 'failed / no report', kind: 'reply'},
+      {from: 'Inventory API', to: 'Outbox', label: 'insert(topic, sku, payload) → False', kind: 'async'},
+      {
+        from: 'Kafka inventory.event',
+        to: 'Ledger consumer',
+        label: 'one partition per sku: deltas in order',
+        kind: 'async',
+      },
     ],
   },
   checks: [
     {
       id: 'sku-key',
-      title: 'The record key is the sku',
+      title: 'Keys inventory.event by the sku',
       detail:
-        'The Kafka record key is the sku (`key=sku` / `key: sku` / `Key: []byte(sku)`), so one sku’s movements land in one partition and stay ordered.',
+        'Three movements for sku-1, sku-2, sku-1 carry those keys and both sku-1 records share a partition. The starter keys by reservation id, which spreads one sku over every partition.',
       match: {
-        python: {all: [/producer\.produce\([^)]*key=sku/]},
-        typescript: {all: [/key:\s*sku\b/]},
-        go: {all: [/Key:\s*\[\]byte\(sku\)/]},
-        scala: {all: [/ProducerRecord(\[[^\]]*\])?\(\s*InventoryTopic,\s*sku\b/]},
-        cpp: {all: [/sku\.data\(\),\s*sku\.size\(\)/]},
+        python: {all: [/producer\.produce\(\s*[^\n]*key\s*=\s*reservation\[["']sku["']\]/]},
+        typescript: {all: [/key:\s*reservation\.sku\b/]},
+        go: {all: [/Key:\s*\[\]byte\(\s*(r|reservation)\.SKU\s*\)/]},
+        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"inventory\.event")\s*,\s*reservation\.sku\s*,/]},
+        cpp: {all: [/(r|reservation)\.sku\.c_str\(\)\s*,\s*(r|reservation)\.sku\.(size|length)\(\)/]},
       },
     },
     {
-      id: 'event-fields',
-      title: 'The event carries delta, reservation_id and reason',
+      id: 'signed-delta',
+      title: 'Carries the signed change to available units',
       detail:
-        'Each event payload carries the signed `delta`, the `reservation_id` and a `reason` in reserved / confirmed / released, so a consumer can attribute a movement to the reservation that caused it.',
+        'A reservation of 3 publishes `delta` -3, its release +3 and its confirmation 0, so a ledger folding deltas rebuilds the counter. The starter publishes +3 for every reason.',
       match: {
-        python: {all: [/["']delta["']\s*:/, /["']reservation_id["']\s*:/, /["']reason["']\s*:/]},
-        typescript: {all: [/\bdelta\b/, /\breservation_id\b/, /\breason\b/]},
-        go: {all: [/\bDelta\b/, /ReservationID/, /\bReason\b/]},
-        scala: {all: [/\bdelta\b/, /reservation_id|reservationId/, /\breason\b/]},
-        cpp: {all: [/\bdelta\b/, /reservation_id|reservationId/, /\breason\b/]},
+        python: {all: [/["']reserved["']\s*:\s*-1/, /["']released["']\s*:\s*\+?1\b/]},
+        typescript: {all: [/reserved:\s*-1/, /released:\s*\+?1\b/]},
+        go: {all: [/"reserved":\s*-1/, /"released":\s*\+?1\b/]},
+        scala: {all: [/"reserved"\s*->\s*-1/, /"released"\s*->\s*\+?1\b/]},
+        cpp: {all: [/\{\s*"reserved"\s*,\s*-1\s*\}/, /\{\s*"released"\s*,\s*\+?1\s*\}/]},
       },
     },
     {
-      id: 'publish-after-hold',
-      title: 'Release clears the hold before publishing',
+      id: 'acks-idempotent',
+      title: 'Configures an idempotent producer with acks=all',
       detail:
-        'On the release path the Redis hold is deleted first and the `released` event is produced after it, so no consumer can observe a release for stock the store still holds.',
+        'A write whose acknowledgement was lost is retried and lands once; a record survives a leader failover. The starter sets `acks=1` and no idempotence.',
       match: {
-        python: {order: [/\.delete\(/, /publish_event\(/]},
-        typescript: {order: [/\.del\(/, /publishEvent\(/]},
-        go: {order: [/\.Del\(/, /publishEvent\(/]},
-        scala: {order: [/\.del\(/, /publishEvent\(/]},
-        cpp: {order: [/->del\(/, /publishEvent\(/]},
+        python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
+        typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
+        go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
+        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
+        cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
     {
-      id: 'outbox',
-      title: 'A rejected produce falls back to the outbox',
+      id: 'outbox-on-failure',
+      title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'When the produce fails (exception, error code or a flush that leaves the record pending) the event is inserted into the outbox store declared in the file, so a relay can republish it after the broker recovers.',
+        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the sku and the payload, and the call returns false. The starter only catches errors raised by `produce` itself, which covers the local queue and nothing the broker does.',
       match: {
-        python: {all: [/class OutboxStore/, /insert_outbox\(/, /except\s+KafkaException/]},
-        typescript: {all: [/class OutboxStore/, /insertOutbox\(/, /catch\s*\(/]},
-        go: {all: [/type OutboxStore struct/, /InsertOutbox\(/, /if err != nil/]},
-        scala: {all: [/object OutboxStore/, /insertOutbox\(/, /catch\s*\{/]},
-        cpp: {all: [/struct OutboxStore/, /insertOutbox\(/, /ERR_NO_ERROR/]},
-      },
-    },
-    {
-      id: 'durable-producer',
-      title: 'Durable producer on inventory.event',
-      detail:
-        'The publisher targets `inventory.event` with required acks `all` (`acks: -1`, `RequireAll`) and idempotence where the stack provides it, so an ack means the record is replicated and a retry cannot duplicate a movement.',
-      match: {
-        python: {all: [/inventory\.event/, /enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
-        typescript: {all: [/inventory\.event/, /idempotent:\s*true/, /acks:\s*-1/]},
-        go: {all: [/inventory\.event/, /RequiredAcks:\s*kafka\.RequireAll/, /Balancer:\s*&kafka\.Hash\{\}/]},
-        scala: {all: [/inventory\.event/, /enable\.idempotence/, /["']acks["'],\s*["']all["']/]},
-        cpp: {all: [/inventory\.event/, /enable\.idempotence/, /set\(["']acks["'],\s*["']all["']/]},
+        python: {
+          all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/],
+          none: [/except\s+KafkaException/],
+        },
+        typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/], none: [/void producer\.send\(/]},
+        go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
+        scala: {
+          all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/],
+          none: [/case\s+_?\w*\s*:\s*KafkaException/],
+        },
+        cpp: {all: [/outbox::Insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
-from uuid import uuid4
 
-import redis
-from confluent_kafka import Producer
-from fastapi import FastAPI
-from pydantic import BaseModel
+from confluent_kafka import KafkaException, Producer
 
-app = FastAPI()
+from inventory.store import outbox
 
-INVENTORY_TOPIC = "inventory.event"
+TOPIC = "inventory.event"
 
-producer = Producer({"bootstrap.servers": "kafka:9092"})
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 
 
-class ReleaseRequest(BaseModel):
-    order_id: str
-    sku: str
-    quantity: int
-
-
-# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-def publish_event(order_id: str, sku: str, quantity: int, reason: str) -> None:
-    event = {
-        "event_id": str(uuid4()),
-        "sku": sku,
-        "order_id": order_id,
-        "quantity": quantity,
+def movement(reservation: dict, reason: str) -> dict:
+    """The event a ledger folds: which sku moved, why, and by how much."""
+    return {
+        "sku": reservation["sku"],
+        "reservation_id": reservation["reservation_id"],
         "reason": reason,
+        "quantity": reservation["quantity"],
+        "delta": reservation["quantity"],
     }
-    producer.produce(INVENTORY_TOPIC, key=order_id, value=json.dumps(event))
-    producer.flush()
 
 
-def release(body: ReleaseRequest) -> None:
-    publish_event(body.order_id, body.sku, body.quantity, "released")
-    r.delete(f"hold:{body.order_id}")
+def publish_movement(reservation: dict, reason: str) -> bool:
+    """Tell the ledger how the sku's available units moved; True once the event is on its way."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    payload = movement(reservation, reason)
+    try:
+        producer.produce(TOPIC, key=reservation["reservation_id"], value=json.dumps(payload))
+        producer.poll(0)
+    except KafkaException:
+        outbox.insert(TOPIC, reservation["reservation_id"], payload)
+        return False
+    return True
 `,
       solution: `import json
-from uuid import uuid4
 
-import redis
-from confluent_kafka import KafkaException, Producer
-from fastapi import FastAPI
-from pydantic import BaseModel
+from confluent_kafka import Producer
 
-app = FastAPI()
+from inventory.store import outbox
 
-INVENTORY_TOPIC = "inventory.event"
+TOPIC = "inventory.event"
+ACK_TIMEOUT_S = 2
+# The change to the sku's available units: a reservation takes them, a release gives them back, a
+# confirmation turns a hold into a sale without touching the available count.
+DELTA_SIGN = {"reserved": -1, "confirmed": 0, "released": 1}
 
-# acks=all makes the broker acknowledge only after the record is replicated; idempotence gives the
-# producer a sequence number per partition, so a retried produce cannot duplicate a movement.
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
-    }
-)
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
+producer = Producer({
+    "bootstrap.servers": "kafka:9092",
+    "acks": "all",  # every in-sync replica has the record before the broker answers
+    "enable.idempotence": True,  # a write retried after a lost acknowledgement lands once
+})
 
 
-class ReleaseRequest(BaseModel):
-    reservation_id: str
-    sku: str
-    quantity: int
-
-
-class OutboxStore:
-    """The outbox table: one row per movement the broker did not accept."""
-
-    def insert_outbox(self, event: dict) -> None:
-        """INSERT INTO outbox (event_id, payload) VALUES (?, ?); a relay republishes the row."""
-        raise NotImplementedError
-
-
-store = OutboxStore()
-
-
-def publish_event(sku: str, delta: int, reservation_id: str, reason: str, available: int) -> None:
-    event = {
-        "event_id": str(uuid4()),
-        "sku": sku,
-        "delta": delta,
-        "reservation_id": reservation_id,
+def movement(reservation: dict, reason: str) -> dict:
+    """The event a ledger folds: which sku moved, why, and by how much."""
+    return {
+        "sku": reservation["sku"],
+        "reservation_id": reservation["reservation_id"],
         "reason": reason,
-        "available": available,
+        "quantity": reservation["quantity"],
+        "delta": DELTA_SIGN[reason] * reservation["quantity"],
     }
-    try:
-        producer.produce(INVENTORY_TOPIC, key=sku, value=json.dumps(event))
-    except KafkaException:
-        store.insert_outbox(event)
-        return
-    if producer.flush(2.0):
-        store.insert_outbox(event)
 
 
-def release(body: ReleaseRequest) -> None:
-    available = int(r.incrby(f"stock:{body.sku}", body.quantity))
-    r.delete(f"hold:{body.reservation_id}")
-    publish_event(body.sku, body.quantity, body.reservation_id, "released", available)
+def publish_movement(reservation: dict, reason: str) -> bool:
+    """Tell the ledger how the sku's available units moved; True once the broker acknowledged it."""
+    payload = movement(reservation, reason)
+    outcome = {}
+
+    def on_delivery(err, msg):
+        outcome["error"] = err
+
+    # Keyed by sku: one sku's movements share a partition, so the ledger folds them in order.
+    producer.produce(TOPIC, key=reservation["sku"], value=json.dumps(payload), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or outcome.get("error") is not None:
+        # The broker did not take it: the relay publishes the row later, so the ledger is late, not wrong.
+        outbox.insert(TOPIC, reservation["sku"], payload)
+        return False
+    return True
 `,
     },
     typescript: {
-      starter: `/** inventory.event. */
-import {randomUUID} from 'node:crypto';
+      starter: `import {Kafka} from 'kafkajs';
 
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
-import {Kafka} from 'kafkajs';
+import {type Reservation, outbox} from 'inventory/store';
 
-export const app = Fastify();
-
-export const inventoryTopic = 'inventory.event';
+export const TOPIC = 'inventory.event';
 
 const kafka = new Kafka({clientId: 'inventoryd', brokers: ['kafka:9092']});
 const producer = kafka.producer();
 void producer.connect();
-const r = new Redis('redis://redis:6379');
 
-interface ReleaseBody {
-  order_id: string;
-  sku: string;
-  quantity: number;
+/** The event a ledger folds: which sku moved, why, and by how much. */
+export function movement(reservation: Reservation, reason: string) {
+  return {
+    sku: reservation.sku,
+    reservation_id: reservation.reservation_id,
+    reason,
+    quantity: reservation.quantity,
+    delta: reservation.quantity,
+  };
 }
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-async function publishEvent(orderId: string, sku: string, quantity: number, reason: string): Promise<void> {
-  const event = {event_id: randomUUID(), sku, order_id: orderId, quantity, reason};
-  await producer.send({
-    topic: inventoryTopic,
-    messages: [{key: orderId, value: JSON.stringify(event)}],
-  });
-}
-
-export async function release(body: ReleaseBody): Promise<void> {
-  await publishEvent(body.order_id, body.sku, body.quantity, 'released');
-  await r.del(\`hold:\${body.order_id}\`);
+/** Tell the ledger how the sku's available units moved; true once the event is on its way. */
+export async function publishMovement(reservation: Reservation, reason: string): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const payload = movement(reservation, reason);
+  try {
+    void producer.send({topic: TOPIC, messages: [{key: reservation.reservation_id, value: JSON.stringify(payload)}], acks: 1});
+  } catch {
+    await outbox.insert(TOPIC, reservation.reservation_id, payload);
+    return false;
+  }
+  return true;
 }
 `,
-      solution: `/** inventory.event: every movement keyed by sku, durable producer, outbox on failure. */
-import {randomUUID} from 'node:crypto';
+      solution: `import {Kafka} from 'kafkajs';
 
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
-import {Kafka} from 'kafkajs';
+import {type Reservation, outbox} from 'inventory/store';
 
-export const app = Fastify();
-
-export const inventoryTopic = 'inventory.event';
+export const TOPIC = 'inventory.event';
+export const ACK_TIMEOUT_MS = 2000;
+// The change to the sku's available units: a reservation takes them, a release gives them back, a
+// confirmation turns a hold into a sale without touching the available count.
+export const DELTA_SIGN: Record<string, number> = {reserved: -1, confirmed: 0, released: 1};
 
 const kafka = new Kafka({clientId: 'inventoryd', brokers: ['kafka:9092']});
-// idempotent: true gives each producer session a sequence number per partition, so a retried record
-// cannot be duplicated; acks: -1 travels with every record and waits for the in-sync replicas.
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+// Idempotent: a write retried after a lost acknowledgement lands once (and needs acks: -1).
+const producer = kafka.producer({idempotent: true});
 void producer.connect();
-const r = new Redis('redis://redis:6379');
 
-type Reason = 'reserved' | 'confirmed' | 'released';
-
-interface StockEvent {
-  event_id: string;
-  sku: string;
-  delta: number;
-  reservation_id: string;
-  reason: Reason;
-  available: number;
+/** The event a ledger folds: which sku moved, why, and by how much. */
+export function movement(reservation: Reservation, reason: string) {
+  return {
+    sku: reservation.sku,
+    reservation_id: reservation.reservation_id,
+    reason,
+    quantity: reservation.quantity,
+    delta: DELTA_SIGN[reason] * reservation.quantity,
+  };
 }
 
-interface ReleaseBody {
-  reservation_id: string;
-  sku: string;
-  quantity: number;
-}
-
-/** The outbox table: one row per movement the broker did not accept. */
-export class OutboxStore {
-  private readonly rows: StockEvent[] = [];
-
-  async insertOutbox(event: StockEvent): Promise<void> {
-    this.rows.push(event);
-  }
-}
-
-export const store = new OutboxStore();
-
-async function publishEvent(sku: string, delta: number, reservation_id: string, reason: Reason, available: number): Promise<void> {
-  const event: StockEvent = {event_id: randomUUID(), sku, delta, reservation_id, reason, available};
+/** Tell the ledger how the sku's available units moved; true once the broker acknowledged it. */
+export async function publishMovement(reservation: Reservation, reason: string): Promise<boolean> {
+  const payload = movement(reservation, reason);
   try {
+    // Keyed by sku: one sku's movements share a partition, so the ledger folds them in order.
+    // acks: -1 (all): every in-sync replica has the record before the broker answers.
     await producer.send({
-      topic: inventoryTopic,
+      topic: TOPIC,
+      messages: [{key: reservation.sku, value: JSON.stringify(payload)}],
       acks: -1,
-      messages: [{key: sku, value: JSON.stringify(event)}],
+      timeout: ACK_TIMEOUT_MS,
     });
-  } catch (error) {
-    await store.insertOutbox(event);
+    return true;
+  } catch {
+    // The broker did not take it: the relay publishes the row later, so the ledger is late, not wrong.
+    await outbox.insert(TOPIC, reservation.sku, payload);
+    return false;
   }
-}
-
-export async function release(body: ReleaseBody): Promise<void> {
-  const available = await r.incrby(\`stock:\${body.sku}\`, body.quantity);
-  await r.del(\`hold:\${body.reservation_id}\`);
-  await publishEvent(body.sku, body.quantity, body.reservation_id, 'released', available);
 }
 `,
     },
@@ -323,41 +277,45 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"inventory/store"
 )
 
-const inventoryTopic = "inventory.event"
+const topic = "inventory.event"
 
-var inventoryWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: inventoryTopic}
+var producer = newProducer()
 
-var rdb *redis.Client
-
-type ReleaseBody struct {
-	OrderID  string \`json:"order_id"\`
-	Sku      string \`json:"sku"\`
-	Quantity int    \`json:"quantity"\`
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-func publishEvent(ctx context.Context, orderID string, sku string, quantity int, reason string) error {
-	event := map[string]any{
-		"event_id": uuid.NewString(),
-		"sku":      sku,
-		"order_id": orderID,
-		"quantity": quantity,
-		"reason":   reason,
+// movement is the event a ledger folds: which sku moved, why, and by how much.
+func movement(r *store.Reservation, reason string) map[string]any {
+	return map[string]any{
+		"sku":            r.SKU,
+		"reservation_id": r.ReservationID,
+		"reason":         reason,
+		"quantity":       r.Quantity,
+		"delta":          r.Quantity,
 	}
-	payload, _ := json.Marshal(event)
-	return inventoryWriter.WriteMessages(ctx, kafka.Message{Key: []byte(orderID), Value: payload})
 }
 
-func release(ctx context.Context, body ReleaseBody) error {
-	if err := publishEvent(ctx, body.OrderID, body.Sku, body.Quantity, "released"); err != nil {
-		return err
+// publishMovement tells the ledger how the sku's available units moved; true once the event is on its way.
+func publishMovement(ctx context.Context, r *store.Reservation, reason string) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	payload := movement(r, reason)
+	value, _ := json.Marshal(payload)
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(r.ReservationID), Value: value}
+	if err := producer.Produce(msg, nil); err != nil {
+		return false, store.InsertOutbox(ctx, topic, r.ReservationID, payload)
 	}
-	return rdb.Del(ctx, "hold:"+body.OrderID).Err()
+	return true, nil
 }
 `,
       solution: `package main
@@ -365,265 +323,637 @@ func release(ctx context.Context, body ReleaseBody) error {
 import (
 	"context"
 	"encoding/json"
+	"time"
 
-	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"inventory/store"
 )
 
-const inventoryTopic = "inventory.event"
+const (
+	topic      = "inventory.event"
+	ackTimeout = 2 * time.Second
+)
 
-// RequiredAcks=RequireAll waits for the in-sync replicas, and the hash balancer keeps every movement
-// of one sku in one partition: together they are kafka-go's durable, ordered producer.
-var inventoryWriter = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        inventoryTopic,
-	RequiredAcks: kafka.RequireAll,
-	Balancer:     &kafka.Hash{},
-}
+// deltaSign is the change to the sku's available units: a reservation takes them, a release gives
+// them back, a confirmation turns a hold into a sale without touching the available count.
+var deltaSign = map[string]int{"reserved": -1, "confirmed": 0, "released": 1}
 
-var rdb *redis.Client
+var producer = newProducer()
 
-type StockEvent struct {
-	EventID       string \`json:"event_id"\`
-	Sku           string \`json:"sku"\`
-	Delta         int    \`json:"delta"\`
-	ReservationID string \`json:"reservation_id"\`
-	Reason        string \`json:"reason"\`
-	Available     int    \`json:"available"\`
-}
-
-type OutboxStore struct{}
-
-// InsertOutbox writes one row per movement the broker did not accept; a relay republishes it.
-func (s *OutboxStore) InsertOutbox(ctx context.Context, event StockEvent) error {
-	return nil
-}
-
-var store = &OutboxStore{}
-
-func publishEvent(ctx context.Context, sku string, delta int, reservationID string, reason string, available int) error {
-	event := StockEvent{EventID: uuid.NewString(), Sku: sku, Delta: delta, ReservationID: reservationID, Reason: reason, Available: available}
-	payload, _ := json.Marshal(event)
-	if err := inventoryWriter.WriteMessages(ctx, kafka.Message{Key: []byte(sku), Value: payload}); err != nil {
-		return store.InsertOutbox(ctx, event)
-	}
-	return nil
-}
-
-func release(ctx context.Context, reservationID string, sku string, quantity int) error {
-	available, err := rdb.IncrBy(ctx, "stock:"+sku, int64(quantity)).Result()
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the record before the broker answers
+		"enable.idempotence": true,  // a write retried after a lost acknowledgement lands once
+	})
 	if err != nil {
-		return err
+		panic(err)
 	}
-	if err := rdb.Del(ctx, "hold:"+reservationID).Err(); err != nil {
-		return err
+	return p
+}
+
+// movement is the event a ledger folds: which sku moved, why, and by how much.
+func movement(r *store.Reservation, reason string) map[string]any {
+	return map[string]any{
+		"sku":            r.SKU,
+		"reservation_id": r.ReservationID,
+		"reason":         reason,
+		"quantity":       r.Quantity,
+		"delta":          deltaSign[reason] * r.Quantity,
 	}
-	return publishEvent(ctx, sku, quantity, reservationID, "released", int(available))
+}
+
+// publishMovement tells the ledger how the sku's available units moved; true once the broker acknowledged it.
+func publishMovement(ctx context.Context, r *store.Reservation, reason string) (bool, error) {
+	payload := movement(r, reason)
+	value, _ := json.Marshal(payload)
+	t := topic
+	// Keyed by sku: one sku's movements share a partition, so the ledger folds them in order.
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(r.SKU), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded // no delivery report within the window
+		}
+	}
+	if err != nil {
+		// The broker did not take it: the relay publishes the row later, so the ledger is late, not wrong.
+		return false, store.InsertOutbox(ctx, topic, r.SKU, payload)
+	}
+	return true, nil
 }
 `,
     },
     scala: {
       starter: `import java.util.Properties
-import java.util.UUID
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import redis.clients.jedis.Jedis
+import org.apache.kafka.common.KafkaException
+import org.apache.kafka.common.serialization.StringSerializer
 import spray.json._
 
-object InventoryPublisher {
-  val InventoryTopic = "inventory.event"
-  val producer = new KafkaProducer[String, String](new Properties())
-  val jedis = new Jedis("redis", 6379)
+import inventory.{Reservation, Store}
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def publishEvent(orderId: String, sku: String, quantity: Int, reason: String): Unit = {
-    val event = JsObject(
-      "event_id" -> JsString(UUID.randomUUID().toString),
-      "sku" -> JsString(sku),
-      "order_id" -> JsString(orderId),
-      "quantity" -> JsNumber(quantity),
-      "reason" -> JsString(reason)
-    )
-    producer.send(new ProducerRecord[String, String](InventoryTopic, orderId, event.compactPrint))
+object Events {
+  val Topic = "inventory.event"
+
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  def release(orderId: String, sku: String, quantity: Int): Unit = {
-    publishEvent(orderId, sku, quantity, "released")
-    jedis.del(s"hold:$orderId")
+  /** The event a ledger folds: which sku moved, why, and by how much. */
+  def movement(reservation: Reservation, reason: String): JsObject =
+    JsObject(
+      "sku" -> JsString(reservation.sku),
+      "reservation_id" -> JsString(reservation.reservation_id),
+      "reason" -> JsString(reason),
+      "quantity" -> JsNumber(reservation.quantity),
+      "delta" -> JsNumber(reservation.quantity)
+    )
+
+  /** Tell the ledger how the sku's available units moved; true once the event is on its way. */
+  def publishMovement(reservation: Reservation, reason: String): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val payload = movement(reservation, reason)
+    try {
+      producer.send(new ProducerRecord[String, String](Topic, reservation.reservation_id, payload.compactPrint))
+      true
+    } catch {
+      case _: KafkaException =>
+        Store.insertOutbox(Topic, reservation.reservation_id, payload)
+        false
+    }
   }
 }
 `,
       solution: `import java.util.Properties
-import java.util.UUID
+import java.util.concurrent.TimeUnit
 
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import redis.clients.jedis.Jedis
+import scala.util.Try
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
 import spray.json._
 
-object InventoryPublisher {
-  val InventoryTopic = "inventory.event"
+import inventory.{Reservation, Store}
 
-  // enable.idempotence gives the producer a sequence number per partition and acks=all waits for the
-  // in-sync replicas, so a retried record is neither duplicated nor lost.
-  val producer = new KafkaProducer[String, String]({
+object Events {
+  val Topic = "inventory.event"
+  val AckTimeoutMs = 2000L
+  // The change to the sku's available units: a reservation takes them, a release gives them back, a
+  // confirmation turns a hold into a sale without touching the available count.
+  val DeltaSign: Map[String, Int] = Map("reserved" -> -1, "confirmed" -> 0, "released" -> 1)
+
+  private val producer: KafkaProducer[String, String] = {
     val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put("enable.idempotence", "true")
-    props.put("acks", "all")
-    props
-  })
-  val jedis = new Jedis("redis", 6379)
-
-  /** The outbox table: one row per movement the broker did not accept. */
-  object OutboxStore {
-    /** INSERT INTO outbox (event_id, payload) VALUES (?, ?); a relay republishes the row. */
-    def insertOutbox(event: JsObject): Unit =
-      throw new UnsupportedOperationException("the outbox is not wired up in the demo")
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "all") // every in-sync replica has the record before the broker answers
+    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  def publishEvent(sku: String, delta: Int, reservationId: String, reason: String, available: Int): Unit = {
-    val event = JsObject(
-      "event_id" -> JsString(UUID.randomUUID().toString),
-      "sku" -> JsString(sku),
-      "delta" -> JsNumber(delta),
-      "reservation_id" -> JsString(reservationId),
+  /** The event a ledger folds: which sku moved, why, and by how much. */
+  def movement(reservation: Reservation, reason: String): JsObject =
+    JsObject(
+      "sku" -> JsString(reservation.sku),
+      "reservation_id" -> JsString(reservation.reservation_id),
       "reason" -> JsString(reason),
-      "available" -> JsNumber(available)
+      "quantity" -> JsNumber(reservation.quantity),
+      "delta" -> JsNumber(DeltaSign(reason) * reservation.quantity)
     )
-    val payload = event.compactPrint
-    try {
-      producer.send(new ProducerRecord[String, String](InventoryTopic, sku, payload))
-    } catch {
-      case _: org.apache.kafka.common.KafkaException => OutboxStore.insertOutbox(event)
-    }
-  }
 
-  def release(reservationId: String, sku: String, quantity: Int): Unit = {
-    val available = jedis.incrBy(s"stock:$sku", quantity.toLong)
-    jedis.del(s"hold:$reservationId")
-    publishEvent(sku, quantity, reservationId, "released", available.toInt)
+  /** Tell the ledger how the sku's available units moved; true once the broker acknowledged it. */
+  def publishMovement(reservation: Reservation, reason: String): Boolean = {
+    val payload = movement(reservation, reason)
+    // Keyed by sku: one sku's movements share a partition, so the ledger folds them in order.
+    val record = new ProducerRecord[String, String](Topic, reservation.sku, payload.compactPrint)
+    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
+    if (acked.isFailure) {
+      // The broker did not take it: the relay publishes the row later, so the ledger is late, not wrong.
+      Store.insertOutbox(Topic, reservation.sku, payload)
+    }
+    acked.isSuccess
   }
 }
 `,
     },
     cpp: {
       starter: `#include <librdkafka/rdkafkacpp.h>
-#include <sw/redis++/redis++.h>
+#include <nlohmann/json.hpp>
 
 #include <memory>
-#include <nlohmann/json.hpp>
 #include <string>
+
+#include "inventory/store.h"  // inventory::Reservation, outbox::Insert
 
 using json = nlohmann::json;
 
-const std::string kInventoryTopic = "inventory.event";
-
-std::string newEventId();
+const std::string kTopic = "inventory.event";
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
+auto producer = makeProducer();
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-void publishEvent(const std::string& orderId, const std::string& sku, int quantity, const std::string& reason) {
-  const json event = {{"event_id", newEventId()}, {"sku", sku}, {"order_id", orderId}, {"quantity", quantity}, {"reason", reason}};
-  const auto payload = event.dump();
-  producer->produce(
-      kInventoryTopic,
-      RdKafka::Topic::PARTITION_UA,
-      RdKafka::Producer::RK_MSG_COPY,
-      const_cast<char*>(payload.data()),
-      payload.size(),
-      orderId.data(),
-      orderId.size(),
-      0,
-      nullptr);
-  producer->flush(2000);
+// The event a ledger folds: which sku moved, why, and by how much.
+json movement(const inventory::Reservation& r, const std::string& reason) {
+  return json{{"sku", r.sku}, {"reservation_id", r.reservation_id}, {"reason", reason}, {"quantity", r.quantity}, {"delta", r.quantity}};
 }
 
-void release(const std::string& orderId, const std::string& sku, int quantity) {
-  publishEvent(orderId, sku, quantity, "released");
-  redis->del("hold:" + orderId);
+// Tell the ledger how the sku's available units moved; true once the event is on its way.
+bool publishMovement(const inventory::Reservation& r, const std::string& reason) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const json payload = movement(r, reason);
+  const std::string value = payload.dump();
+  const RdKafka::ErrorCode err =
+      producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                        value.size(), r.reservation_id.c_str(), r.reservation_id.size(), 0, nullptr);
+  producer->poll(0);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    inventory::outbox::Insert(kTopic, r.reservation_id, payload);
+    return false;
+  }
+  return true;
 }
 `,
       solution: `#include <librdkafka/rdkafkacpp.h>
-#include <sw/redis++/redis++.h>
-
-#include <memory>
 #include <nlohmann/json.hpp>
+
+#include <map>
+#include <memory>
 #include <string>
+
+#include "inventory/store.h"  // inventory::Reservation, outbox::Insert
 
 using json = nlohmann::json;
 
-const std::string kInventoryTopic = "inventory.event";
+const std::string kTopic = "inventory.event";
+constexpr int kAckTimeoutMs = 2000;
+// The change to the sku's available units: a reservation takes them, a release gives them back, a
+// confirmation turns a hold into a sale without touching the available count.
+const std::map<std::string, int> kDeltaSign = {{"reserved", -1}, {"confirmed", 0}, {"released", 1}};
 
-std::string newEventId();
+// The delivery report of the record in flight: publishMovement produces one record and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
+};
+
+DeliveryReport delivery;
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("enable.idempotence", "true", err);
-  conf->set("acks", "all", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the record before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a write retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
+auto producer = makeProducer();
 
-/** The outbox table: one row per movement the broker did not accept. */
-struct OutboxStore {
-  // INSERT INTO outbox (event_id, payload) VALUES ($1, $2); a relay republishes the row.
-  void insertOutbox(const json& event);
-};
-
-OutboxStore store;
-
-void publishEvent(const std::string& sku, int delta, const std::string& reservationId, const std::string& reason, int available) {
-  const json event = {
-      {"event_id", newEventId()},
-      {"sku", sku},
-      {"delta", delta},
-      {"reservation_id", reservationId},
-      {"reason", reason},
-      {"available", available},
-  };
-  const auto payload = event.dump();
-  const auto err = producer->produce(
-      kInventoryTopic,
-      RdKafka::Topic::PARTITION_UA,
-      RdKafka::Producer::RK_MSG_COPY,
-      const_cast<char*>(payload.data()),
-      payload.size(),
-      sku.data(),
-      sku.size(),
-      0,
-      nullptr);
-  if (err != RdKafka::ERR_NO_ERROR) {
-    store.insertOutbox(event);
-  }
-  producer->flush(2000);
+// The event a ledger folds: which sku moved, why, and by how much.
+json movement(const inventory::Reservation& r, const std::string& reason) {
+  return json{{"sku", r.sku},
+              {"reservation_id", r.reservation_id},
+              {"reason", reason},
+              {"quantity", r.quantity},
+              {"delta", kDeltaSign.at(reason) * r.quantity}};
 }
 
-void release(const std::string& reservationId, const std::string& sku, int quantity) {
-  const auto available = redis->incrby("stock:" + sku, quantity);
-  redis->del("hold:" + reservationId);
-  publishEvent(sku, quantity, reservationId, "released", static_cast<int>(available));
+// Tell the ledger how the sku's available units moved; true once the broker acknowledged it.
+bool publishMovement(const inventory::Reservation& r, const std::string& reason) {
+  const json payload = movement(r, reason);
+  const std::string value = payload.dump();
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  // Keyed by sku: one sku's movements share a partition, so the ledger folds them in order.
+  RdKafka::ErrorCode err =
+      producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                        value.size(), r.sku.c_str(), r.sku.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
+  }
+  if (err != RdKafka::ERR_NO_ERROR) {
+    // The broker did not take it: the relay publishes the row later, so the ledger is late, not wrong.
+    inventory::outbox::Insert(kTopic, r.sku, payload);
+    return false;
+  }
+  return true;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+TOPIC = "inventory.event"
+
+
+def _reservation(n, sku="sku-1", quantity=3):
+    return {
+        "reservation_id": f"r-{n}",
+        "tenant": "t1",
+        "idempotency_key": f"k-{n}",
+        "sku": sku,
+        "quantity": quantity,
+        "status": "reserved",
+        "expires_at": 0,
+    }
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.lrange("outbox", 0, -1)]
+
+
+def check_sku_key(ctx):
+    m = ctx.load("events")
+    m.publish_movement(_reservation(1, "sku-1"), "reserved")
+    m.publish_movement(_reservation(2, "sku-2"), "reserved")
+    m.publish_movement(_reservation(3, "sku-1"), "reserved")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three publish_movement calls produced {len(records)} records on inventory.event (topics: {sorted(ctx.kafka.topics)})"
+    keys = [r.key for r in records]
+    assert keys == [b"sku-1", b"sku-2", b"sku-1"], f"the records are keyed {keys}, expected the skus sku-1, sku-2, sku-1"
+    assert records[0].partition == records[2].partition, "both sku-1 movements must land on one partition, or the ledger folds one sku's deltas out of order"
+
+
+def check_signed_delta(ctx):
+    m = ctx.load("events")
+    for reason in ("reserved", "released", "confirmed"):
+        m.publish_movement(_reservation(1), reason)
+    values = [json.loads(v) for v in ctx.kafka.values(TOPIC)]
+    assert len(values) == 3, f"three publish_movement calls produced {len(values)} records"
+    first = values[0]
+    assert first.get("sku") == "sku-1" and first.get("reservation_id") == "r-1" and first.get("reason") == "reserved" and first.get("quantity") == 3, f"the payload is {first}, expected sku, reservation_id, reason and quantity"
+    deltas = [v.get("delta") for v in values]
+    assert deltas == [-3, 3, 0], f"reserved, released and confirmed 3 units published deltas {deltas}, expected [-3, 3, 0]: a ledger folding these must land on the counter"
+
+
+def check_acks_idempotent(ctx):
+    m = ctx.load("events")
+    ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
+    m.publish_movement(_reservation(1), "reserved")
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"after one lost acknowledgement the topic holds {len(ctx.kafka.records(TOPIC))} records: the producer's retry wrote the movement twice and the ledger takes the units twice. Enable idempotence"
+    m.publish_movement(_reservation(2), "reserved")
+    ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
+    assert len(ctx.kafka.records(TOPIC)) == 2, "a leader failover lost the record the leader alone had acknowledged: acks=all waits for every in-sync replica"
+
+
+def check_outbox_on_failure(ctx):
+    m = ctx.load("events")
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_movement(_reservation(1), "reserved")
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the ledger never learns these units moved"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "sku-1" and rows[0].get("payload", {}).get("reservation_id") == "r-1", f"the outbox row is {rows[0]}, expected the topic, the key sku-1 and the payload"
+    assert ok is False, f"publish_movement returned {ok!r} after a failed delivery, expected False"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    ok = m.publish_movement(_reservation(2), "reserved")
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"publish_movement waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("payload", {}).get("reservation_id") == "r-2", f"no delivery report within the window and the outbox holds {rows}"
+    assert ok is False, f"publish_movement returned {ok!r} without a delivery report, expected False"
+`,
+    typescript: `const TOPIC = 'inventory.event';
+
+const reservation = (n: number, sku = 'sku-1', quantity = 3) => ({
+  reservation_id: \`r-\${n}\`,
+  tenant: 't1',
+  idempotency_key: \`k-\${n}\`,
+  sku,
+  quantity,
+  status: 'reserved',
+  expires_at: 0,
+});
+
+const outboxRows = ctx => (ctx.redis.lrange('outbox', 0, -1) as string[]).map(row => JSON.parse(row));
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+export async function check_sku_key(ctx) {
+  const m = ctx.load('events');
+  await m.publishMovement(reservation(1, 'sku-1'), 'reserved');
+  await m.publishMovement(reservation(2, 'sku-2'), 'reserved');
+  await m.publishMovement(reservation(3, 'sku-1'), 'reserved');
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three publishMovement calls produced \${records.length} records on inventory.event\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['sku-1', 'sku-2', 'sku-1'], \`the records are keyed \${JSON.stringify(keys)}, expected the skus sku-1, sku-2, sku-1\`);
+  assert.equal(records[0].partition, records[2].partition, "both sku-1 movements must land on one partition, or the ledger folds one sku's deltas out of order");
+}
+
+export async function check_signed_delta(ctx) {
+  const m = ctx.load('events');
+  for (const reason of ['reserved', 'released', 'confirmed']) await m.publishMovement(reservation(1), reason);
+  await settle();
+  const values = ctx.kafka.values(TOPIC).map(v => JSON.parse(v));
+  assert.equal(values.length, 3, \`three publishMovement calls produced \${values.length} records\`);
+  const first = values[0];
+  assert(first.sku === 'sku-1' && first.reservation_id === 'r-1' && first.reason === 'reserved' && first.quantity === 3, \`the payload is \${JSON.stringify(first)}, expected sku, reservation_id, reason and quantity\`);
+  const deltas = values.map(v => v.delta);
+  assert.deepEqual(deltas, [-3, 3, 0], \`reserved, released and confirmed 3 units published deltas \${JSON.stringify(deltas)}, expected [-3, 3, 0]: a ledger folding these must land on the counter\`);
+}
+
+export async function check_acks_idempotent(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
+  await m.publishMovement(reservation(1), 'reserved');
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`after one lost acknowledgement the topic holds \${ctx.kafka.records(TOPIC).length} records: the producer's retry wrote the movement twice and the ledger takes the units twice. Enable idempotence\`);
+  await m.publishMovement(reservation(2), 'reserved');
+  await settle();
+  ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, 'a leader failover lost the record the leader alone had acknowledged: acks: -1 (all) waits for every in-sync replica');
+}
+
+export async function check_outbox_on_failure(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.failNext(TOPIC, 1);
+  let ok = await m.publishMovement(reservation(1), 'reserved');
+  await settle();
+  let rows = outboxRows(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the ledger never learns these units moved\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'sku-1' && rows[0].payload?.reservation_id === 'r-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key sku-1 and the payload\`);
+  assert.equal(ok, false, \`publishMovement resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  ok = await m.publishMovement(reservation(2), 'reserved');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`publishMovement waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  rows = outboxRows(ctx);
+  assert(rows.length === 2 && rows[1].payload?.reservation_id === 'r-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert.equal(ok, false, \`publishMovement resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"leetbuild/harness"
+
+	"inventory/store"
+)
+
+const eventsTopic = "inventory.event"
+
+func eventsReservation(n int, sku string) *store.Reservation {
+	return &store.Reservation{
+		ReservationID: fmt.Sprintf("r-%d", n), Tenant: "t1", IdempotencyKey: fmt.Sprintf("k-%d", n),
+		SKU: sku, Quantity: 3, Status: "reserved",
+	}
+}
+
+func eventsPublish(ctx *harness.Ctx, r *store.Reservation, reason string) bool {
+	ok, err := publishMovement(context.Background(), r, reason)
+	ctx.NoError(err, "publishMovement")
+	return ok
+}
+
+type eventsRow struct {
+	Topic   string         \`json:"topic"\`
+	Key     string         \`json:"key"\`
+	Payload map[string]any \`json:"payload"\`
+}
+
+func eventsOutbox(ctx *harness.Ctx) []eventsRow {
+	var rows []eventsRow
+	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
+		var row eventsRow
+		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func CheckSkuKey(ctx *harness.Ctx) {
+	eventsPublish(ctx, eventsReservation(1, "sku-1"), "reserved")
+	eventsPublish(ctx, eventsReservation(2, "sku-2"), "reserved")
+	eventsPublish(ctx, eventsReservation(3, "sku-1"), "reserved")
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three publishMovement calls must produce three records on inventory.event; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"sku-1", "sku-2", "sku-1"}, "the records must be keyed by the skus")
+	ctx.Equal(records[0].Partition, records[2].Partition, "both sku-1 movements must land on one partition, or the ledger folds one sku's deltas out of order; the partitions")
+}
+
+func CheckSignedDelta(ctx *harness.Ctx) {
+	for _, reason := range []string{"reserved", "released", "confirmed"} {
+		eventsPublish(ctx, eventsReservation(1, "sku-1"), reason)
+	}
+	ctx.Settle()
+	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 3, "three publishMovement calls must produce three records; the records")
+	var deltas []float64
+	for i, text := range values {
+		var value map[string]any
+		ctx.NoError(json.Unmarshal([]byte(text), &value), "the payload must be JSON")
+		if i == 0 {
+			ctx.Assert(value["sku"] == "sku-1" && value["reservation_id"] == "r-1" && value["reason"] == "reserved" && value["quantity"] == float64(3), "the payload is %s, expected sku, reservation_id, reason and quantity", text)
+		}
+		delta, _ := value["delta"].(float64)
+		deltas = append(deltas, delta)
+	}
+	ctx.Equal(deltas, []float64{-3, 3, 0}, "the deltas of reserved, released and confirmed 3 units (a ledger folding these must land on the counter)")
+}
+
+func CheckAcksIdempotent(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	eventsPublish(ctx, eventsReservation(1, "sku-1"), "reserved")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the movement twice (enable.idempotence); the records")
+	eventsPublish(ctx, eventsReservation(2, "sku-1"), "reserved")
+	ctx.Settle()
+	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+}
+
+func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok := eventsPublish(ctx, eventsReservation(1, "sku-1"), "reserved")
+	ctx.Settle()
+	rows := eventsOutbox(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the ledger never learns these units moved; the rows")
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "sku-1" && rows[0].Payload["reservation_id"] == "r-1", "the outbox row is %v, expected the topic, the key sku-1 and the payload", rows[0])
+	ctx.Equal(ok, false, "publishMovement's result after a failed delivery")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	ok = eventsPublish(ctx, eventsReservation(2, "sku-1"), "reserved")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "publishMovement waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	rows = eventsOutbox(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Payload["reservation_id"] == "r-2", "no delivery report within the window and the outbox holds %v", rows)
+	ctx.Equal(ok, false, "publishMovement's result without a delivery report")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "inventory/store.h"
+
+namespace {
+
+const std::string kEventsTopic = "inventory.event";
+
+inventory::Reservation eventsReservation(int n, const std::string& sku = "sku-1") {
+  return inventory::Reservation{"r-" + std::to_string(n), "t1", "k-" + std::to_string(n), sku, 3, "reserved", 0};
+}
+
+std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> rows;
+  for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
+    const auto row = nlohmann::json::parse(text, nullptr, false);
+    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", text);
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+std::string eventsField(const nlohmann::json& j, const std::string& field) {
+  return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckSkuKey(harness::Ctx& ctx) {
+  publishMovement(eventsReservation(1, "sku-1"), "reserved");
+  publishMovement(eventsReservation(2, "sku-2"), "reserved");
+  publishMovement(eventsReservation(3, "sku-1"), "reserved");
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 3, "three publishMovement calls must produce three records on inventory.event; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"sku-1", "sku-2", "sku-1"}, "the records must be keyed by the skus");
+  ctx.Equal(records[0].Partition, records[2].Partition,
+            "both sku-1 movements must land on one partition, or the ledger folds one sku's deltas out of order; the partitions");
+}
+
+void CheckSignedDelta(harness::Ctx& ctx) {
+  for (const std::string reason : {"reserved", "released", "confirmed"}) publishMovement(eventsReservation(1), reason);
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(values.size(), 3, "three publishMovement calls must produce three records; the records");
+  std::vector<long long> deltas;
+  for (size_t i = 0; i < values.size(); i++) {
+    const auto value = nlohmann::json::parse(values[i], nullptr, false);
+    if (i == 0) {
+      ctx.Assert(eventsField(value, "sku") == "sku-1" && eventsField(value, "reservation_id") == "r-1" &&
+                     eventsField(value, "reason") == "reserved" && value.value("quantity", 0) == 3,
+                 "the payload is %s, expected sku, reservation_id, reason and quantity", values[i]);
+    }
+    deltas.push_back(value.is_object() ? value.value("delta", 99LL) : 99LL);
+  }
+  ctx.Equal(deltas, {-3, 3, 0}, "the deltas of reserved, released and confirmed 3 units (a ledger folding these must land on the counter)");
+}
+
+void CheckAcksIdempotent(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishMovement(eventsReservation(1), "reserved");
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+            "after one lost acknowledgement the producer's retry must not write the movement twice (enable.idempotence); the records");
+  publishMovement(eventsReservation(2), "reserved");
+  ctx.Settle();
+  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2,
+            "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+}
+
+void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  bool ok = publishMovement(eventsReservation(1), "reserved");
+  ctx.Settle();
+  auto rows = eventsOutbox(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the ledger never learns these units moved; the rows");
+  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "sku-1" &&
+                 rows[0].contains("payload") && eventsField(rows[0]["payload"], "reservation_id") == "r-1",
+             "the outbox row is %s, expected the topic, the key sku-1 and the payload", rows[0].dump());
+  ctx.Equal(ok, false, "publishMovement's result after a failed delivery");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const int64_t before = ctx.Clock.Now();
+  ok = publishMovement(eventsReservation(2), "reserved");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "publishMovement waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  rows = eventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "reservation_id") == "r-2",
+             "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Equal(ok, false, "publishMovement's result without a delivery report");
+}
+`,
+  },
   hints: [
-    'Symptom: the rebuilt ledger disagrees with the Redis counter after a busy hour, a replay shows a sku released while a hold still blocked it, and a short broker outage leaves gaps.',
-    'Mechanism: records are keyed by order id so one sku spans partitions, the release is produced before the hold is deleted, the producer runs on defaults, and a failed produce is dropped.',
-    'Change: pass `key=sku` to the produce call, add `delta` and `reservation_id` to the payload, set `enable.idempotence` plus `acks=all`, delete the hold before producing, and insert into the outbox on the failure branch.',
+    "The ledger shows a sku with more units than the warehouse ever received, the same sku's movements arrive out of order, and after a broker restart one reservation never reached the ledger at all.",
+    "Order holds per key, so whatever is the key is what stays ordered. A positive delta for a reservation adds units instead of taking them. `produce` only queues the record: the broker's verdict arrives later in the delivery report, which nothing here waits for.",
+    'Key by `reservation["sku"]`; `delta = DELTA_SIGN[reason] * quantity`; `acks=all` and `enable.idempotence`; pass `on_delivery`, `flush(2)`, and on a remaining message or an error insert the outbox row and return False.',
   ],
-  debrief: `A stock ledger is an ordered log per sku, and the partition key is what makes it ordered: key by sku and every movement of that sku lands in one partition in order, so a consumer folding deltas sees them as they happened. Keyed by order id, two orders touching the same sku interleave, which is why the checks pin the key argument rather than the topic name. The release path is the second contract: the hold is what stops the store from selling the unit again, so the movement may only become visible after the hold is gone. The outbox closes the gap between Redis and the broker, which cannot commit together. Production systems add a relay that claims outbox rows with \`FOR UPDATE SKIP LOCKED\` and consumer-side dedupe on \`event_id\`.`,
+  debrief: `The key is an ordering contract: a ledger folding deltas must see one sku's movements in the order they happened, and Kafka promises order only within a partition. The signed delta is what makes the stream rebuildable: start from a count, fold every event, land on the counter. Waiting for the delivery report gives the return value a meaning, and the outbox turns a broker outage into a delay instead of a gap in the ledger; the idempotent producer closes the one hole that waiting opens, a retry after a lost acknowledgement. Production services write the outbox row in the same transaction as the state change and let a relay do every produce, so the request path never waits on the broker, and they version the event schema so a new field cannot break an old consumer.`,
 };

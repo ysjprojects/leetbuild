@@ -2,263 +2,190 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis query cache keyed by the whole query',
+  title: 'A query cache whose key names every input',
   concept: 'redis',
-  file: 'state',
-  focus: ['search', 'redis', 'catalog'],
+  file: 'cache',
+  focus: ['api', 'cache', 'catalog'],
   task: `## Task
 
-**Starting point.** The starter is the Redis query cache behind \`GET /v1/search\`: it builds a
-cache key from the query string, looks it up, runs the engine on a miss and stores the result set
-with a plain \`SET\`. It compiles, it speeds up the demo, and it hides five flaws.
+**Starting point.** The starter is the query cache \`GET /v1/search\` calls instead of the engine:
+\`cached_search(tenant, q, filters, page_size)\` has \`run_query\`'s signature, looks the page up
+under \`search:{q}\`, and on a miss runs \`run_query\` and stores the page as JSON with a plain
+\`SET\`. Repeated searches come back fast, and it hides four flaws.
 
-**Failure mode the checks target.** The starter's key names one of five inputs, so a hit can carry
-the wrong filters, tenant or catalog version, and with no expiry the wrong answer is permanent.
+**Failure mode the checks target.** Two tenants, two filter sets or two page sizes with the same
+\`q\` share one entry; \`Kettle\` and \` kettle \` fill two entries; nothing expires; and a product
+indexed after the first search stays invisible to that query.
 
-- The key covers the tenant, the **normalized** query, the **filter hash**, the page and the
-  **catalog index version**.
-- Normalize the query (\`strip\` / \`trim\` + lowercase + collapse whitespace).
-- Hash the filters deterministically: canonical JSON with sorted keys, then a digest
-  (\`sha256\` / \`createHash\` / \`MessageDigest\` / FNV-1a), so filter order cannot create two entries
-  that mean the same thing.
-- Entries expire after **60 seconds** (\`CACHE_TTL_S = 60\` with \`setex\` / \`SET … EX\` / \`SetEx\`).
-- The current index version is read per request from Redis, and a catalog update **bumps** it
-  (\`INCR catalog:index_version\`). The next request then misses without waiting for the TTL: that is
-  the difference between a cache key and an eviction signal.`,
+- The key is \`search:{tenant}:{index version}:{digest}\`. The \`digest\` covers the normalized
+  query (\`normalize_query\`), the filters as \`field=value\` pairs sorted by field and joined by
+  \`&\`, and the page size, joined by newlines.
+- The index version is read on every call (\`index_version(tenant)\`): \`put_product\` bumps it, so
+  the next search misses instead of serving the old page for a minute.
+- An entry lives \`CACHE_TTL_S\` = 60 seconds (\`SET … EX\`).`,
   sequence: {
-    participants: ['Search API', 'Redis', 'Query engine', 'Catalog publisher'],
+    participants: ['searchd', 'Redis', 'Catalog index'],
     messages: [
-      {
-        from: 'Search API',
-        to: 'Search API',
-        label: 'normalize q · canonical filter hash · read index version',
-        kind: 'sync',
-      },
-      {
-        from: 'Search API',
-        to: 'Redis',
-        label: 'GET search:{tenant}:{version}:{page}:{filterHash}:{queryHash}',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Search API', label: 'cached page / nil', kind: 'reply'},
-      {from: 'Search API', to: 'Query engine', label: 'run the query (on miss)', kind: 'sync'},
-      {from: 'Query engine', to: 'Search API', label: 'page of products', kind: 'reply'},
-      {from: 'Search API', to: 'Redis', label: 'SETEX key 60 payload', kind: 'async'},
-      {from: 'Catalog publisher', to: 'Redis', label: 'INCR catalog:index_version', kind: 'async'},
+      {from: 'searchd', to: 'Catalog index', label: 'index_version(tenant) → 7', kind: 'sync'},
+      {from: 'searchd', to: 'Redis', label: 'GET search:t-1:7:{digest(q, filters, page_size)}', kind: 'sync'},
+      {from: 'Redis', to: 'searchd', label: 'hit → page · miss → nil', kind: 'reply'},
+      {from: 'searchd', to: 'Catalog index', label: 'run_query(tenant, q, filters, page_size) on a miss', kind: 'sync'},
+      {from: 'searchd', to: 'Redis', label: 'SET key page EX 60', kind: 'sync'},
     ],
   },
   checks: [
     {
-      id: 'cache-key',
-      title: 'The key covers tenant, query, filters, page and index version',
+      id: 'key-inputs',
+      title: 'The key names the tenant, the filters and the page size',
       detail:
-        "The cache key is derived from `(tenant, normalized q, filter hash, page, index version)`. The starter keys by the raw query alone, so a cached unfiltered result set answers a filtered request and one tenant reads another tenant's results.",
+        'The key starts `search:{tenant}:` and its digest covers the filters, sorted by field, and the page size; the starter keys by `q` alone, so another tenant or another filter set gets the first caller’s page.',
       match: {
-        python: {all: [/def cache_key\(/, /tenant/, /filter_hash/, /index_version/, /page/]},
-        typescript: {all: [/function cacheKey\(/, /tenant/, /filterHash/, /indexVersion/, /page/]},
-        go: {all: [/func cacheKey\(/, /tenant/, /filterHash/, /indexVersion/, /page/]},
-        scala: {all: [/def cacheKey\(/, /tenant/, /filterHash/, /indexVersion/, /page/]},
-        cpp: {all: [/cache_key\(/, /tenant/, /filter_hash/, /index_version/, /page/]},
+        python: {all: [/search:\{tenant\}:/, /sorted\(\s*filters/], none: [/f["']search:\{q\}["']/]},
+        typescript: {
+          all: [/search:\$\{tenant\}:/, /Object\.(keys|entries)\(\s*filters\s*\)\s*\.sort\(/],
+          none: [/`search:\$\{q\}`/],
+        },
+        go: {all: [/"search:"\s*\+\s*tenant|"search:%s:/, /sort\.Strings\(/], none: [/"search:"\s*\+\s*q\b/]},
+        scala: {all: [/s"search:\$tenant:/, /\.toSeq\.sorted|\.sortBy\(|SortedMap/], none: [/s"search:\$q"/]},
+        cpp: {
+          all: [/"search:"\s*\+\s*tenant/, /for \(const auto& \[\w+, \w+\] : filters\)/],
+          none: [/"search:"\s*\+\s*q\b/],
+        },
+      },
+    },
+    {
+      id: 'normalized-key',
+      title: 'Two spellings of one search share one entry',
+      detail:
+        'The digest is taken over `normalize_query(q)` (lowercase, trimmed, single spaces), so `Steel Kettle` and ` steel  KETTLE ` with the same filters in another order are one entry.',
+      match: {
+        python: {all: [/normalize_query\(/, /digest\(/]},
+        typescript: {all: [/normalizeQuery\(/, /digest\(/]},
+        go: {all: [/catalog\.NormalizeQuery\(/, /catalog\.Digest\(/]},
+        scala: {all: [/Catalog\.normalizeQuery\(/, /Catalog\.digest\(/]},
+        cpp: {all: [/catalog::normalizeQuery\(/, /catalog::digest\(/]},
       },
     },
     {
       id: 'ttl',
       title: 'Entries expire after 60 seconds',
       detail:
-        'The cache writes with a 60-second TTL (`setex` / `SET … EX` / `SetEx`). The starter writes with no expiry, so the first answer is served until a deploy or a restart.',
+        'Every entry is written with `CACHE_TTL_S` = 60 (`SET … EX`, `setex`); the starter’s plain `SET` keeps a page forever.',
       match: {
-        python: {all: [/CACHE_TTL_S\s*=\s*60/, /\.setex\(/]},
-        typescript: {all: [/CACHE_TTL_S\s*=\s*60/, /\.set\([^;\n]*'EX'/]},
-        go: {all: [/cacheTTLSeconds\s*=\s*60/, /\.SetEx\(/]},
-        scala: {all: [/CacheTtlSeconds\s*=\s*60/, /\.setex\(/]},
-        cpp: {all: [/kCacheTtlSeconds\s*=\s*60/, /\.set\([^;]*kCacheTtlSeconds/]},
+        python: {all: [/CACHE_TTL_S\s*=\s*60\b/, /ex\s*=\s*CACHE_TTL_S|setex\([^\n]*CACHE_TTL_S/]},
+        typescript: {all: [/CACHE_TTL_S\s*=\s*60\b/, /'EX',\s*CACHE_TTL_S|setex\([^\n]*CACHE_TTL_S/]},
+        go: {all: [/cacheTTL\s*=\s*60\s*\*\s*time\.Second/, /\.Set\([^\n]*cacheTTL\)|\.SetEx\([^\n]*cacheTTL/]},
+        scala: {all: [/CacheTtlSeconds\s*=\s*60\b/, /setex\([^\n]*CacheTtlSeconds/]},
+        cpp: {all: [/kCacheTtlSeconds\s*=\s*60\b/, /setex\([^\n]*kCacheTtlSeconds/]},
       },
     },
     {
-      id: 'normalized-query',
-      title: 'Normalizes the query before keying',
+      id: 'index-version',
+      title: 'A catalog write makes the next search miss',
       detail:
-        'The query is trimmed, lowercased and whitespace-collapsed before it enters the key, so `" Red  Shoes "` and `"red shoes"` share one entry. The starter keys the raw string.',
+        'The key carries `index_version(tenant)`, read on every call; `put_product` bumps it, so a newly indexed product shows up on the next search rather than after the TTL.',
       match: {
-        python: {all: [/def normalize_query\(/, /strip\(\)\.lower\(\)/]},
-        typescript: {all: [/function normalizeQuery\(/, /trim\(\)\.toLowerCase\(\)/]},
-        go: {all: [/func normalizeQuery\(/, /strings\.ToLower\(strings\.TrimSpace\(/]},
-        scala: {all: [/def normalizeQuery\(/, /trim\.toLowerCase/]},
-        cpp: {all: [/normalize_query\(/, /tolower/]},
-      },
-    },
-    {
-      id: 'filter-hash',
-      title: 'Hashes filters canonically',
-      detail:
-        'Filters enter the key as a deterministic digest over canonical (sorted-key) JSON, so `{a,b}` and `{b,a}` are one entry. The starter ignores filters entirely, which is the leak that serves unfiltered results to a filtered query.',
-      match: {
-        python: {all: [/def filter_hash\(/, /hashlib/]},
-        typescript: {all: [/function filterHash\(/, /createHash\(/]},
-        go: {all: [/func filterHash\(/, /sha256\./]},
-        scala: {all: [/def filterHash\(/, /MessageDigest/]},
-        cpp: {all: [/filter_hash\(/, /fnv1a/]},
-      },
-    },
-    {
-      id: 'version-bump',
-      title: 'Bumps the index version on a catalog update',
-      detail:
-        'The index version is read per request and incremented when the catalog is republished (`INCR catalog:index_version`), so a price change appears within one TTL instead of being masked by an old key. The starter has no version at all.',
-      match: {
-        python: {all: [/index_version/, /\.incr\(/]},
-        typescript: {all: [/indexVersion/, /\.incr\(/]},
-        go: {all: [/indexVersion/, /\.Incr\(/]},
-        scala: {all: [/indexVersion/, /\.incr\(/]},
-        cpp: {all: [/index_version/, /\.incr\(/]},
+        python: {all: [/catalog\.index_version\(\s*tenant\s*\)/]},
+        typescript: {all: [/indexVersion\(\s*tenant\s*\)/]},
+        go: {all: [/catalog\.IndexVersion\(\s*ctx,\s*tenant\s*\)/]},
+        scala: {all: [/Catalog\.indexVersion\(\s*tenant\s*\)/]},
+        cpp: {all: [/catalog::indexVersion\(\s*tenant\s*\)/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
-import logging
 
 import redis
 
-logger = logging.getLogger("search-cache")
+from search import catalog  # run_query, index_version, normalize_query, digest
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-def search_cached(tenant: str, q: str, filters: dict, page: int, run_search):
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+def cached_search(tenant: str, q: str, filters: dict[str, str], page_size: int) -> list[dict]:
+    """run_query through the query cache: a hit answers from Redis, a miss runs the engine and stores the page."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     key = f"search:{q}"
     hit = r.get(key)
     if hit is not None:
-        logger.info("cache hit tenant=%s q=%r", tenant, q)
         return json.loads(hit)
-    results = run_search(q, filters, page)
+    results = catalog.run_query(tenant, q, filters, page_size)
     r.set(key, json.dumps(results))
     return results
 `,
-      solution: `import hashlib
-import json
-import logging
+      solution: `import json
 
 import redis
 
-logger = logging.getLogger("search-cache")
+from search import catalog  # run_query, index_version, normalize_query, digest
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 CACHE_TTL_S = 60
 
 
-def normalize_query(q: str) -> str:
-    return " ".join(q.strip().lower().split())
+def cache_key(tenant: str, q: str, filters: dict[str, str], page_size: int) -> str:
+    """Every input that changes the page: tenant, index version, normalized query, filters in field order, page size."""
+    pairs = "&".join(f"{field}={filters[field]}" for field in sorted(filters))
+    canonical = "\\n".join([catalog.normalize_query(q), pairs, str(page_size)])
+    return f"search:{tenant}:{catalog.index_version(tenant)}:{catalog.digest(canonical)}"
 
 
-def filter_hash(filters: dict) -> str:
-    canonical = json.dumps(filters, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-
-
-def current_index_version() -> str:
-    return r.get("catalog:index_version") or "0"
-
-
-def cache_key(tenant: str, q: str, filters: dict, page: int, index_version: str) -> str:
-    query_hash = hashlib.sha256(normalize_query(q).encode("utf-8")).hexdigest()[:16]
-    return f"search:{tenant}:{index_version}:{page}:{filter_hash(filters)}:{query_hash}"
-
-
-def bump_index_version() -> None:
-    """A catalog publish rotates the key namespace, so no request waits out the TTL."""
-    r.incr("catalog:index_version")
-
-
-def search_cached(tenant: str, q: str, filters: dict, page: int, run_search):
-    key = cache_key(tenant, q, filters, page, current_index_version())
+def cached_search(tenant: str, q: str, filters: dict[str, str], page_size: int) -> list[dict]:
+    """run_query through the query cache: a hit answers from Redis, a miss runs the engine and stores the page."""
+    key = cache_key(tenant, q, filters, page_size)
     hit = r.get(key)
     if hit is not None:
-        logger.info("cache hit tenant=%s page=%d", tenant, page)
         return json.loads(hit)
-    results = run_search(q, filters, page)
-    r.setex(key, CACHE_TTL_S, json.dumps(results))
+    results = catalog.run_query(tenant, q, filters, page_size)
+    r.set(key, json.dumps(results), ex=CACHE_TTL_S)
     return results
 `,
     },
     typescript: {
-      starter: `/** Query cache: the starter. */
-import {createHash} from 'node:crypto';
+      starter: `import Redis from 'ioredis';
 
-import {Redis} from 'ioredis';
+import {type Hit, digest, indexVersion, normalizeQuery, runQuery} from 'search/catalog';
 
-export const redis = new Redis({host: 'redis', port: 6379});
+const redis = new Redis({host: 'redis', port: 6379});
 
-export async function searchCached(
-  tenant: string,
-  q: string,
-  filters: Record<string, unknown>,
-  page: number,
-  runSearch: (q: string, filters: Record<string, unknown>, page: number) => Promise<unknown[]>,
-): Promise<unknown[]> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  void createHash;
+/** runQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page. */
+export async function cachedSearch(tenant: string, q: string, filters: Record<string, string>, pageSize: number): Promise<Hit[]> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const key = \`search:\${q}\`;
   const hit = await redis.get(key);
-  if (hit !== null) return JSON.parse(hit) as unknown[];
-  const results = await runSearch(q, filters, page);
+  if (hit !== null) return JSON.parse(hit) as Hit[];
+  const results = await runQuery(tenant, q, filters, pageSize);
   await redis.set(key, JSON.stringify(results));
   return results;
 }
 `,
-      solution: `/** Query cache: keyed by the whole query, expiring, and rotated by the index version. */
-import {createHash} from 'node:crypto';
+      solution: `import Redis from 'ioredis';
 
-import {Redis} from 'ioredis';
+import {type Hit, digest, indexVersion, normalizeQuery, runQuery} from 'search/catalog';
 
-export const redis = new Redis({host: 'redis', port: 6379});
+const redis = new Redis({host: 'redis', port: 6379});
 
 const CACHE_TTL_S = 60;
 
-function normalizeQuery(q: string): string {
-  return q.trim().toLowerCase().split(/\\s+/).join(' ');
+/** Every input that changes the page: tenant, index version, normalized query, filters in field order, page size. */
+async function cacheKey(tenant: string, q: string, filters: Record<string, string>, pageSize: number): Promise<string> {
+  const pairs = Object.keys(filters)
+    .sort()
+    .map(field => \`\${field}=\${filters[field]}\`)
+    .join('&');
+  const canonical = [normalizeQuery(q), pairs, String(pageSize)].join('\\n');
+  return \`search:\${tenant}:\${await indexVersion(tenant)}:\${digest(canonical)}\`;
 }
 
-function filterHash(filters: Record<string, unknown>): string {
-  const canonical = JSON.stringify(
-    Object.keys(filters)
-      .sort()
-      .map(field => [field, filters[field]]),
-  );
-  return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
-}
-
-async function currentIndexVersion(): Promise<string> {
-  return (await redis.get('catalog:index_version')) ?? '0';
-}
-
-export function cacheKey(
-  tenant: string,
-  q: string,
-  filters: Record<string, unknown>,
-  page: number,
-  indexVersion: string,
-): string {
-  const queryHash = createHash('sha256').update(normalizeQuery(q)).digest('hex').slice(0, 16);
-  return \`search:\${tenant}:\${indexVersion}:\${page}:\${filterHash(filters)}:\${queryHash}\`;
-}
-
-export async function bumpIndexVersion(): Promise<void> {
-  await redis.incr('catalog:index_version');
-}
-
-export async function searchCached(
-  tenant: string,
-  q: string,
-  filters: Record<string, unknown>,
-  page: number,
-  runSearch: (q: string, filters: Record<string, unknown>, page: number) => Promise<unknown[]>,
-): Promise<unknown[]> {
-  const key = cacheKey(tenant, q, filters, page, await currentIndexVersion());
+/** runQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page. */
+export async function cachedSearch(tenant: string, q: string, filters: Record<string, string>, pageSize: number): Promise<Hit[]> {
+  const key = await cacheKey(tenant, q, filters, pageSize);
   const hit = await redis.get(key);
-  if (hit !== null) return JSON.parse(hit) as unknown[];
-  const results = await runSearch(q, filters, page);
+  if (hit !== null) return JSON.parse(hit) as Hit[];
+  const results = await runQuery(tenant, q, filters, pageSize);
   await redis.set(key, JSON.stringify(results), 'EX', CACHE_TTL_S);
   return results;
 }
@@ -270,34 +197,39 @@ export async function searchCached(
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/redis/go-redis/v9"
+
+	"search/catalog" // RunQuery, IndexVersion, NormalizeQuery, Digest, Hit
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-func searchCached(ctx context.Context, tenant, q string, filters map[string]any, page int, runSearch func() any) (any, error) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	key := fmt.Sprintf("search:%s", q)
-	hit, err := rdb.Get(ctx, key).Result()
+// cachedSearch is RunQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page.
+func cachedSearch(ctx context.Context, tenant, q string, filters map[string]string, pageSize int) ([]catalog.Hit, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	key := "search:" + q
+	raw, err := rdb.Get(ctx, key).Result()
 	if err == nil {
-		var results any
-		json.Unmarshal([]byte(hit), &results)
-		return results, nil
+		var hits []catalog.Hit
+		if json.Unmarshal([]byte(raw), &hits) == nil {
+			return hits, nil
+		}
+	} else if err != redis.Nil {
+		return nil, err
 	}
-	results := runSearch()
-	payload, _ := json.Marshal(results)
-	rdb.Set(ctx, key, payload, 0)
-	return results, nil
+	hits := catalog.RunQuery(ctx, tenant, q, filters, pageSize)
+	page, _ := json.Marshal(hits)
+	if err := rdb.Set(ctx, key, page, 0).Err(); err != nil {
+		return nil, err
+	}
+	return hits, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -305,113 +237,98 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"search/catalog" // RunQuery, IndexVersion, NormalizeQuery, Digest, Hit
 )
 
-const cacheTTLSeconds = 60
+const cacheTTL = 60 * time.Second
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-func normalizeQuery(q string) string {
-	return strings.ToLower(strings.TrimSpace(q))
-}
-
-func filterHash(filters map[string]any) string {
+// cacheKey names every input that changes the page: tenant, index version, normalized query, filters in field order, page size.
+func cacheKey(ctx context.Context, tenant, q string, filters map[string]string, pageSize int) string {
 	fields := make([]string, 0, len(filters))
 	for field := range filters {
 		fields = append(fields, field)
 	}
 	sort.Strings(fields)
-	canonical, _ := json.Marshal(fields)
-	sum := sha256.Sum256(canonical)
-	return hex.EncodeToString(sum[:])[:16]
-}
-
-func currentIndexVersion(ctx context.Context) string {
-	version, err := rdb.Get(ctx, "catalog:index_version").Result()
-	if err != nil {
-		return "0"
+	pairs := make([]string, 0, len(fields))
+	for _, field := range fields {
+		pairs = append(pairs, field+"="+filters[field])
 	}
-	return version
+	canonical := strings.Join([]string{catalog.NormalizeQuery(q), strings.Join(pairs, "&"), fmt.Sprint(pageSize)}, "\\n")
+	return fmt.Sprintf("search:%s:%d:%s", tenant, catalog.IndexVersion(ctx, tenant), catalog.Digest(canonical))
 }
 
-func cacheKey(tenant, q string, filters map[string]any, page int, indexVersion string) string {
-	sum := sha256.Sum256([]byte(normalizeQuery(q)))
-	return fmt.Sprintf("search:%s:%s:%d:%s:%s", tenant, indexVersion, page, filterHash(filters), hex.EncodeToString(sum[:])[:16])
-}
-
-func bumpIndexVersion(ctx context.Context) error {
-	return rdb.Incr(ctx, "catalog:index_version").Err()
-}
-
-func searchCached(ctx context.Context, tenant, q string, filters map[string]any, page int, runSearch func() any) (any, error) {
-	key := cacheKey(tenant, q, filters, page, currentIndexVersion(ctx))
-	hit, err := rdb.Get(ctx, key).Result()
+// cachedSearch is RunQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page.
+func cachedSearch(ctx context.Context, tenant, q string, filters map[string]string, pageSize int) ([]catalog.Hit, error) {
+	key := cacheKey(ctx, tenant, q, filters, pageSize)
+	raw, err := rdb.Get(ctx, key).Result()
 	if err == nil {
-		var results any
-		json.Unmarshal([]byte(hit), &results)
-		return results, nil
+		var hits []catalog.Hit
+		if json.Unmarshal([]byte(raw), &hits) == nil {
+			return hits, nil
+		}
+	} else if err != redis.Nil {
+		return nil, err
 	}
-	results := runSearch()
-	payload, _ := json.Marshal(results)
-	rdb.SetEx(ctx, key, payload, time.Duration(cacheTTLSeconds)*time.Second)
-	return results, nil
+	hits := catalog.RunQuery(ctx, tenant, q, filters, pageSize)
+	page, _ := json.Marshal(hits)
+	if err := rdb.Set(ctx, key, page, cacheTTL).Err(); err != nil {
+		return nil, err
+	}
+	return hits, nil
 }
 `,
     },
     scala: {
-      starter: `import java.security.MessageDigest
+      starter: `import redis.clients.jedis.JedisPooled
+import spray.json._
 
-import redis.clients.jedis.Jedis
+import search.Catalog // runQuery, indexVersion, normalizeQuery, digest
 
 object QueryCache {
-  val jedis = new Jedis("redis", 6379)
+  val jedis = new JedisPooled("redis", 6379)
 
-  def searchCached(tenant: String, q: String, filters: Map[String, String], page: Int)(runSearch: () => String): String = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  /** runQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page. */
+  def cachedSearch(tenant: String, q: String, filters: Map[String, String], pageSize: Int): Seq[JsObject] = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     val key = s"search:$q"
     Option(jedis.get(key)) match {
-      case Some(hit) => hit
+      case Some(hit) => hit.parseJson.asInstanceOf[JsArray].elements.map(_.asJsObject)
       case None =>
-        val results = runSearch()
-        jedis.set(key, results)
+        val results = Catalog.runQuery(tenant, q, filters, pageSize)
+        jedis.set(key, JsArray(results.toVector).compactPrint)
         results
     }
   }
 }
 `,
-      solution: `import java.security.MessageDigest
+      solution: `import redis.clients.jedis.JedisPooled
+import spray.json._
 
-import redis.clients.jedis.Jedis
+import search.Catalog // runQuery, indexVersion, normalizeQuery, digest
 
 object QueryCache {
+  val jedis = new JedisPooled("redis", 6379)
+
   val CacheTtlSeconds = 60
-  val jedis = new Jedis("redis", 6379)
 
-  def normalizeQuery(q: String): String = q.trim.toLowerCase
-
-  def filterHash(filters: Map[String, String]): String = {
-    val canonical = filters.toList.sortBy(_._1).map { case (field, value) => s"$field=$value" }.mkString("&")
-    val digest = MessageDigest.getInstance("SHA-256").digest(canonical.getBytes("UTF-8"))
-    digest.take(8).map("%02x".format(_)).mkString
+  /** Every input that changes the page: tenant, index version, normalized query, filters in field order, page size. */
+  def cacheKey(tenant: String, q: String, filters: Map[String, String], pageSize: Int): String = {
+    val pairs = filters.toSeq.sorted.map { case (field, value) => s"$field=$value" }.mkString("&")
+    val canonical = Seq(Catalog.normalizeQuery(q), pairs, pageSize.toString).mkString("\\n")
+    s"search:$tenant:\${Catalog.indexVersion(tenant)}:\${Catalog.digest(canonical)}"
   }
 
-  def currentIndexVersion: String = Option(jedis.get("catalog:index_version")).getOrElse("0")
-
-  def cacheKey(tenant: String, q: String, filters: Map[String, String], page: Int, indexVersion: String): String = {
-    val queryHash = MessageDigest.getInstance("SHA-256").digest(normalizeQuery(q).getBytes("UTF-8"))
-    val queryHex = queryHash.take(8).map("%02x".format(_)).mkString
-    s"search:$tenant:$indexVersion:$page:\${filterHash(filters)}:$queryHex"
-  }
-
-  def bumpIndexVersion(): Unit = jedis.incr("catalog:index_version")
-
-  def searchCached(tenant: String, q: String, filters: Map[String, String], page: Int)(runSearch: () => String): String = {
-    val key = cacheKey(tenant, q, filters, page, currentIndexVersion)
+  /** runQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page. */
+  def cachedSearch(tenant: String, q: String, filters: Map[String, String], pageSize: Int): Seq[JsObject] = {
+    val key = cacheKey(tenant, q, filters, pageSize)
     Option(jedis.get(key)) match {
-      case Some(hit) => hit
+      case Some(hit) => hit.parseJson.asInstanceOf[JsArray].elements.map(_.asJsObject)
       case None =>
-        val results = runSearch()
-        jedis.setex(key, CacheTtlSeconds, results)
+        val results = Catalog.runQuery(tenant, q, filters, pageSize)
+        jedis.setex(key, CacheTtlSeconds.toLong, JsArray(results.toVector).compactPrint)
         results
     }
   }
@@ -419,93 +336,327 @@ object QueryCache {
 `,
     },
     cpp: {
-      starter: `#include <sw/redis++/redis++.h>
+      starter: `#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
+#include <map>
 #include <string>
 
-using sw::redis::Redis;
+#include "search/catalog.h"  // catalog::runQuery, indexVersion, normalizeQuery, digest
 
-Redis redis("tcp://redis:6379");
+using json = nlohmann::json;
 
-std::string searchCached(const std::string& tenant, const std::string& q, const std::string& filters, int page) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+sw::redis::Redis& redis() {
+  static sw::redis::Redis r("tcp://redis:6379");
+  return r;
+}
+
+// runQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page.
+json cachedSearch(const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters, int page_size) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const std::string key = "search:" + q;
-  if (const auto hit = redis.get(key)) return *hit;
-  const std::string results = "[]";
-  redis.set(key, results);
+  if (const auto hit = redis().get(key)) return json::parse(*hit);
+  const json results = catalog::runQuery(tenant, q, filters, page_size);
+  redis().set(key, results.dump());
   return results;
 }
 `,
-      solution: `#include <sw/redis++/redis++.h>
+      solution: `#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
-#include <algorithm>
-#include <cctype>
-#include <chrono>
-#include <cstdint>
+#include <map>
 #include <string>
 
-#include <nlohmann/json.hpp>
+#include "search/catalog.h"  // catalog::runQuery, indexVersion, normalizeQuery, digest
 
 using json = nlohmann::json;
-using sw::redis::Redis;
 
-constexpr int kCacheTtlSeconds = 60;
-Redis redis("tcp://redis:6379");
+const long kCacheTtlSeconds = 60;
 
-std::string normalize_query(const std::string& q) {
-  std::string out;
-  bool pending = false;
-  for (unsigned char c : q) {
-    if (std::isspace(c)) {
-      pending = !out.empty();
-      continue;
-    }
-    if (pending) out += ' ';
-    pending = false;
-    out += static_cast<char>(std::tolower(c));
-  }
-  return out;
+sw::redis::Redis& redis() {
+  static sw::redis::Redis r("tcp://redis:6379");
+  return r;
 }
 
-std::string filter_hash(const json& filters) {
-  json canonical = json::object();
-  for (const auto& [field, value] : filters.items()) canonical[field] = value;
-  const std::string text = canonical.dump();
-  std::uint64_t fnv1a = 1469598103934665603ull;
-  for (unsigned char c : text) {
-    fnv1a ^= c;
-    fnv1a *= 1099511628211ull;
-  }
-  return std::to_string(fnv1a);
+// Every input that changes the page: tenant, index version, normalized query, filters in field order
+// (a std::map iterates sorted), page size.
+std::string cacheKey(const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters, int page_size) {
+  std::string pairs;
+  for (const auto& [field, value] : filters) pairs += (pairs.empty() ? "" : "&") + field + "=" + value;
+  const std::string canonical = catalog::normalizeQuery(q) + "\\n" + pairs + "\\n" + std::to_string(page_size);
+  return "search:" + tenant + ":" + std::to_string(catalog::indexVersion(tenant)) + ":" + catalog::digest(canonical);
 }
 
-std::string index_version() {
-  if (const auto version = redis.get("catalog:index_version")) return *version;
-  return "0";
-}
-
-std::string cache_key(const std::string& tenant, const std::string& q, const json& filters, int page,
-                      const std::string& version) {
-  return "search:" + tenant + ":" + version + ":" + std::to_string(page) + ":" + filter_hash(filters) + ":" +
-         normalize_query(q);
-}
-
-void bump_index_version() { redis.incr("catalog:index_version"); }
-
-std::string search_cached(const std::string& tenant, const std::string& q, const json& filters, int page) {
-  const std::string key = cache_key(tenant, q, filters, page, index_version());
-  if (const auto hit = redis.get(key)) return *hit;
-  const std::string results = "[]";
-  redis.set(key, results, std::chrono::seconds(kCacheTtlSeconds));
+// runQuery through the query cache: a hit answers from Redis, a miss runs the engine and stores the page.
+json cachedSearch(const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters, int page_size) {
+  const std::string key = cacheKey(tenant, q, filters, page_size);
+  if (const auto hit = redis().get(key)) return json::parse(*hit);
+  const json results = catalog::runQuery(tenant, q, filters, page_size);
+  redis().setex(key, kCacheTtlSeconds, results.dump());
   return results;
 }
 `,
     },
   },
+  harness: {
+    python: `from search import catalog
+
+KETTLES = [
+    {"id": "p-1", "title": "Steel Kettle", "brand": "acme", "category": "kitchen", "price_cents": 3499, "in_stock": True, "cost_cents": 1200},
+    {"id": "p-2", "title": "Glass Kettle", "brand": "brew", "category": "kitchen", "price_cents": 2999, "in_stock": True, "cost_cents": 900},
+]
+COPPER = {"id": "p-9", "title": "Copper Kettle", "brand": "acme", "category": "kitchen", "price_cents": 5999, "in_stock": True, "cost_cents": 3000}
+TRAVEL = {"id": "p-4", "title": "Travel Kettle", "brand": "acme", "category": "kitchen", "price_cents": 1999, "in_stock": True, "cost_cents": 700}
+
+
+def _cache(ctx):
+    for product in KETTLES:
+        catalog.put_product("t-1", product)
+    catalog.put_product("t-2", COPPER)
+    return ctx.load("cache")
+
+
+def _ids(page):
+    return [hit["id"] for hit in page]
+
+
+def check_key_inputs(ctx):
+    m = _cache(ctx)
+    assert _ids(m.cached_search("t-1", "kettle", {}, 10)) == ["p-2", "p-1"], "t-1's search for kettle must answer its two kettles"
+    other = _ids(m.cached_search("t-2", "kettle", {}, 10))
+    assert other == ["p-9"], f"tenant t-2 searching kettle got {other}, expected its own [p-9]: the cache served t-1's page to another tenant"
+    acme = _ids(m.cached_search("t-1", "kettle", {"brand": "acme"}, 10))
+    assert acme == ["p-1"], f"t-1 searching kettle with brand=acme got {acme}, expected [p-1]: the cache answered the unfiltered page"
+    one = _ids(m.cached_search("t-1", "kettle", {}, 1))
+    assert one == ["p-2"], f"t-1 searching kettle with page_size 1 got {one}, expected [p-2]: the cache answered a page of another size"
+    keys = sorted(ctx.redis.keys("search:*"))
+    assert all(k.startswith("search:t-1:") or k.startswith("search:t-2:") for k in keys), f"the cache keys are {keys}: each must start search:{{tenant}}:"
+
+
+def check_normalized_key(ctx):
+    m = _cache(ctx)
+    first = m.cached_search("t-1", "Steel Kettle", {"brand": "acme", "in_stock": "true"}, 10)
+    second = m.cached_search("t-1", "  steel   KETTLE ", {"in_stock": "true", "brand": "acme"}, 10)
+    assert _ids(first) == _ids(second) == ["p-1"], f"the two spellings answered {_ids(first)} and {_ids(second)}, expected [p-1] for both"
+    keys = ctx.redis.keys("search:*")
+    assert len(keys) == 1, f"one search spelled two ways, filters in two orders, left {len(keys)} cache entries {sorted(keys)}: digest the normalized query and the filters sorted by field"
+
+
+def check_ttl(ctx):
+    m = _cache(ctx)
+    m.cached_search("t-1", "kettle", {}, 10)
+    keys = ctx.redis.keys("search:*")
+    assert len(keys) == 1, f"one search left {len(keys)} cache entries {sorted(keys)}, expected 1"
+    ttl = ctx.redis.ttl(keys[0])
+    assert 0 < ttl <= 60, f"the cache entry {keys[0]} has TTL {ttl}: {'it never expires' if ttl == -1 else 'expected at most 60 s'}. Write it with CACHE_TTL_S = 60"
+
+
+def check_index_version(ctx):
+    m = _cache(ctx)
+    assert _ids(m.cached_search("t-1", "kettle", {}, 10)) == ["p-2", "p-1"], "t-1's first search for kettle must answer its two kettles"
+    assert _ids(m.cached_search("t-1", "kettle", {}, 10)) == ["p-2", "p-1"], "the repeated search must answer the same page"
+    catalog.put_product("t-1", TRAVEL)
+    after = _ids(m.cached_search("t-1", "kettle", {}, 10))
+    assert after == ["p-4", "p-2", "p-1"], f"after put_product indexed p-4 the search answered {after}, expected [p-4, p-2, p-1]: the key must carry index_version(tenant), read on every call"
+`,
+    typescript: `const KETTLES = [
+  {id: 'p-1', title: 'Steel Kettle', brand: 'acme', category: 'kitchen', price_cents: 3499, in_stock: true, cost_cents: 1200},
+  {id: 'p-2', title: 'Glass Kettle', brand: 'brew', category: 'kitchen', price_cents: 2999, in_stock: true, cost_cents: 900},
+];
+const COPPER = {id: 'p-9', title: 'Copper Kettle', brand: 'acme', category: 'kitchen', price_cents: 5999, in_stock: true, cost_cents: 3000};
+const TRAVEL = {id: 'p-4', title: 'Travel Kettle', brand: 'acme', category: 'kitchen', price_cents: 1999, in_stock: true, cost_cents: 700};
+
+async function cache(ctx) {
+  const catalog = ctx.load('/support/search/catalog.ts');
+  for (const product of KETTLES) await catalog.putProduct('t-1', product);
+  await catalog.putProduct('t-2', COPPER);
+  return {m: ctx.load('cache'), catalog};
+}
+
+const ids = (page): string => JSON.stringify(page.map(hit => hit.id));
+
+export async function check_key_inputs(ctx) {
+  const {m} = await cache(ctx);
+  assert.equal(ids(await m.cachedSearch('t-1', 'kettle', {}, 10)), '["p-2","p-1"]', "t-1's search for kettle must answer its two kettles");
+  const other = ids(await m.cachedSearch('t-2', 'kettle', {}, 10));
+  assert.equal(other, '["p-9"]', \`tenant t-2 searching kettle got \${other}, expected its own [p-9]: the cache served t-1's page to another tenant\`);
+  const acme = ids(await m.cachedSearch('t-1', 'kettle', {brand: 'acme'}, 10));
+  assert.equal(acme, '["p-1"]', \`t-1 searching kettle with brand=acme got \${acme}, expected [p-1]: the cache answered the unfiltered page\`);
+  const one = ids(await m.cachedSearch('t-1', 'kettle', {}, 1));
+  assert.equal(one, '["p-2"]', \`t-1 searching kettle with page_size 1 got \${one}, expected [p-2]: the cache answered a page of another size\`);
+  const keys = ctx.redis.keys('search:*').sort();
+  assert(keys.every(k => k.startsWith('search:t-1:') || k.startsWith('search:t-2:')), \`the cache keys are \${JSON.stringify(keys)}: each must start search:{tenant}:\`);
+}
+
+export async function check_normalized_key(ctx) {
+  const {m} = await cache(ctx);
+  const first = ids(await m.cachedSearch('t-1', 'Steel Kettle', {brand: 'acme', in_stock: 'true'}, 10));
+  const second = ids(await m.cachedSearch('t-1', '  steel   KETTLE ', {in_stock: 'true', brand: 'acme'}, 10));
+  assert(first === '["p-1"]' && second === '["p-1"]', \`the two spellings answered \${first} and \${second}, expected [p-1] for both\`);
+  const keys = ctx.redis.keys('search:*');
+  assert.equal(keys.length, 1, \`one search spelled two ways, filters in two orders, left \${keys.length} cache entries \${JSON.stringify(keys)}: digest the normalized query and the filters sorted by field\`);
+}
+
+export async function check_ttl(ctx) {
+  const {m} = await cache(ctx);
+  await m.cachedSearch('t-1', 'kettle', {}, 10);
+  const keys = ctx.redis.keys('search:*');
+  assert.equal(keys.length, 1, \`one search left \${keys.length} cache entries \${JSON.stringify(keys)}, expected 1\`);
+  const ttl = Number(ctx.redis.ttl(keys[0]));
+  assert(ttl > 0 && ttl <= 60, \`the cache entry \${keys[0]} has TTL \${ttl}: \${ttl === -1 ? 'it never expires' : 'expected at most 60 s'}. Write it with CACHE_TTL_S = 60\`);
+}
+
+export async function check_index_version(ctx) {
+  const {m, catalog} = await cache(ctx);
+  assert.equal(ids(await m.cachedSearch('t-1', 'kettle', {}, 10)), '["p-2","p-1"]', "t-1's first search for kettle must answer its two kettles");
+  assert.equal(ids(await m.cachedSearch('t-1', 'kettle', {}, 10)), '["p-2","p-1"]', 'the repeated search must answer the same page');
+  await catalog.putProduct('t-1', TRAVEL);
+  const after = ids(await m.cachedSearch('t-1', 'kettle', {}, 10));
+  assert.equal(after, '["p-4","p-2","p-1"]', \`after putProduct indexed p-4 the search answered \${after}, expected [p-4, p-2, p-1]: the key must carry indexVersion(tenant), read on every call\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strings"
+
+	"search/catalog"
+
+	"leetbuild/harness"
+)
+
+var (
+	cacheBg      = context.Background()
+	cacheKettles = []catalog.Product{
+		{ID: "p-1", Title: "Steel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 3499, InStock: true, CostCents: 1200},
+		{ID: "p-2", Title: "Glass Kettle", Brand: "brew", Category: "kitchen", PriceCents: 2999, InStock: true, CostCents: 900},
+	}
+	cacheCopper = catalog.Product{ID: "p-9", Title: "Copper Kettle", Brand: "acme", Category: "kitchen", PriceCents: 5999, InStock: true, CostCents: 3000}
+	cacheTravel = catalog.Product{ID: "p-4", Title: "Travel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 1999, InStock: true, CostCents: 700}
+)
+
+func seedCache() {
+	for _, p := range cacheKettles {
+		catalog.PutProduct(cacheBg, "t-1", p)
+	}
+	catalog.PutProduct(cacheBg, "t-2", cacheCopper)
+}
+
+func page(ctx *harness.Ctx, tenant, q string, filters map[string]string, pageSize int) string {
+	hits, err := cachedSearch(cacheBg, tenant, q, filters, pageSize)
+	ctx.NoError(err, "cachedSearch(%s, %q) failed", tenant, q)
+	ids := []string{}
+	for _, h := range hits {
+		ids = append(ids, h.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
+func CheckKeyInputs(ctx *harness.Ctx) {
+	seedCache()
+	ctx.Equal(page(ctx, "t-1", "kettle", nil, 10), "p-2,p-1", "t-1's search for kettle")
+	ctx.Equal(page(ctx, "t-2", "kettle", nil, 10), "p-9", "tenant t-2 searching kettle must get its own page, not t-1's")
+	ctx.Equal(page(ctx, "t-1", "kettle", map[string]string{"brand": "acme"}, 10), "p-1", "t-1 searching kettle with brand=acme must not get the unfiltered page")
+	ctx.Equal(page(ctx, "t-1", "kettle", nil, 1), "p-2", "t-1 searching kettle with page size 1 must not get a page of another size")
+	for _, k := range ctx.Redis.Keys("search:*") {
+		ctx.Assert(strings.HasPrefix(k, "search:t-1:") || strings.HasPrefix(k, "search:t-2:"), "the cache key %q must start search:{tenant}:", k)
+	}
+}
+
+func CheckNormalizedKey(ctx *harness.Ctx) {
+	seedCache()
+	first := page(ctx, "t-1", "Steel Kettle", map[string]string{"brand": "acme", "in_stock": "true"}, 10)
+	second := page(ctx, "t-1", "  steel   KETTLE ", map[string]string{"in_stock": "true", "brand": "acme"}, 10)
+	ctx.Assert(first == "p-1" && second == "p-1", "the two spellings answered [%s] and [%s], expected [p-1] for both", first, second)
+	keys := ctx.Redis.Keys("search:*")
+	ctx.Equal(len(keys), 1, "one search spelled two ways must share one cache entry (digest the normalized query and the filters sorted by field); the entries %q", keys)
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	seedCache()
+	page(ctx, "t-1", "kettle", nil, 10)
+	keys := ctx.Redis.Keys("search:*")
+	ctx.Equal(len(keys), 1, "one search must leave one cache entry; the entries %q", keys)
+	ttl := ctx.Redis.TTL(keys[0])
+	ctx.Assert(ttl > 0 && ttl <= 60, "the cache entry %s has TTL %d (-1: it never expires): write it with cacheTTL = 60 s", keys[0], ttl)
+}
+
+func CheckIndexVersion(ctx *harness.Ctx) {
+	seedCache()
+	ctx.Equal(page(ctx, "t-1", "kettle", nil, 10), "p-2,p-1", "t-1's first search for kettle")
+	ctx.Equal(page(ctx, "t-1", "kettle", nil, 10), "p-2,p-1", "the repeated search")
+	catalog.PutProduct(cacheBg, "t-1", cacheTravel)
+	ctx.Equal(page(ctx, "t-1", "kettle", nil, 10), "p-4,p-2,p-1", "after PutProduct indexed p-4 the next search must miss (the key carries catalog.IndexVersion, read on every call); the page")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <map>
+#include <string>
+
+#include "search/catalog.h"
+
+namespace {
+
+void seedCache() {
+  catalog::putProduct("t-1", {"p-1", "Steel Kettle", "acme", "kitchen", 3499, true, 1200, 0});
+  catalog::putProduct("t-1", {"p-2", "Glass Kettle", "brew", "kitchen", 2999, true, 900, 0});
+  catalog::putProduct("t-2", {"p-9", "Copper Kettle", "acme", "kitchen", 5999, true, 3000, 0});
+}
+
+std::string page(const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters, int page_size) {
+  std::string ids;
+  for (const auto& hit : cachedSearch(tenant, q, filters, page_size)) ids += (ids.empty() ? "" : ",") + hit.value("id", "");
+  return ids;
+}
+
+}  // namespace
+
+void CheckKeyInputs(harness::Ctx& ctx) {
+  seedCache();
+  ctx.Equal(page("t-1", "kettle", {}, 10), "p-2,p-1", "t-1's search for kettle");
+  ctx.Equal(page("t-2", "kettle", {}, 10), "p-9", "tenant t-2 searching kettle must get its own page, not t-1's");
+  ctx.Equal(page("t-1", "kettle", {{"brand", "acme"}}, 10), "p-1", "t-1 searching kettle with brand=acme must not get the unfiltered page");
+  ctx.Equal(page("t-1", "kettle", {}, 1), "p-2", "t-1 searching kettle with page size 1 must not get a page of another size");
+  for (const auto& k : ctx.Redis.Keys("search:*")) {
+    ctx.Assert(k.rfind("search:t-1:", 0) == 0 || k.rfind("search:t-2:", 0) == 0, "the cache key %q must start search:{tenant}:", k);
+  }
+}
+
+void CheckNormalizedKey(harness::Ctx& ctx) {
+  seedCache();
+  const std::string first = page("t-1", "Steel Kettle", {{"brand", "acme"}, {"in_stock", "true"}}, 10);
+  const std::string second = page("t-1", "  steel   KETTLE ", {{"in_stock", "true"}, {"brand", "acme"}}, 10);
+  ctx.Assert(first == "p-1" && second == "p-1", "the two spellings answered [%s] and [%s], expected [p-1] for both", first, second);
+  const auto keys = ctx.Redis.Keys("search:*");
+  ctx.Equal(keys.size(), 1, "one search spelled two ways must share one cache entry (digest the normalized query and the filters sorted by field); the entries %q", keys);
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  seedCache();
+  page("t-1", "kettle", {}, 10);
+  const auto keys = ctx.Redis.Keys("search:*");
+  ctx.Equal(keys.size(), 1, "one search must leave one cache entry; the entries %q", keys);
+  const long long ttl = ctx.Redis.TTL(keys.front());
+  ctx.Assert(ttl > 0 && ttl <= 60, "the cache entry %s has TTL %d (-1: it never expires): write it with kCacheTtlSeconds = 60", keys.front(), ttl);
+}
+
+void CheckIndexVersion(harness::Ctx& ctx) {
+  seedCache();
+  ctx.Equal(page("t-1", "kettle", {}, 10), "p-2,p-1", "t-1's first search for kettle");
+  ctx.Equal(page("t-1", "kettle", {}, 10), "p-2,p-1", "the repeated search");
+  catalog::putProduct("t-1", {"p-4", "Travel Kettle", "acme", "kitchen", 1999, true, 700, 0});
+  ctx.Equal(page("t-1", "kettle", {}, 10), "p-4,p-2,p-1", "after putProduct indexed p-4 the next search must miss (the key carries catalog::indexVersion, read on every call); the page");
+}
+`,
+  },
   hints: [
-    'A shopper filters by brand and gets the unfiltered page; a second tenant searches the same word and sees the first tenant\'s products; a price changed yesterday still shows. Restarting the process "fixes" it.',
-    'Every hit is keyed by the raw query string alone, so tenant, filters, page and catalog version all collide on one entry, and a plain `SET` keeps that entry until the process dies.',
-    'Add `normalize_query`, `filter_hash` over sorted-key JSON, and `cache_key(tenant, normalized, filterHash, page, indexVersion)`; write with `setex` and `CACHE_TTL_S = 60`; read `catalog:index_version` per request and `INCR` it on publish.',
+    'Search `kettle` as one tenant, then as another: the second tenant gets the first one’s products. Index a new kettle and search again: it stays missing, and the entry has no TTL.',
+    'The key is `search:{q}`: it names the raw query and nothing else, so every other input and every spelling of the query picks its own or someone else’s entry, and a plain `SET` keeps it forever.',
+    'Key `search:{tenant}:{index_version(tenant)}:{digest(normalize_query(q) \\n sorted field=value&… \\n page_size)}`, and write it with `SET key page EX 60`.',
   ],
-  debrief: `The starter looks like a cache and behaves like a sticky note: one entry per query string, shared across tenants, blind to filters, and immortal. The fix names every input in the key, reduces equivalent inputs to one canonical form (trimmed lowercase query, sorted-key filter digest), and sets a TTL as the backstop. The index version is the part worth remembering: a catalog publish invalidates the whole namespace with one \`INCR\`, no key scan and no 60-second wait, which is why the version lives in the key instead of being deleted entry by entry. A production cache also bounds the stored payload, protects against a stampede on a cold key with a short lock or request coalescing, and keeps per-tenant hit-rate metrics so a bad key design shows up as a number.`,
+  debrief: `A cache key is a claim that two requests have the same answer, so it has to name every input that changes the answer: the tenant, the normalized query, the filters in a canonical order, the page size, and the version of the data underneath. The index version turns invalidation into a lookup: a write bumps one counter, the next key differs, and the old entries are left to expire instead of being hunted down. The TTL bounds what the version cannot see, like an entry written by a request that read the version just before a write. Larger systems add request coalescing so a burst of identical misses runs the engine once, and cap the size of a cached page.`,
 };

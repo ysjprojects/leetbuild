@@ -8,498 +8,409 @@ export const monitorReportStep: Step = {
   focus: ['client', 'monitor', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/monitors/{monitor_id}/report\`: it resolves the
-monitor by id alone, reads the latest evaluation and answers with the distance and a hardcoded
-\`"significant": true\`. It serves the demo and hides 4 flaws.
+**Starting point.** The starter serves \`GET /v1/monitors/{monitor_id}/report\` on the monitor and
+sketch stores (\`drift.store\`, \`drift.sketch\`, provided): it loads the monitor with
+\`store.get_monitor(monitor_id)\`, reads the current window's live sketch and the frozen baseline,
+and answers \`{"monitor_id", "metric", "distance", "significant": true}\` with their PSI distance. It
+serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A number without its counts is an opinion: on 20 samples a
-distance of 0.4 is noise, and a monitor that reports it as a crossing trains everyone to ignore it. A
-report that resolves the monitor by id alone also leaks one tenant's drift to another. Both pass
-every demo, because demos ask for their own monitor and do not look at the sample count.
+**Failure mode the checks target.** Any caller who guesses a monitor id reads another tenant's
+drift; a reader cannot tell 50 samples from 50 000, or which window and baseline a number describes;
+a distance of 0.6 on 50 samples is reported like a real shift; and \`significant\` is true whatever
+the distance.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the monitor is resolved **scoped by
-  tenant** with \`store.report(tenant, monitor_id)\`. A foreign or unknown monitor id is **404**.
-- The report always carries the **sample counts** on both sides (\`sample_count\`,
-  \`baseline_sample_count\`), the current window boundaries and the **baseline window**.
-- The state is **explicit**: fewer than \`MIN_SAMPLES = 200\` samples on either side reports
-  \`state: "insufficient_data"\` rather than an alert.
-- \`threshold_crossed\` is true only when the samples are sufficient **and** \`distance >= threshold\`;
-  otherwise it is false, and the state says why.
-- The response carries numbers about the distribution, not feature values.`,
+- The tenant comes from \`X-Tenant-Id\` (**401** without it), and the monitor is resolved with
+  \`store.monitor_for(tenant, monitor_id)\`: a foreign or unknown id is **404**.
+- The report carries \`sample_count\` and \`baseline_sample_count\` (the two sketches' totals),
+  \`window_start\`, \`window_end\` and \`baseline\`.
+- Below \`MIN_SAMPLES\` = 200 on either side, \`state\` is \`"insufficient_data"\`.
+- \`threshold_crossed\` is \`sufficient and distance >= threshold\`; \`state\` is \`"drifting"\` when it
+  holds and \`"ok"\` otherwise.`,
   sequence: {
-    participants: ['Client', 'Drift Monitor', 'report store', 'Redis'],
+    participants: ['Client', 'Drift Monitor', 'monitor store', 'Redis'],
     messages: [
-      {from: 'Client', to: 'Drift Monitor', label: 'GET /v1/monitors/{id}/report · X-Tenant-Id', kind: 'sync'},
-      {from: 'Drift Monitor', to: 'report store', label: 'report(tenant, monitor_id)', kind: 'sync'},
-      {from: 'report store', to: 'Drift Monitor', label: 'distance · counts · baseline window / none', kind: 'reply'},
-      {from: 'Drift Monitor', to: 'Redis', label: 'HGET sketch:live:… · HGET baseline', kind: 'async'},
+      {from: 'Client', to: 'Drift Monitor', label: 'GET /v1/monitors/m-1/report · X-Tenant-Id: t1', kind: 'sync'},
+      {from: 'Drift Monitor', to: 'monitor store', label: 'monitor_for(t1, m-1)', kind: 'sync'},
+      {from: 'monitor store', to: 'Drift Monitor', label: 'monitor · none → 404', kind: 'reply'},
+      {from: 'Drift Monitor', to: 'Redis', label: 'HGETALL sketch:live:t1:m-1:{window} · GET baseline', kind: 'sync'},
       {
         from: 'Drift Monitor',
         to: 'Client',
-        label: '200 {state, distance, sample_count, baseline_window, threshold_crossed}',
+        label: '200 {state, distance, sample_count, baseline_sample_count, threshold_crossed}',
         kind: 'reply',
       },
-      {from: 'Drift Monitor', to: 'Client', label: '404 when the monitor belongs to another tenant', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/monitors/{id}/report',
-      detail: 'Register the report route on `GET /v1/monitors/{monitor_id}/report`.',
+      title: 'Serves GET /v1/monitors/{id}/report',
+      detail: 'Register `GET /v1/monitors/{monitor_id}/report`: it answers the PSI distance of the current window.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/monitors\/\{monitor_id\}\/report["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/monitors\/:monitor_id\/report['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/monitors\/\{monitor_id\}\/report"/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/monitors\/:monitorId\/report['"]/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/monitors\/\{id\}\/report"/]},
         scala: {all: [/path\(\s*"v1"\s*\/\s*"monitors"\s*\/\s*Segment\s*\/\s*"report"\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\([^,]*\/v1\/monitors\//]},
+        cpp: {all: [/svr\.Get\(\s*R?"\(?\/v1\/monitors\//]},
       },
     },
     {
       id: 'tenant-scope',
       title: 'Resolves the monitor inside the tenant',
       detail:
-        'The lookup is `store.report(tenant, monitor_id)` and a missing or foreign monitor is **404**, not another tenant’s drift and not a 403. The starter resolves by monitor id alone, so any caller can read any monitor.',
+        'A missing `X-Tenant-Id` is **401** and the monitor is looked up with `monitor_for`/`monitorFor(tenant, id)`, so another tenant’s monitor is **404**; a lookup by id alone (`get_monitor`) serves anyone’s drift.',
       match: {
-        python: {all: [/store\.report\(tenant, monitor_id\)/, /status_code\s*=\s*404/]},
-        typescript: {all: [/store\.report\(tenant, monitorId\)/, /code\(\s*404\s*\)/]},
-        go: {all: [/store\.Report\(r\.Context\(\), tenant, monitorID\)/, /StatusNotFound/]},
-        scala: {all: [/store\.report\(tenant, monitorId\)/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/store\.report\(tenant, monitorId\)/, /\b404\b/]},
+        python: {all: [/store\.monitor_for\(\s*tenant/, /\b401\b/], none: [/store\.get_monitor\(/]},
+        typescript: {all: [/monitorFor\(\s*tenant/, /\b401\b/], none: [/getMonitor\(/]},
+        go: {all: [/store\.MonitorFor\(/, /StatusUnauthorized|\b401\b/], none: [/store\.GetMonitor\(/]},
+        scala: {all: [/Store\.monitorFor\(\s*tenant/, /Unauthorized|\b401\b/], none: [/Store\.getMonitor\(/]},
+        cpp: {all: [/store::monitorFor\(\s*tenant/, /\b401\b/], none: [/store::getMonitor\(/]},
       },
     },
     {
       id: 'sample-counts',
-      title: 'Always returns the sample counts and the baseline window',
+      title: 'Reports the sample counts, the window and the baseline',
       detail:
-        'The report includes `sample_count`, `baseline_sample_count` and `baseline_window` alongside the distance. The starter returns the distance and hides everything a reader needs to judge it.',
+        'The report carries `sample_count`, `baseline_sample_count`, `window_start`, `window_end` and `baseline` next to the distance.',
       match: {
-        python: {all: [/sample_count/, /baseline_sample_count/, /baseline_window/]},
-        typescript: {all: [/sample_count/, /baseline_sample_count/, /baseline_window/]},
-        go: {all: [/SampleCount/, /BaselineSampleCount/, /BaselineWindow/]},
-        scala: {all: [/sampleCount/, /baselineSampleCount/, /baselineWindow/]},
-        cpp: {all: [/sample_count/, /baseline_sample_count/, /baseline_window/]},
+        python: {all: [/["']sample_count["']/, /["']baseline_sample_count["']/, /["']window_end["']/]},
+        typescript: {all: [/sample_count:/, /baseline_sample_count:/, /window_end:/]},
+        go: {all: [/"sample_count"/, /"baseline_sample_count"/, /"window_end"/]},
+        scala: {all: [/"sample_count"/, /"baseline_sample_count"/, /"window_end"/]},
+        cpp: {all: [/"sample_count"/, /"baseline_sample_count"/, /"window_end"/]},
       },
     },
     {
       id: 'insufficient-data',
       title: 'Calls out insufficient data below the sample floor',
       detail:
-        'Fewer than `MIN_SAMPLES = 200` samples on either side reports `insufficient_data` instead of a crossing. The starter treats 20 samples as significant because the distance looked large.',
+        'Fewer than `MIN_SAMPLES` = 200 samples on either side is `state: "insufficient_data"`, never a crossing.',
       match: {
-        python: {all: [/MIN_SAMPLES\s*=\s*200/, /insufficient_data/]},
-        typescript: {all: [/MIN_SAMPLES\s*=\s*200/, /insufficient_data/]},
-        go: {all: [/minSamples\s*=\s*200/, /insufficient_data/]},
-        scala: {all: [/MinSamples\s*=\s*200/, /insufficient_data/]},
-        cpp: {all: [/kMinSamples\s*=\s*200/, /insufficient_data/]},
+        python: {all: [/MIN_SAMPLES\s*=\s*200\b/, /insufficient_data/]},
+        typescript: {all: [/MIN_SAMPLES\s*=\s*200\b/, /insufficient_data/]},
+        go: {all: [/minSamples\s*=\s*200\b/, /insufficient_data/]},
+        scala: {all: [/MinSamples\s*=\s*200L?\b/, /insufficient_data/]},
+        cpp: {all: [/kMinSamples\s*=\s*200\b/, /insufficient_data/]},
       },
     },
     {
       id: 'threshold-crossed',
       title: 'Reports a crossing only for a sufficient, over-threshold window',
       detail:
-        '`threshold_crossed` is computed as `sufficient and distance >= threshold`, not hardcoded. The starter returns `"significant": true` for whatever it found.',
+        '`threshold_crossed` is computed from the sample floor and `distance >= threshold`, and `state` says `drifting` or `ok`; the starter answers `significant: true` for any distance.',
       match: {
-        python: {all: [/threshold_crossed/, /distance\s*>=\s*threshold/]},
-        typescript: {all: [/threshold_crossed/, /distance\s*>=\s*threshold/]},
-        go: {all: [/threshold_crossed/, /distance\s*>=\s*threshold/]},
-        scala: {all: [/threshold_crossed/, /distance\s*>=\s*threshold/]},
-        cpp: {all: [/threshold_crossed/, /distance\s*>=\s*threshold/]},
+        python: {
+          all: [/["']threshold_crossed["']/, /distance\s*>=\s*monitor\[["']threshold["']\]/],
+          none: [/["']significant["']/],
+        },
+        typescript: {all: [/threshold_crossed:/, /distance\s*>=\s*monitor\.threshold/], none: [/significant:/]},
+        go: {all: [/"threshold_crossed"/, /distance\s*>=\s*monitor\.Threshold/], none: [/"significant"/]},
+        scala: {all: [/"threshold_crossed"/, /distance\s*>=\s*monitor\.threshold/], none: [/"significant"/]},
+        cpp: {all: [/"threshold_crossed"/, /distance\s*>=\s*monitor(->|\.)threshold/], none: [/"significant"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
+      starter: `import time
 
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+
+from drift import sketch, store  # store.get_monitor, monitor_for; sketch.window_start, read_live, read_baseline, psi
 
 app = FastAPI()
-logger = logging.getLogger("drift-monitor")
-
-
-class ReportStore:
-    def resolve(self, monitor_id: str) -> dict | None:
-        """The latest evaluation for a monitor id."""
-        raise NotImplementedError
-
-
-store = ReportStore()
 
 
 @app.get("/v1/monitors/{monitor_id}/report")
-def monitor_report(
-    monitor_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    latest = store.resolve(monitor_id)
-    if latest is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return JSONResponse(
-        {
-            "monitor_id": monitor_id,
-            "metric": latest["metric"],
-            "distance": latest["distance"],
-            "significant": True,
-        },
-        status_code=200,
-    )
+def monitor_report(monitor_id: str, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    monitor = store.get_monitor(monitor_id)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="no such monitor")
+    window = sketch.window_start(int(time.time()), monitor["window_s"])
+    live = sketch.read_live(monitor["tenant"], monitor_id, window)
+    baseline = sketch.read_baseline(monitor["tenant"], monitor["baseline"])
+    return {"monitor_id": monitor_id, "metric": monitor["metric"], "distance": sketch.psi(live, baseline), "significant": True}
 `,
-      solution: `import logging
+      solution: `import time
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+
+from drift import sketch, store  # store.get_monitor, monitor_for; sketch.window_start, read_live, read_baseline, psi
 
 app = FastAPI()
-logger = logging.getLogger("drift-monitor")
 
 MIN_SAMPLES = 200
 
 
-class ReportStore:
-    def report(self, tenant: str, monitor_id: str) -> dict | None:
-        """The monitor's report view, scoped to its owner, or None when it is not theirs."""
-        raise NotImplementedError
-
-
-store = ReportStore()
-
-
 @app.get("/v1/monitors/{monitor_id}/report")
-def monitor_report(
-    monitor_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    report = store.report(tenant, monitor_id)
-    if report is None:
-        raise HTTPException(status_code=404, detail="monitor not found")
-
-    sample_count = int(report["sample_count"])
-    baseline_sample_count = int(report["baseline_sample_count"])
-    distance = float(report["distance"])
-    threshold = float(report["threshold"])
+def monitor_report(monitor_id: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    monitor = store.monitor_for(tenant, monitor_id)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="no such monitor")  # another tenant's monitor does not exist for this caller
+    window = sketch.window_start(int(time.time()), monitor["window_s"])
+    live = sketch.read_live(tenant, monitor_id, window)
+    baseline = sketch.read_baseline(tenant, monitor["baseline"])
+    sample_count = sum(live.values())
+    baseline_sample_count = sum(baseline.values())
+    distance = sketch.psi(live, baseline)
     sufficient = sample_count >= MIN_SAMPLES and baseline_sample_count >= MIN_SAMPLES
-    crossed = sufficient and distance >= threshold
-    logger.info("report tenant=%s monitor=%s sufficient=%s", tenant, monitor_id, sufficient)
-    return JSONResponse(
-        {
-            "monitor_id": monitor_id,
-            "metric": report["metric"],
-            "state": "ok" if sufficient else "insufficient_data",
-            "distance": distance,
-            "threshold": threshold,
-            "sample_count": sample_count,
-            "baseline_sample_count": baseline_sample_count,
-            "window_start": report["window_start"],
-            "window_end": report["window_end"],
-            "baseline_window": report["baseline_window"],
-            "threshold_crossed": crossed,
-        },
-        status_code=200,
-    )
+    crossed = sufficient and distance >= monitor["threshold"]
+    return {
+        "monitor_id": monitor_id,
+        "metric": monitor["metric"],
+        "state": "drifting" if crossed else "ok" if sufficient else "insufficient_data",
+        "distance": distance,
+        "threshold": monitor["threshold"],
+        "threshold_crossed": crossed,
+        "sample_count": sample_count,
+        "baseline_sample_count": baseline_sample_count,
+        "window_start": window,
+        "window_end": window + monitor["window_s"],
+        "baseline": monitor["baseline"],
+    }
 `,
     },
     typescript: {
-      starter: `/** GET /v1/monitors/{id}/report. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-import {store} from './store';
+import {psi, readBaseline, readLive, windowStart} from 'drift/sketch';
+import {getMonitor, monitorFor} from 'drift/store';
 
 export const app = Fastify();
 
-app.get('/v1/monitors/:monitor_id/report', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const {monitor_id: monitorId} = request.params as {monitor_id: string};
-  const latest = await store.resolve(monitorId);
-  if (latest === null) return reply.code(404).send({error: 'not found'});
-  return reply.code(200).send({
-    monitor_id: monitorId,
-    metric: latest.metric,
-    distance: latest.distance,
-    significant: true,
-  });
+app.get('/v1/monitors/:monitorId/report', async (request, reply) => {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const {monitorId} = request.params as {monitorId: string};
+  const monitor = await getMonitor(monitorId);
+  if (monitor === null) return reply.code(404).send({error: 'no such monitor'});
+  const window = windowStart(Math.floor(Date.now() / 1000), monitor.window_s);
+  const live = await readLive(monitor.tenant, monitorId, window);
+  const baseline = await readBaseline(monitor.tenant, monitor.baseline);
+  return {monitor_id: monitorId, metric: monitor.metric, distance: psi(live, baseline), significant: true};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/monitors/{id}/report: significance, not just a number. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 
-import {store} from './store';
+import {type Sketch, psi, readBaseline, readLive, windowStart} from 'drift/sketch';
+import {getMonitor, monitorFor} from 'drift/store';
 
 export const app = Fastify();
 
 const MIN_SAMPLES = 200;
 
-app.get('/v1/monitors/:monitor_id/report', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const {monitor_id: monitorId} = request.params as {monitor_id: string};
-  const report = await store.report(tenant, monitorId);
-  if (report === null) return reply.code(404).send({error: 'monitor not found'});
+const total = (sketch: Sketch): number => Object.values(sketch).reduce((n, count) => n + count, 0);
 
-  const sample_count = report.sample_count;
-  const baseline_sample_count = report.baseline_sample_count;
-  const distance = report.distance;
-  const threshold = report.threshold;
-  const sufficient = sample_count >= MIN_SAMPLES && baseline_sample_count >= MIN_SAMPLES;
-  const crossed = sufficient && distance >= threshold;
-  request.log.info({tenant, monitor: monitorId, sufficient}, 'reported drift');
-  return reply.code(200).send({
+app.get('/v1/monitors/:monitorId/report', async (request, reply) => {
+  const {monitorId} = request.params as {monitorId: string};
+  const tenant = String(request.headers['x-tenant-id'] ?? '');
+  if (tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const monitor = await monitorFor(tenant, monitorId);
+  // Another tenant's monitor does not exist for this caller.
+  if (monitor === null) return reply.code(404).send({error: 'no such monitor'});
+  const window = windowStart(Math.floor(Date.now() / 1000), monitor.window_s);
+  const live = await readLive(tenant, monitorId, window);
+  const baseline = await readBaseline(tenant, monitor.baseline);
+  const sampleCount = total(live);
+  const baselineSampleCount = total(baseline);
+  const distance = psi(live, baseline);
+  const sufficient = sampleCount >= MIN_SAMPLES && baselineSampleCount >= MIN_SAMPLES;
+  const crossed = sufficient && distance >= monitor.threshold;
+  return {
     monitor_id: monitorId,
-    metric: report.metric,
-    state: sufficient ? 'ok' : 'insufficient_data',
+    metric: monitor.metric,
+    state: crossed ? 'drifting' : sufficient ? 'ok' : 'insufficient_data',
     distance,
-    threshold,
-    sample_count,
-    baseline_sample_count,
-    window_start: report.window_start,
-    window_end: report.window_end,
-    baseline_window: report.baseline_window,
+    threshold: monitor.threshold,
     threshold_crossed: crossed,
-  });
+    sample_count: sampleCount,
+    baseline_sample_count: baselineSampleCount,
+    window_start: window,
+    window_end: window + monitor.window_s,
+    baseline: monitor.baseline,
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
+	"time"
+
+	"drift/sketch" // sketch.WindowStart, ReadLive, ReadBaseline, Total, PSI
+	"drift/store"  // store.GetMonitor, MonitorFor
 )
 
-type Report struct {
-	Metric   string  \`json:"metric"\`
-	Distance float64 \`json:"distance"\`
-}
-
-type ReportStore interface {
-	Resolve(ctx context.Context, monitorID string) (*Report, error)
-}
-
-var store ReportStore
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func monitorReport(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	monitorID := r.PathValue("monitor_id")
-	latest, err := store.Resolve(r.Context(), monitorID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	monitorID := r.PathValue("id")
+	monitor := store.GetMonitor(r.Context(), monitorID)
+	if monitor == nil {
+		http.Error(rw, "no such monitor", http.StatusNotFound)
 		return
 	}
-	if latest == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "not found"})
-		return
-	}
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"monitor_id":  monitorID,
-		"metric":      latest.Metric,
-		"distance":    latest.Distance,
-		"significant": true,
-	})
+	window := sketch.WindowStart(time.Now().Unix(), monitor.WindowS)
+	live := sketch.ReadLive(r.Context(), monitor.Tenant, monitorID, window)
+	baseline := sketch.ReadBaseline(r.Context(), monitor.Tenant, monitor.Baseline)
+	writeJSON(rw, http.StatusOK, map[string]any{"monitor_id": monitorID, "metric": monitor.Metric, "distance": sketch.PSI(live, baseline), "significant": true})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/monitors/{monitor_id}/report", monitorReport)
-	_ = http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/monitors/{id}/report", monitorReport)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
+	"time"
+
+	"drift/sketch" // sketch.WindowStart, ReadLive, ReadBaseline, Total, PSI
+	"drift/store"  // store.GetMonitor, MonitorFor
 )
 
 const minSamples = 200
 
-type Report struct {
-	Metric              string  \`json:"metric"\`
-	Distance            float64 \`json:"distance"\`
-	Threshold           float64 \`json:"threshold"\`
-	SampleCount         int64   \`json:"sample_count"\`
-	BaselineSampleCount int64   \`json:"baseline_sample_count"\`
-	WindowStart         int64   \`json:"window_start"\`
-	WindowEnd           int64   \`json:"window_end"\`
-	BaselineWindow      int64   \`json:"baseline_window"\`
-}
-
-type ReportStore interface {
-	Report(ctx context.Context, tenant, monitorID string) (*Report, error)
-}
-
-var store ReportStore
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func monitorReport(rw http.ResponseWriter, r *http.Request) {
+	monitorID := r.PathValue("id")
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	monitorID := r.PathValue("monitor_id")
-	report, err := store.Report(r.Context(), tenant, monitorID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	monitor := store.MonitorFor(r.Context(), tenant, monitorID)
+	if monitor == nil {
+		http.Error(rw, "no such monitor", http.StatusNotFound) // another tenant's monitor does not exist for this caller
 		return
 	}
-	if report == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "monitor not found"})
-		return
-	}
-	sampleCount := report.SampleCount
-	baselineSampleCount := report.BaselineSampleCount
-	distance := report.Distance
-	threshold := report.Threshold
+	window := sketch.WindowStart(time.Now().Unix(), monitor.WindowS)
+	live := sketch.ReadLive(r.Context(), tenant, monitorID, window)
+	baseline := sketch.ReadBaseline(r.Context(), tenant, monitor.Baseline)
+	sampleCount, baselineSampleCount := sketch.Total(live), sketch.Total(baseline)
+	distance := sketch.PSI(live, baseline)
 	sufficient := sampleCount >= minSamples && baselineSampleCount >= minSamples
-	crossed := sufficient && distance >= threshold
+	crossed := sufficient && distance >= monitor.Threshold
+	state := "insufficient_data"
+	if crossed {
+		state = "drifting"
+	} else if sufficient {
+		state = "ok"
+	}
 	writeJSON(rw, http.StatusOK, map[string]any{
 		"monitor_id":            monitorID,
-		"metric":                report.Metric,
-		"state":                 map[bool]string{true: "ok", false: "insufficient_data"}[sufficient],
+		"metric":                monitor.Metric,
+		"state":                 state,
 		"distance":              distance,
-		"threshold":             threshold,
+		"threshold":             monitor.Threshold,
+		"threshold_crossed":     crossed,
 		"sample_count":          sampleCount,
 		"baseline_sample_count": baselineSampleCount,
-		"window_start":          report.WindowStart,
-		"window_end":            report.WindowEnd,
-		"baseline_window":       report.BaselineWindow,
-		"threshold_crossed":     crossed,
+		"window_start":          window,
+		"window_end":            window + monitor.WindowS,
+		"baseline":              monitor.Baseline,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/monitors/{monitor_id}/report", monitorReport)
-	_ = http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/monitors/{id}/report", monitorReport)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-final case class ReportView(metric: String, distance: Double)
+import drift.{Sketch, Store} // Store.getMonitor, monitorFor; Sketch.windowStart, readLive, readBaseline, psi
 
-object ReportApi {
-  implicit val system: ActorSystem = ActorSystem("drift-monitor")
+object Read {
+  private def json(body: JsObject): HttpResponse =
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val store = ReportStore.open()
-
-  val route: Route =
-    path("v1" / "monitors" / Segment / "report") { monitorId =>
-      get {
-        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-        store.resolve(monitorId) match {
-          case None =>
-            complete(StatusCodes.NotFound, """{"error":"not found"}""")
-          case Some(latest) =>
-            complete(StatusCodes.OK, s"""{"monitor_id":"$monitorId","distance":\${latest.distance}}""")
-        }
+  val route: Route = path("v1" / "monitors" / Segment / "report") { monitorId =>
+    get {
+      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+      Store.getMonitor(monitorId) match {
+        case None => complete(StatusCodes.NotFound -> "no such monitor")
+        case Some(monitor) =>
+          val window = Sketch.windowStart(System.currentTimeMillis() / 1000, monitor.windowS)
+          val live = Sketch.readLive(monitor.tenant, monitorId, window)
+          val baseline = Sketch.readBaseline(monitor.tenant, monitor.baseline)
+          complete(json(JsObject(
+            "monitor_id" -> JsString(monitorId),
+            "metric" -> JsString(monitor.metric),
+            "distance" -> JsNumber(Sketch.psi(live, baseline)),
+            "significant" -> JsBoolean(true))))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class MonitorReport(
-    monitor_id: String,
-    metric: String,
-    state: String,
-    distance: Double,
-    threshold: Double,
-    sample_count: Long,
-    baseline_sample_count: Long,
-    window_start: Long,
-    window_end: Long,
-    baseline_window: Long,
-    threshold_crossed: Boolean,
-)
+import drift.{Sketch, Store} // Store.getMonitor, monitorFor; Sketch.windowStart, readLive, readBaseline, psi
 
-object ReportApi {
-  implicit val system: ActorSystem = ActorSystem("drift-monitor")
-  implicit val reportFormat: RootJsonFormat[MonitorReport] = jsonFormat11(MonitorReport)
+object Read {
+  val MinSamples = 200L
 
-  val MinSamples = 200
-  val store = ReportStore.open()
+  private def json(body: JsObject): HttpResponse =
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "monitors" / Segment / "report") { monitorId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            val tenant = tenantOpt.get
-            store.report(tenant, monitorId) match {
-              case None =>
-                complete(StatusCodes.NotFound, """{"error":"monitor not found"}""")
-              case Some(report) =>
-                val sampleCount = report.sampleCount
-                val baselineSampleCount = report.baselineSampleCount
-                val distance = report.distance
-                val threshold = report.threshold
-                val sufficient = sampleCount >= MinSamples && baselineSampleCount >= MinSamples
-                val crossed = sufficient && distance >= threshold
-                complete(
-                  StatusCodes.OK,
-                  MonitorReport(
-                    monitor_id = monitorId,
-                    metric = report.metric,
-                    state = if (sufficient) "ok" else "insufficient_data",
-                    distance = distance,
-                    threshold = threshold,
-                    sample_count = sampleCount,
-                    baseline_sample_count = baselineSampleCount,
-                    window_start = report.windowStart,
-                    window_end = report.windowEnd,
-                    baseline_window = report.baselineWindow,
-                    threshold_crossed = crossed,
-                  ),
-                )
-            }
+  val route: Route = path("v1" / "monitors" / Segment / "report") { monitorId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(tenant) =>
+          Store.monitorFor(tenant, monitorId) match {
+            case None => complete(StatusCodes.NotFound -> "no such monitor") // another tenant's monitor does not exist for this caller
+            case Some(monitor) =>
+              val window = Sketch.windowStart(System.currentTimeMillis() / 1000, monitor.windowS)
+              val live = Sketch.readLive(tenant, monitorId, window)
+              val baseline = Sketch.readBaseline(tenant, monitor.baseline)
+              val sampleCount = live.values.sum
+              val baselineSampleCount = baseline.values.sum
+              val distance = Sketch.psi(live, baseline)
+              val sufficient = sampleCount >= MinSamples && baselineSampleCount >= MinSamples
+              val crossed = sufficient && distance >= monitor.threshold
+              val state = if (crossed) "drifting" else if (sufficient) "ok" else "insufficient_data"
+              complete(json(JsObject(
+                "monitor_id" -> JsString(monitorId),
+                "metric" -> JsString(monitor.metric),
+                "state" -> JsString(state),
+                "distance" -> JsNumber(distance),
+                "threshold" -> JsNumber(monitor.threshold),
+                "threshold_crossed" -> JsBoolean(crossed),
+                "sample_count" -> JsNumber(sampleCount),
+                "baseline_sample_count" -> JsNumber(baselineSampleCount),
+                "window_start" -> JsNumber(window),
+                "window_end" -> JsNumber(window + monitor.windowS),
+                "baseline" -> JsString(monitor.baseline))))
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -508,130 +419,401 @@ object ReportApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
+#include <chrono>
 #include <string>
+
+#include "drift/sketch.h"  // sketch::windowStart, readLive, readBaseline, total, psi
+#include "drift/store.h"   // store::getMonitor, monitorFor
 
 using json = nlohmann::json;
 
-struct MonitorReport {
-  std::string metric;
-  double distance;
-};
-
-struct ReportStore {
-  std::optional<MonitorReport> resolve(const std::string& monitorId);
-};
-
-ReportStore store;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/monitors/([^/]+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto monitorId = req.matches[1].str();
-    const auto latest = store.resolve(monitorId);
-    if (!latest) {
-      res.status = 404;
-      res.set_content(R"({"error":"not found"})", "application/json");
-      return;
-    }
-    res.status = 200;
-    res.set_content(json{{"monitor_id", monitorId},
-                         {"metric", latest->metric},
-                         {"distance", latest->distance},
-                         {"significant", true}}
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void monitor_report(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string monitor_id = req.matches[1];
+  const auto monitor = store::getMonitor(monitor_id);
+  if (!monitor) {
+    res.status = 404;
+    res.set_content("no such monitor", "text/plain");
+    return;
+  }
+  const long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const long window = sketch::windowStart(now, monitor->window_s);
+  const sketch::Sketch live = sketch::readLive(monitor->tenant, monitor_id, window);
+  const sketch::Sketch baseline = sketch::readBaseline(monitor->tenant, monitor->baseline);
+  const json body = {{"monitor_id", monitor_id}, {"metric", monitor->metric}, {"distance", sketch::psi(live, baseline)}, {"significant", true}};
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/monitors/([\\w-]+)/report)", monitor_report); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
+#include <chrono>
 #include <string>
+
+#include "drift/sketch.h"  // sketch::windowStart, readLive, readBaseline, total, psi
+#include "drift/store.h"   // store::getMonitor, monitorFor
 
 using json = nlohmann::json;
 
-constexpr int kMinSamples = 200;
+constexpr long kMinSamples = 200;
 
-struct MonitorReport {
-  std::string metric;
-  double distance;
-  double threshold;
-  long sample_count;
-  long baseline_sample_count;
-  long window_start;
-  long window_end;
-  long baseline_window;
-};
-
-struct ReportStore {
-  std::optional<MonitorReport> report(const std::string& tenant, const std::string& monitorId);
-};
-
-ReportStore store;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/monitors/([^/]+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto monitorId = req.matches[1].str();
-    const auto report = store.report(tenant, monitorId);
-    if (!report) {
-      res.status = 404;
-      res.set_content(R"({"error":"monitor not found"})", "application/json");
-      return;
-    }
-    const long sample_count = report->sample_count;
-    const long baseline_sample_count = report->baseline_sample_count;
-    const double distance = report->distance;
-    const double threshold = report->threshold;
-    const bool sufficient = sample_count >= kMinSamples && baseline_sample_count >= kMinSamples;
-    const bool crossed = sufficient && distance >= threshold;
-    const json body = {
-        {"monitor_id", monitorId},
-        {"metric", report->metric},
-        {"state", sufficient ? "ok" : "insufficient_data"},
-        {"distance", distance},
-        {"threshold", threshold},
-        {"sample_count", sample_count},
-        {"baseline_sample_count", baseline_sample_count},
-        {"window_start", report->window_start},
-        {"window_end", report->window_end},
-        {"baseline_window", report->baseline_window},
-        {"threshold_crossed", crossed},
-    };
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void monitor_report(const httplib::Request& req, httplib::Response& res) {
+  const std::string monitor_id = req.matches[1];
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const auto monitor = store::monitorFor(tenant, monitor_id);
+  if (!monitor) {
+    res.status = 404;  // another tenant's monitor does not exist for this caller
+    res.set_content("no such monitor", "text/plain");
+    return;
+  }
+  const long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const long window = sketch::windowStart(now, monitor->window_s);
+  const sketch::Sketch live = sketch::readLive(tenant, monitor_id, window);
+  const sketch::Sketch baseline = sketch::readBaseline(tenant, monitor->baseline);
+  const long sample_count = sketch::total(live);
+  const long baseline_sample_count = sketch::total(baseline);
+  const double distance = sketch::psi(live, baseline);
+  const bool sufficient = sample_count >= kMinSamples && baseline_sample_count >= kMinSamples;
+  const bool crossed = sufficient && distance >= monitor->threshold;
+  const json body = {{"monitor_id", monitor_id},
+                     {"metric", monitor->metric},
+                     {"state", crossed ? "drifting" : sufficient ? "ok" : "insufficient_data"},
+                     {"distance", distance},
+                     {"threshold", monitor->threshold},
+                     {"threshold_crossed", crossed},
+                     {"sample_count", sample_count},
+                     {"baseline_sample_count", baseline_sample_count},
+                     {"window_start", window},
+                     {"window_end", window + monitor->window_s},
+                     {"baseline", monitor->baseline}};
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/monitors/([\\w-]+)/report)", monitor_report); }
 `,
     },
   },
+  harness: {
+    python: `from drift import sketch, store
+
+REF = "baseline:v3:2026-10-01"
+BASELINE = {1: 2500, 2: 2500}
+DRIFTING = {1: 160, 2: 480}
+STEADY = {1: 330, 2: 310}
+THIN = {1: 10, 2: 40}
+
+
+def _seed(live, tenant="t1"):
+    """A monitor of tenant (window_s 300, threshold 0.2) with its baseline frozen and live merged into the current window."""
+    monitor = store.create_monitor({"tenant": tenant, "model_version": "v3", "metric": "input_distribution", "window_s": 300, "baseline": REF, "threshold": 0.2})
+    sketch.freeze_baseline(tenant, REF, BASELINE)
+    sketch.merge_batch(tenant, monitor["monitor_id"], 300, live)
+    return monitor["monitor_id"]
+
+
+async def _report(ctx, monitor_id, tenant="t1"):
+    m = ctx.load("read")
+    headers = {"X-Tenant-Id": tenant} if tenant else {}
+    async with ctx.client(m.app) as c:
+        return await c.get(f"/v1/monitors/{monitor_id}/report", headers=headers)
+
+
+async def check_route(ctx):
+    monitor_id = _seed(DRIFTING)
+    r = await _report(ctx, monitor_id)
+    assert r.status_code == 200, f"GET /v1/monitors/{monitor_id}/report answered {r.status_code}: {r.text}"
+    want = sketch.psi(DRIFTING, BASELINE)
+    distance = r.json().get("distance")
+    assert isinstance(distance, (int, float)) and abs(distance - want) < 1e-6, f"the report's distance is {distance!r}, expected the PSI of the window against the baseline, {want:.6f}"
+
+
+async def check_tenant_scope(ctx):
+    monitor_id = _seed(DRIFTING)
+    foreign = await _report(ctx, monitor_id, tenant="t2")
+    assert foreign.status_code == 404, f"tenant t2 asking for t1's monitor {monitor_id} got {foreign.status_code} {foreign.text}, expected 404: another tenant's drift leaked"
+    anonymous = await _report(ctx, monitor_id, tenant="")
+    assert anonymous.status_code == 401, f"a report without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    own = await _report(ctx, monitor_id)
+    assert own.status_code == 200, f"t1 asking for its own monitor got {own.status_code}: {own.text}"
+
+
+async def check_sample_counts(ctx):
+    monitor_id = _seed(DRIFTING)
+    window = sketch.window_start(int(ctx.clock.time()), 300)
+    body = (await _report(ctx, monitor_id)).json()
+    want = {"sample_count": 640, "baseline_sample_count": 5000, "window_start": window, "window_end": window + 300, "baseline": REF}
+    seen = {name: body.get(name) for name in want}
+    assert seen == want, f"the report carries {seen}, expected {want}: a distance without its counts, window and baseline cannot be judged"
+
+
+async def check_insufficient_data(ctx):
+    monitor_id = _seed(THIN)
+    body = (await _report(ctx, monitor_id)).json()
+    assert body.get("state") == "insufficient_data", f"a window of 50 samples (MIN_SAMPLES is 200) reported state {body.get('state')!r}: {body}"
+    assert body.get("threshold_crossed") is False, f"a window of 50 samples reported threshold_crossed {body.get('threshold_crossed')!r}, expected False whatever its distance"
+
+
+async def check_threshold_crossed(ctx):
+    drifting = (await _report(ctx, _seed(DRIFTING))).json()
+    assert drifting.get("threshold_crossed") is True and drifting.get("state") == "drifting", f"640 samples at distance {sketch.psi(DRIFTING, BASELINE):.3f} over a 0.2 threshold reported {drifting}, expected threshold_crossed True and state drifting"
+    steady = (await _report(ctx, _seed(STEADY))).json()
+    assert steady.get("threshold_crossed") is False and steady.get("state") == "ok", f"640 samples at distance {sketch.psi(STEADY, BASELINE):.4f} under the 0.2 threshold reported {steady}, expected threshold_crossed False and state ok"
+`,
+    typescript: `const REF = 'baseline:v3:2026-10-01';
+const BASELINE = {1: 2500, 2: 2500};
+const DRIFTING = {1: 160, 2: 480};
+const STEADY = {1: 330, 2: 310};
+const THIN = {1: 10, 2: 40};
+
+/** A monitor of tenant (window_s 300, threshold 0.2) with its baseline frozen and live merged into the current window. */
+async function seed(ctx, live, tenant = 't1'): Promise<string> {
+  const store = ctx.load('/support/drift/store.ts');
+  const sketch = ctx.load('/support/drift/sketch.ts');
+  const monitor = await store.createMonitor({tenant, model_version: 'v3', metric: 'input_distribution', window_s: 300, baseline: REF, threshold: 0.2});
+  await sketch.freezeBaseline(tenant, REF, BASELINE);
+  await sketch.mergeBatch(tenant, monitor.monitor_id, 300, live);
+  return monitor.monitor_id;
+}
+
+function report(ctx, monitorId: string, tenant = 't1') {
+  const c = ctx.client(ctx.load('read').app);
+  return c.get(\`/v1/monitors/\${monitorId}/report\`, {headers: tenant === '' ? {} : {'X-Tenant-Id': tenant}});
+}
+
+export async function check_route(ctx) {
+  const monitorId = await seed(ctx, DRIFTING);
+  const r = await report(ctx, monitorId);
+  assert.equal(r.status, 200, \`GET /v1/monitors/\${monitorId}/report answered \${r.status}: \${r.text}\`);
+  const want = ctx.load('/support/drift/sketch.ts').psi(DRIFTING, BASELINE);
+  const distance = r.json().distance;
+  assert(typeof distance === 'number' && Math.abs(distance - want) < 1e-6, \`the report's distance is \${JSON.stringify(distance)}, expected the PSI of the window against the baseline, \${want.toFixed(6)}\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const monitorId = await seed(ctx, DRIFTING);
+  const foreign = await report(ctx, monitorId, 't2');
+  assert.equal(foreign.status, 404, \`tenant t2 asking for t1's monitor \${monitorId} got \${foreign.status} \${foreign.text}, expected 404: another tenant's drift leaked\`);
+  const anonymous = await report(ctx, monitorId, '');
+  assert.equal(anonymous.status, 401, \`a report without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  const own = await report(ctx, monitorId);
+  assert.equal(own.status, 200, \`t1 asking for its own monitor got \${own.status}: \${own.text}\`);
+}
+
+export async function check_sample_counts(ctx) {
+  const monitorId = await seed(ctx, DRIFTING);
+  const now = Math.floor(ctx.clock.now() / 1000);
+  const window = now - (now % 300);
+  const body = (await report(ctx, monitorId)).json();
+  const want = {sample_count: 640, baseline_sample_count: 5000, window_start: window, window_end: window + 300, baseline: REF};
+  const seen = Object.fromEntries(Object.keys(want).map(name => [name, body[name]]));
+  assert.deepStrictEqual(seen, want, \`the report carries \${JSON.stringify(seen)}, expected \${JSON.stringify(want)}: a distance without its counts, window and baseline cannot be judged\`);
+}
+
+export async function check_insufficient_data(ctx) {
+  const monitorId = await seed(ctx, THIN);
+  const body = (await report(ctx, monitorId)).json();
+  assert.equal(body.state, 'insufficient_data', \`a window of 50 samples (MIN_SAMPLES is 200) reported state \${JSON.stringify(body.state)}: \${JSON.stringify(body)}\`);
+  assert.equal(body.threshold_crossed, false, \`a window of 50 samples reported threshold_crossed \${JSON.stringify(body.threshold_crossed)}, expected false whatever its distance\`);
+}
+
+export async function check_threshold_crossed(ctx) {
+  const drifting = (await report(ctx, await seed(ctx, DRIFTING))).json();
+  assert(drifting.threshold_crossed === true && drifting.state === 'drifting', \`640 samples over a 0.2 threshold reported \${JSON.stringify(drifting)}, expected threshold_crossed true and state drifting\`);
+  const steady = (await report(ctx, await seed(ctx, STEADY))).json();
+  assert(steady.threshold_crossed === false && steady.state === 'ok', \`640 samples under the 0.2 threshold reported \${JSON.stringify(steady)}, expected threshold_crossed false and state ok\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"math"
+	"net/http"
+
+	"drift/sketch"
+	"drift/store"
+
+	"leetbuild/harness"
+)
+
+const ref = "baseline:v3:2026-10-01"
+
+var (
+	readBg   = context.Background()
+	baseline = map[int]int64{1: 2500, 2: 2500}
+	drifting = map[int]int64{1: 160, 2: 480}
+	steady   = map[int]int64{1: 330, 2: 310}
+	thin     = map[int]int64{1: 10, 2: 40}
+)
+
+// seed is a monitor of tenant (window_s 300, threshold 0.2) with its baseline frozen and live merged into the current window.
+func seed(ctx *harness.Ctx, live map[int]int64, tenant string) string {
+	m := store.CreateMonitor(readBg, store.Monitor{Tenant: tenant, ModelVersion: "v3", Metric: "input_distribution", WindowS: 300, Baseline: ref, Threshold: 0.2})
+	sketch.FreezeBaseline(readBg, tenant, ref, baseline)
+	_, err := sketch.MergeBatch(readBg, tenant, m.MonitorID, 300, live)
+	ctx.NoError(err, "seeding the live sketch failed")
+	return m.MonitorID
+}
+
+func report(ctx *harness.Ctx, monitorID, tenant string) *harness.Response {
+	mux := http.NewServeMux()
+	register(mux)
+	c := ctx.HTTP(mux)
+	if tenant == "" {
+		return c.Get("/v1/monitors/" + monitorID + "/report")
+	}
+	return c.Get("/v1/monitors/"+monitorID+"/report", "X-Tenant-Id", tenant)
+}
+
+func body(ctx *harness.Ctx, r *harness.Response) map[string]any {
+	m, _ := r.JSON().(map[string]any)
+	ctx.Assert(m != nil, "the report is not a JSON object: %d %s", r.Status, r.Text())
+	return m
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	monitorID := seed(ctx, drifting, "t1")
+	r := report(ctx, monitorID, "t1")
+	ctx.Equal(r.Status, 200, "GET /v1/monitors/%s/report (%s)", monitorID, r.Text())
+	want := sketch.PSI(drifting, baseline)
+	distance, ok := body(ctx, r)["distance"].(float64)
+	ctx.Assert(ok && math.Abs(distance-want) < 1e-6, "the report's distance is %v, expected the PSI of the window against the baseline, %.6f", body(ctx, r)["distance"], want)
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	monitorID := seed(ctx, drifting, "t1")
+	foreign := report(ctx, monitorID, "t2")
+	ctx.Equal(foreign.Status, 404, "tenant t2 asking for t1's monitor %s must get 404, not another tenant's drift (%s)", monitorID, foreign.Text())
+	ctx.Equal(report(ctx, monitorID, "").Status, 401, "a report without X-Tenant-Id")
+	own := report(ctx, monitorID, "t1")
+	ctx.Equal(own.Status, 200, "t1 asking for its own monitor (%s)", own.Text())
+}
+
+func CheckSampleCounts(ctx *harness.Ctx) {
+	monitorID := seed(ctx, drifting, "t1")
+	window := sketch.WindowStart(ctx.Clock.Now()/1000, 300)
+	b := body(ctx, report(ctx, monitorID, "t1"))
+	want := map[string]any{"sample_count": 640, "baseline_sample_count": 5000, "window_start": window, "window_end": window + 300, "baseline": ref}
+	seen := map[string]any{}
+	for name := range want {
+		seen[name] = b[name]
+	}
+	ctx.Equal(seen, want, "the report must carry the counts, the window and the baseline, or its distance cannot be judged")
+}
+
+func CheckInsufficientData(ctx *harness.Ctx) {
+	b := body(ctx, report(ctx, seed(ctx, thin, "t1"), "t1"))
+	ctx.Equal(b["state"], "insufficient_data", "a window of 50 samples (minSamples is 200), its state (%v)", b)
+	ctx.Equal(b["threshold_crossed"], false, "a window of 50 samples must not report a crossing whatever its distance; threshold_crossed")
+}
+
+func CheckThresholdCrossed(ctx *harness.Ctx) {
+	d := body(ctx, report(ctx, seed(ctx, drifting, "t1"), "t1"))
+	ctx.Assert(d["threshold_crossed"] == true && d["state"] == "drifting", "640 samples over a 0.2 threshold reported %v, expected threshold_crossed true and state drifting", d)
+	s := body(ctx, report(ctx, seed(ctx, steady, "t1"), "t1"))
+	ctx.Assert(s["threshold_crossed"] == false && s["state"] == "ok", "640 samples under the 0.2 threshold reported %v, expected threshold_crossed false and state ok", s)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <cmath>
+#include <string>
+
+#include "drift/sketch.h"
+#include "drift/store.h"
+
+using json = nlohmann::json;
+
+namespace {
+
+const std::string kRef = "baseline:v3:2026-10-01";
+const sketch::Sketch kBaseline = {{1, 2500}, {2, 2500}};
+const sketch::Sketch kDrifting = {{1, 160}, {2, 480}};
+const sketch::Sketch kSteady = {{1, 330}, {2, 310}};
+const sketch::Sketch kThin = {{1, 10}, {2, 40}};
+
+// A monitor of tenant (window_s 300, threshold 0.2) with its baseline frozen and live merged into the current window.
+std::string seed(const sketch::Sketch& live, const std::string& tenant = "t1") {
+  const store::Monitor m = store::createMonitor(store::Monitor{"", tenant, "v3", "input_distribution", 300, kRef, 0.2});
+  sketch::freezeBaseline(tenant, kRef, kBaseline);
+  sketch::mergeBatch(tenant, m.monitor_id, 300, live);
+  return m.monitor_id;
+}
+
+harness::Response report(harness::Ctx& ctx, const std::string& monitor_id, const std::string& tenant = "t1") {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  auto c = ctx.HTTP(*svr);
+  if (tenant.empty()) return c.Get("/v1/monitors/" + monitor_id + "/report");
+  return c.Get("/v1/monitors/" + monitor_id + "/report", "X-Tenant-Id", tenant);
+}
+
+json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+  const json body = json::parse(r.Text(), nullptr, false);
+  ctx.Assert(body.is_object(), "the report is not a JSON object: %d %s", r.Status, r.Text());
+  return body;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  const std::string monitor_id = seed(kDrifting);
+  const auto r = report(ctx, monitor_id);
+  ctx.Equal(r.Status, 200, "GET /v1/monitors/%s/report (%s)", monitor_id, r.Text());
+  const double want = sketch::psi(kDrifting, kBaseline);
+  const json body = bodyOf(ctx, r);
+  ctx.Assert(body.contains("distance") && body["distance"].is_number() && std::abs(body["distance"].get<double>() - want) < 1e-6,
+             "the report's distance is %s, expected the PSI of the window against the baseline, %.6f", body.value("distance", json()).dump(), want);
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  const std::string monitor_id = seed(kDrifting);
+  const auto foreign = report(ctx, monitor_id, "t2");
+  ctx.Equal(foreign.Status, 404, "tenant t2 asking for t1's monitor %s must get 404, not another tenant's drift (%s)", monitor_id, foreign.Text());
+  ctx.Equal(report(ctx, monitor_id, "").Status, 401, "a report without X-Tenant-Id");
+  const auto own = report(ctx, monitor_id);
+  ctx.Equal(own.Status, 200, "t1 asking for its own monitor (%s)", own.Text());
+}
+
+void CheckSampleCounts(harness::Ctx& ctx) {
+  const std::string monitor_id = seed(kDrifting);
+  const long window = sketch::windowStart(static_cast<long>(ctx.Clock.Now() / 1000), 300);
+  const json body = bodyOf(ctx, report(ctx, monitor_id));
+  const json want = {{"sample_count", 640}, {"baseline_sample_count", 5000}, {"window_start", window}, {"window_end", window + 300}, {"baseline", kRef}};
+  json seen = json::object();
+  for (const auto& [name, value] : want.items()) seen[name] = body.contains(name) ? body[name] : json();
+  ctx.Equal(seen, want, "the report must carry the counts, the window and the baseline, or its distance cannot be judged");
+}
+
+void CheckInsufficientData(harness::Ctx& ctx) {
+  const json body = bodyOf(ctx, report(ctx, seed(kThin)));
+  ctx.Equal(body.value("state", ""), "insufficient_data", "a window of 50 samples (kMinSamples is 200), its state (%s)", body.dump());
+  ctx.Assert(body.contains("threshold_crossed") && body["threshold_crossed"] == false, "a window of 50 samples must not report a crossing whatever its distance, got %s", body.dump());
+}
+
+void CheckThresholdCrossed(harness::Ctx& ctx) {
+  const json drifting = bodyOf(ctx, report(ctx, seed(kDrifting)));
+  ctx.Assert(drifting.value("threshold_crossed", false) && drifting.value("state", "") == "drifting", "640 samples over a 0.2 threshold reported %s, expected threshold_crossed true and state drifting", drifting.dump());
+  const json steady = bodyOf(ctx, report(ctx, seed(kSteady)));
+  ctx.Assert(steady.contains("threshold_crossed") && steady["threshold_crossed"] == false && steady.value("state", "") == "ok", "640 samples under the 0.2 threshold reported %s, expected threshold_crossed false and state ok", steady.dump());
+}
+`,
+  },
   hints: [
-    'Symptom: a dashboard shows "significant" on a monitor five minutes after registration, and a tenant pastes another workspace’s monitor id into the URL and gets a report back.',
-    'Mechanism: `store.resolve(monitor_id)` ignores the tenant, the response is built from the distance alone, and the flag is a literal `true`, so nothing in the handler ever looks at how many samples were behind the number.',
-    'Change: `store.report(tenant, monitor_id)` with 404 on none; return `sample_count`, `baseline_sample_count`, `baseline_window`; `sufficient = both >= MIN_SAMPLES`, `state = "ok" / "insufficient_data"`, `threshold_crossed = sufficient and distance >= threshold`.',
+    'Ask for a monitor id with another tenant’s header: its drift comes back. Ask for a window holding 50 samples: the report says `significant: true` and gives no counts to doubt it with.',
+    'The handler resolves the monitor by id alone, so whoever names it reads it. The body is the distance and a constant: no counts, no window, no baseline, and no comparison with the threshold or a sample floor.',
+    'Answer 401 without `X-Tenant-Id`, resolve with `store.monitor_for(tenant, monitor_id)` (404 when absent), return both totals with `window_start`, `window_end` and `baseline`, and derive `state` and `threshold_crossed` from `MIN_SAMPLES` and `distance >= threshold`.',
   ],
-  debrief: `Authorization and lookup are the same call because a tenant-scoped read cannot leak: \`store.report\`
-returns nothing for a foreign monitor, and nothing is a 404, which tells an attacker less than a 403
-would. The counts travel with the distance because significance is a property of the sample, not of
-the number. Modelling "not enough data yet" as its own state, instead of folding it into "no drift"
-or "drift", is what keeps the monitor from crying wolf during the first windows after registration,
-and deriving \`threshold_crossed\` from that state keeps the flag and the explanation consistent.
-Production reports add confidence intervals or p-values per distance measure, per-feature
-breakdowns, a report cache keyed by (monitor, window) and a retention policy that keeps the baseline
-window readable for as long as the comparison is offered.`,
+  debrief: `Scoping the lookup by tenant makes a foreign monitor indistinguishable from a missing one, which is why the answer is 404 rather than 403: a 403 would confirm the id exists. The counts, the window and the baseline are what make a distance an argument instead of an assertion; a reader can check that 640 samples against 5 000 is enough and that the window is the one they meant. The sample floor turns "no evidence" into its own state, so a thin window can never page or turn a dashboard red. Production monitors also report a confidence interval or a p-value from a test suited to the feature type, and keep each closed window's report so a crossing can be audited after its sketch expired.`,
 };

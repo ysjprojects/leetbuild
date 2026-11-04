@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package browseragent;
+
+// The browser driver browserd's workers call (step 3): one browser per session. Navigate follows
+// no redirect: a 3xx answers its status and Location, and the caller decides whether the next hop
+// is allowed. Act clicks or types on the session's current page. Snapshot reads the page without
+// touching it. A page's digest changes whenever the page does.
+service BrowserDriver {
+  rpc Navigate(NavigateRequest) returns (Page);
+  rpc Act(ActRequest) returns (Page);
+  rpc Snapshot(SnapshotRequest) returns (Page);
+}
+
+message NavigateRequest {
+  string session_id = 1;
+  string url = 2;
+}
+
+message ActRequest {
+  string session_id = 1;
+  string action = 2;
+  string selector = 3;
+  string text = 4;
+}
+
+message SnapshotRequest {
+  string session_id = 1;
+}
+
+message Page {
+  string url = 1;
+  int32 status = 2;
+  string location = 3;
+  string digest = 4;
+}

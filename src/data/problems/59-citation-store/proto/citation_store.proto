@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package citationstore;
+
+// The document store the verifier asks (step 3): the current version of a document and its text.
+// A document that was deleted is NOT_FOUND.
+service DocumentStore {
+  rpc GetCurrent(DocumentRef) returns (DocumentVersion);
+}
+
+message DocumentRef {
+  string document_id = 1;
+}
+
+message DocumentVersion {
+  string document_id = 1;
+  int64 version = 2;
+  string text = 3;
+}

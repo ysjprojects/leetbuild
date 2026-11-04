@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package shadoweval;
+
+// A model server: production and the candidate under evaluation serve the same service at two
+// addresses (production-model:9000 and candidate-model:9000). model_version names the version the
+// server runs for the call; the reply says which one answered.
+service Model {
+  rpc Complete(CompleteRequest) returns (CompleteReply);
+}
+
+message CompleteRequest {
+  string model_version = 1;
+  string prompt = 2;
+}
+
+message CompleteReply {
+  string text = 1;
+  string model_version = 2;
+}

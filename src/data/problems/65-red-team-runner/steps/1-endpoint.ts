@@ -2,54 +2,48 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/redteam/runs: probes against test targets only',
+  title: 'POST /v1/redteam/runs: registered test targets only',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'runner', 'db', 'sandbox'],
+  focus: ['client', 'runner', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`POST /v1/redteam/runs\` with body
-\`{"target": "checkout-shadow", "probe_set": "prompt-injection"}\`: it reads the tenant header, looks
-up the probe count, calls \`dispatch\` at the \`target\` string as written, and answers **202** with a
-fresh \`uuid4\` run id. It serves the demo against one sandbox host and hides four flaws.
+**Starting point.** The starter serves \`POST /v1/redteam/runs\` with body \`{"target", "probe_set"}\`: it
+answers 401 without \`X-Tenant-Id\`, looks the probe set up in the provided catalog, builds a queued run
+whose \`endpoint\` is the \`target\` string as sent, stores it through the provided run store under
+\`(tenant, run_id)\` and answers 201. It serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** \`dispatch\` is called at whatever the caller typed into
-\`target\`, so a typo points the whole probe set at a host nobody registered. No environment is
-checked, so a production endpoint is a valid destination. Nothing is validated before \`dispatch\`
-runs, so even a rejection would arrive with probes in flight. And \`Idempotency-Key\` is ignored, so
-every client retry starts a new run and doubles the adversarial traffic.
+**Failure mode the checks target.** A runner points adversarial traffic wherever the run says. A
+target the registry has never heard of, or one that is production, must be refused before the run
+exists. A probe set the catalog lacks must not quietly become another set, and a client that retries a
+slow submission must not start a second run against the same system.
 
-- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). A replay with the same \`(tenant, key)\`
-  returns the existing run (**200**) instead of starting a second one.
-- \`target\` is a name, not a URL, resolved through \`TARGET_REGISTRY\`: an unregistered name is
-  **400** and no probe is sent.
-- A target whose \`environment\` is in \`PRODUCTION_ENVIRONMENTS\` is refused with **403** and no
-  probe is sent.
-- \`probe_set\` selects one of the platform's probe sets; the probe count is looked up server-side.
-- Only after both checks pass does the run get an id and its probe set dispatched to the sandbox
-  endpoint that hosts the target (**201**).`,
+Requirements:
+
+- \`target\` is a name resolved with \`targets.resolve\`: unknown is **400**; a target whose environment is
+  \`targets.PRODUCTION\` is **403**. The run's \`endpoint\` comes from the registry.
+- \`probe_set\` must be in the catalog (\`catalog.plan\`); unknown is **400**. \`probes\` is the plan's total.
+- \`Idempotency-Key\` is required (**400**). The run is stored under \`(tenant, key)\` (\`store.put\`); a
+  replay answers **200** with the stored run (\`store.get\`).
+- A rejected request stores nothing. A new run answers **201** with \`{run_id, status: "queued",
+  target, endpoint, probe_set, plan, probes}\`.`,
   sequence: {
-    participants: ['Operator', 'Red Team Runner', 'target registry', 'probe sandbox'],
+    participants: ['Operator', 'redteamd', 'target registry', 'run store'],
     messages: [
-      {
-        from: 'Operator',
-        to: 'Red Team Runner',
-        label: 'POST /v1/redteam/runs · X-Tenant-Id · Idempotency-Key',
-        kind: 'sync',
-      },
-      {from: 'Red Team Runner', to: 'target registry', label: 'resolve(target)', kind: 'sync'},
-      {from: 'target registry', to: 'Red Team Runner', label: 'endpoint + environment / none', kind: 'reply'},
-      {from: 'Red Team Runner', to: 'Red Team Runner', label: '400 unknown · 403 production', kind: 'sync'},
-      {from: 'Red Team Runner', to: 'probe sandbox', label: 'dispatch(probe_set)', kind: 'async'},
-      {from: 'Red Team Runner', to: 'Operator', label: '201 {run_id, endpoint, probes}', kind: 'reply'},
+      {from: 'Operator', to: 'redteamd', label: 'POST /v1/redteam/runs · X-Tenant-Id · Idempotency-Key', kind: 'sync'},
+      {from: 'redteamd', to: 'target registry', label: 'resolve(target)', kind: 'sync'},
+      {from: 'target registry', to: 'redteamd', label: 'endpoint + environment / none', kind: 'reply'},
+      {from: 'redteamd', to: 'redteamd', label: '400 unknown · 403 production · 400 probe set', kind: 'sync'},
+      {from: 'redteamd', to: 'run store', label: 'get(tenant, key) · put(tenant, key, run)', kind: 'sync'},
+      {from: 'redteamd', to: 'Operator', label: '201 {run_id, endpoint, plan, probes}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
       title: 'Handles POST /v1/redteam/runs',
-      detail: 'Register the run-creation route on `POST /v1/redteam/runs`.',
+      detail:
+        'The start-a-run route answers 201 with the queued run (run_id, target, endpoint, probe_set, plan, probes) stored in the run store, and 401 without X-Tenant-Id.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/redteam\/runs["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/redteam\/runs['"]/]},
@@ -62,114 +56,69 @@ every client retry starts a new run and doubles the adversarial traffic.
       id: 'resolve-registered-target',
       title: 'Resolves the target through the registry',
       detail:
-        '`target` is looked up in `TARGET_REGISTRY` and an unknown name is **400** before anything is dispatched. The starter sends the caller’s string straight at the network, so no unregistered host is ever rejected.',
+        'An unregistered target is 400 and stores no run; a registered one gets the endpoint the registry holds. The starter stores the caller’s string as the endpoint, so any host is a valid destination.',
       match: {
-        python: {all: [/TARGET_REGISTRY/, /resolve_target\(/, /status_code\s*=\s*400/]},
-        typescript: {all: [/TARGET_REGISTRY/, /resolveTarget\(/, /code\(\s*400\s*\)/]},
-        go: {all: [/targetRegistry/, /resolveTarget\(/, /StatusBadRequest/]},
-        scala: {all: [/TargetRegistry/, /resolveTarget\(/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kTargetRegistry/, /resolveTarget\(/, /\b400\b/]},
+        python: {all: [/targets\.resolve\(/], none: [/["']endpoint["']\s*:\s*body\.target/]},
+        typescript: {all: [/targets\.resolve\(/], none: [/endpoint:\s*body\.target/]},
+        go: {all: [/targets\.Resolve\(/], none: [/Endpoint:\s*body\.Target/]},
+        scala: {all: [/Targets\.resolve\(/], none: [/body\.target\s*,\s*body\.target/]},
+        cpp: {all: [/targets::resolve\(/], none: [/\{"endpoint",\s*body/]},
       },
     },
     {
       id: 'refuse-production',
       title: 'Refuses a production target',
       detail:
-        'A target whose environment is in `PRODUCTION_ENVIRONMENTS` is **403** and is never dispatched. The starter has no notion of an environment at all, which is how a red-team run reaches production.',
+        'A registered target whose environment is production is 403 and stores no run. The starter has no notion of an environment, which is how a red-team run reaches production.',
       match: {
-        python: {all: [/PRODUCTION_ENVIRONMENTS/, /status_code\s*=\s*403/]},
-        typescript: {all: [/PRODUCTION_ENVIRONMENTS/, /code\(\s*403\s*\)/]},
-        go: {all: [/productionEnvironments/, /StatusForbidden/]},
-        scala: {all: [/ProductionEnvironments/, /StatusCodes\.Forbidden/]},
-        cpp: {all: [/kProductionEnvironments/, /\b403\b/]},
-      },
-    },
-    {
-      id: 'resolve-before-dispatch',
-      title: 'Validates before any probe is sent',
-      detail:
-        'The registry lookup happens before the probe set is dispatched, so an unregistered or production target can never have probes in flight. A check that runs after `dispatch` is a log line, not a control.',
-      match: {
-        python: {order: [/resolve_target\(/, /dispatch\(/]},
-        typescript: {order: [/resolveTarget\(/, /dispatch\(/]},
-        go: {order: [/resolveTarget\(/, /dispatch\(/]},
-        scala: {order: [/resolveTarget\(/, /dispatch\(/]},
-        cpp: {order: [/resolveTarget\(/, /dispatch\(/]},
+        python: {all: [/targets\.PRODUCTION/, /status_code\s*=\s*403/]},
+        typescript: {all: [/targets\.PRODUCTION/, /code\(\s*403\s*\)/]},
+        go: {all: [/targets\.Production/, /StatusForbidden/]},
+        scala: {all: [/Targets\.Production/, /StatusCodes\.Forbidden/]},
+        cpp: {all: [/targets::kProduction/, /\b403\b/]},
       },
     },
     {
       id: 'idempotent-replay',
-      title: 'Keys retries by (tenant, Idempotency-Key)',
+      title: 'Keys run starts by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the run is stored under `(tenant, key)`; a replay returns the existing run instead of dispatching the probe set a second time. The starter ignores the header entirely.',
+        'Idempotency-Key is required (400 without it); a replay of the same (tenant, key) answers 200 with the same run_id, and another tenant with the same key gets its own run. The starter stores the run under a fresh id, so every retry starts another run.',
       match: {
-        python: {all: [/Idempotency-Key/, /run_store\.get\(/, /run_store\.put\(/]},
-        typescript: {all: [/idempotency-key/, /runStore\.get\(/, /runStore\.put\(/]},
-        go: {all: [/Idempotency-Key/, /runStore\.Get\(/, /runStore\.Put\(/]},
-        scala: {all: [/Idempotency-Key/, /runStore\.get\(/, /runStore\.put\(/]},
-        cpp: {all: [/Idempotency-Key/, /runStore\.get\(/, /runStore\.put\(/]},
+        python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
+        typescript: {all: [/idempotency-key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
+        go: {all: [/Idempotency-Key/, /runs\.Get\(/, /runs\.Put\(\s*[\w.()]+,\s*tenant\s*,\s*idem/]},
+        scala: {all: [/Idempotency-Key/, /Runs\.get\(\s*tenant\s*,/, /Runs\.put\(\s*tenant\s*,\s*idem/]},
+        cpp: {all: [/Idempotency-Key/, /runs::get\(\s*tenant\s*,/, /runs::put\(\s*tenant\s*,\s*idem/]},
+      },
+    },
+    {
+      id: 'known-probe-set',
+      title: 'Refuses a probe set the catalog lacks',
+      detail:
+        'An unknown probe_set is 400 and stores no run; a known one carries its plan and total. The starter falls back to the baseline set, so a typo runs ten probes nobody asked for.',
+      match: {
+        python: {all: [/catalog\.plan\(/], none: [/plan\(\s*["']baseline["']\s*\)/]},
+        typescript: {all: [/catalog\.plan\(/], none: [/plan\(\s*["']baseline["']\s*\)/]},
+        go: {all: [/catalog\.Plan\(/], none: [/Plan\(\s*"baseline"\s*\)/]},
+        scala: {all: [/Catalog\.plan\(/], none: [/plan\(\s*"baseline"\s*\)/]},
+        cpp: {all: [/catalog::plan\(/], none: [/plan\(\s*"baseline"\s*\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import uuid
-
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-app = FastAPI()
-
-PROBE_SETS = {"prompt-injection": 12, "data-exfil": 8, "resource-exhaustion": 6}
-
-
-class RunRequest(BaseModel):
-    target: str
-    probe_set: str
-
-
-class RunStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The run stored for (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, run: dict) -> None:
-        """Store the run under (tenant, idem_key)."""
-        raise NotImplementedError
-
-
-run_store = RunStore()
-
-
-@app.post("/v1/redteam/runs")
-def create_run(
-    body: RunRequest,
-    tenant: str = Header(alias="X-Tenant-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    probes = PROBE_SETS.get(body.probe_set, 4)
-    dispatch(body.target, body.probe_set, probes)
-    return JSONResponse(
-        {"run_id": str(uuid.uuid4()), "tenant": tenant, "target": body.target, "probes": probes},
-        status_code=202,
-    )
-`,
-      solution: `import uuid
+      starter: `import logging
+import uuid
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
+from redteam import catalog
+from redteam.runs import store
 
-TARGET_REGISTRY = {
-    "checkout-shadow": {"endpoint": "sut-shadow.sandbox:9000", "environment": "sandbox"},
-    "search-staging": {"endpoint": "sut-staging.sandbox:9000", "environment": "staging"},
-}
-PRODUCTION_ENVIRONMENTS = {"prod", "production"}
-PROBE_SETS = {"prompt-injection": 12, "data-exfil": 8, "resource-exhaustion": 6}
+app = FastAPI()
+logger = logging.getLogger("redteam")
 
 
 class RunRequest(BaseModel):
@@ -177,36 +126,46 @@ class RunRequest(BaseModel):
     probe_set: str
 
 
-class RunStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The run stored for (tenant, idem_key), if any."""
-        raise NotImplementedError
+@app.post("/v1/redteam/runs")
+def start_run(body: RunRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    if tenant is None or tenant == "":
+        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
+    plan = catalog.plan(body.probe_set) or catalog.plan("baseline")
+    run = {
+        "run_id": str(uuid.uuid4()),
+        "status": "queued",
+        "target": body.target,
+        "endpoint": body.target,
+        "probe_set": body.probe_set,
+        "plan": plan,
+        "probes": sum(entry["probes"] for entry in plan),
+    }
+    store.put(tenant, run["run_id"], run)
+    logger.info("redteam run=%s target=%s probes=%d", run["run_id"], body.target, run["probes"])
+    return JSONResponse(run, status_code=201)
+`,
+      solution: `import logging
+import uuid
 
-    def put(self, tenant: str, idem_key: str, run: dict) -> None:
-        """Store the run under (tenant, idem_key)."""
-        raise NotImplementedError
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from redteam import catalog, targets
+from redteam.runs import store
+
+app = FastAPI()
+logger = logging.getLogger("redteam")
 
 
-run_store = RunStore()
-
-
-def resolve_target(name: str) -> dict:
-    """The registered target, or a refusal. Never returns a caller-supplied URL."""
-    record = TARGET_REGISTRY.get(name)
-    if record is None:
-        raise HTTPException(status_code=400, detail="unknown target")
-    if record["environment"] in PRODUCTION_ENVIRONMENTS:
-        raise HTTPException(status_code=403, detail="production targets are refused")
-    return record
-
-
-def dispatch(endpoint: str, probe_set: str, probes: int) -> None:
-    """Send the probe set at the sandbox endpoint that hosts the target."""
-    raise NotImplementedError
+class RunRequest(BaseModel):
+    target: str
+    probe_set: str
 
 
 @app.post("/v1/redteam/runs")
-def create_run(
+def start_run(
     body: RunRequest,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
     idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -215,38 +174,42 @@ def create_run(
         raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
     if idem_key is None or idem_key == "":
         raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if body.target == "" or body.probe_set == "":
-        raise HTTPException(status_code=400, detail="target and probe_set are required")
+    target = targets.resolve(body.target)
+    if target is None:
+        raise HTTPException(status_code=400, detail="target is not registered")
+    if target["environment"] == targets.PRODUCTION:
+        raise HTTPException(status_code=403, detail="production targets are refused")
+    plan = catalog.plan(body.probe_set)
+    if plan is None:
+        raise HTTPException(status_code=400, detail="probe_set is not in the catalog")
 
-    stored = run_store.get(tenant, idem_key)
+    stored = store.get(tenant, idem_key)
     if stored is not None:
         return JSONResponse(stored, status_code=200)
 
-    record = resolve_target(body.target)
-    probes = PROBE_SETS.get(body.probe_set, 4)
     run = {
         "run_id": str(uuid.uuid4()),
-        "tenant": tenant,
-        "target": body.target,
-        "endpoint": record["endpoint"],
+        "status": "queued",
+        "target": target["name"],
+        "endpoint": target["endpoint"],
         "probe_set": body.probe_set,
-        "probes": probes,
-        "status": "running",
+        "plan": plan,
+        "probes": sum(entry["probes"] for entry in plan),
     }
-    run_store.put(tenant, idem_key, run)
-    dispatch(record["endpoint"], body.probe_set, probes)
+    store.put(tenant, idem_key, run)
+    logger.info("redteam run=%s target=%s probes=%d", run["run_id"], target["name"], run["probes"])
     return JSONResponse(run, status_code=201)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/redteam/runs: flawed code that probes whatever it is handed. */
-import {randomUUID} from 'node:crypto';
+      starter: `import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
 
-export const app = Fastify();
+import * as catalog from 'redteam/catalog';
+import {type Run, store} from 'redteam/runs';
 
-const PROBE_SETS: Record<string, number> = {'prompt-injection': 12, 'data-exfil': 8, 'resource-exhaustion': 6};
+export const app = Fastify();
 
 interface RunBody {
   target: string;
@@ -254,98 +217,68 @@ interface RunBody {
 }
 
 app.post('/v1/redteam/runs', async (request, reply) => {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const body = request.body as RunBody;
-  const probes = PROBE_SETS[body.probe_set] ?? 4;
-  dispatch(body.target, body.probe_set, probes);
-  return reply.code(202).send({run_id: randomUUID(), tenant, target: body.target, probes});
+  const plan = catalog.plan(body.probe_set) ?? catalog.plan('baseline') ?? [];
+  const run: Run = {
+    run_id: randomUUID(),
+    status: 'queued',
+    target: body.target,
+    endpoint: body.target,
+    probe_set: body.probe_set,
+    plan,
+    probes: plan.reduce((sum, entry) => sum + entry.probes, 0),
+  };
+  await store.put(tenant, run.run_id, run);
+  request.log.info({run_id: run.run_id, target: run.target, probes: run.probes}, 'run queued');
+  return reply.code(201).send(run);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/redteam/runs: only a registered, non-production target gets a probe set. */
-import {randomUUID} from 'node:crypto';
+      solution: `import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
 
-import {runStore} from './runs';
+import * as catalog from 'redteam/catalog';
+import {type Run, store} from 'redteam/runs';
+import * as targets from 'redteam/targets';
 
 export const app = Fastify();
-
-interface TargetRecord {
-  endpoint: string;
-  environment: string;
-}
-
-const TARGET_REGISTRY: Record<string, TargetRecord> = {
-  'checkout-shadow': {endpoint: 'sut-shadow.sandbox:9000', environment: 'sandbox'},
-  'search-staging': {endpoint: 'sut-staging.sandbox:9000', environment: 'staging'},
-};
-const PRODUCTION_ENVIRONMENTS: Record<string, true> = {prod: true, production: true};
-const PROBE_SETS: Record<string, number> = {'prompt-injection': 12, 'data-exfil': 8, 'resource-exhaustion': 6};
 
 interface RunBody {
   target: string;
   probe_set: string;
-}
-
-interface Run {
-  run_id: string;
-  tenant: string;
-  target: string;
-  endpoint: string;
-  probe_set: string;
-  probes: number;
-  status: string;
-}
-
-/** The registered target, or null. Never resolves a caller-supplied URL. */
-function resolveTarget(name: string): TargetRecord | null {
-  return Object.prototype.hasOwnProperty.call(TARGET_REGISTRY, name) ? TARGET_REGISTRY[name] : null;
-}
-
-function dispatch(endpoint: string, probeSet: string, probes: number): void {
-  // The sandbox, not the caller, owns the egress: probes leave from here.
-  void {endpoint, probeSet, probes};
 }
 
 app.post('/v1/redteam/runs', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
   if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
+  if (typeof idemKey !== 'string' || idemKey === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const body = (request.body ?? {}) as Partial<RunBody>;
+  const target = typeof body.target === 'string' ? targets.resolve(body.target) : null;
+  if (target === null) return reply.code(400).send({error: 'target is not registered'});
+  if (target.environment === targets.PRODUCTION) return reply.code(403).send({error: 'production targets are refused'});
+  const plan = typeof body.probe_set === 'string' ? catalog.plan(body.probe_set) : null;
+  if (plan === null) return reply.code(400).send({error: 'probe_set is not in the catalog'});
 
-  const stored: Run | null = await runStore.get(tenant, idemKey);
+  const stored = await store.get(tenant, idemKey);
   if (stored !== null) return reply.code(200).send(stored);
-
-  const body = request.body as Partial<RunBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.target !== 'string' || body.target === '')
-    return reply.code(400).send({error: 'target is required'});
-  if (typeof body.probe_set !== 'string' || body.probe_set === '')
-    return reply.code(400).send({error: 'probe_set is required'});
-
-  const record = resolveTarget(body.target);
-  if (record === null) return reply.code(400).send({error: 'unknown target'});
-  if (PRODUCTION_ENVIRONMENTS[record.environment] === true)
-    return reply.code(403).send({error: 'production targets are refused'});
 
   const run: Run = {
     run_id: randomUUID(),
-    tenant,
-    target: body.target,
-    endpoint: record.endpoint,
-    probe_set: body.probe_set,
-    probes: PROBE_SETS[body.probe_set] ?? 4,
-    status: 'running',
+    status: 'queued',
+    target: target.name,
+    endpoint: target.endpoint,
+    probe_set: body.probe_set as string,
+    plan,
+    probes: plan.reduce((sum, entry) => sum + entry.probes, 0),
   };
-  await runStore.put(tenant, idemKey, run);
-  dispatch(record.endpoint, body.probe_set, run.probes);
+  await store.put(tenant, idemKey, run);
+  request.log.info({run_id: run.run_id, target: run.target, probes: run.probes}, 'run queued');
   return reply.code(201).send(run);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -357,9 +290,10 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
-)
 
-var probeSets = map[string]int{"prompt-injection": 12, "data-exfil": 8, "resource-exhaustion": 6}
+	"redteam/catalog" // catalog.Plan(name) — provided
+	"redteam/runs"    // runs.Run, runs.Get(ctx, tenant, idemKey), runs.Put(ctx, tenant, idemKey, run) — provided
+)
 
 type RunRequest struct {
 	Target   string \`json:"target"\`
@@ -372,71 +306,75 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-func createRun(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+func totalProbes(plan []catalog.Planned) int {
+	total := 0
+	for _, entry := range plan {
+		total += entry.Probes
+	}
+	return total
+}
+
+func startRun(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		return
+	}
 	var body RunRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	probes := probeSets[body.ProbeSet]
-	dispatch(r.Context(), body.Target, body.ProbeSet, probes)
-	writeJSON(rw, http.StatusAccepted, map[string]any{
-		"run_id": uuid.NewString(),
-		"tenant": tenant,
-		"target": body.Target,
-		"probes": probes,
-	})
+	plan := catalog.Plan(body.ProbeSet)
+	if plan == nil {
+		plan = catalog.Plan("baseline")
+	}
+	run := runs.Run{
+		RunID:    uuid.NewString(),
+		Status:   "queued",
+		Target:   body.Target,
+		Endpoint: body.Target,
+		ProbeSet: body.ProbeSet,
+		Plan:     plan,
+		Probes:   totalProbes(plan),
+	}
+	if err := runs.Put(r.Context(), tenant, run.RunID, run); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		return
+	}
+	log.Printf("redteam run=%s target=%s probes=%d", run.RunID, run.Target, run.Probes)
+	writeJSON(rw, http.StatusCreated, run)
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/redteam/runs", startRun)
 }
 
 func main() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/redteam/runs", createRun)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	register(mux)
+	log.Fatal(http.ListenAndServe(":8443", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 
 	"github.com/google/uuid"
+
+	"redteam/catalog" // catalog.Plan(name) — provided
+	"redteam/runs"    // runs.Run, runs.Get(ctx, tenant, idemKey), runs.Put(ctx, tenant, idemKey, run) — provided
+	"redteam/targets" // targets.Resolve(name), targets.Production — provided
 )
-
-type TargetRecord struct {
-	Endpoint    string \`json:"endpoint"\`
-	Environment string \`json:"environment"\`
-}
-
-var targetRegistry = map[string]TargetRecord{
-	"checkout-shadow": {Endpoint: "sut-shadow.sandbox:9000", Environment: "sandbox"},
-	"search-staging":  {Endpoint: "sut-staging.sandbox:9000", Environment: "staging"},
-}
-
-var productionEnvironments = map[string]bool{"prod": true, "production": true}
-
-var probeSets = map[string]int{"prompt-injection": 12, "data-exfil": 8, "resource-exhaustion": 6}
 
 type RunRequest struct {
 	Target   string \`json:"target"\`
 	ProbeSet string \`json:"probe_set"\`
 }
-
-type RunStore struct{}
-
-func (s *RunStore) Get(ctx context.Context, tenant, idemKey string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *RunStore) Put(ctx context.Context, tenant, idemKey string, run map[string]any) error {
-	return nil
-}
-
-var runStore = &RunStore{}
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -444,18 +382,15 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-// resolveTarget answers with the registered target and false for anything else, so a caller
-// supplied URL can never be probed.
-func resolveTarget(name string) (TargetRecord, bool) {
-	record, ok := targetRegistry[name]
-	return record, ok
+func totalProbes(plan []catalog.Planned) int {
+	total := 0
+	for _, entry := range plan {
+		total += entry.Probes
+	}
+	return total
 }
 
-func dispatch(ctx context.Context, endpoint, probeSet string, probes int) error {
-	return nil
-}
-
-func createRun(rw http.ResponseWriter, r *http.Request) {
+func startRun(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
 		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
@@ -466,53 +401,61 @@ func createRun(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
 		return
 	}
-	stored, err := runStore.Get(r.Context(), tenant, idemKey)
+	var body RunRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	target, ok := targets.Resolve(body.Target)
+	if !ok {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "target is not registered"})
+		return
+	}
+	if target.Environment == targets.Production {
+		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "production targets are refused"})
+		return
+	}
+	plan := catalog.Plan(body.ProbeSet)
+	if plan == nil {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "probe_set is not in the catalog"})
+		return
+	}
+
+	stored, err := runs.Get(r.Context(), tenant, idemKey)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try again"})
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
 		return
 	}
 	if stored != nil {
 		writeJSON(rw, http.StatusOK, stored)
 		return
 	}
-	var body RunRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+
+	run := runs.Run{
+		RunID:    uuid.NewString(),
+		Status:   "queued",
+		Target:   target.Name,
+		Endpoint: target.Endpoint,
+		ProbeSet: body.ProbeSet,
+		Plan:     plan,
+		Probes:   totalProbes(plan),
+	}
+	if err := runs.Put(r.Context(), tenant, idemKey, run); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
 		return
 	}
-	record, ok := resolveTarget(body.Target)
-	if !ok {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown target"})
-		return
-	}
-	if productionEnvironments[record.Environment] {
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "production targets are refused"})
-		return
-	}
-	run := map[string]any{
-		"run_id":    uuid.NewString(),
-		"tenant":    tenant,
-		"target":    body.Target,
-		"endpoint":  record.Endpoint,
-		"probe_set": body.ProbeSet,
-		"probes":    probeSets[body.ProbeSet],
-		"status":    "running",
-	}
-	if err := runStore.Put(r.Context(), tenant, idemKey, run); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try again"})
-		return
-	}
-	if err := dispatch(r.Context(), record.Endpoint, body.ProbeSet, probeSets[body.ProbeSet]); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "try again"})
-		return
-	}
+	log.Printf("redteam run=%s target=%s probes=%d", run.RunID, run.Target, run.Probes)
 	writeJSON(rw, http.StatusCreated, run)
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/redteam/runs", startRun)
 }
 
 func main() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/redteam/runs", createRun)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	register(mux)
+	log.Fatal(http.ListenAndServe(":8443", mux))
 }
 `,
     },
@@ -528,26 +471,32 @@ import org.apache.pekko.http.scaladsl.server.Route
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
 
+import redteam.{Catalog, Planned, Run, Runs}
+
 final case class RunRequest(target: String, probe_set: String)
 
-object Api {
+object RedTeamApi {
   implicit val system: ActorSystem = ActorSystem("red-team-runner")
-  implicit val runFormat: RootJsonFormat[RunRequest] = jsonFormat2(RunRequest)
-
-  val ProbeSets = Map("prompt-injection" -> 12, "data-exfil" -> 8, "resource-exhaustion" -> 6)
+  implicit val requestFormat: RootJsonFormat[RunRequest] = jsonFormat2(RunRequest)
+  implicit val plannedFormat: RootJsonFormat[Planned] = jsonFormat2(Planned)
+  implicit val runFormat: RootJsonFormat[Run] = jsonFormat7(Run)
 
   val route: Route =
     path("v1" / "redteam" / "runs") {
       post {
-        headerValueByName("X-Tenant-Id") { tenant =>
+        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
           entity(as[RunRequest]) { body =>
-            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val probes = ProbeSets.getOrElse(body.probe_set, 4)
-            dispatch(body.target, body.probe_set, probes)
-            complete(
-              StatusCodes.Accepted,
-              s"""{"run_id":"\${UUID.randomUUID()}","tenant":"$tenant","target":"\${body.target}","probes":$probes}"""
-            )
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+            if (!tenantOpt.exists(_.nonEmpty)) {
+              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
+            } else {
+              val tenant = tenantOpt.get
+              val plan = Catalog.plan(body.probe_set).orElse(Catalog.plan("baseline")).getOrElse(Nil)
+              val run = Run(UUID.randomUUID().toString, "queued", body.target, body.target, body.probe_set, plan, plan.map(_.probes).sum)
+              Runs.put(tenant, run.run_id, run)
+              system.log.info(s"redteam run=\${run.run_id} target=\${run.target} probes=\${run.probes}")
+              complete(StatusCodes.Created, run)
+            }
           }
         }
       }
@@ -569,36 +518,38 @@ import org.apache.pekko.http.scaladsl.server.Route
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
 
+import redteam.{Catalog, Planned, Run, Runs, Targets}
+
 final case class RunRequest(target: String, probe_set: String)
-final case class TargetRecord(endpoint: String, environment: String)
-final case class Run(
-    run_id: String,
-    tenant: String,
-    target: String,
-    endpoint: String,
-    probe_set: String,
-    probes: Int,
-    status: String
-)
 
-object Api {
+object RedTeamApi {
   implicit val system: ActorSystem = ActorSystem("red-team-runner")
-  implicit val runFormat: RootJsonFormat[RunRequest] = jsonFormat2(RunRequest)
-  implicit val targetFormat: RootJsonFormat[TargetRecord] = jsonFormat2(TargetRecord)
-  implicit val runRecordFormat: RootJsonFormat[Run] = jsonFormat7(Run)
+  implicit val requestFormat: RootJsonFormat[RunRequest] = jsonFormat2(RunRequest)
+  implicit val plannedFormat: RootJsonFormat[Planned] = jsonFormat2(Planned)
+  implicit val runFormat: RootJsonFormat[Run] = jsonFormat7(Run)
 
-  val TargetRegistry = Map(
-    "checkout-shadow" -> TargetRecord("sut-shadow.sandbox:9000", "sandbox"),
-    "search-staging" -> TargetRecord("sut-staging.sandbox:9000", "staging")
-  )
-  val ProductionEnvironments = Set("prod", "production")
-  val ProbeSets = Map("prompt-injection" -> 12, "data-exfil" -> 8, "resource-exhaustion" -> 6)
-
-  val runStore = RunStore.open()
-
-  def resolveTarget(name: String): Option[TargetRecord] = TargetRegistry.get(name)
-
-  def dispatch(endpoint: String, probeSet: String, probes: Int): Unit = ()
+  def startRun(tenant: String, idemKey: String, body: RunRequest): Route =
+    Targets.resolve(body.target) match {
+      case None =>
+        complete(StatusCodes.BadRequest, """{"error":"target is not registered"}""")
+      case Some(target) if target.environment == Targets.Production =>
+        complete(StatusCodes.Forbidden, """{"error":"production targets are refused"}""")
+      case Some(target) =>
+        Catalog.plan(body.probe_set) match {
+          case None =>
+            complete(StatusCodes.BadRequest, """{"error":"probe_set is not in the catalog"}""")
+          case Some(plan) =>
+            Runs.get(tenant, idemKey) match {
+              case Some(stored) =>
+                complete(StatusCodes.OK, stored.run)
+              case None =>
+                val run = Run(UUID.randomUUID().toString, "queued", target.name, target.endpoint, body.probe_set, plan, plan.map(_.probes).sum)
+                Runs.put(tenant, idemKey, run)
+                system.log.info(s"redteam run=\${run.run_id} target=\${run.target} probes=\${run.probes}")
+                complete(StatusCodes.Created, run)
+            }
+        }
+    }
 
   val route: Route =
     path("v1" / "redteam" / "runs") {
@@ -611,32 +562,7 @@ object Api {
               } else if (!idemOpt.exists(_.nonEmpty)) {
                 complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
               } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                runStore.get(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
-                  case None =>
-                    resolveTarget(body.target) match {
-                      case None =>
-                        complete(StatusCodes.BadRequest, """{"error":"unknown target"}""")
-                      case Some(record) if ProductionEnvironments.contains(record.environment) =>
-                        complete(StatusCodes.Forbidden, """{"error":"production targets are refused"}""")
-                      case Some(record) =>
-                        val run = Run(
-                          UUID.randomUUID().toString,
-                          tenant,
-                          body.target,
-                          record.endpoint,
-                          body.probe_set,
-                          ProbeSets.getOrElse(body.probe_set, 4),
-                          "running"
-                        )
-                        runStore.put(tenant, idemKey, run)
-                        dispatch(record.endpoint, body.probe_set, run.probes)
-                        complete(StatusCodes.Created, run)
-                    }
-                }
+                startRun(tenantOpt.get, idemOpt.get, body)
               }
             }
           }
@@ -655,34 +581,56 @@ object Api {
 #include <nlohmann/json.hpp>
 
 #include <iostream>
-#include <map>
 #include <string>
+
+#include "ids.h"              // new_uuid() — provided
+#include "redteam/catalog.h"  // catalog::plan(name) — provided
+#include "redteam/runs.h"     // runs::get(tenant, idem_key), runs::put(tenant, idem_key, run) — provided
 
 using json = nlohmann::json;
 
-const std::map<std::string, int> kProbeSets = {
-    {"prompt-injection", 12}, {"data-exfil", 8}, {"resource-exhaustion", 6}};
+int total_probes(const json& plan) {
+  int total = 0;
+  for (const auto& entry : plan) total += entry.value("probes", 0);
+  return total;
+}
 
-std::string uuidString();
+void start_run(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
+    return;
+  }
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) {
+    res.status = 400;
+    res.set_content(R"({"error":"invalid json"})", "application/json");
+    return;
+  }
+  const std::string probe_set = body.value("probe_set", std::string());
+  const json plan = catalog::plan(probe_set).value_or(*catalog::plan("baseline"));
+  const json run = {
+      {"run_id", new_uuid()},
+      {"status", "queued"},
+      {"target", body.value("target", std::string())},
+      {"endpoint", body.value("target", std::string())},
+      {"probe_set", probe_set},
+      {"plan", plan},
+      {"probes", total_probes(plan)},
+  };
+  runs::put(tenant, run["run_id"].get<std::string>(), run);
+  std::cerr << "redteam run=" << run["run_id"] << " target=" << run["target"] << "\\n";
+  res.status = 201;
+  res.set_content(run.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/redteam/runs", start_run); }
 
 int main() {
   httplib::Server svr;
-
-  svr.Post("/v1/redteam/runs", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const auto target = body.value("target", std::string());
-    const auto probeSet = body.value("probe_set", std::string());
-    const int probes = kProbeSets.count(probeSet) > 0 ? kProbeSets.at(probeSet) : 4;
-    dispatch(target, probeSet, probes);
-    res.status = 202;
-    res.set_content(
-        json{{"run_id", uuidString()}, {"tenant", tenant}, {"target", target}, {"probes", probes}}.dump(),
-        "application/json");
-  });
-
+  register_routes(svr);
   svr.listen("0.0.0.0", 8443);
 }
 `,
@@ -690,107 +638,424 @@ int main() {
 #include <nlohmann/json.hpp>
 
 #include <iostream>
-#include <map>
-#include <optional>
-#include <set>
 #include <string>
+
+#include "ids.h"              // new_uuid() — provided
+#include "redteam/catalog.h"  // catalog::plan(name) — provided
+#include "redteam/runs.h"     // runs::get(tenant, idem_key), runs::put(tenant, idem_key, run) — provided
+#include "redteam/targets.h"  // targets::resolve(name), targets::kProduction — provided
 
 using json = nlohmann::json;
 
-struct TargetRecord {
-  std::string endpoint;
-  std::string environment;
-};
-
-const std::map<std::string, TargetRecord> kTargetRegistry = {
-    {"checkout-shadow", {"sut-shadow.sandbox:9000", "sandbox"}},
-    {"search-staging", {"sut-staging.sandbox:9000", "staging"}}};
-const std::set<std::string> kProductionEnvironments = {"prod", "production"};
-const std::map<std::string, int> kProbeSets = {
-    {"prompt-injection", 12}, {"data-exfil", 8}, {"resource-exhaustion", 6}};
-
-struct RunStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& run);
-};
-
-RunStore runStore;
-std::string uuidString();
-void dispatch(const std::string& endpoint, const std::string& probeSet, int probes);
-
-/** The registered target, or nothing: a caller-supplied URL is never probed. */
-std::optional<TargetRecord> resolveTarget(const std::string& name) {
-  const auto it = kTargetRegistry.find(name);
-  if (it == kTargetRegistry.end()) return std::nullopt;
-  return it->second;
+int total_probes(const json& plan) {
+  int total = 0;
+  for (const auto& entry : plan) total += entry.value("probes", 0);
+  return total;
 }
+
+void reject(httplib::Response& res, int status, const std::string& error) {
+  res.status = status;
+  res.set_content(json({{"error", error}}).dump(), "application/json");
+}
+
+void start_run(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reject(res, 401, "missing X-Tenant-Id");
+  const std::string idem_key = req.get_header_value("Idempotency-Key");
+  if (idem_key.empty()) return reject(res, 400, "Idempotency-Key is required");
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object() || !body.contains("target") || !body["target"].is_string()) return reject(res, 400, "target is not registered");
+  const auto target = targets::resolve(body["target"].get<std::string>());
+  if (!target) return reject(res, 400, "target is not registered");
+  if (target->environment == targets::kProduction) return reject(res, 403, "production targets are refused");
+  const std::string probe_set = body.contains("probe_set") && body["probe_set"].is_string() ? body["probe_set"].get<std::string>() : "";
+  const auto plan = catalog::plan(probe_set);
+  if (!plan) return reject(res, 400, "probe_set is not in the catalog");
+
+  if (const auto stored = runs::get(tenant, idem_key)) {
+    res.status = 200;
+    res.set_content(stored->dump(), "application/json");
+    return;
+  }
+  const json run = {
+      {"run_id", new_uuid()},
+      {"status", "queued"},
+      {"target", target->name},
+      {"endpoint", target->endpoint},
+      {"probe_set", probe_set},
+      {"plan", *plan},
+      {"probes", total_probes(*plan)},
+  };
+  runs::put(tenant, idem_key, run);
+  std::cerr << "redteam run=" << run["run_id"] << " target=" << target->name << "\\n";
+  res.status = 201;
+  res.set_content(run.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/redteam/runs", start_run); }
 
 int main() {
   httplib::Server svr;
-
-  svr.Post("/v1/redteam/runs", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    const auto stored = runStore.get(tenant, idemKey);
-    if (stored) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("target") || !body["target"].is_string()) {
-      res.status = 400;
-      res.set_content(R"({"error":"target is required"})", "application/json");
-      return;
-    }
-    const auto target = body["target"].get<std::string>();
-    const auto record = resolveTarget(target);
-    if (!record) {
-      res.status = 400;
-      res.set_content(R"({"error":"unknown target"})", "application/json");
-      return;
-    }
-    if (kProductionEnvironments.count(record->environment) > 0) {
-      res.status = 403;
-      res.set_content(R"({"error":"production targets are refused"})", "application/json");
-      return;
-    }
-    const auto probeSet = body.value("probe_set", std::string());
-    const int probes = kProbeSets.count(probeSet) > 0 ? kProbeSets.at(probeSet) : 4;
-    const json run = {
-        {"run_id", uuidString()},
-        {"tenant", tenant},
-        {"target", target},
-        {"endpoint", record->endpoint},
-        {"probe_set", probeSet},
-        {"probes", probes},
-        {"status", "running"},
-    };
-    runStore.put(tenant, idemKey, run);
-    dispatch(record->endpoint, probeSet, probes);
-    res.status = 201;
-    res.set_content(run.dump(), "application/json");
-  });
-
+  register_routes(svr);
   svr.listen("0.0.0.0", 8443);
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+GOOD = {"target": "checkout-shadow", "probe_set": "baseline"}
+FIELDS = ("run_id", "status", "target", "endpoint", "probe_set", "plan", "probes")
+
+
+def _api(ctx):
+    m = ctx.load("api")
+    return ctx.client(m.app)
+
+
+async def _post(c, body, key="k-1", tenant="t1", with_key=True):
+    headers = {"X-Tenant-Id": tenant}
+    if with_key:
+        headers["Idempotency-Key"] = key
+    return await c.post("/v1/redteam/runs", json=body, headers=headers)
+
+
+def _runs(ctx):
+    return ctx.redis.keys("redteam:run:*")
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, GOOD)
+        assert r.status_code == 201, f"a valid start answered {r.status_code}: {r.text}"
+        run = r.json()
+        for key in FIELDS:
+            assert key in run, f"the 201 body lacks {key!r}: {run}"
+        assert run["status"] == "queued" and run["target"] == "checkout-shadow" and run["probe_set"] == "baseline", f"the run echoes the request with status queued: {run}"
+        assert run["probes"] == 10, f"the baseline set plans 10 probes, the run says {run['probes']}"
+        raw = ctx.redis.get(f"redteam:run:{run['run_id']}")
+        assert raw is not None, f"the run {run['run_id']} must be in the run store (redteam:run:{{id}}): keys {sorted(ctx.redis.keys('redteam:*'))}"
+        r = await c.post("/v1/redteam/runs", json=GOOD, headers={"Idempotency-Key": "k-1"})
+        assert r.status_code == 401, f"without X-Tenant-Id the start must answer 401, got {r.status_code}"
+
+
+async def check_resolve_registered_target(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, {**GOOD, "target": "billing-db.internal:5432"}, key="k-bad")
+        assert r.status_code == 400, f"a target nobody registered (billing-db.internal:5432) answered {r.status_code}, expected 400: the runner would point probes at whatever host the caller typed"
+        assert _runs(ctx) == [], f"a refused start must store no run, found {_runs(ctx)}"
+        r = await _post(c, {**GOOD, "target": "search-staging"}, key="k-ok")
+        assert r.status_code == 201, f"search-staging is registered, got {r.status_code}: {r.text}"
+        endpoint = r.json().get("endpoint")
+        assert endpoint == "search-staging.sandbox.internal", f"the run's endpoint must be the registry's (search-staging.sandbox.internal), got {endpoint!r}: the caller names a target, the registry says where it lives"
+
+
+async def check_refuse_production(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, {**GOOD, "target": "payments-prod"}, key="k-prod")
+        assert r.status_code == 403, f"payments-prod is registered with environment production and answered {r.status_code}, expected 403"
+        assert _runs(ctx) == [], f"a refused production target must store no run, found {[json.loads(ctx.redis.get(k)) for k in _runs(ctx)]}"
+        r = await _post(c, {**GOOD, "target": "checkout-shadow"}, key="k-shadow")
+        assert r.status_code == 201, f"a shadow target is fine, got {r.status_code}: {r.text}"
+
+
+async def check_idempotent_replay(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, GOOD, with_key=False)
+        assert r.status_code == 400, f"a start without Idempotency-Key answered {r.status_code}, expected 400"
+        first = await _post(c, GOOD, key="k-7")
+        assert first.status_code == 201, f"the first start answered {first.status_code}: {first.text}"
+        replay = await _post(c, GOOD, key="k-7")
+        assert replay.status_code == 200, f"a replay of the same (tenant, Idempotency-Key) answered {replay.status_code}, expected 200 with the stored run (the client retried; it must not start a second run against the target)"
+        assert replay.json()["run_id"] == first.json()["run_id"], f"the replay must answer the same run: got {replay.json()['run_id']}, the first start made {first.json()['run_id']}"
+        assert len(_runs(ctx)) == 1, f"one key, one run: the store holds {len(_runs(ctx))} runs after a start and its replay"
+        other = await _post(c, GOOD, key="k-7", tenant="t2")
+        assert other.status_code == 201 and other.json()["run_id"] != first.json()["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)"
+
+
+async def check_known_probe_set(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, {**GOOD, "probe_set": "everything"}, key="k-bad")
+        assert r.status_code == 400, f"a probe set the catalog lacks (everything) answered {r.status_code}, expected 400: it must not turn into another set"
+        assert _runs(ctx) == [], f"a refused probe set must store no run, found {_runs(ctx)}"
+        r = await _post(c, {**GOOD, "probe_set": "injection-only"}, key="k-inj")
+        assert r.status_code == 201, f"injection-only is in the catalog, got {r.status_code}: {r.text}"
+        run = r.json()
+        assert run["plan"] == [{"category": "prompt-injection", "probes": 6}] and run["probes"] == 6, f"the run carries the catalog's plan for injection-only (6 prompt-injection probes): {run}"
+`,
+    typescript: `const GOOD = {target: 'checkout-shadow', probe_set: 'baseline'};
+const FIELDS = ['run_id', 'status', 'target', 'endpoint', 'probe_set', 'plan', 'probes'];
+
+function api(ctx) {
+  const m = ctx.load('api');
+  return ctx.client(m.app);
+}
+
+async function post(c, body, {key = 'k-1', tenant = 't1', withKey = true} = {}) {
+  const headers: Record<string, string> = {'X-Tenant-Id': tenant};
+  if (withKey) headers['Idempotency-Key'] = key;
+  return c.post('/v1/redteam/runs', {body, headers});
+}
+
+const runKeys = ctx => ctx.redis.keys('redteam:run:*');
+
+export async function check_route(ctx) {
+  const c = api(ctx);
+  const r = await post(c, GOOD);
+  assert.equal(r.status, 201, \`a valid start answered \${r.status}: \${r.text}\`);
+  const run = r.json();
+  for (const key of FIELDS) assert(key in run, \`the 201 body lacks \${key}: \${r.text}\`);
+  assert(run.status === 'queued' && run.target === 'checkout-shadow' && run.probe_set === 'baseline', \`the run echoes the request with status queued: \${r.text}\`);
+  assert.equal(run.probes, 10, \`the baseline set plans 10 probes, the run says \${run.probes}\`);
+  assert(ctx.redis.get(\`redteam:run:\${run.run_id}\`) !== null, \`the run \${run.run_id} must be in the run store (redteam:run:{id}): keys \${JSON.stringify(ctx.redis.keys('redteam:*').sort())}\`);
+  const noTenant = await c.post('/v1/redteam/runs', {body: GOOD, headers: {'Idempotency-Key': 'k-1'}});
+  assert.equal(noTenant.status, 401, \`without X-Tenant-Id the start must answer 401, got \${noTenant.status}\`);
+}
+
+export async function check_resolve_registered_target(ctx) {
+  const c = api(ctx);
+  let r = await post(c, {...GOOD, target: 'billing-db.internal:5432'}, {key: 'k-bad'});
+  assert.equal(r.status, 400, \`a target nobody registered (billing-db.internal:5432) answered \${r.status}, expected 400: the runner would point probes at whatever host the caller typed\`);
+  assert.deepEqual(runKeys(ctx), [], \`a refused start must store no run, found \${JSON.stringify(runKeys(ctx))}\`);
+  r = await post(c, {...GOOD, target: 'search-staging'}, {key: 'k-ok'});
+  assert.equal(r.status, 201, \`search-staging is registered, got \${r.status}: \${r.text}\`);
+  assert.equal(r.json().endpoint, 'search-staging.sandbox.internal', \`the run's endpoint must be the registry's (search-staging.sandbox.internal), got \${JSON.stringify(r.json().endpoint)}: the caller names a target, the registry says where it lives\`);
+}
+
+export async function check_refuse_production(ctx) {
+  const c = api(ctx);
+  let r = await post(c, {...GOOD, target: 'payments-prod'}, {key: 'k-prod'});
+  assert.equal(r.status, 403, \`payments-prod is registered with environment production and answered \${r.status}, expected 403\`);
+  assert.deepEqual(runKeys(ctx), [], \`a refused production target must store no run, found \${JSON.stringify(runKeys(ctx))}\`);
+  r = await post(c, {...GOOD, target: 'checkout-shadow'}, {key: 'k-shadow'});
+  assert.equal(r.status, 201, \`a shadow target is fine, got \${r.status}: \${r.text}\`);
+}
+
+export async function check_idempotent_replay(ctx) {
+  const c = api(ctx);
+  const noKey = await post(c, GOOD, {withKey: false});
+  assert.equal(noKey.status, 400, \`a start without Idempotency-Key answered \${noKey.status}, expected 400\`);
+  const first = await post(c, GOOD, {key: 'k-7'});
+  assert.equal(first.status, 201, \`the first start answered \${first.status}: \${first.text}\`);
+  const replay = await post(c, GOOD, {key: 'k-7'});
+  assert.equal(replay.status, 200, \`a replay of the same (tenant, Idempotency-Key) answered \${replay.status}, expected 200 with the stored run (the client retried; it must not start a second run against the target)\`);
+  assert.equal(replay.json().run_id, first.json().run_id, \`the replay must answer the same run: got \${replay.json().run_id}, the first start made \${first.json().run_id}\`);
+  assert.equal(runKeys(ctx).length, 1, \`one key, one run: the store holds \${runKeys(ctx).length} runs after a start and its replay\`);
+  const other = await post(c, GOOD, {key: 'k-7', tenant: 't2'});
+  assert(other.status === 201 && other.json().run_id !== first.json().run_id, 'another tenant reusing the key gets its own run (keys are per tenant)');
+}
+
+export async function check_known_probe_set(ctx) {
+  const c = api(ctx);
+  let r = await post(c, {...GOOD, probe_set: 'everything'}, {key: 'k-bad'});
+  assert.equal(r.status, 400, \`a probe set the catalog lacks (everything) answered \${r.status}, expected 400: it must not turn into another set\`);
+  assert.deepEqual(runKeys(ctx), [], \`a refused probe set must store no run, found \${JSON.stringify(runKeys(ctx))}\`);
+  r = await post(c, {...GOOD, probe_set: 'injection-only'}, {key: 'k-inj'});
+  assert.equal(r.status, 201, \`injection-only is in the catalog, got \${r.status}: \${r.text}\`);
+  const run = r.json();
+  assert(JSON.stringify(run.plan) === JSON.stringify([{category: 'prompt-injection', probes: 6}]) && run.probes === 6, \`the run carries the catalog's plan for injection-only (6 prompt-injection probes): \${r.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"net/http"
+
+	"leetbuild/harness"
+)
+
+var apiGood = map[string]any{"target": "checkout-shadow", "probe_set": "baseline"}
+
+func apiClient(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func apiWith(field string, value any) map[string]any {
+	out := map[string]any{}
+	for k, v := range apiGood {
+		out[k] = v
+	}
+	out[field] = value
+	return out
+}
+
+func apiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+	return c.Post("/v1/redteam/runs", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
+}
+
+func apiRun(ctx *harness.Ctx, r *harness.Response) map[string]any {
+	run, ok := r.JSON().(map[string]any)
+	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
+	return run
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	r := apiPost(c, apiGood, "k-1", "t1")
+	ctx.Equal(r.Status, 201, "a valid start (%s)", r.Text())
+	run := apiRun(ctx, r)
+	for _, key := range []string{"run_id", "status", "target", "endpoint", "probe_set", "plan", "probes"} {
+		_, ok := run[key]
+		ctx.Assert(ok, "the 201 body lacks %s: %s", key, r.Text())
+	}
+	ctx.Assert(run["status"] == "queued" && run["target"] == "checkout-shadow" && run["probe_set"] == "baseline", "the run echoes the request with status queued: %s", r.Text())
+	ctx.Equal(run["probes"], float64(10), "the baseline set plans 10 probes; the run's probes")
+	id, _ := run["run_id"].(string)
+	_, stored := ctx.Redis.Get("redteam:run:" + id)
+	ctx.Assert(stored, "the run %s must be in the run store (redteam:run:{id}): keys %v", id, ctx.Redis.Keys("redteam:*"))
+	noTenant := c.Post("/v1/redteam/runs", apiGood, "Idempotency-Key", "k-1")
+	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the start")
+}
+
+func CheckResolveRegisteredTarget(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	r := apiPost(c, apiWith("target", "billing-db.internal:5432"), "k-bad", "t1")
+	ctx.Equal(r.Status, 400, "a target nobody registered (billing-db.internal:5432): the runner would point probes at whatever host the caller typed")
+	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a refused start must store no run; runs stored")
+	r = apiPost(c, apiWith("target", "search-staging"), "k-ok", "t1")
+	ctx.Equal(r.Status, 201, "search-staging is registered (%s)", r.Text())
+	ctx.Equal(apiRun(ctx, r)["endpoint"], "search-staging.sandbox.internal", "the caller names a target, the registry says where it lives; the run's endpoint")
+}
+
+func CheckRefuseProduction(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	r := apiPost(c, apiWith("target", "payments-prod"), "k-prod", "t1")
+	ctx.Equal(r.Status, 403, "payments-prod is registered with environment production")
+	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a refused production target must store no run; runs stored")
+	r = apiPost(c, apiWith("target", "checkout-shadow"), "k-shadow", "t1")
+	ctx.Equal(r.Status, 201, "a shadow target is fine (%s)", r.Text())
+}
+
+func CheckIdempotentReplay(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	noKey := c.Post("/v1/redteam/runs", apiGood, "X-Tenant-Id", "t1")
+	ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key")
+	first := apiPost(c, apiGood, "k-7", "t1")
+	ctx.Equal(first.Status, 201, "the first start (%s)", first.Text())
+	replay := apiPost(c, apiGood, "k-7", "t1")
+	ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored run (the client retried; it must not start a second run against the target)")
+	ctx.Equal(apiRun(ctx, replay)["run_id"], apiRun(ctx, first)["run_id"], "the replay must answer the same run")
+	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 1, "one key, one run: runs stored after a start and its replay")
+	other := apiPost(c, apiGood, "k-7", "t2")
+	ctx.Assert(other.Status == 201 && apiRun(ctx, other)["run_id"] != apiRun(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)")
+}
+
+func CheckKnownProbeSet(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	r := apiPost(c, apiWith("probe_set", "everything"), "k-bad", "t1")
+	ctx.Equal(r.Status, 400, "a probe set the catalog lacks (everything) must not turn into another set")
+	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a refused probe set must store no run; runs stored")
+	r = apiPost(c, apiWith("probe_set", "injection-only"), "k-inj", "t1")
+	ctx.Equal(r.Status, 201, "injection-only is in the catalog (%s)", r.Text())
+	run := apiRun(ctx, r)
+	ctx.Equal(run["plan"], []any{map[string]any{"category": "prompt-injection", "probes": float64(6)}}, "the run carries the catalog's plan for injection-only")
+	ctx.Equal(run["probes"], float64(6), "injection-only plans 6 probes; the run's probes")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+namespace {
+
+using json = nlohmann::json;
+
+const json kGood = {{"target", "checkout-shadow"}, {"probe_set", "baseline"}};
+
+struct Api {
+  httplib::Server svr;
+  harness::HTTP http;
+  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+
+  harness::Response post(const json& body, const std::string& key = "k-1", const std::string& tenant = "t1") {
+    return http.Post("/v1/redteam/runs", body.dump(), "X-Tenant-Id", tenant, "Idempotency-Key", key);
+  }
+};
+
+json with(json body, const std::string& field, const json& value) {
+  body[field] = value;
+  return body;
+}
+
+json runOf(harness::Ctx& ctx, const harness::Response& r) {
+  const json run = json::parse(r.Text(), nullptr, false);
+  ctx.Assert(run.is_object(), "the body must be a JSON object: %s", r.Text());
+  return run;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  Api api(ctx);
+  const auto r = api.post(kGood);
+  ctx.Equal(r.Status, 201, "a valid start (%s)", r.Text());
+  const json run = runOf(ctx, r);
+  for (const char* key : {"run_id", "status", "target", "endpoint", "probe_set", "plan", "probes"}) {
+    ctx.Assert(run.contains(key), "the 201 body lacks %s: %s", key, r.Text());
+  }
+  ctx.Assert(run["status"] == "queued" && run["target"] == "checkout-shadow" && run["probe_set"] == "baseline", "the run echoes the request with status queued: %s", r.Text());
+  ctx.Assert(run["probes"] == 10, "the baseline set plans 10 probes, the run says %s", run["probes"].dump());
+  const std::string id = run["run_id"].is_string() ? run["run_id"].get<std::string>() : "";
+  ctx.Assert(ctx.Redis.Get("redteam:run:" + id).has_value(), "the run %s must be in the run store (redteam:run:{id}): keys %v", id, ctx.Redis.Keys("redteam:*"));
+  const auto noTenant = api.http.Post("/v1/redteam/runs", kGood.dump(), "Idempotency-Key", "k-1");
+  ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the start");
+}
+
+void CheckResolveRegisteredTarget(harness::Ctx& ctx) {
+  Api api(ctx);
+  auto r = api.post(with(kGood, "target", "billing-db.internal:5432"), "k-bad");
+  ctx.Equal(r.Status, 400, "a target nobody registered (billing-db.internal:5432): the runner would point probes at whatever host the caller typed");
+  ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused start must store no run; runs stored");
+  r = api.post(with(kGood, "target", "search-staging"), "k-ok");
+  ctx.Equal(r.Status, 201, "search-staging is registered (%s)", r.Text());
+  ctx.Assert(runOf(ctx, r).value("endpoint", "") == "search-staging.sandbox.internal", "the run's endpoint must be the registry's (search-staging.sandbox.internal): the caller names a target, the registry says where it lives (%s)", r.Text());
+}
+
+void CheckRefuseProduction(harness::Ctx& ctx) {
+  Api api(ctx);
+  auto r = api.post(with(kGood, "target", "payments-prod"), "k-prod");
+  ctx.Equal(r.Status, 403, "payments-prod is registered with environment production");
+  ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused production target must store no run; runs stored");
+  r = api.post(with(kGood, "target", "checkout-shadow"), "k-shadow");
+  ctx.Equal(r.Status, 201, "a shadow target is fine (%s)", r.Text());
+}
+
+void CheckIdempotentReplay(harness::Ctx& ctx) {
+  Api api(ctx);
+  const auto noKey = api.http.Post("/v1/redteam/runs", kGood.dump(), "X-Tenant-Id", "t1");
+  ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key");
+  const auto first = api.post(kGood, "k-7");
+  ctx.Equal(first.Status, 201, "the first start (%s)", first.Text());
+  const auto replay = api.post(kGood, "k-7");
+  ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored run (the client retried; it must not start a second run against the target)");
+  ctx.Equal(runOf(ctx, replay)["run_id"], runOf(ctx, first)["run_id"], "the replay must answer the same run");
+  ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 1, "one key, one run: runs stored after a start and its replay");
+  const auto other = api.post(kGood, "k-7", "t2");
+  ctx.Assert(other.Status == 201 && runOf(ctx, other)["run_id"] != runOf(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)");
+}
+
+void CheckKnownProbeSet(harness::Ctx& ctx) {
+  Api api(ctx);
+  auto r = api.post(with(kGood, "probe_set", "everything"), "k-bad");
+  ctx.Equal(r.Status, 400, "a probe set the catalog lacks (everything) must not turn into another set");
+  ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused probe set must store no run; runs stored");
+  r = api.post(with(kGood, "probe_set", "injection-only"), "k-inj");
+  ctx.Equal(r.Status, 201, "injection-only is in the catalog (%s)", r.Text());
+  const json run = runOf(ctx, r);
+  ctx.Assert(run["plan"] == json::array({{{"category", "prompt-injection"}, {"probes", 6}}}) && run["probes"] == 6,
+             "the run carries the catalog's plan for injection-only (6 prompt-injection probes): %s", r.Text());
+}
+`,
+  },
   hints: [
-    'An operator retries a timed-out submission and the sandbox logs show the probe set ran twice; a second run, aimed at a hostname that exists in no registry, reached a production host.',
-    'The handler passes `body.target` straight to `dispatch` and mints a new `uuid4` on every call: there is no registry lookup, no environment test, and `idem_key` is parsed but read nowhere.',
-    'Before `dispatch`: look up `run_store.get(tenant, idem_key)` and return the stored run with 200; call `resolve_target` against `TARGET_REGISTRY` (400 unknown, 403 for `PRODUCTION_ENVIRONMENTS`); then `run_store.put` and dispatch.',
+    'Symptom: a run aimed at a hostname nobody registered is accepted, a run against payments-prod is queued, a typo in the probe set runs ten probes anyway, and a retried submission starts a second run.',
+    'Mechanism: the handler copies `body.target` into `endpoint` without asking the registry, never reads an environment, falls back to the baseline plan when the catalog has no match, and stores the run under its own fresh id.',
+    'Change: guards in order (tenant 401, Idempotency-Key 400, `targets.resolve` 400, environment `PRODUCTION` 403, `catalog.plan` 400), then `store.get(tenant, key)` answers 200 on a hit; `store.put(tenant, key, run)` with the registry endpoint.',
   ],
-  debrief: `The fix has its shape because every decision happens before the side effect. A registry turns the caller's string into a key the platform owns, so a typo is a 400 and a hostname is not an input at all. The environment test sits next to that lookup, so a production target is refused while the probe set is still a number in memory. The idempotency lookup runs first of all, because the cheapest way to not double adversarial traffic is to never reach the dispatch call. Production platforms go further on the egress side: the sandbox itself carries an allowlist of hosts it may reach, so a bug in this handler cannot become an incident, and the runner proves it is allowed to probe with a short-lived token tied to the target record.`,
+  debrief: `Every decision happens before the run exists, because a stored run is work a runner will pick up. The registry turns the caller's string into a record the platform owns, so a hostname is not an input and the environment test sits next to that lookup; refusing production at submission is cheaper than trusting every runner to check. Refusing an unknown probe set rather than substituting one keeps the run's plan equal to what the operator asked for, which step 5's report depends on. Keying by \`(tenant, Idempotency-Key)\` turns a retry into a read. Hosted red-team platforms usually go further: a target is registered with an owner who must approve each run, and the approval names a time window.`,
 };

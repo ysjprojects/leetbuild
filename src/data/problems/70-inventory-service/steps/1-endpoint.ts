@@ -2,772 +2,482 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/reservations: quantity and sku that are checked',
+  title: 'POST /v1/reservations: a quantity, a sku and a key that are checked',
   concept: 'http',
   file: 'api',
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/reservations\` with body
-\`{"sku": "sku-123", "quantity": 2}\`, reads the tenant, parses the body, calls \`stock.reserve\` and
-answers \`201\` with a reservation. It compiles, serves the demo and hides four flaws.
+**Starting point.** The starter serves \`POST /v1/reservations\` with \`X-Tenant-Id\`, \`Idempotency-Key\`
+and a body \`{"sku": "sku-1", "quantity": 2}\`: it calls \`stock.reserve\` with a new reservation id,
+answers 409 when the units are not there, and otherwise stores the reservation (\`store.put\`) and
+answers 201 with it. It serves the demo and hides three flaws.
 
-**Failure mode the checks target.** A value believed before it is checked, and a request executed
-twice. A negative \`quantity\` *increases* stock, \`1e6\` passes a cap that does not exist, any sku
-string becomes a reservation, and a client retry after a timeout holds the units twice.
+**Failure mode the checks target.** A quantity of -3 that adds three units to the counter, a tenant
+reserving another tenant's sku, and a client that times out and retries, holding the units twice.
 
-- The tenant comes from the \`X-Tenant-Id\` header; a missing or empty tenant is **401**.
-- \`Idempotency-Key\` is a required header (**400** when missing or empty).
-- \`sku\` must be a non-empty string (**400**) **and** a sku this tenant sells: the catalog lookup
-  decides, and an unknown sku is **404** with no reservation created and no stock touched.
-- \`quantity\` must be an integer from **1** to **MAX_ORDER_QUANTITY** (**1000**). \`0\`, a negative
-  value, \`2.5\` and \`1000000\` are all **400** \`quantity out of range\`.
-- Validation, the catalog lookup and the idempotency lookup all run **before**
-  \`stock.reserve(sku, quantity)\`: a rejected request must not move a counter.
-- Idempotency is keyed by \`(tenant, Idempotency-Key)\`: the record
-  \`{reservation_id, sku, quantity, status: "reserved", expires_at}\` is stored under that pair, with
-  \`expires_at = now + RESERVATION_TTL_S\` (**900**) in epoch seconds. A replay returns the **stored**
-  record with **200** and does not reserve again.
-- A fresh reservation answers **201** with the reservation id, sku, quantity and \`expires_at\`.`,
+- \`MAX_ORDER_QUANTITY = 1000\`: a quantity that is not an integer from 1 to 1000 is **400**, before
+  any stock moves.
+- \`catalog.owner(sku)\` must be the caller's tenant; anything else, an unknown sku included, is
+  **404** and touches nothing.
+- A missing \`Idempotency-Key\` is **400**. Look \`(tenant, key)\` up with \`store.get_by_key\` before
+  reserving, and answer a replay with the stored reservation and **200**.`,
   sequence: {
-    participants: ['Client', 'Inventory API', 'catalog', 'stock store', 'reservations'],
+    participants: ['Storefront', 'Inventory API', 'Reservation store', 'Redis'],
     messages: [
       {
-        from: 'Client',
+        from: 'Storefront',
         to: 'Inventory API',
-        label: 'POST /v1/reservations · X-Tenant-Id · Idempotency-Key',
+        label: 'POST /v1/reservations · Idempotency-Key · {sku, quantity}',
         kind: 'sync',
       },
+      {from: 'Inventory API', to: 'Inventory API', label: 'quantity outside 1..1000 → 400', kind: 'sync'},
+      {from: 'Inventory API', to: 'Reservation store', label: 'get_by_key(tenant, key) → replay: 200', kind: 'sync'},
+      {from: 'Inventory API', to: 'Inventory API', label: 'catalog.owner(sku) ≠ tenant → 404', kind: 'sync'},
+      {from: 'Inventory API', to: 'Redis', label: 'stock.reserve(sku, quantity, id) → false: 409', kind: 'sync'},
+      {from: 'Inventory API', to: 'Reservation store', label: 'put(reservation)', kind: 'sync'},
       {
         from: 'Inventory API',
-        to: 'Inventory API',
-        label: '401 tenant · 400 key/sku/quantity — before any hold',
-        kind: 'sync',
+        to: 'Storefront',
+        label: '201 {reservation_id, status: "reserved", expires_at}',
+        kind: 'reply',
       },
-      {from: 'Inventory API', to: 'catalog', label: 'lookup(sku)', kind: 'sync'},
-      {from: 'catalog', to: 'Inventory API', label: 'known / unknown', kind: 'reply'},
-      {from: 'Inventory API', to: 'reservations', label: 'get(tenant, Idempotency-Key)', kind: 'sync'},
-      {from: 'reservations', to: 'Inventory API', label: 'stored reservation / none', kind: 'reply'},
-      {from: 'Inventory API', to: 'stock store', label: 'reserve(sku, quantity)', kind: 'sync'},
-      {
-        from: 'Inventory API',
-        to: 'reservations',
-        label: 'put(tenant, key, {reservation_id, expires_at})',
-        kind: 'async',
-      },
-      {from: 'Inventory API', to: 'Client', label: '201 fresh · 200 replayed · 404 unknown sku', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/reservations',
-      detail: 'Register the reservation route on `POST /v1/reservations`.',
+      title: 'Reserves through POST /v1/reservations',
+      detail:
+        'A reservation of 3 units answers 201 with the reservation, takes 3 units off `stock:{sku}` and stores the record.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/reservations["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/reservations['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/reservations"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"reservations"\s*\)/, /\bpost\s*\{/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"reservations"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/reservations"/]},
       },
     },
     {
       id: 'quantity-range',
-      title: 'Quantity is an integer in 1..1000, rejected with 400 before the reserve',
+      title: 'Rejects a quantity outside 1..1000 with 400 before the reserve',
       detail:
-        '`MAX_ORDER_QUANTITY` is 1000 and a guard above the stock call rejects a non-integer, `0`, a negative value and anything above the cap with **400** `quantity out of range`.',
+        'Quantities -3, 0 and 1001 answer **400** and leave the counter alone; 1000 is reserved. The starter hands any quantity to the reserve, and a negative one adds stock.',
       match: {
         python: {
-          all: [/MAX_ORDER_QUANTITY/, /status_code\s*=\s*400/],
-          order: [/quantity[^\n]{0,60}MAX_ORDER_QUANTITY/, /stock\.reserve\(/],
+          all: [/MAX_ORDER_QUANTITY\s*=\s*1000/, /\b400\b/],
+          order: [/[<>]=?\s*MAX_ORDER_QUANTITY\b/, /stock\.reserve\(/],
         },
         typescript: {
-          all: [/MAX_ORDER_QUANTITY/, /code\(\s*400\s*\)/],
-          order: [/quantity[^\n]{0,60}MAX_ORDER_QUANTITY/, /stock\.reserve\(/],
+          all: [/MAX_ORDER_QUANTITY\s*=\s*1000/, /\b400\b/],
+          order: [/[<>]=?\s*MAX_ORDER_QUANTITY\b/, /\breserve\(/],
         },
         go: {
-          all: [/maxOrderQuantity/, /StatusBadRequest/],
-          order: [/[Qq]uantity[^\n]{0,60}maxOrderQuantity/, /stock\.Reserve\(/],
+          all: [/maxOrderQuantity\s*=\s*1000/, /StatusBadRequest|\b400\b/],
+          order: [/[<>]=?\s*maxOrderQuantity\b/, /stock\.Reserve\(/],
         },
         scala: {
-          all: [/MaxOrderQuantity/, /StatusCodes\.BadRequest/],
-          order: [/quantity[^\n]{0,60}MaxOrderQuantity/, /stock\.reserve\(/],
+          all: [/MaxOrderQuantity\s*=\s*1000/, /BadRequest|\b400\b/],
+          order: [/[<>]=?\s*MaxOrderQuantity\b/, /Stock\.reserve\(/],
         },
         cpp: {
-          all: [/kMaxOrderQuantity/, /\b400\b/],
-          order: [/quantity[^\n]{0,60}kMaxOrderQuantity/, /stock\.reserve\(/],
+          all: [/kMaxOrderQuantity\s*=\s*1000/, /\b400\b/],
+          order: [/[<>]=?\s*kMaxOrderQuantity\b/, /stock::Reserve\(/],
         },
       },
     },
     {
-      id: 'sku-unknown',
-      title: 'Unknown sku is 404 and touches nothing',
+      id: 'sku-tenant',
+      title: "Answers 404 for a sku the caller's tenant does not sell",
       detail:
-        'A `catalog.lookup(sku)` before the reserve call decides: a sku the tenant does not sell is **404** `unknown sku`, with no reservation row written and no stock moved.',
+        "A reservation of another tenant's sku, or of a sku the catalogue does not know, is **404** with no stock moved and no reservation stored. The starter reserves whatever sku it is sent.",
       match: {
-        python: {
-          all: [/catalog\.lookup\(/, /status_code\s*=\s*404/],
-          order: [/catalog\.lookup\(/, /status_code\s*=\s*404/, /stock\.reserve\(/],
-        },
-        typescript: {
-          all: [/catalog\.lookup\(/, /code\(\s*404\s*\)/],
-          order: [/catalog\.lookup\(/, /code\(\s*404\s*\)/, /stock\.reserve\(/],
-        },
-        go: {
-          all: [/catalog\.Lookup\(/, /StatusNotFound/],
-          order: [/catalog\.Lookup\(/, /StatusNotFound/, /stock\.Reserve\(/],
-        },
-        scala: {
-          all: [/catalog\.lookup\(/, /StatusCodes\.NotFound/],
-          order: [/catalog\.lookup\(/, /StatusCodes\.NotFound/, /stock\.reserve\(/],
-        },
-        cpp: {all: [/catalog\.lookup\(/, /\b404\b/], order: [/catalog\.lookup\(/, /\b404\b/, /stock\.reserve\(/]},
+        python: {all: [/catalog\.owner\(/, /\b404\b/], order: [/catalog\.owner\(/, /stock\.reserve\(/]},
+        typescript: {all: [/\bowner\(/, /\b404\b/], order: [/\bowner\(/, /\breserve\(/]},
+        go: {all: [/catalog\.Owner\(/, /StatusNotFound|\b404\b/], order: [/catalog\.Owner\(/, /stock\.Reserve\(/]},
+        scala: {all: [/Catalog\.owner\(/, /NotFound|\b404\b/], order: [/Catalog\.owner\(/, /Stock\.reserve\(/]},
+        cpp: {all: [/catalog::Owner\(/, /\b404\b/], order: [/catalog::Owner\(/, /stock::Reserve\(/]},
       },
     },
     {
       id: 'idempotency',
-      title: 'A replay returns the stored reservation under (tenant, key)',
+      title: 'Answers a replayed Idempotency-Key with the first reservation',
       detail:
-        'The record with `reservation_id` and `expires_at = now + RESERVATION_TTL_S` is stored under `(tenant, Idempotency-Key)`; a second request with the same key answers **200** with the stored record and does not reach the stock call again.',
+        'The same key twice answers the same `reservation_id` (201, then 200) and takes the units once; a request without the key is **400**. The starter stores the key and never reads it back.',
       match: {
-        python: {
-          all: [/Idempotency-Key/, /reservations\.get\(/, /reservations\.put\(/, /RESERVATION_TTL_S/, /reservation_id/],
-          order: [/reservations\.get\(/, /stock\.reserve\(/],
-        },
-        typescript: {
-          all: [/idempotency-key/, /reservations\.get\(/, /reservations\.put\(/, /RESERVATION_TTL_S/, /reservation_id/],
-          order: [/reservations\.get\(/, /stock\.reserve\(/],
-        },
-        go: {
-          all: [/Idempotency-Key/, /reservations\.Get\(/, /reservations\.Put\(/, /reservationTTLS/, /reservation_id/],
-          order: [/reservations\.Get\(/, /stock\.Reserve\(/],
-        },
-        scala: {
-          all: [
-            /Idempotency-Key/,
-            /reservations\.get\(/,
-            /reservations\.put\(/,
-            /ReservationTtlSeconds/,
-            /reservation_id/,
-          ],
-          order: [/reservations\.get\(/, /stock\.reserve\(/],
-        },
-        cpp: {
-          all: [
-            /Idempotency-Key/,
-            /reservations\.get\(/,
-            /reservations\.put\(/,
-            /kReservationTtlSeconds/,
-            /reservation_id/,
-          ],
-          order: [/reservations\.get\(/, /stock\.reserve\(/],
-        },
-      },
-    },
-    {
-      id: 'no-decrement-on-reject',
-      title: 'Every rejection precedes the stock mutation',
-      detail:
-        'The checks read the first `400`, the first `404` and the first stock call in order: a malformed request, an unknown sku or a replayed key is answered before `stock.reserve(...)` can touch a counter, even when the status codes already look right.',
-      match: {
-        python: {order: [/status_code\s*=\s*400/, /status_code\s*=\s*404/, /stock\.reserve\(/]},
-        typescript: {order: [/code\(\s*400\s*\)/, /code\(\s*404\s*\)/, /stock\.reserve\(/]},
-        go: {order: [/StatusBadRequest/, /StatusNotFound/, /stock\.Reserve\(/]},
-        scala: {order: [/StatusCodes\.BadRequest/, /StatusCodes\.NotFound/, /stock\.reserve\(/]},
-        cpp: {order: [/\b400\b/, /\b404\b/, /stock\.reserve\(/]},
+        python: {all: [/idempotency-key/i, /store\.get_by_key\(/], order: [/store\.get_by_key\(/, /stock\.reserve\(/]},
+        typescript: {all: [/idempotency-key/i, /store\.getByKey\(/], order: [/store\.getByKey\(/, /\breserve\(/]},
+        go: {all: [/Idempotency-Key/i, /store\.GetByKey\(/], order: [/store\.GetByKey\(/, /stock\.Reserve\(/]},
+        scala: {all: [/Idempotency-Key/i, /Store\.getByKey\(/], order: [/Store\.getByKey\(/, /Stock\.reserve\(/]},
+        cpp: {all: [/Idempotency-Key/i, /store::GetByKey\(/], order: [/store::GetByKey\(/, /stock::Reserve\(/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import time
-import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from inventory import catalog, stock  # catalog.owner; stock.reserve, RESERVATION_TTL_S
+from inventory.store import new_id, store  # store.get_by_key, put
 
 app = FastAPI()
 
 
-class StockStore:
-    def reserve(self, sku: str, quantity: int) -> None:
-        """Atomically take \`quantity\` units of \`sku\`; raise when fewer are left."""
-        raise NotImplementedError
+class ReservationIn(BaseModel):
+    sku: str
+    quantity: int
 
 
-stock = StockStore()
-
-
-@app.post("/v1/reservations")
-async def create_reservation(request: Request) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    tenant = request.headers.get("X-Tenant-Id")
-    if not tenant:
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    body = await request.json()
+@app.post("/v1/reservations", status_code=201)
+def create_reservation(body: ReservationIn, request: Request) -> dict:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    reservation_id = new_id()
+    if not stock.reserve(body.sku, body.quantity, reservation_id):
+        raise HTTPException(status_code=409, detail="insufficient stock")
     reservation = {
-        "reservation_id": str(uuid.uuid4()),
-        "sku": body["sku"],
-        "quantity": body["quantity"],
+        "reservation_id": reservation_id,
+        "tenant": tenant,
+        "idempotency_key": request.headers.get("idempotency-key", ""),
+        "sku": body.sku,
+        "quantity": body.quantity,
         "status": "reserved",
-        "expires_at": int(time.time()) + 900,
+        "expires_at": int(time.time()) + stock.RESERVATION_TTL_S,
     }
-    stock.reserve(body["sku"], body["quantity"])
-    return JSONResponse(reservation, status_code=201)
+    store.put(reservation)
+    return reservation
 `,
       solution: `import time
-import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from inventory import catalog, stock  # catalog.owner; stock.reserve, RESERVATION_TTL_S
+from inventory.store import new_id, store  # store.get_by_key, put
 
 app = FastAPI()
 
 MAX_ORDER_QUANTITY = 1000
-RESERVATION_TTL_S = 900
 
 
-class Catalog:
-    def lookup(self, sku: str) -> dict | None:
-        """The catalog record for \`sku\` when this tenant sells it, else None."""
-        raise NotImplementedError
+class ReservationIn(BaseModel):
+    sku: str
+    quantity: int
 
 
-class StockStore:
-    def reserve(self, sku: str, quantity: int) -> None:
-        """Atomically take \`quantity\` units of \`sku\`; raise when fewer are left."""
-        raise NotImplementedError
-
-
-class ReservationStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The reservation stored for (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, reservation: dict) -> None:
-        """Store \`reservation\` under (tenant, idem_key)."""
-        raise NotImplementedError
-
-
-catalog = Catalog()
-stock = StockStore()
-reservations = ReservationStore()
-
-
-@app.post("/v1/reservations")
-async def create_reservation(request: Request) -> JSONResponse:
-    tenant = request.headers.get("X-Tenant-Id")
-    if not tenant:
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    idem_key = request.headers.get("Idempotency-Key")
-    if not idem_key:
-        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    try:
-        body = await request.json()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="body must be JSON")
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="body must be a JSON object")
-
-    sku = body.get("sku")
-    if not isinstance(sku, str) or sku == "":
-        raise HTTPException(status_code=400, detail="sku must be a non-empty string")
-    quantity = body.get("quantity")
-    if not isinstance(quantity, int) or isinstance(quantity, bool) or not 1 <= quantity <= MAX_ORDER_QUANTITY:
+@app.post("/v1/reservations", status_code=201)
+def create_reservation(body: ReservationIn, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    # Every guard runs before the one call that moves stock: the counter subtracts whatever it is given.
+    if not 1 <= body.quantity <= MAX_ORDER_QUANTITY:
         raise HTTPException(status_code=400, detail="quantity out of range")
-
-    if catalog.lookup(sku) is None:
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
+    recorded = store.get_by_key(tenant, key)
+    if recorded is not None:
+        return JSONResponse(recorded)  # a replay answers the first reservation and reserves nothing
+    if catalog.owner(body.sku) != tenant:
         raise HTTPException(status_code=404, detail="unknown sku")
-
-    stored = reservations.get(tenant, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=200)
-
-    stock.reserve(sku, quantity)
+    reservation_id = new_id()
+    if not stock.reserve(body.sku, body.quantity, reservation_id):
+        raise HTTPException(status_code=409, detail="insufficient stock")
     reservation = {
-        "reservation_id": str(uuid.uuid4()),
-        "sku": sku,
-        "quantity": quantity,
+        "reservation_id": reservation_id,
+        "tenant": tenant,
+        "idempotency_key": key,
+        "sku": body.sku,
+        "quantity": body.quantity,
         "status": "reserved",
-        "expires_at": int(time.time()) + RESERVATION_TTL_S,
+        "expires_at": int(time.time()) + stock.RESERVATION_TTL_S,
     }
-    reservations.put(tenant, idem_key, reservation)
-    return JSONResponse(reservation, status_code=201)
+    store.put(reservation)
+    return reservation
 `,
     },
     typescript: {
-      starter: `/** POST /v1/reservations. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
-
-export const app = Fastify();
-
-interface Reservation {
-  reservation_id: string;
-  sku: string;
-  quantity: number;
-  status: string;
-  expires_at: number;
-}
-
-interface StockStore {
-  reserve(sku: string, quantity: number): void;
-}
-
-const stock: StockStore = {
-  reserve() {
-    throw new Error('not implemented');
-  },
-};
-
-app.post('/v1/reservations', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const body = request.body as {sku: string; quantity: number};
-  const reservation: Reservation = {
-    reservation_id: randomUUID(),
-    sku: body.sku,
-    quantity: body.quantity,
-    status: 'reserved',
-    expires_at: Math.floor(Date.now() / 1000) + 900,
-  };
-  stock.reserve(body.sku, body.quantity);
-  return reply.code(201).send(reservation);
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** POST /v1/reservations: validated, catalogued and idempotent stock reservations. */
-import {randomUUID} from 'node:crypto';
-
-import Fastify from 'fastify';
+import {owner} from 'inventory/catalog';
+import {RESERVATION_TTL_S, reserve} from 'inventory/stock';
+import {type Reservation, newId, store} from 'inventory/store';
 
 export const app = Fastify();
 
-const MAX_ORDER_QUANTITY = 1000;
-const RESERVATION_TTL_S = 900;
-
-interface Reservation {
-  reservation_id: string;
-  sku: string;
-  quantity: number;
-  status: string;
-  expires_at: number;
-}
-
-interface Catalog {
-  lookup(sku: string): {sku: string} | null;
-}
-
-interface StockStore {
-  reserve(sku: string, quantity: number): void;
-}
-
-interface ReservationStore {
-  get(tenant: string, idemKey: string): Reservation | null;
-  put(tenant: string, idemKey: string, reservation: Reservation): void;
-}
-
-const catalog: Catalog = {
-  lookup() {
-    throw new Error('not implemented');
-  },
-};
-
-const stock: StockStore = {
-  reserve() {
-    throw new Error('not implemented');
-  },
-};
-
-const reservations: ReservationStore = {
-  get() {
-    throw new Error('not implemented');
-  },
-  put() {
-    throw new Error('not implemented');
-  },
-};
-
 app.post('/v1/reservations', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as {sku?: unknown; quantity?: unknown} | null;
-  if (body === null || typeof body !== 'object' || typeof body.sku !== 'string' || body.sku === '')
-    return reply.code(400).send({error: 'sku must be a non-empty string'});
-  const quantity = body.quantity;
-  if (typeof quantity !== 'number' || !Number.isInteger(quantity) || quantity < 1 || quantity > MAX_ORDER_QUANTITY)
-    return reply.code(400).send({error: 'quantity out of range'});
-
-  if (catalog.lookup(body.sku) === null) return reply.code(404).send({error: 'unknown sku'});
-
-  const stored = reservations.get(tenant, idemKey);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  stock.reserve(body.sku, quantity);
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const tenant = String(request.headers['x-tenant-id'] ?? '');
+  const {sku, quantity} = request.body as {sku: string; quantity: number};
+  const reservationId = newId();
+  if (!(await reserve(sku, quantity, reservationId))) return reply.code(409).send({error: 'insufficient stock'});
   const reservation: Reservation = {
-    reservation_id: randomUUID(),
-    sku: body.sku,
+    reservation_id: reservationId,
+    tenant,
+    idempotency_key: String(request.headers['idempotency-key'] ?? ''),
+    sku,
     quantity,
     status: 'reserved',
     expires_at: Math.floor(Date.now() / 1000) + RESERVATION_TTL_S,
   };
-  reservations.put(tenant, idemKey, reservation);
+  await store.put(reservation);
   return reply.code(201).send(reservation);
 });
+`,
+      solution: `import Fastify from 'fastify';
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+import {owner} from 'inventory/catalog';
+import {RESERVATION_TTL_S, reserve} from 'inventory/stock';
+import {type Reservation, newId, store} from 'inventory/store';
+
+export const app = Fastify();
+
+export const MAX_ORDER_QUANTITY = 1000;
+
+app.post('/v1/reservations', async (request, reply) => {
+  const tenant = String(request.headers['x-tenant-id'] ?? '');
+  const {sku, quantity} = request.body as {sku: string; quantity: number};
+  // Every guard runs before the one call that moves stock: the counter subtracts whatever it is given.
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_ORDER_QUANTITY) {
+    return reply.code(400).send({error: 'quantity out of range'});
+  }
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const recorded = await store.getByKey(tenant, key);
+  if (recorded !== null) return reply.code(200).send(recorded); // a replay answers the first reservation and reserves nothing
+  if ((await owner(sku)) !== tenant) return reply.code(404).send({error: 'unknown sku'});
+  const reservationId = newId();
+  if (!(await reserve(sku, quantity, reservationId))) return reply.code(409).send({error: 'insufficient stock'});
+  const reservation: Reservation = {
+    reservation_id: reservationId,
+    tenant,
+    idempotency_key: key,
+    sku,
+    quantity,
+    status: 'reserved',
+    expires_at: Math.floor(Date.now() / 1000) + RESERVATION_TTL_S,
+  };
+  await store.put(reservation);
+  return reply.code(201).send(reservation);
+});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
+	"inventory/stock" // stock.Reserve, ReservationTTLS
+	"inventory/store" // store.NewID, GetByKey, Put
 )
 
-const holdSeconds = 900
-
-type Reservation struct {
-	ReservationID string \`json:"reservation_id"\`
-	SKU           string \`json:"sku"\`
-	Quantity      int    \`json:"quantity"\`
-	Status        string \`json:"status"\`
-	ExpiresAt     int64  \`json:"expires_at"\`
+type reservationRequest struct {
+	SKU      string \`json:"sku"\`
+	Quantity int    \`json:"quantity"\`
 }
 
-type StockStore struct{}
-
-func (s *StockStore) Reserve(ctx context.Context, sku string, quantity int) error { return nil }
-
-var stock = &StockStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 func createReservation(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
-		return
-	}
-	var body struct {
-		SKU      string \`json:"sku"\`
-		Quantity int    \`json:"quantity"\`
-	}
+	var body reservationRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "body must be JSON"})
+		http.Error(rw, "malformed body", http.StatusBadRequest)
 		return
 	}
-	reservation := Reservation{
-		ReservationID: uuid.NewString(),
-		SKU:           body.SKU,
-		Quantity:      body.Quantity,
-		Status:        "reserved",
-		ExpiresAt:     time.Now().Unix() + holdSeconds,
+	reservationID := store.NewID()
+	held, err := stock.Reserve(r.Context(), body.SKU, body.Quantity, reservationID)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	stock.Reserve(r.Context(), body.SKU, body.Quantity)
+	if !held {
+		http.Error(rw, "insufficient stock", http.StatusConflict)
+		return
+	}
+	reservation := &store.Reservation{
+		ReservationID: reservationID, Tenant: tenant, IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		SKU: body.SKU, Quantity: body.Quantity, Status: "reserved", ExpiresAt: time.Now().Unix() + stock.ReservationTTLS,
+	}
+	if err := store.Put(r.Context(), reservation); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(rw, http.StatusCreated, reservation)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/reservations", createReservation)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
+	"inventory/catalog"
+	"inventory/stock" // stock.Reserve, ReservationTTLS
+	"inventory/store" // store.NewID, GetByKey, Put
 )
 
-const (
-	maxOrderQuantity = 1000
-	reservationTTLS  = 900
-)
+const maxOrderQuantity = 1000
 
-type Reservation struct {
-	ReservationID string \`json:"reservation_id"\`
-	SKU           string \`json:"sku"\`
-	Quantity      int    \`json:"quantity"\`
-	Status        string \`json:"status"\`
-	ExpiresAt     int64  \`json:"expires_at"\`
+type reservationRequest struct {
+	SKU      string \`json:"sku"\`
+	Quantity int    \`json:"quantity"\`
 }
 
-type Catalog struct{}
-
-func (c *Catalog) Lookup(ctx context.Context, sku string) (bool, error) { return false, nil }
-
-type StockStore struct{}
-
-func (s *StockStore) Reserve(ctx context.Context, sku string, quantity int) error { return nil }
-
-type ReservationStore struct{}
-
-func (s *ReservationStore) Get(ctx context.Context, tenant, idemKey string) (*Reservation, error) {
-	return nil, nil
-}
-
-func (s *ReservationStore) Put(ctx context.Context, tenant, idemKey string, reservation *Reservation) error {
-	return nil
-}
-
-var (
-	catalog      = &Catalog{}
-	stock        = &StockStore{}
-	reservations = &ReservationStore{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func createReservation(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	var body reservationRequest
+	// Every guard runs before the one call that moves stock: the counter subtracts whatever it is given.
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Quantity < 1 || body.Quantity > maxOrderQuantity {
+		http.Error(rw, "quantity out of range", http.StatusBadRequest)
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		http.Error(rw, "Idempotency-Key is required", http.StatusBadRequest)
 		return
 	}
-	var body struct {
-		SKU      string \`json:"sku"\`
-		Quantity *int   \`json:"quantity"\`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "body must be JSON"})
-		return
-	}
-	if body.SKU == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "sku must be a non-empty string"})
-		return
-	}
-	if body.Quantity == nil || *body.Quantity < 1 || *body.Quantity > maxOrderQuantity {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "quantity out of range"})
-		return
-	}
-
-	known, err := catalog.Lookup(r.Context(), body.SKU)
+	recorded, err := store.GetByKey(r.Context(), tenant, key)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if !known {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown sku"})
+	if recorded != nil {
+		writeJSON(rw, http.StatusOK, recorded) // a replay answers the first reservation and reserves nothing
 		return
 	}
-
-	stored, err := reservations.Get(r.Context(), tenant, idemKey)
+	if owner := catalog.Owner(r.Context(), body.SKU); owner == "" || owner != tenant {
+		http.Error(rw, "unknown sku", http.StatusNotFound)
+		return
+	}
+	reservationID := store.NewID()
+	held, err := stock.Reserve(r.Context(), body.SKU, body.Quantity, reservationID)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
+	if !held {
+		http.Error(rw, "insufficient stock", http.StatusConflict)
 		return
 	}
-
-	quantity := *body.Quantity
-	if err := stock.Reserve(r.Context(), body.SKU, quantity); err != nil {
-		writeJSON(rw, http.StatusConflict, map[string]string{"error": "insufficient stock"})
-		return
+	reservation := &store.Reservation{
+		ReservationID: reservationID, Tenant: tenant, IdempotencyKey: key,
+		SKU: body.SKU, Quantity: body.Quantity, Status: "reserved", ExpiresAt: time.Now().Unix() + stock.ReservationTTLS,
 	}
-	reservation := &Reservation{
-		ReservationID: uuid.NewString(),
-		SKU:           body.SKU,
-		Quantity:      quantity,
-		Status:        "reserved",
-		ExpiresAt:     time.Now().Unix() + reservationTTLS,
-	}
-	if err := reservations.Put(r.Context(), tenant, idemKey, reservation); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	if err := store.Put(r.Context(), reservation); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(rw, http.StatusCreated, reservation)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/reservations", createReservation)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import java.time.Instant
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class ReserveRequest(sku: String, quantity: Int)
-final case class Reservation(reservation_id: String, sku: String, quantity: Int, status: String, expires_at: Long)
+import inventory.{Catalog, Reservation, Stock, Store} // Catalog.owner; Stock.reserve; Store.getByKey, put
 
-trait StockStore {
-  def reserve(sku: String, quantity: Int): Boolean
-}
+object Api {
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-object stock extends StockStore {
-  def reserve(sku: String, quantity: Int): Boolean = throw new UnsupportedOperationException("stock not wired")
-}
-
-object ReservationApi {
-  implicit val system: ActorSystem = ActorSystem("inventory")
-  implicit val reserveFormat: RootJsonFormat[ReserveRequest] = jsonFormat2(ReserveRequest)
-  implicit val reservationFormat: RootJsonFormat[Reservation] = jsonFormat5(Reservation)
-
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  val route: Route =
-    path("v1" / "reservations") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[ReserveRequest]) { body =>
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              stock.reserve(body.sku, body.quantity)
-              val reservation =
-                Reservation(UUID.randomUUID().toString, body.sku, body.quantity, "reserved", Instant.now.getEpochSecond + 900)
-              complete(StatusCodes.Created, reservation)
+  val route: Route = path("v1" / "reservations") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
+        optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
+          entity(as[String]) { raw =>
+            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+            val body = raw.parseJson.asJsObject.fields
+            val sku = body.get("sku").collect { case JsString(s) => s }.getOrElse("")
+            val quantity = body.get("quantity").collect { case JsNumber(n) => n.toInt }.getOrElse(0)
+            val tenant = tenantHeader.getOrElse("")
+            val reservationId = Store.newId()
+            if (!Stock.reserve(sku, quantity, reservationId)) complete(StatusCodes.Conflict -> "insufficient stock")
+            else {
+              val reservation = Reservation(reservationId, tenant, keyHeader.getOrElse(""), sku, quantity, "reserved", System.currentTimeMillis() / 1000 + Stock.ReservationTtlS)
+              Store.put(reservation)
+              complete(json(StatusCodes.Created, reservation.toJson))
             }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.time.Instant
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class ReserveRequest(sku: String, quantity: Int)
-final case class Reservation(reservation_id: String, sku: String, quantity: Int, status: String, expires_at: Long)
+import inventory.{Catalog, Reservation, Stock, Store} // Catalog.owner; Stock.reserve; Store.getByKey, put
 
-trait Catalog {
-  def lookup(sku: String): Boolean
-}
-
-trait StockStore {
-  def reserve(sku: String, quantity: Int): Boolean
-}
-
-trait ReservationStore {
-  def get(tenant: String, idemKey: String): Option[Reservation]
-  def put(tenant: String, idemKey: String, reservation: Reservation): Unit
-}
-
-object catalog extends Catalog {
-  def lookup(sku: String): Boolean = throw new UnsupportedOperationException("catalog not wired")
-}
-
-object stock extends StockStore {
-  def reserve(sku: String, quantity: Int): Boolean = throw new UnsupportedOperationException("stock not wired")
-}
-
-object reservations extends ReservationStore {
-  def get(tenant: String, idemKey: String): Option[Reservation] =
-    throw new UnsupportedOperationException("store not wired")
-  def put(tenant: String, idemKey: String, reservation: Reservation): Unit =
-    throw new UnsupportedOperationException("store not wired")
-}
-
-object ReservationApi {
-  implicit val system: ActorSystem = ActorSystem("inventory")
-  implicit val reserveFormat: RootJsonFormat[ReserveRequest] = jsonFormat2(ReserveRequest)
-  implicit val reservationFormat: RootJsonFormat[Reservation] = jsonFormat5(Reservation)
-
+object Api {
   val MaxOrderQuantity = 1000
-  val ReservationTtlSeconds = 900L
 
-  val route: Route =
-    path("v1" / "reservations") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[ReserveRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.sku.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"sku must be a non-empty string"}""")
-              } else if (body.quantity < 1 || body.quantity > MaxOrderQuantity) {
-                complete(StatusCodes.BadRequest, """{"error":"quantity out of range"}""")
-              } else if (!catalog.lookup(body.sku)) {
-                complete(StatusCodes.NotFound, """{"error":"unknown sku"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                reservations.get(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
-                  case None =>
-                    stock.reserve(body.sku, body.quantity)
-                    val reservation = Reservation(
-                      UUID.randomUUID().toString,
-                      body.sku,
-                      body.quantity,
-                      "reserved",
-                      Instant.now.getEpochSecond + ReservationTtlSeconds,
-                    )
-                    reservations.put(tenant, idemKey, reservation)
-                    complete(StatusCodes.Created, reservation)
-                }
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  val route: Route = path("v1" / "reservations") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
+        optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
+          entity(as[String]) { raw =>
+            val body = raw.parseJson.asJsObject.fields
+            val sku = body.get("sku").collect { case JsString(s) => s }.getOrElse("")
+            val quantity = body.get("quantity").collect { case JsNumber(n) if n.isValidInt => n.toInt }.getOrElse(0)
+            val tenant = tenantHeader.getOrElse("")
+            val key = keyHeader.getOrElse("")
+            // Every guard runs before the one call that moves stock: the counter subtracts whatever it is given.
+            if (quantity < 1 || quantity > MaxOrderQuantity) complete(StatusCodes.BadRequest -> "quantity out of range")
+            else if (key.isEmpty) complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
+            else
+              Store.getByKey(tenant, key) match {
+                case Some(recorded) => complete(json(StatusCodes.OK, recorded.toJson)) // a replay answers the first reservation and reserves nothing
+                case None if !Catalog.owner(sku).contains(tenant) => complete(StatusCodes.NotFound -> "unknown sku")
+                case None =>
+                  val reservationId = Store.newId()
+                  if (!Stock.reserve(sku, quantity, reservationId)) complete(StatusCodes.Conflict -> "insufficient stock")
+                  else {
+                    val reservation = Reservation(reservationId, tenant, key, sku, quantity, "reserved", System.currentTimeMillis() / 1000 + Stock.ReservationTtlS)
+                    Store.put(reservation)
+                    complete(json(StatusCodes.Created, reservation.toJson))
+                  }
               }
-            }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -779,159 +489,406 @@ object ReservationApi {
 #include <chrono>
 #include <string>
 
+#include "inventory/catalog.h"  // catalog::Owner
+#include "inventory/stock.h"    // stock::Reserve, kReservationTtlS
+#include "inventory/store.h"    // store::GetByKey, Put; NewId
+
 using json = nlohmann::json;
 
-struct StockStore {
-  bool reserve(const std::string& sku, int quantity);
-};
-
-StockStore stock;
-std::string uuidString();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/reservations", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"body must be JSON"})", "application/json");
-      return;
-    }
-    const auto sku = body.value("sku", std::string());
-    const int quantity = body.value("quantity", 0);
-    stock.reserve(sku, quantity);
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-    res.status = 201;
-    res.set_content(json{{"reservation_id", uuidString()},
-                         {"sku", sku},
-                         {"quantity", quantity},
-                         {"status", "reserved"},
-                         {"expires_at", now + 900}}
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+long long epochSeconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+
+void create_reservation(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const json body = json::parse(req.body);
+  const std::string sku = body.value("sku", "");
+  const int quantity = body.value("quantity", 0);
+  const std::string reservation_id = inventory::NewId();
+  if (!inventory::stock::Reserve(sku, quantity, reservation_id)) {
+    res.status = 409;
+    res.set_content("insufficient stock", "text/plain");
+    return;
+  }
+  const inventory::Reservation reservation{reservation_id, tenant, req.get_header_value("Idempotency-Key"), sku, quantity, "reserved",
+                                           epochSeconds() + inventory::stock::kReservationTtlS};
+  inventory::store::Put(reservation);
+  res.status = 201;
+  res.set_content(json(reservation).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/reservations", create_reservation); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
-#include <optional>
 #include <string>
+
+#include "inventory/catalog.h"  // catalog::Owner
+#include "inventory/stock.h"    // stock::Reserve, kReservationTtlS
+#include "inventory/store.h"    // store::GetByKey, Put; NewId
 
 using json = nlohmann::json;
 
 constexpr int kMaxOrderQuantity = 1000;
-constexpr int kReservationTtlSeconds = 900;
 
-struct Catalog {
-  bool lookup(const std::string& sku);
-};
-
-struct StockStore {
-  bool reserve(const std::string& sku, int quantity);
-};
-
-struct ReservationStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& reservation);
-};
-
-Catalog catalog;
-StockStore stock;
-ReservationStore reservations;
-std::string uuidString();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/reservations", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("sku") || !body["sku"].is_string() ||
-        body["sku"].get<std::string>().empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"sku must be a non-empty string"})", "application/json");
-      return;
-    }
-    const auto sku = body["sku"].get<std::string>();
-    if (!body.contains("quantity") || !body["quantity"].is_number_integer()) {
-      res.status = 400;
-      res.set_content(R"({"error":"quantity out of range"})", "application/json");
-      return;
-    }
-    const int quantity = body["quantity"].get<int>();
-    if (quantity < 1 || quantity > kMaxOrderQuantity) {
-      res.status = 400;
-      res.set_content(R"({"error":"quantity out of range"})", "application/json");
-      return;
-    }
-
-    if (!catalog.lookup(sku)) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown sku"})", "application/json");
-      return;
-    }
-
-    const auto stored = reservations.get(tenant, idemKey);
-    if (stored) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-
-    if (!stock.reserve(sku, quantity)) {
-      res.status = 409;
-      res.set_content(R"({"error":"insufficient stock"})", "application/json");
-      return;
-    }
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-    const json reservation = {
-        {"reservation_id", uuidString()},
-        {"sku", sku},
-        {"quantity", quantity},
-        {"status", "reserved"},
-        {"expires_at", now + kReservationTtlSeconds},
-    };
-    reservations.put(tenant, idemKey, reservation);
-    res.status = 201;
-    res.set_content(reservation.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+long long epochSeconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+
+void reply(httplib::Response& res, int status, const std::string& text) {
+  res.status = status;
+  res.set_content(text, "text/plain");
+}
+
+void create_reservation(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const json body = json::parse(req.body, nullptr, false);
+  const bool whole = body.is_object() && body.contains("quantity") && body["quantity"].is_number_integer();
+  const long long quantity = whole ? body["quantity"].get<long long>() : 0;
+  // Every guard runs before the one call that moves stock: the counter subtracts whatever it is given.
+  if (quantity < 1 || quantity > kMaxOrderQuantity) return reply(res, 400, "quantity out of range");
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return reply(res, 400, "Idempotency-Key is required");
+  if (const auto recorded = inventory::store::GetByKey(tenant, key)) {
+    res.set_content(json(*recorded).dump(), "application/json");  // a replay answers the first reservation and reserves nothing
+    return;
+  }
+  const std::string sku = body.value("sku", "");
+  if (inventory::catalog::Owner(sku) != tenant) return reply(res, 404, "unknown sku");
+  const std::string reservation_id = inventory::NewId();
+  if (!inventory::stock::Reserve(sku, static_cast<int>(quantity), reservation_id)) return reply(res, 409, "insufficient stock");
+  const inventory::Reservation reservation{reservation_id, tenant, key, sku, static_cast<int>(quantity), "reserved",
+                                           epochSeconds() + inventory::stock::kReservationTtlS};
+  inventory::store::Put(reservation);
+  res.status = 201;
+  res.set_content(json(reservation).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/reservations", create_reservation); }
 `,
     },
   },
+  harness: {
+    python: `from inventory.store import store
+
+
+async def _world(ctx, units=10):
+    ctx.redis.hset("sku:sku-1", mapping={"tenant": "t1"})
+    ctx.redis.hset("sku:sku-9", mapping={"tenant": "t2"})
+    ctx.redis.set("stock:sku-1", units)
+    ctx.redis.set("stock:sku-9", units)
+    return ctx.client(ctx.load("api").app)
+
+
+async def _reserve(c, sku="sku-1", quantity=3, key="k-1", tenant="t1"):
+    headers = {"X-Tenant-Id": tenant}
+    if key:
+        headers["Idempotency-Key"] = key
+    return await c.post("/v1/reservations", json={"sku": sku, "quantity": quantity}, headers=headers)
+
+
+def _units(ctx, sku="sku-1"):
+    return int(ctx.redis.get(f"stock:{sku}"))
+
+
+async def check_route(ctx):
+    async with await _world(ctx) as c:
+        r = await _reserve(c)
+    assert r.status_code == 201, f"POST /v1/reservations answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("status") == "reserved" and body.get("quantity") == 3 and body.get("sku") == "sku-1", f"the reservation must answer sku-1, 3 units, reserved; got {body}"
+    assert _units(ctx) == 7, f"stock:sku-1 is {_units(ctx)} after reserving 3 of 10, expected 7"
+    stored = store.get(body.get("reservation_id", ""))
+    assert stored is not None and stored["status"] == "reserved", f"the reservation store holds {stored} for {body.get('reservation_id')!r}"
+
+
+async def check_quantity_range(ctx):
+    async with await _world(ctx, units=5000) as c:
+        for n, quantity in enumerate((-3, 0, 1001)):
+            r = await _reserve(c, quantity=quantity, key=f"k-{n}")
+            assert r.status_code == 400, f"a quantity of {quantity} answered {r.status_code} and stock:sku-1 is now {_units(ctx)}: a quantity outside 1..1000 is 400, before any stock moves"
+            assert _units(ctx) == 5000, f"a rejected quantity of {quantity} moved the counter to {_units(ctx)}"
+        r = await _reserve(c, quantity=1000, key="k-9")
+    assert r.status_code == 201, f"a quantity of 1000 (the cap) answered {r.status_code}: {r.text}"
+    assert _units(ctx) == 4000, f"stock:sku-1 is {_units(ctx)} after reserving 1000 of 5000"
+
+
+async def check_sku_tenant(ctx):
+    async with await _world(ctx) as c:
+        other = await _reserve(c, sku="sku-9", key="k-1")
+        unknown = await _reserve(c, sku="sku-404", key="k-2")
+    assert other.status_code == 404, f"tenant t1 reserving t2's sku-9 answered {other.status_code}, expected 404"
+    assert _units(ctx, "sku-9") == 10, f"t1's request moved t2's stock:sku-9 to {_units(ctx, 'sku-9')}"
+    assert unknown.status_code == 404, f"a sku the catalogue does not know answered {unknown.status_code}, expected 404"
+    assert ctx.redis.keys("reservation:*") == [], f"rejected requests stored reservations: {ctx.redis.keys('reservation:*')}"
+
+
+async def check_idempotency(ctx):
+    async with await _world(ctx) as c:
+        first = await _reserve(c, key="k-1")
+        replay = await _reserve(c, key="k-1")
+        missing = await _reserve(c, key="")
+    assert first.status_code == 201, f"the first reservation answered {first.status_code}: {first.text}"
+    assert replay.status_code == 200, f"a replay of Idempotency-Key k-1 answered {replay.status_code}, expected 200 with the first reservation"
+    assert replay.json().get("reservation_id") == first.json().get("reservation_id"), f"the replay answered reservation {replay.json().get('reservation_id')!r}, the first was {first.json().get('reservation_id')!r}"
+    assert _units(ctx) == 7, f"stock:sku-1 is {_units(ctx)} after one reservation of 3 and its replay: the retry held the units again"
+    assert missing.status_code == 400, f"a reservation without Idempotency-Key answered {missing.status_code}, expected 400"
+`,
+    typescript: `import {store} from 'inventory/store';
+
+function world(ctx, units = 10) {
+  ctx.redis.hset('sku:sku-1', 'tenant', 't1');
+  ctx.redis.hset('sku:sku-9', 'tenant', 't2');
+  ctx.redis.set('stock:sku-1', String(units));
+  ctx.redis.set('stock:sku-9', String(units));
+  return ctx.client(ctx.load('api').app);
+}
+
+function reserveReq(c, {sku = 'sku-1', quantity = 3, key = 'k-1', tenant = 't1'} = {}) {
+  const headers: Record<string, string> = {'X-Tenant-Id': tenant};
+  if (key) headers['Idempotency-Key'] = key;
+  return c.post('/v1/reservations', {json: {sku, quantity}, headers});
+}
+
+const units = (ctx, sku = 'sku-1'): number => Number(ctx.redis.get(\`stock:\${sku}\`));
+
+export async function check_route(ctx) {
+  const c = world(ctx);
+  const r = await reserveReq(c);
+  assert.equal(r.status, 201, \`POST /v1/reservations answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.status === 'reserved' && body.quantity === 3 && body.sku === 'sku-1', \`the reservation must answer sku-1, 3 units, reserved; got \${r.text}\`);
+  assert.equal(units(ctx), 7, \`stock:sku-1 is \${units(ctx)} after reserving 3 of 10, expected 7\`);
+  const stored = await store.get(body.reservation_id ?? '');
+  assert(stored !== null && stored.status === 'reserved', \`the reservation store holds \${JSON.stringify(stored)} for \${body.reservation_id}\`);
+}
+
+export async function check_quantity_range(ctx) {
+  const c = world(ctx, 5000);
+  for (const [n, quantity] of [-3, 0, 1001].entries()) {
+    const r = await reserveReq(c, {quantity, key: \`k-\${n}\`});
+    assert.equal(r.status, 400, \`a quantity of \${quantity} answered \${r.status} and stock:sku-1 is now \${units(ctx)}: a quantity outside 1..1000 is 400, before any stock moves\`);
+    assert.equal(units(ctx), 5000, \`a rejected quantity of \${quantity} moved the counter to \${units(ctx)}\`);
+  }
+  const r = await reserveReq(c, {quantity: 1000, key: 'k-9'});
+  assert.equal(r.status, 201, \`a quantity of 1000 (the cap) answered \${r.status}: \${r.text}\`);
+  assert.equal(units(ctx), 4000, \`stock:sku-1 is \${units(ctx)} after reserving 1000 of 5000\`);
+}
+
+export async function check_sku_tenant(ctx) {
+  const c = world(ctx);
+  const other = await reserveReq(c, {sku: 'sku-9', key: 'k-1'});
+  const unknown = await reserveReq(c, {sku: 'sku-404', key: 'k-2'});
+  assert.equal(other.status, 404, \`tenant t1 reserving t2's sku-9 answered \${other.status}, expected 404\`);
+  assert.equal(units(ctx, 'sku-9'), 10, \`t1's request moved t2's stock:sku-9 to \${units(ctx, 'sku-9')}\`);
+  assert.equal(unknown.status, 404, \`a sku the catalogue does not know answered \${unknown.status}, expected 404\`);
+  assert.deepEqual(ctx.redis.keys('reservation:*'), [], \`rejected requests stored reservations: \${JSON.stringify(ctx.redis.keys('reservation:*'))}\`);
+}
+
+export async function check_idempotency(ctx) {
+  const c = world(ctx);
+  const first = await reserveReq(c, {key: 'k-1'});
+  const replay = await reserveReq(c, {key: 'k-1'});
+  const missing = await reserveReq(c, {key: ''});
+  assert.equal(first.status, 201, \`the first reservation answered \${first.status}: \${first.text}\`);
+  assert.equal(replay.status, 200, \`a replay of Idempotency-Key k-1 answered \${replay.status}, expected 200 with the first reservation\`);
+  assert.equal(replay.json().reservation_id, first.json().reservation_id, \`the replay answered reservation \${replay.json().reservation_id}, the first was \${first.json().reservation_id}\`);
+  assert.equal(units(ctx), 7, \`stock:sku-1 is \${units(ctx)} after one reservation of 3 and its replay: the retry held the units again\`);
+  assert.equal(missing.status, 400, \`a reservation without Idempotency-Key answered \${missing.status}, expected 400\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"leetbuild/harness"
+
+	"inventory/store"
+)
+
+func apiWorld(ctx *harness.Ctx, units int) *harness.HTTP {
+	ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1")
+	ctx.Redis.Do("HSET", "sku:sku-9", "tenant", "t2")
+	ctx.Redis.Set("stock:sku-1", units)
+	ctx.Redis.Set("stock:sku-9", units)
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func apiReserve(c *harness.HTTP, sku string, quantity int, key string) *harness.Response {
+	body := map[string]any{"sku": sku, "quantity": quantity}
+	if key == "" {
+		return c.Post("/v1/reservations", body, "X-Tenant-Id", "t1")
+	}
+	return c.Post("/v1/reservations", body, "X-Tenant-Id", "t1", "Idempotency-Key", key)
+}
+
+func apiUnits(ctx *harness.Ctx, sku string) int {
+	value, _ := ctx.Redis.Get("stock:" + sku)
+	n, _ := strconv.Atoi(value)
+	return n
+}
+
+type apiReservation struct {
+	ReservationID string \`json:"reservation_id"\`
+	SKU           string \`json:"sku"\`
+	Quantity      int    \`json:"quantity"\`
+	Status        string \`json:"status"\`
+}
+
+func apiBody(r *harness.Response) apiReservation {
+	var body apiReservation
+	r.Decode(&body)
+	return body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := apiWorld(ctx, 10)
+	r := apiReserve(c, "sku-1", 3, "k-1")
+	ctx.Equal(r.Status, 201, "POST /v1/reservations (%s)", r.Text())
+	body := apiBody(r)
+	ctx.Assert(body.Status == "reserved" && body.Quantity == 3 && body.SKU == "sku-1", "the reservation must answer sku-1, 3 units, reserved; got %s", r.Text())
+	ctx.Equal(apiUnits(ctx, "sku-1"), 7, "stock:sku-1 after reserving 3 of 10")
+	stored, err := store.Get(context.Background(), body.ReservationID)
+	ctx.NoError(err, "reading the reservation store")
+	ctx.Assert(stored != nil && stored.Status == "reserved", "the reservation store holds %+v for %q", stored, body.ReservationID)
+}
+
+func CheckQuantityRange(ctx *harness.Ctx) {
+	c := apiWorld(ctx, 5000)
+	for n, quantity := range []int{-3, 0, 1001} {
+		r := apiReserve(c, "sku-1", quantity, fmt.Sprintf("k-%d", n))
+		ctx.Assert(r.Status == 400, "a quantity of %d answered %d and stock:sku-1 is now %d: a quantity outside 1..1000 is 400, before any stock moves", quantity, r.Status, apiUnits(ctx, "sku-1"))
+		ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of %d", quantity)
+	}
+	r := apiReserve(c, "sku-1", 1000, "k-9")
+	ctx.Equal(r.Status, 201, "a quantity of 1000, the cap (%s)", r.Text())
+	ctx.Equal(apiUnits(ctx, "sku-1"), 4000, "stock:sku-1 after reserving 1000 of 5000")
+}
+
+func CheckSkuTenant(ctx *harness.Ctx) {
+	c := apiWorld(ctx, 10)
+	other := apiReserve(c, "sku-9", 3, "k-1")
+	unknown := apiReserve(c, "sku-404", 3, "k-2")
+	ctx.Equal(other.Status, 404, "tenant t1 reserving t2's sku-9")
+	ctx.Equal(apiUnits(ctx, "sku-9"), 10, "t2's stock:sku-9 after t1's request")
+	ctx.Equal(unknown.Status, 404, "a sku the catalogue does not know")
+	ctx.Equal(len(ctx.Redis.Keys("reservation:*")), 0, "reservations stored by rejected requests")
+}
+
+func CheckIdempotency(ctx *harness.Ctx) {
+	c := apiWorld(ctx, 10)
+	first := apiReserve(c, "sku-1", 3, "k-1")
+	replay := apiReserve(c, "sku-1", 3, "k-1")
+	missing := apiReserve(c, "sku-1", 3, "")
+	ctx.Equal(first.Status, 201, "the first reservation (%s)", first.Text())
+	ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the first reservation; the status")
+	ctx.Equal(apiBody(replay).ReservationID, apiBody(first).ReservationID, "the replay must answer the first reservation's id")
+	ctx.Equal(apiUnits(ctx, "sku-1"), 7, "stock:sku-1 after one reservation of 3 and its replay (the retry must not hold the units again)")
+	ctx.Equal(missing.Status, 400, "a reservation without Idempotency-Key")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+#include "inventory/store.h"
+
+namespace {
+
+harness::HTTP apiWorld(harness::Ctx& ctx, int units) {
+  ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1");
+  ctx.Redis.Do("HSET", "sku:sku-9", "tenant", "t2");
+  ctx.Redis.Do("SET", "stock:sku-1", units);
+  ctx.Redis.Do("SET", "stock:sku-9", units);
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response apiReserve(harness::HTTP& c, const std::string& sku, int quantity, const std::string& key) {
+  const std::string body = nlohmann::json{{"sku", sku}, {"quantity", quantity}}.dump();
+  if (key.empty()) return c.Post("/v1/reservations", body, "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  return c.Post("/v1/reservations", body, "Content-Type", "application/json", "X-Tenant-Id", "t1", "Idempotency-Key", key);
+}
+
+long long apiUnits(harness::Ctx& ctx, const std::string& sku) {
+  const auto value = ctx.Redis.Get("stock:" + sku);
+  return value ? std::stoll(*value) : 0;
+}
+
+nlohmann::json apiBody(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : nlohmann::json::object();
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = apiWorld(ctx, 10);
+  const auto r = apiReserve(c, "sku-1", 3, "k-1");
+  ctx.Equal(r.Status, 201, "POST /v1/reservations (%s)", r.Text());
+  const auto body = apiBody(r);
+  ctx.Assert(body.value("status", "") == "reserved" && body.value("quantity", 0) == 3 && body.value("sku", "") == "sku-1",
+             "the reservation must answer sku-1, 3 units, reserved; got %s", r.Text());
+  ctx.Equal(apiUnits(ctx, "sku-1"), 7, "stock:sku-1 after reserving 3 of 10");
+  const auto stored = inventory::store::Get(body.value("reservation_id", ""));
+  ctx.Assert(stored && stored->status == "reserved", "the reservation store holds no reserved record for %q", body.value("reservation_id", ""));
+}
+
+void CheckQuantityRange(harness::Ctx& ctx) {
+  auto c = apiWorld(ctx, 5000);
+  int n = 0;
+  for (const int quantity : {-3, 0, 1001}) {
+    const auto r = apiReserve(c, "sku-1", quantity, "k-" + std::to_string(n++));
+    ctx.Assert(r.Status == 400, "a quantity of %d answered %d and stock:sku-1 is now %d: a quantity outside 1..1000 is 400, before any stock moves",
+               quantity, r.Status, apiUnits(ctx, "sku-1"));
+    ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of %d", quantity);
+  }
+  const auto r = apiReserve(c, "sku-1", 1000, "k-9");
+  ctx.Equal(r.Status, 201, "a quantity of 1000, the cap (%s)", r.Text());
+  ctx.Equal(apiUnits(ctx, "sku-1"), 4000, "stock:sku-1 after reserving 1000 of 5000");
+}
+
+void CheckSkuTenant(harness::Ctx& ctx) {
+  auto c = apiWorld(ctx, 10);
+  const auto other = apiReserve(c, "sku-9", 3, "k-1");
+  const auto unknown = apiReserve(c, "sku-404", 3, "k-2");
+  ctx.Equal(other.Status, 404, "tenant t1 reserving t2's sku-9");
+  ctx.Equal(apiUnits(ctx, "sku-9"), 10, "t2's stock:sku-9 after t1's request");
+  ctx.Equal(unknown.Status, 404, "a sku the catalogue does not know");
+  ctx.Equal(ctx.Redis.Keys("reservation:*").size(), 0, "reservations stored by rejected requests");
+}
+
+void CheckIdempotency(harness::Ctx& ctx) {
+  auto c = apiWorld(ctx, 10);
+  const auto first = apiReserve(c, "sku-1", 3, "k-1");
+  const auto replay = apiReserve(c, "sku-1", 3, "k-1");
+  const auto missing = apiReserve(c, "sku-1", 3, "");
+  ctx.Equal(first.Status, 201, "the first reservation (%s)", first.Text());
+  ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the first reservation; the status");
+  ctx.Equal(apiBody(replay).value("reservation_id", ""), apiBody(first).value("reservation_id", ""), "the replay must answer the first reservation's id");
+  ctx.Equal(apiUnits(ctx, "sku-1"), 7, "stock:sku-1 after one reservation of 3 and its replay (the retry must not hold the units again)");
+  ctx.Equal(missing.Status, 400, "a reservation without Idempotency-Key");
+}
+`,
+  },
   hints: [
-    'Symptom: after a flash sale the shelf count for one sku is higher than it started, one customer holds twice the units they ordered, and a sku nobody sells has a reservation.',
-    'Mechanism: the handler calls `stock.reserve` with whatever `quantity` the body carried, with no catalog lookup first and no memory of `Idempotency-Key`, so each retry mints a new id.',
-    'Change: before the reserve call, reject quantity outside 1..`MAX_ORDER_QUANTITY` with 400, answer 404 when `catalog.lookup` is empty, and return the record stored under `(tenant, key)` with 200 on a hit.',
+    "A buyer orders -3 units and the sku shows three more in stock; a phone that retried after a timeout holds six units for a three-unit cart; one tenant can empty another tenant's shelf.",
+    'The handler hands the body straight to `stock.reserve`, and the script subtracts whatever it is given, for any sku. The key header is stored with the reservation but never looked up, so every retry is a new reservation.',
+    'Before `stock.reserve`: 400 unless 1 ≤ quantity ≤ `MAX_ORDER_QUANTITY`; 400 without a key; answer `store.get_by_key(tenant, key)` with 200 when it exists; 404 unless `catalog.owner(sku)` equals the tenant.',
   ],
-  debrief: `The fix is a funnel: cheap validation first, then the catalog, then the idempotency lookup, and only then the one call that moves a counter. The order is the point. A guard placed after \`stock.reserve\` returns the right status code while the decrement has already happened, which is why the last check reads positions rather than status codes. Idempotency works because the key is scoped to the tenant and the stored record is returned whole, so a retry carries the original \`reservation_id\` and \`expires_at\` instead of a fresh pair. Production services also persist the idempotency record with its own TTL, answer a replay whose body differs from the original with 409 instead of a silent replay, and run a background sweep that releases holds whose \`expires_at\` has passed.`,
+  debrief: `Every guard sits in front of the one call that moves stock, because the counter cannot tell a bad request from a good one: a negative quantity is arithmetic it will happily do. The tenant check is the same idea for ownership, and it answers 404 rather than 403 so a caller cannot probe which skus other tenants sell. The idempotency lookup comes before any side effect because a retry is the normal case on mobile networks. Two retries that arrive at the same moment can still both miss the index; production services claim the key with \`SET NX\` before reserving, expire the record after a day, and reject a replay whose body differs from the first request.`,
 };

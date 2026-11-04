@@ -1,93 +1,102 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * Inventory service: the course is not "store a number and subtract", it is the debugging you owe
- * a reservation path before a flash sale finds the flaw. A validated, idempotent reservation → one
- * atomic Redis decrement with a floor at zero → a warehouse confirmation with a deadline that keeps
- * a hold on timeout → sku-keyed stock events with an outbox → a stock read the storefront can trust.
+ * Inventory service: the debugging a reservation path needs before a flash sale finds the flaw. A
+ * validated, idempotent reservation → one Lua transition on the stock counter and the hold map →
+ * a warehouse confirmation with a deadline that keeps the hold when it gets no answer → sku-keyed
+ * movement events with an outbox → a stock read from the live counter and the live holds. The
+ * warehouse is a stand-in the harness serves over gRPC.
  */
 export const inventoryServiceProblem: Problem = {
   id: 'inventory-service',
   title: 'Inventory Service',
-  tagline: 'Reserve stock with one atomic decrement and holds that expire on time.',
+  tagline: 'Stock reservations that hold up under a flash sale and a slow warehouse.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Inventory Service
 
-An inventory service is the piece of a commerce platform that decides whether a unit of stock is
-still yours to sell, how long a reservation holds it, and what happens when the warehouse does not
-answer. The visible part is "add to cart"; the parts that decide whether the platform oversells are
-the validation funnel, the atomic counter, the confirmation policy, the ledger stream, and the stock
-number the storefront believes.
+An inventory service decides whether a unit of stock is still yours to sell. "Add to cart" is the
+visible part; whether the platform oversells is decided by the validation in front of the counter,
+the atomicity of the counter, what happens when the warehouse is slow, the movement stream a ledger
+rebuilds from, and the number the storefront shows.
 
 ## The real system
 
-Shopify's Admin API exposes the oversell problem directly: \`inventorySetQuantities\` takes a
-\`changeFromQuantity\` (the \`compareQuantity\` it replaces) so a write only lands if the current
-available quantity still equals the value the caller read, and a concurrent change comes back as a
-user error the caller retries with the fresh number. That compare-and-swap is the same shape as
-this course's Lua script: the check and the write are one operation, and the loser fails cleanly
-with a conflict instead of silently going negative.
+Shopify's Admin API sets inventory with \`inventorySetQuantities\`, which takes a
+\`changeFromQuantity\` per item: the write lands only if the stored quantity still equals the value
+the caller read, and otherwise fails with \`CHANGE_FROM_QUANTITY_STALE\`, so the caller reads again
+instead of overwriting a concurrent change. Step 2's Lua script is the same compare and write, done
+inside Redis.
 
 ## What you build here
 
-One service, **inventoryd**, with five pieces:
+One service, **inventoryd**, on one \`inventory\` support package every step imports:
+\`inventory.catalog\` (\`owner(sku)\` and \`synced_at(sku)\` from \`sku:{sku}\`), \`inventory.stock\`
+(\`stock:{sku}\` available units, \`holds:{sku}\` reservation id → quantity, \`hold:{id}\` alive for
+\`RESERVATION_TTL_S = 900\`; \`reserve\`, \`release\` and \`confirm\`, the transitions step 2 builds) and
+\`inventory.store\` (\`reservation:{id}\`, \`idem:{tenant}:{key}\`, the \`outbox\` list, \`new_id\`).
 
-1. \`POST /v1/reservations\`: a sku, a quantity from **1** to **1000**, and an \`Idempotency-Key\`,
-   rejecting unknown skus and quantities over the per-order cap before any decrement, so a negative
-   quantity cannot quietly increase stock and a replayed key returns the original reservation.
-2. A **Redis** counter decremented by one Lua script that refuses when the result would be negative,
-   with the reservation's TTL mirrored on a hold key: the check and the write are one atomic unit,
-   so two flash-sale buyers against the last unit yield exactly one success.
-3. A **gRPC** warehouse client: \`ConfirmReservation\` under a 2-second deadline, a timeout that
-   leaves the reservation *pending* and retries once with the same reservation id, and a terminal
-   rejection that releases the Redis hold exactly once.
-4. A **Kafka** \`inventory.event\` stream keyed by **sku**, carrying quantity deltas and reservation
-   ids, publishing reserve/confirm/release in order with an outbox for the broker outages, so a
-   sku's movement stream is ordered and the ledger is rebuildable.
-5. \`GET /v1/skus/{id}/stock\`: \`available\`, \`reserved\` and \`on-hand\` computed through the same
-   counter the reservation path decrements, with staleness reported when the warehouse sync is
-   behind, and **404** for a sku the caller's tenant does not own.
+1. \`POST /v1/reservations\` with \`X-Tenant-Id\`, \`Idempotency-Key\` and \`{sku, quantity}\`: a quantity
+   from 1 to 1000, a sku the tenant sells, a replayed key answered with the first reservation; 201
+   with the reservation, 409 when the units are not there.
+2. The **Redis** transitions: \`reserve\` as one Lua script that gives expired holds back, then checks
+   and decrements; a hold key with the reservation's TTL; a \`release\` that credits a reservation once.
+3. The **gRPC** warehouse: \`ConfirmReservation\` at \`warehouse:9000\` under a 2-second deadline, at
+   most two attempts with the same reservation id, \`pending\` with the hold kept when it never
+   answers, the hold released on \`FAILED_PRECONDITION\`.
+4. The **Kafka** \`inventory.event\` stream keyed by sku, each event
+   \`{sku, reservation_id, reason, quantity, delta}\`, from an idempotent producer with \`acks=all\`,
+   with an outbox row when the delivery report fails or does not come.
+5. \`GET /v1/skus/{sku}/stock\`: \`available\`, \`reserved\` and \`on_hand\` from the live counter and the
+   hold map, \`stale\` when the warehouse sync is over 60 s old, 404 for another tenant's sku.
 
 ## The debugging habit
 
-Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
-that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Warehouse robotics and bin locations, multi-node allocation of the same sku, purchase orders and
-backorders, tax and pricing, cart and checkout orchestration, physical reconciliation jobs, and
-per-region replication. The five pieces above are the ones that decide whether the service oversells,
-double-releases or loses a sale.`,
+Warehouse robotics and bin locations, allocation across warehouses, purchase orders and backorders,
+pricing, cart and checkout orchestration, a sweeper that returns expired holds without waiting for
+the next reserve, and the warehouse sync itself.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Storefront', sub: 'reserve · stock', x: 6, y: 50},
-      {id: 'api', kind: 'http', label: 'Inventory API', sub: 'HTTPS :8443', x: 24, y: 50},
-      {id: 'db', kind: 'db', label: 'reservations · outbox', sub: 'Postgres', x: 46, y: 10},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'stock · holds', x: 46, y: 50},
-      {id: 'warehouse', kind: 'grpc', label: 'Warehouse', sub: 'ConfirmReservation', x: 46, y: 90},
-      {id: 'sync', kind: 'service', label: 'Warehouse sync', sub: 'on-hand feed', x: 68, y: 10},
+      {id: 'api', kind: 'http', label: 'inventoryd', sub: 'HTTPS :8443', x: 24, y: 50},
+      {id: 'db', kind: 'db', label: 'reservation store', sub: 'reservation:{id} · outbox', x: 46, y: 10},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'stock:{sku} · holds:{sku} · hold:{id}', x: 46, y: 50},
+      {id: 'warehouse', kind: 'grpc', label: 'Warehouse', sub: 'ConfirmReservation · 2 s', x: 46, y: 90},
+      {id: 'sync', kind: 'service', label: 'Warehouse sync', sub: 'stock:{sku} · synced_at', x: 68, y: 10},
       {id: 'kafka', kind: 'kafka', label: 'inventory.event', sub: 'key = sku', x: 68, y: 50},
-      {id: 'ledger', kind: 'service', label: 'Ledger consumer', sub: 'group · per-sku', x: 88, y: 50},
+      {id: 'ledger', kind: 'service', label: 'Ledger consumer', sub: 'folds deltas per sku', x: 88, y: 50},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
       {from: 'api', to: 'db', kind: 'plain', label: 'reservation · outbox'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'DECR · hold'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'reserve · release · confirm'},
       {from: 'api', to: 'warehouse', kind: 'grpc', label: 'ConfirmReservation'},
       {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce inventory.event'},
       {from: 'kafka', to: 'ledger', kind: 'kafka', label: 'consume'},
       {from: 'sync', to: 'redis', kind: 'redis', label: 'on-hand sync'},
-      {from: 'ledger', to: 'db', kind: 'plain', label: 'append ledger'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

@@ -2,302 +2,245 @@ import type {Step} from '@/lib/types';
 
 export const summarizerClientStep: Step = {
   id: 'dependency',
-  title: 'Model calls with a deadline and a no-fabrication fallback',
+  title: 'The model call: a deadline, terminal refusals and a labelled extract',
   concept: 'grpc',
   file: 'client',
   focus: ['api', 'model', 'extract'],
   task: `## Task
 
-**Starting point.** The starter's \`summarize_with_model(stub, content, band)\` calls the model's
-\`Summarize\` RPC in a \`while True\` loop, returns \`{"kind": "abstractive", "summary": reply.text}\`
-on success, and on failure returns the first 400 characters of the source, or the sentence
-\`summary unavailable\`, under the same label. It compiles, it serves the happy path, and it hides
-five flaws.
+**Starting point.** The starter is the model call the summarizer makes for a source:
+\`summarize(source_hash, content, target_words)\` calls \`SummaryModel.Summarize\` over gRPC up to five
+times, a second apart, and answers \`{kind: "abstractive", summary, model_version}\`; when every
+attempt fails it answers the first 400 characters of the source, or \`summary unavailable\`, under
+the same label. With the model healthy it works, and it hides four flaws.
 
-**Failure mode the checks target.** The call has no deadline, so one hung provider holds the request
-until the caller times out. Every failure is retried, including a refusal, and the loop has no upper
-bound. The fallback is a slice of the source with no trimming rule, labelled \`abstractive\`, or a
-placeholder sentence that a reader takes for content.
+**Failure mode the checks target.** A hung model holds the request open with no end; a refusal is
+asked again and gets the same answer; an outage costs five attempts; and a reader takes a raw slice
+of the source for the model's summary.
 
-Requirements:
+\`\`\`proto
+service SummaryModel { rpc Summarize(SummarizeRequest) returns (SummarizeReply); }  // FAILED_PRECONDITION: refused
+\`\`\`
 
-- Every attempt carries a **5-second deadline** (\`DEADLINE_S\`) on the call itself: a per-attempt
-  \`timeout\`/\`deadline\` or a context deadline, not a wall-clock check after the fact.
-- A refusal is terminal: the \`REFUSED\` detail and the statuses in \`TERMINAL_CODES\` end the call.
-  Only \`RETRYABLE_CODES\` (\`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\`) may be retried, at most
-  \`MAX_ATTEMPTS = 3\`.
-- On failure return \`trim_extract(source)\` bounded by \`EXTRACT_CHARS = 1200\`, marked
-  \`OUTPUT_EXTRACTIVE\`: the source's own words, cut to a known size.
-- Every result carries \`kind\`, either \`OUTPUT_ABSTRACTIVE\` (the model wrote it) or
-  \`OUTPUT_EXTRACTIVE\` (it is the source's text). No result is a placeholder sentence.`,
+- Every attempt carries a \`DEADLINE_S\` = 5 s deadline.
+- Only \`RETRYABLE_CODES\` (\`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\`) are retried, at most
+  \`MAX_ATTEMPTS\` = 3 attempts in all; a refusal or \`INVALID_ARGUMENT\` ends the call.
+- Without a model summary, answer \`{kind: "extractive", summary: text.lead(content, target_words),
+  model_version: ""}\`: the source's own sentences, cut to the band.`,
   sequence: {
-    participants: ['Summarizer', 'Summary model', 'Extractive fallback', 'Reader'],
+    participants: ['Summarizer', 'Summary model', 'Extractive lead'],
     messages: [
-      {from: 'Summarizer', to: 'Summary model', label: 'Summarize(chunk) · deadline 5 s', kind: 'sync'},
-      {from: 'Summary model', to: 'Summarizer', label: 'REFUSED · or UNAVAILABLE', kind: 'reply'},
-      {from: 'Summarizer', to: 'Summarizer', label: 'refusal terminal · retry only UNAVAILABLE/DEADLINE', kind: 'sync'},
-      {from: 'Summarizer', to: 'Extractive fallback', label: 'trim_extract(source, EXTRACT_CHARS)', kind: 'sync'},
-      {from: 'Extractive fallback', to: 'Summarizer', label: 'trimmed extract of the source', kind: 'reply'},
-      {from: 'Summarizer', to: 'Reader', label: '200 {kind: extractive, summary, extractive_chars}', kind: 'reply'},
+      {
+        from: 'Summarizer',
+        to: 'Summary model',
+        label: 'Summarize(source_hash, text, target_words) · 5 s',
+        kind: 'sync',
+      },
+      {
+        from: 'Summary model',
+        to: 'Summarizer',
+        label: 'UNAVAILABLE · DEADLINE_EXCEEDED → retry (3 in all)',
+        kind: 'reply',
+      },
+      {from: 'Summary model', to: 'Summarizer', label: 'FAILED_PRECONDITION refused → stop', kind: 'reply'},
+      {from: 'Summarizer', to: 'Extractive lead', label: 'text.lead(content, target_words)', kind: 'sync'},
+      {
+        from: 'Extractive lead',
+        to: 'Summarizer',
+        label: '{kind: extractive, summary, model_version: ""}',
+        kind: 'reply',
+      },
     ],
   },
   checks: [
     {
       id: 'deadline',
-      title: 'Every attempt carries the 5-second deadline',
+      title: 'Every attempt carries a 5-second deadline',
       detail:
-        '`DEADLINE_S = 5` is applied to the call (a per-attempt `timeout`/`deadline`, context or client-context deadline). The starter calls the model with no deadline at all, so one slow call can hold the request until the caller times out.',
+        'Each `Summarize` call is made with `DEADLINE_S` (5 s), so a hung model costs at most three deadlines before the extract is served; the starter sets none.',
       match: {
-        python: {all: [/DEADLINE_S/, /timeout=DEADLINE_S|wait_for/]},
-        typescript: {all: [/DEADLINE_S/, /deadline:/]},
-        go: {all: [/deadlineSeconds/, /WithTimeout/]},
-        scala: {all: [/DeadlineSeconds/, /withDeadlineAfter/]},
-        cpp: {all: [/kDeadlineSeconds/, /set_deadline/]},
+        python: {all: [/DEADLINE_S\s*=\s*5\b/, /Summarize\([^)]*timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/DEADLINE_MS\s*=\s*5000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
+        go: {all: [/deadline\s*=\s*5\s*\*\s*time\.Second/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
+        scala: {all: [/DeadlineSeconds\s*=\s*5L?\b/, /withDeadlineAfter\(\s*DeadlineSeconds/]},
+        cpp: {all: [/kDeadline\{5\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
     {
       id: 'terminal-refusal',
-      title: 'A refusal is terminal',
+      title: 'Retries only on UNAVAILABLE and DEADLINE_EXCEEDED',
       detail:
-        'A provider refusal (`REFUSED`) and the other non-retryable statuses in `TERMINAL_CODES` end the call immediately; they are never retried. The starter treats a refusal as transient and loops on it until the caller gives up.',
+        'The status of a failed call decides: `RETRYABLE_CODES` are retried, a refusal (`FAILED_PRECONDITION`) or `INVALID_ARGUMENT` ends the call at once. The starter retries whatever failed.',
       match: {
-        python: {all: [/TERMINAL_CODES/, /REFUSED/]},
-        typescript: {all: [/TERMINAL_CODES/, /REFUSED/]},
-        go: {all: [/terminalCodes/, /Refused/]},
-        scala: {all: [/TerminalCodes/, /Refused/]},
-        cpp: {all: [/kTerminalCodes/, /Refused/]},
+        python: {all: [/RETRYABLE_CODES\s*=/, /\.code\(\)\s+(not\s+)?in\s+RETRYABLE_CODES/]},
+        typescript: {all: [/RETRYABLE_CODES\s*=/, /RETRYABLE_CODES\.includes\(/]},
+        go: {all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /status\.Code\(err\)/]},
+        scala: {all: [/RetryableCodes\s*[:=]/, /RetryableCodes\.contains\(/]},
+        cpp: {all: [/kRetryableCodes\s*=/, /kRetryableCodes\.count\(|kRetryableCodes\.find\(/]},
       },
     },
     {
-      id: 'retry-bounded',
-      title: 'Only retryable failures are retried, at most three times',
-      detail:
-        '`RETRYABLE_CODES` (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) is the whole retry surface and `MAX_ATTEMPTS = 3` bounds it. The starter retries every failure forever.',
+      id: 'retry-budget',
+      title: 'Makes at most three attempts',
+      detail: 'An outage costs `MAX_ATTEMPTS` = 3 calls in all, then the extract is served; the starter makes five.',
       match: {
-        python: {all: [/RETRYABLE_CODES/, /MAX_ATTEMPTS/]},
-        typescript: {all: [/RETRYABLE_CODES/, /MAX_ATTEMPTS/]},
-        go: {all: [/retryableCodes/, /maxAttempts/]},
-        scala: {all: [/RetryableCodes/, /MaxAttempts/]},
-        cpp: {all: [/kRetryableCodes/, /kMaxAttempts/]},
+        python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /range\(\s*MAX_ATTEMPTS\s*\)/], none: [/range\(\s*5\s*\)/]},
+        typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /<\s*MAX_ATTEMPTS/], none: [/<\s*5\b/]},
+        go: {all: [/maxAttempts\s*=\s*3\b/, /<\s*maxAttempts/], none: [/<\s*5\b/]},
+        scala: {all: [/MaxAttempts\s*=\s*3\b/, /<\s*MaxAttempts/], none: [/<\s*5\b/]},
+        cpp: {all: [/kMaxAttempts\s*=\s*3\b/, /<\s*kMaxAttempts/], none: [/<\s*5\b/]},
       },
     },
     {
-      id: 'extractive-fallback',
-      title: 'A failure yields a marked extractive fallback',
+      id: 'labelled-fallback',
+      title: 'Serves the extractive lead, labelled extractive',
       detail:
-        'Failure returns `trim_extract(source)` bounded by `EXTRACT_CHARS`, labelled `OUTPUT_EXTRACTIVE`, so the answer is the source’s own words and is marked as such. The starter returns a slice of the source with no trimming rule and no label.',
+        'Without a model summary the answer is `text.lead(content, target_words)` with `kind: "extractive"` and no model version, never a character slice or a placeholder sentence under the `abstractive` label.',
       match: {
-        python: {all: [/trim_extract/, /EXTRACT_CHARS/, /OUTPUT_EXTRACTIVE/]},
-        typescript: {all: [/trimExtract/, /EXTRACT_CHARS/, /OUTPUT_EXTRACTIVE/]},
-        go: {all: [/trimExtract/, /extractChars/, /outputExtractive/]},
-        scala: {all: [/trimExtract/, /ExtractChars/, /OutputExtractive/]},
-        cpp: {all: [/trim_extract/, /kExtractChars/, /kOutputExtractive/]},
-      },
-    },
-    {
-      id: 'output-labelled',
-      title: 'The output type is always labelled',
-      detail:
-        'Every result carries `kind`, one of `OUTPUT_ABSTRACTIVE` or `OUTPUT_EXTRACTIVE`, and no result is a placeholder sentence presented as a summary. The starter labels everything `abstractive` and can return `summary unavailable`.',
-      match: {
-        python: {all: [/OUTPUT_ABSTRACTIVE/, /OUTPUT_EXTRACTIVE/, /kind/], none: [/summary unavailable/i]},
-        typescript: {all: [/OUTPUT_ABSTRACTIVE/, /OUTPUT_EXTRACTIVE/, /kind/], none: [/summary unavailable/i]},
-        go: {all: [/outputAbstractive/, /outputExtractive/, /Kind|kind/], none: [/summary unavailable/i]},
-        scala: {all: [/OutputAbstractive/, /OutputExtractive/, /kind/], none: [/summary unavailable/i]},
-        cpp: {all: [/kOutputAbstractive/, /kOutputExtractive/, /kind/], none: [/summary unavailable/i]},
+        python: {all: [/text\.lead\(/, /["']extractive["']/], none: [/summary unavailable/i, /content\[:\s*\d+\]/]},
+        typescript: {all: [/\blead\(/, /['"]extractive['"]/], none: [/summary unavailable/i, /\.slice\(0,\s*\d+\)/]},
+        go: {all: [/text\.Lead\(/, /"extractive"/], none: [/summary unavailable/i, /content\[:\d+\]/]},
+        scala: {all: [/Text\.lead\(/, /"extractive"/], none: [/summary unavailable/i, /\.take\(\d+\)/]},
+        cpp: {all: [/text::lead\(/, /"extractive"/], none: [/summary unavailable/i, /substr\(0,\s*\d+\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
+      starter: `import time
 
 import grpc
 
-logger = logging.getLogger("summarizer")
+import summarizer_service_pb2
+import summarizer_service_pb2_grpc
+from summarizer import text  # lead
+
+model = summarizer_service_pb2_grpc.SummaryModelStub(grpc.insecure_channel("model:9000"))
 
 
-class SummaryRequest:
-    def __init__(self, content: str, band: str) -> None:
-        self.content = content
-        self.band = band
-
-
-class SummaryModel:
-    def Summarize(self, request: SummaryRequest, timeout: float | None = None):
-        """The gRPC stub the provider serves."""
-        raise NotImplementedError
-
-
-def summarize_with_model(stub: SummaryModel, content: str, band: str) -> dict:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    while True:
+def summarize(source_hash: str, content: str, target_words: int) -> dict:
+    """The summary of a source: {kind, summary, model_version}."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    request = summarizer_service_pb2.SummarizeRequest(source_hash=source_hash, text=content, target_words=target_words)
+    for attempt in range(5):
         try:
-            reply = stub.Summarize(SummaryRequest(content=content, band=band))
-            if reply.refused:
-                continue
-            return {"kind": "abstractive", "summary": reply.text}
-        except grpc.RpcError as err:
-            logger.warning("model call failed: %s", err)
-            if "refused" in (err.details() or ""):
-                continue
-            break
-    return {"kind": "abstractive", "summary": content[:400] or "summary unavailable"}
+            reply = model.Summarize(request)
+            return {"kind": "abstractive", "summary": reply.summary, "model_version": reply.model_version}
+        except grpc.RpcError:
+            time.sleep(1.0)  # the model is flaky: try again
+    return {"kind": "abstractive", "summary": content[:400] or "summary unavailable", "model_version": ""}
 `,
-      solution: `import logging
+      solution: `import grpc
 
-import grpc
-
-logger = logging.getLogger("summarizer")
+import summarizer_service_pb2
+import summarizer_service_pb2_grpc
+from summarizer import text  # lead
 
 DEADLINE_S = 5
 MAX_ATTEMPTS = 3
-EXTRACT_CHARS = 1200
-OUTPUT_ABSTRACTIVE = "abstractive"
-OUTPUT_EXTRACTIVE = "extractive"
-REFUSED = "REFUSED"
-TERMINAL_CODES = {grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.PERMISSION_DENIED}
-RETRYABLE_CODES = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
+RETRYABLE_CODES = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+
+model = summarizer_service_pb2_grpc.SummaryModelStub(grpc.insecure_channel("model:9000"))
 
 
-class SummaryRequest:
-    def __init__(self, content: str, band: str) -> None:
-        self.content = content
-        self.band = band
-
-
-class SummaryModel:
-    def Summarize(self, request: SummaryRequest, timeout: float | None = None):
-        """The gRPC stub the provider serves; every call carries a deadline."""
-        raise NotImplementedError
-
-
-def trim_extract(content: str, chars: int = EXTRACT_CHARS) -> str:
-    """The source's own words, cut at a sentence boundary when one is close enough."""
-    head = content[:chars].strip()
-    if len(content) <= chars:
-        return head
-    stop = max(head.rfind("."), head.rfind("!"), head.rfind("?"))
-    return (head[: stop + 1] if stop > 0 else head) + "…"
-
-
-def summarize_with_model(stub: SummaryModel, content: str, band: str) -> dict:
-    """Abstractive when the model answers; a labelled extractive fallback when it cannot."""
+def summarize(source_hash: str, content: str, target_words: int) -> dict:
+    """The summary of a source: {kind, summary, model_version}."""
+    request = summarizer_service_pb2.SummarizeRequest(source_hash=source_hash, text=content, target_words=target_words)
     for attempt in range(MAX_ATTEMPTS):
         try:
-            reply = stub.Summarize(SummaryRequest(content=content, band=band), timeout=DEADLINE_S)
-            return {
-                "kind": OUTPUT_ABSTRACTIVE,
-                "summary": reply.text,
-                "model_version": reply.model_version,
-            }
-        except grpc.RpcError as err:
-            code = err.code()
-            refused = REFUSED in (err.details() or "")
-            if refused or code in TERMINAL_CODES:
-                logger.info("model call terminal code=%s refused=%s; not retrying", code, refused)
-                break
-            if code not in RETRYABLE_CODES:
-                logger.info("model call failed with %s; not retryable", code)
-                break
-            logger.warning("model attempt %d/%d failed: %s", attempt + 1, MAX_ATTEMPTS, code)
-
-    # The model did not answer. Hand back the source's own words, clearly marked as an extract.
-    return {
-        "kind": OUTPUT_EXTRACTIVE,
-        "summary": trim_extract(content),
-        "extractive_chars": EXTRACT_CHARS,
-        "model_version": None,
-    }
+            reply = model.Summarize(request, timeout=DEADLINE_S)
+            return {"kind": "abstractive", "summary": reply.summary, "model_version": reply.model_version}
+        except grpc.RpcError as exc:
+            if exc.code() not in RETRYABLE_CODES:
+                break  # a refusal or a bad request: asking again gets the same answer
+    # The source's own sentences, cut to the band, and labelled as such.
+    return {"kind": "extractive", "summary": text.lead(content, target_words), "model_version": ""}
 `,
     },
     typescript: {
-      starter: `/** Summarize over gRPC: the starter loops until something comes back. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-import type {SummaryModelClient} from './client_pb';
+import {lead} from 'summarizer/text';
 
-export interface SummaryResult {
+export interface Summarized {
   kind: string;
   summary: string;
+  model_version: string;
 }
 
-export async function summarizeWithModel(
-  client: SummaryModelClient,
-  content: string,
-  band: string,
-): Promise<SummaryResult> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  for (;;) {
+interface SummarizeRequest {
+  source_hash: string;
+  text: string;
+  target_words: number;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('summarizer_service.proto')) as unknown as {
+  summarizerd: {SummaryModel: grpc.ServiceClientConstructor};
+};
+const model = new pkg.summarizerd.SummaryModel('model:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Summarize(request: SummarizeRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{summary: string; model_version: string}>;
+};
+
+/** The summary of a source. */
+export async function summarize(sourceHash: string, content: string, targetWords: number): Promise<Summarized> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const request = {source_hash: sourceHash, text: content, target_words: targetWords};
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const reply = await client.summarize({content, band});
-      if (reply.refused) continue;
-      return {kind: 'abstractive', summary: reply.text};
-    } catch (err) {
-      const failure = err as grpc.ServiceError;
-      if (String(failure.details).includes('refused')) continue;
-      break;
+      const reply = await model.Summarize(request, new grpc.Metadata(), {});
+      return {kind: 'abstractive', summary: reply.summary, model_version: reply.model_version};
+    } catch {
+      const {promise, resolve} = Promise.withResolvers<void>();
+      setTimeout(resolve, 1000); // the model is flaky: try again
+      await promise;
     }
   }
-  return {kind: 'abstractive', summary: content.slice(0, 400) || 'summary unavailable'};
+  return {kind: 'abstractive', summary: content.slice(0, 400) || 'summary unavailable', model_version: ''};
 }
 `,
-      solution: `/** Summarize over gRPC: a deadline, terminal refusals, and a labelled extractive fallback. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-import type {SummaryModelClient} from './client_pb';
+import {lead} from 'summarizer/text';
 
-const DEADLINE_S = 5;
-const MAX_ATTEMPTS = 3;
-const EXTRACT_CHARS = 1200;
-const OUTPUT_ABSTRACTIVE = 'abstractive';
-const OUTPUT_EXTRACTIVE = 'extractive';
-const REFUSED = 'REFUSED';
-const TERMINAL_CODES: Record<number, true> = {
-  [grpc.status.INVALID_ARGUMENT]: true,
-  [grpc.status.PERMISSION_DENIED]: true,
-};
-const RETRYABLE_CODES: Record<number, true> = {
-  [grpc.status.UNAVAILABLE]: true,
-  [grpc.status.DEADLINE_EXCEEDED]: true,
-};
+export const DEADLINE_MS = 5000;
+export const MAX_ATTEMPTS = 3;
+export const RETRYABLE_CODES = [grpc.status.UNAVAILABLE, grpc.status.DEADLINE_EXCEEDED];
 
-export interface SummaryResult {
+export interface Summarized {
   kind: string;
   summary: string;
-  extractive_chars?: number;
-  model_version?: string | null;
+  model_version: string;
 }
 
-/** The source's own words, cut at a sentence boundary when one is close enough. */
-function trimExtract(content: string, chars: number = EXTRACT_CHARS): string {
-  const head = content.slice(0, chars).trim();
-  if (content.length <= chars) return head;
-  const stop = Math.max(head.lastIndexOf('.'), head.lastIndexOf('!'), head.lastIndexOf('?'));
-  return (stop > 0 ? head.slice(0, stop + 1) : head) + '…';
+interface SummarizeRequest {
+  source_hash: string;
+  text: string;
+  target_words: number;
 }
 
-/** Abstractive when the model answers; a labelled extractive fallback when it cannot. */
-export async function summarizeWithModel(
-  client: SummaryModelClient,
-  content: string,
-  band: string,
-): Promise<SummaryResult> {
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('summarizer_service.proto')) as unknown as {
+  summarizerd: {SummaryModel: grpc.ServiceClientConstructor};
+};
+const model = new pkg.summarizerd.SummaryModel('model:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Summarize(request: SummarizeRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{summary: string; model_version: string}>;
+};
+
+/** The summary of a source. */
+export async function summarize(sourceHash: string, content: string, targetWords: number): Promise<Summarized> {
+  const request = {source_hash: sourceHash, text: content, target_words: targetWords};
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
-      const reply = await client.summarize({content, band}, {deadline: Date.now() + DEADLINE_S * 1000});
-      return {kind: OUTPUT_ABSTRACTIVE, summary: reply.text, model_version: reply.modelVersion};
-    } catch (err) {
-      const failure = err as grpc.ServiceError;
-      const refused = String(failure.details ?? '').includes(REFUSED);
-      if (refused || TERMINAL_CODES[failure.code] === true) {
-        console.info({code: failure.code, refused}, 'model call terminal; not retrying');
-        break;
-      }
-      if (RETRYABLE_CODES[failure.code] !== true) break;
+      const reply = await model.Summarize(request, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+      return {kind: 'abstractive', summary: reply.summary, model_version: reply.model_version};
+    } catch (e) {
+      // A refusal or a bad request: asking again gets the same answer.
+      if (!RETRYABLE_CODES.includes((e as grpc.ServiceError).code)) break;
     }
   }
-  return {kind: OUTPUT_EXTRACTIVE, summary: trimExtract(content), extractive_chars: EXTRACT_CHARS};
+  // The source's own sentences, cut to the band, and labelled as such.
+  return {kind: 'extractive', summary: lead(content, targetWords), model_version: ''};
 }
 `,
     },
@@ -306,200 +249,163 @@ export async function summarizeWithModel(
 
 import (
 	"context"
-	"log"
+	"time"
 
 	"google.golang.org/grpc"
-	pb "summarizer/modelpb"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "summarizer/gen/summarizer_service"
+	"summarizer/text" // text.Lead
 )
 
-type Result struct {
-	Kind    string \`json:"kind"\`
-	Summary string \`json:"summary"\`
+var (
+	modelConn, _ = grpc.NewClient("model:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	model        = pb.NewSummaryModelClient(modelConn)
+)
+
+// Summarized is the summary of a source.
+type Summarized struct {
+	Kind         string \`json:"kind"\`
+	Summary      string \`json:"summary"\`
+	ModelVersion string \`json:"model_version"\`
 }
 
-// summarizeWithModel asks the model for a summary.
-func summarizeWithModel(ctx context.Context, client pb.SummaryModelClient, content, band string) Result {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	for {
-		reply, err := client.Summarize(ctx, &pb.SummarizeRequest{Content: content, Band: band})
+// summarize is the summary of a source.
+func summarize(ctx context.Context, sourceHash, content string, targetWords int) Summarized {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	request := &pb.SummarizeRequest{SourceHash: sourceHash, Text: content, TargetWords: int32(targetWords)}
+	for attempt := 0; attempt < 5; attempt++ {
+		reply, err := model.Summarize(ctx, request)
 		if err == nil {
-			if reply.Refused {
-				continue
-			}
-			return Result{Kind: "abstractive", Summary: reply.Text}
+			return Summarized{Kind: "abstractive", Summary: reply.GetSummary(), ModelVersion: reply.GetModelVersion()}
 		}
-		log.Printf("model call failed: %v", err)
-		if grpc.Code(err).String() == "Unavailable" {
-			continue
-		}
-		break
+		time.Sleep(time.Second) // the model is flaky: try again
 	}
-	if len(content) > 400 {
-		return Result{Kind: "abstractive", Summary: content[:400]}
+	excerpt := content
+	if len(excerpt) > 400 {
+		excerpt = excerpt[:400]
 	}
-	return Result{Kind: "abstractive", Summary: "summary unavailable"}
+	if excerpt == "" {
+		excerpt = "summary unavailable"
+	}
+	return Summarized{Kind: "abstractive", Summary: excerpt}
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"log"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	pb "summarizer/modelpb"
+
+	pb "summarizer/gen/summarizer_service"
+	"summarizer/text" // text.Lead
 )
 
 const (
-	deadlineSeconds = 5
-	maxAttempts     = 3
-	extractChars    = 1200
+	deadline    = 5 * time.Second
+	maxAttempts = 3
 )
 
-const (
-	outputAbstractive = "abstractive"
-	outputExtractive  = "extractive"
-	Refused           = "REFUSED"
+var (
+	modelConn, _ = grpc.NewClient("model:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	model        = pb.NewSummaryModelClient(modelConn)
 )
 
-var terminalCodes = map[codes.Code]bool{codes.InvalidArgument: true, codes.PermissionDenied: true}
-var retryableCodes = map[codes.Code]bool{codes.Unavailable: true, codes.DeadlineExceeded: true}
-
-type Result struct {
-	Kind            string \`json:"kind"\`
-	Summary         string \`json:"summary"\`
-	ExtractiveChars int    \`json:"extractive_chars,omitempty"\`
-	ModelVersion    string \`json:"model_version,omitempty"\`
+// Summarized is the summary of a source.
+type Summarized struct {
+	Kind         string \`json:"kind"\`
+	Summary      string \`json:"summary"\`
+	ModelVersion string \`json:"model_version"\`
 }
 
-// trimExtract cuts the source's own words at a sentence boundary when one is close enough.
-func trimExtract(content string, chars int) string {
-	head := strings.TrimSpace(content[:min(len(content), chars)])
-	if len(content) <= chars {
-		return head
-	}
-	stop := strings.LastIndexAny(head, ".!?")
-	if stop > 0 {
-		return head[:stop+1] + "…"
-	}
-	return head + "…"
-}
-
-// summarizeWithModel: abstractive when the model answers, a labelled extractive fallback when not.
-func summarizeWithModel(ctx context.Context, client pb.SummaryModelClient, content, band string) Result {
+// summarize is the summary of a source.
+func summarize(ctx context.Context, sourceHash, content string, targetWords int) Summarized {
+	request := &pb.SummarizeRequest{SourceHash: sourceHash, Text: content, TargetWords: int32(targetWords)}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, time.Duration(deadlineSeconds)*time.Second)
-		reply, err := client.Summarize(attemptCtx, &pb.SummarizeRequest{Content: content, Band: band})
+		callCtx, cancel := context.WithTimeout(ctx, deadline)
+		reply, err := model.Summarize(callCtx, request)
 		cancel()
 		if err == nil {
-			if reply.Refused {
-				log.Printf("model refused; terminal")
-				break
-			}
-			return Result{Kind: outputAbstractive, Summary: reply.Text, ModelVersion: reply.ModelVersion}
+			return Summarized{Kind: "abstractive", Summary: reply.GetSummary(), ModelVersion: reply.GetModelVersion()}
 		}
-		code := status.Code(err)
-		if strings.Contains(status.Convert(err).Message(), Refused) || terminalCodes[code] {
-			log.Printf("model call terminal code=%s; not retrying", code)
-			break
+		if code := status.Code(err); code != codes.Unavailable && code != codes.DeadlineExceeded {
+			break // a refusal or a bad request: asking again gets the same answer
 		}
-		if !retryableCodes[code] {
-			break
-		}
-		log.Printf("model attempt %d/%d failed: %s", attempt+1, maxAttempts, code)
 	}
-	return Result{Kind: outputExtractive, Summary: trimExtract(content, extractChars), ExtractiveChars: extractChars}
+	// The source's own sentences, cut to the band, and labelled as such.
+	return Summarized{Kind: "extractive", Summary: text.Lead(content, targetWords)}
 }
 `,
     },
     scala: {
-      starter: `import io.grpc.ManagedChannel
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-object SummaryClient {
+import summarizer.Text // Text.lead
+import summarizerd.summarizer_service.{SummarizeRequest, SummaryModelGrpc}
 
-  case class Result(kind: String, summary: String)
+final case class Summarized(kind: String, summary: String, modelVersion: String)
 
-  /** Ask the model for a summary. */
-  def summarizeWithModel(stub: SummaryModelGrpc.SummaryModelStub, content: String, band: String): Result = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    var result: Option[Result] = None
-    while (result.isEmpty) {
+object Client {
+  private val model = SummaryModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
+
+  /** The summary of a source. */
+  def summarize(sourceHash: String, content: String, targetWords: Int): Summarized = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val request = SummarizeRequest(sourceHash, content, targetWords)
+    var attempt = 0
+    var result: Option[Summarized] = None
+    while (result.isEmpty && attempt < 5) {
+      attempt += 1
       try {
-        val reply = stub.summarize(SummarizeRequest(content = content, band = band))
-        if (!reply.refused) result = Some(Result("abstractive", reply.text))
+        val reply = model.summarize(request)
+        result = Some(Summarized("abstractive", reply.summary, reply.modelVersion))
       } catch {
-        case err: io.grpc.StatusRuntimeException =>
-          println(s"model call failed: \${err.getStatus}")
-          if (!err.getStatus.getDescription.contains("refused")) {
-            result = Some(Result("abstractive", "summary unavailable"))
-          }
+        case _: StatusRuntimeException => Thread.sleep(1000) // the model is flaky: try again
       }
     }
-    result.get
+    result.getOrElse(Summarized("abstractive", if (content.isEmpty) "summary unavailable" else content.take(400), ""))
   }
 }
 `,
-      solution: `import io.grpc.StatusRuntimeException
+      solution: `import java.util.concurrent.TimeUnit
 
-import java.util.concurrent.TimeUnit
-import scala.util.control.NonFatal
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
 
-object SummaryClient {
+import summarizer.Text // Text.lead
+import summarizerd.summarizer_service.{SummarizeRequest, SummaryModelGrpc}
 
+final case class Summarized(kind: String, summary: String, modelVersion: String)
+
+object Client {
   val DeadlineSeconds = 5L
   val MaxAttempts = 3
-  val ExtractChars = 1200
-  val OutputAbstractive = "abstractive"
-  val OutputExtractive = "extractive"
-  val Refused = "REFUSED"
-  val TerminalCodes = Set(io.grpc.Status.Code.INVALID_ARGUMENT, io.grpc.Status.Code.PERMISSION_DENIED)
-  val RetryableCodes = Set(io.grpc.Status.Code.UNAVAILABLE, io.grpc.Status.Code.DEADLINE_EXCEEDED)
+  val RetryableCodes: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
 
-  case class Result(kind: String, summary: String, extractiveChars: Option[Int], modelVersion: Option[String])
+  private val model = SummaryModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
 
-  /** The source's own words, cut at a sentence boundary when one is close enough. */
-  def trimExtract(content: String, chars: Int = ExtractChars): String = {
-    val head = content.take(chars).trim
-    if (content.length <= chars) head
-    else {
-      val stop = List(head.lastIndexOf('.'), head.lastIndexOf('!'), head.lastIndexOf('?')).max
-      (if (stop > 0) head.take(stop + 1) else head) + "…"
-    }
-  }
-
-  /** Abstractive when the model answers; a labelled extractive fallback when it cannot. */
-  def summarizeWithModel(stub: SummaryModelGrpc.SummaryModelStub, content: String, band: String): Result = {
+  /** The summary of a source. */
+  def summarize(sourceHash: String, content: String, targetWords: Int): Summarized = {
+    val request = SummarizeRequest(sourceHash, content, targetWords)
     var attempt = 0
-    var done = false
-    var answer: Option[Result] = None
-    while (attempt < MaxAttempts && !done) {
+    var retry = true
+    var result: Option[Summarized] = None
+    while (result.isEmpty && retry && attempt < MaxAttempts) {
       attempt += 1
       try {
-        val call = stub.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS)
-        val reply = call.summarize(SummarizeRequest(content = content, band = band))
-        if (reply.refused) {
-          println("model refused; terminal")
-          done = true
-        } else {
-          answer = Some(Result(OutputAbstractive, reply.text, None, Some(reply.modelVersion)))
-          done = true
-        }
+        val reply = model.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).summarize(request)
+        result = Some(Summarized("abstractive", reply.summary, reply.modelVersion))
       } catch {
-        case err: StatusRuntimeException =>
-          val refused = Option(err.getStatus.getDescription).exists(_.contains(Refused))
-          if (refused || TerminalCodes.contains(err.getStatus.getCode)) done = true
-          else if (!RetryableCodes.contains(err.getStatus.getCode)) done = true
-          else println(s"model attempt $attempt/$MaxAttempts failed: \${err.getStatus.getCode}")
-        case NonFatal(err) =>
-          println(s"model call failed: $err")
-          done = true
+        // A refusal or a bad request: asking again gets the same answer.
+        case e: StatusRuntimeException => retry = RetryableCodes.contains(e.getStatus.getCode)
       }
     }
-    answer.getOrElse(Result(OutputExtractive, trimExtract(content), Some(ExtractChars), None))
+    // The source's own sentences, cut to the band, and labelled as such.
+    result.getOrElse(Summarized("extractive", Text.lead(content, targetWords), ""))
   }
 }
 `,
@@ -507,116 +413,401 @@ object SummaryClient {
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
 
-#include "model.grpc.pb.h"
-
-#include <iostream>
+#include <chrono>
 #include <string>
+#include <thread>
 
-struct Result {
+#include "summarizer/text.h"  // summarizer::text::lead
+#include "summarizer_service.grpc.pb.h"
+
+namespace text = summarizer::text;
+
+auto model = summarizerd::SummaryModel::NewStub(grpc::CreateChannel("model:9000", grpc::InsecureChannelCredentials()));
+
+// The summary of a source.
+struct Summarized {
   std::string kind;
   std::string summary;
+  std::string model_version;
 };
 
-// summarize_with_model asks the model for a summary.
-Result summarize_with_model(std::shared_ptr<SummaryModel::Stub> stub, const std::string& content, const std::string& band) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  while (true) {
-    grpc::ClientContext context;
-    SummarizeRequest request;
-    request.set_content(content);
-    request.set_band(band);
-    SummarizeReply reply;
-    const auto status = stub->Summarize(&context, request, &reply);
-    if (status.ok()) {
-      if (reply.refused()) continue;
-      return Result{"abstractive", reply.text()};
-    }
-    std::clog << "model call failed: " << status.error_message() << "\\n";
-    if (status.error_message().find("refused") != std::string::npos) continue;
-    break;
+Summarized summarize(const std::string& source_hash, const std::string& content, long target_words) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  summarizerd::SummarizeRequest request;
+  request.set_source_hash(source_hash);
+  request.set_text(content);
+  request.set_target_words(static_cast<int>(target_words));
+  for (int attempt = 0; attempt < 5; attempt++) {
+    grpc::ClientContext ctx;
+    summarizerd::SummarizeReply reply;
+    if (model->Summarize(&ctx, request, &reply).ok()) return {"abstractive", reply.summary(), reply.model_version()};
+    std::this_thread::sleep_for(std::chrono::seconds{1});  // the model is flaky: try again
   }
-  return Result{"abstractive", content.substr(0, 400).empty() ? "summary unavailable" : content.substr(0, 400)};
+  return {"abstractive", content.empty() ? std::string("summary unavailable") : content.substr(0, 400), ""};
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
 
-#include "model.grpc.pb.h"
-
 #include <chrono>
-#include <iostream>
 #include <set>
 #include <string>
 
-constexpr int kDeadlineSeconds = 5;
+#include "summarizer/text.h"  // summarizer::text::lead
+#include "summarizer_service.grpc.pb.h"
+
+namespace text = summarizer::text;
+
+constexpr std::chrono::seconds kDeadline{5};
 constexpr int kMaxAttempts = 3;
-constexpr std::size_t kExtractChars = 1200;
+const std::set<grpc::StatusCode> kRetryableCodes = {grpc::StatusCode::UNAVAILABLE, grpc::StatusCode::DEADLINE_EXCEEDED};
 
-const char* kOutputAbstractive = "abstractive";
-const char* kOutputExtractive = "extractive";
-const char* Refused = "REFUSED";
+auto model = summarizerd::SummaryModel::NewStub(grpc::CreateChannel("model:9000", grpc::InsecureChannelCredentials()));
 
-static const std::set<grpc::StatusCode> kTerminalCodes = {grpc::StatusCode::INVALID_ARGUMENT,
-                                                          grpc::StatusCode::PERMISSION_DENIED};
-static const std::set<grpc::StatusCode> kRetryableCodes = {grpc::StatusCode::UNAVAILABLE,
-                                                           grpc::StatusCode::DEADLINE_EXCEEDED};
-
-struct Result {
+// The summary of a source.
+struct Summarized {
   std::string kind;
   std::string summary;
-  std::size_t extractive_chars = 0;
+  std::string model_version;
 };
 
-/// The source's own words, cut at a sentence boundary when one is close enough.
-static std::string trim_extract(const std::string& content) {
-  const std::string head = content.substr(0, std::min(content.size(), kExtractChars));
-  if (content.size() <= kExtractChars) return head;
-  const auto stop = head.find_last_of(".!?");
-  if (stop != std::string::npos && stop > 0) return head.substr(0, stop + 1) + "…";
-  return head + "…";
-}
-
-/// Abstractive when the model answers; a labelled extractive fallback when it cannot.
-Result summarize_with_model(const std::shared_ptr<SummaryModel::Stub>& stub, const std::string& content,
-                            const std::string& band) {
-  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-    grpc::ClientContext context;
-    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kDeadlineSeconds));
-    SummarizeRequest request;
-    request.set_content(content);
-    request.set_band(band);
-    SummarizeReply reply;
-    const auto status = stub->Summarize(&context, request, &reply);
-    if (status.ok()) {
-      if (reply.refused()) {
-        std::clog << "model refused; terminal\\n";
-        break;
-      }
-      return Result{kOutputAbstractive, reply.text(), 0};
-    }
-    const bool refused = status.error_message().find(Refused) != std::string::npos;
-    if (refused || kTerminalCodes.count(status.error_code()) == 1) {
-      std::clog << "model call terminal; not retrying\\n";
-      break;
-    }
-    if (kRetryableCodes.count(status.error_code()) == 0) break;
-    std::clog << "model attempt " << attempt + 1 << "/" << kMaxAttempts << " failed\\n";
+Summarized summarize(const std::string& source_hash, const std::string& content, long target_words) {
+  summarizerd::SummarizeRequest request;
+  request.set_source_hash(source_hash);
+  request.set_text(content);
+  request.set_target_words(static_cast<int>(target_words));
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    summarizerd::SummarizeReply reply;
+    const grpc::Status status = model->Summarize(&ctx, request, &reply);
+    if (status.ok()) return {"abstractive", reply.summary(), reply.model_version()};
+    if (!kRetryableCodes.count(status.error_code())) break;  // a refusal or a bad request: asking again gets the same answer
   }
-  return Result{kOutputExtractive, trim_extract(content), kExtractChars};
+  // The source's own sentences, cut to the band, and labelled as such.
+  return {"extractive", text::lead(content, target_words), ""};
 }
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import summarizer_service_pb2
+import summarizer_service_pb2_grpc
+from summarizer import text
+
+SOURCE = "The board met on 3 March. Revenue rose four percent in the quarter. The audit committee approved the accounts.\\n\\nTwo directors stepped down. A new chair takes over in May."
+HASH = "c" * 64
+
+
+class Model(summarizer_service_pb2_grpc.SummaryModelServicer):
+    def Summarize(self, request, context):
+        return summarizer_service_pb2.SummarizeReply(summary=f"A {len(request.text.split())}-word source in {request.target_words} words.", model_version="sm-7")
+
+
+def _client(ctx):
+    ctx.grpc.serve(summarizer_service_pb2_grpc.add_SummaryModelServicer_to_server, Model())
+    return ctx.load("client")
+
+
+def _calls(ctx):
+    return len(ctx.grpc.calls_to("Summarize"))
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    ok = m.summarize(HASH, SOURCE, 20)
+    assert ok.get("kind") == "abstractive" and ok.get("model_version") == "sm-7", f"with the model healthy summarize answered {ok}"
+    for call in ctx.grpc.calls_to("Summarize"):
+        assert call.timeout is not None, "a Summarize call carries no deadline: a hung model holds the request until its caller gives up"
+        assert 4.5 <= call.timeout <= 5.5, f"a Summarize call carries a {call.timeout} s deadline, expected DEADLINE_S = 5"
+    ctx.grpc.set_latency("Summarize", 30.0)
+    before = ctx.clock.time()
+    slow = m.summarize(HASH, SOURCE, 20)
+    waited = ctx.clock.time() - before
+    assert waited <= 16, f"with the model hung summarize took {waited:.0f} s: each attempt must give up after 5 s"
+    assert slow.get("kind") == "extractive", f"with the model hung summarize answered {slow}, expected the extractive lead"
+
+
+def check_terminal_refusal(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("Summarize", grpc.StatusCode.FAILED_PRECONDITION, "refused: the source asks for a diagnosis", times=1)
+    refused = m.summarize(HASH, SOURCE, 20)
+    assert _calls(ctx) == 1, f"a refusal was sent to the model {_calls(ctx)} times: the model answers the same text the same way, so a refusal ends the call"
+    assert ctx.clock.sleeps == 0, "a refusal must not be slept on and retried"
+    assert refused.get("kind") == "extractive", f"after a refusal summarize answered {refused}, expected the extractive lead"
+    ctx.grpc.fail("Summarize", grpc.StatusCode.INVALID_ARGUMENT, "target_words out of range", times=1)
+    m.summarize(HASH, SOURCE, 20)
+    assert _calls(ctx) == 2, f"INVALID_ARGUMENT was retried ({_calls(ctx) - 1} calls for one request): only UNAVAILABLE and DEADLINE_EXCEEDED may be"
+
+
+def check_retry_budget(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("Summarize", grpc.StatusCode.UNAVAILABLE, "model restarting", times=3)
+    down = m.summarize(HASH, SOURCE, 20)
+    assert _calls(ctx) == 3, f"with the model down summarize made {_calls(ctx)} calls, expected MAX_ATTEMPTS = 3"
+    assert down.get("kind") == "extractive", f"after three UNAVAILABLE answers summarize answered {down}, expected the extractive lead"
+    ctx.grpc.fail("Summarize", grpc.StatusCode.UNAVAILABLE, "model restarting", times=1)
+    back = m.summarize(HASH, SOURCE, 20)
+    assert _calls(ctx) == 5 and back.get("kind") == "abstractive", f"one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got {back} after {_calls(ctx) - 3} calls"
+
+
+def check_labelled_fallback(ctx):
+    m = _client(ctx)
+    ok = m.summarize(HASH, SOURCE, 20)
+    assert ok.get("kind") == "abstractive" and ok.get("summary") == "A 30-word source in 20 words.", f"with the model healthy summarize answered {ok}"
+    ctx.grpc.fail("Summarize", grpc.StatusCode.FAILED_PRECONDITION, "refused", times=5)
+    fallback = m.summarize(HASH, SOURCE, 20)
+    expected = text.lead(SOURCE, 20)
+    assert fallback.get("kind") == "extractive", f"when the model gave no summary the answer was labelled {fallback.get('kind')!r}: a reader takes it for the model's summary. Label it extractive"
+    assert fallback.get("summary") == expected, f"the fallback must be the source's own lead cut to 20 words ({expected!r}), got {fallback.get('summary')!r}"
+    assert fallback.get("model_version") == "", f"an extract has no model version, got {fallback.get('model_version')!r}"
+`,
+    typescript: `const SOURCE = 'The board met on 3 March. Revenue rose four percent in the quarter. The audit committee approved the accounts.\\n\\nTwo directors stepped down. A new chair takes over in May.';
+const HASH = 'c'.repeat(64);
+
+function client(ctx) {
+  const pkg = ctx.proto('summarizer_service.proto');
+  ctx.grpc.serve(pkg.summarizerd.SummaryModel.service, {
+    Summarize(call, callback) {
+      const {text, target_words} = call.request;
+      callback(null, {summary: \`A \${text.split(/\\s+/).filter(w => w !== '').length}-word source in \${target_words} words.\`, model_version: 'sm-7'});
+    },
+  });
+  return {m: ctx.load('client'), text: ctx.load('/support/summarizer/text.ts')};
+}
+
+const calls = ctx => ctx.grpc.callsTo('Summarize').length;
+
+export async function check_deadline(ctx) {
+  const {m} = client(ctx);
+  const ok = await m.summarize(HASH, SOURCE, 20);
+  assert(ok.kind === 'abstractive' && ok.model_version === 'sm-7', \`with the model healthy summarize answered \${JSON.stringify(ok)}\`);
+  for (const call of ctx.grpc.callsTo('Summarize')) {
+    assert(call.timeout !== null, 'a Summarize call carries no deadline: a hung model holds the request until its caller gives up');
+    assert(4.5 <= call.timeout && call.timeout <= 5.5, \`a Summarize call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 5000\`);
+  }
+  ctx.grpc.setLatency('Summarize', 30);
+  const before = ctx.clock.now();
+  const slow = await m.summarize(HASH, SOURCE, 20);
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 16, \`with the model hung summarize took \${waited.toFixed(0)} s: each attempt must give up after 5 s\`);
+  assert.equal(slow.kind, 'extractive', \`with the model hung summarize answered \${JSON.stringify(slow)}, expected the extractive lead\`);
+}
+
+export async function check_terminal_refusal(ctx) {
+  const {m} = client(ctx);
+  ctx.grpc.fail('Summarize', ctx.grpc.status.FAILED_PRECONDITION, 'refused: the source asks for a diagnosis', 1);
+  const refused = await m.summarize(HASH, SOURCE, 20);
+  assert.equal(calls(ctx), 1, \`a refusal was sent to the model \${calls(ctx)} times: the model answers the same text the same way, so a refusal ends the call\`);
+  assert.equal(ctx.clock.sleeps, 0, 'a refusal must not be slept on and retried');
+  assert.equal(refused.kind, 'extractive', \`after a refusal summarize answered \${JSON.stringify(refused)}, expected the extractive lead\`);
+  ctx.grpc.fail('Summarize', ctx.grpc.status.INVALID_ARGUMENT, 'target_words out of range', 1);
+  await m.summarize(HASH, SOURCE, 20);
+  assert.equal(calls(ctx), 2, \`INVALID_ARGUMENT was retried (\${calls(ctx) - 1} calls for one request): only UNAVAILABLE and DEADLINE_EXCEEDED may be\`);
+}
+
+export async function check_retry_budget(ctx) {
+  const {m} = client(ctx);
+  ctx.grpc.fail('Summarize', ctx.grpc.status.UNAVAILABLE, 'model restarting', 3);
+  const down = await m.summarize(HASH, SOURCE, 20);
+  assert.equal(calls(ctx), 3, \`with the model down summarize made \${calls(ctx)} calls, expected MAX_ATTEMPTS = 3\`);
+  assert.equal(down.kind, 'extractive', \`after three UNAVAILABLE answers summarize answered \${JSON.stringify(down)}, expected the extractive lead\`);
+  ctx.grpc.fail('Summarize', ctx.grpc.status.UNAVAILABLE, 'model restarting', 1);
+  const back = await m.summarize(HASH, SOURCE, 20);
+  assert(calls(ctx) === 5 && back.kind === 'abstractive', \`one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got \${JSON.stringify(back)} after \${calls(ctx) - 3} calls\`);
+}
+
+export async function check_labelled_fallback(ctx) {
+  const {m, text} = client(ctx);
+  const ok = await m.summarize(HASH, SOURCE, 20);
+  assert(ok.kind === 'abstractive' && ok.summary === 'A 30-word source in 20 words.', \`with the model healthy summarize answered \${JSON.stringify(ok)}\`);
+  ctx.grpc.fail('Summarize', ctx.grpc.status.FAILED_PRECONDITION, 'refused', 5);
+  const fallback = await m.summarize(HASH, SOURCE, 20);
+  const expected = text.lead(SOURCE, 20);
+  assert.equal(fallback.kind, 'extractive', \`when the model gave no summary the answer was labelled \${JSON.stringify(fallback.kind)}: a reader takes it for the model's summary. Label it extractive\`);
+  assert.equal(fallback.summary, expected, \`the fallback must be the source's own lead cut to 20 words (\${JSON.stringify(expected)}), got \${JSON.stringify(fallback.summary)}\`);
+  assert.equal(fallback.model_version, '', \`an extract has no model version, got \${JSON.stringify(fallback.model_version)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	pb "summarizer/gen/summarizer_service"
+	"summarizer/text"
+
+	"leetbuild/harness"
+)
+
+const (
+	clientSource = "The board met on 3 March. Revenue rose four percent in the quarter. The audit committee approved the accounts.\\n\\nTwo directors stepped down. A new chair takes over in May."
+	clientHash   = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+)
+
+type modelPeer struct {
+	pb.UnimplementedSummaryModelServer
+}
+
+func (modelPeer) Summarize(_ context.Context, req *pb.SummarizeRequest) (*pb.SummarizeReply, error) {
+	summary := fmt.Sprintf("A %d-word source in %d words.", len(strings.Fields(req.GetText())), req.GetTargetWords())
+	return &pb.SummarizeReply{Summary: summary, ModelVersion: "sm-7"}, nil
+}
+
+func clientPeer(ctx *harness.Ctx) {
+	pb.RegisterSummaryModelServer(ctx.GRPC.Server(""), modelPeer{})
+}
+
+func clientCall() Summarized { return summarize(context.Background(), clientHash, clientSource, 20) }
+
+func clientCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Summarize", "")) }
+
+func CheckDeadline(ctx *harness.Ctx) {
+	clientPeer(ctx)
+	ok := clientCall()
+	ctx.Assert(ok.Kind == "abstractive" && ok.ModelVersion == "sm-7", "with the model healthy summarize answered %+v", ok)
+	for _, call := range ctx.GRPC.CallsTo("Summarize", "") {
+		ctx.Assert(call.HasDeadline(), "a Summarize call carries no deadline: a hung model holds the request until its caller gives up")
+		ctx.Assert(4500*time.Millisecond <= call.Timeout && call.Timeout <= 5500*time.Millisecond, "a Summarize call carries a %v deadline, expected 5 s", call.Timeout)
+	}
+	ctx.GRPC.SetLatency("Summarize", 30, "")
+	before := ctx.Clock.Now()
+	slow := clientCall()
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 16, "with the model hung summarize took %.0f s: each attempt must give up after 5 s", waited)
+	ctx.Equal(slow.Kind, "extractive", "with the model hung, the kind of the answer")
+}
+
+func CheckTerminalRefusal(ctx *harness.Ctx) {
+	clientPeer(ctx)
+	ctx.GRPC.Fail("Summarize", codes.FailedPrecondition, "refused: the source asks for a diagnosis", 1, "")
+	refused := clientCall()
+	ctx.Equal(clientCalls(ctx), 1, "a refusal ends the call (the model answers the same text the same way); the Summarize calls")
+	ctx.Equal(ctx.Clock.Sleeps(), 0, "a refusal must not be slept on and retried; the sleeps")
+	ctx.Equal(refused.Kind, "extractive", "after a refusal, the kind of the answer")
+	ctx.GRPC.Fail("Summarize", codes.InvalidArgument, "target_words out of range", 1, "")
+	clientCall()
+	ctx.Equal(clientCalls(ctx), 2, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED may be); the Summarize calls")
+}
+
+func CheckRetryBudget(ctx *harness.Ctx) {
+	clientPeer(ctx)
+	ctx.GRPC.Fail("Summarize", codes.Unavailable, "model restarting", 3, "")
+	down := clientCall()
+	ctx.Equal(clientCalls(ctx), 3, "with the model down, the Summarize calls (MAX_ATTEMPTS = 3)")
+	ctx.Equal(down.Kind, "extractive", "after three UNAVAILABLE answers, the kind of the answer")
+	ctx.GRPC.Fail("Summarize", codes.Unavailable, "model restarting", 1, "")
+	back := clientCall()
+	ctx.Assert(clientCalls(ctx) == 5 && back.Kind == "abstractive", "one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got %+v after %d calls", back, clientCalls(ctx)-3)
+}
+
+func CheckLabelledFallback(ctx *harness.Ctx) {
+	clientPeer(ctx)
+	ok := clientCall()
+	ctx.Assert(ok.Kind == "abstractive" && ok.Summary == "A 30-word source in 20 words.", "with the model healthy summarize answered %+v", ok)
+	ctx.GRPC.Fail("Summarize", codes.FailedPrecondition, "refused", 5, "")
+	fallback := clientCall()
+	ctx.Equal(fallback.Kind, "extractive", "when the model gave no summary a reader takes an unlabelled answer for the model's; the kind")
+	ctx.Equal(fallback.Summary, text.Lead(clientSource, 20), "the fallback must be the source's own lead cut to 20 words")
+	ctx.Equal(fallback.ModelVersion, "", "an extract has no model version")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+
+#include "summarizer/text.h"
+#include "summarizer_service.grpc.pb.h"
+
+namespace {
+
+const std::string kSource =
+    "The board met on 3 March. Revenue rose four percent in the quarter. The audit committee approved the accounts.\\n\\nTwo directors stepped down. A new chair takes over in May.";
+const std::string kHash(64, 'c');
+
+class ModelPeer final : public summarizerd::SummaryModel::Service {
+ public:
+  grpc::Status Summarize(grpc::ServerContext*, const summarizerd::SummarizeRequest* req, summarizerd::SummarizeReply* out) override {
+    out->set_summary("A " + std::to_string(summarizer::text::words(req->text()).size()) + "-word source in " + std::to_string(req->target_words()) + " words.");
+    out->set_model_version("sm-7");
+    return grpc::Status::OK;
+  }
+};
+
+void clientPeer(harness::Ctx& ctx) {
+  static ModelPeer* peer = nullptr;
+  delete peer;
+  peer = new ModelPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+}
+
+Summarized clientCall() { return summarize(kHash, kSource, 20); }
+
+size_t clientCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Summarize").size(); }
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  clientPeer(ctx);
+  const Summarized ok = clientCall();
+  ctx.Assert(ok.kind == "abstractive" && ok.model_version == "sm-7", "with the model healthy summarize answered kind %q, model %q", ok.kind, ok.model_version);
+  for (const auto& call : ctx.GRPC.CallsTo("Summarize")) {
+    ctx.Assert(call.HasDeadline(), "a Summarize call carries no deadline: a hung model holds the request until its caller gives up");
+    ctx.Assert(4.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 5.5, "a Summarize call carries a %v s deadline, expected kDeadline = 5 s", call.TimeoutSeconds());
+  }
+  ctx.GRPC.SetLatency("Summarize", 30.0);
+  const int64_t before = ctx.Clock.Now();
+  const Summarized slow = clientCall();
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 16, "with the model hung summarize took %.0f s: each attempt must give up after 5 s", waited);
+  ctx.Equal(slow.kind, "extractive", "with the model hung, the kind of the answer");
+}
+
+void CheckTerminalRefusal(harness::Ctx& ctx) {
+  clientPeer(ctx);
+  ctx.GRPC.Fail("Summarize", grpc::StatusCode::FAILED_PRECONDITION, "refused: the source asks for a diagnosis", 1);
+  const Summarized refused = clientCall();
+  ctx.Equal(clientCalls(ctx), 1, "a refusal ends the call (the model answers the same text the same way); the Summarize calls");
+  ctx.Equal(ctx.Clock.Sleeps(), 0, "a refusal must not be slept on and retried; the sleeps");
+  ctx.Equal(refused.kind, "extractive", "after a refusal, the kind of the answer");
+  ctx.GRPC.Fail("Summarize", grpc::StatusCode::INVALID_ARGUMENT, "target_words out of range", 1);
+  clientCall();
+  ctx.Equal(clientCalls(ctx), 2, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED may be); the Summarize calls");
+}
+
+void CheckRetryBudget(harness::Ctx& ctx) {
+  clientPeer(ctx);
+  ctx.GRPC.Fail("Summarize", grpc::StatusCode::UNAVAILABLE, "model restarting", 3);
+  const Summarized down = clientCall();
+  ctx.Equal(clientCalls(ctx), 3, "with the model down, the Summarize calls (kMaxAttempts = 3)");
+  ctx.Equal(down.kind, "extractive", "after three UNAVAILABLE answers, the kind of the answer");
+  ctx.GRPC.Fail("Summarize", grpc::StatusCode::UNAVAILABLE, "model restarting", 1);
+  const Summarized back = clientCall();
+  ctx.Assert(clientCalls(ctx) == 5 && back.kind == "abstractive", "one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got kind %q after %d calls", back.kind, clientCalls(ctx) - 3);
+}
+
+void CheckLabelledFallback(harness::Ctx& ctx) {
+  clientPeer(ctx);
+  const Summarized ok = clientCall();
+  ctx.Assert(ok.kind == "abstractive" && ok.summary == "A 30-word source in 20 words.", "with the model healthy summarize answered kind %q, %q", ok.kind, ok.summary);
+  ctx.GRPC.Fail("Summarize", grpc::StatusCode::FAILED_PRECONDITION, "refused", 5);
+  const Summarized fallback = clientCall();
+  ctx.Equal(fallback.kind, "extractive", "when the model gave no summary a reader takes an unlabelled answer for the model's; the kind");
+  ctx.Equal(fallback.summary, summarizer::text::lead(kSource, 20), "the fallback must be the source's own lead cut to 20 words");
+  ctx.Equal(fallback.model_version, "", "an extract has no model version");
+}
+`,
+  },
   hints: [
-    'The provider refuses a document and the request pins a worker until the gateway times out. When the model is down, callers receive the first 400 characters of the source as a "summary".',
-    '`stub.Summarize` is called with no `timeout`, and `continue` runs on `reply.refused` and on any `RpcError` whose detail says refused, so the loop has no exit. The fallback reuses `kind: "abstractive"`.',
-    'Pass `timeout=DEADLINE_S`; loop `for attempt in range(MAX_ATTEMPTS)` and `break` unless `err.code()` is in `RETRYABLE_CODES`. Return `trim_extract(content)` with `kind: OUTPUT_EXTRACTIVE`.',
+    "Hang the model and the request never returns; have it refuse a source and it is asked five times; when it is down the answer is the first 400 characters of the source, labelled as the model's.",
+    'The call sets no deadline, the `except` treats a refusal like an outage, the loop runs five times, and the fallback slices characters and reuses the `abstractive` label.',
+    'Pass `timeout=DEADLINE_S`, loop `MAX_ATTEMPTS` times, `break` unless `exc.code()` is in `RETRYABLE_CODES`, and answer `{"kind": "extractive", "summary": text.lead(content, target_words), "model_version": ""}` after the loop.',
   ],
-  debrief: `The fix has two halves: a bounded failure policy and an output contract. The deadline goes on the
-call rather than around it so a hung provider costs five seconds and frees the connection; a
-wall-clock check after the fact leaves the call running. Status classification happens before the
-retry decision because a refusal is an answer, and only the two codes that mean "try again" earn
-another attempt out of a budget of three. The fallback is the source's own words trimmed to a known
-size and labelled extractive, so a reader knows the model did not write that paragraph and a
-dashboard can count how often it happens. Production clients add per-provider circuit breakers and
-extractive fallbacks ranked by sentence salience instead of a prefix.`,
+  debrief: `The status code is the only thing that says whether asking again can help: an outage or a timeout may clear, a refusal is the model's answer to this text and will be the same next time. Three attempts at five seconds put a ceiling of fifteen seconds on the worst case, which is what lets the caller set its own timeout sensibly. The fallback is the extractive lead because it is made of the source's sentences, so a reader can trust every word of it, and the label tells them that is what they are reading. A production client adds jittered backoff between attempts, a circuit breaker so an outage stops costing three deadlines per request, and a metric on the share of extractive answers.`,
 };

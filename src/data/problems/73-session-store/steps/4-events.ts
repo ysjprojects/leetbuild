@@ -5,111 +5,101 @@ export const eventsStep: Step = {
   title: 'Session events: keyed by user, hashed tokens, committed first',
   concept: 'kafka',
   file: 'events',
-  focus: ['api', 'kafka'],
+  focus: ['api', 'redis', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter's \`emit_session_event\` builds a JSON payload with the session id,
-device class, raw token and rotation, logs the token, produces it to \`session.event\` keyed by
-session id with a default-configured producer, and commits the session record afterwards. It
-compiles and hides 5 flaws.
+**Starting point.** The starter opens a session and announces it: \`open_session(user_id,
+device_class, token)\` mints an id, produces \`{type: "session.created", session_id, user_id,
+device_class, token}\` to \`session.event\` keyed by the session id with a producer at \`acks=1\`,
+does not wait for the delivery report, then writes the session with \`store.put_session\` and
+answers \`{session_id, published: true}\`. It serves the demo and hides five flaws.
 
-**Failure mode the checks target.** Keying by session id means two events for one user can land in different
-partitions and be consumed out of order. Publishing the raw token turns the topic into a credential store. And
-producing before committing the record, or dropping the event when the broker rejects it, means the topic and
-the store disagree, which is the bug audit teams spend a week chasing.
+**Failure mode the checks target.** One user's events land on two partitions and the audit consumer
+applies them out of order. The topic, retained and replicated, holds live tokens. A consumer reads
+about a session the store does not have yet. A lost acknowledgement writes the event twice, a
+failover loses it, and a broker that refuses it or never answers loses it for good.
 
-Requirements:
-
-- **Key by user.** The event's partition key is the \`user_id\`, so one user's session history stays ordered.
-- **Hash the token.** The payload carries \`token_hash\`, \`device_class\`, \`session_id\` and \`rotation\`; the
-  raw token is neither published nor logged. A token in a retained, replicated topic is a credential leak with a
-  long memory.
-- **Commit before you announce.** The session record is committed **before** the event is produced, so a consumer
-  cannot see a session the store does not have. Use \`store.commit(id)\` then \`producer.produce(...)\`.
-- **Outbox on failure.** If the broker rejects the produce, write an \`outbox\` row so the event can be replayed
-  after the broker recovers instead of being lost.
-- **Idempotent producer.** The producer runs with \`enable.idempotence\` and \`acks\` set so a retry cannot publish
-  the same event twice.`,
+- The record key is the **user id**.
+- The payload carries \`token_hash\` (\`store.token_hash\`), never the token.
+- \`store.put_session\` first, then the produce.
+- The producer is idempotent with \`acks=all\` (Go uses confluent-kafka-go: kafka-go has no
+  idempotent producer).
+- Wait for the delivery report at most 2 s; on a failure or no report, \`store.outbox_add(topic,
+  key, payload)\` and answer \`published: false\`.`,
   sequence: {
-    participants: ['Session API', 'Session Store', 'session.event', 'Session consumer'],
+    participants: ['Session API', 'Session store', 'session.event', 'Outbox'],
     messages: [
-      {from: 'Session API', to: 'Session Store', label: 'commit session record', kind: 'sync'},
-      {from: 'Session Store', to: 'Session API', label: 'committed', kind: 'reply'},
-      {from: 'Session API', to: 'session.event', label: 'produce · key = user_id · token_hash', kind: 'sync'},
-      {from: 'session.event', to: 'Session consumer', label: 'consume', kind: 'async'},
-      {from: 'Session API', to: 'Session Store', label: 'outbox row on broker reject', kind: 'async'},
-      {from: 'Session API', to: 'Session Store', label: 'commit offset after the record', kind: 'reply'},
+      {from: 'Session API', to: 'Session store', label: 'put_session(id, user, device, token)', kind: 'sync'},
+      {from: 'Session API', to: 'session.event', label: 'produce key = user_id · token_hash · acks=all', kind: 'sync'},
+      {from: 'session.event', to: 'Session API', label: 'delivery report within 2 s → published', kind: 'reply'},
+      {from: 'session.event', to: 'Session API', label: 'error / no report', kind: 'reply'},
+      {from: 'Session API', to: 'Outbox', label: 'outbox_add(topic, key, payload) → published: false', kind: 'async'},
     ],
   },
-  hints: [
-    "An audit consumer sees a login event for a session the store cannot find, sees a user's rotation before their login, and finds live tokens sitting in the topic and the service log.",
-    'The produce runs before `store.commit`, the key is `session_id` so one user spans partitions, payload and log line carry `token`, a failed produce is lost, and the producer uses defaults.',
-    'Commit first, then `produce("session.event", key=user_id, ...)` with a `sha256` `token_hash`; on a produce error call `outbox.add(...)`; configure `enable.idempotence` and `acks: "all"`.',
-  ],
   checks: [
     {
       id: 'user-key',
-      title: 'Keys the event by user id',
+      title: 'Keys session.event by the user id',
       detail:
-        'The record key is the `user_id`, so one user’s events share a partition and keep their order. The starter keys by `session_id`, so a user’s history scatters.',
+        "Events for u-1, u-2, u-1 carry those keys and the two u-1 events share a partition. The starter keys by the session id, which changes at every login, so one user's history spreads over every partition.",
       match: {
-        python: {all: [/key\s*=\s*user_id/]},
-        typescript: {all: [/key\s*:\s*userId/]},
-        go: {all: [/Key:\s*\[\]byte\(userID\)/]},
-        scala: {all: [/ProducerRecord[^\n]*userId/]},
-        cpp: {all: [/producer\.produce\(/, /user_id\.c_str\(\)/]},
+        python: {all: [/key\s*=\s*user_id/], none: [/key\s*=\s*session_id/]},
+        typescript: {all: [/key:\s*userId\b/], none: [/key:\s*sessionId\b/]},
+        go: {all: [/Key:\s*\[\]byte\(userID\)/], none: [/Key:\s*\[\]byte\(sessionID\)/]},
+        scala: {all: [/ProducerRecord\[String, String\]\(Topic,\s*userId/], none: [/Topic,\s*sessionId/]},
+        cpp: {all: [/user_id\.c_str\(\),\s*user_id\.size\(\)/], none: [/session_id\.c_str\(\)/]},
       },
     },
     {
       id: 'hashed-token',
-      title: 'Publishes a token hash and the device class',
+      title: 'The event carries a token hash, never the token',
       detail:
-        'The payload carries `token_hash` and `device_class`, so the event is useful without carrying the credential. The starter publishes the raw `token`.',
+        'The record value carries `token_hash` (the SHA-256 the store keeps) with the session id, user id and device class, and the token itself appears nowhere in it. The starter publishes the token.',
       match: {
-        python: {all: [/token_hash/, /device_class/]},
-        typescript: {all: [/token_hash/, /device_class/]},
-        go: {all: [/TokenHash/, /DeviceClass/]},
-        scala: {all: [/tokenHash/, /deviceClass/]},
-        cpp: {all: [/token_hash/, /device_class/]},
+        python: {all: [/token_hash/], none: [/["']token["']\s*:/]},
+        typescript: {all: [/token_hash/], none: [/[{,]\s*token\s*[,}]/]},
+        go: {all: [/"token_hash"/], none: [/"token":\s*token/]},
+        scala: {all: [/"token_hash"/], none: [/"token"\s*->/]},
+        cpp: {all: [/"token_hash"/], none: [/\{"token",\s*token\}/]},
       },
     },
     {
       id: 'record-first',
-      title: 'Commits the session record before producing the event',
+      title: 'Commits the session before producing its event',
       detail:
-        'The record commit happens before the produce in the source, so a consumer cannot observe a session the store has not committed. The starter produces first.',
+        "When the session enters the user's set the topic is still empty: the event follows the commit. The starter produces first.",
       match: {
-        python: {order: [/store\.commit\(/, /producer\.produce\(/]},
-        typescript: {order: [/store\.commit\(/, /producer\.send\(/]},
-        go: {order: [/store\.Commit\(/, /writer\.WriteMessages\(/]},
-        scala: {order: [/store\.commit\(/, /producer\.send\(/]},
-        cpp: {order: [/store\.commit\(/, /producer\.produce\(/]},
-      },
-    },
-    {
-      id: 'outbox',
-      title: 'Writes an outbox row when the broker rejects the produce',
-      detail:
-        'A failed produce lands in the `outbox` so the event can be replayed later. The starter lets the produce failure disappear.',
-      match: {
-        python: {all: [/outbox\.add\(/]},
-        typescript: {all: [/outbox\.add\(/]},
-        go: {all: [/outbox\.Add\(/]},
-        scala: {all: [/outbox\.add\(/]},
-        cpp: {all: [/outbox\.add\(/]},
+        python: {order: [/store\.put_session\(/, /producer\.produce\(/]},
+        typescript: {order: [/\bputSession\(/, /producer\.send\(/]},
+        go: {order: [/store\.PutSession\(/, /producer\.Produce\(/]},
+        scala: {order: [/Store\.putSession\(/, /producer\.send\(/]},
+        cpp: {order: [/store::putSession\(/, /producer->produce\(/]},
       },
     },
     {
       id: 'idempotent-producer',
-      title: 'Runs an idempotent producer with acks',
+      title: 'An idempotent producer with acks=all',
       detail:
-        'The producer enables `enable.idempotence` and sets `acks` so a retry cannot duplicate the event. The starter uses default producer settings.',
+        'A write whose acknowledgement was lost is retried and lands once; a record survives a leader failover. The starter sets `acks=1` and no idempotence.',
       match: {
-        python: {all: [/enable\.idempotence/, /acks/]},
-        typescript: {all: [/idempotent\s*:\s*true/]},
-        go: {all: [/kafka\.RequireAll/, /Writer\{/]},
-        scala: {all: [/enable\.idempotence/, /acks/]},
-        cpp: {all: [/enable\.idempotence/, /acks/]},
+        python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
+        typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
+        go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
+        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
+        cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
+      },
+    },
+    {
+      id: 'outbox',
+      title: 'Waits for the delivery report and falls back to the outbox',
+      detail:
+        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload, and the call answers `published: false`. The starter fires and forgets.',
+      match: {
+        python: {all: [/store\.outbox_add\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
+        typescript: {all: [/\boutboxAdd\(/, /await producer\.send\(/, /catch/]},
+        go: {all: [/store\.OutboxAdd\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
+        scala: {all: [/Store\.outboxAdd\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
+        cpp: {all: [/store::outboxAdd\(/, /->flush\(/, /dr_cb/]},
       },
     },
   ],
@@ -119,332 +109,811 @@ Requirements:
 
 from confluent_kafka import Producer
 
-producer = Producer({"bootstrap.servers": "kafka:9092"})
+from sessions import store  # new_session_id, put_session, token_hash, outbox_add
+
+TOPIC = "session.event"
+
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 
 
-def emit_session_event(session_id: str, user_id: str, device_class: str, token: str, rotation: int) -> None:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    payload = json.dumps(
-        {
-            "session_id": session_id,
-            "device_class": device_class,
-            "token": token,
-            "rotation": rotation,
-        }
-    )
-    logger.info("session %s changed for token %s", session_id, token)
-    producer.produce("session.event", key=session_id, value=payload)
-    store.commit(session_id)
+def event_payload(session_id: str, user_id: str, device_class: str, token: str) -> dict:
+    return {"type": "session.created", "session_id": session_id, "user_id": user_id, "device_class": device_class, "token": token}
+
+
+def open_session(user_id: str, device_class: str, token: str) -> dict:
+    """Open a session for a completed login and announce it on session.event."""
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+    session_id = store.new_session_id()
+    payload = event_payload(session_id, user_id, device_class, token)
+    producer.produce(TOPIC, key=session_id, value=json.dumps(payload))
+    producer.poll(0)
+    store.put_session(session_id, user_id, device_class, token)
+    return {"session_id": session_id, "published": True}
 `,
-      solution: `import hashlib
-import json
+      solution: `import json
 
 from confluent_kafka import Producer
 
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
+from sessions import store  # new_session_id, put_session, token_hash, outbox_add
+
+TOPIC = "session.event"
+ACK_TIMEOUT_S = 2
+
+producer = Producer({
+    "bootstrap.servers": "kafka:9092",
+    "acks": "all",  # every in-sync replica has the record before the broker answers
+    "enable.idempotence": True,  # a write retried after a lost acknowledgement lands once
+})
+
+
+def event_payload(session_id: str, user_id: str, device_class: str, token: str) -> dict:
+    """What a consumer needs to correlate the session; the hash, never the credential."""
+    return {
+        "type": "session.created",
+        "session_id": session_id,
+        "user_id": user_id,
+        "device_class": device_class,
+        "token_hash": store.token_hash(token),
     }
-)
 
 
-def emit_session_event(session_id: str, user_id: str, device_class: str, token: str, rotation: int) -> None:
-    payload = json.dumps(
-        {
-            "session_id": session_id,
-            "user_id": user_id,
-            "device_class": device_class,
-            "token_hash": hashlib.sha256(token.encode()).hexdigest(),
-            "rotation": rotation,
-        }
-    )
-    # The record is committed first; the event is a notification, not the source of truth.
-    store.commit(session_id)
-    try:
-        producer.produce("session.event", key=user_id, value=payload)
-    except BufferError:
-        outbox.add(session_id, payload)
+def open_session(user_id: str, device_class: str, token: str) -> dict:
+    """Open a session for a completed login, then announce it on session.event."""
+    session_id = store.new_session_id()
+    # The session exists before anyone hears about it.
+    store.put_session(session_id, user_id, device_class, token)
+    payload = event_payload(session_id, user_id, device_class, token)
+    outcome = {}
+
+    def on_delivery(err, msg):
+        outcome["error"] = err
+
+    # One user's events share a partition, so the audit trail reads them in order.
+    producer.produce(TOPIC, key=user_id, value=json.dumps(payload), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or outcome.get("error") is not None:
+        # The broker did not take it: the relay publishes the row later, so the audit trail is late, not wrong.
+        store.outbox_add(TOPIC, user_id, payload)
+        return {"session_id": session_id, "published": False}
+    return {"session_id": session_id, "published": True}
 `,
     },
     typescript: {
-      starter: `import {createHash} from 'crypto';
-import {Kafka} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
 
-const kafka = new Kafka({brokers: ['kafka:9092']});
+import {newSessionId, outboxAdd, putSession, tokenHash} from 'sessions/store';
+
+export const TOPIC = 'session.event';
+
+const kafka = new Kafka({clientId: 'sessiond', brokers: ['kafka:9092']});
 const producer = kafka.producer();
+void producer.connect();
 
-export async function emitSessionEvent(
-  sessionId: string,
-  userId: string,
-  deviceClass: string,
-  token: string,
-  rotation: number,
-): Promise<void> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const payload = JSON.stringify({
-    session_id: sessionId,
-    device_class: deviceClass,
-    token: token,
-    rotation,
-  });
-  logger.info(\`session \${sessionId} changed for token \${token}\`);
-  await producer.send({topic: 'session.event', messages: [{key: sessionId, value: payload}]});
-  await store.commit(sessionId);
+export function eventPayload(sessionId: string, userId: string, deviceClass: string, token: string) {
+  return {type: 'session.created', session_id: sessionId, user_id: userId, device_class: deviceClass, token};
+}
+
+/** Open a session for a completed login and announce it on session.event. */
+export async function openSession(userId: string, deviceClass: string, token: string): Promise<{session_id: string; published: boolean}> {
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  const sessionId = newSessionId();
+  const payload = eventPayload(sessionId, userId, deviceClass, token);
+  void producer.send({topic: TOPIC, messages: [{key: sessionId, value: JSON.stringify(payload)}], acks: 1});
+  await putSession(sessionId, userId, deviceClass, token);
+  return {session_id: sessionId, published: true};
 }
 `,
-      solution: `import {createHash} from 'crypto';
-import {Kafka} from 'kafkajs';
+      solution: `import {Kafka} from 'kafkajs';
 
-const kafka = new Kafka({brokers: ['kafka:9092']});
+import {newSessionId, outboxAdd, putSession, tokenHash} from 'sessions/store';
+
+export const TOPIC = 'session.event';
+export const ACK_TIMEOUT_MS = 2000;
+
+const kafka = new Kafka({clientId: 'sessiond', brokers: ['kafka:9092']});
+// Idempotent: a write retried after a lost acknowledgement lands once (and needs acks: -1).
 const producer = kafka.producer({idempotent: true});
+void producer.connect();
 
-export async function emitSessionEvent(
-  sessionId: string,
-  userId: string,
-  deviceClass: string,
-  token: string,
-  rotation: number,
-): Promise<void> {
-  const payload = JSON.stringify({
-    session_id: sessionId,
-    user_id: userId,
-    device_class: deviceClass,
-    token_hash: createHash('sha256').update(token).digest('hex'),
-    rotation,
-  });
-  // The record is committed first; the event is a notification, not the source of truth.
-  await store.commit(sessionId);
+/** What a consumer needs to correlate the session; the hash, never the credential. */
+export function eventPayload(sessionId: string, userId: string, deviceClass: string, token: string) {
+  return {type: 'session.created', session_id: sessionId, user_id: userId, device_class: deviceClass, token_hash: tokenHash(token)};
+}
+
+/** Open a session for a completed login, then announce it on session.event. */
+export async function openSession(userId: string, deviceClass: string, token: string): Promise<{session_id: string; published: boolean}> {
+  const sessionId = newSessionId();
+  // The session exists before anyone hears about it.
+  await putSession(sessionId, userId, deviceClass, token);
+  const payload = eventPayload(sessionId, userId, deviceClass, token);
   try {
-    await producer.send({topic: 'session.event', messages: [{key: userId, value: payload}]});
+    // One user's events share a partition, so the audit trail reads them in order; acks: -1 (all).
+    await producer.send({topic: TOPIC, messages: [{key: userId, value: JSON.stringify(payload)}], acks: -1, timeout: ACK_TIMEOUT_MS});
+    return {session_id: sessionId, published: true};
   } catch {
-    await outbox.add(sessionId, payload);
+    // The broker did not take it: the relay publishes the row later, so the audit trail is late, not wrong.
+    await outboxAdd(TOPIC, userId, payload);
+    return {session_id: sessionId, published: false};
   }
 }
 `,
     },
     go: {
-      starter: `package session
+      starter: `package main
 
 import (
 	"context"
 	"encoding/json"
-	"log"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"sessions/store" // store.NewSessionID, PutSession, TokenHash, OutboxAdd
 )
 
-var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "session.event"}
+const topic = "session.event"
 
-type SessionEvent struct {
-	SessionID   string \`json:"session_id"\`
-	DeviceClass string \`json:"device_class"\`
-	Token       string \`json:"token"\`
-	Rotation    int    \`json:"rotation"\`
+var producer = newProducer()
+
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
-func EmitSessionEvent(ctx context.Context, sessionID, userID, deviceClass, token string, rotation int) error {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	payload, err := json.Marshal(SessionEvent{SessionID: sessionID, DeviceClass: deviceClass, Token: token, Rotation: rotation})
-	if err != nil {
-		return err
+func eventPayload(sessionID, userID, deviceClass, token string) map[string]any {
+	return map[string]any{"type": "session.created", "session_id": sessionID, "user_id": userID, "device_class": deviceClass, "token": token}
+}
+
+// openSession opens a session for a completed login and announces it on session.event: the new id, and whether the event went out.
+func openSession(ctx context.Context, userID, deviceClass, token string) (string, bool, error) {
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+	sessionID := store.NewSessionID()
+	value, _ := json.Marshal(eventPayload(sessionID, userID, deviceClass, token))
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(sessionID), Value: value}
+	if err := producer.Produce(msg, nil); err != nil {
+		return "", false, err
 	}
-	log.Printf("session %s changed for token %s", sessionID, token)
-	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(sessionID), Value: payload}); err != nil {
-		return err
+	if err := store.PutSession(ctx, sessionID, userID, deviceClass, token); err != nil {
+		return "", false, err
 	}
-	return store.Commit(ctx, sessionID)
+	return sessionID, true, nil
 }
 `,
-      solution: `package session
+      solution: `package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"sessions/store" // store.NewSessionID, PutSession, TokenHash, OutboxAdd
 )
 
-var writer = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        "session.event",
-	RequiredAcks: kafka.RequireAll,
-	Async:        false,
-}
+const (
+	topic      = "session.event"
+	ackTimeout = 2 * time.Second
+)
 
-type SessionEvent struct {
-	SessionID   string \`json:"session_id"\`
-	UserID      string \`json:"user_id"\`
-	DeviceClass string \`json:"device_class"\`
-	TokenHash   string \`json:"token_hash"\`
-	Rotation    int    \`json:"rotation"\`
-}
+var producer = newProducer()
 
-func EmitSessionEvent(ctx context.Context, sessionID, userID, deviceClass, token string, rotation int) error {
-	sum := sha256.Sum256([]byte(token))
-	payload, err := json.Marshal(SessionEvent{
-		SessionID:   sessionID,
-		UserID:      userID,
-		DeviceClass: deviceClass,
-		TokenHash:   hex.EncodeToString(sum[:]),
-		Rotation:    rotation,
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the record before the broker answers
+		"enable.idempotence": true,  // a write retried after a lost acknowledgement lands once
 	})
 	if err != nil {
-		return err
+		panic(err)
 	}
-	// The record is committed first; the event is a notification, not the source of truth.
-	if err := store.Commit(ctx, sessionID); err != nil {
-		return err
+	return p
+}
+
+// eventPayload is what a consumer needs to correlate the session; the hash, never the credential.
+func eventPayload(sessionID, userID, deviceClass, token string) map[string]any {
+	return map[string]any{"type": "session.created", "session_id": sessionID, "user_id": userID, "device_class": deviceClass, "token_hash": store.TokenHash(token)}
+}
+
+// openSession opens a session for a completed login, then announces it on session.event: the new id, and whether the event went out.
+func openSession(ctx context.Context, userID, deviceClass, token string) (string, bool, error) {
+	sessionID := store.NewSessionID()
+	// The session exists before anyone hears about it.
+	if err := store.PutSession(ctx, sessionID, userID, deviceClass, token); err != nil {
+		return "", false, err
 	}
-	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(userID), Value: payload}); err != nil {
-		return outbox.Add(ctx, sessionID, payload)
+	payload := eventPayload(sessionID, userID, deviceClass, token)
+	value, _ := json.Marshal(payload)
+	t := topic
+	// One user's events share a partition, so the audit trail reads them in order.
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(userID), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded // no delivery report within the window
+		}
 	}
-	return nil
+	if err != nil {
+		// The broker did not take it: the relay publishes the row later, so the audit trail is late, not wrong.
+		if err := store.OutboxAdd(ctx, topic, userID, payload); err != nil {
+			return sessionID, false, err
+		}
+		return sessionID, false, nil
+	}
+	return sessionID, true, nil
 }
 `,
     },
     scala: {
-      starter: `package session
+      starter: `import java.util.Properties
 
-import java.util.Properties
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.serialization.StringSerializer
-import io.circe.syntax._
-import io.circe.generic.auto._
+import spray.json._
+
+import sessions.Store // Store.newSessionId, putSession, tokenHash, outboxAdd
 
 object SessionEvents {
-  val props: Properties = {
-    val p = new Properties()
-    p.put("bootstrap.servers", "kafka:9092")
-    p
+  final case class Opened(sessionId: String, published: Boolean)
+
+  val Topic = "session.event"
+
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
-  val producer = new KafkaProducer[String, String](props)
 
-  case class SessionEvent(sessionId: String, deviceClass: String, token: String, rotation: Int)
+  def eventPayload(sessionId: String, userId: String, deviceClass: String, token: String): JsObject =
+    JsObject("type" -> JsString("session.created"), "session_id" -> JsString(sessionId), "user_id" -> JsString(userId),
+      "device_class" -> JsString(deviceClass), "token" -> JsString(token))
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def emitSessionEvent(sessionId: String, userId: String, deviceClass: String, token: String, rotation: Int): Unit = {
-    val payload = SessionEvent(sessionId, deviceClass, token, rotation).asJson.noSpaces
-    logger.info(s"session $sessionId changed for token $token")
-    producer.send(new ProducerRecord[String, String]("session.event", sessionId, payload))
-    store.commit(sessionId)
+  /** Open a session for a completed login and announce it on session.event. */
+  def openSession(userId: String, deviceClass: String, token: String): Opened = {
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+    val sessionId = Store.newSessionId()
+    val payload = eventPayload(sessionId, userId, deviceClass, token)
+    producer.send(new ProducerRecord[String, String](Topic, sessionId, payload.compactPrint))
+    Store.putSession(sessionId, userId, deviceClass, token)
+    Opened(sessionId, published = true)
   }
 }
 `,
-      solution: `package session
+      solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
 
-import java.security.MessageDigest
-import java.util.Properties
+import scala.util.Try
+
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.serialization.StringSerializer
-import io.circe.syntax._
-import io.circe.generic.auto._
+import spray.json._
+
+import sessions.Store // Store.newSessionId, putSession, tokenHash, outboxAdd
 
 object SessionEvents {
-  val props: Properties = {
-    val p = new Properties()
-    p.put("bootstrap.servers", "kafka:9092")
-    p.put("enable.idempotence", "true")
-    p.put("acks", "all")
-    p
+  final case class Opened(sessionId: String, published: Boolean)
+
+  val Topic = "session.event"
+  val AckTimeoutMs = 2000L
+
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "all") // every in-sync replica has the record before the broker answers
+    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
-  val producer = new KafkaProducer[String, String](props)
 
-  case class SessionEvent(
-      sessionId: String,
-      userId: String,
-      deviceClass: String,
-      tokenHash: String,
-      rotation: Int,
-  )
+  /** What a consumer needs to correlate the session; the hash, never the credential. */
+  def eventPayload(sessionId: String, userId: String, deviceClass: String, token: String): JsObject =
+    JsObject("type" -> JsString("session.created"), "session_id" -> JsString(sessionId), "user_id" -> JsString(userId),
+      "device_class" -> JsString(deviceClass), "token_hash" -> JsString(Store.tokenHash(token)))
 
-  def emitSessionEvent(sessionId: String, userId: String, deviceClass: String, token: String, rotation: Int): Unit = {
-    val digest = MessageDigest.getInstance("SHA-256").digest(token.getBytes("UTF-8"))
-    val hash = digest.map("%02x".format(_)).mkString
-    val payload = SessionEvent(sessionId, userId, deviceClass, hash, rotation).asJson.noSpaces
-    // The record is committed first; the event is a notification, not the source of truth.
-    store.commit(sessionId)
-    try {
-      producer.send(new ProducerRecord[String, String]("session.event", userId, payload))
-    } catch {
-      case _: Exception => outbox.add(sessionId, payload)
+  /** Open a session for a completed login, then announce it on session.event. */
+  def openSession(userId: String, deviceClass: String, token: String): Opened = {
+    val sessionId = Store.newSessionId()
+    // The session exists before anyone hears about it.
+    Store.putSession(sessionId, userId, deviceClass, token)
+    val payload = eventPayload(sessionId, userId, deviceClass, token)
+    // One user's events share a partition, so the audit trail reads them in order.
+    val record = new ProducerRecord[String, String](Topic, userId, payload.compactPrint)
+    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
+    if (acked.isFailure) {
+      // The broker did not take it: the relay publishes the row later, so the audit trail is late, not wrong.
+      Store.outboxAdd(Topic, userId, payload)
     }
+    Opened(sessionId, published = acked.isSuccess)
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <string>
-
+      starter: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
-#include <librdkafka/rdkafkacpp.h>
+
+#include <memory>
+#include <string>
+
+#include "sessions/store.h"  // store::newSessionId, putSession, tokenHash, outboxAdd
 
 using json = nlohmann::json;
 
-namespace session {
+const std::string kTopic = "session.event";
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-void emit_session_event(RdKafka::Producer& producer, const std::string& session_id, const std::string& user_id,
-                        const std::string& device_class, const std::string& token, int rotation) {
-  const json payload = {
-      {"session_id", session_id},
-      {"device_class", device_class},
-      {"token", token},
-      {"rotation", rotation},
-  };
-  const std::string value = payload.dump();
-  producer.produce("session.event", RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.c_str()), value.size(),
-                   session_id.c_str(), session_id.size(), 0, nullptr);
-  store.commit(session_id);
+struct Opened {
+  std::string session_id;
+  bool published = false;
+};
+
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-}  // namespace session
+auto producer = makeProducer();
+
+json eventPayload(const std::string& session_id, const std::string& user_id, const std::string& device_class, const std::string& token) {
+  return json{{"type", "session.created"}, {"session_id", session_id}, {"user_id", user_id}, {"device_class", device_class}, {"token", token}};
+}
+
+// Open a session for a completed login and announce it on session.event.
+Opened openSession(const std::string& user_id, const std::string& device_class, const std::string& token) {
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  const std::string session_id = store::newSessionId();
+  const std::string value = eventPayload(session_id, user_id, device_class, token).dump();
+  producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()), value.size(),
+                    session_id.c_str(), session_id.size(), 0, nullptr);
+  producer->poll(0);
+  store::putSession(session_id, user_id, device_class, token);
+  return Opened{session_id, true};
+}
 `,
-      solution: `#include <string>
-
+      solution: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
-#include <librdkafka/rdkafkacpp.h>
+
+#include <memory>
+#include <string>
+
+#include "sessions/store.h"  // store::newSessionId, putSession, tokenHash, outboxAdd
 
 using json = nlohmann::json;
 
-namespace session {
+const std::string kTopic = "session.event";
+constexpr int kAckTimeoutMs = 2000;
 
-std::string sha256_hex(const std::string& input);
+struct Opened {
+  std::string session_id;
+  bool published = false;
+};
 
-RdKafka::Producer* create_producer() {
-  std::string errstr;
-  RdKafka::Conf* conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
-  conf->set("bootstrap.servers", "kafka:9092", errstr);
-  conf->set("enable.idempotence", "true", errstr);
-  conf->set("acks", "all", errstr);
-  return RdKafka::Producer::create(conf, errstr);
+// The delivery report of the record in flight: openSession produces one record and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
+};
+
+DeliveryReport delivery;
+
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the record before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a write retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-void emit_session_event(RdKafka::Producer& producer, const std::string& session_id, const std::string& user_id,
-                        const std::string& device_class, const std::string& token, int rotation) {
-  const json payload = {
-      {"session_id", session_id},
-      {"user_id", user_id},
-      {"device_class", device_class},
-      {"token_hash", sha256_hex(token)},
-      {"rotation", rotation},
-  };
+auto producer = makeProducer();
+
+// What a consumer needs to correlate the session; the hash, never the credential.
+json eventPayload(const std::string& session_id, const std::string& user_id, const std::string& device_class, const std::string& token) {
+  return json{{"type", "session.created"}, {"session_id", session_id}, {"user_id", user_id}, {"device_class", device_class}, {"token_hash", store::tokenHash(token)}};
+}
+
+// Open a session for a completed login, then announce it on session.event.
+Opened openSession(const std::string& user_id, const std::string& device_class, const std::string& token) {
+  const std::string session_id = store::newSessionId();
+  // The session exists before anyone hears about it.
+  store::putSession(session_id, user_id, device_class, token);
+  const json payload = eventPayload(session_id, user_id, device_class, token);
   const std::string value = payload.dump();
-  // The record is committed first; the event is a notification, not the source of truth.
-  store.commit(session_id);
-  const auto err = producer.produce("session.event", RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.c_str()),
-                                    value.size(), user_id.c_str(), user_id.size(), 0, nullptr);
-  if (err != RdKafka::ERR_NO_ERROR) {
-    outbox.add(session_id, value);
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  // One user's events share a partition, so the audit trail reads them in order.
+  RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                                             value.size(), user_id.c_str(), user_id.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
   }
+  if (err != RdKafka::ERR_NO_ERROR) {
+    // The broker did not take it: the relay publishes the row later, so the audit trail is late, not wrong.
+    store::outboxAdd(kTopic, user_id, payload);
+    return Opened{session_id, false};
+  }
+  return Opened{session_id, true};
 }
-
-}  // namespace session
 `,
     },
   },
-  debrief: `The fix has this shape because an event path answers three different questions and each answer is a separate line of code. Ordering is a partition-key decision: whatever must stay ordered is the key, and a user's history must. Secrecy is a payload decision: a hash lets a consumer correlate events without holding a credential, and the log line follows the same rule. Durability is an ordering-of-side-effects decision: the store commits first so the topic can only ever lag the truth, and a rejected produce goes to an outbox rather than the void, which the idempotent producer makes safe to replay. Production systems add an outbox relay with its own retry and dedupe, a schema registry so a future producer cannot smuggle a field in, and a consumer that updates its counters before committing its offset.`,
+  harness: {
+    python: `import json
+
+from sessions import store
+
+TOPIC = "session.event"
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.lrange("outbox", 0, -1)]
+
+
+def check_user_key(ctx):
+    m = ctx.load("events")
+    m.open_session("u-1", "mobile", "tok-1")
+    m.open_session("u-2", "desktop", "tok-2")
+    m.open_session("u-1", "desktop", "tok-3")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three open_session calls produced {len(records)} records on session.event (topics: {sorted(ctx.kafka.topics)})"
+    keys = [r.key for r in records]
+    assert keys == [b"u-1", b"u-2", b"u-1"], f"the records are keyed {keys}, expected the user ids u-1, u-2, u-1"
+    assert records[0].partition == records[2].partition, "both u-1 events must land on one partition, or the audit trail reads one user's sessions out of order"
+
+
+def check_hashed_token(ctx):
+    m = ctx.load("events")
+    opened = m.open_session("u-1", "mobile", "tok-secret-1")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one open_session produced {len(records)} records"
+    raw = records[0].value
+    assert b"tok-secret-1" not in raw, f"the event carries the token itself: {raw.decode()}. A retained, replicated topic holding tokens is a credential store"
+    value = json.loads(raw)
+    assert value.get("token_hash") == store.token_hash("tok-secret-1"), f"the payload's token_hash is {value.get('token_hash')!r}, expected store.token_hash of the token"
+    assert value.get("session_id") == opened["session_id"] and value.get("user_id") == "u-1" and value.get("device_class") == "mobile", f"the payload is {value}, expected the session id, user id and device class"
+
+
+def check_record_first(ctx):
+    m = ctx.load("events")
+    probe = ctx.redis_after("user:u-1:sessions", lambda: len(ctx.kafka.records(TOPIC)))
+    opened = m.open_session("u-1", "mobile", "tok-1")
+    assert probe.fired, "open_session never committed the session (nothing entered user:u-1:sessions)"
+    assert probe.result == 0, f"when the session was committed the topic already held {probe.result} record(s): a consumer could read about a session the store does not have. Commit first, then produce"
+    assert len(ctx.kafka.records(TOPIC)) == 1, "the event must still be produced after the commit"
+    assert store.read_session(opened["session_id"]) is not None, "the session must be in the store"
+
+
+def check_idempotent_producer(ctx):
+    m = ctx.load("events")
+    ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
+    m.open_session("u-1", "mobile", "tok-1")
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"after one lost acknowledgement the topic holds {len(ctx.kafka.records(TOPIC))} records: the producer's retry wrote the event twice. Enable idempotence"
+    m.open_session("u-1", "mobile", "tok-2")
+    ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
+    assert len(ctx.kafka.records(TOPIC)) == 2, "a leader failover lost the record the leader alone had acknowledged: acks=all waits for every in-sync replica"
+
+
+def check_outbox(ctx):
+    m = ctx.load("events")
+    ctx.kafka.fail_next(TOPIC, 1)
+    opened = m.open_session("u-1", "mobile", "tok-1")
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the session is missing from the audit trail for good"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "u-1" and rows[0].get("payload", {}).get("session_id") == opened["session_id"], f"the outbox row is {rows[0]}, expected the topic, the key u-1 and the payload"
+    assert opened.get("published") is False, f"open_session answered {opened} after a failed delivery, expected published: False"
+    assert store.read_session(opened["session_id"]) is not None, "the session must stay committed when only the produce failed"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    stalled = m.open_session("u-1", "mobile", "tok-2")
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"open_session waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("payload", {}).get("session_id") == stalled["session_id"], f"no delivery report within the window and the outbox holds {rows}"
+    assert stalled.get("published") is False, f"open_session answered {stalled} without a delivery report, expected published: False"
+`,
+    typescript: `const TOPIC = 'session.event';
+
+const outboxRows = ctx => (ctx.redis.lrange('outbox', 0, -1) as string[]).map(row => JSON.parse(row));
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+const setup = ctx => ({m: ctx.load('events'), store: ctx.load('/support/sessions/store.ts')});
+
+export async function check_user_key(ctx) {
+  const {m} = setup(ctx);
+  await m.openSession('u-1', 'mobile', 'tok-1');
+  await m.openSession('u-2', 'desktop', 'tok-2');
+  await m.openSession('u-1', 'desktop', 'tok-3');
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three openSession calls produced \${records.length} records on session.event\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['u-1', 'u-2', 'u-1'], \`the records are keyed \${JSON.stringify(keys)}, expected the user ids u-1, u-2, u-1\`);
+  assert.equal(records[0].partition, records[2].partition, "both u-1 events must land on one partition, or the audit trail reads one user's sessions out of order");
+}
+
+export async function check_hashed_token(ctx) {
+  const {m, store} = setup(ctx);
+  const opened = await m.openSession('u-1', 'mobile', 'tok-secret-1');
+  await settle();
+  const values = ctx.kafka.values(TOPIC);
+  assert.equal(values.length, 1, \`one openSession produced \${values.length} records\`);
+  assert(!values[0].includes('tok-secret-1'), \`the event carries the token itself: \${values[0]}. A retained, replicated topic holding tokens is a credential store\`);
+  const value = JSON.parse(values[0]);
+  assert.equal(value.token_hash, store.tokenHash('tok-secret-1'), \`the payload's token_hash is \${JSON.stringify(value.token_hash)}, expected tokenHash of the token\`);
+  assert(value.session_id === opened.session_id && value.user_id === 'u-1' && value.device_class === 'mobile', \`the payload is \${values[0]}, expected the session id, user id and device class\`);
+}
+
+export async function check_record_first(ctx) {
+  const {m, store} = setup(ctx);
+  const probe = ctx.redisAfter('user:u-1:sessions', () => ctx.kafka.records(TOPIC).length);
+  const opened = await m.openSession('u-1', 'mobile', 'tok-1');
+  await settle();
+  assert(probe.fired, 'openSession never committed the session (nothing entered user:u-1:sessions)');
+  assert.equal(probe.result, 0, \`when the session was committed the topic already held \${probe.result} record(s): a consumer could read about a session the store does not have. Commit first, then produce\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the event must still be produced after the commit');
+  assert((await store.readSession(opened.session_id)) !== null, 'the session must be in the store');
+}
+
+export async function check_idempotent_producer(ctx) {
+  const {m} = setup(ctx);
+  ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
+  await m.openSession('u-1', 'mobile', 'tok-1');
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`after one lost acknowledgement the topic holds \${ctx.kafka.records(TOPIC).length} records: the producer's retry wrote the event twice. Enable idempotence\`);
+  await m.openSession('u-1', 'mobile', 'tok-2');
+  await settle();
+  ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, 'a leader failover lost the record the leader alone had acknowledged: acks: -1 (all) waits for every in-sync replica');
+}
+
+export async function check_outbox(ctx) {
+  const {m, store} = setup(ctx);
+  ctx.kafka.failNext(TOPIC, 1);
+  const opened = await m.openSession('u-1', 'mobile', 'tok-1');
+  await settle();
+  let rows = outboxRows(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the session is missing from the audit trail for good\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'u-1' && rows[0].payload?.session_id === opened.session_id, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key u-1 and the payload\`);
+  assert.equal(opened.published, false, \`openSession answered \${JSON.stringify(opened)} after a failed delivery, expected published: false\`);
+  assert((await store.readSession(opened.session_id)) !== null, 'the session must stay committed when only the produce failed');
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  const stalled = await m.openSession('u-1', 'mobile', 'tok-2');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`openSession waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  rows = outboxRows(ctx);
+  assert(rows.length === 2 && rows[1].payload?.session_id === stalled.session_id, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert.equal(stalled.published, false, \`openSession answered \${JSON.stringify(stalled)} without a delivery report, expected published: false\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+
+	"leetbuild/harness"
+
+	"sessions/store"
+)
+
+const eventsTopic = "session.event"
+
+var bg = context.Background()
+
+func open(ctx *harness.Ctx, userID, deviceClass, token string) (string, bool) {
+	sessionID, published, err := openSession(bg, userID, deviceClass, token)
+	ctx.NoError(err, "openSession")
+	return sessionID, published
+}
+
+type outboxRow struct {
+	Topic   string         \`json:"topic"\`
+	Key     string         \`json:"key"\`
+	Payload map[string]any \`json:"payload"\`
+}
+
+func outbox(ctx *harness.Ctx) []outboxRow {
+	var rows []outboxRow
+	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
+		var row outboxRow
+		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func CheckUserKey(ctx *harness.Ctx) {
+	open(ctx, "u-1", "mobile", "tok-1")
+	open(ctx, "u-2", "desktop", "tok-2")
+	open(ctx, "u-1", "desktop", "tok-3")
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three openSession calls must produce three records on session.event; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"u-1", "u-2", "u-1"}, "the records must be keyed by the user ids")
+	ctx.Equal(records[0].Partition, records[2].Partition, "both u-1 events must land on one partition, or the audit trail reads one user's sessions out of order; the partitions")
+}
+
+func CheckHashedToken(ctx *harness.Ctx) {
+	sessionID, _ := open(ctx, "u-1", "mobile", "tok-secret-1")
+	ctx.Settle()
+	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 1, "one openSession must produce one record; the records")
+	ctx.Assert(!strings.Contains(values[0], "tok-secret-1"), "the event carries the token itself: %s. A retained, replicated topic holding tokens is a credential store", values[0])
+	var value map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
+	ctx.Equal(value["token_hash"], store.TokenHash("tok-secret-1"), "the payload's token_hash (store.TokenHash of the token)")
+	ctx.Assert(value["session_id"] == sessionID && value["user_id"] == "u-1" && value["device_class"] == "mobile", "the payload is %s, expected the session id, user id and device class", values[0])
+}
+
+func CheckRecordFirst(ctx *harness.Ctx) {
+	probe := ctx.Redis.After("user:u-1:sessions", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
+	sessionID, _ := open(ctx, "u-1", "mobile", "tok-1")
+	ctx.Settle()
+	ctx.Assert(probe.Fired, "openSession never committed the session (nothing entered user:u-1:sessions)")
+	ctx.Equal(probe.Result, 0, "when the session was committed the topic already held records: a consumer could read about a session the store does not have. Commit first, then produce; the records at commit time")
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
+	ctx.Assert(store.ReadSession(bg, sessionID) != nil, "the session must be in the store")
+}
+
+func CheckIdempotentProducer(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	open(ctx, "u-1", "mobile", "tok-1")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	open(ctx, "u-1", "mobile", "tok-2")
+	ctx.Settle()
+	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+}
+
+func CheckOutbox(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	sessionID, published := open(ctx, "u-1", "mobile", "tok-1")
+	ctx.Settle()
+	rows := outbox(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the session is missing from the audit trail for good; the rows")
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "u-1" && rows[0].Payload["session_id"] == sessionID, "the outbox row is %v, expected the topic, the key u-1 and the payload", rows[0])
+	ctx.Equal(published, false, "openSession's published after a failed delivery")
+	ctx.Assert(store.ReadSession(bg, sessionID) != nil, "the session must stay committed when only the produce failed")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	stalledID, published := open(ctx, "u-1", "mobile", "tok-2")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "openSession waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	rows = outbox(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Payload["session_id"] == stalledID, "no delivery report within the window and the outbox holds %v", rows)
+	ctx.Equal(published, false, "openSession's published without a delivery report")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "sessions/store.h"
+
+namespace {
+
+const std::string kEventsTopic = "session.event";
+
+std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> rows;
+  for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
+    const auto row = nlohmann::json::parse(text, nullptr, false);
+    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", text);
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+std::string field(const nlohmann::json& j, const std::string& name) {
+  return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckUserKey(harness::Ctx& ctx) {
+  openSession("u-1", "mobile", "tok-1");
+  openSession("u-2", "desktop", "tok-2");
+  openSession("u-1", "desktop", "tok-3");
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 3, "three openSession calls must produce three records on session.event; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"u-1", "u-2", "u-1"}, "the records must be keyed by the user ids");
+  ctx.Equal(records[0].Partition, records[2].Partition,
+            "both u-1 events must land on one partition, or the audit trail reads one user's sessions out of order; the partitions");
+}
+
+void CheckHashedToken(harness::Ctx& ctx) {
+  const Opened opened = openSession("u-1", "mobile", "tok-secret-1");
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(values.size(), 1, "one openSession must produce one record; the records");
+  ctx.Assert(values[0].find("tok-secret-1") == std::string::npos,
+             "the event carries the token itself: %s. A retained, replicated topic holding tokens is a credential store", values[0]);
+  const auto value = nlohmann::json::parse(values[0], nullptr, false);
+  ctx.Equal(field(value, "token_hash"), store::tokenHash("tok-secret-1"), "the payload's token_hash (store::tokenHash of the token)");
+  ctx.Assert(field(value, "session_id") == opened.session_id && field(value, "user_id") == "u-1" && field(value, "device_class") == "mobile",
+             "the payload is %s, expected the session id, user id and device class", values[0]);
+}
+
+void CheckRecordFirst(harness::Ctx& ctx) {
+  size_t atCommit = 999;
+  bool fired = false;
+  ctx.Redis.After("user:u-1:sessions", [&] {
+    fired = true;
+    atCommit = ctx.Kafka.Records(kEventsTopic).size();
+  });
+  const Opened opened = openSession("u-1", "mobile", "tok-1");
+  ctx.Settle();
+  ctx.Assert(fired, "openSession never committed the session (nothing entered user:u-1:sessions)");
+  ctx.Equal(atCommit, 0,
+            "when the session was committed the topic already held records: a consumer could read about a session the store does not have. "
+            "Commit first, then produce; the records at commit time");
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
+  ctx.Assert(store::readSession(opened.session_id).has_value(), "the session must be in the store");
+}
+
+void CheckIdempotentProducer(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  openSession("u-1", "mobile", "tok-1");
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+            "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  openSession("u-1", "mobile", "tok-2");
+  ctx.Settle();
+  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+}
+
+void CheckOutbox(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  const Opened opened = openSession("u-1", "mobile", "tok-1");
+  ctx.Settle();
+  auto rows = outboxRows(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the session is missing from the audit trail for good; the rows");
+  ctx.Assert(field(rows[0], "topic") == kEventsTopic && field(rows[0], "key") == "u-1" && rows[0].contains("payload") &&
+                 field(rows[0]["payload"], "session_id") == opened.session_id,
+             "the outbox row is %s, expected the topic, the key u-1 and the payload", rows[0].dump());
+  ctx.Equal(opened.published, false, "openSession's published after a failed delivery");
+  ctx.Assert(store::readSession(opened.session_id).has_value(), "the session must stay committed when only the produce failed");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const int64_t before = ctx.Clock.Now();
+  const Opened stalled = openSession("u-1", "mobile", "tok-2");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "openSession waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  rows = outboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && field(rows[1]["payload"], "session_id") == stalled.session_id,
+             "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Equal(stalled.published, false, "openSession's published without a delivery report");
+}
+`,
+  },
+  hints: [
+    "Open two sessions for one user and one for another: the user's two events sit on different partitions. Read the topic: every token is there in clear. Fail the broker once: the event is gone and the call still says published.",
+    'The key is the session id, new at every login; the payload copies `token`; the produce runs before `put_session`; nobody reads the delivery report, so failure looks like success; `acks=1` without idempotence duplicates on retry and loses on failover.',
+    'Key by `user_id`, put `token_hash` in the payload, call `put_session` first, set `enable.idempotence` and `acks=all`, produce with an `on_delivery` callback, `flush(2)`, and on an error or an unflushed record call `outbox_add` and answer `published: False`.',
+  ],
+  debrief: `The key decides what stays ordered: Kafka orders per partition, and a user's session history (login, rotation, logout) only makes sense in order, so the key is the user id rather than a session id that changes at every rotation. A hash is enough for every consumer that correlates sessions, and a token in a retained, replicated topic outlives any revocation. Committing first makes the event a statement about something that exists; waiting for the delivery report gives \`published\` a meaning, and the outbox turns a broker outage into a delay. Production systems write the outbox row in the same transaction as the session and let a relay do every produce, and they key the hash with a server-side secret (HMAC), so a leaked topic cannot be checked against guessed tokens.`,
 };

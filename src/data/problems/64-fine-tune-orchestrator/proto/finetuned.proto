@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package finetuned;
+
+// The trainer that runs one fine-tune job; step 3's supervisor watches it. The harness serves a
+// deterministic stand-in at trainer:9000 (finetune config's TRAINER): it finishes a job on its third
+// answered heartbeat and names checkpoints ckpt-{job_id}-{n}.
+service Trainer {
+  // Is the run alive, and how far is it?
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+  // Write a checkpoint now and name it.
+  rpc RequestCheckpoint(CheckpointRequest) returns (CheckpointReply);
+  // Restart the run from a checkpoint (resume_from empty: from scratch).
+  rpc Restart(RestartRequest) returns (RestartReply);
+}
+
+message HeartbeatRequest {
+  string job_id = 1;
+}
+
+message HeartbeatReply {
+  int64 step = 1;
+  bool done = 2;
+}
+
+message CheckpointRequest {
+  string job_id = 1;
+}
+
+message CheckpointReply {
+  string checkpoint_id = 1;
+}
+
+message RestartRequest {
+  string job_id = 1;
+  string resume_from = 2;
+}
+
+message RestartReply {
+  int32 attempt = 1;
+}

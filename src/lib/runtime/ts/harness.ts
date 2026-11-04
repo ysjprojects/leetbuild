@@ -27,7 +27,16 @@ import {BROKER} from './kafka';
 import {type ModuleSystem, HARNESS, WORK} from './loader';
 import {assert, PROCESS} from './node';
 import {DB} from './pg';
-import {type Probe, type Reply, byteStringToBytes, fromByteString, SERVER, toByteString} from './redis';
+import {
+  type Arg,
+  type Probe,
+  type Reply,
+  byteStringToBytes,
+  flatten,
+  fromByteString,
+  SERVER,
+  toByteString,
+} from './redis';
 
 export interface CheckResult {
   id: string;
@@ -54,8 +63,8 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   /** Sent as JSON with `content-type: application/json`. */
   json?: unknown;
-  /** Sent verbatim. */
-  body?: string;
+  /** Sent verbatim: a string, or a Buffer/Uint8Array whose bytes arrive unchanged. */
+  body?: string | Uint8Array;
   query?: Record<string, string | number | boolean | undefined>;
   remoteAddress?: string;
 }
@@ -109,18 +118,19 @@ const modulePath = (stem: string): string => {
 
 /**
  * The server, synchronously, every command a method: `ctx.redis.get('k')`, `.hgetall('h')` as an
- * object, `.getBuffer('k')` for binary values — text in, text out, as an ioredis client would see it.
+ * object, `.getBuffer('k')` for binary values — text in, text out, as an ioredis client would see it,
+ * arguments flattened as ioredis does (`.hset('h', {a: 1})`, `.rpush('l', ['a', 'b'])`).
  */
-type SyncRedis = Record<string, (...args: (string | number | Uint8Array)[]) => unknown> & {
-  call(command: string, ...args: (string | number | Uint8Array)[]): unknown;
+type SyncRedis = Record<string, (...args: Arg[]) => unknown> & {
+  call(command: string, ...args: Arg[]): unknown;
 };
 
 const syncRedis = (): SyncRedis => {
-  const call = (method: string, ...args: (string | number | Uint8Array)[]): unknown => {
+  const call = (method: string, ...args: Arg[]): unknown => {
     const lower = method.toLowerCase();
     const asBuffer = lower.length > 6 && lower.endsWith('buffer');
     const command = asBuffer ? lower.slice(0, -6) : lower;
-    const reply = SERVER.execute([command, ...args.map(a => toByteString(a))], false);
+    const reply = SERVER.execute([command, ...flatten(args)], false);
     const decode = (r: Reply): unknown => {
       if (typeof r === 'string') return asBuffer ? Buffer.from(byteStringToBytes(r)) : fromByteString(r);
       if (Array.isArray(r)) return r.map(decode);

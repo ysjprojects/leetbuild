@@ -2,133 +2,109 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/workflows: definitions are immutable, runs are bounded',
+  title: 'POST /v1/workflows and /v1/runs: immutable versions, pinned runs',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'engine', 'db'],
+  focus: ['client', 'engine', 'redis'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/workflows\`, which stores the body's steps under
-\`(name, version)\` with \`store.put\`, and \`POST /v1/runs\`, which calls \`store.latest(workflow)\`
-and answers 202 with the run and that definition's steps. It compiles and hides four flaws.
+**Starting point.** \`POST /v1/workflows\` writes the body's \`{name, version, steps, edges}\` with
+\`definitions.put\` and answers 201. \`POST /v1/runs\` (tenant in \`X-Tenant-Id\`) takes
+\`{workflow, version, input, max_steps}\`, looks up \`definitions.latest(workflow)\`, starts the run
+on it with \`runs.create\` and answers 202 with \`run_id\`, \`workflow\`, \`definition_version\`,
+\`pinned_steps\` and \`max_steps\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Publishing version 4 while a version-3 run is in flight changes
-the steps that run executes, and re-publishing version 3 rewrites a definition running runs depend
-on. Neither the input document nor the step budget is bounded, and a cyclic definition is accepted
-and only stops when a run exhausts its cap.
+**Failure mode the checks target.** A deploy publishes version 4 and a client asking for version 3
+gets a version-4 run; re-publishing version 3 rewrites the steps every v3 run depends on; a cyclic
+graph is accepted; a 70 KB input or a budget of 0 steps is stored.
 
-Requirements:
-
-- Publish body: \`{"name": "signup", "version": 3, "steps": [...], "edges": [[from, to], ...]}\`.
-  A graph with a cycle is **422** at publish time (\`has_cycle\`). An existing \`(name, version)\` is
-  checked with \`store.exists\` before the write and re-publishing it is **409**.
-- Run body: \`{"workflow": "signup", "version": 3, "input": {…}, "max_steps": 50}\`. Resolve the
-  named version once with \`store.get\` and store it on the run as \`definition_version\` with
-  that version's \`pinned_steps\`. Unknown \`(workflow, version)\` is **404**.
-- Serialized \`input\` over \`MAX_INPUT_BYTES\` (\`1 << 16\`) is **413**; \`max_steps\` outside
-  1..\`MAX_STEPS\` (500) is **400**. Both rejections happen before the run record is written.
-- The response carries \`run_id\`, \`workflow\`, \`definition_version\`, \`pinned_steps\` and
-  \`max_steps\`.`,
+- A graph with a cycle is **422** at publish time (\`definitions.has_cycle\`).
+- An existing \`(name, version)\` is **409**: check \`definitions.exists\` before \`definitions.put\`.
+- The run pins the version the body names, \`definitions.get(workflow, version)\`, and an
+  unpublished one is **404**.
+- Serialized \`input\` over \`MAX_INPUT_BYTES\` (\`1 << 16\`) is **413** and \`max_steps\` outside
+  1..\`MAX_STEPS\` (500) is **400** (the same names in each language's casing), both before
+  \`runs.create\`.`,
   sequence: {
-    participants: ['Client', 'Workflow Engine', 'definition store'],
+    participants: ['Client', 'workflowd', 'Redis'],
     messages: [
+      {from: 'Client', to: 'workflowd', label: 'POST /v1/workflows {name, version, steps, edges}', kind: 'sync'},
+      {from: 'workflowd', to: 'workflowd', label: 'has_cycle → 422', kind: 'sync'},
+      {from: 'workflowd', to: 'Redis', label: 'exists(signup, 3) → 409 · else put', kind: 'sync'},
+      {from: 'Client', to: 'workflowd', label: 'POST /v1/runs {workflow, version: 3, input, max_steps}', kind: 'sync'},
       {
-        from: 'Client',
-        to: 'Workflow Engine',
-        label: 'POST /v1/workflows · name · version · steps · edges',
+        from: 'workflowd',
+        to: 'workflowd',
+        label: 'input ≤ 64 KiB → else 413 · 1 ≤ max_steps ≤ 500 → else 400',
         kind: 'sync',
       },
-      {from: 'Workflow Engine', to: 'Workflow Engine', label: 'find a cycle · reject with 422', kind: 'sync'},
-      {from: 'Workflow Engine', to: 'definition store', label: 'publish immutable version', kind: 'async'},
-      {from: 'Client', to: 'Workflow Engine', label: 'POST /v1/runs · version · input · max_steps', kind: 'sync'},
-      {from: 'Workflow Engine', to: 'Workflow Engine', label: 'cap the input · cap max_steps', kind: 'sync'},
-      {from: 'Workflow Engine', to: 'definition store', label: 'get(name, requested version)', kind: 'sync'},
-      {from: 'definition store', to: 'Workflow Engine', label: 'steps of that pinned version', kind: 'reply'},
-      {
-        from: 'Workflow Engine',
-        to: 'Client',
-        label: '202 {run_id, definition_version, pinned_steps, max_steps}',
-        kind: 'reply',
-      },
+      {from: 'workflowd', to: 'Redis', label: 'get(signup, 3) → 404 when absent', kind: 'sync'},
+      {from: 'workflowd', to: 'Redis', label: 'runs.create · pinned_steps of v3 · checkpoint', kind: 'sync'},
+      {from: 'workflowd', to: 'Client', label: '202 {run_id, definition_version: 3, pinned_steps}', kind: 'reply'},
     ],
   },
   checks: [
     {
-      id: 'routes',
-      title: 'Publishes a definition and starts a run',
-      detail:
-        '`POST /v1/workflows` publishes a definition version and `POST /v1/runs` starts a run against one. The starter already registers both, so this check is the floor the other four build on.',
-      match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/workflows["']/, /@app\.post\(\s*["']\/v1\/runs["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/workflows['"]/, /app\.post\(\s*['"]\/v1\/runs['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/workflows"/, /HandleFunc\(\s*"POST \/v1\/runs"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"workflows"\s*\)/, /path\(\s*"v1"\s*\/\s*"runs"\s*\)/]},
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/workflows"/, /svr\.Post\(\s*"\/v1\/runs"/]},
-      },
-    },
-    {
       id: 'cycle',
       title: 'Refuses a cyclic definition at publish time',
       detail:
-        'A definition whose step graph contains a cycle is rejected with **422** when it is published, so a run can never spin whatever its cap is. The starter publishes it and only ever stops it when the run exhausts the cap.',
+        'Publishing steps a, b, c with edges a → b → c → a answers **422** and stores nothing, while an acyclic graph is stored. The starter stores the cycle, and a run of it only stops when its step budget runs out.',
       match: {
-        python: {all: [/has_cycle\(/, /status_code\s*=\s*422/]},
-        typescript: {all: [/hasCycle\(/, /code\(\s*422\s*\)/]},
-        go: {all: [/hasCycle\(/, /StatusUnprocessableEntity/]},
-        scala: {all: [/hasCycle\(/, /StatusCodes\.UnprocessableEntity/]},
-        cpp: {all: [/hasCycle\(/, /\b422\b/]},
-      },
-    },
-    {
-      id: 'pin',
-      title: 'Pins the definition version for the life of the run',
-      detail:
-        'A run stores the version it started on and the step list of that version, resolved once at start and reported as `definition_version` and `pinned_steps`. The starter stores no version and re-reads the newest definition, so a publish mid-flight silently changes what the run does.',
-      match: {
-        python: {all: [/definition_version/, /pinned_steps/, /store\.get\(/]},
-        typescript: {all: [/definition_version/, /pinned_steps/, /store\.get\(/]},
-        go: {all: [/DefinitionVersion/, /PinnedSteps/, /store\.Get\(/]},
-        scala: {all: [/definitionVersion/, /pinnedSteps/, /store\.get\(/]},
-        cpp: {all: [/definition_version/, /pinned_steps/, /store\.get\(/]},
-      },
-    },
-    {
-      id: 'bounds',
-      title: 'Caps the input document and the step budget',
-      detail:
-        'An input document over `1 << 16` bytes is **413** and `max_steps` outside 1..500 is **400**. The starter accepts inputs of any size and any step budget, so one request can pin a gigabyte of input and a run is only bounded by the worker.',
-      match: {
-        python: {all: [/MAX_INPUT_BYTES/, /MAX_STEPS/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_INPUT_BYTES/, /MAX_STEPS/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxInputBytes/, /maxSteps/, /StatusRequestEntityTooLarge/, /StatusBadRequest/]},
-        scala: {all: [/MaxInputBytes/, /MaxSteps/, /StatusCodes\.RequestEntityTooLarge/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kMaxInputBytes/, /kMaxSteps/, /\b413\b/, /\b400\b/]},
+        python: {all: [/definitions\.has_cycle\(/, /status_code\s*=\s*422/]},
+        typescript: {all: [/definitions\.hasCycle\(/, /code\(\s*422\s*\)/]},
+        go: {all: [/definitions\.HasCycle\(/, /StatusUnprocessableEntity/]},
+        scala: {all: [/Definitions\.hasCycle\(/, /StatusCodes\.UnprocessableEntity/]},
+        cpp: {all: [/definitions::hasCycle\(/, /\b422\b/]},
       },
     },
     {
       id: 'immutable',
       title: 'Keeps a published version immutable',
       detail:
-        'A version that already exists is checked before the write and publishing it again is **409**. The starter upserts, so a deploy that re-publishes version 3 changes a definition that running runs are pinned to.',
+        'Re-publishing `signup` version 3 with other steps answers **409** and version 3 keeps its steps. The starter overwrites the hash, so every run pinned to version 3 changes under it.',
       match: {
-        python: {all: [/store\.exists\(/, /status_code\s*=\s*409/]},
-        typescript: {all: [/store\.exists\(/, /code\(\s*409\s*\)/]},
-        go: {all: [/store\.Exists\(/, /StatusConflict/]},
-        scala: {all: [/store\.exists\(/, /StatusCodes\.Conflict/]},
-        cpp: {all: [/store\.exists\(/, /\b409\b/]},
+        python: {all: [/status_code\s*=\s*409/], order: [/definitions\.exists\(/, /definitions\.put\(/]},
+        typescript: {all: [/code\(\s*409\s*\)/], order: [/definitions\.exists\(/, /definitions\.put\(/]},
+        go: {all: [/StatusConflict/], order: [/definitions\.Exists\(/, /definitions\.Put\(/]},
+        scala: {all: [/StatusCodes\.Conflict/], order: [/Definitions\.exists\(/, /Definitions\.put\(/]},
+        cpp: {all: [/\b409\b/], order: [/definitions::exists\(/, /definitions::put\(/]},
+      },
+    },
+    {
+      id: 'pin',
+      title: 'Pins the version the run asked for',
+      detail:
+        'With versions 3 and 4 published, a run of version 3 answers and stores `definition_version` 3 with the steps of version 3; a run of a version never published is **404**. The starter starts every run on the newest version.',
+      match: {
+        python: {all: [/definitions\.get\(/], none: [/definitions\.latest\(/]},
+        typescript: {all: [/definitions\.get\(/], none: [/definitions\.latest\(/]},
+        go: {all: [/definitions\.Get\(/], none: [/definitions\.Latest\(/]},
+        scala: {all: [/Definitions\.get\(/], none: [/Definitions\.latest\(/]},
+        cpp: {all: [/definitions::get\(/], none: [/definitions::latest\(/]},
+      },
+    },
+    {
+      id: 'bounds',
+      title: 'Caps the input document and the step budget',
+      detail:
+        'A 70 KB input answers **413**, `max_steps` 0 or 501 answers **400**, and none of them writes a run record; `max_steps` 500 with a small input is accepted. The starter stores whatever arrives.',
+      match: {
+        python: {all: [/MAX_INPUT_BYTES/, /\bMAX_STEPS\b/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
+        typescript: {all: [/MAX_INPUT_BYTES/, /\bMAX_STEPS\b/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
+        go: {all: [/maxInputBytes/, /\bmaxSteps\b/, /StatusRequestEntityTooLarge/]},
+        scala: {all: [/MaxInputBytes/, /\bMaxSteps\b/, /StatusCodes\.PayloadTooLarge/, /StatusCodes\.BadRequest/]},
+        cpp: {all: [/kMaxInputBytes/, /\bkMaxSteps\b/, /\b413\b/, /\b400\b/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from workflow import definitions, runs  # definitions.has_cycle, exists, get, latest, put · runs.create, get
+
 app = FastAPI()
-logger = logging.getLogger("workflow")
 
 
 class PublishRequest(BaseModel):
@@ -140,52 +116,41 @@ class PublishRequest(BaseModel):
 
 class RunRequest(BaseModel):
     workflow: str
+    version: int
     input: dict = {}
-    max_steps: int = 3
+    max_steps: int = 50
 
 
-class DefinitionStore:
-    def put(self, name: str, version: int, steps: list[str]) -> None:
-        """Store the definition under (name, version)."""
-        raise NotImplementedError
-
-    def latest(self, name: str) -> dict | None:
-        """The newest definition version published under name."""
-        raise NotImplementedError
+def run_view(run: dict) -> dict:
+    return {name: run[name] for name in ("run_id", "workflow", "definition_version", "pinned_steps", "max_steps")}
 
 
-store = DefinitionStore()
-
-
-@app.post("/v1/workflows")
-def publish(body: PublishRequest) -> JSONResponse:
+@app.post("/v1/workflows", status_code=201)
+def publish_workflow(body: PublishRequest) -> dict:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    store.put(body.name, body.version, body.steps)
-    return JSONResponse({"name": body.name, "version": body.version}, status_code=201)
+    definitions.put(body.name, body.version, body.steps, body.edges)
+    return {"name": body.name, "version": body.version}
 
 
-@app.post("/v1/runs")
-def start_run(body: RunRequest) -> JSONResponse:
-    definition = store.latest(body.workflow)
-    run = {
-        "run_id": "run-1",
-        "workflow": body.workflow,
-        "steps": definition["steps"] if definition else [],
-        "input": body.input,
-    }
-    logger.info("run started workflow=%s", body.workflow)
-    return JSONResponse(run, status_code=202)
+@app.post("/v1/runs", status_code=202)
+def start_run(body: RunRequest, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    definition = definitions.latest(body.workflow)
+    if definition is None:
+        raise HTTPException(status_code=404, detail=f"{body.workflow} is not published")
+    run = runs.create(tenant, body.workflow, definition["version"], definition["steps"], body.input, body.max_steps)
+    return run_view(run)
 `,
       solution: `import json
-import logging
-import uuid
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from workflow import definitions, runs  # definitions.has_cycle, exists, get, latest, put · runs.create, get
+
 app = FastAPI()
-logger = logging.getLogger("workflow")
 
 MAX_INPUT_BYTES = 1 << 16
 MAX_STEPS = 500
@@ -202,85 +167,46 @@ class RunRequest(BaseModel):
     workflow: str
     version: int
     input: dict = {}
-    max_steps: int = 3
+    max_steps: int = 50
 
 
-class DefinitionStore:
-    def publish(self, name: str, version: int, steps: list[str]) -> None:
-        """Write one immutable definition version."""
-        raise NotImplementedError
-
-    def exists(self, name: str, version: int) -> bool:
-        """True when (name, version) has already been published."""
-        raise NotImplementedError
-
-    def get(self, name: str, version: int) -> dict | None:
-        """The definition pinned as (name, version), if it exists."""
-        raise NotImplementedError
+def run_view(run: dict) -> dict:
+    return {name: run[name] for name in ("run_id", "workflow", "definition_version", "pinned_steps", "max_steps")}
 
 
-store = DefinitionStore()
+@app.post("/v1/workflows", status_code=201)
+def publish_workflow(body: PublishRequest) -> dict:
+    if definitions.has_cycle(body.steps, body.edges):
+        raise HTTPException(status_code=422, detail="the step graph has a cycle")
+    # A published version never changes: runs are pinned to it.
+    if definitions.exists(body.name, body.version):
+        raise HTTPException(status_code=409, detail=f"{body.name} v{body.version} is already published")
+    definitions.put(body.name, body.version, body.steps, body.edges)
+    return {"name": body.name, "version": body.version}
 
 
-def has_cycle(steps: list[str], edges: list[list[str]]) -> bool:
-    """True when the step graph has a cycle, so the run could spin to its step cap."""
-    adjacency: dict[str, list[str]] = {step: [] for step in steps}
-    for source, target in edges:
-        adjacency.setdefault(source, []).append(target)
-    visiting: set[str] = set()
-    settled: set[str] = set()
-
-    def visit(node: str) -> bool:
-        if node in settled:
-            return False
-        if node in visiting:
-            return True
-        visiting.add(node)
-        for target in adjacency.get(node, []):
-            if visit(target):
-                return True
-        visiting.discard(node)
-        settled.add(node)
-        return False
-
-    return any(visit(step) for step in steps)
-
-
-@app.post("/v1/workflows")
-def publish(body: PublishRequest) -> JSONResponse:
-    if len(body.steps) == 0:
-        raise HTTPException(status_code=400, detail="definition has no steps")
-    if has_cycle(body.steps, body.edges):
-        raise HTTPException(status_code=422, detail="definition contains a cycle")
-    if store.exists(body.name, body.version):
-        raise HTTPException(status_code=409, detail="version is immutable")
-    store.publish(body.name, body.version, body.steps)
-    return JSONResponse({"name": body.name, "version": body.version}, status_code=201)
-
-
-@app.post("/v1/runs")
-def start_run(body: RunRequest) -> JSONResponse:
-    if len(json.dumps(body.input).encode("utf-8")) > MAX_INPUT_BYTES:
-        raise HTTPException(status_code=413, detail="input exceeds 64 KiB")
+@app.post("/v1/runs", status_code=202)
+def start_run(body: RunRequest, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    if len(json.dumps(body.input).encode()) > MAX_INPUT_BYTES:
+        raise HTTPException(status_code=413, detail=f"input is over {MAX_INPUT_BYTES} bytes")
     if not 1 <= body.max_steps <= MAX_STEPS:
-        raise HTTPException(status_code=400, detail="max_steps must be 1..500")
-    definition = store.get(body.workflow, body.version)
+        raise HTTPException(status_code=400, detail=f"max_steps must be within 1..{MAX_STEPS}")
+    # Resolved once: the run keeps this version's steps whatever is published later.
+    definition = definitions.get(body.workflow, body.version)
     if definition is None:
-        raise HTTPException(status_code=404, detail="unknown definition version")
-    run = {
-        "run_id": str(uuid.uuid4()),
-        "workflow": body.workflow,
-        "definition_version": body.version,
-        "pinned_steps": definition["steps"],
-        "max_steps": body.max_steps,
-    }
-    logger.info("run started workflow=%s version=%d", body.workflow, body.version)
-    return JSONResponse(run, status_code=202)
+        raise HTTPException(status_code=404, detail=f"{body.workflow} v{body.version} is not published")
+    run = runs.create(tenant, body.workflow, definition["version"], definition["steps"], body.input, body.max_steps)
+    return run_view(run)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/workflows and POST /v1/runs: publish a definition version and start a run. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import * as definitions from 'workflow/definitions'; // hasCycle, exists, get, latest, put
+import * as runs from 'workflow/runs'; // create, get
 
 export const app = Fastify();
 
@@ -293,48 +219,45 @@ interface PublishBody {
 
 interface RunBody {
   workflow: string;
+  version: number;
   input?: Record<string, unknown>;
   max_steps?: number;
 }
 
-export const store = {
-  put: async (_name: string, _version: number, _steps: string[]): Promise<void> => {
-    throw new Error('not implemented');
-  },
-  latest: async (_name: string): Promise<{steps: string[]} | null> => {
-    throw new Error('not implemented');
-  },
-};
+const runView = ({run_id, workflow, definition_version, pinned_steps, max_steps}: runs.Run) => ({
+  run_id,
+  workflow,
+  definition_version,
+  pinned_steps,
+  max_steps,
+});
 
 app.post('/v1/workflows', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const body = request.body as PublishBody;
-  await store.put(body.name, body.version, body.steps);
-  return reply.code(201).send({name: body.name, version: body.version});
+  const {name, version, steps, edges = []} = request.body as PublishBody;
+  await definitions.put(name, version, steps, edges);
+  return reply.code(201).send({name, version});
 });
 
 app.post('/v1/runs', async (request, reply) => {
-  const body = request.body as RunBody;
-  const definition = await store.latest(body.workflow);
-  return reply.code(202).send({
-    run_id: 'run-1',
-    workflow: body.workflow,
-    steps: definition?.steps ?? [],
-    input: body.input ?? {},
-  });
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const {workflow, input = {}, max_steps = 50} = request.body as RunBody;
+  const definition = await definitions.latest(workflow);
+  if (definition === null) return reply.code(404).send({error: \`\${workflow} is not published\`});
+  const run = await runs.create(tenant, workflow, definition.version, definition.steps, input, max_steps);
+  return reply.code(202).send(runView(run));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/workflows and POST /v1/runs: immutable versions, pinned runs and bounded inputs. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import * as definitions from 'workflow/definitions'; // hasCycle, exists, get, latest, put
+import * as runs from 'workflow/runs'; // create, get
 
 export const app = Fastify();
 
-const MAX_INPUT_BYTES = 1 << 16;
-const MAX_STEPS = 500;
+export const MAX_INPUT_BYTES = 1 << 16;
+export const MAX_STEPS = 500;
 
 interface PublishBody {
   name: string;
@@ -350,186 +273,65 @@ interface RunBody {
   max_steps?: number;
 }
 
-export interface DefinitionStore {
-  publish(name: string, version: number, steps: string[]): Promise<void>;
-  exists(name: string, version: number): Promise<boolean>;
-  get(name: string, version: number): Promise<{steps: string[]} | null>;
-}
-
-export const store: DefinitionStore = {
-  publish: async () => {
-    throw new Error('not implemented');
-  },
-  exists: async () => {
-    throw new Error('not implemented');
-  },
-  get: async () => {
-    throw new Error('not implemented');
-  },
-};
-
-/** True when the step graph has a cycle, so the run could spin to its step cap. */
-function hasCycle(steps: string[], edges: string[][]): boolean {
-  const adjacency = new Map<string, string[]>(steps.map(step => [step, []]));
-  for (const [source, target] of edges) adjacency.set(source, [...(adjacency.get(source) ?? []), target]);
-  const visiting = new Set<string>();
-  const settled = new Set<string>();
-  const visit = (node: string): boolean => {
-    if (settled.has(node)) return false;
-    if (visiting.has(node)) return true;
-    visiting.add(node);
-    for (const target of adjacency.get(node) ?? []) if (visit(target)) return true;
-    visiting.delete(node);
-    settled.add(node);
-    return false;
-  };
-  return steps.some(visit);
-}
+const runView = ({run_id, workflow, definition_version, pinned_steps, max_steps}: runs.Run) => ({
+  run_id,
+  workflow,
+  definition_version,
+  pinned_steps,
+  max_steps,
+});
 
 app.post('/v1/workflows', async (request, reply) => {
-  const body = request.body as PublishBody;
-  if (!Array.isArray(body.steps) || body.steps.length === 0)
-    return reply.code(400).send({error: 'definition has no steps'});
-  if (hasCycle(body.steps, body.edges ?? [])) return reply.code(422).send({error: 'definition contains a cycle'});
-  if (await store.exists(body.name, body.version)) return reply.code(409).send({error: 'version is immutable'});
-  await store.publish(body.name, body.version, body.steps);
-  return reply.code(201).send({name: body.name, version: body.version});
+  const {name, version, steps, edges = []} = request.body as PublishBody;
+  if (definitions.hasCycle(steps, edges)) return reply.code(422).send({error: 'the step graph has a cycle'});
+  // A published version never changes: runs are pinned to it.
+  if (await definitions.exists(name, version)) return reply.code(409).send({error: \`\${name} v\${version} is already published\`});
+  await definitions.put(name, version, steps, edges);
+  return reply.code(201).send({name, version});
 });
 
 app.post('/v1/runs', async (request, reply) => {
-  const body = request.body as RunBody;
-  const input = body.input ?? {};
-  if (Buffer.byteLength(JSON.stringify(input), 'utf8') > MAX_INPUT_BYTES)
-    return reply.code(413).send({error: 'input exceeds 64 KiB'});
-  const maxSteps = body.max_steps ?? 3;
-  if (!Number.isInteger(maxSteps) || maxSteps < 1 || maxSteps > MAX_STEPS)
-    return reply.code(400).send({error: 'max_steps must be 1..500'});
-  const definition = await store.get(body.workflow, body.version);
-  if (definition === null) return reply.code(404).send({error: 'unknown definition version'});
-  request.log.info({workflow: body.workflow, version: body.version}, 'run started');
-  return reply.code(202).send({
-    run_id: randomUUID(),
-    workflow: body.workflow,
-    definition_version: body.version,
-    pinned_steps: definition.steps,
-    max_steps: maxSteps,
-  });
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const {workflow, version, input = {}, max_steps = 50} = request.body as RunBody;
+  if (new TextEncoder().encode(JSON.stringify(input)).length > MAX_INPUT_BYTES) {
+    return reply.code(413).send({error: \`input is over \${MAX_INPUT_BYTES} bytes\`});
+  }
+  if (!(max_steps >= 1 && max_steps <= MAX_STEPS)) return reply.code(400).send({error: \`max_steps must be within 1..\${MAX_STEPS}\`});
+  // Resolved once: the run keeps this version's steps whatever is published later.
+  const definition = await definitions.get(workflow, version);
+  if (definition === null) return reply.code(404).send({error: \`\${workflow} v\${version} is not published\`});
+  const run = await runs.create(tenant, workflow, definition.version, definition.steps, input, max_steps);
+  return reply.code(202).send(runView(run));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"workflow/definitions" // definitions.HasCycle, Exists, Get, Latest, Put
+	"workflow/runs"        // runs.Create, Get
 )
 
-type PublishRequest struct {
+type publishRequest struct {
 	Name    string     \`json:"name"\`
 	Version int        \`json:"version"\`
 	Steps   []string   \`json:"steps"\`
 	Edges   [][]string \`json:"edges"\`
 }
 
-type RunRequest struct {
-	Workflow string         \`json:"workflow"\`
-	Input    map[string]any \`json:"input"\`
-	MaxSteps int            \`json:"max_steps"\`
+type runRequest struct {
+	Workflow string          \`json:"workflow"\`
+	Version  int             \`json:"version"\`
+	Input    json.RawMessage \`json:"input"\`
+	MaxSteps int             \`json:"max_steps"\`
 }
 
-type DefinitionStore struct{}
-
-func (s *DefinitionStore) Put(ctx context.Context, name string, version int, steps []string) error {
-	return nil
-}
-
-func (s *DefinitionStore) Latest(ctx context.Context, name string) (map[string]any, error) {
-	return nil, nil
-}
-
-var store = &DefinitionStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func publish(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	var body PublishRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	store.Put(r.Context(), body.Name, body.Version, body.Steps)
-	writeJSON(rw, http.StatusCreated, map[string]any{"name": body.Name, "version": body.Version})
-}
-
-func startRun(rw http.ResponseWriter, r *http.Request) {
-	var body RunRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	definition, _ := store.Latest(r.Context(), body.Workflow)
-	steps := []string{}
-	if definition != nil {
-		if pinned, ok := definition["steps"].([]string); ok {
-			steps = pinned
-		}
-	}
-	writeJSON(rw, http.StatusAccepted, map[string]any{
-		"run_id":   "run-1",
-		"workflow": body.Workflow,
-		"steps":    steps,
-		"input":    body.Input,
-	})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/workflows", publish)
-	mux.HandleFunc("POST /v1/runs", startRun)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-      solution: `package main
-
-import (
-	"context"
-	"encoding/json"
-	"log"
-	"net/http"
-
-	"github.com/google/uuid"
-)
-
-const (
-	maxInputBytes = 1 << 16
-	maxSteps      = 500
-)
-
-type PublishRequest struct {
-	Name    string     \`json:"name"\`
-	Version int        \`json:"version"\`
-	Steps   []string   \`json:"steps"\`
-	Edges   [][]string \`json:"edges"\`
-}
-
-type RunRequest struct {
-	Workflow string         \`json:"workflow"\`
-	Version  int            \`json:"version"\`
-	Input    map[string]any \`json:"input"\`
-	MaxSteps int            \`json:"max_steps"\`
-}
-
-type Run struct {
+type runView struct {
 	RunID             string   \`json:"run_id"\`
 	Workflow          string   \`json:"workflow"\`
 	DefinitionVersion int      \`json:"definition_version"\`
@@ -537,310 +339,273 @@ type Run struct {
 	MaxSteps          int      \`json:"max_steps"\`
 }
 
-type DefinitionStore struct{}
-
-func (s *DefinitionStore) Publish(ctx context.Context, name string, version int, steps []string) error {
-	return nil
-}
-
-func (s *DefinitionStore) Exists(ctx context.Context, name string, version int) (bool, error) {
-	return false, nil
-}
-
-func (s *DefinitionStore) Get(ctx context.Context, name string, version int) ([]string, error) {
-	return nil, nil
-}
-
-var store = &DefinitionStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-// hasCycle walks the step graph once, so a cyclic definition is refused at publish time.
-func hasCycle(steps []string, edges [][]string) bool {
-	adjacency := map[string][]string{}
-	for _, step := range steps {
-		adjacency[step] = []string{}
-	}
-	for _, edge := range edges {
-		if len(edge) == 2 {
-			adjacency[edge[0]] = append(adjacency[edge[0]], edge[1])
-		}
-	}
-	visiting := map[string]bool{}
-	settled := map[string]bool{}
-	var visit func(node string) bool
-	visit = func(node string) bool {
-		if settled[node] {
-			return false
-		}
-		if visiting[node] {
-			return true
-		}
-		visiting[node] = true
-		for _, target := range adjacency[node] {
-			if visit(target) {
-				return true
-			}
-		}
-		delete(visiting, node)
-		settled[node] = true
-		return false
-	}
-	for _, step := range steps {
-		if visit(step) {
-			return true
-		}
-	}
-	return false
-}
-
-func publish(rw http.ResponseWriter, r *http.Request) {
-	var body PublishRequest
+func publishWorkflow(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	var body publishRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(body.Steps) == 0 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "definition has no steps"})
-		return
-	}
-	if hasCycle(body.Steps, body.Edges) {
-		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "definition contains a cycle"})
-		return
-	}
-	exists, err := store.Exists(r.Context(), body.Name, body.Version)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if exists {
-		writeJSON(rw, http.StatusConflict, map[string]string{"error": "version is immutable"})
-		return
-	}
-	if err := store.Publish(r.Context(), body.Name, body.Version, body.Steps); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
+	definitions.Put(r.Context(), body.Name, body.Version, body.Steps, body.Edges)
 	writeJSON(rw, http.StatusCreated, map[string]any{"name": body.Name, "version": body.Version})
 }
 
 func startRun(rw http.ResponseWriter, r *http.Request) {
-	var body RunRequest
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
+		return
+	}
+	body := runRequest{MaxSteps: 50}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	document, _ := json.Marshal(body.Input)
-	if len(document) > maxInputBytes {
-		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "input exceeds 64 KiB"})
+	definition := definitions.Latest(r.Context(), body.Workflow)
+	if definition == nil {
+		http.Error(rw, body.Workflow+" is not published", http.StatusNotFound)
 		return
 	}
-	if body.MaxSteps == 0 {
-		body.MaxSteps = 3
+	input := map[string]any{}
+	if len(body.Input) > 0 {
+		json.Unmarshal(body.Input, &input)
 	}
-	if body.MaxSteps < 1 || body.MaxSteps > maxSteps {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "max_steps must be 1..500"})
-		return
-	}
-	pinnedSteps, err := store.Get(r.Context(), body.Workflow, body.Version)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if pinnedSteps == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown definition version"})
-		return
-	}
-	run := Run{
-		RunID:             uuid.NewString(),
-		Workflow:          body.Workflow,
-		DefinitionVersion: body.Version,
-		PinnedSteps:       pinnedSteps,
-		MaxSteps:          body.MaxSteps,
-	}
-	log.Printf("run started workflow=%s version=%d", body.Workflow, body.Version)
-	writeJSON(rw, http.StatusAccepted, run)
+	run := runs.Create(r.Context(), tenant, body.Workflow, definition.Version, definition.Steps, input, body.MaxSteps)
+	writeJSON(rw, http.StatusAccepted, runView{run.RunID, run.Workflow, run.DefinitionVersion, run.PinnedSteps, run.MaxSteps})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/workflows", publish)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/workflows", publishWorkflow)
 	mux.HandleFunc("POST /v1/runs", startRun)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+}
+`,
+      solution: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"workflow/definitions" // definitions.HasCycle, Exists, Get, Latest, Put
+	"workflow/runs"        // runs.Create, Get
+)
+
+const (
+	maxInputBytes = 1 << 16
+	maxSteps      = 500
+)
+
+type publishRequest struct {
+	Name    string     \`json:"name"\`
+	Version int        \`json:"version"\`
+	Steps   []string   \`json:"steps"\`
+	Edges   [][]string \`json:"edges"\`
+}
+
+type runRequest struct {
+	Workflow string          \`json:"workflow"\`
+	Version  int             \`json:"version"\`
+	Input    json.RawMessage \`json:"input"\`
+	MaxSteps int             \`json:"max_steps"\`
+}
+
+type runView struct {
+	RunID             string   \`json:"run_id"\`
+	Workflow          string   \`json:"workflow"\`
+	DefinitionVersion int      \`json:"definition_version"\`
+	PinnedSteps       []string \`json:"pinned_steps"\`
+	MaxSteps          int      \`json:"max_steps"\`
+}
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func publishWorkflow(rw http.ResponseWriter, r *http.Request) {
+	var body publishRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if definitions.HasCycle(body.Steps, body.Edges) {
+		http.Error(rw, "the step graph has a cycle", http.StatusUnprocessableEntity)
+		return
+	}
+	// A published version never changes: runs are pinned to it.
+	if definitions.Exists(r.Context(), body.Name, body.Version) {
+		http.Error(rw, fmt.Sprintf("%s v%d is already published", body.Name, body.Version), http.StatusConflict)
+		return
+	}
+	definitions.Put(r.Context(), body.Name, body.Version, body.Steps, body.Edges)
+	writeJSON(rw, http.StatusCreated, map[string]any{"name": body.Name, "version": body.Version})
+}
+
+func startRun(rw http.ResponseWriter, r *http.Request) {
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
+		return
+	}
+	body := runRequest{MaxSteps: 50}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body.Input) > maxInputBytes {
+		http.Error(rw, fmt.Sprintf("input is over %d bytes", maxInputBytes), http.StatusRequestEntityTooLarge)
+		return
+	}
+	if body.MaxSteps < 1 || body.MaxSteps > maxSteps {
+		http.Error(rw, fmt.Sprintf("max_steps must be within 1..%d", maxSteps), http.StatusBadRequest)
+		return
+	}
+	// Resolved once: the run keeps this version's steps whatever is published later.
+	definition := definitions.Get(r.Context(), body.Workflow, body.Version)
+	if definition == nil {
+		http.Error(rw, fmt.Sprintf("%s v%d is not published", body.Workflow, body.Version), http.StatusNotFound)
+		return
+	}
+	input := map[string]any{}
+	if len(body.Input) > 0 {
+		json.Unmarshal(body.Input, &input)
+	}
+	run := runs.Create(r.Context(), tenant, body.Workflow, definition.Version, definition.Steps, input, body.MaxSteps)
+	writeJSON(rw, http.StatusAccepted, runView{run.RunID, run.Workflow, run.DefinitionVersion, run.PinnedSteps, run.MaxSteps})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/workflows", publishWorkflow)
+	mux.HandleFunc("POST /v1/runs", startRun)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class PublishRequest(name: String, version: Int, steps: List[String], edges: List[List[String]] = Nil)
-final case class Definition(name: String, version: Int, steps: List[String])
-final case class RunRequest(workflow: String, input: Map[String, String] = Map.empty, max_steps: Int = 3)
+import workflow.{Definitions, Runs} // Definitions.hasCycle, exists, get, latest, put · Runs.create, get
 
-trait DefinitionStore {
-  def put(name: String, version: Int, steps: List[String]): Unit
-  def latest(name: String): Option[Definition]
-}
+object Api {
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-object DefinitionStore {
-  def open(): DefinitionStore = new DefinitionStore {
-    def put(name: String, version: Int, steps: List[String]): Unit = ()
-    def latest(name: String): Option[Definition] = None
-  }
-}
+  private def runView(run: Runs.Run): JsObject = JsObject(
+    "run_id" -> JsString(run.runId), "workflow" -> JsString(run.workflow), "definition_version" -> JsNumber(run.definitionVersion),
+    "pinned_steps" -> run.pinnedSteps.toJson, "max_steps" -> JsNumber(run.maxSteps))
 
-object WorkflowApi {
-  implicit val system: ActorSystem = ActorSystem("workflow")
-  implicit val publishFormat: RootJsonFormat[PublishRequest] = jsonFormat4(PublishRequest)
-  implicit val runFormat: RootJsonFormat[RunRequest] = jsonFormat3(RunRequest)
-
-  val store = DefinitionStore.open()
-
-  val route: Route =
+  val route: Route = concat(
     path("v1" / "workflows") {
       post {
-        entity(as[PublishRequest]) { body =>
+        entity(as[String]) { raw =>
           // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          store.put(body.name, body.version, body.steps)
-          complete(StatusCodes.Created, s"""{"name":"\${body.name}","version":\${body.version}}""")
+          val body = raw.parseJson.asJsObject.fields
+          val name = body("name").convertTo[String]
+          val version = body("version").convertTo[Long]
+          val steps = body("steps").convertTo[Seq[String]]
+          val edges = body.get("edges").map(_.convertTo[Seq[Seq[String]]]).getOrElse(Seq.empty)
+          Definitions.put(name, version, steps, edges)
+          complete(json(StatusCodes.Created, JsObject("name" -> JsString(name), "version" -> JsNumber(version))))
         }
       }
-    } ~
-      path("v1" / "runs") {
-        post {
-          entity(as[RunRequest]) { body =>
-            val definition = store.latest(body.workflow)
-            val steps = definition.map(_.steps).getOrElse(Nil)
-            complete(
-              StatusCodes.Accepted,
-              s"""{"run_id":"run-1","workflow":"\${body.workflow}","steps":\${steps.mkString("\\"", "\\",\\"", "\\"")}}"""
-            )
-          }
-        }
-      }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class PublishRequest(name: String, version: Int, steps: List[String], edges: List[List[String]] = Nil)
-final case class Definition(name: String, version: Int, steps: List[String])
-final case class RunRequest(workflow: String, version: Int, input: Map[String, String] = Map.empty, max_steps: Int = 3)
-
-trait DefinitionStore {
-  def publish(name: String, version: Int, steps: List[String]): Unit
-  def exists(name: String, version: Int): Boolean
-  def get(name: String, version: Int): Option[Definition]
-}
-
-object DefinitionStore {
-  def open(): DefinitionStore = new DefinitionStore {
-    def publish(name: String, version: Int, steps: List[String]): Unit = ()
-    def exists(name: String, version: Int): Boolean = false
-    def get(name: String, version: Int): Option[Definition] = None
-  }
-}
-
-object WorkflowApi {
-  implicit val system: ActorSystem = ActorSystem("workflow")
-  implicit val publishFormat: RootJsonFormat[PublishRequest] = jsonFormat4(PublishRequest)
-  implicit val runFormat: RootJsonFormat[RunRequest] = jsonFormat4(RunRequest)
-
-  val MaxInputBytes = 1 << 16
-  val MaxSteps = 500
-
-  val store = DefinitionStore.open()
-
-  def hasCycle(steps: List[String], edges: List[List[String]]): Boolean = {
-    val adjacency: Map[String, List[String]] =
-      steps.map(step => step -> edges.collect { case List(source, target) if source == step => target }).toMap
-    val visiting = scala.collection.mutable.Set.empty[String]
-    val settled = scala.collection.mutable.Set.empty[String]
-    def visit(node: String): Boolean = {
-      if (settled.contains(node)) false
-      else if (visiting.contains(node)) true
-      else {
-        visiting += node
-        val cyclic = adjacency.getOrElse(node, Nil).exists(visit)
-        visiting -= node
-        settled += node
-        cyclic
-      }
-    }
-    steps.exists(visit)
-  }
-
-  val route: Route =
-    path("v1" / "workflows") {
+    },
+    path("v1" / "runs") {
       post {
-        entity(as[PublishRequest]) { body =>
-          if (body.steps.isEmpty) {
-            complete(StatusCodes.BadRequest, """{"error":"definition has no steps"}""")
-          } else if (hasCycle(body.steps, body.edges)) {
-            complete(StatusCodes.UnprocessableEntity, """{"error":"definition contains a cycle"}""")
-          } else if (store.exists(body.name, body.version)) {
-            complete(StatusCodes.Conflict, """{"error":"version is immutable"}""")
-          } else {
-            store.publish(body.name, body.version, body.steps)
-            complete(StatusCodes.Created, s"""{"name":"\${body.name}","version":\${body.version}}""")
-          }
-        }
-      }
-    } ~
-      path("v1" / "runs") {
-        post {
-          entity(as[RunRequest]) { body =>
-            val inputBytes = body.input.toString.getBytes(StandardCharsets.UTF_8).length
-            if (inputBytes > MaxInputBytes) {
-              complete(StatusCodes.RequestEntityTooLarge, """{"error":"input exceeds 64 KiB"}""")
-            } else if (body.max_steps < 1 || body.max_steps > MaxSteps) {
-              complete(StatusCodes.BadRequest, """{"error":"max_steps must be 1..500"}""")
-            } else {
-              store.get(body.workflow, body.version) match {
-                case None =>
-                  complete(StatusCodes.NotFound, """{"error":"unknown definition version"}""")
+        optionalHeaderValueByName("X-Tenant-Id") {
+          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+          case Some(tenant) =>
+            entity(as[String]) { raw =>
+              val body = raw.parseJson.asJsObject.fields
+              val workflowName = body("workflow").convertTo[String]
+              val input = body.get("input").map(_.asJsObject).getOrElse(JsObject.empty)
+              val maxSteps = body.get("max_steps").map(_.convertTo[Int]).getOrElse(50)
+              Definitions.latest(workflowName) match {
+                case None => complete(StatusCodes.NotFound -> s"$workflowName is not published")
                 case Some(definition) =>
-                  system.log.info(s"run started workflow=\${body.workflow} version=\${body.version}")
-                  val runId = UUID.randomUUID().toString
-                  val definitionVersion = body.version
-                  val pinnedSteps = definition.steps.mkString("\\"", "\\",\\"", "\\"")
-                  complete(
-                    StatusCodes.Accepted,
-                    s"""{"run_id":"$runId","workflow":"\${body.workflow}","definition_version":$definitionVersion,"pinned_steps":$pinnedSteps,"max_steps":\${body.max_steps}}"""
-                  )
+                  val run = Runs.create(tenant, workflowName, definition.version, definition.steps, input, maxSteps)
+                  complete(json(StatusCodes.Accepted, runView(run)))
               }
             }
+        }
+      }
+    },
+  )
+}
+`,
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
+import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
+import spray.json.DefaultJsonProtocol._
+
+import workflow.{Definitions, Runs} // Definitions.hasCycle, exists, get, latest, put · Runs.create, get
+
+object Api {
+  val MaxInputBytes: Int = 1 << 16
+  val MaxSteps = 500
+
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def runView(run: Runs.Run): JsObject = JsObject(
+    "run_id" -> JsString(run.runId), "workflow" -> JsString(run.workflow), "definition_version" -> JsNumber(run.definitionVersion),
+    "pinned_steps" -> run.pinnedSteps.toJson, "max_steps" -> JsNumber(run.maxSteps))
+
+  val route: Route = concat(
+    path("v1" / "workflows") {
+      post {
+        entity(as[String]) { raw =>
+          val body = raw.parseJson.asJsObject.fields
+          val name = body("name").convertTo[String]
+          val version = body("version").convertTo[Long]
+          val steps = body("steps").convertTo[Seq[String]]
+          val edges = body.get("edges").map(_.convertTo[Seq[Seq[String]]]).getOrElse(Seq.empty)
+          if (Definitions.hasCycle(steps, edges)) complete(StatusCodes.UnprocessableEntity -> "the step graph has a cycle")
+          // A published version never changes: runs are pinned to it.
+          else if (Definitions.exists(name, version)) complete(StatusCodes.Conflict -> s"$name v$version is already published")
+          else {
+            Definitions.put(name, version, steps, edges)
+            complete(json(StatusCodes.Created, JsObject("name" -> JsString(name), "version" -> JsNumber(version))))
           }
         }
       }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
+    },
+    path("v1" / "runs") {
+      post {
+        optionalHeaderValueByName("X-Tenant-Id") {
+          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+          case Some(tenant) =>
+            entity(as[String]) { raw =>
+              val body = raw.parseJson.asJsObject.fields
+              val workflowName = body("workflow").convertTo[String]
+              val version = body("version").convertTo[Long]
+              val input = body.get("input").map(_.asJsObject).getOrElse(JsObject.empty)
+              val maxSteps = body.get("max_steps").map(_.convertTo[Int]).getOrElse(50)
+              if (input.compactPrint.getBytes("UTF-8").length > MaxInputBytes) complete(StatusCodes.PayloadTooLarge -> s"input is over $MaxInputBytes bytes")
+              else if (maxSteps < 1 || maxSteps > MaxSteps) complete(StatusCodes.BadRequest -> s"max_steps must be within 1..$MaxSteps")
+              else
+                // Resolved once: the run keeps this version's steps whatever is published later.
+                Definitions.get(workflowName, version) match {
+                  case None => complete(StatusCodes.NotFound -> s"$workflowName v$version is not published")
+                  case Some(definition) =>
+                    val run = Runs.create(tenant, workflowName, definition.version, definition.steps, input, maxSteps)
+                    complete(json(StatusCodes.Accepted, runView(run)))
+                }
+            }
+        }
+      }
+    },
+  )
 }
 `,
     },
@@ -848,197 +613,441 @@ object WorkflowApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <optional>
 #include <string>
 #include <vector>
 
+#include "workflow/definitions.h"  // definitions::hasCycle, exists, get, latest, put
+#include "workflow/runs.h"         // runs::create, get
+
 using json = nlohmann::json;
 
-struct DefinitionStore {
-  void put(const std::string& name, int version, const std::vector<std::string>& steps);
-  std::optional<json> latest(const std::string& name);
-};
+json runView(const runs::Run& run) {
+  return json{{"run_id", run.run_id}, {"workflow", run.workflow}, {"definition_version", run.definition_version},
+              {"pinned_steps", run.pinned_steps}, {"max_steps", run.max_steps}};
+}
 
-DefinitionStore store;
+void answerError(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(json{{"error", message}}.dump(), "application/json");
+}
 
-int main() {
-  httplib::Server svr;
+void publish_workflow(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const json body = json::parse(req.body);
+  const std::string name = body.value("name", "");
+  const long version = body.value("version", 0L);
+  const auto steps = body.value("steps", std::vector<std::string>{});
+  const auto edges = body.value("edges", std::vector<std::vector<std::string>>{});
+  definitions::put(name, version, steps, edges);
+  res.status = 201;
+  res.set_content(json{{"name", name}, {"version", version}}.dump(), "application/json");
+}
 
-  svr.Post("/v1/workflows", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    store.put(body.value("name", std::string()), body.value("version", 0),
-              body.value("steps", std::vector<std::string>()));
-    res.status = 201;
-    res.set_content(json{{"name", body.value("name", std::string())}, {"version", body.value("version", 0)}}.dump(),
-                    "application/json");
-  });
+void start_run(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return answerError(res, 401, "X-Tenant-Id is required");
+  const json body = json::parse(req.body);
+  const std::string workflow = body.value("workflow", "");
+  const json input = body.value("input", json::object());
+  const long max_steps = body.value("max_steps", 50L);
+  const auto definition = definitions::latest(workflow);
+  if (!definition) return answerError(res, 404, workflow + " is not published");
+  const runs::Run run = runs::create(tenant, workflow, definition->version, definition->steps, input, max_steps);
+  res.status = 202;
+  res.set_content(runView(run).dump(), "application/json");
+}
 
-  svr.Post("/v1/runs", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto newest = store.latest(body.value("workflow", std::string()));
-    json run = {
-        {"run_id", "run-1"},
-        {"workflow", body.value("workflow", std::string())},
-        {"steps", newest ? (*newest)["steps"] : json::array()},
-        {"input", body.value("input", json::object())},
-    };
-    res.status = 202;
-    res.set_content(run.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/workflows", publish_workflow);
+  svr.Post("/v1/runs", start_run);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <functional>
-#include <iostream>
-#include <map>
-#include <optional>
-#include <set>
 #include <string>
 #include <vector>
 
+#include "workflow/definitions.h"  // definitions::hasCycle, exists, get, latest, put
+#include "workflow/runs.h"         // runs::create, get
+
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxInputBytes = 1 << 16;
-constexpr int kMaxSteps = 500;
+constexpr size_t kMaxInputBytes = 1 << 16;
+constexpr long kMaxSteps = 500;
 
-struct Definition {
-  int version = 0;
-  std::vector<std::string> steps;
-};
-
-struct DefinitionStore {
-  void publish(const std::string& name, int version, const std::vector<std::string>& steps);
-  bool exists(const std::string& name, int version);
-  std::optional<Definition> get(const std::string& name, int version);
-};
-
-DefinitionStore store;
-std::string uuidString();
-
-/** True when the step graph has a cycle, so the run could spin to its step cap. */
-bool hasCycle(const std::vector<std::string>& steps, const std::vector<std::vector<std::string>>& edges) {
-  std::map<std::string, std::vector<std::string>> adjacency;
-  for (const auto& step : steps) adjacency[step];
-  for (const auto& edge : edges) {
-    if (edge.size() == 2) adjacency[edge[0]].push_back(edge[1]);
-  }
-  std::set<std::string> visiting;
-  std::set<std::string> settled;
-  std::function<bool(const std::string&)> visit = [&](const std::string& node) -> bool {
-    if (settled.count(node) != 0) return false;
-    if (visiting.count(node) != 0) return true;
-    visiting.insert(node);
-    for (const auto& target : adjacency[node]) {
-      if (visit(target)) return true;
-    }
-    visiting.erase(node);
-    settled.insert(node);
-    return false;
-  };
-  for (const auto& step : steps) {
-    if (visit(step)) return true;
-  }
-  return false;
+json runView(const runs::Run& run) {
+  return json{{"run_id", run.run_id}, {"workflow", run.workflow}, {"definition_version", run.definition_version},
+              {"pinned_steps", run.pinned_steps}, {"max_steps", run.max_steps}};
 }
 
-int main() {
-  httplib::Server svr;
+void answerError(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(json{{"error", message}}.dump(), "application/json");
+}
 
-  svr.Post("/v1/workflows", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("steps")) {
-      res.status = 400;
-      res.set_content(R"({"error":"definition has no steps"})", "application/json");
-      return;
-    }
-    const auto steps = body["steps"].get<std::vector<std::string>>();
-    if (steps.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"definition has no steps"})", "application/json");
-      return;
-    }
-    const auto edges = body.value("edges", std::vector<std::vector<std::string>>());
-    if (hasCycle(steps, edges)) {
-      res.status = 422;
-      res.set_content(R"({"error":"definition contains a cycle"})", "application/json");
-      return;
-    }
-    const auto name = body.value("name", std::string());
-    const int version = body.value("version", 0);
-    if (store.exists(name, version)) {
-      res.status = 409;
-      res.set_content(R"({"error":"version is immutable"})", "application/json");
-      return;
-    }
-    store.publish(name, version, steps);
-    res.status = 201;
-    res.set_content(json{{"name", name}, {"version", version}}.dump(), "application/json");
-  });
+void publish_workflow(const httplib::Request& req, httplib::Response& res) {
+  const json body = json::parse(req.body);
+  const std::string name = body.value("name", "");
+  const long version = body.value("version", 0L);
+  const auto steps = body.value("steps", std::vector<std::string>{});
+  const auto edges = body.value("edges", std::vector<std::vector<std::string>>{});
+  if (definitions::hasCycle(steps, edges)) return answerError(res, 422, "the step graph has a cycle");
+  // A published version never changes: runs are pinned to it.
+  if (definitions::exists(name, version)) return answerError(res, 409, name + " v" + std::to_string(version) + " is already published");
+  definitions::put(name, version, steps, edges);
+  res.status = 201;
+  res.set_content(json{{"name", name}, {"version", version}}.dump(), "application/json");
+}
 
-  svr.Post("/v1/runs", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto input = body.value("input", json::object());
-    if (input.dump().size() > kMaxInputBytes) {
-      res.status = 413;
-      res.set_content(R"({"error":"input exceeds 64 KiB"})", "application/json");
-      return;
-    }
-    const int maxSteps = body.value("max_steps", 3);
-    if (maxSteps < 1 || maxSteps > kMaxSteps) {
-      res.status = 400;
-      res.set_content(R"({"error":"max_steps must be 1..500"})", "application/json");
-      return;
-    }
-    const auto workflow = body.value("workflow", std::string());
-    const int version = body.value("version", 0);
-    const auto definition = store.get(workflow, version);
-    if (!definition) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown definition version"})", "application/json");
-      return;
-    }
-    json run = {
-        {"run_id", uuidString()},
-        {"workflow", workflow},
-        {"definition_version", version},
-        {"pinned_steps", definition->steps},
-        {"max_steps", maxSteps},
-    };
-    std::cerr << "run started workflow=" << workflow << " version=" << version << "\\n";
-    res.status = 202;
-    res.set_content(run.dump(), "application/json");
-  });
+void start_run(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return answerError(res, 401, "X-Tenant-Id is required");
+  const json body = json::parse(req.body);
+  const std::string workflow = body.value("workflow", "");
+  const long version = body.value("version", 0L);
+  const json input = body.value("input", json::object());
+  const long max_steps = body.value("max_steps", 50L);
+  if (input.dump().size() > kMaxInputBytes) return answerError(res, 413, "input is over " + std::to_string(kMaxInputBytes) + " bytes");
+  if (max_steps < 1 || max_steps > kMaxSteps) return answerError(res, 400, "max_steps must be within 1.." + std::to_string(kMaxSteps));
+  // Resolved once: the run keeps this version's steps whatever is published later.
+  const auto definition = definitions::get(workflow, version);
+  if (!definition) return answerError(res, 404, workflow + " v" + std::to_string(version) + " is not published");
+  const runs::Run run = runs::create(tenant, workflow, definition->version, definition->steps, input, max_steps);
+  res.status = 202;
+  res.set_content(runView(run).dump(), "application/json");
+}
 
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/workflows", publish_workflow);
+  svr.Post("/v1/runs", start_run);
 }
 `,
     },
   },
-  hints: [
-    'Symptom: a run started on version 3 executes the steps of version 4 after a deploy, and a run with a cyclic definition keeps going until its step cap stops it.',
-    'Mechanism: `start_run` calls `store.latest(workflow)` and keeps no version on the run, and `publish` upserts whatever arrives, cycle or duplicate version.',
-    'Fix: `has_cycle` then `store.exists` before `store.put` (422, 409); `store.get(workflow, version)` once, stored as `definition_version` and `pinned_steps`; bounds `MAX_INPUT_BYTES` (413) and `MAX_STEPS` (400). The checks cover each.',
+  harness: {
+    python: `from workflow import definitions, runs
+
+V3 = {"name": "signup", "version": 3, "steps": ["create_account", "send_welcome"], "edges": [["create_account", "send_welcome"]]}
+V4 = {
+    "name": "signup",
+    "version": 4,
+    "steps": ["create_account", "send_welcome", "notify_sales"],
+    "edges": [["create_account", "send_welcome"], ["send_welcome", "notify_sales"]],
+}
+TENANT = {"X-Tenant-Id": "t1"}
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+def _run(version=3, input_doc=None, max_steps=50):
+    return {"workflow": "signup", "version": version, "input": {"email": "ada@example.com"} if input_doc is None else input_doc, "max_steps": max_steps}
+
+
+async def check_cycle(ctx):
+    async with _api(ctx) as c:
+        loop = {"name": "loop", "version": 1, "steps": ["a", "b", "c"], "edges": [["a", "b"], ["b", "c"], ["c", "a"]]}
+        r = await c.post("/v1/workflows", json=loop)
+        assert r.status_code == 422, f"publishing a graph whose edges run a → b → c → a answered {r.status_code}, expected 422: a run of it never reaches a last step"
+        assert definitions.get("loop", 1) is None, f"the cyclic graph was stored: {definitions.get('loop', 1)}"
+        r = await c.post("/v1/workflows", json=V3)
+    assert r.status_code == 201, f"publishing an acyclic graph answered {r.status_code}: {r.text}"
+    assert definitions.get("signup", 3) is not None, "the acyclic graph must be stored"
+
+
+async def check_immutable(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/workflows", json=V3)
+        assert r.status_code == 201, f"the first publish of signup v3 answered {r.status_code}: {r.text}"
+        r = await c.post("/v1/workflows", json={**V3, "steps": ["create_account"], "edges": []})
+    assert r.status_code == 409, f"re-publishing signup v3 with other steps answered {r.status_code}, expected 409"
+    stored = definitions.get("signup", 3)["steps"]
+    assert stored == V3["steps"], f"re-publishing signup v3 rewrote it to {stored}: every run pinned to v3 now runs other steps"
+
+
+async def check_pin(ctx):
+    async with _api(ctx) as c:
+        await c.post("/v1/workflows", json=V3)
+        await c.post("/v1/workflows", json=V4)
+        r = await c.post("/v1/runs", json=_run(3), headers=TENANT)
+        assert r.status_code == 202, f"starting a run of signup v3 answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("definition_version") == 3 and body.get("pinned_steps") == V3["steps"], f"a run that asked for signup v3 answered {body}: it must pin version 3 and its steps, whatever was published later"
+        run = runs.get(body["run_id"])
+        assert run["definition_version"] == 3 and run["pinned_steps"] == V3["steps"], f"the stored run is {run}, expected version 3 and its steps"
+        r = await c.post("/v1/runs", json=_run(9), headers=TENANT)
+    assert r.status_code == 404, f"a run of signup v9, never published, answered {r.status_code}, expected 404"
+
+
+async def check_bounds(ctx):
+    async with _api(ctx) as c:
+        await c.post("/v1/workflows", json=V3)
+        r = await c.post("/v1/runs", json=_run(input_doc={"blob": "x" * 70000}), headers=TENANT)
+        assert r.status_code == 413, f"a 70 KB input answered {r.status_code}, expected 413 (MAX_INPUT_BYTES = 1 << 16)"
+        for budget in (0, 501):
+            r = await c.post("/v1/runs", json=_run(max_steps=budget), headers=TENANT)
+            assert r.status_code == 400, f"max_steps {budget} answered {r.status_code}, expected 400 (1..MAX_STEPS = 500)"
+        stored = sorted(ctx.redis.keys("run:run-*"))
+        assert stored == [], f"rejected requests wrote run records: {stored}"
+        r = await c.post("/v1/runs", json=_run(max_steps=500), headers=TENANT)
+    assert r.status_code == 202, f"max_steps 500 with a small input answered {r.status_code}: {r.text}"
+`,
+    typescript: `const V3 = {name: 'signup', version: 3, steps: ['create_account', 'send_welcome'], edges: [['create_account', 'send_welcome']]};
+const V4 = {
+  name: 'signup',
+  version: 4,
+  steps: ['create_account', 'send_welcome', 'notify_sales'],
+  edges: [
+    ['create_account', 'send_welcome'],
+    ['send_welcome', 'notify_sales'],
   ],
-  debrief: `The fix has three shapes because the flaws live at three different moments. At publish time the definition is the whole input, so cycle detection and the \`(name, version)\` existence check are cheap rejections that no run ever sees. At run start the run record copies the version and its step list, because the run must stay reproducible after any later publish; a lookup by \`latest\` makes the run's behaviour depend on deploy timing. The size and \`max_steps\` bounds also sit at start, before anything is written, so a rejected request leaves no record. Production engines go further: a definition is stored under a content hash, so re-publishing identical steps is a no-op rather than a conflict, and edges that name an unknown step are refused alongside cycles.`,
+};
+const TENANT = {'X-Tenant-Id': 't1'};
+
+function api(ctx) {
+  return {
+    c: ctx.client(ctx.load('api').app),
+    definitions: ctx.load('/support/workflow/definitions.ts'),
+    runs: ctx.load('/support/workflow/runs.ts'),
+  };
+}
+
+const run = (version = 3, input: Record<string, unknown> = {email: 'ada@example.com'}, max_steps = 50) => ({workflow: 'signup', version, input, max_steps});
+
+export async function check_cycle(ctx) {
+  const {c, definitions} = api(ctx);
+  const loop = {name: 'loop', version: 1, steps: ['a', 'b', 'c'], edges: [['a', 'b'], ['b', 'c'], ['c', 'a']]};
+  let r = await c.post('/v1/workflows', {json: loop});
+  assert.equal(r.status, 422, \`publishing a graph whose edges run a → b → c → a answered \${r.status}, expected 422: a run of it never reaches a last step\`);
+  assert.equal(await definitions.get('loop', 1), null, 'the cyclic graph was stored');
+  r = await c.post('/v1/workflows', {json: V3});
+  assert.equal(r.status, 201, \`publishing an acyclic graph answered \${r.status}: \${r.text}\`);
+  assert.notEqual(await definitions.get('signup', 3), null, 'the acyclic graph must be stored');
+}
+
+export async function check_immutable(ctx) {
+  const {c, definitions} = api(ctx);
+  let r = await c.post('/v1/workflows', {json: V3});
+  assert.equal(r.status, 201, \`the first publish of signup v3 answered \${r.status}: \${r.text}\`);
+  r = await c.post('/v1/workflows', {json: {...V3, steps: ['create_account'], edges: []}});
+  assert.equal(r.status, 409, \`re-publishing signup v3 with other steps answered \${r.status}, expected 409\`);
+  const stored = (await definitions.get('signup', 3)).steps;
+  assert.deepStrictEqual(stored, V3.steps, \`re-publishing signup v3 rewrote it to \${JSON.stringify(stored)}: every run pinned to v3 now runs other steps\`);
+}
+
+export async function check_pin(ctx) {
+  const {c, runs} = api(ctx);
+  await c.post('/v1/workflows', {json: V3});
+  await c.post('/v1/workflows', {json: V4});
+  let r = await c.post('/v1/runs', {json: run(3), headers: TENANT});
+  assert.equal(r.status, 202, \`starting a run of signup v3 answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(
+    body.definition_version === 3 && JSON.stringify(body.pinned_steps) === JSON.stringify(V3.steps),
+    \`a run that asked for signup v3 answered \${r.text}: it must pin version 3 and its steps, whatever was published later\`,
+  );
+  const stored = await runs.get(body.run_id);
+  assert(stored.definition_version === 3 && JSON.stringify(stored.pinned_steps) === JSON.stringify(V3.steps), \`the stored run is \${JSON.stringify(stored)}, expected version 3 and its steps\`);
+  r = await c.post('/v1/runs', {json: run(9), headers: TENANT});
+  assert.equal(r.status, 404, \`a run of signup v9, never published, answered \${r.status}, expected 404\`);
+}
+
+export async function check_bounds(ctx) {
+  const {c} = api(ctx);
+  await c.post('/v1/workflows', {json: V3});
+  let r = await c.post('/v1/runs', {json: run(3, {blob: 'x'.repeat(70000)}), headers: TENANT});
+  assert.equal(r.status, 413, \`a 70 KB input answered \${r.status}, expected 413 (MAX_INPUT_BYTES = 1 << 16)\`);
+  for (const budget of [0, 501]) {
+    r = await c.post('/v1/runs', {json: run(3, {}, budget), headers: TENANT});
+    assert.equal(r.status, 400, \`max_steps \${budget} answered \${r.status}, expected 400 (1..MAX_STEPS = 500)\`);
+  }
+  const stored = ctx.redis.keys('run:run-*');
+  assert.deepStrictEqual(stored, [], \`rejected requests wrote run records: \${JSON.stringify(stored)}\`);
+  r = await c.post('/v1/runs', {json: run(3, {email: 'ada@example.com'}, 500), headers: TENANT});
+  assert.equal(r.status, 202, \`max_steps 500 with a small input answered \${r.status}: \${r.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"workflow/definitions"
+	"workflow/runs"
+
+	"leetbuild/harness"
+)
+
+var (
+	apiBg = context.Background()
+	v3    = map[string]any{"name": "signup", "version": 3, "steps": []string{"create_account", "send_welcome"}, "edges": [][]string{{"create_account", "send_welcome"}}}
+	v4    = map[string]any{
+		"name": "signup", "version": 4, "steps": []string{"create_account", "send_welcome", "notify_sales"},
+		"edges": [][]string{{"create_account", "send_welcome"}, {"send_welcome", "notify_sales"}},
+	}
+	v3Steps = []string{"create_account", "send_welcome"}
+)
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func runBody(version int, input map[string]any, maxSteps int) map[string]any {
+	return map[string]any{"workflow": "signup", "version": version, "input": input, "max_steps": maxSteps}
+}
+
+var email = map[string]any{"email": "ada@example.com"}
+
+func CheckCycle(ctx *harness.Ctx) {
+	c := api(ctx)
+	loop := map[string]any{"name": "loop", "version": 1, "steps": []string{"a", "b", "c"}, "edges": [][]string{{"a", "b"}, {"b", "c"}, {"c", "a"}}}
+	r := c.Post("/v1/workflows", loop)
+	ctx.Equal(r.Status, 422, "publishing a graph whose edges run a → b → c → a (a run of it never reaches a last step); the status")
+	ctx.Assert(definitions.Get(apiBg, "loop", 1) == nil, "the cyclic graph was stored: %+v", definitions.Get(apiBg, "loop", 1))
+	r = c.Post("/v1/workflows", v3)
+	ctx.Equal(r.Status, 201, "publishing an acyclic graph (%s); the status", r.Text())
+	ctx.Assert(definitions.Get(apiBg, "signup", 3) != nil, "the acyclic graph must be stored")
+}
+
+func CheckImmutable(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/workflows", v3)
+	ctx.Equal(r.Status, 201, "the first publish of signup v3 (%s); the status", r.Text())
+	rewrite := map[string]any{"name": "signup", "version": 3, "steps": []string{"create_account"}, "edges": [][]string{}}
+	r = c.Post("/v1/workflows", rewrite)
+	ctx.Equal(r.Status, 409, "re-publishing signup v3 with other steps; the status")
+	ctx.Equal(definitions.Get(apiBg, "signup", 3).Steps, v3Steps, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run other steps); its steps")
+}
+
+func CheckPin(ctx *harness.Ctx) {
+	c := api(ctx)
+	c.Post("/v1/workflows", v3)
+	c.Post("/v1/workflows", v4)
+	r := c.Post("/v1/runs", runBody(3, email, 50), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 202, "starting a run of signup v3 (%s); the status", r.Text())
+	var body struct {
+		RunID             string   \`json:"run_id"\`
+		DefinitionVersion int      \`json:"definition_version"\`
+		PinnedSteps       []string \`json:"pinned_steps"\`
+	}
+	r.Decode(&body)
+	ctx.Assert(body.DefinitionVersion == 3 && strings.Join(body.PinnedSteps, ",") == strings.Join(v3Steps, ","), "a run that asked for signup v3 answered %s: it must pin version 3 and its steps, whatever was published later", r.Text())
+	stored := runs.Get(apiBg, body.RunID)
+	ctx.Assert(stored != nil && stored.DefinitionVersion == 3 && strings.Join(stored.PinnedSteps, ",") == strings.Join(v3Steps, ","), "the stored run is %+v, expected version 3 and its steps", stored)
+	r = c.Post("/v1/runs", runBody(9, email, 50), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 404, "a run of signup v9, never published; the status")
+}
+
+func CheckBounds(ctx *harness.Ctx) {
+	c := api(ctx)
+	c.Post("/v1/workflows", v3)
+	r := c.Post("/v1/runs", runBody(3, map[string]any{"blob": strings.Repeat("x", 70000)}, 50), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 413, "a 70 KB input (maxInputBytes = 1 << 16); the status")
+	for _, budget := range []int{0, 501} {
+		r = c.Post("/v1/runs", runBody(3, map[string]any{}, budget), "X-Tenant-Id", "t1")
+		ctx.Equal(r.Status, 400, "max_steps %d (1..maxSteps = 500); the status", budget)
+	}
+	ctx.Equal(ctx.Redis.Keys("run:run-*"), []string{}, "rejected requests must not write run records; the run keys")
+	r = c.Post("/v1/runs", runBody(3, email, 500), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 202, "max_steps 500 with a small input (%s); the status", r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "workflow/definitions.h"
+#include "workflow/runs.h"
+
+namespace {
+
+const std::string kV3 = R"({"name": "signup", "version": 3, "steps": ["create_account", "send_welcome"], "edges": [["create_account", "send_welcome"]]})";
+const std::string kV4 =
+    R"({"name": "signup", "version": 4, "steps": ["create_account", "send_welcome", "notify_sales"], "edges": [["create_account", "send_welcome"], ["send_welcome", "notify_sales"]]})";
+const std::vector<std::string> kV3Steps = {"create_account", "send_welcome"};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response post(harness::HTTP& c, const std::string& path, const std::string& body) {
+  return c.Post(path, body, "Content-Type", "application/json", "X-Tenant-Id", "t1");
+}
+
+std::string runBody(long version, const nlohmann::json& input, long max_steps) {
+  return nlohmann::json{{"workflow", "signup"}, {"version", version}, {"input", input}, {"max_steps", max_steps}}.dump();
+}
+
+const nlohmann::json kEmail = {{"email", "ada@example.com"}};
+
+}  // namespace
+
+void CheckCycle(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "/v1/workflows", R"({"name": "loop", "version": 1, "steps": ["a", "b", "c"], "edges": [["a", "b"], ["b", "c"], ["c", "a"]]})");
+  ctx.Equal(r.Status, 422, "publishing a graph whose edges run a → b → c → a (a run of it never reaches a last step); the status");
+  ctx.Assert(!definitions::get("loop", 1), "the cyclic graph was stored");
+  r = post(c, "/v1/workflows", kV3);
+  ctx.Equal(r.Status, 201, "publishing an acyclic graph (%s); the status", r.Text());
+  ctx.Assert(definitions::get("signup", 3).has_value(), "the acyclic graph must be stored");
+}
+
+void CheckImmutable(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "/v1/workflows", kV3);
+  ctx.Equal(r.Status, 201, "the first publish of signup v3 (%s); the status", r.Text());
+  r = post(c, "/v1/workflows", R"({"name": "signup", "version": 3, "steps": ["create_account"], "edges": []})");
+  ctx.Equal(r.Status, 409, "re-publishing signup v3 with other steps; the status");
+  ctx.Equal(definitions::get("signup", 3)->steps, kV3Steps, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run other steps); its steps");
+}
+
+void CheckPin(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  post(c, "/v1/workflows", kV3);
+  post(c, "/v1/workflows", kV4);
+  auto r = post(c, "/v1/runs", runBody(3, kEmail, 50));
+  ctx.Equal(r.Status, 202, "starting a run of signup v3 (%s); the status", r.Text());
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  const bool pinned = body.is_object() && body.value("definition_version", 0L) == 3 && body.value("pinned_steps", std::vector<std::string>{}) == kV3Steps;
+  ctx.Assert(pinned, "a run that asked for signup v3 answered %s: it must pin version 3 and its steps, whatever was published later", r.Text());
+  const auto stored = runs::get(body.value("run_id", ""));
+  ctx.Assert(stored && stored->definition_version == 3 && stored->pinned_steps == kV3Steps, "the stored run must hold version 3 and its steps");
+  r = post(c, "/v1/runs", runBody(9, kEmail, 50));
+  ctx.Equal(r.Status, 404, "a run of signup v9, never published; the status");
+}
+
+void CheckBounds(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  post(c, "/v1/workflows", kV3);
+  auto r = post(c, "/v1/runs", runBody(3, nlohmann::json{{"blob", std::string(70000, 'x')}}, 50));
+  ctx.Equal(r.Status, 413, "a 70 KB input (kMaxInputBytes = 1 << 16); the status");
+  for (const long budget : {0L, 501L}) {
+    r = post(c, "/v1/runs", runBody(3, nlohmann::json::object(), budget));
+    ctx.Equal(r.Status, 400, "max_steps %d (1..kMaxSteps = 500); the status", budget);
+  }
+  ctx.Equal(ctx.Redis.Keys("run:run-*"), std::vector<std::string>{}, "rejected requests must not write run records; the run keys");
+  r = post(c, "/v1/runs", runBody(3, kEmail, 500));
+  ctx.Equal(r.Status, 202, "max_steps 500 with a small input (%s); the status", r.Text());
+}
+`,
+  },
+  hints: [
+    'Publish signup v4 while a client still asks for v3: the 202 says `definition_version` 4. Re-publish v3 with fewer steps and v3 changes; a graph with a cycle is stored without complaint.',
+    "`start_run` reads `definitions.latest` and never looks at the body's version. `publish_workflow` hands everything to `definitions.put`, which overwrites the hash, and nothing measures the input or the budget.",
+    'Publish: `has_cycle` → 422, `exists` → 409, then `put`. Start: 413 when `len(json.dumps(input).encode()) > MAX_INPUT_BYTES`, 400 unless `1 <= max_steps <= MAX_STEPS`, then `definitions.get(workflow, version)` (404) and `runs.create`.',
+  ],
+  debrief: `Each fix sits at the moment its information exists. At publish time the whole graph is in hand, so a cycle and a duplicate version are cheap rejections no run ever sees. At start the run copies its version's step list, because a run that resolves "latest" behaves according to deploy timing instead of what the client asked for. The bounds run before \`runs.create\`, so a rejected request leaves nothing to clean up. Temporal solves the same problem for code: a Pinned workflow finishes on the worker build it started on, and moving it is an explicit operator command. Engines that let a definition change under a running workflow also need a migration story, such as a patch marker the workflow checks before taking the new branch.`,
 };

@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package workflowd;
+
+// The mail service the send_welcome step calls (step 3). SendWelcome sends one message for the
+// effect id it is given and does not deduplicate: two requests are two emails. GetDelivery finds
+// the message sent for an effect id, NOT_FOUND when none was.
+service Mailer {
+  rpc SendWelcome(WelcomeRequest) returns (Delivery);
+  rpc GetDelivery(DeliveryLookup) returns (Delivery);
+}
+
+message WelcomeRequest {
+  string effect_id = 1;
+  string user_id = 2;
+}
+
+message DeliveryLookup {
+  string effect_id = 1;
+}
+
+message Delivery {
+  string message_id = 1;
+  string effect_id = 2;
+}

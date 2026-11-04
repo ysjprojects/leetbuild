@@ -5,48 +5,47 @@ export const citationStateStep: Step = {
   title: 'Redis span cache with version-scoped keys',
   concept: 'redis',
   file: 'state',
-  focus: ['api', 'redis', 'docstore'],
+  focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter serves
-\`GET /v1/spans?document_id=doc-7&version=3&start=412&end=447\`: it looks the span up in Redis,
-resolves it from the document store on a miss, writes the entry back and deletes keys when a document
-is updated. It compiles, it serves the demo, and it hides four flaws.
+**Starting point.** The starter serves \`GET /v1/spans?document_id=doc-7&version=3&start=412&end=447\`,
+the read a citation UI calls to highlight a span: it looks the span up in Redis under
+\`span_key(document_id, start, end)\`, on a miss slices \`documents.get_version(document_id, version)\`
+and writes the slice back, answering \`{document_id, version, start, end, text, cached}\`. It serves
+the demo and hides four flaws.
 
-**Failure mode the checks target.** A key that leaves out part of the span's identity, or spells the
-same span two ways, answers requests with text they did not ask for or caches one span several
-times. Both stay invisible on a document that is never edited or re-read with padded offsets.
+**Failure mode the checks target.** After version 2 of a document is published, a request for
+version 2 is answered with version 1's text; \`start=010\` and \`start=10\` are cached twice; the
+cache only ever grows; and a version that does not exist yet answers an empty span that is still
+served after the version appears.
 
-- The cache key names the **immutable version**: \`span:{document_id}:{version}:{start}:{end}\`.
-- Offsets in the key are **normalized integers** (\`10\`, not the raw query string \`010\`).
-- The entry gets a **long TTL** on write (\`SPAN_TTL_S\`, seven days).
-- A cached payload carries **its version**, and a hit whose version is not the requested one is
-  refused.
-- A write to a document invalidates **nothing**: no \`DEL\` on update, no key sweep.
-- A missing \`X-Tenant-Id\` is **401** and \`version < 1\`, \`start < 0\` or \`end <= start\` is
-  **400**; an unknown version is **404**.`,
+- The key names the **immutable version**: \`span:{document_id}:{version}:{start}:{end}\`.
+- The offsets in the key are **integers** parsed from the query, so \`010\` and \`10\` are one key.
+- An entry is written with a **long TTL**, \`SPAN_TTL_S\` = 7 days: the version never changes, so
+  the TTL only bounds memory.
+- An **unknown version is 404** and nothing is cached for it.`,
   sequence: {
-    participants: ['Client', 'Citation API', 'Redis', 'document store'],
+    participants: ['Citation UI', 'Citation API', 'Redis', 'documents'],
     messages: [
-      {from: 'Client', to: 'Citation API', label: 'GET /v1/spans · doc, version, start, end', kind: 'sync'},
+      {from: 'Citation UI', to: 'Citation API', label: 'GET /v1/spans · doc, version, start, end', kind: 'sync'},
       {from: 'Citation API', to: 'Redis', label: 'GET span:{doc}:{version}:{start}:{end}', kind: 'sync'},
-      {from: 'Redis', to: 'Citation API', label: 'payload{version, text} / nil', kind: 'reply'},
-      {from: 'Citation API', to: 'document store', label: 'getVersion(doc, version) on a miss', kind: 'sync'},
-      {from: 'document store', to: 'Citation API', label: 'immutable version text', kind: 'reply'},
-      {from: 'Citation API', to: 'Redis', label: 'SETEX span:{doc}:{version}:{start}:{end} · TTL 7 d', kind: 'sync'},
-      {from: 'Citation API', to: 'Client', label: '200 {version, text, cached}', kind: 'reply'},
+      {from: 'Redis', to: 'Citation API', label: 'text / nil', kind: 'reply'},
+      {from: 'Citation API', to: 'documents', label: 'get_version(doc, version) on a miss', kind: 'sync'},
+      {from: 'documents', to: 'Citation API', label: 'immutable text · none → 404, nothing cached', kind: 'reply'},
+      {from: 'Citation API', to: 'Redis', label: 'SET … EX SPAN_TTL_S (7 days)', kind: 'sync'},
+      {from: 'Citation API', to: 'Citation UI', label: '200 {version, start, end, text, cached}', kind: 'reply'},
     ],
   },
   hints: [
-    'After a document is updated, span requests for the old version come back with the new text, the hit rate is far below what the traffic predicts, and Redis memory only ever grows.',
-    'The starter keys by document id and the raw offset strings, so the version is not part of the identity and `010` and `10` are two entries; it writes with no expiry and leans on `DEL` instead.',
-    'Build `span_key(document_id, version, int(start), int(end))`, write with `SETEX`/`SET … EX SPAN_TTL_S`, keep the version in the payload and refuse a hit whose version differs, and remove the `DEL` path.',
+    'Publish version 2 of a document, then ask for the same offsets in version 2: the answer is version 1’s text, flagged as cached. Ask for a version that does not exist yet: 200 with an empty text.',
+    'The key is built from the document id and the raw query strings, so the version is not part of the span’s identity and `010` is not `10`; the entry has no expiry, and a missing version is sliced as an empty string and cached.',
+    'Parse the offsets to integers, key `span:{document_id}:{version}:{start}:{end}`, write with `ex=SPAN_TTL_S`, and answer 404 without writing when `get_version` returns nothing.',
   ],
   checks: [
     {
       id: 'route',
       title: 'Handles GET /v1/spans',
-      detail: 'Register the span resolution route on `GET /v1/spans`.',
+      detail: 'Register `GET /v1/spans`, answering the text at the offsets and whether it came from the cache.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/spans["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/spans['"]/]},
@@ -59,324 +58,270 @@ times. Both stay invisible on a document that is never edited or re-read with pa
       id: 'version-key',
       title: 'The cache key names the immutable version',
       detail:
-        'The key is `span:{document_id}:{version}:{start}:{end}`. The starter keys by document id and offsets, so after a document update one version’s cached text answers another version’s request.',
+        'The key is `span:{document_id}:{version}:{start}:{end}`, so version 2’s span is never answered from version 1’s entry. The starter keys by document id and offsets only.',
       match: {
-        python: {all: [/span_key\(/, /span:\{document_id\}:\{version\}/]},
-        typescript: {all: [/spanKey\(/, /span:\$\{documentId\}:\$\{version\}/]},
-        go: {all: [/spanKey\(/, /span:%s:%d/]},
-        scala: {all: [/spanKey\(/, /span:\$documentId:\$version/]},
-        cpp: {all: [/spanKey\(/, /"span:" \+ documentId \+ ":" \+ std::to_string\(version\)/]},
+        python: {all: [/span:\{document_id\}:\{version\}:\{start\}:\{end\}/]},
+        typescript: {all: [/span:\$\{documentId\}:\$\{version\}:\$\{start\}:\$\{end\}/]},
+        go: {all: [/"span:%s:%d:%d:%d"/]},
+        scala: {all: [/span:\$documentId:\$version:\$start:\$end/]},
+        cpp: {all: [/"span:" \+ document_id \+ ":" \+ std::to_string\(version\)/]},
       },
     },
     {
       id: 'numeric-offsets',
-      title: 'Offsets are normalized to integers in the key',
+      title: 'Offsets are integers in the key',
       detail:
-        'The offsets are cast to integers before they are keyed, so `10` and `010` are one key. The starter pastes the raw query strings into the key, so the same span is cached under several keys.',
+        'The offsets are parsed from the query before they are keyed, so `start=010` and `start=10` are one entry. The starter pastes the raw query strings into the key.',
       match: {
-        python: {all: [/span_key\(/, /int\(start\)/, /int\(end\)/]},
-        typescript: {all: [/Math\.trunc\(start\)/, /Math\.trunc\(end\)/]},
-        go: {all: [/strconv\.FormatInt\(start/, /strconv\.FormatInt\(end/]},
-        scala: {all: [/start\.toString/, /end\.toString/]},
-        cpp: {all: [/std::to_string\(start\)/, /std::to_string\(end\)/]},
+        python: {
+          all: [/int\(\s*q\[["']start["']\]\s*\)/, /int\(\s*q\[["']end["']\]\s*\)/],
+          none: [/span_key\([^)\n]*q\[/],
+        },
+        typescript: {
+          all: [/Number\(\s*q\.start\s*\)/, /Number\(\s*q\.end\s*\)/],
+          none: [/spanKey\([^)\n]*q\.(start|end)/],
+        },
+        go: {
+          all: [/strconv\.Atoi\(\s*q\.Get\("start"\)\s*\)/, /strconv\.Atoi\(\s*q\.Get\("end"\)\s*\)/],
+          none: [/spanKey\([^)\n]*q\.Get\(/],
+        },
+        scala: {all: [/"start"\.as\[(Long|Int)\]/, /"end"\.as\[(Long|Int)\]/]},
+        cpp: {
+          all: [
+            /std::stol\(\s*req\.get_param_value\("start"\)\s*\)/,
+            /std::stol\(\s*req\.get_param_value\("end"\)\s*\)/,
+          ],
+          none: [/spanKey\([^)\n]*get_param_value/],
+        },
       },
     },
     {
       id: 'long-ttl',
       title: 'Span entries carry a long TTL',
       detail:
-        'The entry is written with `SPAN_TTL_S`, a long TTL that matches the immutability of the version. The starter writes span keys with no expiry at all, so every span a tenant ever resolves is kept forever.',
+        'The entry is written with `SPAN_TTL_S` (7 days), long because the version is immutable, finite so the cache does not hold every span ever read. The starter writes with no expiry.',
       match: {
-        python: {all: [/SPAN_TTL_S/, /ex=SPAN_TTL_S/]},
-        typescript: {all: [/SPAN_TTL_S/, /'EX',\s*SPAN_TTL_S/]},
-        go: {all: [/spanTtlS/, /spanTtlS\s*\*\s*time\.Second/]},
-        scala: {all: [/SpanTtlS/, /setex\(/]},
-        cpp: {all: [/kSpanTtlS/, /std::chrono::seconds\(kSpanTtlS\)/]},
+        python: {all: [/SPAN_TTL_S\s*=/, /ex\s*=\s*SPAN_TTL_S|setex\(/]},
+        typescript: {all: [/SPAN_TTL_S\s*=/, /['"]EX['"],\s*SPAN_TTL_S|setex\(/]},
+        go: {all: [/spanTTL\s*=/, /\.Set\([^\n]*spanTTL\)|SetEx\(/]},
+        scala: {all: [/SpanTtlS(:\s*\w+)?\s*=/, /setex\([^\n]*SpanTtlS/]},
+        cpp: {all: [/kSpanTtlS\s*=/, /seconds\(kSpanTtlS\)/]},
       },
     },
     {
-      id: 'hit-scope',
-      title: 'A hit for one version never serves another',
+      id: 'unknown-version',
+      title: 'An unknown version is 404 and is not cached',
       detail:
-        'The cached payload carries its version and a hit whose version differs from the requested one is refused, so a stale or migrated key cannot answer for the wrong version. Nothing deletes span keys — an immutable version is never invalidated (`DEL` on update is dead weight).',
+        'When the document has no such version the read answers **404** and writes nothing, so the version is served once it is published. The starter slices an empty text and caches it.',
       match: {
-        python: {all: [/cached\["version"\]\s*!=\s*version/], none: [/\.delete\(/]},
-        typescript: {all: [/cached\.version\s*!==?\s*version/], none: [/\.del\(/]},
-        go: {all: [/cached\.Version\s*!=\s*version/], none: [/\.Del\(/]},
-        scala: {all: [/cached\.version\s*!=\s*version/], none: [/\.del\(/]},
-        cpp: {all: [/cached\.value\("version",\s*0\)\s*!=\s*version/], none: [/\.del\(/]},
+        python: {all: [/\b404\b/], none: [/get_version\([^)\n]*\)\s*or\s*["']/]},
+        typescript: {all: [/code\(\s*404\s*\)/], none: [/getVersion\([^)\n]*\)\)\s*\?\?/]},
+        go: {all: [/StatusNotFound|\b404\b/], none: [/_\s*:=\s*documents\.GetVersion\(/]},
+        scala: {all: [/NotFound|\b404\b/], none: [/getVersion\([^)\n]*\)\.getOrElse/]},
+        cpp: {all: [/\b404\b/], none: [/getVersion\([^)\n]*\)\.value_or/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import json
-
-import redis
-from fastapi import FastAPI, Header
+      starter: `import redis
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from citations import documents  # documents.get_version(document_id, version)
 
 app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-def cache_key(document_id: str, start: str, end: str) -> str:
-    # Offsets arrive as query strings, so "10" and "010" key differently, and the version is not
-    # part of the key at all.
+def span_key(document_id, start, end) -> str:
     return f"span:{document_id}:{start}:{end}"
 
 
 @app.get("/v1/spans")
-def get_span(
-    document_id: str,
-    version: int,
-    start: str,
-    end: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
+def get_span(request: Request) -> JSONResponse:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    raw = r.get(cache_key(document_id, start, end))
-    if raw is not None:
-        return JSONResponse({"text": raw, "cached": True}, status_code=200)
-    text = documents.latest(document_id)[int(start) : int(end)]
-    r.set(cache_key(document_id, start, end), text)
-    return JSONResponse({"text": text, "cached": False}, status_code=200)
-
-
-def on_document_updated(document_id: str) -> None:
-    r.delete(f"span:{document_id}")
+    q = request.query_params
+    document_id, version = q["document_id"], int(q["version"])
+    key = span_key(document_id, q["start"], q["end"])
+    start, end = int(q["start"]), int(q["end"])
+    view = {"document_id": document_id, "version": version, "start": start, "end": end}
+    cached = r.get(key)
+    if cached is not None:
+        return JSONResponse({**view, "text": cached, "cached": True})
+    text = documents.get_version(document_id, version) or ""
+    span = text[start:end]
+    r.set(key, span)
+    return JSONResponse({**view, "text": span, "cached": False})
 `,
-      solution: `import json
-
-import redis
-from fastapi import FastAPI, Header, HTTPException
+      solution: `import redis
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from citations import documents  # documents.get_version(document_id, version)
 
 app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# A version is immutable, so a cached span can live for a long time and never needs invalidating.
+# A version never changes, so an entry is never stale: the TTL only bounds what the cache holds.
 SPAN_TTL_S = 7 * 24 * 3600
 
 
 def span_key(document_id: str, version: int, start: int, end: int) -> str:
-    """The one key for one span of one immutable version: numeric offsets, version included."""
-    return f"span:{document_id}:{version}:{int(start)}:{int(end)}"
-
-
-def cached_span(document_id: str, version: int, start: int, end: int) -> str | None:
-    raw = r.get(span_key(document_id, version, start, end))
-    if raw is None:
-        return None
-    cached = json.loads(raw)
-    if cached["version"] != version:
-        return None
-    return cached["text"]
-
-
-def cache_span(document_id: str, version: int, start: int, end: int, text: str) -> None:
-    payload = json.dumps({"version": version, "text": text})
-    r.set(span_key(document_id, version, start, end), payload, ex=SPAN_TTL_S)
+    return f"span:{document_id}:{version}:{start}:{end}"
 
 
 @app.get("/v1/spans")
-def get_span(
-    document_id: str,
-    version: int,
-    start: int,
-    end: int,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if document_id == "" or version < 1 or start < 0 or end <= start:
-        raise HTTPException(status_code=400, detail="invalid span")
-
-    hit = cached_span(document_id, version, start, end)
-    if hit is not None:
-        return JSONResponse(
-            {"document_id": document_id, "version": version, "start": start, "end": end, "text": hit, "cached": True},
-            status_code=200,
-        )
-
+def get_span(request: Request) -> JSONResponse:
+    q = request.query_params
+    document_id, version = q["document_id"], int(q["version"])
+    start, end = int(q["start"]), int(q["end"])
+    key = span_key(document_id, version, start, end)
+    view = {"document_id": document_id, "version": version, "start": start, "end": end}
+    cached = r.get(key)
+    if cached is not None:
+        return JSONResponse({**view, "text": cached, "cached": True})
     text = documents.get_version(document_id, version)
     if text is None:
-        raise HTTPException(status_code=404, detail="unknown document version")
+        # Nothing is cached: the version may be published later, and a cached miss would outlive that.
+        return JSONResponse({"error": "no such document version"}, status_code=404)
     span = text[start:end]
-    cache_span(document_id, version, start, end, span)
-    return JSONResponse(
-        {"document_id": document_id, "version": version, "start": start, "end": end, "text": span, "cached": False},
-        status_code=200,
-    )
+    r.set(key, span, ex=SPAN_TTL_S)
+    return JSONResponse({**view, "text": span, "cached": False})
 `,
     },
     typescript: {
-      starter: `/** GET /v1/spans: the starter. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
 
-import {documents} from './store';
+import {getVersion} from 'citations/documents';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-function cacheKey(documentId: string, start: string, end: string): string {
-  // The version is missing and the offsets come straight from the query string.
-  return \`span:\${documentId}:\${start}:\${end}\`;
-}
+export const spanKey = (documentId: string, start: string, end: string): string => \`span:\${documentId}:\${start}:\${end}\`;
 
-app.get('/v1/spans', async (request, reply) => {
+app.get('/v1/spans', async request => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const query = request.query as {document_id: string; version: string; start: string; end: string};
-  const cached = await r.get(cacheKey(query.document_id, query.start, query.end));
-  if (cached !== null) return reply.code(200).send({text: cached, cached: true});
-  const text = documents.getLatest(query.document_id).slice(Number(query.start), Number(query.end));
-  await r.set(cacheKey(query.document_id, query.start, query.end), text);
-  return reply.code(200).send({text, cached: false});
+  const q = request.query as Record<string, string>;
+  const documentId = q.document_id;
+  const version = Number(q.version);
+  const key = spanKey(documentId, q.start, q.end);
+  const start = Number(q.start);
+  const end = Number(q.end);
+  const view = {document_id: documentId, version, start, end};
+  const cached = await redis.get(key);
+  if (cached !== null) return {...view, text: cached, cached: true};
+  const text = (await getVersion(documentId, version)) ?? '';
+  const span = text.slice(start, end);
+  await redis.set(key, span);
+  return {...view, text: span, cached: false};
 });
-
-/** Called when a document is updated. */
-export async function onDocumentUpdated(documentId: string): Promise<void> {
-  await r.del(\`span:\${documentId}\`);
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/spans: cache resolved span text under its immutable version. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
 
-import {documents} from './store';
+import {getVersion} from 'citations/documents';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-// A version is immutable, so a cached span can live for a long time and never needs invalidating.
-const SPAN_TTL_S = 7 * 24 * 3600;
+// A version never changes, so an entry is never stale: the TTL only bounds what the cache holds.
+export const SPAN_TTL_S = 7 * 24 * 3600;
 
-function spanKey(documentId: string, version: number, start: number, end: number): string {
-  return \`span:\${documentId}:\${version}:\${Math.trunc(start)}:\${Math.trunc(end)}\`;
-}
-
-async function cachedSpan(
-  documentId: string,
-  version: number,
-  start: number,
-  end: number,
-): Promise<string | null> {
-  const raw = await r.get(spanKey(documentId, version, start, end));
-  if (raw === null) return null;
-  const cached = JSON.parse(raw) as {version: number; text: string};
-  if (cached.version !== version) return null;
-  return cached.text;
-}
-
-async function cacheSpan(
-  documentId: string,
-  version: number,
-  start: number,
-  end: number,
-  text: string,
-): Promise<void> {
-  await r.set(spanKey(documentId, version, start, end), JSON.stringify({version, text}), 'EX', SPAN_TTL_S);
-}
+export const spanKey = (documentId: string, version: number, start: number, end: number): string =>
+  \`span:\${documentId}:\${version}:\${start}:\${end}\`;
 
 app.get('/v1/spans', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-
-  const query = request.query as {document_id?: string; version?: string; start?: string; end?: string};
-  const version = Number(query.version);
-  const start = Number(query.start);
-  const end = Number(query.end);
-  if (
-    typeof query.document_id !== 'string' ||
-    query.document_id === '' ||
-    !Number.isInteger(version) ||
-    version < 1 ||
-    !Number.isInteger(start) ||
-    !Number.isInteger(end) ||
-    start < 0 ||
-    end <= start
-  )
-    return reply.code(400).send({error: 'invalid span'});
-
-  const hit = await cachedSpan(query.document_id, version, start, end);
-  if (hit !== null)
-    return reply
-      .code(200)
-      .send({document_id: query.document_id, version, start, end, text: hit, cached: true});
-
-  const text = documents.getVersion(query.document_id, version);
-  if (text === null) return reply.code(404).send({error: 'unknown document version'});
+  const q = request.query as Record<string, string>;
+  const documentId = q.document_id;
+  const version = Number(q.version);
+  const start = Number(q.start);
+  const end = Number(q.end);
+  const key = spanKey(documentId, version, start, end);
+  const view = {document_id: documentId, version, start, end};
+  const cached = await redis.get(key);
+  if (cached !== null) return {...view, text: cached, cached: true};
+  const text = await getVersion(documentId, version);
+  // Nothing is cached: the version may be published later, and a cached miss would outlive that.
+  if (text === null) return reply.code(404).send({error: 'no such document version'});
   const span = text.slice(start, end);
-  await cacheSpan(query.document_id, version, start, end, span);
-  return reply.code(200).send({document_id: query.document_id, version, start, end, text: span, cached: false});
+  await redis.set(key, span, 'EX', SPAN_TTL_S);
+  return {...view, text: span, cached: false};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
 
 	"github.com/redis/go-redis/v9"
+
+	"citations/documents" // documents.GetVersion(ctx, documentID, version) (string, bool)
 )
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type DocumentStore struct{}
-
-func (s *DocumentStore) Latest(documentID string) (string, bool) {
-	return "", false
+type spanView struct {
+	DocumentID string \`json:"document_id"\`
+	Version    int    \`json:"version"\`
+	Start      int    \`json:"start"\`
+	End        int    \`json:"end"\`
+	Text       string \`json:"text"\`
+	Cached     bool   \`json:"cached"\`
 }
 
-var documents = &DocumentStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func cacheKey(documentID, start, end string) string {
-	// The version is missing and the offsets are the raw query strings.
+// span is text[start:end], clamped to the text.
+func span(text string, start, end int) string {
+	start, end = max(start, 0), min(end, len(text))
+	if start >= end {
+		return ""
+	}
+	return text[start:end]
+}
+
+func spanKey(documentID, start, end string) string {
 	return "span:" + documentID + ":" + start + ":" + end
 }
 
 func getSpan(rw http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	documentID := query.Get("document_id")
-	version := query.Get("version")
-	start := query.Get("start")
-	end := query.Get("end")
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	if raw, err := rdb.Get(r.Context(), cacheKey(documentID, start, end)).Result(); err == nil {
-		writeJSON(rw, http.StatusOK, map[string]any{"text": raw, "cached": true})
+	q := r.URL.Query()
+	documentID := q.Get("document_id")
+	version, _ := strconv.Atoi(q.Get("version"))
+	key := spanKey(documentID, q.Get("start"), q.Get("end"))
+	start, _ := strconv.Atoi(q.Get("start"))
+	end, _ := strconv.Atoi(q.Get("end"))
+	view := spanView{DocumentID: documentID, Version: version, Start: start, End: end}
+	if cached, err := rdb.Get(r.Context(), key).Result(); err == nil {
+		view.Text = cached
+		view.Cached = true
+		writeJSON(rw, http.StatusOK, view)
 		return
 	}
-	text, _ := documents.Latest(documentID)
-	startInt, _ := strconv.Atoi(start)
-	endInt, _ := strconv.Atoi(end)
-	span := text[startInt:endInt]
-	rdb.Set(r.Context(), cacheKey(documentID, start, end), span, 0)
-	writeJSON(rw, http.StatusOK, map[string]any{"version": version, "text": span, "cached": false})
+	text, _ := documents.GetVersion(r.Context(), documentID, version)
+	view.Text = span(text, start, end)
+	rdb.Set(r.Context(), key, view.Text, 0)
+	writeJSON(rw, http.StatusOK, view)
 }
 
-func onDocumentUpdated(ctx context.Context, documentID string) {
-	rdb.Del(ctx, "span:"+documentID)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/spans", getSpan)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -384,225 +329,169 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"citations/documents" // documents.GetVersion(ctx, documentID, version) (string, bool)
 )
 
-// A version is immutable, so a cached span can live for a long time and never needs invalidating.
-const spanTtlS = 7 * 24 * 3600
+// A version never changes, so an entry is never stale: the TTL only bounds what the cache holds.
+const spanTTL = 7 * 24 * time.Hour
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type DocumentStore struct{}
-
-func (s *DocumentStore) GetVersion(documentID string, version int) (string, bool) {
-	return "", false
+type spanView struct {
+	DocumentID string \`json:"document_id"\`
+	Version    int    \`json:"version"\`
+	Start      int    \`json:"start"\`
+	End        int    \`json:"end"\`
+	Text       string \`json:"text"\`
+	Cached     bool   \`json:"cached"\`
 }
 
-var documents = &DocumentStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-type cachedSpanPayload struct {
-	Version int    \`json:"version"\`
-	Text    string \`json:"text"\`
-}
-
-func spanKey(documentID string, version int, start, end int64) string {
-	return fmt.Sprintf("span:%s:%d:%s:%s", documentID, version, strconv.FormatInt(start, 10), strconv.FormatInt(end, 10))
-}
-
-func cachedSpan(ctx context.Context, documentID string, version int, start, end int64) (string, bool) {
-	raw, err := rdb.Get(ctx, spanKey(documentID, version, start, end)).Result()
-	if err != nil {
-		return "", false
+// span is text[start:end], clamped to the text.
+func span(text string, start, end int) string {
+	start, end = max(start, 0), min(end, len(text))
+	if start >= end {
+		return ""
 	}
-	var cached cachedSpanPayload
-	if err := json.Unmarshal([]byte(raw), &cached); err != nil {
-		return "", false
-	}
-	if cached.Version != version {
-		return "", false
-	}
-	return cached.Text, true
+	return text[start:end]
 }
 
-func cacheSpan(ctx context.Context, documentID string, version int, start, end int64, text string) {
-	payload, _ := json.Marshal(cachedSpanPayload{Version: version, Text: text})
-	rdb.Set(ctx, spanKey(documentID, version, start, end), payload, spanTtlS*time.Second)
+func spanKey(documentID string, version, start, end int) string {
+	return fmt.Sprintf("span:%s:%d:%d:%d", documentID, version, start, end)
 }
 
 func getSpan(rw http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("X-Tenant-Id") == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	q := r.URL.Query()
+	documentID := q.Get("document_id")
+	version, _ := strconv.Atoi(q.Get("version"))
+	start, _ := strconv.Atoi(q.Get("start"))
+	end, _ := strconv.Atoi(q.Get("end"))
+	key := spanKey(documentID, version, start, end)
+	view := spanView{DocumentID: documentID, Version: version, Start: start, End: end}
+	if cached, err := rdb.Get(r.Context(), key).Result(); err == nil {
+		view.Text = cached
+		view.Cached = true
+		writeJSON(rw, http.StatusOK, view)
 		return
 	}
-	query := r.URL.Query()
-	documentID := query.Get("document_id")
-	version, errVersion := strconv.Atoi(query.Get("version"))
-	start, errStart := strconv.ParseInt(query.Get("start"), 10, 64)
-	end, errEnd := strconv.ParseInt(query.Get("end"), 10, 64)
-	if documentID == "" || errVersion != nil || version < 1 || errStart != nil || errEnd != nil || start < 0 || end <= start {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid span"})
-		return
-	}
-
-	if hit, ok := cachedSpan(r.Context(), documentID, version, start, end); ok {
-		writeJSON(rw, http.StatusOK, map[string]any{
-			"document_id": documentID,
-			"version":     version,
-			"start":       start,
-			"end":         end,
-			"text":        hit,
-			"cached":      true,
-		})
-		return
-	}
-
-	text, ok := documents.GetVersion(documentID, version)
+	text, ok := documents.GetVersion(r.Context(), documentID, version)
 	if !ok {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown document version"})
+		// Nothing is cached: the version may be published later, and a cached miss would outlive that.
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such document version"})
 		return
 	}
-	span := text[start:end]
-	cacheSpan(r.Context(), documentID, version, start, end, span)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"document_id": documentID,
-		"version":     version,
-		"start":       start,
-		"end":         end,
-		"text":        span,
-		"cached":      false,
-	})
+	view.Text = span(text, start, end)
+	rdb.Set(r.Context(), key, view.Text, spanTTL)
+	writeJSON(rw, http.StatusOK, view)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/spans", getSpan)
-	_ = http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+import redis.clients.jedis.JedisPooled
+import spray.json._
 
-object SpanApi {
-  implicit val system: ActorSystem = ActorSystem("citation-store")
+import citations.Documents // Documents.getVersion(documentId, version): Option[String]
 
-  val jedis = new Jedis("redis", 6379)
+object State {
+  private val jedis = new JedisPooled("redis", 6379)
 
-  def cacheKey(documentId: String, start: String, end: String): String =
-    // The version is missing and the offsets are the raw query strings.
-    s"span:$documentId:$start:$end"
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def view(documentId: String, version: Long, start: Long, end: Long, text: String, cached: Boolean): JsObject =
+    JsObject(
+      "document_id" -> JsString(documentId),
+      "version" -> JsNumber(version),
+      "start" -> JsNumber(start),
+      "end" -> JsNumber(end),
+      "text" -> JsString(text),
+      "cached" -> JsBoolean(cached)
+    )
+
+  def spanKey(documentId: String, start: String, end: String): String = s"span:$documentId:$start:$end"
 
   val route: Route =
     path("v1" / "spans") {
       get {
-        parameters("document_id", "version", "start", "end") { (documentId, version, start, end) =>
+        parameters("document_id", "version".as[Long], "start", "end") { (documentId, version, rawStart, rawEnd) =>
           // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          Option(jedis.get(cacheKey(documentId, start, end))) match {
-            case Some(text) =>
-              complete(StatusCodes.OK, s"""{"text":"$text","cached":true}""")
+          val key = spanKey(documentId, rawStart, rawEnd)
+          val (start, end) = (rawStart.toLong, rawEnd.toLong)
+          Option(jedis.get(key)) match {
+            case Some(cached) => complete(json(StatusCodes.OK, view(documentId, version, start, end, cached, cached = true)))
             case None =>
-              val text = documents.latest(documentId).substring(start.toInt, end.toInt)
-              jedis.set(cacheKey(documentId, start, end), text)
-              complete(StatusCodes.OK, s"""{"text":"$text","cached":false}""")
+              val text = Documents.getVersion(documentId, version).getOrElse("")
+              val span = text.slice(start.toInt, end.toInt)
+              jedis.set(key, span)
+              complete(json(StatusCodes.OK, view(documentId, version, start, end, span, cached = false)))
           }
         }
       }
     }
-
-  def onDocumentUpdated(documentId: String): Unit = {
-    jedis.del(s"span:$documentId")
-    ()
-  }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import redis.clients.jedis.JedisPooled
+import spray.json._
 
-final case class CachedSpan(version: Int, text: String)
+import citations.Documents // Documents.getVersion(documentId, version): Option[String]
 
-object SpanApi {
-  implicit val system: ActorSystem = ActorSystem("citation-store")
-  implicit val cachedFormat: RootJsonFormat[CachedSpan] = jsonFormat2(CachedSpan)
+object State {
+  /** A version never changes, so an entry is never stale: the TTL only bounds what the cache holds. */
+  val SpanTtlS: Long = 7L * 24 * 3600
 
-  // A version is immutable, so a cached span can live for a long time and never needs invalidating.
-  val SpanTtlS = 7 * 24 * 3600
-  val jedis = new Jedis("redis", 6379)
+  private val jedis = new JedisPooled("redis", 6379)
 
-  def spanKey(documentId: String, version: Int, start: Long, end: Long): String =
-    s"span:$documentId:$version:\${start.toString}:\${end.toString}"
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def cachedSpan(documentId: String, version: Int, start: Long, end: Long): Option[String] =
-    Option(jedis.get(spanKey(documentId, version, start, end))).flatMap { raw =>
-      val cached = raw.parseJson.convertTo[CachedSpan]
-      if (cached.version != version) None else Some(cached.text)
-    }
+  private def view(documentId: String, version: Long, start: Long, end: Long, text: String, cached: Boolean): JsObject =
+    JsObject(
+      "document_id" -> JsString(documentId),
+      "version" -> JsNumber(version),
+      "start" -> JsNumber(start),
+      "end" -> JsNumber(end),
+      "text" -> JsString(text),
+      "cached" -> JsBoolean(cached)
+    )
 
-  def cacheSpan(documentId: String, version: Int, start: Long, end: Long, text: String): Unit = {
-    val payload = CachedSpan(version, text).toJson.compactPrint
-    jedis.setex(spanKey(documentId, version, start, end), SpanTtlS, payload)
-  }
+  def spanKey(documentId: String, version: Long, start: Long, end: Long): String = s"span:$documentId:$version:$start:$end"
 
   val route: Route =
     path("v1" / "spans") {
       get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          parameters("document_id", "version".as[Int], "start".as[Long], "end".as[Long]) {
-            (documentId, version, start, end) =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (documentId.isEmpty || version < 1 || start < 0 || end <= start) {
-                complete(StatusCodes.BadRequest, """{"error":"invalid span"}""")
-              } else {
-                cachedSpan(documentId, version, start, end) match {
-                  case Some(hit) =>
-                    complete(
-                      StatusCodes.OK,
-                      s"""{"document_id":"$documentId","version":$version,"start":$start,"end":$end,"text":"$hit","cached":true}"""
-                    )
-                  case None =>
-                    documents.getVersion(documentId, version) match {
-                      case None =>
-                        complete(StatusCodes.NotFound, """{"error":"unknown document version"}""")
-                      case Some(text) =>
-                        val span = text.substring(start.toInt, end.toInt)
-                        cacheSpan(documentId, version, start, end, span)
-                        complete(
-                          StatusCodes.OK,
-                          s"""{"document_id":"$documentId","version":$version,"start":$start,"end":$end,"text":"$span","cached":false}"""
-                        )
-                    }
-                }
+        parameters("document_id", "version".as[Long], "start".as[Long], "end".as[Long]) { (documentId, version, start, end) =>
+          val key = spanKey(documentId, version, start, end)
+          Option(jedis.get(key)) match {
+            case Some(cached) => complete(json(StatusCodes.OK, view(documentId, version, start, end, cached, cached = true)))
+            case None =>
+              Documents.getVersion(documentId, version) match {
+                // Nothing is cached: the version may be published later, and a cached miss would outlive that.
+                case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such document version"))))
+                case Some(text) =>
+                  val span = text.slice(start.toInt, end.toInt)
+                  jedis.setex(key, SpanTtlS, span)
+                  complete(json(StatusCodes.OK, view(documentId, version, start, end, span, cached = false)))
               }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },
@@ -611,149 +500,414 @@ object SpanApi {
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
+#include <algorithm>
 #include <string>
+
+#include "citations/documents.h"  // documents::getVersion(document_id, version) -> std::optional<std::string>
 
 using json = nlohmann::json;
 
-struct DocumentStore {
-  std::string latest(const std::string& documentId) const;
-};
+sw::redis::Redis redis("tcp://redis:6379");
 
-DocumentStore documents;
-
-std::string cacheKey(const std::string& documentId, const std::string& start, const std::string& end) {
-  // The version is missing and the offsets are the raw query strings.
-  return "span:" + documentId + ":" + start + ":" + end;
+// text[start, end), clamped to the text.
+std::string span(const std::string& text, long start, long end) {
+  start = std::max(start, 0L);
+  end = std::min(end, static_cast<long>(text.size()));
+  return start >= end ? "" : text.substr(start, end - start);
 }
 
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  httplib::Server svr;
-
-  svr.Get("/v1/spans", [&redis](const httplib::Request& req, httplib::Response& res) {
-    const auto documentId = req.get_param_value("document_id");
-    const auto start = req.get_param_value("start");
-    const auto end = req.get_param_value("end");
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    if (const auto raw = redis.get(cacheKey(documentId, start, end))) {
-      res.status = 200;
-      res.set_content(json{{"text", *raw}, {"cached", true}}.dump(), "application/json");
-      return;
-    }
-    const auto text = documents.latest(documentId).substr(std::stoll(start), std::stoll(end) - std::stoll(start));
-    redis.set(cacheKey(documentId, start, end), text);
-    res.status = 200;
-    res.set_content(json{{"text", text}, {"cached", false}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+std::string spanKey(const std::string& document_id, const std::string& start, const std::string& end) {
+  return "span:" + document_id + ":" + start + ":" + end;
 }
 
-void onDocumentUpdated(sw::redis::Redis& redis, const std::string& documentId) {
-  redis.del("span:" + documentId);
+void get_span(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string document_id = req.get_param_value("document_id");
+  const long version = std::stol(req.get_param_value("version"));
+  const std::string key = spanKey(document_id, req.get_param_value("start"), req.get_param_value("end"));
+  const long start = std::stol(req.get_param_value("start"));
+  const long end = std::stol(req.get_param_value("end"));
+  json view = {{"document_id", document_id}, {"version", version}, {"start", start}, {"end", end}};
+  if (const auto cached = redis.get(key)) {
+    view["text"] = *cached;
+    view["cached"] = true;
+    res.set_content(view.dump(), "application/json");
+    return;
+  }
+  const std::string text = span(documents::getVersion(document_id, version).value_or(""), start, end);
+  redis.set(key, text);
+  view["text"] = text;
+  view["cached"] = false;
+  res.set_content(view.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) {
+  svr.Get("/v1/spans", get_span);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
+#include <algorithm>
 #include <chrono>
-#include <optional>
 #include <string>
+
+#include "citations/documents.h"  // documents::getVersion(document_id, version) -> std::optional<std::string>
 
 using json = nlohmann::json;
 
-// A version is immutable, so a cached span can live for a long time and never needs invalidating.
-constexpr long long kSpanTtlS = 7 * 24 * 3600;
+// A version never changes, so an entry is never stale: the TTL only bounds what the cache holds.
+constexpr long kSpanTtlS = 7L * 24 * 3600;
 
-struct DocumentStore {
-  std::optional<std::string> getVersion(const std::string& documentId, int version) const;
-};
+sw::redis::Redis redis("tcp://redis:6379");
 
-DocumentStore documents;
-
-std::string spanKey(const std::string& documentId, int version, long long start, long long end) {
-  return "span:" + documentId + ":" + std::to_string(version) + ":" + std::to_string(start) + ":" +
-         std::to_string(end);
+// text[start, end), clamped to the text.
+std::string span(const std::string& text, long start, long end) {
+  start = std::max(start, 0L);
+  end = std::min(end, static_cast<long>(text.size()));
+  return start >= end ? "" : text.substr(start, end - start);
 }
 
-std::optional<std::string> cachedSpan(
-    sw::redis::Redis& redis,
-    const std::string& documentId,
-    int version,
-    long long start,
-    long long end) {
-  const auto raw = redis.get(spanKey(documentId, version, start, end));
-  if (!raw) return std::nullopt;
-  const json cached = json::parse(*raw, nullptr, false);
-  if (!cached.is_object() || cached.value("version", 0) != version) return std::nullopt;
-  return cached.value("text", std::string());
+std::string spanKey(const std::string& document_id, long version, long start, long end) {
+  return "span:" + document_id + ":" + std::to_string(version) + ":" + std::to_string(start) + ":" + std::to_string(end);
 }
 
-void cacheSpan(
-    sw::redis::Redis& redis,
-    const std::string& documentId,
-    int version,
-    long long start,
-    long long end,
-    const std::string& text) {
-  const json payload = {{"version", version}, {"text", text}};
-  redis.set(spanKey(documentId, version, start, end), payload.dump(), std::chrono::seconds(kSpanTtlS));
+void get_span(const httplib::Request& req, httplib::Response& res) {
+  const std::string document_id = req.get_param_value("document_id");
+  const long version = std::stol(req.get_param_value("version"));
+  const long start = std::stol(req.get_param_value("start"));
+  const long end = std::stol(req.get_param_value("end"));
+  const std::string key = spanKey(document_id, version, start, end);
+  json view = {{"document_id", document_id}, {"version", version}, {"start", start}, {"end", end}};
+  if (const auto cached = redis.get(key)) {
+    view["text"] = *cached;
+    view["cached"] = true;
+    res.set_content(view.dump(), "application/json");
+    return;
+  }
+  const auto version_text = documents::getVersion(document_id, version);
+  if (!version_text) {
+    // Nothing is cached: the version may be published later, and a cached miss would outlive that.
+    res.status = 404;
+    res.set_content(json{{"error", "no such document version"}}.dump(), "application/json");
+    return;
+  }
+  const std::string text = span(*version_text, start, end);
+  redis.set(key, text, std::chrono::seconds(kSpanTtlS));
+  view["text"] = text;
+  view["cached"] = false;
+  res.set_content(view.dump(), "application/json");
 }
 
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  httplib::Server svr;
-
-  svr.Get("/v1/spans", [&redis](const httplib::Request& req, httplib::Response& res) {
-    if (req.get_header_value("X-Tenant-Id").empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto documentId = req.get_param_value("document_id");
-    const auto versionText = req.get_param_value("version");
-    const auto startText = req.get_param_value("start");
-    const auto endText = req.get_param_value("end");
-    const int version = versionText.empty() ? 0 : std::stoi(versionText);
-    const long long start = startText.empty() ? -1 : std::stoll(startText);
-    const long long end = endText.empty() ? -1 : std::stoll(endText);
-    if (documentId.empty() || version < 1 || start < 0 || end <= start) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid span"})", "application/json");
-      return;
-    }
-
-    if (const auto hit = cachedSpan(redis, documentId, version, start, end)) {
-      res.status = 200;
-      res.set_content(
-          json{{"document_id", documentId}, {"version", version}, {"start", start}, {"end", end},
-               {"text", *hit}, {"cached", true}}
-              .dump(),
-          "application/json");
-      return;
-    }
-
-    const auto text = documents.getVersion(documentId, version);
-    if (!text) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown document version"})", "application/json");
-      return;
-    }
-    const auto span = text->substr(static_cast<std::size_t>(start), static_cast<std::size_t>(end - start));
-    cacheSpan(redis, documentId, version, start, end, span);
-    res.status = 200;
-    res.set_content(
-        json{{"document_id", documentId}, {"version", version}, {"start", start}, {"end", end},
-             {"text", span}, {"cached", false}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Get("/v1/spans", get_span);
 }
 `,
     },
   },
-  debrief: `The fix has its shape because a cache key is the complete identity of the thing it caches. A span is the text at a range of one immutable version, so the key names the document, the version and the normalized integer range; anything less lets two spans share one entry or one span occupy several. Immutability buys the rest: an entry that cannot go stale carries a long TTL, the \`DEL\` on update is dead weight that can only race with a reader, and the version stamp in the payload lets a migrated key be refused instead of trusted. Production span caches go further than this step did, with a per-document size cap so one huge version cannot evict everything else and a warmer for the versions a corpus reads most.`,
+  harness: {
+    python: `from citations import documents
+
+V1 = "Ada Lovelace wrote the first program in 1843."
+V2 = "Ada Lovelace published the first program in 1843."
+WEEK = 7 * 24 * 3600
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("state").app)
+
+
+async def _span(c, version, start, end):
+    return await c.get(f"/v1/spans?document_id=doc-7&version={version}&start={start}&end={end}")
+
+
+def _spans(ctx):
+    return sorted(ctx.redis.keys("span:*"))
+
+
+async def check_route(ctx):
+    documents.add_version("doc-7", V1)
+    async with _api(ctx) as c:
+        first = await _span(c, 1, 0, 12)
+        again = await _span(c, 1, 0, 12)
+    assert first.status_code == 200 and first.json().get("text") == "Ada Lovelace", f"GET /v1/spans for [0, 12) of version 1 answered {first.status_code} {first.text}, expected the text Ada Lovelace"
+    assert first.json().get("cached") is False and again.json().get("cached") is True, f"the first read must be a miss and the second a hit, got cached={first.json().get('cached')} then {again.json().get('cached')}"
+
+
+async def check_version_key(ctx):
+    documents.add_version("doc-7", V1)
+    documents.add_version("doc-7", V2)
+    async with _api(ctx) as c:
+        await _span(c, 1, 13, 18)
+        r = await _span(c, 2, 13, 18)
+    body = r.json()
+    assert body.get("text") == "publi", f"[13, 18) of version 2 answered {body.get('text')!r} (cached={body.get('cached')}), expected 'publi': version 1's entry answered a request for version 2"
+    assert ctx.redis.exists("span:doc-7:2:13:18"), f"no entry span:doc-7:2:13:18; the cache holds {_spans(ctx)}"
+
+
+async def check_numeric_offsets(ctx):
+    documents.add_version("doc-7", V1)
+    async with _api(ctx) as c:
+        padded = await _span(c, 1, "013", "018")
+        plain = await _span(c, 1, 13, 18)
+    assert padded.json().get("text") == "wrote" and plain.json().get("text") == "wrote", f"start=013&end=018 answered {padded.text}, start=13&end=18 answered {plain.text}"
+    assert plain.json().get("cached") is True, f"start=13 after start=013 was a miss: one span is cached twice ({_spans(ctx)})"
+    assert len(_spans(ctx)) == 1, f"one span is cached under {_spans(ctx)}, expected one key"
+
+
+async def check_long_ttl(ctx):
+    documents.add_version("doc-7", V1)
+    async with _api(ctx) as c:
+        await _span(c, 1, 13, 18)
+    keys = _spans(ctx)
+    assert len(keys) == 1, f"one read cached {keys}"
+    ttl = ctx.redis.ttl(keys[0])
+    assert ttl > 0, f"{keys[0]} has no expiry (TTL {ttl}): every span ever read stays in Redis"
+    assert WEEK - 60 <= ttl <= WEEK, f"{keys[0]} expires in {ttl} s, expected SPAN_TTL_S = 7 days ({WEEK} s)"
+
+
+async def check_unknown_version(ctx):
+    documents.add_version("doc-7", V1)
+    async with _api(ctx) as c:
+        r = await _span(c, 2, 13, 18)
+        assert r.status_code == 404, f"version 2 does not exist yet and the read answered {r.status_code} {r.text}, expected 404"
+        assert _spans(ctx) == [], f"a read of a missing version cached {_spans(ctx)}"
+        documents.add_version("doc-7", V2)
+        r = await _span(c, 2, 13, 18)
+    assert r.status_code == 200 and r.json().get("text") == "publi", f"once version 2 is published the read answered {r.status_code} {r.text}, expected 'publi'"
+`,
+    typescript: `const V1 = 'Ada Lovelace wrote the first program in 1843.';
+const V2 = 'Ada Lovelace published the first program in 1843.';
+const WEEK = 7 * 24 * 3600;
+
+function api(ctx) {
+  return {c: ctx.client(ctx.load('state').app), documents: ctx.load('/support/citations/documents.ts')};
+}
+
+const span = (c, version, start, end) => c.get(\`/v1/spans?document_id=doc-7&version=\${version}&start=\${start}&end=\${end}\`);
+
+const spans = ctx => (ctx.redis.keys('span:*') as string[]).sort();
+
+export async function check_route(ctx) {
+  const {c, documents} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  const first = await span(c, 1, 0, 12);
+  const again = await span(c, 1, 0, 12);
+  assert(first.status === 200 && first.json().text === 'Ada Lovelace', \`GET /v1/spans for [0, 12) of version 1 answered \${first.status} \${first.text}, expected the text Ada Lovelace\`);
+  assert(first.json().cached === false && again.json().cached === true, \`the first read must be a miss and the second a hit, got cached=\${first.json().cached} then \${again.json().cached}\`);
+}
+
+export async function check_version_key(ctx) {
+  const {c, documents} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  await documents.addVersion('doc-7', V2);
+  await span(c, 1, 13, 18);
+  const r = await span(c, 2, 13, 18);
+  assert.equal(r.json().text, 'publi', \`[13, 18) of version 2 answered \${r.text}, expected 'publi': version 1's entry answered a request for version 2\`);
+  assert.equal(ctx.redis.exists('span:doc-7:2:13:18'), 1, \`no entry span:doc-7:2:13:18; the cache holds \${JSON.stringify(spans(ctx))}\`);
+}
+
+export async function check_numeric_offsets(ctx) {
+  const {c, documents} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  const padded = await span(c, 1, '013', '018');
+  const plain = await span(c, 1, 13, 18);
+  assert(padded.json().text === 'wrote' && plain.json().text === 'wrote', \`start=013&end=018 answered \${padded.text}, start=13&end=18 answered \${plain.text}\`);
+  assert.equal(plain.json().cached, true, \`start=13 after start=013 was a miss: one span is cached twice (\${JSON.stringify(spans(ctx))})\`);
+  assert.equal(spans(ctx).length, 1, \`one span is cached under \${JSON.stringify(spans(ctx))}, expected one key\`);
+}
+
+export async function check_long_ttl(ctx) {
+  const {c, documents} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  await span(c, 1, 13, 18);
+  const keys = spans(ctx);
+  assert.equal(keys.length, 1, \`one read cached \${JSON.stringify(keys)}\`);
+  const ttl = ctx.redis.ttl(keys[0]);
+  assert(ttl > 0, \`\${keys[0]} has no expiry (TTL \${ttl}): every span ever read stays in Redis\`);
+  assert(WEEK - 60 <= ttl && ttl <= WEEK, \`\${keys[0]} expires in \${ttl} s, expected SPAN_TTL_S = 7 days (\${WEEK} s)\`);
+}
+
+export async function check_unknown_version(ctx) {
+  const {c, documents} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  let r = await span(c, 2, 13, 18);
+  assert.equal(r.status, 404, \`version 2 does not exist yet and the read answered \${r.status} \${r.text}, expected 404\`);
+  assert.deepStrictEqual(spans(ctx), [], \`a read of a missing version cached \${JSON.stringify(spans(ctx))}\`);
+  await documents.addVersion('doc-7', V2);
+  r = await span(c, 2, 13, 18);
+  assert(r.status === 200 && r.json().text === 'publi', \`once version 2 is published the read answered \${r.status} \${r.text}, expected 'publi'\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"citations/documents"
+
+	"leetbuild/harness"
+)
+
+const (
+	stateV1 = "Ada Lovelace wrote the first program in 1843."
+	stateV2 = "Ada Lovelace published the first program in 1843."
+	week    = 7 * 24 * 3600
+)
+
+var stateBg = context.Background()
+
+func spansAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readSpan(c *harness.HTTP, version int, start, end string) (*harness.Response, map[string]any) {
+	r := c.Get(fmt.Sprintf("/v1/spans?document_id=doc-7&version=%d&start=%s&end=%s", version, start, end))
+	body, _ := r.JSON().(map[string]any)
+	return r, body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	documents.AddVersion(stateBg, "doc-7", stateV1)
+	c := spansAPI(ctx)
+	first, fb := readSpan(c, 1, "0", "12")
+	_, ab := readSpan(c, 1, "0", "12")
+	ctx.Assert(first.Status == 200 && fb["text"] == "Ada Lovelace", "GET /v1/spans for [0, 12) of version 1 answered %d %s, expected the text Ada Lovelace", first.Status, first.Text())
+	ctx.Assert(fb["cached"] == false && ab["cached"] == true, "the first read must be a miss and the second a hit, got cached=%v then %v", fb["cached"], ab["cached"])
+}
+
+func CheckVersionKey(ctx *harness.Ctx) {
+	documents.AddVersion(stateBg, "doc-7", stateV1)
+	documents.AddVersion(stateBg, "doc-7", stateV2)
+	c := spansAPI(ctx)
+	readSpan(c, 1, "13", "18")
+	r, b := readSpan(c, 2, "13", "18")
+	ctx.Assert(b["text"] == "publi", "[13, 18) of version 2 answered %s, expected 'publi': version 1's entry answered a request for version 2", r.Text())
+	ctx.Equal(ctx.Redis.Exists("span:doc-7:2:13:18"), int64(1), "the entry span:doc-7:2:13:18 (the cache holds %q)", ctx.Redis.Keys("span:*"))
+}
+
+func CheckNumericOffsets(ctx *harness.Ctx) {
+	documents.AddVersion(stateBg, "doc-7", stateV1)
+	c := spansAPI(ctx)
+	padded, pb := readSpan(c, 1, "013", "018")
+	plain, b := readSpan(c, 1, "13", "18")
+	ctx.Assert(pb["text"] == "wrote" && b["text"] == "wrote", "start=013&end=018 answered %s, start=13&end=18 answered %s", padded.Text(), plain.Text())
+	ctx.Assert(b["cached"] == true, "start=13 after start=013 was a miss: one span is cached twice (%q)", ctx.Redis.Keys("span:*"))
+	ctx.Equal(len(ctx.Redis.Keys("span:*")), 1, "one span must be cached under one key (%q); the keys", ctx.Redis.Keys("span:*"))
+}
+
+func CheckLongTtl(ctx *harness.Ctx) {
+	documents.AddVersion(stateBg, "doc-7", stateV1)
+	readSpan(spansAPI(ctx), 1, "13", "18")
+	keys := ctx.Redis.Keys("span:*")
+	ctx.Equal(len(keys), 1, "one read must cache one key (%q); the keys", keys)
+	ttl := ctx.Redis.TTL(keys[0])
+	ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): every span ever read stays in Redis", keys[0], ttl)
+	ctx.Assert(week-60 <= ttl && ttl <= week, "%s expires in %d s, expected SPAN_TTL_S = 7 days (%d s)", keys[0], ttl, week)
+}
+
+func CheckUnknownVersion(ctx *harness.Ctx) {
+	documents.AddVersion(stateBg, "doc-7", stateV1)
+	c := spansAPI(ctx)
+	r, _ := readSpan(c, 2, "13", "18")
+	ctx.Equal(r.Status, 404, "version 2 does not exist yet (%s)", r.Text())
+	ctx.Equal(len(ctx.Redis.Keys("span:*")), 0, "a read of a missing version must cache nothing (%q); the keys", ctx.Redis.Keys("span:*"))
+	documents.AddVersion(stateBg, "doc-7", stateV2)
+	r, b := readSpan(c, 2, "13", "18")
+	ctx.Assert(r.Status == 200 && b["text"] == "publi", "once version 2 is published the read answered %d %s, expected 'publi'", r.Status, r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+#include "citations/documents.h"
+
+using json = nlohmann::json;
+
+namespace {
+
+const std::string kStateV1 = "Ada Lovelace wrote the first program in 1843.";
+const std::string kStateV2 = "Ada Lovelace published the first program in 1843.";
+constexpr long long kWeek = 7LL * 24 * 3600;
+
+harness::HTTP spansAPI(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response readSpan(harness::HTTP& c, int version, const std::string& start, const std::string& end) {
+  return c.Get("/v1/spans?document_id=doc-7&version=" + std::to_string(version) + "&start=" + start + "&end=" + end);
+}
+
+json bodyOf(const harness::Response& r) {
+  const json body = json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : json::object();
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kStateV1);
+  auto c = spansAPI(ctx);
+  const auto first = readSpan(c, 1, "0", "12");
+  const auto again = readSpan(c, 1, "0", "12");
+  ctx.Assert(first.Status == 200 && bodyOf(first).value("text", "") == "Ada Lovelace", "GET /v1/spans for [0, 12) of version 1 answered %d %s, expected the text Ada Lovelace", first.Status, first.Text());
+  ctx.Assert(bodyOf(first).value("cached", true) == false && bodyOf(again).value("cached", false) == true, "the first read must be a miss and the second a hit, got %s then %s", first.Text(), again.Text());
+}
+
+void CheckVersionKey(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kStateV1);
+  documents::addVersion("doc-7", kStateV2);
+  auto c = spansAPI(ctx);
+  readSpan(c, 1, "13", "18");
+  const auto r = readSpan(c, 2, "13", "18");
+  ctx.Assert(bodyOf(r).value("text", "") == "publi", "[13, 18) of version 2 answered %s, expected 'publi': version 1's entry answered a request for version 2", r.Text());
+  ctx.Equal(ctx.Redis.Exists("span:doc-7:2:13:18"), 1, "the entry span:doc-7:2:13:18 (the cache holds %q)", ctx.Redis.Keys("span:*"));
+}
+
+void CheckNumericOffsets(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kStateV1);
+  auto c = spansAPI(ctx);
+  const auto padded = readSpan(c, 1, "013", "018");
+  const auto plain = readSpan(c, 1, "13", "18");
+  ctx.Assert(bodyOf(padded).value("text", "") == "wrote" && bodyOf(plain).value("text", "") == "wrote", "start=013&end=018 answered %s, start=13&end=18 answered %s", padded.Text(), plain.Text());
+  ctx.Assert(bodyOf(plain).value("cached", false) == true, "start=13 after start=013 was a miss: one span is cached twice (%q)", ctx.Redis.Keys("span:*"));
+  ctx.Equal(ctx.Redis.Keys("span:*").size(), 1, "one span must be cached under one key (%q); the keys", ctx.Redis.Keys("span:*"));
+}
+
+void CheckLongTtl(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kStateV1);
+  auto c = spansAPI(ctx);
+  readSpan(c, 1, "13", "18");
+  const auto keys = ctx.Redis.Keys("span:*");
+  ctx.Equal(keys.size(), 1, "one read must cache one key (%q); the keys", keys);
+  const long long ttl = ctx.Redis.TTL(keys[0]);
+  ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): every span ever read stays in Redis", keys[0], ttl);
+  ctx.Assert(kWeek - 60 <= ttl && ttl <= kWeek, "%s expires in %d s, expected SPAN_TTL_S = 7 days (%d s)", keys[0], ttl, kWeek);
+}
+
+void CheckUnknownVersion(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kStateV1);
+  auto c = spansAPI(ctx);
+  auto r = readSpan(c, 2, "13", "18");
+  ctx.Equal(r.Status, 404, "version 2 does not exist yet (%s)", r.Text());
+  ctx.Equal(ctx.Redis.Keys("span:*").size(), 0, "a read of a missing version must cache nothing (%q); the keys", ctx.Redis.Keys("span:*"));
+  documents::addVersion("doc-7", kStateV2);
+  r = readSpan(c, 2, "13", "18");
+  ctx.Assert(r.Status == 200 && bodyOf(r).value("text", "") == "publi", "once version 2 is published the read answered %d %s, expected 'publi'", r.Status, r.Text());
+}
+`,
+  },
+  debrief: `Everything follows from the version being immutable: once it is part of the key an entry can never be wrong, so the cache needs no invalidation, only a TTL that bounds memory. Parsing the offsets before keying makes the key a function of the span rather than of how a client spelled it. Refusing to cache a miss is the same idea in reverse: the only thing that can change about a version is that it starts to exist. Production span caches also store a hash of the version's bytes beside the text, to catch a document store that broke immutability, and warm the spans of a new version before the answers citing it go out.`,
 };

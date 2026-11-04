@@ -2,269 +2,225 @@ import type {Step} from '@/lib/types';
 
 export const shadowStateStep: Step = {
   id: 'state',
-  title: 'Redis shadow state with isolated namespaces',
+  title: 'Redis admission: a kill switch read per request and a budget of its own',
   concept: 'redis',
   file: 'state',
   focus: ['shadow', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is the Redis state layer the request path calls before it runs a
-shadow: \`admit\` reads an enabled flag keyed by shard, then reads the tenant's production quota
-counter, compares it with \`PRODUCTION_LIMIT\` and increments it. It compiles, the demo admits
-traffic, and it hides five flaws.
+**Starting point.** The starter is the admission the request path asks before it shadows a request:
+\`admit(config_id)\` looks up the config's tenant, compares the tenant's request counter
+\`quota:{tenant}\` with \`TENANT_QUOTA\`, increments it, and returns \`enabled(config_id)\`, which reads
+\`shadow:{config_id}:enabled\` once and keeps the answer in \`flag_cache\`. It admits the demo's
+requests and hides four flaws.
 
-**Failure mode the checks target.** A shadow that spends production state. The starter meters
-shadow traffic on the tenant's production quota key, so a 20 percent shadow can exhaust a tenant's
-real quota; it reads a per-shard flag, so some instances keep shadowing after a disable; and it
-reserves with GET-then-INCR, so two concurrent shadows both spend the last unit.
+**Failure mode the checks target.** An operator flips the kill switch and the shadow keeps running;
+the shadow spends production's quota counter, so shadow traffic throttles real requests; two
+instances read the same counter and both take the last unit; and a disabled shadow still spends.
 
-Requirements:
-
-- Every key is scoped to the config: \`shadow:{config_id}:…\`, sharing no key with production.
-- The enabled state is **one atomic flag** at \`shadow:{config_id}:enabled\`, read **once per
-  request**; no per-shard copy, so a disable takes effect fleet-wide on the next request.
-- The budget lives at \`shadow:{config_id}:budget\` with its **own** cap and TTL, reserved by **one
-  atomic operation** (a Lua \`EVAL\` script), not a read, a check and a separate increment.
-- A disabled shadow returns without writing anything: no reservation, no counter, no partial state.
-- The budget key expires on first write (\`EXPIRE\` in the same atomic call).`,
+- \`enabled\` reads \`shadow:{config_id}:enabled\` on every call (\`"1"\` is on).
+- The budget is the shadow's own: \`shadow:{config_id}:budget\`, at most \`BUDGET_LIMIT\` = 1000
+  reservations per \`BUDGET_WINDOW_S\` = 3600 s. \`quota:{tenant}\` is never touched.
+- A reservation is one Lua script (\`RESERVE_LUA\`): \`INCR\`, \`EXPIRE\` on the window's first
+  reservation, and past the limit a refund (\`DECR\`) and 0.
+- \`admit\` reads the switch first: a disabled config answers false and writes nothing.`,
   sequence: {
-    participants: ['Shadow Service', 'Redis'],
+    participants: ['Shadow runner', 'Redis'],
     messages: [
-      {from: 'Shadow Service', to: 'Redis', label: 'GET shadow:{cfg}:enabled (once per request)', kind: 'sync'},
-      {from: 'Redis', to: 'Shadow Service', label: '"1" / nil', kind: 'reply'},
-      {from: 'Shadow Service', to: 'Shadow Service', label: 'disabled → return, write nothing', kind: 'sync'},
-      {from: 'Shadow Service', to: 'Redis', label: 'EVAL reserve shadow:{cfg}:budget · TTL', kind: 'sync'},
-      {from: 'Redis', to: 'Shadow Service', label: '1 admitted / 0 over budget', kind: 'reply'},
-      {from: 'Shadow Service', to: 'Redis', label: 'HINCRBY shadow:{cfg}:samples admitted', kind: 'async'},
+      {from: 'Shadow runner', to: 'Redis', label: 'GET shadow:{id}:enabled (every request)', kind: 'sync'},
+      {from: 'Redis', to: 'Shadow runner', label: '"1" / "0"', kind: 'reply'},
+      {from: 'Shadow runner', to: 'Shadow runner', label: 'off → false, nothing written', kind: 'sync'},
+      {from: 'Shadow runner', to: 'Redis', label: 'EVAL reserve shadow:{id}:budget 1000 3600', kind: 'sync'},
+      {from: 'Redis', to: 'Shadow runner', label: '1 admitted / 0 over budget (refunded)', kind: 'reply'},
     ],
   },
   checks: [
     {
-      id: 'namespace',
-      title: 'Every shadow key is scoped to the config',
-      detail:
-        'All keys are built from the config-scoped prefix `shadow:{config_id}:` (or the stack’s equivalent). The starter writes shadow traffic into the tenant’s production keys, so a shadow spends production budget.',
-      match: {
-        python: {all: [/SHADOW_PREFIX/, /shadow:\{config_id\}/]},
-        typescript: {all: [/SHADOW_PREFIX/, /shadow:\{configId\}/]},
-        go: {all: [/shadowPrefix/, /shadow:\{configID\}/]},
-        scala: {all: [/ShadowPrefix/, /shadow:\{configId\}/]},
-        cpp: {all: [/kShadowPrefix/, /shadow:\{configId\}/]},
-      },
-    },
-    {
       id: 'flag',
-      title: 'One fleet-wide enabled flag',
+      title: 'Reads the kill switch on every request',
       detail:
-        'The enabled state is a single key `shadow:{config_id}:enabled`, read once per request. The starter keys the flag per shard, so some instances keep shadowing after a disable.',
+        '`enabled` reads `shadow:{config_id}:enabled` each time it is asked. The starter keeps the first answer in `flag_cache`, so flipping the switch stops nothing until every instance restarts.',
       match: {
-        python: {all: [/ENABLED_KEY/, /:enabled/]},
-        typescript: {all: [/ENABLED_KEY/, /:enabled/]},
-        go: {all: [/enabledKey/, /:enabled/]},
-        scala: {all: [/EnabledKey/, /:enabled/]},
-        cpp: {all: [/kEnabledKey/, /:enabled/]},
+        python: {all: [/shadow:\{config_id\}:enabled/], none: [/flag_cache\[/]},
+        typescript: {all: [/shadow:\$\{configId\}:enabled/], none: [/flagCache\.(get|set|has)\(/]},
+        go: {all: [/":enabled"/], none: [/flagCache\[/]},
+        scala: {all: [/shadow:\$configId:enabled/], none: [/flagCache\.(getOrElseUpdate|get|put|update)\(/]},
+        cpp: {all: [/":enabled"/], none: [/flag_cache\[|flag_cache\.(find|emplace|insert)\(/]},
       },
     },
     {
       id: 'budget',
-      title: 'The shadow draws from its own budget',
+      title: 'Spends its own budget, not the tenant quota',
       detail:
-        'The budget key `shadow:{config_id}:budget` has its own limit, separate from any production counter. The starter spends the tenant’s production quota, so exhausting the shadow starves the real path.',
+        "Reservations land on `shadow:{config_id}:budget` and stop at `BUDGET_LIMIT`; `quota:{tenant}` keeps its value. The starter increments the tenant's production counter, so shadow traffic eats the quota real requests are throttled by.",
       match: {
-        python: {all: [/BUDGET_KEY/, /BUDGET_LIMIT/]},
-        typescript: {all: [/BUDGET_KEY/, /BUDGET_LIMIT/]},
-        go: {all: [/budgetKey/, /budgetLimit/]},
-        scala: {all: [/BudgetKey/, /BudgetLimit/]},
-        cpp: {all: [/kBudgetKey/, /kBudgetLimit/]},
+        python: {all: [/:budget/, /BUDGET_LIMIT\s*=\s*1000\b/], none: [/quota:/]},
+        typescript: {all: [/:budget/, /BUDGET_LIMIT\s*=\s*1000\b/], none: [/quota:/]},
+        go: {all: [/:budget/, /budgetLimit\s*=\s*1000\b/], none: [/quota:/]},
+        scala: {all: [/:budget/, /BudgetLimit\s*=\s*1000L?\b/], none: [/quota:/]},
+        cpp: {all: [/:budget/, /kBudgetLimit\s*=\s*1000\b/], none: [/quota:/]},
       },
     },
     {
       id: 'atomic',
-      title: 'Reserves the budget atomically with a TTL',
+      title: 'Reserves in one script that starts the window',
       detail:
-        'The reservation is one atomic script (`EVAL`/`NewScript`/`eval`) that refunds an over-budget increment and sets the TTL on first write. The starter does GET-then-INCR, so two concurrent shadows both spend the last unit.',
+        "The check, the increment and the window's `EXPIRE` are one Lua script (`RESERVE_LUA` through `eval`/`NewScript`), so two instances cannot both take the last unit and the budget refills. The starter reads, compares and increments in three commands with no TTL.",
       match: {
-        python: {all: [/RESERVE_LUA/, /\.eval\(/]},
-        typescript: {all: [/RESERVE_LUA/, /\.eval\(/]},
-        go: {all: [/reserveLua/, /NewScript\(/]},
-        scala: {all: [/ReserveLua/, /\.eval\(/]},
-        cpp: {all: [/kReserveLua/, /\.eval[<(]/]},
+        python: {
+          all: [/\.eval\(|register_script\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/\br\.incr\(/],
+        },
+        typescript: {
+          all: [/\.eval\(|defineCommand\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/redis\.incr\(/],
+        },
+        go: {
+          all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/rdb\.Incr\(/],
+        },
+        scala: {
+          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/jedis\.incr\(/],
+        },
+        cpp: {
+          all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]INCR['"]/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/redis\.incr\(/],
+        },
       },
     },
     {
       id: 'no-partial',
-      title: 'Reads the flag before it writes anything',
+      title: 'Reads the switch before it writes anything',
       detail:
-        'The enabled flag is read before the budget reservation, so a disabled shadow leaves no partial state (no reservation, no counter). The starter admits first and cleans up later, if at all.',
+        '`admit` asks `enabled` first and returns before any reservation when the switch is off. The starter spends first and asks last, so a disabled config still burns budget on every request.',
       match: {
-        python: {order: [/admit\(/, /self\.enabled\(config_id\)/, /self\.redis\.eval\(/]},
-        typescript: {order: [/admit\(/, /this\.enabled\(configId\)/, /this\.redis\.eval\(/]},
-        go: {order: [/Admit\(/, /s\.enabled\(/, /\.Run\(/]},
-        scala: {order: [/def admit/, /this\.enabled\(configId\)/, /\.eval\(/]},
-        cpp: {order: [/bool admit\(/, /enabled\(configId\)/, /\.eval[<(]/]},
+        python: {order: [/def admit/, /if not enabled\(config_id\)/, /\.eval\(|register_script|reserve\(/]},
+        typescript: {order: [/function admit/, /if \(!\(await enabled\(configId\)\)\)/, /\.eval\(|reserve\(/]},
+        go: {order: [/func admit/, /if !enabled\(ctx, configID\)/, /\.Run\(|\.Eval\(/]},
+        scala: {order: [/def admit/, /if \(!enabled\(configId\)\)/, /jedis\.eval/]},
+        cpp: {order: [/bool admit\(/, /if \(!enabled\(config_id\)\)/, /redis\.eval/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-import time
+      starter: `import redis
 
-logger = logging.getLogger("shadow.state")
+from shadow import store  # get_config
 
-PRODUCTION_QUOTA_KEY = "quota:{tenant}:{window}"
-PRODUCTION_LIMIT = 1000
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+TENANT_QUOTA = 10_000
+
+# A config's switch is read once per process and kept here.
+flag_cache: dict[str, bool] = {}
 
 
-class ShadowState:
-    def __init__(self, redis):
-        self.redis = redis
+def enabled(config_id: str) -> bool:
+    """Whether the config's kill switch is on."""
+    if config_id not in flag_cache:
+        flag_cache[config_id] = r.get(f"shadow:{config_id}:enabled") == "1"
+    return flag_cache[config_id]
 
-    def is_enabled(self, config_id: str, shard: str) -> bool:
-        return self.redis.get(f"shadow:enabled:{config_id}:{shard}") == "1"
 
-    def admit(self, config_id: str, tenant: str) -> bool:
-        # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-        if not self.is_enabled(config_id, "shard-0"):
-            return False
-        window = int(time.time() // 60)
-        key = PRODUCTION_QUOTA_KEY.format(tenant=tenant, window=window)
-        used = int(self.redis.get(key) or 0)
-        if used >= PRODUCTION_LIMIT:
-            return False
-        self.redis.incr(key)
-        return True
+def admit(config_id: str) -> bool:
+    """Whether this request may be shadowed; a True answer has reserved one unit of budget."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = store.get_config(config_id)["tenant"]
+    used = int(r.get(f"quota:{tenant}") or 0)
+    if used >= TENANT_QUOTA:
+        return False
+    r.incr(f"quota:{tenant}")
+    return enabled(config_id)
 `,
-      solution: `import logging
+      solution: `import redis
 
-logger = logging.getLogger("shadow.state")
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-SHADOW_PREFIX = "shadow:"
-ENABLED_KEY = "shadow:{config_id}:enabled"
-BUDGET_KEY = "shadow:{config_id}:budget"
-SAMPLES_KEY = "shadow:{config_id}:samples"
-BUDGET_LIMIT = 500
-BUDGET_TTL_S = 60
-DEFAULT_COST = 1
+BUDGET_LIMIT = 1000
+BUDGET_WINDOW_S = 3600
 
-# One atomic reservation: increment, refund when over budget, expire the key on first write.
+# One script: count the reservation, start the window with the first one, refund past the limit.
 RESERVE_LUA = """
-local used = redis.call('INCRBY', KEYS[1], ARGV[1])
-if used > tonumber(ARGV[2]) then
-  redis.call('DECRBY', KEYS[1], ARGV[1])
+local used = redis.call('INCR', KEYS[1])
+if used == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+if used > tonumber(ARGV[1]) then
+  redis.call('DECR', KEYS[1])
   return 0
-end
-if used == tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
 end
 return 1
 """
 
 
-class ShadowState:
-    def __init__(self, redis):
-        self.redis = redis
+def enabled(config_id: str) -> bool:
+    """Whether the config's kill switch is on, read now."""
+    return r.get(f"shadow:{config_id}:enabled") == "1"
 
-    def enabled(self, config_id: str) -> bool:
-        """The single fleet-wide flag: one key, no per-shard suffix."""
-        return self.redis.get(ENABLED_KEY.format(config_id=config_id)) == "1"
 
-    def admit(self, config_id: str, cost: int = DEFAULT_COST) -> bool:
-        # Read the fleet-wide flag once, before any write: a disabled shadow writes nothing.
-        if not self.enabled(config_id):
-            return False
-        reserved = self.redis.eval(
-            RESERVE_LUA,
-            1,
-            BUDGET_KEY.format(config_id=config_id),
-            cost,
-            BUDGET_LIMIT,
-            BUDGET_TTL_S,
-        )
-        if reserved != 1:
-            return False
-        samples = SAMPLES_KEY.format(config_id=config_id)
-        self.redis.hincrby(samples, "admitted", 1)
-        self.redis.expire(samples, BUDGET_TTL_S)
-        return True
+def admit(config_id: str) -> bool:
+    """Whether this request may be shadowed; a True answer has reserved one unit of budget."""
+    if not enabled(config_id):
+        return False  # a disabled shadow writes nothing
+    return r.eval(RESERVE_LUA, 1, f"shadow:{config_id}:budget", BUDGET_LIMIT, BUDGET_WINDOW_S) == 1
 `,
     },
     typescript: {
-      starter: `/** Redis shadow state. */
-import type {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-const PRODUCTION_QUOTA_KEY = 'quota:{tenant}:{window}';
-const PRODUCTION_LIMIT = 1000;
+import {getConfig} from 'shadow/store';
 
-export class ShadowState {
-  constructor(private readonly redis: Redis) {}
+const redis = new Redis({host: 'redis', port: 6379});
 
-  private async isEnabled(configId: string, shard: string): Promise<boolean> {
-    return (await this.redis.get(\`shadow:enabled:\${configId}:\${shard}\`)) === '1';
-  }
+export const TENANT_QUOTA = 10_000;
 
-  async admit(configId: string, tenant: string): Promise<boolean> {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    if (!(await this.isEnabled(configId, 'shard-0'))) return false;
-    const window = Math.floor(Date.now() / 60000);
-    const key = PRODUCTION_QUOTA_KEY.replace('{tenant}', tenant).replace('{window}', String(window));
-    const used = Number((await this.redis.get(key)) ?? 0);
-    if (used >= PRODUCTION_LIMIT) return false;
-    await this.redis.incr(key);
-    return true;
-  }
+// A config's switch is read once per process and kept here.
+const flagCache = new Map<string, boolean>();
+
+/** Whether the config's kill switch is on. */
+export async function enabled(configId: string): Promise<boolean> {
+  if (!flagCache.has(configId)) flagCache.set(configId, (await redis.get(\`shadow:\${configId}:enabled\`)) === '1');
+  return flagCache.get(configId) === true;
+}
+
+/** Whether this request may be shadowed; a true answer has reserved one unit of budget. */
+export async function admit(configId: string): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const config = await getConfig(configId);
+  const quota = \`quota:\${config?.tenant ?? ''}\`;
+  const used = Number((await redis.get(quota)) ?? 0);
+  if (used >= TENANT_QUOTA) return false;
+  await redis.incr(quota);
+  return enabled(configId);
 }
 `,
-      solution: `/** Redis shadow state: config-scoped keys, one fleet-wide flag, its own budget. */
-import type {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const SHADOW_PREFIX = 'shadow:';
-export const ENABLED_KEY = 'shadow:{configId}:enabled';
-export const BUDGET_KEY = 'shadow:{configId}:budget';
-export const SAMPLES_KEY = 'shadow:{configId}:samples';
-export const BUDGET_LIMIT = 500;
-export const BUDGET_TTL_S = 60;
+const redis = new Redis({host: 'redis', port: 6379});
 
-/** One atomic reservation: increment, refund when over budget, expire the key on first write. */
+export const BUDGET_LIMIT = 1000;
+export const BUDGET_WINDOW_S = 3600;
+
+// One script: count the reservation, start the window with the first one, refund past the limit.
 export const RESERVE_LUA = \`
-local used = redis.call('INCRBY', KEYS[1], ARGV[1])
-if used > tonumber(ARGV[2]) then
-  redis.call('DECRBY', KEYS[1], ARGV[1])
+local used = redis.call('INCR', KEYS[1])
+if used == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+if used > tonumber(ARGV[1]) then
+  redis.call('DECR', KEYS[1])
   return 0
-end
-if used == tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
 end
 return 1
 \`;
 
-const keyOf = (template: string, configId: string): string => template.replace('{configId}', configId);
+/** Whether the config's kill switch is on, read now. */
+export async function enabled(configId: string): Promise<boolean> {
+  return (await redis.get(\`shadow:\${configId}:enabled\`)) === '1';
+}
 
-export class ShadowState {
-  constructor(private readonly redis: Redis) {}
-
-  /** The single fleet-wide flag: one key, no per-shard suffix. */
-  private async enabled(configId: string): Promise<boolean> {
-    return (await this.redis.get(keyOf(ENABLED_KEY, configId))) === '1';
-  }
-
-  async admit(configId: string, cost = 1): Promise<boolean> {
-    // Read the fleet-wide flag once, before any write: a disabled shadow writes nothing.
-    if (!(await this.enabled(configId))) return false;
-    const reserved = await this.redis.eval(
-      RESERVE_LUA,
-      1,
-      keyOf(BUDGET_KEY, configId),
-      cost,
-      BUDGET_LIMIT,
-      BUDGET_TTL_S,
-    );
-    if (reserved !== 1) return false;
-    const samples = keyOf(SAMPLES_KEY, configId);
-    await this.redis.hincrby(samples, 'admitted', 1);
-    await this.redis.expire(samples, BUDGET_TTL_S);
-    return true;
-  }
+/** Whether this request may be shadowed; a true answer has reserved one unit of budget. */
+export async function admit(configId: string): Promise<boolean> {
+  if (!(await enabled(configId))) return false; // a disabled shadow writes nothing
+  return (await redis.eval(RESERVE_LUA, 1, \`shadow:\${configId}:budget\`, BUDGET_LIMIT, BUDGET_WINDOW_S)) === 1;
 }
 `,
     },
@@ -274,177 +230,150 @@ export class ShadowState {
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"shadow/store" // store.GetConfig
 )
 
-const (
-	productionQuotaKey = "quota:{tenant}:{window}"
-	productionLimit    = 1000
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type ShadowState struct {
-	redis *redis.Client
-}
+const tenantQuota = 10000
 
-func NewShadowState(client *redis.Client) *ShadowState {
-	return &ShadowState{redis: client}
-}
+// A config's switch is read once per process and kept here.
+var flagCache = map[string]bool{}
 
-func (s *ShadowState) isEnabled(ctx context.Context, configID, shard string) bool {
-	value, _ := s.redis.Get(ctx, fmt.Sprintf("shadow:enabled:%s:%s", configID, shard)).Result()
-	return value == "1"
-}
-
-func (s *ShadowState) Admit(ctx context.Context, configID, tenant string) bool {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	if !s.isEnabled(ctx, configID, "shard-0") {
-		return false
+// enabled reports whether the config's kill switch is on.
+func enabled(ctx context.Context, configID string) bool {
+	if on, seen := flagCache[configID]; seen {
+		return on
 	}
-	window := time.Now().Unix() / 60
-	key := fmt.Sprintf(productionQuotaKey, tenant, window)
-	used, _ := s.redis.Get(ctx, key).Int()
-	if used >= productionLimit {
-		return false
+	on := rdb.Get(ctx, "shadow:"+configID+":enabled").Val() == "1"
+	flagCache[configID] = on
+	return on
+}
+
+// admit reports whether this request may be shadowed; true has reserved one unit of budget.
+func admit(ctx context.Context, configID string) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	config := store.GetConfig(ctx, configID)
+	if config == nil {
+		return false, fmt.Errorf("no config %s", configID)
 	}
-	s.redis.Incr(ctx, key)
-	return true
+	quota := "quota:" + config.Tenant
+	used, _ := rdb.Get(ctx, quota).Int()
+	if used >= tenantQuota {
+		return false, nil
+	}
+	if err := rdb.Incr(ctx, quota).Err(); err != nil {
+		return false, err
+	}
+	return enabled(ctx, configID), nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"strings"
 
 	"github.com/redis/go-redis/v9"
 )
 
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
 const (
-	shadowPrefix  = "shadow:"
-	enabledKey    = "shadow:{configID}:enabled"
-	budgetKey     = "shadow:{configID}:budget"
-	samplesKey    = "shadow:{configID}:samples"
-	budgetLimit   = 500
-	budgetTTLSecs = 60
+	budgetLimit   = 1000
+	budgetWindowS = 3600
 )
 
-// One atomic reservation: increment, refund when over budget, expire the key on first write.
-const reserveLua = \`
-local used = redis.call('INCRBY', KEYS[1], ARGV[1])
-if used > tonumber(ARGV[2]) then
-  redis.call('DECRBY', KEYS[1], ARGV[1])
+// reserve counts the reservation, starts the window with the first one, and refunds past the limit.
+var reserve = redis.NewScript(\`
+local used = redis.call('INCR', KEYS[1])
+if used == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+if used > tonumber(ARGV[1]) then
+  redis.call('DECR', KEYS[1])
   return 0
 end
-if used == tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
-end
 return 1
-\`
+\`)
 
-type ShadowState struct {
-	redis   *redis.Client
-	reserve *redis.Script
+// enabled reports whether the config's kill switch is on, read now.
+func enabled(ctx context.Context, configID string) bool {
+	return rdb.Get(ctx, "shadow:"+configID+":enabled").Val() == "1"
 }
 
-func NewShadowState(client *redis.Client) *ShadowState {
-	return &ShadowState{redis: client, reserve: redis.NewScript(reserveLua)}
-}
-
-func keyOf(template, configID string) string {
-	return strings.ReplaceAll(template, "{configID}", configID)
-}
-
-// enabled reads the single fleet-wide flag: one key, no per-shard suffix.
-func (s *ShadowState) enabled(ctx context.Context, configID string) (bool, error) {
-	value, err := s.redis.Get(ctx, keyOf(enabledKey, configID)).Result()
-	return value == "1", err
-}
-
-func (s *ShadowState) Admit(ctx context.Context, configID string, cost int) (bool, error) {
-	// Read the fleet-wide flag once, before any write: a disabled shadow writes nothing.
-	on, err := s.enabled(ctx, configID)
-	if err != nil || !on {
-		return false, err
+// admit reports whether this request may be shadowed; true has reserved one unit of budget.
+func admit(ctx context.Context, configID string) (bool, error) {
+	if !enabled(ctx, configID) {
+		return false, nil // a disabled shadow writes nothing
 	}
-	reserved, err := s.reserve.Run(ctx, s.redis, []string{keyOf(budgetKey, configID)}, cost, budgetLimit, budgetTTLSecs).Int()
-	if err != nil || reserved != 1 {
-		return false, err
-	}
-	samples := keyOf(samplesKey, configID)
-	s.redis.HIncrBy(ctx, samples, "admitted", 1)
-	s.redis.Expire(ctx, samples, budgetTTLSecs)
-	return true, nil
+	n, err := reserve.Run(ctx, rdb, []string{"shadow:" + configID + ":budget"}, budgetLimit, budgetWindowS).Int64()
+	return n == 1, err
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
 
-final class ShadowState(jedis: Jedis) {
-  private def isEnabled(configId: String, shard: String): Boolean =
-    jedis.get(s"shadow:enabled:$configId:$shard") == "1"
+import scala.collection.concurrent.TrieMap
 
-  def admit(configId: String, tenant: String): Boolean = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    if (!isEnabled(configId, "shard-0")) return false
-    val window = (System.currentTimeMillis() / 60000L).toString
-    val key = s"quota:$tenant:$window"
-    val used = Option(jedis.get(key)).map(_.toInt).getOrElse(0)
-    if (used >= 1000) return false
-    jedis.incr(key)
-    true
+import shadow.Store // Store.getConfig
+
+object ShadowState {
+  val TenantQuota = 10000L
+
+  private val jedis = new JedisPooled("redis", 6379)
+
+  // A config's switch is read once per process and kept here.
+  private val flagCache = TrieMap.empty[String, Boolean]
+
+  /** Whether the config's kill switch is on. */
+  def enabled(configId: String): Boolean = flagCache.getOrElseUpdate(configId, jedis.get(s"shadow:$configId:enabled") == "1")
+
+  /** Whether this request may be shadowed; true has reserved one unit of budget. */
+  def admit(configId: String): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val quota = s"quota:\${Store.getConfig(configId).map(_.tenant).getOrElse("")}"
+    val used = Option(jedis.get(quota)).map(_.toLong).getOrElse(0L)
+    if (used >= TenantQuota) false
+    else {
+      jedis.incr(quota)
+      enabled(configId)
+    }
   }
 }
 `,
-      solution: `import redis.clients.jedis.Jedis
+      solution: `import redis.clients.jedis.JedisPooled
+
+import scala.jdk.CollectionConverters._
 
 object ShadowState {
-  val ShadowPrefix = "shadow:"
-  val EnabledKey = "shadow:{configId}:enabled"
-  val BudgetKey = "shadow:{configId}:budget"
-  val SamplesKey = "shadow:{configId}:samples"
-  val BudgetLimit = 500
-  val BudgetTtlSeconds = 60
+  val BudgetLimit = 1000L
+  val BudgetWindowS = 3600L
 
-  /** One atomic reservation: increment, refund when over budget, expire the key on first write. */
-  val ReserveLua =
-    """
-      |local used = redis.call('INCRBY', KEYS[1], ARGV[1])
-      |if used > tonumber(ARGV[2]) then
-      |  redis.call('DECRBY', KEYS[1], ARGV[1])
+  private val jedis = new JedisPooled("redis", 6379)
+
+  // One script: count the reservation, start the window with the first one, refund past the limit.
+  val ReserveLua: String =
+    """local used = redis.call('INCR', KEYS[1])
+      |if used == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+      |if used > tonumber(ARGV[1]) then
+      |  redis.call('DECR', KEYS[1])
       |  return 0
-      |end
-      |if used == tonumber(ARGV[1]) then
-      |  redis.call('EXPIRE', KEYS[1], ARGV[3])
       |end
       |return 1
       |""".stripMargin
 
-  def keyOf(template: String, configId: String): String = template.replace("{configId}", configId)
-}
+  /** Whether the config's kill switch is on, read now. */
+  def enabled(configId: String): Boolean = jedis.get(s"shadow:$configId:enabled") == "1"
 
-final class ShadowState(jedis: Jedis) {
-  import ShadowState._
-
-  /** The single fleet-wide flag: one key, no per-shard suffix. */
-  def enabled(configId: String): Boolean =
-    jedis.get(keyOf(EnabledKey, configId)) == "1"
-
-  def admit(configId: String, cost: Int = 1): Boolean = {
-    // Read the fleet-wide flag once, before any write: a disabled shadow writes nothing.
-    if (!this.enabled(configId)) return false
-    val reserved = jedis.eval(
-      ReserveLua,
-      java.util.List.of(keyOf(BudgetKey, configId)),
-      java.util.List.of(cost.toString, BudgetLimit.toString, BudgetTtlSeconds.toString)
-    )
-    if (reserved.toString.toInt != 1) return false
-    val samples = keyOf(SamplesKey, configId)
-    jedis.hincrBy(samples, "admitted", 1)
-    jedis.expire(samples, BudgetTtlSeconds.toLong)
-    true
+  /** Whether this request may be shadowed; true has reserved one unit of budget. */
+  def admit(configId: String): Boolean = {
+    if (!enabled(configId)) false // a disabled shadow writes nothing
+    else {
+      val args = List(BudgetLimit.toString, BudgetWindowS.toString).asJava
+      jedis.eval(ReserveLua, List(s"shadow:$configId:budget").asJava, args).asInstanceOf[java.lang.Long] == 1L
+    }
   }
 }
 `,
@@ -452,104 +381,340 @@ final class ShadowState(jedis: Jedis) {
     cpp: {
       starter: `#include <sw/redis++/redis++.h>
 
-#include <chrono>
 #include <string>
+#include <unordered_map>
 
-using sw::redis::Redis;
+#include "shadow/store.h"  // store::getConfig
 
-constexpr int kProductionLimit = 1000;
+sw::redis::Redis redis("tcp://redis:6379");
 
-class ShadowState {
- public:
-  explicit ShadowState(Redis& redis) : redis_(redis) {}
+constexpr long long kTenantQuota = 10000;
 
-  bool isEnabled(const std::string& configId, const std::string& shard) {
-    auto value = redis_.get("shadow:enabled:" + configId + ":" + shard);
-    return value && *value == "1";
-  }
+// A config's switch is read once per process and kept here.
+std::unordered_map<std::string, bool> flag_cache;
 
-  bool admit(const std::string& configId, const std::string& tenant) {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    if (!isEnabled(configId, "shard-0")) return false;
-    auto used = redis_.get("quota:" + tenant);
-    if (used && std::stoi(*used) >= kProductionLimit) return false;
-    redis_.incr("quota:" + tenant);
-    return true;
-  }
+// Whether the config's kill switch is on.
+bool enabled(const std::string& config_id) {
+  const auto seen = flag_cache.find(config_id);
+  if (seen != flag_cache.end()) return seen->second;
+  const bool on = redis.get("shadow:" + config_id + ":enabled").value_or("") == "1";
+  flag_cache[config_id] = on;
+  return on;
+}
 
- private:
-  Redis& redis_;
-};
+// Whether this request may be shadowed; true has reserved one unit of budget.
+bool admit(const std::string& config_id) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const auto config = store::getConfig(config_id);
+  const std::string quota = "quota:" + (config ? config->tenant : "");
+  const auto used = redis.get(quota);
+  if (used && std::stoll(*used) >= kTenantQuota) return false;
+  redis.incr(quota);
+  return enabled(config_id);
+}
 `,
       solution: `#include <sw/redis++/redis++.h>
 
-#include <chrono>
 #include <string>
 
-using sw::redis::Redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-const std::string kShadowPrefix = "shadow:";
-const std::string kEnabledKey = "shadow:{configId}:enabled";
-const std::string kBudgetKey = "shadow:{configId}:budget";
-const std::string kSamplesKey = "shadow:{configId}:samples";
-constexpr int kBudgetLimit = 500;
-constexpr int kBudgetTtlSeconds = 60;
+constexpr long long kBudgetLimit = 1000;
+constexpr long long kBudgetWindowS = 3600;
 
-// One atomic reservation: increment, refund when over budget, expire the key on first write.
-const std::string kReserveLua = R"(
-local used = redis.call('INCRBY', KEYS[1], ARGV[1])
-if used > tonumber(ARGV[2]) then
-  redis.call('DECRBY', KEYS[1], ARGV[1])
+// One script: count the reservation, start the window with the first one, refund past the limit.
+const std::string kReserveLua = R"lua(
+local used = redis.call('INCR', KEYS[1])
+if used == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+if used > tonumber(ARGV[1]) then
+  redis.call('DECR', KEYS[1])
   return 0
 end
-if used == tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
-end
 return 1
-)";
+)lua";
 
-std::string keyOf(const std::string& tmpl, const std::string& configId) {
-  auto out = tmpl;
-  const std::string needle = "{configId}";
-  for (auto pos = out.find(needle); pos != std::string::npos; pos = out.find(needle, pos))
-    out.replace(pos, needle.size(), configId);
-  return out;
+// Whether the config's kill switch is on, read now.
+bool enabled(const std::string& config_id) { return redis.get("shadow:" + config_id + ":enabled").value_or("") == "1"; }
+
+// Whether this request may be shadowed; true has reserved one unit of budget.
+bool admit(const std::string& config_id) {
+  if (!enabled(config_id)) return false;  // a disabled shadow writes nothing
+  return redis.eval<long long>(kReserveLua, {"shadow:" + config_id + ":budget"},
+                               {std::to_string(kBudgetLimit), std::to_string(kBudgetWindowS)}) == 1;
 }
-
-class ShadowState {
- public:
-  explicit ShadowState(Redis& redis) : redis_(redis) {}
-
-  /** The single fleet-wide flag: one key, no per-shard suffix. */
-  bool enabled(const std::string& configId) {
-    auto value = redis_.get(keyOf(kEnabledKey, configId));
-    return value && *value == "1";
-  }
-
-  bool admit(const std::string& configId, int cost = 1) {
-    // Read the fleet-wide flag once, before any write: a disabled shadow writes nothing.
-    if (!enabled(configId)) return false;
-    auto reserved = redis_.eval<int>(
-        kReserveLua,
-        {keyOf(kBudgetKey, configId)},
-        {std::to_string(cost), std::to_string(kBudgetLimit), std::to_string(kBudgetTtlSeconds)});
-    if (reserved != 1) return false;
-    const auto samples = keyOf(kSamplesKey, configId);
-    redis_.hincrby(samples, "admitted", 1);
-    redis_.expire(samples, std::chrono::seconds(kBudgetTtlSeconds));
-    return true;
-  }
-
- private:
-  Redis& redis_;
-};
 `,
     },
   },
+  harness: {
+    python: `from shadow import store
+
+
+def _config():
+    return store.create_config("t1", "cand-2026-04", 5, ["latency"])["config_id"]
+
+
+def check_flag(ctx):
+    m = ctx.load("state")
+    cfg = _config()
+    assert m.admit(cfg) is True, "an enabled config with an empty budget must be admitted"
+    store.set_enabled(cfg, False)
+    assert m.admit(cfg) is False, f"shadow:{cfg}:enabled was flipped to 0 and admit still answered True: the switch must be read on every request, or an operator cannot stop a shadow"
+    store.set_enabled(cfg, True)
+    assert m.admit(cfg) is True, "once the switch is back on, admit must answer True again"
+
+
+def check_budget(ctx):
+    m = ctx.load("state")
+    cfg = _config()
+    budget = f"shadow:{cfg}:budget"
+    ctx.redis.set("quota:t1", 7)  # production's request counter for t1
+    for n in range(3):
+        assert m.admit(cfg) is True, f"reservation {n + 1} of an empty budget was refused"
+    assert ctx.redis.get("quota:t1") == "7", f"three shadowed requests moved production's counter quota:t1 from 7 to {ctx.redis.get('quota:t1')}: shadow traffic spends the quota real requests are throttled by"
+    assert ctx.redis.get(budget) == "3", f"{budget} holds {ctx.redis.get(budget)!r} after three reservations, expected 3"
+    ctx.redis.set(budget, 1000)
+    assert m.admit(cfg) is False, f"with {budget} at BUDGET_LIMIT (1000) admit answered True"
+    assert ctx.redis.get(budget) == "1000", f"a refused reservation left {budget} at {ctx.redis.get(budget)}, expected 1000"
+
+
+def check_atomic(ctx):
+    m = ctx.load("state")
+    cfg = _config()
+    budget = f"shadow:{cfg}:budget"
+    assert m.admit(cfg) is True, "an enabled config with an empty budget must be admitted"
+    assert ctx.redis.exists(budget), f"admit reserved nothing on {budget}: the shadow's budget is its own key"
+    ttl = ctx.redis.ttl(budget)
+    assert 0 < ttl <= 3600, f"after the first reservation {budget} has TTL {ttl}: the window starts with it (EXPIRE in the same script), or the budget never refills"
+    ctx.redis.set(budget, 999)
+
+    def rival():  # another instance reserves the last unit right after this one touched the budget
+        if int(ctx.redis.get(budget) or 0) < 1000:
+            ctx.redis.incr(budget)
+
+    ctx.redis_after(budget, rival)
+    m.admit(cfg)
+    used = int(ctx.redis.get(budget))
+    assert used <= 1000, f"two instances racing for the last unit left {budget} at {used}, over BUDGET_LIMIT 1000: the check and the increment must be one script"
+
+
+def check_no_partial(ctx):
+    m = ctx.load("state")
+    cfg = _config()
+    budget = f"shadow:{cfg}:budget"
+    ctx.redis.set("quota:t1", 7)
+    store.set_enabled(cfg, False)
+    assert m.admit(cfg) is False, "a disabled config must not be admitted"
+    assert ctx.redis.get("quota:t1") == "7" and ctx.redis.exists(budget) == 0, f"a disabled config spent: quota:t1 is {ctx.redis.get('quota:t1')}, {budget} is {ctx.redis.get(budget)!r}. Read the switch before anything is written"
+`,
+    typescript: `function world(ctx) {
+  const m = ctx.load('state');
+  const store = ctx.load('/support/shadow/store.ts');
+  return {m, store};
+}
+
+const newConfig = async (store): Promise<string> => (await store.createConfig('t1', 'cand-2026-04', 5, ['latency'])).config_id;
+
+export async function check_flag(ctx) {
+  const {m, store} = world(ctx);
+  const cfg = await newConfig(store);
+  assert.equal(await m.admit(cfg), true, 'an enabled config with an empty budget must be admitted');
+  await store.setEnabled(cfg, false);
+  assert.equal(await m.admit(cfg), false, \`shadow:\${cfg}:enabled was flipped to 0 and admit still answered true: the switch must be read on every request, or an operator cannot stop a shadow\`);
+  await store.setEnabled(cfg, true);
+  assert.equal(await m.admit(cfg), true, 'once the switch is back on, admit must answer true again');
+}
+
+export async function check_budget(ctx) {
+  const {m, store} = world(ctx);
+  const cfg = await newConfig(store);
+  const budget = \`shadow:\${cfg}:budget\`;
+  ctx.redis.set('quota:t1', '7'); // production's request counter for t1
+  for (let n = 1; n <= 3; n += 1) assert.equal(await m.admit(cfg), true, \`reservation \${n} of an empty budget was refused\`);
+  assert.equal(ctx.redis.get('quota:t1'), '7', \`three shadowed requests moved production's counter quota:t1 from 7 to \${ctx.redis.get('quota:t1')}: shadow traffic spends the quota real requests are throttled by\`);
+  assert.equal(ctx.redis.get(budget), '3', \`\${budget} holds \${JSON.stringify(ctx.redis.get(budget))} after three reservations, expected 3\`);
+  ctx.redis.set(budget, '1000');
+  assert.equal(await m.admit(cfg), false, \`with \${budget} at BUDGET_LIMIT (1000) admit answered true\`);
+  assert.equal(ctx.redis.get(budget), '1000', \`a refused reservation left \${budget} at \${ctx.redis.get(budget)}, expected 1000\`);
+}
+
+export async function check_atomic(ctx) {
+  const {m, store} = world(ctx);
+  const cfg = await newConfig(store);
+  const budget = \`shadow:\${cfg}:budget\`;
+  assert.equal(await m.admit(cfg), true, 'an enabled config with an empty budget must be admitted');
+  assert.equal(ctx.redis.exists(budget), 1, \`admit reserved nothing on \${budget}: the shadow's budget is its own key\`);
+  const ttl = ctx.redis.ttl(budget);
+  assert(ttl > 0 && ttl <= 3600, \`after the first reservation \${budget} has TTL \${ttl}: the window starts with it (EXPIRE in the same script), or the budget never refills\`);
+  ctx.redis.set(budget, '999');
+  // Another instance reserves the last unit right after this one touched the budget.
+  ctx.redisAfter(budget, () => {
+    if (Number(ctx.redis.get(budget) ?? 0) < 1000) ctx.redis.incr(budget);
+  });
+  await m.admit(cfg);
+  const used = Number(ctx.redis.get(budget));
+  assert(used <= 1000, \`two instances racing for the last unit left \${budget} at \${used}, over BUDGET_LIMIT 1000: the check and the increment must be one script\`);
+}
+
+export async function check_no_partial(ctx) {
+  const {m, store} = world(ctx);
+  const cfg = await newConfig(store);
+  const budget = \`shadow:\${cfg}:budget\`;
+  ctx.redis.set('quota:t1', '7');
+  await store.setEnabled(cfg, false);
+  assert.equal(await m.admit(cfg), false, 'a disabled config must not be admitted');
+  assert(ctx.redis.get('quota:t1') === '7' && ctx.redis.exists(budget) === 0, \`a disabled config spent: quota:t1 is \${ctx.redis.get('quota:t1')}, \${budget} is \${JSON.stringify(ctx.redis.get(budget))}. Read the switch before anything is written\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strconv"
+
+	"shadow/store"
+
+	"leetbuild/harness"
+)
+
+var stateBg = context.Background()
+
+func stateConfig() string {
+	return store.CreateConfig(stateBg, "t1", "cand-2026-04", 5, []string{"latency"}).ConfigID
+}
+
+func mustAdmit(ctx *harness.Ctx, configID string) bool {
+	ok, err := admit(stateBg, configID)
+	ctx.NoError(err, "admit(%s) failed", configID)
+	return ok
+}
+
+func redisInt(ctx *harness.Ctx, key string) int {
+	value, _ := ctx.Redis.Get(key)
+	n, _ := strconv.Atoi(value)
+	return n
+}
+
+func CheckFlag(ctx *harness.Ctx) {
+	cfg := stateConfig()
+	ctx.Equal(mustAdmit(ctx, cfg), true, "an enabled config with an empty budget must be admitted; admitted")
+	store.SetEnabled(stateBg, cfg, false)
+	ctx.Equal(mustAdmit(ctx, cfg), false, "shadow:%s:enabled was flipped to 0: the switch must be read on every request, or an operator cannot stop a shadow; admitted", cfg)
+	store.SetEnabled(stateBg, cfg, true)
+	ctx.Equal(mustAdmit(ctx, cfg), true, "once the switch is back on, admit must answer true again; admitted")
+}
+
+func CheckBudget(ctx *harness.Ctx) {
+	cfg := stateConfig()
+	budget := "shadow:" + cfg + ":budget"
+	ctx.Redis.Set("quota:t1", "7") // production's request counter for t1
+	for n := 1; n <= 3; n++ {
+		ctx.Equal(mustAdmit(ctx, cfg), true, "reservation %d of an empty budget; admitted", n)
+	}
+	ctx.Equal(redisInt(ctx, "quota:t1"), 7, "three shadowed requests must leave production's counter quota:t1 alone (shadow traffic would spend the quota real requests are throttled by); quota:t1")
+	ctx.Equal(redisInt(ctx, budget), 3, "%s after three reservations", budget)
+	ctx.Redis.Set(budget, "1000")
+	ctx.Equal(mustAdmit(ctx, cfg), false, "with %s at BUDGET_LIMIT (1000); admitted", budget)
+	ctx.Equal(redisInt(ctx, budget), 1000, "a refused reservation must leave %s at the limit", budget)
+}
+
+func CheckAtomic(ctx *harness.Ctx) {
+	cfg := stateConfig()
+	budget := "shadow:" + cfg + ":budget"
+	ctx.Equal(mustAdmit(ctx, cfg), true, "an enabled config with an empty budget must be admitted; admitted")
+	ctx.Equal(ctx.Redis.Exists(budget), int64(1), "admit must reserve on %s, the shadow's own key; it exists", budget)
+	ttl := ctx.Redis.TTL(budget)
+	ctx.Assert(ttl > 0 && ttl <= 3600, "after the first reservation %s has TTL %d: the window starts with it (EXPIRE in the same script), or the budget never refills", budget, ttl)
+	ctx.Redis.Set(budget, "999")
+	// Another instance reserves the last unit right after this one touched the budget.
+	ctx.Redis.After(budget, func() any {
+		if redisInt(ctx, budget) < 1000 {
+			ctx.Redis.Do("INCR", budget)
+		}
+		return nil
+	})
+	mustAdmit(ctx, cfg)
+	used := redisInt(ctx, budget)
+	ctx.Assert(used <= 1000, "two instances racing for the last unit left %s at %d, over BUDGET_LIMIT 1000: the check and the increment must be one script", budget, used)
+}
+
+func CheckNoPartial(ctx *harness.Ctx) {
+	cfg := stateConfig()
+	budget := "shadow:" + cfg + ":budget"
+	ctx.Redis.Set("quota:t1", "7")
+	store.SetEnabled(stateBg, cfg, false)
+	ctx.Equal(mustAdmit(ctx, cfg), false, "a disabled config must not be admitted; admitted")
+	ctx.Assert(redisInt(ctx, "quota:t1") == 7 && ctx.Redis.Exists(budget) == 0, "a disabled config spent: quota:t1 is %d, %s is %d. Read the switch before anything is written", redisInt(ctx, "quota:t1"), budget, redisInt(ctx, budget))
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+
+#include "shadow/store.h"
+
+namespace {
+
+std::string stateConfig() { return store::createConfig("t1", "cand-2026-04", 5, {"latency"}).config_id; }
+
+long long redisInt(harness::Ctx& ctx, const std::string& key) {
+  const auto value = ctx.Redis.Get(key);
+  return value && !value->empty() ? std::stoll(*value) : 0;
+}
+
+}  // namespace
+
+void CheckFlag(harness::Ctx& ctx) {
+  const std::string cfg = stateConfig();
+  ctx.Equal(admit(cfg), true, "an enabled config with an empty budget must be admitted; admitted");
+  store::setEnabled(cfg, false);
+  ctx.Equal(admit(cfg), false, "shadow:%s:enabled was flipped to 0: the switch must be read on every request, or an operator cannot stop a shadow; admitted", cfg);
+  store::setEnabled(cfg, true);
+  ctx.Equal(admit(cfg), true, "once the switch is back on, admit must answer true again; admitted");
+}
+
+void CheckBudget(harness::Ctx& ctx) {
+  const std::string cfg = stateConfig();
+  const std::string budget = "shadow:" + cfg + ":budget";
+  ctx.Redis.Set("quota:t1", "7");  // production's request counter for t1
+  for (int n = 1; n <= 3; n++) ctx.Equal(admit(cfg), true, "reservation %d of an empty budget; admitted", n);
+  ctx.Equal(redisInt(ctx, "quota:t1"), 7, "three shadowed requests must leave production's counter quota:t1 alone (shadow traffic would spend the quota real requests are throttled by); quota:t1");
+  ctx.Equal(redisInt(ctx, budget), 3, "%s after three reservations", budget);
+  ctx.Redis.Set(budget, "1000");
+  ctx.Equal(admit(cfg), false, "with %s at BUDGET_LIMIT (1000); admitted", budget);
+  ctx.Equal(redisInt(ctx, budget), 1000, "a refused reservation must leave %s at the limit", budget);
+}
+
+void CheckAtomic(harness::Ctx& ctx) {
+  const std::string cfg = stateConfig();
+  const std::string budget = "shadow:" + cfg + ":budget";
+  ctx.Equal(admit(cfg), true, "an enabled config with an empty budget must be admitted; admitted");
+  ctx.Equal(ctx.Redis.Exists(budget), 1, "admit must reserve on %s, the shadow's own key; it exists", budget);
+  const long long ttl = ctx.Redis.TTL(budget);
+  ctx.Assert(ttl > 0 && ttl <= 3600, "after the first reservation %s has TTL %d: the window starts with it (EXPIRE in the same script), or the budget never refills", budget, ttl);
+  ctx.Redis.Set(budget, "999");
+  // Another instance reserves the last unit right after this one touched the budget.
+  ctx.Redis.After(budget, [&ctx, budget] {
+    if (redisInt(ctx, budget) < 1000) ctx.Redis.Do("INCR", budget);
+  });
+  admit(cfg);
+  const long long used = redisInt(ctx, budget);
+  ctx.Assert(used <= 1000, "two instances racing for the last unit left %s at %d, over BUDGET_LIMIT 1000: the check and the increment must be one script", budget, used);
+}
+
+void CheckNoPartial(harness::Ctx& ctx) {
+  const std::string cfg = stateConfig();
+  const std::string budget = "shadow:" + cfg + ":budget";
+  ctx.Redis.Set("quota:t1", "7");
+  store::setEnabled(cfg, false);
+  ctx.Equal(admit(cfg), false, "a disabled config must not be admitted; admitted");
+  ctx.Assert(redisInt(ctx, "quota:t1") == 7 && ctx.Redis.Exists(budget) == 0, "a disabled config spent: quota:t1 is %d, %s is %d. Read the switch before anything is written", redisInt(ctx, "quota:t1"), budget, redisInt(ctx, budget));
+}
+`,
+  },
   hints: [
-    'Symptom: a tenant with a 5 percent shadow starts getting 429s on real traffic at 95 percent of its quota, and an operator who disables the config still sees samples arriving from some instances.',
-    'Mechanism: `admit` increments `quota:{tenant}:{window}`, the same key the production limiter reads, after a flag lookup keyed by `"shard-0"`; and `get` followed by `incr` lets two concurrent requests both see `used < limit`.',
-    'Change: build keys from `SHADOW_PREFIX` (`ENABLED_KEY`, `BUDGET_KEY` with `BUDGET_LIMIT`), read `self.enabled(config_id)` first and return on false, then reserve with one `self.redis.eval(RESERVE_LUA, …)` that refunds over-budget and sets the TTL.',
+    'Flip a running config\'s switch to "0": shadowed requests keep coming. Meanwhile the tenant\'s real requests start hitting their quota on a day with normal traffic.',
+    "The switch is read once into a process cache, the budget is the tenant's production counter, and the counter is read, compared and incremented in three round trips another instance can land between. The spending happens before the switch is asked.",
+    'Drop `flag_cache` and GET `shadow:{config_id}:enabled` per call; return False first when it is off; then one `eval` of a script that INCRs `shadow:{config_id}:budget`, EXPIREs it on 1, and DECRs and returns 0 past 1000.',
   ],
-  debrief: `The fix is a data-model change before it is a Redis change. Scoping every key under \`shadow:{config_id}:\` is what keeps a shadow off production state: once the budget and the flag live under that prefix, the shadow can exhaust itself without touching \`quota:{tenant}:…\`. One flag in one key makes a disable true fleet-wide on the next read instead of eventually, and reading it before the reservation is what guarantees a disabled shadow leaves no partial counter. GET-then-INCR is the classic read-modify-write race; the Lua script increments, refunds an over-budget increment and sets the TTL in one round trip, so concurrency and expiry are handled in the same place. Production shadow runners also put a config version in every key, so a rolled-back config cannot read the previous run's counters.`,
+  debrief: `Every rule here is about where the shadow's state lives. A switch that is cached is a switch nobody can flip, so it is read where it is used, and one key serves the whole fleet. A budget that shares production's counter couples the experiment to production's throttling, so the shadow gets its own key and its own window. The reservation is a single script because the race is between instances, not threads: only Redis sees both. Production runners usually push the switch instead of polling it (a pub/sub channel or a config service watch) to save the extra GET, and size the budget from the share and the candidate's capacity rather than a fixed constant.`,
 };

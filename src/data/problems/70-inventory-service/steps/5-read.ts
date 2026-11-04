@@ -2,435 +2,252 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/skus/{id}/stock: the number the storefront trusts',
+  title: 'GET /v1/skus/{sku}/stock: the number the storefront trusts',
   concept: 'http',
   file: 'read',
   focus: ['client', 'api', 'redis', 'sync'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/skus/{id}/stock\`, the number the storefront shows
-next to "add to cart": it looks the sku up by id, returns an \`on_hand\` from an in-process cache the
-warehouse sync refreshed at most an hour ago, and answers with \`sku\` and \`on_hand\`. It compiles,
-serves the demo and hides four flaws.
+**Starting point.** The starter serves \`GET /v1/skus/{sku}/stock\`, the number the storefront shows
+next to "add to cart": it answers 404 for a sku the catalogue does not know, reads \`stock:{sku}\`
+through a five-minute in-process cache, and answers
+\`{sku, available, reserved: 0, on_hand, synced_at, stale: false}\`. It serves the demo and hides four
+flaws.
 
-**Failure mode the checks target.** A cached on-hand promises units a reservation would refuse, and
-ignoring \`reserved\` makes sold-but-unshipped stock read as available. A read that hides its
-staleness turns a stalled warehouse sync into a silent oversell, and a read scoped only by sku id
-shows tenant A what tenant B has in the warehouse.
+**Failure mode the checks target.** A storefront that shows units a reservation took a minute ago,
+units sitting in carts that are counted nowhere, a tenant reading another tenant's stock, and a
+warehouse sync that stalled without anyone being told.
 
-- \`available\`, \`reserved\` and \`on_hand\` are computed through the **same counter the reservation
-  path decrements**: \`available\` is the live \`stock:{sku}\` value, \`reserved\` is every live
-  \`hold:{sku}:*\` summed, and \`on_hand = available + reserved\`. No cached count
-  (\`ON_HAND_CACHE_TTL_S\`) sits in front of the counter.
-- \`available\` cannot exceed what a new reservation would grant: it is the live counter value with a
-  floor at zero through a \`non_negative\` helper.
-- Staleness is explicit: the warehouse sync stamps \`sync:updated_at\` (epoch seconds), and the
-  response carries \`synced_at\`, \`staleness_ms\`, and \`stale = now − synced_at > SYNC_STALE_AFTER_S\`
-  (60 s). A stale read still answers; the storefront decides what to show.
-- The caller is a tenant (\`X-Tenant-Id\`): the sku is scoped through \`catalog.owner(sku)\`, and a
-  sku owned by another tenant, or by nobody, is **404** before any counter is read.`,
+- \`available\` and \`reserved\` come from one Lua snapshot of \`stock:{sku}\` and \`holds:{sku}\`: a hold
+  whose \`hold:{id}\` key is gone counts as available again, a live one as reserved;
+  \`on_hand = available + reserved\`. Nothing caches the counter.
+- \`catalog.owner(sku)\` must be the caller's tenant, else **404**.
+- \`stale\` is true when \`synced_at\` is missing or older than \`SYNC_STALE_AFTER_S = 60\` seconds.`,
   sequence: {
-    participants: ['Storefront', 'Inventory API', 'Redis', 'Warehouse sync'],
+    participants: ['Storefront', 'Inventory API', 'Redis'],
     messages: [
-      {
-        from: 'Storefront',
-        to: 'Inventory API',
-        label: 'GET /v1/skus/{id}/stock · X-Tenant-Id',
-        kind: 'sync',
-      },
-      {
-        from: 'Inventory API',
-        to: 'Inventory API',
-        label: 'catalog.owner(sku) ≠ tenant → 404',
-        kind: 'sync',
-      },
-      {
-        from: 'Inventory API',
-        to: 'Redis',
-        label: 'GET stock:{sku} · SCAN hold:{sku}:*',
-        kind: 'sync',
-      },
-      {
-        from: 'Redis',
-        to: 'Inventory API',
-        label: 'available · every live hold, summed',
-        kind: 'reply',
-      },
-      {
-        from: 'Inventory API',
-        to: 'Inventory API',
-        label: 'on_hand = available + reserved',
-        kind: 'sync',
-      },
-      {
-        from: 'Warehouse sync',
-        to: 'Redis',
-        label: 'SET sync:updated_at — the last warehouse count',
-        kind: 'async',
-      },
-      {from: 'Inventory API', to: 'Redis', label: 'GET sync:updated_at', kind: 'sync'},
-      {from: 'Redis', to: 'Inventory API', label: 'synced_at, epoch seconds', kind: 'reply'},
-      {
-        from: 'Inventory API',
-        to: 'Inventory API',
-        label: 'stale = now − synced_at > SYNC_STALE_AFTER_S',
-        kind: 'sync',
-      },
+      {from: 'Storefront', to: 'Inventory API', label: 'GET /v1/skus/{sku}/stock · X-Tenant-Id', kind: 'sync'},
+      {from: 'Inventory API', to: 'Redis', label: 'catalog.owner(sku) ≠ tenant → 404', kind: 'sync'},
+      {from: 'Inventory API', to: 'Redis', label: 'EVAL levels · stock:{sku} holds:{sku}', kind: 'sync'},
+      {from: 'Redis', to: 'Inventory API', label: '{available, reserved} from one snapshot', kind: 'reply'},
+      {from: 'Inventory API', to: 'Inventory API', label: 'synced_at older than 60 s → stale', kind: 'sync'},
       {
         from: 'Inventory API',
         to: 'Storefront',
-        label: '200 {available, reserved, on_hand, synced_at, staleness_ms, stale}',
+        label: '200 {available, reserved, on_hand, synced_at, stale}',
         kind: 'reply',
       },
     ],
   },
   checks: [
     {
-      id: 'route-read',
-      title: 'Serves GET /v1/skus/{id}/stock',
-      detail:
-        'The stock read is registered on `GET /v1/skus/{id}/stock` (the language’s path-parameter route) and its response carries `sku` and `on_hand` for that sku.',
-      match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/skus\/\{id\}\/stock["']/, /["']sku["']/, /["']on_hand["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/skus\/:id\/stock['"]/, /\bsku\b/, /\bon_hand\b/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/skus\/\{id\}\/stock"/, /"sku"/, /"on_hand"/]},
-        scala: {
-          all: [/path\(\s*"v1"\s*\/\s*"skus"\s*\/\s*Segment\s*\/\s*"stock"\s*\)/, /\bsku\b/, /\bon_hand\b/],
-        },
-        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/skus\//, /"sku"/, /"on_hand"/]},
-      },
-    },
-    {
-      id: 'computed-fields',
-      title: 'Reports available, reserved and on_hand from one source',
-      detail:
-        '`available` is the live counter, `reserved` is every live hold on the sku summed by `reserved_for`/`reservedFor` over the `hold:{sku}:*` keys, and `on_hand` is `available + reserved`: one source, three fields.',
-      match: {
-        python: {
-          all: [
-            /def reserved_for\(/,
-            /scan_iter\(match=f?["']hold:\{sku\}:/,
-            /["']available["']/,
-            /["']reserved["']/,
-            /["']on_hand["']:\s*available\s*\+\s*reserved/,
-          ],
-        },
-        typescript: {
-          all: [
-            /async function reservedFor\(/,
-            /scanStream\(\{match: `hold:\$\{sku\}:\*`/,
-            /\bavailable\b/,
-            /\breserved\b/,
-            /on_hand: available \+ reserved/,
-          ],
-        },
-        go: {
-          all: [
-            /func reservedFor\(/,
-            /rdb\.Scan\(ctx, cursor, pattern, 100\)/,
-            /"hold:" \+ sku/,
-            /"available"/,
-            /"reserved"/,
-            /"on_hand":\s*available \+ reserved/,
-          ],
-        },
-        scala: {
-          all: [
-            /def reservedFor\(/,
-            /jedis\.scan\(cursor, params\)/,
-            /"hold:" \+ sku/,
-            /\bavailable\b/,
-            /\breserved\b/,
-            /on_hand\s*=\s*available \+ reserved/,
-          ],
-        },
-        cpp: {
-          all: [
-            /long long reservedFor\(/,
-            /redis\.scan\(cursor, "hold:" \+ sku/,
-            /"available"/,
-            /"reserved"/,
-            /"on_hand",\s*available \+ reserved/,
-          ],
-        },
-      },
-    },
-    {
       id: 'live-counter',
-      title: 'Reads the same counter the reservation path decrements',
+      title: 'Reads the counter the reservation path decrements',
       detail:
-        '`available` comes from the `stock:{sku}` key through the shared `counter_key`/`counterKey` helper, the counter the reservation path decrements, and no cache-TTL read path (`ON_HAND_CACHE_TTL_S`, `cached_on_hand`) sits in front of it.',
+        'A read after a reservation of 4 shows 4 fewer available units. The starter answers from a five-minute cache of the counter.',
       match: {
-        python: {
-          all: [/def counter_key\(/, /f?["']stock:\{sku\}["']/, /\.get\(counter_key\(id\)\)/],
-          none: [/ON_HAND_CACHE_TTL_S|on_hand_cache|cached_on_hand\(/],
-        },
-        typescript: {
-          all: [/function counterKey\(/, /`stock:\$\{sku\}`/, /\.get\(counterKey\(id\)\)/],
-          none: [/ON_HAND_CACHE_TTL_S|onHandCache|cachedOnHand\(/],
-        },
-        go: {
-          all: [/func counterKey\(/, /"stock:"\s*\+\s*sku/, /rdb\.Get\(r\.Context\(\), counterKey\(id\)\)/],
-          none: [/onHandCacheTtlS|onHandCache|cachedOnHand\(/],
-        },
-        scala: {
-          all: [/def counterKey\(/, /"stock:" \+ sku/, /jedis\.get\(counterKey\(id\)\)/],
-          none: [/OnHandCacheTtlS|onHandCache|cachedOnHand\(/],
-        },
-        cpp: {
-          all: [/counterKey\(/, /"stock:" \+ sku/, /redis\.get\(counterKey\(sku\)\)/],
-          none: [/kOnHandCacheTtlS|on_hand_cache|cached_on_hand\(/],
-        },
+        python: {all: [/stock_key\(/], none: [/ON_HAND_CACHE_TTL_S/]},
+        typescript: {all: [/stockKey\(/], none: [/ON_HAND_CACHE_TTL_S/]},
+        go: {all: [/stock\.Key\(/], none: [/onHandCacheTTL/]},
+        scala: {all: [/Stock\.key\(/], none: [/OnHandCacheTtlS/]},
+        cpp: {all: [/stock::Key\(/], none: [/kOnHandCacheTtlS/]},
       },
     },
     {
-      id: 'staleness',
-      title: 'Reports staleness against SYNC_STALE_AFTER_S',
+      id: 'reserved-holds',
+      title: 'Counts live holds as reserved and expired ones as available',
       detail:
-        '`sync:updated_at` is compared with `now` and the response carries `synced_at`, `staleness_ms` and `stale`, true when the warehouse sync is older than `SYNC_STALE_AFTER_S` (60 s).',
+        'With one live hold of 2 and one expired hold of 3 on a sku of 10, the read answers available 8, reserved 2, on_hand 10. The starter reports nothing reserved.',
       match: {
-        python: {
-          all: [/["']sync:updated_at["']/, /SYNC_STALE_AFTER_S/, /["']stale["']\s*:/, /["']staleness_ms["']\s*:/],
-        },
-        typescript: {all: [/['"]sync:updated_at['"]/, /SYNC_STALE_AFTER_S/, /\bstale\b/, /staleness_ms/]},
-        go: {all: [/"sync:updated_at"/, /syncStaleAfterS/, /"stale":/, /"staleness_ms":/]},
-        scala: {all: [/"sync:updated_at"/, /SyncStaleAfterS/, /\bstale\b/, /staleness_ms/]},
-        cpp: {all: [/"sync:updated_at"/, /kSyncStaleAfterS/, /"stale"/, /"staleness_ms"/]},
+        python: {all: [/holds_key\(/, /EXISTS|\.exists\(/]},
+        typescript: {all: [/holdsKey\(/, /EXISTS|\.exists\(/]},
+        go: {all: [/stock\.HoldsKey\(/, /EXISTS|\.Exists\(/]},
+        scala: {all: [/Stock\.holdsKey\(/, /EXISTS|\.exists\(/]},
+        cpp: {all: [/stock::HoldsKey\(/, /EXISTS|\.exists\(/]},
       },
     },
     {
       id: 'tenant-404',
-      title: '404s a sku the tenant does not own',
+      title: "Answers 404 for a sku the caller's tenant does not sell",
       detail:
-        'The sku is scoped through `catalog.owner(sku)` and anything that is not the caller’s tenant, another owner or no owner, is **404** before any counter is read.',
+        "Tenant t1 reading t2's sku gets **404**, as for an unknown sku; t2 reading it gets 200. The starter only checks that the sku exists.",
       match: {
-        python: {all: [/X-Tenant-Id/, /catalog\.owner\(/, /status_code\s*=\s*404/]},
-        typescript: {all: [/x-tenant-id/, /catalog\.owner\(/, /code\(\s*404\s*\)/]},
-        go: {all: [/X-Tenant-Id/, /catalog\.Owner\(/, /StatusNotFound/]},
-        scala: {all: [/X-Tenant-Id/, /catalog\.owner\(/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/X-Tenant-Id/, /catalog\.owner\(/, /\b404\b/]},
+        python: {all: [/catalog\.owner\(sku\)\s*!=\s*tenant|tenant\s*!=\s*catalog\.owner\(/]},
+        typescript: {all: [/owner\(sku\)\)?\s*!==\s*tenant|tenant\s*!==\s*\(?await owner\(/]},
+        go: {all: [/owner\s*!=\s*tenant|Owner\([^\n]*\)\s*!=\s*tenant/]},
+        scala: {all: [/owner\(sku\)\.contains\(|owner\(sku\)\s*!=\s*Some\(/]},
+        cpp: {all: [/Owner\(sku\)\s*!=\s*tenant/]},
+      },
+    },
+    {
+      id: 'stale',
+      title: 'Reports stale when the warehouse sync is over 60 s old',
+      detail:
+        'A sync written now reads `stale: false`; two minutes later the same read says `stale: true`, with `synced_at` in the body. The starter always answers `stale: false`.',
+      match: {
+        python: {all: [/SYNC_STALE_AFTER_S/, /catalog\.synced_at\(/]},
+        typescript: {all: [/SYNC_STALE_AFTER_S/, /syncedAt\(/]},
+        go: {all: [/syncStaleAfter/, /catalog\.SyncedAt\(/]},
+        scala: {all: [/SyncStaleAfterS/, /Catalog\.syncedAt\(/]},
+        cpp: {all: [/kSyncStaleAfterS/, /catalog::SyncedAt\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-import time
+      starter: `import time
 
 import redis
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+
+from inventory import catalog  # catalog.owner, synced_at
+from inventory.stock import holds_key, stock_key
 
 app = FastAPI()
-logger = logging.getLogger("inventoryd")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# The on-hand number the warehouse sync produced, refreshed hourly.
-ON_HAND_CACHE_TTL_S = 3600
-on_hand_cache: dict[str, tuple[float, int]] = {}
+ON_HAND_CACHE_TTL_S = 300
+_cache: dict[str, tuple[float, int]] = {}
 
 
-def cached_on_hand(sku: str) -> int:
-    """The warehouse on-hand count from the last refresh, at most an hour behind the sync."""
-    refreshed_at, on_hand = on_hand_cache.get(sku, (0.0, 0))
-    if time.time() - refreshed_at > ON_HAND_CACHE_TTL_S:
-        on_hand_cache[sku] = (time.time(), on_hand)
-    return on_hand
-
-
-@app.get("/v1/skus/{id}/stock")
-def read_stock(id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    logger.info("stock read tenant=%s sku=%s", tenant, id)
-    on_hand = cached_on_hand(id)
-    return JSONResponse({"sku": id, "on_hand": on_hand}, status_code=200)
+@app.get("/v1/skus/{sku}/stock")
+def read_stock(sku: str, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    if catalog.owner(sku) is None:
+        raise HTTPException(status_code=404, detail="unknown sku")
+    cached = _cache.get(sku)
+    if cached is None or time.time() - cached[0] > ON_HAND_CACHE_TTL_S:
+        cached = (time.time(), int(r.get(stock_key(sku)) or 0))
+        _cache[sku] = cached
+    available = cached[1]
+    return {
+        "sku": sku,
+        "available": available,
+        "reserved": 0,
+        "on_hand": available,
+        "synced_at": catalog.synced_at(sku),
+        "stale": False,
+    }
 `,
-      solution: `import logging
-import time
+      solution: `import time
 
 import redis
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+
+from inventory import catalog  # catalog.owner, synced_at
+from inventory.stock import holds_key, stock_key
 
 app = FastAPI()
-logger = logging.getLogger("inventoryd")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-SYNC_UPDATED_AT_KEY = "sync:updated_at"
 SYNC_STALE_AFTER_S = 60
 
-
-class SkuCatalog:
-    def owner(self, sku: str) -> str | None:
-        """The tenant that owns the sku, or None when no tenant does."""
-        raise NotImplementedError
-
-
-catalog = SkuCatalog()
-
-
-def counter_key(sku: str) -> str:
-    """The same counter the reservation path decrements."""
-    return f"stock:{sku}"
-
-
-def reserved_for(sku: str) -> int:
-    """Every live hold on this sku, summed: the holds the reservation path sets with a TTL."""
-    total = 0
-    for key in r.scan_iter(match=f"hold:{sku}:*"):
-        total += int(r.get(key) or 0)
-    return total
+# One snapshot of the counter and the hold map: a hold whose key expired is available again (the
+# next reserve credits it), a live one is reserved. KEYS: stock:{sku}, holds:{sku}.
+LEVELS_LUA = """
+local available = tonumber(redis.call('GET', KEYS[1]) or '0')
+local reserved = 0
+local entries = redis.call('HGETALL', KEYS[2])
+for i = 1, #entries, 2 do
+  if redis.call('EXISTS', 'hold:' .. entries[i]) == 1 then
+    reserved = reserved + tonumber(entries[i + 1])
+  else
+    available = available + tonumber(entries[i + 1])
+  end
+end
+return {available, reserved}
+"""
+levels = r.register_script(LEVELS_LUA)
 
 
-def non_negative(value: int) -> int:
-    """What a new reservation would actually be granted: never a negative unit of stock."""
-    return max(value, 0)
-
-
-def read_synced_at() -> int:
-    """When the warehouse sync last wrote a count, epoch seconds."""
-    raw = r.get(SYNC_UPDATED_AT_KEY)
-    return int(raw) if raw else 0
-
-
-def staleness_ms(synced_at: int, now: int) -> int:
-    """How far the warehouse sync is behind this read, in milliseconds."""
-    return max((now - synced_at) * 1000, 0)
-
-
-@app.get("/v1/skus/{id}/stock")
-def read_stock(id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if catalog.owner(id) != tenant:
+@app.get("/v1/skus/{sku}/stock")
+def read_stock(sku: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if catalog.owner(sku) != tenant:
         raise HTTPException(status_code=404, detail="unknown sku")
-    available = non_negative(int(r.get(counter_key(id)) or 0))
-    reserved = reserved_for(id)
-    now = int(time.time())
-    synced_at = read_synced_at()
-    lag_ms = staleness_ms(synced_at, now)
-    stale = lag_ms > SYNC_STALE_AFTER_S * 1000
-    logger.info(
-        "stock read tenant=%s sku=%s available=%d reserved=%d stale=%s", tenant, id, available, reserved, stale
-    )
-    return JSONResponse(
-        {
-            "sku": id,
-            "available": available,
-            "reserved": reserved,
-            "on_hand": available + reserved,
-            "synced_at": synced_at,
-            "staleness_ms": lag_ms,
-            "stale": stale,
-        },
-        status_code=200,
-    )
+    available, reserved = levels(keys=[stock_key(sku), holds_key(sku)])
+    synced_at = catalog.synced_at(sku)
+    # A counter the warehouse has not confirmed for a while can promise units the shelf does not have.
+    stale = synced_at is None or time.time() - synced_at > SYNC_STALE_AFTER_S
+    return {
+        "sku": sku,
+        "available": available,
+        "reserved": reserved,
+        "on_hand": available + reserved,
+        "synced_at": synced_at,
+        "stale": stale,
+    }
 `,
     },
     typescript: {
-      starter: `/** GET /v1/skus/{id}/stock. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {owner, syncedAt} from 'inventory/catalog';
+import {holdsKey, stockKey} from 'inventory/stock';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-// The on-hand number the warehouse sync produced, refreshed hourly.
-const ON_HAND_CACHE_TTL_S = 3600;
-const onHandCache = new Map<string, {refreshedAt: number; onHand: number}>();
+export const ON_HAND_CACHE_TTL_S = 300;
+const cache = new Map<string, {at: number; units: number}>();
 
-/** The warehouse on-hand count from the last refresh, at most an hour behind the sync. */
-function cachedOnHand(sku: string): number {
-  const hit = onHandCache.get(sku) ?? {refreshedAt: 0, onHand: 0};
-  if (Date.now() - hit.refreshedAt > ON_HAND_CACHE_TTL_S * 1000) {
-    onHandCache.set(sku, {refreshedAt: Date.now(), onHand: hit.onHand});
+app.get('/v1/skus/:sku/stock', async (request, reply) => {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const {sku} = request.params as {sku: string};
+  if ((await owner(sku)) === null) return reply.code(404).send({error: 'unknown sku'});
+  const now = Date.now() / 1000;
+  let cached = cache.get(sku);
+  if (cached === undefined || now - cached.at > ON_HAND_CACHE_TTL_S) {
+    cached = {at: now, units: Number((await redis.get(stockKey(sku))) ?? 0)};
+    cache.set(sku, cached);
   }
-  return hit.onHand;
-}
-
-app.get('/v1/skus/:id/stock', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const {id} = request.params as {id: string};
-  request.log.info({tenant: request.headers['x-tenant-id'], sku: id}, 'stock read');
-  return reply.code(200).send({sku: id, on_hand: cachedOnHand(id)});
+  return {sku, available: cached.units, reserved: 0, on_hand: cached.units, synced_at: await syncedAt(sku), stale: false};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/skus/{id}/stock: the live counter the reservation path decrements. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {owner, syncedAt} from 'inventory/catalog';
+import {holdsKey, stockKey} from 'inventory/stock';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
 
-const SYNC_UPDATED_AT_KEY = 'sync:updated_at';
-const SYNC_STALE_AFTER_S = 60;
+export const SYNC_STALE_AFTER_S = 60;
 
-const catalog = {
-  /** The tenant that owns the sku, or null when no tenant does. */
-  owner(sku: string): string | null {
-    throw new Error(\`no catalog row for \${sku}\`);
-  },
-};
+// One snapshot of the counter and the hold map: a hold whose key expired is available again (the
+// next reserve credits it), a live one is reserved. KEYS: stock:{sku}, holds:{sku}.
+const LEVELS_LUA = \`
+local available = tonumber(redis.call('GET', KEYS[1]) or '0')
+local reserved = 0
+local entries = redis.call('HGETALL', KEYS[2])
+for i = 1, #entries, 2 do
+  if redis.call('EXISTS', 'hold:' .. entries[i]) == 1 then
+    reserved = reserved + tonumber(entries[i + 1])
+  else
+    available = available + tonumber(entries[i + 1])
+  end
+end
+return {available, reserved}
+\`;
 
-/** The same counter the reservation path decrements. */
-export function counterKey(sku: string): string {
-  return \`stock:\${sku}\`;
+interface LevelsRedis extends Redis {
+  stockLevels(stock: string, holds: string): Promise<[number, number]>;
 }
 
-/** Every live hold on this sku, summed: the holds the reservation path sets with a TTL. */
-export async function reservedFor(sku: string): Promise<number> {
-  let total = 0;
-  for await (const batch of r.scanStream({match: \`hold:\${sku}:*\`})) {
-    for (const key of batch as string[]) {
-      const raw = await r.get(key);
-      if (raw !== null) total += Number(raw);
-    }
-  }
-  return total;
-}
+const redis = new Redis({host: 'redis', port: 6379}) as LevelsRedis;
+redis.defineCommand('stockLevels', {numberOfKeys: 2, lua: LEVELS_LUA});
 
-/** What a new reservation would actually be granted: never a negative unit of stock. */
-export function nonNegative(value: number): number {
-  return Math.max(value, 0);
-}
-
-/** When the warehouse sync last wrote a count, epoch seconds. */
-async function readSyncedAt(): Promise<number> {
-  const raw = await r.get(SYNC_UPDATED_AT_KEY);
-  return raw === null ? 0 : Number(raw);
-}
-
-/** How far the warehouse sync is behind this read, in milliseconds. */
-export function stalenessMs(syncedAt: number, now: number): number {
-  return Math.max((now - syncedAt) * 1000, 0);
-}
-
-app.get('/v1/skus/:id/stock', async (request, reply) => {
-  const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const {id} = request.params as {id: string};
-  if (catalog.owner(id) !== tenant) return reply.code(404).send({error: 'unknown sku'});
-  const available = nonNegative(Number((await r.get(counterKey(id))) ?? 0));
-  const reserved = await reservedFor(id);
-  const now = Math.floor(Date.now() / 1000);
-  const syncedAt = await readSyncedAt();
-  const lagMs = stalenessMs(syncedAt, now);
-  const stale = lagMs > SYNC_STALE_AFTER_S * 1000;
-  request.log.info({tenant, sku: id, available, reserved, stale}, 'stock read');
-  return reply.code(200).send({
-    sku: id,
-    available,
-    reserved,
-    on_hand: available + reserved,
-    synced_at: syncedAt,
-    staleness_ms: lagMs,
-    stale,
-  });
+app.get('/v1/skus/:sku/stock', async (request, reply) => {
+  const {sku} = request.params as {sku: string};
+  const tenant = String(request.headers['x-tenant-id'] ?? '');
+  if ((await owner(sku)) !== tenant) return reply.code(404).send({error: 'unknown sku'});
+  const [available, reserved] = (await redis.stockLevels(stockKey(sku), holdsKey(sku))).map(Number);
+  const synced = await syncedAt(sku);
+  // A counter the warehouse has not confirmed for a while can promise units the shelf does not have.
+  const stale = synced === null || Date.now() / 1000 - synced > SYNC_STALE_AFTER_S;
+  return {sku, available, reserved, on_hand: available + reserved, synced_at: synced, stale};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -438,331 +255,228 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"inventory/catalog" // catalog.Owner, SyncedAt
+	"inventory/stock"   // stock.Key, HoldsKey
 )
 
-// The on-hand number the warehouse sync produced, refreshed hourly.
-const onHandCacheTtlS = 3600
+const onHandCacheTTL = 300 * time.Second
 
-type onHandEntry struct {
-	refreshedAtS int64
-	onHand       int64
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+type cachedUnits struct {
+	at    time.Time
+	units int64
 }
 
-var (
-	rdb         = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-	onHandCache = map[string]onHandEntry{}
-)
+var onHandCache = map[string]cachedUnits{}
 
-// cachedOnHand is the warehouse on-hand count from the last refresh, at most an hour behind.
-func cachedOnHand(sku string) int64 {
-	hit := onHandCache[sku]
-	if time.Now().Unix()-hit.refreshedAtS > onHandCacheTtlS {
-		hit.refreshedAtS = time.Now().Unix()
-		onHandCache[sku] = hit
-	}
-	return hit.onHand
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readStock(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	sku := r.PathValue("id")
-	tenant := r.Header.Get("X-Tenant-Id")
-	log.Printf("stock read tenant=%s sku=%s", tenant, sku)
-	writeJSON(rw, http.StatusOK, map[string]any{"sku": sku, "on_hand": cachedOnHand(sku)})
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	sku := r.PathValue("sku")
+	if catalog.Owner(r.Context(), sku) == "" {
+		http.Error(rw, "unknown sku", http.StatusNotFound)
+		return
+	}
+	cached, ok := onHandCache[sku]
+	if !ok || time.Since(cached.at) > onHandCacheTTL {
+		units, _ := rdb.Get(r.Context(), stock.Key(sku)).Int64()
+		cached = cachedUnits{at: time.Now(), units: units}
+		onHandCache[sku] = cached
+	}
+	var syncedAt any
+	if at, synced := catalog.SyncedAt(r.Context(), sku); synced {
+		syncedAt = at
+	}
+	writeJSON(rw, http.StatusOK, map[string]any{
+		"sku": sku, "available": cached.units, "reserved": 0, "on_hand": cached.units, "synced_at": syncedAt, "stale": false,
+	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/skus/{id}/stock", readStock)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/skus/{sku}/stock", readStock)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"inventory/catalog" // catalog.Owner, SyncedAt
+	"inventory/stock"   // stock.Key, HoldsKey
 )
 
-const (
-	syncUpdatedAtKey = "sync:updated_at"
-	syncStaleAfterS  = 60
-)
+const syncStaleAfter = 60 // seconds
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type skuCatalog struct{}
+// One snapshot of the counter and the hold map: a hold whose key expired is available again (the
+// next reserve credits it), a live one is reserved. KEYS: stock:{sku}, holds:{sku}.
+var levelsScript = redis.NewScript(\`
+local available = tonumber(redis.call('GET', KEYS[1]) or '0')
+local reserved = 0
+local entries = redis.call('HGETALL', KEYS[2])
+for i = 1, #entries, 2 do
+  if redis.call('EXISTS', 'hold:' .. entries[i]) == 1 then
+    reserved = reserved + tonumber(entries[i + 1])
+  else
+    available = available + tonumber(entries[i + 1])
+  end
+end
+return {available, reserved}
+\`)
 
-// Owner is the tenant that owns the sku, or "" when no tenant does.
-func (c *skuCatalog) Owner(ctx context.Context, sku string) string {
-	panic("no catalog row for " + sku)
-}
-
-var catalog = &skuCatalog{}
-
-// counterKey is the same counter the reservation path decrements.
-func counterKey(sku string) string {
-	return "stock:" + sku
-}
-
-// reservedFor sums every live hold on this sku: the holds the reservation path sets with a TTL.
-func reservedFor(ctx context.Context, sku string) int64 {
-	var total int64
-	var cursor uint64
-	pattern := "hold:" + sku + ":*"
-	for {
-		keys, next, err := rdb.Scan(ctx, cursor, pattern, 100).Result()
-		if err != nil {
-			panic(err)
-		}
-		for _, key := range keys {
-			if raw, err := rdb.Get(ctx, key).Int64(); err == nil {
-				total += raw
-			}
-		}
-		cursor = next
-		if cursor == 0 {
-			break
-		}
-	}
-	return total
-}
-
-// nonNegative is what a new reservation would actually be granted: never negative.
-func nonNegative(value int64) int64 {
-	if value < 0 {
-		return 0
-	}
-	return value
-}
-
-// readSyncedAt is when the warehouse sync last wrote a count, epoch seconds.
-func readSyncedAt(ctx context.Context) int64 {
-	raw, err := rdb.Get(ctx, syncUpdatedAtKey).Int64()
-	if err != nil {
-		return 0
-	}
-	return raw
-}
-
-// stalenessMs is how far the warehouse sync is behind this read, in milliseconds.
-func stalenessMs(syncedAt, now int64) int64 {
-	lag := (now - syncedAt) * 1000
-	if lag < 0 {
-		return 0
-	}
-	return lag
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readStock(rw http.ResponseWriter, r *http.Request) {
+	sku := r.PathValue("sku")
 	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	if owner := catalog.Owner(r.Context(), sku); owner == "" || owner != tenant {
+		http.Error(rw, "unknown sku", http.StatusNotFound)
 		return
 	}
-	id := r.PathValue("id")
-	if catalog.Owner(r.Context(), id) != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown sku"})
+	levels, err := levelsScript.Run(r.Context(), rdb, []string{stock.Key(sku), stock.HoldsKey(sku)}).Int64Slice()
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	raw, _ := rdb.Get(r.Context(), counterKey(id)).Int64()
-	available := nonNegative(raw)
-	reserved := reservedFor(r.Context(), id)
-	now := time.Now().Unix()
-	syncedAt := readSyncedAt(r.Context())
-	lagMs := stalenessMs(syncedAt, now)
-	stale := lagMs > syncStaleAfterS*1000
-	log.Printf("stock read tenant=%s sku=%s available=%d reserved=%d stale=%t", tenant, id, available, reserved, stale)
+	available, reserved := levels[0], levels[1]
+	// A counter the warehouse has not confirmed for a while can promise units the shelf does not have.
+	var syncedAt any
+	stale := true
+	if at, synced := catalog.SyncedAt(r.Context(), sku); synced {
+		syncedAt = at
+		stale = time.Now().Unix()-at > syncStaleAfter
+	}
 	writeJSON(rw, http.StatusOK, map[string]any{
-		"sku":          id,
-		"available":    available,
-		"reserved":     reserved,
-		"on_hand":      available + reserved,
-		"synced_at":    syncedAt,
-		"staleness_ms": lagMs,
-		"stale":        stale,
+		"sku": sku, "available": available, "reserved": reserved, "on_hand": available + reserved, "synced_at": syncedAt, "stale": stale,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/skus/{id}/stock", readStock)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/skus/{sku}/stock", readStock)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import scala.collection.mutable
+
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import redis.clients.jedis.JedisPooled
+import spray.json._
 
-final case class StockView(sku: String, on_hand: Long)
+import inventory.{Catalog, Stock} // Catalog.owner, syncedAt; Stock.key, holdsKey
 
-object StockRead {
-  implicit val system: ActorSystem = ActorSystem("inventoryd")
-  implicit val stockViewFormat: RootJsonFormat[StockView] = jsonFormat2(StockView)
+object Read {
+  val jedis = new JedisPooled("redis", 6379)
 
-  // The on-hand number the warehouse sync produced, refreshed hourly.
-  val OnHandCacheTtlS = 3600L
-  val onHandCache = scala.collection.mutable.Map.empty[String, (Long, Long)]
-  val jedis = new Jedis("redis", 6379)
+  val OnHandCacheTtlS = 300L
+  private val cache = mutable.Map.empty[String, (Long, Long)]
 
-  // The warehouse on-hand count from the last refresh, at most an hour behind the sync.
-  def cachedOnHand(sku: String): Long = {
-    val (refreshedAt, onHand) = onHandCache.getOrElse(sku, (0L, 0L))
-    if (System.currentTimeMillis() / 1000L - refreshedAt > OnHandCacheTtlS) {
-      onHandCache(sku) = (System.currentTimeMillis() / 1000L, onHand)
-    }
-    onHand
-  }
+  private def nowSeconds(): Long = System.currentTimeMillis() / 1000
 
-  val route: Route =
-    path("v1" / "skus" / Segment / "stock") { id =>
-      get {
-        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          system.log.info("stock read tenant=" + tenantOpt.getOrElse("") + " sku=" + id)
-          complete(StatusCodes.OK, StockView(id, cachedOnHand(id)))
+  val route: Route = path("v1" / "skus" / Segment / "stock") { sku =>
+    get {
+      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+      if (Catalog.owner(sku).isEmpty) complete(StatusCodes.NotFound -> "unknown sku")
+      else {
+        val (_, units) = cache.get(sku).filter { case (at, _) => nowSeconds() - at <= OnHandCacheTtlS }.getOrElse {
+          val fresh = (nowSeconds(), Option(jedis.get(Stock.key(sku))).map(_.toLong).getOrElse(0L))
+          cache(sku) = fresh
+          fresh
         }
+        val body = JsObject(
+          "sku" -> JsString(sku),
+          "available" -> JsNumber(units),
+          "reserved" -> JsNumber(0),
+          "on_hand" -> JsNumber(units),
+          "synced_at" -> Catalog.syncedAt(sku).map(JsNumber(_)).getOrElse(JsNull),
+          "stale" -> JsBoolean(false)
+        )
+        complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import scala.jdk.CollectionConverters._
+
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import redis.clients.jedis.params.ScanParams
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import redis.clients.jedis.JedisPooled
+import spray.json._
 
-import scala.jdk.CollectionConverters._
+import inventory.{Catalog, Stock} // Catalog.owner, syncedAt; Stock.key, holdsKey
 
-final case class StockView(
-    sku: String,
-    available: Long,
-    reserved: Long,
-    on_hand: Long,
-    synced_at: Long,
-    staleness_ms: Long,
-    stale: Boolean
-)
+object Read {
+  val jedis = new JedisPooled("redis", 6379)
 
-object StockRead {
-  implicit val system: ActorSystem = ActorSystem("inventoryd")
-  implicit val stockViewFormat: RootJsonFormat[StockView] = jsonFormat7(StockView)
-
-  val SyncUpdatedAtKey = "sync:updated_at"
   val SyncStaleAfterS = 60L
 
-  val jedis = new Jedis("redis", 6379)
+  // One snapshot of the counter and the hold map: a hold whose key expired is available again (the
+  // next reserve credits it), a live one is reserved. KEYS: stock:{sku}, holds:{sku}.
+  val LevelsLua: String =
+    """
+      |local available = tonumber(redis.call('GET', KEYS[1]) or '0')
+      |local reserved = 0
+      |local entries = redis.call('HGETALL', KEYS[2])
+      |for i = 1, #entries, 2 do
+      |  if redis.call('EXISTS', 'hold:' .. entries[i]) == 1 then
+      |    reserved = reserved + tonumber(entries[i + 1])
+      |  else
+      |    available = available + tonumber(entries[i + 1])
+      |  end
+      |end
+      |return {available, reserved}
+      |""".stripMargin
 
-  object catalog {
-    /** The tenant that owns the sku, or None when no tenant does. */
-    def owner(sku: String): Option[String] = throw new UnsupportedOperationException("no catalog row for " + sku)
-  }
-
-  /** The same counter the reservation path decrements. */
-  def counterKey(sku: String): String = "stock:" + sku
-
-  /** Every live hold on this sku, summed: the holds the reservation path sets with a TTL. */
-  def reservedFor(sku: String): Long = {
-    var cursor = "0"
-    val params = new ScanParams().\`match\`("hold:" + sku + ":*")
-    var total = 0L
-    do {
-      val page = jedis.scan(cursor, params)
-      cursor = page.getCursor
-      for (key <- page.getResult.asScala) {
-        total += Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-      }
-    } while (cursor != "0")
-    total
-  }
-
-  /** What a new reservation would actually be granted: never a negative unit of stock. */
-  def nonNegative(value: Long): Long = math.max(value, 0L)
-
-  /** When the warehouse sync last wrote a count, epoch seconds. */
-  def readSyncedAt(): Long = Option(jedis.get(SyncUpdatedAtKey)).map(_.toLong).getOrElse(0L)
-
-  /** How far the warehouse sync is behind this read, in milliseconds. */
-  def stalenessMs(syncedAt: Long, now: Long): Long = math.max((now - syncedAt) * 1000L, 0L)
-
-  val route: Route =
-    path("v1" / "skus" / Segment / "stock") { id =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          tenantOpt.filter(_.nonEmpty) match {
-            case None =>
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            case Some(tenant) if catalog.owner(id).forall(_ != tenant) =>
-              complete(StatusCodes.NotFound, """{"error":"unknown sku"}""")
-            case Some(tenant) =>
-              val available = nonNegative(Option(jedis.get(counterKey(id))).map(_.toLong).getOrElse(0L))
-              val reserved = reservedFor(id)
-              val now = System.currentTimeMillis() / 1000L
-              val syncedAt = readSyncedAt()
-              val lagMs = stalenessMs(syncedAt, now)
-              val stale = lagMs > SyncStaleAfterS * 1000L
-              system.log.info(
-                "stock read tenant=" + tenant + " sku=" + id + " available=" + available +
-                  " reserved=" + reserved + " stale=" + stale
-              )
-              complete(
-                StatusCodes.OK,
-                StockView(
-                  sku = id,
-                  available = available,
-                  reserved = reserved,
-                  on_hand = available + reserved,
-                  synced_at = syncedAt,
-                  staleness_ms = lagMs,
-                  stale = stale
-                )
-              )
-          }
+  val route: Route = path("v1" / "skus" / Segment / "stock") { sku =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        if (!Catalog.owner(sku).contains(tenant.getOrElse(""))) complete(StatusCodes.NotFound -> "unknown sku")
+        else {
+          val levels = jedis
+            .eval(LevelsLua, List(Stock.key(sku), Stock.holdsKey(sku)).asJava, List.empty[String].asJava)
+            .asInstanceOf[java.util.List[AnyRef]]
+            .asScala
+            .map(_.asInstanceOf[java.lang.Long].longValue)
+          val (available, reserved) = (levels(0), levels(1))
+          val syncedAt = Catalog.syncedAt(sku)
+          // A counter the warehouse has not confirmed for a while can promise units the shelf does not have.
+          val stale = syncedAt.forall(at => System.currentTimeMillis() / 1000 - at > SyncStaleAfterS)
+          val body = JsObject(
+            "sku" -> JsString(sku),
+            "available" -> JsNumber(available),
+            "reserved" -> JsNumber(reserved),
+            "on_hand" -> JsNumber(available + reserved),
+            "synced_at" -> syncedAt.map(JsNumber(_)).getOrElse(JsNull),
+            "stale" -> JsBoolean(stale)
+          )
+          complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -773,157 +487,393 @@ object StockRead {
 #include <sw/redis++/redis++.h>
 
 #include <chrono>
+#include <map>
 #include <string>
-#include <unordered_map>
+#include <utility>
+
+#include "inventory/catalog.h"  // catalog::Owner, SyncedAt
+#include "inventory/stock.h"    // stock::Key, HoldsKey
 
 using json = nlohmann::json;
 
-constexpr long long kOnHandCacheTtlS = 3600;
-
-struct CachedOnHand {
-  long long refreshed_at_s = 0;
-  long long on_hand = 0;
-};
-
 sw::redis::Redis redis("tcp://redis:6379");
-std::unordered_map<std::string, CachedOnHand> on_hand_cache;
 
-// cached_on_hand is the warehouse on-hand count from the last refresh, at most an hour behind.
-long long cached_on_hand(const std::string& sku) {
-  auto& hit = on_hand_cache[sku];
-  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                       .count();
-  if (now - hit.refreshed_at_s > kOnHandCacheTtlS) hit.refreshed_at_s = now;
-  return hit.on_hand;
+constexpr long long kOnHandCacheTtlS = 300;
+std::map<std::string, std::pair<long long, long long>> onHandCache;  // sku → (fetched at, units)
+
+long long epochSeconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/skus/([^/]+)/stock)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const std::string sku = req.matches[1];
-    std::cerr << "stock read tenant=" << req.get_header_value("X-Tenant-Id") << " sku=" << sku << "\\n";
-    res.status = 200;
-    res.set_content(json{{"sku", sku}, {"on_hand", cached_on_hand(sku)}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void read_stock(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string sku = req.matches[1];
+  if (!inventory::catalog::Owner(sku)) {
+    res.status = 404;
+    res.set_content("unknown sku", "text/plain");
+    return;
+  }
+  auto cached = onHandCache.find(sku);
+  if (cached == onHandCache.end() || epochSeconds() - cached->second.first > kOnHandCacheTtlS) {
+    const auto units = redis.get(inventory::stock::Key(sku));
+    onHandCache[sku] = {epochSeconds(), units ? std::stoll(*units) : 0};
+    cached = onHandCache.find(sku);
+  }
+  const long long units = cached->second.second;
+  const auto synced_at = inventory::catalog::SyncedAt(sku);
+  const json body{{"sku", sku}, {"available", units}, {"reserved", 0}, {"on_hand", units},
+                  {"synced_at", synced_at ? json(*synced_at) : json(nullptr)}, {"stale", false}};
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/skus/([\\w-]+)/stock)", read_stock); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
-#include <algorithm>
 #include <chrono>
-#include <iostream>
-#include <iterator>
 #include <string>
 #include <vector>
 
+#include "inventory/catalog.h"  // catalog::Owner, SyncedAt
+#include "inventory/stock.h"    // stock::Key, HoldsKey
+
 using json = nlohmann::json;
-using sw::redis::Redis;
 
-Redis redis("tcp://redis:6379");
+sw::redis::Redis redis("tcp://redis:6379");
 
-const std::string kSyncUpdatedAtKey = "sync:updated_at";
 constexpr long long kSyncStaleAfterS = 60;
 
-struct SkuCatalog {
-  /** The tenant that owns the sku, or empty when no tenant does. */
-  std::string owner(const std::string& sku);
-};
+// One snapshot of the counter and the hold map: a hold whose key expired is available again (the
+// next reserve credits it), a live one is reserved. KEYS: stock:{sku}, holds:{sku}.
+const std::string kLevelsLua = R"lua(
+local available = tonumber(redis.call('GET', KEYS[1]) or '0')
+local reserved = 0
+local entries = redis.call('HGETALL', KEYS[2])
+for i = 1, #entries, 2 do
+  if redis.call('EXISTS', 'hold:' .. entries[i]) == 1 then
+    reserved = reserved + tonumber(entries[i + 1])
+  else
+    available = available + tonumber(entries[i + 1])
+  end
+end
+return {available, reserved}
+)lua";
 
-SkuCatalog catalog;
-
-/** The same counter the reservation path decrements. */
-std::string counterKey(const std::string& sku) { return "stock:" + sku; }
-
-/** Every live hold on this sku, summed: the holds the reservation path sets with a TTL. */
-long long reservedFor(const std::string& sku) {
-  long long total = 0;
-  long long cursor = 0;
-  std::vector<std::string> keys;
-  do {
-    keys.clear();
-    cursor = redis.scan(cursor, "hold:" + sku + ":*", 100, std::back_inserter(keys));
-    for (const auto& key : keys) {
-      const auto raw = redis.get(key);
-      if (raw) total += std::stoll(*raw);
-    }
-  } while (cursor != 0);
-  return total;
+long long epochSeconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-/** What a new reservation would actually be granted: never a negative unit of stock. */
-long long nonNegative(long long value) { return value < 0 ? 0 : value; }
-
-/** When the warehouse sync last wrote a count, epoch seconds. */
-long long readSyncedAt() {
-  const auto raw = redis.get(kSyncUpdatedAtKey);
-  return raw ? std::stoll(*raw) : 0;
+void read_stock(const httplib::Request& req, httplib::Response& res) {
+  const std::string sku = req.matches[1];
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (inventory::catalog::Owner(sku) != tenant) {
+    res.status = 404;
+    res.set_content("unknown sku", "text/plain");
+    return;
+  }
+  const std::vector<std::string> keys = {inventory::stock::Key(sku), inventory::stock::HoldsKey(sku)};
+  const auto [available, reserved] = redis.eval<long long, long long>(kLevelsLua, keys, std::vector<std::string>{});
+  const auto synced_at = inventory::catalog::SyncedAt(sku);
+  // A counter the warehouse has not confirmed for a while can promise units the shelf does not have.
+  const bool stale = !synced_at || epochSeconds() - *synced_at > kSyncStaleAfterS;
+  const json body{{"sku", sku},
+                  {"available", available},
+                  {"reserved", reserved},
+                  {"on_hand", available + reserved},
+                  {"synced_at", synced_at ? json(*synced_at) : json(nullptr)},
+                  {"stale", stale}};
+  res.set_content(body.dump(), "application/json");
 }
 
-/** How far the warehouse sync is behind this read, in milliseconds. */
-long long stalenessMs(long long synced_at, long long now) {
-  return std::max((now - synced_at) * 1000, 0LL);
-}
-
-long long nowSeconds() {
-  return std::chrono::duration_cast<std::chrono::seconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/skus/([^/]+)/stock)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const std::string sku = req.matches[1];
-    if (catalog.owner(sku) != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown sku"})", "application/json");
-      return;
-    }
-    const auto raw = redis.get(counterKey(sku));
-    const long long available = nonNegative(raw ? std::stoll(*raw) : 0);
-    const long long reserved = reservedFor(sku);
-    const long long now = nowSeconds();
-    const long long synced_at = readSyncedAt();
-    const long long lag_ms = stalenessMs(synced_at, now);
-    const bool stale = lag_ms > kSyncStaleAfterS * 1000;
-    std::cerr << "stock read tenant=" << tenant << " sku=" << sku << " available=" << available
-              << " reserved=" << reserved << " stale=" << stale << "\\n";
-    res.status = 200;
-    res.set_content(
-        json{{"sku", sku},
-             {"available", available},
-             {"reserved", reserved},
-             {"on_hand", available + reserved},
-             {"synced_at", synced_at},
-             {"staleness_ms", lag_ms},
-             {"stale", stale}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/skus/([\\w-]+)/stock)", read_stock); }
 `,
     },
   },
+  harness: {
+    python: `from inventory import stock
+
+
+async def _world(ctx):
+    now = int(ctx.clock.time())
+    ctx.redis.hset("sku:sku-1", mapping={"tenant": "t1", "synced_at": now})
+    ctx.redis.hset("sku:sku-9", mapping={"tenant": "t2", "synced_at": now})
+    ctx.redis.set("stock:sku-1", 10)
+    ctx.redis.set("stock:sku-9", 10)
+    return ctx.client(ctx.load("read").app)
+
+
+async def _read(c, sku="sku-1", tenant="t1"):
+    return await c.get(f"/v1/skus/{sku}/stock", headers={"X-Tenant-Id": tenant})
+
+
+async def check_live_counter(ctx):
+    async with await _world(ctx) as c:
+        before = await _read(c)
+        assert before.status_code == 200, f"GET /v1/skus/sku-1/stock answered {before.status_code}: {before.text}"
+        assert before.json().get("available") == 10, f"a sku with 10 units reads {before.json()}"
+        stock.reserve("sku-1", 4, "r-1")
+        after = await _read(c)
+    available = after.json().get("available")
+    assert available == 6, f"after a reservation of 4 the read still shows {available} available: the storefront promises units the counter already gave away. Read stock:sku-1, not a cache"
+
+
+async def check_reserved_holds(ctx):
+    async with await _world(ctx) as c:
+        stock.reserve("sku-1", 3, "r-1")
+        ctx.clock.advance(600)
+        stock.reserve("sku-1", 2, "r-2")
+        ctx.clock.advance(400)  # r-1's hold expired, r-2's is live
+        r = await _read(c)
+    body = r.json()
+    got = (body.get("available"), body.get("reserved"), body.get("on_hand"))
+    assert got == (8, 2, 10), f"with a live hold of 2 and an expired hold of 3 on 10 units the read answers available, reserved, on_hand = {got}, expected (8, 2, 10): an expired hold is available again, a live one is reserved"
+
+
+async def check_tenant_404(ctx):
+    async with await _world(ctx) as c:
+        other = await _read(c, sku="sku-9", tenant="t1")
+        unknown = await _read(c, sku="sku-404", tenant="t1")
+        own = await _read(c, sku="sku-9", tenant="t2")
+    assert other.status_code == 404, f"tenant t1 reading t2's sku-9 answered {other.status_code} {other.text}, expected 404"
+    assert unknown.status_code == 404, f"a sku the catalogue does not know answered {unknown.status_code}, expected 404"
+    assert own.status_code == 200, f"tenant t2 reading its own sku-9 answered {own.status_code}"
+
+
+async def check_stale(ctx):
+    async with await _world(ctx) as c:
+        fresh = await _read(c)
+        ctx.clock.advance(120)  # the warehouse sync stopped writing
+        late = await _read(c)
+    assert fresh.json().get("stale") is False, f"a sync written just now reads {fresh.json()}, expected stale false"
+    assert fresh.json().get("synced_at") is not None, f"the read must carry synced_at, got {fresh.json()}"
+    assert late.json().get("stale") is True, f"two minutes after the last warehouse sync the read answers {late.json()}, expected stale true (SYNC_STALE_AFTER_S = 60)"
+`,
+    typescript: `import {reserve} from 'inventory/stock';
+
+function world(ctx) {
+  const now = String(Math.floor(ctx.clock.now() / 1000));
+  ctx.redis.hset('sku:sku-1', 'tenant', 't1', 'synced_at', now);
+  ctx.redis.hset('sku:sku-9', 'tenant', 't2', 'synced_at', now);
+  ctx.redis.set('stock:sku-1', '10');
+  ctx.redis.set('stock:sku-9', '10');
+  return ctx.client(ctx.load('read').app);
+}
+
+const read = (c, sku = 'sku-1', tenant = 't1') => c.get(\`/v1/skus/\${sku}/stock\`, {headers: {'X-Tenant-Id': tenant}});
+
+export async function check_live_counter(ctx) {
+  const c = world(ctx);
+  const before = await read(c);
+  assert.equal(before.status, 200, \`GET /v1/skus/sku-1/stock answered \${before.status}: \${before.text}\`);
+  assert.equal(before.json().available, 10, \`a sku with 10 units reads \${before.text}\`);
+  await reserve('sku-1', 4, 'r-1');
+  const available = (await read(c)).json().available;
+  assert.equal(available, 6, \`after a reservation of 4 the read still shows \${available} available: the storefront promises units the counter already gave away. Read stock:sku-1, not a cache\`);
+}
+
+export async function check_reserved_holds(ctx) {
+  const c = world(ctx);
+  await reserve('sku-1', 3, 'r-1');
+  ctx.clock.advance(600);
+  await reserve('sku-1', 2, 'r-2');
+  ctx.clock.advance(400); // r-1's hold expired, r-2's is live
+  const body = (await read(c)).json();
+  const got = [body.available, body.reserved, body.on_hand];
+  assert.deepEqual(got, [8, 2, 10], \`with a live hold of 2 and an expired hold of 3 on 10 units the read answers available, reserved, on_hand = \${JSON.stringify(got)}, expected [8, 2, 10]: an expired hold is available again, a live one is reserved\`);
+}
+
+export async function check_tenant_404(ctx) {
+  const c = world(ctx);
+  const other = await read(c, 'sku-9', 't1');
+  const unknown = await read(c, 'sku-404', 't1');
+  const own = await read(c, 'sku-9', 't2');
+  assert.equal(other.status, 404, \`tenant t1 reading t2's sku-9 answered \${other.status} \${other.text}, expected 404\`);
+  assert.equal(unknown.status, 404, \`a sku the catalogue does not know answered \${unknown.status}, expected 404\`);
+  assert.equal(own.status, 200, \`tenant t2 reading its own sku-9 answered \${own.status}\`);
+}
+
+export async function check_stale(ctx) {
+  const c = world(ctx);
+  const fresh = (await read(c)).json();
+  ctx.clock.advance(120); // the warehouse sync stopped writing
+  const late = (await read(c)).json();
+  assert.equal(fresh.stale, false, \`a sync written just now reads \${JSON.stringify(fresh)}, expected stale false\`);
+  assert(fresh.synced_at !== null && fresh.synced_at !== undefined, \`the read must carry synced_at, got \${JSON.stringify(fresh)}\`);
+  assert.equal(late.stale, true, \`two minutes after the last warehouse sync the read answers \${JSON.stringify(late)}, expected stale true (SYNC_STALE_AFTER_S = 60)\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"leetbuild/harness"
+
+	"inventory/stock"
+)
+
+func readWorld(ctx *harness.Ctx) *harness.HTTP {
+	now := ctx.Clock.Now() / 1000
+	ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1", "synced_at", now)
+	ctx.Redis.Do("HSET", "sku:sku-9", "tenant", "t2", "synced_at", now)
+	ctx.Redis.Set("stock:sku-1", 10)
+	ctx.Redis.Set("stock:sku-9", 10)
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+type readBody struct {
+	Available int  \`json:"available"\`
+	Reserved  int  \`json:"reserved"\`
+	OnHand    int  \`json:"on_hand"\`
+	SyncedAt  *int \`json:"synced_at"\`
+	Stale     bool \`json:"stale"\`
+}
+
+func readStockOf(ctx *harness.Ctx, c *harness.HTTP, sku, tenant string) (*harness.Response, readBody) {
+	r := c.Get("/v1/skus/"+sku+"/stock", "X-Tenant-Id", tenant)
+	var body readBody
+	if r.Status == 200 {
+		r.Decode(&body)
+	}
+	return r, body
+}
+
+func readReserve(ctx *harness.Ctx, quantity int, reservationID string) {
+	ok, err := stock.Reserve(context.Background(), "sku-1", quantity, reservationID)
+	ctx.NoError(err, "reserving through inventory/stock")
+	ctx.Assert(ok, "reserving %d units of sku-1 was refused", quantity)
+}
+
+func CheckLiveCounter(ctx *harness.Ctx) {
+	c := readWorld(ctx)
+	r, before := readStockOf(ctx, c, "sku-1", "t1")
+	ctx.Equal(r.Status, 200, "GET /v1/skus/sku-1/stock (%s)", r.Text())
+	ctx.Equal(before.Available, 10, "the available units of a sku with 10")
+	readReserve(ctx, 4, "r-1")
+	_, after := readStockOf(ctx, c, "sku-1", "t1")
+	ctx.Equal(after.Available, 6, "the available units after a reservation of 4 (the storefront must not promise units the counter already gave away: read stock:sku-1, not a cache)")
+}
+
+func CheckReservedHolds(ctx *harness.Ctx) {
+	c := readWorld(ctx)
+	readReserve(ctx, 3, "r-1")
+	ctx.Clock.Advance(600)
+	readReserve(ctx, 2, "r-2")
+	ctx.Clock.Advance(400) // r-1's hold expired, r-2's is live
+	_, body := readStockOf(ctx, c, "sku-1", "t1")
+	ctx.Equal([]int{body.Available, body.Reserved, body.OnHand}, []int{8, 2, 10}, "available, reserved, on_hand with a live hold of 2 and an expired hold of 3 on 10 units (an expired hold is available again, a live one is reserved)")
+}
+
+func CheckTenant404(ctx *harness.Ctx) {
+	c := readWorld(ctx)
+	other, _ := readStockOf(ctx, c, "sku-9", "t1")
+	unknown, _ := readStockOf(ctx, c, "sku-404", "t1")
+	own, _ := readStockOf(ctx, c, "sku-9", "t2")
+	ctx.Equal(other.Status, 404, "tenant t1 reading t2's sku-9")
+	ctx.Equal(unknown.Status, 404, "a sku the catalogue does not know")
+	ctx.Equal(own.Status, 200, "tenant t2 reading its own sku-9")
+}
+
+func CheckStale(ctx *harness.Ctx) {
+	c := readWorld(ctx)
+	_, fresh := readStockOf(ctx, c, "sku-1", "t1")
+	ctx.Clock.Advance(120) // the warehouse sync stopped writing
+	_, late := readStockOf(ctx, c, "sku-1", "t1")
+	ctx.Equal(fresh.Stale, false, "stale for a sync written just now")
+	ctx.Assert(fresh.SyncedAt != nil, "the read must carry synced_at")
+	ctx.Equal(late.Stale, true, "stale two minutes after the last warehouse sync (SYNC_STALE_AFTER_S = 60)")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "inventory/stock.h"
+
+namespace {
+
+harness::HTTP readWorld(harness::Ctx& ctx) {
+  const long long now = ctx.Clock.Now() / 1000;
+  ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1", "synced_at", now);
+  ctx.Redis.Do("HSET", "sku:sku-9", "tenant", "t2", "synced_at", now);
+  ctx.Redis.Do("SET", "stock:sku-1", 10);
+  ctx.Redis.Do("SET", "stock:sku-9", 10);
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response readStockOf(harness::HTTP& c, const std::string& sku, const std::string& tenant) {
+  return c.Get("/v1/skus/" + sku + "/stock", "X-Tenant-Id", tenant);
+}
+
+nlohmann::json readBody(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : nlohmann::json::object();
+}
+
+void readReserve(harness::Ctx& ctx, int quantity, const std::string& reservation_id) {
+  ctx.Assert(inventory::stock::Reserve("sku-1", quantity, reservation_id), "reserving %d units of sku-1 was refused", quantity);
+}
+
+}  // namespace
+
+void CheckLiveCounter(harness::Ctx& ctx) {
+  auto c = readWorld(ctx);
+  const auto r = readStockOf(c, "sku-1", "t1");
+  ctx.Equal(r.Status, 200, "GET /v1/skus/sku-1/stock (%s)", r.Text());
+  ctx.Equal(readBody(r).value("available", -1LL), 10, "the available units of a sku with 10");
+  readReserve(ctx, 4, "r-1");
+  ctx.Equal(readBody(readStockOf(c, "sku-1", "t1")).value("available", -1LL), 6,
+            "the available units after a reservation of 4 (the storefront must not promise units the counter already gave away: "
+            "read stock:sku-1, not a cache)");
+}
+
+void CheckReservedHolds(harness::Ctx& ctx) {
+  auto c = readWorld(ctx);
+  readReserve(ctx, 3, "r-1");
+  ctx.Clock.Advance(600);
+  readReserve(ctx, 2, "r-2");
+  ctx.Clock.Advance(400);  // r-1's hold expired, r-2's is live
+  const auto body = readBody(readStockOf(c, "sku-1", "t1"));
+  const std::vector<long long> got = {body.value("available", -1LL), body.value("reserved", -1LL), body.value("on_hand", -1LL)};
+  ctx.Equal(got, {8, 2, 10},
+            "available, reserved, on_hand with a live hold of 2 and an expired hold of 3 on 10 units (an expired hold is "
+            "available again, a live one is reserved)");
+}
+
+void CheckTenant404(harness::Ctx& ctx) {
+  auto c = readWorld(ctx);
+  ctx.Equal(readStockOf(c, "sku-9", "t1").Status, 404, "tenant t1 reading t2's sku-9");
+  ctx.Equal(readStockOf(c, "sku-404", "t1").Status, 404, "a sku the catalogue does not know");
+  ctx.Equal(readStockOf(c, "sku-9", "t2").Status, 200, "tenant t2 reading its own sku-9");
+}
+
+void CheckStale(harness::Ctx& ctx) {
+  auto c = readWorld(ctx);
+  const auto fresh = readBody(readStockOf(c, "sku-1", "t1"));
+  ctx.Clock.Advance(120);  // the warehouse sync stopped writing
+  const auto late = readBody(readStockOf(c, "sku-1", "t1"));
+  ctx.Equal(fresh.value("stale", true), false, "stale for a sync written just now");
+  ctx.Assert(fresh.contains("synced_at") && !fresh["synced_at"].is_null(), "the read must carry synced_at, got %s", fresh.dump());
+  ctx.Equal(late.value("stale", false), true, "stale two minutes after the last warehouse sync (SYNC_STALE_AFTER_S = 60)");
+}
+`,
+  },
   hints: [
-    'Symptom: the storefront badge says 3 in stock while "add to cart" answers 409, an hour after the warehouse sync stalled, and merchant A can fetch merchant B’s stock by guessing a sku id.',
-    'Mechanism: the handler serves `cached_on_hand` refreshed every `ON_HAND_CACHE_TTL_S`, sums no holds, compares nothing against `sync:updated_at`, and resolves the sku without checking its owner.',
-    'Change: 404 unless `catalog.owner(sku)` is the tenant, read `stock:{sku}` through `counter_key` with `non_negative`, sum `hold:{sku}:*` into `reserved`, and add `synced_at`, `staleness_ms`, `stale` from `SYNC_STALE_AFTER_S`.',
+    'A shopper adds the last unit to the cart, and the product page still says three left for the next five minutes; units sitting in abandoned carts are counted nowhere; a stalled warehouse feed goes unnoticed.',
+    'The counter the reservation path decrements is read once and kept for five minutes, `reserved` is a literal 0, the tenant is never compared, and `stale` is a constant.',
+    'Run one Lua script over `stock:{sku}` and `holds:{sku}` that adds expired holds to available and live ones to reserved; 404 unless `catalog.owner(sku)` is the tenant; `stale` when `synced_at` is missing or older than `SYNC_STALE_AFTER_S`.',
   ],
-  debrief: `The read side has one job: return the number a reservation would be admitted against. The starter fails the way a cache fails, by becoming a second writer of a number it does not own: an hourly \`on_hand\` disagrees with \`stock:{sku}\` by exactly the holds and sales since the last refresh. The fix is one source with three views: \`available\` floored at zero by \`non_negative\`, \`reserved\` as the live holds summed, \`on_hand\` as their sum. Freshness is explicit so a sync that stopped an hour ago is visible in the body, and scope comes before numbers so a foreign sku is 404 with no counters. Production inventory reads add a per-warehouse watermark instead of one global timestamp and report in-transit and damaged units alongside reserved.`,
+  debrief: `The read is built from the same keys the reservation path writes, in one script, because a number assembled from two moments can show a unit both reserved and available. Counting an expired hold as available makes the read agree with what the next reserve will do, so the storefront never says "sold out" for units an abandoned cart is about to give back. Reporting staleness instead of hiding it lets the storefront decide what to show when the warehouse feed is behind, which is a product call, not the inventory service's. Production storefronts put a short CDN cache in front of this read for listing pages and keep the live read for the product page and checkout, and they show "only a few left" rather than an exact count when the sync is stale.`,
 };

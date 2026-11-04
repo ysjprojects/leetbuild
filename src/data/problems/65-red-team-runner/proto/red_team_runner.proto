@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package redteamd;
+
+// The probe sandbox step 3 calls once per attempt: it forwards one adversarial probe to the
+// registered target over isolated egress and reports whether the target blocked it. The harness
+// serves a deterministic stand-in at sandbox:9000 (redteam/sandbox in the support modules).
+service Sandbox {
+  rpc Probe(ProbeRequest) returns (ProbeReply);
+}
+
+message ProbeRequest {
+  string run_id = 1;
+  string target = 2;
+  string probe_id = 3;
+  string category = 4;
+  string payload = 5;
+}
+
+message ProbeReply {
+  bool blocked = 1;
+  string output = 2;
+}

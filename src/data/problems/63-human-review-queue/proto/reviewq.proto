@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package reviewq;
+
+// The enforcement service step 3 asks before the review queue clears an item without a reviewer.
+// It answers a grant when the policy lets the queue clear that category by itself, and
+// PERMISSION_DENIED when the policy refuses it.
+service Enforcement {
+  rpc AutoResolve(AutoResolveRequest) returns (Grant);
+}
+
+message AutoResolveRequest {
+  string tenant = 1;
+  string item_id = 2;
+  string category = 3;
+}
+
+message Grant {
+  string grant_id = 1;
+}

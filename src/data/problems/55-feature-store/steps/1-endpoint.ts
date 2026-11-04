@@ -2,166 +2,132 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/features/definitions: one definition, both paths',
+  title: 'POST /v1/features/definitions: one immutable definition per version',
   concept: 'http',
   file: 'api',
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter accepts \`POST /v1/features/definitions\` with body
-\`{"name": "amount_7d", "version": 2, "dtype": "float64", "computation_ref": "window_avg_7d", "freshness_slo": 300}\`,
-stores it under \`name:version\` and echoes it back with 200. It serves the demo and hides four flaws.
+**Starting point.** The starter serves \`POST /v1/features/definitions\` on the registry
+(\`features.registry\`, provided) with body
+\`{"name": "amount_7d", "version": 2, "dtype": "float64", "computation_ref": "window_avg_7d", "freshness_slo": 300}\`:
+it checks \`dtype\` against \`DTYPES\`, stamps \`created_at\`, stores the body with
+\`registry.put_definition\` and answers 201 with the stored definition. It serves the demo and hides
+three flaws.
 
-**Failure mode the checks target.** A definition that can be written over is one training and serving
-can disagree about; a dangling \`computation_ref\` and a \`null\` freshness SLO only surface once a
-model has been trained on them.
+**Failure mode the checks target.** A second registration of \`amount_7d\` version 2 rewrites the
+definition a model was trained on; a definition whose computation does not exist is accepted and
+fails an hour later in the training job; a definition without a freshness SLO is stored without
+one, so no reader can tell a stale value from a fresh one.
 
-- A definition is keyed by **(name, version)**. Registering an existing pair is **409** and the stored
-  record stays untouched. The starter writes over it.
-- \`dtype\` is one of \`int64\`, \`float64\`, \`string\`, \`bool\` (**400** otherwise).
-- \`computation_ref\` is resolved against the compute registry at registration; a reference that names
-  nothing is **422**. The starter accepts any string.
-- \`freshness_slo\` (seconds) is **required** and positive (**400** when missing or \`null\`). The
-  starter has no such field and stores \`freshness\` as \`null\`.
-- The response is the definition **as stored**, including the creation time, with **201**, not a
-  restatement of the request body.
-
-## What to keep
-
-The route, the request model and the store are fine. The fix is the key check, the resolution step and
-the explicit SLO: validate everything before the write, and never overwrite a stored version.`,
+- A definition is immutable per **(name, version)**: store it with \`registry.create_definition\`
+  (one \`SET NX\`) and answer **409** when the pair exists, also when another registration lands
+  between a check and the write.
+- \`computation_ref\` must resolve (\`registry.computation_exists\`): one that names nothing is **422**
+  and nothing is stored.
+- \`freshness_slo\` (seconds) is required and positive: missing, \`null\` or ≤ 0 is **400**.`,
   sequence: {
-    participants: ['Client', 'Feature API', 'Definition registry'],
+    participants: ['Client', 'Feature API', 'Registry'],
     messages: [
-      {
-        from: 'Client',
-        to: 'Feature API',
-        label: 'POST /v1/features/definitions {name, version, dtype, ref, slo}',
-        kind: 'sync',
-      },
-      {from: 'Feature API', to: 'Definition registry', label: 'has(feature:name:version)', kind: 'sync'},
-      {from: 'Definition registry', to: 'Feature API', label: 'existing / none', kind: 'reply'},
-      {
-        from: 'Feature API',
-        to: 'Feature API',
-        label: '409 existing · 422 dangling ref · 400 without an SLO',
-        kind: 'sync',
-      },
-      {from: 'Feature API', to: 'Definition registry', label: 'put(feature:name:version, definition)', kind: 'async'},
-      {
-        from: 'Feature API',
-        to: 'Client',
-        label: '201 {name, version, dtype, computation_ref, freshness_slo}',
-        kind: 'reply',
-      },
+      {from: 'Client', to: 'Feature API', label: 'POST /v1/features/definitions · amount_7d v2', kind: 'sync'},
+      {from: 'Feature API', to: 'Feature API', label: 'dtype in DTYPES · freshness_slo > 0 → else 400', kind: 'sync'},
+      {from: 'Feature API', to: 'Registry', label: 'computation_exists(window_avg_7d) → else 422', kind: 'sync'},
+      {from: 'Feature API', to: 'Registry', label: 'create_definition · SET NX definition:amount_7d:2', kind: 'sync'},
+      {from: 'Registry', to: 'Feature API', label: 'stored · or exists → 409', kind: 'reply'},
+      {from: 'Feature API', to: 'Client', label: '201 the definition as stored', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/features/definitions',
-      detail: 'Register the definition route on `POST /v1/features/definitions`.',
+      title: 'Registers a definition and answers it as stored',
+      detail:
+        '`POST /v1/features/definitions` answers **201** with the stored definition, `created_at` included, and a `dtype` outside `DTYPES` is **400**.',
       match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/features\/definitions["']\)/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/features\/definitions['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/features\/definitions"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"features"\s*\/\s*"definitions"\s*\)/, /\bpost\s*\{/]},
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/features\/definitions"/]},
+        python: {all: [/@app\.post\(\s*["']\/v1\/features\/definitions["']/, /DTYPES/]},
+        typescript: {all: [/app\.post\(\s*['"]\/v1\/features\/definitions['"]/, /DTYPES/]},
+        go: {all: [/HandleFunc\(\s*"POST \/v1\/features\/definitions"/, /dtypes\[/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"features"\s*\/\s*"definitions"\s*\)/, /Dtypes\.contains/]},
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/features\/definitions"/, /kDtypes/]},
       },
     },
     {
       id: 'immutable-version',
-      title: 'Treats (name, version) as immutable',
+      title: 'A registered (name, version) is never written over',
       detail:
-        'The store key is built from both `name` and `version`, an existing pair answers **409**, and the stored record is never overwritten. The starter keys by name only and mutates the definition in place.',
+        'The definition is stored with `create_definition`/`createDefinition` (one `SET NX`) and an existing pair answers **409**, the stored definition untouched, also when a rival registration lands between a check and the write. The starter writes with `put_definition`, a plain `SET`.',
       match: {
-        python: {all: [/status_code\s*=\s*409/, /f"feature:\{body\.name\}:\{body\.version\}"/]},
-        typescript: {all: [/code\(\s*409\s*\)/, /feature:\$\{body\.name\}:\$\{body\.version\}/]},
-        go: {all: [/StatusConflict/, /"feature:"\s*\+\s*body\.Name/, /strconv\.Itoa\(body\.Version\)/]},
-        scala: {all: [/StatusCodes\.Conflict/, /s"feature:\$\{body\.name\}:\$\{body\.version\}"/]},
-        cpp: {all: [/\b409\b/, /"feature:"\s*\+\s*body\.value\("name"/]},
+        python: {all: [/registry\.create_definition\(/, /\b409\b/], none: [/put_definition\(/]},
+        typescript: {all: [/createDefinition\(/, /\b409\b/], none: [/putDefinition\(/]},
+        go: {all: [/registry\.CreateDefinition\(/, /StatusConflict|\b409\b/], none: [/PutDefinition\(/]},
+        scala: {all: [/Registry\.createDefinition\(/, /Conflict|\b409\b/], none: [/putDefinition\(/]},
+        cpp: {all: [/registry::createDefinition\(/, /\b409\b/], none: [/putDefinition\(/]},
       },
     },
     {
-      id: 'resolve-ref',
-      title: 'Resolves computation_ref or answers 422',
+      id: 'computation-ref',
+      title: 'A computation_ref that resolves to nothing is 422',
       detail:
-        '`computation_ref` is looked up in the compute registry and a reference that does not resolve is **422**. The starter stores any string and lets the training job discover the typo.',
+        '`computation_ref` is looked up in the compute registry (`computation_exists`/`computationExists`) before the write; one it does not know answers **422** and nothing is stored. The starter stores any string.',
       match: {
-        python: {all: [/COMPUTATION_REFS/, /status_code\s*=\s*422/]},
-        typescript: {all: [/COMPUTATION_REFS/, /code\(\s*422\s*\)/]},
-        go: {all: [/computationRefs/, /StatusUnprocessableEntity/]},
-        scala: {all: [/ComputationRefs/, /StatusCodes\.UnprocessableEntity/]},
-        cpp: {all: [/kComputationRefs/, /\b422\b/]},
+        python: {
+          all: [/registry\.computation_exists\(/, /\b422\b/],
+          order: [/registry\.computation_exists\(/, /registry\.create_definition\(/],
+        },
+        typescript: {all: [/computationExists\(/, /\b422\b/], order: [/computationExists\(/, /createDefinition\(/]},
+        go: {
+          all: [/registry\.ComputationExists\(/, /StatusUnprocessableEntity|\b422\b/],
+          order: [/registry\.ComputationExists\(/, /registry\.CreateDefinition\(/],
+        },
+        scala: {
+          all: [/Registry\.computationExists\(/, /UnprocessableEntity|\b422\b/],
+          order: [/Registry\.computationExists\(/, /Registry\.createDefinition\(/],
+        },
+        cpp: {
+          all: [/registry::computationExists\(/, /\b422\b/],
+          order: [/registry::computationExists\(/, /registry::createDefinition\(/],
+        },
       },
     },
     {
       id: 'freshness-slo',
-      title: 'Requires an explicit freshness SLO',
+      title: 'freshness_slo is required and positive',
       detail:
-        'A missing, `null` or non-positive `freshness_slo` is **400**, and the stored definition carries the explicit value. The starter defaults it to `null`, so no consumer can alert on staleness.',
+        'A body whose `freshness_slo` is missing, `null`, zero or negative answers **400** and nothing is stored. The starter treats the field as optional and stores the definition without one.',
       match: {
-        python: {all: [/freshness_slo/, /status_code\s*=\s*400/]},
-        typescript: {all: [/freshness_slo/, /code\(\s*400\s*\)/]},
-        go: {all: [/FreshnessSlo/, /StatusBadRequest/]},
-        scala: {all: [/freshness_slo/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/freshness_slo/, /\b400\b/]},
-      },
-    },
-    {
-      id: 'stored-record',
-      title: 'Stores and returns the canonical definition',
-      detail:
-        'The handler writes the validated definition under the (name, version) key and answers **201** with that stored record. The starter answers 200 with a restatement of the request.',
-      match: {
-        python: {all: [/status_code\s*=\s*201/, /JSONResponse\(record/]},
-        typescript: {all: [/code\(\s*201\s*\)/, /send\(record\)/]},
-        go: {all: [/StatusCreated/, /Encode\(record\)/]},
-        scala: {all: [/StatusCodes\.Created/, /complete\(StatusCodes\.Created, record\)/]},
-        cpp: {all: [/\b201\b/, /set_content\(record\.dump\(\)/]},
+        python: {
+          all: [
+            /freshness_slo\s+is\s+None|freshness_slo\s*==\s*None|not\s+[\w.]*freshness_slo/,
+            /freshness_slo\s*<=\s*0|freshness_slo\s*<\s*1/,
+          ],
+        },
+        typescript: {
+          all: [
+            /typeof\s+\w+\s*!==\s*['"]number['"]|freshness_slo\s*===?\s*(?:null|undefined)/,
+            /(?:slo|freshness_slo)\s*<=\s*0|(?:slo|freshness_slo)\s*<\s*1/,
+          ],
+        },
+        go: {all: [/FreshnessSLO\s*==\s*nil/, /FreshnessSLO\s*<=\s*0|FreshnessSLO\s*<\s*1/]},
+        scala: {all: [/"freshness_slo"\)\.filter\(\s*_\s*>\s*0\s*\)|freshnessSlo\s*<=\s*0/]},
+        cpp: {all: [/slo\.is_number(?:_integer)?\(\)/, /slo\.get<long long>\(\)\s*<=\s*0/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+      starter: `import time
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI()
-
-DEFINITIONS: dict[str, dict] = {}
-
-
-class Definition(BaseModel):
-    name: str
-    version: int
-    dtype: str
-    computation_ref: str
-    freshness: int | None = None
-
-
-@app.post("/v1/features/definitions")
-def register(body: Definition) -> JSONResponse:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    record = {**body.model_dump(), "created_at": 0}
-    DEFINITIONS[f"{body.name}:{body.version}"] = record
-    return JSONResponse(record, status_code=200)
-`,
-      solution: `import time
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from features import registry  # get_definition, create_definition, put_definition, computation_exists
 
 app = FastAPI()
 
 DTYPES = ("int64", "float64", "string", "bool")
-COMPUTATION_REFS = ("window_avg_7d", "last_value", "count_1h", "sum_24h")
-DEFINITIONS: dict[str, dict] = {}
 
 
-class Definition(BaseModel):
+class DefinitionBody(BaseModel):
     name: str
     version: int
     dtype: str
@@ -169,70 +135,60 @@ class Definition(BaseModel):
     freshness_slo: int | None = None
 
 
-@app.post("/v1/features/definitions")
-def register(body: Definition) -> JSONResponse:
-    key = f"feature:{body.name}:{body.version}"
-    if key in DEFINITIONS:
-        return JSONResponse({"error": "definition exists", "version": body.version}, status_code=409)
+@app.post("/v1/features/definitions", status_code=201)
+def register_definition(body: DefinitionBody) -> dict:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
     if body.dtype not in DTYPES:
-        return JSONResponse({"error": "unsupported dtype"}, status_code=400)
-    if body.computation_ref not in COMPUTATION_REFS:
-        return JSONResponse({"error": "unknown computation_ref"}, status_code=422)
+        raise HTTPException(status_code=400, detail=f"dtype must be one of {', '.join(DTYPES)}")
+    definition = {**body.model_dump(), "created_at": int(time.time())}
+    registry.put_definition(definition)
+    return definition
+`,
+      solution: `import time
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from features import registry  # get_definition, create_definition, put_definition, computation_exists
+
+app = FastAPI()
+
+DTYPES = ("int64", "float64", "string", "bool")
+
+
+class DefinitionBody(BaseModel):
+    name: str
+    version: int
+    dtype: str
+    computation_ref: str
+    freshness_slo: int | None = None
+
+
+@app.post("/v1/features/definitions", status_code=201)
+def register_definition(body: DefinitionBody) -> dict:
+    if body.dtype not in DTYPES:
+        raise HTTPException(status_code=400, detail=f"dtype must be one of {', '.join(DTYPES)}")
     if body.freshness_slo is None or body.freshness_slo <= 0:
-        return JSONResponse({"error": "freshness_slo is required"}, status_code=400)
-    record = {
-        "name": body.name,
-        "version": body.version,
-        "dtype": body.dtype,
-        "computation_ref": body.computation_ref,
-        "freshness_slo": body.freshness_slo,
-        "created_at": int(time.time()),
-    }
-    DEFINITIONS[key] = record
-    return JSONResponse(record, status_code=201)
+        raise HTTPException(status_code=400, detail="freshness_slo (seconds) is required and must be positive")
+    if not registry.computation_exists(body.computation_ref):
+        raise HTTPException(status_code=422, detail=f"computation_ref {body.computation_ref!r} names no computation")
+    definition = {**body.model_dump(), "created_at": int(time.time())}
+    # One SET NX: the existence check and the write cannot be split by another registration.
+    if not registry.create_definition(definition):
+        raise HTTPException(status_code=409, detail=f"{body.name} v{body.version} is already registered")
+    return definition
 `,
     },
     typescript: {
-      starter: `/** POST /v1/features/definitions. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {type Definition, putDefinition} from 'features/registry'; // also getDefinition, createDefinition, computationExists
 
 export const app = Fastify();
 
-const DEFINITIONS = new Map<string, Record<string, unknown>>();
+export const DTYPES = ['int64', 'float64', 'string', 'bool'];
 
-interface Definition {
-  name: string;
-  version: number;
-  dtype: string;
-  computation_ref: string;
-  freshness?: number | null;
-}
-
-app.post('/v1/features/definitions', async (request, reply) => {
-  const body = request.body as Definition;
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const record = {...body, created_at: Math.floor(Date.now() / 1000)};
-  DEFINITIONS.set(\`\${body.name}:\${body.version}\`, record);
-  return reply.code(200).send(record);
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** POST /v1/features/definitions: an immutable, reference-checked definition both paths read. */
-import Fastify from 'fastify';
-
-export const app = Fastify();
-
-const DTYPES: Record<string, true> = {int64: true, float64: true, string: true, bool: true};
-const COMPUTATION_REFS: Record<string, true> = {
-  window_avg_7d: true,
-  last_value: true,
-  count_1h: true,
-  sum_24h: true,
-};
-const DEFINITIONS = new Map<string, Record<string, unknown>>();
-
-interface Definition {
+interface DefinitionBody {
   name: string;
   version: number;
   dtype: string;
@@ -241,27 +197,50 @@ interface Definition {
 }
 
 app.post('/v1/features/definitions', async (request, reply) => {
-  const body = request.body as Definition;
-  const key = \`feature:\${body.name}:\${body.version}\`;
-  if (DEFINITIONS.has(key)) return reply.code(409).send({error: 'definition exists', version: body.version});
-  if (DTYPES[body.dtype] === undefined) return reply.code(400).send({error: 'unsupported dtype'});
-  if (COMPUTATION_REFS[body.computation_ref] === undefined)
-    return reply.code(422).send({error: 'unknown computation_ref'});
-  if (body.freshness_slo == null || body.freshness_slo <= 0)
-    return reply.code(400).send({error: 'freshness_slo is required'});
-  const record = {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const body = request.body as DefinitionBody;
+  if (!DTYPES.includes(body.dtype)) return reply.code(400).send({error: \`dtype must be one of \${DTYPES.join(', ')}\`});
+  const definition = {...body, freshness_slo: body.freshness_slo ?? null, created_at: Math.floor(Date.now() / 1000)} as Definition;
+  await putDefinition(definition);
+  return reply.code(201).send(definition);
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {type Definition, computationExists, createDefinition} from 'features/registry'; // also getDefinition, putDefinition
+
+export const app = Fastify();
+
+export const DTYPES = ['int64', 'float64', 'string', 'bool'];
+
+interface DefinitionBody {
+  name: string;
+  version: number;
+  dtype: string;
+  computation_ref: string;
+  freshness_slo?: number | null;
+}
+
+app.post('/v1/features/definitions', async (request, reply) => {
+  const body = request.body as DefinitionBody;
+  if (!DTYPES.includes(body.dtype)) return reply.code(400).send({error: \`dtype must be one of \${DTYPES.join(', ')}\`});
+  const slo = body.freshness_slo;
+  if (typeof slo !== 'number' || slo <= 0) return reply.code(400).send({error: 'freshness_slo (seconds) is required and must be positive'});
+  if (!(await computationExists(body.computation_ref))) {
+    return reply.code(422).send({error: \`computation_ref \${body.computation_ref} names no computation\`});
+  }
+  const definition: Definition = {
     name: body.name,
     version: body.version,
     dtype: body.dtype,
     computation_ref: body.computation_ref,
-    freshness_slo: body.freshness_slo,
+    freshness_slo: slo,
     created_at: Math.floor(Date.now() / 1000),
   };
-  DEFINITIONS.set(key, record);
-  return reply.code(201).send(record);
+  // One SET NX: the existence check and the write cannot be split by another registration.
+  if (!(await createDefinition(definition))) return reply.code(409).send({error: \`\${body.name} v\${body.version} is already registered\`});
+  return reply.code(201).send(definition);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -269,27 +248,53 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"time"
+
+	"features/registry" // registry.GetDefinition, CreateDefinition, PutDefinition, ComputationExists
 )
 
-var definitions = map[string]map[string]any{}
+var dtypes = map[string]bool{"int64": true, "float64": true, "string": true, "bool": true}
 
-func registerDefinition(rw http.ResponseWriter, r *http.Request) {
-	var body map[string]any
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	body["created_at"] = time.Now().Unix()
-	definitions[fmt.Sprintf("%v:%v", body["name"], body["version"])] = body
-	rw.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(rw).Encode(body)
+type definitionBody struct {
+	Name           string \`json:"name"\`
+	Version        int    \`json:"version"\`
+	Dtype          string \`json:"dtype"\`
+	ComputationRef string \`json:"computation_ref"\`
+	FreshnessSLO   *int64 \`json:"freshness_slo"\`
 }
 
-func main() {
-	mux := http.NewServeMux()
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func registerDefinition(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	var body definitionBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, "malformed body", http.StatusBadRequest)
+		return
+	}
+	if !dtypes[body.Dtype] {
+		http.Error(rw, "dtype must be one of int64, float64, string, bool", http.StatusBadRequest)
+		return
+	}
+	slo := int64(0)
+	if body.FreshnessSLO != nil {
+		slo = *body.FreshnessSLO
+	}
+	d := registry.Definition{Name: body.Name, Version: body.Version, Dtype: body.Dtype, ComputationRef: body.ComputationRef, FreshnessSLO: slo, CreatedAt: time.Now().Unix()}
+	if err := registry.PutDefinition(r.Context(), d); err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, http.StatusCreated, d)
+}
+
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/features/definitions", registerDefinition)
-	_ = http.ListenAndServe(":8443", mux)
 }
 `,
       solution: `package main
@@ -297,150 +302,138 @@ func main() {
 import (
 	"encoding/json"
 	"net/http"
-	"strconv"
 	"time"
+
+	"features/registry" // registry.GetDefinition, CreateDefinition, PutDefinition, ComputationExists
 )
 
-var (
-	dtypes          = map[string]bool{"int64": true, "float64": true, "string": true, "bool": true}
-	computationRefs = map[string]bool{"window_avg_7d": true, "last_value": true, "count_1h": true, "sum_24h": true}
-	definitions     = map[string]map[string]any{}
-)
+var dtypes = map[string]bool{"int64": true, "float64": true, "string": true, "bool": true}
 
-type definition struct {
+type definitionBody struct {
 	Name           string \`json:"name"\`
 	Version        int    \`json:"version"\`
 	Dtype          string \`json:"dtype"\`
 	ComputationRef string \`json:"computation_ref"\`
-	FreshnessSlo   *int   \`json:"freshness_slo"\`
+	FreshnessSLO   *int64 \`json:"freshness_slo"\`
+}
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func registerDefinition(rw http.ResponseWriter, r *http.Request) {
-	var body definition
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	key := "feature:" + body.Name + ":" + strconv.Itoa(body.Version)
-	if _, exists := definitions[key]; exists {
-		http.Error(rw, \`{"error":"definition exists"}\`, http.StatusConflict)
+	var body definitionBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, "malformed body", http.StatusBadRequest)
 		return
 	}
 	if !dtypes[body.Dtype] {
-		http.Error(rw, \`{"error":"unsupported dtype"}\`, http.StatusBadRequest)
+		http.Error(rw, "dtype must be one of int64, float64, string, bool", http.StatusBadRequest)
 		return
 	}
-	if !computationRefs[body.ComputationRef] {
-		http.Error(rw, \`{"error":"unknown computation_ref"}\`, http.StatusUnprocessableEntity)
+	if body.FreshnessSLO == nil || *body.FreshnessSLO <= 0 {
+		http.Error(rw, "freshness_slo (seconds) is required and must be positive", http.StatusBadRequest)
 		return
 	}
-	if body.FreshnessSlo == nil || *body.FreshnessSlo <= 0 {
-		http.Error(rw, \`{"error":"freshness_slo is required"}\`, http.StatusBadRequest)
+	known, err := registry.ComputationExists(r.Context(), body.ComputationRef)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	record := map[string]any{
-		"name":            body.Name,
-		"version":         body.Version,
-		"dtype":           body.Dtype,
-		"computation_ref": body.ComputationRef,
-		"freshness_slo":   *body.FreshnessSlo,
-		"created_at":      time.Now().Unix(),
+	if !known {
+		http.Error(rw, "computation_ref "+body.ComputationRef+" names no computation", http.StatusUnprocessableEntity)
+		return
 	}
-	definitions[key] = record
-	rw.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(rw).Encode(record)
+	d := registry.Definition{Name: body.Name, Version: body.Version, Dtype: body.Dtype, ComputationRef: body.ComputationRef, FreshnessSLO: *body.FreshnessSLO, CreatedAt: time.Now().Unix()}
+	// One SET NX: the existence check and the write cannot be split by another registration.
+	stored, err := registry.CreateDefinition(r.Context(), d)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !stored {
+		http.Error(rw, body.Name+" is already registered at this version", http.StatusConflict)
+		return
+	}
+	writeJSON(rw, http.StatusCreated, d)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/features/definitions", registerDefinition)
-	_ = http.ListenAndServe(":8443", mux)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class Definition(
-    name: String,
-    version: Int,
-    dtype: String,
-    computation_ref: String,
-    freshness: Option[Int])
+import features.Registry // Registry.getDefinition, createDefinition, putDefinition, computationExists
 
-object DefineApi {
-  implicit val system: ActorSystem = ActorSystem("feature-store")
-  implicit val definitionFormat: RootJsonFormat[Definition] = jsonFormat5(Definition)
+object Api {
+  val Dtypes: Set[String] = Set("int64", "float64", "string", "bool")
 
-  val definitions = scala.collection.mutable.Map.empty[String, Definition]
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "features" / "definitions") {
-      post {
-        entity(as[Definition]) { body =>
-          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          definitions(s"\${body.name}:\${body.version}") = body
-          complete(StatusCodes.OK, body)
+  private def text(fields: Map[String, JsValue], name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
+  private def number(fields: Map[String, JsValue], name: String): Option[Long] = fields.get(name).collect { case JsNumber(n) => n.toLong }
+
+  val route: Route = path("v1" / "features" / "definitions") {
+    post {
+      entity(as[String]) { raw =>
+        // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+        val fields = raw.parseJson.asJsObject.fields
+        if (!Dtypes.contains(text(fields, "dtype"))) complete(StatusCodes.BadRequest -> "dtype must be one of int64, float64, string, bool")
+        else {
+          val d = Registry.Definition(text(fields, "name"), number(fields, "version").getOrElse(0L), text(fields, "dtype"),
+            text(fields, "computation_ref"), number(fields, "freshness_slo").getOrElse(0L), System.currentTimeMillis() / 1000)
+          Registry.putDefinition(d)
+          complete(json(StatusCodes.Created, d.toJson))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class Definition(
-    name: String,
-    version: Int,
-    dtype: String,
-    computation_ref: String,
-    freshness_slo: Option[Int])
+import features.Registry // Registry.getDefinition, createDefinition, putDefinition, computationExists
 
-object DefineApi {
-  implicit val system: ActorSystem = ActorSystem("feature-store")
-  implicit val definitionFormat: RootJsonFormat[Definition] = jsonFormat5(Definition)
+object Api {
+  val Dtypes: Set[String] = Set("int64", "float64", "string", "bool")
 
-  val Dtypes = Set("int64", "float64", "string", "bool")
-  val ComputationRefs = Set("window_avg_7d", "last_value", "count_1h", "sum_24h")
-  val definitions = scala.collection.mutable.Map.empty[String, Definition]
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "features" / "definitions") {
-      post {
-        entity(as[Definition]) { body =>
-          val key = s"feature:\${body.name}:\${body.version}"
-          if (definitions.contains(key)) complete(StatusCodes.Conflict, s"""{"error":"definition exists"}""")
-          else if (!Dtypes.contains(body.dtype))
-            complete(StatusCodes.BadRequest, s"""{"error":"unsupported dtype"}""")
-          else if (!ComputationRefs.contains(body.computation_ref))
-            complete(StatusCodes.UnprocessableEntity, s"""{"error":"unknown computation_ref"}""")
-          else if (body.freshness_slo.forall(_ <= 0))
-            complete(StatusCodes.BadRequest, s"""{"error":"freshness_slo is required"}""")
-          else {
-            val record = body.copy(freshness_slo = body.freshness_slo)
-            definitions(key) = record
-            complete(StatusCodes.Created, record)
+  private def text(fields: Map[String, JsValue], name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
+  private def number(fields: Map[String, JsValue], name: String): Option[Long] = fields.get(name).collect { case JsNumber(n) => n.toLong }
+
+  val route: Route = path("v1" / "features" / "definitions") {
+    post {
+      entity(as[String]) { raw =>
+        val fields = raw.parseJson.asJsObject.fields
+        val ref = text(fields, "computation_ref")
+        if (!Dtypes.contains(text(fields, "dtype"))) complete(StatusCodes.BadRequest -> "dtype must be one of int64, float64, string, bool")
+        else
+          number(fields, "freshness_slo").filter(_ > 0) match {
+            case None => complete(StatusCodes.BadRequest -> "freshness_slo (seconds) is required and must be positive")
+            case Some(_) if !Registry.computationExists(ref) => complete(StatusCodes.UnprocessableEntity -> s"computation_ref $ref names no computation")
+            case Some(slo) =>
+              val d = Registry.Definition(text(fields, "name"), number(fields, "version").getOrElse(0L), text(fields, "dtype"), ref, slo,
+                System.currentTimeMillis() / 1000)
+              // One SET NX: the existence check and the write cannot be split by another registration.
+              if (Registry.createDefinition(d)) complete(json(StatusCodes.Created, d.toJson))
+              else complete(StatusCodes.Conflict -> s"\${d.name} v\${d.version} is already registered")
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -449,27 +442,38 @@ object DefineApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+#include <set>
 #include <string>
-#include <unordered_map>
+
+#include "features/registry.h"  // registry::getDefinition, createDefinition, putDefinition, computationExists
 
 using json = nlohmann::json;
 
-std::unordered_map<std::string, json> definitions;
+const std::set<std::string> kDtypes = {"int64", "float64", "string", "bool"};
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/features/definitions", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    definitions[body.value("name", std::string()) + ":" + std::to_string(body.value("version", 0))] = body;
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+long long now_seconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+
+void reply(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(message, "text/plain");
+}
+
+void register_definition(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object() || !kDtypes.count(body.value("dtype", ""))) return reply(res, 400, "dtype must be one of int64, float64, string, bool");
+  const json slo = body.value("freshness_slo", json());
+  const registry::Definition d{body.value("name", ""), body.value("version", 0L), body.value("dtype", ""), body.value("computation_ref", ""),
+                               slo.is_number() ? slo.get<long long>() : 0, now_seconds()};
+  registry::putDefinition(d);
+  res.status = 201;
+  res.set_content(registry::toJson(d).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/features/definitions", register_definition); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -477,62 +481,433 @@ int main() {
 #include <chrono>
 #include <set>
 #include <string>
-#include <unordered_map>
+
+#include "features/registry.h"  // registry::getDefinition, createDefinition, putDefinition, computationExists
 
 using json = nlohmann::json;
 
 const std::set<std::string> kDtypes = {"int64", "float64", "string", "bool"};
-const std::set<std::string> kComputationRefs = {"window_avg_7d", "last_value", "count_1h", "sum_24h"};
-std::unordered_map<std::string, json> definitions;
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/features/definitions", [](const httplib::Request& req, httplib::Response& res) {
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(json{{"error", "invalid body"}}.dump(), "application/json");
-      return;
-    }
-    const auto key = "feature:" + body.value("name", std::string()) + ":" + std::to_string(body.value("version", 0LL));
-    if (definitions.count(key) > 0) {
-      res.status = 409;
-      res.set_content(json{{"error", "definition exists"}}.dump(), "application/json");
-      return;
-    }
-    if (kDtypes.count(body.value("dtype", std::string())) == 0) {
-      res.status = 400;
-      res.set_content(json{{"error", "unsupported dtype"}}.dump(), "application/json");
-      return;
-    }
-    if (kComputationRefs.count(body.value("computation_ref", std::string())) == 0) {
-      res.status = 422;
-      res.set_content(json{{"error", "unknown computation_ref"}}.dump(), "application/json");
-      return;
-    }
-    if (!body.contains("freshness_slo") || body["freshness_slo"].is_null() ||
-        body["freshness_slo"].get<long long>() <= 0) {
-      res.status = 400;
-      res.set_content(json{{"error", "freshness_slo is required"}}.dump(), "application/json");
-      return;
-    }
-    json record = body;
-    record["created_at"] = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    definitions[key] = record;
-    res.status = 201;
-    res.set_content(record.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+long long now_seconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+
+void reply(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(message, "text/plain");
+}
+
+void register_definition(const httplib::Request& req, httplib::Response& res) {
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object() || !kDtypes.count(body.value("dtype", ""))) return reply(res, 400, "dtype must be one of int64, float64, string, bool");
+  const json slo = body.value("freshness_slo", json());
+  if (!slo.is_number_integer() || slo.get<long long>() <= 0) return reply(res, 400, "freshness_slo (seconds) is required and must be positive");
+  const std::string ref = body.value("computation_ref", "");
+  if (!registry::computationExists(ref)) return reply(res, 422, "computation_ref " + ref + " names no computation");
+  const registry::Definition d{body.value("name", ""), body.value("version", 0L), body.value("dtype", ""), ref, slo.get<long long>(), now_seconds()};
+  // One SET NX: the existence check and the write cannot be split by another registration.
+  if (!registry::createDefinition(d)) return reply(res, 409, d.name + " v" + std::to_string(d.version) + " is already registered");
+  res.status = 201;
+  res.set_content(registry::toJson(d).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/features/definitions", register_definition); }
 `,
     },
   },
+  harness: {
+    python: `import time
+
+from features import registry
+
+BODY = {"name": "amount_7d", "version": 2, "dtype": "float64", "computation_ref": "window_avg_7d", "freshness_slo": 300}
+
+
+def _api(ctx):
+    registry.register_computation("window_avg_7d")
+    registry.register_computation("window_sum_1d")
+    m = ctx.load("api")
+    return ctx.client(m.app)
+
+
+async def _register(c, body=None, **changes):
+    return await c.post("/v1/features/definitions", json={**(BODY if body is None else body), **changes})
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _register(c)
+        assert r.status_code == 201, f"POST /v1/features/definitions answered {r.status_code}: {r.text}"
+        body = r.json()
+        stored = registry.get_definition("amount_7d", 2)
+        assert stored is not None, "after a 201 the registry holds no definition:amount_7d:2"
+        assert body == stored, f"the response {body} must be the definition as stored: {stored}"
+        assert all(body.get(k) == v for k, v in BODY.items()), f"the stored definition {body} lost a field of the request {BODY}"
+        assert abs(body.get("created_at", 0) - time.time()) <= 5, f"created_at is {body.get('created_at')!r}, expected the registration time in epoch seconds"
+        bad = await _register(c, name="amount_30d", dtype="float32")
+    assert bad.status_code == 400, f"a dtype outside DTYPES answered {bad.status_code}, expected 400"
+    assert registry.get_definition("amount_30d", 2) is None, "a definition with an unknown dtype was stored"
+
+
+async def check_immutable_version(ctx):
+    async with _api(ctx) as c:
+        first = await _register(c)
+        assert first.status_code == 201, f"the first registration of amount_7d v2 answered {first.status_code}: {first.text}"
+        again = await _register(c, dtype="int64", computation_ref="window_sum_1d")
+        assert again.status_code == 409, f"a second registration of amount_7d v2 answered {again.status_code}, expected 409: a version is immutable"
+        stored = registry.get_definition("amount_7d", 2)
+        assert stored == first.json(), f"the second registration rewrote amount_7d v2: the registry holds {stored}, the first registration was {first.json()}"
+        # A rival registration of v3 lands right after this one first touches the key.
+        rival = {**BODY, "version": 3, "dtype": "int64", "created_at": int(time.time())}
+        probe = ctx.redis_after("definition:amount_7d:3", lambda: registry.create_definition(rival))
+        r = await _register(c, version=3)
+    assert probe.fired, "the registration of amount_7d v3 never touched definition:amount_7d:3"
+    if probe.error is not None:
+        raise probe.error
+    stored = registry.get_definition("amount_7d", 3)
+    if probe.result:
+        assert r.status_code == 409 and stored == rival, f"a rival registration of amount_7d v3 landed between the check and the write; the endpoint answered {r.status_code} and the registry holds {stored}, expected 409 with the rival kept. Store with one SET NX"
+    else:
+        assert r.status_code == 201 and stored == r.json(), f"the registration won the race but answered {r.status_code}; the registry holds {stored}"
+
+
+async def check_computation_ref(ctx):
+    async with _api(ctx) as c:
+        r = await _register(c, computation_ref="window_avg_7days")
+        assert r.status_code == 422, f"a computation_ref the compute registry does not know answered {r.status_code}, expected 422"
+        assert registry.get_definition("amount_7d", 2) is None, f"a definition with a dangling computation_ref was stored: {registry.get_definition('amount_7d', 2)}"
+        r = await _register(c)
+    assert r.status_code == 201, f"with a computation_ref that resolves the registration answered {r.status_code}: {r.text}"
+
+
+async def check_freshness_slo(ctx):
+    without = {k: v for k, v in BODY.items() if k != "freshness_slo"}
+    async with _api(ctx) as c:
+        for version, body, what in ((10, without, "missing"), (11, {**BODY, "freshness_slo": None}, "null"), (12, {**BODY, "freshness_slo": 0}, "0"), (13, {**BODY, "freshness_slo": -5}, "-5")):
+            r = await _register(c, body, version=version)
+            assert r.status_code == 400, f"a freshness_slo that is {what} answered {r.status_code}, expected 400"
+            assert registry.get_definition("amount_7d", version) is None, f"a definition whose freshness_slo is {what} was stored: {registry.get_definition('amount_7d', version)}"
+        r = await _register(c, version=14)
+    assert r.status_code == 201 and r.json().get("freshness_slo") == 300, f"a definition with freshness_slo 300 answered {r.status_code} {r.text}"
+`,
+    typescript: `const BODY = {name: 'amount_7d', version: 2, dtype: 'float64', computation_ref: 'window_avg_7d', freshness_slo: 300};
+
+async function api(ctx) {
+  const registry = ctx.load('/support/features/registry.ts');
+  await registry.registerComputation('window_avg_7d');
+  await registry.registerComputation('window_sum_1d');
+  const m = ctx.load('api');
+  return {c: ctx.client(m.app), registry};
+}
+
+const register = (c, body: Record<string, unknown>) => c.post('/v1/features/definitions', {json: body});
+
+export async function check_route(ctx) {
+  const {c, registry} = await api(ctx);
+  const r = await register(c, BODY);
+  assert.equal(r.status, 201, \`POST /v1/features/definitions answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  const stored = await registry.getDefinition('amount_7d', 2);
+  assert(stored !== null, 'after a 201 the registry holds no definition:amount_7d:2');
+  assert.deepStrictEqual(body, stored, \`the response \${r.text} must be the definition as stored: \${JSON.stringify(stored)}\`);
+  for (const [k, v] of Object.entries(BODY)) assert.equal(body[k], v, \`the stored definition \${r.text} lost the field \${k} of the request\`);
+  assert(Math.abs(body.created_at - Date.now() / 1000) <= 5, \`created_at is \${body.created_at}, expected the registration time in epoch seconds\`);
+  const bad = await register(c, {...BODY, name: 'amount_30d', dtype: 'float32'});
+  assert.equal(bad.status, 400, \`a dtype outside DTYPES answered \${bad.status}, expected 400\`);
+  assert.equal(await registry.getDefinition('amount_30d', 2), null, 'a definition with an unknown dtype was stored');
+}
+
+export async function check_immutable_version(ctx) {
+  const {c, registry} = await api(ctx);
+  const first = await register(c, BODY);
+  assert.equal(first.status, 201, \`the first registration of amount_7d v2 answered \${first.status}: \${first.text}\`);
+  const again = await register(c, {...BODY, dtype: 'int64', computation_ref: 'window_sum_1d'});
+  assert.equal(again.status, 409, \`a second registration of amount_7d v2 answered \${again.status}, expected 409: a version is immutable\`);
+  const stored = await registry.getDefinition('amount_7d', 2);
+  assert.deepStrictEqual(stored, first.json(), \`the second registration rewrote amount_7d v2: the registry holds \${JSON.stringify(stored)}\`);
+  // A rival registration of v3 lands right after this one first touches the key.
+  const rival = {...BODY, version: 3, dtype: 'int64', created_at: Math.floor(Date.now() / 1000)};
+  const probe = ctx.redisAfter('definition:amount_7d:3', () => ctx.redis.set('definition:amount_7d:3', JSON.stringify(rival), 'NX') === 'OK');
+  const r = await register(c, {...BODY, version: 3});
+  assert(probe.fired, 'the registration of amount_7d v3 never touched definition:amount_7d:3');
+  if (probe.error !== undefined) throw probe.error;
+  const won = await probe.result;
+  const now = await registry.getDefinition('amount_7d', 3);
+  if (won) {
+    assert(r.status === 409 && JSON.stringify(now) === JSON.stringify(rival), \`a rival registration of amount_7d v3 landed between the check and the write; the endpoint answered \${r.status} and the registry holds \${JSON.stringify(now)}, expected 409 with the rival kept. Store with one SET NX\`);
+  } else {
+    assert(r.status === 201, \`the registration won the race but answered \${r.status}\`);
+    assert.deepStrictEqual(now, r.json(), 'the registry must hold the definition the endpoint answered');
+  }
+}
+
+export async function check_computation_ref(ctx) {
+  const {c, registry} = await api(ctx);
+  let r = await register(c, {...BODY, computation_ref: 'window_avg_7days'});
+  assert.equal(r.status, 422, \`a computation_ref the compute registry does not know answered \${r.status}, expected 422\`);
+  assert.equal(await registry.getDefinition('amount_7d', 2), null, 'a definition with a dangling computation_ref was stored');
+  r = await register(c, BODY);
+  assert.equal(r.status, 201, \`with a computation_ref that resolves the registration answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_freshness_slo(ctx) {
+  const {c, registry} = await api(ctx);
+  const {freshness_slo: _slo, ...without} = BODY;
+  const cases: [number, Record<string, unknown>, string][] = [
+    [10, without, 'missing'],
+    [11, {...BODY, freshness_slo: null}, 'null'],
+    [12, {...BODY, freshness_slo: 0}, '0'],
+    [13, {...BODY, freshness_slo: -5}, '-5'],
+  ];
+  for (const [version, body, what] of cases) {
+    const r = await register(c, {...body, version});
+    assert.equal(r.status, 400, \`a freshness_slo that is \${what} answered \${r.status}, expected 400\`);
+    assert.equal(await registry.getDefinition('amount_7d', version), null, \`a definition whose freshness_slo is \${what} was stored\`);
+  }
+  const r = await register(c, {...BODY, version: 14});
+  assert(r.status === 201 && r.json().freshness_slo === 300, \`a definition with freshness_slo 300 answered \${r.status} \${r.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	"features/registry"
+
+	"leetbuild/harness"
+)
+
+var bg = context.Background()
+
+func body(changes map[string]any) map[string]any {
+	out := map[string]any{"name": "amount_7d", "version": 2, "dtype": "float64", "computation_ref": "window_avg_7d", "freshness_slo": 300}
+	for k, v := range changes {
+		if v == "-" {
+			delete(out, k)
+		} else {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	registry.RegisterComputation(bg, "window_avg_7d")
+	registry.RegisterComputation(bg, "window_sum_1d")
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func stored(ctx *harness.Ctx, version int) *registry.Definition {
+	d, err := registry.GetDefinition(bg, "amount_7d", version)
+	ctx.NoError(err, "GetDefinition(amount_7d, %d)", version)
+	return d
+}
+
+func answered(ctx *harness.Ctx, r *harness.Response) registry.Definition {
+	var d registry.Definition
+	ctx.NoError(json.Unmarshal(r.Body, &d), "the response must be the definition as JSON, got %s", r.Text())
+	return d
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/features/definitions", body(nil))
+	ctx.Equal(r.Status, 201, "POST /v1/features/definitions (%s)", r.Text())
+	d := stored(ctx, 2)
+	ctx.Assert(d != nil, "after a 201 the registry holds no definition:amount_7d:2")
+	ctx.Equal(answered(ctx, r), *d, "the response must be the definition as stored")
+	ctx.Assert(d.Dtype == "float64" && d.ComputationRef == "window_avg_7d" && d.FreshnessSLO == 300, "the stored definition %+v lost a field of the request", *d)
+	age := time.Now().Unix() - d.CreatedAt
+	ctx.Assert(age >= -5 && age <= 5, "created_at is %d, expected the registration time in epoch seconds", d.CreatedAt)
+	bad := c.Post("/v1/features/definitions", body(map[string]any{"name": "amount_30d", "dtype": "float32"}))
+	ctx.Equal(bad.Status, 400, "a dtype outside dtypes")
+	missing, _ := registry.GetDefinition(bg, "amount_30d", 2)
+	ctx.Assert(missing == nil, "a definition with an unknown dtype was stored")
+}
+
+func CheckImmutableVersion(ctx *harness.Ctx) {
+	c := api(ctx)
+	first := c.Post("/v1/features/definitions", body(nil))
+	ctx.Equal(first.Status, 201, "the first registration of amount_7d v2 (%s)", first.Text())
+	again := c.Post("/v1/features/definitions", body(map[string]any{"dtype": "int64", "computation_ref": "window_sum_1d"}))
+	ctx.Equal(again.Status, 409, "a second registration of amount_7d v2 (a version is immutable)")
+	ctx.Equal(*stored(ctx, 2), answered(ctx, first), "the second registration must not rewrite amount_7d v2; the registry holds")
+	// A rival registration of v3 lands right after this one first touches the key.
+	rival := registry.Definition{Name: "amount_7d", Version: 3, Dtype: "int64", ComputationRef: "window_avg_7d", FreshnessSLO: 300, CreatedAt: time.Now().Unix()}
+	probe := ctx.Redis.After("definition:amount_7d:3", func() any {
+		won, err := registry.CreateDefinition(bg, rival)
+		ctx.NoError(err, "the rival registration failed")
+		return won
+	})
+	r := c.Post("/v1/features/definitions", body(map[string]any{"version": 3}))
+	ctx.Assert(probe.Fired, "the registration of amount_7d v3 never touched definition:amount_7d:3")
+	ctx.Assert(probe.Err == nil, "the rival registration failed: %v", probe.Err)
+	now := stored(ctx, 3)
+	if probe.Result == true {
+		ctx.Assert(r.Status == 409 && now != nil && *now == rival, "a rival registration of amount_7d v3 landed between the check and the write; the endpoint answered %d and the registry holds %+v, expected 409 with the rival kept. Store with one SET NX", r.Status, now)
+	} else {
+		ctx.Equal(r.Status, 201, "the registration won the race")
+		ctx.Equal(*now, answered(ctx, r), "the registry must hold the definition the endpoint answered")
+	}
+}
+
+func CheckComputationRef(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/features/definitions", body(map[string]any{"computation_ref": "window_avg_7days"}))
+	ctx.Equal(r.Status, 422, "a computation_ref the compute registry does not know")
+	ctx.Assert(stored(ctx, 2) == nil, "a definition with a dangling computation_ref was stored: %+v", stored(ctx, 2))
+	r = c.Post("/v1/features/definitions", body(nil))
+	ctx.Equal(r.Status, 201, "with a computation_ref that resolves, the registration (%s)", r.Text())
+}
+
+func CheckFreshnessSlo(ctx *harness.Ctx) {
+	c := api(ctx)
+	cases := []struct {
+		version int
+		slo     any
+		what    string
+	}{{10, "-", "missing"}, {11, nil, "null"}, {12, 0, "0"}, {13, -5, "-5"}}
+	for _, tc := range cases {
+		r := c.Post("/v1/features/definitions", body(map[string]any{"version": tc.version, "freshness_slo": tc.slo}))
+		ctx.Equal(r.Status, 400, "a freshness_slo that is %s", tc.what)
+		ctx.Assert(stored(ctx, tc.version) == nil, "a definition whose freshness_slo is %s was stored: %+v", tc.what, stored(ctx, tc.version))
+	}
+	r := c.Post("/v1/features/definitions", body(map[string]any{"version": 14}))
+	ctx.Assert(r.Status == 201 && answered(ctx, r).FreshnessSLO == 300, "a definition with freshness_slo 300 answered %d %s", r.Status, r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <memory>
+#include <optional>
+#include <string>
+
+#include "features/registry.h"
+
+using json = nlohmann::json;
+
+namespace {
+
+const json kBody = {{"name", "amount_7d"}, {"version", 2}, {"dtype", "float64"}, {"computation_ref", "window_avg_7d"}, {"freshness_slo", 300}};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  registry::registerComputation("window_avg_7d");
+  registry::registerComputation("window_sum_1d");
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+json with(json body, const json& changes) {
+  for (const auto& [k, v] : changes.items()) body[k] = v;
+  return body;
+}
+
+harness::Response post(harness::HTTP& c, const json& body) {
+  return c.Post("/v1/features/definitions", body.dump(), "Content-Type", "application/json");
+}
+
+std::optional<json> stored(long version) {
+  const auto d = registry::getDefinition("amount_7d", version);
+  if (!d) return std::nullopt;
+  return registry::toJson(*d);
+}
+
+json parsed(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
+
+long long nowSeconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = post(c, kBody);
+  ctx.Equal(r.Status, 201, "POST /v1/features/definitions (%s)", r.Text());
+  const auto d = stored(2);
+  ctx.Assert(d.has_value(), "after a 201 the registry holds no definition:amount_7d:2");
+  ctx.Equal(parsed(r), *d, "the response must be the definition as stored");
+  for (const auto& [k, v] : kBody.items()) ctx.Equal((*d)[k], v, "the stored definition lost the field %s of the request", k);
+  const long long age = nowSeconds() - d->value("created_at", 0LL);
+  ctx.Assert(age >= -5 && age <= 5, "created_at is %s, expected the registration time in epoch seconds", (*d)["created_at"].dump());
+  const auto bad = post(c, with(kBody, {{"name", "amount_30d"}, {"dtype", "float32"}}));
+  ctx.Equal(bad.Status, 400, "a dtype outside kDtypes");
+  ctx.Assert(!registry::getDefinition("amount_30d", 2), "a definition with an unknown dtype was stored");
+}
+
+void CheckImmutableVersion(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto first = post(c, kBody);
+  ctx.Equal(first.Status, 201, "the first registration of amount_7d v2 (%s)", first.Text());
+  const auto again = post(c, with(kBody, {{"dtype", "int64"}, {"computation_ref", "window_sum_1d"}}));
+  ctx.Equal(again.Status, 409, "a second registration of amount_7d v2 (a version is immutable)");
+  ctx.Equal(stored(2).value_or(json()), parsed(first), "the second registration must not rewrite amount_7d v2; the registry holds");
+  // A rival registration of v3 lands right after this one first touches the key.
+  const registry::Definition rival{"amount_7d", 3, "int64", "window_avg_7d", 300, nowSeconds()};
+  auto fired = std::make_shared<bool>(false);
+  auto won = std::make_shared<bool>(false);
+  ctx.Redis.After("definition:amount_7d:3", [fired, won, rival] {
+    *fired = true;
+    *won = registry::createDefinition(rival);
+  });
+  const auto r = post(c, with(kBody, {{"version", 3}}));
+  ctx.Assert(*fired, "the registration of amount_7d v3 never touched definition:amount_7d:3");
+  const json now = stored(3).value_or(json());
+  if (*won) {
+    ctx.Assert(r.Status == 409 && now == registry::toJson(rival),
+               "a rival registration of amount_7d v3 landed between the check and the write; the endpoint answered %d and the registry holds %s, expected 409 with the rival kept. Store with one SET NX",
+               r.Status, now.dump());
+  } else {
+    ctx.Equal(r.Status, 201, "the registration won the race");
+    ctx.Equal(now, parsed(r), "the registry must hold the definition the endpoint answered");
+  }
+}
+
+void CheckComputationRef(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, with(kBody, {{"computation_ref", "window_avg_7days"}}));
+  ctx.Equal(r.Status, 422, "a computation_ref the compute registry does not know");
+  ctx.Assert(!stored(2), "a definition with a dangling computation_ref was stored: %s", stored(2).value_or(json()).dump());
+  r = post(c, kBody);
+  ctx.Equal(r.Status, 201, "with a computation_ref that resolves, the registration (%s)", r.Text());
+}
+
+void CheckFreshnessSlo(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  json without = kBody;
+  without.erase("freshness_slo");
+  const std::vector<std::pair<json, std::string>> cases = {
+      {with(without, {{"version", 10}}), "missing"},
+      {with(kBody, {{"version", 11}, {"freshness_slo", nullptr}}), "null"},
+      {with(kBody, {{"version", 12}, {"freshness_slo", 0}}), "0"},
+      {with(kBody, {{"version", 13}, {"freshness_slo", -5}}), "-5"},
+  };
+  for (const auto& [body, what] : cases) {
+    const auto r = post(c, body);
+    ctx.Equal(r.Status, 400, "a freshness_slo that is %s", what);
+    ctx.Assert(!stored(body["version"].get<long>()), "a definition whose freshness_slo is %s was stored", what);
+  }
+  const auto r = post(c, with(kBody, {{"version", 14}}));
+  ctx.Assert(r.Status == 201 && parsed(r).value("freshness_slo", 0) == 300, "a definition with freshness_slo 300 answered %d %s", r.Status, r.Text());
+}
+`,
+  },
   hints: [
-    'Register the same name and version twice: the second call answers 200 and the stored definition quietly changes. A typo in computation_ref is accepted, and freshness comes back null.',
-    'The handler writes to DEFINITIONS before checking anything: no lookup of the existing key, no registry of known computation refs, and the model declares an optional freshness instead of a required freshness_slo.',
-    'Check the key first and answer 409; keep a COMPUTATION_REFS tuple and answer 422 on a miss; require a positive freshness_slo (400 otherwise); build the record explicitly and answer 201 with it.',
+    'Register amount_7d version 2 twice with different dtypes: the second answers 201 and the registry now holds it. A typo in computation_ref and a body without freshness_slo are stored too.',
+    'The handler stores with put_definition, a plain SET over whatever the key holds, and never asks the compute registry or looks at freshness_slo. A GET before the write still loses to a registration landing between the two.',
+    'Answer 400 when freshness_slo is missing, null or ≤ 0; 422 unless `registry.computation_exists(ref)`; then store with `registry.create_definition` (SET NX) and answer 409 when it returns false.',
   ],
-  debrief: `The fix validates everything before the single write because a registry is the shared contract between training and serving: an identifier that can be mutated in place is not a version, it is a rename that silently changes what a model was trained on. The 409 keeps every version addressable and immutable. Resolving \`computation_ref\` at registration moves the failure from a training job an hour later to the request that caused it. The freshness SLO is the one field that lets a consumer decide whether a value is usable; a \`null\` default turns a stale value into an unremarkable one. Production registries also record an owner per feature and a deprecation window, so a version can be retired without breaking the models still pinned to it.`,
+  debrief: `The write is the check: \`SET NX\` makes the existence test and the store one command, so a registration landing between a read and a write cannot replace the first one, and the 409 keeps every version exactly as it was when a model was trained on it. Resolving the computation at registration moves the failure from a training job an hour later to the request that caused it. The SLO is required because it is the one field that lets a reader decide whether a value is still usable; without it every stale value looks fresh. Feature registries also record an owner per feature and deprecate a version rather than delete it, so the models pinned to it keep resolving.`,
 };

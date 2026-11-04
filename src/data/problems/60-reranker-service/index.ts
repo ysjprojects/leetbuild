@@ -1,24 +1,25 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {rerankEndpointStep} from './steps/1-endpoint';
 import {rerankStateStep} from './steps/2-state';
 import {rerankClientStep} from './steps/3-dependency';
 import {rerankEventsStep} from './steps/4-events';
 import {readStatsStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Reranking service: the course is not "call a cross-encoder and sort", it is the debugging you
- * owe a reranker before anyone trusts the order it returns. A query and candidate set with hard
- * caps → a Redis score cache keyed by the whole (query, passage, version) triple → a gRPC batch
- * call whose failures become unscored markers that keep retrieval order → outcomes published by
- * query fingerprint with an outbox → a stats read that reports the unscored share per version so
- * silent degradation cannot hide.
+ * owe a reranker before anyone trusts the order it returns. Byte caps and a reported cut on the
+ * endpoint → a Redis score cache keyed by the whole (query, passage, version) triple → a gRPC batch
+ * client whose failures are unscored, not neutral → numbers-only outcomes keyed by query fingerprint
+ * with an outbox → a stats read per model version that shows silent degradation.
  */
 export const rerankerServiceProblem: Problem = {
   id: 'reranker-service',
   title: 'Reranking Service',
   tagline:
-    'Reorder retrieved passages under a candidate cap, a pair-keyed score cache and an unscored marker for failed batches.',
+    'Reorder retrieved passages behind byte caps, with a Redis score cache keyed per query, passage and model build.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -26,69 +27,72 @@ export const rerankerServiceProblem: Problem = {
   statement: `# Reranking Service
 
 A reranking service takes the passages a retriever already returned and puts them in the order a
-reader or a generator should see them. The visible part is a list of scores.
+reader or a generator should see them. Its failures rarely look like errors: a degraded model, a stale
+cache or a clipped passage all still produce a list, just in the wrong order.
 
 ## The real system
 
-Hosted rerankers put the request budget in the API contract. Cohere's Rerank endpoint truncates
-every document to \`max_tokens_per_doc\` (4096 tokens by default) and documents that more than about
-1,000 documents per request should be split across calls; the caller learns the budget up front
-rather than discovering it as a timeout. A score that describes a clipped passage is not the score
-of the full passage, so this course reports truncation per passage and lets the caller decide whether
-to re-fetch or accept a degraded comparison. When a model batch fails, the service marks those
-passages **unscored** in retrieval order; a neutral score would make an infrastructure failure
-indistinguishable from mid-tier relevance.
+Cohere's Rerank API puts the request budget in the contract: each document is truncated to
+\`max_tokens_per_doc\` (4096 tokens by default), and the docs recommend against sending more than 1,000
+documents in one request. This course builds the service around such a model: caps the caller can
+see, truncation reported per passage, a score cache that knows which build produced a score, and a
+client that says "unscored" when a batch fails instead of inventing a number.
 
 ## What you build here
 
-One service, **rerankd**, with five pieces:
+One service, **rerankd**, whose steps share the provided \`rerank\` package: \`config\` (the model's
+address \`reranker:9000\`, the topic \`rerank.done\`, \`fingerprint(text)\`, the stats key layout),
+\`model\` (the deterministic cross-encoder stand-in: the share of the query's words a passage holds),
+\`outcome\` (the record a finished rerank hands to step 4) and \`outbox\` (\`insert(topic, key, payload)\`).
 
-1. \`POST /v1/rerank\`: authenticated tenant, a query capped at **2 KiB** and at most **200**
-   candidate passages of **4 KiB** each, per-passage truncation reported in the response, and a
-   score order that is deterministic under ties.
-2. A **Redis** score cache keyed by \`(query fingerprint, passage hash, model version)\` with a
-   30-minute TTL, where a miss on either half of the pair recomputes and a model version bump
-   serves a fresh score for the same pair.
-3. A **gRPC** reranker client: batches of **64** with a **700 ms** deadline per batch, a failed
-   batch returning unscored markers that keep the original retrieval order, a malformed batch
-   treated as terminal, and the remaining batches still completing.
-4. A **Kafka** \`rerank.done\` path keyed by query fingerprint, carrying candidate counts, latency
-   and a score histogram, without the query or passage text, with an idempotent producer and an
-   outbox row when the produce fails.
-5. \`GET /v1/rerank/cache/stats\`: hit ratio, unscored batch share and latency percentiles per model
-   version, plus the share of requests that used fallback order.
+1. \`POST /v1/rerank\` with \`{query, candidates: [{passage_id, text}]}\`: 401 without \`X-Tenant-Id\`, 413
+   over 2 KiB of query, 400 over 200 candidates, texts cut at 4 KiB and marked \`truncated\`, results by
+   score then \`passage_id\`.
+2. \`cached_scores(query, passages, model_version, compute)\`: one \`MGET\` of
+   \`rerank:score:{fingerprint(query)}:{fingerprint(passage)}:{model_version}\`, one \`compute\` over the
+   misses, a 30-minute TTL.
+3. \`rerank_passages(query, passages)\` over \`Reranker.Score\` (\`reranker_service.proto\`): batches of 64,
+   700 ms each, a failed batch unscored, \`INVALID_ARGUMENT\` terminal.
+4. \`publish_outcome(outcome)\` to \`rerank.done\`, keyed by query fingerprint, counts and a score
+   histogram only, an idempotent producer, an outbox row from the delivery report.
+5. \`GET /v1/rerank/cache/stats\` from the consumer's per-version hashes \`rerank:stats:{v}\` and latency
+   lists \`rerank:latency:{v}:queue|model\`: hit ratio, unscored and fallback shares, boundary latency.
 
 ## The debugging habit
 
-Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
-that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Model training and fine-tuning, embedding generation and vector index choice, cross-encoder
-architecture details, passage chunking strategies, per-tenant relevance tuning, online A/B
-infrastructure, and the retrieval layer itself. The five pieces above are the ones that decide
-whether a reranked list is correct and shippable.`,
+Model training, embedding generation and the retrieval layer, token-exact budgets, per-tenant
+relevance tuning, the stats consumer and the outbox relay. The five pieces above decide whether a
+reranked list is correct and whether anyone can tell when it is not.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'rerank · stats', x: 8, y: 50},
-      {id: 'api', kind: 'http', label: 'Rerank API', sub: 'HTTPS :8443', x: 28, y: 50},
-      {id: 'db', kind: 'db', label: 'outbox · counters', sub: 'stats rows', x: 50, y: 12},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'score cache · TTL', x: 50, y: 50},
-      {id: 'kafka', kind: 'kafka', label: 'rerank.done', sub: 'key = query fingerprint', x: 50, y: 88},
-      {id: 'reranker', kind: 'grpc', label: 'Reranker model', sub: 'Rerank · 700 ms', x: 74, y: 24},
-      {id: 'consumer', kind: 'service', label: 'Stats consumer', sub: 'group rerank-stats', x: 74, y: 76},
+      {id: 'api', kind: 'http', label: 'rerankd', sub: 'POST /v1/rerank', x: 28, y: 50},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'score cache · stats · outbox', x: 52, y: 18},
+      {id: 'reranker', kind: 'grpc', label: 'Reranker model', sub: 'Score · 64 per batch · 700 ms', x: 52, y: 82},
+      {id: 'kafka', kind: 'kafka', label: 'rerank.done', sub: 'key = query fingerprint', x: 74, y: 50},
+      {id: 'consumer', kind: 'service', label: 'Stats consumer', sub: 'per model version', x: 92, y: 24},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'score cache'},
-      {from: 'api', to: 'db', kind: 'plain', label: 'outbox · counters'},
-      {from: 'api', to: 'reranker', kind: 'grpc', label: 'Rerank(batch of 64)'},
-      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce rerank.done'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'MGET · SET EX · outbox'},
+      {from: 'api', to: 'reranker', kind: 'grpc', label: 'Score(batch)'},
+      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce (numbers only)'},
       {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'db', kind: 'plain', label: 'hit ratio · unscored share'},
-      {from: 'consumer', to: 'redis', kind: 'redis', label: 'latency · histogram'},
+      {from: 'consumer', to: 'redis', kind: 'redis', label: 'rerank:stats:{v} · latency lists'},
     ],
   },
   steps: [rerankEndpointStep, rerankStateStep, rerankClientStep, rerankEventsStep, readStatsStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

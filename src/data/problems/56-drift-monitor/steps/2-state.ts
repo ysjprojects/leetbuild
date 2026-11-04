@@ -2,153 +2,124 @@ import type {Step} from '@/lib/types';
 
 export const windowedSketchStep: Step = {
   id: 'state',
-  title: 'Redis windowed sketches updated atomically',
+  title: 'Redis windowed sketches merged atomically',
   concept: 'redis',
   file: 'state',
   focus: ['monitor', 'redis', 'baseline'],
   task: `## Task
 
-**Starting point.** The starter merges a batch of \`(bucket, count)\` pairs into a Redis hash under
-one \`sketch:{tenant}:{monitor}:{window}\` namespace, one \`HGET\`, add and \`HSET\` per bucket, and
-sets a 3600 s TTL on the first write. It serves the demo and hides 5 flaws.
+**Starting point.** The starter is the sketch store the evaluator writes into:
+\`merge_batch(tenant, monitor_id, window_s, batch)\` adds a batch of \`{bucket: count}\` into the hash
+\`sketch:live:{tenant}:{monitor_id}\` with one \`HGET\` and one \`HSET\` per bucket, sets a 3600 s
+expiry and returns the hash's sample count; \`freeze_baseline(tenant, baseline_ref, batch)\` deletes
+and rewrites the JSON baseline under \`sketch:baseline:{tenant}:{baseline_ref}\`. It serves the demo
+and hides four flaws.
 
-**Failure mode the checks target.** A read-modify-write from the client is a lost-update race; a
-shared key between the live signal and its own baseline makes the comparison self-referential; a
-fixed TTL is not a window. Each one leaves the monitor running, quiet and wrong.
+**Failure mode the checks target.** Two evaluator replicas merging into one sketch lose each other's
+counts; the 10:00 window starts with the 09:00 counts, and under steady traffic the sketch never
+resets at all; and a re-run of the freeze job silently rebases the monitor on today's traffic.
 
-Input distributions are tracked as **windowed sketches** in Redis, one per (tenant, monitor, window),
-with the baseline kept apart.
-
-- The **live** sketch key is \`sketch:live:{tenant}:{monitor_id}:{window}\`, where \`window\` is the
-  window start (\`floor(now / window_s) * window_s\`). A key without the tenant, the monitor or the
-  window mixes unrelated monitors or does not reset.
-- A batch must be merged by **one atomic Lua \`EVAL\`**: the counters are incremented server-side with
-  \`HINCRBY\`, not read and written back from the client.
-- The **baseline** sketch lives under its own prefix, \`sketch:baseline:{tenant}:{baseline_ref}\`, and a
-  live merge refuses a key in that space.
-- The baseline is **frozen once**: \`freeze_baseline\` uses a write-once set, so a second freeze is a
-  no-op rather than a silent overwrite of the reference.
-- **Window expiry follows the window boundary exactly**: \`EXPIRE\` is set to
-  \`window_end - now\` (\`window_end = window_start + window_s\`), so the key dies when its window's last
-  second does.`,
+- One sketch per window: \`live_key(tenant, monitor_id, window)\` is
+  \`sketch:live:{tenant}:{monitor_id}:{window}\`, \`window\` being the window's start
+  (\`now // window_s * window_s\`).
+- A batch is merged by **one Lua script**: \`HINCRBY\` per bucket, the window's total returned.
+- The script's \`EXPIRE\` is the seconds left in the window (\`window + window_s - now\`), so the
+  sketch dies with its window.
+- A baseline is written **once** (\`SET … NX\`); a second freeze returns \`False\` and leaves it as it
+  was.`,
   sequence: {
-    participants: ['Drift Monitor', 'Redis', 'Baseline sketch'],
+    participants: ['Window evaluator', 'Redis', 'Baseline job'],
     messages: [
       {
-        from: 'Drift Monitor',
+        from: 'Window evaluator',
         to: 'Redis',
-        label: 'EVAL merge · KEYS[sketch:live:{tenant}:{monitor}:{window}]',
+        label: 'EVALSHA merge sketch:live:t1:m-1:900 · 1 640 · 2 210 · 200',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Drift Monitor', label: '{total, ttl}', kind: 'reply'},
-      {from: 'Drift Monitor', to: 'Baseline sketch', label: 'freeze_baseline · SET NX', kind: 'async'},
-      {from: 'Baseline sketch', to: 'Drift Monitor', label: 'OK / nil on a second freeze', kind: 'reply'},
-      {
-        from: 'Drift Monitor',
-        to: 'Drift Monitor',
-        label: 'EXPIRE = window_end - now, claimed inside the same script',
-        kind: 'sync',
-      },
+      {from: 'Redis', to: 'Window evaluator', label: 'HINCRBY ×2 · EXPIRE 200 → window total', kind: 'reply'},
+      {from: 'Baseline job', to: 'Redis', label: 'SET sketch:baseline:t1:baseline:v3:2026-10-01 {…} NX', kind: 'sync'},
+      {from: 'Redis', to: 'Baseline job', label: 'OK · nil on a second freeze', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'atomic-merge',
-      title: 'Merges a whole batch with one atomic script',
+      title: 'Merges a whole batch in one Lua script',
       detail:
-        'Every bucket of a batch is merged inside one `EVAL`/`NewScript` call with `HINCRBY`. The starter reads with `HGET`, adds in the client and writes with `HSET`, so two concurrent batches can lose an increment.',
+        'Every bucket of a batch is incremented with `HINCRBY` inside one script (`EVAL`/`register_script`/`defineCommand`/`NewScript`); a client-side `HGET` then `HSET` loses the increment another replica made in between.',
       match: {
-        python: {all: [/MERGE_LUA/, /\.eval\(/, /HINCRBY/]},
-        typescript: {all: [/MERGE_LUA/, /\.eval\(/, /HINCRBY/]},
-        go: {all: [/(mergeScript|NewScript)/, /\.Run\(/, /HINCRBY/]},
-        scala: {all: [/MergeLua/, /\.eval\(/, /HINCRBY/]},
-        cpp: {all: [/kMergeLua/, /\.eval</, /HINCRBY/]},
+        python: {all: [/register_script\(|\.eval\(/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
+        typescript: {all: [/defineCommand\(|\.eval\(/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
+        go: {all: [/redis\.NewScript\(|\.Eval\(/, /HINCRBY/], none: [/\.HGet\(/, /\.HSet\(/]},
+        scala: {all: [/jedis\.eval(sha)?\(/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
+        cpp: {all: [/redis\.eval(sha)?[<(]/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
       },
     },
     {
-      id: 'live-key',
-      title: 'Keys live sketches by tenant, monitor and window',
+      id: 'window-key',
+      title: 'Keeps one sketch per window',
       detail:
-        'The live key is `sketch:live:{tenant}:{monitor_id}:{window}`, built by `live_key`/`liveKey`. A key that drops the monitor, the tenant or the window makes unrelated monitors share a sketch or lets a window skip its reset.',
+        'The live key carries the window start (`live_key`/`liveKey(tenant, monitor_id, window)`), so a new window starts from an empty sketch instead of the previous window’s counts.',
       match: {
-        python: {all: [/sketch:live:/, /live_key\(/]},
-        typescript: {all: [/sketch:live:/, /liveKey\(/]},
-        go: {all: [/sketch:live:/, /liveKey\(/]},
-        scala: {all: [/sketch:live:/, /liveKey\(/]},
-        cpp: {all: [/"sketch:live:"/, /liveKey\(/]},
+        python: {all: [/def live_key\([^)]*\bwindow/]},
+        typescript: {all: [/function liveKey\([^)]*\bwindow|liveKey\s*=\s*\([^)]*\bwindow/]},
+        go: {all: [/func liveKey\([^)]*\bwindow/]},
+        scala: {all: [/def liveKey\([^)]*\bwindow/]},
+        cpp: {all: [/liveKey\([^)]*\bwindow/]},
       },
     },
     {
-      id: 'baseline-separate',
-      title: 'Keeps the baseline out of the live key space',
+      id: 'window-ttl',
+      title: 'Expires the sketch at the end of its window',
       detail:
-        'Baseline sketches use their own `sketch:baseline:` prefix, and a merge refuses a key in that space instead of writing into it. The starter puts live and baseline traffic in one mutable key, so the reference drifts with the signal it is supposed to judge.',
+        'The expiry is the seconds left in the window (`window + window_s - now`), set on every merge, so the key dies with its window; a fixed hour slides forward on every write.',
       match: {
-        python: {all: [/sketch:baseline:/, /BASELINE_PREFIX/, /raise ValueError/]},
-        typescript: {all: [/sketch:baseline:/, /BASELINE_PREFIX/, /throw new Error/]},
-        go: {all: [/sketch:baseline:/, /baselinePrefix/, /panic\(/]},
-        scala: {all: [/sketch:baseline:/, /BaselinePrefix/, /IllegalArgumentException/]},
-        cpp: {all: [/"sketch:baseline:"/, /kBaselinePrefix/, /std::invalid_argument/]},
+        python: {all: [/window_s\s*-\s*now|window_end\s*-\s*now|EXPIREAT|expireat/], none: [/\b3600\b/]},
+        typescript: {all: [/windowS\s*-\s*now|windowEnd\s*-\s*now|EXPIREAT|expireat/], none: [/\b3600\b/]},
+        go: {all: [/windowS\s*-\s*now|windowEnd\s*-\s*now|EXPIREAT|ExpireAt/], none: [/\b3600\b/, /time\.Hour/]},
+        scala: {all: [/windowS\s*-\s*now|windowEnd\s*-\s*now|EXPIREAT|expireAt/], none: [/\b3600\b/]},
+        cpp: {all: [/window_s\s*-\s*now|window_end\s*-\s*now|EXPIREAT|expireat/], none: [/\b3600\b/]},
       },
     },
     {
       id: 'baseline-frozen',
-      title: 'Freezes the baseline once',
+      title: 'Writes the baseline once',
       detail:
-        'The baseline is written with a write-once set (`nx=True`, `NX`, `SetNX`, `SetParams…nx()`, `UpdateType::NOT_EXIST`), so a later freeze cannot overwrite the reference. The starter deletes and rewrites the key, so a re-run silently rebases the monitor on the new traffic.',
+        'The baseline is written with a set-if-absent (`nx=True`, `NX`, `SetNX`, `SetParams.nx()`, `UpdateType::NOT_EXIST`) and not deleted first, so a second freeze reports false and the reference stays as it was.',
       match: {
-        python: {all: [/freeze_baseline\(/, /nx=True/]},
-        typescript: {all: [/freezeBaseline\(/, /['"]NX['"]/]},
-        go: {all: [/FreezeBaseline\(/, /SetNX\(/]},
-        scala: {all: [/freezeBaseline\(/, /SetParams/]},
-        cpp: {all: [/freezeBaseline\(/, /UpdateType::NOT_EXIST/]},
-      },
-    },
-    {
-      id: 'window-boundary',
-      title: 'Expires the sketch exactly at the window boundary',
-      detail:
-        'The TTL is `window_end - now`, set by `EXPIRE` inside the merge script, so the key dies when its window ends. The starter expires the key 3600 s after the first write, out of step with the window it claims to represent.',
-      match: {
-        python: {all: [/window_end\(/, /EXPIRE/]},
-        typescript: {all: [/windowEnd\(/, /EXPIRE/]},
-        go: {all: [/windowEnd\(/, /EXPIRE/]},
-        scala: {all: [/windowEnd\(/, /EXPIRE/]},
-        cpp: {all: [/windowEnd\(/, /EXPIRE/]},
+        python: {all: [/nx\s*=\s*True/], none: [/\.delete\(/]},
+        typescript: {all: [/['"]NX['"]/], none: [/\.del\(/]},
+        go: {all: [/SetNX\(|Mode:\s*"NX"/], none: [/\.Del\(/]},
+        scala: {all: [/\.nx\(\)/], none: [/\.del\(/]},
+        cpp: {all: [/UpdateType::NOT_EXIST/], none: [/\.del\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import time
+      starter: `import json
 
 import redis
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-SKETCH_ROOT = "sketch"
 
-
-def window(now: int, window_s: int) -> int:
-    return now // window_s * window_s
-
-
-def merge_batch(tenant: str, monitor_id: str, window_start: int, batch: dict[int, int]) -> int:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    key = f"{SKETCH_ROOT}:{tenant}:{monitor_id}:{window_start}"
-    total = 0
-    for bucket_id, count in batch.items():
-        current = int(r.hget(key, bucket_id) or 0)
-        r.hset(key, bucket_id, current + count)
-        total += current + count
+def merge_batch(tenant: str, monitor_id: str, window_s: int, batch: dict[int, int]) -> int:
+    """Merge a batch of bucket counts into the monitor's sketch for the current window; returns the window's sample count."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    key = f"sketch:live:{tenant}:{monitor_id}"
+    for bucket, count in batch.items():
+        current = int(r.hget(key, bucket) or 0)
+        r.hset(key, bucket, current + count)
     r.expire(key, 3600)
-    return total
+    return sum(int(count) for count in r.hvals(key))
 
 
 def freeze_baseline(tenant: str, baseline_ref: str, batch: dict[int, int]) -> bool:
-    key = f"{SKETCH_ROOT}:{tenant}:{baseline_ref}"
+    """Store the reference sketch monitors are compared against; True when this call wrote it."""
+    key = f"sketch:baseline:{tenant}:{baseline_ref}"
     r.delete(key)
-    r.hset(key, mapping={str(k): v for k, v in batch.items()})
+    r.set(key, json.dumps({str(bucket): count for bucket, count in batch.items()}))
     return True
 `,
       solution: `import json
@@ -158,162 +129,122 @@ import redis
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-LIVE_PREFIX = "sketch:live:"
-BASELINE_PREFIX = "sketch:baseline:"
-
+# HINCRBY every (bucket, count) pair of ARGV, expire the hash after ARGV[#ARGV] seconds, return its total.
 MERGE_LUA = """
-local total = 0
 for i = 1, #ARGV - 1, 2 do
   redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
-  total = total + redis.call('HGET', KEYS[1], ARGV[i])
 end
 redis.call('EXPIRE', KEYS[1], ARGV[#ARGV])
+local total = 0
+for _, count in ipairs(redis.call('HVALS', KEYS[1])) do
+  total = total + tonumber(count)
+end
 return total
 """
+merge = r.register_script(MERGE_LUA)
 
 
 def window_start(now: int, window_s: int) -> int:
     return now // window_s * window_s
 
 
-def window_end(now: int, window_s: int) -> int:
-    return window_start(now, window_s) + window_s
-
-
 def live_key(tenant: str, monitor_id: str, window: int) -> str:
-    return f"{LIVE_PREFIX}{tenant}:{monitor_id}:{window}"
+    return f"sketch:live:{tenant}:{monitor_id}:{window}"
 
 
-def baseline_key(tenant: str, baseline_ref: str) -> str:
-    return f"{BASELINE_PREFIX}{tenant}:{baseline_ref}"
-
-
-def merge_batch(tenant: str, monitor_id: str, window: int, window_s: int, batch: dict[int, int]) -> int:
-    """Merge one batch of (bucket, count) pairs into the window's sketch, atomically."""
-    key = live_key(tenant, monitor_id, window)
-    if key.startswith(BASELINE_PREFIX):
-        raise ValueError("baseline sketches are immutable")
+def merge_batch(tenant: str, monitor_id: str, window_s: int, batch: dict[int, int]) -> int:
+    """Merge a batch of bucket counts into the monitor's sketch for the current window; returns the window's sample count."""
     now = int(time.time())
-    ttl = max(window_end(now, window_s) - now, 1)
+    window = window_start(now, window_s)
     args: list[int] = []
-    for bucket_id, count in batch.items():
-        args.extend([bucket_id, count])
-    args.append(ttl)
-    return int(r.eval(MERGE_LUA, 1, key, *args))
+    for bucket, count in sorted(batch.items()):
+        args += [bucket, count]
+    args.append(window + window_s - now)  # the seconds left in the window: the sketch dies with it
+    return int(merge(keys=[live_key(tenant, monitor_id, window)], args=args))
 
 
 def freeze_baseline(tenant: str, baseline_ref: str, batch: dict[int, int]) -> bool:
-    """Freeze the reference once; a later freeze is a no-op, never an overwrite."""
-    key = baseline_key(tenant, baseline_ref)
-    if key.startswith(LIVE_PREFIX):
-        raise ValueError("a baseline sketch never shares the live prefix")
-    payload = json.dumps({str(bucket): count for bucket, count in batch.items()})
-    return bool(r.set(key, payload, nx=True))
+    """Store the reference sketch monitors are compared against; True when this call wrote it."""
+    key = f"sketch:baseline:{tenant}:{baseline_ref}"
+    payload = json.dumps({str(bucket): count for bucket, count in sorted(batch.items())})
+    return bool(r.set(key, payload, nx=True))  # a reference is written once, never rebased
 `,
     },
     typescript: {
-      starter: `/** Windowed sketches in Redis. */
-import Redis from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const r = new Redis({host: 'redis', port: 6379});
+const redis = new Redis({host: 'redis', port: 6379});
 
-const SKETCH_ROOT = 'sketch';
+/** Bucket id → count. */
+export type Sketch = Record<number, number>;
 
-interface Batch {
-  [bucket: string]: number;
-}
-
-function window(now: number, windowS: number): number {
-  return Math.floor(now / windowS) * windowS;
-}
-
-export async function mergeBatch(
-  tenant: string,
-  monitorId: string,
-  windowStart: number,
-  batch: Batch,
-): Promise<number> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const key = SKETCH_ROOT + ':' + tenant + ':' + monitorId + ':' + windowStart;
-  let total = 0;
+/** Merge a batch of bucket counts into the monitor's sketch for the current window; returns the window's sample count. */
+export async function mergeBatch(tenant: string, monitorId: string, windowS: number, batch: Sketch): Promise<number> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const key = \`sketch:live:\${tenant}:\${monitorId}\`;
   for (const [bucket, count] of Object.entries(batch)) {
-    const current = Number((await r.hget(key, bucket)) ?? 0);
-    await r.hset(key, bucket, current + count);
-    total += current + count;
+    const current = Number((await redis.hget(key, bucket)) ?? 0);
+    await redis.hset(key, bucket, current + Number(count));
   }
-  await r.expire(key, 3600);
-  return total;
+  await redis.expire(key, 3600);
+  const counts = await redis.hvals(key);
+  return counts.reduce((total, count) => total + Number(count), 0);
 }
 
-export async function freezeBaseline(tenant: string, baselineRef: string, batch: Batch): Promise<boolean> {
-  const key = SKETCH_ROOT + ':' + tenant + ':' + baselineRef;
-  await r.del(key);
-  await r.hset(key, batch);
+/** Store the reference sketch monitors are compared against; true when this call wrote it. */
+export async function freezeBaseline(tenant: string, baselineRef: string, batch: Sketch): Promise<boolean> {
+  const key = \`sketch:baseline:\${tenant}:\${baselineRef}\`;
+  await redis.del(key);
+  await redis.set(key, JSON.stringify(batch));
   return true;
 }
 `,
-      solution: `/** Windowed sketches in Redis: one atomic merge per batch, a frozen baseline. */
-import Redis from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const r = new Redis({host: 'redis', port: 6379});
-
-const LIVE_PREFIX = 'sketch:live:';
-const BASELINE_PREFIX = 'sketch:baseline:';
-
-const MERGE_LUA = \`
-local total = 0
+/** HINCRBY every (bucket, count) pair of ARGV, expire the hash after ARGV[#ARGV] seconds, return its total. */
+export const MERGE_LUA = \`
 for i = 1, #ARGV - 1, 2 do
   redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
-  total = total + redis.call('HGET', KEYS[1], ARGV[i])
 end
 redis.call('EXPIRE', KEYS[1], ARGV[#ARGV])
+local total = 0
+for _, count in ipairs(redis.call('HVALS', KEYS[1])) do
+  total = total + tonumber(count)
+end
 return total
 \`;
 
-interface Batch {
-  [bucket: string]: number;
+interface SketchRedis extends Redis {
+  mergeSketch(key: string, ...args: number[]): Promise<number>;
 }
 
-/** Start of the window that contains \`now\`: the bucket every key and TTL is built from. */
-export function windowStart(now: number, windowS: number): number {
-  return Math.floor(now / windowS) * windowS;
-}
+const redis = new Redis({host: 'redis', port: 6379}) as SketchRedis;
+redis.defineCommand('mergeSketch', {numberOfKeys: 1, lua: MERGE_LUA});
 
-/** The instant this window ends; a sketch may live exactly this long. */
-export function windowEnd(now: number, windowS: number): number {
-  return windowStart(now, windowS) + windowS;
-}
+/** Bucket id → count. */
+export type Sketch = Record<number, number>;
 
-export function liveKey(tenant: string, monitorId: string, window: number): string {
-  return LIVE_PREFIX + tenant + ':' + monitorId + ':' + window;
-}
+export const windowStart = (now: number, windowS: number): number => Math.floor(now / windowS) * windowS;
 
-export function baselineKey(tenant: string, baselineRef: string): string {
-  return BASELINE_PREFIX + tenant + ':' + baselineRef;
-}
+export const liveKey = (tenant: string, monitorId: string, window: number): string => \`sketch:live:\${tenant}:\${monitorId}:\${window}\`;
 
-export async function mergeBatch(
-  tenant: string,
-  monitorId: string,
-  window: number,
-  windowS: number,
-  batch: Batch,
-): Promise<number> {
-  const key = liveKey(tenant, monitorId, window);
-  if (key.startsWith(BASELINE_PREFIX)) throw new Error('baseline sketches are immutable');
+/** Merge a batch of bucket counts into the monitor's sketch for the current window; returns the window's sample count. */
+export async function mergeBatch(tenant: string, monitorId: string, windowS: number, batch: Sketch): Promise<number> {
   const now = Math.floor(Date.now() / 1000);
-  const ttl = Math.max(windowEnd(now, windowS) - now, 1);
-  const args: string[] = [];
-  for (const [bucket, count] of Object.entries(batch)) args.push(bucket, String(count));
-  args.push(String(ttl));
-  return (await r.eval(MERGE_LUA, 1, key, ...args)) as number;
+  const window = windowStart(now, windowS);
+  const args = Object.entries(batch)
+    .map(([bucket, count]) => [Number(bucket), Number(count)])
+    .sort((a, b) => a[0] - b[0])
+    .flat();
+  args.push(window + windowS - now); // the seconds left in the window: the sketch dies with it
+  return Number(await redis.mergeSketch(liveKey(tenant, monitorId, window), ...args));
 }
 
-export async function freezeBaseline(tenant: string, baselineRef: string, batch: Batch): Promise<boolean> {
-  const key = baselineKey(tenant, baselineRef);
-  if (key.startsWith(LIVE_PREFIX)) throw new Error('a baseline sketch never shares the live prefix');
-  const reply = await r.set(key, JSON.stringify(batch), 'NX');
-  return reply === 'OK';
+/** Store the reference sketch monitors are compared against; true when this call wrote it. */
+export async function freezeBaseline(tenant: string, baselineRef: string, batch: Sketch): Promise<boolean> {
+  const key = \`sketch:baseline:\${tenant}:\${baselineRef}\`;
+  // A reference is written once, never rebased.
+  return (await redis.set(key, JSON.stringify(batch), 'NX')) === 'OK';
 }
 `,
     },
@@ -322,51 +253,44 @@ export async function freezeBaseline(tenant: string, baselineRef: string, batch:
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const sketchRoot = "sketch"
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type Batch map[string]int64
-
-var rdb *redis.Client
-
-func window(now int64, windowS int64) int64 {
-	return now / windowS * windowS
-}
-
-func sketchKey(parts ...string) string {
-	key := sketchRoot
-	for _, part := range parts {
-		key = key + ":" + part
-	}
-	return key
-}
-
-func mergeBatch(ctx context.Context, tenant, monitorID string, windowStart int64, batch Batch) (int64, error) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	key := sketchKey(tenant, monitorID, fmt.Sprintf("%d", windowStart))
-	var total int64
+// mergeBatch merges a batch of bucket counts into the monitor's sketch for the current window and
+// returns the window's sample count.
+func mergeBatch(ctx context.Context, tenant, monitorID string, windowS int64, batch map[int]int64) (int64, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	key := "sketch:live:" + tenant + ":" + monitorID
 	for bucket, count := range batch {
-		current, _ := rdb.HGet(ctx, key, bucket).Int64()
-		rdb.HSet(ctx, key, bucket, current+count)
-		total += current + count
+		field := strconv.Itoa(bucket)
+		current, _ := rdb.HGet(ctx, key, field).Int64()
+		if err := rdb.HSet(ctx, key, field, current+count).Err(); err != nil {
+			return 0, err
+		}
 	}
-	rdb.Expire(ctx, key, time.Hour)
+	rdb.Expire(ctx, key, 3600*time.Second)
+	var total int64
+	for _, count := range rdb.HVals(ctx, key).Val() {
+		n, _ := strconv.ParseInt(count, 10, 64)
+		total += n
+	}
 	return total, nil
 }
 
-func FreezeBaseline(ctx context.Context, tenant, baselineRef string, batch Batch) (bool, error) {
-	key := sketchKey(tenant, baselineRef)
+// freezeBaseline stores the reference sketch monitors are compared against; true when this call wrote it.
+func freezeBaseline(ctx context.Context, tenant, baselineRef string, batch map[int]int64) (bool, error) {
+	key := "sketch:baseline:" + tenant + ":" + baselineRef
+	payload, _ := json.Marshal(batch)
 	rdb.Del(ctx, key)
-	values := make(map[string]any, len(batch))
-	for bucket, count := range batch {
-		values[bucket] = count
+	if err := rdb.Set(ctx, key, payload, 0).Err(); err != nil {
+		return false, err
 	}
-	rdb.HSet(ctx, key, values)
 	return true, nil
 }
 `,
@@ -376,299 +300,551 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"sort"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	livePrefix     = "sketch:live:"
-	baselinePrefix = "sketch:baseline:"
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type Batch map[string]int64
-
-var rdb *redis.Client
-
-var mergeScript = redis.NewScript(\`
-local total = 0
+// merge HINCRBYs every (bucket, count) pair of ARGV, expires the hash after ARGV[#ARGV] seconds and returns its total.
+var merge = redis.NewScript(\`
 for i = 1, #ARGV - 1, 2 do
   redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
-  total = total + redis.call('HGET', KEYS[1], ARGV[i])
 end
 redis.call('EXPIRE', KEYS[1], ARGV[#ARGV])
+local total = 0
+for _, count in ipairs(redis.call('HVALS', KEYS[1])) do
+  total = total + tonumber(count)
+end
 return total
 \`)
 
-func windowStart(now, windowS int64) int64 {
-	return now / windowS * windowS
-}
-
-func windowEnd(now, windowS int64) int64 {
-	return windowStart(now, windowS) + windowS
-}
+func windowStart(now, windowS int64) int64 { return now / windowS * windowS }
 
 func liveKey(tenant, monitorID string, window int64) string {
-	return fmt.Sprintf("%s%s:%s:%d", livePrefix, tenant, monitorID, window)
+	return fmt.Sprintf("sketch:live:%s:%s:%d", tenant, monitorID, window)
 }
 
-func baselineKey(tenant, baselineRef string) string {
-	return fmt.Sprintf("%s%s:%s", baselinePrefix, tenant, baselineRef)
-}
-
-func mergeBatch(ctx context.Context, tenant, monitorID string, window, windowS int64, batch Batch) (int64, error) {
-	key := liveKey(tenant, monitorID, window)
-	if strings.HasPrefix(key, baselinePrefix) {
-		panic("baseline sketches are immutable")
-	}
+// mergeBatch merges a batch of bucket counts into the monitor's sketch for the current window and
+// returns the window's sample count.
+func mergeBatch(ctx context.Context, tenant, monitorID string, windowS int64, batch map[int]int64) (int64, error) {
 	now := time.Now().Unix()
-	ttl := windowEnd(now, windowS) - now
-	if ttl < 1 {
-		ttl = 1
+	window := windowStart(now, windowS)
+	buckets := make([]int, 0, len(batch))
+	for bucket := range batch {
+		buckets = append(buckets, bucket)
 	}
-	args := make([]any, 0, len(batch)*2+1)
-	for bucket, count := range batch {
-		args = append(args, bucket, count)
+	sort.Ints(buckets)
+	var args []any
+	for _, bucket := range buckets {
+		args = append(args, bucket, batch[bucket])
 	}
-	args = append(args, ttl)
-	return mergeScript.Run(ctx, rdb, []string{key}, args...).Int64()
+	args = append(args, window+windowS-now) // the seconds left in the window: the sketch dies with it
+	return merge.Run(ctx, rdb, []string{liveKey(tenant, monitorID, window)}, args...).Int64()
 }
 
-func FreezeBaseline(ctx context.Context, tenant, baselineRef string, batch Batch) (bool, error) {
-	key := baselineKey(tenant, baselineRef)
-	if strings.HasPrefix(key, livePrefix) {
-		panic("a baseline sketch never shares the live prefix")
-	}
-	payload, err := json.Marshal(batch)
-	if err != nil {
-		return false, err
-	}
-	return rdb.SetNX(ctx, key, payload, 0).Result()
+// freezeBaseline stores the reference sketch monitors are compared against; true when this call wrote it.
+func freezeBaseline(ctx context.Context, tenant, baselineRef string, batch map[int]int64) (bool, error) {
+	key := "sketch:baseline:" + tenant + ":" + baselineRef
+	payload, _ := json.Marshal(batch)
+	return rdb.SetNX(ctx, key, payload, 0).Result() // a reference is written once, never rebased
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
+import spray.json._
 
-object SketchStore {
-  val SketchRoot = "sketch"
+import scala.jdk.CollectionConverters._
 
-  val jedis = new Jedis("redis", 6379)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  def window(now: Long, windowS: Long): Long = now / windowS * windowS
-
-  def sketchKey(parts: String*): String = (SketchRoot +: parts).mkString(":")
-
-  def mergeBatch(tenant: String, monitorId: String, windowStart: Long, batch: Map[Int, Long]): Long = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val key = sketchKey(tenant, monitorId, windowStart.toString)
-    var total = 0L
+  /** Merge a batch of bucket counts into the monitor's sketch for the current window; returns the window's sample count. */
+  def mergeBatch(tenant: String, monitorId: String, windowS: Long, batch: Map[Int, Long]): Long = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val key = s"sketch:live:$tenant:$monitorId"
     batch.foreach { case (bucket, count) =>
       val current = Option(jedis.hget(key, bucket.toString)).map(_.toLong).getOrElse(0L)
       jedis.hset(key, bucket.toString, (current + count).toString)
-      total += current + count
     }
-    jedis.expire(key, 3600)
-    total
+    jedis.expire(key, 3600L)
+    jedis.hvals(key).asScala.map(_.toLong).sum
   }
 
+  /** Store the reference sketch monitors are compared against; true when this call wrote it. */
   def freezeBaseline(tenant: String, baselineRef: String, batch: Map[Int, Long]): Boolean = {
-    val key = sketchKey(tenant, baselineRef)
+    val key = s"sketch:baseline:$tenant:$baselineRef"
     jedis.del(key)
-    val values = batch.map { case (bucket, count) => bucket.toString -> count.toString }
-    jedis.hset(key, values)
+    jedis.set(key, JsObject(batch.map { case (bucket, count) => bucket.toString -> JsNumber(count) }).compactPrint)
     true
   }
 }
 `,
-      solution: `import scala.jdk.CollectionConverters._
-
-import redis.clients.jedis.Jedis
+      solution: `import redis.clients.jedis.JedisPooled
 import redis.clients.jedis.params.SetParams
+import spray.json._
 
-object SketchStore {
-  val LivePrefix = "sketch:live:"
-  val BaselinePrefix = "sketch:baseline:"
+import scala.jdk.CollectionConverters._
 
+object State {
+  val jedis = new JedisPooled("redis", 6379)
+
+  /** HINCRBY every (bucket, count) pair of ARGV, expire the hash after ARGV[#ARGV] seconds, return its total. */
   val MergeLua: String =
-    """
-local total = 0
-for i = 1, #ARGV - 1, 2 do
-  redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
-  total = total + redis.call('HGET', KEYS[1], ARGV[i])
-end
-redis.call('EXPIRE', KEYS[1], ARGV[#ARGV])
-return total
-"""
-
-  val jedis = new Jedis("redis", 6379)
+    """for i = 1, #ARGV - 1, 2 do
+      |  redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
+      |end
+      |redis.call('EXPIRE', KEYS[1], ARGV[#ARGV])
+      |local total = 0
+      |for _, count in ipairs(redis.call('HVALS', KEYS[1])) do
+      |  total = total + tonumber(count)
+      |end
+      |return total
+      |""".stripMargin
 
   def windowStart(now: Long, windowS: Long): Long = now / windowS * windowS
 
-  def windowEnd(now: Long, windowS: Long): Long = windowStart(now, windowS) + windowS
+  def liveKey(tenant: String, monitorId: String, window: Long): String = s"sketch:live:$tenant:$monitorId:$window"
 
-  def liveKey(tenant: String, monitorId: String, window: Long): String =
-    s"$LivePrefix$tenant:$monitorId:$window"
-
-  def baselineKey(tenant: String, baselineRef: String): String =
-    s"$BaselinePrefix$tenant:$baselineRef"
-
-  def mergeBatch(tenant: String, monitorId: String, window: Long, windowS: Long, batch: Map[Int, Long]): Long = {
-    val key = liveKey(tenant, monitorId, window)
-    if (key.startsWith(BaselinePrefix)) {
-      throw new IllegalArgumentException("baseline sketches are immutable")
-    }
+  /** Merge a batch of bucket counts into the monitor's sketch for the current window; returns the window's sample count. */
+  def mergeBatch(tenant: String, monitorId: String, windowS: Long, batch: Map[Int, Long]): Long = {
     val now = System.currentTimeMillis() / 1000
-    val ttl = math.max(windowEnd(now, windowS) - now, 1L)
-    val args = batch.flatMap { case (bucket, count) => List(bucket.toString, count.toString) }.toList :+ ttl.toString
-    jedis.eval(MergeLua, List(key).asJava, args.asJava).asInstanceOf[java.lang.Long].longValue()
+    val window = windowStart(now, windowS)
+    val pairs = batch.toSeq.sortBy(_._1).flatMap { case (bucket, count) => Seq(bucket.toString, count.toString) }
+    val args = pairs :+ (window + windowS - now).toString // the seconds left in the window: the sketch dies with it
+    jedis.eval(MergeLua, List(liveKey(tenant, monitorId, window)).asJava, args.asJava).asInstanceOf[java.lang.Long]
   }
 
+  /** Store the reference sketch monitors are compared against; true when this call wrote it. */
   def freezeBaseline(tenant: String, baselineRef: String, batch: Map[Int, Long]): Boolean = {
-    val key = baselineKey(tenant, baselineRef)
-    if (key.startsWith(LivePrefix)) {
-      throw new IllegalArgumentException("a baseline sketch never shares the live prefix")
-    }
-    val payload = batch.map { case (bucket, count) => s"$bucket=$count" }.mkString(";")
-    jedis.set(key, payload, SetParams.setParams().nx()) == "OK"
+    val key = s"sketch:baseline:$tenant:$baselineRef"
+    val payload = JsObject(batch.map { case (bucket, count) => bucket.toString -> JsNumber(count) }).compactPrint
+    jedis.set(key, payload, SetParams.setParams().nx()) != null // a reference is written once, never rebased
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <sw/redis++/redis++.h>
+      starter: `#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
-#include <chrono>
+#include <map>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
-using sw::redis::Redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-const std::string kSketchRoot = "sketch";
+// Bucket id → count.
+using Sketch = std::map<int, long>;
 
-Redis redis("tcp://redis:6379");
-
-long window(long now, long windowS) { return now / windowS * windowS; }
-
-std::string sketchKey(const std::vector<std::string>& parts) {
-  std::string key = kSketchRoot;
-  for (const auto& part : parts) key += ":" + part;
-  return key;
-}
-
-long mergeBatch(const std::string& tenant,
-                const std::string& monitorId,
-                long windowStart,
-                const std::unordered_map<std::string, long>& batch) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const auto key = sketchKey({tenant, monitorId, std::to_string(windowStart)});
-  long total = 0;
+// Merge a batch of bucket counts into the monitor's sketch for the current window; returns the
+// window's sample count.
+long long mergeBatch(const std::string& tenant, const std::string& monitor_id, long window_s, const Sketch& batch) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string key = "sketch:live:" + tenant + ":" + monitor_id;
   for (const auto& [bucket, count] : batch) {
-    const auto current = redis.hget(key, bucket).value_or("0");
-    redis.hset(key, bucket, std::to_string(std::stol(current) + count));
-    total += std::stol(current) + count;
+    const auto current = redis.hget(key, std::to_string(bucket));
+    redis.hset(key, std::to_string(bucket), std::to_string((current ? std::stol(*current) : 0) + count));
   }
-  redis.expire(key, std::chrono::seconds(3600));
+  redis.expire(key, 3600);
+  long long total = 0;
+  for (const std::string& count : redis.hvals(key)) total += std::stoll(count);
   return total;
 }
 
-bool freezeBaseline(const std::string& tenant,
-                    const std::string& baselineRef,
-                    const std::unordered_map<std::string, long>& batch) {
-  const auto key = sketchKey({tenant, baselineRef});
+// Store the reference sketch monitors are compared against; true when this call wrote it.
+bool freezeBaseline(const std::string& tenant, const std::string& baseline_ref, const Sketch& batch) {
+  const std::string key = "sketch:baseline:" + tenant + ":" + baseline_ref;
+  nlohmann::json payload = nlohmann::json::object();
+  for (const auto& [bucket, count] : batch) payload[std::to_string(bucket)] = count;
   redis.del(key);
-  std::unordered_map<std::string, std::string> values;
-  for (const auto& [bucket, count] : batch) values[bucket] = std::to_string(count);
-  redis.hset(key, values.begin(), values.end());
+  redis.set(key, payload.dump());
   return true;
 }
 `,
-      solution: `#include <sw/redis++/redis++.h>
+      solution: `#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
-#include <algorithm>
 #include <chrono>
-#include <stdexcept>
+#include <map>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
-using sw::redis::Redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-const std::string kLivePrefix = "sketch:live:";
-const std::string kBaselinePrefix = "sketch:baseline:";
+// Bucket id → count.
+using Sketch = std::map<int, long>;
 
-const std::string kMergeLua = R"(
-local total = 0
+// HINCRBY every (bucket, count) pair of ARGV, expire the hash after ARGV[#ARGV] seconds, return its total.
+const std::string kMergeLua = R"lua(
 for i = 1, #ARGV - 1, 2 do
   redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
-  total = total + redis.call('HGET', KEYS[1], ARGV[i])
 end
 redis.call('EXPIRE', KEYS[1], ARGV[#ARGV])
+local total = 0
+for _, count in ipairs(redis.call('HVALS', KEYS[1])) do
+  total = total + tonumber(count)
+end
 return total
-)";
+)lua";
 
-Redis redis("tcp://redis:6379");
+long windowStart(long now, long window_s) { return now / window_s * window_s; }
 
-long windowStart(long now, long windowS) { return now / windowS * windowS; }
-
-long windowEnd(long now, long windowS) { return windowStart(now, windowS) + windowS; }
-
-std::string liveKey(const std::string& tenant, const std::string& monitorId, long window) {
-  return kLivePrefix + tenant + ":" + monitorId + ":" + std::to_string(window);
+std::string liveKey(const std::string& tenant, const std::string& monitor_id, long window) {
+  return "sketch:live:" + tenant + ":" + monitor_id + ":" + std::to_string(window);
 }
 
-std::string baselineKey(const std::string& tenant, const std::string& baselineRef) {
-  return kBaselinePrefix + tenant + ":" + baselineRef;
-}
-
-long mergeBatch(const std::string& tenant,
-                const std::string& monitorId,
-                long window,
-                long windowS,
-                const std::unordered_map<std::string, long>& batch) {
-  const auto key = liveKey(tenant, monitorId, window);
-  if (key.rfind(kBaselinePrefix, 0) == 0) {
-    throw std::invalid_argument("baseline sketches are immutable");
-  }
-  const long now =
-      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-  const long ttl = std::max(windowEnd(now, windowS) - now, 1L);
+// Merge a batch of bucket counts into the monitor's sketch for the current window; returns the
+// window's sample count.
+long long mergeBatch(const std::string& tenant, const std::string& monitor_id, long window_s, const Sketch& batch) {
+  const long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const long window = windowStart(now, window_s);
   std::vector<std::string> args;
   for (const auto& [bucket, count] : batch) {
-    args.push_back(bucket);
+    args.push_back(std::to_string(bucket));
     args.push_back(std::to_string(count));
   }
-  args.push_back(std::to_string(ttl));
-  return redis.eval<long>(kMergeLua, {key}, args.begin(), args.end());
+  args.push_back(std::to_string(window + window_s - now));  // the seconds left in the window: the sketch dies with it
+  const std::vector<std::string> keys = {liveKey(tenant, monitor_id, window)};
+  return redis.eval<long long>(kMergeLua, keys.begin(), keys.end(), args.begin(), args.end());
 }
 
-bool freezeBaseline(const std::string& tenant,
-                    const std::string& baselineRef,
-                    const std::unordered_map<std::string, long>& batch) {
-  const auto key = baselineKey(tenant, baselineRef);
-  if (key.rfind(kLivePrefix, 0) == 0) {
-    throw std::invalid_argument("a baseline sketch never shares the live prefix");
-  }
-  std::string payload;
-  for (const auto& [bucket, count] : batch) payload += bucket + "=" + std::to_string(count) + ";";
-  return redis.set(key, payload, std::chrono::seconds(0), sw::redis::UpdateType::NOT_EXIST);
+// Store the reference sketch monitors are compared against; true when this call wrote it.
+bool freezeBaseline(const std::string& tenant, const std::string& baseline_ref, const Sketch& batch) {
+  const std::string key = "sketch:baseline:" + tenant + ":" + baseline_ref;
+  nlohmann::json payload = nlohmann::json::object();
+  for (const auto& [bucket, count] : batch) payload[std::to_string(bucket)] = count;
+  // A reference is written once, never rebased.
+  return redis.set(key, payload.dump(), std::chrono::milliseconds(0), sw::redis::UpdateType::NOT_EXIST);
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+REF = "baseline:v3:2026-10-01"
+BASELINE_KEY = f"sketch:baseline:t1:{REF}"
+
+
+def check_atomic_merge(ctx):
+    m = ctx.load("state")
+    first = m.merge_batch("t1", "m-1", 300, {1: 5})
+    assert first == 5, f"the first batch of 5 samples reported {first!r} samples in the window"
+    keys = ctx.redis.keys("sketch:*")
+    assert len(keys) == 1, f"one merge left {keys} in Redis, expected one sketch"
+    key = keys[0]
+    # Another evaluator replica merges its batch between this merge's commands.
+    rival = ctx.redis_after(key, lambda: m.merge_batch("t1", "m-1", 300, {1: 7, 2: 1}))
+    m.merge_batch("t1", "m-1", 300, {1: 3, 2: 2})
+    assert rival.fired, f"the second merge never touched {key}"
+    if rival.error is not None:
+        raise rival.error
+    counts = ctx.redis.hgetall(key)
+    assert counts == {"1": "15", "2": "3"}, f"{key} holds {counts} after batches of 5, 7 and 3 in bucket 1 and 1 and 2 in bucket 2, expected 15 and 3: the other replica's increment landed between your read and your write and was overwritten. Merge the batch with HINCRBY inside one script"
+
+
+def _into_window(ctx, offset):
+    """Move the clock to offset seconds into a 300 s window; returns that window's start."""
+    now = int(ctx.clock.time())
+    if (offset - now) % 300:
+        ctx.clock.advance((offset - now) % 300)
+    return int(ctx.clock.time()) - offset
+
+
+def check_window_key(ctx):
+    m = ctx.load("state")
+    window = _into_window(ctx, 10)
+    m.merge_batch("t1", "m-1", 300, {1: 4})
+    first = ctx.redis.hgetall(f"sketch:live:t1:m-1:{window}")
+    assert first == {"1": "4"}, f"a batch 10 s into window {window} (window_s 300) must land in sketch:live:t1:m-1:{window}, which holds {first}; Redis holds {sorted(ctx.redis.keys('sketch:*'))}"
+    ctx.clock.advance(300)
+    total = m.merge_batch("t1", "m-1", 300, {2: 6})
+    second = ctx.redis.hgetall(f"sketch:live:t1:m-1:{window + 300}")
+    assert second == {"2": "6"}, f"the batch 300 s later must start the sketch of window {window + 300}, which holds {second}; Redis holds {sorted(ctx.redis.keys('sketch:*'))}"
+    assert total == 6, f"the first batch of window {window + 300} reported {total} samples, expected 6: the new window started with the previous window's counts"
+
+
+def check_window_ttl(ctx):
+    m = ctx.load("state")
+    window = _into_window(ctx, 100)
+    key = f"sketch:live:t1:m-1:{window}"
+    m.merge_batch("t1", "m-1", 300, {1: 4})
+    ttl = ctx.redis.ttl(key)
+    assert 199 <= ttl <= 200, f"100 s into window {window} the window has 200 s left, but {key} expires in {ttl} s (Redis holds {sorted(ctx.redis.keys('sketch:*'))}): the expiry must be the seconds left in the window"
+    ctx.clock.advance(50)
+    m.merge_batch("t1", "m-1", 300, {1: 4})
+    ttl = ctx.redis.ttl(key)
+    assert 149 <= ttl <= 150, f"150 s into the window {key} expires in {ttl} s, expected 150: a later write must not push the expiry past the window's end"
+    ctx.clock.advance(150)
+    assert ctx.redis.exists(key) == 0, f"the window ended but {key} is still there"
+
+
+def check_baseline_frozen(ctx):
+    m = ctx.load("state")
+    assert m.freeze_baseline("t1", REF, {1: 10, 2: 20}) is True, "the first freeze must write the baseline and return True"
+    raw = ctx.redis.get(BASELINE_KEY)
+    assert raw is not None and json.loads(raw) == {"1": 10, "2": 20}, f"{BASELINE_KEY} holds {raw!r}, expected the JSON object {{\\"1\\": 10, \\"2\\": 20}}"
+    again = m.freeze_baseline("t1", REF, {1: 99})
+    assert again is False, f"a second freeze of {REF} returned {again!r}, expected False: the reference already exists"
+    raw = ctx.redis.get(BASELINE_KEY)
+    assert raw is not None and json.loads(raw) == {"1": 10, "2": 20}, f"a second freeze rewrote the baseline to {raw!r}: the monitor is now compared against today's traffic. Write it once (SET NX)"
+    assert ctx.redis.ttl(BASELINE_KEY) == -1, "the baseline must not expire"
+`,
+    typescript: `const REF = 'baseline:v3:2026-10-01';
+const BASELINE_KEY = \`sketch:baseline:t1:\${REF}\`;
+
+const sketchKeys = (ctx): string => JSON.stringify((ctx.redis.keys('sketch:*') as string[]).sort());
+
+export async function check_atomic_merge(ctx) {
+  const m = ctx.load('state');
+  const first = await m.mergeBatch('t1', 'm-1', 300, {1: 5});
+  assert.equal(first, 5, \`the first batch of 5 samples reported \${first} samples in the window\`);
+  const keys = ctx.redis.keys('sketch:*');
+  assert.equal(keys.length, 1, \`one merge left \${JSON.stringify(keys)} in Redis, expected one sketch\`);
+  const key = keys[0];
+  // Another evaluator replica merges its batch between this merge's commands.
+  const rival = ctx.redisAfter(key, () => m.mergeBatch('t1', 'm-1', 300, {1: 7, 2: 1}));
+  await m.mergeBatch('t1', 'm-1', 300, {1: 3, 2: 2});
+  assert(rival.fired, \`the second merge never touched \${key}\`);
+  await rival.result;
+  const counts = ctx.redis.hgetall(key);
+  assert.deepStrictEqual(counts, {1: '15', 2: '3'}, \`\${key} holds \${JSON.stringify(counts)} after batches of 5, 7 and 3 in bucket 1 and 1 and 2 in bucket 2, expected 15 and 3: the other replica's increment landed between your read and your write and was overwritten. Merge the batch with HINCRBY inside one script\`);
+}
+
+/** Move the clock to offset seconds into a 300 s window; returns that window's start. */
+function intoWindow(ctx, offset: number): number {
+  const now = Math.floor(ctx.clock.now() / 1000);
+  const step = (((offset - now) % 300) + 300) % 300;
+  if (step > 0) ctx.clock.advance(step);
+  return Math.floor(ctx.clock.now() / 1000) - offset;
+}
+
+export async function check_window_key(ctx) {
+  const m = ctx.load('state');
+  const window = intoWindow(ctx, 10);
+  await m.mergeBatch('t1', 'm-1', 300, {1: 4});
+  const first = ctx.redis.hgetall(\`sketch:live:t1:m-1:\${window}\`);
+  assert.deepStrictEqual(first, {1: '4'}, \`a batch 10 s into window \${window} (window_s 300) must land in sketch:live:t1:m-1:\${window}, which holds \${JSON.stringify(first)}; Redis holds \${sketchKeys(ctx)}\`);
+  ctx.clock.advance(300);
+  const total = await m.mergeBatch('t1', 'm-1', 300, {2: 6});
+  const second = ctx.redis.hgetall(\`sketch:live:t1:m-1:\${window + 300}\`);
+  assert.deepStrictEqual(second, {2: '6'}, \`the batch 300 s later must start the sketch of window \${window + 300}, which holds \${JSON.stringify(second)}; Redis holds \${sketchKeys(ctx)}\`);
+  assert.equal(total, 6, \`the first batch of window \${window + 300} reported \${total} samples, expected 6: the new window started with the previous window's counts\`);
+}
+
+export async function check_window_ttl(ctx) {
+  const m = ctx.load('state');
+  const window = intoWindow(ctx, 100);
+  const key = \`sketch:live:t1:m-1:\${window}\`;
+  await m.mergeBatch('t1', 'm-1', 300, {1: 4});
+  let ttl = ctx.redis.ttl(key);
+  assert(ttl >= 199 && ttl <= 200, \`100 s into window \${window} the window has 200 s left, but \${key} expires in \${ttl} s (Redis holds \${sketchKeys(ctx)}): the expiry must be the seconds left in the window\`);
+  ctx.clock.advance(50);
+  await m.mergeBatch('t1', 'm-1', 300, {1: 4});
+  ttl = ctx.redis.ttl(key);
+  assert(ttl >= 149 && ttl <= 150, \`150 s into the window \${key} expires in \${ttl} s, expected 150: a later write must not push the expiry past the window's end\`);
+  ctx.clock.advance(150);
+  assert.equal(ctx.redis.exists(key), 0, \`the window ended but \${key} is still there\`);
+}
+
+export async function check_baseline_frozen(ctx) {
+  const m = ctx.load('state');
+  assert.equal(await m.freezeBaseline('t1', REF, {1: 10, 2: 20}), true, 'the first freeze must write the baseline and return true');
+  let raw = ctx.redis.get(BASELINE_KEY);
+  assert(raw !== null && JSON.stringify(JSON.parse(raw)) === '{"1":10,"2":20}', \`\${BASELINE_KEY} holds \${JSON.stringify(raw)}, expected the JSON object {"1": 10, "2": 20}\`);
+  const again = await m.freezeBaseline('t1', REF, {1: 99});
+  assert.equal(again, false, \`a second freeze of \${REF} returned \${again}, expected false: the reference already exists\`);
+  raw = ctx.redis.get(BASELINE_KEY);
+  assert(raw !== null && JSON.stringify(JSON.parse(raw)) === '{"1":10,"2":20}', \`a second freeze rewrote the baseline to \${JSON.stringify(raw)}: the monitor is now compared against today's traffic. Write it once (SET NX)\`);
+  assert.equal(ctx.redis.ttl(BASELINE_KEY), -1, 'the baseline must not expire');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"leetbuild/harness"
+)
+
+const (
+	ref         = "baseline:v3:2026-10-01"
+	baselineKey = "sketch:baseline:t1:" + ref
+)
+
+var stateBg = context.Background()
+
+func merged(ctx *harness.Ctx, batch map[int]int64) int64 {
+	total, err := mergeBatch(stateBg, "t1", "m-1", 300, batch)
+	ctx.NoError(err, "mergeBatch(t1, m-1, 300, %v) failed", batch)
+	return total
+}
+
+func CheckAtomicMerge(ctx *harness.Ctx) {
+	ctx.Equal(merged(ctx, map[int]int64{1: 5}), 5, "the first batch of 5 samples; the window's samples")
+	keys := ctx.Redis.Keys("sketch:*")
+	ctx.Equal(len(keys), 1, "one merge must leave one sketch in Redis (%q); the keys", keys)
+	key := keys[0]
+	// Another evaluator replica merges its batch between this merge's commands.
+	rival := ctx.Redis.After(key, func() any {
+		_, err := mergeBatch(stateBg, "t1", "m-1", 300, map[int]int64{1: 7, 2: 1})
+		return err
+	})
+	merged(ctx, map[int]int64{1: 3, 2: 2})
+	ctx.Assert(rival.Fired, "the second merge never touched %s", key)
+	ctx.Assert(rival.Result == nil, "the other replica's merge failed: %v", rival.Result)
+	ctx.Equal(ctx.Redis.HGetAll(key), map[string]string{"1": "15", "2": "3"}, "%s after batches of 5, 7 and 3 in bucket 1 and 1 and 2 in bucket 2: the other replica's increment landed between your read and your write and was overwritten. Merge the batch with HINCRBY inside one script", key)
+}
+
+// intoWindow moves the clock to offset seconds into a 300 s window and returns that window's start.
+func intoWindow(ctx *harness.Ctx, offset int64) int64 {
+	now := ctx.Clock.Now() / 1000
+	if step := ((offset-now)%300 + 300) % 300; step > 0 {
+		ctx.Clock.Advance(float64(step))
+	}
+	return ctx.Clock.Now()/1000 - offset
+}
+
+func CheckWindowKey(ctx *harness.Ctx) {
+	window := intoWindow(ctx, 10)
+	merged(ctx, map[int]int64{1: 4})
+	first := fmt.Sprintf("sketch:live:t1:m-1:%d", window)
+	ctx.Equal(ctx.Redis.HGetAll(first), map[string]string{"1": "4"}, "a batch 10 s into window %d (window_s 300) must land in %s (Redis holds %q)", window, first, ctx.Redis.Keys("sketch:*"))
+	ctx.Clock.Advance(300)
+	total := merged(ctx, map[int]int64{2: 6})
+	second := fmt.Sprintf("sketch:live:t1:m-1:%d", window+300)
+	ctx.Equal(ctx.Redis.HGetAll(second), map[string]string{"2": "6"}, "the batch 300 s later must start the sketch of window %d, %s (Redis holds %q)", window+300, second, ctx.Redis.Keys("sketch:*"))
+	ctx.Equal(total, 6, "the first batch of window %d must not count the previous window's samples; the window's samples", window+300)
+}
+
+func CheckWindowTtl(ctx *harness.Ctx) {
+	window := intoWindow(ctx, 100)
+	key := fmt.Sprintf("sketch:live:t1:m-1:%d", window)
+	merged(ctx, map[int]int64{1: 4})
+	ttl := ctx.Redis.TTL(key)
+	ctx.Assert(ttl >= 199 && ttl <= 200, "100 s into window %d the window has 200 s left, but %s expires in %d s (Redis holds %q): the expiry must be the seconds left in the window", window, key, ttl, ctx.Redis.Keys("sketch:*"))
+	ctx.Clock.Advance(50)
+	merged(ctx, map[int]int64{1: 4})
+	ttl = ctx.Redis.TTL(key)
+	ctx.Assert(ttl >= 149 && ttl <= 150, "150 s into the window %s expires in %d s, expected 150: a later write must not push the expiry past the window's end", key, ttl)
+	ctx.Clock.Advance(150)
+	ctx.Equal(ctx.Redis.Exists(key), 0, "the window ended, so %s must be gone; exists", key)
+}
+
+func CheckBaselineFrozen(ctx *harness.Ctx) {
+	first, err := freezeBaseline(stateBg, "t1", ref, map[int]int64{1: 10, 2: 20})
+	ctx.NoError(err, "the first freeze failed")
+	ctx.Equal(first, true, "the first freeze must write the baseline; written")
+	want := map[string]any{"1": 10, "2": 20}
+	stored := func() map[string]any {
+		raw, _ := ctx.Redis.Get(baselineKey)
+		var out map[string]any
+		json.Unmarshal([]byte(raw), &out)
+		return out
+	}
+	ctx.Equal(stored(), want, "%s must hold the JSON object {\\"1\\": 10, \\"2\\": 20}", baselineKey)
+	again, err := freezeBaseline(stateBg, "t1", ref, map[int]int64{1: 99})
+	ctx.NoError(err, "the second freeze failed")
+	ctx.Equal(again, false, "a second freeze of %s must report that the reference already exists; written", ref)
+	ctx.Equal(stored(), want, "a second freeze rewrote the baseline: the monitor is now compared against today's traffic. Write it once (SET NX); the baseline")
+	ctx.Equal(ctx.Redis.TTL(baselineKey), -1, "the baseline must not expire; its TTL")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+
+namespace {
+
+const std::string kRef = "baseline:v3:2026-10-01";
+const std::string kBaselineKey = "sketch:baseline:t1:" + kRef;
+
+std::map<std::string, std::string> hash(const std::map<std::string, std::string>& m) { return m; }
+
+}  // namespace
+
+void CheckAtomicMerge(harness::Ctx& ctx) {
+  ctx.Equal(mergeBatch("t1", "m-1", 300, {{1, 5}}), 5, "the first batch of 5 samples; the window's samples");
+  const auto keys = ctx.Redis.Keys("sketch:*");
+  ctx.Equal(keys.size(), 1, "one merge must leave one sketch in Redis (%q); the keys", keys);
+  const std::string key = keys[0];
+  // Another evaluator replica merges its batch between this merge's commands.
+  auto fired = std::make_shared<bool>(false);
+  auto error = std::make_shared<std::optional<std::string>>();
+  ctx.Redis.After(key, [fired, error] {
+    *fired = true;
+    try {
+      mergeBatch("t1", "m-1", 300, {{1, 7}, {2, 1}});
+    } catch (const std::exception& e) {
+      *error = e.what();
+    }
+  });
+  mergeBatch("t1", "m-1", 300, {{1, 3}, {2, 2}});
+  ctx.Assert(*fired, "the second merge never touched %s", key);
+  ctx.Assert(!*error, "the other replica's merge failed: %s", error->value_or(""));
+  ctx.Equal(ctx.Redis.HGetAll(key), hash({{"1", "15"}, {"2", "3"}}), "%s after batches of 5, 7 and 3 in bucket 1 and 1 and 2 in bucket 2: the other replica's increment landed between your read and your write and was overwritten. Merge the batch with HINCRBY inside one script", key);
+}
+
+// Move the clock to offset seconds into a 300 s window; returns that window's start.
+long intoWindow(harness::Ctx& ctx, long offset) {
+  const long now = static_cast<long>(ctx.Clock.Now() / 1000);
+  const long step = ((offset - now) % 300 + 300) % 300;
+  if (step > 0) ctx.Clock.Advance(static_cast<double>(step));
+  return static_cast<long>(ctx.Clock.Now() / 1000) - offset;
+}
+
+void CheckWindowKey(harness::Ctx& ctx) {
+  const long window = intoWindow(ctx, 10);
+  mergeBatch("t1", "m-1", 300, {{1, 4}});
+  const std::string first = "sketch:live:t1:m-1:" + std::to_string(window);
+  ctx.Equal(ctx.Redis.HGetAll(first), hash({{"1", "4"}}), "a batch 10 s into window %d (window_s 300) must land in %s (Redis holds %q)", window, first, ctx.Redis.Keys("sketch:*"));
+  ctx.Clock.Advance(300);
+  const long long total = mergeBatch("t1", "m-1", 300, {{2, 6}});
+  const std::string second = "sketch:live:t1:m-1:" + std::to_string(window + 300);
+  ctx.Equal(ctx.Redis.HGetAll(second), hash({{"2", "6"}}), "the batch 300 s later must start the sketch of window %d, %s (Redis holds %q)", window + 300, second, ctx.Redis.Keys("sketch:*"));
+  ctx.Equal(total, 6, "the first batch of window %d must not count the previous window's samples; the window's samples", window + 300);
+}
+
+void CheckWindowTtl(harness::Ctx& ctx) {
+  const long window = intoWindow(ctx, 100);
+  const std::string key = "sketch:live:t1:m-1:" + std::to_string(window);
+  mergeBatch("t1", "m-1", 300, {{1, 4}});
+  long long ttl = ctx.Redis.TTL(key);
+  ctx.Assert(ttl >= 199 && ttl <= 200, "100 s into window %d the window has 200 s left, but %s expires in %d s (Redis holds %q): the expiry must be the seconds left in the window", window, key, ttl, ctx.Redis.Keys("sketch:*"));
+  ctx.Clock.Advance(50);
+  mergeBatch("t1", "m-1", 300, {{1, 4}});
+  ttl = ctx.Redis.TTL(key);
+  ctx.Assert(ttl >= 149 && ttl <= 150, "150 s into the window %s expires in %d s, expected 150: a later write must not push the expiry past the window's end", key, ttl);
+  ctx.Clock.Advance(150);
+  ctx.Equal(ctx.Redis.Exists(key), 0, "the window ended, so %s must be gone; exists", key);
+}
+
+void CheckBaselineFrozen(harness::Ctx& ctx) {
+  ctx.Equal(freezeBaseline("t1", kRef, {{1, 10}, {2, 20}}), true, "the first freeze must write the baseline; written");
+  const nlohmann::json want = {{"1", 10}, {"2", 20}};
+  const auto stored = [&ctx] { return nlohmann::json::parse(ctx.Redis.Get(kBaselineKey).value_or("null")); };
+  ctx.Equal(stored(), want, "%s must hold the JSON object {\\"1\\": 10, \\"2\\": 20}", kBaselineKey);
+  ctx.Equal(freezeBaseline("t1", kRef, {{1, 99}}), false, "a second freeze of %s must report that the reference already exists; written", kRef);
+  ctx.Equal(stored(), want, "a second freeze rewrote the baseline: the monitor is now compared against today's traffic. Write it once (SET NX); the baseline");
+  ctx.Equal(ctx.Redis.TTL(kBaselineKey), -1, "the baseline must not expire; its TTL");
+}
+`,
+  },
   hints: [
-    'Symptom: the evaluated distribution has fewer samples than the batches that arrived, the distance to the baseline shrinks toward zero week over week, and keys from old windows are still alive.',
-    'Mechanism: `HGET` then `HSET` leaves a gap where a concurrent batch reads the same value; live merges and `freeze_baseline` write the same mutable namespace; the TTL is counted from the first write, not the window.',
-    'Change: one `EVAL` with `HINCRBY` per bucket and `EXPIRE window_end - now` inside it; `sketch:live:` and `sketch:baseline:` prefixes with the merge refusing the latter; `freeze_baseline` writes with `nx`.',
+    'Run two evaluator replicas against one monitor and compare their batch totals with the sketch: counts are missing. Look at the sketch an hour into steady traffic: it still holds every sample since the first.',
+    'A read in the client and a write back are two commands another replica can land between. The key has no window in it, and an expiry reset to an hour on every write keeps moving away. `DEL` then `SET` overwrites any baseline.',
+    'Key the sketch `sketch:live:{tenant}:{monitor_id}:{window}`, merge with one script doing `HINCRBY` per bucket and `EXPIRE` of `window + window_s - now`, and freeze with `SET … NX`.',
   ],
-  debrief: `The merge moves into one Lua script because Redis executes a script atomically: every \`HINCRBY\` and
-the \`EXPIRE\` for a batch land together, and a concurrent batch sees either all of it or none of
-it. The TTL is computed from the window boundary inside the same script so the key's lifetime and
-its contents are decided at the same moment. Splitting the key space is what keeps the reference a
-reference: the live path cannot reach \`sketch:baseline:\`, and the write-once freeze means a
-re-run cannot rebase the monitor on today's traffic. Production deployments go further with
-serialized sketch types (t-digest, count-min) merged inside the script, per-feature namespaces and
-a compaction job that archives expired windows, none of which this step does.`,
+  debrief: `Redis runs a script without interleaving another client's command, so the batch's increments and the expiry land as one change: no replica can read a half-merged sketch or overwrite a count it did not see. Putting the window start into the key is what makes the window real; the expiry only cleans up, and it is set to the window's end so the key dies with the data it holds instead of an hour after the latest write. The baseline is the opposite of a live sketch: written once, without an expiry, and outside every merge, because a reference that changes cannot detect change. Production drift monitors keep sketches with bounded memory (t-digests or fixed bins per feature) and store each window's summary before its key expires.`,
 };

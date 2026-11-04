@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package featurestore;
+
+// The offline store step 3's backfill scans: one call per partition of a feature version. A scan
+// answers, for every entity in the partition, the newest value whose event time is at or before
+// as_of (0 asks for the newest value there is). A caller the warehouse does not let read the
+// feature is PERMISSION_DENIED.
+service OfflineStore {
+  rpc Scan(ScanRequest) returns (ScanResponse);
+}
+
+message ScanRequest {
+  string feature = 1;
+  int64 version = 2;
+  string partition = 3;
+  // Epoch seconds; 0 = the newest value there is.
+  int64 as_of = 4;
+}
+
+message ScanRow {
+  string entity = 1;
+  double value = 2;
+  // The value is null (nothing was computed for the entity): value is then 0 and means nothing.
+  bool is_null = 3;
+  // Epoch seconds.
+  int64 event_ts = 4;
+}
+
+message ScanResponse {
+  repeated ScanRow rows = 1;
+}

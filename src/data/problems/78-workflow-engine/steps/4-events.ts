@@ -1,56 +1,39 @@
 import type {Step} from '@/lib/types';
 
-/**
- * Step 4 — the run-keyed step event. One `workflow.step` record per transition, keyed by the run id
- * so one run's history stays in order on one partition, carrying the step name, the effect id and
- * the outcome and never the step's document, with an outbox row written before the produce.
- */
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Step events keyed by run id for audit',
+  title: 'workflow.step events keyed by run id, through an outbox',
   concept: 'kafka',
   file: 'events',
-  focus: ['worker', 'kafka', 'audit'],
+  focus: ['worker', 'kafka', 'ledger'],
   task: `## Task
 
-**Starting point.** The starter's \`publish_step(run_id, workflow, step, document)\` builds an event
-holding the run id, the workflow name, the step, the step's document and \`"outcome": "done"\`, and
-produces it to \`workflow.step\` with \`key=workflow\` from a producer on default settings. It
-compiles and hides five flaws.
+**Starting point.** \`publish_step(run, step, outcome)\` tells the audit consumers that a step of a
+run (the record \`runs.get\` returns) reached \`outcome\`: it produces
+\`{run_id, workflow, step, "outcome": "done", input}\` to \`workflow.step\` keyed by the step name,
+from a producer with \`acks=1\`, and returns \`True\`. It serves the demo and hides five flaws.
 
-**Failure mode the checks target.** An auditor replaying one run's history reads other runs
-interleaved, cannot tell a running step from a finished one, finds the customer's document on a
-topic retained for days, and misses the transitions that happened while the broker was down or a
-leader failed over.
+**Failure mode the checks target.** An auditor replaying one run finds its events spread over
+several partitions in no order, cannot tell a started step from a finished one, reads the
+customer's input on a topic kept for days, and misses the transitions lost to a broker outage, a
+lost acknowledgement or a leader failover.
 
-Requirements for \`publish_step(run_id, step, effect_id, outcome)\` (\`publishStep\` elsewhere):
-
-- The message key is the run id: \`key=run_id\`, \`key: runId\`, \`Key: []byte(runID)\`,
-  \`new ProducerRecord[String, String]("workflow.step", runId, …)\`, \`runId.data()\`.
-- The event carries \`run_id\`, \`step\`, \`effect_id\` and \`outcome\`, and no document.
-- \`outcome\` comes from a fixed set, \`started\`, \`succeeded\`, \`failed\`, \`skipped\`
-  (\`OUTCOMES\` in python and typescript, \`Outcomes\` in scala, \`kOutcomes\` in cpp,
-  \`outcomeStarted\` and \`outcomeSucceeded\` in go). The caller publishes \`started\` before the
-  step runs and \`succeeded\` after it returns.
-- \`outbox.insert(...)\` runs before the produce and \`outbox.delete(...)\` only after the broker
-  acknowledged the record.
-- The producer sets \`acks=all\` with \`enable.idempotence\` (KafkaJS \`idempotent: true\` with
-  \`acks: -1\`, kafka-go \`RequiredAcks: kafka.RequireAll\` with a \`Completion\` callback).`,
+- Key every event by the run id.
+- The value is \`{run_id, workflow, step, effect_id, outcome}\`, \`effect_id\` = \`"{run_id}:{step}"\`.
+- \`outcome\` is one of \`OUTCOMES\` (\`started\`, \`succeeded\`, \`failed\`; the same name in each
+  language's casing); anything else raises before producing.
+- An idempotent producer with \`acks=all\`.
+- \`outbox.insert(event_id, topic, key, event)\` (\`event_id\` = \`"{run_id}:{step}:{outcome}"\`)
+  before the produce; wait at most 2 s for the delivery report; acknowledged →
+  \`outbox.remove(event_id)\` and \`True\`, otherwise \`False\` and the row stays.`,
   sequence: {
-    participants: ['Worker', 'Outbox (Postgres)', 'workflow.step topic', 'Audit consumer'],
+    participants: ['Worker', 'Outbox (Redis)', 'workflow.step', 'Audit consumer'],
     messages: [
-      {
-        from: 'Worker',
-        to: 'Outbox (Postgres)',
-        label: 'insert(run_id, effect_id, outcome) — the row lands first',
-        kind: 'sync',
-      },
-      {from: 'Outbox (Postgres)', to: 'Worker', label: 'row committed', kind: 'reply'},
-      {from: 'Worker', to: 'workflow.step topic', label: 'produce key = run_id · acks=all', kind: 'sync'},
-      {from: 'workflow.step topic', to: 'Worker', label: 'acknowledged by every replica', kind: 'reply'},
-      {from: 'Worker', to: 'Outbox (Postgres)', label: 'delete(effect_id) — the event is durable now', kind: 'sync'},
-      {from: 'workflow.step topic', to: 'Audit consumer', label: 'one partition per run id', kind: 'async'},
-      {from: 'Audit consumer', to: 'Audit consumer', label: "append the outcome to the run's history", kind: 'sync'},
+      {from: 'Worker', to: 'Outbox (Redis)', label: 'insert(r1:send_welcome:started, …)', kind: 'sync'},
+      {from: 'Worker', to: 'workflow.step', label: 'produce key = r1 · idempotent · acks=all', kind: 'sync'},
+      {from: 'workflow.step', to: 'Worker', label: 'delivery report within 2 s', kind: 'reply'},
+      {from: 'Worker', to: 'Outbox (Redis)', label: 'acknowledged → remove · else the row stays', kind: 'sync'},
+      {from: 'workflow.step', to: 'Audit consumer', label: "one partition holds all of r1's history", kind: 'async'},
     ],
   },
   checks: [
@@ -58,65 +41,68 @@ Requirements for \`publish_step(run_id, step, effect_id, outcome)\` (\`publishSt
       id: 'key-run',
       title: 'Keys every event by run id',
       detail:
-        'The message key is the run id — `key=run_id`, `key: runId`, `Key: []byte(runID)`, `new ProducerRecord[String, String]("workflow.step", runId, …)`, `runId.data()`. Every event about one run then lands on one partition and the audit consumer reads that run’s history in order. The starter keys by the workflow definition name, so one run’s events scatter and a replay cannot rebuild the run.',
+        "Events for r1, r2, r1 are keyed `r1`, `r2`, `r1` and both r1 events share a partition. The starter keys by step name, which spreads one run's history over unordered partitions.",
       match: {
-        python: {all: [/"workflow\.step"/, /key=run_id/]},
-        typescript: {all: [/workflow\.step/, /key: runId/]},
-        go: {all: [/"workflow\.step"/, /Key: \[\]byte\(runID\)/]},
-        scala: {all: [/new ProducerRecord\[String, String\]\("workflow\.step", runId/]},
-        cpp: {all: [/kStepTopic/, /runId\.data\(\)/]},
+        python: {all: [/key\s*=\s*(run_id|run\[["']run_id["']\])/], none: [/key\s*=\s*step\b/]},
+        typescript: {all: [/key:\s*(runId|run\.run_id)/], none: [/key:\s*step\b/]},
+        go: {all: [/Key:\s*\[\]byte\(\s*run\.RunID\s*\)/]},
+        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*run\.runId\s*,/]},
+        cpp: {all: [/run\.run_id\.c_str\(\)\s*,\s*run\.run_id\.(size|length)\(\)/]},
       },
     },
     {
       id: 'outcome',
-      title: 'Publishes the step outcomes from a fixed set',
+      title: 'Publishes the outcome it was given, from a fixed set',
       detail:
-        'The vocabulary is the four names the engine understands — `OUTCOMES` in python and typescript, `Outcomes` in scala, `kOutcomes` in cpp, `outcomeStarted` and `outcomeSucceeded` in go — and the caller publishes `started` before the step runs and `succeeded` once it returns. The starter reports `"done"`, so a step that retried after reporting its start looks finished while it is still running.',
+        'A `started` then a `succeeded` publish produce those two outcomes; an outcome outside `OUTCOMES` raises and produces nothing. The starter writes `done` for everything.',
       match: {
-        python: {all: [/OUTCOMES/, /"started"/, /"succeeded"/]},
-        typescript: {all: [/OUTCOMES/, /'started'/, /'succeeded'/]},
-        go: {all: [/outcomeStarted/, /outcomeSucceeded/, /outcome(s)?\s*(=|:=)/]},
-        scala: {all: [/Outcomes/, /"started"/, /"succeeded"/]},
-        cpp: {all: [/kOutcomes/, /kStarted/, /kSucceeded/]},
+        python: {all: [/OUTCOMES/, /"succeeded"/], none: [/["']done["']/]},
+        typescript: {all: [/OUTCOMES/, /'succeeded'/], none: [/["']done["']/]},
+        go: {all: [/\boutcomes\b/, /"succeeded"/], none: [/"done"/]},
+        scala: {all: [/Outcomes/, /"succeeded"/], none: [/"done"/]},
+        cpp: {all: [/kOutcomes/, /"succeeded"/], none: [/"done"/]},
       },
     },
     {
-      id: 'no-payload',
-      title: 'Keeps the step payload out of the event',
+      id: 'no-input',
+      title: 'Carries ids and names, not the input',
       detail:
-        'The event carries the run id, the step name, the `effect_id` and the `outcome` — and nothing the step received. The topic is retained for days and replicated, so the step’s document written there outlives every retention policy the run has. The starter ships the document in the event, so the auditor reads a customer’s input on a topic that never expires it.',
+        "The value is exactly `run_id`, `workflow`, `step`, `effect_id` and `outcome`; the customer's email from the run's input appears nowhere. The starter copies the input onto a topic retained for days.",
       match: {
-        python: {all: [/effect_id/, /"outcome"/], none: [/"payload"/]},
-        typescript: {all: [/effectId/, /outcome/], none: [/payload/]},
-        go: {all: [/EffectID/, /Outcome/], none: [/payload/]},
-        scala: {all: [/effectId/, /"outcome"/], none: [/"payload"/]},
-        cpp: {all: [/effect_id/, /"outcome"/], none: [/"payload"/]},
-      },
-    },
-    {
-      id: 'outbox',
-      title: 'Writes an outbox row before the produce',
-      detail:
-        '`outbox.insert(...)` runs before the produce and `outbox.delete(...)` runs only after the broker acknowledged the record, so a transition survives a broker outage: the row stays behind for a relay to republish. The starter produces with no row at all, so the history loses the transition exactly when the broker is down.',
-      match: {
-        python: {all: [/outbox\.delete\(/], order: [/outbox\.insert\(/, /producer\.produce\(/]},
-        typescript: {all: [/outbox\.delete\(/], order: [/outbox\.insert\(/, /producer\.send\(/]},
-        go: {all: [/outbox\.Delete\(/], order: [/outbox\.Insert\(/, /writer\.WriteMessages\(/]},
-        scala: {all: [/outbox\.delete\(/], order: [/outbox\.insert\(/, /producer\.send\(/]},
-        cpp: {all: [/outbox\.remove\(/], order: [/outbox\.insert\(/, /producer\.produce\(/]},
+        python: {all: [/effect_id/], none: [/run\[["']input["']\]/]},
+        typescript: {all: [/effect_id/], none: [/run\.input/]},
+        go: {all: [/"effect_id"/], none: [/run\.Input/]},
+        scala: {all: [/"effect_id"/], none: [/run\.input/]},
+        cpp: {all: [/"effect_id"/], none: [/run\.input/]},
       },
     },
     {
       id: 'acks',
-      title: 'Configures a durable, idempotent producer',
+      title: 'Configures an idempotent producer with acks=all',
       detail:
-        '`acks=all` with `enable.idempotence` (KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a `Completion` callback) means an acknowledged record is replicated and a producer retry cannot duplicate it. The starter leaves the defaults, so "published" does not mean "durable" and a leader failover can lose a transition the worker already reported.',
+        'After a lost acknowledgement the topic holds the event once, and a leader failover keeps every acknowledged event. The starter sets `acks=1` and no idempotence.',
       match: {
-        python: {all: [/"acks":\s*"all"/, /"enable\.idempotence":\s*True/]},
-        typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
-        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /Completion:/]},
-        scala: {all: [/ACKS_CONFIG, "all"/, /ENABLE_IDEMPOTENCE_CONFIG/]},
-        cpp: {all: [/set\("acks", "all"\)/, /set\("enable\.idempotence", "true"\)/]},
+        python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
+        typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
+        go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
+        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
+        cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
+      },
+    },
+    {
+      id: 'outbox',
+      title: 'Keeps an outbox row until the broker acknowledges',
+      detail:
+        'An acknowledged event leaves the outbox empty and returns true; a failed delivery, or no report within 2 s, returns false and leaves the row with the topic, the key and the event. The starter returns true and keeps nothing.',
+      match: {
+        python: {
+          all: [/on_delivery\s*=/, /producer\.flush\(/, /outbox\.remove\(/],
+          order: [/outbox\.insert\(/, /producer\.produce\(/],
+        },
+        typescript: {all: [/outbox\.remove\(/, /catch/], order: [/outbox\.insert\(/, /producer\.send\(/]},
+        go: {all: [/TopicPartition\.Error/, /outbox\.Remove\(/], order: [/outbox\.Insert\(/, /producer\.Produce\(/]},
+        scala: {all: [/Outbox\.remove\(/, /\.get\(\s*[^\n]*TimeUnit/], order: [/Outbox\.insert\(/, /producer\.send\(/]},
+        cpp: {all: [/dr_cb/, /outbox::remove\(/], order: [/outbox::insert\(/, /producer->produce\(/]},
       },
     },
   ],
@@ -126,163 +112,112 @@ Requirements for \`publish_step(run_id, step, effect_id, outcome)\` (\`publishSt
 
 from confluent_kafka import Producer
 
-producer = Producer({"bootstrap.servers": "kafka:9092"})
+from workflow import outbox  # outbox.insert(event_id, topic, key, payload), outbox.remove(event_id)
+
+TOPIC = "workflow.step"
+
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 
 
-def publish_step(run_id: str, workflow: str, step: str, document: dict) -> None:
-    """Report one step transition to the workflow.step topic."""
+def publish_step(run: dict, step: str, outcome: str) -> bool:
+    """Tell the audit consumers that step of the run reached outcome; True once the broker has the event."""
     # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    event = {
-        "run_id": run_id,
-        "workflow": workflow,
-        "step": step,
-        "document": document,
-        "outcome": "done",
-    }
-    producer.produce("workflow.step", key=workflow, value=json.dumps(event))
-    producer.flush(2.0)
+    event = {"run_id": run["run_id"], "workflow": run["workflow"], "step": step, "outcome": "done", "input": run["input"]}
+    producer.produce(TOPIC, key=step, value=json.dumps(event))
+    producer.poll(0)
+    return True
 `,
       solution: `import json
-from typing import Callable
 
-from confluent_kafka import KafkaException, Producer
+from confluent_kafka import Producer
 
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "acks": "all",
-        "enable.idempotence": True,
-    }
-)
+from workflow import outbox  # outbox.insert(event_id, topic, key, payload), outbox.remove(event_id)
 
-OUTCOMES = {"started", "succeeded", "failed", "skipped"}
+TOPIC = "workflow.step"
+OUTCOMES = ("started", "succeeded", "failed")
+ACK_TIMEOUT_S = 2
 
-
-class OutboxStore:
-    """One row per undelivered event; a relay republishes it when the broker recovers."""
-
-    def insert(self, run_id: str, event_id: str, document: str) -> None:
-        raise NotImplementedError
-
-    def delete(self, event_id: str) -> None:
-        raise NotImplementedError
+producer = Producer({
+    "bootstrap.servers": "kafka:9092",
+    "acks": "all",  # every in-sync replica has the event before the broker answers
+    "enable.idempotence": True,  # a write retried after a lost acknowledgement lands once
+})
 
 
-outbox = OutboxStore()
-
-
-def publish_step(run_id: str, step: str, effect_id: str, outcome: str) -> None:
-    """Report one step transition: the outbox row lands first, the event second."""
+def publish_step(run: dict, step: str, outcome: str) -> bool:
+    """Tell the audit consumers that step of the run reached outcome; True once the broker has the event."""
     if outcome not in OUTCOMES:
-        raise ValueError(f"unknown outcome {outcome}")
-    event = {
-        "run_id": run_id,
-        "step": step,
-        "effect_id": effect_id,
-        "outcome": outcome,
-    }
-    document = json.dumps(event)
-    outbox.insert(run_id, effect_id, document)
-    try:
-        producer.produce("workflow.step", key=run_id, value=document)
-        producer.flush(2.0)
-    except KafkaException:
-        # The row stays put: a relay republishes it once the broker is back.
-        return
-    outbox.delete(effect_id)
+        raise ValueError(f"unknown outcome {outcome!r}, expected one of {OUTCOMES}")
+    run_id = run["run_id"]
+    # Ids and names only: the run's input stays in the run store, off a topic retained for days.
+    event = {"run_id": run_id, "workflow": run["workflow"], "step": step, "effect_id": f"{run_id}:{step}", "outcome": outcome}
+    event_id = f"{run_id}:{step}:{outcome}"
+    # The row lands first: if the broker never takes the event, the relay publishes it later.
+    outbox.insert(event_id, TOPIC, run_id, event)
+    report = {}
 
+    def on_delivery(err, msg) -> None:
+        report["error"] = err
 
-def run_step(run_id: str, step: str, effect_id: str, effect: Callable[[], None]) -> None:
-    """Report the transition around the step's effect: started, then what actually happened."""
-    publish_step(run_id, step, effect_id, "started")
-    try:
-        effect()
-    except Exception:
-        publish_step(run_id, step, effect_id, "failed")
-        raise
-    publish_step(run_id, step, effect_id, "succeeded")
+    producer.produce(TOPIC, key=run_id, value=json.dumps(event), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or report.get("error") is not None:
+        return False
+    outbox.remove(event_id)
+    return True
 `,
     },
     typescript: {
-      starter: `/** workflow.step: report one step transition to the topic. */
-import {Kafka} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
 
-const kafka = new Kafka({clientId: 'workflow', brokers: ['kafka:9092']});
+import * as outbox from 'workflow/outbox'; // insert(eventId, topic, key, payload), remove(eventId)
+import type {Run} from 'workflow/runs';
+
+export const TOPIC = 'workflow.step';
+
+const kafka = new Kafka({clientId: 'workflowd', brokers: ['kafka:9092']});
 const producer = kafka.producer();
 void producer.connect();
 
-/** Report one step transition to the workflow.step topic. */
-export async function publishStep(
-  runId: string,
-  workflow: string,
-  step: string,
-  document: Record<string, unknown>,
-): Promise<void> {
+/** Tell the audit consumers that step of the run reached outcome; true once the broker has the event. */
+export async function publishStep(run: Run, step: string, outcome: string): Promise<boolean> {
   // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const event = {run_id: runId, workflow, step, document, outcome: 'done'};
-  await producer.send({
-    topic: 'workflow.step',
-    messages: [{key: workflow, value: JSON.stringify(event)}],
-  });
+  const event = {run_id: run.run_id, workflow: run.workflow, step, outcome: 'done', input: run.input};
+  await producer.send({topic: TOPIC, messages: [{key: step, value: JSON.stringify(event)}], acks: 1});
+  return true;
 }
 `,
-      solution: `/** workflow.step: one durable, run-keyed event per step transition; the outbox row goes first. */
-import {Kafka} from 'kafkajs';
+      solution: `import {Kafka} from 'kafkajs';
 
-const kafka = new Kafka({clientId: 'workflow', brokers: ['kafka:9092']});
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+import * as outbox from 'workflow/outbox'; // insert(eventId, topic, key, payload), remove(eventId)
+import type {Run} from 'workflow/runs';
+
+export const TOPIC = 'workflow.step';
+export const OUTCOMES = ['started', 'succeeded', 'failed'];
+export const ACK_TIMEOUT_MS = 2000;
+
+const kafka = new Kafka({clientId: 'workflowd', brokers: ['kafka:9092']});
+// Idempotent: a write retried after a lost acknowledgement lands once (and needs acks: -1).
+const producer = kafka.producer({idempotent: true});
 void producer.connect();
 
-const OUTCOMES = ['started', 'succeeded', 'failed', 'skipped'] as const;
-type Outcome = (typeof OUTCOMES)[number];
-
-export const outbox = {
-  insert: async (_runId: string, _eventId: string, _document: string): Promise<void> => {
-    throw new Error('not implemented');
-  },
-  delete: async (_eventId: string): Promise<void> => {
-    throw new Error('not implemented');
-  },
-};
-
-/** Report one step transition: the outbox row lands first, the event second. */
-export async function publishStep(
-  runId: string,
-  step: string,
-  effectId: string,
-  outcome: Outcome,
-): Promise<void> {
-  const event = {run_id: runId, step, effect_id: effectId, outcome};
-  const document = JSON.stringify(event);
-  await outbox.insert(runId, effectId, document);
+/** Tell the audit consumers that step of the run reached outcome; true once the broker has the event. */
+export async function publishStep(run: Run, step: string, outcome: string): Promise<boolean> {
+  if (!OUTCOMES.includes(outcome)) throw new Error(\`unknown outcome \${outcome}, expected one of \${OUTCOMES.join(', ')}\`);
+  const runId = run.run_id;
+  // Ids and names only: the run's input stays in the run store, off a topic retained for days.
+  const event = {run_id: runId, workflow: run.workflow, step, effect_id: \`\${runId}:\${step}\`, outcome};
+  const eventId = \`\${runId}:\${step}:\${outcome}\`;
+  // The row lands first: if the broker never takes the event, the relay publishes it later.
+  await outbox.insert(eventId, TOPIC, runId, event);
   try {
-    await producer.send({
-      topic: 'workflow.step',
-      acks: -1,
-      messages: [{key: runId, value: document}],
-    });
+    // acks: -1 (all): every in-sync replica has the event before the broker answers.
+    await producer.send({topic: TOPIC, messages: [{key: runId, value: JSON.stringify(event)}], acks: -1, timeout: ACK_TIMEOUT_MS});
   } catch {
-    // The row stays put: a relay republishes it once the broker is back.
-    return;
+    return false;
   }
-  await outbox.delete(effectId);
-}
-
-/** Report the transition around the step's effect: started, then what actually happened. */
-export async function runStep(
-  runId: string,
-  step: string,
-  effectId: string,
-  effect: () => Promise<void>,
-): Promise<void> {
-  await publishStep(runId, step, effectId, 'started');
-  try {
-    await effect();
-  } catch (error) {
-    await publishStep(runId, step, effectId, 'failed');
-    throw error;
-  }
-  await publishStep(runId, step, effectId, 'succeeded');
+  await outbox.remove(eventId);
+  return true;
 }
 `,
     },
@@ -293,28 +228,35 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"workflow/runs" // runs.Run
 )
 
-var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "workflow.step"}
+const topic = "workflow.step"
 
-type stepEvent struct {
-	RunID    string         \`json:"run_id"\`
-	Workflow string         \`json:"workflow"\`
-	Step     string         \`json:"step"\`
-	Document map[string]any \`json:"document"\`
-	Outcome  string         \`json:"outcome"\`
+var producer = newProducer()
+
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
-// PublishStep reports one step transition to the workflow.step topic.
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-func PublishStep(ctx context.Context, runID string, workflow string, step string, document map[string]any) error {
-	event := stepEvent{RunID: runID, Workflow: workflow, Step: step, Document: document, Outcome: "done"}
-	value, err := json.Marshal(event)
-	if err != nil {
-		return err
+// publishStep tells the audit consumers that step of the run reached outcome; true once the broker
+// has the event. The outbox is the package workflow/outbox: outbox.Insert(ctx, eventID, topic, key,
+// payload) error, outbox.Remove(ctx, eventID) error.
+func publishStep(ctx context.Context, run *runs.Run, step, outcome string) (bool, error) {
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+	value, _ := json.Marshal(map[string]any{"run_id": run.RunID, "workflow": run.Workflow, "step": step, "outcome": "done", "input": run.Input})
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(step), Value: value}
+	if err := producer.Produce(msg, nil); err != nil {
+		return false, err
 	}
-	return writer.WriteMessages(ctx, kafka.Message{Key: []byte(workflow), Value: value})
+	return true, nil
 }
 `,
       solution: `package main
@@ -323,276 +265,663 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"workflow/outbox" // outbox.Insert(ctx, eventID, topic, key, payload) error, outbox.Remove(ctx, eventID) error
+	"workflow/runs"   // runs.Run
 )
 
 const (
-	outcomeStarted   = "started"
-	outcomeSucceeded = "succeeded"
-	outcomeFailed    = "failed"
-	outcomeSkipped   = "skipped"
+	topic      = "workflow.step"
+	ackTimeout = 2 * time.Second
 )
 
-var stepOutcomes = map[string]bool{
-	outcomeStarted:   true,
-	outcomeSucceeded: true,
-	outcomeFailed:    true,
-	outcomeSkipped:   true,
-}
+var outcomes = map[string]bool{"started": true, "succeeded": true, "failed": true}
 
-// RequiredAcks=RequireAll plus a completion callback: the record is on every replica when the
-// callback fires, so the outbox row may be deleted only then. The callback also reports a batch the
-// broker refused, which a synchronous WriteMessages would have returned as an error.
-var writer = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        "workflow.step",
-	RequiredAcks: kafka.RequireAll,
-	Balancer:     &kafka.Hash{},
-	Completion: func(messages []kafka.Message, err error) {
-		if err != nil {
-			log.Printf("%d step events not delivered: %v", len(messages), err)
-		}
-	},
-}
+var producer = newProducer()
 
-// OutboxStore is the seam the worker's transaction store implements.
-type OutboxStore struct{}
-
-func (s *OutboxStore) Insert(ctx context.Context, runID string, eventID string, document string) error {
-	return nil
-}
-
-func (s *OutboxStore) Delete(ctx context.Context, eventID string) error {
-	return nil
-}
-
-var outbox = &OutboxStore{}
-
-type stepEvent struct {
-	RunID    string \`json:"run_id"\`
-	Step     string \`json:"step"\`
-	EffectID string \`json:"effect_id"\`
-	Outcome  string \`json:"outcome"\`
-}
-
-// PublishStep writes the outbox row first and deletes it only once the broker acknowledged the
-// record, so a broker outage leaves the row behind for a relay instead of losing the transition.
-func PublishStep(ctx context.Context, runID string, step string, effectID string, outcome string) error {
-	if !stepOutcomes[outcome] {
-		return fmt.Errorf("unknown outcome %q", outcome)
-	}
-	event := stepEvent{RunID: runID, Step: step, EffectID: effectID, Outcome: outcome}
-	document, err := json.Marshal(event)
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the event before the broker answers
+		"enable.idempotence": true,  // a write retried after a lost acknowledgement lands once
+	})
 	if err != nil {
-		return err
+		panic(err)
 	}
-	if err := outbox.Insert(ctx, runID, effectID, string(document)); err != nil {
-		return err
-	}
-	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(runID), Value: document}); err != nil {
-		// The row stays put: a relay republishes it once the broker is back.
-		return err
-	}
-	return outbox.Delete(ctx, effectID)
+	return p
 }
 
-// RunStep reports "started" before the step runs and "succeeded" once its effect returned.
-func RunStep(ctx context.Context, runID string, step string, effectID string, effect func(context.Context) error) error {
-	outcome := outcomeStarted
-	if err := PublishStep(ctx, runID, step, effectID, outcome); err != nil {
-		return err
+// publishStep tells the audit consumers that step of the run reached outcome; true once the broker
+// has the event.
+func publishStep(ctx context.Context, run *runs.Run, step, outcome string) (bool, error) {
+	if !outcomes[outcome] {
+		return false, fmt.Errorf("unknown outcome %q, expected started, succeeded or failed", outcome)
 	}
-	if err := effect(ctx); err != nil {
-		outcome = outcomeFailed
-		return PublishStep(ctx, runID, step, effectID, outcome)
+	// Ids and names only: the run's input stays in the run store, off a topic retained for days.
+	event := map[string]any{"run_id": run.RunID, "workflow": run.Workflow, "step": step, "effect_id": run.RunID + ":" + step, "outcome": outcome}
+	eventID := run.RunID + ":" + step + ":" + outcome
+	// The row lands first: if the broker never takes the event, the relay publishes it later.
+	if err := outbox.Insert(ctx, eventID, topic, run.RunID, event); err != nil {
+		return false, err
 	}
-	outcome = outcomeSucceeded
-	return PublishStep(ctx, runID, step, effectID, outcome)
+	value, _ := json.Marshal(event)
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(run.RunID), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded // no delivery report within the window
+		}
+	}
+	if err != nil {
+		return false, nil // the row stays for the relay
+	}
+	return true, outbox.Remove(ctx, eventID)
 }
 `,
     },
     scala: {
       starter: `import java.util.Properties
 
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-object StepEvents {
-  val producer = new KafkaProducer[String, String]({
+import workflow.{Outbox, Runs} // Outbox.insert(eventId, topic, key, payload), Outbox.remove(eventId) · Runs.Run
+
+object Events {
+  val Topic = "workflow.step"
+
+  private val producer: KafkaProducer[String, String] = {
     val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props
-  })
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+  }
 
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def publishStep(runId: String, workflow: String, step: String, document: String): Unit = {
-    val event = s"""{"run_id":"$runId","workflow":"$workflow","step":"$step","document":$document,"outcome":"done"}"""
-    producer.send(new ProducerRecord("workflow.step", workflow, event))
+  /** Tell the audit consumers that step of the run reached outcome; true once the broker has the event. */
+  def publishStep(run: Runs.Run, step: String, outcome: String): Boolean = {
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+    val event = JsObject(
+      "run_id" -> JsString(run.runId), "workflow" -> JsString(run.workflow), "step" -> JsString(step),
+      "outcome" -> JsString("done"), "input" -> run.input)
+    producer.send(new ProducerRecord[String, String](Topic, step, event.compactPrint))
+    true
   }
 }
 `,
       solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
 
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
+import scala.util.Try
 
-object StepEvents {
-  /** The outcome vocabulary the engine understands; anything else is a bug in the worker. */
-  val Outcomes: Set[String] = Set("started", "succeeded", "failed", "skipped")
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
 
-  val producer = new KafkaProducer[String, String]({
+import workflow.{Outbox, Runs} // Outbox.insert(eventId, topic, key, payload), Outbox.remove(eventId) · Runs.Run
+
+object Events {
+  val Topic = "workflow.step"
+  val Outcomes: Set[String] = Set("started", "succeeded", "failed")
+  val AckTimeoutMs = 2000L
+
+  private val producer: KafkaProducer[String, String] = {
     val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ProducerConfig.ACKS_CONFIG, "all")
-    props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
-    props
-  })
-
-  /** The outbox seam: the row is written by the worker's transaction store. */
-  object OutboxStore {
-    def insert(runId: String, eventId: String, document: String): Unit = ()
-    def delete(eventId: String): Unit = ()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "all") // every in-sync replica has the event before the broker answers
+    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
 
-  val outbox = OutboxStore
-
-  /** Report one step transition: the outbox row lands first, the event second. */
-  def publishStep(runId: String, step: String, effectId: String, outcome: String): Unit = {
-    require(Outcomes.contains(outcome), s"unknown outcome $outcome")
-    val event = s"""{"run_id":"$runId","step":"$step","effect_id":"$effectId","outcome":"$outcome"}"""
-    outbox.insert(runId, effectId, event)
-    // get() waits for the broker's acknowledgement, so the row is deleted only once the record is
-    // durable: a produce that never lands leaves the row behind for a relay to republish.
-    producer.send(new ProducerRecord[String, String]("workflow.step", runId, event)).get()
-    outbox.delete(effectId)
-  }
-
-  /** Report the transition around the step's effect: started, then what actually happened. */
-  def runStep(runId: String, step: String, effectId: String)(effect: => Unit): Unit = {
-    publishStep(runId, step, effectId, "started")
-    try {
-      effect
-      publishStep(runId, step, effectId, "succeeded")
-    } catch {
-      case error: Throwable =>
-        publishStep(runId, step, effectId, "failed")
-        throw error
-    }
+  /** Tell the audit consumers that step of the run reached outcome; true once the broker has the event. */
+  def publishStep(run: Runs.Run, step: String, outcome: String): Boolean = {
+    require(Outcomes.contains(outcome), s"unknown outcome $outcome, expected one of \${Outcomes.mkString(", ")}")
+    // Ids and names only: the run's input stays in the run store, off a topic retained for days.
+    val event = JsObject(
+      "run_id" -> JsString(run.runId), "workflow" -> JsString(run.workflow), "step" -> JsString(step),
+      "effect_id" -> JsString(s"\${run.runId}:$step"), "outcome" -> JsString(outcome))
+    val eventId = s"\${run.runId}:$step:$outcome"
+    // The row lands first: if the broker never takes the event, the relay publishes it later.
+    Outbox.insert(eventId, Topic, run.runId, event)
+    val acked = Try(producer.send(new ProducerRecord[String, String](Topic, run.runId, event.compactPrint)).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
+    if (acked.isSuccess) Outbox.remove(eventId)
+    acked.isSuccess
   }
 }
 `,
     },
     cpp: {
       starter: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
 
 #include <memory>
-#include <nlohmann/json.hpp>
 #include <string>
+
+#include "workflow/outbox.h"  // outbox::insert(event_id, topic, key, payload), outbox::remove(event_id)
+#include "workflow/runs.h"    // runs::Run
 
 using json = nlohmann::json;
 
-const std::string kStepTopic = "workflow.step";
+const std::string kTopic = "workflow.step";
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-void publishStep(RdKafka::Producer& producer, const std::string& runId, const std::string& workflow,
-                 const std::string& step, const json& document) {
-  const json event = {
-      {"run_id", runId}, {"workflow", workflow}, {"step", step}, {"document", document}, {"outcome", "done"}};
-  const auto body = event.dump();
-  producer.produce(kStepTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-                   const_cast<char*>(body.data()), body.size(), workflow.data(), workflow.size(), 0, nullptr);
-  producer.flush(2000);
+auto producer = makeProducer();
+
+// Tell the audit consumers that step of the run reached outcome; true once the broker has the event.
+bool publishStep(const runs::Run& run, const std::string& step, const std::string& outcome) {
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+  const json event = {{"run_id", run.run_id}, {"workflow", run.workflow}, {"step", step}, {"outcome", "done"}, {"input", run.input}};
+  const std::string value = event.dump();
+  producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()), value.size(),
+                    step.c_str(), step.size(), 0, nullptr);
+  producer->poll(0);
+  return true;
 }
 `,
       solution: `#include <librdkafka/rdkafkacpp.h>
-
-#include <functional>
-#include <memory>
 #include <nlohmann/json.hpp>
+
+#include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
-#include <vector>
+
+#include "workflow/outbox.h"  // outbox::insert(event_id, topic, key, payload), outbox::remove(event_id)
+#include "workflow/runs.h"    // runs::Run
 
 using json = nlohmann::json;
 
-const std::string kStepTopic = "workflow.step";
+const std::string kTopic = "workflow.step";
+const std::set<std::string> kOutcomes = {"started", "succeeded", "failed"};
+constexpr int kAckTimeoutMs = 2000;
 
-const std::vector<std::string> kOutcomes = {"started", "succeeded", "failed", "skipped"};
-const std::string kStarted = "started";
-const std::string kSucceeded = "succeeded";
-
-/** Options applies one global option to the rdkafka conf and throws when the name is unknown. */
-struct Options {
-  explicit Options(RdKafka::Conf* conf) : conf_(conf) {}
-
-  void set(const std::string& name, const std::string& value) const {
-    std::string errstr;
-    if (conf_->set(name, value, errstr) != RdKafka::Conf::CONF_OK) {
-      throw std::runtime_error("kafka option " + name + ": " + errstr);
-    }
-  }
-
-  RdKafka::Conf* conf_;
+// The delivery report of the event in flight: publishStep produces one event and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
 };
 
-/** OutboxStore is the seam the worker's transaction store implements. */
-struct OutboxStore {
-  void insert(const std::string& runId, const std::string& eventId, const std::string& document);
-  void remove(const std::string& eventId);
-};
-
-OutboxStore outbox;
+DeliveryReport delivery;
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
-  const Options options(conf.get());
-  options.set("bootstrap.servers", "kafka:9092");
-  options.set("acks", "all");
-  options.set("enable.idempotence", "true");
   std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the event before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a write retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-/** publishStep writes the outbox row first and removes it only once the broker acknowledged. */
-void publishStep(RdKafka::Producer& producer, const std::string& runId, const std::string& step,
-                 const std::string& effectId, const std::string& outcome) {
-  const json event = {{"run_id", runId}, {"step", step}, {"effect_id", effectId}, {"outcome", outcome}};
-  const auto document = event.dump();
-  outbox.insert(runId, effectId, document);
-  const auto delivery = producer.produce(kStepTopic, RdKafka::Topic::PARTITION_UA,
-                                         RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(document.data()),
-                                         document.size(), runId.data(), runId.size(), 0, nullptr);
-  if (delivery != RdKafka::ERR_NO_ERROR) {
-    // The row stays put: a relay republishes it once the broker is back.
-    return;
-  }
-  if (producer.flush(2000) != RdKafka::ERR_NO_ERROR) {
-    return;
-  }
-  outbox.remove(effectId);
-}
+auto producer = makeProducer();
 
-/** runStep reports "started" before the step and "succeeded" once its effect returned. */
-void runStep(RdKafka::Producer& producer, const std::string& runId, const std::string& step,
-             const std::string& effectId, const std::function<void()>& effect) {
-  publishStep(producer, runId, step, effectId, kStarted);
-  effect();
-  publishStep(producer, runId, step, effectId, kSucceeded);
+// Tell the audit consumers that step of the run reached outcome; true once the broker has the event.
+bool publishStep(const runs::Run& run, const std::string& step, const std::string& outcome) {
+  if (kOutcomes.count(outcome) == 0) throw std::invalid_argument("unknown outcome " + outcome + ", expected started, succeeded or failed");
+  // Ids and names only: the run's input stays in the run store, off a topic retained for days.
+  const json event = {{"run_id", run.run_id}, {"workflow", run.workflow}, {"step", step}, {"effect_id", run.run_id + ":" + step}, {"outcome", outcome}};
+  const std::string event_id = run.run_id + ":" + step + ":" + outcome;
+  // The row lands first: if the broker never takes the event, the relay publishes it later.
+  outbox::insert(event_id, kTopic, run.run_id, event);
+  const std::string value = event.dump();
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                                             value.size(), run.run_id.c_str(), run.run_id.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
+  }
+  if (err != RdKafka::ERR_NO_ERROR) return false;  // the row stays for the relay
+  outbox::remove(event_id);
+  return true;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+TOPIC = "workflow.step"
+EXPECTED = {"run_id": "r1", "workflow": "signup", "step": "send_welcome", "effect_id": "r1:send_welcome", "outcome": "started"}
+
+
+def _run(run_id="r1"):
+    return {
+        "run_id": run_id,
+        "tenant": "t1",
+        "workflow": "signup",
+        "definition_version": 3,
+        "pinned_steps": ["create_account", "send_welcome"],
+        "input": {"email": "ada@example.com"},
+        "max_steps": 50,
+        "started_at": 1000,
+    }
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.hgetall("outbox").values()]
+
+
+def check_key_run(ctx):
+    m = ctx.load("events")
+    m.publish_step(_run("r1"), "create_account", "succeeded")
+    m.publish_step(_run("r2"), "create_account", "succeeded")
+    m.publish_step(_run("r1"), "send_welcome", "started")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three publish_step calls produced {len(records)} records on workflow.step (topics: {sorted(ctx.kafka.topics)})"
+    keys = [r.key for r in records]
+    assert keys == [b"r1", b"r2", b"r1"], f"the records are keyed {keys}, expected the run ids r1, r2, r1"
+    assert records[0].partition == records[2].partition, "both r1 events must land on one partition, or the auditor reads r1's history out of order"
+
+
+def check_outcome(ctx):
+    m = ctx.load("events")
+    m.publish_step(_run(), "send_welcome", "started")
+    m.publish_step(_run(), "send_welcome", "succeeded")
+    outcomes = [json.loads(r.value).get("outcome") for r in ctx.kafka.records(TOPIC)]
+    assert outcomes == ["started", "succeeded"], f"publishing started then succeeded produced the outcomes {outcomes}: the auditor cannot tell a running step from a finished one"
+    try:
+        m.publish_step(_run(), "send_welcome", "done")
+    except Exception:
+        pass
+    else:
+        raise AssertionError("publish_step accepted the outcome 'done', which is not in OUTCOMES")
+    assert len(ctx.kafka.records(TOPIC)) == 2, "an unknown outcome must be refused before anything is produced"
+
+
+def check_no_input(ctx):
+    m = ctx.load("events")
+    m.publish_step(_run(), "send_welcome", "started")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one publish_step produced {len(records)} records"
+    raw = records[0].value.decode() if isinstance(records[0].value, bytes) else records[0].value
+    assert "ada@example.com" not in raw, f"the event carries the run's input: {raw}. The topic keeps it for days after the run store deletes it"
+    value = json.loads(raw)
+    assert value == EXPECTED, f"the event is {value}, expected exactly {EXPECTED}"
+
+
+def check_acks(ctx):
+    m = ctx.load("events")
+    ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
+    m.publish_step(_run(), "create_account", "succeeded")
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"after one lost acknowledgement the topic holds {len(ctx.kafka.records(TOPIC))} records: the producer's retry wrote the event twice. Enable idempotence"
+    m.publish_step(_run(), "send_welcome", "started")
+    ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
+    assert len(ctx.kafka.records(TOPIC)) == 2, "a leader failover lost an event the leader alone had acknowledged: acks=all waits for every in-sync replica"
+
+
+def check_outbox(ctx):
+    m = ctx.load("events")
+    ok = m.publish_step(_run(), "create_account", "succeeded")
+    assert ok is True, f"publish_step returned {ok!r} for an acknowledged event, expected True"
+    assert _outbox(ctx) == [], f"the broker acknowledged the event and the outbox still holds {_outbox(ctx)}: the relay would publish it again"
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_step(_run(), "send_welcome", "started")
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the transition is gone from the history"
+    row = rows[0]
+    assert row.get("topic") == TOPIC and row.get("key") == "r1" and row.get("payload", {}).get("outcome") == "started", f"the outbox row is {row}, expected the topic, the key r1 and the event"
+    assert ok is False, f"publish_step returned {ok!r} after a failed delivery, expected False"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    ok = m.publish_step(_run(), "send_welcome", "succeeded")
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"publish_step waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s"
+    assert len(_outbox(ctx)) == 2, f"no acknowledgement within the window and the outbox holds {_outbox(ctx)}"
+    assert ok is False, f"publish_step returned {ok!r} without an acknowledgement, expected False"
+`,
+    typescript: `const TOPIC = 'workflow.step';
+const EXPECTED = {run_id: 'r1', workflow: 'signup', step: 'send_welcome', effect_id: 'r1:send_welcome', outcome: 'started'};
+
+const run = (runId = 'r1') => ({
+  run_id: runId,
+  tenant: 't1',
+  workflow: 'signup',
+  definition_version: 3,
+  pinned_steps: ['create_account', 'send_welcome'],
+  input: {email: 'ada@example.com'},
+  max_steps: 50,
+  started_at: 1000,
+});
+
+const outboxRows = ctx => Object.values(ctx.redis.hgetall('outbox') as Record<string, string>).map(row => JSON.parse(row));
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+/** What publishStep resolved, or the message it rejected with. */
+async function publish(m, runId: string, step: string, outcome: string): Promise<unknown> {
+  try {
+    return await m.publishStep(run(runId), step, outcome);
+  } catch (e) {
+    return \`rejected: \${(e as Error).message}\`;
+  }
+}
+
+export async function check_key_run(ctx) {
+  const m = ctx.load('events');
+  await publish(m, 'r1', 'create_account', 'succeeded');
+  await publish(m, 'r2', 'create_account', 'succeeded');
+  await publish(m, 'r1', 'send_welcome', 'started');
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three publishStep calls produced \${records.length} records on workflow.step\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['r1', 'r2', 'r1'], \`the records are keyed \${JSON.stringify(keys)}, expected the run ids r1, r2, r1\`);
+  assert.equal(records[0].partition, records[2].partition, "both r1 events must land on one partition, or the auditor reads r1's history out of order");
+}
+
+export async function check_outcome(ctx) {
+  const m = ctx.load('events');
+  await publish(m, 'r1', 'send_welcome', 'started');
+  await publish(m, 'r1', 'send_welcome', 'succeeded');
+  await settle();
+  const outcomes = ctx.kafka.values(TOPIC).map(v => JSON.parse(v).outcome);
+  assert.deepEqual(outcomes, ['started', 'succeeded'], \`publishing started then succeeded produced the outcomes \${JSON.stringify(outcomes)}: the auditor cannot tell a running step from a finished one\`);
+  const refused = await publish(m, 'r1', 'send_welcome', 'done');
+  assert(typeof refused === 'string' && refused.startsWith('rejected'), "publishStep accepted the outcome 'done', which is not in OUTCOMES");
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, 'an unknown outcome must be refused before anything is produced');
+}
+
+export async function check_no_input(ctx) {
+  const m = ctx.load('events');
+  await publish(m, 'r1', 'send_welcome', 'started');
+  await settle();
+  const values = ctx.kafka.values(TOPIC);
+  assert.equal(values.length, 1, \`one publishStep produced \${values.length} records\`);
+  assert(!values[0].includes('ada@example.com'), \`the event carries the run's input: \${values[0]}. The topic keeps it for days after the run store deletes it\`);
+  assert.deepStrictEqual(JSON.parse(values[0]), EXPECTED, \`the event is \${values[0]}, expected exactly \${JSON.stringify(EXPECTED)}\`);
+}
+
+export async function check_acks(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
+  await publish(m, 'r1', 'create_account', 'succeeded');
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`after one lost acknowledgement the topic holds \${ctx.kafka.records(TOPIC).length} records: the producer's retry wrote the event twice. Enable idempotence\`);
+  await publish(m, 'r1', 'send_welcome', 'started');
+  await settle();
+  ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, 'a leader failover lost an event the leader alone had acknowledged: acks: -1 (all) waits for every in-sync replica');
+}
+
+export async function check_outbox(ctx) {
+  const m = ctx.load('events');
+  let ok = await publish(m, 'r1', 'create_account', 'succeeded');
+  assert.equal(ok, true, \`publishStep resolved \${JSON.stringify(ok)} for an acknowledged event, expected true\`);
+  assert.deepStrictEqual(outboxRows(ctx), [], \`the broker acknowledged the event and the outbox still holds \${JSON.stringify(outboxRows(ctx))}: the relay would publish it again\`);
+  ctx.kafka.failNext(TOPIC, 1);
+  ok = await publish(m, 'r1', 'send_welcome', 'started');
+  await settle();
+  let rows = outboxRows(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the transition is gone from the history\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'r1' && rows[0].payload?.outcome === 'started', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key r1 and the event\`);
+  assert.equal(ok, false, \`publishStep resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  ok = await publish(m, 'r1', 'send_welcome', 'succeeded');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`publishStep waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s\`);
+  rows = outboxRows(ctx);
+  assert.equal(rows.length, 2, \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert.equal(ok, false, \`publishStep resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+
+	"workflow/runs"
+
+	"leetbuild/harness"
+)
+
+const eventsTopic = "workflow.step"
+
+var eventsBg = context.Background()
+
+func eventsRun(runID string) *runs.Run {
+	return &runs.Run{
+		RunID: runID, Tenant: "t1", Workflow: "signup", DefinitionVersion: 3, PinnedSteps: []string{"create_account", "send_welcome"},
+		Input: map[string]any{"email": "ada@example.com"}, MaxSteps: 50, StartedAt: 1000,
+	}
+}
+
+func eventsPublish(runID, step, outcome string) (bool, error) {
+	return publishStep(eventsBg, eventsRun(runID), step, outcome)
+}
+
+type eventsRow struct {
+	Topic   string         \`json:"topic"\`
+	Key     string         \`json:"key"\`
+	Payload map[string]any \`json:"payload"\`
+}
+
+func eventsOutbox(ctx *harness.Ctx) []eventsRow {
+	rows := []eventsRow{}
+	for _, text := range ctx.Redis.HGetAll("outbox") {
+		var row eventsRow
+		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func CheckKeyRun(ctx *harness.Ctx) {
+	eventsPublish("r1", "create_account", "succeeded")
+	eventsPublish("r2", "create_account", "succeeded")
+	eventsPublish("r1", "send_welcome", "started")
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three publishStep calls must produce three records on workflow.step; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"r1", "r2", "r1"}, "the records must be keyed by the run ids")
+	ctx.Equal(records[0].Partition, records[2].Partition, "both r1 events must land on one partition, or the auditor reads r1's history out of order; the partitions")
+}
+
+func CheckOutcome(ctx *harness.Ctx) {
+	eventsPublish("r1", "send_welcome", "started")
+	eventsPublish("r1", "send_welcome", "succeeded")
+	ctx.Settle()
+	var outcomes []any
+	for _, v := range ctx.Kafka.Values(eventsTopic) {
+		var event map[string]any
+		json.Unmarshal([]byte(v), &event)
+		outcomes = append(outcomes, event["outcome"])
+	}
+	ctx.Equal(outcomes, []any{"started", "succeeded"}, "publishing started then succeeded (otherwise the auditor cannot tell a running step from a finished one); the outcomes")
+	_, err := eventsPublish("r1", "send_welcome", "done")
+	ctx.Assert(err != nil, "publishStep accepted the outcome \\"done\\", which is not in outcomes")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "an unknown outcome must be refused before anything is produced; the records")
+}
+
+func CheckNoInput(ctx *harness.Ctx) {
+	eventsPublish("r1", "send_welcome", "started")
+	ctx.Settle()
+	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 1, "one publishStep must produce one record; the records")
+	ctx.Assert(!strings.Contains(values[0], "ada@example.com"), "the event carries the run's input: %s. The topic keeps it for days after the run store deletes it", values[0])
+	var event map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
+	ctx.Equal(event, map[string]any{"run_id": "r1", "workflow": "signup", "step": "send_welcome", "effect_id": "r1:send_welcome", "outcome": "started"}, "the event")
+}
+
+func CheckAcks(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	eventsPublish("r1", "create_account", "succeeded")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	eventsPublish("r1", "send_welcome", "started")
+	ctx.Settle()
+	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
+}
+
+func CheckOutbox(ctx *harness.Ctx) {
+	ok, err := eventsPublish("r1", "create_account", "succeeded")
+	ctx.NoError(err, "publishStep failed for a healthy broker")
+	ctx.Equal(ok, true, "publishStep's result for an acknowledged event")
+	ctx.Equal(len(eventsOutbox(ctx)), 0, "the broker acknowledged the event, so the outbox must be empty (the relay would publish it again); the rows")
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok, _ = eventsPublish("r1", "send_welcome", "started")
+	ctx.Settle()
+	rows := eventsOutbox(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the transition is gone from the history; the rows")
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "r1" && rows[0].Payload["outcome"] == "started", "the outbox row is %+v, expected the topic, the key r1 and the event", rows[0])
+	ctx.Equal(ok, false, "publishStep's result after a failed delivery")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	ok, _ = eventsPublish("r1", "send_welcome", "succeeded")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "publishStep waited %.0f s for a broker that does not answer: wait for the report at most 2 s", waited)
+	ctx.Equal(len(eventsOutbox(ctx)), 2, "no acknowledgement within the window must leave a second row; the rows")
+	ctx.Equal(ok, false, "publishStep's result without an acknowledgement")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "workflow/runs.h"
+
+namespace {
+
+const std::string kEventsTopic = "workflow.step";
+
+runs::Run eventsRun(const std::string& run_id) {
+  runs::Run run;
+  run.run_id = run_id;
+  run.tenant = "t1";
+  run.workflow = "signup";
+  run.definition_version = 3;
+  run.pinned_steps = {"create_account", "send_welcome"};
+  run.input = nlohmann::json{{"email", "ada@example.com"}};
+  run.max_steps = 50;
+  run.started_at = 1000;
+  return run;
+}
+
+// What publishStep returned: "true", "false", or "threw".
+std::string publish(const std::string& run_id, const std::string& step, const std::string& outcome) {
+  try {
+    return publishStep(eventsRun(run_id), step, outcome) ? "true" : "false";
+  } catch (const std::exception&) {
+    return "threw";
+  }
+}
+
+std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> rows;
+  for (const auto& [event_id, text] : ctx.Redis.HGetAll("outbox")) {
+    const auto row = nlohmann::json::parse(text, nullptr, false);
+    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", text);
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+std::string text(const nlohmann::json& j, const std::string& field) {
+  return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckKeyRun(harness::Ctx& ctx) {
+  publish("r1", "create_account", "succeeded");
+  publish("r2", "create_account", "succeeded");
+  publish("r1", "send_welcome", "started");
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 3, "three publishStep calls must produce three records on workflow.step; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"r1", "r2", "r1"}, "the records must be keyed by the run ids");
+  ctx.Equal(records[0].Partition, records[2].Partition, "both r1 events must land on one partition, or the auditor reads r1's history out of order; the partitions");
+}
+
+void CheckOutcome(harness::Ctx& ctx) {
+  publish("r1", "send_welcome", "started");
+  publish("r1", "send_welcome", "succeeded");
+  ctx.Settle();
+  std::vector<std::string> outcomes;
+  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) outcomes.push_back(text(nlohmann::json::parse(v, nullptr, false), "outcome"));
+  ctx.Equal(outcomes, {"started", "succeeded"}, "publishing started then succeeded (otherwise the auditor cannot tell a running step from a finished one); the outcomes");
+  ctx.Equal(publish("r1", "send_welcome", "done"), "threw", "the outcome \\"done\\" is not in kOutcomes and must be refused; publishStep");
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "an unknown outcome must be refused before anything is produced; the records");
+}
+
+void CheckNoInput(harness::Ctx& ctx) {
+  publish("r1", "send_welcome", "started");
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(values.size(), 1, "one publishStep must produce one record; the records");
+  ctx.Assert(values[0].find("ada@example.com") == std::string::npos, "the event carries the run's input: %s. The topic keeps it for days after the run store deletes it", values[0]);
+  const nlohmann::json expected = {{"run_id", "r1"}, {"workflow", "signup"}, {"step", "send_welcome"}, {"effect_id", "r1:send_welcome"}, {"outcome", "started"}};
+  ctx.Equal(nlohmann::json::parse(values[0], nullptr, false), expected, "the event");
+}
+
+void CheckAcks(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publish("r1", "create_account", "succeeded");
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  publish("r1", "send_welcome", "started");
+  ctx.Settle();
+  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
+}
+
+void CheckOutbox(harness::Ctx& ctx) {
+  ctx.Equal(publish("r1", "create_account", "succeeded"), "true", "publishStep's result for an acknowledged event");
+  ctx.Equal(eventsOutbox(ctx).size(), 0, "the broker acknowledged the event, so the outbox must be empty (the relay would publish it again); the rows");
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  std::string ok = publish("r1", "send_welcome", "started");
+  ctx.Settle();
+  auto rows = eventsOutbox(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the transition is gone from the history; the rows");
+  ctx.Assert(text(rows[0], "topic") == kEventsTopic && text(rows[0], "key") == "r1" && rows[0].contains("payload") && text(rows[0]["payload"], "outcome") == "started",
+             "the outbox row is %s, expected the topic, the key r1 and the event", rows[0].dump());
+  ctx.Equal(ok, "false", "publishStep's result after a failed delivery");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const int64_t before = ctx.Clock.Now();
+  ok = publish("r1", "send_welcome", "succeeded");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "publishStep waited %.0f s for a broker that does not answer: wait for the report at most 2 s", waited);
+  ctx.Equal(eventsOutbox(ctx).size(), 2, "no acknowledgement within the window must leave a second row; the rows");
+  ctx.Equal(ok, "false", "publishStep's result without an acknowledgement");
+}
+`,
+  },
   hints: [
-    'Symptom: the auditor replays `workflow.step` for one run and sees other runs interleaved; after a broker outage, transitions the worker reported are missing from the history.',
-    'Mechanism: `publish_step` sets `key=workflow`, so one run spreads across partitions; it produces with no outbox row and default acks, so a rejected or unreplicated record is simply gone.',
-    'Fix: `key=run_id`; `outbox.insert` before `producer.produce`, `outbox.delete` after the ack; `"acks": "all"` with `"enable.idempotence": True`; `OUTCOMES` with `started`/`succeeded`; no document. The checks cover each.',
+    "Replay run r1 from `workflow.step`: its events sit on several partitions in no order, every one says `done`, each carries the customer's email, and the ones produced during a broker outage are missing.",
+    'The key is the step name, so one run spreads over as many partitions as it has steps. The value copies `run["input"]` and a fixed `"done"`, and `produce` with `poll(0)` returns before any acknowledgement from an `acks=1` producer.',
+    'Check `outcome in OUTCOMES`; value `{run_id, workflow, step, effect_id, outcome}`; `outbox.insert`, then `produce(key=run_id, on_delivery=…)` and `flush(2)`; acknowledged → `outbox.remove`, `True`, else `False`. Producer: `acks=all`, `enable.idempotence`.',
   ],
-  debrief: `The event exists for an auditor replaying one run, and that decides each fix. The key is the run id because a partition is the only ordering guarantee Kafka gives; keyed by definition name, one run scatters. The outcome vocabulary lets the history tell a running step from a finished one, which \`"done"\` cannot. The document stays out because topic retention outlives the run's own retention policy. The outbox row is inserted before the produce and deleted after the acknowledgement, so a crash between the two replays the row, and \`acks=all\` with idempotence makes that acknowledgement mean replicated. Production events also carry a per-run sequence number so the auditor can order a run without trusting the clock.`,
+  debrief: `The key is the run id because a partition is the only order Kafka gives, and an auditor needs one run's transitions in order. The value carries ids and names, never the input, because the topic's retention outlives any deletion the run store honours. The outbox row goes in before the produce and comes out only on an acknowledgement, so a broker outage delays an event instead of losing it; the idempotent \`acks=all\` producer keeps a retry or a failover from duplicating or dropping one. A process that dies between the ack and the removal still lets the relay publish twice, so consumers deduplicate on run, step and outcome. Production systems write the row in the same transaction as the state change and let a relay such as Debezium's outbox event router do every produce.`,
 };

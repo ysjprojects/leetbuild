@@ -2,41 +2,42 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/browser/sessions/{id}: replay without leaking',
+  title: 'GET /v1/browser/sessions/{id}: the owner’s bounded trace and a screenshot that expires',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'api', 'store', 'redis', 'artifact'],
+  focus: ['client', 'api', 'redis', 'store', 'artifact'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/browser/sessions/{id}\`: it loads the session by id, copies every step of the input log (\`typed_values\` and \`html\` included) into the response, and returns a permanent public bucket URL for the screenshot. It serves the demo and hides four flaws.
+**Starting point.** The starter serves \`GET /v1/browser/sessions/{id}\` with the tenant in
+\`X-Tenant-Id\` (401 when missing): it loads the session with \`sessions.load_session\` (404 when
+missing) and answers its \`sessions.public_view\` with \`steps\`, the whole trace from
+\`trace.read_trace\`, and \`screenshot\`, \`{url: screenshots.public_url(id, step_index)}\`. It
+serves the demo and hides three flaws.
 
-**Failure mode the checks target.** Scope: the write path authenticated, the read path only looked up an id, so any caller can replay any session. Redaction: typed values and page content in the replay make a status endpoint a copy of the data redaction protects. Expiry: a permanent screenshot URL is a read credential for life. Shape: the input log is unbounded and the budget is not read from the enforced state.
+**Failure mode the checks target.** Any tenant that learns a session id reads that session's trace;
+a session of a few hundred steps answers all of them at once; the screenshot link works for anyone,
+for as long as the object exists.
 
-- Tenant from the \`X-Tenant-Id\` header; missing is **401**.
-- The session's **owning tenant** is compared with the caller's: a foreign session answers **404**, exactly like a missing id.
-- The response is the **step trace** in \`step_index\` order, bounded to the last \`TRACE_LIMIT\` steps, plus \`budget_remaining\` and \`budget_exhausted\` read with \`HGETALL\` from the \`session:{id}\` hash.
-- Each step carries \`redacted_fields\` from the shared \`redact(...)\` helper; no typed value and no page content in the response.
-- The screenshot reference is **signed** with an expiry of at most **15 minutes** (\`SCREENSHOT_TTL_S = 900\`), re-signed per request, with \`expires_at\` in the body.`,
+- A session of another tenant is **404** with the same body as a missing id.
+- \`steps\` is the last **\`TRACE_LIMIT\` = 50** steps of the trace, in step order.
+- \`screenshot\` is \`screenshots.sign_screenshot(id, step_index, SCREENSHOT_TTL_S)\` with
+  **\`SCREENSHOT_TTL_S\` = 900**: \`{url, expires_at}\`, signed afresh on every read.`,
   sequence: {
-    participants: ['Client', 'Session API', 'Session state', 'Trace store', 'Screenshot store'],
+    participants: ['Client', 'Session API', 'Redis', 'Trace store', 'Screenshot store'],
     messages: [
       {from: 'Client', to: 'Session API', label: 'GET /v1/browser/sessions/{id} · X-Tenant-Id', kind: 'sync'},
       {
         from: 'Session API',
-        to: 'Session state',
-        label: 'HGETALL session:{id} · tenant · budget_remaining · budget_exhausted',
+        to: 'Redis',
+        label: 'load_session(id) → another tenant: 404 like a missing id',
         kind: 'sync',
       },
-      {from: 'Session state', to: 'Session API', label: 'owning tenant · budget outcome', kind: 'reply'},
-      {from: 'Session API', to: 'Session API', label: 'owning tenant == caller? else 404', kind: 'sync'},
-      {from: 'Session API', to: 'Trace store', label: 'last TRACE_LIMIT steps in step_index order', kind: 'sync'},
-      {from: 'Trace store', to: 'Session API', label: 'steps with redacted_fields only', kind: 'reply'},
-      {from: 'Session API', to: 'Screenshot store', label: 'sign(final ref, SCREENSHOT_TTL_S)', kind: 'sync'},
-      {from: 'Screenshot store', to: 'Session API', label: 'signed url · expires_at', kind: 'reply'},
+      {from: 'Session API', to: 'Trace store', label: 'read_trace(id) → last TRACE_LIMIT steps', kind: 'sync'},
+      {from: 'Session API', to: 'Screenshot store', label: 'sign_screenshot(id, step, 900 s)', kind: 'sync'},
       {
         from: 'Session API',
         to: 'Client',
-        label: '200 {steps, budget, screenshot} · 401 no tenant · 404 foreign',
+        label: '200 {budget_remaining, steps, screenshot: {url, expires_at}}',
         kind: 'reply',
       },
     ],
@@ -46,348 +47,154 @@ export const readStep: Step = {
       id: 'route',
       title: 'Serves GET /v1/browser/sessions/{id}',
       detail:
-        'Register the session-read route on `GET /v1/browser/sessions/{session_id}` with the session id as a path parameter.',
+        'Register `GET /v1/browser/sessions/{id}`: the owner reads the session’s public view with its `steps` and `screenshot`; a request without `X-Tenant-Id` is 401.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/browser\/sessions\/\{session_id\}["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/browser\/sessions\/:sessionId['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/browser\/sessions\/\{session_id\}"/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/browser\/sessions\/:/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/browser\/sessions\/\{id\}"/]},
         scala: {all: [/path\(\s*"v1"\s*\/\s*"browser"\s*\/\s*"sessions"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(/, /\/v1\/browser\/sessions\//]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/browser\/sessions\//]},
       },
     },
     {
       id: 'tenant-scope',
-      title: 'Answers 404 for a session the caller does not own',
+      title: 'A foreign session answers like a missing one',
       detail:
-        'The owning tenant of `session:{id}` is compared with the caller’s `X-Tenant-Id`, and a foreign or unknown session is the same **404** — never the body. The starter serves whichever session id it is given, so one tenant can replay another tenant’s session.',
+        'The session’s owning tenant is compared with the caller’s; another tenant’s session is 404 with the body a missing id gets. The starter looks the session up by id alone.',
       match: {
-        python: {all: [/status_code\s*=\s*404/, /owner\s*!=\s*tenant/]},
-        typescript: {all: [/code\(\s*404\s*\)/, /owner\s*!==\s*tenant/]},
-        go: {all: [/StatusNotFound/, /owner\s*!=\s*tenant/]},
-        scala: {all: [/StatusCodes\.NotFound/, /owner\s*!=\s*tenant/]},
-        cpp: {all: [/\b404\b/, /owner\s*!=\s*tenant/]},
+        python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*session\[["']tenant["']\]/]},
+        typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*session\.tenant/]},
+        go: {all: [/\.Tenant\s*!=\s*tenant|tenant\s*!=\s*session\.Tenant/]},
+        scala: {all: [/\.tenant\s*!=\s*tenant|_\.tenant\s*==\s*tenant/]},
+        cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*session->tenant/]},
       },
     },
     {
-      id: 'no-typed-values',
-      title: 'Replays field names, never typed values or page content',
+      id: 'trace-bounded',
+      title: 'Answers the last 50 steps',
       detail:
-        'The replay carries `redacted_fields` from the shared `redact(...)` helper and the response contains no typed input value and no page content — `typed_values`, `input_value`, `values` and `html` never appear. The starter ships the typed values and the captured page "for debugging".',
+        '`steps` is the tail of the trace, `TRACE_LIMIT` (50) steps in step order; the starter answers the whole trace.',
       match: {
-        python: {all: [/redacted_fields/, /redact\(/], none: [/typed_values/, /input_value/, /["']values["']/, /html/]},
-        typescript: {
-          all: [/redacted_fields/, /redact\(/],
-          none: [/typed_values/, /input_value/, /['"]values['"]/, /html/],
-        },
-        go: {all: [/redacted_fields/, /redact\(/], none: [/typed_values/, /input_value/, /"values"/, /html/]},
-        scala: {all: [/redacted_fields/, /redact\(/], none: [/typed_values/, /input_value/, /"values"/, /html/]},
-        cpp: {all: [/redacted_fields/, /redact\(/], none: [/typed_values/, /input_value/, /"values"/, /html/]},
+        python: {all: [/TRACE_LIMIT\s*=\s*50\b/, /\[\s*-TRACE_LIMIT\s*:\s*\]/]},
+        typescript: {all: [/TRACE_LIMIT\s*=\s*50\b/, /\.slice\(\s*-TRACE_LIMIT\s*\)/]},
+        go: {all: [/traceLimit\s*=\s*50\b/, /len\(steps\)\s*-\s*traceLimit/]},
+        scala: {all: [/TraceLimit\s*=\s*50\b/, /takeRight\(\s*TraceLimit\s*\)/]},
+        cpp: {all: [/kTraceLimit\s*=\s*50\b/, /steps\.end\(\)\s*-\s*kTraceLimit/]},
       },
     },
     {
       id: 'screenshot-expiry',
-      title: 'Signs the screenshot reference with a 15-minute expiry',
+      title: 'The screenshot reference is signed and expires within 15 minutes',
       detail:
-        'The screenshot reference is signed per request with an expiry of at most 900 seconds — `SCREENSHOT_TTL_S = 900` (`screenshotTtlS`, `ScreenshotTtlS`, `kScreenshotTtlS`) passed to the signer, which returns `expires_at`. The starter hands out a permanent public bucket URL.',
+        'The screenshot is `sign_screenshot`/`signScreenshot` with `SCREENSHOT_TTL_S` (900), answered with its `expires_at` and signed on each read; the starter answers the store’s permanent `public_url`.',
       match: {
-        python: {all: [/SCREENSHOT_TTL_S\s*=\s*900/, /\.sign\(/, /expires_at/]},
-        typescript: {all: [/SCREENSHOT_TTL_S\s*=\s*900/, /\.sign\(/, /expires_at/]},
-        go: {all: [/screenshotTtlS\s*=\s*900/, /\.Sign\(/, /expires_at/]},
-        scala: {all: [/ScreenshotTtlS\s*=\s*900/, /\.sign\(/, /expires_at/]},
-        cpp: {all: [/kScreenshotTtlS\s*=\s*900/, /\.sign\(/, /expires_at/]},
-      },
-    },
-    {
-      id: 'trace-budget',
-      title: 'Returns the bounded step trace with the budget from Redis',
-      detail:
-        'The body carries the trace — `step_index` order, bounded by a page-size constant (`TRACE_LIMIT` / `traceLimit` / `TraceLimit` / `kTraceLimit`) — plus the budget outcome (`budget_remaining`, `budget_exhausted`) read from the same `session:{id}` hash the worker writes with `HGETALL`. The starter returns the whole input log and reads no state.',
-      match: {
-        python: {
-          all: [/step_index/, /TRACE_LIMIT/, /session:\{session_id\}/, /\.hgetall\(|\.hget\(/, /budget_remaining/],
-        },
-        typescript: {
-          all: [
-            /step_index/,
-            /TRACE_LIMIT/,
-            /['"]session:['"]\s*\+\s*sessionId/,
-            /\.hgetall\(|\.hget\(/,
-            /budget_remaining/,
-          ],
-        },
-        go: {
-          all: [/step_index/, /traceLimit/, /"session:"\s*\+\s*sessionID/, /\.HGetAll\(|\.HGet\(/, /budget_remaining/],
-        },
+        python: {all: [/screenshots\.sign_screenshot\(/, /SCREENSHOT_TTL_S\s*=\s*900\b/], none: [/public_url\(/]},
+        typescript: {all: [/signScreenshot\(/, /SCREENSHOT_TTL_S\s*=\s*900\b/], none: [/publicUrl\(/]},
+        go: {all: [/screenshots\.SignScreenshot\(/, /screenshotTTLS\s*=\s*900\b/], none: [/screenshots\.PublicURL\(/]},
         scala: {
-          all: [/step_index/, /TraceLimit/, /s"session:\$sessionId"/, /\.hgetAll\(|\.hget\(/, /budget_remaining/],
+          all: [/Screenshots\.signScreenshot\(/, /ScreenshotTtlS\s*=\s*900L?\b/],
+          none: [/Screenshots\.publicUrl\(/],
         },
         cpp: {
-          all: [/step_index/, /kTraceLimit/, /"session:"\s*\+\s*sessionId/, /\.hgetall\(|\.hget\(/, /budget_remaining/],
+          all: [/screenshots::signScreenshot\(/, /kScreenshotTtlS\s*=\s*900\b/],
+          none: [/screenshots::publicUrl\(/],
         },
       },
     },
   ],
   code: {
     python: {
-      starter: `import redis
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI, HTTPException, Request
+
+from browser import screenshots  # public_url, sign_screenshot
+from browser import sessions  # load_session, public_view
+from browser import trace  # read_trace
 
 app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-
-class SessionStore:
-    def load(self, session_id: str) -> dict | None:
-        """The session document, by id alone."""
-        raise NotImplementedError
-
-
-class TraceStore:
-    def all(self, session_id: str) -> list[dict]:
-        """The whole input log of the session, typed input and page content included."""
-        raise NotImplementedError
-
-
-sessions = SessionStore()
-trace = TraceStore()
 
 
 @app.get("/v1/browser/sessions/{session_id}")
-def read_session(session_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    session = sessions.load(session_id)
-    steps = [
-        {
-            "step_index": step["step_index"],
-            "action": step["action"],
-            "typed_values": step["typed_values"],
-            "html": step["html"],
-        }
-        for step in trace.all(session_id)
-    ]
-    return JSONResponse(
-        {
-            "session_id": session_id,
-            "status": session["status"],
-            "steps": steps,
-            "screenshot_url": f"https://public-screenshots.example.com/{session_id}/final.png",
-        }
-    )
+def read_session(session_id: str, request: Request) -> dict:
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    session = sessions.load_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="no such session")
+    steps = trace.read_trace(session_id)
+    shot = {"url": screenshots.public_url(session_id, session["step_index"])}
+    return {**sessions.public_view(session), "steps": steps, "screenshot": shot}
 `,
-      solution: `import redis
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+      solution: `from fastapi import FastAPI, HTTPException, Request
+
+from browser import screenshots  # public_url, sign_screenshot
+from browser import sessions  # load_session, public_view
+from browser import trace  # read_trace
 
 app = FastAPI()
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-TRACE_LIMIT = 20
+TRACE_LIMIT = 50
 SCREENSHOT_TTL_S = 900
-REDACTED_FIELDS = ("password", "card", "token")
-
-
-class TraceStore:
-    """Provided trace storage: the steps the worker appended for a session."""
-
-    def page(self, session_id: str, limit: int) -> list[dict]:
-        """Up to limit steps in step_index order, newest last, typed input still attached."""
-        raise NotImplementedError
-
-
-class ScreenshotSigner:
-    """Provided signer: the store serves the object only for a valid signature."""
-
-    def sign(self, session_id: str, ttl_s: int) -> dict:
-        """Sign the final screenshot reference so it expires in ttl_s seconds."""
-        raise NotImplementedError
-
-
-trace = TraceStore()
-signer = ScreenshotSigner()
-
-
-def redact(typed_input: dict) -> list[str]:
-    """The names of the fields the agent filled; what it typed never leaves the worker."""
-    return sorted(name for name in typed_input if name.lower() in REDACTED_FIELDS)
-
-
-def replay(step: dict) -> dict:
-    """One step of the replay: field names, never the typed input or the page content."""
-    return {
-        "step_index": step["step_index"],
-        "action": step["action"],
-        "target_digest": step["target_digest"],
-        "outcome": step["outcome"],
-        "redacted_fields": redact(step["typed_input"]),
-    }
 
 
 @app.get("/v1/browser/sessions/{session_id}")
-def read_session(
-    session_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-
-    session = r.hgetall(f"session:{session_id}")
-    owner = session.get("tenant")
-    if owner != tenant:
-        raise HTTPException(status_code=404, detail="session not found")
-
-    steps = [replay(step) for step in trace.page(session_id, TRACE_LIMIT)]
-    screenshot = signer.sign(session_id, SCREENSHOT_TTL_S)
-    return JSONResponse(
-        {
-            "session_id": session_id,
-            "status": session.get("status", "unknown"),
-            "steps": steps,
-            "budget_remaining": int(session.get("budget_remaining", 0)),
-            "budget_exhausted": session.get("budget_exhausted") == "true",
-            "screenshot_url": screenshot["url"],
-            "screenshot_expires_at": screenshot["expires_at"],
-        }
-    )
+def read_session(session_id: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    session = sessions.load_session(session_id)
+    # Another tenant's session answers exactly like a missing one: the id confirms nothing.
+    if session is None or session["tenant"] != tenant:
+        raise HTTPException(status_code=404, detail="no such session")
+    steps = trace.read_trace(session_id)[-TRACE_LIMIT:]
+    shot = screenshots.sign_screenshot(session_id, session["step_index"], SCREENSHOT_TTL_S)
+    return {**sessions.public_view(session), "steps": steps, "screenshot": shot}
 `,
     },
     typescript: {
-      starter: `/** GET /v1/browser/sessions/:sessionId. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Fastify from 'fastify';
+
+import {publicUrl, signScreenshot} from 'browser/screenshots';
+import {loadSession, publicView} from 'browser/sessions';
+import {readTrace} from 'browser/trace';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
-
-interface LoggedStep {
-  step_index: number;
-  action: string;
-  typed_values: string[];
-  html: string;
-}
-
-class SessionStore {
-  /** The session document, by id alone. */
-  async load(sessionId: string): Promise<{status: string} | null> {
-    throw new Error('not implemented');
-  }
-}
-
-class TraceStore {
-  /** The whole input log of the session, typed input and page content included. */
-  async all(sessionId: string): Promise<LoggedStep[]> {
-    throw new Error('not implemented');
-  }
-}
-
-const sessions = new SessionStore();
-const trace = new TraceStore();
 
 app.get('/v1/browser/sessions/:sessionId', async (request, reply) => {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {sessionId} = request.params as {sessionId: string};
-  const session = await sessions.load(sessionId);
-  const steps = await trace.all(sessionId);
-  return reply.code(200).send({
-    session_id: sessionId,
-    status: session?.status,
-    steps,
-    screenshot_url: 'https://public-screenshots.example.com/' + sessionId + '/final.png',
-  });
+  const session = await loadSession(sessionId);
+  if (session === null) return reply.code(404).send({error: 'no such session'});
+  const steps = await readTrace(sessionId);
+  const screenshot = {url: publicUrl(sessionId, session.step_index)};
+  return {...publicView(session), steps, screenshot};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/browser/sessions/:sessionId: the bounded, scoped, redacted step replay. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Fastify from 'fastify';
+
+import {publicUrl, signScreenshot} from 'browser/screenshots';
+import {loadSession, publicView} from 'browser/sessions';
+import {readTrace} from 'browser/trace';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
 
-const TRACE_LIMIT = 20;
-const SCREENSHOT_TTL_S = 900;
-const REDACTED_FIELDS = ['password', 'card', 'token'];
-
-interface StepRow {
-  step_index: number;
-  action: string;
-  target_digest: string;
-  outcome: string;
-  typed_input: Record<string, string>;
-}
-
-interface ReplayStep {
-  step_index: number;
-  action: string;
-  target_digest: string;
-  outcome: string;
-  redacted_fields: string[];
-}
-
-interface SignedShot {
-  url: string;
-  expires_at: number;
-}
-
-class TraceStore {
-  /** Up to limit steps in step_index order, newest last, typed input still attached. */
-  async page(sessionId: string, limit: number): Promise<StepRow[]> {
-    throw new Error('not implemented');
-  }
-}
-
-class ScreenshotSigner {
-  /** Sign the final screenshot reference so it expires in ttlS seconds. */
-  async sign(sessionId: string, ttlS: number): Promise<SignedShot> {
-    throw new Error('not implemented');
-  }
-}
-
-const trace = new TraceStore();
-const signer = new ScreenshotSigner();
-
-/** The names of the fields the agent filled; what it typed never leaves the worker. */
-function redact(typedInput: Record<string, string>): string[] {
-  return Object.keys(typedInput)
-    .filter(name => REDACTED_FIELDS.includes(name.toLowerCase()))
-    .sort();
-}
-
-/** One step of the replay: field names, never the typed input or the page content. */
-function replay(step: StepRow): ReplayStep {
-  return {
-    step_index: step.step_index,
-    action: step.action,
-    target_digest: step.target_digest,
-    outcome: step.outcome,
-    redacted_fields: redact(step.typed_input),
-  };
-}
+export const TRACE_LIMIT = 50;
+export const SCREENSHOT_TTL_S = 900;
 
 app.get('/v1/browser/sessions/:sessionId', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {sessionId} = request.params as {sessionId: string};
-  const session = await r.hgetall('session:' + sessionId);
-  const owner = session.tenant;
-  if (owner !== tenant) return reply.code(404).send({error: 'session not found'});
-
-  const steps = (await trace.page(sessionId, TRACE_LIMIT)).map(replay);
-  const shot = await signer.sign(sessionId, SCREENSHOT_TTL_S);
-  return reply.code(200).send({
-    session_id: sessionId,
-    status: session.status ?? 'unknown',
-    steps,
-    budget_remaining: Number(session.budget_remaining ?? 0),
-    budget_exhausted: session.budget_exhausted === 'true',
-    screenshot_url: shot.url,
-    screenshot_expires_at: shot.expires_at,
-  });
+  const session = await loadSession(sessionId);
+  // Another tenant's session answers exactly like a missing one: the id confirms nothing.
+  if (session === null || session.tenant !== tenant) return reply.code(404).send({error: 'no such session'});
+  const steps = (await readTrace(sessionId)).slice(-TRACE_LIMIT);
+  const screenshot = signScreenshot(sessionId, session.step_index, SCREENSHOT_TTL_S);
+  return {...publicView(session), steps, screenshot};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -395,338 +202,177 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"browser/screenshots" // screenshots.PublicURL, SignScreenshot
+	"browser/sessions"    // sessions.LoadSession, PublicView
+	"browser/trace"       // trace.ReadTrace
 )
 
-type LoggedStep struct {
-	StepIndex   int      \`json:"step_index"\`
-	Action      string   \`json:"action"\`
-	TypedInput  string   \`json:"typed_values"\`
-	HTML        string   \`json:"html"\`
-}
-
-// SessionStore loads a session document by id alone.
-type SessionStore struct{}
-
-func (s *SessionStore) Load(sessionID string) (map[string]string, error) {
-	return nil, nil
-}
-
-// TraceStore returns the whole input log of a session.
-type TraceStore struct{}
-
-func (s *TraceStore) All(sessionID string) ([]LoggedStep, error) {
-	return nil, nil
-}
-
-var (
-	sessions = &SessionStore{}
-	trace    = &TraceStore{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readSession(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	sessionID := r.PathValue("session_id")
-	session, _ := sessions.Load(sessionID)
-	steps, _ := trace.All(sessionID)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"session_id":     sessionID,
-		"status":         session["status"],
-		"steps":          steps,
-		"screenshot_url": "https://public-screenshots.example.com/" + sessionID + "/final.png",
-	})
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
+		return
+	}
+	sessionID := r.PathValue("id")
+	session := sessions.LoadSession(r.Context(), sessionID)
+	if session == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such session"})
+		return
+	}
+	steps, err := trace.ReadTrace(r.Context(), sessionID)
+	if err != nil {
+		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	view := sessions.PublicView(session)
+	view["steps"] = steps
+	view["screenshot"] = map[string]string{"url": screenshots.PublicURL(sessionID, session.StepIndex)}
+	writeJSON(rw, http.StatusOK, view)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/browser/sessions/{session_id}", readSession)
-	log.Fatal(http.ListenAndServe(":8443", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/browser/sessions/{id}", readSession)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
-	"sort"
-	"strconv"
-	"strings"
 
-	"github.com/redis/go-redis/v9"
+	"browser/screenshots" // screenshots.PublicURL, SignScreenshot
+	"browser/sessions"    // sessions.LoadSession, PublicView
+	"browser/trace"       // trace.ReadTrace
 )
 
 const (
-	traceLimit     = 20
-	screenshotTtlS = 900
+	traceLimit     = 50
+	screenshotTTLS = 900
 )
 
-var rdb *redis.Client
-
-// redactedFields names the sensitive fields; what the agent typed never leaves the worker.
-var redactedFields = map[string]bool{"password": true, "card": true, "token": true}
-
-// StepRow is one stored step of a session trace.
-type StepRow struct {
-	StepIndex    int            \`json:"step_index"\`
-	Action       string         \`json:"action"\`
-	TargetDigest string         \`json:"target_digest"\`
-	Outcome      string         \`json:"outcome"\`
-	TypedInput   map[string]any \`json:"typed_input"\`
-}
-
-// ReplayStep is one step as the client sees it: field names, never typed input.
-type ReplayStep struct {
-	StepIndex      int      \`json:"step_index"\`
-	Action         string   \`json:"action"\`
-	TargetDigest   string   \`json:"target_digest"\`
-	Outcome        string   \`json:"outcome"\`
-	RedactedFields []string \`json:"redacted_fields"\`
-}
-
-// SignedShot is the screenshot reference the signer produces.
-type SignedShot struct {
-	URL       string \`json:"url"\`
-	ExpiresAt int64  \`json:"expires_at"\`
-}
-
-// TraceStore is the provided trace storage.
-type TraceStore struct{}
-
-func (s *TraceStore) Page(ctx context.Context, sessionID string, limit int) ([]StepRow, error) {
-	return nil, nil
-}
-
-// ScreenshotSigner is the provided signer: the store serves the object only for a valid signature.
-type ScreenshotSigner struct{}
-
-func (s *ScreenshotSigner) Sign(ctx context.Context, sessionID string, ttlS int) (SignedShot, error) {
-	return SignedShot{}, nil
-}
-
-var (
-	trace  = &TraceStore{}
-	signer = &ScreenshotSigner{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
-}
-
-// redact turns typed input into the names of the filled fields.
-func redact(typedInput map[string]any) []string {
-	names := make([]string, 0, len(typedInput))
-	for name := range typedInput {
-		if redactedFields[strings.ToLower(name)] {
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	return names
-}
-
-func replay(step StepRow) ReplayStep {
-	return ReplayStep{
-		StepIndex:      step.StepIndex,
-		Action:         step.Action,
-		TargetDigest:   step.TargetDigest,
-		Outcome:        step.Outcome,
-		RedactedFields: redact(step.TypedInput),
-	}
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readSession(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	sessionID := r.PathValue("session_id")
-	session, err := rdb.HGetAll(r.Context(), "session:"+sessionID).Result()
+	sessionID := r.PathValue("id")
+	session := sessions.LoadSession(r.Context(), sessionID)
+	// Another tenant's session answers exactly like a missing one: the id confirms nothing.
+	if session == nil || session.Tenant != tenant {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such session"})
+		return
+	}
+	steps, err := trace.ReadTrace(r.Context(), sessionID)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	owner := session["tenant"]
-	if owner != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "session not found"})
-		return
+	if len(steps) > traceLimit {
+		steps = steps[len(steps)-traceLimit:]
 	}
-	rows, err := trace.Page(r.Context(), sessionID, traceLimit)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	steps := make([]ReplayStep, 0, len(rows))
-	for _, row := range rows {
-		steps = append(steps, replay(row))
-	}
-	shot, err := signer.Sign(r.Context(), sessionID, screenshotTtlS)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	remaining, _ := strconv.Atoi(session["budget_remaining"])
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"session_id":            sessionID,
-		"status":                session["status"],
-		"steps":                 steps,
-		"budget_remaining":      remaining,
-		"budget_exhausted":      session["budget_exhausted"] == "true",
-		"screenshot_url":        shot.URL,
-		"screenshot_expires_at": shot.ExpiresAt,
-	})
+	view := sessions.PublicView(session)
+	view["steps"] = steps
+	view["screenshot"] = screenshots.SignScreenshot(sessionID, session.StepIndex, screenshotTTLS)
+	writeJSON(rw, http.StatusOK, view)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/browser/sessions/{session_id}", readSession)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/browser/sessions/{id}", readSession)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-final case class LoggedStep(step_index: Int, action: String, typed_values: List[String], html: String)
-
-object SessionStore {
-  /** The session document, by id alone. */
-  def load(sessionId: String): Option[LoggedStep] = None
-}
-
-object TraceStore {
-  /** The whole input log of the session, typed input and page content included. */
-  def all(sessionId: String): List[LoggedStep] = Nil
-}
+import browser.Screenshots // Screenshots.publicUrl, signScreenshot
+import browser.Sessions    // Sessions.loadSession, publicView
+import browser.Trace       // Trace.readTrace
 
 object Read {
-  implicit val system: ActorSystem = ActorSystem("browser-agent")
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def jsonEntity(body: String): ResponseEntity =
-    HttpEntity(ContentTypes.\`application/json\`, body)
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  val route: Route =
-    path("v1" / "browser" / "sessions" / Segment) { sessionId =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val session = SessionStore.load(sessionId)
-        val steps = TraceStore.all(sessionId)
-        complete(
-          StatusCodes.OK,
-          jsonEntity(
-            s"""{"session_id":"$sessionId","steps":\${steps.size},"screenshot_url":"https://public-screenshots.example.com/$sessionId/final.png"}"""
-          )
-        )
-      }
+  def read(tenant: String, sessionId: String): HttpResponse =
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    Sessions.loadSession(sessionId) match {
+      case None => error(StatusCodes.NotFound, "no such session")
+      case Some(session) =>
+        val steps = Trace.readTrace(sessionId)
+        val screenshot = JsObject("url" -> JsString(Screenshots.publicUrl(sessionId, session.stepIndex)))
+        json(StatusCodes.OK, JsObject(Sessions.publicView(session).fields ++ Map("steps" -> JsArray(steps.toVector), "screenshot" -> screenshot)))
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json._
-
-import scala.jdk.CollectionConverters._
-
-/** One stored step of a session trace. */
-final case class StepRow(step_index: Int, action: String, target_digest: String, outcome: String, typed_input: Map[String, String])
-/** One step as the client sees it: field names, never typed input. */
-final case class ReplayStep(step_index: Int, action: String, target_digest: String, outcome: String, redacted_fields: List[String])
-final case class SignedShot(url: String, expires_at: Long)
-
-object TraceStore {
-  /** Up to limit steps in step_index order, newest last, typed input still attached. */
-  def page(sessionId: String, limit: Int): List[StepRow] = Nil
-}
-
-object ScreenshotSigner {
-  /** Sign the final screenshot reference so it expires in ttlS seconds. */
-  def sign(sessionId: String, ttlS: Int): SignedShot = SignedShot("", 0L)
-}
-
-object Read {
-  implicit val system: ActorSystem = ActorSystem("browser-agent")
-  val jedis = new Jedis("redis", 6379)
-
-  val TraceLimit = 20
-  val ScreenshotTtlS = 900
-  val RedactedFields = Set("password", "card", "token")
-
-  def jsonEntity(body: String): ResponseEntity =
-    HttpEntity(ContentTypes.\`application/json\`, body)
-
-  /** The names of the fields the agent filled; what it typed never leaves the worker. */
-  def redact(typedInput: Map[String, String]): List[String] =
-    typedInput.keys.filter(name => RedactedFields.contains(name.toLowerCase)).toList.sorted
-
-  def replay(step: StepRow): ReplayStep =
-    ReplayStep(step.step_index, step.action, step.target_digest, step.outcome, redact(step.typed_input))
-
-  def stepJson(step: ReplayStep): JsObject =
-    JsObject(
-      "step_index" -> JsNumber(step.step_index),
-      "action" -> JsString(step.action),
-      "target_digest" -> JsString(step.target_digest),
-      "outcome" -> JsString(step.outcome),
-      "redacted_fields" -> JsArray(step.redacted_fields.map(JsString(_)).toVector)
-    )
-
-  val route: Route =
-    path("v1" / "browser" / "sessions" / Segment) { sessionId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          val tenant = tenantOpt.filter(_.nonEmpty)
-          if (tenant.isEmpty) {
-            complete(StatusCodes.Unauthorized, jsonEntity("""{"error":"missing X-Tenant-Id"}"""))
-          } else {
-            val session = jedis.hgetAll(s"session:$sessionId").asScala.toMap
-            val owner = session.getOrElse("tenant", "")
-            if (owner != tenant.get) {
-              complete(StatusCodes.NotFound, jsonEntity("""{"error":"session not found"}"""))
-            } else {
-              val steps = TraceStore.page(sessionId, TraceLimit).map(replay)
-              val shot = ScreenshotSigner.sign(sessionId, ScreenshotTtlS)
-              val response = JsObject(
-                "session_id" -> JsString(sessionId),
-                "status" -> JsString(session.getOrElse("status", "unknown")),
-                "steps" -> JsArray(steps.map(stepJson).toVector),
-                "budget_remaining" -> JsNumber(session.getOrElse("budget_remaining", "0").toInt),
-                "budget_exhausted" -> JsBoolean(session.getOrElse("budget_exhausted", "false") == "true"),
-                "screenshot_url" -> JsString(shot.url),
-                "screenshot_expires_at" -> JsNumber(shot.expires_at)
-              )
-              complete(StatusCodes.OK, jsonEntity(response.compactPrint))
-            }
-          }
+  val route: Route = path("v1" / "browser" / "sessions" / Segment) { sessionId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        tenant.filter(_.nonEmpty) match {
+          case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
+          case Some(t) => complete(read(t, sessionId))
         }
       }
     }
+  }
+}
+`,
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
+import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+import browser.Screenshots // Screenshots.publicUrl, signScreenshot
+import browser.Sessions    // Sessions.loadSession, publicView
+import browser.Trace       // Trace.readTrace
+
+object Read {
+  val TraceLimit = 50
+  val ScreenshotTtlS = 900L
+
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
+
+  def read(tenant: String, sessionId: String): HttpResponse =
+    // Another tenant's session answers exactly like a missing one: the id confirms nothing.
+    Sessions.loadSession(sessionId).filter(_.tenant == tenant) match {
+      case None => error(StatusCodes.NotFound, "no such session")
+      case Some(session) =>
+        val steps = Trace.readTrace(sessionId).takeRight(TraceLimit)
+        val shot = Screenshots.signScreenshot(sessionId, session.stepIndex, ScreenshotTtlS)
+        val screenshot = JsObject("url" -> JsString(shot.url), "expires_at" -> JsNumber(shot.expiresAt))
+        json(StatusCodes.OK, JsObject(Sessions.publicView(session).fields ++ Map("steps" -> JsArray(steps.toVector), "screenshot" -> screenshot)))
+    }
+
+  val route: Route = path("v1" / "browser" / "sessions" / Segment) { sessionId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        tenant.filter(_.nonEmpty) match {
+          case None => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
+          case Some(t) => complete(read(t, sessionId))
+        }
+      }
+    }
   }
 }
 `,
@@ -735,176 +381,388 @@ object Read {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
-#include <string>
-
-using json = nlohmann::json;
-
-struct LoggedStep {
-  int stepIndex = 0;
-  std::string action;
-  std::string typedValues;
-  std::string html;
-};
-
-// SessionStore loads a session document by id alone.
-struct SessionStore {
-  std::optional<json> load(const std::string& sessionId);
-};
-
-// TraceStore returns the whole input log of a session.
-struct TraceStore {
-  json all(const std::string& sessionId);
-};
-
-SessionStore sessions;
-TraceStore trace;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/browser/sessions/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const auto sessionId = req.matches[1].str();
-    const auto session = sessions.load(sessionId);
-    res.status = 200;
-    res.set_content(json{{"session_id", sessionId},
-                         {"status", session->value("status", "")},
-                         {"steps", trace.all(sessionId)},
-                         {"screenshot_url", "https://public-screenshots.example.com/" + sessionId + "/final.png"}}
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
-
-#include <algorithm>
-#include <set>
 #include <string>
 #include <vector>
 
+#include "browser/screenshots.h"  // screenshots::publicUrl, signScreenshot
+#include "browser/sessions.h"     // sessions::loadSession, publicView
+#include "browser/trace.h"        // trace::readTrace
+
 using json = nlohmann::json;
 
-constexpr int kTraceLimit = 20;
-constexpr int kScreenshotTtlS = 900;
-
-// The sensitive field names; what the agent typed never leaves the worker.
-const std::set<std::string> kRedactedFields = {"password", "card", "token"};
-
-// StepRow is one stored step of a session trace.
-struct StepRow {
-  int stepIndex = 0;
-  std::string action;
-  std::string targetDigest;
-  std::string outcome;
-  json typedInput;
-};
-
-// ReplayStep is one step as the client sees it: field names, never typed input.
-struct ReplayStep {
-  int stepIndex = 0;
-  std::string action;
-  std::string targetDigest;
-  std::string outcome;
-  std::vector<std::string> redactedFields;
-};
-
-struct SignedShot {
-  std::string url;
-  long long expiresAt = 0;
-};
-
-// TraceStore is the provided trace storage.
-struct TraceStore {
-  std::vector<StepRow> page(const std::string& sessionId, int limit);
-};
-
-// ScreenshotSigner is the provided signer.
-struct ScreenshotSigner {
-  SignedShot sign(const std::string& sessionId, int ttlS);
-};
-
-TraceStore trace;
-ScreenshotSigner signer;
-
-// redact turns typed input into the names of the filled fields.
-std::vector<std::string> redact(const json& typedInput) {
-  std::vector<std::string> names;
-  for (auto it = typedInput.begin(); it != typedInput.end(); ++it) {
-    std::string name = it.key();
-    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
-    if (kRedactedFields.count(name) > 0) names.push_back(it.key());
-  }
-  std::sort(names.begin(), names.end());
-  return names;
+void fail(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(json{{"error", message}}.dump(), "application/json");
 }
 
-ReplayStep replay(const StepRow& step) {
-  return ReplayStep{step.stepIndex, step.action, step.targetDigest, step.outcome, redact(step.typedInput)};
+void read_session(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, "X-Tenant-Id is required");
+  const std::string session_id = req.matches[1];
+  const auto session = sessions::loadSession(session_id);
+  if (!session) return fail(res, 404, "no such session");
+  const std::vector<json> steps = trace::readTrace(session_id);
+  json view = sessions::publicView(*session);
+  view["steps"] = steps;
+  view["screenshot"] = json{{"url", screenshots::publicUrl(session_id, session->step_index)}};
+  res.set_content(view.dump(), "application/json");
 }
 
-json stepJson(const ReplayStep& step) {
-  json fields = json::array();
-  for (const auto& name : step.redactedFields) fields.push_back(name);
-  return json{
-      {"step_index", step.stepIndex},
-      {"action", step.action},
-      {"target_digest", step.targetDigest},
-      {"outcome", step.outcome},
-      {"redacted_fields", fields},
-  };
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/browser/sessions/([\\w-]+))", read_session); }
+`,
+      solution: `#include <httplib.h>
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "browser/screenshots.h"  // screenshots::publicUrl, signScreenshot
+#include "browser/sessions.h"     // sessions::loadSession, publicView
+#include "browser/trace.h"        // trace::readTrace
+
+using json = nlohmann::json;
+
+constexpr long kTraceLimit = 50;
+constexpr long long kScreenshotTtlS = 900;
+
+void fail(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(json{{"error", message}}.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-  sw::redis::Redis redis("tcp://redis:6379");
-
-  svr.Get(R"(/v1/browser/sessions/([^/]+))", [&](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto sessionId = req.matches[1].str();
-    const auto session = redis.hgetall("session:" + sessionId);
-    const auto owner = session.count("tenant") ? session.at("tenant") : std::string();
-    if (owner != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"session not found"})", "application/json");
-      return;
-    }
-    json steps = json::array();
-    for (const auto& row : trace.page(sessionId, kTraceLimit)) steps.push_back(stepJson(replay(row)));
-    const auto shot = signer.sign(sessionId, kScreenshotTtlS);
-    const int remaining = session.count("budget_remaining") ? std::stoi(session.at("budget_remaining")) : 0;
-    const bool exhausted = session.count("budget_exhausted") && session.at("budget_exhausted") == "true";
-    res.status = 200;
-    res.set_content(json{{"session_id", sessionId},
-                         {"status", session.count("status") ? session.at("status") : std::string("unknown")},
-                         {"steps", steps},
-                         {"budget_remaining", remaining},
-                         {"budget_exhausted", exhausted},
-                         {"screenshot_url", shot.url},
-                         {"screenshot_expires_at", shot.expiresAt}}
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void read_session(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return fail(res, 401, "X-Tenant-Id is required");
+  const std::string session_id = req.matches[1];
+  const auto session = sessions::loadSession(session_id);
+  // Another tenant's session answers exactly like a missing one: the id confirms nothing.
+  if (!session || session->tenant != tenant) return fail(res, 404, "no such session");
+  std::vector<json> steps = trace::readTrace(session_id);
+  if (static_cast<long>(steps.size()) > kTraceLimit) steps.erase(steps.begin(), steps.end() - kTraceLimit);
+  const screenshots::Shot shot = screenshots::signScreenshot(session_id, session->step_index, kScreenshotTtlS);
+  json view = sessions::publicView(*session);
+  view["steps"] = steps;
+  view["screenshot"] = json{{"url", shot.url}, {"expires_at", shot.expires_at}};
+  res.set_content(view.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/browser/sessions/([\\w-]+))", read_session); }
 `,
     },
   },
+  harness: {
+    python: `import time
+
+from browser import screenshots, sessions, trace
+
+
+def _world(ctx, steps=3):
+    sid = sessions.create_session("acme", "public-web", "buy a kettle", 200, "https://www.example.com/")["session_id"]
+    for index in range(1, steps + 1):
+        trace.append_step(sid, {"session_id": sid, "step_index": index, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.digest(f"#b{index}")})
+    ctx.redis.hset(sessions.session_key(sid), mapping={"step_index": steps, "budget_remaining": 200 - steps})
+    return ctx.client(ctx.load("read").app), sid
+
+
+async def _get(c, sid, tenant="acme"):
+    return await c.get(f"/v1/browser/sessions/{sid}", headers={"X-Tenant-Id": tenant} if tenant else {})
+
+
+async def check_route(ctx):
+    c, sid = _world(ctx)
+    async with c:
+        r = await _get(c, sid)
+        assert r.status_code == 200, f"GET /v1/browser/sessions/{sid} answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("session_id") == sid and body.get("budget_remaining") == 197, f"the read must answer the session's view (budget_remaining 197), got {body}"
+        assert [s.get("step_index") for s in body.get("steps", [])] == [1, 2, 3], f"the read must answer the trace, got steps {body.get('steps')}"
+        assert body.get("screenshot", {}).get("url"), f"the read must answer a screenshot reference, got {body.get('screenshot')}"
+        r = await _get(c, sid, tenant=None)
+    assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}, expected 401"
+
+
+async def check_tenant_scope(ctx):
+    c, sid = _world(ctx)
+    async with c:
+        foreign = await _get(c, sid, tenant="globex")
+        missing = await _get(c, "s-404", tenant="globex")
+    assert foreign.status_code == 404, f"tenant globex read acme's session {sid} and got {foreign.status_code}: {foreign.text[:200]}. A foreign session must be 404"
+    assert foreign.text == missing.text, f"a foreign session answered {foreign.text!r} and a missing one {missing.text!r}: they must be indistinguishable"
+
+
+async def check_trace_bounded(ctx):
+    c, sid = _world(ctx, steps=60)
+    async with c:
+        r = await _get(c, sid)
+    assert r.status_code == 200, f"the read answered {r.status_code}: {r.text[:200]}"
+    indexes = [s.get("step_index") for s in r.json().get("steps", [])]
+    assert indexes == list(range(11, 61)), f"a 60-step session answered {len(indexes)} steps ({indexes[:3]}…{indexes[-3:]}): it must answer the last TRACE_LIMIT = 50, steps 11 to 60 in order"
+
+
+async def check_screenshot_expiry(ctx):
+    c, sid = _world(ctx)
+    async with c:
+        first = (await _get(c, sid)).json().get("screenshot", {})
+        now = int(time.time())
+        assert "expires_at" in first, f"the screenshot reference {first} has no expires_at: a permanent URL is a read credential for life"
+        assert 0 < first["expires_at"] - now <= 900, f"the screenshot expires {first['expires_at'] - now} s from now, expected at most SCREENSHOT_TTL_S = 900"
+        assert screenshots.verify(first["url"], now), f"the screenshot store refuses {first['url']}: sign it with sign_screenshot"
+        assert not screenshots.verify(first["url"], now + 901), "the screenshot URL still works 901 s later"
+        ctx.clock.advance(600)
+        second = (await _get(c, sid)).json().get("screenshot", {})
+    assert second.get("expires_at", 0) > first["expires_at"], f"a read 600 s later answered the same expiry {second.get('expires_at')}: sign the reference on every read"
+`,
+    typescript: `async function world(ctx, steps = 3) {
+  const sessions = ctx.load('/support/browser/sessions.ts');
+  const trace = ctx.load('/support/browser/trace.ts');
+  const sid = (await sessions.createSession('acme', 'public-web', 'buy a kettle', 200, 'https://www.example.com/')).session_id;
+  for (let index = 1; index <= steps; index++) {
+    await trace.appendStep(sid, {session_id: sid, step_index: index, action: 'click', outcome: 'ok', reason: '', target_digest: trace.digest(\`#b\${index}\`)});
+  }
+  ctx.redis.hset(sessions.sessionKey(sid), {step_index: String(steps), budget_remaining: String(200 - steps)});
+  return {c: ctx.client(ctx.load('read').app), sid};
+}
+
+const get = (c, sid: string, tenant: string | null = 'acme') =>
+  c.get(\`/v1/browser/sessions/\${sid}\`, {headers: tenant ? {'X-Tenant-Id': tenant} : {}});
+
+export async function check_route(ctx) {
+  const {c, sid} = await world(ctx);
+  let r = await get(c, sid);
+  assert.equal(r.status, 200, \`GET /v1/browser/sessions/\${sid} answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.session_id === sid && body.budget_remaining === 197, \`the read must answer the session's view (budget_remaining 197), got \${r.text}\`);
+  assert.deepStrictEqual((body.steps ?? []).map(s => s.step_index), [1, 2, 3], \`the read must answer the trace, got steps \${JSON.stringify(body.steps)}\`);
+  assert(body.screenshot?.url, \`the read must answer a screenshot reference, got \${JSON.stringify(body.screenshot)}\`);
+  r = await get(c, sid, null);
+  assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}, expected 401\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c, sid} = await world(ctx);
+  const foreign = await get(c, sid, 'globex');
+  const missing = await get(c, 's-404', 'globex');
+  assert.equal(foreign.status, 404, \`tenant globex read acme's session \${sid} and got \${foreign.status}: \${foreign.text.slice(0, 200)}. A foreign session must be 404\`);
+  assert.equal(foreign.text, missing.text, \`a foreign session answered \${foreign.text} and a missing one \${missing.text}: they must be indistinguishable\`);
+}
+
+export async function check_trace_bounded(ctx) {
+  const {c, sid} = await world(ctx, 60);
+  const r = await get(c, sid);
+  assert.equal(r.status, 200, \`the read answered \${r.status}: \${r.text.slice(0, 200)}\`);
+  const indexes = (r.json().steps ?? []).map(s => s.step_index);
+  const want = Array.from({length: 50}, (_, i) => i + 11);
+  assert.deepStrictEqual(indexes, want, \`a 60-step session answered \${indexes.length} steps: it must answer the last TRACE_LIMIT = 50, steps 11 to 60 in order\`);
+}
+
+export async function check_screenshot_expiry(ctx) {
+  const {c, sid} = await world(ctx);
+  const {verify} = ctx.load('/support/browser/screenshots.ts');
+  const first = (await get(c, sid)).json().screenshot ?? {};
+  const now = Math.floor(ctx.clock.now() / 1000);
+  assert(typeof first.expires_at === 'number', \`the screenshot reference \${JSON.stringify(first)} has no expires_at: a permanent URL is a read credential for life\`);
+  assert(first.expires_at - now > 0 && first.expires_at - now <= 900, \`the screenshot expires \${first.expires_at - now} s from now, expected at most SCREENSHOT_TTL_S = 900\`);
+  assert(verify(first.url, now), \`the screenshot store refuses \${first.url}: sign it with signScreenshot\`);
+  assert(!verify(first.url, now + 901), 'the screenshot URL still works 901 s later');
+  ctx.clock.advance(600);
+  const second = (await get(c, sid)).json().screenshot ?? {};
+  assert((second.expires_at ?? 0) > first.expires_at, \`a read 600 s later answered the same expiry \${second.expires_at}: sign the reference on every read\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"browser/screenshots"
+	"browser/sessions"
+	"browser/trace"
+
+	"leetbuild/harness"
+)
+
+var readBg = context.Background()
+
+func world(ctx *harness.Ctx, steps int) (*harness.HTTP, string) {
+	sid := sessions.CreateSession(readBg, "acme", "public-web", "buy a kettle", 200, "https://www.example.com/").ID
+	for index := 1; index <= steps; index++ {
+		trace.AppendStep(readBg, sid, map[string]any{"session_id": sid, "step_index": index, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.Digest(fmt.Sprintf("#b%d", index))})
+	}
+	ctx.Redis.Do("HSET", sessions.SessionKey(sid), "step_index", fmt.Sprint(steps), "budget_remaining", fmt.Sprint(200-steps))
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux), sid
+}
+
+type readView struct {
+	SessionID       string \`json:"session_id"\`
+	BudgetRemaining int    \`json:"budget_remaining"\`
+	Steps           []struct {
+		StepIndex int \`json:"step_index"\`
+	} \`json:"steps"\`
+	Screenshot struct {
+		URL       string \`json:"url"\`
+		ExpiresAt int64  \`json:"expires_at"\`
+	} \`json:"screenshot"\`
+}
+
+func read(c *harness.HTTP, sid, tenant string) (*harness.Response, readView) {
+	r := c.Get("/v1/browser/sessions/"+sid, "X-Tenant-Id", tenant)
+	var v readView
+	if r.Status == 200 {
+		r.Decode(&v)
+	}
+	return r, v
+}
+
+func indexes(v readView) []int {
+	out := []int{}
+	for _, s := range v.Steps {
+		out = append(out, s.StepIndex)
+	}
+	return out
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c, sid := world(ctx, 3)
+	r, v := read(c, sid, "acme")
+	ctx.Equal(r.Status, 200, "GET /v1/browser/sessions/%s (%s)", sid, r.Text())
+	ctx.Assert(v.SessionID == sid && v.BudgetRemaining == 197, "the read must answer the session's view (budget_remaining 197), got %s", r.Text())
+	ctx.Equal(indexes(v), []int{1, 2, 3}, "the read must answer the trace; steps")
+	ctx.Assert(v.Screenshot.URL != "", "the read must answer a screenshot reference, got %s", r.Text())
+	r = c.Get("/v1/browser/sessions/" + sid)
+	ctx.Equal(r.Status, 401, "a read without X-Tenant-Id")
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	c, sid := world(ctx, 3)
+	foreign, _ := read(c, sid, "globex")
+	missing, _ := read(c, "s-404", "globex")
+	ctx.Equal(foreign.Status, 404, "tenant globex read acme's session %s: a foreign session must be 404 (%s)", sid, foreign.Text())
+	ctx.Equal(foreign.Text(), missing.Text(), "a foreign session and a missing one must be indistinguishable; the body")
+}
+
+func CheckTraceBounded(ctx *harness.Ctx) {
+	c, sid := world(ctx, 60)
+	r, v := read(c, sid, "acme")
+	ctx.Equal(r.Status, 200, "the read (%s)", r.Text())
+	want := []int{}
+	for i := 11; i <= 60; i++ {
+		want = append(want, i)
+	}
+	ctx.Equal(indexes(v), want, "a 60-step session must answer the last traceLimit = 50 steps, 11 to 60 in order; steps")
+}
+
+func CheckScreenshotExpiry(ctx *harness.Ctx) {
+	c, sid := world(ctx, 3)
+	_, first := read(c, sid, "acme")
+	now := ctx.Clock.Now() / 1000
+	ctx.Assert(first.Screenshot.ExpiresAt > 0, "the screenshot reference has no expires_at: a permanent URL is a read credential for life")
+	ctx.Assert(first.Screenshot.ExpiresAt-now > 0 && first.Screenshot.ExpiresAt-now <= 900, "the screenshot expires %d s from now, expected at most screenshotTTLS = 900", first.Screenshot.ExpiresAt-now)
+	ctx.Assert(screenshots.Verify(first.Screenshot.URL, now), "the screenshot store refuses %s: sign it with SignScreenshot", first.Screenshot.URL)
+	ctx.Assert(!screenshots.Verify(first.Screenshot.URL, now+901), "the screenshot URL still works 901 s later")
+	ctx.Clock.Advance(600)
+	_, second := read(c, sid, "acme")
+	ctx.Assert(second.Screenshot.ExpiresAt > first.Screenshot.ExpiresAt, "a read 600 s later answered the same expiry %d: sign the reference on every read", second.Screenshot.ExpiresAt)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "browser/screenshots.h"
+#include "browser/sessions.h"
+#include "browser/trace.h"
+
+namespace {
+
+struct World {
+  harness::HTTP c;
+  std::string sid;
+};
+
+World world(harness::Ctx& ctx, long steps) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  const std::string sid = sessions::createSession("acme", "public-web", "buy a kettle", 200, "https://www.example.com/").session_id;
+  for (long index = 1; index <= steps; index++) {
+    trace::appendStep(sid, {{"session_id", sid}, {"step_index", index}, {"action", "click"}, {"outcome", "ok"}, {"reason", ""}, {"target_digest", trace::digest("#b" + std::to_string(index))}});
+  }
+  ctx.Redis.Do("HSET", sessions::sessionKey(sid), "step_index", std::to_string(steps), "budget_remaining", std::to_string(200 - steps));
+  return World{ctx.HTTP(*svr), sid};
+}
+
+nlohmann::json bodyOf(const harness::Response& r) {
+  const auto v = nlohmann::json::parse(r.Text(), nullptr, false);
+  return v.is_object() ? v : nlohmann::json::object();
+}
+
+std::vector<long> indexes(const nlohmann::json& body) {
+  std::vector<long> out;
+  if (body.contains("steps") && body["steps"].is_array()) {
+    for (const auto& s : body["steps"]) out.push_back(s.value("step_index", 0L));
+  }
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto w = world(ctx, 3);
+  auto r = w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme");
+  ctx.Equal(r.Status, 200, "GET /v1/browser/sessions/%s (%s)", w.sid, r.Text());
+  const auto body = bodyOf(r);
+  ctx.Assert(body.value("session_id", "") == w.sid && body.value("budget_remaining", 0L) == 197, "the read must answer the session's view (budget_remaining 197), got %s", r.Text());
+  ctx.Equal(indexes(body), std::vector<long>{1, 2, 3}, "the read must answer the trace; steps");
+  ctx.Assert(body.contains("screenshot") && !body["screenshot"].value("url", "").empty(), "the read must answer a screenshot reference, got %s", r.Text());
+  r = w.c.Get("/v1/browser/sessions/" + w.sid);
+  ctx.Equal(r.Status, 401, "a read without X-Tenant-Id");
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  auto w = world(ctx, 3);
+  const auto foreign = w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "globex");
+  const auto missing = w.c.Get("/v1/browser/sessions/s-404", "X-Tenant-Id", "globex");
+  ctx.Equal(foreign.Status, 404, "tenant globex read acme's session %s: a foreign session must be 404 (%s)", w.sid, foreign.Text());
+  ctx.Equal(foreign.Text(), missing.Text(), "a foreign session and a missing one must be indistinguishable; the body");
+}
+
+void CheckTraceBounded(harness::Ctx& ctx) {
+  auto w = world(ctx, 60);
+  const auto r = w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme");
+  ctx.Equal(r.Status, 200, "the read (%s)", r.Text());
+  std::vector<long> want;
+  for (long i = 11; i <= 60; i++) want.push_back(i);
+  ctx.Equal(indexes(bodyOf(r)), want, "a 60-step session must answer the last kTraceLimit = 50 steps, 11 to 60 in order; steps");
+}
+
+void CheckScreenshotExpiry(harness::Ctx& ctx) {
+  auto w = world(ctx, 3);
+  const auto first = bodyOf(w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme")).value("screenshot", nlohmann::json::object());
+  const long long now = ctx.Clock.Now() / 1000;
+  const long long expires = first.value("expires_at", 0LL);
+  ctx.Assert(expires > 0, "the screenshot reference %s has no expires_at: a permanent URL is a read credential for life", first.dump());
+  ctx.Assert(expires - now > 0 && expires - now <= 900, "the screenshot expires %d s from now, expected at most kScreenshotTtlS = 900", expires - now);
+  ctx.Assert(screenshots::verify(first.value("url", ""), now), "the screenshot store refuses %s: sign it with signScreenshot", first.value("url", ""));
+  ctx.Assert(!screenshots::verify(first.value("url", ""), now + 901), "the screenshot URL still works 901 s later");
+  ctx.Clock.Advance(600);
+  const auto second = bodyOf(w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme")).value("screenshot", nlohmann::json::object());
+  ctx.Assert(second.value("expires_at", 0LL) > expires, "a read 600 s later answered the same expiry %d: sign the reference on every read", second.value("expires_at", 0LL));
+}
+`,
+  },
   hints: [
-    "Any caller who guesses a session id can replay another tenant's session, the replay shows the password the agent typed and the full page, and a screenshot link pasted in a ticket works forever.",
-    'read_session loads the session without comparing its owner to X-Tenant-Id, copies typed_values and html out of trace.all(), reads nothing from Redis, and builds a public bucket URL by string formatting.',
-    'Compare owner != tenant and answer 404; emit redacted_fields via redact() and drop typed_values and html; HGETALL session:{id} for budget_remaining and budget_exhausted, bound by TRACE_LIMIT; signer.sign(..., SCREENSHOT_TTL_S = 900) with expires_at.',
+    'Read a session with another tenant’s header: the whole trace comes back. Read a long session: every step comes back in one response. Open the screenshot URL a day later: it still works.',
+    'The session is looked up by id alone and never compared with the caller’s tenant; `read_trace` is answered whole; `public_url` is the store’s permanent address, with no expiry and no signature.',
+    '404 with the missing-id body when `session["tenant"] != tenant`; answer `read_trace(id)[-TRACE_LIMIT:]`; answer `sign_screenshot(id, session["step_index"], SCREENSHOT_TTL_S)` on every read.',
   ],
-  debrief: `The fix treats the read path with the same suspicion as the write path, because that is where tenant isolation usually goes missing: the write authenticated, the read only looked up an id. Comparing the owning tenant and answering the same \`404\` for foreign and missing sessions keeps the endpoint from becoming an oracle for which ids exist. Reusing the pipeline's \`redact(...)\` helper keeps the replay from becoming a second copy of data the events step already scrubbed, and a signed reference with \`expires_at\` turns a permanent bucket URL into a credential that stops working on its own. Reading the budget from the hash enforcement writes means the client sees the number that stops the next step. Production platforms usually add an audit record of who replayed whose session.`,
+  debrief: `On the read path an id stops being a secret and becomes a guess, so ownership is checked on every read, and a foreign session looks exactly like a missing one: a 403 would confirm the id exists. The trace limit bounds a response by design rather than by the longest session anyone ran. A signed reference that expires turns the screenshot URL from a credential into a short-lived capability, and signing per read means a link pasted into a ticket stops working within fifteen minutes. Production replays page the trace with a cursor, sign with a rotated key the store verifies without a call, and log each replay as an access to the session.`,
 };

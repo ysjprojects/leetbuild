@@ -2,301 +2,257 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'GET /v1/search: the query DSL is not a filter injection',
+  title: 'GET /v1/search: caps and a filter allowlist in front of the engine',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'search', 'engine'],
+  focus: ['client', 'api', 'catalog'],
   task: `## Task
 
-**Starting point.** The starter registers \`GET /v1/search\`, reads \`q\`, \`filters\` and
-\`page_size\` off the request with the \`X-Tenant-Id\` header, parses the filter string as JSON and
-hands the three values straight to the query engine. It compiles, it serves the demo, and it hides
-four flaws.
+**Starting point.** The starter serves \`GET /v1/search\` on the catalog index (\`search.catalog\`,
+provided): it reads \`X-Tenant-Id\` (401 when missing), \`q\`, \`page_size\` (default 20) and
+\`filters\`, a JSON object of strings, and answers \`{results, page_size}\` from
+\`run_query(tenant, q, filters, page_size)\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Passing the caller's filter string to the engine makes every
-indexed field addressable, so a crafted filter can name an unpublished field or another tenant's
-attribute. Without caps, a page size of 10000 or a megabyte query exhausts the index.
+**Failure mode the checks target.** A 10 KB query or \`page_size=10000\` goes straight to the engine;
+a filter on \`cost_cents\`, a field the index stores for merchandising but shoppers must not see,
+tells a shopper which product costs what; a malformed \`filters\` crashes the handler.
 
-- \`q\` is a non-empty string of at most **256 bytes** of UTF-8 (**400** otherwise).
-- \`filters\` is a JSON object whose keys are checked against the **per-tenant allowlist**
-  \`{"brand", "category", "in_stock", "min_price", "max_price"}\`. An unknown field is **400** and
-  the response names the offending field and lists the allowed set. Only allowlisted fields reach
-  the engine.
-- \`page_size\` is an integer from **1** to **100** (**400** above the cap).
-- The engine query is assembled by a helper (\`build_engine_query\` / \`buildEngineQuery\`) from the
-  **validated** fields and the tenant, not by interpolating the caller's filter string. The tenant
-  travels in the query, so the engine scopes the result set to the caller's catalog.
-- Log the decision: tenant, page size, the *names* of the filters used. Keep the raw filter text and
-  the query text out of the log.`,
+- \`q\` is 1 to \`MAX_QUERY_BYTES\` = 256 bytes of UTF-8 (bytes, not characters); a blank or longer
+  one is **400**.
+- \`page_size\` is an integer from 1 to \`MAX_PAGE_SIZE\` = 100; anything else is **400**.
+- \`filters\` parses as a JSON object whose values are strings; anything else is **400**.
+- Filter fields are checked against \`ALLOWED_FILTER_FIELDS\`: \`brand\`, \`category\`, \`in_stock\`,
+  \`min_price\`, \`max_price\`. An unknown one is **400** with a body that names it and carries the
+  \`allowed\` list.`,
   sequence: {
-    participants: ['Client', 'Search API', 'Query engine'],
+    participants: ['Storefront', 'searchd', 'Catalog index'],
     messages: [
-      {from: 'Client', to: 'Search API', label: 'GET /v1/search · X-Tenant-Id · q · filters · page_size', kind: 'sync'},
-      {from: 'Search API', to: 'Search API', label: 'cap q · allowlist filter fields · cap page_size', kind: 'sync'},
-      {from: 'Search API', to: 'Query engine', label: 'buildEngineQuery(validated, tenant)', kind: 'sync'},
-      {from: 'Query engine', to: 'Search API', label: 'page of products', kind: 'reply'},
-      {from: 'Search API', to: 'Client', label: '200 {results, page_size}', kind: 'reply'},
+      {
+        from: 'Storefront',
+        to: 'searchd',
+        label: 'GET /v1/search · X-Tenant-Id · q · filters · page_size',
+        kind: 'sync',
+      },
+      {
+        from: 'searchd',
+        to: 'searchd',
+        label: 'q ≤ 256 bytes · 1 ≤ page_size ≤ 100 · filters ⊆ allowlist',
+        kind: 'sync',
+      },
+      {from: 'searchd', to: 'Catalog index', label: 'run_query(tenant, q, filters, page_size)', kind: 'sync'},
+      {from: 'Catalog index', to: 'searchd', label: 'public views, cheapest first', kind: 'reply'},
+      {from: 'searchd', to: 'Storefront', label: '200 {results, page_size} · or 400 {error, allowed}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/search',
-      detail: 'Register the search route on `GET /v1/search`.',
+      title: 'Handles GET /v1/search for the caller’s tenant',
+      detail: 'Register `GET /v1/search` and answer the tenant’s matching products, cheapest first.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/search["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/search['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/search"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"search"\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*"\/v1\/search"/]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/search["']/, /run_query\(/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/search['"]/, /runQuery\(/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/search"/, /catalog\.RunQuery\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"search"\s*\)/, /Catalog\.runQuery\(/]},
+        cpp: {all: [/svr\.Get\(\s*"\/v1\/search"/, /catalog::runQuery\(/]},
       },
     },
     {
       id: 'query-cap',
-      title: 'Caps the text query at 256 bytes',
+      title: 'Caps q at 256 bytes and refuses a blank one',
       detail:
-        '`q` must be non-empty and at most `1 << 8` bytes of UTF-8; anything larger is **400**. The starter forwards an unbounded query to the engine.',
+        '`q` is measured in UTF-8 bytes against `MAX_QUERY_BYTES` = 256, and a blank `q` (which matches the whole catalog) is refused; both answer **400**.',
       match: {
-        python: {all: [/MAX_QUERY_BYTES/, /status_code\s*=\s*400/, /encode\("utf-8"\)/]},
-        typescript: {all: [/MAX_QUERY_BYTES/, /code\(\s*400\s*\)/, /Buffer\.byteLength/]},
-        go: {all: [/maxQueryBytes/, /StatusBadRequest/, /len\(\[\]byte\(/]},
-        scala: {all: [/MaxQueryBytes/, /StatusCodes\.BadRequest/, /getBytes/]},
-        cpp: {all: [/kMaxQueryBytes/, /\b400\b/, /\.size\(\)/]},
+        python: {all: [/MAX_QUERY_BYTES\s*=\s*256/, /len\(\s*q\.encode\(/]},
+        typescript: {
+          all: [/MAX_QUERY_BYTES\s*=\s*256/, /TextEncoder\(\)\.encode\(\s*q\s*\)\.length|Buffer\.byteLength\(\s*q/],
+        },
+        go: {all: [/maxQueryBytes\s*=\s*256/, /len\(\s*(\[\]byte\()?q\)?\s*\)\s*>\s*maxQueryBytes/]},
+        scala: {all: [/MaxQueryBytes\s*=\s*256/, /getBytes\(\s*"UTF-8"\s*\)\.length\s*>\s*MaxQueryBytes/]},
+        cpp: {all: [/kMaxQueryBytes\s*=\s*256/, /q\.size\(\)\s*>\s*kMaxQueryBytes/]},
       },
     },
     {
       id: 'page-cap',
-      title: 'Caps the page size at 100',
+      title: 'Caps page_size at 100',
       detail:
-        '`page_size` is an integer from 1 to 100; the starter accepts `page_size=10000`, so one request can pull the whole catalog out of the index.',
+        '`page_size` must be an integer from 1 to `MAX_PAGE_SIZE` = 100; the starter forwards `page_size=10000`, so one request reads a whole catalog.',
       match: {
-        python: {all: [/MAX_PAGE_SIZE/, /page_size/]},
-        typescript: {all: [/MAX_PAGE_SIZE/, /pageSize/]},
-        go: {all: [/maxPageSize/, /pageSize/]},
-        scala: {all: [/MaxPageSize/, /pageSize/]},
-        cpp: {all: [/kMaxPageSize/, /page_size/]},
+        python: {all: [/MAX_PAGE_SIZE\s*=\s*100/, /page_size\s*(<=|>)\s*MAX_PAGE_SIZE/]},
+        typescript: {all: [/MAX_PAGE_SIZE\s*=\s*100/, /pageSize\s*>\s*MAX_PAGE_SIZE/]},
+        go: {all: [/maxPageSize\s*=\s*100/, /pageSize\s*>\s*maxPageSize/]},
+        scala: {all: [/MaxPageSize\s*=\s*100/, /(size|pageSize)\s*>\s*MaxPageSize|1 to MaxPageSize/]},
+        cpp: {all: [/kMaxPageSize\s*=\s*100/, /page_size\s*>\s*kMaxPageSize/]},
       },
     },
     {
       id: 'filter-allowlist',
-      title: 'Rejects unknown filter fields with the allowed set',
+      title: 'Refuses filter fields outside the allowlist',
       detail:
-        'Filter keys are checked against the per-tenant allowlist; an unknown field is **400** and the message names the field and the allowed set. The starter passes the filter string through, so any index field is addressable.',
+        'Every filter field is checked against `ALLOWED_FILTER_FIELDS`; an unknown one is **400** naming the field with the `allowed` list. The engine filters on any stored field, `cost_cents` included.',
       match: {
-        python: {all: [/ALLOWED_FILTER_FIELDS/, /status_code\s*=\s*400/, /unknown filter/]},
-        typescript: {all: [/ALLOWED_FILTER_FIELDS/, /code\(\s*400\s*\)/, /unknown filter/]},
-        go: {all: [/allowedFilterFields/, /StatusBadRequest/, /unknown filter/]},
-        scala: {all: [/AllowedFilterFields/, /StatusCodes\.BadRequest/, /unknown filter/]},
-        cpp: {all: [/kAllowedFilterFields/, /\b400\b/, /unknown filter/]},
+        python: {
+          all: [
+            /ALLOWED_FILTER_FIELDS\s*=/,
+            /not in ALLOWED_FILTER_FIELDS|-\s*set\(\s*ALLOWED_FILTER_FIELDS/,
+            /allowed/,
+          ],
+        },
+        typescript: {all: [/ALLOWED_FILTER_FIELDS\s*=/, /ALLOWED_FILTER_FIELDS\.(includes|has)\(/, /allowed:/]},
+        go: {all: [/allowedFilterFields\s*=/, /range allowedFilterFields|allowedFilterFields\[/, /"allowed"/]},
+        cpp: {all: [/kAllowedFilterFields\s*=/, /kAllowedFilterFields\.(begin|end|count)\(/, /"allowed"/]},
+        scala: {all: [/AllowedFilterFields(:[^=\n]*)?\s*=/, /AllowedFilterFields\.contains\(/, /"allowed"/]},
       },
     },
     {
-      id: 'engine-scoping',
-      title: 'Builds the engine query from validated fields, tenant-scoped',
+      id: 'filter-shape',
+      title: 'A malformed filters value is 400, not a crash',
       detail:
-        "The engine query is assembled by `buildEngineQuery` from the validated filter fields and the tenant, never from the caller's raw filter string. The starter interpolates the string, so a filter can address a field outside the tenant's catalog.",
+        '`filters` must parse as a JSON object of strings; malformed JSON, an array, or a non-string value answers **400**. The starter parses without a guard, so bad input surfaces as a 500 or as an empty page.',
       match: {
-        python: {all: [/def build_engine_query\(/, /tenant/]},
-        typescript: {all: [/function buildEngineQuery\(/, /tenant/]},
-        go: {all: [/func buildEngineQuery\(/, /tenant/]},
-        scala: {all: [/def buildEngineQuery\(/, /tenant/]},
-        cpp: {all: [/buildEngineQuery\(/, /tenant/]},
+        python: {
+          all: [
+            /except\s+(json\.)?(JSONDecodeError|ValueError)/,
+            /isinstance\(\s*\w+,\s*dict\s*\)/,
+            /isinstance\(\s*\w+,\s*str\s*\)/,
+          ],
+        },
+        typescript: {all: [/catch\s*(\(\w*\))?\s*\{/, /Array\.isArray\(/, /typeof \w+ === 'string'/]},
+        go: {all: [/if err := json\.Unmarshal\(/]},
+        scala: {all: [/Try\(|catch\s*\{/, /JsString\(/]},
+        cpp: {all: [/json::parse\([^\n]*,\s*nullptr,\s*false\)/, /is_object\(\)/, /is_string\(\)/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
-import logging
 
-from fastapi import FastAPI, Header, Query
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from search import catalog  # catalog.run_query(tenant, q, filters, page_size) -> list of public views
+
 app = FastAPI()
-logger = logging.getLogger("search")
 
-
-class QueryEngine:
-    def search(self, q: str, filters: str, size: int) -> list[dict]:
-        """Run a query against the index."""
-        raise NotImplementedError
-
-
-engine = QueryEngine()
+DEFAULT_PAGE_SIZE = 20
 
 
 @app.get("/v1/search")
-def search(
-    q: str = Query(default=""),
-    filters: str = Query(default="{}"),
-    page_size: int = Query(default=10),
-    tenant: str = Header(default="", alias="X-Tenant-Id"),
-) -> JSONResponse:
+def search(request: Request) -> JSONResponse:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    parsed = json.loads(filters)
-    results = engine.search(q, parsed, page_size)
-    logger.info("search tenant=%s q=%r filters=%r", tenant, q, filters)
-    return JSONResponse({"results": results, "page_size": page_size}, status_code=200)
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "missing X-Tenant-Id"}, status_code=401)
+    q = request.query_params.get("q", "")
+    page_size = int(request.query_params.get("page_size", DEFAULT_PAGE_SIZE))
+    filters = json.loads(request.query_params.get("filters", "{}"))
+    results = catalog.run_query(tenant, q, filters, page_size)
+    return JSONResponse({"results": results, "page_size": page_size})
 `,
       solution: `import json
-import logging
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from search import catalog  # catalog.run_query(tenant, q, filters, page_size) -> list of public views
+
 app = FastAPI()
-logger = logging.getLogger("search")
 
-MAX_QUERY_BYTES = 1 << 8
+DEFAULT_PAGE_SIZE = 20
+MAX_QUERY_BYTES = 256
 MAX_PAGE_SIZE = 100
-ALLOWED_FILTER_FIELDS = {"brand", "category", "in_stock", "min_price", "max_price"}
+# What a shopper may filter on: the engine filters on any stored field, cost_cents included.
+ALLOWED_FILTER_FIELDS = ("brand", "category", "in_stock", "min_price", "max_price")
 
 
-class QueryEngine:
-    def search(self, query: dict) -> list[dict]:
-        """Run the validated query against the index."""
-        raise NotImplementedError
-
-
-engine = QueryEngine()
-
-
-def build_engine_query(q: str, tenant: str, filters: dict, page_size: int) -> dict:
-    """Assemble the engine query from validated fields only, scoped to the tenant's catalog."""
-    return {"q": q, "tenant": tenant, "filters": filters, "page_size": page_size}
+def bad_request(error: str, **extra) -> JSONResponse:
+    return JSONResponse({"error": error, **extra}, status_code=400)
 
 
 @app.get("/v1/search")
-def search(
-    q: str = Query(default=""),
-    filters: str = Query(default="{}"),
-    page_size: int = Query(default=10),
-    tenant: str = Header(default="", alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if q == "":
-        raise HTTPException(status_code=400, detail="q must be a non-empty string")
-    if len(q.encode("utf-8")) > MAX_QUERY_BYTES:
-        raise HTTPException(status_code=400, detail="q exceeds 256 bytes")
-    if page_size < 1 or page_size > MAX_PAGE_SIZE:
-        raise HTTPException(status_code=400, detail="page_size must be 1..100")
-
+def search(request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "missing X-Tenant-Id"}, status_code=401)
+    q = request.query_params.get("q", "")
+    if not q.strip() or len(q.encode("utf-8")) > MAX_QUERY_BYTES:
+        return bad_request(f"q must be 1 to {MAX_QUERY_BYTES} bytes of UTF-8")
     try:
-        requested = json.loads(filters)
+        page_size = int(request.query_params.get("page_size", DEFAULT_PAGE_SIZE))
+    except ValueError:
+        page_size = 0
+    if not 1 <= page_size <= MAX_PAGE_SIZE:
+        return bad_request(f"page_size must be an integer from 1 to {MAX_PAGE_SIZE}")
+    try:
+        filters = json.loads(request.query_params.get("filters", "{}"))
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="filters must be a JSON object")
-    if not isinstance(requested, dict):
-        raise HTTPException(status_code=400, detail="filters must be a JSON object")
-
-    unknown = [f for f in requested if f not in ALLOWED_FILTER_FIELDS]
+        filters = None
+    if not isinstance(filters, dict) or not all(isinstance(value, str) for value in filters.values()):
+        return bad_request("filters must be a JSON object of strings")
+    unknown = [field for field in filters if field not in ALLOWED_FILTER_FIELDS]
     if unknown:
-        raise HTTPException(
-            status_code=400,
-            detail=f"unknown filter field '{unknown[0]}'; allowed: {sorted(ALLOWED_FILTER_FIELDS)}",
-        )
-    validated = {f: requested[f] for f in ALLOWED_FILTER_FIELDS if f in requested}
-
-    query = build_engine_query(q, tenant, validated, page_size)
-    logger.info("search tenant=%s page_size=%d filters=%s", tenant, page_size, sorted(validated))
-    page = engine.search(query)
-    return JSONResponse({"results": page, "page_size": page_size, "tenant": tenant}, status_code=200)
+        return bad_request(f"unknown filter field {unknown[0]}", allowed=list(ALLOWED_FILTER_FIELDS))
+    results = catalog.run_query(tenant, q, filters, page_size)
+    return JSONResponse({"results": results, "page_size": page_size})
 `,
     },
     typescript: {
-      starter: `/** GET /v1/search: the starter. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {runQuery} from 'search/catalog'; // runQuery(tenant, q, filters, pageSize): Promise<Hit[]>
 
 export const app = Fastify();
 
-const engine = {
-  search: async (q: string, filters: Record<string, unknown>, size: number): Promise<unknown[]> => {
-    void q;
-    void filters;
-    void size;
-    return [];
-  },
-};
+const DEFAULT_PAGE_SIZE = 20;
 
 app.get('/v1/search', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const {q = '', filters = '{}', page_size = '10'} = request.query as Record<string, string>;
-  const tenant = request.headers['x-tenant-id'] as string;
-  const results = await engine.search(q, JSON.parse(filters), Number(page_size));
-  request.log.info({tenant, q, filters}, 'searched');
-  return reply.code(200).send({results, page_size: Number(page_size)});
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  const query = request.query as Record<string, string | undefined>;
+  const q = query.q ?? '';
+  const pageSize = Number(query.page_size ?? DEFAULT_PAGE_SIZE);
+  const filters = JSON.parse(query.filters ?? '{}') as Record<string, string>;
+  const results = await runQuery(tenant, q, filters, pageSize);
+  return {results, page_size: pageSize};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/search: a bounded query DSL with an allowlisted filter surface. */
-import {createHash} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {runQuery} from 'search/catalog'; // runQuery(tenant, q, filters, pageSize): Promise<Hit[]>
 
 export const app = Fastify();
 
-const MAX_QUERY_BYTES = 1 << 8;
+const DEFAULT_PAGE_SIZE = 20;
+const MAX_QUERY_BYTES = 256;
 const MAX_PAGE_SIZE = 100;
-const ALLOWED_FILTER_FIELDS: Record<string, true> = {
-  brand: true,
-  category: true,
-  in_stock: true,
-  min_price: true,
-  max_price: true,
-};
-
-const engine = {
-  search: async (query: EngineQuery): Promise<unknown[]> => {
-    void query;
-    return [];
-  },
-};
-
-interface EngineQuery {
-  q: string;
-  tenant: string;
-  filters: Record<string, unknown>;
-  page_size: number;
-}
-
-function buildEngineQuery(q: string, tenant: string, filters: Record<string, unknown>, pageSize: number): EngineQuery {
-  return {q, tenant, filters, page_size: pageSize};
-}
+// What a shopper may filter on: the engine filters on any stored field, cost_cents included.
+const ALLOWED_FILTER_FIELDS = ['brand', 'category', 'in_stock', 'min_price', 'max_price'];
 
 app.get('/v1/search', async (request, reply) => {
-  const {q = '', filters = '{}', page_size = '10'} = request.query as Record<string, string>;
   const tenant = request.headers['x-tenant-id'];
   if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  if (q === '') return reply.code(400).send({error: 'q must be a non-empty string'});
-  if (Buffer.byteLength(q, 'utf8') > MAX_QUERY_BYTES) return reply.code(400).send({error: 'q exceeds 256 bytes'});
-  const pageSize = Number(page_size);
+  const query = request.query as Record<string, string | undefined>;
+  const q = query.q ?? '';
+  if (q.trim() === '' || new TextEncoder().encode(q).length > MAX_QUERY_BYTES)
+    return reply.code(400).send({error: \`q must be 1 to \${MAX_QUERY_BYTES} bytes of UTF-8\`});
+  const pageSize = Number(query.page_size ?? DEFAULT_PAGE_SIZE);
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > MAX_PAGE_SIZE)
-    return reply.code(400).send({error: 'page_size must be 1..100'});
-
-  let requested: unknown;
+    return reply.code(400).send({error: \`page_size must be an integer from 1 to \${MAX_PAGE_SIZE}\`});
+  let filters: unknown;
   try {
-    requested = JSON.parse(filters);
+    filters = JSON.parse(query.filters ?? '{}');
   } catch {
-    return reply.code(400).send({error: 'filters must be a JSON object'});
+    filters = null;
   }
-  if (typeof requested !== 'object' || requested === null || Array.isArray(requested))
-    return reply.code(400).send({error: 'filters must be a JSON object'});
-
-  const given = requested as Record<string, unknown>;
-  const unknown = Object.keys(given).filter(field => ALLOWED_FILTER_FIELDS[field] !== true);
-  if (unknown.length > 0)
-    return reply.code(400).send({error: \`unknown filter field '\${unknown[0]}'; allowed: \${Object.keys(ALLOWED_FILTER_FIELDS).sort()}\`});
-  const validated: Record<string, unknown> = {};
-  for (const field of Object.keys(ALLOWED_FILTER_FIELDS)) if (field in given) validated[field] = given[field];
-
-  const query = buildEngineQuery(q, tenant, validated, pageSize);
-  request.log.info({tenant, page_size: pageSize, filters: Object.keys(validated)}, 'searched');
-  const results = await engine.search(query);
-  return reply.code(200).send({results, page_size: pageSize, tenant});
+  if (typeof filters !== 'object' || filters === null || Array.isArray(filters) || !Object.values(filters).every(value => typeof value === 'string'))
+    return reply.code(400).send({error: 'filters must be a JSON object of strings'});
+  const unknown = Object.keys(filters).filter(field => !ALLOWED_FILTER_FIELDS.includes(field));
+  if (unknown.length > 0) return reply.code(400).send({error: \`unknown filter field \${unknown[0]}\`, allowed: ALLOWED_FILTER_FIELDS});
+  const results = await runQuery(tenant, q, filters as Record<string, string>, pageSize);
+  return {results, page_size: pageSize};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -304,99 +260,81 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"strconv"
+
+	"search/catalog" // catalog.RunQuery(ctx, tenant, q, filters, pageSize) []catalog.Hit
 )
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+const defaultPageSize = 20
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func engineSearch(q, filters string, size int) []any {
-	return nil
+	json.NewEncoder(rw).Encode(v)
 }
 
 func search(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	q := r.URL.Query().Get("q")
-	filters := r.URL.Query().Get("filters")
-	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	results := engineSearch(q, filters, pageSize)
-	log.Printf("search tenant=%s q=%q filters=%q", tenant, q, filters)
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		return
+	}
+	params := r.URL.Query()
+	q := params.Get("q")
+	pageSize := defaultPageSize
+	if raw := params.Get("page_size"); raw != "" {
+		pageSize, _ = strconv.Atoi(raw)
+	}
+	filters := map[string]string{}
+	json.Unmarshal([]byte(params.Get("filters")), &filters)
+	results := catalog.RunQuery(r.Context(), tenant, q, filters, pageSize)
 	writeJSON(rw, http.StatusOK, map[string]any{"results": results, "page_size": pageSize})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/search", search)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
-      solution:
-        `package main
+      solution: `package main
 
 import (
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
+
+	"search/catalog" // catalog.RunQuery(ctx, tenant, q, filters, pageSize) []catalog.Hit
 )
 
 const (
-	maxQueryBytes = 1 << 8
-	maxPageSize   = 100
+	defaultPageSize = 20
+	maxQueryBytes   = 256
+	maxPageSize     = 100
 )
 
-var allowedFilterFields = map[string]bool{
-	"brand":     true,
-	"category":  true,
-	"in_stock":  true,
-	"min_price": true,
-	"max_price": true,
-}
+// What a shopper may filter on: the engine filters on any stored field, cost_cents included.
+var allowedFilterFields = []string{"brand", "category", "in_stock", "min_price", "max_price"}
 
-type engineQuery struct {
-	Q        string         ` +
-        '`json:"q"`' +
-        `
-	Tenant   string         ` +
-        '`json:"tenant"`' +
-        `
-	Filters  map[string]any ` +
-        '`json:"filters"`' +
-        `
-	PageSize int            ` +
-        '`json:"page_size"`' +
-        `
-}
-
-func allowedFields() []string {
-	fields := make([]string, 0, len(allowedFilterFields))
-	for field := range allowedFilterFields {
-		fields = append(fields, field)
-	}
-	sort.Strings(fields)
-	return fields
-}
-
-func buildEngineQuery(q, tenant string, filters map[string]any, pageSize int) engineQuery {
-	return engineQuery{Q: q, Tenant: tenant, Filters: filters, PageSize: pageSize}
-}
-
-func engineSearch(query engineQuery) []any {
-	return nil
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func badRequest(rw http.ResponseWriter, body map[string]any) {
+	writeJSON(rw, http.StatusBadRequest, body)
+}
+
+func allowed(field string) bool {
+	for _, name := range allowedFilterFields {
+		if name == field {
+			return true
+		}
+	}
+	return false
 }
 
 func search(rw http.ResponseWriter, r *http.Request) {
@@ -405,157 +343,132 @@ func search(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
 		return
 	}
-	q := r.URL.Query().Get("q")
-	if q == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "q must be a non-empty string"})
+	params := r.URL.Query()
+	q := params.Get("q")
+	if strings.TrimSpace(q) == "" || len(q) > maxQueryBytes {
+		badRequest(rw, map[string]any{"error": fmt.Sprintf("q must be 1 to %d bytes of UTF-8", maxQueryBytes)})
 		return
 	}
-	if len([]byte(q)) > maxQueryBytes {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "q exceeds 256 bytes"})
-		return
-	}
-	pageSize, err := strconv.Atoi(r.URL.Query().Get("page_size"))
-	if err != nil {
-		pageSize = 10
+	pageSize := defaultPageSize
+	if raw := params.Get("page_size"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			n = 0
+		}
+		pageSize = n
 	}
 	if pageSize < 1 || pageSize > maxPageSize {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "page_size must be 1..100"})
+		badRequest(rw, map[string]any{"error": fmt.Sprintf("page_size must be an integer from 1 to %d", maxPageSize)})
 		return
 	}
-	var requested map[string]any
-	if err := json.Unmarshal([]byte(r.URL.Query().Get("filters")), &requested); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "filters must be a JSON object"})
-		return
-	}
-	for field := range requested {
-		if !allowedFilterFields[field] {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{
-				"error": "unknown filter field '" + field + "'; allowed: " + strings.Join(allowedFields(), ", "),
-			})
+	filters := map[string]string{}
+	if raw := params.Get("filters"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &filters); err != nil {
+			badRequest(rw, map[string]any{"error": "filters must be a JSON object of strings"})
 			return
 		}
 	}
-	validated := make(map[string]any)
-	for field := range allowedFilterFields {
-		if value, ok := requested[field]; ok {
-			validated[field] = value
+	for field := range filters {
+		if !allowed(field) {
+			badRequest(rw, map[string]any{"error": "unknown filter field " + field, "allowed": allowedFilterFields})
+			return
 		}
 	}
-	query := buildEngineQuery(q, tenant, validated, pageSize)
-	log.Printf("search tenant=%s page_size=%d filters=%v", tenant, pageSize, allowedFields())
-	results := engineSearch(query)
-	writeJSON(rw, http.StatusOK, map[string]any{"results": results, "page_size": pageSize, "tenant": tenant})
+	results := catalog.RunQuery(r.Context(), tenant, q, filters, pageSize)
+	writeJSON(rw, http.StatusOK, map[string]any{"results": results, "page_size": pageSize})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/search", search)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
+
+import search.Catalog // Catalog.runQuery(tenant, q, filters, pageSize): Seq[JsObject]
 
 object SearchApi {
-  implicit val system: ActorSystem = ActorSystem("product-search")
+  val DefaultPageSize = 20
 
-  def engineSearch(q: String, filters: String, size: Int): Seq[String] = Seq.empty
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "search") {
-      get {
-        parameters("q".?, "filters".?, "page_size".as[Int].?) { (qOpt, filtersOpt, sizeOpt) =>
-          headerValueByName("X-Tenant-Id") { tenant =>
+  val route: Route = path("v1" / "search") {
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing X-Tenant-Id"))))
+        case Some(tenant) =>
+          parameters("q".optional, "page_size".optional, "filters".optional) { (q, pageSize, filters) =>
             // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val q = qOpt.getOrElse("")
-            val filters = filtersOpt.getOrElse("{}")
-            val pageSize = sizeOpt.getOrElse(10)
-            val results = engineSearch(q, filters, pageSize)
-            system.log.info(s"search tenant=$tenant q=$q filters=$filters")
-            complete(StatusCodes.OK, s"""{"results":[],"page_size":$pageSize}""")
+            val size = pageSize.map(_.toInt).getOrElse(DefaultPageSize)
+            val requested = filters.getOrElse("{}").parseJson.asJsObject.fields.map { case (field, value) => field -> value.toString }
+            val results = Catalog.runQuery(tenant, q.getOrElse(""), requested, size)
+            complete(json(StatusCodes.OK, JsObject("results" -> JsArray(results.toVector), "page_size" -> JsNumber(size))))
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.nio.charset.StandardCharsets
-
-import scala.util.Try
-import scala.util.control.NonFatal
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
 import spray.json._
 
+import scala.util.Try
+
+import search.Catalog // Catalog.runQuery(tenant, q, filters, pageSize): Seq[JsObject]
+
 object SearchApi {
-  implicit val system: ActorSystem = ActorSystem("product-search")
-
-  val MaxQueryBytes = 1 << 8
+  val DefaultPageSize = 20
+  val MaxQueryBytes = 256
   val MaxPageSize = 100
-  val AllowedFilterFields = Set("brand", "category", "in_stock", "min_price", "max_price")
+  // What a shopper may filter on: the engine filters on any stored field, cost_cents included.
+  val AllowedFilterFields: Seq[String] = Seq("brand", "category", "in_stock", "min_price", "max_price")
 
-  final case class EngineQuery(q: String, tenant: String, filters: Map[String, JsValue], pageSize: Int)
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def buildEngineQuery(q: String, tenant: String, filters: Map[String, JsValue], pageSize: Int): EngineQuery =
-    EngineQuery(q, tenant, filters, pageSize)
+  private def badRequest(error: String, extra: (String, JsValue)*): HttpResponse =
+    json(StatusCodes.BadRequest, JsObject((("error" -> JsString(error)) +: extra).toMap))
 
-  def engineSearch(query: EngineQuery): Seq[String] = Seq.empty
-
-  val route: Route =
-    path("v1" / "search") {
-      get {
-        parameters("q".?, "filters".?, "page_size".as[Int].?) { (qOpt, filtersOpt, sizeOpt) =>
-          headerValueByName("X-Tenant-Id") { tenant =>
-            val q = qOpt.getOrElse("")
-            val pageSize = sizeOpt.getOrElse(10)
-            if (q.isEmpty) {
-              complete(StatusCodes.BadRequest, s"""{"error":"q must be a non-empty string"}""")
-            } else if (q.getBytes(StandardCharsets.UTF_8).length > MaxQueryBytes) {
-              complete(StatusCodes.BadRequest, s"""{"error":"q exceeds 256 bytes"}""")
-            } else if (pageSize < 1 || pageSize > MaxPageSize) {
-              complete(StatusCodes.BadRequest, s"""{"error":"page_size must be 1..100"}""")
-            } else {
-              Try(filtersOpt.getOrElse("{}").parseJson.asJsObject) match {
-                case scala.util.Failure(_) =>
-                  complete(StatusCodes.BadRequest, s"""{"error":"filters must be a JSON object"}""")
-                case scala.util.Success(requested) =>
-                  val fields = requested.fields.keySet
-                  val unknown = fields.diff(AllowedFilterFields)
-                  if (unknown.nonEmpty) {
-                    complete(
-                      StatusCodes.BadRequest,
-                      s"""{"error":"unknown filter field '\${unknown.head}'; allowed: \${AllowedFilterFields.toList.sorted.mkString(", ")}"}""",
-                    )
-                  } else {
-                    val validated = requested.fields.filter { case (field, _) => AllowedFilterFields.contains(field) }
-                    val query = buildEngineQuery(q, tenant, validated, pageSize)
-                    system.log.info(s"search tenant=$tenant page_size=$pageSize filters=\${validated.keySet.toList.sorted}")
-                    val results = engineSearch(query)
-                    complete(StatusCodes.OK, s"""{"results":[],"page_size":$pageSize}""")
-                  }
-              }
-            }
-          }
-        }
-      }
+  /** The filters as field → text, or None unless the value is a JSON object of strings. */
+  private def parseFilters(raw: String): Option[Map[String, String]] =
+    Try(raw.parseJson).toOption.collect { case JsObject(fields) => fields }.flatMap { fields =>
+      val strings = fields.collect { case (field, JsString(value)) => field -> value }
+      if (strings.size == fields.size) Some(strings) else None
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  val route: Route = path("v1" / "search") {
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("missing X-Tenant-Id"))))
+        case Some(tenant) =>
+          parameters("q".optional, "page_size".optional, "filters".optional) { (q, pageSize, filters) =>
+            val text = q.getOrElse("")
+            val size = pageSize.map(raw => raw.toIntOption.getOrElse(0)).getOrElse(DefaultPageSize)
+            if (text.trim.isEmpty || text.getBytes("UTF-8").length > MaxQueryBytes)
+              complete(badRequest(s"q must be 1 to $MaxQueryBytes bytes of UTF-8"))
+            else if (size < 1 || size > MaxPageSize)
+              complete(badRequest(s"page_size must be an integer from 1 to $MaxPageSize"))
+            else
+              parseFilters(filters.getOrElse("{}")) match {
+                case None => complete(badRequest("filters must be a JSON object of strings"))
+                case Some(requested) =>
+                  requested.keys.find(field => !AllowedFilterFields.contains(field)) match {
+                    case Some(field) => complete(badRequest(s"unknown filter field $field", "allowed" -> JsArray(AllowedFilterFields.map(JsString(_)).toVector)))
+                    case None =>
+                      val results = Catalog.runQuery(tenant, text, requested, size)
+                      complete(json(StatusCodes.OK, JsObject("results" -> JsArray(results.toVector), "page_size" -> JsNumber(size))))
+                  }
+              }
+          }
+      }
+    }
   }
 }
 `,
@@ -564,136 +477,521 @@ object SearchApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
+#include <map>
 #include <string>
+
+#include "search/catalog.h"  // catalog::runQuery(tenant, q, filters, page_size) -> JSON array of public views
 
 using json = nlohmann::json;
 
-std::vector<std::string> engineSearch(const std::string& q, const std::string& filters, int size) {
-  (void)q;
-  (void)filters;
-  (void)size;
-  return {};
+const int kDefaultPageSize = 20;
+
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get("/v1/search", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto q = req.get_param_value("q");
-    const auto filters = req.get_param_value("filters");
-    const int pageSize = req.has_param("page_size") ? std::stoi(req.get_param_value("page_size")) : 10;
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const auto results = engineSearch(q, filters, pageSize);
-    std::cerr << "search tenant=" << tenant << " q=" << q << " filters=" << filters << "\\n";
-    res.status = 200;
-    res.set_content(json{{"results", results}, {"page_size", pageSize}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void search(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "missing X-Tenant-Id"}});
+  const std::string q = req.get_param_value("q");
+  const int page_size = req.has_param("page_size") ? std::stoi(req.get_param_value("page_size")) : kDefaultPageSize;
+  const auto filters = json::parse(req.has_param("filters") ? req.get_param_value("filters") : "{}").get<std::map<std::string, std::string>>();
+  reply(res, 200, {{"results", catalog::runQuery(tenant, q, filters, page_size)}, {"page_size", page_size}});
 }
+
+void register_routes(httplib::Server& svr) { svr.Get("/v1/search", search); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <iostream>
-#include <set>
+#include <cctype>
+#include <map>
 #include <string>
+#include <vector>
+
+#include "search/catalog.h"  // catalog::runQuery(tenant, q, filters, page_size) -> JSON array of public views
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxQueryBytes = 1 << 8;
-constexpr int kMaxPageSize = 100;
-const std::set<std::string> kAllowedFilterFields = {"brand", "category", "in_stock", "min_price", "max_price"};
+const int kDefaultPageSize = 20;
+const size_t kMaxQueryBytes = 256;
+const int kMaxPageSize = 100;
+// What a shopper may filter on: the engine filters on any stored field, cost_cents included.
+const std::vector<std::string> kAllowedFilterFields = {"brand", "category", "in_stock", "min_price", "max_price"};
 
-struct EngineQuery {
-  std::string q;
-  std::string tenant;
-  json filters;
-  int page_size;
-};
-
-EngineQuery buildEngineQuery(const std::string& q, const std::string& tenant, const json& filters, int pageSize) {
-  return EngineQuery{q, tenant, filters, pageSize};
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-std::vector<std::string> engineSearch(const EngineQuery& query) {
-  (void)query;
-  return {};
+void search(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "missing X-Tenant-Id"}});
+  const std::string q = req.get_param_value("q");
+  if (q.find_first_not_of(" \\t\\r\\n") == std::string::npos || q.size() > kMaxQueryBytes) {
+    return reply(res, 400, {{"error", "q must be 1 to 256 bytes of UTF-8"}});
+  }
+  int page_size = kDefaultPageSize;
+  if (req.has_param("page_size")) {
+    const std::string raw = req.get_param_value("page_size");
+    const bool digits = !raw.empty() && raw.size() <= 6 && std::all_of(raw.begin(), raw.end(), [](unsigned char c) { return std::isdigit(c); });
+    page_size = digits ? std::stoi(raw) : 0;
+  }
+  if (page_size < 1 || page_size > kMaxPageSize) return reply(res, 400, {{"error", "page_size must be an integer from 1 to 100"}});
+  const json parsed = json::parse(req.has_param("filters") ? req.get_param_value("filters") : "{}", nullptr, false);
+  if (!parsed.is_object()) return reply(res, 400, {{"error", "filters must be a JSON object of strings"}});
+  std::map<std::string, std::string> filters;
+  for (const auto& item : parsed.items()) {
+    if (!item.value().is_string()) return reply(res, 400, {{"error", "filters must be a JSON object of strings"}});
+    if (std::find(kAllowedFilterFields.begin(), kAllowedFilterFields.end(), item.key()) == kAllowedFilterFields.end()) {
+      return reply(res, 400, {{"error", "unknown filter field " + item.key()}, {"allowed", kAllowedFilterFields}});
+    }
+    filters[item.key()] = item.value().get<std::string>();
+  }
+  reply(res, 200, {{"results", catalog::runQuery(tenant, q, filters, page_size)}, {"page_size", page_size}});
 }
 
-std::string allowedFields() {
+void register_routes(httplib::Server& svr) { svr.Get("/v1/search", search); }
+`,
+    },
+  },
+  harness: {
+    python: `from search import catalog
+
+TENANT = "t-1"
+PRODUCTS = [
+    {"id": "p-1", "title": "Steel Kettle", "brand": "acme", "category": "kitchen", "price_cents": 3499, "in_stock": True, "cost_cents": 1200},
+    {"id": "p-2", "title": "Glass Kettle", "brand": "brew", "category": "kitchen", "price_cents": 2999, "in_stock": False, "cost_cents": 900},
+    {"id": "p-3", "title": "Kettle Descaler", "brand": "acme", "category": "cleaning", "price_cents": 899, "in_stock": True, "cost_cents": 150},
+]
+OTHER = {"id": "p-9", "title": "Copper Kettle", "brand": "acme", "category": "kitchen", "price_cents": 5999, "in_stock": True, "cost_cents": 3000}
+ALLOWED = ("brand", "category", "in_stock", "min_price", "max_price")
+
+
+def _api(ctx):
+    for product in PRODUCTS:
+        catalog.put_product(TENANT, product)
+    catalog.put_product("t-2", OTHER)
+    return ctx.client(ctx.load("api").app)
+
+
+async def _search(c, **params):
+    try:
+        return await c.get("/v1/search", params=params, headers={"X-Tenant-Id": TENANT})
+    except Exception as exc:
+        raise AssertionError(f"GET /v1/search with {params} crashed the handler ({type(exc).__name__}: {exc}): a bad input must answer 400")
+
+
+def _ids(r):
+    return [hit["id"] for hit in r.json().get("results", [])]
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _search(c, q="kettle")
+    assert r.status_code == 200, f"GET /v1/search?q=kettle answered {r.status_code}: {r.text}"
+    assert _ids(r) == ["p-3", "p-2", "p-1"], f"the search answered {_ids(r)}, expected the tenant's three kettles, cheapest first"
+    assert r.json().get("page_size") == 20, f"without page_size the response must say 20, got {r.json().get('page_size')!r}"
+
+
+async def check_query_cap(ctx):
+    async with _api(ctx) as c:
+        long = "kettle " + "x" * 300
+        r = await _search(c, q=long)
+        assert r.status_code == 400, f"a {len(long)}-byte query answered {r.status_code}: q is capped at 256 bytes"
+        r = await _search(c, q="é" * 129)
+        assert r.status_code == 400, f"a query of 129 characters and 258 bytes (é is two bytes in UTF-8) answered {r.status_code}: the cap counts bytes, not characters"
+        r = await _search(c, q="é" * 128)
+        assert r.status_code == 200, f"a query of exactly 256 bytes answered {r.status_code}: 256 bytes is within the cap"
+        r = await _search(c, q="   ")
+    assert r.status_code == 400, f"a blank query answered {r.status_code} with {_ids(r) if r.status_code == 200 else r.text}: an empty q matches the whole catalog"
+
+
+async def check_page_cap(ctx):
+    async with _api(ctx) as c:
+        for size in ("10000", "101", "0"):
+            r = await _search(c, q="kettle", page_size=size)
+            assert r.status_code == 400, f"page_size={size} answered {r.status_code}: page_size is an integer from 1 to 100"
+        r = await _search(c, q="kettle", page_size="ten")
+        assert r.status_code == 400, f"page_size=ten answered {r.status_code}, expected 400"
+        r = await _search(c, q="kettle", page_size="1")
+        assert r.status_code == 200 and _ids(r) == ["p-3"], f"page_size=1 answered {r.status_code} {r.text}, expected the cheapest kettle"
+        r = await _search(c, q="kettle", page_size="100")
+    assert r.status_code == 200, f"page_size=100 answered {r.status_code}: 100 is within the cap"
+
+
+async def check_filter_allowlist(ctx):
+    async with _api(ctx) as c:
+        r = await _search(c, q="kettle", filters='{"cost_cents": "1200"}')
+        assert r.status_code == 400, f"a filter on cost_cents answered {r.status_code} with {_ids(r) if r.status_code == 200 else r.text}: the wholesale cost is one guess away. Check filter fields against ALLOWED_FILTER_FIELDS"
+        assert "cost_cents" in r.text, f"the 400 must name the unknown field (cost_cents), got {r.text}"
+        allowed = r.json().get("allowed")
+        assert isinstance(allowed, list) and sorted(allowed) == sorted(ALLOWED), f"the 400 must carry the allowed list {list(ALLOWED)}, got {allowed!r}"
+        r = await _search(c, q="kettle", filters='{"brand": "acme", "max_price": "1000"}')
+        assert r.status_code == 200 and _ids(r) == ["p-3"], f"brand=acme and max_price=1000 answered {r.status_code} {r.text}, expected [p-3]"
+        r = await _search(c, q="kettle", filters='{"in_stock": "true"}')
+    assert r.status_code == 200 and _ids(r) == ["p-3", "p-1"], f"in_stock=true answered {r.status_code} {r.text}, expected [p-3, p-1]"
+
+
+async def check_filter_shape(ctx):
+    async with _api(ctx) as c:
+        for raw in ('{"in_stock": true}', '["brand"]', "brand=acme"):
+            r = await _search(c, q="kettle", filters=raw)
+            assert r.status_code == 400, f"filters={raw} answered {r.status_code}: filters must be a JSON object of strings, anything else is 400"
+        r = await _search(c, q="kettle", filters='{"category": "kitchen"}')
+    assert r.status_code == 200 and _ids(r) == ["p-2", "p-1"], f"category=kitchen answered {r.status_code} {r.text}, expected [p-2, p-1]"
+`,
+    typescript: `const TENANT = 't-1';
+const PRODUCTS = [
+  {id: 'p-1', title: 'Steel Kettle', brand: 'acme', category: 'kitchen', price_cents: 3499, in_stock: true, cost_cents: 1200},
+  {id: 'p-2', title: 'Glass Kettle', brand: 'brew', category: 'kitchen', price_cents: 2999, in_stock: false, cost_cents: 900},
+  {id: 'p-3', title: 'Kettle Descaler', brand: 'acme', category: 'cleaning', price_cents: 899, in_stock: true, cost_cents: 150},
+];
+const OTHER = {id: 'p-9', title: 'Copper Kettle', brand: 'acme', category: 'kitchen', price_cents: 5999, in_stock: true, cost_cents: 3000};
+const ALLOWED = ['brand', 'category', 'in_stock', 'min_price', 'max_price'];
+
+async function api(ctx) {
+  const catalog = ctx.load('/support/search/catalog.ts');
+  for (const product of PRODUCTS) await catalog.putProduct(TENANT, product);
+  await catalog.putProduct('t-2', OTHER);
+  return ctx.client(ctx.load('api').app);
+}
+
+async function search(c, query: Record<string, string>) {
+  try {
+    return await c.get('/v1/search', {query, headers: {'X-Tenant-Id': TENANT}});
+  } catch (e) {
+    assert.fail(\`GET /v1/search with \${JSON.stringify(query)} crashed the handler (\${(e as Error).message}): a bad input must answer 400\`);
+  }
+}
+
+function ids(r): string[] {
+  try {
+    return (r.json().results ?? []).map(hit => hit.id);
+  } catch {
+    return [];
+  }
+}
+
+export async function check_route(ctx) {
+  const c = await api(ctx);
+  const r = await search(c, {q: 'kettle'});
+  assert.equal(r.status, 200, \`GET /v1/search?q=kettle answered \${r.status}: \${r.text}\`);
+  assert.deepStrictEqual(ids(r), ['p-3', 'p-2', 'p-1'], \`the search answered \${JSON.stringify(ids(r))}, expected the tenant's three kettles, cheapest first\`);
+  assert.equal(r.json().page_size, 20, \`without page_size the response must say 20, got \${JSON.stringify(r.json().page_size)}\`);
+}
+
+export async function check_query_cap(ctx) {
+  const c = await api(ctx);
+  const long = 'kettle ' + 'x'.repeat(300);
+  let r = await search(c, {q: long});
+  assert.equal(r.status, 400, \`a \${long.length}-byte query answered \${r.status}: q is capped at 256 bytes\`);
+  r = await search(c, {q: 'é'.repeat(129)});
+  assert.equal(r.status, 400, \`a query of 129 characters and 258 bytes (é is two bytes in UTF-8) answered \${r.status}: the cap counts bytes, not characters\`);
+  r = await search(c, {q: 'é'.repeat(128)});
+  assert.equal(r.status, 200, \`a query of exactly 256 bytes answered \${r.status}: 256 bytes is within the cap\`);
+  r = await search(c, {q: '   '});
+  assert.equal(r.status, 400, \`a blank query answered \${r.status} with \${r.text}: an empty q matches the whole catalog\`);
+}
+
+export async function check_page_cap(ctx) {
+  const c = await api(ctx);
+  for (const size of ['10000', '101', '0', 'ten']) {
+    const r = await search(c, {q: 'kettle', page_size: size});
+    assert.equal(r.status, 400, \`page_size=\${size} answered \${r.status}: page_size is an integer from 1 to 100\`);
+  }
+  let r = await search(c, {q: 'kettle', page_size: '1'});
+  assert(r.status === 200 && JSON.stringify(ids(r)) === '["p-3"]', \`page_size=1 answered \${r.status} \${r.text}, expected the cheapest kettle\`);
+  r = await search(c, {q: 'kettle', page_size: '100'});
+  assert.equal(r.status, 200, \`page_size=100 answered \${r.status}: 100 is within the cap\`);
+}
+
+export async function check_filter_allowlist(ctx) {
+  const c = await api(ctx);
+  let r = await search(c, {q: 'kettle', filters: '{"cost_cents": "1200"}'});
+  assert.equal(r.status, 400, \`a filter on cost_cents answered \${r.status} with \${r.text}: the wholesale cost is one guess away. Check filter fields against ALLOWED_FILTER_FIELDS\`);
+  assert(r.text.includes('cost_cents'), \`the 400 must name the unknown field (cost_cents), got \${r.text}\`);
+  const allowed = r.json().allowed;
+  assert(Array.isArray(allowed) && JSON.stringify([...allowed].sort()) === JSON.stringify([...ALLOWED].sort()), \`the 400 must carry the allowed list \${JSON.stringify(ALLOWED)}, got \${JSON.stringify(allowed)}\`);
+  r = await search(c, {q: 'kettle', filters: '{"brand": "acme", "max_price": "1000"}'});
+  assert(r.status === 200 && JSON.stringify(ids(r)) === '["p-3"]', \`brand=acme and max_price=1000 answered \${r.status} \${r.text}, expected [p-3]\`);
+  r = await search(c, {q: 'kettle', filters: '{"in_stock": "true"}'});
+  assert(r.status === 200 && JSON.stringify(ids(r)) === '["p-3","p-1"]', \`in_stock=true answered \${r.status} \${r.text}, expected [p-3, p-1]\`);
+}
+
+export async function check_filter_shape(ctx) {
+  const c = await api(ctx);
+  for (const raw of ['{"in_stock": true}', '["brand"]', 'brand=acme']) {
+    const r = await search(c, {q: 'kettle', filters: raw});
+    assert.equal(r.status, 400, \`filters=\${raw} answered \${r.status}: filters must be a JSON object of strings, anything else is 400\`);
+  }
+  const r = await search(c, {q: 'kettle', filters: '{"category": "kitchen"}'});
+  assert(r.status === 200 && JSON.stringify(ids(r)) === '["p-2","p-1"]', \`category=kitchen answered \${r.status} \${r.text}, expected [p-2, p-1]\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+
+	"search/catalog"
+
+	"leetbuild/harness"
+)
+
+const apiTenant = "t-1"
+
+var (
+	apiProducts = []catalog.Product{
+		{ID: "p-1", Title: "Steel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 3499, InStock: true, CostCents: 1200},
+		{ID: "p-2", Title: "Glass Kettle", Brand: "brew", Category: "kitchen", PriceCents: 2999, InStock: false, CostCents: 900},
+		{ID: "p-3", Title: "Kettle Descaler", Brand: "acme", Category: "cleaning", PriceCents: 899, InStock: true, CostCents: 150},
+	}
+	apiOther   = catalog.Product{ID: "p-9", Title: "Copper Kettle", Brand: "acme", Category: "kitchen", PriceCents: 5999, InStock: true, CostCents: 3000}
+	apiAllowed = []string{"brand", "category", "in_stock", "max_price", "min_price"}
+)
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	for _, p := range apiProducts {
+		catalog.PutProduct(context.Background(), apiTenant, p)
+	}
+	catalog.PutProduct(context.Background(), "t-2", apiOther)
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func searchFor(c *harness.HTTP, params map[string]string) *harness.Response {
+	values := url.Values{}
+	for k, v := range params {
+		values.Set(k, v)
+	}
+	return c.Get("/v1/search?"+values.Encode(), "X-Tenant-Id", apiTenant)
+}
+
+func hitIDs(r *harness.Response) []string {
+	var body struct {
+		Results []struct {
+			ID string \`json:"id"\`
+		} \`json:"results"\`
+	}
+	r.Decode(&body)
+	out := []string{}
+	for _, hit := range body.Results {
+		out = append(out, hit.ID)
+	}
+	return out
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := searchFor(c, map[string]string{"q": "kettle"})
+	ctx.Equal(r.Status, 200, "GET /v1/search?q=kettle (%s)", r.Text())
+	ctx.Equal(hitIDs(r), []string{"p-3", "p-2", "p-1"}, "the search must answer the tenant's three kettles, cheapest first")
+	var body struct {
+		PageSize int \`json:"page_size"\`
+	}
+	r.Decode(&body)
+	ctx.Equal(body.PageSize, 20, "without page_size the response's page_size")
+}
+
+func CheckQueryCap(ctx *harness.Ctx) {
+	c := api(ctx)
+	long := "kettle " + strings.Repeat("x", 300)
+	r := searchFor(c, map[string]string{"q": long})
+	ctx.Equal(r.Status, 400, "a %d-byte query must be refused: q is capped at 256 bytes; the status", len(long))
+	r = searchFor(c, map[string]string{"q": strings.Repeat("é", 129)})
+	ctx.Equal(r.Status, 400, "a query of 129 characters and 258 bytes (é is two bytes in UTF-8): the cap counts bytes, not characters; the status")
+	r = searchFor(c, map[string]string{"q": strings.Repeat("é", 128)})
+	ctx.Equal(r.Status, 200, "a query of exactly 256 bytes is within the cap; the status")
+	r = searchFor(c, map[string]string{"q": "   "})
+	ctx.Equal(r.Status, 400, "a blank query matches the whole catalog and must be refused (%s); the status", r.Text())
+}
+
+func CheckPageCap(ctx *harness.Ctx) {
+	c := api(ctx)
+	for _, size := range []string{"10000", "101", "0", "ten"} {
+		r := searchFor(c, map[string]string{"q": "kettle", "page_size": size})
+		ctx.Equal(r.Status, 400, "page_size=%s must be refused (an integer from 1 to 100); the status", size)
+	}
+	r := searchFor(c, map[string]string{"q": "kettle", "page_size": "1"})
+	ctx.Assert(r.Status == 200 && strings.Join(hitIDs(r), ",") == "p-3", "page_size=1 answered %d %s, expected the cheapest kettle", r.Status, r.Text())
+	r = searchFor(c, map[string]string{"q": "kettle", "page_size": "100"})
+	ctx.Equal(r.Status, 200, "page_size=100 is within the cap; the status")
+}
+
+func CheckFilterAllowlist(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := searchFor(c, map[string]string{"q": "kettle", "filters": \`{"cost_cents": "1200"}\`})
+	ctx.Equal(r.Status, 400, "a filter on cost_cents answered %s: the wholesale cost is one guess away. Check filter fields against allowedFilterFields; the status", r.Text())
+	ctx.Assert(strings.Contains(r.Text(), "cost_cents"), "the 400 must name the unknown field (cost_cents), got %s", r.Text())
+	var body struct {
+		Allowed []string \`json:"allowed"\`
+	}
+	r.Decode(&body)
+	sort.Strings(body.Allowed)
+	ctx.Equal(body.Allowed, apiAllowed, "the 400 must carry the allowed list")
+	r = searchFor(c, map[string]string{"q": "kettle", "filters": \`{"brand": "acme", "max_price": "1000"}\`})
+	ctx.Assert(r.Status == 200 && strings.Join(hitIDs(r), ",") == "p-3", "brand=acme and max_price=1000 answered %d %s, expected [p-3]", r.Status, r.Text())
+	r = searchFor(c, map[string]string{"q": "kettle", "filters": \`{"in_stock": "true"}\`})
+	ctx.Assert(r.Status == 200 && strings.Join(hitIDs(r), ",") == "p-3,p-1", "in_stock=true answered %d %s, expected [p-3, p-1]", r.Status, r.Text())
+}
+
+func CheckFilterShape(ctx *harness.Ctx) {
+	c := api(ctx)
+	for _, raw := range []string{\`{"in_stock": true}\`, \`["brand"]\`, "brand=acme"} {
+		r := searchFor(c, map[string]string{"q": "kettle", "filters": raw})
+		ctx.Equal(r.Status, 400, "filters=%s must be refused: filters is a JSON object of strings (%s); the status", raw, r.Text())
+	}
+	r := searchFor(c, map[string]string{"q": "kettle", "filters": \`{"category": "kitchen"}\`})
+	ctx.Assert(r.Status == 200 && strings.Join(hitIDs(r), ",") == "p-2,p-1", "category=kitchen answered %d %s, expected [p-2, p-1]", r.Status, r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "search/catalog.h"
+
+namespace {
+
+const std::string kTenant = "t-1";
+
+std::vector<catalog::Product> products() {
+  return {{"p-1", "Steel Kettle", "acme", "kitchen", 3499, true, 1200, 0},
+          {"p-2", "Glass Kettle", "brew", "kitchen", 2999, false, 900, 0},
+          {"p-3", "Kettle Descaler", "acme", "cleaning", 899, true, 150, 0}};
+}
+
+harness::HTTP api(harness::Ctx& ctx) {
+  for (const auto& p : products()) catalog::putProduct(kTenant, p);
+  catalog::putProduct("t-2", {"p-9", "Copper Kettle", "acme", "kitchen", 5999, true, 3000, 0});
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+std::string encode(const std::string& text) {
   std::string out;
-  for (const auto& field : kAllowedFilterFields) {
-    if (!out.empty()) out += ", ";
-    out += field;
+  for (unsigned char c : text) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += static_cast<char>(c);
+    } else {
+      char buf[4];
+      std::snprintf(buf, sizeof buf, "%%%02X", c);
+      out += buf;
+    }
   }
   return out;
 }
 
-int main() {
-  httplib::Server svr;
+harness::Response searchFor(harness::HTTP& c, const std::vector<std::pair<std::string, std::string>>& params) {
+  std::string path = "/v1/search";
+  char sep = '?';
+  for (const auto& [name, value] : params) {
+    path += sep + name + "=" + encode(value);
+    sep = '&';
+  }
+  return c.Get(path, "X-Tenant-Id", kTenant);
+}
 
-  svr.Get("/v1/search", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto q = req.get_param_value("q");
-    if (q.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"q must be a non-empty string"})", "application/json");
-      return;
-    }
-    if (q.size() > kMaxQueryBytes) {
-      res.status = 400;
-      res.set_content(R"({"error":"q exceeds 256 bytes"})", "application/json");
-      return;
-    }
-    const int pageSize = req.has_param("page_size") ? std::stoi(req.get_param_value("page_size")) : 10;
-    if (pageSize < 1 || pageSize > kMaxPageSize) {
-      res.status = 400;
-      res.set_content(R"({"error":"page_size must be 1..100"})", "application/json");
-      return;
-    }
-    const json requested = json::parse(req.get_param_value("filters"), nullptr, false);
-    if (!requested.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"filters must be a JSON object"})", "application/json");
-      return;
-    }
-    for (const auto& [field, value] : requested.items()) {
-      if (kAllowedFilterFields.count(field) == 0) {
-        res.status = 400;
-        res.set_content(
-            json{{"error", "unknown filter field '" + field + "'; allowed: " + allowedFields()}}.dump(),
-            "application/json");
-        return;
-      }
-    }
-    json validated = json::object();
-    for (const auto& field : kAllowedFilterFields)
-      if (requested.contains(field)) validated[field] = requested[field];
-    const auto query = buildEngineQuery(q, tenant, validated, pageSize);
-    std::cerr << "search tenant=" << tenant << " page_size=" << pageSize << " filters=" << validated.size() << "\\n";
-    const auto results = engineSearch(query);
-    res.status = 200;
-    res.set_content(json{{"results", results}, {"page_size", pageSize}, {"tenant", tenant}}.dump(), "application/json");
-  });
+std::string ids(const harness::Response& r) {
+  std::string out;
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  if (!body.is_object() || !body.contains("results") || !body["results"].is_array()) return out;
+  for (const auto& hit : body["results"]) out += (out.empty() ? "" : ",") + hit.value("id", "");
+  return out;
+}
 
-  svr.listen("0.0.0.0", 8443);
+std::string repeat(const std::string& s, int n) {
+  std::string out;
+  for (int i = 0; i < n; ++i) out += s;
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = searchFor(c, {{"q", "kettle"}});
+  ctx.Equal(r.Status, 200, "GET /v1/search?q=kettle (%s)", r.Text());
+  ctx.Equal(ids(r), "p-3,p-2,p-1", "the search must answer the tenant's three kettles, cheapest first");
+  ctx.Equal(nlohmann::json::parse(r.Text()).value("page_size", 0), 20, "without page_size the response's page_size");
+}
+
+void CheckQueryCap(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::string longer = "kettle " + repeat("x", 300);
+  auto r = searchFor(c, {{"q", longer}});
+  ctx.Equal(r.Status, 400, "a %d-byte query must be refused: q is capped at 256 bytes; the status", longer.size());
+  r = searchFor(c, {{"q", repeat("é", 129)}});
+  ctx.Equal(r.Status, 400, "a query of 129 characters and 258 bytes (é is two bytes in UTF-8): the cap counts bytes, not characters; the status");
+  r = searchFor(c, {{"q", repeat("é", 128)}});
+  ctx.Equal(r.Status, 200, "a query of exactly 256 bytes is within the cap; the status");
+  r = searchFor(c, {{"q", "   "}});
+  ctx.Equal(r.Status, 400, "a blank query matches the whole catalog and must be refused (%s); the status", r.Text());
+}
+
+void CheckPageCap(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  for (const std::string size : {"10000", "101", "0", "ten"}) {
+    const auto r = searchFor(c, {{"q", "kettle"}, {"page_size", size}});
+    ctx.Equal(r.Status, 400, "page_size=%s must be refused (an integer from 1 to 100); the status", size);
+  }
+  auto r = searchFor(c, {{"q", "kettle"}, {"page_size", "1"}});
+  ctx.Assert(r.Status == 200 && ids(r) == "p-3", "page_size=1 answered %d %s, expected the cheapest kettle", r.Status, r.Text());
+  r = searchFor(c, {{"q", "kettle"}, {"page_size", "100"}});
+  ctx.Equal(r.Status, 200, "page_size=100 is within the cap; the status");
+}
+
+void CheckFilterAllowlist(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = searchFor(c, {{"q", "kettle"}, {"filters", R"({"cost_cents": "1200"})"}});
+  ctx.Equal(r.Status, 400, "a filter on cost_cents answered %s: the wholesale cost is one guess away. Check filter fields against kAllowedFilterFields; the status", r.Text());
+  ctx.Assert(r.Text().find("cost_cents") != std::string::npos, "the 400 must name the unknown field (cost_cents), got %s", r.Text());
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  std::vector<std::string> allowed;
+  if (body.is_object() && body.contains("allowed") && body["allowed"].is_array()) {
+    for (const auto& name : body["allowed"]) allowed.push_back(name.is_string() ? name.get<std::string>() : name.dump());
+  }
+  std::sort(allowed.begin(), allowed.end());
+  ctx.Equal(allowed, {"brand", "category", "in_stock", "max_price", "min_price"}, "the 400 must carry the allowed list");
+  r = searchFor(c, {{"q", "kettle"}, {"filters", R"({"brand": "acme", "max_price": "1000"})"}});
+  ctx.Assert(r.Status == 200 && ids(r) == "p-3", "brand=acme and max_price=1000 answered %d %s, expected [p-3]", r.Status, r.Text());
+  r = searchFor(c, {{"q", "kettle"}, {"filters", R"({"in_stock": "true"})"}});
+  ctx.Assert(r.Status == 200 && ids(r) == "p-3,p-1", "in_stock=true answered %d %s, expected [p-3, p-1]", r.Status, r.Text());
+}
+
+void CheckFilterShape(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  for (const std::string raw : {R"({"in_stock": true})", R"(["brand"])", "brand=acme"}) {
+    const auto r = searchFor(c, {{"q", "kettle"}, {"filters", raw}});
+    ctx.Equal(r.Status, 400, "filters=%s must be refused: filters is a JSON object of strings (%s); the status", raw, r.Text());
+  }
+  const auto r = searchFor(c, {{"q", "kettle"}, {"filters", R"({"category": "kitchen"})"}});
+  ctx.Assert(r.Status == 200 && ids(r) == "p-2,p-1", "category=kitchen answered %d %s, expected [p-2, p-1]", r.Status, r.Text());
 }
 `,
-    },
   },
   hints: [
-    'A shopper sends `filters={"internal_cost": {"gt": 0}}` and gets a ranked page back; another sends `page_size=10000` and the index spends seconds on one request. Nothing in the handler said no.',
-    "The handler trusts every input and the engine sees the caller's filter object verbatim, so any index field is addressable and no size is bounded. Validation that lives after the engine call protects nothing.",
-    'Before the engine call: check `q` by UTF-8 byte length against `MAX_QUERY_BYTES`, `page_size` against `MAX_PAGE_SIZE`, filter keys against `ALLOWED_FILTER_FIELDS` (400 naming the field), then call `buildEngineQuery(validated, tenant)`.',
+    'Search with `filters={"cost_cents":"1200"}`: one kettle comes back, so a shopper can learn the wholesale cost by guessing. A 300-byte query and `page_size=10000` both answer 200, and `filters=brand=acme` answers 500.',
+    'The handler passes every request value to `run_query` as it arrived, and the engine treats any stored field as a filter. Nothing bounds `q` or the page size, and the JSON parse has no guard.',
+    'Before `run_query`: 400 unless `q` is 1 to 256 UTF-8 bytes, `page_size` an integer from 1 to 100, and `filters` a JSON object of strings whose keys are all in `ALLOWED_FILTER_FIELDS` (name the field, return `allowed`).',
   ],
-  debrief: `The fix has two halves that are one idea: the caller supplies data, the server decides which fields exist. Cheap checks (byte length, page range, key allowlist) run first so a rejection costs nothing on the index, and the engine query is built by a helper whose parameters are the validated fields and the tenant, so the raw filter text has no path into the engine at all. The tenant inside the query is what scopes the result set; a header that is read and then forgotten scopes nothing. Production search services go further: filter values are typed (a price is a number, a range is two numbers), field visibility per tenant comes from the catalog rather than a constant, and the query language carries a version so old clients cannot address retired fields.`,
+  debrief: `The engine stays general on purpose: merchandising tools filter on cost and margin, so the place that decides what a shopper can address is the public endpoint, and the allowlist sits there beside the caps. Every rejection is a 400 the client can correct, with the allowed list in the body, instead of a 500 or a silently empty page. The query cap counts bytes because the URL, the cache key and the index all pay in bytes. A larger deployment derives the allowlist per tenant from the index schema, bounds query complexity (term count, wildcards) as well as length, and rate-limits each tenant so one storefront's crawler cannot starve the rest.`,
 };

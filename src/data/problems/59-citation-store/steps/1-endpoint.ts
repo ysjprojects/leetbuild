@@ -8,56 +8,64 @@ export const citationEndpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/citations\` with body
-\`{"document_id": "doc-7", "version": 3, "start": 412, "end": 447, "quote": "…"}\`, slices the
-document's latest text at the caller's offsets and stores the result under the tenant. It compiles,
-it serves the demo, and it hides four flaws.
+**Starting point.** The starter serves \`POST /v1/citations\` with body \`{"answer_id", "document_id",
+"version", "start", "end", "quote"}\`: it reads the tenant from \`X-Tenant-Id\`, slices the document's
+newest text (\`documents.latest\`) at the caller's offsets and stores that slice as the quote through
+\`store.create\`, answering **201** with the row. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A citation is a claim that these bytes, at these offsets, in
-this version, say this. A handler that forwards the caller's offsets without comparing them to the
-document, resolves them against whatever the document says today, or records a client retry as a
-second citation produces records that look fine until a reviewer clicks one after an edit.
+**Failure mode the checks target.** A citation is a claim that these characters, at these offsets,
+in this version, say this. The starter accepts a request with no tenant or an empty span, never
+compares the quote with the document, resolves a version 1 citation against version 2's text, and
+records a client's retry as a second citation.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`document_id\` is a non-empty string, \`version\` an integer **>= 1**, \`start\` an integer
-  **>= 0**, \`end > start\`, and \`quote\` a non-empty string of at most **16 KiB**; anything else is
+- A missing \`X-Tenant-Id\` is **401**. \`version < 1\`, \`start < 0\`, \`end <= start\`, an empty
+  \`document_id\` or \`answer_id\`, and a quote empty or longer than \`MAX_QUOTE_CHARS\` (16 KiB) are
   **400**.
-- The quote must equal the bytes at \`[start, end)\` of the document's **named version**. On a
-  mismatch answer **422** with both texts, \`{"stored": …, "supplied": …}\`: the text that is
-  actually at those offsets and the text the caller sent, so the caller can see how the span
-  drifted.
-- Offsets resolve against the immutable **version** in the request, not the document's latest
-  text, and the stored record keeps that version.
-- \`Idempotency-Key\` is required (**400** when missing). A replay of \`(tenant, key)\` returns the
-  stored record instead of recording a second one.`,
+- Resolve the span in the **named version** (\`documents.get_version\`; an unknown version is **404**).
+- The quote must equal the text at \`[start, end)\`; a mismatch is **422** with
+  \`{"stored": …, "supplied": …}\`.
+- \`Idempotency-Key\` is required (**400**). Look it up with \`store.by_key(tenant, key)\` before
+  creating: a replay answers the citation the first attempt created; a new citation is bound with
+  \`store.bind_key\`.`,
   sequence: {
-    participants: ['Client', 'Citation API', 'document store', 'citation store'],
+    participants: ['Client', 'Citation API', 'documents', 'citation store'],
     messages: [
       {from: 'Client', to: 'Citation API', label: 'POST /v1/citations · X-Tenant-Id · Idempotency-Key', kind: 'sync'},
-      {from: 'Citation API', to: 'Citation API', label: 'validate span · tenant · key', kind: 'sync'},
-      {from: 'Citation API', to: 'citation store', label: 'get(tenant, idem_key)', kind: 'sync'},
-      {from: 'citation store', to: 'Citation API', label: 'stored citation / none', kind: 'reply'},
-      {from: 'Citation API', to: 'document store', label: 'getVersion(document_id, version)', kind: 'sync'},
-      {from: 'document store', to: 'Citation API', label: 'version text', kind: 'reply'},
+      {from: 'Citation API', to: 'Citation API', label: 'tenant → 401 · span, MAX_QUOTE_CHARS → 400', kind: 'sync'},
+      {from: 'Citation API', to: 'citation store', label: 'by_key(tenant, key)', kind: 'sync'},
+      {from: 'citation store', to: 'Citation API', label: 'the first attempt’s citation / none', kind: 'reply'},
+      {from: 'Citation API', to: 'documents', label: 'get_version(document_id, version)', kind: 'sync'},
+      {from: 'documents', to: 'Citation API', label: 'that version’s text', kind: 'reply'},
       {
         from: 'Citation API',
         to: 'Citation API',
-        label: 'quote != text[start:end] → 422 {stored, supplied}',
+        label: 'text[start:end] != quote → 422 {stored, supplied}',
         kind: 'sync',
       },
-      {from: 'Citation API', to: 'Client', label: '200 {id, version, start, end, status}', kind: 'reply'},
+      {
+        from: 'Citation API',
+        to: 'citation store',
+        label: 'create(tenant, …) · bind_key(tenant, key, id)',
+        kind: 'sync',
+      },
+      {
+        from: 'Citation API',
+        to: 'Client',
+        label: '201 {id, version, start, end, quote, status: pending}',
+        kind: 'reply',
+      },
     ],
   },
   hints: [
-    'After a document edit, every citation recorded against it highlights the wrong sentence; a client that retried a timeout owns two citation ids for one quote; a request with no tenant still gets 200.',
-    'The starter slices `documents.latest(document_id)`, keeps no version in the record, trusts the quote without reading the bytes, and keys storage by document id, so edits and retries both rewrite what was recorded.',
-    'Guard tenant, Idempotency-Key, span shape and quote size first. Fetch `(document_id, version)`, compare `text[start:end]` to the quote, answer 422 with `stored` and `supplied`, then `store.get`/`store.put` under `(tenant, key)`.',
+    'Publish version 2 of a document, then cite version 1: the stored quote is version 2’s text. Retry a timed-out request and the answer owns two citation ids for one quote.',
+    'The starter never reads the version the request names: it slices `documents.latest` and stores that slice in place of the quote, so nothing is ever compared, and it never looks at `Idempotency-Key`.',
+    'Answer 401/400 before any read, look up `store.by_key(tenant, key)`, read `documents.get_version(document_id, version)`, answer 422 with `stored` and `supplied` when `text[start:end] != quote`, then `store.create` and `store.bind_key`.',
   ],
   checks: [
     {
       id: 'route',
       title: 'Handles POST /v1/citations',
-      detail: 'Register the citation route on `POST /v1/citations`.',
+      detail: 'Register `POST /v1/citations`, answering **201** with the stored citation.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/citations["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/citations['"]/]},
@@ -68,85 +76,122 @@ second citation produces records that look fine until a reviewer clicks one afte
     },
     {
       id: 'validate',
-      title: 'Rejects a malformed span and a missing tenant',
+      title: 'Rejects a missing tenant and a malformed span',
       detail:
-        'A missing `X-Tenant-Id` is **401**; `version < 1`, `start < 0`, `end <= start`, an empty `document_id` or an oversized `quote` is **400**. The starter forwards whatever the caller sent.',
+        'A missing `X-Tenant-Id` is **401**; `version < 1`, `start < 0`, `end <= start`, an empty id and a quote over `MAX_QUOTE_CHARS` are **400**, and nothing is stored. The starter stores whatever arrives.',
       match: {
         python: {
           all: [
-            /status_code\s*=\s*401/,
-            /status_code\s*=\s*400/,
-            /body\.version\s*<\s*1/,
-            /body\.end\s*<=\s*body\.start/,
+            /\b401\b/,
+            /\b400\b/,
+            /version\s*(<\s*1|<=\s*0)/,
+            /end\s*<=\s*[\w.]*start|start\s*>=\s*[\w.]*end/,
+            /MAX_QUOTE_CHARS/,
           ],
         },
         typescript: {
-          all: [/code\(\s*401\s*\)/, /code\(\s*400\s*\)/, /body\.version\s*<\s*1/, /body\.end\s*<=\s*body\.start/],
+          all: [
+            /code\(\s*401\s*\)/,
+            /code\(\s*400\s*\)/,
+            /version\s*(<\s*1|<=\s*0)/,
+            /end\s*<=\s*[\w.]*start|start\s*>=\s*[\w.]*end/,
+            /MAX_QUOTE_CHARS/,
+          ],
         },
         go: {
-          all: [/StatusUnauthorized/, /StatusBadRequest/, /body\.Version\s*<\s*1/, /body\.End\s*<=\s*body\.Start/],
+          all: [
+            /StatusUnauthorized|\b401\b/,
+            /StatusBadRequest|\b400\b/,
+            /Version\s*(<\s*1|<=\s*0)/,
+            /End\s*<=\s*[\w.]*Start|Start\s*>=\s*[\w.]*End/,
+            /maxQuoteChars/,
+          ],
         },
         scala: {
           all: [
-            /StatusCodes\.Unauthorized/,
-            /StatusCodes\.BadRequest/,
-            /body\.version\s*<\s*1/,
-            /body\.end\s*<=\s*body\.start/,
+            /Unauthorized|\b401\b/,
+            /BadRequest|\b400\b/,
+            /version\s*(<\s*1|<=\s*0)/,
+            /end\s*<=\s*[\w.]*start|start\s*>=\s*[\w.]*end/,
+            /MaxQuoteChars/,
           ],
         },
-        cpp: {all: [/\b401\b/, /\b400\b/, /version\s*<\s*1/, /end\s*<=\s*start/]},
+        cpp: {
+          all: [
+            /\b401\b/,
+            /\b400\b/,
+            /version\s*(<\s*1|<=\s*0)/,
+            /end\s*<=\s*[\w.]*start|start\s*>=\s*[\w.]*end/,
+            /kMaxQuoteChars/,
+          ],
+        },
       },
     },
     {
       id: 'span-match',
-      title: 'The quote must equal the bytes at those offsets',
+      title: 'The quote must equal the text at those offsets',
       detail:
-        'The quote is compared against the slice of the version text and a mismatch answers **422** with the stored text and the supplied quote. The starter stores the quote without ever reading the document bytes.',
+        'The quote is compared with the version’s text at `[start, end)`; a mismatch answers **422** with `stored` (the text that is there) and `supplied` (the quote sent), and nothing is stored. The starter never compares: it stores its own slice.',
       match: {
-        python: {all: [/status_code\s*=\s*422/, /actual\s*!=\s*body\.quote/, /"stored"/, /"supplied"/]},
-        typescript: {all: [/code\(\s*422\s*\)/, /actual\s*!==?\s*body\.quote/, /stored:/, /supplied:/]},
-        go: {all: [/StatusUnprocessableEntity/, /actual\s*!=\s*body\.Quote/, /"stored"/, /"supplied"/]},
-        scala: {all: [/StatusCodes\.UnprocessableEntity/, /actual\s*!=\s*body\.quote/, /"stored"/, /"supplied"/]},
-        cpp: {all: [/\b422\b/, /actual\s*!=\s*quote/, /"stored"/, /"supplied"/]},
+        python: {all: [/\b422\b/, /["']stored["']/, /["']supplied["']/, /!=\s*body\.quote\b/]},
+        typescript: {all: [/code\(\s*422\s*\)/, /\bstored\b/, /\bsupplied\b/, /!==?\s*body\.quote\b/]},
+        go: {all: [/StatusUnprocessableEntity|\b422\b/, /"stored"/, /"supplied"/, /!=\s*body\.Quote\b/]},
+        scala: {all: [/UnprocessableEntity|\b422\b/, /"stored"/, /"supplied"/, /!=\s*body\.quote\b/]},
+        cpp: {all: [/\b422\b/, /"stored"/, /"supplied"/, /!=\s*body\.quote\b/]},
       },
     },
     {
       id: 'version-scope',
-      title: 'Resolves against the named immutable version',
+      title: 'Resolves the span in the named version',
       detail:
-        'The span resolves against `(document_id, version)` — the version the caller named — and the stored record keeps that version, so a later edit cannot re-point it. The starter resolves the document’s latest text and keeps no version.',
+        'The text comes from `get_version(document_id, version)`, the immutable version the request names, so a citation of version 1 keeps version 1’s quote after version 2 is published. The starter reads `latest`.',
       match: {
-        python: {all: [/resolve_span\(/, /documents\.get_version\(/, /"version":\s*body\.version/]},
-        typescript: {all: [/resolveSpan\(/, /documents\.getVersion\(/, /version:\s*body\.version/]},
-        go: {all: [/resolveSpan\(/, /documents\.GetVersion\(/, /"version":\s*body\.Version/]},
-        scala: {all: [/resolveSpan\(/, /documents\.getVersion\(/, /Citation\([^)]*body\.version/]},
-        cpp: {all: [/resolveSpan\(/, /documents\.getVersion\(/, /\{"version",\s*version\}/]},
+        python: {all: [/documents\.get_version\(/], none: [/documents\.latest\(/]},
+        typescript: {all: [/getVersion\(/], none: [/\blatest\(/]},
+        go: {all: [/documents\.GetVersion\(/], none: [/documents\.Latest\(/]},
+        scala: {all: [/Documents\.getVersion\(/], none: [/Documents\.latest\(/]},
+        cpp: {all: [/documents::getVersion\(/], none: [/documents::latest\(/]},
       },
     },
     {
       id: 'idempotent',
-      title: 'Keys a replayed record by (tenant, Idempotency-Key)',
+      title: 'Keys a retried request by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the record is stored under `(tenant, key)`; a replay returns the stored citation instead of recording a second one. The starter ignores the header and keys by document id alone.',
+        '`Idempotency-Key` is required (**400**), the citation it created is looked up (`by_key`/`byKey`) before anything is created, and a new citation is bound to it; a retry answers the same id.',
       match: {
-        python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/], order: [/store\.get\(/, /store\.put\(/]},
-        typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/], order: [/store\.get\(/, /store\.put\(/]},
-        go: {all: [/Idempotency-Key/, /store\.Get\(/, /store\.Put\(/], order: [/store\.Get\(/, /store\.Put\(/]},
-        scala: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/], order: [/store\.get\(/, /store\.put\(/]},
-        cpp: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/], order: [/store\.get\(/, /store\.put\(/]},
+        python: {
+          all: [/idempotency-key/i, /store\.by_key\(/, /store\.bind_key\(/],
+          order: [/store\.by_key\(/, /store\.create\(/],
+        },
+        typescript: {all: [/idempotency-key/i, /byKey\(/, /bindKey\(/], order: [/byKey\(/, /\bcreate\(/]},
+        go: {
+          all: [/Idempotency-Key/i, /store\.ByKey\(/, /store\.BindKey\(/],
+          order: [/store\.ByKey\(/, /store\.Create\(/],
+        },
+        scala: {
+          all: [/Idempotency-Key/i, /Store\.byKey\(/, /Store\.bindKey\(/],
+          order: [/Store\.byKey\(/, /Store\.create\(/],
+        },
+        cpp: {
+          all: [/Idempotency-Key/i, /store::byKey\(/, /store::bindKey\(/],
+          order: [/store::byKey\(/, /store::create\(/],
+        },
       },
     },
   ],
   code: {
     python: {
-      starter: `from fastapi import FastAPI, Header
+      starter: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+from citations import documents, store  # documents.get_version, latest; store.create, by_key, bind_key
 
 app = FastAPI()
 
 
 class CitationRequest(BaseModel):
+    answer_id: str
     document_id: str
     version: int
     start: int
@@ -154,41 +199,27 @@ class CitationRequest(BaseModel):
     quote: str
 
 
-class CitationStore:
-    def put(self, tenant: str, citation: dict) -> None:
-        """Store the citation for the tenant."""
-        raise NotImplementedError
-
-
-store = CitationStore()
-
-
-@app.post("/v1/citations")
-def record(
-    body: CitationRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")
-) -> JSONResponse:
+@app.post("/v1/citations", status_code=201)
+def create_citation(body: CitationRequest, request: Request) -> JSONResponse:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    text = documents.latest(body.document_id)
-    citation = {
-        "document_id": body.document_id,
-        "start": body.start,
-        "end": body.end,
-        "quote": text[body.start : body.end],
-        "status": "verified",
-    }
-    store.put(tenant, citation)
-    return JSONResponse(citation, status_code=200)
+    tenant = request.headers.get("x-tenant-id", "")
+    text = documents.latest(body.document_id) or ""
+    citation = store.create(tenant, {**body.model_dump(), "quote": text[body.start : body.end]})
+    return JSONResponse(citation, status_code=201)
 `,
-      solution: `from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from citations import documents, store  # documents.get_version, latest; store.create, by_key, bind_key
+
 app = FastAPI()
 
-MAX_QUOTE_BYTES = 1 << 14
+MAX_QUOTE_CHARS = 16 * 1024
 
 
 class CitationRequest(BaseModel):
+    answer_id: str
     document_id: str
     version: int
     start: int
@@ -196,506 +227,340 @@ class CitationRequest(BaseModel):
     quote: str
 
 
-class CitationStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The citation stored under (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, citation: dict) -> None:
-        """Store the citation under (tenant, idem_key)."""
-        raise NotImplementedError
-
-
-store = CitationStore()
-
-
-def resolve_span(document_id: str, version: int, start: int, end: int) -> str | None:
-    """The bytes at [start, end) of that immutable version, or None when the version is unknown."""
-    text = documents.get_version(document_id, version)
-    if text is None:
-        return None
-    return text[start:end]
-
-
-@app.post("/v1/citations")
-def record(
-    body: CitationRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if idem_key is None or idem_key == "":
-        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if body.document_id == "" or body.version < 1:
-        raise HTTPException(status_code=400, detail="document_id and version are required")
+def span_error(body: CitationRequest) -> str | None:
+    """Why the request cannot be a citation, or None."""
+    if not body.document_id or not body.answer_id:
+        return "document_id and answer_id are required"
+    if body.version < 1:
+        return "version must be >= 1"
     if body.start < 0 or body.end <= body.start:
-        raise HTTPException(status_code=400, detail="offsets must satisfy 0 <= start < end")
-    if body.quote == "" or len(body.quote.encode("utf-8")) > MAX_QUOTE_BYTES:
-        raise HTTPException(status_code=400, detail="quote must be 1 byte .. 16 KiB")
+        return "the span must have 0 <= start < end"
+    if not body.quote or len(body.quote) > MAX_QUOTE_CHARS:
+        return f"the quote must be 1 to {MAX_QUOTE_CHARS} characters"
+    return None
 
-    stored = store.get(tenant, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=200)
 
-    actual = resolve_span(body.document_id, body.version, body.start, body.end)
-    if actual is None:
-        raise HTTPException(status_code=404, detail="unknown document version")
-    if actual != body.quote:
-        return JSONResponse(
-            {"error": "span does not match", "stored": actual, "supplied": body.quote},
-            status_code=422,
-        )
-
-    citation = {
-        "id": idem_key,
-        "document_id": body.document_id,
-        "version": body.version,
-        "start": body.start,
-        "end": body.end,
-        "quote": body.quote,
-        "status": "verified",
-    }
-    store.put(tenant, idem_key, citation)
-    return JSONResponse(citation, status_code=200)
+@app.post("/v1/citations", status_code=201)
+def create_citation(body: CitationRequest, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "X-Tenant-Id is required"}, status_code=401)
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        return JSONResponse({"error": "Idempotency-Key is required"}, status_code=400)
+    error = span_error(body)
+    if error is not None:
+        return JSONResponse({"error": error}, status_code=400)
+    replay = store.by_key(tenant, key)
+    if replay is not None:
+        return JSONResponse(replay, status_code=201)  # a retry answers the citation the first attempt created
+    # The version the request names: it never changes, so neither does what the citation points at.
+    text = documents.get_version(body.document_id, body.version)
+    if text is None:
+        return JSONResponse({"error": "no such document version"}, status_code=404)
+    stored = text[body.start : body.end]
+    if stored != body.quote:
+        return JSONResponse({"error": "the quote is not the text at those offsets", "stored": stored, "supplied": body.quote}, status_code=422)
+    citation = store.create(tenant, body.model_dump())
+    store.bind_key(tenant, key, citation["id"])
+    return JSONResponse(citation, status_code=201)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/citations: the starter. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
-
-import {documents, store} from './store';
+import {getVersion, latest} from 'citations/documents';
+import {type CitationFields, bindKey, byKey, create} from 'citations/store';
 
 export const app = Fastify();
-
-interface CitationBody {
-  document_id: string;
-  version: number;
-  start: number;
-  end: number;
-  quote: string;
-}
 
 app.post('/v1/citations', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as CitationBody;
-  const text = documents.getLatest(body.document_id);
-  const citation = {
-    id: randomUUID(),
-    document_id: body.document_id,
-    start: body.start,
-    end: body.end,
-    quote: text.slice(body.start, body.end),
-    status: 'verified',
-  };
-  await store.put(tenant, citation);
-  return reply.code(200).send(citation);
+  const tenant = (request.headers['x-tenant-id'] as string | undefined) ?? '';
+  const body = request.body as CitationFields;
+  const text = (await latest(body.document_id)) ?? '';
+  const citation = await create(tenant, {...body, quote: text.slice(body.start, body.end)});
+  return reply.code(201).send(citation);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/citations: record a span that must resolve against an immutable version. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 
-import {documents, store} from './store';
+import {getVersion, latest} from 'citations/documents';
+import {type CitationFields, bindKey, byKey, create} from 'citations/store';
 
 export const app = Fastify();
 
-const MAX_QUOTE_BYTES = 1 << 14;
+export const MAX_QUOTE_CHARS = 16 * 1024;
 
-interface CitationBody {
-  document_id: string;
-  version: number;
-  start: number;
-  end: number;
-  quote: string;
-}
-
-interface Citation {
-  id: string;
-  document_id: string;
-  version: number;
-  start: number;
-  end: number;
-  quote: string;
-  status: string;
-}
-
-function resolveSpan(documentId: string, version: number, start: number, end: number): string | null {
-  const text = documents.getVersion(documentId, version);
-  if (text === null) return null;
-  return text.slice(start, end);
+/** Why the request cannot be a citation, or null. */
+function spanError(body: CitationFields): string | null {
+  if (!body.document_id || !body.answer_id) return 'document_id and answer_id are required';
+  if (!Number.isInteger(body.version) || body.version < 1) return 'version must be an integer >= 1';
+  if (!Number.isInteger(body.start) || !Number.isInteger(body.end) || body.start < 0 || body.end <= body.start) {
+    return 'the span must have 0 <= start < end';
+  }
+  if (!body.quote || body.quote.length > MAX_QUOTE_CHARS) return \`the quote must be 1 to \${MAX_QUOTE_CHARS} characters\`;
+  return null;
 }
 
 app.post('/v1/citations', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<CitationBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.document_id !== 'string' || body.document_id === '')
-    return reply.code(400).send({error: 'document_id is required'});
-  if (!Number.isInteger(body.version) || body.version < 1)
-    return reply.code(400).send({error: 'version must be an integer >= 1'});
-  if (!Number.isInteger(body.start) || !Number.isInteger(body.end) || body.start < 0 || body.end <= body.start)
-    return reply.code(400).send({error: 'offsets must satisfy 0 <= start < end'});
-  const quote = body.quote;
-  if (typeof quote !== 'string' || quote === '' || Buffer.byteLength(quote, 'utf8') > MAX_QUOTE_BYTES)
-    return reply.code(400).send({error: 'quote must be 1 byte .. 16 KiB'});
-
-  const stored: Citation | null = await store.get(tenant, idemKey);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  const actual = resolveSpan(body.document_id, body.version, body.start, body.end);
-  if (actual === null) return reply.code(404).send({error: 'unknown document version'});
-  if (actual !== body.quote)
-    return reply.code(422).send({error: 'span does not match', stored: actual, supplied: body.quote});
-
-  const citation: Citation = {
-    id: idemKey,
-    document_id: body.document_id,
-    version: body.version,
-    start: body.start,
-    end: body.end,
-    quote: body.quote,
-    status: 'verified',
-  };
-  await store.put(tenant, idemKey, citation);
-  return reply.code(200).send(citation);
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const body = request.body as CitationFields;
+  const error = spanError(body);
+  if (error !== null) return reply.code(400).send({error});
+  const replay = await byKey(tenant, key);
+  if (replay !== null) return reply.code(201).send(replay); // a retry answers the citation the first attempt created
+  // The version the request names: it never changes, so neither does what the citation points at.
+  const text = await getVersion(body.document_id, body.version);
+  if (text === null) return reply.code(404).send({error: 'no such document version'});
+  const stored = text.slice(body.start, body.end);
+  if (stored !== body.quote) {
+    return reply.code(422).send({error: 'the quote is not the text at those offsets', stored, supplied: body.quote});
+  }
+  const citation = await create(tenant, body);
+  await bindKey(tenant, key, citation.id);
+  return reply.code(201).send(citation);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
+
+	"citations/documents" // documents.GetVersion, Latest
+	"citations/store"     // store.Create, ByKey, BindKey
 )
 
-type CitationRequest struct {
-	DocumentID string \`json:"document_id"\`
-	Version    int    \`json:"version"\`
-	Start      int    \`json:"start"\`
-	End        int    \`json:"end"\`
-	Quote      string \`json:"quote"\`
-}
-
-type CitationStore struct{}
-
-func (s *CitationStore) Put(ctx context.Context, tenant string, citation map[string]any) error {
-	return nil
-}
-
-var store = &CitationStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func record(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	var body CitationRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
+// span is text[start:end], clamped to the text.
+func span(text string, start, end int) string {
+	start, end = max(start, 0), min(end, len(text))
+	if start >= end {
+		return ""
 	}
+	return text[start:end]
+}
+
+func createCitation(rw http.ResponseWriter, r *http.Request) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	text, _ := documents.Latest(body.DocumentID)
-	citation := map[string]any{
-		"document_id": body.DocumentID,
-		"start":       body.Start,
-		"end":         body.End,
-		"quote":       text[body.Start:body.End],
-		"status":      "verified",
-	}
-	_ = store.Put(r.Context(), tenant, citation)
-	writeJSON(rw, http.StatusOK, citation)
+	tenant := r.Header.Get("X-Tenant-Id")
+	var body store.Citation
+	json.NewDecoder(r.Body).Decode(&body)
+	text, _ := documents.Latest(r.Context(), body.DocumentID)
+	body.Quote = span(text, body.Start, body.End)
+	writeJSON(rw, http.StatusCreated, store.Create(r.Context(), tenant, body))
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/citations", record)
-	_ = http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/citations", createCitation)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+
+	"citations/documents" // documents.GetVersion, Latest
+	"citations/store"     // store.Create, ByKey, BindKey
 )
 
-const maxQuoteBytes = 1 << 14
+const maxQuoteChars = 16 * 1024
 
-type CitationRequest struct {
-	DocumentID string \`json:"document_id"\`
-	Version    int    \`json:"version"\`
-	Start      int    \`json:"start"\`
-	End        int    \`json:"end"\`
-	Quote      string \`json:"quote"\`
-}
-
-type CitationStore struct{}
-
-func (s *CitationStore) Get(ctx context.Context, tenant, idemKey string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *CitationStore) Put(ctx context.Context, tenant, idemKey string, citation map[string]any) error {
-	return nil
-}
-
-var store = &CitationStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func resolveSpan(documentID string, version, start, end int) (string, bool) {
-	text, ok := documents.GetVersion(documentID, version)
-	if !ok {
-		return "", false
+// span is text[start:end], clamped to the text.
+func span(text string, start, end int) string {
+	start, end = max(start, 0), min(end, len(text))
+	if start >= end {
+		return ""
 	}
-	if start < 0 || end > len(text) || end <= start {
-		return "", false
-	}
-	return text[start:end], true
+	return text[start:end]
 }
 
-func record(rw http.ResponseWriter, r *http.Request) {
+// spanError says why the request cannot be a citation, or "".
+func spanError(body store.Citation) string {
+	if body.DocumentID == "" || body.AnswerID == "" {
+		return "document_id and answer_id are required"
+	}
+	if body.Version < 1 {
+		return "version must be >= 1"
+	}
+	if body.Start < 0 || body.End <= body.Start {
+		return "the span must have 0 <= start < end"
+	}
+	if body.Quote == "" || len(body.Quote) > maxQuoteChars {
+		return fmt.Sprintf("the quote must be 1 to %d characters", maxQuoteChars)
+	}
+	return ""
+}
+
+func createCitation(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
 		return
 	}
-	var body CitationRequest
+	var body store.Citation
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if body.DocumentID == "" || body.Version < 1 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "document_id and version are required"})
+	if msg := spanError(body); msg != "" {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
-	if body.Start < 0 || body.End <= body.Start {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "offsets must satisfy 0 <= start < end"})
+	if replay := store.ByKey(r.Context(), tenant, key); replay != nil {
+		writeJSON(rw, http.StatusCreated, replay) // a retry answers the citation the first attempt created
 		return
 	}
-	if body.Quote == "" || len(body.Quote) > maxQuoteBytes {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "quote must be 1 byte .. 16 KiB"})
-		return
-	}
-
-	stored, err := store.Get(r.Context(), tenant, idemKey)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
-		return
-	}
-
-	actual, ok := resolveSpan(body.DocumentID, body.Version, body.Start, body.End)
+	// The version the request names: it never changes, so neither does what the citation points at.
+	text, ok := documents.GetVersion(r.Context(), body.DocumentID, body.Version)
 	if !ok {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown document version"})
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such document version"})
 		return
 	}
-	if actual != body.Quote {
-		writeJSON(rw, http.StatusUnprocessableEntity, map[string]any{
-			"error":    "span does not match",
-			"stored":   actual,
-			"supplied": body.Quote,
-		})
+	if stored := span(text, body.Start, body.End); stored != body.Quote {
+		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "the quote is not the text at those offsets", "stored": stored, "supplied": body.Quote})
 		return
 	}
-
-	citation := map[string]any{
-		"id":          idemKey,
-		"document_id": body.DocumentID,
-		"version":     body.Version,
-		"start":       body.Start,
-		"end":         body.End,
-		"quote":       body.Quote,
-		"status":      "verified",
-	}
-	if err := store.Put(r.Context(), tenant, idemKey, citation); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	writeJSON(rw, http.StatusOK, citation)
+	citation := store.Create(r.Context(), tenant, body)
+	store.BindKey(r.Context(), tenant, key, citation.ID)
+	writeJSON(rw, http.StatusCreated, citation)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/citations", record)
-	_ = http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/citations", createCitation)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class CitationRequest(document_id: String, version: Int, start: Int, end: Int, quote: String)
-final case class Citation(
-    id: String,
-    document_id: String,
-    version: Int,
-    start: Int,
-    end: Int,
-    quote: String,
-    status: String
-)
+import citations.{Documents, Store} // Documents.getVersion, latest; Store.create, byKey, bindKey
 
-object CitationApi {
-  implicit val system: ActorSystem = ActorSystem("citation-store")
-  implicit val requestFormat: RootJsonFormat[CitationRequest] = jsonFormat5(CitationRequest)
-  implicit val citationFormat: RootJsonFormat[Citation] = jsonFormat7(Citation)
+object Api {
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val store = CitationStore.open()
+  /** The request body as a citation of no one yet: answer_id, document_id, version, start, end, quote. */
+  private def citationOf(raw: String): Store.Citation = {
+    val fields = raw.parseJson.asJsObject.fields
+    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
+    def number(name: String): Long = fields.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
+    Store.Citation("", "", text("answer_id"), text("document_id"), number("version"), number("start"), number("end"), text("quote"), "", "")
+  }
 
   val route: Route =
     path("v1" / "citations") {
       post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[CitationRequest]) { body =>
+        (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenant, key) =>
+          entity(as[String]) { raw =>
             // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-            val text = documents.latest(body.document_id)
-            val citation = Citation(
-              java.util.UUID.randomUUID().toString,
-              body.document_id,
-              body.version,
-              body.start,
-              body.end,
-              text.substring(body.start, body.end),
-              "verified"
-            )
-            store.put(tenant, citation)
-            complete(StatusCodes.OK, citation)
+            val body = citationOf(raw)
+            val text = Documents.latest(body.documentId).getOrElse("")
+            val citation = Store.create(tenant.getOrElse(""), body.copy(quote = text.slice(body.start.toInt, body.end.toInt)))
+            complete(json(StatusCodes.Created, citation.toJson))
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
-      solution: `import java.nio.charset.StandardCharsets
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class CitationRequest(document_id: String, version: Int, start: Int, end: Int, quote: String)
-final case class Citation(
-    id: String,
-    document_id: String,
-    version: Int,
-    start: Int,
-    end: Int,
-    quote: String,
-    status: String
-)
+import citations.{Documents, Store} // Documents.getVersion, latest; Store.create, byKey, bindKey
 
-object CitationApi {
-  implicit val system: ActorSystem = ActorSystem("citation-store")
-  implicit val requestFormat: RootJsonFormat[CitationRequest] = jsonFormat5(CitationRequest)
-  implicit val citationFormat: RootJsonFormat[Citation] = jsonFormat7(Citation)
+object Api {
+  val MaxQuoteChars: Int = 16 * 1024
 
-  val MaxQuoteBytes = 1 << 14
-  val store = CitationStore.open()
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def resolveSpan(documentId: String, version: Int, start: Int, end: Int): Option[String] =
-    documents.getVersion(documentId, version).map(_.substring(start, end))
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
+
+  /** The request body as a citation of no one yet: answer_id, document_id, version, start, end, quote. */
+  private def citationOf(raw: String): Store.Citation = {
+    val fields = raw.parseJson.asJsObject.fields
+    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
+    def number(name: String): Long = fields.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
+    Store.Citation("", "", text("answer_id"), text("document_id"), number("version"), number("start"), number("end"), text("quote"), "", "")
+  }
+
+  /** Why the request cannot be a citation. */
+  def spanError(body: Store.Citation): Option[String] =
+    if (body.documentId.isEmpty || body.answerId.isEmpty) Some("document_id and answer_id are required")
+    else if (body.version < 1) Some("version must be >= 1")
+    else if (body.start < 0 || body.end <= body.start) Some("the span must have 0 <= start < end")
+    else if (body.quote.isEmpty || body.quote.length > MaxQuoteChars) Some(s"the quote must be 1 to $MaxQuoteChars characters")
+    else None
+
+  def createCitation(tenant: String, key: String, body: Store.Citation): HttpResponse =
+    if (tenant.isEmpty) error(StatusCodes.Unauthorized, "X-Tenant-Id is required")
+    else if (key.isEmpty) error(StatusCodes.BadRequest, "Idempotency-Key is required")
+    else
+      spanError(body) match {
+        case Some(message) => error(StatusCodes.BadRequest, message)
+        case None =>
+          Store.byKey(tenant, key) match {
+            case Some(replay) => json(StatusCodes.Created, replay.toJson) // a retry answers the citation the first attempt created
+            case None =>
+              // The version the request names: it never changes, so neither does what the citation points at.
+              Documents.getVersion(body.documentId, body.version) match {
+                case None => error(StatusCodes.NotFound, "no such document version")
+                case Some(text) =>
+                  val stored = text.slice(body.start.toInt, body.end.toInt)
+                  if (stored != body.quote)
+                    json(
+                      StatusCodes.UnprocessableEntity,
+                      JsObject("error" -> JsString("the quote is not the text at those offsets"), "stored" -> JsString(stored), "supplied" -> JsString(body.quote))
+                    )
+                  else {
+                    val citation = Store.create(tenant, body)
+                    Store.bindKey(tenant, key, citation.id)
+                    json(StatusCodes.Created, citation.toJson)
+                  }
+              }
+          }
+      }
 
   val route: Route =
     path("v1" / "citations") {
       post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[CitationRequest]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.document_id.isEmpty || body.version < 1) {
-                complete(StatusCodes.BadRequest, """{"error":"document_id and version are required"}""")
-              } else if (body.start < 0 || body.end <= body.start) {
-                complete(StatusCodes.BadRequest, """{"error":"offsets must satisfy 0 <= start < end"}""")
-              } else if (body.quote.isEmpty || body.quote.getBytes(StandardCharsets.UTF_8).length > MaxQuoteBytes) {
-                complete(StatusCodes.BadRequest, """{"error":"quote must be 1 byte .. 16 KiB"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                store.get(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
-                  case None =>
-                    resolveSpan(body.document_id, body.version, body.start, body.end) match {
-                      case None =>
-                        complete(StatusCodes.NotFound, """{"error":"unknown document version"}""")
-                      case Some(actual) if actual != body.quote =>
-                        complete(
-                          StatusCodes.UnprocessableEntity,
-                          s"""{"error":"span does not match","stored":"$actual","supplied":"\${body.quote}"}"""
-                        )
-                      case Some(_) =>
-                        val citation = Citation(
-                          idemKey,
-                          body.document_id,
-                          body.version,
-                          body.start,
-                          body.end,
-                          body.quote,
-                          "verified"
-                        )
-                        store.put(tenant, idemKey, citation)
-                        complete(StatusCodes.OK, citation)
-                    }
-                }
-              }
-            }
+        (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenant, key) =>
+          entity(as[String]) { raw =>
+            complete(createCitation(tenant.getOrElse(""), key.getOrElse(""), citationOf(raw)))
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },
@@ -703,153 +568,533 @@ object CitationApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <optional>
+#include <algorithm>
 #include <string>
+
+#include "citations/documents.h"  // documents::getVersion, latest
+#include "citations/store.h"      // store::create, byKey, bindKey
 
 using json = nlohmann::json;
 
-struct CitationStore {
-  void put(const std::string& tenant, const json& citation);
-};
+// text[start, end), clamped to the text.
+std::string span(const std::string& text, long start, long end) {
+  start = std::max(start, 0L);
+  end = std::min(end, static_cast<long>(text.size()));
+  return start >= end ? "" : text.substr(start, end - start);
+}
 
-CitationStore store;
+// The request body as a citation of no one yet: answer_id, document_id, version, start, end, quote.
+store::Citation citationOf(const json& body) {
+  store::Citation c;
+  c.answer_id = body.value("answer_id", "");
+  c.document_id = body.value("document_id", "");
+  c.version = body.value("version", 0L);
+  c.start = body.value("start", 0L);
+  c.end = body.value("end", 0L);
+  c.quote = body.value("quote", "");
+  return c;
+}
 
-int main() {
-  httplib::Server svr;
+void create_citation(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  store::Citation body = citationOf(json::parse(req.body));
+  body.quote = span(documents::latest(body.document_id).value_or(""), body.start, body.end);
+  res.status = 201;
+  res.set_content(store::toJson(store::create(tenant, body)).dump(), "application/json");
+}
 
-  svr.Post("/v1/citations", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const auto documentId = body.value("document_id", std::string());
-    const auto start = body.value("start", 0);
-    const auto end = body.value("end", 0);
-    const auto text = documents.latest(documentId);
-    const json citation = {
-        {"document_id", documentId},
-        {"start", start},
-        {"end", end},
-        {"quote", text.substr(static_cast<std::size_t>(start), static_cast<std::size_t>(end - start))},
-        {"status", "verified"},
-    };
-    store.put(tenant, citation);
-    res.status = 200;
-    res.set_content(citation.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/citations", create_citation);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
+#include <algorithm>
 #include <string>
+
+#include "citations/documents.h"  // documents::getVersion, latest
+#include "citations/store.h"      // store::create, byKey, bindKey
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxQuoteBytes = 1 << 14;
+constexpr long kMaxQuoteChars = 16 * 1024;
 
-struct DocumentStore {
-  std::optional<std::string> getVersion(const std::string& documentId, int version) const;
-};
-
-DocumentStore documents;
-
-struct CitationStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& citation);
-};
-
-CitationStore store;
-
-std::optional<std::string> resolveSpan(const std::string& documentId, int version, long long start, long long end) {
-  const auto text = documents.getVersion(documentId, version);
-  if (!text.has_value()) return std::nullopt;
-  if (start < 0 || end > static_cast<long long>(text->size()) || end <= start) return std::nullopt;
-  return text->substr(static_cast<std::size_t>(start), static_cast<std::size_t>(end - start));
+// text[start, end), clamped to the text.
+std::string span(const std::string& text, long start, long end) {
+  start = std::max(start, 0L);
+  end = std::min(end, static_cast<long>(text.size()));
+  return start >= end ? "" : text.substr(start, end - start);
 }
 
-int main() {
-  httplib::Server svr;
+// The request body as a citation of no one yet: answer_id, document_id, version, start, end, quote.
+store::Citation citationOf(const json& body) {
+  store::Citation c;
+  c.answer_id = body.value("answer_id", "");
+  c.document_id = body.value("document_id", "");
+  c.version = body.value("version", 0L);
+  c.start = body.value("start", 0L);
+  c.end = body.value("end", 0L);
+  c.quote = body.value("quote", "");
+  return c;
+}
 
-  svr.Post("/v1/citations", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    const auto documentId = body.value("document_id", std::string());
-    const int version = body.value("version", 0);
-    const long long start = body.value("start", 0);
-    const long long end = body.value("end", 0);
-    const auto quote = body.value("quote", std::string());
-    if (documentId.empty() || version < 1) {
-      res.status = 400;
-      res.set_content(R"({"error":"document_id and version are required"})", "application/json");
-      return;
-    }
-    if (start < 0 || end <= start) {
-      res.status = 400;
-      res.set_content(R"({"error":"offsets must satisfy 0 <= start < end"})", "application/json");
-      return;
-    }
-    if (quote.empty() || quote.size() > kMaxQuoteBytes) {
-      res.status = 400;
-      res.set_content(R"({"error":"quote must be 1 byte .. 16 KiB"})", "application/json");
-      return;
-    }
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-    const auto stored = store.get(tenant, idemKey);
-    if (stored) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
+// Why the request cannot be a citation, or "".
+std::string spanError(const store::Citation& body) {
+  if (body.document_id.empty() || body.answer_id.empty()) return "document_id and answer_id are required";
+  if (body.version < 1) return "version must be >= 1";
+  if (body.start < 0 || body.end <= body.start) return "the span must have 0 <= start < end";
+  if (body.quote.empty() || static_cast<long>(body.quote.size()) > kMaxQuoteChars) {
+    return "the quote must be 1 to " + std::to_string(kMaxQuoteChars) + " characters";
+  }
+  return "";
+}
 
-    const auto actual = resolveSpan(documentId, version, start, end);
-    if (!actual.has_value()) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown document version"})", "application/json");
-      return;
-    }
-    if (actual != quote) {
-      res.status = 422;
-      res.set_content(
-          json{{"error", "span does not match"}, {"stored", *actual}, {"supplied", quote}}.dump(),
-          "application/json");
-      return;
-    }
+void create_citation(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, json{{"error", "X-Tenant-Id is required"}});
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return reply(res, 400, json{{"error", "Idempotency-Key is required"}});
+  const json parsed = json::parse(req.body, nullptr, false);
+  if (!parsed.is_object()) return reply(res, 400, json{{"error", "the body must be a JSON object"}});
+  const store::Citation body = citationOf(parsed);
+  if (const std::string error = spanError(body); !error.empty()) return reply(res, 400, json{{"error", error}});
+  if (const auto replay = store::byKey(tenant, key)) {
+    return reply(res, 201, store::toJson(*replay));  // a retry answers the citation the first attempt created
+  }
+  // The version the request names: it never changes, so neither does what the citation points at.
+  const auto text = documents::getVersion(body.document_id, body.version);
+  if (!text) return reply(res, 404, json{{"error", "no such document version"}});
+  const std::string stored = span(*text, body.start, body.end);
+  if (stored != body.quote) {
+    return reply(res, 422, json{{"error", "the quote is not the text at those offsets"}, {"stored", stored}, {"supplied", body.quote}});
+  }
+  const store::Citation citation = store::create(tenant, body);
+  store::bindKey(tenant, key, citation.id);
+  reply(res, 201, store::toJson(citation));
+}
 
-    const json citation = {
-        {"id", idemKey},
-        {"document_id", documentId},
-        {"version", version},
-        {"start", start},
-        {"end", end},
-        {"quote", quote},
-        {"status", "verified"},
-    };
-    store.put(tenant, idemKey, citation);
-    res.status = 200;
-    res.set_content(citation.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/citations", create_citation);
 }
 `,
     },
   },
-  debrief: `The fix has its shape because a citation's identity is \`(document_id, version, start, end)\` and nothing less. The guard clauses run first and in cost order so a malformed request is refused before the document store is paid for. The handler then fetches the named version, slices it and compares, because offsets and a quote only mean something together; the 422 carries both texts so the caller can re-anchor instead of guessing. The record keeps the version so a later edit cannot re-point it, and it is stored under \`(tenant, Idempotency-Key)\` so a client retry returns the same citation id. Production stores go further than this step did: they normalize offsets across encodings and re-verify stored citations in a background job whenever a document's text is rewritten.`,
+  harness: {
+    python: `from citations import documents, store
+
+V1 = "The tower is 300 metres tall and opened in 1889."
+V2 = "The tower is 330 metres tall and opened in 1889."
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+def _body(**over):
+    return {"answer_id": "a-1", "document_id": "doc-7", "version": 1, "start": 13, "end": 16, "quote": "300", **over}
+
+
+async def _cite(c, body, tenant="t1", key="k-1"):
+    headers = {}
+    if tenant:
+        headers["X-Tenant-Id"] = tenant
+    if key:
+        headers["Idempotency-Key"] = key
+    return await c.post("/v1/citations", json=body, headers=headers)
+
+
+async def check_route(ctx):
+    documents.add_version("doc-7", V1)
+    async with _api(ctx) as c:
+        r = await _cite(c, _body())
+    assert r.status_code == 201, f"POST /v1/citations answered {r.status_code}: {r.text}"
+    citation_id = r.json().get("id")
+    row = store.get(citation_id) if citation_id else None
+    assert row is not None and row["document_id"] == "doc-7" and row["quote"] == "300", f"the answer {r.text} names no stored citation of doc-7 quoting 300 (stored: {row})"
+
+
+async def check_validate(ctx):
+    documents.add_version("doc-7", V1)
+    async with _api(ctx) as c:
+        r = await _cite(c, _body(), tenant="")
+        assert r.status_code == 401, f"a citation without X-Tenant-Id answered {r.status_code}, expected 401: a citation belongs to an authenticated tenant"
+        cases = [
+            ("version 0", _body(version=0)),
+            ("start -1", _body(start=-1)),
+            ("end equal to start", _body(end=13, quote="3")),
+            ("an empty document_id", _body(document_id="")),
+            ("a quote over 16 KiB", _body(start=0, end=16385, quote="x" * 16385)),
+        ]
+        for n, (what, body) in enumerate(cases):
+            r = await _cite(c, body, key=f"k-{n}")
+            assert r.status_code == 400, f"a request with {what} answered {r.status_code} {r.text[:160]}, expected 400"
+    assert store.get("c-1") is None, f"a rejected request stored a citation: {store.get('c-1')}"
+
+
+async def check_span_match(ctx):
+    documents.add_version("doc-7", V1)
+    async with _api(ctx) as c:
+        r = await _cite(c, _body(quote="301"))
+    assert r.status_code == 422, f"quoting 301 where version 1 says 300 answered {r.status_code} {r.text}, expected 422"
+    body = r.json()
+    assert body.get("stored") == "300" and body.get("supplied") == "301", f"the 422 must carry both texts, stored 300 and supplied 301, got {body}"
+    assert store.get("c-1") is None, f"a quote that is not the text at its offsets was stored: {store.get('c-1')}"
+
+
+async def check_version_scope(ctx):
+    documents.add_version("doc-7", V1)
+    documents.add_version("doc-7", V2)
+    async with _api(ctx) as c:
+        r = await _cite(c, _body(), key="k-1")
+        assert r.status_code == 201, f"citing version 1 with its own text (300) answered {r.status_code} {r.text}: the span must resolve in the version the request names, not the newest one"
+        row = store.get(r.json()["id"])
+        assert row["version"] == 1 and row["quote"] == "300", f"the citation of version 1 was stored as version {row['version']} quoting {row['quote']!r}: version 1 says 300, version 2 says 330"
+        r = await _cite(c, _body(version=2, quote="330"), key="k-2")
+        assert r.status_code == 201, f"citing version 2 with its own text (330) answered {r.status_code} {r.text}"
+        r = await _cite(c, _body(quote="330"), key="k-3")
+    assert r.status_code == 422, f"quoting version 2's text (330) as version 1 answered {r.status_code}, expected 422: version 1 says 300"
+
+
+async def check_idempotent(ctx):
+    documents.add_version("doc-7", V1)
+    async with _api(ctx) as c:
+        first = await _cite(c, _body(), key="k-1")
+        retry = await _cite(c, _body(), key="k-1")
+        assert first.status_code == 201 and retry.status_code == 201, f"the first attempt answered {first.status_code}, the retry {retry.status_code}: {retry.text}"
+        assert retry.json().get("id") == first.json().get("id"), f"a retry with the same Idempotency-Key created {retry.json().get('id')} next to {first.json().get('id')}: it must answer the citation the first attempt created"
+        rows = store.for_answer("a-1")
+        assert len(rows) == 1, f"two attempts with one Idempotency-Key stored {len(rows)} citations"
+        other = await _cite(c, _body(), tenant="t2", key="k-1")
+        assert other.status_code == 201 and other.json().get("id") != first.json().get("id"), f"another tenant's request with the same key answered {other.status_code} {other.text}: keys are scoped by tenant"
+        none = await _cite(c, _body(), key="")
+    assert none.status_code == 400, f"a citation without Idempotency-Key answered {none.status_code}, expected 400"
+`,
+    typescript: `const V1 = 'The tower is 300 metres tall and opened in 1889.';
+const V2 = 'The tower is 330 metres tall and opened in 1889.';
+
+function api(ctx) {
+  return {
+    c: ctx.client(ctx.load('api').app),
+    documents: ctx.load('/support/citations/documents.ts'),
+    store: ctx.load('/support/citations/store.ts'),
+  };
+}
+
+const body = (over = {}) => ({answer_id: 'a-1', document_id: 'doc-7', version: 1, start: 13, end: 16, quote: '300', ...over});
+
+function cite(c, json, tenant = 't1', key = 'k-1') {
+  const headers: Record<string, string> = {};
+  if (tenant) headers['X-Tenant-Id'] = tenant;
+  if (key) headers['Idempotency-Key'] = key;
+  return c.post('/v1/citations', {json, headers});
+}
+
+export async function check_route(ctx) {
+  const {c, documents, store} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  const r = await cite(c, body());
+  assert.equal(r.status, 201, \`POST /v1/citations answered \${r.status}: \${r.text}\`);
+  const id = r.json().id;
+  const row = id ? await store.get(id) : null;
+  assert(row !== null && row.document_id === 'doc-7' && row.quote === '300', \`the answer \${r.text} names no stored citation of doc-7 quoting 300 (stored: \${JSON.stringify(row)})\`);
+}
+
+export async function check_validate(ctx) {
+  const {c, documents, store} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  let r = await cite(c, body(), '');
+  assert.equal(r.status, 401, \`a citation without X-Tenant-Id answered \${r.status}, expected 401: a citation belongs to an authenticated tenant\`);
+  const cases: [string, object][] = [
+    ['version 0', body({version: 0})],
+    ['start -1', body({start: -1})],
+    ['end equal to start', body({end: 13, quote: '3'})],
+    ['an empty document_id', body({document_id: ''})],
+    ['a quote over 16 KiB', body({start: 0, end: 16385, quote: 'x'.repeat(16385)})],
+  ];
+  for (const [n, [what, json]] of cases.entries()) {
+    r = await cite(c, json, 't1', \`k-\${n}\`);
+    assert.equal(r.status, 400, \`a request with \${what} answered \${r.status} \${r.text.slice(0, 160)}, expected 400\`);
+  }
+  assert.equal(await store.get('c-1'), null, 'a rejected request stored a citation');
+}
+
+export async function check_span_match(ctx) {
+  const {c, documents, store} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  const r = await cite(c, body({quote: '301'}));
+  assert.equal(r.status, 422, \`quoting 301 where version 1 says 300 answered \${r.status} \${r.text}, expected 422\`);
+  const b = r.json();
+  assert(b.stored === '300' && b.supplied === '301', \`the 422 must carry both texts, stored 300 and supplied 301, got \${r.text}\`);
+  assert.equal(await store.get('c-1'), null, 'a quote that is not the text at its offsets was stored');
+}
+
+export async function check_version_scope(ctx) {
+  const {c, documents, store} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  await documents.addVersion('doc-7', V2);
+  let r = await cite(c, body(), 't1', 'k-1');
+  assert.equal(r.status, 201, \`citing version 1 with its own text (300) answered \${r.status} \${r.text}: the span must resolve in the version the request names, not the newest one\`);
+  const row = await store.get(r.json().id);
+  assert(row.version === 1 && row.quote === '300', \`the citation of version 1 was stored as version \${row.version} quoting \${JSON.stringify(row.quote)}: version 1 says 300, version 2 says 330\`);
+  r = await cite(c, body({version: 2, quote: '330'}), 't1', 'k-2');
+  assert.equal(r.status, 201, \`citing version 2 with its own text (330) answered \${r.status} \${r.text}\`);
+  r = await cite(c, body({quote: '330'}), 't1', 'k-3');
+  assert.equal(r.status, 422, \`quoting version 2's text (330) as version 1 answered \${r.status}, expected 422: version 1 says 300\`);
+}
+
+export async function check_idempotent(ctx) {
+  const {c, documents, store} = api(ctx);
+  await documents.addVersion('doc-7', V1);
+  const first = await cite(c, body(), 't1', 'k-1');
+  const retry = await cite(c, body(), 't1', 'k-1');
+  assert(first.status === 201 && retry.status === 201, \`the first attempt answered \${first.status}, the retry \${retry.status}: \${retry.text}\`);
+  assert.equal(retry.json().id, first.json().id, \`a retry with the same Idempotency-Key created \${retry.json().id} next to \${first.json().id}: it must answer the citation the first attempt created\`);
+  const rows = await store.forAnswer('a-1');
+  assert.equal(rows.length, 1, \`two attempts with one Idempotency-Key stored \${rows.length} citations\`);
+  const other = await cite(c, body(), 't2', 'k-1');
+  assert(other.status === 201 && other.json().id !== first.json().id, \`another tenant's request with the same key answered \${other.status} \${other.text}: keys are scoped by tenant\`);
+  const none = await cite(c, body(), 't1', '');
+  assert.equal(none.status, 400, \`a citation without Idempotency-Key answered \${none.status}, expected 400\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"citations/documents"
+	"citations/store"
+
+	"leetbuild/harness"
+)
+
+const (
+	apiV1 = "The tower is 300 metres tall and opened in 1889."
+	apiV2 = "The tower is 330 metres tall and opened in 1889."
+)
+
+var apiBg = context.Background()
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func citeBody(over map[string]any) map[string]any {
+	body := map[string]any{"answer_id": "a-1", "document_id": "doc-7", "version": 1, "start": 13, "end": 16, "quote": "300"}
+	for k, v := range over {
+		body[k] = v
+	}
+	return body
+}
+
+func cite(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
+	header := []string{}
+	if tenant != "" {
+		header = append(header, "X-Tenant-Id", tenant)
+	}
+	if key != "" {
+		header = append(header, "Idempotency-Key", key)
+	}
+	return c.Post("/v1/citations", body, header...)
+}
+
+func idOf(r *harness.Response) string {
+	m, _ := r.JSON().(map[string]any)
+	id, _ := m["id"].(string)
+	return id
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	documents.AddVersion(apiBg, "doc-7", apiV1)
+	r := cite(api(ctx), citeBody(nil), "t1", "k-1")
+	ctx.Equal(r.Status, 201, "POST /v1/citations (%s)", r.Text())
+	row := store.Get(apiBg, idOf(r))
+	ctx.Assert(row != nil && row.DocumentID == "doc-7" && row.Quote == "300", "the answer %s names no stored citation of doc-7 quoting 300 (stored: %+v)", r.Text(), row)
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	documents.AddVersion(apiBg, "doc-7", apiV1)
+	c := api(ctx)
+	r := cite(c, citeBody(nil), "", "k-1")
+	ctx.Equal(r.Status, 401, "a citation without X-Tenant-Id (a citation belongs to an authenticated tenant)")
+	cases := []struct {
+		what string
+		over map[string]any
+	}{
+		{"version 0", map[string]any{"version": 0}},
+		{"start -1", map[string]any{"start": -1}},
+		{"end equal to start", map[string]any{"end": 13, "quote": "3"}},
+		{"an empty document_id", map[string]any{"document_id": ""}},
+		{"a quote over 16 KiB", map[string]any{"start": 0, "end": 16385, "quote": strings.Repeat("x", 16385)}},
+	}
+	for n, tc := range cases {
+		r = cite(c, citeBody(tc.over), "t1", fmt.Sprintf("k-%d", n))
+		ctx.Equal(r.Status, 400, "a request with %s", tc.what)
+	}
+	ctx.Assert(store.Get(apiBg, "c-1") == nil, "a rejected request stored a citation: %+v", store.Get(apiBg, "c-1"))
+}
+
+func CheckSpanMatch(ctx *harness.Ctx) {
+	documents.AddVersion(apiBg, "doc-7", apiV1)
+	r := cite(api(ctx), citeBody(map[string]any{"quote": "301"}), "t1", "k-1")
+	ctx.Equal(r.Status, 422, "quoting 301 where version 1 says 300 (%s)", r.Text())
+	b, _ := r.JSON().(map[string]any)
+	ctx.Assert(b["stored"] == "300" && b["supplied"] == "301", "the 422 must carry both texts, stored 300 and supplied 301, got %s", r.Text())
+	ctx.Assert(store.Get(apiBg, "c-1") == nil, "a quote that is not the text at its offsets was stored: %+v", store.Get(apiBg, "c-1"))
+}
+
+func CheckVersionScope(ctx *harness.Ctx) {
+	documents.AddVersion(apiBg, "doc-7", apiV1)
+	documents.AddVersion(apiBg, "doc-7", apiV2)
+	c := api(ctx)
+	r := cite(c, citeBody(nil), "t1", "k-1")
+	ctx.Equal(r.Status, 201, "citing version 1 with its own text (300) must succeed: the span resolves in the version the request names, not the newest one (%s)", r.Text())
+	row := store.Get(apiBg, idOf(r))
+	ctx.Assert(row != nil && row.Version == 1 && row.Quote == "300", "the citation of version 1 was stored as %+v: version 1 says 300, version 2 says 330", row)
+	r = cite(c, citeBody(map[string]any{"version": 2, "quote": "330"}), "t1", "k-2")
+	ctx.Equal(r.Status, 201, "citing version 2 with its own text (330) (%s)", r.Text())
+	r = cite(c, citeBody(map[string]any{"quote": "330"}), "t1", "k-3")
+	ctx.Equal(r.Status, 422, "quoting version 2's text (330) as version 1 (version 1 says 300)")
+}
+
+func CheckIdempotent(ctx *harness.Ctx) {
+	documents.AddVersion(apiBg, "doc-7", apiV1)
+	c := api(ctx)
+	first := cite(c, citeBody(nil), "t1", "k-1")
+	retry := cite(c, citeBody(nil), "t1", "k-1")
+	ctx.Assert(first.Status == 201 && retry.Status == 201, "the first attempt answered %d, the retry %d: %s", first.Status, retry.Status, retry.Text())
+	ctx.Equal(idOf(retry), idOf(first), "a retry with the same Idempotency-Key must answer the citation the first attempt created; the id")
+	ctx.Equal(len(store.ForAnswer(apiBg, "a-1")), 1, "two attempts with one Idempotency-Key; the citations stored")
+	other := cite(c, citeBody(nil), "t2", "k-1")
+	ctx.Assert(other.Status == 201 && idOf(other) != idOf(first), "another tenant's request with the same key answered %d %s: keys are scoped by tenant", other.Status, other.Text())
+	none := cite(c, citeBody(nil), "t1", "")
+	ctx.Equal(none.Status, 400, "a citation without Idempotency-Key")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "citations/documents.h"
+#include "citations/store.h"
+
+using json = nlohmann::json;
+
+namespace {
+
+const std::string kV1 = "The tower is 300 metres tall and opened in 1889.";
+const std::string kV2 = "The tower is 330 metres tall and opened in 1889.";
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+json citeBody(const json& over = json::object()) {
+  json body = {{"answer_id", "a-1"}, {"document_id", "doc-7"}, {"version", 1}, {"start", 13}, {"end", 16}, {"quote", "300"}};
+  body.update(over);
+  return body;
+}
+
+harness::Response cite(harness::HTTP& c, const json& body, const std::string& tenant, const std::string& key) {
+  if (tenant.empty()) return c.Post("/v1/citations", body.dump(), "Content-Type", "application/json", "Idempotency-Key", key);
+  if (key.empty()) return c.Post("/v1/citations", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
+  return c.Post("/v1/citations", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
+}
+
+json bodyOf(const harness::Response& r) {
+  const json body = json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : json::object();
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kV1);
+  auto c = api(ctx);
+  const auto r = cite(c, citeBody(), "t1", "k-1");
+  ctx.Equal(r.Status, 201, "POST /v1/citations (%s)", r.Text());
+  const auto row = store::get(bodyOf(r).value("id", ""));
+  ctx.Assert(row && row->document_id == "doc-7" && row->quote == "300", "the answer %s names no stored citation of doc-7 quoting 300", r.Text());
+}
+
+void CheckValidate(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kV1);
+  auto c = api(ctx);
+  auto r = cite(c, citeBody(), "", "k-1");
+  ctx.Equal(r.Status, 401, "a citation without X-Tenant-Id (a citation belongs to an authenticated tenant)");
+  const std::vector<std::pair<std::string, json>> cases = {
+      {"version 0", json{{"version", 0}}},
+      {"start -1", json{{"start", -1}}},
+      {"end equal to start", json{{"end", 13}, {"quote", "3"}}},
+      {"an empty document_id", json{{"document_id", ""}}},
+      {"a quote over 16 KiB", json{{"start", 0}, {"end", 16385}, {"quote", std::string(16385, 'x')}}},
+  };
+  for (size_t n = 0; n < cases.size(); n++) {
+    r = cite(c, citeBody(cases[n].second), "t1", "k-" + std::to_string(n));
+    ctx.Equal(r.Status, 400, "a request with %s", cases[n].first);
+  }
+  ctx.Assert(!store::get("c-1"), "a rejected request stored a citation");
+}
+
+void CheckSpanMatch(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kV1);
+  auto c = api(ctx);
+  const auto r = cite(c, citeBody(json{{"quote", "301"}}), "t1", "k-1");
+  ctx.Equal(r.Status, 422, "quoting 301 where version 1 says 300 (%s)", r.Text());
+  const json b = bodyOf(r);
+  ctx.Assert(b.value("stored", "") == "300" && b.value("supplied", "") == "301", "the 422 must carry both texts, stored 300 and supplied 301, got %s", r.Text());
+  ctx.Assert(!store::get("c-1"), "a quote that is not the text at its offsets was stored");
+}
+
+void CheckVersionScope(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kV1);
+  documents::addVersion("doc-7", kV2);
+  auto c = api(ctx);
+  auto r = cite(c, citeBody(), "t1", "k-1");
+  ctx.Equal(r.Status, 201, "citing version 1 with its own text (300) must succeed: the span resolves in the version the request names, not the newest one (%s)", r.Text());
+  const auto row = store::get(bodyOf(r).value("id", ""));
+  ctx.Assert(row && row->version == 1 && row->quote == "300", "the citation of version 1 was stored as version %d quoting %q: version 1 says 300, version 2 says 330",
+             row ? row->version : 0L, row ? row->quote : "");
+  r = cite(c, citeBody(json{{"version", 2}, {"quote", "330"}}), "t1", "k-2");
+  ctx.Equal(r.Status, 201, "citing version 2 with its own text (330) (%s)", r.Text());
+  r = cite(c, citeBody(json{{"quote", "330"}}), "t1", "k-3");
+  ctx.Equal(r.Status, 422, "quoting version 2's text (330) as version 1 (version 1 says 300)");
+}
+
+void CheckIdempotent(harness::Ctx& ctx) {
+  documents::addVersion("doc-7", kV1);
+  auto c = api(ctx);
+  const auto first = cite(c, citeBody(), "t1", "k-1");
+  const auto retry = cite(c, citeBody(), "t1", "k-1");
+  ctx.Assert(first.Status == 201 && retry.Status == 201, "the first attempt answered %d, the retry %d: %s", first.Status, retry.Status, retry.Text());
+  ctx.Equal(bodyOf(retry).value("id", ""), bodyOf(first).value("id", ""), "a retry with the same Idempotency-Key must answer the citation the first attempt created; the id");
+  ctx.Equal(store::forAnswer("a-1").size(), 1, "two attempts with one Idempotency-Key; the citations stored");
+  const auto other = cite(c, citeBody(), "t2", "k-1");
+  ctx.Assert(other.Status == 201 && bodyOf(other).value("id", "") != bodyOf(first).value("id", ""), "another tenant's request with the same key answered %d %s: keys are scoped by tenant",
+             other.Status, other.Text());
+  const auto none = cite(c, citeBody(), "t1", "");
+  ctx.Equal(none.Status, 400, "a citation without Idempotency-Key");
+}
+`,
+  },
+  debrief: `The record is only worth storing if it can be checked later, so the shape of the fix is "compare at write time, against something that cannot change": the immutable version the request names. Answering 422 with both texts turns a silent mismatch into a message a client can act on. The Idempotency-Key lookup sits before the read and the create because a retry must not depend on whether the document moved in between. Production stores normalise text before comparing (Unicode form, whitespace), record which model run produced the citation, expire the idempotency records after a day or so, and bind the key to a hash of the body so a reused key with a different span is rejected.`,
 };
