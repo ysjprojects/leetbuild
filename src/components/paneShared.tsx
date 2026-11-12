@@ -1,15 +1,18 @@
 import {type FC, memo} from 'react';
 
 import type {CheckResult} from '@/lib/judge';
+import type {StepAttempt} from '@/lib/scoring';
 import {
   type Company,
   type Concept,
   type Difficulty,
   type Language,
+  type Problem,
   type ProblemTag,
   CONCEPT_LABEL,
   LANGUAGE_LABEL,
   LANGUAGES,
+  stepKey,
   TAG_LABEL,
 } from '@/lib/types';
 import {concept} from '@/styles/palette';
@@ -129,3 +132,12 @@ const languageOption = (language: Language): {value: Language; label: string} =>
 export const LANGUAGE_OPTIONS = LANGUAGES.map(languageOption);
 
 export const linkClass = 'text-iris-300 underline decoration-iris-400/50 hover:text-iris-200';
+
+export type PaneTab = 'problem' | 'step';
+
+/** A step is playable once the previous one is accepted or revealed. */
+export function unlocked(problem: Problem, index: number, attempts: Record<string, StepAttempt>): boolean {
+  if (index === 0) return true;
+  const previous = attempts[stepKey(problem.id, problem.steps[index - 1].id)];
+  return previous !== undefined && previous.status !== 'open';
+}

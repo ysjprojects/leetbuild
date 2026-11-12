@@ -1,8 +1,7 @@
 import {type FC, type ReactNode, memo, useCallback, useMemo, useState} from 'react';
 
-import type {HighlightedSpan} from '@/lib/editor';
 import {githubSlug} from '@/lib/export';
-import {leetbuildHighlighter} from '@/lib/highlight';
+import {type HighlightedSpan, leetbuildHighlighter} from '@/lib/highlight';
 import {type Block, type InlineLeaf, type PopQuizSpec, inlineTokens, parseBlocks} from '@/lib/markdown';
 
 import ArchitectureDiagram from './ArchitectureDiagram';

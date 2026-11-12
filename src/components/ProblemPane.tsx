@@ -33,6 +33,7 @@ import {useDialog} from './Dialog';
 import GpuDiagram from './GpuDiagram';
 import Markdown, {InlineMarkdown} from './Markdown';
 import {
+  type PaneTab,
   CompanyMark,
   ConceptChip,
   DifficultyChip,
@@ -40,6 +41,7 @@ import {
   linkClass,
   primaryButtonClass,
   TagChip,
+  unlocked,
 } from './paneShared';
 import SequenceDiagram from './SequenceDiagram';
 import {mod} from './Shortcuts';
@@ -48,15 +50,6 @@ import StepEditor from './StepEditor';
 import SystemDiagram from './SystemDiagram';
 import {renderWidget} from './widgets';
 import {tabClass} from './widgets/frame';
-
-export type PaneTab = 'problem' | 'step';
-
-/** A step is playable once the previous one is accepted or revealed. */
-export function unlocked(problem: Problem, index: number, attempts: Record<string, StepAttempt>): boolean {
-  if (index === 0) return true;
-  const previous = attempts[stepKey(problem.id, problem.steps[index - 1].id)];
-  return previous !== undefined && previous.status !== 'open';
-}
 
 /**
  * One node of the step rail: the step's number, or its status once decided (✓ accepted, ◐ revealed,

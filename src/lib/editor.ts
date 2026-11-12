@@ -1,7 +1,7 @@
 /**
- * CodeMirror configuration shared by the step editor and the static code blocks: the editing
- * feature set, the grammar per language, indentation conventions, and the token → CSS class
- * mapping that the `.tok-*` palette in globals.scss colours.
+ * CodeMirror configuration of the step editor: the editing feature set, the grammar per language
+ * and indentation conventions. The token → CSS class mapping it shares with static code blocks
+ * (the `.tok-*` palette in globals.scss) lives in `highlight.ts`.
  */
 import {defaultKeymap, history, historyKeymap, indentWithTab} from '@codemirror/commands';
 import {cpp} from '@codemirror/lang-cpp';
@@ -17,7 +17,6 @@ import {
   StreamLanguage,
   syntaxHighlighting,
 } from '@codemirror/language';
-import {scala} from '@codemirror/legacy-modes/mode/clike';
 import {protobuf} from '@codemirror/legacy-modes/mode/protobuf';
 import {highlightSelectionMatches, searchKeymap} from '@codemirror/search';
 import {type Extension, EditorState} from '@codemirror/state';
@@ -30,11 +29,11 @@ import {
   lineNumbers,
   rectangularSelection,
 } from '@codemirror/view';
-import {highlightCode, tagHighlighter, tags} from '@lezer/highlight';
 import {vim} from '@replit/codemirror-vim';
 
 import {changeGutter} from './changeGutter';
 import type {EditorSettings} from './editorSettings';
+import {scalaLanguage, tokenHighlighter} from './highlight';
 import type {Language} from './types';
 
 /** What an editor can highlight: the five languages, plus `.proto` for the provided contracts. */
@@ -46,7 +45,7 @@ const grammars: Record<Syntax, LanguageSupport | StreamLanguage<unknown>> = {
   python: python(),
   typescript: javascript({typescript: true}),
   go: go(),
-  scala: StreamLanguage.define(scala),
+  scala: scalaLanguage,
   cpp: cpp(),
   cuda: cpp(),
   proto: StreamLanguage.define(protobuf),
@@ -67,65 +66,6 @@ export const INDENT: Record<Syntax, {unit: string; tabSize: number}> = {
   scala: {unit: '  ', tabSize: 2},
   proto: {unit: '  ', tabSize: 2},
 };
-
-// ---- token classes ------------------------------------------------------------------------------
-
-/** Tag → CSS class mapping shared by editors and static code blocks (see globals.scss). */
-export const tokenHighlighter = tagHighlighter([
-  {tag: tags.comment, class: 'tok-comment'},
-  {tag: tags.keyword, class: 'tok-keyword'},
-  {tag: tags.controlKeyword, class: 'tok-controlKeyword'},
-  {tag: tags.operatorKeyword, class: 'tok-keyword'},
-  {tag: tags.definitionKeyword, class: 'tok-keyword'},
-  {tag: tags.moduleKeyword, class: 'tok-keyword'},
-  {tag: tags.modifier, class: 'tok-modifier'},
-  {tag: tags.annotation, class: 'tok-annotation'},
-  {tag: tags.attributeName, class: 'tok-annotation'},
-  {tag: tags.meta, class: 'tok-meta'},
-  {tag: tags.processingInstruction, class: 'tok-processingInstruction'},
-  {tag: tags.macroName, class: 'tok-macroName'},
-  {tag: tags.typeName, class: 'tok-typeName'},
-  {tag: tags.className, class: 'tok-className'},
-  {tag: tags.namespace, class: 'tok-namespace'},
-  {tag: tags.string, class: 'tok-string'},
-  {tag: tags.special(tags.string), class: 'tok-string2'},
-  {tag: tags.character, class: 'tok-character'},
-  {tag: tags.number, class: 'tok-number'},
-  {tag: tags.bool, class: 'tok-bool'},
-  {tag: tags.atom, class: 'tok-atom'},
-  {tag: tags.literal, class: 'tok-literal'},
-  {tag: tags.variableName, class: 'tok-variableName'},
-  {tag: tags.special(tags.variableName), class: 'tok-variableName2'},
-  {tag: tags.propertyName, class: 'tok-propertyName'},
-  {tag: tags.function(tags.variableName), class: 'tok-function'},
-  {tag: tags.definition(tags.variableName), class: 'tok-definition'},
-  {tag: tags.labelName, class: 'tok-labelName'},
-  {tag: tags.operator, class: 'tok-operator'},
-  {tag: tags.punctuation, class: 'tok-punctuation'},
-  {tag: tags.heading, class: 'tok-labelName'},
-  {tag: tags.invalid, class: 'tok-invalid'},
-]);
-
-export interface HighlightedSpan {
-  text: string;
-  className: string;
-}
-
-/** Tokenize a snippet for static rendering (code blocks, solutions); `\n` becomes an empty-class span. */
-export function highlightCodeSpans(code: string, language: Language): HighlightedSpan[] {
-  const support = grammars[language];
-  const parser = 'language' in support ? support.language.parser : support.parser;
-  const tree = parser.parse(code);
-  const spans: HighlightedSpan[] = [];
-  highlightCode(
-    code,
-    tree,
-    tokenHighlighter,
-    (text, className) => spans.push({text, className}),
-    () => spans.push({text: '\n', className: ''}),
-  );
-  return spans;
-}
 
 // ---- editor feature sets ---------------------------------------------------------------------
 

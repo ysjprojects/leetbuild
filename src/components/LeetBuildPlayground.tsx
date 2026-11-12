@@ -62,36 +62,37 @@ import {BadgeGlyph} from './Badges';
 import Confetti from './Confetti';
 import {useDialog} from './Dialog';
 import {EditorSettingsForm, GearIcon} from './EditorSettings';
+import {type CoursePanes, loadCoursePanes, loadedCoursePanes} from './loadCoursePanes';
 import {BrandLockup, LoadingScreen} from './LoadingScreen';
 import ModeSwitch from './ModeSwitch';
-import {ghostButtonClass, LANGUAGE_OPTIONS} from './paneShared';
+import {type PaneTab, ghostButtonClass, LANGUAGE_OPTIONS, unlocked} from './paneShared';
 import ProblemList from './ProblemList';
-import ProblemPane, {type PaneTab, unlocked} from './ProblemPane';
 import Scratchpad, {ScratchpadIcon} from './Scratchpad';
 import {Select} from './Select';
 import {isEditable, KeyboardIcon, MAC, mod, ShortcutList} from './Shortcuts';
 import {CertificateForm, LinkedInButton, POST_HINT} from './Social';
 import SplitGutter from './SplitGutter';
-import StepEditor from './StepEditor';
 import ThemeToggle from './ThemeToggle';
 import {BudgetPicker, SessionList, TimerIdlePill, TimerPill} from './Timer';
-import VerdictPane, {SubmissionCode} from './VerdictPane';
 
 const summaryById = new Map(problemSummaries.map(summary => [summary.id, summary]));
 
 /**
- * The open course: the `Problem` once its chunk has arrived, `null` while it is on its way (and on
- * the list). `failed` when the fetch failed; `retry` asks again.
+ * The open course: the `Problem` once its chunk and the course view's components (`panes`) have
+ * arrived, `null` while either is on its way (and on the list). `failed` when a fetch failed;
+ * `retry` asks again.
  */
-const useProblem = (id: string | null): {problem: Problem | null; failed: boolean; retry: () => void} => {
+const useProblem = (
+  id: string | null,
+): {problem: Problem | null; panes: CoursePanes | null; failed: boolean; retry: () => void} => {
   const [, setArrived] = useState(0);
   const [failedId, setFailedId] = useState<string | null>(null);
   const [tries, setTries] = useState(0);
   useEffect(() => {
-    if (id === null || loadedProblem(id) !== undefined) return undefined;
+    if (id === null || (loadedProblem(id) !== undefined && loadedCoursePanes() !== null)) return undefined;
     let live = true;
     setFailedId(null);
-    loadProblem(id).then(
+    Promise.all([loadProblem(id), loadCoursePanes()]).then(
       () => {
         if (live) setArrived(n => n + 1);
       },
@@ -104,7 +105,13 @@ const useProblem = (id: string | null): {problem: Problem | null; failed: boolea
     };
   }, [id, tries]);
   const retry = useCallback(() => setTries(n => n + 1), []);
-  return {problem: id === null ? null : loadedProblem(id) ?? null, failed: id !== null && failedId === id, retry};
+  const panes = loadedCoursePanes();
+  return {
+    problem: id === null || panes === null ? null : loadedProblem(id) ?? null,
+    panes,
+    failed: id !== null && failedId === id,
+    retry,
+  };
 };
 
 /**
@@ -733,7 +740,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
 
   /** The course the address names, as the list knows it; the course itself arrives through `useProblem`. */
   const summary = problemId === null ? null : summaryById.get(problemId) ?? null;
-  const {problem, failed: problemFailed, retry: retryProblem} = useProblem(summary === null ? null : summary.id);
+  const {problem, panes, failed: problemFailed, retry: retryProblem} = useProblem(summary === null ? null : summary.id);
   const step: Step | null =
     problem === null ? null : resolveStep(problem, progress.attempts, stepId ?? progress.lastStep[problem.id]);
   const stepIndex = problem === null || step === null ? -1 : problem.steps.indexOf(step);
@@ -1333,7 +1340,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   /** A past submission's code, read-only, with the edits since it and a way to put it back in the editor. */
   const onViewSubmission = useCallback(
     (submission: Submission) => {
-      if (step === null || submission.code === undefined) return;
+      if (step === null || panes === null || submission.code === undefined) return;
       const code = submission.code;
       const sameLanguage = submission.language === language;
       void openDialog({
@@ -1346,7 +1353,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
           minute: '2-digit',
         })}`,
         body: (
-          <SubmissionCode
+          <panes.SubmissionCode
             code={code}
             current={sameLanguage ? filesRef.current[step.id] ?? codeFor(step, language).starter : null}
             language={submission.language}
@@ -1361,7 +1368,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         setResetKey(k => k + 1);
       });
     },
-    [step, language, openDialog, writeFile, openTab],
+    [step, panes, language, openDialog, writeFile, openTab],
   );
 
   const onRevealHint = useCallback(
@@ -1645,7 +1652,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         </div>
       </header>
 
-      {problem === null || step === null ? (
+      {problem === null || step === null || panes === null ? (
         <main className="min-h-0 flex-1 overflow-y-auto">
           <ProblemList
             activeDays={progress.activeDays}
@@ -1675,7 +1682,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
               className={`${paneOpen ? 'block' : 'hidden'} h-[62vh] overflow-hidden lg:h-full ${
                 layout.pane ? 'lg:block' : 'lg:hidden'
               }`}>
-              <ProblemPane
+              <panes.ProblemPane
                 attempt={attempt}
                 attempts={progress.attempts}
                 certified={certified}
@@ -1827,7 +1834,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                       </span>
                       <span>{openProvided.note}</span>
                     </div>
-                    <StepEditor
+                    <panes.StepEditor
                       className="min-h-0 min-w-0 flex-1"
                       fileKey={`${problem.id}/${openFile}/${language}`}
                       language={openProvided.syntax}
@@ -1836,7 +1843,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     />
                   </>
                 ) : (
-                  <StepEditor
+                  <panes.StepEditor
                     baseline={openStarter}
                     className="min-h-0 min-w-0 flex-1"
                     fileKey={`${problem.id}/${openFile}/${language}`}
@@ -1854,7 +1861,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
               <div
                 className="border-ink-700 flex h-[40vh] min-h-0 min-w-0 flex-col border-t lg:h-auto lg:border-t-0"
                 ref={verdictRef}>
-                <VerdictPane
+                <panes.VerdictPane
                   attempt={attempt}
                   comparing={comparing}
                   consoleRun={consoleRun}
