@@ -71,10 +71,18 @@ Each of them is one system at the classic courses' bar: its steps share one cont
 `/mock-interview` is the timed practice loop, linked from the header switch and from the landing
 page's mode card. A scenario opens with an interviewer brief and a flawed patch; the learner
 has 20–25 minutes and an **offline AI pair** (reset, review, reveal the flaw, test idea), plus a
-button that copies a review prompt for the learner's own AI assistant. Submit grades the step with
-the same static checks the course uses. Accepted or not, the report shows the checks, what the patch
-got wrong, follow-up questions, a debrief and copyable notes. There is no login, no hosted model, no
-solution reveal and no effect on course points: it is a practice session, not an assessment product.
+button that copies a review prompt for the learner's own AI assistant. Submit grades the step as the
+course does: the step's runtime harness runs the patch in the browser (Python, TypeScript, Go, and
+C++ where the browser has WebAssembly stack switching) inside the course's system, every other step
+on its reference solution, and decides every check, with what the run observed under each failed
+one; the static checks stay a hint, as the AI pair's _Review_ (a reading of the code, not a run) and
+as a shape note where they disagree with the run, and decide only where nothing runs (Scala). The
+runtime boots when the clock starts, so the first Submit does not wait for its download. When the
+clock runs out or the learner finishes, the report grades the code on screen the same way.
+Accepted or not, the report shows the checks, what the patch got wrong, follow-up questions, a
+debrief and copyable notes. There is no login, no hosted model, no solution reveal and no effect on
+course points: it is a practice session, not an assessment product. Opening a scenario fetches its
+course, a chunk of its own, as the practice mode does.
 
 Every debugging course contributes a scenario; they live in `src/data/mock.ts` and point at real steps
 (`ai-gateway/tenant-budget`, `booking-engine/endpoint`, …). The picker lists them in threes,

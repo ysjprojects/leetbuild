@@ -218,6 +218,14 @@ export function withRuntime(verdict: Verdict, run: RunResult): Verdict {
   };
 }
 
+/** The message every failing check reported (typically one unimplemented function, a compile error): said once. */
+export function commonMessage(verdict: Verdict): string | null {
+  if (verdict.accepted || verdict.trial === true) return null;
+  const failing = verdict.results.filter(r => !r.passed);
+  const first = failing[0]?.message;
+  return first !== undefined && failing.every(r => r.message === first) ? first : null;
+}
+
 // ---- explaining a check ----------------------------------------------------------------------------
 
 /**

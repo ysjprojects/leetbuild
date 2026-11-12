@@ -1,13 +1,14 @@
 import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
 import type {BottomTab, ConsoleRun} from '@/lib/console';
-import {type CheckResult, type Verdict, describeMatcher} from '@/lib/judge';
+import {type CheckResult, type Verdict, commonMessage, describeMatcher} from '@/lib/judge';
 import {type MetricRow, comparedRows, metricByCheck, total} from '@/lib/metrics';
 import {type RuntimeStatus, STATUS_TEXT} from '@/lib/runtime/client';
 import type {StepAttempt, Submission} from '@/lib/scoring';
 import {type Language, type Step, type StepCheck, fileName, LANGUAGE_LABEL} from '@/lib/types';
 
 import {InlineMarkdown} from './Markdown';
+import {ShapeNote} from './paneShared';
 import {mod} from './Shortcuts';
 import {LinkedInButton, POST_HINT} from './Social';
 import StepEditor from './StepEditor';
@@ -488,12 +489,7 @@ const VerdictPane: FC<{
     const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
     const runError = verdict?.run?.error;
     /** Every failing check reported the same thing (typically one unimplemented function): say it once. */
-    const common = useMemo(() => {
-      if (verdict === null || verdict.accepted || verdict.trial === true) return null;
-      const failing = verdict.results.filter(r => !r.passed);
-      const first = failing[0]?.message;
-      return first !== undefined && failing.every(r => r.message === first) ? first : null;
-    }, [verdict]);
+    const common = useMemo(() => (verdict === null ? null : commonMessage(verdict)), [verdict]);
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="border-ink-700 text-ink-300 flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5 text-[11px]">
@@ -700,19 +696,7 @@ const VerdictPane: FC<{
                             example
                           </span>
                         ) : null}
-                        {result !== null && result.shape !== undefined && result.shape !== result.passed ? (
-                          <span
-                            className={`ml-auto shrink-0 rounded-full border px-1.5 text-[10px] ${
-                              result.passed ? 'border-ink-600 text-ink-400' : 'border-warning-400/50 text-warning-300'
-                            }`}
-                            title={
-                              result.passed
-                                ? 'Your code passes this check but is shaped differently from the reference solution — that is fine; the runtime result decides.'
-                                : 'Your code is shaped like the reference solution but does not pass when run: the logic, not the spelling, is off.'
-                            }>
-                            {result.passed ? 'unlike the reference' : 'looks right, fails'}
-                          </span>
-                        ) : null}
+                        {result !== null ? <ShapeNote result={result} /> : null}
                       </p>
                       {result !== null && !result.passed ? (
                         <>

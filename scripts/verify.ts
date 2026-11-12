@@ -24,6 +24,7 @@ import {gpuProblems} from '../src/lib/gpuFigure';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {malformedBlocksOf, widgetsOf} from '../src/lib/markdown';
 import {CLANG_VERSION, CPP_UNSUPPORTED, cppSupported} from '../src/lib/runtime/cpp/support';
+import {stepJob} from '../src/lib/runtime/job';
 import {
   type NodeRuntime,
   createNodeCppRuntime,
@@ -31,7 +32,7 @@ import {
   createNodePythonRuntime,
   createNodeTypeScriptRuntime,
 } from '../src/lib/runtime/node';
-import {type RunJob, type RunResult} from '../src/lib/runtime/types';
+import {type RunResult} from '../src/lib/runtime/types';
 import {STEP_POINTS} from '../src/lib/scoring';
 import {
   type Language,
@@ -453,19 +454,6 @@ async function loadProblems(): Promise<Problem[]> {
   return problems;
 }
 
-/** The job that runs `step` of `problem` with `code` as its file: every other file is the reference solution. */
-function runJob(problem: Problem, step: Step, language: Language, code: string): RunJob {
-  const files: Record<string, string> = {};
-  for (const s of problem.steps) files[fileName(s.file, language)] = s === step ? code : codeFor(s, language).solution;
-  return {
-    files,
-    support: problem.support?.[language] ?? {},
-    harness: step.harness?.[language] ?? '',
-    checks: step.checks.map(c => c.id),
-    entry: fileName(step.file, language),
-  };
-}
-
 const describeRun = (run: RunResult): string =>
   run.error !== undefined
     ? `error: ${run.error}`
@@ -548,7 +536,7 @@ async function verifyPrograms(problem: Problem, runtime: NodeRuntime): Promise<{
     if (!runsAsProgram(problem, step, 'python')) continue;
     const tag = `${problem.id}/${step.id} [python program]`;
     const run = (code: string): Promise<RunResult> =>
-      runtime.run({...runJob(problem, step, 'python', code), harness: '', checks: [], program: true});
+      runtime.run({...stepJob(problem, step, 'python', code), harness: '', checks: [], program: true});
     const solution = await run(codeFor(step, 'python').solution);
     if (!selfTestPasses(solution)) errors.push(`${tag}: the solution's self-test fails — ${describeProgram(solution)}`);
     const starter = await run(codeFor(step, 'python').starter);
@@ -632,8 +620,8 @@ async function precompileCpp(problems: Problem[]): Promise<void> {
     problem.steps
       .filter(step => step.harness?.cpp !== undefined)
       .flatMap(step => [
-        runJob(problem, step, 'cpp', codeFor(step, 'cpp').solution),
-        runJob(problem, step, 'cpp', codeFor(step, 'cpp').starter),
+        stepJob(problem, step, 'cpp', codeFor(step, 'cpp').solution),
+        stepJob(problem, step, 'cpp', codeFor(step, 'cpp').starter),
       ]),
   );
   // A worker peaks near 2 GB (Node, clang, the sysroot); past what memory holds (4 GB left to this
@@ -677,10 +665,10 @@ async function verifyRuntime(
       const name = checkName(check.id);
       if (!declares(harness, name)) errors.push(`${tag}: harness defines no ${name}`);
     }
-    const solution = await runtime.run(runJob(problem, step, language, codeFor(step, language).solution));
+    const solution = await runtime.run(stepJob(problem, step, language, codeFor(step, language).solution));
     if (solution.error !== undefined || !solution.checks.every(c => c.passed))
       errors.push(`${tag}: solution fails — ${describeRun(solution)}`);
-    const starter = await runtime.run(runJob(problem, step, language, codeFor(step, language).starter));
+    const starter = await runtime.run(stepJob(problem, step, language, codeFor(step, language).starter));
     if (starter.error === undefined && starter.checks.every(c => c.passed))
       errors.push(`${tag}: the starter already passes every runtime check`);
     if (verbose) {

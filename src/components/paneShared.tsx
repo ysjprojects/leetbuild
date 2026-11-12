@@ -1,5 +1,6 @@
 import {type FC, memo} from 'react';
 
+import type {CheckResult} from '@/lib/judge';
 import {
   type Company,
   type Concept,
@@ -91,6 +92,27 @@ export const TagChip: FC<{tag: ProblemTag}> = memo(({tag}) => (
   </span>
 ));
 TagChip.displayName = 'TagChip';
+
+/**
+ * Where the runtime decided a check and the static matcher read the code differently: advisory, the
+ * run decides. Nothing when they agree, or when the check was judged statically.
+ */
+export const ShapeNote: FC<{result: CheckResult}> = memo(({result}) =>
+  result.shape === undefined || result.shape === result.passed ? null : (
+    <span
+      className={`ml-auto shrink-0 rounded-full border px-1.5 text-[10px] ${
+        result.passed ? 'border-ink-600 text-ink-400' : 'border-warning-400/50 text-warning-300'
+      }`}
+      title={
+        result.passed
+          ? 'Your code passes this check but is shaped differently from the reference solution — that is fine; the runtime result decides.'
+          : 'Your code is shaped like the reference solution but does not pass when run: the logic, not the spelling, is off.'
+      }>
+      {result.passed ? 'unlike the reference' : 'looks right, fails'}
+    </span>
+  ),
+);
+ShapeNote.displayName = 'ShapeNote';
 
 export const ghostButtonClass =
   'rounded-lg px-3 py-1.5 text-[12px] font-semibold text-ink-200 transition hover:bg-ink-800 hover:text-ink-50 disabled:cursor-not-allowed disabled:opacity-30';

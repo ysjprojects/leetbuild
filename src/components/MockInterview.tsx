@@ -7,7 +7,9 @@ import {
   listedMockScenarios,
   resolveMockScenario,
 } from '@/data/mock';
-import {type Verdict, judge} from '@/lib/judge';
+import {type Verdict, commonMessage, judge, withRuntime} from '@/lib/judge';
+import {type RuntimeStatus, getRunner, runtimeHarness, STATUS_TEXT} from '@/lib/runtime/client';
+import {stepJob} from '@/lib/runtime/job';
 import {formatClock} from '@/lib/timer';
 import {type Difficulty, type Language, codeFor, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
 
@@ -16,7 +18,7 @@ import {SearchIcon} from './ListControls';
 import {BrandLockup} from './LoadingScreen';
 import Markdown from './Markdown';
 import ModeSwitch from './ModeSwitch';
-import {DifficultyChip, ghostButtonClass, LANGUAGE_OPTIONS} from './paneShared';
+import {DifficultyChip, ghostButtonClass, LANGUAGE_OPTIONS, ShapeNote} from './paneShared';
 import {Select} from './Select';
 import StepEditor from './StepEditor';
 
@@ -54,30 +56,74 @@ const copyText = async (text: string): Promise<boolean> => {
   }
 };
 
-/** A compact pass/fail list, used both while the clock runs and in the report. */
-const CheckResults: FC<{verdict: Verdict; title: string}> = memo(({verdict, title}) => (
-  <div className="border-ink-700 bg-ink-850 rounded-xl border p-4">
-    <p className="text-ink-100 flex items-baseline justify-between gap-3 text-[13px] font-bold">
-      <span>{title}</span>
-      <span className="font-code text-ink-300 shrink-0">
-        {verdict.passed}/{verdict.total} checks
-      </span>
-    </p>
-    <ul className="mt-3 space-y-2">
-      {verdict.results.map(result => (
-        <li className="flex gap-2.5 text-[12px] leading-6" key={result.id}>
-          <span className={result.passed ? 'text-success-300' : 'text-danger-300'}>{result.passed ? '✓' : '✗'}</span>
-          <span className="min-w-0">
-            <span className={result.passed ? 'text-ink-200' : 'text-ink-50 font-semibold'}>{result.title}</span>
-            {!result.passed ? (
-              <span className="text-ink-400 mt-1 block text-[11px] leading-5">{result.detail}</span>
-            ) : null}
-          </span>
-        </li>
-      ))}
-    </ul>
-  </div>
+/**
+ * Grade `code` the way the course does: where the step has a harness for the language and the
+ * language runs in this browser, the harness exercises the code inside the course's system and
+ * decides every check, the static matchers staying as each check's shape note; elsewhere (Scala,
+ * C++ without WebAssembly stack switching) the static checks decide.
+ */
+const grade = async (scenario: ResolvedMockScenario, language: Language, code: string): Promise<Verdict> => {
+  const verdict = judge(scenario.step, language, code);
+  const runner = getRunner(language);
+  if (runtimeHarness(scenario.step, language) === undefined || runner === null) return verdict;
+  return withRuntime(verdict, await runner.run(stepJob(scenario.problem, scenario.step, language, code)));
+};
+
+/** A grading under way: the language's runtime booting (a download the first time), then the checks running. */
+const GradingStatus: FC<{runtime: RuntimeStatus; className: string}> = memo(({runtime, className}) => (
+  <p className={`text-ink-200 flex items-center gap-2 ${className}`} role="status">
+    <span
+      aria-hidden
+      className="bg-danger-300 h-1.5 w-1.5 shrink-0 animate-pulse rounded-full motion-reduce:animate-none"
+    />
+    {runtime.state === 'booting' ? STATUS_TEXT[runtime.phase] : 'running your code against the checks…'}
+  </p>
 ));
+GradingStatus.displayName = 'GradingStatus';
+
+/**
+ * A compact pass/fail list, used both while the clock runs and in the report: for a failed check,
+ * what the run observed, then what the check is for.
+ */
+const CheckResults: FC<{verdict: Verdict; title: string}> = memo(({verdict, title}) => {
+  const common = commonMessage(verdict);
+  return (
+    <div className="border-ink-700 bg-ink-850 rounded-xl border p-4">
+      <p className="text-ink-100 flex items-baseline justify-between gap-3 text-[13px] font-bold">
+        <span>{title}</span>
+        <span className="font-code text-ink-300 shrink-0">
+          {verdict.passed}/{verdict.total} checks
+        </span>
+      </p>
+      {common !== null ? (
+        <p className="font-code text-danger-200 mt-2 text-[11px] leading-5">
+          {verdict.run?.error !== undefined ? `Could not run: ${common}` : common}
+        </p>
+      ) : null}
+      <ul className="mt-3 space-y-2">
+        {verdict.results.map(result => (
+          <li className="flex gap-2.5 text-[12px] leading-6" key={result.id}>
+            <span className={result.passed ? 'text-success-300' : 'text-danger-300'}>{result.passed ? '✓' : '✗'}</span>
+            <span className="min-w-0 flex-1">
+              <span className="flex items-baseline gap-2">
+                <span className={result.passed ? 'text-ink-200' : 'text-ink-50 font-semibold'}>{result.title}</span>
+                <ShapeNote result={result} />
+              </span>
+              {!result.passed ? (
+                <>
+                  {result.message !== undefined && result.message !== common ? (
+                    <span className="font-code text-danger-200 mt-1 block text-[11px] leading-5">{result.message}</span>
+                  ) : null}
+                  <span className="text-ink-400 mt-1 block text-[11px] leading-5">{result.detail}</span>
+                </>
+              ) : null}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+});
 CheckResults.displayName = 'CheckResults';
 
 const SignalChip: FC<{signal: string}> = memo(({signal}) => (
@@ -381,6 +427,14 @@ const MockInterview: FC = memo(() => {
   const [attempts, setAttempts] = useState(0);
   const [hints, setHints] = useState(0);
   const [verdict, setVerdict] = useState<Verdict | null>(null);
+  /** The code `verdict` graded: the report grades again only when the code on screen is different. */
+  const [verdictCode, setVerdictCode] = useState<string | null>(null);
+  /** A submission, or the report's final grading, is running. */
+  const [grading, setGrading] = useState(false);
+  /** Bumped per grading and whenever the scenario restarts: a result that arrives for anything else is dropped. */
+  const gradeSeq = useRef(0);
+  const runner = useMemo(() => getRunner(language), [language]);
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({state: 'idle'});
   const [messages, setMessages] = useState<AssistantMessage[]>([]);
   const [followUps, setFollowUps] = useState<Record<number, string>>({});
   const [copied, setCopied] = useState(false);
@@ -416,6 +470,35 @@ const MockInterview: FC = memo(() => {
     return () => window.clearTimeout(timer);
   }, [phase, secondsLeft]);
 
+  useEffect(() => {
+    if (runner === null) {
+      setRuntimeStatus({state: 'idle'});
+      return undefined;
+    }
+    setRuntimeStatus(runner.status);
+    return runner.onStatus(setRuntimeStatus);
+  }, [runner]);
+
+  // The clock runs: boot the language's runtime now, so the first Submit does not wait for its download.
+  useEffect(() => {
+    if (phase === 'running' && scenario !== null && runtimeHarness(scenario.step, language) !== undefined) {
+      runner?.prewarm();
+    }
+  }, [phase, scenario, language, runner]);
+
+  // The report grades the code on screen: a submission's verdict when it graded this code, a fresh run otherwise.
+  useEffect(() => {
+    if (phase !== 'report' || scenario === null || verdictCode === code) return;
+    const token = ++gradeSeq.current;
+    setGrading(true);
+    void grade(scenario, language, code).then(result => {
+      if (gradeSeq.current !== token) return;
+      setGrading(false);
+      setVerdict(result);
+      setVerdictCode(code);
+    });
+  }, [phase, scenario, language, code, verdictCode]);
+
   /** Open a scenario on its own page with the clock not yet running: the patch loads, the brief shows, nothing counts. */
   const prepare = useCallback((next: ResolvedMockScenario, chosen: Language) => {
     const starters = startersFor(next);
@@ -427,6 +510,9 @@ const MockInterview: FC = memo(() => {
     setAttempts(0);
     setHints(0);
     setVerdict(null);
+    setVerdictCode(null);
+    setGrading(false);
+    gradeSeq.current += 1;
     setFollowUps({});
     setCopied(false);
     setPromptCopied(false);
@@ -441,6 +527,9 @@ const MockInterview: FC = memo(() => {
     setScenario(null);
     setCodeByLanguage(null);
     setVerdict(null);
+    setVerdictCode(null);
+    setGrading(false);
+    gradeSeq.current += 1;
     setMessages([]);
   }, []);
 
@@ -501,27 +590,35 @@ const MockInterview: FC = memo(() => {
   );
 
   const onSubmit = useCallback(() => {
-    if (scenario === null) return;
-    const result = judge(scenario.step, language, code);
-    setVerdict(result);
-    setAttempts(value => value + 1);
-    if (result.accepted) {
-      setPhase('report');
-      say('Accepted: every check passes. Read the debrief and answer the follow-ups.', 'ai', 'ok');
-    } else {
-      say(
-        `Not yet — ${result.passed}/${result.total} checks pass. I put the failing ones under the editor; fix the code, not the check names.`,
-        'ai',
-        'warn',
-      );
-    }
-  }, [code, language, say, scenario]);
+    if (scenario === null || grading) return;
+    const token = ++gradeSeq.current;
+    const submitted = code;
+    setGrading(true);
+    void grade(scenario, language, submitted).then(result => {
+      if (gradeSeq.current !== token) return;
+      setGrading(false);
+      setVerdict(result);
+      setVerdictCode(submitted);
+      // A runtime that could not run the code is not a wrong submission, as in the course.
+      if (result.run?.error !== undefined) {
+        say(`The checks could not run: ${result.run.error}. That does not count as a submission.`, 'ai', 'warn');
+        return;
+      }
+      setAttempts(value => value + 1);
+      if (result.accepted) {
+        setPhase('report');
+        say('Accepted: every check passes. Read the debrief and answer the follow-ups.', 'ai', 'ok');
+      } else {
+        say(
+          `Not yet — ${result.passed}/${result.total} checks pass. I put the failing ones under the editor; fix the code, not the check names.`,
+          'ai',
+          'warn',
+        );
+      }
+    });
+  }, [code, grading, language, say, scenario]);
 
-  const onFinish = useCallback(() => {
-    if (scenario === null) return;
-    setVerdict(judge(scenario.step, language, code));
-    setPhase('report');
-  }, [code, language, scenario]);
+  const onFinish = useCallback(() => setPhase('report'), []);
 
   const onReset = useCallback(() => {
     if (scenario === null) return;
@@ -535,12 +632,14 @@ const MockInterview: FC = memo(() => {
     );
   }, [language, say, scenario]);
 
+  /** A read of the code against the static checks: a hint where Submit runs the code, the grade where it cannot. */
   const onReview = useCallback(() => {
     if (scenario === null) return;
     const result = judge(scenario.step, language, code);
+    const read = runtimeHarness(scenario.step, language) !== undefined ? 'Reading the code, not running it' : 'Review';
     if (result.accepted) {
       say(
-        'All checks pass. Before you submit, explain why each check passes and which one would catch a regression.',
+        `${read}: every check looks satisfied. Before you submit, say which check would catch a regression.`,
         'ai',
         'ok',
       );
@@ -548,7 +647,7 @@ const MockInterview: FC = memo(() => {
     }
     const failed = result.results.filter(item => !item.passed);
     say(
-      `Review: ${result.passed}/${result.total} pass.\n${failed
+      `${read}: ${result.passed}/${result.total} checks look satisfied.\n${failed
         .map(item => `• ${item.title}\n  ${item.detail}`)
         .join('\n')}`,
       'ai',
@@ -678,9 +777,10 @@ const MockInterview: FC = memo(() => {
   }
 
   if (scenario === null) return null;
-  const shownVerdict = verdict ?? judge(scenario.step, language, code);
+  /** The verdict of the code on screen, once graded: a submission's, or the report's final run. */
+  const graded = verdict !== null && verdictCode === code ? verdict : null;
   const timeUp = secondsLeft === 0;
-  const outcome = shownVerdict.accepted ? 'Accepted' : timeUp ? 'Time’s up' : 'Not accepted';
+  const outcome = graded === null ? 'Grading…' : graded.accepted ? 'Accepted' : timeUp ? 'Time’s up' : 'Not accepted';
   const used = scenario.minutes * 60 - secondsLeft;
   const step = scenario.step;
 
@@ -707,7 +807,7 @@ const MockInterview: FC = memo(() => {
             <div className="grid gap-3 sm:grid-cols-4">
               {[
                 ['Outcome', outcome],
-                ['Checks', `${shownVerdict.passed}/${shownVerdict.total}`],
+                ['Checks', graded === null ? '…' : `${graded.passed}/${graded.total}`],
                 ['Submissions', String(attempts)],
                 ['AI hints', String(hints)],
               ].map(([label, value]) => (
@@ -717,11 +817,18 @@ const MockInterview: FC = memo(() => {
                 </div>
               ))}
             </div>
-            <CheckResults title="What the checks found" verdict={shownVerdict} />
+            {graded === null ? (
+              <GradingStatus
+                className="border-ink-700 bg-ink-850 rounded-xl border p-4 text-[12px]"
+                runtime={runtimeStatus}
+              />
+            ) : (
+              <CheckResults title="What the checks found" verdict={graded} />
+            )}
             <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
               <p className="text-danger-200 text-[12px] font-bold uppercase tracking-wide">What the patch got wrong</p>
               <p className="text-ink-200 mt-2 text-[13px] leading-6">{scenario.aiNote}</p>
-              {!shownVerdict.accepted ? (
+              {graded !== null && !graded.accepted ? (
                 <p className="text-ink-400 mt-3 text-[12px] leading-6">
                   You used {formatClock(used)} of the {scenario.minutes}:00 budget. Retry and name the failure mode
                   before you run the checks.
@@ -825,8 +932,8 @@ const MockInterview: FC = memo(() => {
             <span className="sm:hidden">Finish</span>
             <span className="hidden sm:inline">Finish &amp; report</span>
           </button>
-          <button className={MOCK_PRIMARY} onClick={onSubmit} type="button">
-            Submit ⌘⏎
+          <button className={MOCK_PRIMARY} disabled={grading} onClick={onSubmit} type="button">
+            {grading ? 'Running…' : 'Submit ⌘⏎'}
           </button>
         </div>
         <div aria-hidden className="bg-ink-800 h-0.5 w-full">
@@ -896,7 +1003,9 @@ const MockInterview: FC = memo(() => {
               value={code}
             />
           )}
-          {verdict !== null && !verdict.accepted ? (
+          {grading ? (
+            <GradingStatus className="border-ink-700 shrink-0 border-t px-3 py-2 text-[11px]" runtime={runtimeStatus} />
+          ) : verdict !== null && !verdict.accepted ? (
             <div className="border-ink-700 max-h-[16rem] shrink-0 overflow-y-auto border-t p-2">
               <CheckResults title="Latest submission" verdict={verdict} />
             </div>
