@@ -1,7 +1,12 @@
 import Link from 'next/link';
 import {type ChangeEvent, type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
-import {type ResolvedMockScenario, resolvedMockScenarios} from '@/data/mock';
+import {
+  type ListedMockScenario,
+  type ResolvedMockScenario,
+  listedMockScenarios,
+  resolveMockScenario,
+} from '@/data/mock';
 import {type Verdict, judge} from '@/lib/judge';
 import {formatClock} from '@/lib/timer';
 import {type Difficulty, type Language, codeFor, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
@@ -151,7 +156,7 @@ const SignalToggle: FC<{signal: string; on: boolean; toggle: (signal: string) =>
 SignalToggle.displayName = 'SignalToggle';
 
 /** Words of the search, lower-cased, against title, brief, role, signals and the course the scenario comes from. */
-const matchesScenario = (scenario: ResolvedMockScenario, q: string): boolean => {
+const matchesScenario = (scenario: ListedMockScenario, q: string): boolean => {
   const words = q.toLowerCase().split(/\s+/).filter(Boolean);
   if (words.length === 0) return true;
   const text = [scenario.title, scenario.blurb, scenario.role, scenario.problem.title, ...scenario.signals]
@@ -160,43 +165,49 @@ const matchesScenario = (scenario: ResolvedMockScenario, q: string): boolean => 
   return words.every(w => text.includes(w));
 };
 
-/** One scenario: the whole card starts it. The course it comes from sits above the title, so a wall of cards still reads. */
-const ScenarioCard: FC<{scenario: ResolvedMockScenario; number: number; onStart: (s: ResolvedMockScenario) => void}> =
-  memo(({scenario, number, onStart}) => {
-    const accent = DIFFICULTY_ACCENT[scenario.problem.difficulty];
-    const onClick = useCallback(() => onStart(scenario), [onStart, scenario]);
-    return (
-      <button
-        className={`border-ink-700 bg-ink-850 group relative flex flex-col overflow-hidden rounded-2xl border p-4 text-left transition ${accent.hover}`}
-        onClick={onClick}
-        type="button">
-        <span aria-hidden className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${accent.rail}`} />
-        <span className="flex w-full items-center gap-2">
-          <span
-            className={`font-code flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border text-[11px] font-bold ${accent.number}`}>
-            {number}
-          </span>
-          <span className="text-ink-300 min-w-0 flex-1 truncate text-[11px] font-semibold">
-            {scenario.problem.title}
-          </span>
-          <DifficultyChip difficulty={scenario.problem.difficulty} />
+/**
+ * One scenario: the whole card starts it. The course it comes from sits above the title, so a wall
+ * of cards still reads. `busy` while the course is on its way.
+ */
+const ScenarioCard: FC<{
+  scenario: ListedMockScenario;
+  number: number;
+  busy: boolean;
+  onStart: (s: ListedMockScenario) => void;
+}> = memo(({scenario, number, busy, onStart}) => {
+  const accent = DIFFICULTY_ACCENT[scenario.problem.difficulty];
+  const onClick = useCallback(() => onStart(scenario), [onStart, scenario]);
+  return (
+    <button
+      aria-busy={busy}
+      className={`border-ink-700 bg-ink-850 group relative flex flex-col overflow-hidden rounded-2xl border p-4 text-left transition ${accent.hover}`}
+      onClick={onClick}
+      type="button">
+      <span aria-hidden className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${accent.rail}`} />
+      <span className="flex w-full items-center gap-2">
+        <span
+          className={`font-code flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border text-[11px] font-bold ${accent.number}`}>
+          {number}
         </span>
-        <span className="text-ink-50 mt-3 block text-[14px] font-bold leading-snug">{scenario.title}</span>
-        <span className="text-ink-200 mt-1.5 block flex-1 text-[12px] leading-5">{scenario.blurb}</span>
-        <span className="mt-3 flex flex-wrap gap-1.5">
-          {scenario.signals.map(signal => (
-            <SignalChip key={signal} signal={signal} />
-          ))}
+        <span className="text-ink-300 min-w-0 flex-1 truncate text-[11px] font-semibold">{scenario.problem.title}</span>
+        <DifficultyChip difficulty={scenario.problem.difficulty} />
+      </span>
+      <span className="text-ink-50 mt-3 block text-[14px] font-bold leading-snug">{scenario.title}</span>
+      <span className="text-ink-200 mt-1.5 block flex-1 text-[12px] leading-5">{scenario.blurb}</span>
+      <span className="mt-3 flex flex-wrap gap-1.5">
+        {scenario.signals.map(signal => (
+          <SignalChip key={signal} signal={signal} />
+        ))}
+      </span>
+      <span className="border-ink-700/70 mt-3 flex w-full items-center justify-between border-t pt-2.5 text-[11px]">
+        <span className="text-ink-400 truncate">{scenario.role}</span>
+        <span className="text-danger-300 group-hover:text-danger-200 font-code shrink-0 font-semibold transition">
+          {scenario.minutes}:00 · {busy ? 'Opening…' : 'Start ›'}
         </span>
-        <span className="border-ink-700/70 mt-3 flex w-full items-center justify-between border-t pt-2.5 text-[11px]">
-          <span className="text-ink-400 truncate">{scenario.role}</span>
-          <span className="text-danger-300 group-hover:text-danger-200 font-code shrink-0 font-semibold transition">
-            {scenario.minutes}:00 · Start ›
-          </span>
-        </span>
-      </button>
-    );
-  });
+      </span>
+    </button>
+  );
+});
 ScenarioCard.displayName = 'ScenarioCard';
 
 /**
@@ -247,86 +258,106 @@ const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLa
 );
 ScenarioBrief.displayName = 'ScenarioBrief';
 
-/** The setup page's list: a search pill and the six signals to narrow by, then the cards in threes. */
-const ScenarioPicker: FC<{scenarios: readonly ResolvedMockScenario[]; onStart: (s: ResolvedMockScenario) => void}> =
-  memo(({scenarios, onStart}) => {
-    const [q, setQ] = useState('');
-    const [on, setOn] = useState<readonly string[]>([]);
-    const onSearch = useCallback((e: ChangeEvent<HTMLInputElement>) => setQ(e.target.value), []);
-    const toggle = useCallback(
-      (signal: string) =>
-        setOn(current => (current.includes(signal) ? current.filter(s => s !== signal) : [...current, signal])),
-      [],
-    );
-    const clear = useCallback(() => {
-      setQ('');
-      setOn([]);
-    }, []);
-    const numbers = useMemo(() => new Map(scenarios.map((s, i) => [s.id, i + 1])), [scenarios]);
-    const visible = useMemo(
-      () => scenarios.filter(s => matchesScenario(s, q) && on.every(signal => s.signals.includes(signal))),
-      [scenarios, q, on],
-    );
-    const filtering = q.trim() !== '' || on.length > 0;
-    return (
-      <div className="mx-auto w-full max-w-5xl px-5 pb-10 pt-6">
-        <div className="mb-4 flex flex-wrap items-center gap-2">
-          <label className="bg-ink-800 text-ink-400 focus-within:bg-ink-700 flex h-10 w-full items-center gap-2 rounded-full px-4 transition sm:w-64">
-            <SearchIcon />
-            <input
-              aria-label="search scenarios"
-              className="text-ink-50 placeholder:text-ink-400 w-full border-0 bg-transparent p-0 text-[13px] focus:outline-none focus:ring-0 [&::-webkit-search-cancel-button]:hidden"
-              onChange={onSearch}
-              placeholder="Search scenarios"
-              type="search"
-              value={q}
-            />
-          </label>
-          <div aria-label="signals" className="flex flex-wrap gap-1.5" role="group">
-            {SIGNALS.map(signal => (
-              <SignalToggle key={signal} on={on.includes(signal)} signal={signal} toggle={toggle} />
-            ))}
-          </div>
-          <span className="text-ink-300 ml-auto flex items-center gap-2 text-[13px]">
-            {filtering ? (
-              <>
-                <span>
-                  <span className="font-code text-ink-100">{visible.length}</span> of {scenarios.length}
-                </span>
-                <button
-                  className="text-danger-300 hover:text-danger-200 text-[12px] transition"
-                  onClick={clear}
-                  type="button">
-                  clear
-                </button>
-              </>
-            ) : (
-              <span>
-                <span className="font-code text-ink-100">{scenarios.length}</span> scenarios
-              </span>
-            )}
-          </span>
+/**
+ * The setup page's list: a search pill and the six signals to narrow by, then the cards in threes.
+ * `opening`: the scenario whose course is on its way; `failed`: the last one did not arrive.
+ */
+const ScenarioPicker: FC<{
+  scenarios: readonly ListedMockScenario[];
+  opening: string | null;
+  failed: boolean;
+  onStart: (s: ListedMockScenario) => void;
+}> = memo(({scenarios, opening, failed, onStart}) => {
+  const [q, setQ] = useState('');
+  const [on, setOn] = useState<readonly string[]>([]);
+  const onSearch = useCallback((e: ChangeEvent<HTMLInputElement>) => setQ(e.target.value), []);
+  const toggle = useCallback(
+    (signal: string) =>
+      setOn(current => (current.includes(signal) ? current.filter(s => s !== signal) : [...current, signal])),
+    [],
+  );
+  const clear = useCallback(() => {
+    setQ('');
+    setOn([]);
+  }, []);
+  const numbers = useMemo(() => new Map(scenarios.map((s, i) => [s.id, i + 1])), [scenarios]);
+  const visible = useMemo(
+    () => scenarios.filter(s => matchesScenario(s, q) && on.every(signal => s.signals.includes(signal))),
+    [scenarios, q, on],
+  );
+  const filtering = q.trim() !== '' || on.length > 0;
+  return (
+    <div className="mx-auto w-full max-w-5xl px-5 pb-10 pt-6">
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <label className="bg-ink-800 text-ink-400 focus-within:bg-ink-700 flex h-10 w-full items-center gap-2 rounded-full px-4 transition sm:w-64">
+          <SearchIcon />
+          <input
+            aria-label="search scenarios"
+            className="text-ink-50 placeholder:text-ink-400 w-full border-0 bg-transparent p-0 text-[13px] focus:outline-none focus:ring-0 [&::-webkit-search-cancel-button]:hidden"
+            onChange={onSearch}
+            placeholder="Search scenarios"
+            type="search"
+            value={q}
+          />
+        </label>
+        <div aria-label="signals" className="flex flex-wrap gap-1.5" role="group">
+          {SIGNALS.map(signal => (
+            <SignalToggle key={signal} on={on.includes(signal)} signal={signal} toggle={toggle} />
+          ))}
         </div>
-        {visible.length === 0 ? (
-          <p className="border-ink-700 text-ink-300 rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
-            No scenario matches.{' '}
-            <button className="text-danger-300 hover:text-danger-200 transition" onClick={clear} type="button">
-              Clear the search ›
-            </button>
-          </p>
-        ) : (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {visible.map(s => (
-              <ScenarioCard key={s.id} number={numbers.get(s.id) ?? 0} onStart={onStart} scenario={s} />
-            ))}
-          </div>
-        )}
-        <p className="text-ink-400 border-ink-700 mt-6 border-t pt-4 text-[11px]">
-          Offline AI pair · no login · no model API · no solution reveal.
-        </p>
+        <span className="text-ink-300 ml-auto flex items-center gap-2 text-[13px]">
+          {filtering ? (
+            <>
+              <span>
+                <span className="font-code text-ink-100">{visible.length}</span> of {scenarios.length}
+              </span>
+              <button
+                className="text-danger-300 hover:text-danger-200 text-[12px] transition"
+                onClick={clear}
+                type="button">
+                clear
+              </button>
+            </>
+          ) : (
+            <span>
+              <span className="font-code text-ink-100">{scenarios.length}</span> scenarios
+            </span>
+          )}
+        </span>
       </div>
-    );
-  });
+      {failed ? (
+        <p
+          className="border-danger-400/40 bg-danger-400/10 text-danger-200 mb-4 rounded-xl border px-4 py-3 text-[12px]"
+          role="alert">
+          The scenario's course did not load. Check the connection and start it again.
+        </p>
+      ) : null}
+      {visible.length === 0 ? (
+        <p className="border-ink-700 text-ink-300 rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
+          No scenario matches.{' '}
+          <button className="text-danger-300 hover:text-danger-200 transition" onClick={clear} type="button">
+            Clear the search ›
+          </button>
+        </p>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {visible.map(s => (
+            <ScenarioCard
+              busy={opening === s.id}
+              key={s.id}
+              number={numbers.get(s.id) ?? 0}
+              onStart={onStart}
+              scenario={s}
+            />
+          ))}
+        </div>
+      )}
+      <p className="text-ink-400 border-ink-700 mt-6 border-t pt-4 text-[11px]">
+        Offline AI pair · no login · no model API · no solution reveal.
+      </p>
+    </div>
+  );
+});
 ScenarioPicker.displayName = 'ScenarioPicker';
 
 /**
@@ -337,7 +368,12 @@ ScenarioPicker.displayName = 'ScenarioPicker';
  */
 const MockInterview: FC = memo(() => {
   const [phase, setPhase] = useState<Phase>('setup');
-  const [scenarioId, setScenarioId] = useState<string | null>(null);
+  const [scenario, setScenario] = useState<ResolvedMockScenario | null>(null);
+  /** The scenario whose course is being fetched; `openFailed` when the last fetch failed. */
+  const [opening, setOpening] = useState<string | null>(null);
+  const [openFailed, setOpenFailed] = useState(false);
+  /** Bumped per open: a course that arrives after another card was picked opens nothing. */
+  const openRequest = useRef(0);
   const [language, setLanguage] = useState<Language>('python');
   const [codeByLanguage, setCodeByLanguage] = useState<Record<Language, string> | null>(null);
   const [editorReset, setEditorReset] = useState(0);
@@ -354,10 +390,6 @@ const MockInterview: FC = memo(() => {
   const mainRef = useRef<HTMLElement>(null);
   const nextMessage = useRef(1);
 
-  const scenario = useMemo(
-    () => resolvedMockScenarios.find(candidate => candidate.id === scenarioId) ?? null,
-    [scenarioId],
-  );
   const code = codeByLanguage?.[language] ?? '';
 
   const say = useCallback((text: string, from: AssistantMessage['from'] = 'ai', tone?: AssistantMessage['tone']) => {
@@ -387,7 +419,7 @@ const MockInterview: FC = memo(() => {
   /** Open a scenario on its own page with the clock not yet running: the patch loads, the brief shows, nothing counts. */
   const prepare = useCallback((next: ResolvedMockScenario, chosen: Language) => {
     const starters = startersFor(next);
-    setScenarioId(next.id);
+    setScenario(next);
     setLanguage(chosen);
     setCodeByLanguage(starters);
     setEditorReset(value => value + 1);
@@ -406,7 +438,7 @@ const MockInterview: FC = memo(() => {
 
   const backToSetup = useCallback(() => {
     setPhase('setup');
-    setScenarioId(null);
+    setScenario(null);
     setCodeByLanguage(null);
     setVerdict(null);
     setMessages([]);
@@ -433,7 +465,26 @@ const MockInterview: FC = memo(() => {
   }, [phase, scenario, openDialog, backToSetup, say]);
   const sealed = phase === 'ready';
 
-  const openScenario = useCallback((next: ResolvedMockScenario) => prepare(next, next.defaultLanguage), [prepare]);
+  const openScenario = useCallback(
+    (next: ListedMockScenario) => {
+      const request = ++openRequest.current;
+      setOpening(next.id);
+      setOpenFailed(false);
+      resolveMockScenario(next).then(
+        resolved => {
+          if (request !== openRequest.current) return;
+          setOpening(null);
+          prepare(resolved, resolved.defaultLanguage);
+        },
+        () => {
+          if (request !== openRequest.current) return;
+          setOpening(null);
+          setOpenFailed(true);
+        },
+      );
+    },
+    [prepare],
+  );
   const retry = useCallback(() => {
     if (scenario !== null) prepare(scenario, language);
   }, [prepare, scenario, language]);
@@ -596,12 +647,12 @@ const MockInterview: FC = memo(() => {
                 Fix the code. <span className="text-danger-300">Beat the clock.</span>
               </h1>
               <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7">
-                {resolvedMockScenarios.length} scenarios: debug a flawed patch against an interviewer's brief, with an
+                {listedMockScenarios.length} scenarios: debug a flawed patch against an interviewer's brief, with an
                 offline AI pair, fix the flaw, and prove it before time runs out.
               </p>
               <div className="mt-5 flex flex-wrap gap-2">
                 {[
-                  `${resolvedMockScenarios.length} scenarios`,
+                  `${listedMockScenarios.length} scenarios`,
                   '20–25 min',
                   `${LANGUAGES.length} languages`,
                   'Offline AI pair',
@@ -615,7 +666,12 @@ const MockInterview: FC = memo(() => {
               </div>
             </div>
           </div>
-          <ScenarioPicker onStart={openScenario} scenarios={resolvedMockScenarios} />
+          <ScenarioPicker
+            failed={openFailed}
+            onStart={openScenario}
+            opening={opening}
+            scenarios={listedMockScenarios}
+          />
         </main>
       </div>
     );

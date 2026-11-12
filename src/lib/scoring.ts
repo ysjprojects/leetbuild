@@ -3,7 +3,15 @@
  * each wrong submission takes a slice off (never below a floor), and revealing the solution marks
  * the step done for zero points. Totals roll up into a rank title and per-concept mastery.
  */
-import {type Concept, type Difficulty, type Language, type Problem, type Track, CONCEPTS, stepKey} from './types';
+import {
+  type Concept,
+  type Difficulty,
+  type Language,
+  type ProblemSummary,
+  type Track,
+  CONCEPTS,
+  stepKey,
+} from './types';
 
 /** One judged submission, kept per step (newest last, capped) for the Submissions list. */
 export interface Submission {
@@ -68,7 +76,7 @@ export interface ProblemScore {
   total: number;
 }
 
-export function problemScore(problem: Problem, attempts: Record<string, StepAttempt>): ProblemScore {
+export function problemScore(problem: ProblemSummary, attempts: Record<string, StepAttempt>): ProblemScore {
   let score = 0;
   let done = 0;
   let accepted = 0;
@@ -155,7 +163,7 @@ export function rankProgress(score: number, max: number): RankProgress {
 }
 
 export function profile(
-  problems: readonly Problem[],
+  problems: readonly ProblemSummary[],
   attempts: Record<string, StepAttempt>,
   submissions: number,
   acceptedSubmissions: number,

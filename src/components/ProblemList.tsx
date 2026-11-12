@@ -14,7 +14,7 @@ import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@
 import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
-import {type Difficulty, type Problem, ALL_LANGUAGES, stepKey, stepPath} from '@/lib/types';
+import {type Difficulty, type ProblemSummary, ALL_LANGUAGES, stepKey, stepPath} from '@/lib/types';
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
@@ -182,7 +182,7 @@ const ProfileStrip: FC<{
   profile: Profile;
   streak: Streak;
   badges: Record<string, number>;
-  problems: readonly Problem[];
+  problems: readonly ProblemSummary[];
   attempts: Record<string, StepAttempt>;
   activeDays: readonly string[];
   today: string;
@@ -388,22 +388,24 @@ const ProfileStrip: FC<{
 ProfileStrip.displayName = 'ProfileStrip';
 
 /** One square per step, as on the share card: solid = first try, tinted = with help, outlined = revealed, dim = open. */
-const StepSquares: FC<{problem: Problem; attempts: Record<string, StepAttempt>}> = memo(({problem, attempts}) => (
-  <span aria-hidden className="flex items-center gap-[3px]">
-    {problem.steps.map(step => {
-      const attempt = attempts[stepKey(problem.id, step.id)] ?? OPEN_ATTEMPT;
-      const tone =
-        attempt.status === 'accepted'
-          ? attempt.hints === 0 && attempt.wrong === 0
-            ? 'bg-iris-400'
-            : 'bg-iris-400/45'
-          : attempt.status === 'revealed'
-          ? 'border-warning-400/70 border'
-          : 'bg-ink-700';
-      return <span className={`h-2.5 w-2.5 rounded-[3px] ${tone}`} key={step.id} />;
-    })}
-  </span>
-));
+const StepSquares: FC<{problem: ProblemSummary; attempts: Record<string, StepAttempt>}> = memo(
+  ({problem, attempts}) => (
+    <span aria-hidden className="flex items-center gap-[3px]">
+      {problem.steps.map(step => {
+        const attempt = attempts[stepKey(problem.id, step.id)] ?? OPEN_ATTEMPT;
+        const tone =
+          attempt.status === 'accepted'
+            ? attempt.hints === 0 && attempt.wrong === 0
+              ? 'bg-iris-400'
+              : 'bg-iris-400/45'
+            : attempt.status === 'revealed'
+            ? 'border-warning-400/70 border'
+            : 'bg-ink-700';
+        return <span className={`h-2.5 w-2.5 rounded-[3px] ${tone}`} key={step.id} />;
+      })}
+    </span>
+  ),
+);
 StepSquares.displayName = 'StepSquares';
 
 /**
@@ -471,7 +473,7 @@ const TrackBrief: FC<{track: TrackFilter}> = memo(({track}) => {
 TrackBrief.displayName = 'TrackBrief';
 
 const ProblemRow: FC<{
-  problem: Problem;
+  problem: ProblemSummary;
   index: number;
   attempts: Record<string, StepAttempt>;
   best: TimedSession | null;
@@ -542,7 +544,7 @@ const ProblemRow: FC<{
 ProblemRow.displayName = 'ProblemRow';
 
 const ProblemList: FC<{
-  problems: readonly Problem[];
+  problems: readonly ProblemSummary[];
   attempts: Record<string, StepAttempt>;
   profile: Profile;
   streak: Streak;

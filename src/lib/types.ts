@@ -210,11 +210,15 @@ export interface Sequence {
   messages: SequenceMessage[];
 }
 
-export interface Step {
+/** A step as the problem list, scores and badges know it, before its course is loaded (see `ProblemSummary`). */
+export interface StepSummary {
   id: string;
   title: string;
   /** The concept this step exercises; problems cover all four across their steps. */
   concept: Concept;
+}
+
+export interface Step extends StepSummary {
   /** snake_case stem of the file the learner edits (see `fileName`). */
   file: string;
   /** Task statement in the course markdown dialect (components/Kernels/Markdown.tsx); may embed `:::widget`. */
@@ -312,7 +316,12 @@ export const sourceCredit = (source: Source, publication?: string, date: (d: str
     .filter((part): part is string => part !== undefined && part !== '')
     .join(' · ');
 
-export interface Problem {
+/**
+ * A course as the problem list, scores, badges and timed runs know it without loading it. The
+ * summaries of every course ship with the app (`src/data/problems/summaries.ts`, generated from the
+ * courses by `yarn build:summaries`); a course itself is its own chunk, fetched when it opens.
+ */
+export interface ProblemSummary {
   id: string;
   title: string;
   /** One line for the problem list. */
@@ -331,6 +340,12 @@ export interface Problem {
    * this language only (the deep-learning track: `python` for PyTorch, `cuda` for kernels).
    */
   language?: Language;
+  /** Company-tagged courses: the company whose writing the course is derived from. */
+  company?: Company;
+  steps: StepSummary[];
+}
+
+export interface Problem extends ProblemSummary {
   /** Problem statement: the real system, the simplified abstraction built here, what is out of scope. */
   statement: string;
   /**
@@ -355,8 +370,6 @@ export interface Problem {
    * runtime generates the packages the step files import (`chat/gen/chat`).
    */
   support?: Partial<Record<Language, Record<string, string>>>;
-  /** Company-tagged courses: the company whose writing the course is derived from. */
-  company?: Company;
   /**
    * The pieces the problem is built on: a company-tagged course's posts and papers, or a deep-learning
    * problem's papers, code, posts and docs (every one of those problems cites some).
@@ -370,7 +383,7 @@ export function stepKey(problemId: string, stepId: string): string {
 }
 
 /** URL segment of a step, numbered like its source file: step 2 `cache-aside` → `2-cache-aside`. */
-export function stepSlug(problem: Problem, step: Step): string {
+export function stepSlug(problem: ProblemSummary, step: StepSummary): string {
   return `${problem.steps.indexOf(step) + 1}-${step.id}`;
 }
 
@@ -380,7 +393,7 @@ export function stepBySlug(problem: Problem, slug: string): Step | undefined {
 }
 
 /** Site-relative address of a step: `/image-cache/2-cache-aside`. */
-export function stepPath(problem: Problem, step: Step): string {
+export function stepPath(problem: ProblemSummary, step: StepSummary): string {
   return `/${problem.id}/${stepSlug(problem, step)}`;
 }
 

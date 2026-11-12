@@ -50,6 +50,7 @@ import {clangVersion, CPP_RUNTIME_MANIFEST, cppPackFromSources, cppRuntimeFresh}
 import {fetchCpp} from './fetch-cpp';
 import {fetchTorch} from './fetch-torch';
 import {GO_RUNTIME_MANIFEST, goRuntimeHash} from './go-runtime';
+import {renderSummaries} from './summaries';
 
 const args = process.argv.slice(2);
 const flag = (name: string): string | null => {
@@ -587,6 +588,14 @@ function cppRuntimeFreshness(): string[] {
   return errors;
 }
 
+/** The committed course summaries and module map must be what the courses render to (`yarn build:summaries`). */
+async function summariesFreshness(): Promise<string[]> {
+  const rendered = await renderSummaries();
+  return Object.entries(rendered).flatMap(([file, source]) =>
+    existsSync(file) && readFileSync(file, 'utf8') === source ? [] : [`${file} is stale: run yarn build:summaries`],
+  );
+}
+
 /**
  * This run's share of the problems (all of them without `--shard`): heaviest first, each to the
  * lightest shard, weighed by the harnessed steps the run executes. A problem with nothing to execute
@@ -729,6 +738,12 @@ async function main(): Promise<void> {
   const errors: string[] = [...judgeSelfTest(), ...goRuntimeFreshness(), ...cppRuntimeFreshness()];
   console.log(`${errors.length === 0 ? '✓' : '✗'} judge self-tests, Go and C++ runtimes built from these sources`);
   const problems = await loadProblems();
+  // `--file` verifies a course the index may not import yet; the summaries are of the index.
+  if (onlyFile === null) {
+    const stale = await summariesFreshness();
+    console.log(`${stale.length === 0 ? '✓' : '✗'} course summaries and modules built from these courses`);
+    errors.push(...stale);
+  }
   errors.push(
     ...protoCollisions(problems, onlyProblem === null ? null : problems.filter(p => onlyProblem.endsWith(p.id))),
   );

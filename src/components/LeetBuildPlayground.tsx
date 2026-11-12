@@ -2,7 +2,8 @@ import type {EditorView} from '@codemirror/view';
 import Router from 'next/router';
 import {type CSSProperties, type FC, Fragment, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
-import {problems} from '@/data/problems';
+import {loadedProblem, loadProblem} from '@/data/problems/load';
+import {problemSummaries} from '@/data/problems/summaries';
 import {downloadCertificate} from '@/lib/certificate';
 import {type BottomTab, type ConsoleRun, finished} from '@/lib/console';
 import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl} from '@/lib/export';
@@ -45,6 +46,7 @@ import {
 import {
   type Language,
   type Problem,
+  type ProblemSummary,
   type Step,
   codeFor,
   fileName,
@@ -75,8 +77,35 @@ import ThemeToggle from './ThemeToggle';
 import {BudgetPicker, SessionList, TimerIdlePill, TimerPill} from './Timer';
 import VerdictPane, {SubmissionCode} from './VerdictPane';
 
-const problemById: Record<string, Problem> = {};
-for (const problem of problems) problemById[problem.id] = problem;
+const summaryById = new Map(problemSummaries.map(summary => [summary.id, summary]));
+
+/**
+ * The open course: the `Problem` once its chunk has arrived, `null` while it is on its way (and on
+ * the list). `failed` when the fetch failed; `retry` asks again.
+ */
+const useProblem = (id: string | null): {problem: Problem | null; failed: boolean; retry: () => void} => {
+  const [, setArrived] = useState(0);
+  const [failedId, setFailedId] = useState<string | null>(null);
+  const [tries, setTries] = useState(0);
+  useEffect(() => {
+    if (id === null || loadedProblem(id) !== undefined) return undefined;
+    let live = true;
+    setFailedId(null);
+    loadProblem(id).then(
+      () => {
+        if (live) setArrived(n => n + 1);
+      },
+      () => {
+        if (live) setFailedId(id);
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [id, tries]);
+  const retry = useCallback(() => setTries(n => n + 1), []);
+  return {problem: id === null ? null : loadedProblem(id) ?? null, failed: id !== null && failedId === id, retry};
+};
 
 /**
  * The step an address opens: the named one when it exists and is reachable, otherwise the first.
@@ -138,7 +167,7 @@ const loadLayout = (): Layout => {
 const TOAST_MS = 6000;
 const EMPTY_SHAPES: readonly Shape[] = [];
 /** The per-problem run history names no other problem, so the list needs none. */
-const EMPTY_PROBLEMS: readonly Problem[] = [];
+const EMPTY_PROBLEMS: readonly ProblemSummary[] = [];
 
 /** A fresh badge: dismisses itself after a while; the LinkedIn action keeps it open while in use. */
 const BadgeToast: FC<{id: number; badge: Badge; onDismiss: (id: number) => void}> = memo(({id, badge, onDismiss}) => {
@@ -702,7 +731,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   openFileRef.current = openFile;
   progressRef.current = progress;
 
-  const problem = problemId === null ? null : problemById[problemId] ?? null;
+  /** The course the address names, as the list knows it; the course itself arrives through `useProblem`. */
+  const summary = problemId === null ? null : summaryById.get(problemId) ?? null;
+  const {problem, failed: problemFailed, retry: retryProblem} = useProblem(summary === null ? null : summary.id);
   const step: Step | null =
     problem === null ? null : resolveStep(problem, progress.attempts, stepId ?? progress.lastStep[problem.id]);
   const stepIndex = problem === null || step === null ? -1 : problem.steps.indexOf(step);
@@ -726,7 +757,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const openProvided =
     openFile !== null && isProvidedId(openFile) ? provided.find(f => f.path === providedPath(openFile)) ?? null : null;
   const profile = useMemo(
-    () => computeProfile(problems, progress.attempts, progress.submissions, progress.acceptedSubmissions),
+    () => computeProfile(problemSummaries, progress.attempts, progress.submissions, progress.acceptedSubmissions),
     [progress.attempts, progress.submissions, progress.acceptedSubmissions],
   );
   const today = dayKey(new Date());
@@ -736,7 +767,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   useEffect(() => {
     if (!loaded) return;
     const earnedNow = earnedBadges(
-      problems,
+      problemSummaries,
       progress.attempts,
       progress.activeDays,
       dayKey(new Date()),
@@ -939,13 +970,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
 
   // Timer mode -------------------------------------------------------------------------------------
   const timer = progress.timer;
-  const timedProblem = timer === null ? undefined : problemById[timer.problemId];
+  const timedProblem = timer === null ? undefined : summaryById.get(timer.problemId);
 
   /** Close the run as `outcome` and file it in the history. */
   const endTimer = useCallback((outcome: SessionOutcome) => {
     setProgress(p => {
       if (p.timer === null) return p;
-      const target = problemById[p.timer.problemId];
+      const target = summaryById.get(p.timer.problemId);
       if (target === undefined) return {...p, timer: null};
       const session = finishSession(p.timer, target, p.attempts, outcome, Date.now());
       return {...p, timer: null, sessions: [...p.sessions, session].slice(-SESSION_HISTORY)};
@@ -1534,6 +1565,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const ideStyle = useMemo(() => ({'--lb-rows': `${layout.y}fr 8px ${1 - layout.y}fr`} as CSSProperties), [layout.y]);
 
   if (!loaded) return <LoadingScreen phase="progress" problemId={problemId} />;
+  if (summary !== null && problem === null) {
+    return <LoadingScreen onRetry={problemFailed ? retryProblem : undefined} phase="course" problemId={problemId} />;
+  }
 
   return (
     <div className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
@@ -1617,7 +1651,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
             activeDays={progress.activeDays}
             attempts={progress.attempts}
             badges={progress.badges}
-            problems={problems}
+            problems={problemSummaries}
             profile={profile}
             sessions={progress.sessions}
             streak={streak}

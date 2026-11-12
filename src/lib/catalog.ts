@@ -6,7 +6,7 @@
 import {type StepAttempt, problemScore, STEP_POINTS} from './scoring';
 import {
   type Difficulty,
-  type Problem,
+  type ProblemSummary,
   type ProblemTag,
   type Track,
   CONCEPT_LABEL,
@@ -63,7 +63,7 @@ export const TRACKS: readonly {key: TrackFilter; label: string; hint?: string}[]
   {key: 'dllm', label: TRACK_LABEL.dllm, hint: TRACK_HINT.dllm},
 ];
 
-export const inTrack = (problem: Problem, track: TrackFilter): boolean =>
+export const inTrack = (problem: ProblemSummary, track: TrackFilter): boolean =>
   track === 'all' || (problem.track ?? 'systems') === track;
 
 export const STATUS_LABEL: Record<StatusFilter, string> = {
@@ -83,7 +83,10 @@ export const SORTS: readonly {key: SortKey; label: string; blurb: string}[] = [
   {key: 'title', label: 'Title', blurb: 'A → Z'},
 ];
 
-export function problemStatus(problem: Problem, attempts: Record<string, StepAttempt>): Exclude<StatusFilter, 'all'> {
+export function problemStatus(
+  problem: ProblemSummary,
+  attempts: Record<string, StepAttempt>,
+): Exclude<StatusFilter, 'all'> {
   const score = problemScore(problem, attempts);
   return score.done === score.total ? 'solved' : score.done > 0 ? 'started' : 'open';
 }
@@ -96,7 +99,7 @@ const tokens = (q: string): string[] =>
     .filter(t => t !== '');
 
 /** Everything a search may hit: title, tagline, id, difficulty, concepts, company, step titles. */
-const haystack = (problem: Problem): string =>
+const haystack = (problem: ProblemSummary): string =>
   [
     problem.title,
     problem.tagline,
@@ -110,7 +113,7 @@ const haystack = (problem: Problem): string =>
     .join('\n')
     .toLowerCase();
 
-export function matchesSearch(problem: Problem, q: string): boolean {
+export function matchesSearch(problem: ProblemSummary, q: string): boolean {
   const words = tokens(q);
   if (words.length === 0) return true;
   const text = haystack(problem);
@@ -124,10 +127,10 @@ const DIFFICULTY_RANK: Record<Difficulty, number> = Object.fromEntries(DIFFICULT
 
 /** The problems `query` keeps, in the order it asks for; `problems` is the catalogue and decides ties. */
 export function applyListQuery(
-  problems: readonly Problem[],
+  problems: readonly ProblemSummary[],
   attempts: Record<string, StepAttempt>,
   query: ListQuery,
-): Problem[] {
+): ProblemSummary[] {
   const order = new Map(problems.map((p, i) => [p.id, i]));
   const kept = problems.filter(
     p =>
@@ -138,8 +141,8 @@ export function applyListQuery(
       (query.tag === 'all' || p.tag === query.tag) &&
       matchesSearch(p, query.q),
   );
-  const byOrder = (a: Problem, b: Problem): number => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0);
-  const natural = (a: Problem, b: Problem): number => {
+  const byOrder = (a: ProblemSummary, b: ProblemSummary): number => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0);
+  const natural = (a: ProblemSummary, b: ProblemSummary): number => {
     switch (query.sort) {
       case 'difficulty':
         return DIFFICULTY_RANK[a.difficulty] - DIFFICULTY_RANK[b.difficulty];

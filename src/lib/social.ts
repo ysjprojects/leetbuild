@@ -11,7 +11,7 @@ import {type Badge, shareText} from './gamify';
 import {type StepAttempt, problemScore} from './scoring';
 import type {Progress} from './storage';
 import {bestSession, formatClock} from './timer';
-import {type Concept, type Difficulty, type Language, type Problem, type Step, LANGUAGE_LABEL, stepKey} from './types';
+import {type Language, type Problem, type ProblemSummary, type Step, LANGUAGE_LABEL, stepKey} from './types';
 
 export const ORGANIZATION = 'LeetBuild';
 const HASHTAGS = '#LeetBuild #SystemDesign #DistributedSystems';
@@ -30,29 +30,10 @@ export function resultShareText(
   return `${shareText(problem, attempts, language, url)}\n\n${HASHTAGS}`;
 }
 
-/** What a certificate needs to know about a course — a tenth of a `Problem`, so the certificate page ships no step code. */
-export interface CourseSummary {
-  id: string;
-  title: string;
-  tagline: string;
-  difficulty: Difficulty;
-  concepts: Concept[];
-  steps: number;
-}
-
-export const summarize = (problem: Problem): CourseSummary => ({
-  id: problem.id,
-  title: problem.title,
-  tagline: problem.tagline,
-  difficulty: problem.difficulty,
-  concepts: problem.concepts,
-  steps: problem.steps.length,
-});
-
 export interface CertificateDetails {
   /** The learner's name as it appears on the certificate. */
   name: string;
-  problem: CourseSummary;
+  problem: ProblemSummary;
   /** When the last step was accepted. */
   completedAt: number;
   language: Language;
@@ -71,7 +52,7 @@ export function certificateDetails(problem: Problem, progress: Progress, languag
   const score = problemScore(problem, progress.attempts);
   return {
     name: progress.name,
-    problem: summarize(problem),
+    problem,
     completedAt: completedAt || Date.now(),
     language,
     score: score.score,
@@ -116,7 +97,7 @@ export function certificateUrl(origin: string, details: CertificateDetails): str
   return `${origin}/certificate/${details.problem.id}?${params.toString()}`;
 }
 
-export function certificateTitle(problem: Pick<CourseSummary, 'title'>): string {
+export function certificateTitle(problem: Pick<ProblemSummary, 'title'>): string {
   return `${problem.title} — built step by step on LeetBuild`;
 }
 
@@ -148,7 +129,7 @@ export function stepShareText(problem: Problem, step: Step, language: Language, 
 
 export function courseShareText(details: CertificateDetails, url: string): string {
   const time = details.time === null ? '' : ` in a timed run of ${formatClock(details.time)}`;
-  return `Completed the ${details.problem.title} course on LeetBuild — ${details.problem.steps} steps in ${
+  return `Completed the ${details.problem.title} course on LeetBuild — ${details.problem.steps.length} steps in ${
     LANGUAGE_LABEL[details.language]
   }, ${details.score}/${details.max} points${time}.\n\n${
     details.problem.tagline

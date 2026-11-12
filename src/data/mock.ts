@@ -1,6 +1,7 @@
-import type {Language, Problem, Step} from '@/lib/types';
+import type {Language, Problem, ProblemSummary, Step} from '@/lib/types';
 
-import {problems} from './problems';
+import {loadProblem} from './problems/load';
+import {problemSummaries} from './problems/summaries';
 
 /**
  * A mock interview is a timed slice of a course: an interviewer brief, a flawed patch to debug,
@@ -29,6 +30,12 @@ export interface MockScenario {
   defaultLanguage: Language;
 }
 
+/** A scenario on the picker, beside the course it comes from as the problem list knows it. */
+export interface ListedMockScenario extends MockScenario {
+  problem: ProblemSummary;
+}
+
+/** A scenario that has opened: its course loaded and the step it points at resolved. */
 export interface ResolvedMockScenario extends MockScenario {
   problem: Problem;
   step: Step;
@@ -2438,9 +2445,16 @@ export const mockScenarios: readonly MockScenario[] = [
   },
 ];
 
-/** The scenarios whose problem and step still exist, with their content resolved. */
-export const resolvedMockScenarios: readonly ResolvedMockScenario[] = mockScenarios.flatMap(scenario => {
-  const problem = problems.find(p => p.id === scenario.problemId);
-  const step = problem?.steps.find(s => s.id === scenario.stepId);
-  return problem === undefined || step === undefined ? [] : [{...scenario, problem, step}];
+/** The scenarios whose course and step still exist, each with its course's summary. */
+export const listedMockScenarios: readonly ListedMockScenario[] = mockScenarios.flatMap(scenario => {
+  const problem = problemSummaries.find(p => p.id === scenario.problemId);
+  return problem === undefined || !problem.steps.some(s => s.id === scenario.stepId) ? [] : [{...scenario, problem}];
 });
+
+/** Open a scenario: fetch its course (a chunk of its own) and resolve the step it points at. */
+export async function resolveMockScenario(scenario: MockScenario): Promise<ResolvedMockScenario> {
+  const problem = await loadProblem(scenario.problemId);
+  const step = problem.steps.find(s => s.id === scenario.stepId);
+  if (step === undefined) throw new Error(`${scenario.id}: ${scenario.problemId} has no step '${scenario.stepId}'`);
+  return {...scenario, problem, step};
+}

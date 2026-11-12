@@ -10,7 +10,7 @@ import {
   formatClock,
   remainingSeconds,
 } from '@/lib/timer';
-import {type Problem, LANGUAGE_LABEL} from '@/lib/types';
+import {type ProblemSummary, LANGUAGE_LABEL} from '@/lib/types';
 
 /**
  * Timer mode as the learner sees it: the countdown pill in the header (green → amber under five
@@ -41,7 +41,7 @@ Clock.displayName = 'Clock';
 /** Ticks once a second while mounted; reports the moment the budget runs out exactly once. */
 export const TimerPill: FC<{
   timer: ActiveTimer;
-  problem: Problem | undefined;
+  problem: ProblemSummary | undefined;
   onExpire: () => void;
   onClick: () => void;
 }> = memo(({timer, problem, onExpire, onClick}) => {
@@ -95,7 +95,7 @@ TimerPill.displayName = 'TimerPill';
  * and the tooltip names the best counted time once there is one.
  */
 export const TimerIdlePill: FC<{
-  problem: Problem;
+  problem: ProblemSummary;
   sessions: readonly TimedSession[];
   onStart: () => void;
   onHistory: () => void;
@@ -130,7 +130,7 @@ export const TimerIdlePill: FC<{
 TimerIdlePill.displayName = 'TimerIdlePill';
 
 const BudgetOption: FC<{
-  problem: Problem;
+  problem: ProblemSummary;
   factor: number;
   label: string;
   blurb: string;
@@ -158,7 +158,7 @@ const BudgetOption: FC<{
 BudgetOption.displayName = 'BudgetOption';
 
 /** The start dialog's body: pick a budget; `onChange` receives the factor. */
-export const BudgetPicker: FC<{problem: Problem; initial: number; onChange: (factor: number) => void}> = memo(
+export const BudgetPicker: FC<{problem: ProblemSummary; initial: number; onChange: (factor: number) => void}> = memo(
   ({problem, initial, onChange}) => {
     const [factor, setFactor] = useState(initial);
     const pick = useCallback(
@@ -200,35 +200,38 @@ const formatWhen = (at: number): string =>
   new Date(at).toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit'});
 
 /** Runs newest first; `showProblem` names the problem on each row (the all-problems history). */
-export const SessionList: FC<{sessions: readonly TimedSession[]; problems: readonly Problem[]; showProblem: boolean}> =
-  memo(({sessions, problems, showProblem}) => {
-    if (sessions.length === 0) return null;
-    const titles: Record<string, string> = {};
-    for (const p of problems) titles[p.id] = p.title;
-    return (
-      <ul className="divide-ink-700/70 divide-y">
-        {[...sessions].reverse().map(s => (
-          <li className="flex items-start gap-3 py-1.5 text-[12px]" key={`${s.problemId}/${s.startedAt}`}>
-            <span
-              className={`font-code mt-0.5 w-16 shrink-0 text-right text-[13px] font-semibold ${
-                s.counted ? 'text-success-300' : s.outcome === 'completed' ? 'text-ink-200' : 'text-ink-400'
-              }`}
-              title={s.counted ? 'completed within the budget: counted' : 'not counted'}>
-              {s.counted ? '✓ ' : ''}
-              {formatClock(s.elapsed)}
+export const SessionList: FC<{
+  sessions: readonly TimedSession[];
+  problems: readonly ProblemSummary[];
+  showProblem: boolean;
+}> = memo(({sessions, problems, showProblem}) => {
+  if (sessions.length === 0) return null;
+  const titles: Record<string, string> = {};
+  for (const p of problems) titles[p.id] = p.title;
+  return (
+    <ul className="divide-ink-700/70 divide-y">
+      {[...sessions].reverse().map(s => (
+        <li className="flex items-start gap-3 py-1.5 text-[12px]" key={`${s.problemId}/${s.startedAt}`}>
+          <span
+            className={`font-code mt-0.5 w-16 shrink-0 text-right text-[13px] font-semibold ${
+              s.counted ? 'text-success-300' : s.outcome === 'completed' ? 'text-ink-200' : 'text-ink-400'
+            }`}
+            title={s.counted ? 'completed within the budget: counted' : 'not counted'}>
+            {s.counted ? '✓ ' : ''}
+            {formatClock(s.elapsed)}
+          </span>
+          <span className="min-w-0 flex-1">
+            {showProblem ? (
+              <span className="text-ink-50 block font-semibold">{titles[s.problemId] ?? s.problemId}</span>
+            ) : null}
+            <span className="text-ink-300 block">{describeSession(s)}</span>
+            <span className="text-ink-400 font-code block text-[11px]">
+              {formatWhen(s.startedAt)} · budget {formatClock(s.budget)} · {LANGUAGE_LABEL[s.language]}
             </span>
-            <span className="min-w-0 flex-1">
-              {showProblem ? (
-                <span className="text-ink-50 block font-semibold">{titles[s.problemId] ?? s.problemId}</span>
-              ) : null}
-              <span className="text-ink-300 block">{describeSession(s)}</span>
-              <span className="text-ink-400 font-code block text-[11px]">
-                {formatWhen(s.startedAt)} · budget {formatClock(s.budget)} · {LANGUAGE_LABEL[s.language]}
-              </span>
-            </span>
-          </li>
-        ))}
-      </ul>
-    );
-  });
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+});
 SessionList.displayName = 'SessionList';

@@ -38,7 +38,7 @@ Every PR passes the four below locally before review, and `yarn check:scala` as 
 
 ## Writing a course
 
-A course is a directory `src/data/problems/<NN>-<id>/`: `index.ts` (metadata, statement, architecture diagram, support modules, step order), `steps/<k>-<step-id>.ts` (one step each), `proto/*.proto` and the `proto.ts` that `yarn protogen` generates from them, `support.ts` for hand-written helpers. It is registered in `src/data/problems/index.ts`. Copy the nearest existing course — `14-dropbox-gates` is the smallest — rather than starting blank.
+A course is a directory `src/data/problems/<NN>-<id>/`: `index.ts` (metadata, statement, architecture diagram, support modules, step order), `steps/<k>-<step-id>.ts` (one step each), `proto/*.proto` and the `proto.ts` that `yarn protogen` generates from them, `support.ts` for hand-written helpers. It is registered in `src/data/problems/index.ts`, and `yarn build:summaries` then regenerates the two committed files the app loads the catalogue through: `src/data/problems/summaries.ts`, what the problem list, scores and badges know of every course, and `modules.ts`, the module each course is fetched from, as a chunk of its own, when it opens. Rerun it whenever a course's title, tagline, difficulty, concepts, estimate, track, tag, language or company changes, or a step's id, title or concept. Copy the nearest existing course — `14-dropbox-gates` is the smallest — rather than starting blank.
 
 What `yarn verify` holds every course to:
 
@@ -51,6 +51,7 @@ What `yarn verify` holds every course to:
 - Company-tagged courses: `company` ⇔ `sources`, every source with an https URL, a `YYYY-MM-DD` (or `YYYY-MM`) date, a title and what the course takes from it; the statement has a `## From the source` section.
 - A debugging course (its steps start from working code with flaws): the statement has a `## The debugging habit` section; each step's task opens with `**Starting point.**` and says how many flaws the starter hides, which is the number of checks the Python starter fails; the starter's only `TODO`, in every language, reads `TODO: this starter has N flaws. The task says where to look; the checks say what must change.` (a `TODO` that lists the flaws is the answer key); task, hints and debrief never frame the step as an interview.
 - Across the catalogue, every `.proto` file name and every top-level `package.Message`, `Service` and `Enum` is unique: one Python runtime serves every course on a page, and protobuf's descriptor pool holds each file and symbol once. Name the proto after the course and give it a package of its own.
+- The committed course summaries and module map (`src/data/problems/summaries.ts`, `modules.ts`) are what `yarn build:summaries` renders from the courses.
 - The catalogue's maximum is the sum over every problem (7 / 10 / 19 points per step by difficulty) and simply grows as content is added; issued certificates keep the maximum they were earned under.
 
 What the checks cannot enforce, reviewers will:

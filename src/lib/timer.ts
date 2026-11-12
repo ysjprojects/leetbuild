@@ -7,7 +7,7 @@
  * solution revealed. Running on past the budget is allowed and recorded, but never counted.
  */
 import {type StepAttempt, OPEN_ATTEMPT} from './scoring';
-import {type Language, type Problem, stepKey} from './types';
+import {type Language, type ProblemSummary, stepKey} from './types';
 
 export interface ActiveTimer {
   problemId: string;
@@ -47,7 +47,7 @@ export const BUDGETS: readonly {factor: number; label: string; blurb: string}[] 
 /** Sessions kept in the history (oldest dropped first). */
 export const SESSION_HISTORY = 200;
 
-export function budgetSeconds(problem: Problem, factor: number): number {
+export function budgetSeconds(problem: ProblemSummary, factor: number): number {
   return Math.max(60, Math.round(problem.minutes * 60 * factor));
 }
 
@@ -72,13 +72,13 @@ export function remainingSeconds(timer: ActiveTimer, now: number): number {
   return timer.budget - elapsedSeconds(timer, now);
 }
 
-export function startTimer(problem: Problem, factor: number, language: Language, now: number): ActiveTimer {
+export function startTimer(problem: ProblemSummary, factor: number, language: Language, now: number): ActiveTimer {
   return {problemId: problem.id, startedAt: now, budget: budgetSeconds(problem, factor), overtime: false, language};
 }
 
 /** Steps of the problem accepted / revealed right now. */
 export function stepsDone(
-  problem: Problem,
+  problem: ProblemSummary,
   attempts: Record<string, StepAttempt>,
 ): {accepted: number; revealed: number} {
   let accepted = 0;
@@ -92,7 +92,7 @@ export function stepsDone(
 }
 
 /** Every step is done (accepted or revealed): the run is over, whether or not it counts. */
-export function isComplete(problem: Problem, attempts: Record<string, StepAttempt>): boolean {
+export function isComplete(problem: ProblemSummary, attempts: Record<string, StepAttempt>): boolean {
   const done = stepsDone(problem, attempts);
   return problem.steps.length > 0 && done.accepted + done.revealed === problem.steps.length;
 }
@@ -103,7 +103,7 @@ export function isComplete(problem: Problem, attempts: Record<string, StepAttemp
  */
 export function finishSession(
   timer: ActiveTimer,
-  problem: Problem,
+  problem: ProblemSummary,
   attempts: Record<string, StepAttempt>,
   outcome: SessionOutcome,
   now: number,

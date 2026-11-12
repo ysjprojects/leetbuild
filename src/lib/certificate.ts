@@ -128,7 +128,11 @@ export function drawCertificate(canvas: HTMLCanvasElement, details: CertificateD
   ctx.fillStyle = ink[300];
   ctx.font = `400 36px ${SANS}`;
   const concepts = details.problem.concepts.map(c => CONCEPT_LABEL[c]).join(' · ');
-  ctx.fillText(`${details.problem.steps} steps · ${concepts} · in ${LANGUAGE_LABEL[details.language]}`, left, 890);
+  ctx.fillText(
+    `${details.problem.steps.length} steps · ${concepts} · in ${LANGUAGE_LABEL[details.language]}`,
+    left,
+    890,
+  );
 
   // Facts row.
   const facts: [string, string][] = [

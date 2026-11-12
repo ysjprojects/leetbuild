@@ -6,21 +6,19 @@ import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from '
 
 import {BrandLockup} from '@/components/LoadingScreen';
 import {LinkedInButton, POST_HINT, PROFILE_HINT} from '@/components/Social';
-import {problems} from '@/data/problems';
+import {problemSummaries} from '@/data/problems/summaries';
 import {downloadCertificate, drawCertificate} from '@/lib/certificate';
 import {STEP_POINTS} from '@/lib/scoring';
 import {
   type CertificateDetails,
-  type CourseSummary,
   certificateId,
   certificateTitle,
   certificateUrl,
   courseShareText,
   linkedInAddCertificateUrl,
   linkedInPostUrl,
-  summarize,
 } from '@/lib/social';
-import {type Language, ALL_LANGUAGES} from '@/lib/types';
+import {type Language, type ProblemSummary, ALL_LANGUAGES} from '@/lib/types';
 
 /**
  * A certificate's own page: pre-rendered per course (so a LinkedIn link unfurls with the course's
@@ -33,10 +31,10 @@ import {type Language, ALL_LANGUAGES} from '@/lib/types';
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL;
 
 interface Props {
-  course: CourseSummary;
+  course: ProblemSummary;
 }
 
-const Certificate: FC<{course: CourseSummary}> = memo(({course}) => {
+const Certificate: FC<{course: ProblemSummary}> = memo(({course}) => {
   const router = useRouter();
   const canvas = useRef<HTMLCanvasElement>(null);
   const [origin, setOrigin] = useState(SITE_URL ?? '');
@@ -54,7 +52,7 @@ const Certificate: FC<{course: CourseSummary}> = memo(({course}) => {
     // The scale the certificate was earned on; links issued before `m` existed fall back to today's.
     const issuedMax = Number(one(q.m));
     const max =
-      Number.isInteger(issuedMax) && issuedMax > 0 ? issuedMax : STEP_POINTS[course.difficulty] * course.steps;
+      Number.isInteger(issuedMax) && issuedMax > 0 ? issuedMax : STEP_POINTS[course.difficulty] * course.steps.length;
     const score = Math.min(max, Math.max(0, Number(one(q.s)) || 0));
     const time = Number(one(q.t));
     return {
@@ -169,12 +167,11 @@ Page.displayName = 'CertificatePage';
 export default Page;
 
 export const getStaticPaths: GetStaticPaths = () => ({
-  paths: problems.map(problem => ({params: {course: problem.id}})),
+  paths: problemSummaries.map(problem => ({params: {course: problem.id}})),
   fallback: false,
 });
 
 export const getStaticProps: GetStaticProps<Props, {course: string}> = ({params}) => {
-  const problem = problems.find(p => p.id === params?.course);
-  if (problem === undefined) return {notFound: true};
-  return {props: {course: summarize(problem)}};
+  const course = problemSummaries.find(p => p.id === params?.course);
+  return course === undefined ? {notFound: true} : {props: {course}};
 };

@@ -19,6 +19,7 @@
     "build:runtime": "tsx scripts/build-runtime.ts",
     "build:go": "tsx scripts/build-go.ts",
     "build:cpp": "tsx scripts/build-cpp.ts",
+    "build:summaries": "tsx scripts/build-summaries.ts",
     "fetch:torch": "tsx scripts/fetch-torch.ts",
     "fetch:cpp": "tsx scripts/fetch-cpp.ts",
     "predev": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts && tsx scripts/fetch-cpp.ts",

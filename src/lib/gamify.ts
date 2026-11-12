@@ -12,8 +12,8 @@ import {type TimedSession, budgetSeconds} from './timer';
 import {
   type Concept,
   type Language,
-  type Problem,
-  type Step,
+  type ProblemSummary,
+  type StepSummary,
   CONCEPT_LABEL,
   CONCEPTS,
   LANGUAGE_LABEL,
@@ -292,8 +292,8 @@ const hash = (text: string): number => {
 };
 
 export interface DailyPick {
-  problem: Problem;
-  step: Step;
+  problem: ProblemSummary;
+  step: StepSummary;
   /** Position of the step in its problem. */
   index: number;
 }
@@ -304,7 +304,7 @@ export interface DailyPick {
  * other problems move on; it changes when the picked step is done, and with the date.
  */
 export function stepOfTheDay(
-  problems: readonly Problem[],
+  problems: readonly ProblemSummary[],
   attempts: Record<string, StepAttempt>,
   today: string,
 ): DailyPick | null {
@@ -335,9 +335,9 @@ const flag = (earned: boolean): BadgeProgress => ({value: earned ? 1 : 0, target
 
 /** The problem with the highest `done/total` among those `eligible` (ties: the one with more steps done). */
 const closest = (
-  problems: readonly Problem[],
-  eligible: (problem: Problem) => boolean,
-  done: (problem: Problem) => number,
+  problems: readonly ProblemSummary[],
+  eligible: (problem: ProblemSummary) => boolean,
+  done: (problem: ProblemSummary) => number,
 ): BadgeProgress => {
   let best: BadgeProgress = {value: 0, target: 1};
   let bestRatio = -1;
@@ -360,10 +360,10 @@ const closest = (
  * the budget the run was started with.
  */
 const timedProgress = (
-  problems: readonly Problem[],
+  problems: readonly ProblemSummary[],
   sessions: readonly TimedSession[],
 ): Record<string, BadgeProgress> => {
-  const byId: Record<string, Problem> = {};
+  const byId: Record<string, ProblemSummary> = {};
   for (const p of problems) byId[p.id] = p;
   const counted = sessions.filter(s => s.counted && byId[s.problemId] !== undefined);
   const tight = counted.filter(s => s.budget <= budgetSeconds(byId[s.problemId], TIGHT_FACTOR));
@@ -382,7 +382,7 @@ const timedProgress = (
 
 /** Progress toward every badge, by id. */
 export function badgeProgress(
-  problems: readonly Problem[],
+  problems: readonly ProblemSummary[],
   attempts: Record<string, StepAttempt>,
   activeDays: readonly string[],
   today: string,
@@ -393,10 +393,10 @@ export function badgeProgress(
   let unassisted = false;
   let firstTry = false;
   let comeback = false;
-  const acceptedIn = (problem: Problem): number =>
+  const acceptedIn = (problem: ProblemSummary): number =>
     problem.steps.filter(s => (attempts[stepKey(problem.id, s.id)] ?? OPEN_ATTEMPT).status === 'accepted').length;
   /** Accepted steps of a problem whose record is still spotless (no hints, no wrong submissions, nothing revealed). */
-  const spotlessIn = (problem: Problem): number => {
+  const spotlessIn = (problem: ProblemSummary): number => {
     let count = 0;
     for (const step of problem.steps) {
       const attempt = attempts[stepKey(problem.id, step.id)] ?? OPEN_ATTEMPT;
@@ -467,7 +467,7 @@ export function badgeProgress(
 
 /** Every badge the attempt record earns right now (badges are never revoked; the store keeps the union). */
 export function earnedBadges(
-  problems: readonly Problem[],
+  problems: readonly ProblemSummary[],
   attempts: Record<string, StepAttempt>,
   activeDays: readonly string[],
   today: string,
@@ -479,7 +479,7 @@ export function earnedBadges(
 
 /** The result card for one problem, Wordle style: one square per step, then the score. */
 export function shareText(
-  problem: Problem,
+  problem: ProblemSummary,
   attempts: Record<string, StepAttempt>,
   language: Language,
   url: string,

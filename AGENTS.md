@@ -34,7 +34,11 @@ npm run format                    # prettier --write + eslint --fix
 ```
 
 `npx tsx scripts/build-runtime.ts` regenerates the runtime workers (`public/{py,ts,go,cpp}/worker.js`);
-`next dev`/`next build` normally do this through the package scripts.
+`next dev`/`next build` normally do this through the package scripts. `npx tsx scripts/build-summaries.ts`
+(`yarn build:summaries`) regenerates the committed `src/data/problems/summaries.ts` and `modules.ts`, the
+course summaries the app ships and the module each course loads from when it opens; run it after adding a
+course or changing a course's or a step's title, id or other summary field. `yarn verify` fails while
+they are stale.
 
 ## Generated artifacts and how to delete them
 

@@ -2,15 +2,16 @@ import Link from 'next/link';
 import {type CSSProperties, type FC, createContext, memo, useContext} from 'react';
 
 /**
- * The screen a visitor sees before the app is interactive, in two phases: while the playground
- * chunk downloads (`app`, rendered into the static HTML, so it is there before any script runs) and
- * while the progress store reads IndexedDB (`progress`). It is a shape-true skeleton of what is
- * about to appear — the landing page on `/`, the three-pane playground on a course — so nothing
- * jumps when the real thing takes over. Bones shimmer (`.lb-bone`, globals.scss) unless motion is
- * reduced; the status line is a live region.
+ * The screen a visitor sees before the app is interactive, in phases: while the playground chunk
+ * downloads (`app`, rendered into the static HTML, so it is there before any script runs), while
+ * the progress store reads IndexedDB (`progress`) and, on a course, while the course's own chunk
+ * downloads (`course`; it starts with the app's, so it is usually there by then). It is a
+ * shape-true skeleton of what is about to appear — the landing page on `/`, the three-pane
+ * playground on a course — so nothing jumps when the real thing takes over. Bones shimmer
+ * (`.lb-bone`, globals.scss) unless motion is reduced; the status line is a live region.
  */
 
-export type LoadingPhase = 'app' | 'progress';
+export type LoadingPhase = 'app' | 'progress' | 'course';
 
 /** The course route being loaded (`null` for the problem list), provided by the page to the dynamic import's placeholder. */
 export const LoadingRoute = createContext<string | null>(null);
@@ -93,9 +94,10 @@ export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
 );
 LandingIntro.displayName = 'LandingIntro';
 
-const PHASES: Record<LoadingPhase, {index: number; label: string; width: string}> = {
-  app: {index: 1, label: 'loading the app', width: '38%'},
-  progress: {index: 2, label: 'restoring your progress', width: '84%'},
+const PHASES: Record<LoadingPhase, {index: number; label: string}> = {
+  app: {index: 1, label: 'loading the app'},
+  progress: {index: 2, label: 'restoring your progress'},
+  course: {index: 3, label: 'loading the course'},
 };
 
 const Bone: FC<{className: string; style?: CSSProperties}> = memo(({className, style}) => (
@@ -355,48 +357,79 @@ PlaygroundSkeleton.displayName = 'PlaygroundSkeleton';
 
 // ---- the screen ----------------------------------------------------------------------------------
 
-export const LoadingScreen: FC<{phase: LoadingPhase; problemId: string | null}> = memo(({phase, problemId}) => {
-  const {index, label, width} = PHASES[phase];
-  return (
-    <div aria-busy className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
-      <header className="border-ink-700 bg-ink-950/60 flex shrink-0 items-center gap-x-4 border-b px-3 py-2">
-        <div className="flex items-center gap-2">
-          <BrandLockup />
+/** `onRetry`: the phase failed (the course's chunk did not arrive); the status line offers to try again. */
+export const LoadingScreen: FC<{phase: LoadingPhase; problemId: string | null; onRetry?: () => void}> = memo(
+  ({phase, problemId, onRetry}) => {
+    const {index, label} = PHASES[phase];
+    // The list waits for the app and the store; a course for its own chunk too.
+    const total = problemId === null ? 2 : 3;
+    return (
+      <div
+        aria-busy={onRetry === undefined}
+        className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
+        <header className="border-ink-700 bg-ink-950/60 flex shrink-0 items-center gap-x-4 border-b px-3 py-2">
+          <div className="flex items-center gap-2">
+            <BrandLockup />
+          </div>
+          <div className="ml-auto flex items-center gap-2">
+            <Bone className="h-6 w-24 rounded-md" />
+            <Bone className="h-6 w-16 rounded-full" />
+            {problemId !== null ? <Bone className="hidden h-6 w-20 rounded-full sm:block" /> : null}
+            <Bone className="h-7 w-7 rounded-full" />
+            <Bone className="hidden h-7 w-7 rounded-full sm:block" />
+            <Bone className="h-7 w-7 rounded-full" />
+          </div>
+        </header>
+        {/* Progress by phase, short of full until the real thing replaces the screen. */}
+        <div aria-hidden className="bg-ink-800 h-0.5 shrink-0">
+          <div
+            className="lb-progress bg-iris-400 h-full"
+            style={{width: `${Math.round((index / (total + 0.4)) * 100)}%`}}
+          />
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          <Bone className="h-6 w-24 rounded-md" />
-          <Bone className="h-6 w-16 rounded-full" />
-          {problemId !== null ? <Bone className="hidden h-6 w-20 rounded-full sm:block" /> : null}
-          <Bone className="h-7 w-7 rounded-full" />
-          <Bone className="hidden h-7 w-7 rounded-full sm:block" />
-          <Bone className="h-7 w-7 rounded-full" />
+
+        {problemId === null ? <ProblemListSkeleton /> : <PlaygroundSkeleton />}
+
+        <div className="pointer-events-none fixed inset-x-0 bottom-4 flex justify-center px-4">
+          <p
+            aria-live="polite"
+            className="border-ink-700 bg-ink-850/95 text-ink-200 flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] shadow-lg"
+            role="status">
+            {onRetry === undefined ? (
+              <>
+                <span
+                  aria-hidden
+                  className="bg-iris-300 h-1.5 w-1.5 animate-pulse rounded-full motion-reduce:animate-none"
+                />
+                <span>
+                  {label}…{' '}
+                  <span className="font-code text-ink-400">
+                    {index}/{total}
+                  </span>
+                </span>
+                <span aria-hidden className="text-ink-500 hidden sm:inline">
+                  ·
+                </span>
+                <span className="text-ink-400 hidden sm:inline">⌘⏎ or Ctrl+⏎ submits the open file</span>
+              </>
+            ) : (
+              <>
+                <span aria-hidden className="bg-danger-300 h-1.5 w-1.5 rounded-full" />
+                <span>the course did not load</span>
+                <button
+                  className="text-iris-300 hover:text-iris-200 pointer-events-auto font-semibold transition"
+                  onClick={onRetry}
+                  type="button">
+                  Try again
+                </button>
+              </>
+            )}
+          </p>
         </div>
-      </header>
-      {/* Progress by phase: the chunk is the first of two waits, the store the second. */}
-      <div aria-hidden className="bg-ink-800 h-0.5 shrink-0">
-        <div className="lb-progress bg-iris-400 h-full" style={{width}} />
       </div>
-
-      {problemId === null ? <ProblemListSkeleton /> : <PlaygroundSkeleton />}
-
-      <div className="pointer-events-none fixed inset-x-0 bottom-4 flex justify-center px-4">
-        <p
-          aria-live="polite"
-          className="border-ink-700 bg-ink-850/95 text-ink-200 flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] shadow-lg"
-          role="status">
-          <span aria-hidden className="bg-iris-300 h-1.5 w-1.5 animate-pulse rounded-full motion-reduce:animate-none" />
-          <span>
-            {label}… <span className="font-code text-ink-400">{index}/2</span>
-          </span>
-          <span aria-hidden className="text-ink-500 hidden sm:inline">
-            ·
-          </span>
-          <span className="text-ink-400 hidden sm:inline">⌘⏎ or Ctrl+⏎ submits the open file</span>
-        </p>
-      </div>
-    </div>
-  );
-});
+    );
+  },
+);
 LoadingScreen.displayName = 'LoadingScreen';
 
 /** Placeholder of the page's dynamic import: the route comes through `LoadingRoute`, since `dynamic()` passes no props. */

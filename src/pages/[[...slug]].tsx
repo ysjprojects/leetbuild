@@ -1,11 +1,12 @@
 import type {GetStaticPaths, GetStaticProps} from 'next';
 import dynamic from 'next/dynamic';
 import Head from 'next/head';
-import {type FC, memo} from 'react';
+import {type FC, memo, useEffect} from 'react';
 
 import LearnPage from '@/components/LearnPage';
 import {AppLoading, LoadingRoute} from '@/components/LoadingScreen';
 import {problems} from '@/data/problems';
+import {loadProblem} from '@/data/problems/load';
 import {type Guide, guideOf, learnPath} from '@/lib/export';
 import {stepBySlug, stepPath, stepSlug} from '@/lib/types';
 
@@ -42,6 +43,10 @@ const loading = (): JSX.Element => <AppLoading />;
 const LeetBuildPlayground = dynamic(() => import('@/components/LeetBuildPlayground'), {loading, ssr: false});
 
 const Page: FC<Props> = memo(({problemId, stepId, guide, path, title, description}) => {
+  // A course's own chunk downloads beside the playground's, not after it; the playground reports a failure.
+  useEffect(() => {
+    if (guide === null && problemId !== null) loadProblem(problemId).catch(() => undefined);
+  }, [guide, problemId]);
   const url = SITE_URL === undefined ? undefined : `${SITE_URL}${path}`;
   return (
     <>
