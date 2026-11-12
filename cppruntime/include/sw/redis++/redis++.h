@@ -264,6 +264,8 @@ T parse(const lb::Json& r) {
   } else if constexpr (is_pair<T>::value) {
     using A = std::remove_const_t<typename T::first_type>;
     using B = typename T::second_type;
+    // A pair nested in a one-element array (GEOPOS of one member) is that element, as in redis++.
+    if (r.is_array() && r.size() == 1 && r[0].is_array()) return parse<T>(r[0]);
     return T(parse<A>(r[0]), parse<B>(r[1]));
   } else if constexpr (is_tuple<T>::value) {
     return parse_tuple<T>(r, std::make_index_sequence<std::tuple_size_v<T>>{});
@@ -381,6 +383,20 @@ concept iterator = !stringish<T> && !range<T> && !std::is_arithmetic_v<T> && req
   *it;
   ++it;
 };
+
+// What redis++ takes for an output iterator as the generic command()'s last argument (its IsIter):
+// an inserter, or an iterator (a type std::iterator_traits gives a value type) that is not a string.
+template <class T>
+concept out_iterator = !stringish<T> && (requires { typename T::container_type; } || requires {
+  typename std::iterator_traits<T>::value_type;
+  requires !std::is_void_v<typename std::iterator_traits<T>::value_type>;
+});
+
+template <class... A>
+constexpr bool ends_with_output() {
+  if constexpr (sizeof...(A) == 0) return false;
+  else return out_iterator<std::tuple_element_t<sizeof...(A) - 1, std::tuple<A...>>>;
+}
 
 inline void add(std::vector<std::string>& args, const std::string& s) { args.push_back(s); }
 inline void add(std::vector<std::string>& args, std::string_view s) { args.emplace_back(s); }
@@ -730,6 +746,27 @@ class Commands {
     if (type != UpdateType::ALWAYS) args.push_back(detail::update_flag(type));
     return run<bool>(std::move(args));
   }
+  // SET … GET: the value the key held before (nullopt: none), whether or not this SET took place.
+  Ret<OptionalString> set_with_get_option(const StringView& key, const StringView& val,
+                                          const std::chrono::milliseconds& ttl = std::chrono::milliseconds(0),
+                                          UpdateType type = UpdateType::ALWAYS) {
+    std::vector<std::string> args = detail::cmd("SET", key, val);
+    if (ttl.count() > 0) {
+      args.push_back("PX");
+      args.push_back(std::to_string(ttl.count()));
+    }
+    if (type != UpdateType::ALWAYS) args.push_back(detail::update_flag(type));
+    args.push_back("GET");
+    return run<OptionalString>(std::move(args));
+  }
+  Ret<OptionalString> set_with_get_option(const StringView& key, const StringView& val, bool keepttl,
+                                          UpdateType type = UpdateType::ALWAYS) {
+    std::vector<std::string> args = detail::cmd("SET", key, val);
+    if (keepttl) args.push_back("KEEPTTL");
+    if (type != UpdateType::ALWAYS) args.push_back(detail::update_flag(type));
+    args.push_back("GET");
+    return run<OptionalString>(std::move(args));
+  }
   // An integer TTL, in seconds (not real redis++, where it would mean KEEPTTL).
   template <class I>
     requires(std::is_integral_v<I> && !std::is_same_v<I, bool>)
@@ -817,6 +854,9 @@ class Commands {
   }
   Ret<bool> hsetnx(const StringView& key, const StringView& field, const StringView& val) {
     return run<bool>(detail::cmd("HSETNX", key, field, val));
+  }
+  Ret<bool> hsetnx(const StringView& key, const std::pair<StringView, StringView>& item) {
+    return hsetnx(key, item.first, item.second);
   }
   template <detail::iterator Input>
   Ret<void> hmset(const StringView& key, Input first, Input last) {
@@ -1076,8 +1116,10 @@ class Commands {
     return run<long long>(detail::cmd("PUBLISH", channel, message));
   }
 
-  // ---- the generic command: redis.command<OptionalString>("GET", key); without a type, the hiredis reply
+  // ---- the generic command: redis.command<OptionalString>("GET", key); without a type, the hiredis
+  // reply. A Redis also takes an output iterator as the last argument (below, in Redis).
   template <class T = ReplyUPtr, class... Args>
+    requires(!detail::ends_with_output<Args...>())
   Ret<T> command(const StringView& name, const Args&... args) {
     return run<T>(detail::cmd(name, args...));
   }
@@ -1131,6 +1173,21 @@ class Redis : public Commands<Redis, Immediate> {
   }
 
   using Base::command;
+  // The generic command with an output iterator last: the reply's elements written to it.
+  template <class... Args>
+    requires(detail::ends_with_output<Args...>())
+  void command(const StringView& name, const Args&... args) {
+    const auto all = std::forward_as_tuple(args...);
+    std::vector<std::string> cmd{std::string(name)};
+    [&]<size_t... I>(std::index_sequence<I...>) {
+      (detail::add(cmd, std::get<I>(all)), ...);
+    }(std::make_index_sequence<sizeof...(Args) - 1>{});
+    reply::to_output(detail::execute(cmd), std::get<sizeof...(Args) - 1>(all));
+  }
+  template <detail::iterator Input, detail::output Output>
+  void command(Input first, Input last, Output output) {
+    reply::to_output(detail::execute(detail::range_args(first, last)), output);
+  }
   using Base::spop;
   using Base::zpopmax;
   using Base::zpopmin;
@@ -1358,6 +1415,17 @@ class Redis : public Commands<Redis, Immediate> {
                                                  opts.offset, opts.count)),
                      output);
   }
+  // ZREVRANGEBYLEX: the interval's upper bound first, as Redis takes it.
+  template <class Interval, detail::output Output>
+  void zrevrangebylex(const StringView& key, const Interval& interval, Output output) {
+    reply::to_output(detail::execute(detail::cmd("ZREVRANGEBYLEX", key, interval.upper(), interval.lower())), output);
+  }
+  template <class Interval, detail::output Output>
+  void zrevrangebylex(const StringView& key, const Interval& interval, const LimitOptions& opts, Output output) {
+    reply::to_output(detail::execute(detail::cmd("ZREVRANGEBYLEX", key, interval.upper(), interval.lower(), "LIMIT",
+                                                 opts.offset, opts.count)),
+                     output);
+  }
   template <detail::output Output>
   void zpopmin(const StringView& key, long long count, Output output) {
     reply::to_output(detail::execute(detail::cmd("ZPOPMIN", key, count)), output);
@@ -1432,6 +1500,10 @@ class Redis : public Commands<Redis, Immediate> {
   template <detail::iterator Input, detail::output Output>
   void script_exists(Input first, Input last, Output output) {
     reply::to_output(detail::execute(detail::join({"SCRIPT", "EXISTS"}, detail::range_args(first, last))), output);
+  }
+  template <class T, detail::output Output>
+  void script_exists(std::initializer_list<T> il, Output output) {
+    script_exists(il.begin(), il.end(), output);
   }
   bool script_exists(const StringView& sha) {
     return reply::parse<long long>(detail::execute(detail::cmd("SCRIPT", "EXISTS", sha))[0]) == 1;
@@ -1643,6 +1715,24 @@ class Queued : public Commands<Self, Deferred<Self>> {
     args.insert(args.end(), {"LIMIT", std::to_string(opts.offset), std::to_string(opts.count)});
     return dispatch<void>(std::move(args));
   }
+  template <class Interval>
+  Self& zrangebylex(const StringView& key, const Interval& interval) {
+    return dispatch<void>(detail::cmd("ZRANGEBYLEX", key, interval.lower(), interval.upper()));
+  }
+  template <class Interval>
+  Self& zrangebylex(const StringView& key, const Interval& interval, const LimitOptions& opts) {
+    return dispatch<void>(
+        detail::cmd("ZRANGEBYLEX", key, interval.lower(), interval.upper(), "LIMIT", opts.offset, opts.count));
+  }
+  template <class Interval>
+  Self& zrevrangebylex(const StringView& key, const Interval& interval) {
+    return dispatch<void>(detail::cmd("ZREVRANGEBYLEX", key, interval.upper(), interval.lower()));
+  }
+  template <class Interval>
+  Self& zrevrangebylex(const StringView& key, const Interval& interval, const LimitOptions& opts) {
+    return dispatch<void>(
+        detail::cmd("ZREVRANGEBYLEX", key, interval.upper(), interval.lower(), "LIMIT", opts.offset, opts.count));
+  }
   using Commands<Self, Deferred<Self>>::zpopmin;
   using Commands<Self, Deferred<Self>>::zpopmax;
   using Commands<Self, Deferred<Self>>::spop;
@@ -1652,6 +1742,7 @@ class Queued : public Commands<Self, Deferred<Self>> {
   Self& scan(long long cursor, const StringView& pattern = "*", long long count = 10) {
     return dispatch<void>(detail::cmd("SCAN", cursor, "MATCH", pattern, "COUNT", count));
   }
+  Self& scan(long long cursor, long long count) { return scan(cursor, "*", count); }
   Self& georadius(const StringView& key, const std::pair<double, double>& loc, double radius, GeoUnit unit,
                   long long count, bool asc, bool with_coord = false, bool with_dist = false, bool with_hash = false) {
     std::vector<std::string> args =
@@ -1663,6 +1754,40 @@ class Queued : public Commands<Self, Deferred<Self>> {
     args.push_back(asc ? "ASC" : "DESC");
     return dispatch<void>(std::move(args));
   }
+  Self& georadiusbymember(const StringView& key, const StringView& member, double radius, GeoUnit unit,
+                          long long count, bool asc, bool with_coord = false, bool with_dist = false,
+                          bool with_hash = false) {
+    std::vector<std::string> args = detail::cmd("GEORADIUSBYMEMBER", key, member, radius, detail::unit(unit));
+    if (with_dist) args.push_back("WITHDIST");
+    if (with_hash) args.push_back("WITHHASH");
+    if (with_coord) args.push_back("WITHCOORD");
+    if (count > 0) args.insert(args.end(), {"COUNT", std::to_string(count)});
+    args.push_back(asc ? "ASC" : "DESC");
+    return dispatch<void>(std::move(args));
+  }
+  Self& geopos(const StringView& key, const StringView& member) {
+    return dispatch<void>(detail::cmd("GEOPOS", key, member));
+  }
+  template <detail::iterator Input>
+  Self& geopos(const StringView& key, Input first, Input last) {
+    return dispatch<void>(detail::join(detail::cmd("GEOPOS", key), detail::range_args(first, last)));
+  }
+  template <class T>
+  Self& geopos(const StringView& key, std::initializer_list<T> il) {
+    return geopos(key, il.begin(), il.end());
+  }
+
+  Self& script_load(const StringView& script) { return dispatch<void>(detail::cmd("SCRIPT", "LOAD", script)); }
+  Self& script_exists(const StringView& sha) { return dispatch<void>(detail::cmd("SCRIPT", "EXISTS", sha)); }
+  template <detail::iterator Input>
+  Self& script_exists(Input first, Input last) {
+    return dispatch<void>(detail::join({"SCRIPT", "EXISTS"}, detail::range_args(first, last)));
+  }
+  template <class T>
+  Self& script_exists(std::initializer_list<T> il) {
+    return script_exists(il.begin(), il.end());
+  }
+  Self& script_flush() { return dispatch<void>(detail::cmd("SCRIPT", "FLUSH")); }
 
   Self& eval(const StringView& script, detail::Args keys, detail::Args args) {
     return dispatch<void>(detail::script_cmd("EVAL", script, detail::arg_list(keys), detail::arg_list(args)));
@@ -1699,7 +1824,13 @@ class Queued : public Commands<Self, Deferred<Self>> {
 
 class Pipeline : public Queued<Pipeline> {
  public:
+  explicit Pipeline(ConnectionOptions options = {}) : options_(std::move(options)) {}
   QueuedReplies exec() { return send("redis.pipeline"); }
+  // A Redis on the pipeline's connection: its commands run at once, outside the pipeline.
+  Redis redis() { return Redis(options_); }
+
+ private:
+  ConnectionOptions options_;
 };
 
 class Transaction : public Queued<Transaction> {
@@ -1718,7 +1849,7 @@ class Transaction : public Queued<Transaction> {
   std::shared_ptr<detail::WatchState> watch_;
 };
 
-inline Pipeline Redis::pipeline(bool) { return Pipeline(); }
+inline Pipeline Redis::pipeline(bool) { return Pipeline(options_); }
 inline Transaction Redis::transaction(bool, bool) { return Transaction(options_, watch_); }
 
 // A subscriber: its callbacks run inside consume(), one message per call.

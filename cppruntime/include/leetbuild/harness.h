@@ -476,7 +476,10 @@ class Redis {
   long long Publish(const std::string& channel, const std::string& message);
 
   // Run fn right after the first command of the learner's that touches key, before that command's
-  // reply reaches the learner: another client racing between two of the learner's commands.
+  // reply reaches the learner: another client racing between two of the learner's commands. fn
+  // runs at once on a thread of its own and may block (call the learner's gRPC client, sleep, take
+  // a lock): the command's reply waits until fn returns. In a pipeline, a fn that blocks lets the
+  // pipeline's later commands run before it resumes.
   void After(const std::string& key, std::function<void()> fn);
 
   // Receive what is published on channel (on a thread of its own, as it arrives).

@@ -275,8 +275,12 @@ Json Json::parse(const std::string& text) {
 
 Json call(const std::string& op, const Json& request) {
   const std::string body = request.dump();
-  return Json::parse(
-      take_reply(lb_call(op.data(), static_cast<int>(op.size()), body.data(), static_cast<int>(body.size()))));
+  int length = lb_call(op.data(), static_cast<int>(op.size()), body.data(), static_cast<int>(body.size()));
+  if (length < 0) {
+    lb_join();
+    length = -1 - length;
+  }
+  return Json::parse(take_reply(length));
 }
 
 Json call_async(const std::string& op, const Json& request) {

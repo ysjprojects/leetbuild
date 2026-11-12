@@ -160,6 +160,10 @@ interface Thread {
   reply: Uint8Array;
   /** Its exceptions in flight (libc++abi's __cxa_eh_globals) while another thread runs. */
   eh: Uint8Array;
+  /** The callbacks its current call ran that blocked (probes): the call's reply waits for them to end (lb_join). */
+  awaiting: Promise<void>[];
+  /** A blocked callback's: ends its caller's wait for it (it exited). */
+  abandon?: () => void;
 }
 
 interface Exports {
@@ -245,7 +249,14 @@ class Instance {
   private exports!: Exports;
   private readonly threads = new Map<number, Thread>();
   /** The program's own thread: static initialization and the check run on it. */
-  private readonly main: Thread = {id: 1, sp: 0, stack: null, reply: new Uint8Array(), eh: new Uint8Array(EH_BYTES)};
+  private readonly main: Thread = {
+    id: 1,
+    sp: 0,
+    stack: null,
+    reply: new Uint8Array(),
+    eh: new Uint8Array(EH_BYTES),
+    awaiting: [],
+  };
   private current: Thread = this.main;
   private nextThreadId = 2;
   private readonly parked = new Map<number, (woken: number) => void>();
@@ -266,8 +277,10 @@ class Instance {
   private readonly ready: (() => void)[] = [];
   /** Settles in progress: `settle.release` ends them early (a Drain whose function returned). */
   private readonly settling = new Set<() => void>();
-  /** Calls into the program made synchronously from inside one of its own (a harness hook): no stack to suspend there. */
+  /** Inside the synchronous start of a callback run from a call (`invoke`): exit() there can only unwind. */
   private synchronous = 0;
+  /** The callbacks starting inside a call, innermost last: whether each blocked, handing back to its caller. */
+  private readonly inline: {blocked: boolean}[] = [];
 
   constructor(private readonly onOutput: ((stream: 'stdout' | 'stderr', text: string) => void) | null) {
     this.crashed = new Promise(resolve => {
@@ -384,12 +397,18 @@ class Instance {
     next();
   }
 
-  /** An import the calling thread waits on: its stack is saved, the CPU handed on, and both taken back when the wait ends. */
+  /**
+   * An import the calling thread waits on: its stack is saved, the CPU handed on, and both taken
+   * back when the wait ends. A callback starting inside a call (`invoke`) that waits hands back to
+   * that call instead, which goes on holding the CPU.
+   */
   private suspending<A extends unknown[], R>(fn: (...args: A) => Promise<R>): WebAssembly.Suspending {
     return new WebAssembly.Suspending((async (...args: A): Promise<R> => {
       const self = this.current;
       this.leave(self);
-      this.release();
+      const inline = this.inline.at(-1);
+      if (inline === undefined) this.release();
+      else inline.blocked = true;
       const result = await fn(...args);
       await this.acquire();
       // Over (the next check's world is not this program's), or the process exited: never resume.
@@ -402,8 +421,8 @@ class Instance {
     }) as unknown as (...args: never[]) => Promise<unknown>);
   }
 
-  /** Start a green thread running `entry` on a fresh stack, once it gets the CPU. */
-  private spawn(entry: (thread: Thread) => Promise<unknown>): number {
+  /** A thread with a fresh stack of its own. */
+  private newThread(): Thread {
     const stack = this.exports.malloc(STACK_BYTES);
     const thread: Thread = {
       id: this.nextThreadId++,
@@ -411,8 +430,15 @@ class Instance {
       stack,
       reply: new Uint8Array(),
       eh: new Uint8Array(EH_BYTES),
+      awaiting: [],
     };
     this.threads.set(thread.id, thread);
+    return thread;
+  }
+
+  /** Start a green thread running `entry` on a fresh stack, once it gets the CPU. */
+  private spawn(entry: (thread: Thread) => Promise<unknown>): number {
+    const thread = this.newThread();
     void this.acquire().then(() => {
       if (!this.live || this.exitStatus !== null) {
         this.release();
@@ -433,6 +459,55 @@ class Instance {
   }
 
   /**
+   * Run `handle`'s invocable from inside the running thread's call (a probe firing inside a
+   * command), at once, on a thread of its own: it may block (a gRPC call, a lock, a sleep), which
+   * an import called synchronously could not. Should it block, the call goes on (a pipeline's next
+   * commands run) and its reply waits for the callback to end (lb_join).
+   */
+  private invoke(handle: number): void {
+    const caller = this.current;
+    this.leave(caller);
+    const thread = this.newThread();
+    this.enter(thread);
+    const inline = {blocked: false};
+    this.inline.push(inline);
+    this.synchronous += 1;
+    let ran: Promise<unknown>;
+    try {
+      ran = WebAssembly.promising(this.exports.lb_invoke)(handle);
+    } finally {
+      this.synchronous -= 1;
+      this.inline.pop();
+      this.enter(caller);
+    }
+    if (!inline.blocked) {
+      // It ran to its end inside the call (a trap rejects `ran`).
+      this.threads.delete(thread.id);
+      if (thread.stack !== null) this.exports.free(thread.stack);
+      ran.catch(error => this.die(error));
+      return;
+    }
+    caller.awaiting.push(
+      new Promise<void>(resolve => {
+        // exit() on it ends the caller's wait too.
+        thread.abandon = resolve;
+        ran.then(
+          () => {
+            this.finish(thread);
+            resolve();
+          },
+          error => {
+            this.finish(thread);
+            if (error instanceof ProgramExit) this.exitStatus ??= error.status;
+            else this.die(error);
+            resolve();
+          },
+        );
+      }),
+    );
+  }
+
+  /**
    * exit() on one of the program's threads: the status is the program's, and the thread stops where
    * it is, running nothing more. A JS exception would unwind it instead, and C++ catches those
    * (`catch (...)`) and runs every local destructor on the way out, which exit() must not.
@@ -441,6 +516,7 @@ class Instance {
     this.exitStatus ??= status;
     // The check's own thread exited: the check cannot go on.
     if (this.current === this.main) this.die(new ProgramExit(status));
+    this.current.abandon?.();
     this.release();
     return new Promise<never>(() => undefined);
   }
@@ -472,14 +548,7 @@ class Instance {
   private world(): BridgeWorld {
     return {
       deliver: (handle, payload) => this.deliver(handle, payload),
-      invoke: handle => {
-        this.synchronous += 1;
-        try {
-          this.exports.lb_invoke(handle);
-        } finally {
-          this.synchronous -= 1;
-        }
-      },
+      invoke: handle => this.invoke(handle),
       tracked: work => this.tracked(work),
       live: () => this.live,
     };
@@ -606,8 +675,11 @@ class Instance {
         const [op, body] = request(opPtr, opLen, reqPtr, reqLen);
         const handler = calls[op];
         if (handler === undefined) throw new Error(`the C++ runtime has no call ${op}`);
-        return this.setReply(handler(body as never));
+        const length = this.setReply(handler(body as never));
+        // A callback the call ran blocked: the caller waits for it (lb_join) before reading the reply.
+        return this.current.awaiting.length > 0 ? -1 - length : length;
       },
+      join: this.suspending(() => Promise.all(this.current.awaiting.splice(0)).then(() => undefined)),
       call_async: this.suspending(async (opPtr: number, opLen: number, reqPtr: number, reqLen: number) => {
         const [op, body] = request(opPtr, opLen, reqPtr, reqLen);
         const handler = asyncCalls[op];
@@ -715,7 +787,7 @@ class Instance {
         }
         return ERRNO.SUCCESS;
       },
-      // Not async: inside a synchronous call there is no stack to suspend, and exit() can only unwind.
+      // Not async: in a callback's synchronous start (`invoke`) its caller holds the CPU, so exit() can only unwind.
       proc_exit: new WebAssembly.Suspending(((status: number): Promise<never> => {
         if (this.synchronous > 0) throw new ProgramExit(status);
         return this.exit(status);

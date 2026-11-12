@@ -34,8 +34,11 @@ LB_IMPORT(sleep) void lb_sleep(double ms);
 // sleep due has run; tick: the clock held where it is).
 LB_IMPORT(settle) void lb_settle();
 LB_IMPORT(tick) void lb_tick();
-// A request to the JavaScript side (op and JSON request); the reply's length, then its bytes.
+// A request to the JavaScript side (op and JSON request); the reply's length, then its bytes. A
+// negative length (-1 - length) says a callback the request ran (a probe) blocked: lb_join waits
+// for every such callback to end before the reply is read.
 LB_IMPORT(call) int lb_call(const char* op, int op_len, const char* request, int request_len);
+LB_IMPORT(join) void lb_join();
 LB_IMPORT(call_async) int lb_call_async(const char* op, int op_len, const char* request, int request_len);
 LB_IMPORT(reply) void lb_reply(char* into);
 }
@@ -133,8 +136,10 @@ class WaitQueue {
   std::vector<int> waiters_;
 };
 
-// Functions the JavaScript side calls back: synchronously (a Redis probe firing inside a command)
-// or on a thread of their own with a payload (a published message). Each returns its handle.
+// Functions the JavaScript side calls back: from inside a call of the program's (a Redis probe
+// firing inside a command; run at once on a thread of their own, the call's reply waiting for
+// them if they block) or on a thread of their own with a payload (a published message). Each
+// returns its handle.
 int invocable(std::function<void()> fn);
 int receiver(std::function<void(const std::string&)> fn);
 

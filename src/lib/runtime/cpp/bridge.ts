@@ -9,7 +9,10 @@
 export interface BridgeWorld {
   /** Run `handle`'s lb::receiver with `payload` (JSON text) on a thread of its own: a delivered message. */
   deliver(handle: number, payload: string): void;
-  /** Run `handle`'s lb::invocable now, on the thread making the call: a probe firing inside a command. */
+  /**
+   * Run `handle`'s lb::invocable now, from inside the call being made (a probe firing inside a
+   * command), on a thread of its own: if it blocks, the call's reply waits for it to end.
+   */
   invoke(handle: number): void;
   /** Asynchronous work a thread waits on (a statement): the world does not settle while any is in flight. */
   tracked<T>(work: Promise<T>): Promise<T>;
