@@ -4,6 +4,7 @@ export const bookingClientStep: Step = {
   id: 'dependency',
   title: 'Calendar sync calls that confirm idempotently',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['api', 'calendar', 'redis'],
   task: `## Task

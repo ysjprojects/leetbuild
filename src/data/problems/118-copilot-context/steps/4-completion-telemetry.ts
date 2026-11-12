@@ -4,6 +4,7 @@ export const completionTelemetryStep: Step = {
   id: 'completion-telemetry',
   title: 'completion.shown / completion.accepted: ids and sizes, not the code',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'telemetry',
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task

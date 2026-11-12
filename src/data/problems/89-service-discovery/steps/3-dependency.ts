@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Health probes with a deadline and a shared verdict',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'probe',
   focus: ['discovery', 'instances', 'redis'],
   task: `## Task

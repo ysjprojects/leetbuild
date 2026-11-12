@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/sessions/{id}/context: the newest turns within budget, cached per tenant and turn',
   concept: 'http',
+  guides: ['honest-reads', 'keys-and-expiry'],
   file: 'read',
   focus: ['client', 'api', 'redis'],
   task: `## Task

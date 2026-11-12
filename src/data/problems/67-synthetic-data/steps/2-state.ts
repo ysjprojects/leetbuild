@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis job state: a diversity window per seed entity in one script',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

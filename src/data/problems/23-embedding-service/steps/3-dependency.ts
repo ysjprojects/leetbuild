@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Model server calls: a deadline, one retry, and the right model',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'model-output'],
   file: 'client',
   focus: ['api', 'model'],
   task: `## Task

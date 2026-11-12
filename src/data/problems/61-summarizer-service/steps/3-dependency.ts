@@ -4,6 +4,7 @@ export const summarizerClientStep: Step = {
   id: 'dependency',
   title: 'The model call: a deadline, terminal refusals and a labelled extract',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['api', 'model', 'extract'],
   task: `## Task

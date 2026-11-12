@@ -4,6 +4,7 @@ export const uploadStateStep: Step = {
   id: 'state',
   title: 'A Redis commit that holds only for a complete chunk set',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

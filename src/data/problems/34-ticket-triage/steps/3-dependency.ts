@@ -4,6 +4,7 @@ export const triageDependencyStep: Step = {
   id: 'dependency',
   title: 'Classifier with a rule-based fallback that stays useful',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['triage', 'classifier', 'rules'],
   task: `## Task

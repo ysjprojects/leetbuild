@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/returns/{id}: the refund attached to the return',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'db', 'refunds'],
   task: `## Task

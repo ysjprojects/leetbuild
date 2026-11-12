@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/ads/serve: limits before ranking',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['client', 'server', 'db', 'redis'],
   task: `## Task

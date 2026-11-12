@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/logs: a record the index can accept',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['agent', 'api', 'registry'],
   task: `## Task

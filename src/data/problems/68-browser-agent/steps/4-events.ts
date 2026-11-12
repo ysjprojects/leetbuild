@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'browser.step events keyed by session, redacted, appended before the commit',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['worker', 'kafka', 'consumer', 'store'],
   task: `## Task

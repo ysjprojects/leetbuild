@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/sandbox/jobs: code that declares what it needs',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'redis'],
   task: `## Task

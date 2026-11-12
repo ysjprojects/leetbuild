@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'A vector cache keyed by model version, written once',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

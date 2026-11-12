@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Kafka: form-keyed submission events with a value hash and an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'outbox'],
   task: `## Task

@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/usage: one row per report, whatever the retries',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'meter', 'store'],
   task: `## Task

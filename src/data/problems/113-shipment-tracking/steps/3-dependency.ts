@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Carrier polls with a deadline, recorded failures and scheduled retries',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['api', 'carrier', 'scheduler'],
   task: `## Task

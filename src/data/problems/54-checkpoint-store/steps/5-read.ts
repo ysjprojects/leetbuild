@@ -4,6 +4,7 @@ export const readCheckpointStep: Step = {
   id: 'read',
   title: 'GET the latest checkpoint a resumed run can trust',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'redis'],
   task: `## Task

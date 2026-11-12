@@ -4,6 +4,7 @@ export const trainingEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/training/runs: one clamped, known, idempotent run',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'scheduler', 'store', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'The model call on a miss, and what may be written back',
   concept: 'grpc',
+  guides: ['model-output', 'deadlines-and-retries'],
   file: 'client',
   focus: ['cache', 'llm', 'policy', 'redis'],
   task: `## Task

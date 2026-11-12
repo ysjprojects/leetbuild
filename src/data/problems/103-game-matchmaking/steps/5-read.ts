@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/matches/{id}: pending players stay on the roster',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'redis'],
   task: `## Task

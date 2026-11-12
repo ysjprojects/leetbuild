@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Shard leases: claim, heartbeat, complete, reap',
   concept: 'redis',
+  guides: ['atomic-state', 'leases'],
   file: 'state',
   focus: ['worker', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis status timeline: forward only, applied atomically',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['api', 'redis', 'carrier'],
   task: `## Task

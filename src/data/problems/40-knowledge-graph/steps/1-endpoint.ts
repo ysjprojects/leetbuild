@@ -4,6 +4,7 @@ export const entityUpsertStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/entities: the server decides what merges',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'db'],
   task: `## Task

@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/verifications: the caller does not set the verdict',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['client', 'api', 'redis', 'storage'],
   task: `## Task

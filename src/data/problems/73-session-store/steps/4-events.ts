@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Session events: keyed by user, hashed tokens, committed first',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'redis', 'kafka', 'consumer'],
   task: `## Task

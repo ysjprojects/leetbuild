@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'feedback.recorded keyed by tenant, with a fingerprint and an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['collector', 'kafka', 'consumer', 'redis'],
   task: `## Task

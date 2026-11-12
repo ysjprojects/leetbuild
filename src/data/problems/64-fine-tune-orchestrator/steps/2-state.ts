@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis budget: one Lua script per reservation move',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'budget',
   focus: ['api', 'redis'],
   task: `## Task

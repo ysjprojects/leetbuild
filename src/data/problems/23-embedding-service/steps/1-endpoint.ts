@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/embeddings: batches that stay inside their caps',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'model'],
   task: `## Task

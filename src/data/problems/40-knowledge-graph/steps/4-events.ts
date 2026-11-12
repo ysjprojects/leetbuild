@@ -4,6 +4,7 @@ export const graphEventsStep: Step = {
   id: 'events',
   title: 'graph.changed events keyed by entity, after the commit',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'db', 'kafka', 'consumer', 'outbox'],
   task: `## Task

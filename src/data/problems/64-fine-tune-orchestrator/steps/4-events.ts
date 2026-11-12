@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'finetune.job: commit the move, then announce it',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['redis', 'kafka'],
   task: `## Task

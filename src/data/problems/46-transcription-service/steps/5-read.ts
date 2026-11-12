@@ -4,6 +4,7 @@ export const transcriptionReadStep: Step = {
   id: 'read',
   title: 'GET /v1/transcriptions/{id}: done only when it is done',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/loads/{id}: counts that reconcile',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['reader', 'api', 'warehouse', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const publishClassifiedStep: Step = {
   id: 'publish-classified',
   title: 'entity.classified: keyed by entity, acknowledged or kept, applied newest-first',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'publish_classified',
   focus: ['metasense', 'classified', 'catalog', 'redis'],
   task: `## Task

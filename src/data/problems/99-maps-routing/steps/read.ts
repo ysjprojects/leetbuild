@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/routes/{id}: a stored route with its provenance',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'store'],
   task: `## Task

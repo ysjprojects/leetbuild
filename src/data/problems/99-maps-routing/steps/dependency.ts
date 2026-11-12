@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Engine calls with a deadline and an honest fallback',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['api', 'engine', 'fallback'],
   task: `## Task

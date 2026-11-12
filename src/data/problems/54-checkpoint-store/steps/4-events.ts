@@ -4,6 +4,7 @@ export const checkpointEventsStep: Step = {
   id: 'events',
   title: 'Checkpoint events keyed by training run',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task

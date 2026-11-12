@@ -4,6 +4,7 @@ export const neighborReadStep: Step = {
   id: 'read',
   title: 'GET /v1/entities/{id}/neighbors: a bounded walk inside the tenant',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task

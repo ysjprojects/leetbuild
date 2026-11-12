@@ -19,7 +19,10 @@ import {existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node
 import {cpus, tmpdir, totalmem} from 'node:os';
 import {join, resolve} from 'node:path';
 
+import {GUIDE_CONTENT} from '../src/data/guides';
+import {GUIDES} from '../src/data/guides/meta';
 import {architectureProblems} from '../src/lib/architecture';
+import {guidePath, GUIDES_PATH, learnPath} from '../src/lib/export';
 import {gpuProblems} from '../src/lib/gpuFigure';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {malformedBlocksOf, widgetsOf} from '../src/lib/markdown';
@@ -41,9 +44,11 @@ import {
   codeFor,
   figureIds,
   fileName,
+  GUIDE_IDS,
   isArchitectureFigure,
   problemLanguages,
   runsAsProgram,
+  stepPath,
   SYSTEMS_CONCEPTS,
 } from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
@@ -267,6 +272,12 @@ function verifyStep(problem: Problem, step: Step, index: number): string[] {
   // A debugging course says once, in its statement, how to work its steps (the steps no longer repeat it).
   if (index === 0 && /\*\*Starting point\.\*\*/.test(step.task) && !/^## The debugging habit$/m.test(problem.statement))
     errors.push(`${tag}: a course whose steps start from a flawed starter needs a "## The debugging habit" section`);
+  // A debugging step links the failure-mode guides that explain what its starter gets wrong.
+  if (/\*\*Starting point\.\*\*/.test(step.task)) {
+    if (step.guides === undefined || step.guides.length === 0)
+      errors.push(`${tag}: a debugging step names the failure-mode guides behind its flaws (guides)`);
+    else if (new Set(step.guides).size !== step.guides.length) errors.push(`${tag}: a guide is named twice`);
+  }
   return errors;
 }
 
@@ -576,6 +587,52 @@ function cppRuntimeFreshness(): string[] {
   return errors;
 }
 
+/**
+ * The failure-mode guides (src/data/guides): each reads like a course's learning guide (sections, a
+ * demo or a figure, pop quizzes, well-formed blocks), its internal links land on real pages, its
+ * sources can be checked, it has no em dash, and at least one debugging step names it.
+ */
+function verifyGuides(problems: Problem[]): string[] {
+  const errors: string[] = [];
+  const pages = new Set<string>(['/', GUIDES_PATH, ...GUIDE_IDS.map(guidePath)]);
+  for (const problem of problems) {
+    pages.add(`/${problem.id}`);
+    if (problem.learn !== undefined) pages.add(learnPath(problem.id));
+    for (const step of problem.steps) pages.add(stepPath(problem, step));
+  }
+  for (const id of GUIDE_IDS) {
+    const tag = `guide ${id}`;
+    const {guide, sources} = GUIDE_CONTENT[id];
+    if (!/^#\s+\S/m.test(guide)) errors.push(`${tag}: no '#' section`);
+    const widgets = widgetsOf(guide);
+    if (widgets.length === 0 && !/^:::(sequence|diagram)\b/m.test(guide))
+      errors.push(`${tag}: no demo or figure (a :::widget, a :::sequence or a :::diagram)`);
+    for (const w of widgets) if (WIDGETS[w] === undefined) errors.push(`${tag}: unknown widget '${w}'`);
+    for (const what of malformedBlocksOf(guide)) errors.push(`${tag}: ${what}`);
+    const quizzes = guide.match(/^:::quiz\b/gm)?.length ?? 0;
+    if (quizzes < 3) errors.push(`${tag}: ${quizzes} pop quiz(zes); a guide has at least 3`);
+    if (`${GUIDES[id].title}\n${GUIDES[id].tagline}\n${guide}`.includes('—'))
+      errors.push(`${tag}: an em dash; write a colon, a comma or two sentences`);
+    const framing = /\binterviewer\b|\bAI draft\b/i.exec(guide);
+    if (framing !== null) errors.push(`${tag}: "${framing[0]}": a debugging course's code is the starter`);
+    for (const [, href] of guide.matchAll(/\]\((\/[^)\s#?]*)/g))
+      if (!pages.has(href)) errors.push(`${tag}: the link ${href} leads to no page`);
+    if (sources.length === 0) errors.push(`${tag}: cites no sources`);
+    for (const s of sources) {
+      if (!/^https:\/\//.test(s.url)) errors.push(`${tag}: source '${s.title}' needs an https URL`);
+      if (s.title.trim() === '' || s.takes.trim() === '')
+        errors.push(`${tag}: a source needs a title and what the guide takes from it`);
+      if (s.kind === undefined || (s.venue ?? '').trim() === '')
+        errors.push(`${tag}: source '${s.title}' names its kind and venue`);
+      if (s.date !== undefined && !/^\d{4}-\d{2}(-\d{2})?$/.test(s.date))
+        errors.push(`${tag}: source '${s.title}' is dated YYYY-MM-DD or YYYY-MM (got '${s.date}')`);
+    }
+    if (!problems.some(problem => problem.steps.some(step => step.guides?.includes(id) === true)))
+      errors.push(`${tag}: no step names it`);
+  }
+  return errors;
+}
+
 /** The committed course summaries and module map must be what the courses render to (`yarn build:summaries`). */
 async function summariesFreshness(): Promise<string[]> {
   const rendered = await renderSummaries();
@@ -731,6 +788,9 @@ async function main(): Promise<void> {
     const stale = await summariesFreshness();
     console.log(`${stale.length === 0 ? '✓' : '✗'} course summaries and modules built from these courses`);
     errors.push(...stale);
+    const guides = verifyGuides(problems);
+    console.log(`${guides.length === 0 ? '✓' : '✗'} failure-mode guides`);
+    errors.push(...guides);
   }
   errors.push(
     ...protoCollisions(problems, onlyProblem === null ? null : problems.filter(p => onlyProblem.endsWith(p.id))),

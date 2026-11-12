@@ -4,6 +4,7 @@ export const trainingDependencyStep: Step = {
   id: 'dependency',
   title: 'Preemption that checkpoints before it kills',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'preempt',
   focus: ['scheduler', 'worker', 'redis'],
   task: `## Task

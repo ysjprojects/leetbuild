@@ -4,6 +4,7 @@ export const translateEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/translations: a validated request pinned to a glossary version',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['client', 'api', 'redis', 'mt'],
   task: `## Task

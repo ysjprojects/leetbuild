@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Scatter-gather over index shards with deadlines and a quorum',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries'],
   file: 'client',
   focus: ['search', 'shards'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Feature calls with a slice of the auction each, and a degraded bid at the floor',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['api', 'features', 'scorer'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Media and pricing calls before a partial publish',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['api', 'media', 'pricing'],
   task: `## Task

@@ -4,6 +4,7 @@ export const refundReadStep: Step = {
   id: 'read',
   title: 'GET /v1/payments/{id}/refunds: the totals finance trusts',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['finance', 'api', 'records', 'ledger', 'psp'],
   task: `## Task

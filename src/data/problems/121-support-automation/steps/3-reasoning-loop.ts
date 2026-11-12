@@ -4,6 +4,7 @@ export const reasoningLoopStep: Step = {
   id: 'reasoning-loop',
   title: 'Chain of Thought loop: deadlines, bounded iterations, a tool registry',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'cot_workflow',
   focus: ['workflow', 'llm', 'tools', 'redis'],
   task: `## Task

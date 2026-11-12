@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis headroom per sku and hour window',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

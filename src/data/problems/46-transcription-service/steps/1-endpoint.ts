@@ -4,6 +4,7 @@ export const transcriptionEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/transcriptions: hours of audio, one job',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'db', 'storage'],
   task: `## Task

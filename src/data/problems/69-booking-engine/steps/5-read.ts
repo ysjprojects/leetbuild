@@ -4,6 +4,7 @@ export const bookingReadStep: Step = {
   id: 'read',
   title: 'GET /v1/resources/{id}/availability: timezones that do not lie',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'redis'],
   task: `## Task

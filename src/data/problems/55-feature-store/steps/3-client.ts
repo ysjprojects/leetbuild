@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Backfill scans with a deadline, a cutoff and honest gaps',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['worker', 'offline', 'redis'],
   task: `## Task

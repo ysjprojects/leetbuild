@@ -1,13 +1,15 @@
 import Link from 'next/link';
 import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
-import {learnPath} from '@/lib/export';
+import {GUIDES} from '@/data/guides/meta';
+import {guidePath, learnPath} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
 import {runtimeHarness} from '@/lib/runtime/client';
 import {CPP_UNSUPPORTED} from '@/lib/runtime/cpp/support';
 import {type ProblemScore, type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
 import {
   type Company,
+  type GuideId,
   type Language,
   type Problem,
   type ProblemFigure,
@@ -18,6 +20,7 @@ import {
   CONCEPT_LABEL,
   figureIds,
   fileName,
+  GUIDE_IDS,
   isArchitectureFigure,
   LANGUAGE_LABEL,
   runsAsProgram,
@@ -341,6 +344,47 @@ const GuideLink: FC<{problemId: string}> = memo(({problemId}) => (
   </Link>
 ));
 GuideLink.displayName = 'GuideLink';
+
+/** A failure-mode guide as a chip: its title, its summary on hover; it opens the guide's page. */
+const GuideChip: FC<{id: GuideId}> = memo(({id}) => (
+  <Link
+    className="border-iris-400/40 bg-iris-400/10 text-iris-200 hover:border-iris-400/70 hover:text-ink-50 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition"
+    href={guidePath(id)}
+    title={GUIDES[id].tagline}>
+    <DocumentGlyph />
+    {GUIDES[id].title}
+  </Link>
+));
+GuideChip.displayName = 'GuideChip';
+
+/** The failure-mode guides behind a step, above its hints: reading one costs no points. */
+const StepGuides: FC<{guides: readonly GuideId[]}> = memo(({guides}) => (
+  <section className="mt-4">
+    <p className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">Guides · free to read</p>
+    <div className="mt-1.5 flex flex-wrap gap-2">
+      {guides.map(id => (
+        <GuideChip id={id} key={id} />
+      ))}
+    </div>
+  </section>
+));
+StepGuides.displayName = 'StepGuides';
+
+/** A debugging course's guides, under its statement: every failure mode its steps hide, in reading order. */
+const CourseGuides: FC<{problem: Problem}> = memo(({problem}) => {
+  const ids = GUIDE_IDS.filter(id => problem.steps.some(step => step.guides?.includes(id) === true));
+  return ids.length === 0 ? null : (
+    <section className="border-ink-700 mt-4 border-t pt-3">
+      <p className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">The failure modes this course hides</p>
+      <div className="mt-1.5 flex flex-wrap gap-2">
+        {ids.map(id => (
+          <GuideChip id={id} key={id} />
+        ))}
+      </div>
+    </section>
+  );
+});
+CourseGuides.displayName = 'CourseGuides';
 
 const CompanyHeader: FC<{company: Company}> = memo(({company}) => (
   <div className="border-ink-700 bg-ink-800/60 mb-3 flex items-center gap-3 rounded-xl border p-3">
@@ -674,6 +718,7 @@ const ProblemPane: FC<{
                 <CourseComplete certified={certified} onCertificate={onCertificate} problem={problem} score={score} />
               ) : null}
               <Markdown highlight={leetbuildHighlighter} renderWidget={renderWidget} source={problem.statement} />
+              {problem.learn === undefined ? <CourseGuides problem={problem} /> : null}
               {problem.sources !== undefined && problem.sources.length > 0 ? (
                 <Sources company={problem.company} sources={problem.sources} />
               ) : null}
@@ -729,6 +774,7 @@ const ProblemPane: FC<{
                   source={step.task}
                 />
               </div>
+              {step.guides !== undefined && step.guides.length > 0 ? <StepGuides guides={step.guides} /> : null}
               <Hints attempt={attempt} hints={step.hints} key={`hints:${step.id}`} onReveal={onRevealHint} />
               <Solution
                 attempt={attempt}

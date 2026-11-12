@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Match events keyed by match id, started only after every join',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['matchmaker', 'kafka', 'redis'],
   task: `## Task

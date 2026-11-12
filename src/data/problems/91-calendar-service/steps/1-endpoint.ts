@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/events: a rule that ends, instants with an offset',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['client', 'api', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Lifecycle events keyed by secret name, without material',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'redis', 'kafka', 'audit'],
   task: `## Task

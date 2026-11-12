@@ -4,6 +4,7 @@ export const verifyEndpointStep: Step = {
   id: 'verify-endpoint',
   title: 'POST /v1/entities/{id}/verify: owner only, tier derived on the server, audited',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'verify_api',
   focus: ['owner', 'metasense', 'redis'],
   task: `## Task

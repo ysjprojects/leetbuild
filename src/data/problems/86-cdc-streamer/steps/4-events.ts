@@ -4,6 +4,7 @@ export const changeEventsStep: Step = {
   id: 'events',
   title: 'Change events keyed by row, confirmed by the broker',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['replicator', 'kafka', 'sink'],
   task: `## Task

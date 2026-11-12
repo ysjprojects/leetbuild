@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/trending: a window, a floor, a category filter and no user linkage',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'trending',
   focus: ['client', 'api', 'terms', 'consumer'],
   task: `## Task

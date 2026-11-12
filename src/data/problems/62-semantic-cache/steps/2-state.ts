@@ -11,6 +11,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis entries in one tenant-scoped index',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['cache', 'redis'],
   task: `## Task

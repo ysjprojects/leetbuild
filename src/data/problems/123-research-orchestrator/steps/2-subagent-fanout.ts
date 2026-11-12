@@ -4,6 +4,7 @@ export const subagentFanoutStep: Step = {
   id: 'subagent-fanout',
   title: 'Lead agent: subagents in parallel, under the budget, with a deadline',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'lead_agent',
   focus: ['lead', 'subagent'],
   task: `## Task

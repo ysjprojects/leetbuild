@@ -4,6 +4,7 @@ export const sessionStateStep: Step = {
   id: 'state',
   title: 'Redis turn state where barge-in and late frames cannot race',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['gateway', 'redis'],
   task: `## Task

@@ -5,6 +5,7 @@ export const feedbackEventsStep: Step = {
   id: 'feedback-events',
   title: 'One feedback event per request, counted once',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'feedback',
   focus: ['router', 'kafka', 'quality', 'redis'],
   task: `## Task

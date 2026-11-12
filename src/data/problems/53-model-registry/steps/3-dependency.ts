@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'A serving probe that gates the pointer',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries'],
   file: 'client',
   focus: ['registry', 'serving', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Decision events: keyed by item, pseudonymous, after the commit, never dropped',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['queue', 'kafka', 'consumer', 'items'],
   task: `## Task

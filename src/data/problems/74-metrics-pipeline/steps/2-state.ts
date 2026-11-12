@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis window merges: one script, one claim, one expiry',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry', 'idempotent-requests'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const refundEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/refunds: no more than was paid, once per key',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'ledger', 'records'],
   task: `## Task

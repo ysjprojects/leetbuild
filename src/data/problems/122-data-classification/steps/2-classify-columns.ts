@@ -4,6 +4,7 @@ export const classifyColumnsStep: Step = {
   id: 'classify-columns',
   title: 'Classify: batches the model can read, a deadline, one retry, a closed tag library',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'model-output'],
   file: 'classify_columns',
   focus: ['metasense', 'llm'],
   task: `## Task

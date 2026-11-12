@@ -4,6 +4,7 @@ export const queryEndpointStep: Step = {
   id: 'query-endpoint',
   title: 'POST /v1/queries: workspace resolved, tables proposed for ACK',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'queries_api',
   focus: ['analyst', 'api', 'agents', 'workspaces'],
   task: `## Task

@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'A query cache whose key names every input',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'cache',
   focus: ['api', 'cache', 'catalog'],
   task: `## Task

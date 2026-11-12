@@ -5,6 +5,7 @@ export const tenantBudgetStep: Step = {
   id: 'tenant-budget',
   title: 'Daily budget: one atomic reservation',
   concept: 'redis',
+  guides: ['keys-and-expiry', 'atomic-state'],
   file: 'budget',
   focus: ['gateway', 'budget'],
   task: `## Task

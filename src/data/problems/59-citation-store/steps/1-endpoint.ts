@@ -4,6 +4,7 @@ export const citationEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/citations: spans that must resolve',
   concept: 'http',
+  guides: ['request-boundaries', 'model-output', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'db'],
   task: `## Task

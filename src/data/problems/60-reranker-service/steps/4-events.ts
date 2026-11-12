@@ -4,6 +4,7 @@ export const rerankEventsStep: Step = {
   id: 'events',
   title: 'rerank.done: keyed by query fingerprint, numbers only, an outbox from the delivery report',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'redis', 'consumer'],
   task: `## Task

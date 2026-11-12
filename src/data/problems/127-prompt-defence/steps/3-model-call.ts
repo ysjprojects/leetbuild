@@ -7,6 +7,7 @@ export const modelCallStep: Step = {
   id: 'model-call',
   title: 'gRPC: a sectioned prompt, a canary, a deadline, a schema',
   concept: 'grpc',
+  guides: ['model-output', 'deadlines-and-retries'],
   file: 'model_call',
   focus: ['api', 'model'],
   task: `## Task

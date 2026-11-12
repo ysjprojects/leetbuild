@@ -4,6 +4,7 @@ export const subscriptionEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/subscriptions: only the tables and columns a tenant may stream',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'redis', 'pg'],
   task: `## Task

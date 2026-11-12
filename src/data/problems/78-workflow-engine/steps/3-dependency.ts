@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'gRPC side effects guarded by an effect ledger',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'idempotent-requests'],
   file: 'client',
   focus: ['worker', 'mailer', 'ledger'],
   task: `## Task

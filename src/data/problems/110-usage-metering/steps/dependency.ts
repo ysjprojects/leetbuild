@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Billing close under one id, bounded and reconciled',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'idempotent-requests'],
   file: 'client',
   focus: ['api', 'engine', 'redis', 'store'],
   task: `## Task

@@ -4,6 +4,7 @@ export const storageClientStep: Step = {
   id: 'dependency',
   title: 'Object-store writes that confirm the checksum',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['api', 'store'],
   task: `## Task

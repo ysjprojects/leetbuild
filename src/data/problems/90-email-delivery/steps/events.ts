@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Delivery events keyed by recipient, after the relay answers',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'relay', 'kafka', 'consumer'],
   task: `## Task

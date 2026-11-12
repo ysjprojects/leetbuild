@@ -4,6 +4,7 @@ export const answerGuardStep: Step = {
   id: 'answer-guard',
   title: 'The output guard: grounding, secrets, divergence, a signature',
   concept: 'grpc',
+  guides: ['model-output', 'request-boundaries'],
   file: 'answer_guard',
   focus: ['api', 'model', 'redis', 'kafka'],
   task: `## Task

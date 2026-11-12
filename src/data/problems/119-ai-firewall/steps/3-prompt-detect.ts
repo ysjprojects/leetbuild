@@ -4,6 +4,7 @@ export const promptDetectStep: Step = {
   id: 'prompt-detect',
   title: 'Detect: score 1–99, tags, a 150 ms deadline, fail closed',
   concept: 'grpc',
+  guides: ['model-output', 'failing-dependencies', 'deadlines-and-retries'],
   file: 'detect',
   focus: ['aifw', 'guard'],
   task: `## Task

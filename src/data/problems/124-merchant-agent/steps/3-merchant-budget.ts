@@ -4,6 +4,7 @@ export const merchantBudgetStep: Step = {
   id: 'merchant-budget',
   title: 'Per-shop budget, shop-scoped tool cache, write tools once',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'budget_cache',
   focus: ['api', 'redis', 'tools'],
   task: `## Task

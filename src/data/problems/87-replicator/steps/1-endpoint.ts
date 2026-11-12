@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/replications: an approved pair and a frozen conflict policy',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['client', 'api', 'store'],
   task: `## Task

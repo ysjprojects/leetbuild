@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis job leases with hard wall-clock limits',
   concept: 'redis',
+  guides: ['leases', 'atomic-state'],
   file: 'state',
   focus: ['runner', 'redis'],
   task: `## Task

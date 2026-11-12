@@ -11,6 +11,7 @@ import {type Architecture, architectureToMermaid} from './architecture';
 import {type GpuFigure, gpuToMermaid} from './gpuFigure';
 import {
   type Diagram,
+  type GuideId,
   type Language,
   type Problem,
   type Sequence,
@@ -307,20 +308,39 @@ export function exportFileName(problemId: string, language: Language): string {
 /** The learning guide's page: `/<problem>/learn`. */
 export const learnPath = (problemId: string): string => `/${problemId}/learn`;
 
-/** What the guide's page needs of a course — serializable, so the page is pre-rendered without the course data. */
+/** The failure-mode guides' index, and one guide's page: `/guides/atomic-state`. */
+export const GUIDES_PATH = '/guides';
+export const guidePath = (id: GuideId): string => `${GUIDES_PATH}/${id}`;
+
+/** A step a failure-mode guide sends the reader to, to practise what it explains. */
+export interface PracticeStep {
+  title: string;
+  href: string;
+}
+
+/**
+ * What a guide's page needs — serializable, so the page is pre-rendered without the course data: a
+ * course's learning guide, or a failure-mode guide the debugging courses share.
+ */
 export interface Guide {
-  problemId: string;
+  /** Names the downloads: `leetbuild-<id>-guide.md`. */
+  id: string;
+  /** The page's one way back: the course the guide belongs to, or the guides' index. */
+  back: {href: string; label: string};
   title: string;
   tagline: string;
   learn: string;
   sources: Source[];
+  /** A failure-mode guide's steps to practise it on, by course: each course's title and its steps. */
+  practice?: {course: string; steps: PracticeStep[]}[];
 }
 
 export const guideOf = (problem: Problem): Guide | null =>
   problem.learn === undefined
     ? null
     : {
-        problemId: problem.id,
+        id: problem.id,
+        back: {href: `/${problem.id}`, label: 'back to the course'},
         title: problem.title,
         tagline: problem.tagline,
         learn: problem.learn,
@@ -349,8 +369,8 @@ export function learnToMarkdown(guide: Guide): string {
 }
 
 /** File name for a learning-guide download: `leetbuild-dropbox-gates-guide.md` / `.pdf`. */
-export const learnFileName = (problemId: string, extension: 'md' | 'pdf' = 'md'): string =>
-  `leetbuild-${problemId}-guide.${extension}`;
+export const learnFileName = (id: string, extension: 'md' | 'pdf' = 'md'): string =>
+  `leetbuild-${id}-guide.${extension}`;
 
 /** Trigger a browser download of `text` as a Markdown file. */
 export function downloadMarkdown(name: string, text: string): void {

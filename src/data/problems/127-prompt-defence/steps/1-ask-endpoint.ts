@@ -4,6 +4,7 @@ export const askEndpointStep: Step = {
   id: 'ask-endpoint',
   title: 'POST /v1/ask: tokens, control characters, repeated tokens',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'ask_api',
   focus: ['client', 'api', 'docs', 'redis'],
   task: `## Task

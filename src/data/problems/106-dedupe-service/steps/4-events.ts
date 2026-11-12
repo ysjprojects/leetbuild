@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Dedupe events keyed by dataset, carrying digests, with an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const auditEventsStep: Step = {
   id: 'events',
   title: 'One audit event per redaction, with offsets instead of values',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['redactor', 'kafka', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Fuzzy matches under a 200 ms deadline that degrade to exact-only',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries', 'request-boundaries'],
   file: 'client',
   focus: ['api', 'similarity'],
   task: `## Task

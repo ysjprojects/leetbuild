@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Session state: a sliding expiry under a hard cap, rotated in one script',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

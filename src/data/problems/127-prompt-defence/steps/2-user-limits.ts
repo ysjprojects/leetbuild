@@ -14,6 +14,7 @@ export const userLimitsStep: Step = {
   id: 'user-limits',
   title: 'Redis: per-user windows, a block-list, sessions',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'limits',
   focus: ['api', 'redis'],
   task: `## Task

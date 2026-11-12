@@ -8,6 +8,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis recent-turn buffer: one capped, expiring list per tenant and session',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

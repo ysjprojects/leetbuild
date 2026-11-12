@@ -4,6 +4,7 @@ export const shadowEventsStep: Step = {
   id: 'events',
   title: 'Comparison events keyed by config with no user content',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['shadow', 'kafka', 'consumer', 'redis'],
   task: `## Task

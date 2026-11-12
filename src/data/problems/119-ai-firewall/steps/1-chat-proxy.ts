@@ -4,6 +4,7 @@ export const chatProxyStep: Step = {
   id: 'chat-proxy',
   title: 'POST /v1/chat: the prompt found, capped, scored and forwarded',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'firewall_api',
   focus: ['client', 'aifw', 'guard', 'app'],
   task: `## Task

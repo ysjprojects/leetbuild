@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Suggester call: a 150 ms deadline, one attempt, a fallback nobody caches',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['api', 'suggester', 'redis'],
   task: `## Task

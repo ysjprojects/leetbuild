@@ -4,6 +4,7 @@ export const invoiceEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/invoices: drafts are mutable, finals are not',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'db'],
   task: `## Task

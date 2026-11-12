@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/products/{id}: the tenant’s current public document',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'product',
   focus: ['client', 'api', 'catalog'],
   task: `## Task

@@ -4,6 +4,7 @@ export const citationEventsStep: Step = {
   id: 'events',
   title: 'Verification events keyed by document for lineage',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['consumer', 'db', 'kafka', 'lineage'],
   task: `## Task

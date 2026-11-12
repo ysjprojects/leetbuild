@@ -4,6 +4,7 @@ export const cacheStateStep: Step = {
   id: 'state',
   title: 'Redis entries: one conditional fill that dies with its version',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'cache',
   focus: ['cache', 'redis'],
   task: `## Task

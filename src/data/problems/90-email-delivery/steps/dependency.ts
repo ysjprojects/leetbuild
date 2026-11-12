@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Relay calls with one message id and terminal bounces',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'dispatch',
   focus: ['api', 'relay', 'store', 'redis'],
   task: `## Task

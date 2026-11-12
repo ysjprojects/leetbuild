@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Counters committed with the comment in one Lua script',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis', 'db'],
   task: `## Task

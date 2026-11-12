@@ -4,6 +4,7 @@ export const contextManagementStep: Step = {
   id: 'context-management',
   title: 'Context management: declared, scoped, budgeted, expiring',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'context_store',
   focus: ['workflow', 'redis', 'retriever'],
   task: `## Task

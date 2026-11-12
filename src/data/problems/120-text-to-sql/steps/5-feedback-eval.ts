@@ -4,6 +4,7 @@ export const feedbackEvalStep: Step = {
   id: 'feedback-eval',
   title: 'query.feedback: the evaluation signals, per workspace',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'feedback',
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task

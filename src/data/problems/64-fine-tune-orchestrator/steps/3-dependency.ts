@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Trainer supervisor: checkpoint before restart, give up after three misses',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'leases'],
   file: 'supervisor',
   focus: ['supervisor', 'trainer'],
   task: `## Task

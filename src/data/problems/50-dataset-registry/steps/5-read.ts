@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/datasets/{dataset}/versions/{version}: provenance, not just bytes',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'registry', 'db', 'storage'],
   task: `## Task

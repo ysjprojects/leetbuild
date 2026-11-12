@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'A Redis sync cursor that survives quiet weeks and rebalances',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry', 'idempotent-requests'],
   file: 'state',
   focus: ['hub', 'redis'],
   task: `## Task

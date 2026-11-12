@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET a thread: cursor pages, tombstones and counts from the counters',
   concept: 'http',
+  guides: ['honest-reads'],
   file: 'read',
   focus: ['client', 'api', 'redis', 'db'],
   task: `## Task

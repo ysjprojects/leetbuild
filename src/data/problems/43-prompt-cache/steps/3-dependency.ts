@@ -4,6 +4,7 @@ export const cacheDependencyStep: Step = {
   id: 'dependency',
   title: 'The miss path: a deadline and a rule for what is stored',
   concept: 'grpc',
+  guides: ['model-output', 'deadlines-and-retries'],
   file: 'miss',
   focus: ['cache', 'model', 'redis'],
   task: `## Task

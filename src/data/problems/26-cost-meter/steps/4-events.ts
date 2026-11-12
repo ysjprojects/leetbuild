@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'billing.usage: keyed by tenant, deduplicable, never lost quietly',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['meter', 'kafka', 'consumer'],
   task: `## Task

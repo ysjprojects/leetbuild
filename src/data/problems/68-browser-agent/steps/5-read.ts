@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/browser/sessions/{id}: the owner’s bounded trace and a screenshot that expires',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'redis', 'store', 'artifact'],
   task: `## Task

@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/prices/{sku}: the price the storefront charges',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['storefront', 'operator', 'api', 'db', 'redis'],
   task: `## Task

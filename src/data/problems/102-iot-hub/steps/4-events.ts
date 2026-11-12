@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Command transitions keyed by device for the fleet audit',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['hub', 'kafka', 'audit', 'outbox'],
   task: `## Task

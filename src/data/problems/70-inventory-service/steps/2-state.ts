@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis stock transitions: one script per move, holds that expire',
   concept: 'redis',
+  guides: ['atomic-state', 'leases', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

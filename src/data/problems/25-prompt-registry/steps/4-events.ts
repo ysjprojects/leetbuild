@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Lifecycle events on prompt.lifecycle, keyed by name',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['registry', 'kafka', 'consumer'],
   task: `## Task

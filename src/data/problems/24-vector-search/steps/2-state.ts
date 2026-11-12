@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'A Redis result cache keyed by tenant, version, digest and k',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'state',
   focus: ['search', 'cache', 'corpus'],
   task: `## Task

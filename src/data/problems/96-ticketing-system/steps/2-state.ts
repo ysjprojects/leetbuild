@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis assignment leases and unread badges',
   concept: 'redis',
+  guides: ['leases', 'atomic-state'],
   file: 'state',
   focus: ['agent', 'api', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/instances: registration that is scoped and expires',
   concept: 'http',
+  guides: ['request-boundaries', 'keys-and-expiry'],
   file: 'api',
   focus: ['client', 'discovery', 'db', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'One Lua script claims the whole roster or none of it',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['matchmaker', 'redis'],
   task: `## Task

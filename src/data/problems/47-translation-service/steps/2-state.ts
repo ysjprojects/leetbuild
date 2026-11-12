@@ -4,6 +4,7 @@ export const glossaryStateStep: Step = {
   id: 'state',
   title: 'Glossary versions and translation memory in Redis',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

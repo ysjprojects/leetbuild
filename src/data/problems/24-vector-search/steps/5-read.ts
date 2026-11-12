@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: "GET /v1/documents/{id}/neighbors: the tenant's document, in its own version",
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'search', 'corpus'],
   task: `## Task

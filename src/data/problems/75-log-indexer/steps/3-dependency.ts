@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Shard writes with a deadline, a bounded retry set and one batch id',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['writer', 'shard'],
   task: `## Task

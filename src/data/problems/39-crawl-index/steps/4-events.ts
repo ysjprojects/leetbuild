@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Page events keyed by host, carrying references, after the index write',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['crawler', 'index', 'kafka', 'indexer', 'store'],
   task: `## Task

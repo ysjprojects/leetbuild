@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/audit/decisions/{id}/verify: verification that recomputes',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'auditd', 'redis', 'db'],
   task: `## Task

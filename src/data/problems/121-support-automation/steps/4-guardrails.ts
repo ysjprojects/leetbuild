@@ -4,6 +4,7 @@ export const guardrailsStep: Step = {
   id: 'guardrails',
   title: 'Guardrails framework: parallel checks, one deadline, fail closed',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies', 'model-output'],
   file: 'guardrail_gate',
   focus: ['workflow', 'guardrails', 'human'],
   task: `## Task

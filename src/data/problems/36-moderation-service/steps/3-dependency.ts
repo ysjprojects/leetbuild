@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Classifier triage that only auto-acts on strong, corroborated evidence',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'model-output', 'failing-dependencies'],
   file: 'client',
   focus: ['api', 'classifier', 'redis'],
   task: `## Task

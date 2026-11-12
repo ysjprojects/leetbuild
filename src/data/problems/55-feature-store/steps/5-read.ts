@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/features/{name}/versions/{v}/stats: null rate, pinned baseline, freshness',
   concept: 'http',
+  guides: ['honest-reads'],
   file: 'read',
   focus: ['client', 'api', 'monitor', 'redis'],
   task: `## Task

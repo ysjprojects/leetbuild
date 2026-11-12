@@ -4,6 +4,7 @@ export const trainingReadStep: Step = {
   id: 'read',
   title: 'GET /v1/training/runs/{id}: state that matches the cluster',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'scheduler', 'redis', 'cluster'],
   task: `## Task

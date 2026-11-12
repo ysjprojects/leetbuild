@@ -4,6 +4,7 @@ export const fimCallStep: Step = {
   id: 'fim-call',
   title: 'Complete: fill-in-the-middle under a 300 ms deadline, n generated, ≤ n shown',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'fim_call',
   focus: ['api', 'model'],
   task: `## Task

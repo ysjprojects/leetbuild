@@ -5,6 +5,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'A position event per applied position, keyed by vehicle',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'redis', 'kafka', 'map'],
   task: `## Task

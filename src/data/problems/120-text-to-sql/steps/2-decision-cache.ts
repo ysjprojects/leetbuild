@@ -4,6 +4,7 @@ export const decisionCacheStep: Step = {
   id: 'decision-cache',
   title: 'Redis: decision cache and query budget',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'decisions',
   focus: ['api', 'redis', 'agents'],
   task: `## Task

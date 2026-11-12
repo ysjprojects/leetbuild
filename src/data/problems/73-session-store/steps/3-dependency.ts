@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Token validation: a short cache that fails closed',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'auth_client',
   focus: ['api', 'auth'],
   task: `## Task

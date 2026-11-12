@@ -106,6 +106,12 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   `cppruntime/`, rebuilt into the committed `public/cpp/runtime.pack.gz` by `yarn build:cpp`, and
   `yarn verify` needs Node 24 to run it. Harness checks stay outcome-based; update the README when what
   a course runs changes.
+- The debugging courses' learning material is organised by failure mode: eleven shared guides in
+  `src/data/guides/` (ids in `GUIDE_IDS`, `src/lib/types.ts`), each a page at `/guides/<id>`. Every
+  step of a debugging course names the guides behind its flaws in `guides`, most relevant first; a
+  failure mode no guide covers becomes a new guide, not a course's own `learn`. `yarn verify` checks
+  each guide (sections, a demo or a figure, three or more quizzes, links that land, sources) and that
+  every debugging step names one.
 
 ## Pull requests
 

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Storage writes with a deadline that keep the trace',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['collector', 'storage', 'quarantine'],
   task: `## Task

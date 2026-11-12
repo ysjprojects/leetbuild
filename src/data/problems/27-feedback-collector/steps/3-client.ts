@@ -4,6 +4,7 @@ export const clientStep: Step = {
   id: 'client',
   title: 'Attribution under a 200 ms deadline, unattributed on failure',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries', 'keys-and-expiry'],
   file: 'client',
   focus: ['collector', 'attribution'],
   task: `## Task

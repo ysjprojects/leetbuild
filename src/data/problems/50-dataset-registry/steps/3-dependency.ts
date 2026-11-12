@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'A validator call that gates promotion',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries'],
   file: 'client',
   focus: ['registry', 'validator', 'redis'],
   task: `## Task

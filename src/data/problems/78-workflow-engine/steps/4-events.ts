@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'workflow.step events keyed by run id, through an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['worker', 'kafka', 'ledger'],
   task: `## Task

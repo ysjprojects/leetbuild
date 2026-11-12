@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'CRM sync through an outbox, one key per note',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'crm_sync',
   focus: ['api', 'store', 'worker', 'crm'],
   task: `## Task

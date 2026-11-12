@@ -4,6 +4,7 @@ export const progressReadStep: Step = {
   id: 'read',
   title: 'GET /v1/tasks/{id}/progress: agreement without peer peeking',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'service', 'redis', 'quality'],
   task: `## Task

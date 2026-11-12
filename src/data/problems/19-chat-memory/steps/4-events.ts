@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'session.turn events keyed by conversation, without content, with an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'worker'],
   task: `## Task

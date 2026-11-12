@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Object-store writes: a deadline, a part-sized retry, a commit before the index',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['api', 'store', 'redis'],
   task: `## Task

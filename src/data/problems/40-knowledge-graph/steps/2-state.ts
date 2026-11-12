@@ -4,6 +4,7 @@ export const adjacencyCacheStep: Step = {
   id: 'state',
   title: 'Redis adjacency cache invalidated by a version, not a delete',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis', 'db'],
   task: `## Task

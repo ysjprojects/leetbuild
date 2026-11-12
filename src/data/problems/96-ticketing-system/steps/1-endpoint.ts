@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/tickets: a transition table in front of the state',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['requester', 'agent', 'api', 'store'],
   task: `## Task

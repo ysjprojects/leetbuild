@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'The eval gate: only a verdict opens it',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies', 'model-output'],
   file: 'client',
   focus: ['registry', 'eval', 'redis'],
   task: `## Task

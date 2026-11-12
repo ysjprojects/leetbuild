@@ -31,6 +31,7 @@ export const triageStateStep: Step = {
   id: 'state',
   title: 'Redis dedupe and per-queue admission in one script',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['triage', 'redis'],
   task: `## Task

@@ -5,6 +5,7 @@ export const modelCallStep: Step = {
   id: 'model-call',
   title: 'The model call: bounded retries, a fallback, a breaker',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'model_call',
   focus: ['router', 'large', 'small', 'redis'],
   task: `## Task

@@ -3,6 +3,7 @@ import type {Step} from '@/lib/types';
 export const changeEventsStep: Step = {
   id: 'events',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   title: 'sync.change events keyed by document, after the apply',
   focus: ['sync', 'kafka', 'redis', 'audit'],

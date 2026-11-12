@@ -4,6 +4,7 @@ export const researchEndpointStep: Step = {
   id: 'research-endpoint',
   title: 'POST /v1/research: the server sets the budget, a retry finds its job',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'redis'],
   task: `## Task

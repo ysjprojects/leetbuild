@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis suppression and per-recipient rate limits',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'admission',
   focus: ['api', 'redis'],
   task: `## Task

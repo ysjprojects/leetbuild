@@ -5,6 +5,7 @@ export const streamingCancelStep: Step = {
   id: 'streaming-cancel',
   title: 'Stream tokens, stop when the tab closes',
   concept: 'http',
+  guides: ['deadlines-and-retries'],
   file: 'chat_stream',
   focus: ['client', 'gateway', 'providers'],
   task: `## Task

@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Lineage events keyed by feature, after the commit',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['worker', 'kafka', 'db'],
   task: `## Task

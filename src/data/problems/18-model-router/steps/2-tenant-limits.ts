@@ -5,6 +5,7 @@ export const tenantLimitsStep: Step = {
   id: 'tenant-limits',
   title: 'Rate window: one atomic reservation',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'limits',
   focus: ['router', 'redis'],
   task: `## Task

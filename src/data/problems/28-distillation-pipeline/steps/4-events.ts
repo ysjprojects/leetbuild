@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Accepted samples on distill.sample, keyed by dataset',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'trainer', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Model calls with a rules fallback instead of a zero',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries'],
   file: 'client',
   focus: ['scorer', 'model', 'rules'],
   task: `## Task

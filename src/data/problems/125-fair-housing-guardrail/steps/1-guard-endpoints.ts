@@ -4,6 +4,7 @@ export const guardEndpointsStep: Step = {
   id: 'guard-endpoints',
   title: 'POST /v1/guard/{input,output}: authenticated, capped, version-pinned',
   concept: 'http',
+  guides: ['request-boundaries', 'model-output'],
   file: 'guard_api',
   focus: ['assistant', 'guard'],
   task: `## Task

@@ -4,6 +4,7 @@ export const judgeGateStep: Step = {
   id: 'judge-gate',
   title: 'LLM-as-judge: calibrated judges gate the release',
   concept: 'grpc',
+  guides: ['model-output'],
   file: 'judge_gate',
   focus: ['api', 'judge', 'gtx'],
   task: `## Task

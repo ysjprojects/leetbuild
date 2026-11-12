@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'The placement stream: one event per booking, after the ledger',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['scheduler', 'redis', 'kafka', 'consumer'],
   task: `## Task

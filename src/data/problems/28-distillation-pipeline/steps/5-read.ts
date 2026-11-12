@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/distill/jobs/{id}: the acceptance report',
   concept: 'http',
+  guides: ['honest-reads'],
   file: 'read',
   focus: ['client', 'api', 'redis'],
   task: `## Task

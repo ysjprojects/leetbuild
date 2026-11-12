@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Model calls per record: a deadline, bounded retries, a pinned version',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'model-output'],
   file: 'client',
   focus: ['worker', 'model'],
   task: `## Task

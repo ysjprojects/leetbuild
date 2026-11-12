@@ -4,6 +4,7 @@ export const traceEventsStep: Step = {
   id: 'trace-events',
   title: 'research.trace: decisions without content, an end-state eval that survives a crash',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'trace_events',
   focus: ['lead', 'kafka', 'evaluator', 'redis'],
   task: `## Task

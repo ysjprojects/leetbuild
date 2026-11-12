@@ -3,6 +3,7 @@ import type {Step} from '@/lib/types';
 export const applyStateStep: Step = {
   id: 'state',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   title: 'One Lua apply: compare the base, take a server-wide revision',
   focus: ['sync', 'redis'],

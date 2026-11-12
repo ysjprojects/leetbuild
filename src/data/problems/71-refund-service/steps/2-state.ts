@@ -4,6 +4,7 @@ export const refundStateStep: Step = {
   id: 'state',
   title: 'Redis refund ledger: claims in one script, for the payment’s lifetime',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry', 'idempotent-requests'],
   file: 'state',
   focus: ['api', 'ledger', 'records'],
   task: `## Task

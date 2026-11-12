@@ -4,6 +4,7 @@ export const citationClientStep: Step = {
   id: 'dependency',
   title: 'Document fetches that re-anchor or mark a citation broken',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies', 'model-output'],
   file: 'client',
   focus: ['consumer', 'docstore'],
   task: `## Task

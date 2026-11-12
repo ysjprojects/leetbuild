@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Heartbeats that renew metadata and expiry in one script',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['discovery', 'redis', 'reaper'],
   task: `## Task

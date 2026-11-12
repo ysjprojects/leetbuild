@@ -4,6 +4,7 @@ export const evalGateStep: Step = {
   id: 'eval-gate',
   title: 'Eval gate: one verdict per release, on evidence',
   concept: 'kafka',
+  guides: ['consuming-events', 'model-output', 'producing-events'],
   file: 'eval_gate',
   focus: ['events', 'eval', 'redis', 'metrics'],
   task: `## Task

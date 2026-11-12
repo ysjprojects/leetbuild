@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis run progress: one sample, one count, in one script',
   concept: 'redis',
+  guides: ['atomic-state', 'consuming-events', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

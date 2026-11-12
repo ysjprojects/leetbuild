@@ -5,6 +5,7 @@ export const routeEndpointStep: Step = {
   id: 'route-endpoint',
   title: 'POST /v1/route: the router picks the model',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'router_api',
   focus: ['client', 'router', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const changePlanStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/subscriptions: plan changes prorated over the real period',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['client', 'billing', 'db'],
   task: `## Task

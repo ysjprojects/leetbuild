@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Job events keyed by job id for a run history',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['worker', 'kafka', 'consumer', 'redis'],
   task: `## Task

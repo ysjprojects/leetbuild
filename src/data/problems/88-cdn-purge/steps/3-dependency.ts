@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'BatchPurge with a deadline, one batch id and per-path outcomes',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['purge', 'cdn', 'edges'],
   task: `## Task

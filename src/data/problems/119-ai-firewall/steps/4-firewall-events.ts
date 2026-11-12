@@ -4,6 +4,7 @@ export const firewallEventsStep: Step = {
   id: 'firewall-events',
   title: 'ai.firewall.events and response-phase sensitive data detection',
   concept: 'kafka',
+  guides: ['producing-events', 'request-boundaries'],
   file: 'events',
   focus: ['aifw', 'kafka', 'app', 'client'],
   task: `## Task

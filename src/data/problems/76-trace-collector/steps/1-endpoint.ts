@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/spans: spans are validated at the edge',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['sdk', 'collector', 'redis'],
   task: `## Task

@@ -17,6 +17,7 @@ export const summarizerStateStep: Step = {
   id: 'state',
   title: 'Redis progress for a chunked source, bound to its content hash',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

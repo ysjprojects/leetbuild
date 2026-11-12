@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'One atomic Redis decision per serve',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['server', 'redis'],
   task: `## Task

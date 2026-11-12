@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'cdn.purged events keyed by domain, with stable ids and an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['purge', 'kafka', 'consumer', 'redis'],
   task: `## Task

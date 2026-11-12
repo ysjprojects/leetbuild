@@ -4,6 +4,7 @@ export const rerankEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/rerank: caps, truncation and a deterministic order',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['client', 'api', 'reranker'],
   task: `## Task

@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/prices: guardrails around every change',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['operator', 'api', 'db'],
   task: `## Task

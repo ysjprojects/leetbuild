@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'audit.appended events keyed by tenant, after the chain moved',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['auditd', 'kafka', 'mirror', 'db'],
   task: `## Task

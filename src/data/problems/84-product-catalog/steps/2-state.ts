@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis published-pointer swap with a single reference',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['api', 'redis', 'db'],
   task: `## Task

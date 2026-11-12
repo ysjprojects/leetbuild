@@ -4,6 +4,7 @@ export const runGuardStep: Step = {
   id: 'run-guard',
   title: 'POST /v1/queries/{id}/run: a guard between generated SQL and the warehouse',
   concept: 'http',
+  guides: ['request-boundaries', 'honest-reads'],
   file: 'run_api',
   focus: ['analyst', 'api', 'warehouse'],
   task: `## Task

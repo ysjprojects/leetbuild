@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Turn events keyed by session that carry a redacted reference',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['gateway', 'kafka', 'consumer', 'transcripts'],
   task: `## Task

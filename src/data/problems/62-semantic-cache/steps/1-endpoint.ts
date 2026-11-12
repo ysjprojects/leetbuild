@@ -4,6 +4,7 @@ export const lookupEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/semantic-cache/lookup: a floor the caller cannot lower',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries', 'keys-and-expiry'],
   file: 'api',
   focus: ['client', 'cache', 'policy', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Fetcher calls: a deadline, bounded retries and a status policy',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['crawler', 'fetcher', 'hosts', 'redis'],
   task: `## Task

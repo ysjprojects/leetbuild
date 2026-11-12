@@ -4,6 +4,7 @@ export const invoiceEventsStep: Step = {
   id: 'events',
   title: 'Invoice events keyed by invoice with line digests',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task

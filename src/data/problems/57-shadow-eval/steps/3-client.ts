@@ -4,6 +4,7 @@ export const shadowClientStep: Step = {
   id: 'dependency',
   title: 'A candidate call that cannot hurt the production answer',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries'],
   file: 'client',
   focus: ['shadow', 'prodmodel', 'candidate', 'redis'],
   task: `## Task

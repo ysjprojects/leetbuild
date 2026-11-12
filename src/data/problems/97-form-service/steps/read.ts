@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET submissions and exports: owner only, redacted, cursor-paged, audited',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['admin', 'api', 'db', 'outbox'],
   task: `## Task

@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'flag.event: keyed by flag, after the commit, outbox on the delivery report',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'redis', 'kafka', 'consumer'],
   task: `## Task

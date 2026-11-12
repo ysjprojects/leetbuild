@@ -5,6 +5,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'The latest position per vehicle, decided in one Lua script',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

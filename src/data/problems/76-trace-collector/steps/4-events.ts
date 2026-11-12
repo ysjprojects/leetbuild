@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'trace.completed events keyed by service for the latency rollup',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['collector', 'kafka', 'rollup', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/bids: the exchange sets the deadline',
   concept: 'http',
+  guides: ['request-boundaries', 'deadlines-and-retries'],
   file: 'api',
   focus: ['exchange', 'api', 'features', 'scorer', 'redis'],
   task: `## Task

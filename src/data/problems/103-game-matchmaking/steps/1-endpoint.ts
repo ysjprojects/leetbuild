@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/matchmaking/tickets: one player, one open ticket',
   concept: 'http',
+  guides: ['request-boundaries', 'atomic-state'],
   file: 'api',
   focus: ['client', 'api', 'redis'],
   task: `## Task

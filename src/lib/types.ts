@@ -210,6 +210,25 @@ export interface Sequence {
   messages: SequenceMessage[];
 }
 
+/**
+ * The failure-mode guides the debugging courses share (`src/data/guides/`, each at `/guides/<id>`),
+ * in reading order: one way systems like these break, how to find it, fix it and prove the fix.
+ */
+export const GUIDE_IDS = [
+  'request-boundaries',
+  'idempotent-requests',
+  'atomic-state',
+  'keys-and-expiry',
+  'leases',
+  'deadlines-and-retries',
+  'failing-dependencies',
+  'producing-events',
+  'consuming-events',
+  'honest-reads',
+  'model-output',
+] as const;
+export type GuideId = (typeof GUIDE_IDS)[number];
+
 /** A step as the problem list, scores and badges know it, before its course is loaded (see `ProblemSummary`). */
 export interface StepSummary {
   id: string;
@@ -219,6 +238,11 @@ export interface StepSummary {
 }
 
 export interface Step extends StepSummary {
+  /**
+   * The failure-mode guides that explain what this step's starter gets wrong, most relevant first
+   * (`GUIDE_IDS`; every step of a debugging course names at least one). The step links to them.
+   */
+  guides?: GuideId[];
   /** snake_case stem of the file the learner edits (see `fileName`). */
   file: string;
   /** Task statement in the course markdown dialect (components/Kernels/Markdown.tsx); may embed `:::widget`. */

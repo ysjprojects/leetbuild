@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Stock movements keyed by sku, with a signed delta and an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'ledger', 'db'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Judge calls: a deadline, bounded retries, parked instead of passed',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies', 'model-output'],
   file: 'client',
   focus: ['api', 'judge', 'redis'],
   task: `## Task

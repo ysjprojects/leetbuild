@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'embed.ready: one event per stored document',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'redis', 'topic', 'outbox', 'indexer'],
   task: `## Task

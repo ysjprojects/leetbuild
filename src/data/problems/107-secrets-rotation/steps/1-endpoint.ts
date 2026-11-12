@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/secrets: a fingerprint goes out, the material stays in',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['ops', 'api', 'vault'],
   task: `## Task

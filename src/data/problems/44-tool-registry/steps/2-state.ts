@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'The catalog: immutable versions behind one pointer',
   concept: 'redis',
+  guides: ['model-output', 'atomic-state'],
   file: 'state',
   focus: ['registry', 'redis', 'client'],
   task: `## Task

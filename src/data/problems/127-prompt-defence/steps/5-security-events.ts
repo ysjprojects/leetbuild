@@ -4,6 +4,7 @@ export const securityEventsStep: Step = {
   id: 'security-events',
   title: 'Kafka: one event per decision, signatures counted per hour',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'security_events',
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Worker calls with retry classification and a poison limit',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['worker', 'effect', 'dlq', 'redis'],
   task: `## Task

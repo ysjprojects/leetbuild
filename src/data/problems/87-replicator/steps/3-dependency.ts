@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'ApplyChange over gRPC: a deadline, three attempts, one change id',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'consuming-events'],
   file: 'client',
   focus: ['api', 'target', 'redis'],
   task: `## Task

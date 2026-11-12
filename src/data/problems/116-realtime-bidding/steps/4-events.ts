@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Bid events keyed by auction, losses included, after the spend settles',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['exchange', 'api', 'redis', 'kafka', 'outbox'],
   task: `## Task

@@ -4,6 +4,7 @@ export const cacheReadStep: Step = {
   id: 'read',
   title: 'GET /v1/cache/stats: the numbers a rollout decision trusts',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'stats',
   focus: ['client', 'cache', 'consumer', 'redis'],
   task: `## Task

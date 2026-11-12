@@ -5,6 +5,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'A geofence check that times out, retries, and alerts once',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'geofence',
   focus: ['api', 'dispatch'],
   task: `## Task

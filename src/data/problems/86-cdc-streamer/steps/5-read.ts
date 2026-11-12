@@ -4,6 +4,7 @@ export const lagReadStep: Step = {
   id: 'read',
   title: 'GET /v1/subscriptions/{id}/lag: the lag an operator can page on',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'redis', 'pg'],
   task: `## Task

@@ -4,6 +4,7 @@ export const extractionCacheStep: Step = {
   id: 'extraction-cache',
   title: 'Redis: cache by content and taxonomy, atomic merchant budget, review leases',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry', 'leases'],
   file: 'extraction_cache',
   focus: ['catalogd', 'redis', 'llm'],
   task: `## Task

@@ -4,6 +4,7 @@ export const triageEventsStep: Step = {
   id: 'events',
   title: 'triage.decided keyed by tenant, recorded before it is committed',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['triage', 'kafka', 'consumer', 'db'],
   task: `## Task

@@ -4,6 +4,7 @@ export const processorClientStep: Step = {
   id: 'dependency',
   title: 'Processor calls with invoice-scoped idempotency',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['billing', 'processor'],
   task: `## Task

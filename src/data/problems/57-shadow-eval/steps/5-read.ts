@@ -4,6 +4,7 @@ export const shadowReadStep: Step = {
   id: 'read',
   title: 'GET /v1/shadow/configs/{id}/report: an interval before a verdict',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'shadow', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Auto-resolve: a granted safe class, a deadline, a person when in doubt',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'model-output', 'deadlines-and-retries'],
   file: 'client',
   focus: ['queue', 'enforcement', 'items'],
   task: `## Task

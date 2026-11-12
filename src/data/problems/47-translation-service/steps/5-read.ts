@@ -4,6 +4,7 @@ export const glossaryReadStep: Step = {
   id: 'read',
   title: "GET /v1/glossaries/{source}/{target}: one tenant's glossary, by version",
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'redis'],
   task: `## Task

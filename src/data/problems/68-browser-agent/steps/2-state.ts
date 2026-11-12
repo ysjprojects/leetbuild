@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'One atomic step transition with a lease that expires',
   concept: 'redis',
+  guides: ['leases', 'atomic-state'],
   file: 'state',
   focus: ['worker', 'redis'],
   task: `## Task

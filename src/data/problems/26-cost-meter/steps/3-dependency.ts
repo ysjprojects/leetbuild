@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Pricing: a deadline, a fresh fallback table, uncosted when unsure',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries'],
   file: 'client',
   focus: ['meter', 'pricing'],
   task: `## Task

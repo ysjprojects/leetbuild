@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Quota events keyed by team, with amounts not identities',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['broker', 'kafka', 'consumer', 'redis'],
   task: `## Task

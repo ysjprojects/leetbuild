@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis take: one reviewer per item, leases that end, an SLA that does not reset',
   concept: 'redis',
+  guides: ['leases', 'atomic-state'],
   file: 'state',
   focus: ['queue', 'redis', 'items'],
   task: `## Task

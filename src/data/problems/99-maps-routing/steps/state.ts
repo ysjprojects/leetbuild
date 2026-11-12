@@ -9,6 +9,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis route cache keyed by cell and traffic epoch',
   concept: 'redis',
+  guides: ['keys-and-expiry', 'failing-dependencies'],
   file: 'state',
   focus: ['api', 'redis', 'engine'],
   task: `## Task

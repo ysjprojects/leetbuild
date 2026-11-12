@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Search events keyed by tenant, with a digest instead of the vector',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['search', 'kafka', 'consumer'],
   task: `## Task

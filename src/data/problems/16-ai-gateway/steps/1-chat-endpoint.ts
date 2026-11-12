@@ -5,6 +5,7 @@ export const chatEndpointStep: Step = {
   id: 'chat-endpoint',
   title: 'POST /v1/chat: validate, call, account',
   concept: 'http',
+  guides: ['request-boundaries', 'deadlines-and-retries'],
   file: 'chat_api',
   focus: ['client', 'gateway', 'providers'],
   task: `## Task

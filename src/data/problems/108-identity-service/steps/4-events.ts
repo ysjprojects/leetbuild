@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Lifecycle events keyed by user, without contact data',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task

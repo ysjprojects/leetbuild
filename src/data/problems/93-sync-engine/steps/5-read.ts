@@ -3,6 +3,7 @@ import type {Step} from '@/lib/types';
 export const pullReadStep: Step = {
   id: 'read',
   concept: 'http',
+  guides: ['honest-reads'],
   file: 'read',
   title: 'GET /v1/sync/pull: a cursor that covers exactly the page',
   focus: ['device', 'sync', 'redis'],

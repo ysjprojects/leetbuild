@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Sandbox probes: a deadline, one retry, a shared kill switch',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'runner',
   focus: ['runner', 'sandbox', 'redis'],
   task: `## Task

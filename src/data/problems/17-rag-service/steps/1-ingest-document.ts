@@ -4,6 +4,7 @@ export const ingestDocumentStep: Step = {
   id: 'ingest-document',
   title: 'POST /v1/documents: one version, one event, one transaction',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests', 'producing-events'],
   file: 'ingest_api',
   focus: ['client', 'api', 'redis'],
   task: `## Task

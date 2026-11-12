@@ -4,6 +4,7 @@ export const redactionStateStep: Step = {
   id: 'state',
   title: 'A per-tenant hourly budget, reserved in one script',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['redactor', 'redis', 'detector'],
   task: `## Task

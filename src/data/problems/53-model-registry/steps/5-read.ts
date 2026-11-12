@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/models/{name}/versions/{v}: the eval record, attached',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries', 'model-output'],
   file: 'read',
   focus: ['client', 'registry', 'redis', 'eval', 'db'],
   task: `## Task

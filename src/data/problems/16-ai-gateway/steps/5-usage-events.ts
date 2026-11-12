@@ -5,6 +5,7 @@ export const usageEventsStep: Step = {
   id: 'usage-events',
   title: 'One usage event per request, billed once',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'usage_events',
   focus: ['gateway', 'usage', 'billing'],
   task: `## Task

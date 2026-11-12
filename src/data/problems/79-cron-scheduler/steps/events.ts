@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Run events keyed by schedule, every outcome included',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'redis', 'consumer'],
   task: `## Task

@@ -87,6 +87,11 @@ export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
             href="#problems">
             Browse courses ↓
           </a>
+          <Link
+            className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 text-[12px] font-semibold underline"
+            href="/guides">
+            Failure-mode guides
+          </Link>
         </div>
       </div>
     </section>

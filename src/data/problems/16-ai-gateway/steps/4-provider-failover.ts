@@ -5,6 +5,7 @@ export const providerFailoverStep: Step = {
   id: 'provider-failover',
   title: 'Failover: one fallback, bounded, idempotent',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'failover',
   focus: ['gateway', 'providers', 'budget'],
   task: `## Task

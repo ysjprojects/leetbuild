@@ -4,6 +4,7 @@ export const driftEventsStep: Step = {
   id: 'events',
   title: 'Drift events keyed by monitor for an auditable history',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['monitor', 'kafka', 'consumer'],
   task: `## Task

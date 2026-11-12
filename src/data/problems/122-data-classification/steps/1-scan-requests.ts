@@ -4,6 +4,7 @@ export const scanRequestsStep: Step = {
   id: 'scan-requests',
   title: 'schema.changed: one job per new schema, committed after the work',
   concept: 'kafka',
+  guides: ['consuming-events'],
   file: 'scan_intake',
   focus: ['platforms', 'schema', 'metasense', 'redis'],
   task: `## Task

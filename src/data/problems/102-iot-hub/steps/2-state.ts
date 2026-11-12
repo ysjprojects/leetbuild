@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis shadow with desired and reported versions kept apart',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['hub', 'redis', 'device'],
   task: `## Task

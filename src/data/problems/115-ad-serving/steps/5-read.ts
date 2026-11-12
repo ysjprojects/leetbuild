@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/campaigns/{id}/delivery: render counts and a projection',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['advertiser', 'server', 'redis', 'db'],
   task: `## Task

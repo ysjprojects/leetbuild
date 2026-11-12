@@ -4,6 +4,7 @@ export const monitorReportStep: Step = {
   id: 'read',
   title: 'GET /v1/monitors/{id}/report: significance, not just a number',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'monitor', 'redis'],
   task: `## Task

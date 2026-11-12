@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'Reads and renders: the eval of these bytes, values as text',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries', 'model-output'],
   file: 'read',
   focus: ['client', 'registry', 'redis'],
   task: `## Task

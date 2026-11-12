@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'price.changed events keyed by sku, with an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'db', 'kafka', 'relay'],
   task: `## Task

@@ -4,6 +4,7 @@ export const refundEventsStep: Step = {
   id: 'events',
   title: 'Refund events keyed by payment, after the PSP confirmed',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'psp', 'bus', 'outbox', 'sync'],
   task: `## Task

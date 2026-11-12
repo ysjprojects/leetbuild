@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/voice/sessions/{id}: a tenant-scoped transcript in pages',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'gateway', 'redis', 'transcripts'],
   task: `## Task

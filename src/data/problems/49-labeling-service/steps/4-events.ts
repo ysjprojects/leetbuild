@@ -4,6 +4,7 @@ export const labelEventsStep: Step = {
   id: 'events',
   title: 'Label events keyed by task, after the label is saved',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['service', 'redis', 'kafka', 'outbox'],
   task: `## Task

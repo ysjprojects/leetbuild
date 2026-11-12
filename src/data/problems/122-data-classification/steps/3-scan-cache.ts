@@ -4,6 +4,7 @@ export const scanCacheStep: Step = {
   id: 'scan-cache',
   title: 'Redis: results by schema hash, a daily budget reserved atomically, keys that expire',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'scan_cache',
   focus: ['metasense', 'redis', 'llm'],
   task: `## Task

@@ -12,10 +12,12 @@ import ThemeToggle from './ThemeToggle';
 import {renderWidget} from './widgets';
 
 /**
- * A course's learning guide on its own page: the concepts walked through with figures, interactive
- * demos and pop quizzes, a table of contents that follows the sections, and the static versions to
- * take away — the Markdown (figures as Mermaid, quizzes with the answer behind a spoiler) and a PDF
- * laid out for paper (lib/pdf.ts; figures as images, demos as notes, answers printed).
+ * A learning guide on its own page: a course's (`/<course>/learn`) or a failure-mode guide the
+ * debugging courses share (`/guides/<id>`, which ends with the steps to practise it on). The
+ * concepts walked through with figures, interactive demos and pop quizzes, a table of contents that
+ * follows the sections, and the static versions to take away: the Markdown (figures as Mermaid,
+ * quizzes with the answer behind a spoiler) and a PDF laid out for paper (lib/pdf.ts; figures as
+ * images, demos as notes, answers printed).
  */
 
 /** The guide's sections: every `#` heading outside fenced code, with the anchor the heading renders. */
@@ -31,6 +33,37 @@ const sectionsOf = (markdown: string): {title: string; id: string}[] => {
   }
   return out;
 };
+
+/** A failure-mode guide's last section: the steps whose starters hide the failure mode, to practise on, by course. */
+const Practice: FC<{practice: NonNullable<Guide['practice']>}> = memo(({practice}) => {
+  const steps = practice.reduce((n, course) => n + course.steps.length, 0);
+  return (
+    <section className="border-ink-700 mt-10 border-t pt-4">
+      <p className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">Practise it</p>
+      <p className="text-ink-300 mt-1 text-[13px] leading-6">
+        {steps} {steps === 1 ? 'step starts' : 'steps start'} from a starter that hides this failure mode, in{' '}
+        {practice.length} {practice.length === 1 ? 'course' : 'courses'}.
+      </p>
+      <ul className="mt-3 grid gap-x-8 gap-y-3 sm:grid-cols-2">
+        {practice.map(course => (
+          <li className="text-[13px] leading-5" key={course.course}>
+            <span className="text-ink-100 font-semibold">{course.course}</span>
+            <ul className="mt-0.5 space-y-0.5">
+              {course.steps.map(step => (
+                <li key={step.href}>
+                  <Link className={linkClass} href={step.href}>
+                    {step.title}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+});
+Practice.displayName = 'Practice';
 
 const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
   const sections = useMemo(() => sectionsOf(guide.learn), [guide.learn]);
@@ -52,13 +85,13 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
   }, [sections]);
 
   const onDownload = useCallback(() => {
-    downloadMarkdown(learnFileName(guide.problemId), learnToMarkdown(guide));
+    downloadMarkdown(learnFileName(guide.id), learnToMarkdown(guide));
   }, [guide]);
   // The PDF machinery (pdfmake, the figure rasterizer) loads only when someone asks for a PDF.
   const onPdf = useCallback(() => {
     setPreparing(true);
     import('@/lib/guidePdf')
-      .then(({downloadGuidePdf}) => downloadGuidePdf(guide, learnFileName(guide.problemId, 'pdf')))
+      .then(({downloadGuidePdf}) => downloadGuidePdf(guide, learnFileName(guide.id, 'pdf')))
       .catch((error: unknown) => {
         console.error(error);
       })
@@ -77,9 +110,9 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
       </header>
 
       <section className="mt-8">
-        {/* The one way back: the description is where the guide is opened from. */}
-        <Link className={`${ghostButtonClass} -ml-3`} href={`/${guide.problemId}`}>
-          ← back to the course
+        {/* The one way back: the course's description, or the guides' index, is where a guide is opened from. */}
+        <Link className={`${ghostButtonClass} -ml-3`} href={guide.back.href}>
+          ← {guide.back.label}
         </Link>
         <h1 className="text-ink-50 mt-1 text-3xl font-extrabold leading-tight tracking-tight">{guide.title}</h1>
         <p className="text-ink-300 mt-2 max-w-3xl text-[14px] leading-6">{guide.tagline}</p>
@@ -118,6 +151,7 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
         </nav>
         <article className="min-w-0 max-w-4xl">
           <Markdown highlight={leetbuildHighlighter} renderWidget={renderWidget} source={guide.learn} />
+          {guide.practice !== undefined && guide.practice.length > 0 ? <Practice practice={guide.practice} /> : null}
           {guide.sources.length > 0 ? (
             <section className="border-ink-700 mt-10 border-t pt-4">
               <p className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">Sources</p>

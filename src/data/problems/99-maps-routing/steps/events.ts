@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Route events keyed by region, without anyone’s coordinates',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer', 'store'],
   task: `## Task

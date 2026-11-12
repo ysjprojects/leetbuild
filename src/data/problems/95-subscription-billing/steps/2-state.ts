@@ -4,6 +4,7 @@ export const billingCursorStep: Step = {
   id: 'state',
   title: 'Redis run markers: one charge per subscription period',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['billing', 'redis', 'processor'],
   task: `## Task

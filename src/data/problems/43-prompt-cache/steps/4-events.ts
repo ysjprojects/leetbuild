@@ -4,6 +4,7 @@ export const cacheEventsStep: Step = {
   id: 'events',
   title: 'Decision events keyed by tenant, counted before the commit',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['cache', 'kafka', 'consumer', 'redis'],
   task: `## Task

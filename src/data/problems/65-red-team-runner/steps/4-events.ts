@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Findings on redteam.finding, keyed by target, with sealed evidence',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['runner', 'kafka', 'reviewer', 'redis'],
   task: `## Task

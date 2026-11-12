@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'A shard fan-out that says when a page is partial',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries'],
   file: 'shards',
   focus: ['api', 'shards'],
   task: `## Task

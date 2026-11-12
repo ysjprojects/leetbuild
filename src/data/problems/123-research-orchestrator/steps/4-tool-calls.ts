@@ -4,6 +4,7 @@ export const toolCallsStep: Step = {
   id: 'tool-calls',
   title: 'Tool calls: a deadline, bounded retries, untrusted text, literal citations',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'model-output'],
   file: 'tool_calls',
   focus: ['subagent', 'tools', 'citation'],
   task: `## Task

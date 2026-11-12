@@ -4,6 +4,7 @@ export const triageEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/tickets/triage: the caller does not pick its own queue',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'triage', 'rules', 'db'],
   task: `## Task

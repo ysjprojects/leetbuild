@@ -4,6 +4,7 @@ export const checkpointEndpointStep: Step = {
   id: 'endpoint',
   title: 'PUT a checkpoint chunk: each chunk at its own index',
   concept: 'http',
+  guides: ['idempotent-requests', 'atomic-state'],
   file: 'api',
   focus: ['client', 'api', 'redis'],
   task: `## Task

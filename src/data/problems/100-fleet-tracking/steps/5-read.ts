@@ -5,6 +5,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/fleets/{id}/positions: one instant, flagged, capped, paged',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'snapshot',
   focus: ['dispatcher', 'api', 'redis'],
   task: `## Task

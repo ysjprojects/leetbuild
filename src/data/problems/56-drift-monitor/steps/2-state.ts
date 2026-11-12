@@ -4,6 +4,7 @@ export const windowedSketchStep: Step = {
   id: 'state',
   title: 'Redis windowed sketches merged atomically',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['monitor', 'redis', 'baseline'],
   task: `## Task

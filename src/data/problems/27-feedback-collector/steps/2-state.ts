@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'One ballot per user and request, taken in one Redis command',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['collector', 'redis'],
   task: `## Task

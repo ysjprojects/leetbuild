@@ -3,6 +3,7 @@ import type {Step} from '@/lib/types';
 export const pushEndpointStep: Step = {
   id: 'endpoint',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   title: 'POST /v1/sync/push: each change against the revision it edited',
   focus: ['device', 'sync', 'redis'],

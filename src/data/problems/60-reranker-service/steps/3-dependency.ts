@@ -4,6 +4,7 @@ export const rerankClientStep: Step = {
   id: 'dependency',
   title: 'The reranker client: batches, a deadline, unscored is not a score',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['api', 'reranker'],
   task: `## Task

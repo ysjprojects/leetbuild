@@ -4,6 +4,7 @@ export const shadowEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/shadow/configs: a shadow that is observe-only',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'shadow', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const triageReadStep: Step = {
   id: 'read',
   title: 'GET /v1/queues/{id}/summary: figures a queue manager can act on',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'summary', 'db'],
   task: `## Task

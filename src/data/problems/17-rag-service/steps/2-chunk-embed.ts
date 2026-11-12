@@ -4,6 +4,7 @@ export const chunkEmbedStep: Step = {
   id: 'chunk-embed',
   title: 'Chunk and embed: stable ids, batches, a deadline, bounded retries',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'chunk_embed',
   focus: ['worker', 'embed', 'redis'],
   task: `## Task

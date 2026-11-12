@@ -4,6 +4,7 @@ export const monitorEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/monitors: monitors that observe something real',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'monitor', 'registry'],
   task: `## Task

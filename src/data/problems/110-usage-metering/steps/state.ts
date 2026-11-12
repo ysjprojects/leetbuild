@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis windowed counters with atomic add-and-flag',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry', 'idempotent-requests'],
   file: 'state',
   focus: ['api', 'redis', 'store'],
   task: `## Task

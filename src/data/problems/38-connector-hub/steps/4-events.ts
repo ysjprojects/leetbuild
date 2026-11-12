@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Sync events keyed by connector, with an outbox',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['hub', 'kafka', 'consumer', 'redis'],
   task: `## Task

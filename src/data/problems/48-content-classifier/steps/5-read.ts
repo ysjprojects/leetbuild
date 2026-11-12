@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/taxonomies/{id}: versioned reads with an audit trail',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'classifier', 'taxonomy'],
   task: `## Task

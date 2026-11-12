@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/tickets/{id}: a private timeline paged by keyset',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['requester', 'agent', 'api', 'store'],
   task: `## Task

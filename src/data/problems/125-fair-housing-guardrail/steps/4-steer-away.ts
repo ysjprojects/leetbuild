@@ -4,6 +4,7 @@ export const steerAwayStep: Step = {
   id: 'steer-away',
   title: 'POST /v1/turn: guard the question, regenerate once, return the fallback, escalate',
   concept: 'http',
+  guides: ['model-output', 'failing-dependencies'],
   file: 'steer_away',
   focus: ['guard', 'model', 'review', 'redis'],
   task: `## Task

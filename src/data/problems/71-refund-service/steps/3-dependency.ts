@@ -4,6 +4,7 @@ export const refundDependencyStep: Step = {
   id: 'dependency',
   title: 'PSP calls with a stable idempotency key',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['api', 'psp', 'records', 'ledger'],
   task: `## Task

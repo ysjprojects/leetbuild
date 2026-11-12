@@ -4,6 +4,7 @@ export const cacheEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/completions/cached: a key a tenant cannot cross',
   concept: 'http',
+  guides: ['request-boundaries', 'keys-and-expiry'],
   file: 'api',
   focus: ['client', 'cache', 'redis'],
   task: `## Task

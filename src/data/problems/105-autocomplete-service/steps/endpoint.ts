@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'GET /v1/autocomplete: a folded, bounded prefix and ten distinct suggestions',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['client', 'api', 'terms'],
   task: `## Task

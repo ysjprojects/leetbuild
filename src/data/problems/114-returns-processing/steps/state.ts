@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis returnable quantities with atomic decrements',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['api', 'redis', 'db'],
   task: `## Task

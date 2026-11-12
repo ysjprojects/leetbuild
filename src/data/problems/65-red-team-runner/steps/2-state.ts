@@ -28,6 +28,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis probe claims inside an hourly budget',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['runner', 'redis'],
   task: `## Task

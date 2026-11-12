@@ -4,6 +4,7 @@ export const invoiceDependencyStep: Step = {
   id: 'dependency',
   title: 'Tax calls that hold the invoice when unsure',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['api', 'tax', 'redis'],
   task: `## Task

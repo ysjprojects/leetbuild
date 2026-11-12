@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'gRPC EncodeSegment: the segment span, a scaled deadline, two attempts',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['api', 'worker', 'source'],
   task: `## Task

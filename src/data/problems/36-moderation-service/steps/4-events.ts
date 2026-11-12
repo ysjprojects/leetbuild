@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Moderation events keyed by content id, reporter stripped',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer', 'db'],
   task: `## Task

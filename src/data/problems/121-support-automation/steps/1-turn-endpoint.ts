@@ -4,6 +4,7 @@ export const turnEndpointStep: Step = {
   id: 'turn-endpoint',
   title: 'POST /v1/conversations/{id}/messages: verified role, capped, idempotent',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'turn_api',
   focus: ['client', 'api', 'db', 'workflow'],
   task: `## Task

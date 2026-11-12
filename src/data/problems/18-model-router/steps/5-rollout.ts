@@ -5,6 +5,7 @@ export const rolloutStep: Step = {
   id: 'rollout',
   title: 'Canary rollout: gated by evals, safe to roll back',
   concept: 'http',
+  guides: ['model-output', 'atomic-state', 'request-boundaries'],
   file: 'rollout',
   focus: ['client', 'router', 'redis', 'eval'],
   task: `## Task

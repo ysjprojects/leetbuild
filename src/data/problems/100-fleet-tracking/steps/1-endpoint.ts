@@ -5,6 +5,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/vehicles/positions: admit a batch, or none of it',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['device', 'api'],
   task: `## Task

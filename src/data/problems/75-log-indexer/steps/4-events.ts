@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'log.indexed after the shard commits, keyed by service',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['writer', 'shard', 'kafka'],
   task: `## Task

@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'replication.applied: one event per confirmed batch, keyed by shard',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task

@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis taxonomy cache and per-tenant counters',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'state',
   focus: ['classifier', 'redis', 'taxonomy'],
   task: `## Task

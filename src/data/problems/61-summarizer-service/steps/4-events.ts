@@ -4,6 +4,7 @@ export const summarizerEventsStep: Step = {
   id: 'events',
   title: 'summary.done: keyed by source hash, numbers only, after the record is saved',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'store', 'consumer'],
   task: `## Task

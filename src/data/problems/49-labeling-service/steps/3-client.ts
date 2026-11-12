@@ -4,6 +4,7 @@ export const prelabelClientStep: Step = {
   id: 'dependency',
   title: 'Pre-label calls that degrade to an unlabeled item',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['service', 'model'],
   task: `## Task

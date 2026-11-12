@@ -4,6 +4,7 @@ export const shadowStateStep: Step = {
   id: 'state',
   title: 'Redis admission: a kill switch read per request and a budget of its own',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['shadow', 'redis'],
   task: `## Task

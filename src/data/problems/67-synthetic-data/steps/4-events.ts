@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Admitted records on synthetic.record, keyed by recipe',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task

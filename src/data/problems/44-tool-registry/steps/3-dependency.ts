@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Sandbox validation before a catalog version goes live',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['registry', 'sandbox', 'vault', 'redis'],
   task: `## Task

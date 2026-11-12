@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis dedupe and per-tenant ingest quota',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry', 'idempotent-requests'],
   file: 'state',
   focus: ['ingest', 'redis'],
   task: `## Task

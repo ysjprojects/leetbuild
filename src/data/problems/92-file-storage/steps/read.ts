@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/files/{id}: a tenant-scoped link that expires and names who asked',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'reader', 'redis', 'audit'],
   task: `## Task

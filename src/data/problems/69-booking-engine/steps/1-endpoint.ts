@@ -4,6 +4,7 @@ export const bookingEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/bookings: a range that must be real and future',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'redis'],
   task: `## Task

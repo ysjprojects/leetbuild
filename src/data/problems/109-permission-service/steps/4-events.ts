@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Permission events keyed by subject, relayed from the outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'outbox', 'kafka', 'projector', 'redis'],
   task: `## Task

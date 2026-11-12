@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/semantic-cache/{tenant}/stats: a hit rate with its context',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'cache', 'stats', 'redis'],
   task: `## Task

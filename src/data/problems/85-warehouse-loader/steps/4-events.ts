@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Load events keyed by table, completed once',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'outbox'],
   task: `## Task

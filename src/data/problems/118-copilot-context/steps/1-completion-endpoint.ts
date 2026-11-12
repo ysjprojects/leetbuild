@@ -4,6 +4,7 @@ export const completionEndpointStep: Step = {
   id: 'completion-endpoint',
   title: 'POST /v1/completions: a prompt that fits the window',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'completion_api',
   focus: ['editor', 'api'],
   task: `## Task

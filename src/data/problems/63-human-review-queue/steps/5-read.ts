@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/review/queues/{tenant}/{priority}: numbers an operator can staff from',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['console', 'queue', 'redis'],
   task: `## Task

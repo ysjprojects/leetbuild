@@ -4,6 +4,7 @@ export const classifierTiersStep: Step = {
   id: 'classifier-tiers',
   title: 'The tiers: stop list, classifier under a deadline, judge for the band, fail closed',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies', 'model-output'],
   file: 'classify_tiers',
   focus: ['guard', 'classifier', 'judge'],
   task: `## Task

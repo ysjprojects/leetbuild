@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'A GPU pool per tenant: one script to admit, a lease, an owner to release',
   concept: 'redis',
+  guides: ['leases', 'atomic-state'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

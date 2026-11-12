@@ -4,6 +4,7 @@ export const taskEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/tasks: a labeling task pinned to a spec',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'service', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Start the workload: a deadline, a health gate, a rollback',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['scheduler', 'agent', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const keyLimitsStep: Step = {
   id: 'key-limits',
   title: 'Per-key rate limit: one atomic window before any cost',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'rate_limit',
   focus: ['aifw', 'redis', 'guard'],
   task: `## Task

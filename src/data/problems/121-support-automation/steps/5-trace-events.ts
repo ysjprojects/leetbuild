@@ -4,6 +4,7 @@ export const traceEventsStep: Step = {
   id: 'trace-events',
   title: 'assistant.trace: one span per call, keyed by conversation, without the text',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'trace_events',
   focus: ['workflow', 'kafka', 'consumer', 'redis', 'db'],
   task: `## Task

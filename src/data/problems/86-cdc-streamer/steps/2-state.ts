@@ -4,6 +4,7 @@ export const lsnCursorStep: Step = {
   id: 'state',
   title: 'A Redis LSN cursor per table that only moves forward',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['redis', 'replicator', 'sink'],
   task: `## Task

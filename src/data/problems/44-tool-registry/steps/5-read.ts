@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: "GET /v1/tools/{name}: resolution against the caller's pin and allowlist",
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'registry', 'redis'],
   task: `## Task

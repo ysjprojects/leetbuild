@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Impression events keyed by campaign, counted at render',
   concept: 'kafka',
+  guides: ['producing-events', 'idempotent-requests'],
   file: 'events',
   focus: ['server', 'kafka', 'counter', 'redis'],
   task: `## Task

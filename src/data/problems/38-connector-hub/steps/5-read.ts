@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/connectors/{id}/health: lag measured from the last page that landed',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'hub', 'redis', 'db'],
   task: `## Task

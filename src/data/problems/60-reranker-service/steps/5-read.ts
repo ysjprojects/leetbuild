@@ -4,6 +4,7 @@ export const readStatsStep: Step = {
   id: 'read',
   title: 'GET /v1/rerank/cache/stats: per model version, at the boundaries',
   concept: 'http',
+  guides: ['honest-reads'],
   file: 'read',
   focus: ['client', 'api', 'redis', 'consumer'],
   task: `## Task

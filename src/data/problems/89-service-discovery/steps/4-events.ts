@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Membership events keyed by service, published on the real expiry',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['discovery', 'kafka', 'consumer', 'reaper'],
   task: `## Task

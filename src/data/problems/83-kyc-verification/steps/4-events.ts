@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Decision events keyed by applicant with document digests',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'db', 'kafka'],
   task: `## Task

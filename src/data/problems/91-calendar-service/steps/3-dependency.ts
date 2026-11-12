@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Attendee notifications: one token per change, one kind per attendee',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'idempotent-requests'],
   file: 'client',
   focus: ['api', 'notifier'],
   task: `## Task

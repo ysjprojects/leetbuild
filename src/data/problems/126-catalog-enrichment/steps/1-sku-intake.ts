@@ -4,6 +4,7 @@ export const skuIntakeStep: Step = {
   id: 'sku-intake',
   title: 'sku.upserted: validate, content-hash, enqueue, then commit',
   concept: 'kafka',
+  guides: ['consuming-events', 'producing-events'],
   file: 'sku_intake',
   focus: ['feed', 'upserted', 'catalogd', 'redis', 'extract'],
   task: `## Task

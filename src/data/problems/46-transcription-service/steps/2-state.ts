@@ -4,6 +4,7 @@ export const transcriptionStateStep: Step = {
   id: 'state',
   title: 'A Redis chunk ledger that claims each chunk once',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['worker', 'redis', 'db'],
   task: `## Task

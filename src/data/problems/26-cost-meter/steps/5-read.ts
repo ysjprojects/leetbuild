@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/tenants/{tenant}/spend: the number the limiter enforces',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'meter', 'redis', 'limiter'],
   task: `## Task

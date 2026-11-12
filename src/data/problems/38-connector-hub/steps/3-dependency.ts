@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Vendor fetches with a deadline, backoff and a breaker',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['hub', 'vendor', 'oauth', 'redis'],
   task: `## Task

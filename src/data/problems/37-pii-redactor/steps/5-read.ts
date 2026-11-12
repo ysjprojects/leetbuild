@@ -4,6 +4,7 @@ export const readRedactionStep: Step = {
   id: 'read',
   title: 'GET /v1/documents/{id}/redaction: spans for the owner, no text',
   concept: 'http',
+  guides: ['request-boundaries', 'honest-reads'],
   file: 'read',
   focus: ['client', 'redactor', 'redis'],
   task: `## Task

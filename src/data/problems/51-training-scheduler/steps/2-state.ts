@@ -4,6 +4,7 @@ export const trainingStateStep: Step = {
   id: 'state',
   title: 'Redis queue positions and leased starts',
   concept: 'redis',
+  guides: ['leases', 'atomic-state'],
   file: 'state',
   focus: ['scheduler', 'redis', 'worker'],
   task: `## Task

@@ -6,6 +6,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'A Redis buffer per index, capped and drained by scripts',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['api', 'redis', 'writer'],
   task: `## Task

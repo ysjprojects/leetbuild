@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Rollup events: after the shard accepted, keyed by series, with an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['shards', 'kafka'],
   task: `## Task

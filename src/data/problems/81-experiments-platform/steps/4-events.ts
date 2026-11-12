@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Exposure events: once per unit, keyed by experiment',
   concept: 'kafka',
+  guides: ['consuming-events', 'producing-events'],
   file: 'events',
   focus: ['api', 'redis', 'kafka', 'consumer'],
   task: `## Task

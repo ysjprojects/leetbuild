@@ -4,6 +4,7 @@ export const policyCacheStep: Step = {
   id: 'policy-cache',
   title: 'Redis: versioned policy with an atomic publish, decision cache, expiring strikes',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'policy_cache',
   focus: ['guard', 'redis', 'policy'],
   task: `## Task

@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/bidders/{id}/stats: timeouts and spend on the same page as wins',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['dashboard', 'api', 'redis', 'consumer'],
   task: `## Task

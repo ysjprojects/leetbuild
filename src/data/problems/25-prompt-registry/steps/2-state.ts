@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'The live pointer: promote and roll back in one script',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['registry', 'redis'],
   task: `## Task

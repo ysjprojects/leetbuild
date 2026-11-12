@@ -4,6 +4,7 @@ export const neighboringTabsStep: Step = {
   id: 'neighboring-tabs',
   title: 'Neighboring tabs: per-session snippets, a low bar, one round trip',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'tab_snippets',
   focus: ['api', 'redis'],
   task: `## Task

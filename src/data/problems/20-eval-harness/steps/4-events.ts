@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'eval.sample: one event per scored sample, keyed by run',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'warehouse', 'redis'],
   task: `## Task

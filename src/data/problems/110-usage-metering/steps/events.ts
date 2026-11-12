@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Rollup events keyed by account, after the count',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'redis', 'kafka', 'analytics'],
   task: `## Task

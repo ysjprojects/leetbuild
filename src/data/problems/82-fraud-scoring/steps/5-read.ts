@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/cases/{id}: review without oversharing',
   concept: 'http',
+  guides: ['request-boundaries', 'honest-reads'],
   file: 'read',
   focus: ['reviewer', 'scorer', 'redis', 'audit'],
   task: `## Task

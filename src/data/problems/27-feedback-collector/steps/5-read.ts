@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET satisfaction: a recent window, a sample floor and a 60-second cache',
   concept: 'http',
+  guides: ['honest-reads', 'keys-and-expiry'],
   file: 'read',
   focus: ['client', 'collector', 'redis'],
   task: `## Task

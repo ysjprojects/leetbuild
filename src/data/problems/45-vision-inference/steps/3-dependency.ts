@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Model calls on a GPU slot: a deadline, bounded retries, a recorded downgrade',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies', 'leases'],
   file: 'client',
   focus: ['api', 'large', 'small', 'redis'],
   task: `## Task

@@ -4,6 +4,7 @@ export const publishEnrichedStep: Step = {
   id: 'publish-enriched',
   title: 'sku.enriched: idempotent produce, outbox, index before commit, human wins',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'enriched_events',
   focus: ['catalogd', 'enriched', 'indexer', 'search'],
   task: `## Task

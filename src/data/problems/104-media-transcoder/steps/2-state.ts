@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis segment claims with a lease, done after encode, a gapless manifest',
   concept: 'redis',
+  guides: ['atomic-state', 'leases', 'consuming-events'],
   file: 'state',
   focus: ['api', 'redis', 'worker'],
   task: `## Task

@@ -4,6 +4,7 @@ export const reviewEndpointStep: Step = {
   id: 'review-endpoint',
   title: 'POST /v1/skus/{sku_id}/review: role, lease, idempotency, versioned labels',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests', 'leases'],
   file: 'review_api',
   focus: ['reviewer', 'catalogd', 'redis', 'enriched'],
   task: `## Task

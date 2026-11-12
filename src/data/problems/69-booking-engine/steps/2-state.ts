@@ -4,6 +4,7 @@ export const bookingStateStep: Step = {
   id: 'state',
   title: 'Redis hold map with one atomic transition',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry', 'leases'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

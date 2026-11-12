@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis permission cache invalidated by a version bump',
   concept: 'redis',
+  guides: ['honest-reads', 'atomic-state'],
   file: 'state',
   focus: ['api', 'redis', 'store'],
   task: `## Task

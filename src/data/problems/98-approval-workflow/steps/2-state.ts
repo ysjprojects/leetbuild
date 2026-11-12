@@ -6,6 +6,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis approval state with one compare-and-swap per decision',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

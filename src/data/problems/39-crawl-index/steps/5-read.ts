@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/crawl/jobs/{job_id}: a live report that says when a crawl stalls',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'crawler', 'registry', 'redis'],
   task: `## Task

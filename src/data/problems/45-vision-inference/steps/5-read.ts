@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: "GET /v1/inferences/{id}: the tenant's own result, pending or expired said out loud",
   concept: 'http',
+  guides: ['request-boundaries', 'honest-reads'],
   file: 'read',
   focus: ['client', 'api', 'redis'],
   task: `## Task

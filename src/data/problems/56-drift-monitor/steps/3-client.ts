@@ -4,6 +4,7 @@ export const alertClientStep: Step = {
   id: 'dependency',
   title: 'Alerting calls that page once and carry their evidence',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'leases'],
   file: 'client',
   focus: ['monitor', 'alerting', 'evaluator'],
   task: `## Task

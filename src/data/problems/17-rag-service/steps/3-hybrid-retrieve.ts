@@ -4,6 +4,7 @@ export const hybridRetrieveStep: Step = {
   id: 'hybrid-retrieve',
   title: 'Hybrid retrieval: a tenant prefilter, RRF, offsets, a per-tenant cache',
   concept: 'redis',
+  guides: ['honest-reads', 'keys-and-expiry'],
   file: 'retrieve',
   focus: ['api', 'redis'],
   task: `## Task

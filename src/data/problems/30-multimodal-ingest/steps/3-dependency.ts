@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Vision captions under a deadline, degraded when they fail',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries'],
   file: 'client',
   focus: ['ingest', 'vision', 'objects', 'redis'],
   task: `## Task

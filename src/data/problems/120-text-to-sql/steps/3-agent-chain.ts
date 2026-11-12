@@ -4,6 +4,7 @@ export const agentChainStep: Step = {
   id: 'agent-chain',
   title: 'Agent chain: deadlines, column pruning, parsed output',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'model-output'],
   file: 'agent_chain',
   focus: ['api', 'agents', 'workspaces'],
   task: `## Task

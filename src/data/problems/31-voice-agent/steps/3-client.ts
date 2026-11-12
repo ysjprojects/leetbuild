@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'A Synthesize stream that stops on barge-in and resumes instead of replaying',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['gateway', 'tts', 'redis'],
   task: `## Task

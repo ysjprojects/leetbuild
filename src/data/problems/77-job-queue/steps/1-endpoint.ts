@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/jobs: enqueue with a dedupe key that means something',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests', 'atomic-state'],
   file: 'api',
   focus: ['client', 'api', 'registry', 'redis'],
   task: `## Task

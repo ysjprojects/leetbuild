@@ -4,6 +4,7 @@ export const summarizerReadStep: Step = {
   id: 'read',
   title: 'GET /v1/summaries/{id}: scoped to the tenant, citations that know when they are stale',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries', 'model-output'],
   file: 'read',
   focus: ['client', 'api', 'store'],
   task: `## Task

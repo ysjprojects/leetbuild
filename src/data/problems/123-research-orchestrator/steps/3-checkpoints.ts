@@ -4,6 +4,7 @@ export const checkpointsStep: Step = {
   id: 'checkpoints',
   title: 'Checkpoints in Redis: resume a crashed lead, reserve tool calls atomically',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'checkpoints',
   focus: ['lead', 'redis'],
   task: `## Task

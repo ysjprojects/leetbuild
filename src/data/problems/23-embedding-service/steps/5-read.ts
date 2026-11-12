@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/embeddings/{content_hash}: the tenant’s vector, under the model asked for',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['indexer', 'api', 'redis'],
   task: `## Task

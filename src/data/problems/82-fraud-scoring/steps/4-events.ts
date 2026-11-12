@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Score events keyed by account, counted before the commit',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['scorer', 'kafka', 'consumer', 'redis'],
   task: `## Task

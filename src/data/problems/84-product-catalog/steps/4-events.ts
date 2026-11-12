@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Catalog events keyed by product for storefront sync',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task

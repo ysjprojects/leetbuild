@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Impression events keyed by user, with positions and an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'analytics'],
   task: `## Task

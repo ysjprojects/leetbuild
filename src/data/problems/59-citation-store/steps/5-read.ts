@@ -4,6 +4,7 @@ export const readCitationsStep: Step = {
   id: 'read',
   title: 'GET /v1/citations/{id}: an answer that names its evidence',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries', 'model-output'],
   file: 'read',
   focus: ['client', 'api', 'db'],
   task: `## Task

@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Asset events keyed by asset, with no way to the bytes',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['ingest', 'indexer', 'kafka', 'consumer'],
   task: `## Task

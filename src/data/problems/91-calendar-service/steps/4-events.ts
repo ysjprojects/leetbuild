@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'A calendar-keyed change stream, published after the commit',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'redis', 'kafka', 'sync'],
   task: `## Task

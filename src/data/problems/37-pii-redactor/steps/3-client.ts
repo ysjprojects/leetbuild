@@ -4,6 +4,7 @@ export const detectorClientStep: Step = {
   id: 'dependency',
   title: 'The detector client: a deadline, two attempts, a fallback that says so',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries'],
   file: 'client',
   focus: ['redactor', 'detector', 'regex'],
   task: `## Task

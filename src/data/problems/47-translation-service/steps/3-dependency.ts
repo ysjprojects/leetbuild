@@ -4,6 +4,7 @@ export const mtClientStep: Step = {
   id: 'dependency',
   title: 'MT calls with a deadline and a marked fallback',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'client',
   focus: ['api', 'mt', 'redis'],
   task: `## Task

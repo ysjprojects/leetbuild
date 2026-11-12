@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'The kill switch: commit, then push under a deadline',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies'],
   file: 'kill',
   focus: ['api', 'relay', 'redis', 'sdk'],
   task: `## Task

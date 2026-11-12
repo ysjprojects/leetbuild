@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'The window hash: one script, integer micro-dollars, an hour of grace',
   concept: 'redis',
+  guides: ['keys-and-expiry', 'atomic-state'],
   file: 'state',
   focus: ['meter', 'redis', 'limiter'],
   task: `## Task

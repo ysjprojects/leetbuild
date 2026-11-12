@@ -4,6 +4,7 @@ export const slotReadStep: Step = {
   id: 'dependency',
   title: 'Slot reads under a deadline, with no batch skipped',
   concept: 'grpc',
+  guides: ['consuming-events', 'deadlines-and-retries'],
   file: 'client',
   focus: ['replicator', 'pg', 'redis', 'kafka'],
   task: `## Task

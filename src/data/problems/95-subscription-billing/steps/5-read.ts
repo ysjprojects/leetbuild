@@ -4,6 +4,7 @@ export const invoiceLedgerStep: Step = {
   id: 'read',
   title: 'GET /v1/subscriptions/{id}/invoices: a ledger that ties out',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'billing', 'db', 'processor'],
   task: `## Task

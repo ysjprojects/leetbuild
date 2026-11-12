@@ -4,6 +4,7 @@ export const summarizerEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/summaries: a byte cap, a band the text cannot pick, one summary per key',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'api',
   focus: ['client', 'api', 'rules', 'store'],
   task: `## Task

@@ -3,6 +3,7 @@ import type {Step} from '@/lib/types';
 export const mergeClientStep: Step = {
   id: 'dependency',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   title: 'Three-way merges over gRPC that keep both edits when they fail',
   focus: ['sync', 'merger', 'redis'],

@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Kafka transcode.event: job-keyed, completion after the job is final, signed references',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer', 'output'],
   task: `## Task

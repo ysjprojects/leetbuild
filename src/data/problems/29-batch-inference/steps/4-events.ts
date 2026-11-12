@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Shard events on batch.shard and a coordinator that folds once',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['worker', 'store', 'kafka', 'coordinator', 'redis'],
   task: `## Task

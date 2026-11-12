@@ -4,6 +4,7 @@ export const invoiceReadStep: Step = {
   id: 'read',
   title: "GET /v1/invoices/{id}: the issuer's copy and the customer's copy",
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['client', 'api', 'auditor'],
   task: `## Task

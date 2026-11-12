@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Shipment events keyed by shipment, after the commit, without the address',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'redis', 'kafka', 'projection'],
   task: `## Task

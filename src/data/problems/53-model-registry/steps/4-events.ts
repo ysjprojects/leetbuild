@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Model events keyed by model name, committed first',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['registry', 'kafka', 'db'],
   task: `## Task

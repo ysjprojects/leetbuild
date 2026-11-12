@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Warehouse confirmation: a deadline, one id per reservation, a hold kept on silence',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['api', 'warehouse', 'redis'],
   task: `## Task

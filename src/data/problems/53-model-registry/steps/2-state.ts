@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis stages and the active pointer in one atomic swap',
   concept: 'redis',
+  guides: ['atomic-state', 'model-output'],
   file: 'state',
   focus: ['registry', 'redis'],
   task: `## Task

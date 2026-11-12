@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis feature cache with a single-flight refresh',
   concept: 'redis',
+  guides: ['keys-and-expiry', 'leases', 'failing-dependencies'],
   file: 'state',
   focus: ['api', 'redis', 'features'],
   task: `## Task

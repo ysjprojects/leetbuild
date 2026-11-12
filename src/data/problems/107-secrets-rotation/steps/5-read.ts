@@ -4,6 +4,7 @@ export const readStep: Step = {
   id: 'read',
   title: 'GET /v1/secrets/{name}/versions: metadata, health and acceptance',
   concept: 'http',
+  guides: ['honest-reads', 'request-boundaries'],
   file: 'read',
   focus: ['ops', 'api', 'vault'],
   task: `## Task

@@ -4,6 +4,7 @@ export const invoiceStateStep: Step = {
   id: 'state',
   title: 'Redis gapless numbering with atomic claim',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['api', 'redis', 'db'],
   task: `## Task

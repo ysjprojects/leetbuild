@@ -4,6 +4,7 @@ export const localeEventsStep: Step = {
   id: 'events',
   title: 'translation.done events keyed by locale pair, counted before the commit',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task

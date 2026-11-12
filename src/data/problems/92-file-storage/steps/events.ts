@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'File events keyed by file id, after the change, without the filename',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task

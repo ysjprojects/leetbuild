@@ -4,6 +4,7 @@ export const transcriptionEventsStep: Step = {
   id: 'events',
   title: 'Transcript segments keyed by job, redacted before they are published',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['worker', 'redactor', 'kafka', 'db'],
   task: `## Task

@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/models: a version with checked lineage',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests', 'model-output'],
   file: 'api',
   focus: ['client', 'registry', 'db', 'eval'],
   task: `## Task

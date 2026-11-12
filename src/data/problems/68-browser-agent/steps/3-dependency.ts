@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Driver calls with deadlines, verified clicks and every hop authorized',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'request-boundaries'],
   file: 'client',
   focus: ['worker', 'driver', 'profile'],
   task: `## Task

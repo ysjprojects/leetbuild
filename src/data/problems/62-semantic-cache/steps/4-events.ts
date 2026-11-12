@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Result events keyed by tenant, with an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['cache', 'kafka', 'stats', 'redis'],
   task: `## Task

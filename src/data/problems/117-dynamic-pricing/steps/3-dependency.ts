@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Demand model calls with a last-approved fallback',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies', 'model-output'],
   file: 'client',
   focus: ['api', 'demand', 'redis', 'db'],
   task: `## Task

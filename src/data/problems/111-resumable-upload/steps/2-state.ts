@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'A Redis part manifest that registers each part once',
   concept: 'redis',
+  guides: ['atomic-state', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

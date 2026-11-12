@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'The node ledger: one script books, one script releases',
   concept: 'redis',
+  guides: ['atomic-state', 'leases'],
   file: 'state',
   focus: ['scheduler', 'redis'],
   task: `## Task

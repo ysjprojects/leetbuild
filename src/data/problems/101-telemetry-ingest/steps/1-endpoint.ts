@@ -4,6 +4,7 @@ export const endpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/telemetry: registry devices, declared metrics, sane values',
   concept: 'http',
+  guides: ['request-boundaries'],
   file: 'api',
   focus: ['device', 'ingest', 'registry'],
   task: `## Task

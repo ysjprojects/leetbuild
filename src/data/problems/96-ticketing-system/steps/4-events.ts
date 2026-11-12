@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Ticket events keyed by ticket, produced after the commit',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'store', 'kafka'],
   task: `## Task

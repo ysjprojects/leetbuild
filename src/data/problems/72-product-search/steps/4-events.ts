@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'search.event: keyed by tenant, without what the shopper typed',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'telemetry',
   focus: ['api', 'kafka', 'analytics'],
   task: `## Task

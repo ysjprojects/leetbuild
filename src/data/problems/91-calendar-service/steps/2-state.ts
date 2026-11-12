@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'A generation-stamped expansion cache in Redis',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

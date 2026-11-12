@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'suggest.event: keyed by tenant, a prefix hash, an outbox on failed delivery',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'outbox', 'consumer'],
   task: `## Task

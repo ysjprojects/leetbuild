@@ -4,6 +4,7 @@ export const citationStateStep: Step = {
   id: 'state',
   title: 'Redis span cache with version-scoped keys',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis', 'db'],
   task: `## Task

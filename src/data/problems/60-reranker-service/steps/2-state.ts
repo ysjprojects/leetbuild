@@ -4,6 +4,7 @@ export const rerankStateStep: Step = {
   id: 'state',
   title: 'A Redis score cache keyed by query, passage and model version',
   concept: 'redis',
+  guides: ['keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis', 'reranker'],
   task: `## Task

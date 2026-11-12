@@ -4,6 +4,7 @@ export const assistEndpointStep: Step = {
   id: 'assist-endpoint',
   title: 'POST /v1/assist: the shop and its permissions come from the server',
   concept: 'http',
+  guides: ['request-boundaries', 'idempotent-requests'],
   file: 'assist_api',
   focus: ['merchant', 'api', 'turns'],
   task: `## Task

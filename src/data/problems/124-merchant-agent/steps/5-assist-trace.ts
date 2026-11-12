@@ -4,6 +4,7 @@ export const assistTraceStep: Step = {
   id: 'assist-trace',
   title: 'assist.trace: shop key, no merchant data, outbox, insert before commit',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'assist_trace',
   focus: ['api', 'kafka', 'builder', 'gtx'],
   task: `## Task

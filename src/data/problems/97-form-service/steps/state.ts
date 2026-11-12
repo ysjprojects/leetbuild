@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis: a one-time captcha and a limit on form and address',
   concept: 'redis',
+  guides: ['keys-and-expiry', 'atomic-state'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

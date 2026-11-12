@@ -4,6 +4,7 @@ export const resolutionClientStep: Step = {
   id: 'dependency',
   title: 'Entity resolution over gRPC: a timeout parks, it does not decide',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'failing-dependencies', 'model-output'],
   file: 'client',
   focus: ['api', 'resolver', 'review'],
   task: `## Task

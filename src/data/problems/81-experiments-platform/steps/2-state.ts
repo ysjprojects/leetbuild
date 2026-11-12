@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Sticky assignments in Redis, one per experiment and unit',
   concept: 'redis',
+  guides: ['atomic-state'],
   file: 'state',
   focus: ['api', 'redis', 'store'],
   task: `## Task

@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'Windowed rollups keyed by device, with an outbox',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['ingest', 'kafka', 'rollup', 'redis'],
   task: `## Task

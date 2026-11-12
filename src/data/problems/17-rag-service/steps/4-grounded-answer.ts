@@ -4,6 +4,7 @@ export const groundedAnswerStep: Step = {
   id: 'grounded-answer',
   title: 'POST /v1/answer: retrieved text is data, quotes are checked',
   concept: 'http',
+  guides: ['model-output'],
   file: 'answer_api',
   focus: ['client', 'api', 'llm'],
   task: `## Task

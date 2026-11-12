@@ -4,6 +4,7 @@ export const extractAttributesStep: Step = {
   id: 'extract-attributes',
   title: 'Extract: retrieval first, a schema, taxonomy validation, confidence gate',
   concept: 'grpc',
+  guides: ['model-output', 'deadlines-and-retries'],
   file: 'extract_attributes',
   focus: ['catalogd', 'taxonomy', 'llm'],
   task: `## Task

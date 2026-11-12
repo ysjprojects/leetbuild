@@ -4,6 +4,7 @@ export const dependencyStep: Step = {
   id: 'dependency',
   title: 'Guardrail checks before every ramp',
   concept: 'grpc',
+  guides: ['failing-dependencies', 'deadlines-and-retries', 'request-boundaries'],
   file: 'ramp',
   focus: ['api', 'stats'],
   task: `## Task

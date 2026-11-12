@@ -30,6 +30,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis queue claims with a lease that expires',
   concept: 'redis',
+  guides: ['leases', 'atomic-state'],
   file: 'state',
   focus: ['api', 'redis', 'console'],
   task: `## Task

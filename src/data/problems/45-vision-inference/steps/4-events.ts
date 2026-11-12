@@ -4,6 +4,7 @@ export const eventsStep: Step = {
   id: 'events',
   title: 'vision.inference events keyed by model version, with a digest and no image',
   concept: 'kafka',
+  guides: ['producing-events'],
   file: 'events',
   focus: ['api', 'kafka', 'quality', 'redis'],
   task: `## Task

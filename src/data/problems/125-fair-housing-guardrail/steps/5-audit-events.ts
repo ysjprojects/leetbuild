@@ -4,6 +4,7 @@ export const auditEventsStep: Step = {
   id: 'audit-events',
   title: 'fairhousing.audit: keyed by conversation, a text hash, an outbox, append before commit',
   concept: 'kafka',
+  guides: ['producing-events', 'consuming-events'],
   file: 'audit_events',
   focus: ['guard', 'kafka', 'consumer', 'audit'],
   task: `## Task

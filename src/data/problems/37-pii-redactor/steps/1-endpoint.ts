@@ -4,6 +4,7 @@ export const redactEndpointStep: Step = {
   id: 'endpoint',
   title: 'POST /v1/redact: fail closed, echo nothing',
   concept: 'http',
+  guides: ['request-boundaries', 'failing-dependencies'],
   file: 'api',
   focus: ['client', 'redactor', 'detector'],
   task: `## Task

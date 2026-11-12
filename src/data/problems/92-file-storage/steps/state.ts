@@ -4,6 +4,7 @@ export const stateStep: Step = {
   id: 'state',
   title: 'Redis upload sessions: one reservation, counted once, released once',
   concept: 'redis',
+  guides: ['atomic-state', 'idempotent-requests', 'keys-and-expiry'],
   file: 'state',
   focus: ['api', 'redis'],
   task: `## Task

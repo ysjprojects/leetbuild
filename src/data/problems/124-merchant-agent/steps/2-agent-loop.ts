@@ -4,6 +4,7 @@ export const agentLoopStep: Step = {
   id: 'agent-loop',
   title: 'The agentic loop: just-in-time instructions, bounded turns',
   concept: 'grpc',
+  guides: ['deadlines-and-retries', 'model-output'],
   file: 'agent_loop',
   focus: ['api', 'model', 'tools'],
   task: `## Task

@@ -4,6 +4,7 @@ export const transcriptionDependencyStep: Step = {
   id: 'dependency',
   title: 'ASR streams that resume a chunk instead of restarting the file',
   concept: 'grpc',
+  guides: ['deadlines-and-retries'],
   file: 'client',
   focus: ['worker', 'asr', 'redis'],
   task: `## Task
