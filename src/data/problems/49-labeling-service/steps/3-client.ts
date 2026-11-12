@@ -229,8 +229,7 @@ export async function prelabelItem(itemId: string, text: string, specVersion: st
       return {item_id: itemId, status: 'prelabeled', labels: [...reply.labels], error: ''};
     } catch (e) {
       const {code, details} = e as grpc.ServiceError;
-      const name = Object.keys(grpc.status).find(key => grpc.status[key as keyof typeof grpc.status] === code) ?? String(code);
-      error = \`\${name}: \${details}\`;
+      error = \`\${grpc.status[code]}: \${details}\`;
       if (!RETRYABLE.has(code)) break; // a refusal answers the same way every time
     }
   }

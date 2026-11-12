@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package metasensed;
+
+// The LLM gateway step 2 calls: one Classify per batch of at most 150 columns. The gateway builds the
+// prompt from the entity, the column names and the tag library, and answers the model's raw output in
+// content: a JSON array of {"column_name", "assigned_tag"}, which nothing has checked yet. The harness
+// serves a deterministic stand-in at llm-gateway:9000.
+service Classifier {
+  rpc Classify(ClassifyRequest) returns (ClassifyReply);
+}
+
+message ClassifyRequest {
+  string entity = 1;
+  repeated string columns = 2;
+  repeated string tag_library = 3;
+}
+
+message ClassifyReply {
+  string content = 1;
+  string model = 2;
+}

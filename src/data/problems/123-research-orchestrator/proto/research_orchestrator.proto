@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package researchd;
+
+// A subagent: one task of the lead agent's plan, researched in a context window of its own. The
+// lead calls Run once per task (step 2); the harness serves a stand-in at subagents:9000.
+service Subagent {
+  rpc Run(RunRequest) returns (RunReply);
+}
+
+// The task description the lead hands a subagent: what to find, in what shape, with which tools,
+// and where to stop.
+message RunRequest {
+  string job_id = 1;
+  string task_id = 2;
+  string objective = 3;
+  string output_format = 4;
+  repeated string tools = 5;
+  string boundaries = 6;
+}
+
+// findings is the subagent's condensed answer; transcript is everything it read and wrote on the
+// way, which stays with the subagent.
+message RunReply {
+  string findings = 1;
+  string transcript = 2;
+  int64 tokens = 3;
+}
+
+// The tool service a subagent calls (step 4): search and fetch. The harness serves a stand-in at
+// tools:9000. A fetched page is whatever the web says, instructions included.
+service Tools {
+  rpc Call(CallRequest) returns (CallReply);
+}
+
+message CallRequest {
+  string name = 1;
+  string input = 2;
+}
+
+message CallReply {
+  string text = 1;
+  string source_id = 2;
+}

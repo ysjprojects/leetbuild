@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package adserved;
+
+// The ad exchange step 3 asks when a slot has no direct campaign: one SelectAd per serve, answered
+// with the winning bid. A request the exchange cannot parse is INVALID_ARGUMENT; a slow or
+// overloaded exchange is DEADLINE_EXCEEDED or UNAVAILABLE at the caller.
+service Exchange {
+  rpc SelectAd(SelectAdRequest) returns (Bid);
+}
+
+message SelectAdRequest {
+  string placement = 1;
+  string user_hash = 2;
+}
+
+message Bid {
+  string campaign_id = 1;
+  string creative_id = 2;
+  int64 price_micros = 3;
+}

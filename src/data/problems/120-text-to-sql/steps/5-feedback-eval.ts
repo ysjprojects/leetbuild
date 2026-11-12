@@ -8,382 +8,370 @@ export const feedbackEvalStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/queries/{id}/feedback\`, looks the record up,
-produces \`{query_id, user, rating}\` to \`query.feedback\` keyed by the query id from a default
-producer, and its \`eval\` consumer commits each message and then adds the rating to
-\`feedback:{user}\`. A rating goes onto the topic and a counter moves, so the dashboard shows
-numbers. It compiles and hides 5 flaws.
+**Starting point.** The starter is the feedback pipeline. \`publish_feedback(record, rating)\` turns a
+rated query record into \`build_event(record, rating)\` = \`{query_id, user, workspace, rating}\`,
+produces it to \`query.feedback\` keyed by the query id with \`acks=1\`, waits up to 2 s for the delivery
+report and returns whether it arrived. \`run_eval()\` consumes as group \`eval\` with auto-commit off,
+commits each record, then runs \`HINCRBY eval:{workspace}\` on \`queries\` and \`rating_sum\`. It serves the
+demo and hides 5 flaws.
 
-**Failure mode the checks target.** An event with only a rating cannot tell "the intent was
-wrong" from "the tables were wrong" from "it ran but returned nothing", the failures the source's
-evaluation separates; keying by query id destroys per-user order; a plain producer duplicates under
-retry and double-counts a workspace's success rate; and commit-before-write is the crash that
-quietly makes the dashboard lie.
+**Failure mode the checks target.** A user's ratings scattered over partitions; a dashboard that
+cannot say whether the intent, the tables or the run went wrong; a lost acknowledgement that counts
+one query twice and a leader failover that loses one; a consumer crash between commit and write that
+drops a rating.
 
-Requirements. Body \`{"rating": 4}\` (1–5, **400** otherwise).
+Requirements:
 
-- Publish one \`query.feedback\` event per call keyed by the **user**, carrying the signals the
-  source evaluates: \`query_id\`, \`user\`, \`workspace\`, \`tables_proposed\`, \`tables_acked\`,
-  \`run_ok\`, \`has_output\` and \`rating\`, taken from the query record.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent). A broker failure is
-  **503** to the caller.
-- The consumer (group \`eval\`, manual commits) computes \`table_overlap\`
-  (\`|proposed ∩ acked| / |acked|\`) and updates \`eval:{workspace}\` with \`HINCRBY\` on
-  \`queries\`, \`run_ok\`, \`has_output\`, \`overlap_milli\` (score × 1000) and \`rating_sum\`.
-- Commit the offset **after** the Redis write.`,
+- Key the record by the record's **user**.
+- The event carries the signals the source evaluates: \`query_id\`, \`user\`, \`workspace\`, \`rating\`,
+  \`tables_proposed\`, \`tables_acked\`, \`run_ok\`, \`has_output\`.
+- The producer is **idempotent** with \`acks=all\` (Go uses confluent-kafka-go for this).
+- \`run_eval\` adds \`queries\`, \`run_ok\`, \`has_output\` (0 or 1), \`rating_sum\` and \`overlap_milli\` =
+  round(1000 × \`table_overlap\`), where \`table_overlap\` = |proposed ∩ acked| / |acked| (0 when nothing
+  was ACKed), and commits only **after** the writes.`,
   sequence: {
     participants: ['querygen', 'query.feedback', 'Eval consumer', 'Redis'],
     messages: [
-      {from: 'querygen', to: 'query.feedback', label: 'produce · key = user · acks = all · idempotent', kind: 'sync'},
-      {from: 'query.feedback', to: 'querygen', label: 'ack / broker error → 503', kind: 'reply'},
+      {from: 'querygen', to: 'query.feedback', label: 'produce key = user · idempotent · acks = all', kind: 'sync'},
+      {from: 'query.feedback', to: 'querygen', label: 'delivery report within 2 s → true / false', kind: 'reply'},
       {from: 'query.feedback', to: 'Eval consumer', label: 'consume · group eval', kind: 'async'},
       {from: 'Eval consumer', to: 'Eval consumer', label: 'table_overlap(proposed, acked)', kind: 'sync'},
       {
         from: 'Eval consumer',
         to: 'Redis',
-        label: 'HINCRBY eval:{workspace} queries · run_ok · has_output · overlap_milli',
+        label: 'HINCRBY eval:{workspace} queries · run_ok · has_output · overlap_milli · rating_sum',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Eval consumer', label: 'new counter values', kind: 'reply'},
-      {from: 'Eval consumer', to: 'query.feedback', label: 'commit offset after the write', kind: 'async'},
+      {from: 'Eval consumer', to: 'query.feedback', label: 'commit offset after the writes', kind: 'async'},
     ],
   },
-  hints: [
-    'Symptoms: the dashboard cannot say whether the intent or the tables were wrong, a workspace shows two successes for one retried query, and a consumer crash leaves a rating missing for good.',
-    'The event is built from the body alone and keyed by `query_id`; the producer has no idempotence or `acks` setting and a broker error still returns `accepted`; `consume` commits before the `HINCRBY`.',
-    'Build the event from the record (`workspace`, `tables_proposed`, `tables_acked`, `run_ok`, `has_output`), `key=user`, `enable.idempotence` + `acks=all`, 503 on produce failure; consumer: auto-commit off, `HINCRBY` on `eval:{workspace}` including `overlap_milli`, then commit.',
-  ],
   checks: [
     {
       id: 'user-key',
-      title: 'Keyed by user, carries the query id',
+      title: 'Keys feedback by user',
       detail:
-        'The message key is the user (one user’s events stay in one partition) and the event carries `query_id`. The starter keys by the query id, so one user’s events scatter across partitions.',
+        "Three ratings from ana, ben and ana carry those keys, and ana's two land on one partition. The starter keys by query id, which scatters one user's feedback over every partition.",
       match: {
-        python: {all: [/key=user/, /query_id/]},
-        typescript: {all: [/key:\s*user\b/, /query_id/]},
-        go: {all: [/Key:\s*\[\]byte\(user\)/, /query_id/]},
-        scala: {all: [/ProducerRecord\("query\.feedback",\s*user/, /query_id/]},
-        cpp: {all: [/produce\([^;]*user\.data\(\)/, /query_id/]},
-      },
-    },
-    {
-      id: 'idempotent-acks',
-      title: 'Idempotent producer with acks=all',
-      detail:
-        'The producer is configured for idempotence and `acks=all` — `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true`, or required acks `all` with a hash balancer — so a retried produce cannot double-count a workspace.',
-      match: {
-        python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
-        typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
-        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /Balancer:\s*&kafka\.Hash\{\}/]},
-        scala: {all: [/enable\.idempotence/, /"acks"/]},
-        cpp: {all: [/enable\.idempotence/, /set\("acks",\s*"all"/]},
+        python: {all: [/key\s*=\s*record\[["']user["']\]/]},
+        typescript: {all: [/key:\s*record\.user/]},
+        go: {all: [/Key:\s*\[\]byte\(\s*rec\.User\s*\)/]},
+        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Config\.Topic\s*,\s*record\.user\s*,/]},
+        cpp: {all: [/user\.c_str\(\)\s*,\s*user\.(size|length)\(\)/]},
       },
     },
     {
       id: 'signals',
       title: 'Carries the evaluation signals, not just a rating',
       detail:
-        'The event has `tables_proposed`, `tables_acked`, `run_ok` and `has_output` beside the rating — the signals the source’s evaluation separates. The starter sends the rating alone.',
+        'The event holds query_id, user, workspace, rating, tables_proposed, tables_acked, run_ok and has_output, taken from the record. The starter sends the rating alone, so no one can tell a wrong table pick from an empty result.',
       match: {
-        python: {all: [/tables_proposed/, /tables_acked/, /run_ok/, /has_output/]},
-        typescript: {all: [/tables_proposed/, /tables_acked/, /run_ok/, /has_output/]},
-        go: {all: [/tables_proposed/, /tables_acked/, /run_ok/, /has_output/]},
-        scala: {all: [/tables_proposed/, /tables_acked/, /run_ok/, /has_output/]},
-        cpp: {all: [/tables_proposed/, /tables_acked/, /run_ok/, /has_output/]},
+        python: {all: [/["']tables_acked["']\s*:\s*record\[/, /["']has_output["']\s*:\s*record\[/]},
+        typescript: {all: [/tables_acked:\s*record\.tables_acked/, /has_output:\s*record\.has_output/]},
+        go: {all: [/"tables_acked":\s*rec\.TablesAcked/, /"has_output":\s*rec\.HasOutput/]},
+        scala: {all: [/"tables_acked"\s*->/, /"has_output"\s*->\s*record\.has_output/]},
+        cpp: {all: [/\{"tables_acked",\s*record/, /\{"has_output",\s*record/]},
       },
     },
     {
-      id: 'overlap-score',
-      title: 'Computes table overlap into eval:{workspace}',
+      id: 'idempotent-acks',
+      title: 'Idempotent producer with acks=all',
       detail:
-        '`table_overlap` scores `|proposed ∩ acked| / |acked|` and the consumer adds it as `overlap_milli` to the `eval:{workspace}` hash alongside the success counters. The starter counts ratings only.',
+        'A write whose acknowledgement was lost is retried and lands once, and a record survives a leader failover right after its acknowledgement. The starter sets acks=1 and no idempotence.',
       match: {
-        python: {all: [/def table_overlap\(/, /overlap_milli/, /eval:\{workspace\}/]},
-        typescript: {all: [/function tableOverlap\(/, /overlap_milli/, /eval:\$\{workspace\}/]},
-        go: {all: [/func tableOverlap\(/, /overlap_milli/, /"eval:"\s*\+\s*event\.Workspace/]},
-        scala: {all: [/def tableOverlap\(/, /overlap_milli/, /eval:\$workspace/]},
-        cpp: {all: [/tableOverlap\(/, /overlap_milli/, /"eval:"/]},
+        python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["'](all|-1)["']/]},
+        typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
+        go: {all: [/"enable\.idempotence":\s*true/, /"acks":\s*"(all|-1)"/]},
+        scala: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"(all|-1)"/]},
+        cpp: {all: [/"enable\.idempotence",\s*"true"/, /"acks",\s*"(all|-1)"/]},
+      },
+    },
+    {
+      id: 'eval-counters',
+      title: 'Aggregates the signals and the table overlap into eval:{workspace}',
+      detail:
+        'Three Mobility events leave queries 3, run_ok 2, has_output 1, rating_sum 8 and overlap_milli 2500 (overlaps 1, 0.5 and 1). The starter counts queries and ratings only.',
+      match: {
+        python: {all: [/table_overlap\(/, /["']overlap_milli["']/, /["']has_output["']\s*,\s*int\(/]},
+        typescript: {all: [/tableOverlap\(/, /['"]overlap_milli['"]/]},
+        go: {all: [/tableOverlap\(/, /"overlap_milli"/]},
+        scala: {all: [/tableOverlap\(/, /"overlap_milli"/]},
+        cpp: {all: [/table_overlap\(/, /"overlap_milli"/]},
       },
     },
     {
       id: 'write-before-commit',
       title: 'Writes the counters before committing the offset',
       detail:
-        'Auto-commit is off and the `HINCRBY`s run before the offset commit; committing first makes a crash lose the update forever. The starter commits first.',
+        'At every commit the counters already include the committed record, and nothing is left uncommitted. The starter commits first, so a crash between the commit and the write loses that rating.',
       match: {
-        python: {all: [/enable\.auto\.commit/], order: [/\.hincrby\(/, /consumer\.commit\(/]},
-        typescript: {all: [/autoCommit:\s*false/], order: [/\.hincrby\(/, /commitOffsets\(/]},
-        go: {order: [/\.HIncrBy\(/, /CommitMessages\(/]},
-        scala: {all: [/ENABLE_AUTO_COMMIT_CONFIG|enable\.auto\.commit/], order: [/\.hincrBy\(/, /commitSync\(/]},
-        cpp: {all: [/enable\.auto\.commit/], order: [/->hincrby\(|\.hincrby\(/, /commitSync\(/]},
+        python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
+        typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
+        go: {order: [/\.HIncrBy\(/, /\.CommitMessage\(/]},
+        scala: {order: [/\.hincrBy\(/, /\.commitSync\(/]},
+        cpp: {order: [/\.hincrby\(/, /->commitSync\(/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
+import logging
 
 import redis
 from confluent_kafka import Consumer, Producer
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
 
-from query_store import store
+from querygen.config import TOPIC
 
-app = FastAPI()
-producer = Producer({"bootstrap.servers": "kafka:9092"})
+GROUP = "eval"
+ACK_TIMEOUT_S = 2.0
+log = logging.getLogger("querygen.feedback")
+
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-TOPIC = "query.feedback"
 
-
-class FeedbackRequest(BaseModel):
-    rating: int
-
-
-@app.post("/v1/queries/{query_id}/feedback")
-def feedback(query_id: str, body: FeedbackRequest, user: str = Header(alias="X-User-Id")) -> dict:
+def build_event(record: dict, rating: int) -> dict:
+    """The feedback event for a rated query."""
     # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    record = store.get_query(query_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="unknown query")
-    event = {"query_id": query_id, "user": user, "rating": body.rating}
-    producer.produce(TOPIC, key=query_id, value=json.dumps(event))
-    producer.flush()
-    return {"accepted": True}
+    return {"query_id": record["query_id"], "user": record["user"], "workspace": record["workspace"], "rating": rating}
 
 
-def consume() -> None:
-    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "eval"})
+def publish_feedback(record: dict, rating: int) -> bool:
+    """One event on query.feedback; True once the broker acknowledged it."""
+    delivered = []
+
+    def on_delivery(err, msg) -> None:
+        if err is not None:
+            log.warning("feedback for %s not delivered: %s", record["query_id"], err)
+        delivered.append(err is None)
+
+    producer.produce(TOPIC, key=record["query_id"], value=json.dumps(build_event(record, rating)), on_delivery=on_delivery)
+    producer.flush(ACK_TIMEOUT_S)  # the delivery report fires here, delivered or refused
+    return delivered == [True]
+
+
+def run_eval() -> None:
+    """Fold every feedback event into its workspace's counters."""
+    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": GROUP, "auto.offset.reset": "earliest", "enable.auto.commit": False})
     consumer.subscribe([TOPIC])
     while True:
         msg = consumer.poll(1.0)
-        if msg is None:
+        if msg is None or msg.error():
             continue
-        consumer.commit(msg)
+        consumer.commit(message=msg, asynchronous=False)
         event = json.loads(msg.value())
-        r.hincrby("feedback:" + event["user"], "rating_sum", event["rating"])
+        key = f"eval:{event['workspace']}"
+        r.hincrby(key, "queries", 1)
+        r.hincrby(key, "rating_sum", int(event["rating"]))
 `,
       solution: `import json
+import logging
 
 import redis
-from confluent_kafka import Consumer, KafkaException, Producer
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from confluent_kafka import Consumer, Producer
 
-from query_store import store
+from querygen.config import TOPIC
 
-app = FastAPI()
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
-    }
-)
+GROUP = "eval"
+ACK_TIMEOUT_S = 2.0
+log = logging.getLogger("querygen.feedback")
+
+# Idempotent with acks=all: a retry after a lost acknowledgement lands once, on every replica.
+producer = Producer({"bootstrap.servers": "kafka:9092", "enable.idempotence": True, "acks": "all"})
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-TOPIC = "query.feedback"
 
-
-class FeedbackRequest(BaseModel):
-    rating: int
-
-
-@app.post("/v1/queries/{query_id}/feedback")
-def feedback(query_id: str, body: FeedbackRequest, user: str = Header(alias="X-User-Id")) -> dict:
-    if not 1 <= body.rating <= 5:
-        raise HTTPException(status_code=400, detail="rating must be 1..5")
-    record = store.get_query(query_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="unknown query")
-    event = {
-        "query_id": query_id,
-        "user": user,
+def build_event(record: dict, rating: int) -> dict:
+    """The feedback event for a rated query: the rating and the signals that explain it."""
+    return {
+        "query_id": record["query_id"],
+        "user": record["user"],
         "workspace": record["workspace"],
+        "rating": rating,
         "tables_proposed": record["tables_proposed"],
         "tables_acked": record["tables_acked"],
-        "run_ok": bool(record.get("run_ok", False)),
-        "has_output": bool(record.get("has_output", False)),
-        "rating": body.rating,
+        "run_ok": record["run_ok"],
+        "has_output": record["has_output"],
     }
-    try:
-        producer.produce(TOPIC, key=user, value=json.dumps(event))
-        producer.flush(2.0)
-    except KafkaException as exc:
-        raise HTTPException(status_code=503, detail="TRY_AGAIN") from exc
-    return {"accepted": True}
+
+
+def publish_feedback(record: dict, rating: int) -> bool:
+    """One event on query.feedback, keyed by user so one user's feedback stays in order; True once acknowledged."""
+    delivered = []
+
+    def on_delivery(err, msg) -> None:
+        if err is not None:
+            log.warning("feedback for %s not delivered: %s", record["query_id"], err)
+        delivered.append(err is None)
+
+    producer.produce(TOPIC, key=record["user"], value=json.dumps(build_event(record, rating)), on_delivery=on_delivery)
+    producer.flush(ACK_TIMEOUT_S)  # the delivery report fires here, delivered or refused
+    return delivered == [True]
 
 
 def table_overlap(proposed: list[str], acked: list[str]) -> float:
-    wanted = {name.lower() for name in acked}
-    if not wanted:
+    """How much of what the user ACKed the table agent had proposed: |proposed ∩ acked| / |acked|."""
+    if not acked:
         return 0.0
-    found = wanted & {name.lower() for name in proposed}
-    return len(found) / len(wanted)
+    return len(set(proposed) & set(acked)) / len(set(acked))
 
 
-def consume() -> None:
-    consumer = Consumer(
-        {"bootstrap.servers": "kafka:9092", "group.id": "eval", "enable.auto.commit": False}
-    )
+def run_eval() -> None:
+    """Fold every feedback event into its workspace's counters, then commit."""
+    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": GROUP, "auto.offset.reset": "earliest", "enable.auto.commit": False})
     consumer.subscribe([TOPIC])
     while True:
         msg = consumer.poll(1.0)
-        if msg is None:
+        if msg is None or msg.error():
             continue
         event = json.loads(msg.value())
-        workspace = event["workspace"]
-        key = f"eval:{workspace}"
-        overlap = table_overlap(event["tables_proposed"], event["tables_acked"])
-        pipe = r.pipeline()
-        pipe.hincrby(key, "queries", 1)
-        pipe.hincrby(key, "run_ok", int(event["run_ok"]))
-        pipe.hincrby(key, "has_output", int(event["has_output"]))
-        pipe.hincrby(key, "overlap_milli", int(overlap * 1000))
-        pipe.hincrby(key, "rating_sum", int(event["rating"]))
-        pipe.execute()
-        consumer.commit(msg)
+        key = f"eval:{event['workspace']}"
+        r.hincrby(key, "queries", 1)
+        r.hincrby(key, "run_ok", int(bool(event["run_ok"])))
+        r.hincrby(key, "has_output", int(bool(event["has_output"])))
+        r.hincrby(key, "rating_sum", int(event["rating"]))
+        r.hincrby(key, "overlap_milli", round(1000 * table_overlap(event["tables_proposed"], event["tables_acked"])))
+        # After the writes: a crash before this line replays the record instead of losing it.
+        consumer.commit(message=msg, asynchronous=False)
 `,
     },
     typescript: {
-      starter: `/** query.feedback: the starter. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 import {Kafka} from 'kafkajs';
 
-import {store} from './store';
+import {TOPIC} from 'querygen/config';
+import type {QueryRecord} from 'querygen/queries';
 
-export const app = Fastify();
+export const GROUP = 'eval';
+export const ACK_TIMEOUT_MS = 2000;
+
 const kafka = new Kafka({clientId: 'querygen', brokers: ['kafka:9092']});
 const producer = kafka.producer();
 void producer.connect();
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-const TOPIC = 'query.feedback';
-
-interface FeedbackBody {
-  rating: number;
+/** The feedback event for a rated query. */
+export function buildEvent(record: QueryRecord, rating: number): Record<string, unknown> {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  return {query_id: record.query_id, user: record.user, workspace: record.workspace, rating};
 }
 
-app.post('/v1/queries/:id/feedback', async (request, reply) => {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const user = request.headers['x-user-id'] as string;
-  const {id} = request.params as {id: string};
-  const body = request.body as FeedbackBody;
-  const record = await store.getQuery(id);
-  if (record === null) return reply.code(404).send({error: 'unknown query'});
-  const event = {query_id: id, user, rating: body.rating};
-  await producer.send({topic: TOPIC, messages: [{key: id, value: JSON.stringify(event)}]});
-  return reply.code(202).send({accepted: true});
-});
+/** One event on query.feedback; true once the broker acknowledged it. */
+export async function publishFeedback(record: QueryRecord, rating: number): Promise<boolean> {
+  try {
+    await producer.send({
+      topic: TOPIC,
+      messages: [{key: record.query_id, value: JSON.stringify(buildEvent(record, rating))}],
+      acks: 1,
+      timeout: ACK_TIMEOUT_MS,
+    });
+    return true;
+  } catch (err) {
+    console.warn(\`feedback for \${record.query_id} not delivered: \${(err as Error).message}\`);
+    return false;
+  }
+}
 
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'eval'});
+/** Fold every feedback event into its workspace's counters. */
+export async function runEval(): Promise<void> {
+  const consumer = kafka.consumer({groupId: GROUP});
   await consumer.connect();
-  await consumer.subscribe({topic: TOPIC});
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
   await consumer.run({
+    autoCommit: false,
     eachMessage: async ({topic, partition, message}) => {
       await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {user: string; rating: number};
-      await r.hincrby(\`feedback:\${event.user}\`, 'rating_sum', event.rating);
+      const event = JSON.parse(String(message.value)) as {workspace: string; rating: number};
+      const key = \`eval:\${event.workspace}\`;
+      await redis.hincrby(key, 'queries', 1);
+      await redis.hincrby(key, 'rating_sum', event.rating);
     },
   });
 }
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** query.feedback: one idempotent, user-keyed event with the evaluation signals; counters before commit. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 import {Kafka} from 'kafkajs';
 
-import {store} from './store';
+import {TOPIC} from 'querygen/config';
+import type {QueryRecord} from 'querygen/queries';
 
-export const app = Fastify();
+export const GROUP = 'eval';
+export const ACK_TIMEOUT_MS = 2000;
+
 const kafka = new Kafka({clientId: 'querygen', brokers: ['kafka:9092']});
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+// Idempotent: a retry after a lost acknowledgement lands once (and needs acks: -1, every replica).
+const producer = kafka.producer({idempotent: true});
 void producer.connect();
-const r = new Redis('redis://redis:6379');
-
-const TOPIC = 'query.feedback';
-
-interface FeedbackBody {
-  rating: number;
-}
+const redis = new Redis({host: 'redis', port: 6379});
 
 interface FeedbackEvent {
   query_id: string;
   user: string;
   workspace: string;
+  rating: number;
   tables_proposed: string[];
   tables_acked: string[];
   run_ok: boolean;
   has_output: boolean;
-  rating: number;
 }
 
-app.post('/v1/queries/:id/feedback', async (request, reply) => {
-  const user = request.headers['x-user-id'] as string;
-  const {id} = request.params as {id: string};
-  const body = request.body as Partial<FeedbackBody> | null;
-  const rating = body?.rating;
-  if (!Number.isInteger(rating) || rating === undefined || rating < 1 || rating > 5)
-    return reply.code(400).send({error: 'rating must be 1..5'});
-  const record = await store.getQuery(id);
-  if (record === null) return reply.code(404).send({error: 'unknown query'});
-  const event: FeedbackEvent = {
-    query_id: id,
-    user,
+/** The feedback event for a rated query: the rating and the signals that explain it. */
+export function buildEvent(record: QueryRecord, rating: number): FeedbackEvent {
+  return {
+    query_id: record.query_id,
+    user: record.user,
     workspace: record.workspace,
+    rating,
     tables_proposed: record.tables_proposed,
     tables_acked: record.tables_acked,
-    run_ok: record.run_ok ?? false,
-    has_output: record.has_output ?? false,
-    rating,
+    run_ok: record.run_ok,
+    has_output: record.has_output,
   };
-  try {
-    await producer.send({topic: TOPIC, acks: -1, messages: [{key: user, value: JSON.stringify(event)}]});
-  } catch {
-    return reply.code(503).send({error: 'TRY_AGAIN'});
-  }
-  return reply.code(202).send({accepted: true});
-});
-
-function tableOverlap(proposed: string[], acked: string[]): number {
-  const wanted = new Set(acked.map(name => name.toLowerCase()));
-  if (wanted.size === 0) return 0;
-  let found = 0;
-  for (const name of new Set(proposed.map(candidate => candidate.toLowerCase()))) if (wanted.has(name)) found += 1;
-  return found / wanted.size;
 }
 
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'eval'});
+/** One event on query.feedback, keyed by user so one user's feedback stays in order; true once acknowledged. */
+export async function publishFeedback(record: QueryRecord, rating: number): Promise<boolean> {
+  try {
+    await producer.send({
+      topic: TOPIC,
+      messages: [{key: record.user, value: JSON.stringify(buildEvent(record, rating))}],
+      acks: -1,
+      timeout: ACK_TIMEOUT_MS,
+    });
+    return true;
+  } catch (err) {
+    console.warn(\`feedback for \${record.query_id} not delivered: \${(err as Error).message}\`);
+    return false;
+  }
+}
+
+/** How much of what the user ACKed the table agent had proposed: |proposed ∩ acked| / |acked|. */
+export function tableOverlap(proposed: string[], acked: string[]): number {
+  const ackedSet = new Set(acked);
+  if (ackedSet.size === 0) return 0;
+  return new Set(proposed.filter(t => ackedSet.has(t))).size / ackedSet.size;
+}
+
+/** Fold every feedback event into its workspace's counters, then commit. */
+export async function runEval(): Promise<void> {
+  const consumer = kafka.consumer({groupId: GROUP});
   await consumer.connect();
-  await consumer.subscribe({topic: TOPIC});
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
   await consumer.run({
     autoCommit: false,
     eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as FeedbackEvent;
-      const workspace = event.workspace;
-      const key = \`eval:\${workspace}\`;
-      const overlap = tableOverlap(event.tables_proposed, event.tables_acked);
-      await r
-        .multi()
-        .hincrby(key, 'queries', 1)
-        .hincrby(key, 'run_ok', event.run_ok ? 1 : 0)
-        .hincrby(key, 'has_output', event.has_output ? 1 : 0)
-        .hincrby(key, 'overlap_milli', Math.floor(overlap * 1000))
-        .hincrby(key, 'rating_sum', event.rating)
-        .exec();
+      const event = JSON.parse(String(message.value)) as FeedbackEvent;
+      const key = \`eval:\${event.workspace}\`;
+      await redis.hincrby(key, 'queries', 1);
+      await redis.hincrby(key, 'run_ok', event.run_ok ? 1 : 0);
+      await redis.hincrby(key, 'has_output', event.has_output ? 1 : 0);
+      await redis.hincrby(key, 'rating_sum', event.rating);
+      await redis.hincrby(key, 'overlap_milli', Math.round(1000 * tableOverlap(event.tables_proposed, event.tables_acked)));
+      // After the writes: a crash before this line replays the record instead of losing it.
       await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
     },
   });
 }
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -392,58 +380,87 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 import (
 	"context"
 	"encoding/json"
-	"net/http"
+	"log"
+	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
 
-	"querygen/store"
+	"querygen/config"  // config.Topic — provided
+	"querygen/queries" // queries.Record — provided
 )
 
-var (
-	feedbackWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "query.feedback"}
-	rdb            *redis.Client
+const (
+	group      = "eval"
+	ackTimeout = 2 * time.Second
 )
 
-type FeedbackRequest struct {
-	Rating int \`json:"rating"\`
-}
+var producer = newProducer()
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-func feedback(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	user := r.Header.Get("X-User-Id")
-	id := r.PathValue("id")
-	body := FeedbackRequest{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	record, err := store.GetQuery(r.Context(), id)
-	if err != nil || record == nil {
-		rw.WriteHeader(http.StatusNotFound)
-		return
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
 	}
-	event := map[string]any{"query_id": id, "user": user, "rating": body.Rating}
-	payload, _ := json.Marshal(event)
-	_ = feedbackWriter.WriteMessages(r.Context(), kafka.Message{Key: []byte(id), Value: payload})
-	rw.WriteHeader(http.StatusAccepted)
+	return p
 }
 
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   "query.feedback",
-		GroupID: "eval",
-	})
+// buildEvent is the feedback event for a rated query.
+func buildEvent(rec queries.Record, rating int) map[string]any {
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+	return map[string]any{"query_id": rec.QueryID, "user": rec.User, "workspace": rec.Workspace, "rating": rating}
+}
+
+// publishFeedback puts one event on query.feedback; true once the broker acknowledged it.
+func publishFeedback(ctx context.Context, rec queries.Record, rating int) bool {
+	value, _ := json.Marshal(buildEvent(rec, rating))
+	t := config.Topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(rec.QueryID), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error // the delivery report: acknowledged or refused
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded
+		}
+	}
+	if err != nil {
+		log.Printf("feedback for %s not delivered: %v", rec.QueryID, err)
+		return false
+	}
+	return true
+}
+
+// runEval folds every feedback event into its workspace's counters.
+func runEval(ctx context.Context) error {
+	consumer, err := kafka.NewConsumer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "group.id": group, "auto.offset.reset": "earliest", "enable.auto.commit": false})
+	if err != nil {
+		return err
+	}
+	if err := consumer.SubscribeTopics([]string{config.Topic}, nil); err != nil {
+		return err
+	}
 	for {
-		msg, err := reader.FetchMessage(ctx)
+		msg, err := consumer.ReadMessage(-1)
 		if err != nil {
+			return err
+		}
+		if _, err := consumer.CommitMessage(msg); err != nil {
+			return err
+		}
+		var event struct {
+			Workspace string \`json:"workspace"\`
+			Rating    int64  \`json:"rating"\`
+		}
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
 			continue
 		}
-		_ = reader.CommitMessages(ctx, msg)
-		var event struct {
-			User   string \`json:"user"\`
-			Rating int64  \`json:"rating"\`
-		}
-		_ = json.Unmarshal(msg.Value, &event)
-		rdb.HIncrBy(ctx, "feedback:"+event.User, "rating_sum", event.Rating)
+		key := "eval:" + event.Workspace
+		rdb.HIncrBy(ctx, key, "queries", 1)
+		rdb.HIncrBy(ctx, key, "rating_sum", event.Rating)
 	}
 }
 `,
@@ -452,127 +469,140 @@ func consume(ctx context.Context) {
 import (
 	"context"
 	"encoding/json"
-	"net/http"
-	"strings"
+	"log"
+	"math"
+	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
 
-	"querygen/store"
+	"querygen/config"  // config.Topic — provided
+	"querygen/queries" // queries.Record — provided
 )
 
-// RequiredAcks=RequireAll with a stable hash balancer is the kafka-go equivalent of an idempotent
-// producer: the broker acknowledges only once the record is replicated, and retries of the same
-// key land on the same partition instead of duplicating across them.
-var feedbackWriter = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        "query.feedback",
-	RequiredAcks: kafka.RequireAll,
-	Balancer:     &kafka.Hash{},
-	Async:        false,
+const (
+	group      = "eval"
+	ackTimeout = 2 * time.Second
+)
+
+var producer = newProducer()
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the record before the broker answers
+		"enable.idempotence": true,  // a write retried after a lost acknowledgement lands once
+	})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
-var rdb *redis.Client
-
-type FeedbackRequest struct {
-	Rating int \`json:"rating"\`
-}
-
-type FeedbackEvent struct {
+// feedbackEvent is the rating and the signals that explain it.
+type feedbackEvent struct {
 	QueryID        string   \`json:"query_id"\`
 	User           string   \`json:"user"\`
 	Workspace      string   \`json:"workspace"\`
+	Rating         int64    \`json:"rating"\`
 	TablesProposed []string \`json:"tables_proposed"\`
 	TablesAcked    []string \`json:"tables_acked"\`
 	RunOK          bool     \`json:"run_ok"\`
 	HasOutput      bool     \`json:"has_output"\`
-	Rating         int      \`json:"rating"\`
 }
 
-func feedback(rw http.ResponseWriter, r *http.Request) {
-	user := r.Header.Get("X-User-Id")
-	id := r.PathValue("id")
-	body := FeedbackRequest{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	if body.Rating < 1 || body.Rating > 5 {
-		rw.WriteHeader(http.StatusBadRequest)
-		return
+// buildEvent is the feedback event for a rated query: the rating and the signals that explain it.
+func buildEvent(rec queries.Record, rating int) map[string]any {
+	return map[string]any{
+		"query_id":        rec.QueryID,
+		"user":            rec.User,
+		"workspace":       rec.Workspace,
+		"rating":          rating,
+		"tables_proposed": rec.TablesProposed,
+		"tables_acked":    rec.TablesAcked,
+		"run_ok":          rec.RunOK,
+		"has_output":      rec.HasOutput,
 	}
-	record, err := store.GetQuery(r.Context(), id)
-	if err != nil || record == nil {
-		rw.WriteHeader(http.StatusNotFound)
-		return
-	}
-	event := FeedbackEvent{
-		QueryID:        id,
-		User:           user,
-		Workspace:      record.Workspace,
-		TablesProposed: record.TablesProposed,
-		TablesAcked:    record.TablesAcked,
-		RunOK:          record.RunOK,
-		HasOutput:      record.HasOutput,
-		Rating:         body.Rating,
-	}
-	payload, _ := json.Marshal(event)
-	if err := feedbackWriter.WriteMessages(r.Context(), kafka.Message{Key: []byte(user), Value: payload}); err != nil {
-		rw.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
-	rw.WriteHeader(http.StatusAccepted)
 }
 
-func tableOverlap(proposed, acked []string) float64 {
-	wanted := map[string]bool{}
-	for _, name := range acked {
-		wanted[strings.ToLower(name)] = true
-	}
-	if len(wanted) == 0 {
-		return 0
-	}
-	found := map[string]bool{}
-	for _, name := range proposed {
-		if lowered := strings.ToLower(name); wanted[lowered] {
-			found[lowered] = true
+// publishFeedback puts one event on query.feedback, keyed by user so one user's feedback stays in
+// order; true once the broker acknowledged it.
+func publishFeedback(ctx context.Context, rec queries.Record, rating int) bool {
+	value, _ := json.Marshal(buildEvent(rec, rating))
+	t := config.Topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(rec.User), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error // the delivery report: acknowledged or refused
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded
 		}
 	}
-	return float64(len(found)) / float64(len(wanted))
+	if err != nil {
+		log.Printf("feedback for %s not delivered: %v", rec.QueryID, err)
+		return false
+	}
+	return true
 }
 
-func boolCount(value bool) int64 {
-	if value {
+// tableOverlap is how much of what the user ACKed the table agent had proposed: |proposed ∩ acked| / |acked|.
+func tableOverlap(proposed, acked []string) float64 {
+	ackedSet := map[string]bool{}
+	for _, t := range acked {
+		ackedSet[t] = true
+	}
+	if len(ackedSet) == 0 {
+		return 0
+	}
+	both := map[string]bool{}
+	for _, t := range proposed {
+		if ackedSet[t] {
+			both[t] = true
+		}
+	}
+	return float64(len(both)) / float64(len(ackedSet))
+}
+
+func flag(b bool) int64 {
+	if b {
 		return 1
 	}
 	return 0
 }
 
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   "query.feedback",
-		GroupID: "eval",
-	})
+// runEval folds every feedback event into its workspace's counters, then commits.
+func runEval(ctx context.Context) error {
+	consumer, err := kafka.NewConsumer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "group.id": group, "auto.offset.reset": "earliest", "enable.auto.commit": false})
+	if err != nil {
+		return err
+	}
+	if err := consumer.SubscribeTopics([]string{config.Topic}, nil); err != nil {
+		return err
+	}
 	for {
-		msg, err := reader.FetchMessage(ctx)
+		msg, err := consumer.ReadMessage(-1)
 		if err != nil {
-			continue
+			return err
 		}
-		var event FeedbackEvent
+		var event feedbackEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			_ = reader.CommitMessages(ctx, msg)
+			consumer.CommitMessage(msg) // malformed: skip it, do not replay it for ever
 			continue
 		}
 		key := "eval:" + event.Workspace
-		overlap := tableOverlap(event.TablesProposed, event.TablesAcked)
-		pipe := rdb.TxPipeline()
-		pipe.HIncrBy(ctx, key, "queries", 1)
-		pipe.HIncrBy(ctx, key, "run_ok", boolCount(event.RunOK))
-		pipe.HIncrBy(ctx, key, "has_output", boolCount(event.HasOutput))
-		pipe.HIncrBy(ctx, key, "overlap_milli", int64(overlap*1000))
-		pipe.HIncrBy(ctx, key, "rating_sum", int64(event.Rating))
-		if _, err := pipe.Exec(ctx); err != nil {
-			continue
+		rdb.HIncrBy(ctx, key, "queries", 1)
+		rdb.HIncrBy(ctx, key, "run_ok", flag(event.RunOK))
+		rdb.HIncrBy(ctx, key, "has_output", flag(event.HasOutput))
+		rdb.HIncrBy(ctx, key, "rating_sum", event.Rating)
+		rdb.HIncrBy(ctx, key, "overlap_milli", int64(math.Round(1000*tableOverlap(event.TablesProposed, event.TablesAcked))))
+		// After the writes: a crash before this line replays the record instead of losing it.
+		if _, err := consumer.CommitMessage(msg); err != nil {
+			return err
 		}
-		_ = reader.CommitMessages(ctx, msg)
 	}
 }
 `,
@@ -580,283 +610,745 @@ func consume(ctx context.Context) {
     scala: {
       starter: `import java.util.Properties
 
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import redis.clients.jedis.Jedis
-import spray.json._
-import spray.json.DefaultJsonProtocol._
+import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
+import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
+import redis.clients.jedis.JedisPooled
 
-object FeedbackApi {
-  val producer = new KafkaProducer[String, String](new Properties())
-  val jedis = new Jedis("redis", 6379)
+import scala.concurrent.duration._
+import scala.concurrent.{Await, Promise}
+import scala.jdk.CollectionConverters._
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def publish(user: String, queryId: String, rating: Int): Unit = {
-    val payload = JsObject("query_id" -> JsString(queryId), "user" -> JsString(user), "rating" -> JsNumber(rating)).compactPrint
-    producer.send(new ProducerRecord("query.feedback", queryId, payload))
+import querygen.{Config, QueryRecord}
+
+object Feedback {
+  val Group = "eval"
+
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
+  private val jedis = new JedisPooled("redis", 6379)
 
-  def consume(): Unit = {
-    val consumer = new KafkaConsumer[String, String](new Properties())
-    consumer.subscribe(java.util.List.of("query.feedback"))
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(200))
-      records.forEach { record =>
-        consumer.commitSync()
-        val event = record.value().parseJson.asJsObject.fields
-        jedis.hincrBy(s"feedback:\${event("user").convertTo[String]}", "rating_sum", event("rating").convertTo[Long])
+  /** The feedback event for a rated query. */
+  def buildEvent(record: QueryRecord, rating: Int): ujson.Obj =
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    ujson.Obj("query_id" -> record.query_id, "user" -> record.user, "workspace" -> record.workspace, "rating" -> rating)
+
+  /** One event on query.feedback; true once the broker acknowledged it. */
+  def publishFeedback(record: QueryRecord, rating: Int): Boolean = {
+    val delivered = Promise[Boolean]()
+    val report: Callback = new Callback {
+      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
+        if (exception != null) System.err.println(s"feedback for \${record.query_id} not delivered: \${exception.getMessage}")
+        delivered.trySuccess(exception == null)
       }
     }
+    producer.send(new ProducerRecord[String, String](Config.Topic, record.query_id, ujson.write(buildEvent(record, rating))), report)
+    producer.flush()
+    Await.result(delivered.future, 2.seconds)
+  }
+
+  /** Fold every feedback event into its workspace's counters. */
+  def runEval(): Unit = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("group.id", Group)
+    props.put("auto.offset.reset", "earliest")
+    props.put("enable.auto.commit", "false")
+    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
+    consumer.subscribe(List(Config.Topic).asJava)
+    while (true)
+      consumer.poll(java.time.Duration.ofSeconds(1)).asScala.foreach { record =>
+        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
+        val event = ujson.read(record.value())
+        val key = s"eval:\${event("workspace").str}"
+        jedis.hincrBy(key, "queries", 1L)
+        jedis.hincrBy(key, "rating_sum", event("rating").num.toLong)
+      }
   }
 }
 `,
       solution: `import java.util.Properties
 
-import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaConsumer}
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import redis.clients.jedis.Jedis
-import spray.json._
-import spray.json.DefaultJsonProtocol._
+import org.apache.kafka.clients.consumer.{KafkaConsumer, OffsetAndMetadata}
+import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecord, RecordMetadata}
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
+import redis.clients.jedis.JedisPooled
 
-final case class QueryRecord(
-    workspace: String,
-    tables_proposed: Seq[String],
-    tables_acked: Seq[String],
-    run_ok: Boolean,
-    has_output: Boolean
-)
+import scala.concurrent.duration._
+import scala.concurrent.{Await, Promise}
+import scala.jdk.CollectionConverters._
 
-final case class FeedbackEvent(
-    query_id: String,
-    user: String,
-    workspace: String,
-    tables_proposed: Seq[String],
-    tables_acked: Seq[String],
-    run_ok: Boolean,
-    has_output: Boolean,
-    rating: Int
-)
+import querygen.{Config, QueryRecord}
 
-object FeedbackApi {
-  implicit val eventFormat: RootJsonFormat[FeedbackEvent] = jsonFormat8(FeedbackEvent)
+object Feedback {
+  val Group = "eval"
 
-  val producer = new KafkaProducer[String, String]({
+  // Idempotent with acks=all: a retry after a lost acknowledgement lands once, on every replica.
+  private val producer: KafkaProducer[String, String] = {
     val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put("enable.idempotence", "true")
+    props.put("bootstrap.servers", "kafka:9092")
     props.put("acks", "all")
-    props
-  })
-  val jedis = new Jedis("redis", 6379)
-
-  def publish(user: String, queryId: String, record: QueryRecord, rating: Int): Unit = {
-    require(rating >= 1 && rating <= 5, "rating must be 1..5")
-    val event = FeedbackEvent(
-      queryId,
-      user,
-      record.workspace,
-      record.tables_proposed,
-      record.tables_acked,
-      record.run_ok,
-      record.has_output,
-      rating
-    )
-    producer.send(new ProducerRecord("query.feedback", user, event.toJson.compactPrint)).get()
+    props.put("enable.idempotence", "true")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
   }
+  private val jedis = new JedisPooled("redis", 6379)
 
-  def tableOverlap(proposed: Seq[String], acked: Seq[String]): Double = {
-    val wanted = acked.map(_.toLowerCase).toSet
-    if (wanted.isEmpty) 0.0
-    else proposed.map(_.toLowerCase).toSet.intersect(wanted).size.toDouble / wanted.size
-  }
+  private def strings(values: List[String]): ujson.Arr = ujson.Arr.from(values.map(ujson.Str(_)))
 
-  def consume(): Unit = {
-    val props = new Properties()
-    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, "eval")
-    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
-    val consumer = new KafkaConsumer[String, String](props)
-    consumer.subscribe(java.util.List.of("query.feedback"))
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(200))
-      records.forEach { record =>
-        val event = record.value().parseJson.convertTo[FeedbackEvent]
-        val workspace = event.workspace
-        val key = s"eval:$workspace"
-        val overlap = tableOverlap(event.tables_proposed, event.tables_acked)
-        val tx = jedis.multi()
-        tx.hincrBy(key, "queries", 1L)
-        tx.hincrBy(key, "run_ok", if (event.run_ok) 1L else 0L)
-        tx.hincrBy(key, "has_output", if (event.has_output) 1L else 0L)
-        tx.hincrBy(key, "overlap_milli", (overlap * 1000).toLong)
-        tx.hincrBy(key, "rating_sum", event.rating.toLong)
-        tx.exec()
-        consumer.commitSync()
+  /** The feedback event for a rated query: the rating and the signals that explain it. */
+  def buildEvent(record: QueryRecord, rating: Int): ujson.Obj = ujson.Obj(
+    "query_id" -> record.query_id,
+    "user" -> record.user,
+    "workspace" -> record.workspace,
+    "rating" -> rating,
+    "tables_proposed" -> strings(record.tables_proposed),
+    "tables_acked" -> strings(record.tables_acked),
+    "run_ok" -> record.run_ok,
+    "has_output" -> record.has_output
+  )
+
+  /** One event on query.feedback, keyed by user so one user's feedback stays in order; true once acknowledged. */
+  def publishFeedback(record: QueryRecord, rating: Int): Boolean = {
+    val delivered = Promise[Boolean]()
+    val report: Callback = new Callback {
+      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
+        if (exception != null) System.err.println(s"feedback for \${record.query_id} not delivered: \${exception.getMessage}")
+        delivered.trySuccess(exception == null)
       }
     }
+    producer.send(new ProducerRecord[String, String](Config.Topic, record.user, ujson.write(buildEvent(record, rating))), report)
+    producer.flush()
+    Await.result(delivered.future, 2.seconds)
+  }
+
+  /** How much of what the user ACKed the table agent had proposed: |proposed ∩ acked| / |acked|. */
+  def tableOverlap(proposed: Seq[String], acked: Seq[String]): Double = {
+    val ackedSet = acked.toSet
+    if (ackedSet.isEmpty) 0.0 else (proposed.toSet & ackedSet).size.toDouble / ackedSet.size
+  }
+
+  /** Fold every feedback event into its workspace's counters, then commit. */
+  def runEval(): Unit = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("group.id", Group)
+    props.put("auto.offset.reset", "earliest")
+    props.put("enable.auto.commit", "false")
+    val consumer = new KafkaConsumer[String, String](props, new StringDeserializer, new StringDeserializer)
+    consumer.subscribe(List(Config.Topic).asJava)
+    while (true)
+      consumer.poll(java.time.Duration.ofSeconds(1)).asScala.foreach { record =>
+        val event = ujson.read(record.value())
+        val key = s"eval:\${event("workspace").str}"
+        val overlap = tableOverlap(event("tables_proposed").arr.map(_.str).toList, event("tables_acked").arr.map(_.str).toList)
+        jedis.hincrBy(key, "queries", 1L)
+        jedis.hincrBy(key, "run_ok", if (event("run_ok").bool) 1L else 0L)
+        jedis.hincrBy(key, "has_output", if (event("has_output").bool) 1L else 0L)
+        jedis.hincrBy(key, "rating_sum", event("rating").num.toLong)
+        jedis.hincrBy(key, "overlap_milli", math.round(1000 * overlap))
+        // After the writes: a crash before this line replays the record instead of losing it.
+        consumer.commitSync(Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
+      }
   }
 }
 `,
     },
     cpp: {
       starter: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
+#include <iostream>
 #include <memory>
-#include <nlohmann/json.hpp>
 #include <string>
+
+#include "querygen/config.h"  // config::kTopic — provided
 
 using json = nlohmann::json;
 
-const std::string kFeedbackTopic = "query.feedback";
+const std::string kGroup = "eval";
+constexpr int kAckTimeoutMs = 2000;
 
-std::unique_ptr<RdKafka::Producer> producer;
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
+sw::redis::Redis redis("tcp://redis:6379");
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-void publish(const std::string& user, const std::string& queryId, int rating) {
-  const json event = {{"query_id", queryId}, {"user", user}, {"rating", rating}};
-  const auto payload = event.dump();
-  producer->produce(
-      kFeedbackTopic,
-      RdKafka::Topic::PARTITION_UA,
-      RdKafka::Producer::RK_MSG_COPY,
-      const_cast<char*>(payload.data()),
-      payload.size(),
-      queryId.data(),
-      queryId.size(),
-      0,
-      nullptr);
-  producer->flush(2000);
+// The delivery report: whether the broker acknowledged the last record.
+class Deliveries : public RdKafka::DeliveryReportCb {
+ public:
+  bool delivered = false;
+  void dr_cb(RdKafka::Message& message) override {
+    delivered = message.err() == RdKafka::ERR_NO_ERROR;
+    if (!delivered) std::cerr << "feedback not delivered: " << message.errstr() << "\\n";
+  }
+};
+
+Deliveries deliveries;
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
+  conf->set("dr_cb", &deliveries, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-void consume() {
+auto producer = make_producer();
+
+// The feedback event for a rated query.
+json build_event(const json& record, int rating) {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  return json{{"query_id", record["query_id"]}, {"user", record["user"]}, {"workspace", record["workspace"]}, {"rating", rating}};
+}
+
+// One event on query.feedback; true once the broker acknowledged it.
+bool publish_feedback(const json& record, int rating) {
+  const std::string value = build_event(record, rating).dump();
+  const std::string key = record.value("query_id", "");
+  deliveries.delivered = false;
+  const RdKafka::ErrorCode queued =
+      producer->produce(config::kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                        value.size(), key.c_str(), key.size(), 0, nullptr);
+  if (queued != RdKafka::ERR_NO_ERROR) return false;
+  producer->flush(kAckTimeoutMs);  // the delivery report fires here, delivered or refused
+  return deliveries.delivered;
+}
+
+// Fold every feedback event into its workspace's counters.
+void run_eval() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("group.id", "eval", err);
+  conf->set("group.id", kGroup, err);
+  conf->set("auto.offset.reset", "earliest", err);
+  conf->set("enable.auto.commit", "false", err);
   std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({kFeedbackTopic});
+  consumer->subscribe({config::kTopic});
   while (true) {
-    std::unique_ptr<RdKafka::Message> msg(consumer->consume(200));
+    std::unique_ptr<RdKafka::Message> msg(consumer->consume(1000));
     if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
-    consumer->commitSync();
-    const json event = json::parse(static_cast<const char*>(msg->payload()),
-                                   static_cast<const char*>(msg->payload()) + msg->len());
-    redis->hincrby("feedback:" + event["user"].get<std::string>(), "rating_sum", event["rating"].get<long long>());
+    consumer->commitSync(msg.get());
+    const json event = json::parse(std::string(static_cast<const char*>(msg->payload()), msg->len()), nullptr, false);
+    if (!event.is_object()) continue;
+    const std::string key = "eval:" + event.value("workspace", "");
+    redis.hincrby(key, "queries", 1);
+    redis.hincrby(key, "rating_sum", event.value("rating", 0));
   }
 }
 `,
       solution: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
-#include <algorithm>
-#include <cctype>
+#include <cmath>
+#include <iostream>
 #include <memory>
-#include <nlohmann/json.hpp>
 #include <set>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "querygen/config.h"  // config::kTopic — provided
+
 using json = nlohmann::json;
 
-const std::string kFeedbackTopic = "query.feedback";
+const std::string kGroup = "eval";
+constexpr int kAckTimeoutMs = 2000;
 
-struct QueryRecord {
-  std::string workspace;
-  std::vector<std::string> tablesProposed;
-  std::vector<std::string> tablesAcked;
-  bool runOk = false;
-  bool hasOutput = false;
+sw::redis::Redis redis("tcp://redis:6379");
+
+// The delivery report: whether the broker acknowledged the last record.
+class Deliveries : public RdKafka::DeliveryReportCb {
+ public:
+  bool delivered = false;
+  void dr_cb(RdKafka::Message& message) override {
+    delivered = message.err() == RdKafka::ERR_NO_ERROR;
+    if (!delivered) std::cerr << "feedback not delivered: " << message.errstr() << "\\n";
+  }
 };
 
-std::unique_ptr<RdKafka::Producer> makeProducer() {
+Deliveries deliveries;
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("enable.idempotence", "true", err);
-  conf->set("acks", "all", err);
+  conf->set("acks", "all", err);                 // every in-sync replica has the record before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a write retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &deliveries, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
+auto producer = make_producer();
 
-void publish(const std::string& user, const std::string& queryId, const QueryRecord& record, int rating) {
-  if (rating < 1 || rating > 5) throw std::invalid_argument("rating must be 1..5");
-  const json event = {
-      {"query_id", queryId},
-      {"user", user},
-      {"workspace", record.workspace},
-      {"tables_proposed", record.tablesProposed},
-      {"tables_acked", record.tablesAcked},
-      {"run_ok", record.runOk},
-      {"has_output", record.hasOutput},
-      {"rating", rating},
-  };
-  const auto payload = event.dump();
-  const auto err = producer->produce(
-      kFeedbackTopic,
-      RdKafka::Topic::PARTITION_UA,
-      RdKafka::Producer::RK_MSG_COPY,
-      const_cast<char*>(payload.data()),
-      payload.size(),
-      user.data(),
-      user.size(),
-      0,
-      nullptr);
-  if (err != RdKafka::ERR_NO_ERROR) throw std::runtime_error("TRY_AGAIN: " + RdKafka::err2str(err));
-  producer->flush(2000);
+// The feedback event for a rated query: the rating and the signals that explain it.
+json build_event(const json& record, int rating) {
+  return json{{"query_id", record["query_id"]},
+              {"user", record["user"]},
+              {"workspace", record["workspace"]},
+              {"rating", rating},
+              {"tables_proposed", record["tables_proposed"]},
+              {"tables_acked", record["tables_acked"]},
+              {"run_ok", record["run_ok"]},
+              {"has_output", record["has_output"]}};
 }
 
-std::set<std::string> lowered(const std::vector<std::string>& names) {
-  std::set<std::string> out;
-  for (auto name : names) {
-    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
-    out.insert(name);
-  }
-  return out;
+// One event on query.feedback, keyed by user so one user's feedback stays in order; true once acknowledged.
+bool publish_feedback(const json& record, int rating) {
+  const std::string value = build_event(record, rating).dump();
+  const std::string user = record.value("user", "");
+  deliveries.delivered = false;
+  const RdKafka::ErrorCode queued =
+      producer->produce(config::kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                        value.size(), user.c_str(), user.size(), 0, nullptr);
+  if (queued != RdKafka::ERR_NO_ERROR) return false;
+  producer->flush(kAckTimeoutMs);  // the delivery report fires here, delivered or refused
+  return deliveries.delivered;
 }
 
-double tableOverlap(const std::vector<std::string>& proposed, const std::vector<std::string>& acked) {
-  const auto wanted = lowered(acked);
-  if (wanted.empty()) return 0.0;
-  std::size_t found = 0;
-  for (const auto& name : lowered(proposed)) {
-    if (wanted.count(name) != 0) found += 1;
-  }
-  return static_cast<double>(found) / static_cast<double>(wanted.size());
+// How much of what the user ACKed the table agent had proposed: |proposed ∩ acked| / |acked|.
+double table_overlap(const std::vector<std::string>& proposed, const std::vector<std::string>& acked) {
+  const std::set<std::string> acked_set(acked.begin(), acked.end());
+  if (acked_set.empty()) return 0;
+  std::set<std::string> both;
+  for (const auto& t : proposed)
+    if (acked_set.count(t) > 0) both.insert(t);
+  return static_cast<double>(both.size()) / static_cast<double>(acked_set.size());
 }
 
-void consume() {
+// Fold every feedback event into its workspace's counters, then commit.
+void run_eval() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("group.id", "eval", err);
+  conf->set("group.id", kGroup, err);
+  conf->set("auto.offset.reset", "earliest", err);
   conf->set("enable.auto.commit", "false", err);
   std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({kFeedbackTopic});
+  consumer->subscribe({config::kTopic});
   while (true) {
-    std::unique_ptr<RdKafka::Message> msg(consumer->consume(200));
+    std::unique_ptr<RdKafka::Message> msg(consumer->consume(1000));
     if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
-    const json event = json::parse(static_cast<const char*>(msg->payload()),
-                                   static_cast<const char*>(msg->payload()) + msg->len());
-    const auto key = "eval:" + event["workspace"].get<std::string>();
-    const auto overlap = tableOverlap(event["tables_proposed"].get<std::vector<std::string>>(),
-                                      event["tables_acked"].get<std::vector<std::string>>());
-    auto tx = redis->transaction();
-    tx.hincrby(key, "queries", 1)
-        .hincrby(key, "run_ok", event["run_ok"].get<bool>() ? 1 : 0)
-        .hincrby(key, "has_output", event["has_output"].get<bool>() ? 1 : 0)
-        .hincrby(key, "overlap_milli", static_cast<long long>(overlap * 1000))
-        .hincrby(key, "rating_sum", event["rating"].get<long long>());
-    tx.exec();
-    consumer->commitSync();
+    const json event = json::parse(std::string(static_cast<const char*>(msg->payload()), msg->len()), nullptr, false);
+    if (!event.is_object()) {
+      consumer->commitSync(msg.get());  // malformed: skip it, do not replay it for ever
+      continue;
+    }
+    const std::string key = "eval:" + event.value("workspace", "");
+    const double overlap = table_overlap(event.value("tables_proposed", std::vector<std::string>{}), event.value("tables_acked", std::vector<std::string>{}));
+    redis.hincrby(key, "queries", 1);
+    redis.hincrby(key, "run_ok", event.value("run_ok", false) ? 1 : 0);
+    redis.hincrby(key, "has_output", event.value("has_output", false) ? 1 : 0);
+    redis.hincrby(key, "rating_sum", event.value("rating", 0));
+    redis.hincrby(key, "overlap_milli", std::llround(1000 * overlap));
+    // After the writes: a crash before this line replays the record instead of losing it.
+    consumer->commitSync(msg.get());
   }
 }
 `,
     },
   },
-  debrief: `The event's shape follows what the evaluation is for. QueryGPT records five signals per question (intent, table overlap, successful run, run-has-output, judged similarity) because each one isolates a component: the intent agent, the table agent, the generator, and the generator's taste in filter values. A rating alone collapses them into one number nobody can act on; tables proposed and ACKed let the consumer compute overlap per workspace, the number that says which curation needs work. The Kafka half is three contracts: the key is an ordering contract (user, not query), the producer needs idempotence and acks=all so a retry cannot double-count a success, and the consumer writes before it commits. Production pipelines add the LLM-judged similarity against golden SQL, the vanilla/decoupled split that scores the generator with the true tables, and a dead-letter topic for unparseable events.`,
+  harness: {
+    python: `import json
+
+TOPIC = "query.feedback"
+SIGNALS = ["has_output", "query_id", "rating", "run_ok", "tables_acked", "tables_proposed", "user", "workspace"]
+
+
+def _record(query_id="q1", user="ana", workspace="mobility", proposed=("trips", "drivers"), acked=("trips",), run_ok=True, has_output=True):
+    return {
+        "query_id": query_id, "user": user, "workspace": workspace, "question": "How many trips yesterday?", "status": "ran",
+        "tables_proposed": list(proposed), "tables_acked": list(acked), "sql": "SELECT 1", "run_ok": run_ok, "has_output": has_output,
+    }
+
+
+def _events(ctx):
+    return [json.loads(r.value) for r in ctx.kafka.records(TOPIC)]
+
+
+def _seed_events(ctx):
+    events = [
+        dict(query_id="q1", user="ana", workspace="mobility", rating=5, tables_proposed=["trips", "drivers"], tables_acked=["trips"], run_ok=True, has_output=True),
+        dict(query_id="q2", user="ben", workspace="mobility", rating=2, tables_proposed=["trips"], tables_acked=["trips", "cities"], run_ok=True, has_output=False),
+        dict(query_id="q3", user="ana", workspace="mobility", rating=1, tables_proposed=["trips"], tables_acked=["trips"], run_ok=False, has_output=False),
+        dict(query_id="q4", user="cy", workspace="ads", rating=4, tables_proposed=["ad_campaigns"], tables_acked=["ad_campaigns"], run_ok=True, has_output=True),
+    ]
+    for event in events:
+        ctx.kafka.seed(TOPIC, key=event["user"], value=json.dumps(event))
+
+
+def _counters(ctx, workspace="mobility"):
+    return {k: int(v) for k, v in ctx.redis.hgetall(f"eval:{workspace}").items()}
+
+
+def check_user_key(ctx):
+    m = ctx.load("feedback")
+    for query_id, user in (("q1", "ana"), ("q2", "ben"), ("q3", "ana")):
+        assert m.publish_feedback(_record(query_id, user), 4) is True, f"publish_feedback for {query_id} must return True once the broker acknowledged it"
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three ratings produced {len(records)} records on {TOPIC}"
+    keys = [r.key for r in records]
+    assert keys == [b"ana", b"ben", b"ana"], f"records must be keyed by the user, got {keys}"
+    assert records[0].partition == records[2].partition, "one user's feedback must land on one partition so it stays in order"
+
+
+def check_signals(ctx):
+    m = ctx.load("feedback")
+    record = _record("q9", "ana", proposed=("trips", "drivers"), acked=("trips",), run_ok=True, has_output=False)
+    assert m.publish_feedback(record, 2) is True, "publish_feedback must return True once the broker acknowledged it"
+    events = _events(ctx)
+    assert len(events) == 1, f"one rating produced {len(events)} events"
+    event = events[0]
+    assert sorted(event) == SIGNALS, f"the event must carry exactly {SIGNALS}, it carries {sorted(event)}"
+    assert event["tables_proposed"] == ["trips", "drivers"] and event["tables_acked"] == ["trips"], f"the table lists come from the record: {event}"
+    assert event["run_ok"] is True and event["has_output"] is False and event["rating"] == 2, f"run_ok, has_output and rating come from the record and the call: {event}"
+
+
+def check_idempotent_acks(ctx):
+    m = ctx.load("feedback")
+    ctx.kafka.lose_acks(TOPIC, 1)
+    assert m.publish_feedback(_record("q1"), 5) is True, "a lost acknowledgement is retried by the client, not reported: publish_feedback must return True"
+    ids = [e["query_id"] for e in _events(ctx)]
+    assert ids == ["q1"], f"after one lost acknowledgement the topic holds {ids}: the retry wrote the rating twice (enable idempotence)"
+    m.publish_feedback(_record("q2"), 3)
+    ctx.kafka.failover(TOPIC)
+    ids = [e["query_id"] for e in _events(ctx)]
+    assert "q2" in ids, f"a leader failover right after the acknowledgement lost the rating, the topic holds {ids}: wait for all in-sync replicas (acks=all)"
+
+
+def check_eval_counters(ctx):
+    _seed_events(ctx)
+    m = ctx.load("feedback")
+    ctx.drain(m.run_eval)
+    counters = _counters(ctx)
+    expected = {"queries": 3, "run_ok": 2, "has_output": 1, "rating_sum": 8, "overlap_milli": 2500}
+    assert counters == expected, f"eval:mobility is {counters}, expected {expected} (overlaps 1, 0.5 and 1)"
+    assert _counters(ctx, "ads").get("queries") == 1, f"the Ads event counts in eval:ads, which is {_counters(ctx, 'ads')}"
+
+
+def check_write_before_commit(ctx):
+    _seed_events(ctx)
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(sum(_counters(ctx, w).get("queries", 0) for w in ("mobility", "ads"))))
+    m = ctx.load("feedback")
+    ctx.drain(m.run_eval)
+    assert at_commit, "the consumer never committed an offset"
+    assert at_commit == [1, 2, 3, 4], f"queries counted at each commit: {at_commit}, expected [1, 2, 3, 4]: write the counters before the commit, or a crash in between loses the rating"
+    assert ctx.kafka.lag("eval", TOPIC) == 0, f"the consumer left {ctx.kafka.lag('eval', TOPIC)} record(s) uncommitted"
+`,
+    typescript: `const TOPIC = 'query.feedback';
+const SIGNALS = ['has_output', 'query_id', 'rating', 'run_ok', 'tables_acked', 'tables_proposed', 'user', 'workspace'];
+
+function record(queryId = 'q1', user = 'ana', {workspace = 'mobility', proposed = ['trips', 'drivers'], acked = ['trips'], runOk = true, hasOutput = true} = {}) {
+  return {
+    query_id: queryId, user, workspace, question: 'How many trips yesterday?', status: 'ran',
+    tables_proposed: proposed, tables_acked: acked, sql: 'SELECT 1', run_ok: runOk, has_output: hasOutput,
+  };
+}
+
+const events = ctx => ctx.kafka.records(TOPIC).map(r => JSON.parse(r.value.toString()));
+
+function seedEvents(ctx) {
+  const all = [
+    {query_id: 'q1', user: 'ana', workspace: 'mobility', rating: 5, tables_proposed: ['trips', 'drivers'], tables_acked: ['trips'], run_ok: true, has_output: true},
+    {query_id: 'q2', user: 'ben', workspace: 'mobility', rating: 2, tables_proposed: ['trips'], tables_acked: ['trips', 'cities'], run_ok: true, has_output: false},
+    {query_id: 'q3', user: 'ana', workspace: 'mobility', rating: 1, tables_proposed: ['trips'], tables_acked: ['trips'], run_ok: false, has_output: false},
+    {query_id: 'q4', user: 'cy', workspace: 'ads', rating: 4, tables_proposed: ['ad_campaigns'], tables_acked: ['ad_campaigns'], run_ok: true, has_output: true},
+  ];
+  for (const event of all) ctx.kafka.seed(TOPIC, {key: event.user, value: JSON.stringify(event)});
+}
+
+const counters = (ctx, workspace = 'mobility'): Record<string, number> =>
+  Object.fromEntries(Object.entries(ctx.redis.hgetall(\`eval:\${workspace}\`) as Record<string, string>).map(([k, v]) => [k, Number(v)]));
+
+export async function check_user_key(ctx) {
+  const m = ctx.load('feedback');
+  for (const [queryId, user] of [['q1', 'ana'], ['q2', 'ben'], ['q3', 'ana']]) {
+    assert.equal(await m.publishFeedback(record(queryId, user), 4), true, \`publishFeedback for \${queryId} must resolve true once the broker acknowledged it\`);
+  }
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three ratings produced \${records.length} records on \${TOPIC}\`);
+  const keys = records.map(r => r.key?.toString() ?? null);
+  assert.deepStrictEqual(keys, ['ana', 'ben', 'ana'], \`records must be keyed by the user, got \${JSON.stringify(keys)}\`);
+  assert.equal(records[0].partition, records[2].partition, "one user's feedback must land on one partition so it stays in order");
+}
+
+export async function check_signals(ctx) {
+  const m = ctx.load('feedback');
+  assert.equal(await m.publishFeedback(record('q9', 'ana', {hasOutput: false}), 2), true, 'publishFeedback must resolve true once the broker acknowledged it');
+  const all = events(ctx);
+  assert.equal(all.length, 1, \`one rating produced \${all.length} events\`);
+  const event = all[0];
+  assert.deepStrictEqual(Object.keys(event).sort(), SIGNALS, \`the event must carry exactly \${SIGNALS.join(', ')}, it carries \${Object.keys(event).sort().join(', ')}\`);
+  assert(JSON.stringify(event.tables_proposed) === '["trips","drivers"]' && JSON.stringify(event.tables_acked) === '["trips"]', \`the table lists come from the record: \${JSON.stringify(event)}\`);
+  assert(event.run_ok === true && event.has_output === false && event.rating === 2, \`run_ok, has_output and rating come from the record and the call: \${JSON.stringify(event)}\`);
+}
+
+export async function check_idempotent_acks(ctx) {
+  const m = ctx.load('feedback');
+  ctx.kafka.loseAcks(TOPIC, 1);
+  assert.equal(await m.publishFeedback(record('q1'), 5), true, 'a lost acknowledgement is retried by the client, not reported: publishFeedback must resolve true');
+  let ids = events(ctx).map(e => e.query_id);
+  assert.deepStrictEqual(ids, ['q1'], \`after one lost acknowledgement the topic holds \${JSON.stringify(ids)}: the retry wrote the rating twice (idempotent: true)\`);
+  await m.publishFeedback(record('q2'), 3);
+  ctx.kafka.failover(TOPIC);
+  ids = events(ctx).map(e => e.query_id);
+  assert(ids.includes('q2'), \`a leader failover right after the acknowledgement lost the rating, the topic holds \${JSON.stringify(ids)}: wait for all in-sync replicas (acks: -1)\`);
+}
+
+export async function check_eval_counters(ctx) {
+  seedEvents(ctx);
+  const m = ctx.load('feedback');
+  await ctx.drain(m.runEval());
+  const expected = {queries: 3, run_ok: 2, has_output: 1, rating_sum: 8, overlap_milli: 2500};
+  const got = counters(ctx);
+  const sorted = (o: Record<string, number>) => JSON.stringify(Object.keys(o).sort().map(k => [k, o[k]]));
+  assert.equal(sorted(got), sorted(expected), \`eval:mobility is \${JSON.stringify(got)}, expected \${JSON.stringify(expected)} (overlaps 1, 0.5 and 1)\`);
+  assert.equal(counters(ctx, 'ads').queries, 1, \`the Ads event counts in eval:ads, which is \${JSON.stringify(counters(ctx, 'ads'))}\`);
+}
+
+export async function check_write_before_commit(ctx) {
+  seedEvents(ctx);
+  const atCommit: number[] = [];
+  ctx.kafka.onCommit(() => atCommit.push((counters(ctx).queries ?? 0) + (counters(ctx, 'ads').queries ?? 0)));
+  const m = ctx.load('feedback');
+  await ctx.drain(m.runEval());
+  assert(atCommit.length > 0, 'the consumer never committed an offset');
+  assert.deepStrictEqual(atCommit, [1, 2, 3, 4], \`queries counted at each commit: \${JSON.stringify(atCommit)}, expected [1,2,3,4]: write the counters before the commit, or a crash in between loses the rating\`);
+  assert.equal(ctx.kafka.lag('eval', TOPIC), 0, \`the consumer left \${ctx.kafka.lag('eval', TOPIC)} record(s) uncommitted\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+	"strconv"
+
+	"querygen/queries"
+
+	"leetbuild/harness"
+)
+
+const feedbackTopic = "query.feedback"
+
+var feedbackSignals = []string{"has_output", "query_id", "rating", "run_ok", "tables_acked", "tables_proposed", "user", "workspace"}
+
+func feedbackRecord(id, user string, hasOutput bool) queries.Record {
+	return queries.Record{QueryID: id, User: user, Workspace: "mobility", Question: "How many trips yesterday?", Status: "ran", TablesProposed: []string{"trips", "drivers"}, TablesAcked: []string{"trips"}, SQL: "SELECT 1", RunOK: true, HasOutput: hasOutput}
+}
+
+func feedbackEvents(ctx *harness.Ctx) []map[string]any {
+	var events []map[string]any
+	for _, r := range ctx.Kafka.Records(feedbackTopic) {
+		var event map[string]any
+		json.Unmarshal(r.Value, &event)
+		events = append(events, event)
+	}
+	return events
+}
+
+func feedbackSeed(ctx *harness.Ctx) {
+	events := []map[string]any{
+		{"query_id": "q1", "user": "ana", "workspace": "mobility", "rating": 5, "tables_proposed": []string{"trips", "drivers"}, "tables_acked": []string{"trips"}, "run_ok": true, "has_output": true},
+		{"query_id": "q2", "user": "ben", "workspace": "mobility", "rating": 2, "tables_proposed": []string{"trips"}, "tables_acked": []string{"trips", "cities"}, "run_ok": true, "has_output": false},
+		{"query_id": "q3", "user": "ana", "workspace": "mobility", "rating": 1, "tables_proposed": []string{"trips"}, "tables_acked": []string{"trips"}, "run_ok": false, "has_output": false},
+		{"query_id": "q4", "user": "cy", "workspace": "ads", "rating": 4, "tables_proposed": []string{"ad_campaigns"}, "tables_acked": []string{"ad_campaigns"}, "run_ok": true, "has_output": true},
+	}
+	for _, event := range events {
+		raw, _ := json.Marshal(event)
+		ctx.Kafka.Seed(feedbackTopic, event["user"], string(raw))
+	}
+}
+
+func feedbackCounters(ctx *harness.Ctx, workspace string) map[string]int64 {
+	out := map[string]int64{}
+	for k, v := range ctx.Redis.HGetAll("eval:" + workspace) {
+		n, _ := strconv.ParseInt(v, 10, 64)
+		out[k] = n
+	}
+	return out
+}
+
+func CheckUserKey(ctx *harness.Ctx) {
+	for _, r := range [][2]string{{"q1", "ana"}, {"q2", "ben"}, {"q3", "ana"}} {
+		ctx.Equal(publishFeedback(context.Background(), feedbackRecord(r[0], r[1], true), 4), true, "publishFeedback for %s once the broker acknowledged it", r[0])
+	}
+	ctx.Settle()
+	records := ctx.Kafka.Records(feedbackTopic)
+	ctx.Equal(len(records), 3, "three ratings; records on %s", feedbackTopic)
+	keys := ctx.Kafka.Keys(feedbackTopic)
+	sort.Strings(keys)
+	ctx.Equal(keys, []string{"ana", "ana", "ben"}, "records must be keyed by the user")
+	var ana []int
+	for _, r := range records {
+		if string(r.Key) == "ana" {
+			ana = append(ana, r.Partition)
+		}
+	}
+	ctx.Assert(len(ana) == 2 && ana[0] == ana[1], "one user's feedback must land on one partition so it stays in order; ana's partitions %v", ana)
+}
+
+func CheckSignals(ctx *harness.Ctx) {
+	ctx.Equal(publishFeedback(context.Background(), feedbackRecord("q9", "ana", false), 2), true, "publishFeedback once the broker acknowledged it")
+	ctx.Settle()
+	events := feedbackEvents(ctx)
+	ctx.Equal(len(events), 1, "one rating; events")
+	var fields []string
+	for k := range events[0] {
+		fields = append(fields, k)
+	}
+	sort.Strings(fields)
+	ctx.Equal(fields, feedbackSignals, "the event's fields")
+	event := events[0]
+	ctx.Equal(event["tables_proposed"], []any{"trips", "drivers"}, "tables_proposed comes from the record")
+	ctx.Equal(event["tables_acked"], []any{"trips"}, "tables_acked comes from the record")
+	ctx.Assert(event["run_ok"] == true && event["has_output"] == false && event["rating"] == float64(2), "run_ok, has_output and rating come from the record and the call: %v", event)
+}
+
+func CheckIdempotentAcks(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(feedbackTopic, 1)
+	ctx.Equal(publishFeedback(context.Background(), feedbackRecord("q1", "ana", true), 5), true, "a lost acknowledgement is retried by the client, not reported; publishFeedback")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(feedbackTopic)), 1, "after one lost acknowledgement the retry wrote the rating twice (enable.idempotence); the records")
+	publishFeedback(context.Background(), feedbackRecord("q2", "ana", true), 3)
+	ctx.Settle()
+	ctx.Kafka.Failover(feedbackTopic)
+	ctx.Equal(len(ctx.Kafka.Records(feedbackTopic)), 2, "after a leader failover both ratings must still be on the topic (acks=all); the records")
+}
+
+func CheckEvalCounters(ctx *harness.Ctx) {
+	feedbackSeed(ctx)
+	ctx.Drain(func() { runEval(context.Background()) })
+	ctx.Equal(feedbackCounters(ctx, "mobility"), map[string]int64{"queries": 3, "run_ok": 2, "has_output": 1, "rating_sum": 8, "overlap_milli": 2500}, "eval:mobility (overlaps 1, 0.5 and 1)")
+	ctx.Equal(feedbackCounters(ctx, "ads")["queries"], int64(1), "the Ads event counts in eval:ads; queries")
+}
+
+func CheckWriteBeforeCommit(ctx *harness.Ctx) {
+	feedbackSeed(ctx)
+	var atCommit []int64
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		atCommit = append(atCommit, feedbackCounters(ctx, "mobility")["queries"]+feedbackCounters(ctx, "ads")["queries"])
+	})
+	ctx.Drain(func() { runEval(context.Background()) })
+	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
+	ctx.Equal(atCommit, []int64{1, 2, 3, 4}, "queries counted at each commit (write the counters before the commit, or a crash in between loses the rating)")
+	ctx.Equal(ctx.Kafka.Lag("eval", feedbackTopic), int64(0), "records the consumer left uncommitted")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cstdlib>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace {
+
+using json = nlohmann::json;
+
+const std::string kFeedbackTopic = "query.feedback";
+
+json feedbackRecord(const std::string& id, const std::string& user, bool has_output = true) {
+  return {{"query_id", id}, {"user", user}, {"workspace", "mobility"}, {"question", "How many trips yesterday?"}, {"status", "ran"},
+          {"tables_proposed", {"trips", "drivers"}}, {"tables_acked", {"trips"}}, {"sql", "SELECT 1"}, {"run_ok", true}, {"has_output", has_output}};
+}
+
+std::vector<json> feedbackEvents(harness::Ctx& ctx) {
+  std::vector<json> events;
+  for (const auto& r : ctx.Kafka.Records(kFeedbackTopic)) events.push_back(json::parse(r.Value.value_or(""), nullptr, false));
+  return events;
+}
+
+void feedbackSeed(harness::Ctx& ctx) {
+  const std::vector<json> events = {
+      {{"query_id", "q1"}, {"user", "ana"}, {"workspace", "mobility"}, {"rating", 5}, {"tables_proposed", {"trips", "drivers"}}, {"tables_acked", {"trips"}}, {"run_ok", true}, {"has_output", true}},
+      {{"query_id", "q2"}, {"user", "ben"}, {"workspace", "mobility"}, {"rating", 2}, {"tables_proposed", {"trips"}}, {"tables_acked", {"trips", "cities"}}, {"run_ok", true}, {"has_output", false}},
+      {{"query_id", "q3"}, {"user", "ana"}, {"workspace", "mobility"}, {"rating", 1}, {"tables_proposed", {"trips"}}, {"tables_acked", {"trips"}}, {"run_ok", false}, {"has_output", false}},
+      {{"query_id", "q4"}, {"user", "cy"}, {"workspace", "ads"}, {"rating", 4}, {"tables_proposed", {"ad_campaigns"}}, {"tables_acked", {"ad_campaigns"}}, {"run_ok", true}, {"has_output", true}},
+  };
+  for (const auto& event : events) ctx.Kafka.Seed(kFeedbackTopic, event["user"].get<std::string>(), event.dump());
+}
+
+std::map<std::string, long long> feedbackCounters(harness::Ctx& ctx, const std::string& workspace) {
+  std::map<std::string, long long> out;
+  for (const auto& [k, v] : ctx.Redis.HGetAll("eval:" + workspace)) out[k] = std::atoll(v.c_str());
+  return out;
+}
+
+}  // namespace
+
+void CheckUserKey(harness::Ctx& ctx) {
+  for (const auto& [id, user] : std::vector<std::pair<std::string, std::string>>{{"q1", "ana"}, {"q2", "ben"}, {"q3", "ana"}}) {
+    ctx.Equal(publish_feedback(feedbackRecord(id, user), 4), true, "publish_feedback for %s once the broker acknowledged it", id);
+  }
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kFeedbackTopic);
+  ctx.Equal(records.size(), 3, "three ratings; records on query.feedback");
+  ctx.Equal(ctx.Kafka.Keys(kFeedbackTopic), {"ana", "ben", "ana"}, "records must be keyed by the user");
+  ctx.Equal(records[0].Partition, records[2].Partition, "one user's feedback must land on one partition so it stays in order; ana's partitions");
+}
+
+void CheckSignals(harness::Ctx& ctx) {
+  ctx.Equal(publish_feedback(feedbackRecord("q9", "ana", false), 2), true, "publish_feedback once the broker acknowledged it");
+  ctx.Settle();
+  const auto events = feedbackEvents(ctx);
+  ctx.Equal(events.size(), 1, "one rating; events");
+  const json& event = events[0];
+  std::vector<std::string> fields;
+  if (event.is_object())
+    for (const auto& item : event.items()) fields.push_back(item.key());
+  std::sort(fields.begin(), fields.end());
+  ctx.Equal(fields, std::vector<std::string>{"has_output", "query_id", "rating", "run_ok", "tables_acked", "tables_proposed", "user", "workspace"}, "the event's fields");
+  ctx.Assert(event["tables_proposed"] == json({"trips", "drivers"}) && event["tables_acked"] == json({"trips"}), "the table lists come from the record: %s", event.dump());
+  ctx.Assert(event["run_ok"] == true && event["has_output"] == false && event["rating"] == 2, "run_ok, has_output and rating come from the record and the call: %s", event.dump());
+}
+
+void CheckIdempotentAcks(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kFeedbackTopic, 1);
+  ctx.Equal(publish_feedback(feedbackRecord("q1", "ana"), 5), true, "a lost acknowledgement is retried by the client, not reported; publish_feedback");
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kFeedbackTopic).size(), 1, "after one lost acknowledgement the retry wrote the rating twice (enable.idempotence); the records");
+  publish_feedback(feedbackRecord("q2", "ana"), 3);
+  ctx.Settle();
+  ctx.Kafka.Failover(kFeedbackTopic);
+  ctx.Equal(ctx.Kafka.Records(kFeedbackTopic).size(), 2, "after a leader failover both ratings must still be on the topic (acks=all); the records");
+}
+
+void CheckEvalCounters(harness::Ctx& ctx) {
+  feedbackSeed(ctx);
+  ctx.Drain([] { run_eval(); });
+  const std::map<std::string, long long> expected = {{"queries", 3}, {"run_ok", 2}, {"has_output", 1}, {"rating_sum", 8}, {"overlap_milli", 2500}};
+  ctx.Equal(feedbackCounters(ctx, "mobility"), expected, "eval:mobility (overlaps 1, 0.5 and 1)");
+  ctx.Equal(feedbackCounters(ctx, "ads")["queries"], 1, "the Ads event counts in eval:ads; queries");
+}
+
+void CheckWriteBeforeCommit(harness::Ctx& ctx) {
+  feedbackSeed(ctx);
+  auto atCommit = std::make_shared<std::vector<long long>>();
+  ctx.Kafka.OnCommit([&ctx, atCommit](const std::string&, const harness::KafkaOffsets&) {
+    atCommit->push_back(feedbackCounters(ctx, "mobility")["queries"] + feedbackCounters(ctx, "ads")["queries"]);
+  });
+  ctx.Drain([] { run_eval(); });
+  ctx.Assert(!atCommit->empty(), "the consumer never committed an offset");
+  ctx.Equal(*atCommit, std::vector<long long>{1, 2, 3, 4}, "queries counted at each commit (write the counters before the commit, or a crash in between loses the rating)");
+  ctx.Equal(ctx.Kafka.Lag("eval", kFeedbackTopic), 0, "records the consumer left uncommitted");
+}
+`,
+  },
+  hints: [
+    "Symptom: one user's ratings arrive out of order, the dashboard cannot say whether a bad rating came from the tables or an empty result, a broker hiccup counts one query twice, and a consumer restart loses a rating.",
+    'Mechanism: the key is the query id; `build_event` copies four fields; the producer has `acks=1` and no idempotence, so a lost acknowledgement is rewritten; `run_eval` commits before its `HINCRBY`s and never computes the overlap.',
+    'Change: `key=record["user"]`; copy `tables_proposed`, `tables_acked`, `run_ok`, `has_output`; `enable.idempotence` + `acks=all`; in `run_eval`, HINCRBY `queries`, `run_ok`, `has_output`, `rating_sum`, `overlap_milli = round(1000 * table_overlap(...))`, then commit.',
+  ],
+  debrief: `A rating alone says a user was unhappy; the signals say why. Table overlap measures the table agent against what the user ACKed, \`run_ok\` and \`has_output\` separate SQL that failed from SQL that ran and found nothing, and together they point at the agent to fix, the split QueryGPT's evaluation draws. Keying by user keeps one user's feedback in order; idempotence with \`acks=all\` makes a retry land once and a failover keep what was acknowledged; writing before the commit means a crash replays a rating rather than losing it. The replay can still count a rating twice; a consumer that remembers the query ids it has folded in, with a SET NX beside the counters, closes that gap.`,
 };

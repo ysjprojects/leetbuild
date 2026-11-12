@@ -8,115 +8,104 @@ export const merchantBudgetStep: Step = {
   focus: ['api', 'redis', 'tools'],
   task: `## Task
 
-**Starting point.** The starter is the spending layer every assist turn goes through: \`charge\`
-\`GET\`s two counters under \`budget:{shop}\` and \`INCRBY\`s them when the turn fits; \`invoke_tool\`
-caches read-tool results under \`tool:{name}:{digest}\` with no TTL and runs write tools on every
-call; \`assist_turn\` calls \`Complete\` first and charges afterwards. A single shop with budget
-left sails through, so the demo passes. It hides five flaws.
+**Starting point.** The starter is the spending layer step 2's loop calls. \`reserve(shop, tokens)\`
+reads \`requests\` and \`tokens\` from the hash \`budget:{shop}\` with \`HMGET\` and \`HINCRBY\`s both when
+the call fits (**30** requests, **150 000** tokens). \`invoke_tool(shop, turn_id, name, args_json)\`
+caches a read tool's \`Tools.Invoke\` result under \`tool:{name}:{sha256(args)}\` with no TTL and
+invokes a write tool on every call. It serves the demo and hides 5 flaws.
 
-**Failure mode the checks target.** Two concurrent turns both pass the budget check and overspend.
-A shop that had one busy minute is locked out for good, because the key has no window. A "customers
-from Toronto" answer computed for one merchant is served to another from the cache. A retried turn
-fills the merchant's product form twice. And an over-budget turn has already been paid for by the
-time it is refused.
+**Failure mode the checks target.** Two replicas both pass the check and overspend. A shop that had
+one busy minute is refused for good. A "customers from Toronto" answer computed for one merchant is
+served to another, and stays stale forever. A retried turn fills the merchant's product form twice.
 
-- Each shop gets **30 requests** and **150 000 tokens** per **60-second window**. The key is
-  \`budget:{shop}:{window}\`, \`window = floor(unix_seconds / WINDOW_S)\`, \`WINDOW_S = 60\`.
-- One atomic Lua \`EVAL\` (\`RESERVE_LUA\`) reads both counters, rejects when either reservation does
-  not fit, and \`HINCRBY\`s both when it does, setting \`EXPIRE\` on first write.
-- \`reserve\` runs before \`model.Complete\`; a refused turn is 429 with \`Retry-After\`.
-- Read-tool results are cached under \`tool:{shop}:{name}:{digest}\` (digest = SHA-256 of the args
-  JSON) with \`ex=CACHE_TTL_S\` (\`CACHE_TTL_S = 120\`).
-- Write tools run once per turn: \`fill_product_form\` is claimed with \`SET NX EX\` on
-  \`write:{shop}:{turn_id}:{name}\` (24 h); a second attempt in the same turn returns the stored
-  result.`,
+- The limits hold per **60-second window**: the hash is \`budget:{shop}:{window}\` with
+  \`window = unix_seconds // WINDOW_S\`, and it expires with its window.
+- One Lua script (\`RESERVE_LUA\`) reads both counters, refuses when either would pass its limit,
+  and \`HINCRBY\`s both otherwise, setting \`EXPIRE\` on first write.
+- Read results are cached under \`tool:{shop}:{name}:{digest}\` for \`CACHE_TTL_S = 120\`.
+- A write tool (\`writes\` in the catalog) is claimed with \`SET NX\` on
+  \`write:{shop}:{turn_id}:{name}\` (24 h): a second call in the turn answers the stored result.`,
   sequence: {
-    participants: ['sidekick API', 'Redis', 'Model', 'Tools'],
+    participants: ['agent loop', 'budget_cache', 'Redis', 'Tools'],
     messages: [
-      {from: 'sidekick API', to: 'Redis', label: 'EVAL reserve · budget:{shop}:{window}', kind: 'sync'},
-      {from: 'Redis', to: 'sidekick API', label: '{1, 29, 148 400, 47}', kind: 'reply'},
-      {from: 'sidekick API', to: 'Model', label: 'Complete(...) only after the reservation', kind: 'sync'},
-      {from: 'Model', to: 'sidekick API', label: 'tool_call segment_customers', kind: 'reply'},
-      {from: 'sidekick API', to: 'Redis', label: 'GET tool:{shop}:segment_customers:{digest}', kind: 'sync'},
-      {from: 'Redis', to: 'sidekick API', label: 'miss', kind: 'reply'},
-      {from: 'sidekick API', to: 'Tools', label: 'Invoke(shop, segment_customers, args)', kind: 'sync'},
+      {from: 'agent loop', to: 'budget_cache', label: 'reserve(shop, 2000)', kind: 'sync'},
+      {from: 'budget_cache', to: 'Redis', label: 'EVALSHA RESERVE_LUA budget:{shop}:{window}', kind: 'sync'},
+      {from: 'Redis', to: 'budget_cache', label: '1 (reserved) · 0 (over the limit)', kind: 'reply'},
+      {from: 'agent loop', to: 'budget_cache', label: 'invoke_tool(shop, turn, segment_customers, args)', kind: 'sync'},
+      {from: 'budget_cache', to: 'Redis', label: 'GET tool:{shop}:segment_customers:{digest}', kind: 'sync'},
+      {from: 'budget_cache', to: 'Tools', label: 'Invoke · 10 s (on a miss)', kind: 'sync'},
       {
-        from: 'sidekick API',
+        from: 'budget_cache',
         to: 'Redis',
-        label: 'SET … EX 120 · SET write:{shop}:{turn}:{name} NX for writes',
-        kind: 'async',
+        label: 'SET … EX 120 · writes: SET write:{shop}:{turn}:{name} NX',
+        kind: 'sync',
       },
     ],
   },
-  hints: [
-    "A merchant's staff see another shop's customer list in a segment answer, and a shop that was busy for one minute last Tuesday still gets 429 on every assist turn.",
-    '`charge` does `GET` then `INCRBY` on `budget:{shop}` with no window or expiry; `tool:{name}:{digest}` has no shop in it; `charge` is called after `model.Complete`; nothing claims a write tool.',
-    'Move both counters into `RESERVE_LUA` on `budget:{shop}:{window}` with `EXPIRE` on creation; call `reserve` before `Complete`; key the cache `tool:{shop}:{name}:{digest}` with `ex=CACHE_TTL_S`; `SET write:{shop}:{turn_id}:{name} NX EX`.',
-  ],
   checks: [
     {
       id: 'atomic-reserve',
-      title: 'Reserves both counters in one Lua script with expiry',
+      title: 'Reserves both counters in one Lua script',
       detail:
-        'Requests and tokens are read, checked and incremented inside one `EVAL`, which also sets `EXPIRE` on first write. A client-side read followed by `INCRBY` races: two turns can both observe budget that only one of them can spend.',
+        'A shop with one request left and two replicas reserving at once: exactly one gets it and the hash holds 30, not 31. The read, the limit test and both increments run in one script. The starter reads, then increments, in separate commands.',
       match: {
-        python: {all: [/RESERVE_LUA/, /\.eval\(/, /HINCRBY/, /EXPIRE/]},
-        typescript: {all: [/RESERVE_LUA/, /\.eval\(/, /HINCRBY/, /EXPIRE/]},
-        go: {all: [/(reserveScript|NewScript)/, /\.Run\(/, /HINCRBY/, /EXPIRE/]},
-        scala: {all: [/ReserveLua/, /\.eval\(/, /HINCRBY/, /EXPIRE/]},
-        cpp: {all: [/kReserveLua/, /\.eval</, /HINCRBY/, /EXPIRE/]},
+        python: {all: [/register_script\(|\.eval\(/, /HINCRBY/], none: [/\br\.hincrby\(|\.hmget\(/]},
+        typescript: {all: [/defineCommand\(|\.eval\(/, /HINCRBY/], none: [/redis\.hincrby\(|redis\.hmget\(/]},
+        go: {all: [/redis\.NewScript\(|\.Eval\(/, /HINCRBY/], none: [/rdb\.HIncrBy\(|rdb\.HMGet\(/]},
+        scala: {all: [/jedis\.eval\(/, /HINCRBY/], none: [/jedis\.hincrBy\(|jedis\.hmget\(/]},
+        cpp: {all: [/redis\.eval</, /HINCRBY/], none: [/redis\.hincrby\(|redis\.hmget\(/]},
       },
     },
     {
-      id: 'shop-window-key',
-      title: 'Keys the budget by shop and 60-second window',
+      id: 'budget-window',
+      title: 'Counts per 60-second window that expires',
       detail:
-        'The key is `budget:{shop}:{window}` from the authenticated shop and the minute bucket (`WINDOW_S = 60`). The starter’s `budget:{shop}` never resets, so a shop that had one busy minute is locked out for good.',
+        'The 31st reservation in a minute is refused, the budget hash has a TTL of at most 60 s, and a minute later the shop reserves again; 100 000 tokens plus 60 000 is refused, plus 50 000 fits. The starter keeps one counter forever.',
       match: {
-        python: {all: [/budget:\{shop\}:\{window\}/, /WINDOW_S\s*=\s*60/]},
-        typescript: {all: [/budget:\$\{shop\}:\$\{window\}/, /WINDOW_S\s*=\s*60/]},
-        go: {all: [/budget:%s:%d/, /windowSeconds\s*=\s*60/]},
-        scala: {all: [/budget:\$shop:\$window/, /WindowSeconds\s*=\s*60/]},
-        cpp: {all: [/"budget:"\s*\+\s*shop\s*\+\s*":"/, /kWindowSeconds\s*=\s*60/]},
+        python: {all: [/\/\/\s*WINDOW_S\b/, /EXPIRE/]},
+        typescript: {all: [/\/\s*WINDOW_S\b/, /EXPIRE/]},
+        go: {all: [/\/\s*windowSeconds\b/, /EXPIRE/]},
+        scala: {all: [/\/\s*WindowS\b/, /EXPIRE/]},
+        cpp: {all: [/\/\s*kWindowS\b/, /EXPIRE/]},
       },
     },
     {
       id: 'shop-scoped-cache',
-      title: 'Caches tool results per shop with a 120 s TTL',
+      title: 'Keys the tool cache by shop',
       detail:
-        'The tool cache key is `tool:{shop}:{name}:{digest}` and every entry is written with `EX CACHE_TTL_S` (120). The starter keys by tool and args only and never expires — a cross-merchant leak that persists.',
+        "Shop s1's second identical segment query is a cache hit; shop s2 asking the same thing gets its own Invoke and its own customers. The starter's key has no shop, so s2 gets s1's answer.",
       match: {
-        python: {all: [/tool:\{shop\}:\{name\}:\{digest\}/, /CACHE_TTL_S\s*=\s*120/, /ex\s*=\s*CACHE_TTL_S/]},
-        typescript: {all: [/tool:\$\{shop\}:\$\{name\}:\$\{digest\}/, /CACHE_TTL_S\s*=\s*120/, /'EX',\s*CACHE_TTL_S/]},
-        go: {all: [/tool:%s:%s:%s/, /cacheTTL\s*=\s*120\s*\*\s*time\.Second/, /\.Set\([^)]*cacheTTL\)/]},
-        scala: {all: [/tool:\$shop:\$name:\$digest/, /CacheTtlS\s*=\s*120/, /\.setex\(/]},
-        cpp: {all: [/"tool:"\s*\+\s*shop/, /kCacheTtlS\s*=\s*120/, /std::chrono::seconds\(kCacheTtlS\)/]},
+        python: {all: [/f["']tool:\{shop\}:/]},
+        typescript: {all: [/tool:\$\{shop\}:/]},
+        go: {all: [/"tool:"\s*\+\s*shop\s*\+/]},
+        scala: {all: [/s"tool:\$shop:/]},
+        cpp: {all: [/"tool:"\s*\+\s*shop\s*\+/]},
+      },
+    },
+    {
+      id: 'cache-ttl',
+      title: 'Expires cached tool results after 120 s',
+      detail:
+        'A cached result has a TTL of at most 120 s, and after 121 s the next call reaches the tool again. The starter caches forever, so a merchant who adds a customer never sees it.',
+      match: {
+        python: {all: [/ex\s*=\s*CACHE_TTL_S/]},
+        typescript: {all: [/['"]EX['"],\s*CACHE_TTL_S/]},
+        go: {all: [/rdb\.Set\([^\n]*cacheTTL\)/]},
+        scala: {all: [/\.ex\(\s*CacheTtlS\s*\)/]},
+        cpp: {all: [/redis\.set\([^\n]*kCacheTtl/]},
       },
     },
     {
       id: 'write-once',
-      title: 'Claims write tools with SET NX per shop and turn',
+      title: 'Runs a write tool once per turn',
       detail:
-        'A write tool is claimed with `SET write:{shop}:{turn_id}:{name} … NX EX` before it runs; a failed claim returns the stored result. The starter invokes `fill_product_form` on every attempt.',
+        'Two `fill_product_form` calls in one turn reach the tool once and answer the same result; the claim key lives about a day; another turn fills again. The starter invokes the write on every call.',
       match: {
-        python: {all: [/write:\{shop\}:\{turn_id\}:\{name\}/, /nx\s*=\s*True/]},
-        typescript: {all: [/write:\$\{shop\}:\$\{turnId\}:\$\{name\}/, /'NX'/]},
-        go: {all: [/write:%s:%s:%s/, /SetNX\(/]},
-        scala: {all: [/write:\$shop:\$turnId:\$name/, /\.nx\(\)/]},
-        cpp: {all: [/"write:"\s*\+\s*shop/, /UpdateType::NOT_EXIST/]},
-      },
-    },
-    {
-      id: 'reserve-first',
-      title: 'Reserves before the model call',
-      detail:
-        'The reservation runs before `Complete`; a refused turn never reaches the model. The starter calls the model first and charges afterwards, so an over-budget turn is still paid for.',
-      match: {
-        python: {order: [/reserve\(/, /model\.Complete\(/]},
-        typescript: {order: [/reserve\(/, /model\.Complete\(/]},
-        go: {order: [/reserve\(/, /model\.Complete\(/]},
-        scala: {order: [/reserve\(/, /model[\s\S]{0,80}\.complete\(/]},
-        cpp: {order: [/reserve\(/, /model->Complete\(/]},
+        python: {all: [/nx\s*=\s*True/, /write:\{shop\}:\{turn_id\}/]},
+        typescript: {all: [/['"]NX['"]/, /write:\$\{shop\}:\$\{turnId\}/]},
+        go: {all: [/\.SetNX\(/, /"write:"\s*\+\s*shop/]},
+        scala: {all: [/\.nx\(\)/, /s"write:\$shop:\$turnId/]},
+        cpp: {all: [/UpdateType::NOT_EXIST/, /"write:"\s*\+\s*shop/]},
       },
     },
   ],
@@ -127,971 +116,1191 @@ time it is refused.
 import grpc
 import redis
 
-import sidekick_pb2
-import sidekick_pb2_grpc
-from fastapi import HTTPException
+import merchant_agent_pb2
+import merchant_agent_pb2_grpc
+from sidekick.catalog import CATALOG
+from sidekick.config import TOOLS_ADDR
+
+MAX_REQUESTS = 30
+MAX_TOKENS = 150_000
+TOOL_DEADLINE_S = 10.0
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
-model = sidekick_pb2_grpc.ModelStub(grpc.insecure_channel("model:9000"))
-tools = sidekick_pb2_grpc.ToolsStub(grpc.insecure_channel("tools:9000"))
-
-LIMIT_REQUESTS = 30
-LIMIT_TOKENS = 150_000
-WRITE_TOOLS = {"fill_product_form"}
+tools = merchant_agent_pb2_grpc.ToolsStub(grpc.insecure_channel(TOOLS_ADDR))
 
 
-def charge(shop: str, tokens: int) -> tuple[bool, int, int]:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+def reserve(shop: str, tokens: int) -> bool:
+    """Reserve one model call and its tokens for the shop; False when either does not fit."""
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     key = f"budget:{shop}"
-    used_req = int(r.get(f"{key}:req") or 0)
-    used_tok = int(r.get(f"{key}:tok") or 0)
-    if used_req + 1 > LIMIT_REQUESTS or used_tok + tokens > LIMIT_TOKENS:
-        return False, LIMIT_REQUESTS - used_req, LIMIT_TOKENS - used_tok
-    r.incrby(f"{key}:req", 1)
-    r.incrby(f"{key}:tok", tokens)
-    return True, LIMIT_REQUESTS - used_req - 1, LIMIT_TOKENS - used_tok - tokens
+    requests, used = r.hmget(key, "requests", "tokens")
+    if int(requests or 0) + 1 > MAX_REQUESTS or int(used or 0) + tokens > MAX_TOKENS:
+        return False
+    r.hincrby(key, "requests", 1)
+    r.hincrby(key, "tokens", tokens)
+    return True
 
 
 def invoke_tool(shop: str, turn_id: str, name: str, args_json: str) -> str:
-    digest = hashlib.sha256(args_json.encode("utf-8")).hexdigest()[:32]
-    key = f"tool:{name}:{digest}"
-    if name not in WRITE_TOOLS:
-        cached = r.get(key)
-        if cached is not None:
-            return cached
-    result = tools.Invoke(sidekick_pb2.InvokeRequest(shop=shop, name=name, args_json=args_json), timeout=10.0)
-    if name not in WRITE_TOOLS:
-        r.set(key, result.result_json)
-    return result.result_json
-
-
-def assist_turn(shop: str, turn_id: str, message: str, page: str, max_tokens: int) -> dict:
-    wanted = len(message) // 4 + max_tokens
-    request = sidekick_pb2.CompleteRequest(
-        system="You are Sidekick.",
-        messages=[sidekick_pb2.Message(role="user", content=f"[page: {page}] {message}")],
-    )
-    reply = model.Complete(request, timeout=10.0)
-    ok, left_req, left_tok = charge(shop, wanted)
-    if not ok:
-        raise HTTPException(status_code=429, detail="shop budget exceeded", headers={"Retry-After": "60"})
-    if reply.HasField("tool_call"):
-        result = invoke_tool(shop, turn_id, reply.tool_call.name, reply.tool_call.args_json)
-        return {"tool": reply.tool_call.name, "result": result, "remaining_tokens": left_tok}
-    return {"reply": reply.text, "remaining_tokens": left_tok}
+    """The tool's result for the shop: reads from the cache when it can."""
+    request = merchant_agent_pb2.InvokeRequest(shop=shop, turn_id=turn_id, name=name, args_json=args_json)
+    tool = CATALOG.get(name)
+    if tool is not None and tool.writes:
+        return tools.Invoke(request, timeout=TOOL_DEADLINE_S).result_json
+    key = f"tool:{name}:{hashlib.sha256(args_json.encode('utf-8')).hexdigest()}"
+    cached = r.get(key)
+    if cached is not None:
+        return cached
+    result = tools.Invoke(request, timeout=TOOL_DEADLINE_S).result_json
+    r.set(key, result)
+    return result
 `,
       solution: `import hashlib
-import json
 import time
 
 import grpc
 import redis
 
-import sidekick_pb2
-import sidekick_pb2_grpc
-from fastapi import HTTPException
+import merchant_agent_pb2
+import merchant_agent_pb2_grpc
+from sidekick.catalog import CATALOG
+from sidekick.config import TOOLS_ADDR
 
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-model = sidekick_pb2_grpc.ModelStub(grpc.insecure_channel("model:9000"))
-tools = sidekick_pb2_grpc.ToolsStub(grpc.insecure_channel("tools:9000"))
-
+MAX_REQUESTS = 30
+MAX_TOKENS = 150_000
 WINDOW_S = 60
-LIMIT_REQUESTS = 30
-LIMIT_TOKENS = 150_000
 CACHE_TTL_S = 120
 WRITE_CLAIM_TTL_S = 86_400
-WRITE_TOOLS = {"fill_product_form"}
+TOOL_DEADLINE_S = 10.0
 
+# KEYS[1] the shop's window; ARGV tokens, max requests, max tokens, window seconds. 1 reserved, 0 refused.
 RESERVE_LUA = """
-local req = tonumber(redis.call('HGET', KEYS[1], 'req')) or 0
-local tok = tonumber(redis.call('HGET', KEYS[1], 'tok')) or 0
-local want_req = tonumber(ARGV[1])
-local want_tok = tonumber(ARGV[2])
-if req + want_req > tonumber(ARGV[3]) or tok + want_tok > tonumber(ARGV[4]) then
-  return {0, tonumber(ARGV[3]) - req, tonumber(ARGV[4]) - tok, redis.call('TTL', KEYS[1])}
+local requests = tonumber(redis.call('HGET', KEYS[1], 'requests') or '0')
+local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or '0')
+local want = tonumber(ARGV[1])
+if requests + 1 > tonumber(ARGV[2]) or tokens + want > tonumber(ARGV[3]) then
+  return 0
 end
-redis.call('HINCRBY', KEYS[1], 'req', want_req)
-redis.call('HINCRBY', KEYS[1], 'tok', want_tok)
+redis.call('HINCRBY', KEYS[1], 'requests', 1)
+redis.call('HINCRBY', KEYS[1], 'tokens', want)
 if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[5])
+  redis.call('EXPIRE', KEYS[1], ARGV[4])
 end
-return {1, tonumber(ARGV[3]) - req - want_req, tonumber(ARGV[4]) - tok - want_tok, redis.call('TTL', KEYS[1])}
+return 1
 """
 
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+tools = merchant_agent_pb2_grpc.ToolsStub(grpc.insecure_channel(TOOLS_ADDR))
+reserve_script = r.register_script(RESERVE_LUA)
 
-def budget_key(shop: str, window: int) -> str:
-    return f"budget:{shop}:{window}"
 
-
-def reserve(shop: str, tokens: int) -> tuple[bool, int, int, int]:
+def reserve(shop: str, tokens: int) -> bool:
+    """Reserve one model call and its tokens in the shop's current minute; False when either does not fit."""
     window = int(time.time()) // WINDOW_S
-    ok, left_req, left_tok, ttl = r.eval(
-        RESERVE_LUA, 1, budget_key(shop, window), 1, tokens, LIMIT_REQUESTS, LIMIT_TOKENS, WINDOW_S
-    )
-    return bool(ok), int(left_req), int(left_tok), int(ttl)
-
-
-def cache_key(shop: str, name: str, args_json: str) -> str:
-    digest = hashlib.sha256(args_json.encode("utf-8")).hexdigest()[:32]
-    return f"tool:{shop}:{name}:{digest}"
-
-
-def invoke_once(shop: str, name: str, args_json: str) -> str:
-    request = sidekick_pb2.InvokeRequest(shop=shop, name=name, args_json=args_json)
-    return tools.Invoke(request, timeout=10.0).result_json
-
-
-def invoke_write(shop: str, turn_id: str, name: str, args_json: str) -> str:
-    """A write tool runs once per (shop, turn, tool): the claim is SET NX, the result is stored under it."""
-    key = f"write:{shop}:{turn_id}:{name}"
-    claimed = r.set(key, "pending", nx=True, ex=WRITE_CLAIM_TTL_S)
-    if not claimed:
-        stored = r.get(key)
-        return stored if stored not in (None, "pending") else json.dumps({"status": "already_applied"})
-    result = invoke_once(shop, name, args_json)
-    r.set(key, result, ex=WRITE_CLAIM_TTL_S)
-    return result
+    return reserve_script(keys=[f"budget:{shop}:{window}"], args=[tokens, MAX_REQUESTS, MAX_TOKENS, WINDOW_S]) == 1
 
 
 def invoke_tool(shop: str, turn_id: str, name: str, args_json: str) -> str:
-    if name in WRITE_TOOLS:
-        return invoke_write(shop, turn_id, name, args_json)
-    key = cache_key(shop, name, args_json)
+    """The tool's result for the shop: reads from the shop's cache, writes once per turn."""
+    request = merchant_agent_pb2.InvokeRequest(shop=shop, turn_id=turn_id, name=name, args_json=args_json)
+    tool = CATALOG.get(name)
+    if tool is not None and tool.writes:
+        claim = f"write:{shop}:{turn_id}:{name}"
+        if not r.set(claim, "", nx=True, ex=WRITE_CLAIM_TTL_S):
+            return r.get(claim) or ""  # this turn already wrote: answer what it wrote
+        try:
+            result = tools.Invoke(request, timeout=TOOL_DEADLINE_S).result_json
+        except grpc.RpcError:
+            r.delete(claim)  # nothing was written: let a retry try again
+            raise
+        r.set(claim, result, ex=WRITE_CLAIM_TTL_S)
+        return result
+    key = f"tool:{shop}:{name}:{hashlib.sha256(args_json.encode('utf-8')).hexdigest()}"
     cached = r.get(key)
     if cached is not None:
         return cached
-    result = invoke_once(shop, name, args_json)
+    result = tools.Invoke(request, timeout=TOOL_DEADLINE_S).result_json
     r.set(key, result, ex=CACHE_TTL_S)
     return result
-
-
-def assist_turn(shop: str, turn_id: str, message: str, page: str, max_tokens: int) -> dict:
-    wanted = len(message) // 4 + max_tokens
-    ok, left_req, left_tok, ttl = reserve(shop, wanted)
-    if not ok:
-        raise HTTPException(
-            status_code=429,
-            detail="shop budget exceeded",
-            headers={"Retry-After": str(max(ttl, 1)), "X-RateLimit-Remaining": str(left_tok)},
-        )
-    request = sidekick_pb2.CompleteRequest(
-        system="You are Sidekick.",
-        messages=[sidekick_pb2.Message(role="user", content=f"[page: {page}] {message}")],
-    )
-    reply = model.Complete(request, timeout=10.0)
-    if reply.HasField("tool_call"):
-        result = invoke_tool(shop, turn_id, reply.tool_call.name, reply.tool_call.args_json)
-        return {"tool": reply.tool_call.name, "result": result, "remaining_tokens": left_tok}
-    return {"reply": reply.text, "remaining_tokens": left_tok}
 `,
     },
     typescript: {
-      starter: `/** Spending layer: flawed code that charges after the call and caches across shops. */
-import {createHash} from 'node:crypto';
+      starter: `import {createHash} from 'node:crypto';
 
-import {Redis} from 'ioredis';
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
 
-import {model, tools} from './clients';
+import {CATALOG} from 'sidekick/catalog';
+import {TOOLS_ADDR} from 'sidekick/config';
 
-const r = new Redis('redis://redis:6379');
+export const MAX_REQUESTS = 30;
+export const MAX_TOKENS = 150_000;
+export const TOOL_DEADLINE_MS = 10_000;
 
-const LIMIT_REQUESTS = 30;
-const LIMIT_TOKENS = 150_000;
-const WRITE_TOOLS: Record<string, true> = {fill_product_form: true};
-
-export class BudgetExceeded extends Error {
-  constructor(
-    readonly retryAfter: number,
-    readonly remainingTokens: number,
-  ) {
-    super('shop budget exceeded');
-  }
+interface InvokeRequest {
+  shop: string;
+  turn_id: string;
+  name: string;
+  args_json: string;
+}
+interface ToolsClient {
+  Invoke(request: InvokeRequest, options?: {deadline: number}): Promise<{result_json: string}>;
 }
 
-async function charge(shop: string, tokens: number): Promise<[boolean, number, number]> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+const {sidekickrpc} = grpc.loadPackageDefinition(protoLoader.loadSync('merchant_agent.proto')) as unknown as {
+  sidekickrpc: {Tools: new (target: string, credentials: grpc.ChannelCredentials) => ToolsClient};
+};
+const tools = new sidekickrpc.Tools(TOOLS_ADDR, grpc.credentials.createInsecure());
+export const redis = new Redis({host: 'redis', port: 6379});
+
+/** Reserve one model call and its tokens for the shop; false when either does not fit. */
+export async function reserve(shop: string, tokens: number): Promise<boolean> {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const key = \`budget:\${shop}\`;
-  const usedReq = Number((await r.get(\`\${key}:req\`)) ?? 0);
-  const usedTokens = Number((await r.get(\`\${key}:tok\`)) ?? 0);
-  if (usedReq + 1 > LIMIT_REQUESTS || usedTokens + tokens > LIMIT_TOKENS)
-    return [false, LIMIT_REQUESTS - usedReq, LIMIT_TOKENS - usedTokens];
-  await r.incrby(\`\${key}:req\`, 1);
-  await r.incrby(\`\${key}:tok\`, tokens);
-  return [true, LIMIT_REQUESTS - usedReq - 1, LIMIT_TOKENS - usedTokens - tokens];
+  const [requests, used] = await redis.hmget(key, 'requests', 'tokens');
+  if (Number(requests ?? 0) + 1 > MAX_REQUESTS || Number(used ?? 0) + tokens > MAX_TOKENS) return false;
+  await redis.hincrby(key, 'requests', 1);
+  await redis.hincrby(key, 'tokens', tokens);
+  return true;
 }
 
+/** The tool's result for the shop: reads from the cache when it can. */
 export async function invokeTool(shop: string, turnId: string, name: string, argsJson: string): Promise<string> {
-  const digest = createHash('sha256').update(argsJson).digest('hex').slice(0, 32);
-  const key = \`tool:\${name}:\${digest}\`;
-  if (WRITE_TOOLS[name] !== true) {
-    const cached = await r.get(key);
-    if (cached !== null) return cached;
+  const request = {shop, turn_id: turnId, name, args_json: argsJson};
+  if (Object.hasOwn(CATALOG, name) && CATALOG[name].writes) {
+    return (await tools.Invoke(request, {deadline: Date.now() + TOOL_DEADLINE_MS})).result_json;
   }
-  const result = await tools.Invoke({shop, name, args_json: argsJson});
-  if (WRITE_TOOLS[name] !== true) await r.set(key, result.result_json);
-  return result.result_json;
-}
-
-export async function assistTurn(shop: string, turnId: string, message: string, page: string, maxTokens: number) {
-  const wanted = Math.floor(message.length / 4) + maxTokens;
-  const reply = await model.Complete({
-    system: 'You are Sidekick.',
-    messages: [{role: 'user', content: \`[page: \${page}] \${message}\`}],
-    tools: [],
-    instructions: '',
-  });
-  const [ok, , leftTokens] = await charge(shop, wanted);
-  if (!ok) throw new BudgetExceeded(60, leftTokens);
-  if (reply.tool_call !== undefined) {
-    const result = await invokeTool(shop, turnId, reply.tool_call.name, reply.tool_call.args_json);
-    return {tool: reply.tool_call.name, result, remaining_tokens: leftTokens};
-  }
-  return {reply: reply.text, remaining_tokens: leftTokens};
+  const key = \`tool:\${name}:\${createHash('sha256').update(argsJson).digest('hex')}\`;
+  const cached = await redis.get(key);
+  if (cached !== null) return cached;
+  const result = (await tools.Invoke(request, {deadline: Date.now() + TOOL_DEADLINE_MS})).result_json;
+  await redis.set(key, result);
+  return result;
 }
 `,
-      solution: `/** Spending layer: atomic per-shop reservation first, shop-scoped tool cache, write tools claimed once. */
-import {createHash} from 'node:crypto';
+      solution: `import {createHash} from 'node:crypto';
 
-import {Redis} from 'ioredis';
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
 
-import {model, tools} from './clients';
+import {CATALOG} from 'sidekick/catalog';
+import {TOOLS_ADDR} from 'sidekick/config';
 
-const r = new Redis('redis://redis:6379');
+export const MAX_REQUESTS = 30;
+export const MAX_TOKENS = 150_000;
+export const WINDOW_S = 60;
+export const CACHE_TTL_S = 120;
+export const WRITE_CLAIM_TTL_S = 86_400;
+export const TOOL_DEADLINE_MS = 10_000;
 
-const WINDOW_S = 60;
-const LIMIT_REQUESTS = 30;
-const LIMIT_TOKENS = 150_000;
-const CACHE_TTL_S = 120;
-const WRITE_CLAIM_TTL_S = 86_400;
-const WRITE_TOOLS: Record<string, true> = {fill_product_form: true};
-
-const RESERVE_LUA = \`
-local req = tonumber(redis.call('HGET', KEYS[1], 'req')) or 0
-local tok = tonumber(redis.call('HGET', KEYS[1], 'tok')) or 0
-local want_req = tonumber(ARGV[1])
-local want_tok = tonumber(ARGV[2])
-if req + want_req > tonumber(ARGV[3]) or tok + want_tok > tonumber(ARGV[4]) then
-  return {0, tonumber(ARGV[3]) - req, tonumber(ARGV[4]) - tok, redis.call('TTL', KEYS[1])}
+/** KEYS[1] the shop's window; ARGV tokens, max requests, max tokens, window seconds. 1 reserved, 0 refused. */
+export const RESERVE_LUA = \`
+local requests = tonumber(redis.call('HGET', KEYS[1], 'requests') or '0')
+local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or '0')
+local want = tonumber(ARGV[1])
+if requests + 1 > tonumber(ARGV[2]) or tokens + want > tonumber(ARGV[3]) then
+  return 0
 end
-redis.call('HINCRBY', KEYS[1], 'req', want_req)
-redis.call('HINCRBY', KEYS[1], 'tok', want_tok)
+redis.call('HINCRBY', KEYS[1], 'requests', 1)
+redis.call('HINCRBY', KEYS[1], 'tokens', want)
 if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[5])
+  redis.call('EXPIRE', KEYS[1], ARGV[4])
 end
-return {1, tonumber(ARGV[3]) - req - want_req, tonumber(ARGV[4]) - tok - want_tok, redis.call('TTL', KEYS[1])}
+return 1
 \`;
 
-export class BudgetExceeded extends Error {
-  constructor(
-    readonly retryAfter: number,
-    readonly remainingTokens: number,
-  ) {
-    super('shop budget exceeded');
-  }
+interface InvokeRequest {
+  shop: string;
+  turn_id: string;
+  name: string;
+  args_json: string;
+}
+interface ToolsClient {
+  Invoke(request: InvokeRequest, options?: {deadline: number}): Promise<{result_json: string}>;
+}
+interface BudgetRedis extends Redis {
+  reserveBudget(key: string, tokens: number, maxRequests: number, maxTokens: number, windowS: number): Promise<number>;
 }
 
-async function reserve(shop: string, tokens: number): Promise<[boolean, number, number, number]> {
-  const window = Math.floor(Date.now() / 1000 / WINDOW_S);
-  const reply = (await r.eval(
-    RESERVE_LUA,
-    1,
-    \`budget:\${shop}:\${window}\`,
-    1,
-    tokens,
-    LIMIT_REQUESTS,
-    LIMIT_TOKENS,
-    WINDOW_S,
-  )) as [number, number, number, number];
-  return [reply[0] === 1, reply[1], reply[2], reply[3]];
+const {sidekickrpc} = grpc.loadPackageDefinition(protoLoader.loadSync('merchant_agent.proto')) as unknown as {
+  sidekickrpc: {Tools: new (target: string, credentials: grpc.ChannelCredentials) => ToolsClient};
+};
+const tools = new sidekickrpc.Tools(TOOLS_ADDR, grpc.credentials.createInsecure());
+export const redis = new Redis({host: 'redis', port: 6379}) as BudgetRedis;
+redis.defineCommand('reserveBudget', {numberOfKeys: 1, lua: RESERVE_LUA});
+
+/** Reserve one model call and its tokens in the shop's current minute; false when either does not fit. */
+export async function reserve(shop: string, tokens: number): Promise<boolean> {
+  const window = Math.floor(Math.floor(Date.now() / 1000) / WINDOW_S);
+  return (await redis.reserveBudget(\`budget:\${shop}:\${window}\`, tokens, MAX_REQUESTS, MAX_TOKENS, WINDOW_S)) === 1;
 }
 
-function cacheKey(shop: string, name: string, argsJson: string): string {
-  const digest = createHash('sha256').update(argsJson).digest('hex').slice(0, 32);
-  return \`tool:\${shop}:\${name}:\${digest}\`;
-}
-
-/** A write tool runs once per (shop, turn, tool): the claim is SET NX, the result is stored under it. */
-async function invokeWrite(shop: string, turnId: string, name: string, argsJson: string): Promise<string> {
-  const key = \`write:\${shop}:\${turnId}:\${name}\`;
-  const claimed = await r.set(key, 'pending', 'EX', WRITE_CLAIM_TTL_S, 'NX');
-  if (claimed === null) {
-    const stored = await r.get(key);
-    return stored === null || stored === 'pending' ? JSON.stringify({status: 'already_applied'}) : stored;
-  }
-  const result = await tools.Invoke({shop, name, args_json: argsJson});
-  await r.set(key, result.result_json, 'EX', WRITE_CLAIM_TTL_S);
-  return result.result_json;
-}
-
+/** The tool's result for the shop: reads from the shop's cache, writes once per turn. */
 export async function invokeTool(shop: string, turnId: string, name: string, argsJson: string): Promise<string> {
-  if (WRITE_TOOLS[name] === true) return invokeWrite(shop, turnId, name, argsJson);
-  const key = cacheKey(shop, name, argsJson);
-  const cached = await r.get(key);
-  if (cached !== null) return cached;
-  const result = await tools.Invoke({shop, name, args_json: argsJson});
-  await r.set(key, result.result_json, 'EX', CACHE_TTL_S);
-  return result.result_json;
-}
-
-export async function assistTurn(shop: string, turnId: string, message: string, page: string, maxTokens: number) {
-  const wanted = Math.floor(message.length / 4) + maxTokens;
-  const [ok, , leftTokens, ttl] = await reserve(shop, wanted);
-  if (!ok) throw new BudgetExceeded(Math.max(ttl, 1), leftTokens);
-  const reply = await model.Complete({
-    system: 'You are Sidekick.',
-    messages: [{role: 'user', content: \`[page: \${page}] \${message}\`}],
-    tools: [],
-    instructions: '',
-  });
-  if (reply.tool_call !== undefined) {
-    const result = await invokeTool(shop, turnId, reply.tool_call.name, reply.tool_call.args_json);
-    return {tool: reply.tool_call.name, result, remaining_tokens: leftTokens};
+  const request = {shop, turn_id: turnId, name, args_json: argsJson};
+  if (Object.hasOwn(CATALOG, name) && CATALOG[name].writes) {
+    const claim = \`write:\${shop}:\${turnId}:\${name}\`;
+    if ((await redis.set(claim, '', 'EX', WRITE_CLAIM_TTL_S, 'NX')) === null) return (await redis.get(claim)) ?? ''; // this turn already wrote
+    let result: string;
+    try {
+      result = (await tools.Invoke(request, {deadline: Date.now() + TOOL_DEADLINE_MS})).result_json;
+    } catch (err) {
+      await redis.del(claim); // nothing was written: let a retry try again
+      throw err;
+    }
+    await redis.set(claim, result, 'EX', WRITE_CLAIM_TTL_S);
+    return result;
   }
-  return {reply: reply.text, remaining_tokens: leftTokens};
+  const key = \`tool:\${shop}:\${name}:\${createHash('sha256').update(argsJson).digest('hex')}\`;
+  const cached = await redis.get(key);
+  if (cached !== null) return cached;
+  const result = (await tools.Invoke(request, {deadline: Date.now() + TOOL_DEADLINE_MS})).result_json;
+  await redis.set(key, result, 'EX', CACHE_TTL_S);
+  return result;
 }
 `,
     },
     go: {
-      starter: `package agent
+      starter: `package main
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
-	pb "sidekick/sidekickpb"
+	"sidekick/catalog" // catalog.Lookup(name) — provided
+	"sidekick/config"  // config.ToolsAddr — provided
+	pb "sidekickrpc/gen/merchant_agent"
 )
 
 const (
-	limitRequests = 30
-	limitTokens   = 150000
+	maxRequests  = 30
+	maxTokens    = 150_000
+	toolDeadline = 10 * time.Second
 )
 
-var writeTools = map[string]bool{"fill_product_form": true}
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+var toolsConn, _ = grpc.NewClient(config.ToolsAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var toolsClient = pb.NewToolsClient(toolsConn)
 
-var (
-	rdb      *redis.Client
-	model    pb.ModelClient
-	toolsRPC pb.ToolsClient
-)
-
-var ErrBudget = errors.New("shop budget exceeded")
-
-func charge(ctx context.Context, shop string, tokens int64) (bool, int64, int64) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	key := fmt.Sprintf("budget:%s", shop)
-	usedReq, _ := rdb.Get(ctx, key+":req").Int64()
-	usedTokens, _ := rdb.Get(ctx, key+":tok").Int64()
-	if usedReq+1 > limitRequests || usedTokens+tokens > limitTokens {
-		return false, limitRequests - usedReq, limitTokens - usedTokens
+// reserve reserves one model call and its tokens for the shop; false when either does not fit.
+func reserve(ctx context.Context, shop string, tokens int64) (bool, error) {
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+	key := "budget:" + shop
+	counts, err := rdb.HMGet(ctx, key, "requests", "tokens").Result()
+	if err != nil {
+		return false, err
 	}
-	rdb.IncrBy(ctx, key+":req", 1)
-	rdb.IncrBy(ctx, key+":tok", tokens)
-	return true, limitRequests - usedReq - 1, limitTokens - usedTokens - tokens
+	requests, used := int64(0), int64(0)
+	if s, ok := counts[0].(string); ok {
+		requests, _ = strconv.ParseInt(s, 10, 64)
+	}
+	if s, ok := counts[1].(string); ok {
+		used, _ = strconv.ParseInt(s, 10, 64)
+	}
+	if requests+1 > maxRequests || used+tokens > maxTokens {
+		return false, nil
+	}
+	if err := rdb.HIncrBy(ctx, key, "requests", 1).Err(); err != nil {
+		return false, err
+	}
+	return true, rdb.HIncrBy(ctx, key, "tokens", tokens).Err()
 }
 
-func InvokeTool(ctx context.Context, shop, turnID, name, argsJSON string) (string, error) {
-	sum := sha256.Sum256([]byte(argsJSON))
-	key := fmt.Sprintf("tool:%s:%s", name, hex.EncodeToString(sum[:16]))
-	if !writeTools[name] {
-		if cached, err := rdb.Get(ctx, key).Result(); err == nil {
-			return cached, nil
-		}
-	}
-	result, err := toolsRPC.Invoke(ctx, &pb.InvokeRequest{Shop: shop, Name: name, ArgsJson: argsJSON})
+func callTool(ctx context.Context, shop, turnID, name, argsJSON string) (string, error) {
+	callCtx, cancel := context.WithTimeout(ctx, toolDeadline)
+	defer cancel()
+	reply, err := toolsClient.Invoke(callCtx, &pb.InvokeRequest{Shop: shop, TurnId: turnID, Name: name, ArgsJson: argsJSON})
 	if err != nil {
 		return "", err
 	}
-	if !writeTools[name] {
-		rdb.Set(ctx, key, result.ResultJson, 0)
-	}
-	return result.ResultJson, nil
+	return reply.GetResultJson(), nil
 }
 
-func AssistTurn(ctx context.Context, shop, turnID, message, page string, maxTokens int64) (map[string]any, error) {
-	wanted := int64(len(message)/4) + maxTokens
-	reply, err := model.Complete(ctx, &pb.CompleteRequest{
-		System:   "You are Sidekick.",
-		Messages: []*pb.Message{{Role: "user", Content: fmt.Sprintf("[page: %s] %s", page, message)}},
-	})
+// invokeTool is the tool's result for the shop: reads from the cache when it can.
+func invokeTool(ctx context.Context, shop, turnID, name, argsJSON string) (string, error) {
+	if tool, ok := catalog.Lookup(name); ok && tool.Writes {
+		return callTool(ctx, shop, turnID, name, argsJSON)
+	}
+	sum := sha256.Sum256([]byte(argsJSON))
+	key := "tool:" + name + ":" + hex.EncodeToString(sum[:])
+	cached, err := rdb.Get(ctx, key).Result()
+	if err == nil {
+		return cached, nil
+	}
+	if !errors.Is(err, redis.Nil) {
+		return "", err
+	}
+	result, err := callTool(ctx, shop, turnID, name, argsJSON)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	ok, _, leftTokens := charge(ctx, shop, wanted)
-	if !ok {
-		return nil, ErrBudget
-	}
-	if reply.ToolCall != nil {
-		result, err := InvokeTool(ctx, shop, turnID, reply.ToolCall.Name, reply.ToolCall.ArgsJson)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"tool": reply.ToolCall.Name, "result": result, "remaining_tokens": leftTokens}, nil
-	}
-	return map[string]any{"reply": reply.Text, "remaining_tokens": leftTokens}, nil
+	return result, rdb.Set(ctx, key, result, 0).Err()
 }
 `,
-      solution: `package agent
+      solution: `package main
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
+	"errors"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
-	pb "sidekick/sidekickpb"
+	"sidekick/catalog" // catalog.Lookup(name) — provided
+	"sidekick/config"  // config.ToolsAddr — provided
+	pb "sidekickrpc/gen/merchant_agent"
 )
 
 const (
+	maxRequests   = 30
+	maxTokens     = 150_000
 	windowSeconds = 60
-	limitRequests = 30
-	limitTokens   = 150000
 	cacheTTL      = 120 * time.Second
 	writeClaimTTL = 24 * time.Hour
+	toolDeadline  = 10 * time.Second
 )
 
-var writeTools = map[string]bool{"fill_product_form": true}
-
-var (
-	rdb      *redis.Client
-	model    pb.ModelClient
-	toolsRPC pb.ToolsClient
-)
-
-type BudgetError struct {
-	RetryAfter      int64
-	RemainingTokens int64
-}
-
-func (e *BudgetError) Error() string { return "shop budget exceeded" }
-
+// KEYS[1] the shop's window; ARGV tokens, max requests, max tokens, window seconds. 1 reserved, 0 refused.
 var reserveScript = redis.NewScript(\`
-local req = tonumber(redis.call('HGET', KEYS[1], 'req')) or 0
-local tok = tonumber(redis.call('HGET', KEYS[1], 'tok')) or 0
-local want_req = tonumber(ARGV[1])
-local want_tok = tonumber(ARGV[2])
-if req + want_req > tonumber(ARGV[3]) or tok + want_tok > tonumber(ARGV[4]) then
-  return {0, tonumber(ARGV[3]) - req, tonumber(ARGV[4]) - tok, redis.call('TTL', KEYS[1])}
+local requests = tonumber(redis.call('HGET', KEYS[1], 'requests') or '0')
+local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or '0')
+local want = tonumber(ARGV[1])
+if requests + 1 > tonumber(ARGV[2]) or tokens + want > tonumber(ARGV[3]) then
+  return 0
 end
-redis.call('HINCRBY', KEYS[1], 'req', want_req)
-redis.call('HINCRBY', KEYS[1], 'tok', want_tok)
+redis.call('HINCRBY', KEYS[1], 'requests', 1)
+redis.call('HINCRBY', KEYS[1], 'tokens', want)
 if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[5])
+  redis.call('EXPIRE', KEYS[1], ARGV[4])
 end
-return {1, tonumber(ARGV[3]) - req - want_req, tonumber(ARGV[4]) - tok - want_tok, redis.call('TTL', KEYS[1])}
+return 1
 \`)
 
-func reserve(ctx context.Context, shop string, tokens int64) (bool, int64, int64, int64, error) {
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+var toolsConn, _ = grpc.NewClient(config.ToolsAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var toolsClient = pb.NewToolsClient(toolsConn)
+
+// reserve reserves one model call and its tokens in the shop's current minute; false when either does not fit.
+func reserve(ctx context.Context, shop string, tokens int64) (bool, error) {
 	window := time.Now().Unix() / windowSeconds
-	key := fmt.Sprintf("budget:%s:%d", shop, window)
-	values, err := reserveScript.Run(ctx, rdb, []string{key}, 1, tokens, limitRequests, limitTokens, windowSeconds).Int64Slice()
-	if err != nil {
-		return false, 0, 0, 0, err
-	}
-	return values[0] == 1, values[1], values[2], values[3], nil
+	key := "budget:" + shop + ":" + strconv.FormatInt(window, 10)
+	reserved, err := reserveScript.Run(ctx, rdb, []string{key}, tokens, maxRequests, maxTokens, windowSeconds).Int()
+	return reserved == 1, err
 }
 
-func cacheKey(shop, name, argsJSON string) string {
-	sum := sha256.Sum256([]byte(argsJSON))
-	return fmt.Sprintf("tool:%s:%s:%s", shop, name, hex.EncodeToString(sum[:16]))
-}
-
-func invokeOnce(ctx context.Context, shop, name, argsJSON string) (string, error) {
-	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+func callTool(ctx context.Context, shop, turnID, name, argsJSON string) (string, error) {
+	callCtx, cancel := context.WithTimeout(ctx, toolDeadline)
 	defer cancel()
-	result, err := toolsRPC.Invoke(callCtx, &pb.InvokeRequest{Shop: shop, Name: name, ArgsJson: argsJSON})
+	reply, err := toolsClient.Invoke(callCtx, &pb.InvokeRequest{Shop: shop, TurnId: turnID, Name: name, ArgsJson: argsJSON})
 	if err != nil {
 		return "", err
 	}
-	return result.ResultJson, nil
+	return reply.GetResultJson(), nil
 }
 
-// invokeWrite runs a write tool once per (shop, turn, tool): the claim is SET NX, the result is stored under it.
-func invokeWrite(ctx context.Context, shop, turnID, name, argsJSON string) (string, error) {
-	key := fmt.Sprintf("write:%s:%s:%s", shop, turnID, name)
-	claimed, err := rdb.SetNX(ctx, key, "pending", writeClaimTTL).Result()
-	if err != nil {
-		return "", err
-	}
-	if !claimed {
-		stored, err := rdb.Get(ctx, key).Result()
-		if err != nil || stored == "pending" {
-			return \`{"status":"already_applied"}\`, nil
+// invokeTool is the tool's result for the shop: reads from the shop's cache, writes once per turn.
+func invokeTool(ctx context.Context, shop, turnID, name, argsJSON string) (string, error) {
+	if tool, ok := catalog.Lookup(name); ok && tool.Writes {
+		claim := "write:" + shop + ":" + turnID + ":" + name
+		claimed, err := rdb.SetNX(ctx, claim, "", writeClaimTTL).Result()
+		if err != nil {
+			return "", err
 		}
-		return stored, nil
+		if !claimed {
+			return rdb.Get(ctx, claim).Val(), nil // this turn already wrote: answer what it wrote
+		}
+		result, err := callTool(ctx, shop, turnID, name, argsJSON)
+		if err != nil {
+			rdb.Del(ctx, claim) // nothing was written: let a retry try again
+			return "", err
+		}
+		return result, rdb.Set(ctx, claim, result, writeClaimTTL).Err()
 	}
-	result, err := invokeOnce(ctx, shop, name, argsJSON)
-	if err != nil {
-		return "", err
-	}
-	rdb.Set(ctx, key, result, writeClaimTTL)
-	return result, nil
-}
-
-func InvokeTool(ctx context.Context, shop, turnID, name, argsJSON string) (string, error) {
-	if writeTools[name] {
-		return invokeWrite(ctx, shop, turnID, name, argsJSON)
-	}
-	key := cacheKey(shop, name, argsJSON)
-	if cached, err := rdb.Get(ctx, key).Result(); err == nil {
+	sum := sha256.Sum256([]byte(argsJSON))
+	key := "tool:" + shop + ":" + name + ":" + hex.EncodeToString(sum[:])
+	cached, err := rdb.Get(ctx, key).Result()
+	if err == nil {
 		return cached, nil
 	}
-	result, err := invokeOnce(ctx, shop, name, argsJSON)
+	if !errors.Is(err, redis.Nil) {
+		return "", err
+	}
+	result, err := callTool(ctx, shop, turnID, name, argsJSON)
 	if err != nil {
 		return "", err
 	}
-	rdb.Set(ctx, key, result, cacheTTL)
-	return result, nil
-}
-
-func AssistTurn(ctx context.Context, shop, turnID, message, page string, maxTokens int64) (map[string]any, error) {
-	wanted := int64(len(message)/4) + maxTokens
-	ok, _, leftTokens, ttl, err := reserve(ctx, shop, wanted)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, &BudgetError{RetryAfter: max(ttl, 1), RemainingTokens: leftTokens}
-	}
-	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	reply, err := model.Complete(callCtx, &pb.CompleteRequest{
-		System:   "You are Sidekick.",
-		Messages: []*pb.Message{{Role: "user", Content: fmt.Sprintf("[page: %s] %s", page, message)}},
-	})
-	if err != nil {
-		return nil, err
-	}
-	if reply.ToolCall != nil {
-		result, err := InvokeTool(ctx, shop, turnID, reply.ToolCall.Name, reply.ToolCall.ArgsJson)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"tool": reply.ToolCall.Name, "result": result, "remaining_tokens": leftTokens}, nil
-	}
-	return map[string]any{"reply": reply.Text, "remaining_tokens": leftTokens}, nil
+	return result, rdb.Set(ctx, key, result, cacheTTL).Err()
 }
 `,
     },
     scala: {
       starter: `import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 
 import io.grpc.ManagedChannelBuilder
-import redis.clients.jedis.Jedis
+import redis.clients.jedis.JedisPooled
 
-final case class BudgetExceeded(retryAfter: Long, remainingTokens: Long) extends RuntimeException("shop budget exceeded")
+import sidekick.{Catalog, Config}
+import sidekickrpc.merchant_agent.{InvokeRequest, ToolsGrpc}
 
 object BudgetCache {
-  val LimitRequests = 30L
-  val LimitTokens = 150000L
-  val WriteTools = Set("fill_product_form")
+  val MaxRequests = 30L
+  val MaxTokens = 150000L
+  val ToolDeadlineMs = 10000L
 
-  val jedis = new Jedis("redis", 6379)
-  val model = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
-  val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forAddress("tools", 9000).usePlaintext().build())
+  private val jedis = new JedisPooled("redis", 6379)
+  private val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.ToolsAddr).usePlaintext().build())
 
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def charge(shop: String, tokens: Long): (Boolean, Long, Long) = {
+  private def sha256Hex(text: String): String =
+    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
+
+  /** Reserve one model call and its tokens for the shop; false when either does not fit. */
+  def reserve(shop: String, tokens: Long): Boolean = {
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val key = s"budget:$shop"
-    val usedReq = Option(jedis.get(key + ":req")).map(_.toLong).getOrElse(0L)
-    val usedTokens = Option(jedis.get(key + ":tok")).map(_.toLong).getOrElse(0L)
-    if (usedReq + 1 > LimitRequests || usedTokens + tokens > LimitTokens) {
-      (false, LimitRequests - usedReq, LimitTokens - usedTokens)
-    } else {
-      jedis.incrBy(key + ":req", 1)
-      jedis.incrBy(key + ":tok", tokens)
-      (true, LimitRequests - usedReq - 1, LimitTokens - usedTokens - tokens)
+    val counts = jedis.hmget(key, "requests", "tokens")
+    val requests = Option(counts.get(0)).map(_.toLong).getOrElse(0L)
+    val used = Option(counts.get(1)).map(_.toLong).getOrElse(0L)
+    if (requests + 1 > MaxRequests || used + tokens > MaxTokens) false
+    else {
+      jedis.hincrBy(key, "requests", 1)
+      jedis.hincrBy(key, "tokens", tokens)
+      true
     }
   }
 
-  def digestOf(argsJson: String): String =
-    MessageDigest.getInstance("SHA-256").digest(argsJson.getBytes("UTF-8")).take(16).map("%02x".format(_)).mkString
+  private def call(shop: String, turnId: String, name: String, argsJson: String): String =
+    tools
+      .withDeadlineAfter(ToolDeadlineMs, TimeUnit.MILLISECONDS)
+      .invoke(InvokeRequest(shop = shop, turnId = turnId, name = name, argsJson = argsJson))
+      .resultJson
 
-  def invokeTool(shop: String, turnId: String, name: String, argsJson: String): String = {
-    val key = s"tool:$name:\${digestOf(argsJson)}"
-    val cached = if (WriteTools.contains(name)) None else Option(jedis.get(key))
-    cached.getOrElse {
-      val result = tools.invoke(InvokeRequest(shop = shop, name = name, argsJson = argsJson)).resultJson
-      if (!WriteTools.contains(name)) jedis.set(key, result)
-      result
+  /** The tool's result for the shop: reads from the cache when it can. */
+  def invokeTool(shop: String, turnId: String, name: String, argsJson: String): String =
+    if (Catalog.lookup(name).exists(_.writes)) call(shop, turnId, name, argsJson)
+    else {
+      val key = s"tool:$name:\${sha256Hex(argsJson)}"
+      Option(jedis.get(key)).getOrElse {
+        val result = call(shop, turnId, name, argsJson)
+        jedis.set(key, result)
+        result
+      }
     }
-  }
-
-  def assistTurn(shop: String, turnId: String, message: String, page: String, maxTokens: Long): Map[String, String] = {
-    val wanted = message.length / 4 + maxTokens
-    val reply = model.complete(
-      CompleteRequest(system = "You are Sidekick.", messages = Seq(Message(role = "user", content = s"[page: $page] $message")))
-    )
-    val (ok, _, leftTokens) = charge(shop, wanted)
-    if (!ok) throw BudgetExceeded(60L, leftTokens)
-    reply.toolCall match {
-      case Some(call) =>
-        val result = invokeTool(shop, turnId, call.name, call.argsJson)
-        Map("tool" -> call.name, "result" -> result, "remaining_tokens" -> leftTokens.toString)
-      case None =>
-        Map("reply" -> reply.text, "remaining_tokens" -> leftTokens.toString)
-    }
-  }
 }
 `,
       solution: `import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
-import io.grpc.ManagedChannelBuilder
-import redis.clients.jedis.Jedis
+import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+import redis.clients.jedis.JedisPooled
 import redis.clients.jedis.params.SetParams
 
-final case class BudgetExceeded(retryAfter: Long, remainingTokens: Long) extends RuntimeException("shop budget exceeded")
+import scala.jdk.CollectionConverters._
+
+import sidekick.{Catalog, Config}
+import sidekickrpc.merchant_agent.{InvokeRequest, ToolsGrpc}
 
 object BudgetCache {
-  val WindowSeconds = 60L
-  val LimitRequests = 30L
-  val LimitTokens = 150000L
+  val MaxRequests = 30L
+  val MaxTokens = 150000L
+  val WindowS = 60L
   val CacheTtlS = 120L
   val WriteClaimTtlS = 86400L
-  val WriteTools = Set("fill_product_form")
+  val ToolDeadlineMs = 10000L
 
-  val jedis = new Jedis("redis", 6379)
-  val model = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
-  val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forAddress("tools", 9000).usePlaintext().build())
-
-  val ReserveLua =
-    """
-      |local req = tonumber(redis.call('HGET', KEYS[1], 'req')) or 0
-      |local tok = tonumber(redis.call('HGET', KEYS[1], 'tok')) or 0
-      |local want_req = tonumber(ARGV[1])
-      |local want_tok = tonumber(ARGV[2])
-      |if req + want_req > tonumber(ARGV[3]) or tok + want_tok > tonumber(ARGV[4]) then
-      |  return {0, tonumber(ARGV[3]) - req, tonumber(ARGV[4]) - tok, redis.call('TTL', KEYS[1])}
+  /** KEYS[1] the shop's window; ARGV tokens, max requests, max tokens, window seconds. 1 reserved, 0 refused. */
+  val ReserveLua: String =
+    """local requests = tonumber(redis.call('HGET', KEYS[1], 'requests') or '0')
+      |local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or '0')
+      |local want = tonumber(ARGV[1])
+      |if requests + 1 > tonumber(ARGV[2]) or tokens + want > tonumber(ARGV[3]) then
+      |  return 0
       |end
-      |redis.call('HINCRBY', KEYS[1], 'req', want_req)
-      |redis.call('HINCRBY', KEYS[1], 'tok', want_tok)
+      |redis.call('HINCRBY', KEYS[1], 'requests', 1)
+      |redis.call('HINCRBY', KEYS[1], 'tokens', want)
       |if redis.call('TTL', KEYS[1]) < 0 then
-      |  redis.call('EXPIRE', KEYS[1], ARGV[5])
+      |  redis.call('EXPIRE', KEYS[1], ARGV[4])
       |end
-      |return {1, tonumber(ARGV[3]) - req - want_req, tonumber(ARGV[4]) - tok - want_tok, redis.call('TTL', KEYS[1])}
+      |return 1
       |""".stripMargin
 
-  def reserve(shop: String, tokens: Long): (Boolean, Long, Long, Long) = {
-    val window = System.currentTimeMillis() / 1000 / WindowSeconds
-    val result = jedis
-      .eval(
-        ReserveLua,
-        1,
-        s"budget:$shop:$window",
-        "1",
-        tokens.toString,
-        LimitRequests.toString,
-        LimitTokens.toString,
-        WindowSeconds.toString
-      )
-      .asInstanceOf[java.util.List[Long]]
-    (result.get(0) == 1L, result.get(1), result.get(2), result.get(3))
+  private val jedis = new JedisPooled("redis", 6379)
+  private val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.ToolsAddr).usePlaintext().build())
+
+  private def sha256Hex(text: String): String =
+    MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString
+
+  /** Reserve one model call and its tokens in the shop's current minute; false when either does not fit. */
+  def reserve(shop: String, tokens: Long): Boolean = {
+    val window = System.currentTimeMillis() / 1000 / WindowS
+    val args = List(tokens, MaxRequests, MaxTokens, WindowS).map(_.toString)
+    jedis.eval(ReserveLua, List(s"budget:$shop:$window").asJava, args.asJava).asInstanceOf[java.lang.Long] == 1L
   }
 
-  def digestOf(argsJson: String): String =
-    MessageDigest.getInstance("SHA-256").digest(argsJson.getBytes("UTF-8")).take(16).map("%02x".format(_)).mkString
-
-  def cacheKey(shop: String, name: String, argsJson: String): String = {
-    val digest = digestOf(argsJson)
-    s"tool:$shop:$name:$digest"
-  }
-
-  def invokeOnce(shop: String, name: String, argsJson: String): String =
+  private def call(shop: String, turnId: String, name: String, argsJson: String): String =
     tools
-      .withDeadlineAfter(10000L, TimeUnit.MILLISECONDS)
-      .invoke(InvokeRequest(shop = shop, name = name, argsJson = argsJson))
+      .withDeadlineAfter(ToolDeadlineMs, TimeUnit.MILLISECONDS)
+      .invoke(InvokeRequest(shop = shop, turnId = turnId, name = name, argsJson = argsJson))
       .resultJson
 
-  // A write tool runs once per (shop, turn, tool): the claim is SET NX, the result is stored under it.
-  def invokeWrite(shop: String, turnId: String, name: String, argsJson: String): String = {
-    val key = s"write:$shop:$turnId:$name"
-    val claimed = jedis.set(key, "pending", SetParams.setParams().nx().ex(WriteClaimTtlS))
-    if (claimed == null) {
-      Option(jedis.get(key)).filter(_ != "pending").getOrElse("""{"status":"already_applied"}""")
+  /** The tool's result for the shop: reads from the shop's cache, writes once per turn. */
+  def invokeTool(shop: String, turnId: String, name: String, argsJson: String): String =
+    if (Catalog.lookup(name).exists(_.writes)) {
+      val claim = s"write:$shop:$turnId:$name"
+      if (jedis.set(claim, "", SetParams.setParams().nx().ex(WriteClaimTtlS)) == null) {
+        Option(jedis.get(claim)).getOrElse("") // this turn already wrote: answer what it wrote
+      } else {
+        val result =
+          try call(shop, turnId, name, argsJson)
+          catch {
+            case e: StatusRuntimeException =>
+              jedis.del(claim) // nothing was written: let a retry try again
+              throw e
+          }
+        jedis.set(claim, result, SetParams.setParams().ex(WriteClaimTtlS))
+        result
+      }
     } else {
-      val result = invokeOnce(shop, name, argsJson)
-      jedis.setex(key, WriteClaimTtlS, result)
-      result
-    }
-  }
-
-  def invokeTool(shop: String, turnId: String, name: String, argsJson: String): String = {
-    if (WriteTools.contains(name)) invokeWrite(shop, turnId, name, argsJson)
-    else {
-      val key = cacheKey(shop, name, argsJson)
+      val key = s"tool:$shop:$name:\${sha256Hex(argsJson)}"
       Option(jedis.get(key)).getOrElse {
-        val result = invokeOnce(shop, name, argsJson)
-        jedis.setex(key, CacheTtlS, result)
+        val result = call(shop, turnId, name, argsJson)
+        jedis.set(key, result, SetParams.setParams().ex(CacheTtlS))
         result
       }
     }
-  }
-
-  def assistTurn(shop: String, turnId: String, message: String, page: String, maxTokens: Long): Map[String, String] = {
-    val wanted = message.length / 4 + maxTokens
-    val (ok, _, leftTokens, ttl) = reserve(shop, wanted)
-    if (!ok) throw BudgetExceeded(math.max(ttl, 1L), leftTokens)
-    val reply = model
-      .withDeadlineAfter(10000L, TimeUnit.MILLISECONDS)
-      .complete(
-        CompleteRequest(
-          system = "You are Sidekick.",
-          messages = Seq(Message(role = "user", content = s"[page: $page] $message"))
-        )
-      )
-    reply.toolCall match {
-      case Some(call) =>
-        val result = invokeTool(shop, turnId, call.name, call.argsJson)
-        Map("tool" -> call.name, "result" -> result, "remaining_tokens" -> leftTokens.toString)
-      case None =>
-        Map("reply" -> reply.text, "remaining_tokens" -> leftTokens.toString)
-    }
-  }
 }
 `,
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
-#include <openssl/sha.h>
 #include <sw/redis++/redis++.h>
 
-#include "sidekick.grpc.pb.h"
-
-#include <iomanip>
-#include <memory>
-#include <set>
-#include <sstream>
+#include <chrono>
 #include <stdexcept>
 #include <string>
-#include <tuple>
+#include <vector>
 
-using json = nlohmann::json;
+#include "digest.h"            // sha256_hex(bytes) — provided
+#include "merchant_agent.grpc.pb.h"
+#include "sidekick/catalog.h"  // catalog::lookup(name) — provided
+#include "sidekick/config.h"   // config::kToolsAddr — provided
 
-constexpr long long kLimitRequests = 30;
-constexpr long long kLimitTokens = 150000;
-const std::set<std::string> kWriteTools = {"fill_product_form"};
+constexpr long long kMaxRequests = 30;
+constexpr long long kMaxTokens = 150000;
+constexpr std::chrono::seconds kToolDeadline{10};
 
 sw::redis::Redis redis("tcp://redis:6379");
-std::unique_ptr<sidekick::Model::Stub> model =
-    sidekick::Model::NewStub(grpc::CreateChannel("model:9000", grpc::InsecureChannelCredentials()));
-std::unique_ptr<sidekick::Tools::Stub> tools =
-    sidekick::Tools::NewStub(grpc::CreateChannel("tools:9000", grpc::InsecureChannelCredentials()));
+auto tools_stub = sidekickrpc::Tools::NewStub(grpc::CreateChannel(config::kToolsAddr, grpc::InsecureChannelCredentials()));
 
-struct BudgetExceeded : std::runtime_error {
-  long long retryAfter;
-  long long remainingTokens;
-  BudgetExceeded(long long retry, long long remaining)
-      : std::runtime_error("shop budget exceeded"), retryAfter(retry), remainingTokens(remaining) {}
-};
-
-std::string digestOf(const std::string& argsJson) {
-  unsigned char hash[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char*>(argsJson.data()), argsJson.size(), hash);
-  std::ostringstream out;
-  for (int i = 0; i < 16; i++) out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
-  return out.str();
+// Reserve one model call and its tokens for the shop; false when either does not fit.
+bool reserve(const std::string& shop, long long tokens) {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  const std::string key = "budget:" + shop;
+  std::vector<sw::redis::OptionalString> counts;
+  redis.hmget(key, {"requests", "tokens"}, std::back_inserter(counts));
+  const long long requests = counts[0] ? std::stoll(*counts[0]) : 0;
+  const long long used = counts[1] ? std::stoll(*counts[1]) : 0;
+  if (requests + 1 > kMaxRequests || used + tokens > kMaxTokens) return false;
+  redis.hincrby(key, "requests", 1);
+  redis.hincrby(key, "tokens", tokens);
+  return true;
 }
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-std::tuple<bool, long long, long long> charge(const std::string& shop, long long tokens) {
-  const auto key = "budget:" + shop;
-  auto rawReq = redis.get(key + ":req");
-  const long long usedReq = rawReq ? std::stoll(*rawReq) : 0;
-  auto rawTok = redis.get(key + ":tok");
-  const long long usedTokens = rawTok ? std::stoll(*rawTok) : 0;
-  if (usedReq + 1 > kLimitRequests || usedTokens + tokens > kLimitTokens)
-    return {false, kLimitRequests - usedReq, kLimitTokens - usedTokens};
-  redis.incrby(key + ":req", 1);
-  redis.incrby(key + ":tok", tokens);
-  return {true, kLimitRequests - usedReq - 1, kLimitTokens - usedTokens - tokens};
-}
-
-std::string invokeTool(const std::string& shop, const std::string& turnId, const std::string& name, const std::string& argsJson) {
-  const auto key = "tool:" + name + ":" + digestOf(argsJson);
-  const bool isWrite = kWriteTools.count(name) > 0;
-  if (!isWrite) {
-    if (auto cached = redis.get(key)) return *cached;
-  }
+std::string call_tool(const std::string& shop, const std::string& turn_id, const std::string& name, const std::string& args_json) {
   grpc::ClientContext ctx;
-  sidekick::InvokeRequest request;
+  ctx.set_deadline(std::chrono::system_clock::now() + kToolDeadline);
+  sidekickrpc::InvokeRequest request;
   request.set_shop(shop);
+  request.set_turn_id(turn_id);
   request.set_name(name);
-  request.set_args_json(argsJson);
-  sidekick::InvokeReply reply;
-  const grpc::Status status = tools->Invoke(&ctx, request, &reply);
-  if (!status.ok()) throw std::runtime_error("tool failed: " + status.error_message());
-  if (!isWrite) redis.set(key, reply.result_json());
+  request.set_args_json(args_json);
+  sidekickrpc::InvokeReply reply;
+  const grpc::Status status = tools_stub->Invoke(&ctx, request, &reply);
+  if (!status.ok()) throw std::runtime_error("tools: " + status.error_message());
   return reply.result_json();
 }
 
-json assistTurn(const std::string& shop, const std::string& turnId, const std::string& message, const std::string& page, long long maxTokens) {
-  const long long wanted = static_cast<long long>(message.size()) / 4 + maxTokens;
-  grpc::ClientContext ctx;
-  sidekick::CompleteRequest request;
-  request.set_system("You are Sidekick.");
-  auto* first = request.add_messages();
-  first->set_role("user");
-  first->set_content("[page: " + page + "] " + message);
-  sidekick::CompleteReply reply;
-  const grpc::Status status = model->Complete(&ctx, request, &reply);
-  if (!status.ok()) throw std::runtime_error("model failed: " + status.error_message());
-  const auto [ok, leftReq, leftTokens] = charge(shop, wanted);
-  if (!ok) throw BudgetExceeded(60, leftTokens);
-  if (reply.has_tool_call()) {
-    const auto result = invokeTool(shop, turnId, reply.tool_call().name(), reply.tool_call().args_json());
-    return json{{"tool", reply.tool_call().name()}, {"result", result}, {"remaining_tokens", leftTokens}};
-  }
-  return json{{"reply", reply.text()}, {"remaining_tokens", leftTokens}};
+// The tool's result for the shop: reads from the cache when it can.
+std::string invoke_tool(const std::string& shop, const std::string& turn_id, const std::string& name, const std::string& args_json) {
+  const catalog::Tool* tool = catalog::lookup(name);
+  if (tool != nullptr && tool->writes) return call_tool(shop, turn_id, name, args_json);
+  const std::string key = "tool:" + name + ":" + sha256_hex(args_json);
+  if (const auto cached = redis.get(key)) return *cached;
+  const std::string result = call_tool(shop, turn_id, name, args_json);
+  redis.set(key, result);
+  return result;
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
-#include <openssl/sha.h>
 #include <sw/redis++/redis++.h>
 
-#include "sidekick.grpc.pb.h"
-
-#include <algorithm>
 #include <chrono>
-#include <iomanip>
-#include <memory>
-#include <set>
-#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <tuple>
-#include <vector>
 
-using json = nlohmann::json;
+#include "digest.h"            // sha256_hex(bytes) — provided
+#include "merchant_agent.grpc.pb.h"
+#include "sidekick/catalog.h"  // catalog::lookup(name) — provided
+#include "sidekick/config.h"   // config::kToolsAddr — provided
 
-constexpr long long kWindowSeconds = 60;
-constexpr long long kLimitRequests = 30;
-constexpr long long kLimitTokens = 150000;
-constexpr long long kCacheTtlS = 120;
-constexpr long long kWriteClaimTtlS = 86400;
-constexpr int kCallDeadlineMs = 10000;
-const std::set<std::string> kWriteTools = {"fill_product_form"};
+constexpr long long kMaxRequests = 30;
+constexpr long long kMaxTokens = 150000;
+constexpr long long kWindowS = 60;
+constexpr std::chrono::seconds kCacheTtl{120};
+constexpr std::chrono::seconds kWriteClaimTtl{86400};
+constexpr std::chrono::seconds kToolDeadline{10};
 
-const char* kReserveLua = R"LUA(
-local req = tonumber(redis.call('HGET', KEYS[1], 'req')) or 0
-local tok = tonumber(redis.call('HGET', KEYS[1], 'tok')) or 0
-local want_req = tonumber(ARGV[1])
-local want_tok = tonumber(ARGV[2])
-if req + want_req > tonumber(ARGV[3]) or tok + want_tok > tonumber(ARGV[4]) then
-  return {0, tonumber(ARGV[3]) - req, tonumber(ARGV[4]) - tok, redis.call('TTL', KEYS[1])}
+// KEYS[1] the shop's window; ARGV tokens, max requests, max tokens, window seconds. 1 reserved, 0 refused.
+const std::string kReserveLua = R"lua(
+local requests = tonumber(redis.call('HGET', KEYS[1], 'requests') or '0')
+local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or '0')
+local want = tonumber(ARGV[1])
+if requests + 1 > tonumber(ARGV[2]) or tokens + want > tonumber(ARGV[3]) then
+  return 0
 end
-redis.call('HINCRBY', KEYS[1], 'req', want_req)
-redis.call('HINCRBY', KEYS[1], 'tok', want_tok)
+redis.call('HINCRBY', KEYS[1], 'requests', 1)
+redis.call('HINCRBY', KEYS[1], 'tokens', want)
 if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[5])
+  redis.call('EXPIRE', KEYS[1], ARGV[4])
 end
-return {1, tonumber(ARGV[3]) - req - want_req, tonumber(ARGV[4]) - tok - want_tok, redis.call('TTL', KEYS[1])}
-)LUA";
+return 1
+)lua";
 
 sw::redis::Redis redis("tcp://redis:6379");
-std::unique_ptr<sidekick::Model::Stub> model =
-    sidekick::Model::NewStub(grpc::CreateChannel("model:9000", grpc::InsecureChannelCredentials()));
-std::unique_ptr<sidekick::Tools::Stub> tools =
-    sidekick::Tools::NewStub(grpc::CreateChannel("tools:9000", grpc::InsecureChannelCredentials()));
+auto tools_stub = sidekickrpc::Tools::NewStub(grpc::CreateChannel(config::kToolsAddr, grpc::InsecureChannelCredentials()));
 
-struct BudgetExceeded : std::runtime_error {
-  long long retryAfter;
-  long long remainingTokens;
-  BudgetExceeded(long long retry, long long remaining)
-      : std::runtime_error("shop budget exceeded"), retryAfter(retry), remainingTokens(remaining) {}
-};
-
-std::chrono::system_clock::time_point callDeadline() {
-  return std::chrono::system_clock::now() + std::chrono::milliseconds(kCallDeadlineMs);
+// Reserve one model call and its tokens in the shop's current minute; false when either does not fit.
+bool reserve(const std::string& shop, long long tokens) {
+  const long long now_s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const std::string key = "budget:" + shop + ":" + std::to_string(now_s / kWindowS);
+  return redis.eval<long long>(kReserveLua, {key},
+                               {std::to_string(tokens), std::to_string(kMaxRequests), std::to_string(kMaxTokens), std::to_string(kWindowS)}) == 1;
 }
 
-std::tuple<bool, long long, long long, long long> reserve(const std::string& shop, long long tokens) {
-  const auto window = std::chrono::duration_cast<std::chrono::seconds>(
-                          std::chrono::system_clock::now().time_since_epoch())
-                          .count() /
-                      kWindowSeconds;
-  const auto key = "budget:" + shop + ":" + std::to_string(window);
-  const auto result = redis.eval<std::vector<long long>>(
-      kReserveLua, {key}, {1, tokens, kLimitRequests, kLimitTokens, kWindowSeconds});
-  return {result[0] == 1, result[1], result[2], result[3]};
-}
-
-std::string digestOf(const std::string& argsJson) {
-  unsigned char hash[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char*>(argsJson.data()), argsJson.size(), hash);
-  std::ostringstream out;
-  for (int i = 0; i < 16; i++) out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
-  return out.str();
-}
-
-std::string invokeOnce(const std::string& shop, const std::string& name, const std::string& argsJson) {
+std::string call_tool(const std::string& shop, const std::string& turn_id, const std::string& name, const std::string& args_json) {
   grpc::ClientContext ctx;
-  ctx.set_deadline(callDeadline());
-  sidekick::InvokeRequest request;
+  ctx.set_deadline(std::chrono::system_clock::now() + kToolDeadline);
+  sidekickrpc::InvokeRequest request;
   request.set_shop(shop);
+  request.set_turn_id(turn_id);
   request.set_name(name);
-  request.set_args_json(argsJson);
-  sidekick::InvokeReply reply;
-  const grpc::Status status = tools->Invoke(&ctx, request, &reply);
-  if (!status.ok()) throw std::runtime_error("tool failed: " + status.error_message());
+  request.set_args_json(args_json);
+  sidekickrpc::InvokeReply reply;
+  const grpc::Status status = tools_stub->Invoke(&ctx, request, &reply);
+  if (!status.ok()) throw std::runtime_error("tools: " + status.error_message());
   return reply.result_json();
 }
 
-// A write tool runs once per (shop, turn, tool): the claim is SET NX, the result is stored under it.
-std::string invokeWrite(const std::string& shop, const std::string& turnId, const std::string& name, const std::string& argsJson) {
-  const auto key = "write:" + shop + ":" + turnId + ":" + name;
-  const bool claimed =
-      redis.set(key, "pending", std::chrono::seconds(kWriteClaimTtlS), sw::redis::UpdateType::NOT_EXIST);
-  if (!claimed) {
-    const auto stored = redis.get(key);
-    if (!stored || *stored == "pending") return R"({"status":"already_applied"})";
-    return *stored;
+// The tool's result for the shop: reads from the shop's cache, writes once per turn.
+std::string invoke_tool(const std::string& shop, const std::string& turn_id, const std::string& name, const std::string& args_json) {
+  const catalog::Tool* tool = catalog::lookup(name);
+  if (tool != nullptr && tool->writes) {
+    const std::string claim = "write:" + shop + ":" + turn_id + ":" + name;
+    if (!redis.set(claim, "", kWriteClaimTtl, sw::redis::UpdateType::NOT_EXIST)) return redis.get(claim).value_or("");  // this turn already wrote
+    std::string result;
+    try {
+      result = call_tool(shop, turn_id, name, args_json);
+    } catch (...) {
+      redis.del(claim);  // nothing was written: let a retry try again
+      throw;
+    }
+    redis.set(claim, result, kWriteClaimTtl);
+    return result;
   }
-  const auto result = invokeOnce(shop, name, argsJson);
-  redis.set(key, result, std::chrono::seconds(kWriteClaimTtlS));
+  const std::string key = "tool:" + shop + ":" + name + ":" + sha256_hex(args_json);
+  if (const auto cached = redis.get(key)) return *cached;
+  const std::string result = call_tool(shop, turn_id, name, args_json);
+  redis.set(key, result, kCacheTtl);
   return result;
-}
-
-std::string invokeTool(const std::string& shop, const std::string& turnId, const std::string& name, const std::string& argsJson) {
-  if (kWriteTools.count(name) > 0) return invokeWrite(shop, turnId, name, argsJson);
-  const auto key = "tool:" + shop + ":" + name + ":" + digestOf(argsJson);
-  if (auto cached = redis.get(key)) return *cached;
-  const auto result = invokeOnce(shop, name, argsJson);
-  redis.set(key, result, std::chrono::seconds(kCacheTtlS));
-  return result;
-}
-
-json assistTurn(const std::string& shop, const std::string& turnId, const std::string& message, const std::string& page, long long maxTokens) {
-  const long long wanted = static_cast<long long>(message.size()) / 4 + maxTokens;
-  const auto [ok, leftReq, leftTokens, ttl] = reserve(shop, wanted);
-  if (!ok) throw BudgetExceeded(std::max(ttl, 1LL), leftTokens);
-  grpc::ClientContext ctx;
-  ctx.set_deadline(callDeadline());
-  sidekick::CompleteRequest request;
-  request.set_system("You are Sidekick.");
-  auto* first = request.add_messages();
-  first->set_role("user");
-  first->set_content("[page: " + page + "] " + message);
-  sidekick::CompleteReply reply;
-  const grpc::Status status = model->Complete(&ctx, request, &reply);
-  if (!status.ok()) throw std::runtime_error("model failed: " + status.error_message());
-  if (reply.has_tool_call()) {
-    const auto result = invokeTool(shop, turnId, reply.tool_call().name(), reply.tool_call().args_json());
-    return json{{"tool", reply.tool_call().name()}, {"result", result}, {"remaining_tokens", leftTokens}};
-  }
-  return json{{"reply", reply.text()}, {"remaining_tokens", leftTokens}};
 }
 `,
     },
   },
-  debrief: `The step is tenancy under concurrency. A read-then-increment budget passes every serial test and fails when the assistant is busy, which is when the budget matters; one Lua script makes read, check and increment a single step and sets the window's expiry at creation, so a shop's counters die with their minute instead of accumulating forever. Reserving before the model call means a refused turn is not paid for. The cache is where the code quietly crosses merchants: a key built from the tool and its arguments is the same key for every shop that asks the same question, so the shop goes first in the key. The write claim is the agent-specific part: an assistant that fills product forms edits merchant data, and a retried turn must not edit it twice. Production systems add per-tool TTLs and invalidate the cache when the merchant edits the underlying record.`,
+  harness: {
+    python: `import merchant_agent_pb2
+import merchant_agent_pb2_grpc
+from sidekick import config, tools
+
+TORONTO = '{"query":"default_address_city = Toronto"}'
+SEO = '{"product_id":"p-1","field":"seo_description"}'
+
+
+class ToolsPeer(merchant_agent_pb2_grpc.ToolsServicer):
+    """The stand-in tools: answers from sidekick.tools."""
+
+    def Invoke(self, request, context):
+        return merchant_agent_pb2.InvokeReply(result_json=tools.invoke(request.shop, request.name, request.args_json))
+
+
+def _world(ctx):
+    ctx.grpc.serve(merchant_agent_pb2_grpc.add_ToolsServicer_to_server, ToolsPeer(), config.TOOLS_ADDR)
+    return ctx.load("budget_cache")
+
+
+def _invoked(ctx):
+    return [(call.request.shop, call.request.name) for call in ctx.grpc.calls_to("Invoke")]
+
+
+def check_atomic_reserve(ctx):
+    m = _world(ctx)
+    sent = []
+    original = m.r.execute_command
+
+    def recording(*args, **kwargs):
+        sent.append(str(args[0]).upper())
+        return original(*args, **kwargs)
+
+    m.r.execute_command = recording
+    assert m.reserve("s1", 2000) is True, "the first reservation of a fresh shop must fit"
+    scripted = [cmd for cmd in sent if cmd in ("EVAL", "EVALSHA")]
+    assert scripted, f"reserve sent {sent} to Redis: the read, the limit test and both increments must run inside one EVAL/EVALSHA, or two replicas both pass the test"
+    client_side = [cmd for cmd in sent if cmd in ("HGET", "HMGET", "HGETALL", "HINCRBY", "HSET", "GET", "INCRBY")]
+    assert not client_side, f"reserve sent {sent}: {client_side} from the client let another replica land between the read and the increment"
+    keys = ctx.redis.keys("budget:s1*")
+    assert len(keys) == 1 and ctx.redis.hgetall(keys[0]) == {"requests": "1", "tokens": "2000"}, f"one reservation counts one request and its tokens: {[(k, ctx.redis.hgetall(k)) for k in keys]}"
+
+
+def check_budget_window(ctx):
+    m = _world(ctx)
+    results = [m.reserve("s1", 2000) for _ in range(31)]
+    assert results[:30] == [True] * 30, f"30 requests fit in a minute, got {results[:30].count(True)} reserved"
+    assert results[30] is False, "the 31st request in a minute must be refused"
+    keys = ctx.redis.keys("budget:s1*")
+    assert keys, "reserve left no budget:s1… key"
+    ttl = ctx.redis.ttl(keys[0])
+    assert 0 < ttl <= 60, f"{keys[0]} has TTL {ttl}: the counter must expire with its 60 s window, or a shop that had one busy minute is refused for good"
+    ctx.clock.advance(60)
+    assert m.reserve("s1", 2000) is True, "a minute later the shop is in a new window and must reserve again"
+    assert m.reserve("s2", 100_000) is True, "100 000 tokens fit in 150 000"
+    assert m.reserve("s2", 60_000) is False, "100 000 + 60 000 tokens is over 150 000 and must be refused"
+    assert m.reserve("s2", 50_000) is True, "a refused reservation must not count: 100 000 + 50 000 fits exactly"
+
+
+def check_shop_scoped_cache(ctx):
+    m = _world(ctx)
+    first = m.invoke_tool("s1", "t-1", "segment_customers", TORONTO)
+    again = m.invoke_tool("s1", "t-2", "segment_customers", TORONTO)
+    assert '"shop":"s1"' in first and again == first, f"s1 asked twice and must get its own answer twice: {first!r}, {again!r}"
+    assert len(_invoked(ctx)) == 1, f"s1's second identical query must be a cache hit, the tool was called {len(_invoked(ctx))} times"
+    other = m.invoke_tool("s2", "t-3", "segment_customers", TORONTO)
+    assert '"shop":"s2"' in other, f"s2 asked the same question and got {other!r}: another merchant's customers, served from the cache"
+    assert _invoked(ctx) == [("s1", "segment_customers"), ("s2", "segment_customers")], f"each shop's first query reaches the tool: {_invoked(ctx)}"
+
+
+def check_cache_ttl(ctx):
+    m = _world(ctx)
+    m.invoke_tool("s1", "t-1", "segment_customers", TORONTO)
+    keys = ctx.redis.keys("tool:*")
+    assert len(keys) == 1, f"one read leaves one cache key, found {keys}"
+    ttl = ctx.redis.ttl(keys[0])
+    assert 0 < ttl <= 120, f"{keys[0]} has TTL {ttl}: cached results expire after CACHE_TTL_S = 120"
+    ctx.clock.advance(121)
+    m.invoke_tool("s1", "t-2", "segment_customers", TORONTO)
+    assert len(_invoked(ctx)) == 2, f"after 121 s the next query must reach the tool again, it was called {len(_invoked(ctx))} times: a customer added a minute ago is invisible"
+
+
+def check_write_once(ctx):
+    m = _world(ctx)
+    first = m.invoke_tool("s1", "t-1", "fill_product_form", SEO)
+    again = m.invoke_tool("s1", "t-1", "fill_product_form", SEO)
+    assert _invoked(ctx) == [("s1", "fill_product_form")], f"two fill_product_form calls in turn t-1 reached the tool {len(_invoked(ctx))} times: the form was filled twice"
+    assert again == first, f"the second call in the turn answers the stored result: {first!r} then {again!r}"
+    ttl = ctx.redis.ttl("write:s1:t-1:fill_product_form")
+    assert 82_800 <= ttl <= 86_400, f"the claim write:s1:t-1:fill_product_form must live about a day, TTL {ttl}"
+    m.invoke_tool("s1", "t-2", "fill_product_form", SEO)
+    assert len(_invoked(ctx)) == 2, "another turn is another write"
+`,
+    typescript: `const TORONTO = '{"query":"default_address_city = Toronto"}';
+const SEO = '{"product_id":"p-1","field":"seo_description"}';
+
+/** The stand-in tools, the learner's module. */
+function world(ctx) {
+  const {sidekickrpc} = ctx.proto('merchant_agent.proto');
+  const config = ctx.load('/support/sidekick/config.ts');
+  const tools = ctx.load('/support/sidekick/tools.ts');
+  ctx.grpc.serve(sidekickrpc.Tools.service, {
+    Invoke(call, callback) {
+      callback(null, {result_json: tools.invoke(call.request.shop, call.request.name, call.request.args_json)});
+    },
+  }, config.TOOLS_ADDR);
+  return ctx.load('budget_cache');
+}
+
+const invoked = (ctx): string[] => ctx.grpc.callsTo('Invoke').map(call => call.request.shop + ' ' + call.request.name);
+
+export async function check_atomic_reserve(ctx) {
+  const m = world(ctx);
+  const window = Math.floor(Math.floor(ctx.clock.now() / 1000) / 60);
+  const keys = ['budget:s1', \`budget:s1:\${window}\`];
+  for (const key of keys) ctx.redis.hset(key, {requests: 29, tokens: 0});
+  let other = '';
+  // another replica reserving the last request, landing right after this one's first command
+  for (const key of keys) {
+    ctx.redisAfter(key, () => {
+      if (other !== '') return;
+      if (Number(ctx.redis.hget(key, 'requests') ?? 0) + 1 > 30) {
+        other = 'refused';
+        return;
+      }
+      ctx.redis.hincrby(key, 'requests', 1);
+      ctx.redis.hincrby(key, 'tokens', 2000);
+      other = 'reserved';
+    });
+  }
+  const mine = (await m.reserve('s1', 2000)) ? 'reserved' : 'refused';
+  assert(other !== '', 'reserve never touched budget:s1 or budget:s1:{window}');
+  assert.deepEqual([mine, other].sort(), ['refused', 'reserved'], \`one request was left and two replicas got \${mine} and \${other}: the read and the increments must run in one script\`);
+  const counts = keys.map(key => Number(ctx.redis.hget(key, 'requests') ?? 0));
+  assert(Math.max(...counts) === 30, \`the budget hash must stop at 30 requests, it holds \${JSON.stringify(counts)}\`);
+}
+
+export async function check_budget_window(ctx) {
+  const m = world(ctx);
+  const results: boolean[] = [];
+  for (let i = 0; i < 31; i += 1) results.push(await m.reserve('s1', 2000));
+  assert.equal(results.slice(0, 30).filter(Boolean).length, 30, \`30 requests fit in a minute, got \${results.slice(0, 30).filter(Boolean).length} reserved\`);
+  assert.equal(results[30], false, 'the 31st request in a minute must be refused');
+  const keys = ctx.redis.keys('budget:s1*');
+  assert(keys.length > 0, 'reserve left no budget:s1… key');
+  const ttl = ctx.redis.ttl(keys[0]);
+  assert(ttl > 0 && ttl <= 60, \`\${keys[0]} has TTL \${ttl}: the counter must expire with its 60 s window, or a shop that had one busy minute is refused for good\`);
+  ctx.clock.advance(60);
+  assert.equal(await m.reserve('s1', 2000), true, 'a minute later the shop is in a new window and must reserve again');
+  assert.equal(await m.reserve('s2', 100_000), true, '100 000 tokens fit in 150 000');
+  assert.equal(await m.reserve('s2', 60_000), false, '100 000 + 60 000 tokens is over 150 000 and must be refused');
+  assert.equal(await m.reserve('s2', 50_000), true, 'a refused reservation must not count: 100 000 + 50 000 fits exactly');
+}
+
+export async function check_shop_scoped_cache(ctx) {
+  const m = world(ctx);
+  const first = await m.invokeTool('s1', 't-1', 'segment_customers', TORONTO);
+  const again = await m.invokeTool('s1', 't-2', 'segment_customers', TORONTO);
+  assert(first.includes('"shop":"s1"') && again === first, \`s1 asked twice and must get its own answer twice: \${first}, \${again}\`);
+  assert.equal(invoked(ctx).length, 1, \`s1's second identical query must be a cache hit, the tool was called \${invoked(ctx).length} times\`);
+  const other = await m.invokeTool('s2', 't-3', 'segment_customers', TORONTO);
+  assert(other.includes('"shop":"s2"'), \`s2 asked the same question and got \${other}: another merchant's customers, served from the cache\`);
+  assert.deepEqual(invoked(ctx), ['s1 segment_customers', 's2 segment_customers'], \`each shop's first query reaches the tool: \${JSON.stringify(invoked(ctx))}\`);
+}
+
+export async function check_cache_ttl(ctx) {
+  const m = world(ctx);
+  await m.invokeTool('s1', 't-1', 'segment_customers', TORONTO);
+  const keys = ctx.redis.keys('tool:*');
+  assert.equal(keys.length, 1, \`one read leaves one cache key, found \${JSON.stringify(keys)}\`);
+  const ttl = ctx.redis.ttl(keys[0]);
+  assert(ttl > 0 && ttl <= 120, \`\${keys[0]} has TTL \${ttl}: cached results expire after CACHE_TTL_S = 120\`);
+  ctx.clock.advance(121);
+  await m.invokeTool('s1', 't-2', 'segment_customers', TORONTO);
+  assert.equal(invoked(ctx).length, 2, \`after 121 s the next query must reach the tool again, it was called \${invoked(ctx).length} times: a customer added a minute ago is invisible\`);
+}
+
+export async function check_write_once(ctx) {
+  const m = world(ctx);
+  const first = await m.invokeTool('s1', 't-1', 'fill_product_form', SEO);
+  const again = await m.invokeTool('s1', 't-1', 'fill_product_form', SEO);
+  assert.deepEqual(invoked(ctx), ['s1 fill_product_form'], \`two fill_product_form calls in turn t-1 reached the tool \${invoked(ctx).length} times: the form was filled twice\`);
+  assert.equal(again, first, \`the second call in the turn answers the stored result: \${first} then \${again}\`);
+  const ttl = ctx.redis.ttl('write:s1:t-1:fill_product_form');
+  assert(ttl >= 82_800 && ttl <= 86_400, \`the claim write:s1:t-1:fill_product_form must live about a day, TTL \${ttl}\`);
+  await m.invokeTool('s1', 't-2', 'fill_product_form', SEO);
+  assert.equal(invoked(ctx).length, 2, 'another turn is another write');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"sidekick/config"
+	"sidekick/tools"
+	pb "sidekickrpc/gen/merchant_agent"
+
+	"leetbuild/harness"
+)
+
+const (
+	budgetToronto = \`{"query":"default_address_city = Toronto"}\`
+	budgetSeo     = \`{"product_id":"p-1","field":"seo_description"}\`
+)
+
+// budgetTools is the stand-in tools: answers from sidekick/tools.
+type budgetTools struct {
+	pb.UnimplementedToolsServer
+}
+
+func (budgetTools) Invoke(_ context.Context, req *pb.InvokeRequest) (*pb.InvokeReply, error) {
+	return &pb.InvokeReply{ResultJson: tools.Invoke(req.GetShop(), req.GetName(), req.GetArgsJson())}, nil
+}
+
+func budgetWorld(ctx *harness.Ctx) {
+	pb.RegisterToolsServer(ctx.GRPC.Server(config.ToolsAddr), &budgetTools{})
+}
+
+func budgetReserve(ctx *harness.Ctx, shop string, tokens int64) bool {
+	ok, err := reserve(context.Background(), shop, tokens)
+	ctx.NoError(err, "reserve(%q, %d)", shop, tokens)
+	return ok
+}
+
+func budgetInvoke(ctx *harness.Ctx, shop, turnID, name, args string) string {
+	out, err := invokeTool(context.Background(), shop, turnID, name, args)
+	ctx.NoError(err, "invokeTool(%q, %q, %q)", shop, turnID, name)
+	return out
+}
+
+func budgetInvoked(ctx *harness.Ctx) []string {
+	out := []string{}
+	for _, c := range ctx.GRPC.CallsTo("Invoke", "") {
+		req, _ := c.Request.(*pb.InvokeRequest)
+		out = append(out, req.GetShop()+" "+req.GetName())
+	}
+	return out
+}
+
+func CheckAtomicReserve(ctx *harness.Ctx) {
+	budgetWorld(ctx)
+	window := ctx.Clock.Now() / 1000 / 60
+	keys := []string{"budget:s1", fmt.Sprintf("budget:s1:%d", window)}
+	for _, key := range keys {
+		ctx.Redis.Do("HSET", key, "requests", 29, "tokens", 0)
+	}
+	other := ""
+	// another replica reserving the last request, landing right after this one's first command
+	for _, k := range keys {
+		key := k
+		ctx.Redis.After(key, func() any {
+			if other != "" {
+				return nil
+			}
+			n, _ := strconv.Atoi(ctx.Redis.HGetAll(key)["requests"])
+			if n+1 > 30 {
+				other = "refused"
+				return nil
+			}
+			ctx.Redis.Do("HINCRBY", key, "requests", 1)
+			ctx.Redis.Do("HINCRBY", key, "tokens", 2000)
+			other = "reserved"
+			return nil
+		})
+	}
+	mine := "refused"
+	if budgetReserve(ctx, "s1", 2000) {
+		mine = "reserved"
+	}
+	ctx.Assert(other != "", "reserve never touched budget:s1 or budget:s1:{window}")
+	ctx.Assert(mine != other, "one request was left and two replicas got %s and %s: the read and the increments must run in one script", mine, other)
+	most := 0
+	for _, key := range keys {
+		n, _ := strconv.Atoi(ctx.Redis.HGetAll(key)["requests"])
+		if n > most {
+			most = n
+		}
+	}
+	ctx.Equal(most, 30, "the budget hash must stop at 30 requests; requests")
+}
+
+func CheckBudgetWindow(ctx *harness.Ctx) {
+	budgetWorld(ctx)
+	reserved := 0
+	for i := 0; i < 30; i++ {
+		if budgetReserve(ctx, "s1", 2000) {
+			reserved++
+		}
+	}
+	ctx.Equal(reserved, 30, "30 requests fit in a minute; reserved")
+	ctx.Assert(!budgetReserve(ctx, "s1", 2000), "the 31st request in a minute must be refused")
+	keys := ctx.Redis.Keys("budget:s1*")
+	ctx.Assert(len(keys) > 0, "reserve left no budget:s1… key")
+	ttl := ctx.Redis.TTL(keys[0])
+	ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the counter must expire with its 60 s window, or a shop that had one busy minute is refused for good", keys[0], ttl)
+	ctx.Clock.Advance(60)
+	ctx.Assert(budgetReserve(ctx, "s1", 2000), "a minute later the shop is in a new window and must reserve again")
+	ctx.Assert(budgetReserve(ctx, "s2", 100000), "100 000 tokens fit in 150 000")
+	ctx.Assert(!budgetReserve(ctx, "s2", 60000), "100 000 + 60 000 tokens is over 150 000 and must be refused")
+	ctx.Assert(budgetReserve(ctx, "s2", 50000), "a refused reservation must not count: 100 000 + 50 000 fits exactly")
+}
+
+func CheckShopScopedCache(ctx *harness.Ctx) {
+	budgetWorld(ctx)
+	first := budgetInvoke(ctx, "s1", "t-1", "segment_customers", budgetToronto)
+	again := budgetInvoke(ctx, "s1", "t-2", "segment_customers", budgetToronto)
+	ctx.Assert(strings.Contains(first, \`"shop":"s1"\`) && again == first, "s1 asked twice and must get its own answer twice: %s, %s", first, again)
+	ctx.Equal(len(budgetInvoked(ctx)), 1, "s1's second identical query must be a cache hit; tool calls")
+	other := budgetInvoke(ctx, "s2", "t-3", "segment_customers", budgetToronto)
+	ctx.Assert(strings.Contains(other, \`"shop":"s2"\`), "s2 asked the same question and got %s: another merchant's customers, served from the cache", other)
+	ctx.Equal(budgetInvoked(ctx), []string{"s1 segment_customers", "s2 segment_customers"}, "each shop's first query reaches the tool")
+}
+
+func CheckCacheTtl(ctx *harness.Ctx) {
+	budgetWorld(ctx)
+	budgetInvoke(ctx, "s1", "t-1", "segment_customers", budgetToronto)
+	keys := ctx.Redis.Keys("tool:*")
+	ctx.Equal(len(keys), 1, "one read leaves one cache key (%v)", keys)
+	ttl := ctx.Redis.TTL(keys[0])
+	ctx.Assert(ttl > 0 && ttl <= 120, "%s has TTL %d: cached results expire after cacheTTL = 120 s", keys[0], ttl)
+	ctx.Clock.Advance(121)
+	budgetInvoke(ctx, "s1", "t-2", "segment_customers", budgetToronto)
+	ctx.Equal(len(budgetInvoked(ctx)), 2, "after 121 s the next query must reach the tool again (a customer added a minute ago is invisible); tool calls")
+}
+
+func CheckWriteOnce(ctx *harness.Ctx) {
+	budgetWorld(ctx)
+	first := budgetInvoke(ctx, "s1", "t-1", "fill_product_form", budgetSeo)
+	again := budgetInvoke(ctx, "s1", "t-1", "fill_product_form", budgetSeo)
+	ctx.Equal(budgetInvoked(ctx), []string{"s1 fill_product_form"}, "two fill_product_form calls in turn t-1 must fill the form once; tool calls")
+	ctx.Equal(again, first, "the second call in the turn answers the stored result")
+	ttl := ctx.Redis.TTL("write:s1:t-1:fill_product_form")
+	ctx.Assert(ttl >= 82800 && ttl <= 86400, "the claim write:s1:t-1:fill_product_form must live about a day, TTL %d", ttl)
+	budgetInvoke(ctx, "s1", "t-2", "fill_product_form", budgetSeo)
+	ctx.Equal(len(budgetInvoked(ctx)), 2, "another turn is another write; tool calls")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "merchant_agent.grpc.pb.h"
+#include "sidekick/config.h"
+#include "sidekick/tools.h"
+
+namespace {
+
+const std::string kToronto = R"({"query":"default_address_city = Toronto"})";
+const std::string kSeo = R"({"product_id":"p-1","field":"seo_description"})";
+
+// The stand-in tools: answers from sidekick/tools.h.
+class BudgetTools final : public sidekickrpc::Tools::Service {
+ public:
+  grpc::Status Invoke(grpc::ServerContext*, const sidekickrpc::InvokeRequest* req, sidekickrpc::InvokeReply* reply) override {
+    reply->set_result_json(tools::invoke(req->shop(), req->name(), req->args_json()));
+    return grpc::Status::OK;
+  }
+};
+
+void budgetWorld(harness::Ctx& ctx) {
+  static BudgetTools peer;
+  ctx.GRPC.Server(config::kToolsAddr)->RegisterService(&peer);
+}
+
+std::vector<std::string> budgetInvoked(harness::Ctx& ctx) {
+  std::vector<std::string> out;
+  for (const auto& c : ctx.GRPC.CallsTo("Invoke")) {
+    const auto req = c.Request<sidekickrpc::InvokeRequest>();
+    out.push_back(req.shop() + " " + req.name());
+  }
+  return out;
+}
+
+long long requestsIn(harness::Ctx& ctx, const std::string& key) {
+  const auto raw = ctx.Redis.HGet(key, "requests");
+  return raw ? std::strtoll(raw->c_str(), nullptr, 10) : 0;
+}
+
+}  // namespace
+
+void CheckAtomicReserve(harness::Ctx& ctx) {
+  budgetWorld(ctx);
+  const long long window = ctx.Clock.Now() / 1000 / 60;
+  const std::vector<std::string> keys = {"budget:s1", "budget:s1:" + std::to_string(window)};
+  for (const auto& key : keys) ctx.Redis.Do("HSET", key, "requests", 29, "tokens", 0);
+  std::string other;
+  // another replica reserving the last request, landing right after this one's first command
+  for (const auto& key : keys) {
+    ctx.Redis.After(key, [&ctx, &other, key] {
+      if (!other.empty()) return;
+      if (requestsIn(ctx, key) + 1 > 30) {
+        other = "refused";
+        return;
+      }
+      ctx.Redis.Do("HINCRBY", key, "requests", 1);
+      ctx.Redis.Do("HINCRBY", key, "tokens", 2000);
+      other = "reserved";
+    });
+  }
+  const std::string mine = reserve("s1", 2000) ? "reserved" : "refused";
+  ctx.Assert(!other.empty(), "reserve never touched budget:s1 or budget:s1:{window}");
+  ctx.Assert(mine != other, "one request was left and two replicas got %s and %s: the read and the increments must run in one script", mine, other);
+  ctx.Equal(std::max(requestsIn(ctx, keys[0]), requestsIn(ctx, keys[1])), 30, "the budget hash must stop at 30 requests; requests");
+}
+
+void CheckBudgetWindow(harness::Ctx& ctx) {
+  budgetWorld(ctx);
+  int reserved = 0;
+  for (int i = 0; i < 30; ++i) reserved += reserve("s1", 2000) ? 1 : 0;
+  ctx.Equal(reserved, 30, "30 requests fit in a minute; reserved");
+  ctx.Assert(!reserve("s1", 2000), "the 31st request in a minute must be refused");
+  const auto keys = ctx.Redis.Keys("budget:s1*");
+  ctx.Assert(!keys.empty(), "reserve left no budget:s1… key");
+  const long long ttl = ctx.Redis.TTL(keys[0]);
+  ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the counter must expire with its 60 s window, or a shop that had one busy minute is refused for good", keys[0], ttl);
+  ctx.Clock.Advance(60);
+  ctx.Assert(reserve("s1", 2000), "a minute later the shop is in a new window and must reserve again");
+  ctx.Assert(reserve("s2", 100000), "100 000 tokens fit in 150 000");
+  ctx.Assert(!reserve("s2", 60000), "100 000 + 60 000 tokens is over 150 000 and must be refused");
+  ctx.Assert(reserve("s2", 50000), "a refused reservation must not count: 100 000 + 50 000 fits exactly");
+}
+
+void CheckShopScopedCache(harness::Ctx& ctx) {
+  budgetWorld(ctx);
+  const std::string first = invoke_tool("s1", "t-1", "segment_customers", kToronto);
+  const std::string again = invoke_tool("s1", "t-2", "segment_customers", kToronto);
+  ctx.Assert(first.find(R"("shop":"s1")") != std::string::npos && again == first, "s1 asked twice and must get its own answer twice: %s, %s", first, again);
+  ctx.Equal(budgetInvoked(ctx).size(), 1, "s1's second identical query must be a cache hit; tool calls");
+  const std::string other = invoke_tool("s2", "t-3", "segment_customers", kToronto);
+  ctx.Assert(other.find(R"("shop":"s2")") != std::string::npos, "s2 asked the same question and got %s: another merchant's customers, served from the cache", other);
+  ctx.Equal(budgetInvoked(ctx), std::vector<std::string>{"s1 segment_customers", "s2 segment_customers"}, "each shop's first query reaches the tool");
+}
+
+void CheckCacheTtl(harness::Ctx& ctx) {
+  budgetWorld(ctx);
+  invoke_tool("s1", "t-1", "segment_customers", kToronto);
+  const auto keys = ctx.Redis.Keys("tool:*");
+  ctx.Equal(keys.size(), 1, "one read leaves one cache key (%v)", keys);
+  const long long ttl = ctx.Redis.TTL(keys[0]);
+  ctx.Assert(ttl > 0 && ttl <= 120, "%s has TTL %d: cached results expire after kCacheTtl = 120 s", keys[0], ttl);
+  ctx.Clock.Advance(121);
+  invoke_tool("s1", "t-2", "segment_customers", kToronto);
+  ctx.Equal(budgetInvoked(ctx).size(), 2, "after 121 s the next query must reach the tool again (a customer added a minute ago is invisible); tool calls");
+}
+
+void CheckWriteOnce(harness::Ctx& ctx) {
+  budgetWorld(ctx);
+  const std::string first = invoke_tool("s1", "t-1", "fill_product_form", kSeo);
+  const std::string again = invoke_tool("s1", "t-1", "fill_product_form", kSeo);
+  ctx.Equal(budgetInvoked(ctx), std::vector<std::string>{"s1 fill_product_form"}, "two fill_product_form calls in turn t-1 must fill the form once; tool calls");
+  ctx.Equal(again, first, "the second call in the turn answers the stored result");
+  const long long ttl = ctx.Redis.TTL("write:s1:t-1:fill_product_form");
+  ctx.Assert(ttl >= 82800 && ttl <= 86400, "the claim write:s1:t-1:fill_product_form must live about a day, TTL %d", ttl);
+  invoke_tool("s1", "t-2", "fill_product_form", kSeo);
+  ctx.Equal(budgetInvoked(ctx).size(), 2, "another turn is another write; tool calls");
+}
+`,
+  },
+  hints: [
+    "Symptom: a shop over its limit still gets answers when two admin tabs ask at once, a shop that was busy last Tuesday is refused today, and one merchant's segment answer names another merchant's customers.",
+    'Mechanism: `HMGET` and the two `HINCRBY`s are separate round trips, so two replicas both read 29; `budget:{shop}` never expires or rolls over; the cache key has no shop and no TTL; a write tool is invoked on every call.',
+    'Change: `RESERVE_LUA` via `register_script` on `budget:{shop}:{window}` with `EXPIRE` on first write; cache key `tool:{shop}:{name}:{digest}` with `ex=CACHE_TTL_S`; for writes `SET write:{shop}:{turn_id}:{name} NX EX 86400` before `Invoke`, and answer the stored value when the claim exists.',
+  ],
+  debrief: `Every key in this step names its owner and its lifetime. The budget belongs to a shop and a minute, so the shop is in the key, the window is in the key, and the key expires with the window; the script makes "read, test, increment" one step, because replicas share Redis and nothing else. The tool cache is merchant data, so its key carries the shop, and its TTL is how stale an answer may be. A write is claimed before it runs, so a retry answers the first result instead of acting twice, and the claim is released when the call fails. Production systems also refund the unused part of a reservation once the model reports real usage, and invalidate a shop's cached reads when one of its writes lands.`,
 };

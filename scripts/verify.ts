@@ -99,6 +99,9 @@ const MIN_CHECKS = 3;
 const HINTS = {min: 2, max: 3};
 /** The flaw counts a task spells out ("hides three flaws"). */
 const WORD_NUMBERS: Record<string, number> = {one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7};
+/** A debugging starter's one TODO: the number of flaws, and where to look, never the flaws themselves. */
+const STARTER_TODO =
+  /TODO: this starter has (\w+) flaws?\. The task says where to look; the checks say what must change\./;
 
 /**
  * Invariants of the judge itself, checked before any content: comment blanking per language, the
@@ -226,13 +229,28 @@ function verifyStep(problem: Problem, step: Step, index: number): string[] {
   // starter (the Python starter's failing checks), and the debrief explains the fix, never an
   // interviewer; a systems course never frames its copy as an interview.
   if (problem.track !== 'dllm') {
-    const stated = /hides (one|two|three|four|five|six|seven|\d+) (?:production )?flaws?\b/i.exec(step.task);
+    const stated = /hides\s+(one|two|three|four|five|six|seven|\d+)\s+(?:production\s+)?flaws?\b/i.exec(step.task);
     const python = step.code.python;
     if (stated !== null && python !== undefined) {
       const n = WORD_NUMBERS[stated[1].toLowerCase()] ?? Number(stated[1]);
       const failing = judge(step, 'python', python.starter).results.filter(r => !r.passed).length;
       if (n !== failing)
         errors.push(`${tag}: the task says the starter hides ${n} flaw(s) but the checks find ${failing} in Python`);
+    }
+    // The starter's one TODO names how many flaws there are and nothing else: a TODO that lists them is
+    // the answer key.
+    if (stated !== null) {
+      const n = WORD_NUMBERS[stated[1].toLowerCase()] ?? Number(stated[1]);
+      for (const language of problemLanguages(problem)) {
+        const todos = (step.code[language]?.starter ?? '').split('\n').filter(line => /\bTODO\b/.test(line));
+        const said = STARTER_TODO.exec(todos.join('\n'))?.[1];
+        if (todos.length !== 1 || said === undefined)
+          errors.push(
+            `${tag} [${language}]: the starter's only TODO should read "TODO: this starter has ${stated[1]} flaws. The task says where to look; the checks say what must change."`,
+          );
+        else if ((WORD_NUMBERS[said.toLowerCase()] ?? Number(said)) !== n)
+          errors.push(`${tag} [${language}]: the starter's TODO says ${said} flaw(s), the task ${n}`);
+      }
     }
     const interview = /\binterviewer\b|\binterview (question|signal)\b/i.exec(
       `${step.task}\n${step.debrief}\n${step.hints.join('\n')}`,

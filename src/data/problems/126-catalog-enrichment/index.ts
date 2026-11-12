@@ -1,27 +1,29 @@
 import {DOORDASH} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {skuIntakeStep} from './steps/1-sku-intake';
 import {extractAttributesStep} from './steps/2-extract-attributes';
 import {extractionCacheStep} from './steps/3-extraction-cache';
 import {reviewEndpointStep} from './steps/4-review-endpoint';
 import {publishEnrichedStep} from './steps/5-publish-enriched';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * DoorDash's LLM-built product knowledge graph, cut down to the service that enriches one SKU:
- * merchant upserts consumed and content-hashed before the offset commit → an extraction call that
- * retrieves candidate brands from the taxonomy before the model, asks for a schema, validates the
- * answer against the taxonomy and sends low-confidence SKUs to review → a Redis layer with a cache
- * keyed by taxonomy version and content hash, an atomic per-merchant daily budget and review-claim
- * leases → a review endpoint whose corrections become versioned labels → `sku.enriched` events
- * through an idempotent producer and an outbox, applied to the catalog and the search index before
- * the commit, with human attributes never overwritten by the model.
+ * DoorDash's LLM-built product knowledge graph, cut down to the service that enriches one SKU. One
+ * contract runs through the five steps: the provided `enrich` package (`enrich.taxonomy` for the
+ * brands, units and schema; `enrich.store` for every Redis key the steps share) → a Kafka intake that
+ * content-hashes merchant upserts into `sku.extract` jobs → a gRPC extraction constrained by the
+ * taxonomy that parks doubtful results for review → a Redis layer (content cache, atomic merchant
+ * budget, review leases) → a review endpoint whose decisions become labels and human events →
+ * `sku.enriched`, published idempotently with an outbox and indexed so a model run cannot undo a
+ * reviewer.
  */
 export const catalogEnrichmentProblem: Problem = {
   id: 'catalog-enrichment',
   title: 'Catalog Enrichment',
   tagline:
-    "DoorDash's product knowledge graph: extract SKU attributes with a model constrained by the taxonomy, gate on confidence, route to human review, and feed the corrections back.",
+    "DoorDash's product knowledge graph: SKU attributes from a model that may only pick taxonomy brands, and reviewer corrections kept as labels that later model runs cannot overwrite.",
   difficulty: 'hard',
   concepts: ['kafka', 'grpc', 'redis', 'http'],
   tag: 'ai-systems',
@@ -56,9 +58,9 @@ export const catalogEnrichmentProblem: Problem = {
   statement: `# Catalog Enrichment
 
 A grocery merchant onboards with forty thousand SKUs. Half of the titles look like
-"DOVE SLK GLW BW 500ML" and a third have no brand field. Shoppers will search for "organic oat
-milk 1 l" tomorrow. The enrichment service turns that feed into attributes a search index, a ranker
-and a substitution model can use, and it is where a model that invents a brand does real damage.
+"DOVE SLK GLW BW 500ML" and a third have no brand field. The enrichment service turns that feed into
+attributes a search index, a ranker and a substitution model can use, and it is where a model that
+invents a brand does real damage.
 
 ## The real system
 
@@ -75,24 +77,30 @@ substitutions, so a wrong attribute is a wrong item in a cart.
 The knowledge-graph post gives this course its three mechanisms: **retrieval before the model**,
 **confidence as a routing signal** and **labels as the product**. The search post adds the shape
 of the call: structured output against a curated candidate list. The numbers here (20 candidate
-brands, the 0.85 threshold, the 5-second deadline, the daily budget, the 15-minute lease) are
-operating choices made for this course.
+brands, the 0.85 threshold, the 5-second deadline, 50 000 extractions per merchant per day, the
+15-minute lease) are operating choices made for this course.
 
 ## What you build here
 
-One service, **catalogd**, with five pieces:
+One service, **catalogd**, on a provided package, \`enrich\`: \`enrich.taxonomy\` (\`VERSION\`,
+\`nearest_brands\`, \`ALLOWED_UNITS\`, \`has_category\`, \`ATTRIBUTE_SCHEMA\`) and \`enrich.store\`, the
+Redis keys every step shares (content hashes, proposals, leases, labels, catalog and search rows,
+the outbox).
 
-1. A **Kafka** intake: consume \`sku.upserted\` in group \`catalog-enrichment\`, validate,
-   dead-letter, skip unchanged content hashes, enqueue on \`sku.extract\` keyed by merchant, commit
-   after the enqueue.
-2. A **gRPC** extraction call: 20 candidate brands before the model, a schema, a 5-second deadline
-   with one retry on \`UNAVAILABLE\`, validation against the taxonomy, review below confidence 0.85.
-3. A **Redis** layer: a cache keyed by taxonomy version and content hash, an atomic daily budget per
-   merchant, review leases with \`SET NX EX 900\`.
-4. \`POST /v1/skus/{sku_id}/review\`: role, lease and \`Idempotency-Key\` enforced, every decision
-   stored as a versioned label.
-5. A **Kafka** publish path: \`sku.enriched\` through an idempotent producer with an outbox, applied
-   to the catalog and the search index before the commit, human attributes kept over model ones.
+1. **Kafka** intake: \`sku.upserted\` (group \`catalog-enrichment\`) becomes jobs
+   \`{sku_id, merchant, content_hash, title, description, images}\` on \`sku.extract\`, keyed by
+   merchant; malformed records go to \`sku.upserted.dlq\`.
+2. **gRPC** \`Extractor.Extract\` with candidate brands and a schema: \`extract_attributes(job)\`
+   returns \`{sku_id, merchant, attributes, confidence, taxonomy_version, source, status}\` and parks
+   doubtful results with \`store.enqueue_review\`.
+3. **Redis** in front of it, \`enrich(job)\`: a cache at \`extract:{taxonomy_version}:{content_hash}\`,
+   a merchant's \`budget:{merchant}:{day}\` reserved by one Lua script, and \`claim_review\` on
+   \`review:lease:{sku_id}\`.
+4. \`POST /v1/skus/{sku_id}/review\`: the lease holder's decision becomes \`label:{sku_id}:v{n}\` and
+   an event with \`source: "human"\`.
+5. **Kafka** \`sku.enriched\` (\`{sku_id, merchant, attributes, attributes_version, taxonomy_version,
+   source}\`): \`publish\` with an outbox, and an indexer that writes \`catalog:{id}\` and
+   \`search:{id}\` unless the event is stale or a model event over a human one.
 
 ## The debugging habit
 
@@ -108,25 +116,34 @@ resolution across merchants, the duplicate-brand check, and the ranking and subs
       {id: 'feed', kind: 'client', label: 'Merchant feed', sub: 'SKU upserts', x: 6, y: 30},
       {id: 'reviewer', kind: 'client', label: 'Reviewer', sub: 'POST …/review', x: 6, y: 70},
       {id: 'upserted', kind: 'kafka', label: 'sku.upserted', sub: 'key = merchant', x: 24, y: 30},
-      {id: 'catalogd', kind: 'http', label: 'catalogd', sub: 'HTTPS :8443', x: 42, y: 50},
-      {id: 'taxonomy', kind: 'db', label: 'taxonomy · labels', sub: 'brands · outbox', x: 60, y: 10},
+      {id: 'extract', kind: 'kafka', label: 'sku.extract', sub: 'jobs · key = merchant', x: 24, y: 8},
+      {id: 'catalogd', kind: 'http', label: 'catalogd', sub: 'HTTP · consumers', x: 42, y: 50},
+      {id: 'taxonomy', kind: 'db', label: 'enrich.taxonomy', sub: 'brands · units · schema', x: 60, y: 10},
       {id: 'llm', kind: 'grpc', label: 'Extractor', sub: 'Extract · :50051', x: 60, y: 36},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'cache · budget · leases', x: 60, y: 62},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'cache · budget · leases · labels', x: 60, y: 62},
       {id: 'enriched', kind: 'kafka', label: 'sku.enriched', sub: 'key = merchant', x: 60, y: 88},
-      {id: 'indexer', kind: 'service', label: 'Index consumer', sub: 'group catalog-index', x: 78, y: 88},
-      {id: 'search', kind: 'db', label: 'catalog · search index', sub: 'attributes by version', x: 94, y: 88},
+      {id: 'indexer', kind: 'service', label: 'Indexer', sub: 'group catalog-index', x: 78, y: 88},
+      {id: 'search', kind: 'db', label: 'catalog · search', sub: 'catalog:{id} · search:{id}', x: 94, y: 88},
     ],
     edges: [
       {from: 'feed', to: 'upserted', kind: 'kafka', label: 'produce sku.upserted'},
       {from: 'upserted', to: 'catalogd', kind: 'kafka', label: 'consume · group catalog-enrichment'},
-      {from: 'reviewer', to: 'catalogd', kind: 'http', label: 'HTTPS'},
-      {from: 'catalogd', to: 'taxonomy', kind: 'plain', label: 'brands · labels · outbox'},
-      {from: 'catalogd', to: 'llm', kind: 'grpc', label: 'Extract'},
-      {from: 'catalogd', to: 'redis', kind: 'redis', label: 'EVAL · SET NX EX'},
-      {from: 'catalogd', to: 'enriched', kind: 'kafka', label: 'produce sku.enriched'},
+      {from: 'catalogd', to: 'extract', kind: 'kafka', label: 'job · then commit'},
+      {from: 'reviewer', to: 'catalogd', kind: 'http', label: 'decision · Idempotency-Key'},
+      {from: 'catalogd', to: 'taxonomy', kind: 'plain', label: 'nearest_brands · has_category'},
+      {from: 'catalogd', to: 'llm', kind: 'grpc', label: 'Extract · 5 s'},
+      {from: 'catalogd', to: 'redis', kind: 'redis', label: 'EVALSHA · SET NX EX · labels'},
+      {from: 'catalogd', to: 'enriched', kind: 'kafka', label: 'publish · outbox on refusal'},
       {from: 'enriched', to: 'indexer', kind: 'kafka', label: 'consume'},
-      {from: 'indexer', to: 'search', kind: 'plain', label: 'apply · upsert · then commit'},
+      {from: 'indexer', to: 'search', kind: 'plain', label: 'apply · index · then commit'},
     ],
   },
   steps: [skuIntakeStep, extractAttributesStep, extractionCacheStep, reviewEndpointStep, publishEnrichedStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

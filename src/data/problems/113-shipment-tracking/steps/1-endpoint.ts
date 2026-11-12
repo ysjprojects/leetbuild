@@ -8,417 +8,304 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db', 'registry'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/shipments\` with body
-\`{"order_id": "ord_8123", "carrier": "ups", "service_level": "ground"}\`, looks up the order's last
-shipment, reuses that shipment's id (or the order id) for the new record, stores it under an empty
-tenant and answers **201**. It serves the demo and hides four flaws.
+**Starting point.** The starter serves \`POST /v1/shipments\` with body
+\`{"order_id": "ord_8123", "carrier": "ups", "service_level": "ground"}\` on the shipments store
+(\`shipments.store\`, provided): it reads the tenant from \`X-Tenant-Id\`, looks up the order's last
+shipment (\`store.last_for_order\`), reuses that shipment's id (or takes \`store.new_shipment_id()\`),
+saves the shipment in \`label\` (\`store.save\`) and answers **201** with it. It serves the demo and
+hides four flaws.
 
-**Failure mode the checks target.** A retried checkout creates a second label for the same parcel
-and the carrier bills both; a typo in \`carrier\` produces a label no partner will scan; a retry
-after a cancellation resurrects the voided id.
+**Failure mode the checks target.** A checkout that times out and retries buys a second label for
+the same parcel; a typo in \`carrier\` produces a label no partner will scan; the replacement for a
+cancelled label lands on the voided id.
 
-- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401** and a missing
-  \`Idempotency-Key\` is **400**.
-- \`order_id\` is a non-empty string and \`service_level\` is one of \`ground\`, \`express\`,
-  \`freight\` (**400** otherwise). The \`carrier\` code must exist in the partner registry
-  (\`registry.lookup\`): an unknown code is **422**.
-- One active shipment per order: when \`store.active_for_order(tenant, order_id)\` finds a shipment
-  in \`label\`, \`in_transit\` or \`out_for_delivery\`, answer **409** with
-  \`{"error": "active_shipment_exists", "shipment_id": "<the existing one>"}\`.
-- A \`CANCELLED\` shipment does not block a replacement, but the replacement gets a new id from
-  \`new_shipment_id()\` and names the cancelled one in \`replacement_of\`.
-- Creations are keyed by \`(tenant, Idempotency-Key)\` through \`store.get_by_key\` and
-  \`store.put_by_key\`; a replay returns the stored shipment with **200**.`,
+- A missing tenant is **401**; \`order_id\` is required and \`service_level\` is one of \`ground\`,
+  \`express\`, \`freight\` (**400** otherwise); a carrier \`registry.lookup\` does not know is **422**.
+- \`Idempotency-Key\` is required (**400**). Look \`(tenant, key)\` up with \`store.get_by_key\` first
+  and answer a recorded shipment with **200**; record a new one with \`store.put_by_key\`.
+- One live shipment per order: when \`store.active_for_order\` finds one, answer **409**
+  \`{"error": "active_shipment_exists", "shipment_id": "<its id>"}\`.
+- A new shipment always takes \`store.new_shipment_id()\`; after a \`cancelled\` one it names that id
+  in \`replacement_of\`.`,
   sequence: {
-    participants: ['Client', 'Shipment API', 'partner registry', 'shipments'],
+    participants: ['Client', 'Shipment API', 'partner registry', 'shipments store'],
     messages: [
       {from: 'Client', to: 'Shipment API', label: 'POST /v1/shipments · X-Tenant-Id · Idempotency-Key', kind: 'sync'},
-      {from: 'Shipment API', to: 'partner registry', label: 'lookup("ups") before a label exists', kind: 'sync'},
+      {from: 'Shipment API', to: 'partner registry', label: 'lookup("ups")', kind: 'sync'},
       {from: 'partner registry', to: 'Shipment API', label: 'partner / none → 422', kind: 'reply'},
-      {from: 'Shipment API', to: 'shipments', label: 'get_by_key(tenant, idem_key)', kind: 'sync'},
-      {from: 'shipments', to: 'Shipment API', label: 'the stored shipment / none', kind: 'reply'},
-      {from: 'Shipment API', to: 'shipments', label: 'active_for_order(tenant, order_id)', kind: 'sync'},
-      {from: 'shipments', to: 'Shipment API', label: 'the live shipment / none', kind: 'reply'},
-      {from: 'Shipment API', to: 'Shipment API', label: '409 {active_shipment_exists, shipment_id}', kind: 'sync'},
-      {from: 'Shipment API', to: 'shipments', label: 'put_by_key · new_shipment_id() · replacement_of', kind: 'async'},
+      {from: 'Shipment API', to: 'shipments store', label: 'get_by_key(tenant, key) → recorded → 200', kind: 'sync'},
+      {from: 'Shipment API', to: 'shipments store', label: 'active_for_order → live → 409', kind: 'sync'},
+      {from: 'Shipment API', to: 'shipments store', label: 'last_for_order → cancelled → replacement_of', kind: 'sync'},
+      {from: 'Shipment API', to: 'shipments store', label: 'new_shipment_id · save · put_by_key', kind: 'sync'},
       {from: 'Shipment API', to: 'Client', label: '201 {shipment_id, status: label}', kind: 'reply'},
     ],
   },
   hints: [
-    'Support sees the same order billed for two labels after a checkout timeout, and a shipment whose first scan lands on an id the carrier already voided.',
-    'The handler asks only for the last shipment, then copies its id. Nothing distinguishes an active shipment (block) from a cancelled one (replace), and a retry re-runs the create.',
-    'Guard in cost order: tenant, `Idempotency-Key`, body, `registry.lookup`. Then `store.get_by_key` for replays, `store.active_for_order` for 409, and `new_shipment_id()` plus `replacement_of` after a cancel. The checks cover the status codes.',
+    'Retry a create whose response was lost and the order holds two labels; a create for carrier `upss` goes through; cancel a label and its replacement comes back under the voided id.',
+    'Nothing asks the partner registry and nothing records the `Idempotency-Key`. `last_for_order` is read only to copy its id: a live shipment and a cancelled one look the same to the handler.',
+    'Guard in order: tenant 401, key 400, body 400, `registry.lookup` 422. Then `get_by_key` (200), `active_for_order` (409 naming it), a fresh `new_shipment_id()` with `replacement_of` after a cancelled one, `save` and `put_by_key`.',
   ],
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/shipments',
+      title: 'Creates a shipment on POST /v1/shipments',
       detail:
-        'Register the create route on `POST /v1/shipments`. The starter already answers this route, so this check passes on it — the four below are where it fails.',
+        'Register `POST /v1/shipments`; a valid create answers **201** with the shipment in `label`, saved for the tenant.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/shipments["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/shipments['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/shipments"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"shipments"\s*\)/, /\bpost\s*\{/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"shipments"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/shipments"/]},
       },
     },
     {
       id: 'validate',
-      title: 'Authenticates the tenant and validates the carrier against the registry',
+      title: 'Refuses an unknown tenant, body or carrier before saving',
       detail:
-        'A missing tenant is **401**, a missing `Idempotency-Key` or a service level outside the allowed set is **400**, and a carrier code the partner registry does not know is **422**. The starter accepts any carrier string, so labels are created for carriers that will never scan them.',
+        'A missing tenant is **401**, an empty `order_id` or a service level outside `ground`/`express`/`freight` is **400**, and a carrier code `registry.lookup` does not know is **422**; nothing is saved for a refused create.',
       match: {
-        python: {
-          all: [/status_code\s*=\s*401/, /status_code\s*=\s*400/, /status_code\s*=\s*422/, /registry\.lookup\(/],
-        },
-        typescript: {all: [/code\(\s*401\s*\)/, /code\(\s*400\s*\)/, /code\(\s*422\s*\)/, /registry\.lookup\(/]},
-        go: {all: [/StatusUnauthorized/, /StatusBadRequest/, /StatusUnprocessableEntity/, /registry\.Lookup\(/]},
-        scala: {
-          all: [
-            /StatusCodes\.Unauthorized/,
-            /StatusCodes\.BadRequest/,
-            /StatusCodes\.UnprocessableEntity/,
-            /registry\.lookup\(/,
-          ],
-        },
-        cpp: {all: [/\b401\b/, /\b400\b/, /\b422\b/, /registry\.lookup\(/]},
+        python: {all: [/registry\.lookup\(/, /\b422\b/, /\b401\b/]},
+        typescript: {all: [/registry\.lookup\(/, /\b422\b/, /\b401\b/]},
+        go: {all: [/registry\.Lookup\(/, /StatusUnprocessableEntity|\b422\b/, /StatusUnauthorized|\b401\b/]},
+        scala: {all: [/Registry\.lookup\(/, /UnprocessableEntity|\b422\b/, /Unauthorized|\b401\b/]},
+        cpp: {all: [/registry::lookup\(/, /\b422\b/, /\b401\b/]},
       },
     },
     {
       id: 'single-active',
-      title: 'Answers 409 with the existing shipment for a second active shipment',
+      title: 'Answers 409 naming the live shipment',
       detail:
-        'A second shipment for an order that already has one in `label`, `in_transit` or `out_for_delivery` is **409** with `active_shipment_exists` and the existing shipment id, decided by `active_for_order`. The starter creates the second label and bills it.',
+        'A second create for an order whose shipment is still `label`, `in_transit` or `out_for_delivery` (`active_for_order`) is **409** with `active_shipment_exists` and the live shipment id, and saves nothing.',
       match: {
-        python: {all: [/status_code\s*=\s*409/, /active_shipment_exists/, /store\.active_for_order\(/]},
-        typescript: {all: [/code\(\s*409\s*\)/, /active_shipment_exists/, /store\.activeForOrder\(/]},
-        go: {all: [/StatusConflict/, /active_shipment_exists/, /store\.ActiveForOrder\(/]},
-        scala: {all: [/StatusCodes\.Conflict/, /active_shipment_exists/, /store\.activeForOrder\(/]},
-        cpp: {all: [/\b409\b/, /active_shipment_exists/, /store\.activeForOrder\(/]},
+        python: {all: [/store\.active_for_order\(/, /\b409\b/, /active_shipment_exists/]},
+        typescript: {all: [/store\.activeForOrder\(/, /\b409\b/, /active_shipment_exists/]},
+        go: {all: [/store\.ActiveForOrder\(/, /StatusConflict|\b409\b/, /active_shipment_exists/]},
+        scala: {all: [/Store\.activeForOrder\(/, /Conflict|\b409\b/, /active_shipment_exists/]},
+        cpp: {all: [/store::activeForOrder\(/, /\b409\b/, /active_shipment_exists/]},
       },
     },
     {
       id: 'idempotency-key',
-      title: 'Keys creations by (tenant, Idempotency-Key)',
+      title: 'Keys a create by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the shipment is stored under `(tenant, key)`; a replay returns the stored shipment with **200** instead of creating a second one. The starter ignores the header entirely.',
+        '`Idempotency-Key` is required (**400**); the recorded shipment is looked up (`get_by_key`) before the live-shipment rule and answered with **200** on a replay, and a new shipment is recorded (`put_by_key`).',
       match: {
-        python: {all: [/Idempotency-Key/, /store\.get_by_key\(/, /store\.put_by_key\(/]},
-        typescript: {all: [/idempotency-key/, /store\.getByKey\(/, /store\.putByKey\(/]},
-        go: {all: [/Idempotency-Key/, /store\.GetByKey\(/, /store\.PutByKey\(/]},
-        scala: {all: [/Idempotency-Key/, /store\.getByKey\(/, /store\.putByKey\(/]},
-        cpp: {all: [/Idempotency-Key/, /store\.getByKey\(/, /store\.putByKey\(/]},
+        python: {
+          all: [/idempotency-key/i, /store\.get_by_key\(/, /store\.put_by_key\(/],
+          order: [/store\.get_by_key\(/, /store\.active_for_order\(/],
+        },
+        typescript: {
+          all: [/idempotency-key/i, /store\.getByKey\(/, /store\.putByKey\(/],
+          order: [/store\.getByKey\(/, /store\.activeForOrder\(/],
+        },
+        go: {
+          all: [/Idempotency-Key/i, /store\.GetByKey\(/, /store\.PutByKey\(/],
+          order: [/store\.GetByKey\(/, /store\.ActiveForOrder\(/],
+        },
+        scala: {
+          all: [/Idempotency-Key/i, /Store\.getByKey\(/, /Store\.putByKey\(/],
+          order: [/Store\.getByKey\(/, /Store\.activeForOrder\(/],
+        },
+        cpp: {
+          all: [/Idempotency-Key/i, /store::getByKey\(/, /store::putByKey\(/],
+          order: [/store::getByKey\(/, /store::activeForOrder\(/],
+        },
       },
     },
     {
       id: 'replacement',
-      title: 'Replaces a cancelled shipment with a new id',
+      title: 'Replaces a cancelled shipment under a new id',
       detail:
-        'A cancelled shipment does not block a replacement, but the replacement carries a fresh `new_shipment_id()` and records `replacement_of` instead of reusing the voided id. The starter hands the cancelled shipment id to the replacement, so its first scan lands on a closed shipment.',
+        'Every new shipment takes `new_shipment_id()`; after a `cancelled` shipment the new one names it in `replacement_of`. Copying the previous shipment id hands the replacement a voided label.',
       match: {
-        python: {all: [/CANCELLED/, /replacement_of/, /new_shipment_id\(\)/]},
-        typescript: {all: [/CANCELLED/, /replacement_of/, /newShipmentId\(\)/]},
-        go: {all: [/cancelledStatus/, /replacement_of/, /newShipmentID\(\)/]},
-        scala: {all: [/Cancelled/, /replacement_of/, /newShipmentId\(\)/]},
-        cpp: {all: [/kCancelled/, /replacement_of/, /newShipmentId\(\)/]},
+        python: {all: [/["']cancelled["']/, /replacement_of/], none: [/["']shipment_id["']\s*:\s*previous\b/]},
+        typescript: {all: [/['"]cancelled['"]/, /replacement_of/], none: [/shipment_id:\s*previous\b/]},
+        go: {
+          all: [/"cancelled"/, /ReplacementOf/],
+          none: [/ShipmentID:\s*previous\.ShipmentID|\bshipmentID\s*=\s*previous\.ShipmentID/],
+        },
+        scala: {all: [/"cancelled"/, /replacementOf|replacement_of/], none: [/previous\.map\(_\.shipmentId\)/]},
+        cpp: {all: [/"cancelled"/], none: [/previous\s*\?\s*previous->shipment_id\s*:\s*store::newShipmentId/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
+      starter: `import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from shipments import registry, store  # registry.lookup; store.new_shipment_id, save, last_for_order, active_for_order, get_by_key, put_by_key
+
 app = FastAPI()
-logger = logging.getLogger("shipments")
 
 
 class CreateShipment(BaseModel):
-    order_id: str
-    carrier: str
-    service_level: str
-
-
-class PartnerRegistry:
-    def lookup(self, carrier: str) -> dict | None:
-        """The partner record for a carrier code, or None when the code is unknown."""
-        raise NotImplementedError
-
-
-class ShipmentStore:
-    def last_for_order(self, tenant: str, order_id: str) -> dict | None:
-        """The order's most recent shipment, cancelled or not."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, shipment: dict) -> None:
-        """Store the shipment for the order."""
-        raise NotImplementedError
-
-
-registry = PartnerRegistry()
-store = ShipmentStore()
+    order_id: str = ""
+    carrier: str = ""
+    service_level: str = ""
 
 
 @app.post("/v1/shipments")
-def create_shipment(body: CreateShipment) -> JSONResponse:
+def create_shipment(body: CreateShipment, request: Request) -> JSONResponse:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    previous = store.last_for_order("", body.order_id)
+    tenant = request.headers.get("x-tenant-id", "")
+    previous = store.last_for_order(tenant, body.order_id)
     shipment = {
-        "shipment_id": (previous or {}).get("shipment_id") or body.order_id,
+        "shipment_id": previous["shipment_id"] if previous is not None else store.new_shipment_id(),
+        "tenant_id": tenant,
         "order_id": body.order_id,
         "carrier": body.carrier,
         "service_level": body.service_level,
         "status": "label",
+        "replacement_of": "",
+        "created_at": int(time.time()),
     }
-    store.put("", shipment)
-    logger.info("shipment created order=%s", body.order_id)
+    store.save(shipment)
     return JSONResponse(shipment, status_code=201)
 `,
-      solution: `import logging
-import uuid
+      solution: `import time
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("shipments")
+from shipments import registry, store  # registry.lookup; store.new_shipment_id, save, last_for_order, active_for_order, get_by_key, put_by_key
 
-SERVICE_LEVELS = {"ground", "express", "freight"}
-CANCELLED = "cancelled"
+app = FastAPI()
+
+SERVICE_LEVELS = ("ground", "express", "freight")
 
 
 class CreateShipment(BaseModel):
-    order_id: str
-    carrier: str
-    service_level: str
+    order_id: str = ""
+    carrier: str = ""
+    service_level: str = ""
 
 
-class PartnerRegistry:
-    def lookup(self, carrier: str) -> dict | None:
-        """The partner record for a carrier code, or None when the code is unknown."""
-        raise NotImplementedError
-
-
-class ShipmentStore:
-    def get_by_key(self, tenant: str, idem_key: str) -> dict | None:
-        """The shipment created under (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put_by_key(self, tenant: str, idem_key: str, shipment: dict) -> None:
-        """Store the shipment under (tenant, idem_key)."""
-        raise NotImplementedError
-
-    def active_for_order(self, tenant: str, order_id: str) -> dict | None:
-        """The order's one live shipment: the one still in label / in_transit / out_for_delivery."""
-        raise NotImplementedError
-
-    def last_for_order(self, tenant: str, order_id: str) -> dict | None:
-        """The order's most recent shipment, cancelled or not."""
-        raise NotImplementedError
-
-
-registry = PartnerRegistry()
-store = ShipmentStore()
-
-
-def new_shipment_id() -> str:
-    return f"shp_{uuid.uuid4().hex}"
+def refuse(status: int, message: str) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status)
 
 
 @app.post("/v1/shipments")
-def create_shipment(
-    body: CreateShipment,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if idem_key is None or idem_key == "":
-        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if body.order_id == "":
-        raise HTTPException(status_code=400, detail="order_id is required")
-    if body.service_level not in SERVICE_LEVELS:
-        raise HTTPException(status_code=400, detail="unknown service level")
+def create_shipment(body: CreateShipment, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return refuse(401, "X-Tenant-Id is required")
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        return refuse(400, "Idempotency-Key is required")
+    if not body.order_id or body.service_level not in SERVICE_LEVELS:
+        return refuse(400, "order_id is required and service_level is one of ground, express, freight")
     if registry.lookup(body.carrier) is None:
-        raise HTTPException(status_code=422, detail="unknown carrier code")
-
-    stored = store.get_by_key(tenant, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=200)
-
+        return refuse(422, f"no partner has carrier code {body.carrier!r}")
+    # A replay answers what the first attempt created, before the live-shipment rule sees it.
+    recorded = store.get_by_key(tenant, key)
+    if recorded is not None:
+        return JSONResponse(recorded, status_code=200)
     active = store.active_for_order(tenant, body.order_id)
     if active is not None:
-        return JSONResponse(
-            {"error": "active_shipment_exists", "shipment_id": active["shipment_id"]},
-            status_code=409,
-        )
-
+        return JSONResponse({"error": "active_shipment_exists", "shipment_id": active["shipment_id"]}, status_code=409)
     previous = store.last_for_order(tenant, body.order_id)
-    replaced = previous if previous is not None and previous["status"] == CANCELLED else None
     shipment = {
-        "shipment_id": new_shipment_id(),
+        "shipment_id": store.new_shipment_id(),  # a voided id stays voided
+        "tenant_id": tenant,
         "order_id": body.order_id,
         "carrier": body.carrier,
         "service_level": body.service_level,
         "status": "label",
-        "replacement_of": replaced["shipment_id"] if replaced is not None else None,
+        "replacement_of": previous["shipment_id"] if previous is not None and previous["status"] == "cancelled" else "",
+        "created_at": int(time.time()),
     }
-    store.put_by_key(tenant, idem_key, shipment)
-    logger.info(
-        "shipment created tenant=%s order=%s shipment=%s replacement_of=%s",
-        tenant,
-        body.order_id,
-        shipment["shipment_id"],
-        shipment["replacement_of"],
-    )
+    store.save(shipment)
+    store.put_by_key(tenant, key, shipment)
     return JSONResponse(shipment, status_code=201)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/shipments: create a shipment for an order. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import * as registry from 'shipments/registry'; // registry.lookup
+import * as store from 'shipments/store'; // store.newShipmentId, save, lastForOrder, activeForOrder, getByKey, putByKey
 
 export const app = Fastify();
 
 interface CreateShipment {
-  order_id: string;
-  carrier: string;
-  service_level: string;
+  order_id?: string;
+  carrier?: string;
+  service_level?: string;
 }
-
-class PartnerRegistry {
-  /** The partner record for a carrier code, or null when the code is unknown. */
-  async lookup(carrier: string): Promise<Record<string, unknown> | null> {
-    throw new Error('not implemented');
-  }
-}
-
-class ShipmentStore {
-  /** The order's most recent shipment, cancelled or not. */
-  async lastForOrder(tenant: string, orderId: string): Promise<{shipment_id: string} | null> {
-    throw new Error('not implemented');
-  }
-
-  async put(tenant: string, shipment: Record<string, unknown>): Promise<void> {
-    throw new Error('not implemented');
-  }
-}
-
-const registry = new PartnerRegistry();
-const store = new ShipmentStore();
 
 app.post('/v1/shipments', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const body = request.body as CreateShipment;
-  const previous = await store.lastForOrder('', body.order_id);
-  const shipment = {
-    shipment_id: previous?.shipment_id ?? body.order_id,
-    order_id: body.order_id,
-    carrier: body.carrier,
-    service_level: body.service_level,
+  const tenant = String(request.headers['x-tenant-id'] ?? '');
+  const body = (request.body ?? {}) as CreateShipment;
+  const previous = await store.lastForOrder(tenant, body.order_id ?? '');
+  const shipment: store.Shipment = {
+    shipment_id: previous !== null ? previous.shipment_id : await store.newShipmentId(),
+    tenant_id: tenant,
+    order_id: body.order_id ?? '',
+    carrier: body.carrier ?? '',
+    service_level: body.service_level ?? '',
     status: 'label',
+    replacement_of: '',
+    created_at: Math.floor(Date.now() / 1000),
   };
-  await store.put('', shipment);
-  request.log.info({order_id: body.order_id}, 'shipment created');
+  await store.save(shipment);
   return reply.code(201).send(shipment);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/shipments: one live shipment per order, idempotent, carrier checked. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import * as registry from 'shipments/registry'; // registry.lookup
+import * as store from 'shipments/store'; // store.newShipmentId, save, lastForOrder, activeForOrder, getByKey, putByKey
 
 export const app = Fastify();
 
-const SERVICE_LEVELS: Record<string, true> = {ground: true, express: true, freight: true};
-const CANCELLED = 'cancelled';
+const SERVICE_LEVELS = ['ground', 'express', 'freight'];
 
 interface CreateShipment {
-  order_id: string;
-  carrier: string;
-  service_level: string;
-}
-
-class PartnerRegistry {
-  /** The partner record for a carrier code, or null when the code is unknown. */
-  async lookup(carrier: string): Promise<Record<string, unknown> | null> {
-    throw new Error('not implemented');
-  }
-}
-
-class ShipmentStore {
-  /** The shipment created under (tenant, idemKey), if any. */
-  async getByKey(tenant: string, idemKey: string): Promise<Record<string, unknown> | null> {
-    throw new Error('not implemented');
-  }
-
-  async putByKey(tenant: string, idemKey: string, shipment: Record<string, unknown>): Promise<void> {
-    throw new Error('not implemented');
-  }
-
-  /** The order's one live shipment: the one still in label / in_transit / out_for_delivery. */
-  async activeForOrder(tenant: string, orderId: string): Promise<{shipment_id: string} | null> {
-    throw new Error('not implemented');
-  }
-
-  /** The order's most recent shipment, cancelled or not. */
-  async lastForOrder(tenant: string, orderId: string): Promise<Record<string, unknown> | null> {
-    throw new Error('not implemented');
-  }
-}
-
-const registry = new PartnerRegistry();
-const store = new ShipmentStore();
-
-function newShipmentId(): string {
-  return 'shp_' + randomUUID().replace(/-/g, '');
+  order_id?: string;
+  carrier?: string;
+  service_level?: string;
 }
 
 app.post('/v1/shipments', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<CreateShipment> | null;
-  if (body === null || typeof body !== 'object' || typeof body.order_id !== 'string' || body.order_id === '')
-    return reply.code(400).send({error: 'order_id is required'});
-  if (body.service_level === undefined || SERVICE_LEVELS[body.service_level] !== true)
-    return reply.code(400).send({error: 'unknown service level'});
-  if ((await registry.lookup(body.carrier as string)) === null)
-    return reply.code(422).send({error: 'unknown carrier code'});
-
-  const stored = await store.getByKey(tenant, idemKey);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  const active = await store.activeForOrder(tenant, body.order_id);
-  if (active !== null)
-    return reply.code(409).send({error: 'active_shipment_exists', shipment_id: active.shipment_id});
-
-  const previous = await store.lastForOrder(tenant, body.order_id);
-  const replaced = previous !== null && previous.status === CANCELLED ? previous : null;
-  const shipment = {
-    shipment_id: newShipmentId(),
-    order_id: body.order_id,
-    carrier: body.carrier,
-    service_level: body.service_level,
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const body = (request.body ?? {}) as CreateShipment;
+  const orderId = body.order_id ?? '';
+  const carrier = body.carrier ?? '';
+  const serviceLevel = body.service_level ?? '';
+  if (orderId === '' || !SERVICE_LEVELS.includes(serviceLevel)) {
+    return reply.code(400).send({error: 'order_id is required and service_level is one of ground, express, freight'});
+  }
+  if (registry.lookup(carrier) === null) return reply.code(422).send({error: \`no partner has carrier code "\${carrier}"\`});
+  // A replay answers what the first attempt created, before the live-shipment rule sees it.
+  const recorded = await store.getByKey(tenant, key);
+  if (recorded !== null) return reply.code(200).send(recorded);
+  const active = await store.activeForOrder(tenant, orderId);
+  if (active !== null) return reply.code(409).send({error: 'active_shipment_exists', shipment_id: active.shipment_id});
+  const previous = await store.lastForOrder(tenant, orderId);
+  const shipment: store.Shipment = {
+    shipment_id: await store.newShipmentId(), // a voided id stays voided
+    tenant_id: tenant,
+    order_id: orderId,
+    carrier,
+    service_level: serviceLevel,
     status: 'label',
-    replacement_of: replaced === null ? null : replaced.shipment_id,
+    replacement_of: previous !== null && previous.status === 'cancelled' ? previous.shipment_id : '',
+    created_at: Math.floor(Date.now() / 1000),
   };
-  await store.putByKey(tenant, idemKey, shipment);
-  request.log.info({tenant, order_id: body.order_id, shipment_id: shipment.shipment_id}, 'shipment created');
+  await store.save(shipment);
+  await store.putByKey(tenant, key, shipment);
   return reply.code(201).send(shipment);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -426,393 +313,206 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+	"time"
+
+	"shipments/store" // store.NewShipmentID, Save, LastForOrder, ActiveForOrder, GetByKey, PutByKey; the partners: registry.Lookup in "shipments/registry"
 )
 
-type createShipment struct {
+type createRequest struct {
 	OrderID      string \`json:"order_id"\`
 	Carrier      string \`json:"carrier"\`
 	ServiceLevel string \`json:"service_level"\`
 }
 
-type partnerRegistry struct{}
-
-func (r *partnerRegistry) Lookup(carrier string) (map[string]any, error) {
-	return nil, nil
-}
-
-type shipmentStore struct{}
-
-// LastForOrder returns the order's most recent shipment, cancelled or not.
-func (s *shipmentStore) LastForOrder(tenant, orderID string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *shipmentStore) Put(tenant string, shipment map[string]any) error {
-	return nil
-}
-
-var (
-	registry = &partnerRegistry{}
-	store    = &shipmentStore{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func createShipmentRoute(rw http.ResponseWriter, r *http.Request) {
+func createShipment(rw http.ResponseWriter, r *http.Request) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	var body createShipment
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	previous, _ := store.LastForOrder("", body.OrderID)
-	shipmentID := body.OrderID
+	tenant := r.Header.Get("X-Tenant-Id")
+	var body createRequest
+	json.NewDecoder(r.Body).Decode(&body)
+	previous := store.LastForOrder(r.Context(), tenant, body.OrderID)
+	shipmentID := store.NewShipmentID(r.Context())
 	if previous != nil {
-		shipmentID, _ = previous["shipment_id"].(string)
+		shipmentID = previous.ShipmentID
 	}
-	shipment := map[string]any{
-		"shipment_id":   shipmentID,
-		"order_id":      body.OrderID,
-		"carrier":       body.Carrier,
-		"service_level": body.ServiceLevel,
-		"status":        "label",
+	s := store.Shipment{
+		ShipmentID: shipmentID, TenantID: tenant, OrderID: body.OrderID, Carrier: body.Carrier,
+		ServiceLevel: body.ServiceLevel, Status: "label", CreatedAt: time.Now().Unix(),
 	}
-	_ = store.Put("", shipment)
-	log.Printf("shipment created order=%s", body.OrderID)
-	writeJSON(rw, http.StatusCreated, shipment)
+	store.Save(r.Context(), s)
+	writeJSON(rw, http.StatusCreated, s)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/shipments", createShipmentRoute)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/shipments", createShipment)
 }
 `,
       solution: `package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
-)
+	"time"
 
-const cancelledStatus = "cancelled"
+	"shipments/registry" // registry.Lookup
+	"shipments/store"    // store.NewShipmentID, Save, LastForOrder, ActiveForOrder, GetByKey, PutByKey
+)
 
 var serviceLevels = map[string]bool{"ground": true, "express": true, "freight": true}
 
-type createShipment struct {
+type createRequest struct {
 	OrderID      string \`json:"order_id"\`
 	Carrier      string \`json:"carrier"\`
 	ServiceLevel string \`json:"service_level"\`
 }
 
-type partnerRegistry struct{}
-
-func (r *partnerRegistry) Lookup(carrier string) (map[string]any, error) {
-	return nil, nil
-}
-
-type shipmentStore struct{}
-
-// GetByKey returns the shipment created under (tenant, idemKey), if any.
-func (s *shipmentStore) GetByKey(tenant, idemKey string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *shipmentStore) PutByKey(tenant, idemKey string, shipment map[string]any) error {
-	return nil
-}
-
-// ActiveForOrder returns the order's one live shipment: the one still in
-// label / in_transit / out_for_delivery.
-func (s *shipmentStore) ActiveForOrder(tenant, orderID string) (map[string]any, error) {
-	return nil, nil
-}
-
-// LastForOrder returns the order's most recent shipment, cancelled or not.
-func (s *shipmentStore) LastForOrder(tenant, orderID string) (map[string]any, error) {
-	return nil, nil
-}
-
-var (
-	registry = &partnerRegistry{}
-	store    = &shipmentStore{}
-)
-
-func newShipmentID() string {
-	buf := make([]byte, 16)
-	_, _ = rand.Read(buf)
-	return "shp_" + hex.EncodeToString(buf)
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func createShipmentRoute(rw http.ResponseWriter, r *http.Request) {
+func refuse(rw http.ResponseWriter, status int, message string) {
+	writeJSON(rw, status, map[string]string{"error": message})
+}
+
+func createShipment(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		refuse(rw, http.StatusUnauthorized, "X-Tenant-Id is required")
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		refuse(rw, http.StatusBadRequest, "Idempotency-Key is required")
 		return
 	}
-	var body createShipment
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	var body createRequest
+	json.NewDecoder(r.Body).Decode(&body)
+	if body.OrderID == "" || !serviceLevels[body.ServiceLevel] {
+		refuse(rw, http.StatusBadRequest, "order_id is required and service_level is one of ground, express, freight")
 		return
 	}
-	if body.OrderID == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "order_id is required"})
+	if registry.Lookup(body.Carrier) == nil {
+		refuse(rw, http.StatusUnprocessableEntity, fmt.Sprintf("no partner has carrier code %q", body.Carrier))
 		return
 	}
-	if !serviceLevels[body.ServiceLevel] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown service level"})
+	// A replay answers what the first attempt created, before the live-shipment rule sees it.
+	if recorded := store.GetByKey(r.Context(), tenant, key); recorded != nil {
+		writeJSON(rw, http.StatusOK, recorded)
 		return
 	}
-	partner, err := registry.Lookup(body.Carrier)
-	if err != nil || partner == nil {
-		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "unknown carrier code"})
+	if active := store.ActiveForOrder(r.Context(), tenant, body.OrderID); active != nil {
+		writeJSON(rw, http.StatusConflict, map[string]string{"error": "active_shipment_exists", "shipment_id": active.ShipmentID})
 		return
 	}
-	stored, err := store.GetByKey(tenant, idemKey)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
+	s := store.Shipment{
+		ShipmentID: store.NewShipmentID(r.Context()), // a voided id stays voided
+		TenantID:   tenant, OrderID: body.OrderID, Carrier: body.Carrier, ServiceLevel: body.ServiceLevel,
+		Status: "label", CreatedAt: time.Now().Unix(),
 	}
-	if stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
-		return
+	if previous := store.LastForOrder(r.Context(), tenant, body.OrderID); previous != nil && previous.Status == "cancelled" {
+		s.ReplacementOf = previous.ShipmentID
 	}
-	active, err := store.ActiveForOrder(tenant, body.OrderID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if active != nil {
-		writeJSON(rw, http.StatusConflict, map[string]any{
-			"error":       "active_shipment_exists",
-			"shipment_id": active["shipment_id"],
-		})
-		return
-	}
-	previous, err := store.LastForOrder(tenant, body.OrderID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	shipment := map[string]any{
-		"shipment_id":   newShipmentID(),
-		"order_id":      body.OrderID,
-		"carrier":       body.Carrier,
-		"service_level": body.ServiceLevel,
-		"status":        "label",
-		"replacement_of": nil,
-	}
-	if previous != nil && previous["status"] == cancelledStatus {
-		shipment["replacement_of"] = previous["shipment_id"]
-	}
-	if err := store.PutByKey(tenant, idemKey, shipment); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("shipment created tenant=%s order=%s shipment=%s", tenant, body.OrderID, shipment["shipment_id"])
-	writeJSON(rw, http.StatusCreated, shipment)
+	store.Save(r.Context(), s)
+	store.PutByKey(r.Context(), tenant, key, s)
+	writeJSON(rw, http.StatusCreated, s)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/shipments", createShipmentRoute)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/shipments", createShipment)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class CreateShipment(order_id: String, carrier: String, service_level: String)
+import shipments.{Registry, Store} // Registry.lookup; Store.newShipmentId, save, lastForOrder, activeForOrder, getByKey, putByKey
 
-class PartnerRegistry {
-  /** The partner record for a carrier code, or None when the code is unknown. */
-  def lookup(carrier: String): Option[Map[String, String]] = None
-}
+object Api {
+  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
 
-object PartnerRegistry {
-  def open(): PartnerRegistry = new PartnerRegistry
-}
-
-class ShipmentStore {
-  /** The order's most recent shipment, cancelled or not. */
-  def lastForOrder(tenant: String, orderId: String): Option[Map[String, String]] = None
-
-  def put(tenant: String, shipment: Map[String, String]): Unit = ()
-}
-
-object ShipmentStore {
-  def open(): ShipmentStore = new ShipmentStore
-}
-
-object ShipmentApi {
-  implicit val system: ActorSystem = ActorSystem("shipments")
-  implicit val createFormat: RootJsonFormat[CreateShipment] = jsonFormat3(CreateShipment)
-
-  val registry = PartnerRegistry.open()
-  val store = ShipmentStore.open()
-
-  val route: Route =
-    path("v1" / "shipments") {
-      post {
-        entity(as[CreateShipment]) { body =>
+  val route: Route = path("v1" / "shipments") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenantHeader =>
+        entity(as[String]) { raw =>
           // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val previous = store.lastForOrder("", body.order_id)
-          val shipmentId = previous.flatMap(_.get("shipment_id")).getOrElse(body.order_id)
-          val shipment = Map(
-            "shipment_id" -> shipmentId,
-            "order_id" -> body.order_id,
-            "carrier" -> body.carrier,
-            "service_level" -> body.service_level,
-            "status" -> "label"
-          )
-          store.put("", shipment)
-          system.log.info(s"shipment created order=" + body.order_id)
-          complete(StatusCodes.Created, shipment)
+          val tenant = tenantHeader.getOrElse("")
+          val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject.empty)
+          val previous = Store.lastForOrder(tenant, text(body, "order_id"))
+          val shipment = Store.Shipment(previous.map(_.shipmentId).getOrElse(Store.newShipmentId()), tenant, text(body, "order_id"),
+            text(body, "carrier"), text(body, "service_level"), "label", "", System.currentTimeMillis() / 1000)
+          Store.save(shipment)
+          complete(HttpResponse(StatusCodes.Created, entity = HttpEntity(ContentTypes.\`application/json\`, shipment.toJson.compactPrint)))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class CreateShipment(order_id: String, carrier: String, service_level: String)
+import shipments.{Registry, Store} // Registry.lookup; Store.newShipmentId, save, lastForOrder, activeForOrder, getByKey, putByKey
 
-class PartnerRegistry {
-  /** The partner record for a carrier code, or None when the code is unknown. */
-  def lookup(carrier: String): Option[Map[String, String]] = None
-}
+object Api {
+  val ServiceLevels: Set[String] = Set("ground", "express", "freight")
 
-object PartnerRegistry {
-  def open(): PartnerRegistry = new PartnerRegistry
-}
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-class ShipmentStore {
-  /** The shipment created under (tenant, idemKey), if any. */
-  def getByKey(tenant: String, idemKey: String): Option[Map[String, String]] = None
+  private def refuse(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  def putByKey(tenant: String, idemKey: String, shipment: Map[String, String]): Unit = ()
+  private def text(body: JsObject, name: String): String = body.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
 
-  /** The order's one live shipment: the one still in label / in_transit / out_for_delivery. */
-  def activeForOrder(tenant: String, orderId: String): Option[Map[String, String]] = None
+  private def create(tenant: String, key: String, raw: String): HttpResponse = {
+    if (tenant.isEmpty) return refuse(StatusCodes.Unauthorized, "X-Tenant-Id is required")
+    if (key.isEmpty) return refuse(StatusCodes.BadRequest, "Idempotency-Key is required")
+    val body = scala.util.Try(raw.parseJson.asJsObject).getOrElse(JsObject.empty)
+    val orderId = text(body, "order_id")
+    val carrier = text(body, "carrier")
+    val serviceLevel = text(body, "service_level")
+    if (orderId.isEmpty || !ServiceLevels(serviceLevel)) return refuse(StatusCodes.BadRequest, "order_id is required and service_level is one of ground, express, freight")
+    if (Registry.lookup(carrier).isEmpty) return refuse(StatusCodes.UnprocessableEntity, s"no partner has carrier code $carrier")
+    // A replay answers what the first attempt created, before the live-shipment rule sees it.
+    Store.getByKey(tenant, key) match {
+      case Some(recorded) => json(StatusCodes.OK, recorded.toJson)
+      case None =>
+        Store.activeForOrder(tenant, orderId) match {
+          case Some(active) => json(StatusCodes.Conflict, JsObject("error" -> JsString("active_shipment_exists"), "shipment_id" -> JsString(active.shipmentId)))
+          case None =>
+            val replacementOf = Store.lastForOrder(tenant, orderId).filter(_.status == "cancelled").map(_.shipmentId).getOrElse("")
+            // A voided id stays voided: every new shipment takes a new id.
+            val shipment = Store.Shipment(Store.newShipmentId(), tenant, orderId, carrier, serviceLevel, "label", replacementOf, System.currentTimeMillis() / 1000)
+            Store.save(shipment)
+            Store.putByKey(tenant, key, shipment)
+            json(StatusCodes.Created, shipment.toJson)
+        }
+    }
+  }
 
-  /** The order's most recent shipment, cancelled or not. */
-  def lastForOrder(tenant: String, orderId: String): Option[Map[String, String]] = None
-}
-
-object ShipmentStore {
-  def open(): ShipmentStore = new ShipmentStore
-}
-
-object ShipmentApi {
-  implicit val system: ActorSystem = ActorSystem("shipments")
-  implicit val createFormat: RootJsonFormat[CreateShipment] = jsonFormat3(CreateShipment)
-
-  val ServiceLevels = Set("ground", "express", "freight")
-  val Cancelled = "cancelled"
-
-  val registry = PartnerRegistry.open()
-  val store = ShipmentStore.open()
-
-  def newShipmentId(): String = "shp_" + UUID.randomUUID().toString.replace("-", "")
-
-  val route: Route =
-    path("v1" / "shipments") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[CreateShipment]) { body =>
-              if (!tenantOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.order_id.isEmpty || !ServiceLevels.contains(body.service_level)) {
-                complete(StatusCodes.BadRequest, """{"error":"invalid order_id or service_level"}""")
-              } else if (registry.lookup(body.carrier).isEmpty) {
-                complete(StatusCodes.UnprocessableEntity, """{"error":"unknown carrier code"}""")
-              } else {
-                val tenant = tenantOpt.get
-                val idemKey = idemOpt.get
-                store.getByKey(tenant, idemKey) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
-                  case None =>
-                    store.activeForOrder(tenant, body.order_id) match {
-                      case Some(active) =>
-                        complete(
-                          StatusCodes.Conflict,
-                          """{"error":"active_shipment_exists","shipment_id":"""" + active
-                            .getOrElse("shipment_id", "") + """"}"""
-                        )
-                      case None =>
-                        val replaced = store
-                          .lastForOrder(tenant, body.order_id)
-                          .filter(_.getOrElse("status", "") == Cancelled)
-                        val shipment = Map(
-                          "shipment_id" -> newShipmentId(),
-                          "order_id" -> body.order_id,
-                          "carrier" -> body.carrier,
-                          "service_level" -> body.service_level,
-                          "status" -> "label",
-                          "replacement_of" -> replaced.flatMap(_.get("shipment_id")).getOrElse("")
-                        )
-                        store.putByKey(tenant, idemKey, shipment)
-                        system.log.info(
-                          "shipment created tenant=" + tenant + " order=" + body.order_id +
-                            " shipment=" + shipment("shipment_id") + " replacement_of=" + shipment("replacement_of")
-                        )
-                        complete(StatusCodes.Created, shipment)
-                    }
-                }
-              }
-            }
+  val route: Route = path("v1" / "shipments") {
+    post {
+      optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+        optionalHeaderValueByName("Idempotency-Key") { key =>
+          entity(as[String]) { raw =>
+            complete(create(tenant.getOrElse(""), key.getOrElse(""), raw))
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -821,152 +521,498 @@ object ShipmentApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <optional>
+#include <chrono>
 #include <string>
+
+#include "shipments/registry.h"  // registry::lookup
+#include "shipments/store.h"     // store::newShipmentId, save, lastForOrder, activeForOrder, getByKey, putByKey
 
 using json = nlohmann::json;
 
-struct PartnerRegistry {
-  std::optional<json> lookup(const std::string& carrier);
-};
-
-struct ShipmentStore {
-  std::optional<json> lastForOrder(const std::string& tenant, const std::string& orderId);
-  void put(const std::string& tenant, const json& shipment);
-};
-
-PartnerRegistry registry;
-ShipmentStore store;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/shipments", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const auto orderId = body.value("order_id", std::string());
-    const auto previous = store.lastForOrder("", orderId);
-    json shipment = {
-        {"shipment_id", previous ? previous->value("shipment_id", orderId) : orderId},
-        {"order_id", orderId},
-        {"carrier", body.value("carrier", std::string())},
-        {"service_level", body.value("service_level", std::string())},
-        {"status", "label"},
-    };
-    store.put("", shipment);
-    std::cerr << "shipment created order=" << orderId << "\\n";
-    res.status = 201;
-    res.set_content(shipment.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+long now_seconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+
+void create_shipment(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const json body = json::parse(req.body, nullptr, false);
+  const std::string order_id = body.is_object() ? body.value("order_id", "") : "";
+  const auto previous = store::lastForOrder(tenant, order_id);
+  const store::Shipment s{previous ? previous->shipment_id : store::newShipmentId(),
+                          tenant,
+                          order_id,
+                          body.is_object() ? body.value("carrier", "") : "",
+                          body.is_object() ? body.value("service_level", "") : "",
+                          "label",
+                          "",
+                          now_seconds()};
+  store::save(s);
+  res.status = 201;
+  res.set_content(json(s).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/shipments", create_shipment); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <optional>
+#include <chrono>
 #include <set>
 #include <string>
+
+#include "shipments/registry.h"  // registry::lookup
+#include "shipments/store.h"     // store::newShipmentId, save, lastForOrder, activeForOrder, getByKey, putByKey
 
 using json = nlohmann::json;
 
 const std::set<std::string> kServiceLevels = {"ground", "express", "freight"};
-const std::string kCancelled = "cancelled";
 
-struct PartnerRegistry {
-  std::optional<json> lookup(const std::string& carrier);
-};
-
-struct ShipmentStore {
-  std::optional<json> getByKey(const std::string& tenant, const std::string& idemKey);
-  void putByKey(const std::string& tenant, const std::string& idemKey, const json& shipment);
-  std::optional<json> activeForOrder(const std::string& tenant, const std::string& orderId);
-  std::optional<json> lastForOrder(const std::string& tenant, const std::string& orderId);
-};
-
-PartnerRegistry registry;
-ShipmentStore store;
-std::string newShipmentId();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/shipments", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("order_id")) {
-      res.status = 400;
-      res.set_content(R"({"error":"order_id is required"})", "application/json");
-      return;
-    }
-    const auto orderId = body["order_id"].get<std::string>();
-    const auto serviceLevel = body.value("service_level", std::string());
-    if (orderId.empty() || kServiceLevels.count(serviceLevel) == 0) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid order_id or service_level"})", "application/json");
-      return;
-    }
-    if (!registry.lookup(body.value("carrier", std::string()))) {
-      res.status = 422;
-      res.set_content(R"({"error":"unknown carrier code"})", "application/json");
-      return;
-    }
-    const auto stored = store.getByKey(tenant, idemKey);
-    if (stored) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    const auto active = store.activeForOrder(tenant, orderId);
-    if (active) {
-      res.status = 409;
-      res.set_content(
-          json{{"error", "active_shipment_exists"}, {"shipment_id", active->value("shipment_id", "")}}.dump(),
-          "application/json");
-      return;
-    }
-    const auto previous = store.lastForOrder(tenant, orderId);
-    json shipment = {
-        {"shipment_id", newShipmentId()},
-        {"order_id", orderId},
-        {"carrier", body.value("carrier", std::string())},
-        {"service_level", serviceLevel},
-        {"status", "label"},
-        {"replacement_of", nullptr},
-    };
-    if (previous && previous->value("status", std::string()) == kCancelled) {
-      shipment["replacement_of"] = (*previous)["shipment_id"];
-    }
-    store.putByKey(tenant, idemKey, shipment);
-    std::cerr << "shipment created tenant=" << tenant << " order=" << orderId
-              << " shipment=" << shipment["shipment_id"] << "\\n";
-    res.status = 201;
-    res.set_content(shipment.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+long now_seconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+
+void reply_json(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
+
+void create_shipment(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply_json(res, 401, {{"error", "X-Tenant-Id is required"}});
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return reply_json(res, 400, {{"error", "Idempotency-Key is required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  const std::string order_id = body.is_object() ? body.value("order_id", "") : "";
+  const std::string carrier = body.is_object() ? body.value("carrier", "") : "";
+  const std::string service_level = body.is_object() ? body.value("service_level", "") : "";
+  if (order_id.empty() || kServiceLevels.count(service_level) == 0) {
+    return reply_json(res, 400, {{"error", "order_id is required and service_level is one of ground, express, freight"}});
+  }
+  if (!registry::lookup(carrier)) return reply_json(res, 422, {{"error", "no partner has carrier code " + carrier}});
+  // A replay answers what the first attempt created, before the live-shipment rule sees it.
+  if (const auto recorded = store::getByKey(tenant, key)) return reply_json(res, 200, json(*recorded));
+  if (const auto active = store::activeForOrder(tenant, order_id)) {
+    return reply_json(res, 409, {{"error", "active_shipment_exists"}, {"shipment_id", active->shipment_id}});
+  }
+  const auto previous = store::lastForOrder(tenant, order_id);
+  const store::Shipment s{store::newShipmentId(),  // a voided id stays voided
+                          tenant,
+                          order_id,
+                          carrier,
+                          service_level,
+                          "label",
+                          previous && previous->status == "cancelled" ? previous->shipment_id : "",
+                          now_seconds()};
+  store::save(s);
+  store::putByKey(tenant, key, s);
+  reply_json(res, 201, json(s));
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/shipments", create_shipment); }
 `,
     },
   },
-  debrief: `The fix is a sequence of guards, and the order matters: the cheap rejections (tenant, header, body shape) run before the registry lookup, which may be a network call, and the idempotency lookup runs before the active check so a replay returns the stored shipment without re-deciding anything. The cancelled case is where a naive fix goes wrong. Reusing the order's last id looks like idempotency, but that id was voided at the carrier, so the replacement needs a fresh id and a \`replacement_of\` link to the one it supersedes. Production services go further: the idempotency record also stores a request hash so a replay with a different body is rejected, and voiding a label is an explicit carrier call rather than a status flip in the store.`,
+  harness: {
+    python: `from shipments import store
+
+BODY = {"order_id": "ord_8123", "carrier": "ups", "service_level": "ground"}
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+async def _create(c, key, body=None, tenant="t-acme"):
+    headers = {"Idempotency-Key": key}
+    if tenant:
+        headers["X-Tenant-Id"] = tenant
+    return await c.post("/v1/shipments", json=BODY if body is None else body, headers=headers)
+
+
+def _created(r, what):
+    assert r.status_code == 201, f"{what} answered {r.status_code}: {r.text}"
+    return r.json()["shipment_id"]
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _create(c, "k-1")
+    shipment_id = _created(r, "POST /v1/shipments")
+    body = r.json()
+    assert body.get("status") == "label" and body.get("order_id") == "ord_8123", f"a new shipment must answer status label for ord_8123, got {body}"
+    saved = store.get_shipment(shipment_id)
+    assert saved is not None and saved["tenant_id"] == "t-acme" and saved["carrier"] == "ups", f"the store holds {saved} for {shipment_id}, expected t-acme's ups shipment"
+
+
+async def check_validate(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/shipments", json=BODY, headers={"Idempotency-Key": "k-1"})
+        assert r.status_code == 401, f"a create without X-Tenant-Id answered {r.status_code}, expected 401"
+        r = await _create(c, "k-2", {**BODY, "carrier": "upss"})
+        assert r.status_code == 422, f"a create for carrier 'upss' (no partner has it) answered {r.status_code}, expected 422: ask registry.lookup"
+        r = await _create(c, "k-3", {**BODY, "service_level": "overnight"})
+        assert r.status_code == 400, f"service_level 'overnight' answered {r.status_code}, expected 400 (ground, express, freight)"
+        r = await _create(c, "k-4", {**BODY, "order_id": ""})
+        assert r.status_code == 400, f"an empty order_id answered {r.status_code}, expected 400"
+        saved = ctx.redis.keys("order:*")
+        assert saved == [], f"refused creates still saved shipments: {sorted(saved)}"
+        r = await _create(c, "k-5", {**BODY, "carrier": "fedex", "service_level": "express"})
+    _created(r, "a valid fedex express create")
+
+
+async def check_single_active(ctx):
+    async with _api(ctx) as c:
+        first_id = _created(await _create(c, "k-1"), "the first create")
+        second = await _create(c, "k-2")
+    assert second.status_code == 409, f"a second shipment for ord_8123 while {first_id} is live answered {second.status_code} {second.text}, expected 409"
+    body = second.json()
+    assert body.get("error") == "active_shipment_exists" and body.get("shipment_id") == first_id, f"the 409 must name the live shipment ({{error: active_shipment_exists, shipment_id: {first_id}}}), got {body}"
+    ids = ctx.redis.lrange("order:t-acme:ord_8123", 0, -1)
+    assert ids == [first_id], f"the order lists shipments {ids}: the refused create saved one"
+    store.set_status(first_id, "delivered", 100)
+    async with _api(ctx) as c:
+        _created(await _create(c, "k-3"), "a create after the order's shipment was delivered (no longer live)")
+
+
+async def check_idempotency_key(ctx):
+    async with _api(ctx) as c:
+        first = await _create(c, "k-1")
+        first_id = _created(first, "the first create")
+        replay = await _create(c, "k-1")
+        assert replay.status_code == 200, f"a replay of Idempotency-Key k-1 answered {replay.status_code} {replay.text}, expected 200 with the recorded shipment"
+        assert replay.json() == first.json(), f"the replay must answer the recorded shipment {first.json()}, got {replay.json()}"
+        missing = await c.post("/v1/shipments", json=BODY, headers={"X-Tenant-Id": "t-acme"})
+        assert missing.status_code == 400, f"a create without Idempotency-Key answered {missing.status_code}, expected 400"
+        ids = ctx.redis.lrange("order:t-acme:ord_8123", 0, -1)
+        assert ids == [first_id], f"one create and its replay left {ids} on the order, expected [{first_id!r}]"
+        other = await _create(c, "k-1", tenant="t-globex")
+    other_id = _created(other, "another tenant's create with the same key")
+    assert other_id != first_id, "another tenant's key k-1 answered t-acme's shipment: keys are scoped by tenant"
+
+
+async def check_replacement(ctx):
+    async with _api(ctx) as c:
+        first_id = _created(await _create(c, "k-1"), "the first create")
+    store.set_status(first_id, "cancelled", 100)
+    async with _api(ctx) as c:
+        second = await _create(c, "k-2")
+    second_id = _created(second, "a create after the order's shipment was cancelled")
+    assert second_id != first_id, f"the replacement reused the cancelled id {first_id}: the carrier's scans for the voided label would land on it"
+    assert second.json().get("replacement_of") == first_id, f"the replacement must name {first_id} in replacement_of, got {second.json()}"
+    assert store.get_shipment(first_id)["status"] == "cancelled", f"the cancelled shipment now reads {store.get_shipment(first_id)}"
+`,
+    typescript: `const BODY = {order_id: 'ord_8123', carrier: 'ups', service_level: 'ground'};
+
+function api(ctx) {
+  return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/shipments/store.ts')};
+}
+
+function create(c, key: string, body: Record<string, string> = BODY, tenant = 't-acme') {
+  const headers: Record<string, string> = {'Idempotency-Key': key};
+  if (tenant !== '') headers['X-Tenant-Id'] = tenant;
+  return c.post('/v1/shipments', {json: body, headers});
+}
+
+function created(r, what: string): string {
+  assert.equal(r.status, 201, \`\${what} answered \${r.status}: \${r.text}\`);
+  return r.json().shipment_id;
+}
+
+export async function check_route(ctx) {
+  const {c, store} = api(ctx);
+  const r = await create(c, 'k-1');
+  const shipmentId = created(r, 'POST /v1/shipments');
+  const body = r.json();
+  assert(body.status === 'label' && body.order_id === 'ord_8123', \`a new shipment must answer status label for ord_8123, got \${r.text}\`);
+  const saved = await store.getShipment(shipmentId);
+  assert(saved !== null && saved.tenant_id === 't-acme' && saved.carrier === 'ups', \`the store holds \${JSON.stringify(saved)} for \${shipmentId}, expected t-acme's ups shipment\`);
+}
+
+export async function check_validate(ctx) {
+  const {c} = api(ctx);
+  let r = await c.post('/v1/shipments', {json: BODY, headers: {'Idempotency-Key': 'k-1'}});
+  assert.equal(r.status, 401, \`a create without X-Tenant-Id answered \${r.status}, expected 401\`);
+  r = await create(c, 'k-2', {...BODY, carrier: 'upss'});
+  assert.equal(r.status, 422, \`a create for carrier 'upss' (no partner has it) answered \${r.status}, expected 422: ask registry.lookup\`);
+  r = await create(c, 'k-3', {...BODY, service_level: 'overnight'});
+  assert.equal(r.status, 400, \`service_level 'overnight' answered \${r.status}, expected 400 (ground, express, freight)\`);
+  r = await create(c, 'k-4', {...BODY, order_id: ''});
+  assert.equal(r.status, 400, \`an empty order_id answered \${r.status}, expected 400\`);
+  const saved = ctx.redis.keys('order:*');
+  assert.equal(saved.length, 0, \`refused creates still saved shipments: \${JSON.stringify(saved)}\`);
+  created(await create(c, 'k-5', {...BODY, carrier: 'fedex', service_level: 'express'}), 'a valid fedex express create');
+}
+
+export async function check_single_active(ctx) {
+  const {c, store} = api(ctx);
+  const firstId = created(await create(c, 'k-1'), 'the first create');
+  const second = await create(c, 'k-2');
+  assert.equal(second.status, 409, \`a second shipment for ord_8123 while \${firstId} is live answered \${second.status} \${second.text}, expected 409\`);
+  const body = second.json();
+  assert(body.error === 'active_shipment_exists' && body.shipment_id === firstId, \`the 409 must name the live shipment (active_shipment_exists, \${firstId}), got \${second.text}\`);
+  const ids = ctx.redis.lrange('order:t-acme:ord_8123', 0, -1);
+  assert.deepStrictEqual(ids, [firstId], \`the order lists shipments \${JSON.stringify(ids)}: the refused create saved one\`);
+  await store.setStatus(firstId, 'delivered', 100);
+  created(await create(c, 'k-3'), "a create after the order's shipment was delivered (no longer live)");
+}
+
+export async function check_idempotency_key(ctx) {
+  const {c} = api(ctx);
+  const first = await create(c, 'k-1');
+  const firstId = created(first, 'the first create');
+  const replay = await create(c, 'k-1');
+  assert.equal(replay.status, 200, \`a replay of Idempotency-Key k-1 answered \${replay.status} \${replay.text}, expected 200 with the recorded shipment\`);
+  assert.deepStrictEqual(replay.json(), first.json(), \`the replay must answer the recorded shipment \${first.text}, got \${replay.text}\`);
+  const missing = await c.post('/v1/shipments', {json: BODY, headers: {'X-Tenant-Id': 't-acme'}});
+  assert.equal(missing.status, 400, \`a create without Idempotency-Key answered \${missing.status}, expected 400\`);
+  const ids = ctx.redis.lrange('order:t-acme:ord_8123', 0, -1);
+  assert.deepStrictEqual(ids, [firstId], \`one create and its replay left \${JSON.stringify(ids)} on the order, expected one shipment\`);
+  const otherId = created(await create(c, 'k-1', BODY, 't-globex'), "another tenant's create with the same key");
+  assert.notEqual(otherId, firstId, "another tenant's key k-1 answered t-acme's shipment: keys are scoped by tenant");
+}
+
+export async function check_replacement(ctx) {
+  const {c, store} = api(ctx);
+  const firstId = created(await create(c, 'k-1'), 'the first create');
+  await store.setStatus(firstId, 'cancelled', 100);
+  const second = await create(c, 'k-2');
+  const secondId = created(second, "a create after the order's shipment was cancelled");
+  assert.notEqual(secondId, firstId, \`the replacement reused the cancelled id \${firstId}: the carrier's scans for the voided label would land on it\`);
+  assert.equal(second.json().replacement_of, firstId, \`the replacement must name \${firstId} in replacement_of, got \${second.text}\`);
+  assert.equal((await store.getShipment(firstId)).status, 'cancelled', 'the cancelled shipment must stay cancelled');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"shipments/store"
+
+	"leetbuild/harness"
+)
+
+var (
+	apiBg = context.Background()
+	body  = map[string]string{"order_id": "ord_8123", "carrier": "ups", "service_level": "ground"}
+)
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func with(field, value string) map[string]string {
+	out := map[string]string{}
+	for k, v := range body {
+		out[k] = v
+	}
+	out[field] = value
+	return out
+}
+
+func create(c *harness.HTTP, key string, b map[string]string, tenant string) *harness.Response {
+	headers := []string{"Idempotency-Key", key}
+	if tenant != "" {
+		headers = append(headers, "X-Tenant-Id", tenant)
+	}
+	return c.Post("/v1/shipments", b, headers...)
+}
+
+func created(ctx *harness.Ctx, r *harness.Response, what string) string {
+	ctx.Equal(r.Status, 201, "%s (%s); the status", what, r.Text())
+	var s struct {
+		ShipmentID string \`json:"shipment_id"\`
+	}
+	r.Decode(&s)
+	return s.ShipmentID
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := create(c, "k-1", body, "t-acme")
+	shipmentID := created(ctx, r, "POST /v1/shipments")
+	var got store.Shipment
+	r.Decode(&got)
+	ctx.Assert(got.Status == "label" && got.OrderID == "ord_8123", "a new shipment must answer status label for ord_8123, got %s", r.Text())
+	saved := store.GetShipment(apiBg, shipmentID)
+	ctx.Assert(saved != nil && saved.TenantID == "t-acme" && saved.Carrier == "ups", "the store holds %+v for %s, expected t-acme's ups shipment", saved, shipmentID)
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/shipments", body, "Idempotency-Key", "k-1")
+	ctx.Equal(r.Status, 401, "a create without X-Tenant-Id; the status")
+	r = create(c, "k-2", with("carrier", "upss"), "t-acme")
+	ctx.Equal(r.Status, 422, "a create for carrier 'upss' (no partner has it) must be refused; ask registry.Lookup; the status")
+	r = create(c, "k-3", with("service_level", "overnight"), "t-acme")
+	ctx.Equal(r.Status, 400, "service_level 'overnight' (ground, express, freight); the status")
+	r = create(c, "k-4", with("order_id", ""), "t-acme")
+	ctx.Equal(r.Status, 400, "an empty order_id; the status")
+	saved := ctx.Redis.Keys("order:*")
+	ctx.Assert(len(saved) == 0, "refused creates still saved shipments: %q", saved)
+	fedex := with("carrier", "fedex")
+	fedex["service_level"] = "express"
+	created(ctx, create(c, "k-5", fedex, "t-acme"), "a valid fedex express create")
+}
+
+func CheckSingleActive(ctx *harness.Ctx) {
+	c := api(ctx)
+	firstID := created(ctx, create(c, "k-1", body, "t-acme"), "the first create")
+	second := create(c, "k-2", body, "t-acme")
+	ctx.Equal(second.Status, 409, "a second shipment for ord_8123 while %s is live (%s); the status", firstID, second.Text())
+	var conflict struct {
+		Error      string \`json:"error"\`
+		ShipmentID string \`json:"shipment_id"\`
+	}
+	second.Decode(&conflict)
+	ctx.Assert(conflict.Error == "active_shipment_exists" && conflict.ShipmentID == firstID, "the 409 must name the live shipment (active_shipment_exists, %s), got %s", firstID, second.Text())
+	ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), []string{firstID}, "the refused create must save nothing; the order's shipments")
+	store.SetStatus(apiBg, firstID, "delivered", 100)
+	created(ctx, create(c, "k-3", body, "t-acme"), "a create after the order's shipment was delivered (no longer live)")
+}
+
+func CheckIdempotencyKey(ctx *harness.Ctx) {
+	c := api(ctx)
+	first := create(c, "k-1", body, "t-acme")
+	firstID := created(ctx, first, "the first create")
+	replay := create(c, "k-1", body, "t-acme")
+	ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the recorded shipment (%s); the status", replay.Text())
+	ctx.Equal(replay.JSON(), first.JSON(), "the replay must answer the recorded shipment")
+	missing := c.Post("/v1/shipments", body, "X-Tenant-Id", "t-acme")
+	ctx.Equal(missing.Status, 400, "a create without Idempotency-Key; the status")
+	ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), []string{firstID}, "one create and its replay; the order's shipments")
+	otherID := created(ctx, create(c, "k-1", body, "t-globex"), "another tenant's create with the same key")
+	ctx.Assert(otherID != firstID, "another tenant's key k-1 answered t-acme's shipment: keys are scoped by tenant")
+}
+
+func CheckReplacement(ctx *harness.Ctx) {
+	c := api(ctx)
+	firstID := created(ctx, create(c, "k-1", body, "t-acme"), "the first create")
+	store.SetStatus(apiBg, firstID, "cancelled", 100)
+	second := create(c, "k-2", body, "t-acme")
+	secondID := created(ctx, second, "a create after the order's shipment was cancelled")
+	ctx.Assert(secondID != firstID, "the replacement reused the cancelled id %s: the carrier's scans for the voided label would land on it", firstID)
+	var got store.Shipment
+	second.Decode(&got)
+	ctx.Equal(got.ReplacementOf, firstID, "the replacement must name the cancelled shipment; replacement_of")
+	ctx.Equal(store.GetShipment(apiBg, firstID).Status, "cancelled", "the cancelled shipment's status")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "shipments/store.h"
+
+using json = nlohmann::json;
+
+namespace {
+
+const json kBody = {{"order_id", "ord_8123"}, {"carrier", "ups"}, {"service_level", "ground"}};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+json with(const std::string& field, const std::string& value) {
+  json out = kBody;
+  out[field] = value;
+  return out;
+}
+
+harness::Response create(harness::HTTP& c, const std::string& key, const json& body, const std::string& tenant) {
+  std::vector<std::string> headers = {"Content-Type", "application/json", "Idempotency-Key", key};
+  if (!tenant.empty()) {
+    headers.push_back("X-Tenant-Id");
+    headers.push_back(tenant);
+  }
+  return c.Send("POST", "/v1/shipments", body.dump(), headers);
+}
+
+std::string created(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+  ctx.Equal(r.Status, 201, "%s (%s); the status", what, r.Text());
+  return json::parse(r.Text()).value("shipment_id", "");
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = create(c, "k-1", kBody, "t-acme");
+  const std::string shipment_id = created(ctx, r, "POST /v1/shipments");
+  const json got = json::parse(r.Text());
+  ctx.Assert(got.value("status", "") == "label" && got.value("order_id", "") == "ord_8123", "a new shipment must answer status label for ord_8123, got %s", r.Text());
+  const auto saved = store::getShipment(shipment_id);
+  ctx.Assert(saved && saved->tenant_id == "t-acme" && saved->carrier == "ups", "the store holds tenant %q carrier %q for %s, expected t-acme's ups shipment",
+             saved ? saved->tenant_id : "", saved ? saved->carrier : "", shipment_id);
+}
+
+void CheckValidate(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = c.Post("/v1/shipments", kBody.dump(), "Content-Type", "application/json", "Idempotency-Key", "k-1");
+  ctx.Equal(r.Status, 401, "a create without X-Tenant-Id; the status");
+  r = create(c, "k-2", with("carrier", "upss"), "t-acme");
+  ctx.Equal(r.Status, 422, "a create for carrier 'upss' (no partner has it) must be refused; ask registry::lookup; the status");
+  r = create(c, "k-3", with("service_level", "overnight"), "t-acme");
+  ctx.Equal(r.Status, 400, "service_level 'overnight' (ground, express, freight); the status");
+  r = create(c, "k-4", with("order_id", ""), "t-acme");
+  ctx.Equal(r.Status, 400, "an empty order_id; the status");
+  const auto saved = ctx.Redis.Keys("order:*");
+  ctx.Assert(saved.empty(), "refused creates still saved shipments: %q", saved);
+  json fedex = with("carrier", "fedex");
+  fedex["service_level"] = "express";
+  created(ctx, create(c, "k-5", fedex, "t-acme"), "a valid fedex express create");
+}
+
+void CheckSingleActive(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::string first_id = created(ctx, create(c, "k-1", kBody, "t-acme"), "the first create");
+  const auto second = create(c, "k-2", kBody, "t-acme");
+  ctx.Equal(second.Status, 409, "a second shipment for ord_8123 while %s is live (%s); the status", first_id, second.Text());
+  const json conflict = json::parse(second.Text(), nullptr, false);
+  ctx.Assert(conflict.is_object() && conflict.value("error", "") == "active_shipment_exists" && conflict.value("shipment_id", "") == first_id,
+             "the 409 must name the live shipment (active_shipment_exists, %s), got %s", first_id, second.Text());
+  ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), {first_id}, "the refused create must save nothing; the order's shipments");
+  store::setStatus(first_id, "delivered", 100);
+  created(ctx, create(c, "k-3", kBody, "t-acme"), "a create after the order's shipment was delivered (no longer live)");
+}
+
+void CheckIdempotencyKey(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto first = create(c, "k-1", kBody, "t-acme");
+  const std::string first_id = created(ctx, first, "the first create");
+  const auto replay = create(c, "k-1", kBody, "t-acme");
+  ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the recorded shipment (%s); the status", replay.Text());
+  ctx.Equal(json::parse(replay.Text()), json::parse(first.Text()), "the replay must answer the recorded shipment");
+  const auto missing = c.Post("/v1/shipments", kBody.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t-acme");
+  ctx.Equal(missing.Status, 400, "a create without Idempotency-Key; the status");
+  ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), {first_id}, "one create and its replay; the order's shipments");
+  const std::string other_id = created(ctx, create(c, "k-1", kBody, "t-globex"), "another tenant's create with the same key");
+  ctx.Assert(other_id != first_id, "another tenant's key k-1 answered t-acme's shipment: keys are scoped by tenant");
+}
+
+void CheckReplacement(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::string first_id = created(ctx, create(c, "k-1", kBody, "t-acme"), "the first create");
+  store::setStatus(first_id, "cancelled", 100);
+  const auto second = create(c, "k-2", kBody, "t-acme");
+  const std::string second_id = created(ctx, second, "a create after the order's shipment was cancelled");
+  ctx.Assert(second_id != first_id, "the replacement reused the cancelled id %s: the carrier's scans for the voided label would land on it", first_id);
+  ctx.Equal(json::parse(second.Text()).value("replacement_of", ""), first_id, "the replacement must name the cancelled shipment; replacement_of");
+  ctx.Equal(store::getShipment(first_id)->status, "cancelled", "the cancelled shipment's status");
+}
+`,
+  },
+  debrief: `The order of the guards is the design. The cheap refusals (tenant, key, body, registry) cost nothing, and the idempotency lookup runs before the one-live-shipment rule because the replay of a create that succeeded is not a second shipment and must not read as a conflict. A cancelled label keeps its id for good, so the carrier's late scans for it can never land on the replacement; \`replacement_of\` is the link support follows from one to the other. What this step does not do: the shipment and its idempotency record are two writes, so a crash between them lets a retry create twice. A production service writes both in one transaction, expires the records after a day, and keeps a hash of the body to refuse a key reused with a different order.`,
 };

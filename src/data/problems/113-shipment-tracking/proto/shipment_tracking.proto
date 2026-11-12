@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package shiptrack;
+
+// The carrier gateway step 3 polls: the carrier's latest scan of a shipment. A carrier that cannot
+// answer fails the call (UNAVAILABLE, or DEADLINE_EXCEEDED when it is slower than the caller's deadline).
+service CarrierGateway {
+  rpc PollStatus(PollRequest) returns (CarrierScan);
+}
+
+message PollRequest {
+  string carrier = 1;
+  string shipment_id = 2;
+}
+
+message CarrierScan {
+  string status = 1;
+  int64 scan_at = 2;
+  string city = 3;
+  string carrier_ref = 4;
+}

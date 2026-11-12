@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package catalogenrich;
+
+// The attribute extractor step 2 calls: a model behind gRPC that reads a SKU's title and
+// description and answers its attributes. Given a JSON schema it answers one JSON object; given
+// candidate brands it picks the brand among them (or null). confidence is the model's own score.
+service Extractor {
+  rpc Extract(ExtractRequest) returns (ExtractReply);
+}
+
+message ExtractRequest {
+  string sku_id = 1;
+  string title = 2;
+  string description = 3;
+  repeated string candidate_brands = 4;
+  string schema = 5;
+}
+
+message ExtractReply {
+  string output = 1;
+  double confidence = 2;
+}

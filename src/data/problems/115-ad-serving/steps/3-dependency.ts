@@ -2,40 +2,35 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Exchange calls with a house-ad fallback',
+  title: 'One exchange call under 150 ms, with a house ad',
   concept: 'grpc',
   file: 'client',
-  focus: ['server', 'exchange', 'house', 'redis'],
+  focus: ['server', 'exchange', 'house'],
   task: `## Task
 
-**Starting point.** The starter is the exchange client behind \`select(placement, user_hash)\`, the
-only hop a serve makes outside this service: it calls \`SelectAd\` with a 150 ms deadline, retries
-up to \`MAX_ATTEMPTS\` times with a sleep between tries, and answers \`{"ad": None}\` when every try
-fails. It compiles and hides four flaws that only show up when the exchange is slow.
+**Starting point.** The starter is \`select_ad(placement, user_hash)\`, the hop a serve makes when
+no direct campaign won: it calls \`Exchange.SelectAd\` on \`exchange:9000\` with a 1-second
+deadline, retries any error up to \`MAX_ATTEMPTS\` times with a short sleep, and answers
+\`{"ad": {...}, "kind": "paid", "fallback": false, "fallback_reason": null}\` with the bid, or
+\`{"ad": null, ...}\` when every try failed. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The starter returns an empty slot on a timeout, which nobody is
-billed for and nobody sees in a report, and it loops over \`SelectAd\` inside the same request, so a
-slow exchange adds the deadline to the page load several times over. Both look fine in a demo where
-the exchange always answers on the first try.
+**Failure mode the checks target.** A slow exchange holds the page for seconds, an exchange that is
+down is asked three times per page, the slot it leaves is blank and nobody can count it, and a
+request the exchange refuses as malformed is retried until it happens to pass.
 
-- The exchange is called **once per serve**, over gRPC, with a hard **150 ms** deadline
-  (\`EXCHANGE_DEADLINE_MS\`): no second call, no loop and no sleep inside the request.
-- On \`DEADLINE_EXCEEDED\` (or \`UNAVAILABLE\`) the request serves the **house ad**, a real creative
-  that keeps the slot filled, marked \`fallback: true\` with the reason. An empty slot is revenue
-  lost with nothing in the logs to reconcile.
-- The house ad carries \`price_micros = 0\` and its impression is of a different kind from a paid
-  one, so billing and the delivery reports can separate them.
-- Other status codes are not the exchange being down: propagate them instead of quietly filling the
-  slot with house inventory.`,
+- **One** \`SelectAd\` per serve, with an \`EXCHANGE_DEADLINE_S\` of **0.15 s**: no loop, no sleep.
+- On \`DEADLINE_EXCEEDED\` or \`UNAVAILABLE\` the answer is the house ad: \`{"ad": HOUSE_AD,
+  "kind": "house", "fallback": true, "fallback_reason": "deadline_exceeded"}\` (or
+  \`"unavailable"\`), so billing and the delivery report count it apart from paid impressions.
+- Any other status raises \`ExchangeError\`: the exchange rejected the request itself.`,
   sequence: {
-    participants: ['Ad Server', 'exchange', 'house ad'],
+    participants: ['Ad Server', 'Ad exchange', 'House ads'],
     messages: [
-      {from: 'Ad Server', to: 'exchange', label: 'SelectAd(placement, user_hash) · deadline 150 ms', kind: 'sync'},
-      {from: 'exchange', to: 'Ad Server', label: 'bid · campaign_version · price_micros', kind: 'reply'},
-      {from: 'Ad Server', to: 'Ad Server', label: 'DEADLINE_EXCEEDED / UNAVAILABLE → fallback', kind: 'sync'},
-      {from: 'Ad Server', to: 'house ad', label: 'pick the house creative', kind: 'sync'},
-      {from: 'house ad', to: 'Ad Server', label: 'creative · price_micros = 0', kind: 'reply'},
-      {from: 'Ad Server', to: 'Ad Server', label: 'impression_kind = fallback · fallback_reason', kind: 'sync'},
+      {from: 'Ad Server', to: 'Ad exchange', label: 'SelectAd(placement, user_hash) · deadline 150 ms', kind: 'sync'},
+      {from: 'Ad exchange', to: 'Ad Server', label: 'Bid → kind paid', kind: 'reply'},
+      {from: 'Ad exchange', to: 'Ad Server', label: 'DEADLINE_EXCEEDED / UNAVAILABLE', kind: 'reply'},
+      {from: 'Ad Server', to: 'House ads', label: 'HOUSE_AD · kind house · fallback_reason', kind: 'sync'},
+      {from: 'Ad exchange', to: 'Ad Server', label: 'INVALID_ARGUMENT → raise ExchangeError', kind: 'reply'},
     ],
   },
   checks: [
@@ -43,291 +38,245 @@ the exchange always answers on the first try.
       id: 'deadline',
       title: 'Calls the exchange under a 150 ms deadline',
       detail:
-        'The hop carries a hard 150 ms deadline (`EXCHANGE_DEADLINE_MS`): the caller gets an answer or a deadline error inside the page-load budget. The starter already sets it — it is the retry and the empty slot around it that are wrong.',
+        'The `SelectAd` call carries a deadline of 150 ms (`EXCHANGE_DEADLINE_S`), the share of the page budget the exchange gets; the starter gives it a full second.',
       match: {
-        python: {all: [/EXCHANGE_DEADLINE_MS\s*=\s*150/, /timeout\s*=/]},
-        typescript: {all: [/EXCHANGE_DEADLINE_MS\s*=\s*150/, /\bdeadline\b/]},
-        go: {all: [/exchangeDeadlineMs\s*=\s*150/, /context\.WithTimeout/]},
-        scala: {all: [/ExchangeDeadlineMs\s*=\s*150/, /withDeadlineAfter/]},
-        cpp: {all: [/kExchangeDeadlineMs\s*=\s*150/, /set_deadline/]},
+        python: {
+          all: [/EXCHANGE_DEADLINE_S\s*=\s*0?\.15\b/, /SelectAd\([\s\S]{0,200}?timeout\s*=\s*EXCHANGE_DEADLINE_S/],
+        },
+        typescript: {
+          all: [/EXCHANGE_DEADLINE_MS\s*=\s*150\b/, /SelectAd\([\s\S]{0,200}?deadline:[^\n]*EXCHANGE_DEADLINE_MS/],
+        },
+        go: {
+          all: [
+            /exchangeDeadline\s*=\s*150\s*\*\s*time\.Millisecond/,
+            /context\.WithTimeout\([^\n]*exchangeDeadline\s*\)/,
+          ],
+        },
+        scala: {
+          all: [
+            /ExchangeDeadlineMs\s*=\s*150L?\b/,
+            /withDeadlineAfter\(\s*ExchangeDeadlineMs,\s*TimeUnit\.MILLISECONDS/,
+          ],
+        },
+        cpp: {all: [/kExchangeDeadline\{150\}/, /set_deadline\([^\n]*kExchangeDeadline\)/]},
       },
     },
     {
-      id: 'no-inline-retry',
+      id: 'one-call',
       title: 'Makes exactly one exchange call per serve',
       detail:
-        'No loop over `SelectAd`, no backoff, no sleep inside the request: a slow exchange costs one deadline, not several. The starter loops until it has tried `MAX_ATTEMPTS` times, so page load pays the deadline again for every extra call.',
+        'An exchange that is down or slow costs one call and one deadline: no retry loop and no sleep inside the request. The starter tries `MAX_ATTEMPTS` times and sleeps between tries.',
       match: {
-        python: {all: [/SelectAd/], none: [/\bfor\s+attempt\b/, /MAX_ATTEMPTS/, /\bretry\b/]},
-        typescript: {all: [/SelectAd/], none: [/\bfor\s*\([^)]*attempt/, /MAX_ATTEMPTS/, /\bretry\b/]},
-        go: {all: [/SelectAd/], none: [/\bfor\s+attempt/, /maxAttempts/, /\bretry\b/]},
-        scala: {all: [/selectAd/], none: [/\bfor\s*\([^)]*attempt/, /\bMaxAttempts\b/, /\bretry\b/]},
-        cpp: {all: [/SelectAd/], none: [/\bfor\s*\([^)]*attempt/, /kMaxAttempts/, /\bretry\b/]},
+        python: {none: [/time\.sleep\(/, /for \w+ in range\(/, /while\s+True/]},
+        typescript: {none: [/setTimeout\(/, /for \(let attempt/, /for \(;;\)/, /while \(true\)/]},
+        go: {none: [/time\.Sleep\(/, /for attempt :=/]},
+        scala: {none: [/Thread\.sleep\(/, /\(1 to MaxAttempts\)/, /while \(true\)/]},
+        cpp: {none: [/sleep_for\(/, /for \(int attempt/, /while \(true\)/]},
       },
     },
     {
       id: 'house-fallback',
-      title: 'Serves the house ad, marked, when the exchange times out',
+      title: 'Serves the house ad, marked, when the exchange cannot answer',
       detail:
-        'A `DEADLINE_EXCEEDED` (or `UNAVAILABLE`) response is a house ad with `fallback: true`, not an empty slot. The starter answers `{"ad": null}` and the impression simply disappears.',
+        '`DEADLINE_EXCEEDED` or `UNAVAILABLE` answers `HOUSE_AD` with `kind: "house"`, `fallback: true` and the status as `fallback_reason`; a bid answers `kind: "paid"`, `fallback: false`. The starter leaves the slot empty.',
       match: {
-        python: {all: [/HOUSE_AD_CREATIVE/, /fallback/, /DEADLINE_EXCEEDED/]},
-        typescript: {all: [/HOUSE_AD_CREATIVE/, /fallback/, /DEADLINE_EXCEEDED/]},
-        go: {all: [/houseAdCreative/, /Fallback/, /DeadlineExceeded/]},
-        scala: {all: [/HouseAdCreative/, /fallback/, /DEADLINE_EXCEEDED/]},
-        cpp: {all: [/kHouseAdCreative/, /fallback/, /DEADLINE_EXCEEDED/]},
+        python: {all: [/DEADLINE_EXCEEDED/, /UNAVAILABLE/, /HOUSE_AD/, /["']kind["']\s*:\s*["']house["']/]},
+        typescript: {all: [/DEADLINE_EXCEEDED/, /UNAVAILABLE/, /HOUSE_AD/, /kind:\s*['"]house['"]/]},
+        go: {all: [/codes\.DeadlineExceeded/, /codes\.Unavailable/, /store\.HouseAd/, /Kind:\s*"house"/]},
+        scala: {all: [/DEADLINE_EXCEEDED/, /UNAVAILABLE/, /Store\.HouseAd/, /"house"/]},
+        cpp: {all: [/DEADLINE_EXCEEDED/, /UNAVAILABLE/, /store::kHouseAd/, /"house"/]},
       },
     },
     {
-      id: 'counted-separately',
-      title: 'Marks fallback impressions apart from paid ones',
+      id: 'propagate-errors',
+      title: 'Raises ExchangeError for any other status',
       detail:
-        'The response says which kind of impression it is: a paid bid and a house fallback are different kinds, so delivery and billing can count them separately instead of crediting the fallback to a campaign that never paid.',
+        'An `INVALID_ARGUMENT` (or any status other than the two above) raises `ExchangeError` after one call: the exchange refused this request, and another try or a house ad would hide the bug. The starter retries it.',
       match: {
-        python: {all: [/IMPRESSION_KIND_PAID/, /IMPRESSION_KIND_FALLBACK/]},
-        typescript: {all: [/IMPRESSION_KIND_PAID/, /IMPRESSION_KIND_FALLBACK/]},
-        go: {all: [/ImpressionKindPaid/, /ImpressionKindFallback/]},
-        scala: {all: [/ImpressionKindPaid/, /ImpressionKindFallback/]},
-        cpp: {all: [/kImpressionPaid/, /kImpressionFallback/]},
-      },
-    },
-    {
-      id: 'fallback-marker',
-      title: 'Names why the fallback was served',
-      detail:
-        'The house ad carries `fallback_reason` — `"timeout"` here — so on-call can tell a deadline from a hard error without guessing, and the delivery report can show fallback share per placement.',
-      match: {
-        python: {all: [/fallback_reason/, /['"]timeout['"]/]},
-        typescript: {all: [/fallback_reason/, /['"]timeout['"]/]},
-        go: {all: [/FallbackReason/, /['"]timeout['"]/]},
-        scala: {all: [/fallback_reason/, /['"]timeout['"]/]},
-        cpp: {all: [/fallback_reason/, /['"]timeout['"]/]},
+        python: {all: [/raise ExchangeError\(/]},
+        typescript: {all: [/throw new ExchangeError\(/]},
+        go: {all: [/fmt\.Errorf\(\s*"%w[^"]*",\s*ErrExchange/]},
+        scala: {all: [/throw new ExchangeError\(/]},
+        cpp: {all: [/throw ExchangeError\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-import time
+      starter: `import time
 
-import grpc  # grpcio
+import grpc
 
-logger = logging.getLogger("adserver.exchange")
+import ad_serving_pb2
+import ad_serving_pb2_grpc
+from ads.store import HOUSE_AD
 
-EXCHANGE_DEADLINE_MS = 150
+EXCHANGE_DEADLINE_S = 1.0
 MAX_ATTEMPTS = 3
 
-
-class ExchangeClient:
-    def __init__(self, stub) -> None:
-        self._stub = stub
-
-    def select(self, placement: str, user_hash: str) -> dict:
-        # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        last_error = None
-        for attempt in range(MAX_ATTEMPTS):
-            try:
-                bid = self._stub.SelectAd(
-                    SelectAdRequest(placement=placement, user_hash=user_hash),
-                    timeout=EXCHANGE_DEADLINE_MS / 1000,
-                )
-                return {
-                    "ad": {
-                        "campaign_id": bid.campaign_id,
-                        "creative_id": bid.creative_id,
-                        "price_micros": bid.price_micros,
-                    },
-                    "campaign_version": bid.campaign_version,
-                    "fallback": False,
-                }
-            except grpc.RpcError as err:
-                last_error = err
-                time.sleep(EXCHANGE_DEADLINE_MS / 1000)
-        logger.warning("exchange gave up: %s", last_error)
-        return {"ad": None, "reason": "exchange_unavailable", "fallback": False}
-`,
-      solution: `import logging
-
-import grpc  # grpcio
-
-logger = logging.getLogger("adserver.exchange")
-
-EXCHANGE_DEADLINE_MS = 150
-HOUSE_AD_CAMPAIGN = "house"
-HOUSE_AD_CREATIVE = "house_default_banner"
-IMPRESSION_KIND_PAID = "paid"
-IMPRESSION_KIND_FALLBACK = "fallback"
+exchange = ad_serving_pb2_grpc.ExchangeStub(grpc.insecure_channel("exchange:9000"))
 
 
-class ExchangeClient:
-    """One call per serve, one deadline, and a house creative when the exchange does not answer."""
+class ExchangeError(Exception):
+    """The exchange refused the request itself."""
 
-    def __init__(self, stub) -> None:
-        self._stub = stub
 
-    def select(self, placement: str, user_hash: str) -> dict:
-        """The deadline is the whole latency budget for this hop: exactly one SelectAd."""
+def select_ad(placement: str, user_hash: str) -> dict:
+    """The ad for a slot no direct campaign filled."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    for _ in range(MAX_ATTEMPTS):
         try:
-            bid = self._stub.SelectAd(
-                SelectAdRequest(placement=placement, user_hash=user_hash),
-                timeout=EXCHANGE_DEADLINE_MS / 1000,
-            )
-        except grpc.RpcError as err:
-            code = err.code()
-            if code not in (grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE):
-                raise
-            logger.warning("exchange down code=%s placement=%s", code, placement)
-            return house_ad("timeout")
-        return {
-            "ad": {
-                "campaign_id": bid.campaign_id,
-                "creative_id": bid.creative_id,
-                "price_micros": bid.price_micros,
-            },
-            "campaign_version": bid.campaign_version,
-            "fallback": False,
-            "impression_kind": IMPRESSION_KIND_PAID,
-        }
+            bid = exchange.SelectAd(ad_serving_pb2.SelectAdRequest(placement=placement, user_hash=user_hash), timeout=EXCHANGE_DEADLINE_S)
+            ad = {"campaign_id": bid.campaign_id, "creative_id": bid.creative_id, "price_micros": bid.price_micros}
+            return {"ad": ad, "kind": "paid", "fallback": False, "fallback_reason": None}
+        except grpc.RpcError:
+            time.sleep(0.05)
+    return {"ad": None, "kind": "paid", "fallback": False, "fallback_reason": None}
+`,
+      solution: `import grpc
+
+import ad_serving_pb2
+import ad_serving_pb2_grpc
+from ads.store import HOUSE_AD
+
+EXCHANGE_DEADLINE_S = 0.15
+# The exchange could not answer in time: the slot is still ours to fill.
+FALLBACK_CODES = (grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE)
+
+exchange = ad_serving_pb2_grpc.ExchangeStub(grpc.insecure_channel("exchange:9000"))
 
 
-def house_ad(fallback_reason: str) -> dict:
-    """Fills the slot at price 0, and is counted under its own impression kind."""
-    return {
-        "ad": {"campaign_id": HOUSE_AD_CAMPAIGN, "creative_id": HOUSE_AD_CREATIVE, "price_micros": 0},
-        "campaign_version": HOUSE_AD_CAMPAIGN + ":v1",
-        "fallback": True,
-        "fallback_reason": fallback_reason,
-        "impression_kind": IMPRESSION_KIND_FALLBACK,
-    }
+class ExchangeError(Exception):
+    """The exchange refused the request itself."""
+
+
+def select_ad(placement: str, user_hash: str) -> dict:
+    """The ad for a slot no direct campaign filled."""
+    try:
+        bid = exchange.SelectAd(ad_serving_pb2.SelectAdRequest(placement=placement, user_hash=user_hash), timeout=EXCHANGE_DEADLINE_S)
+    except grpc.RpcError as exc:
+        if exc.code() in FALLBACK_CODES:
+            # A house ad keeps the page whole; kind and reason keep it out of the advertisers' bills.
+            return {"ad": dict(HOUSE_AD), "kind": "house", "fallback": True, "fallback_reason": exc.code().name.lower()}
+        # A request the exchange rejected is a bug to surface, not a slot to fill.
+        raise ExchangeError(f"exchange: {exc.code().name}: {exc.details()}") from exc
+    ad = {"campaign_id": bid.campaign_id, "creative_id": bid.creative_id, "price_micros": bid.price_micros}
+    return {"ad": ad, "kind": "paid", "fallback": False, "fallback_reason": None}
 `,
     },
     typescript: {
-      starter: `/** Exchange client. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-const EXCHANGE_DEADLINE_MS = 150;
-const MAX_ATTEMPTS = 3;
+import {type Ad, HOUSE_AD} from 'ads/store';
 
-export interface Bid {
+export const EXCHANGE_DEADLINE_MS = 1000;
+export const MAX_ATTEMPTS = 3;
+
+interface Bid {
   campaign_id: string;
-  campaign_version: string;
   creative_id: string;
-  price_micros: number;
+  price_micros: number | string;
 }
 
+/** The ad for one slot and how it was filled. */
 export interface Selection {
-  ad: {campaign_id: string; creative_id: string; price_micros: number} | null;
-  campaign_version?: string;
+  ad: Ad | null;
+  kind: 'paid' | 'house';
   fallback: boolean;
-  reason?: string;
+  fallback_reason: string | null;
 }
 
-export class ExchangeClient {
-  constructor(private readonly client: grpc.Client) {}
+type BidCallback = (error: grpc.ServiceError | null, bid?: Bid) => void;
 
-  select(placement: string, userHash: string): Promise<Selection> {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const call = (attempt: number): Promise<Selection> =>
-      new Promise((resolve, reject) => {
-        this.client.makeUnaryRequest(
-          '/ads.Exchange/SelectAd',
-          (value: unknown) => Buffer.from(JSON.stringify(value)),
-          (bytes: Buffer) => JSON.parse(bytes.toString()) as Bid,
-          {placement, user_hash: userHash},
-          {deadline: Date.now() + EXCHANGE_DEADLINE_MS},
-          (error, bid) => {
-            if (error !== null && error !== undefined) {
-              if (attempt + 1 < MAX_ATTEMPTS) resolve(call(attempt + 1));
-              else reject(error);
-              return;
-            }
-            resolve({
-              ad: {
-                campaign_id: (bid as Bid).campaign_id,
-                creative_id: (bid as Bid).creative_id,
-                price_micros: (bid as Bid).price_micros,
-              },
-              campaign_version: (bid as Bid).campaign_version,
-              fallback: false,
-            });
-          },
-        );
-      });
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('ad_serving.proto')) as unknown as {
+  adserved: {Exchange: grpc.ServiceClientConstructor};
+};
+const exchange = new pkg.adserved.Exchange('exchange:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  SelectAd(request: {placement: string; user_hash: string}, options: grpc.CallOptions, callback: BidCallback): grpc.ClientUnaryCall;
+};
 
-    return call(0).catch(() => ({ad: null, reason: 'exchange_unavailable', fallback: false}));
+/** The exchange refused the request itself. */
+export class ExchangeError extends Error {}
+
+function selectAdCall(placement: string, userHash: string): Promise<Bid> {
+  const {promise, resolve, reject} = Promise.withResolvers<Bid>();
+  exchange.SelectAd({placement, user_hash: userHash}, {deadline: Date.now() + EXCHANGE_DEADLINE_MS}, (error, bid) => (error ? reject(error) : resolve(bid as Bid)));
+  return promise;
+}
+
+/** The ad for a slot no direct campaign filled. */
+export async function selectAd(placement: string, userHash: string): Promise<Selection> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      const bid = await selectAdCall(placement, userHash);
+      return {ad: {campaign_id: bid.campaign_id, creative_id: bid.creative_id, price_micros: Number(bid.price_micros)}, kind: 'paid', fallback: false, fallback_reason: null};
+    } catch {
+      const {promise, resolve} = Promise.withResolvers<void>();
+      setTimeout(resolve, 50);
+      await promise;
+    }
   }
+  return {ad: null, kind: 'paid', fallback: false, fallback_reason: null};
 }
 `,
-      solution: `/** Exchange client: one call under a 150 ms deadline, house ad on timeout. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-const EXCHANGE_DEADLINE_MS = 150;
-const HOUSE_AD_CAMPAIGN = 'house';
-const HOUSE_AD_CREATIVE = 'house_default_banner';
-const IMPRESSION_KIND_PAID = 'paid';
-const IMPRESSION_KIND_FALLBACK = 'fallback';
+import {type Ad, HOUSE_AD} from 'ads/store';
 
-export interface Bid {
+export const EXCHANGE_DEADLINE_MS = 150;
+// The exchange could not answer in time: the slot is still ours to fill.
+const FALLBACK_CODES: readonly number[] = [grpc.status.DEADLINE_EXCEEDED, grpc.status.UNAVAILABLE];
+
+interface Bid {
   campaign_id: string;
-  campaign_version: string;
   creative_id: string;
-  price_micros: number;
+  price_micros: number | string;
 }
 
+/** The ad for one slot and how it was filled. */
 export interface Selection {
-  ad: {campaign_id: string; creative_id: string; price_micros: number};
-  campaign_version: string;
+  ad: Ad | null;
+  kind: 'paid' | 'house';
   fallback: boolean;
-  fallback_reason?: string;
-  impression_kind: string;
+  fallback_reason: string | null;
 }
 
-export function houseAd(fallbackReason: string): Selection {
-  return {
-    ad: {campaign_id: HOUSE_AD_CAMPAIGN, creative_id: HOUSE_AD_CREATIVE, price_micros: 0},
-    campaign_version: \`\${HOUSE_AD_CAMPAIGN}:v1\`,
-    fallback: true,
-    fallback_reason: fallbackReason,
-    impression_kind: IMPRESSION_KIND_FALLBACK,
-  };
+type BidCallback = (error: grpc.ServiceError | null, bid?: Bid) => void;
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('ad_serving.proto')) as unknown as {
+  adserved: {Exchange: grpc.ServiceClientConstructor};
+};
+const exchange = new pkg.adserved.Exchange('exchange:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  SelectAd(request: {placement: string; user_hash: string}, options: grpc.CallOptions, callback: BidCallback): grpc.ClientUnaryCall;
+};
+
+/** The exchange refused the request itself. */
+export class ExchangeError extends Error {}
+
+function selectAdCall(placement: string, userHash: string): Promise<Bid> {
+  const {promise, resolve, reject} = Promise.withResolvers<Bid>();
+  exchange.SelectAd({placement, user_hash: userHash}, {deadline: Date.now() + EXCHANGE_DEADLINE_MS}, (error, bid) => (error ? reject(error) : resolve(bid as Bid)));
+  return promise;
 }
 
-export class ExchangeClient {
-  constructor(private readonly client: grpc.Client) {}
-
-  select(placement: string, userHash: string): Promise<Selection> {
-    return new Promise((resolve, reject) => {
-      this.client.makeUnaryRequest(
-        '/ads.Exchange/SelectAd',
-        (value: unknown) => Buffer.from(JSON.stringify(value)),
-        (bytes: Buffer) => JSON.parse(bytes.toString()) as Bid,
-        {placement, user_hash: userHash},
-        {deadline: Date.now() + EXCHANGE_DEADLINE_MS},
-        (error, bid) => {
-          if (error !== null && error !== undefined) {
-            const down =
-              error.code === grpc.status.DEADLINE_EXCEEDED || error.code === grpc.status.UNAVAILABLE;
-            if (!down) {
-              reject(error);
-              return;
-            }
-            resolve(houseAd('timeout'));
-            return;
-          }
-          resolve({
-            ad: {
-              campaign_id: (bid as Bid).campaign_id,
-              creative_id: (bid as Bid).creative_id,
-              price_micros: (bid as Bid).price_micros,
-            },
-            campaign_version: (bid as Bid).campaign_version,
-            fallback: false,
-            impression_kind: IMPRESSION_KIND_PAID,
-          });
-        },
-      );
-    });
+/** The ad for a slot no direct campaign filled. */
+export async function selectAd(placement: string, userHash: string): Promise<Selection> {
+  let bid: Bid;
+  try {
+    bid = await selectAdCall(placement, userHash);
+  } catch (e) {
+    const {code, details} = e as grpc.ServiceError;
+    if (FALLBACK_CODES.includes(code)) {
+      // A house ad keeps the page whole; kind and reason keep it out of the advertisers' bills.
+      return {ad: {...HOUSE_AD}, kind: 'house', fallback: true, fallback_reason: grpc.status[code].toLowerCase()};
+    }
+    // A request the exchange rejected is a bug to surface, not a slot to fill.
+    throw new ExchangeError(\`exchange: \${grpc.status[code]}: \${details}\`);
   }
+  return {ad: {campaign_id: bid.campaign_id, creative_id: bid.creative_id, price_micros: Number(bid.price_micros)}, kind: 'paid', fallback: false, fallback_reason: null};
 }
 `,
     },
@@ -336,221 +285,176 @@ export class ExchangeClient {
 
 import (
 	"context"
-	"log"
+	"errors"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"ads/store" // store.Ad, store.HouseAd
+	pb "ads/gen/ad_serving"
 )
 
 const (
-	exchangeDeadlineMs = 150
-	maxAttempts        = 3
+	exchangeDeadline = time.Second
+	maxAttempts      = 3
 )
 
-type Bid struct {
-	CampaignID      string
-	CampaignVersion string
-	CreativeID      string
-	PriceMicros     int64
-}
+var (
+	exchangeConn, _ = grpc.NewClient("exchange:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	exchange        = pb.NewExchangeClient(exchangeConn)
+)
 
+// ErrExchange: the exchange refused the request itself.
+var ErrExchange = errors.New("exchange error")
+
+// Selection is the ad for one slot and how it was filled.
 type Selection struct {
-	Ad              *Ad
-	CampaignVersion string
-	Fallback        bool
-	Reason          string
+	Ad             store.Ad \`json:"ad"\`
+	Kind           string   \`json:"kind"\`
+	Fallback       bool     \`json:"fallback"\`
+	FallbackReason string   \`json:"fallback_reason"\`
 }
 
-type Ad struct {
-	CampaignID  string
-	CreativeID  string
-	PriceMicros int64
-}
-
-type ExchangeClient struct {
-	client ExchangeServiceClient
-}
-
-func (c *ExchangeClient) Select(ctx context.Context, placement, userHash string) (Selection, error) {
+// selectAd is the ad for a slot no direct campaign filled.
+func selectAd(ctx context.Context, placement, userHash string) (Selection, error) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, exchangeDeadlineMs*time.Millisecond)
-		bid, err := c.client.SelectAd(callCtx, &SelectAdRequest{Placement: placement, UserHash: userHash})
+		callCtx, cancel := context.WithTimeout(ctx, exchangeDeadline)
+		bid, err := exchange.SelectAd(callCtx, &pb.SelectAdRequest{Placement: placement, UserHash: userHash})
 		cancel()
 		if err == nil {
-			return Selection{
-				Ad:              &Ad{CampaignID: bid.CampaignID, CreativeID: bid.CreativeID, PriceMicros: bid.PriceMicros},
-				CampaignVersion: bid.CampaignVersion,
-			}, nil
+			return Selection{Ad: store.Ad{CampaignID: bid.GetCampaignId(), CreativeID: bid.GetCreativeId(), PriceMicros: bid.GetPriceMicros()}, Kind: "paid"}, nil
 		}
-		lastErr = err
-		time.Sleep(exchangeDeadlineMs * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
-	log.Printf("exchange gave up: %v", lastErr)
-	return Selection{Reason: "exchange_unavailable"}, nil
+	return Selection{Kind: "paid"}, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"log"
+	"errors"
+	"fmt"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+
+	"ads/store" // store.Ad, store.HouseAd
+	pb "ads/gen/ad_serving"
 )
 
-const (
-	exchangeDeadlineMs     = 150
-	houseAdCampaign        = "house"
-	houseAdCreative        = "house_default_banner"
-	ImpressionKindPaid     = "paid"
-	ImpressionKindFallback = "fallback"
+const exchangeDeadline = 150 * time.Millisecond
+
+var (
+	exchangeConn, _ = grpc.NewClient("exchange:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	exchange        = pb.NewExchangeClient(exchangeConn)
 )
 
-type Bid struct {
-	CampaignID      string
-	CampaignVersion string
-	CreativeID      string
-	PriceMicros     int64
-}
+// ErrExchange: the exchange refused the request itself.
+var ErrExchange = errors.New("exchange error")
 
-type Ad struct {
-	CampaignID  string
-	CreativeID  string
-	PriceMicros int64
-}
+// fallbackReasons: the exchange could not answer in time, so the slot is still ours to fill.
+var fallbackReasons = map[codes.Code]string{codes.DeadlineExceeded: "deadline_exceeded", codes.Unavailable: "unavailable"}
 
+// Selection is the ad for one slot and how it was filled.
 type Selection struct {
-	Ad             *Ad
-	CampaignVersion string
-	Fallback       bool
-	FallbackReason string
-	ImpressionKind string
+	Ad             store.Ad \`json:"ad"\`
+	Kind           string   \`json:"kind"\`
+	Fallback       bool     \`json:"fallback"\`
+	FallbackReason string   \`json:"fallback_reason"\`
 }
 
-type ExchangeClient struct {
-	client ExchangeServiceClient
-}
-
-func houseAd(fallbackReason string) Selection {
-	return Selection{
-		Ad:             &Ad{CampaignID: houseAdCampaign, CreativeID: houseAdCreative, PriceMicros: 0},
-		CampaignVersion: houseAdCampaign + ":v1",
-		Fallback:       true,
-		FallbackReason: fallbackReason,
-		ImpressionKind: ImpressionKindFallback,
-	}
-}
-
-func (c *ExchangeClient) Select(ctx context.Context, placement, userHash string) (Selection, error) {
-	// The deadline is the whole latency budget for this hop: exactly one SelectAd.
-	callCtx, cancel := context.WithTimeout(ctx, exchangeDeadlineMs*time.Millisecond)
+// selectAd is the ad for a slot no direct campaign filled.
+func selectAd(ctx context.Context, placement, userHash string) (Selection, error) {
+	callCtx, cancel := context.WithTimeout(ctx, exchangeDeadline)
 	defer cancel()
-	bid, err := c.client.SelectAd(callCtx, &SelectAdRequest{Placement: placement, UserHash: userHash})
+	bid, err := exchange.SelectAd(callCtx, &pb.SelectAdRequest{Placement: placement, UserHash: userHash})
 	if err != nil {
-		code := status.Code(err)
-		if code != codes.DeadlineExceeded && code != codes.Unavailable {
-			return Selection{}, err
+		if reason, ok := fallbackReasons[status.Code(err)]; ok {
+			// A house ad keeps the page whole; kind and reason keep it out of the advertisers' bills.
+			return Selection{Ad: store.HouseAd, Kind: "house", Fallback: true, FallbackReason: reason}, nil
 		}
-		log.Printf("exchange down code=%s placement=%s", code, placement)
-		return houseAd("timeout"), nil
+		// A request the exchange rejected is a bug to surface, not a slot to fill.
+		return Selection{}, fmt.Errorf("%w: %v", ErrExchange, err)
 	}
-	return Selection{
-		Ad:             &Ad{CampaignID: bid.CampaignID, CreativeID: bid.CreativeID, PriceMicros: bid.PriceMicros},
-		CampaignVersion: bid.CampaignVersion,
-		Fallback:       false,
-		ImpressionKind: ImpressionKindPaid,
-	}, nil
+	return Selection{Ad: store.Ad{CampaignID: bid.GetCampaignId(), CreativeID: bid.GetCreativeId(), PriceMicros: bid.GetPriceMicros()}, Kind: "paid"}, nil
 }
 `,
     },
     scala: {
       starter: `import java.util.concurrent.TimeUnit
 
-import scala.concurrent.{ExecutionContext, Future}
+import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-object ExchangeClient {
-  val ExchangeDeadlineMs = 150
+import ads.Store // Store.Ad, Store.HouseAd
+import adserved.ad_serving.{ExchangeGrpc, SelectAdRequest}
+
+/** The exchange refused the request itself. */
+final class ExchangeError(message: String) extends Exception(message)
+
+/** The ad for one slot and how it was filled. */
+final case class Selection(ad: Option[Store.Ad], kind: String, fallback: Boolean, fallbackReason: Option[String])
+
+object Client {
+  val ExchangeDeadlineMs = 1000L
   val MaxAttempts = 3
-}
 
-final case class Bid(campaign_id: String, campaign_version: String, creative_id: String, price_micros: Long)
+  private val exchange = ExchangeGrpc.blockingStub(ManagedChannelBuilder.forAddress("exchange", 9000).usePlaintext().build())
 
-final case class Selection(ad: Option[Bid], campaign_version: String, fallback: Boolean, reason: String)
-
-class ExchangeClient(stub: ExchangeServiceGrpc.ExchangeServiceStub)(implicit ec: ExecutionContext) {
-  import ExchangeClient._
-
-  def select(placement: String, userHash: String): Future[Selection] = {
+  /** The ad for a slot no direct campaign filled. */
+  def selectAd(placement: String, userHash: String): Selection = {
     // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    def call(attempt: Int): Future[Selection] =
-      stub
-        .withDeadlineAfter(ExchangeDeadlineMs, TimeUnit.MILLISECONDS)
-        .selectAd(SelectAdRequest(placement, userHash))
-        .map(bid => Selection(Some(bid), bid.campaign_version, fallback = false, reason = ""))
-        .recoverWith { case _ if attempt + 1 < MaxAttempts => call(attempt + 1) }
-
-    call(0).recover { case _ => Selection(None, "", fallback = false, reason = "exchange_unavailable") }
+    val bids = (1 to MaxAttempts).iterator.map { _ =>
+      try Some(exchange.withDeadlineAfter(ExchangeDeadlineMs, TimeUnit.MILLISECONDS).selectAd(SelectAdRequest(placement, userHash)))
+      catch {
+        case _: StatusRuntimeException =>
+          Thread.sleep(50)
+          None
+      }
+    }
+    bids
+      .collectFirst { case Some(bid) => Selection(Some(Store.Ad(bid.campaignId, bid.creativeId, bid.priceMicros)), "paid", fallback = false, None) }
+      .getOrElse(Selection(None, "paid", fallback = false, None))
   }
 }
 `,
       solution: `import java.util.concurrent.TimeUnit
 
-import scala.concurrent.{ExecutionContext, Future}
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
 
-object ExchangeClient {
-  val ExchangeDeadlineMs = 150
-  val HouseAdCampaign = "house"
-  val HouseAdCreative = "house_default_banner"
-  val ImpressionKindPaid = "paid"
-  val ImpressionKindFallback = "fallback"
-}
+import ads.Store // Store.Ad, Store.HouseAd
+import adserved.ad_serving.{ExchangeGrpc, SelectAdRequest}
 
-final case class Bid(campaign_id: String, campaign_version: String, creative_id: String, price_micros: Long)
+/** The exchange refused the request itself. */
+final class ExchangeError(message: String) extends Exception(message)
 
-final case class Ad(campaign_id: String, creative_id: String, price_micros: Long)
+/** The ad for one slot and how it was filled. */
+final case class Selection(ad: Option[Store.Ad], kind: String, fallback: Boolean, fallbackReason: Option[String])
 
-final case class Selection(
-    ad: Ad,
-    campaign_version: String,
-    fallback: Boolean,
-    fallback_reason: String,
-    impression_kind: String)
+object Client {
+  val ExchangeDeadlineMs = 150L
+  /** The exchange could not answer in time: the slot is still ours to fill. */
+  private val FallbackCodes = Set(Status.Code.DEADLINE_EXCEEDED, Status.Code.UNAVAILABLE)
 
-class ExchangeClient(stub: ExchangeServiceGrpc.ExchangeServiceStub)(implicit ec: ExecutionContext) {
-  import ExchangeClient._
+  private val exchange = ExchangeGrpc.blockingStub(ManagedChannelBuilder.forAddress("exchange", 9000).usePlaintext().build())
 
-  def houseAd(fallbackReason: String): Selection =
-    Selection(
-      Ad(HouseAdCampaign, HouseAdCreative, 0L),
-      s"$HouseAdCampaign:v1",
-      fallback = true,
-      fallback_reason = fallbackReason,
-      impression_kind = ImpressionKindFallback)
-
-  def select(placement: String, userHash: String): Future[Selection] = {
-    // The deadline is the whole latency budget for this hop: exactly one selectAd.
-    stub
-      .withDeadlineAfter(ExchangeDeadlineMs, TimeUnit.MILLISECONDS)
-      .selectAd(SelectAdRequest(placement, userHash))
-      .map { bid =>
-        Selection(
-          Ad(bid.campaign_id, bid.creative_id, bid.price_micros),
-          bid.campaign_version,
-          fallback = false,
-          fallback_reason = "",
-          impression_kind = ImpressionKindPaid)
-      }
-      .recoverWith {
-        case status if status.getStatus.getCode == io.grpc.Status.Code.DEADLINE_EXCEEDED =>
-          Future.successful(houseAd("timeout"))
-        case status if status.getStatus.getCode == io.grpc.Status.Code.UNAVAILABLE =>
-          Future.successful(houseAd("timeout"))
-      }
-  }
+  /** The ad for a slot no direct campaign filled. */
+  def selectAd(placement: String, userHash: String): Selection =
+    try {
+      val bid = exchange.withDeadlineAfter(ExchangeDeadlineMs, TimeUnit.MILLISECONDS).selectAd(SelectAdRequest(placement, userHash))
+      Selection(Some(Store.Ad(bid.campaignId, bid.creativeId, bid.priceMicros)), "paid", fallback = false, None)
+    } catch {
+      // A house ad keeps the page whole; kind and reason keep it out of the advertisers' bills.
+      case e: StatusRuntimeException if FallbackCodes.contains(e.getStatus.getCode) =>
+        Selection(Some(Store.HouseAd), "house", fallback = true, Some(e.getStatus.getCode.name.toLowerCase))
+      // A request the exchange rejected is a bug to surface, not a slot to fill.
+      case e: StatusRuntimeException => throw new ExchangeError(s"exchange: \${e.getStatus.getCode}")
+    }
 }
 `,
     },
@@ -558,137 +462,469 @@ class ExchangeClient(stub: ExchangeServiceGrpc.ExchangeServiceStub)(implicit ec:
       starter: `#include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
-constexpr int kExchangeDeadlineMs = 150;
+#include "ad_serving.grpc.pb.h"
+#include "ads/store.h"  // store::Ad, store::kHouseAd
+
+constexpr std::chrono::milliseconds kExchangeDeadline{1000};
 constexpr int kMaxAttempts = 3;
 
-struct Bid {
-  std::string campaign_id;
-  std::string campaign_version;
-  std::string creative_id;
-  long price_micros;
+auto exchange = adserved::Exchange::NewStub(grpc::CreateChannel("exchange:9000", grpc::InsecureChannelCredentials()));
+
+// The exchange refused the request itself.
+struct ExchangeError : std::runtime_error {
+  using std::runtime_error::runtime_error;
 };
 
-struct Ad {
-  std::string campaign_id;
-  std::string creative_id;
-  long price_micros;
-};
-
+// The ad for one slot and how it was filled.
 struct Selection {
-  Ad ad;
-  std::string campaign_version;
-  bool fallback;
+  store::Ad ad;
+  std::string kind;
+  bool fallback = false;
+  std::string fallback_reason;
 };
 
-class ExchangeClient {
- public:
-  explicit ExchangeClient(std::shared_ptr<ads::Exchange::Stub> stub) : stub_(std::move(stub)) {}
-
-  Selection Select(const std::string& placement, const std::string& userHash) {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    grpc::Status last_status;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-      grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kExchangeDeadlineMs));
-      ads::SelectAdRequest request;
-      request.set_placement(placement);
-      request.set_user_hash(userHash);
-      ads::Bid bid;
-      const auto status = stub_->SelectAd(&context, request, &bid);
-      if (status.ok()) {
-        return Selection{Ad{bid.campaign_id(), bid.creative_id(), bid.price_micros()}, bid.campaign_version(), false};
-      }
-      last_status = status;
-      std::this_thread::sleep_for(std::chrono::milliseconds(kExchangeDeadlineMs));
+// The ad for a slot no direct campaign filled.
+Selection selectAd(const std::string& placement, const std::string& user_hash) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kExchangeDeadline);
+    adserved::SelectAdRequest request;
+    request.set_placement(placement);
+    request.set_user_hash(user_hash);
+    adserved::Bid bid;
+    if (exchange->SelectAd(&ctx, request, &bid).ok()) {
+      return Selection{store::Ad{bid.campaign_id(), bid.creative_id(), bid.price_micros()}, "paid", false, ""};
     }
-    return Selection{Ad{}, "", false};
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
-
- private:
-  std::shared_ptr<ads::Exchange::Stub> stub_;
-};
+  return Selection{store::Ad{}, "paid", false, ""};
+}
 `,
       solution: `#include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <map>
+#include <stdexcept>
 #include <string>
 
-constexpr int kExchangeDeadlineMs = 150;
-const std::string kHouseAdCampaign = "house";
-const std::string kHouseAdCreative = "house_default_banner";
-const std::string kImpressionPaid = "paid";
-const std::string kImpressionFallback = "fallback";
+#include "ad_serving.grpc.pb.h"
+#include "ads/store.h"  // store::Ad, store::kHouseAd
 
-struct Bid {
-  std::string campaign_id;
-  std::string campaign_version;
-  std::string creative_id;
-  long price_micros;
+constexpr std::chrono::milliseconds kExchangeDeadline{150};
+
+auto exchange = adserved::Exchange::NewStub(grpc::CreateChannel("exchange:9000", grpc::InsecureChannelCredentials()));
+
+// The exchange could not answer in time: the slot is still ours to fill.
+const std::map<grpc::StatusCode, std::string> kFallbackReasons = {
+    {grpc::StatusCode::DEADLINE_EXCEEDED, "deadline_exceeded"},
+    {grpc::StatusCode::UNAVAILABLE, "unavailable"},
 };
 
-struct Ad {
-  std::string campaign_id;
-  std::string creative_id;
-  long price_micros;
+// The exchange refused the request itself.
+struct ExchangeError : std::runtime_error {
+  using std::runtime_error::runtime_error;
 };
 
+// The ad for one slot and how it was filled.
 struct Selection {
-  Ad ad;
-  std::string campaign_version;
-  bool fallback;
+  store::Ad ad;
+  std::string kind;
+  bool fallback = false;
   std::string fallback_reason;
-  std::string impression_kind;
 };
 
-/** Fills the slot at price 0, counted under its own impression kind. */
-Selection HouseAd(const std::string& fallbackReason) {
-  return Selection{Ad{kHouseAdCampaign, kHouseAdCreative, 0},
-                   kHouseAdCampaign + ":v1",
-                   true,
-                   fallbackReason,
-                   kImpressionFallback};
-}
-
-class ExchangeClient {
- public:
-  explicit ExchangeClient(std::shared_ptr<ads::Exchange::Stub> stub) : stub_(std::move(stub)) {}
-
-  Selection Select(const std::string& placement, const std::string& userHash) {
-    // The deadline is the whole latency budget for this hop: exactly one SelectAd.
-    grpc::ClientContext context;
-    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kExchangeDeadlineMs));
-    ads::SelectAdRequest request;
-    request.set_placement(placement);
-    request.set_user_hash(userHash);
-    ads::Bid bid;
-    const auto status = stub_->SelectAd(&context, request, &bid);
-    if (!status.ok()) {
-      if (status.error_code() != grpc::StatusCode::DEADLINE_EXCEEDED &&
-          status.error_code() != grpc::StatusCode::UNAVAILABLE) {
-        throw std::runtime_error(status.error_message());
-      }
-      return HouseAd("timeout");
-    }
-    return Selection{Ad{bid.campaign_id(), bid.creative_id(), bid.price_micros()},
-                     bid.campaign_version(),
-                     false,
-                     "",
-                     kImpressionPaid};
+// The ad for a slot no direct campaign filled.
+Selection selectAd(const std::string& placement, const std::string& user_hash) {
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + kExchangeDeadline);
+  adserved::SelectAdRequest request;
+  request.set_placement(placement);
+  request.set_user_hash(user_hash);
+  adserved::Bid bid;
+  const grpc::Status status = exchange->SelectAd(&ctx, request, &bid);
+  if (!status.ok()) {
+    const auto reason = kFallbackReasons.find(status.error_code());
+    // A house ad keeps the page whole; kind and reason keep it out of the advertisers' bills.
+    if (reason != kFallbackReasons.cend()) return Selection{store::kHouseAd, "house", true, reason->second};
+    // A request the exchange rejected is a bug to surface, not a slot to fill.
+    throw ExchangeError("exchange: " + status.error_message());
   }
-
- private:
-  std::shared_ptr<ads::Exchange::Stub> stub_;
-};
+  return Selection{store::Ad{bid.campaign_id(), bid.creative_id(), bid.price_micros()}, "paid", false, ""};
+}
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import ad_serving_pb2
+import ad_serving_pb2_grpc
+
+BID = {"campaign_id": "c-9", "creative_id": "cr-c-9", "price_micros": 1200}
+HOUSE = {"campaign_id": "house", "creative_id": "house-default", "price_micros": 0}
+PAID = {"ad": BID, "kind": "paid", "fallback": False, "fallback_reason": None}
+
+
+class Exchange(ad_serving_pb2_grpc.ExchangeServicer):
+    """Bids 1200 micros for c-9 on every slot."""
+
+    def SelectAd(self, request, context):
+        return ad_serving_pb2.Bid(**BID)
+
+
+def _client(ctx):
+    ctx.grpc.serve(ad_serving_pb2_grpc.add_ExchangeServicer_to_server, Exchange())
+    return ctx.load("client")
+
+
+def _select(m):
+    try:
+        return m.select_ad("home-top", "u-1")
+    except m.ExchangeError:
+        return None
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    got = m.select_ad("home-top", "u-1")
+    assert got == PAID, f"with the exchange answering, select_ad returned {got}, expected the paid bid {PAID}"
+    calls = ctx.grpc.calls_to("SelectAd")
+    assert len(calls) == 1, f"one serve made {len(calls)} SelectAd calls"
+    assert calls[0].timeout is not None, "SelectAd carries no deadline: a stalled exchange holds the page"
+    assert 0.1 <= calls[0].timeout <= 0.2, f"SelectAd carries a {calls[0].timeout} s deadline, expected EXCHANGE_DEADLINE_S = 0.15: the exchange gets a slice of the page budget, not a second"
+
+
+def check_one_call(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("SelectAd", grpc.StatusCode.UNAVAILABLE, times=3)
+    _select(m)
+    calls = len(ctx.grpc.calls_to("SelectAd"))
+    assert calls == 1, f"with the exchange down one serve made {calls} SelectAd calls: every page paid for the outage {calls} times. Call once"
+    assert ctx.clock.sleeps == 0, f"select_ad slept {ctx.clock.sleeps} times inside the request"
+    ctx.grpc.failures.clear()
+    ctx.grpc.set_latency("SelectAd", 5.0)
+    before = ctx.clock.time()
+    _select(m)
+    waited = ctx.clock.time() - before
+    assert waited <= 0.2, f"with the exchange taking 5 s the serve waited {waited:.2f} s, expected one 150 ms deadline"
+    assert len(ctx.grpc.calls_to("SelectAd")) == 2, "a slow exchange gets one call per serve"
+
+
+def check_house_fallback(ctx):
+    m = _client(ctx)
+    ctx.grpc.set_latency("SelectAd", 5.0)
+    got = m.select_ad("home-top", "u-1")
+    want = {"ad": HOUSE, "kind": "house", "fallback": True, "fallback_reason": "deadline_exceeded"}
+    assert got == want, f"with the exchange past its deadline select_ad returned {got}, expected the marked house ad {want}: an empty slot is revenue lost with nothing to count"
+    ctx.grpc.set_latency("SelectAd", 0.0)
+    ctx.grpc.fail("SelectAd", grpc.StatusCode.UNAVAILABLE)
+    got = m.select_ad("home-top", "u-1")
+    assert got == {**want, "fallback_reason": "unavailable"}, f"with the exchange UNAVAILABLE select_ad returned {got}, expected the house ad with fallback_reason unavailable"
+    got = m.select_ad("home-top", "u-1")
+    assert got == PAID, f"once the exchange answers again select_ad returned {got}, expected the paid bid"
+
+
+def check_propagate_errors(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("SelectAd", grpc.StatusCode.INVALID_ARGUMENT, "placement home-top is not registered")
+    try:
+        got = m.select_ad("home-top", "u-1")
+    except m.ExchangeError:
+        pass
+    except Exception as other:
+        raise AssertionError(f"INVALID_ARGUMENT raised {type(other).__name__}: {other}, expected ExchangeError")
+    else:
+        raise AssertionError(f"INVALID_ARGUMENT from the exchange answered {got}: a request the exchange refuses is a bug to surface, not a slot to fill. Raise ExchangeError")
+    calls = len(ctx.grpc.calls_to("SelectAd"))
+    assert calls == 1, f"an INVALID_ARGUMENT was sent {calls} times: the same request fails the same way"
+`,
+    typescript: `const BID = {campaign_id: 'c-9', creative_id: 'cr-c-9', price_micros: 1200};
+const HOUSE = {campaign_id: 'house', creative_id: 'house-default', price_micros: 0};
+const PAID = {ad: BID, kind: 'paid', fallback: false, fallback_reason: null};
+
+/** An exchange that bids 1200 micros for c-9 on every slot. */
+function client(ctx) {
+  const pkg = ctx.proto('ad_serving.proto');
+  ctx.grpc.serve(pkg.adserved.Exchange.service, {
+    SelectAd(_call, callback) {
+      callback(null, BID);
+    },
+  });
+  return ctx.load('client');
+}
+
+async function select(m) {
+  try {
+    return await m.selectAd('home-top', 'u-1');
+  } catch (e) {
+    if (e instanceof m.ExchangeError) return null;
+    throw e;
+  }
+}
+
+export async function check_deadline(ctx) {
+  const m = client(ctx);
+  const got = await m.selectAd('home-top', 'u-1');
+  assert.deepStrictEqual(got, PAID, \`with the exchange answering, selectAd returned \${JSON.stringify(got)}, expected the paid bid\`);
+  const calls = ctx.grpc.callsTo('SelectAd');
+  assert.equal(calls.length, 1, \`one serve made \${calls.length} SelectAd calls\`);
+  assert(calls[0].timeout !== null, 'SelectAd carries no deadline: a stalled exchange holds the page');
+  assert(0.1 <= calls[0].timeout && calls[0].timeout <= 0.2, \`SelectAd carries a \${calls[0].timeout} s deadline, expected EXCHANGE_DEADLINE_MS = 150: the exchange gets a slice of the page budget, not a second\`);
+}
+
+export async function check_one_call(ctx) {
+  const m = client(ctx);
+  ctx.grpc.fail('SelectAd', ctx.grpc.status.UNAVAILABLE, '', 3);
+  await select(m);
+  const calls = ctx.grpc.callsTo('SelectAd').length;
+  assert.equal(calls, 1, \`with the exchange down one serve made \${calls} SelectAd calls: every page paid for the outage \${calls} times. Call once\`);
+  assert.equal(ctx.clock.sleeps, 0, \`selectAd slept \${ctx.clock.sleeps} times inside the request\`);
+  ctx.grpc.clearFailures();
+  ctx.grpc.setLatency('SelectAd', 5.0);
+  const before = ctx.clock.now();
+  await select(m);
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 0.2, \`with the exchange taking 5 s the serve waited \${waited.toFixed(2)} s, expected one 150 ms deadline\`);
+  assert.equal(ctx.grpc.callsTo('SelectAd').length, 2, 'a slow exchange gets one call per serve');
+}
+
+export async function check_house_fallback(ctx) {
+  const m = client(ctx);
+  ctx.grpc.setLatency('SelectAd', 5.0);
+  let got = await m.selectAd('home-top', 'u-1');
+  const want = {ad: HOUSE, kind: 'house', fallback: true, fallback_reason: 'deadline_exceeded'};
+  assert.deepStrictEqual(got, want, \`with the exchange past its deadline selectAd returned \${JSON.stringify(got)}, expected the marked house ad: an empty slot is revenue lost with nothing to count\`);
+  ctx.grpc.setLatency('SelectAd', 0);
+  ctx.grpc.fail('SelectAd', ctx.grpc.status.UNAVAILABLE);
+  got = await m.selectAd('home-top', 'u-1');
+  assert.deepStrictEqual(got, {...want, fallback_reason: 'unavailable'}, \`with the exchange UNAVAILABLE selectAd returned \${JSON.stringify(got)}, expected the house ad with fallback_reason unavailable\`);
+  got = await m.selectAd('home-top', 'u-1');
+  assert.deepStrictEqual(got, PAID, \`once the exchange answers again selectAd returned \${JSON.stringify(got)}, expected the paid bid\`);
+}
+
+export async function check_propagate_errors(ctx) {
+  const m = client(ctx);
+  ctx.grpc.fail('SelectAd', ctx.grpc.status.INVALID_ARGUMENT, 'placement home-top is not registered');
+  let got;
+  try {
+    got = await m.selectAd('home-top', 'u-1');
+  } catch (e) {
+    assert(e instanceof m.ExchangeError, \`INVALID_ARGUMENT threw \${(e as Error).constructor.name}: \${(e as Error).message}, expected ExchangeError\`);
+    const calls = ctx.grpc.callsTo('SelectAd').length;
+    assert.equal(calls, 1, \`an INVALID_ARGUMENT was sent \${calls} times: the same request fails the same way\`);
+    return;
+  }
+  assert.fail(\`INVALID_ARGUMENT from the exchange answered \${JSON.stringify(got)}: a request the exchange refuses is a bug to surface, not a slot to fill. Throw ExchangeError\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	"ads/store"
+	pb "ads/gen/ad_serving"
+
+	"leetbuild/harness"
+)
+
+var clientBg = context.Background()
+
+// exchangePeer bids 1200 micros for c-9 on every slot.
+type exchangePeer struct {
+	pb.UnimplementedExchangeServer
+}
+
+func (exchangePeer) SelectAd(_ context.Context, _ *pb.SelectAdRequest) (*pb.Bid, error) {
+	return &pb.Bid{CampaignId: "c-9", CreativeId: "cr-c-9", PriceMicros: 1200}, nil
+}
+
+var (
+	clientBid  = store.Ad{CampaignID: "c-9", CreativeID: "cr-c-9", PriceMicros: 1200}
+	clientPaid = Selection{Ad: clientBid, Kind: "paid"}
+)
+
+func clientPeer(ctx *harness.Ctx) {
+	pb.RegisterExchangeServer(ctx.GRPC.Server(""), exchangePeer{})
+}
+
+func clientSelect(ctx *harness.Ctx, why string) Selection {
+	got, err := selectAd(clientBg, "home-top", "u-1")
+	ctx.NoError(err, "%s: selectAd", why)
+	return got
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	clientPeer(ctx)
+	ctx.Equal(clientSelect(ctx, "with the exchange answering"), clientPaid, "with the exchange answering, selectAd must return the paid bid")
+	calls := ctx.GRPC.CallsTo("SelectAd", "")
+	ctx.Equal(len(calls), 1, "one serve's SelectAd calls")
+	ctx.Assert(calls[0].HasDeadline(), "SelectAd carries no deadline: a stalled exchange holds the page")
+	ctx.Assert(100*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 200*time.Millisecond, "SelectAd carries a %v deadline, expected exchangeDeadline = 150 ms: the exchange gets a slice of the page budget, not a second", calls[0].Timeout)
+}
+
+func CheckOneCall(ctx *harness.Ctx) {
+	clientPeer(ctx)
+	ctx.GRPC.Fail("SelectAd", codes.Unavailable, "", 3, "")
+	selectAd(clientBg, "home-top", "u-1")
+	calls := len(ctx.GRPC.CallsTo("SelectAd", ""))
+	ctx.Equal(calls, 1, "with the exchange down one serve must make one SelectAd call, not pay for the outage on every try; the calls")
+	ctx.Equal(ctx.Clock.Sleeps(), 0, "selectAd must not sleep inside the request; the sleeps")
+	ctx.GRPC.ClearFailures()
+	ctx.GRPC.SetLatency("SelectAd", 5.0, "")
+	before := ctx.Clock.Now()
+	selectAd(clientBg, "home-top", "u-1")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 0.2, "with the exchange taking 5 s the serve waited %.2f s, expected one 150 ms deadline", waited)
+	ctx.Equal(len(ctx.GRPC.CallsTo("SelectAd", "")), 2, "a slow exchange gets one call per serve; the calls")
+}
+
+func CheckHouseFallback(ctx *harness.Ctx) {
+	clientPeer(ctx)
+	ctx.GRPC.SetLatency("SelectAd", 5.0, "")
+	want := Selection{Ad: store.HouseAd, Kind: "house", Fallback: true, FallbackReason: "deadline_exceeded"}
+	ctx.Equal(clientSelect(ctx, "with the exchange past its deadline"), want, "with the exchange past its deadline selectAd must return the marked house ad (an empty slot is revenue lost with nothing to count)")
+	ctx.GRPC.SetLatency("SelectAd", 0, "")
+	ctx.GRPC.Fail("SelectAd", codes.Unavailable, "", 1, "")
+	want.FallbackReason = "unavailable"
+	ctx.Equal(clientSelect(ctx, "with the exchange UNAVAILABLE"), want, "with the exchange UNAVAILABLE selectAd must return the house ad with fallback_reason unavailable")
+	ctx.Equal(clientSelect(ctx, "once the exchange answers again"), clientPaid, "once the exchange answers again selectAd must return the paid bid")
+}
+
+func CheckPropagateErrors(ctx *harness.Ctx) {
+	clientPeer(ctx)
+	ctx.GRPC.Fail("SelectAd", codes.InvalidArgument, "placement home-top is not registered", 1, "")
+	got, err := selectAd(clientBg, "home-top", "u-1")
+	ctx.Assert(err != nil, "INVALID_ARGUMENT from the exchange answered %+v: a request the exchange refuses is a bug to surface, not a slot to fill. Return an error wrapping ErrExchange", got)
+	ctx.ErrorIs(err, ErrExchange, "INVALID_ARGUMENT returned %v", err)
+	ctx.Equal(len(ctx.GRPC.CallsTo("SelectAd", "")), 1, "an INVALID_ARGUMENT fails the same way every time; the calls")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+
+#include "ad_serving.grpc.pb.h"
+#include "ads/store.h"
+
+namespace {
+
+// Bids 1200 micros for c-9 on every slot.
+class ExchangePeer final : public adserved::Exchange::Service {
+ public:
+  grpc::Status SelectAd(grpc::ServerContext*, const adserved::SelectAdRequest*, adserved::Bid* out) override {
+    out->set_campaign_id("c-9");
+    out->set_creative_id("cr-c-9");
+    out->set_price_micros(1200);
+    return grpc::Status::OK;
+  }
+};
+
+void clientPeer(harness::Ctx& ctx) {
+  static ExchangePeer* peer = nullptr;
+  delete peer;
+  peer = new ExchangePeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+}
+
+std::string clientShow(const Selection& s) {
+  return "{ad " + s.ad.campaign_id + "/" + s.ad.creative_id + "/" + std::to_string(s.ad.price_micros) + ", kind " + s.kind +
+         ", fallback " + (s.fallback ? "true" : "false") + ", fallback_reason \\"" + s.fallback_reason + "\\"}";
+}
+
+bool clientSame(const Selection& s, const std::string& campaign, const std::string& creative, long long price, const std::string& kind, bool fallback,
+                const std::string& reason) {
+  return s.ad.campaign_id == campaign && s.ad.creative_id == creative && s.ad.price_micros == price && s.kind == kind && s.fallback == fallback &&
+         s.fallback_reason == reason;
+}
+
+Selection clientSelect(harness::Ctx& ctx, const std::string& why) {
+  try {
+    return selectAd("home-top", "u-1");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("%s: selectAd threw %s: %s", why, harness::CurrentExceptionType(), e.what());
+  }
+}
+
+void clientQuiet() {
+  try {
+    selectAd("home-top", "u-1");
+  } catch (const ExchangeError&) {
+  }
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  clientPeer(ctx);
+  const Selection got = clientSelect(ctx, "with the exchange answering");
+  ctx.Assert(clientSame(got, "c-9", "cr-c-9", 1200, "paid", false, ""), "with the exchange answering, selectAd returned %s, expected the paid bid", clientShow(got));
+  const auto calls = ctx.GRPC.CallsTo("SelectAd");
+  ctx.Equal(calls.size(), 1, "one serve's SelectAd calls");
+  ctx.Assert(calls[0].HasDeadline(), "SelectAd carries no deadline: a stalled exchange holds the page");
+  ctx.Assert(0.1 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 0.2,
+             "SelectAd carries a %v s deadline, expected kExchangeDeadline = 150 ms: the exchange gets a slice of the page budget, not a second", calls[0].TimeoutSeconds());
+}
+
+void CheckOneCall(harness::Ctx& ctx) {
+  clientPeer(ctx);
+  ctx.GRPC.Fail("SelectAd", grpc::StatusCode::UNAVAILABLE, "", 3);
+  clientQuiet();
+  ctx.Equal(ctx.GRPC.CallsTo("SelectAd").size(), 1, "with the exchange down one serve must make one SelectAd call, not pay for the outage on every try; the calls");
+  ctx.Equal(ctx.Clock.Sleeps(), 0, "selectAd must not sleep inside the request; the sleeps");
+  ctx.GRPC.ClearFailures();
+  ctx.GRPC.SetLatency("SelectAd", 5.0);
+  const int64_t before = ctx.Clock.Now();
+  clientQuiet();
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 0.2, "with the exchange taking 5 s the serve waited %.2f s, expected one 150 ms deadline", waited);
+  ctx.Equal(ctx.GRPC.CallsTo("SelectAd").size(), 2, "a slow exchange gets one call per serve; the calls");
+}
+
+void CheckHouseFallback(harness::Ctx& ctx) {
+  clientPeer(ctx);
+  ctx.GRPC.SetLatency("SelectAd", 5.0);
+  Selection got = clientSelect(ctx, "with the exchange past its deadline");
+  ctx.Assert(clientSame(got, "house", "house-default", 0, "house", true, "deadline_exceeded"),
+             "with the exchange past its deadline selectAd returned %s, expected the marked house ad: an empty slot is revenue lost with nothing to count", clientShow(got));
+  ctx.GRPC.SetLatency("SelectAd", 0);
+  ctx.GRPC.Fail("SelectAd", grpc::StatusCode::UNAVAILABLE);
+  got = clientSelect(ctx, "with the exchange UNAVAILABLE");
+  ctx.Assert(clientSame(got, "house", "house-default", 0, "house", true, "unavailable"),
+             "with the exchange UNAVAILABLE selectAd returned %s, expected the house ad with fallback_reason unavailable", clientShow(got));
+  got = clientSelect(ctx, "once the exchange answers again");
+  ctx.Assert(clientSame(got, "c-9", "cr-c-9", 1200, "paid", false, ""), "once the exchange answers again selectAd returned %s, expected the paid bid", clientShow(got));
+}
+
+void CheckPropagateErrors(harness::Ctx& ctx) {
+  clientPeer(ctx);
+  ctx.GRPC.Fail("SelectAd", grpc::StatusCode::INVALID_ARGUMENT, "placement home-top is not registered");
+  bool raised = false;
+  Selection got;
+  try {
+    got = selectAd("home-top", "u-1");
+  } catch (const ExchangeError&) {
+    raised = true;
+  } catch (const std::exception& e) {
+    ctx.Fatalf("INVALID_ARGUMENT threw %s: %s, expected ExchangeError", harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Assert(raised, "INVALID_ARGUMENT from the exchange answered %s: a request the exchange refuses is a bug to surface, not a slot to fill. Throw ExchangeError", clientShow(got));
+  ctx.Equal(ctx.GRPC.CallsTo("SelectAd").size(), 1, "an INVALID_ARGUMENT fails the same way every time; the calls");
+}
+`,
+  },
   hints: [
-    'When the exchange is slow, pages stall for most of a second and then render a blank slot; the delivery report shows fewer impressions than page views and cannot say why.',
-    'The `for attempt in range(MAX_ATTEMPTS)` loop catches every `RpcError`, sleeps a full deadline, and tries again; after the last failure it returns `{"ad": None}` with no fallback flag, no kind and no reason.',
-    'Delete the loop and the sleep: one `SelectAd` call. On `DEADLINE_EXCEEDED`/`UNAVAILABLE` return `HOUSE_AD_CREATIVE` with `price_micros = 0`, `fallback: true`, `fallback_reason: "timeout"` and `IMPRESSION_KIND_FALLBACK`; re-raise other codes.',
+    'Make the exchange slow and the page waits three seconds, then renders an empty slot; take it down and every page asks it three times.',
+    'The loop catches every `RpcError`, sleeps and tries again under a one-second deadline, whatever the status; when it gives up it returns `ad: None` with nothing saying why.',
+    'One `SelectAd` with `timeout=EXCHANGE_DEADLINE_S` (0.15). In the `except`: for DEADLINE_EXCEEDED or UNAVAILABLE return `HOUSE_AD` with `kind: "house"`, `fallback: True` and the code’s name lowercased; otherwise raise `ExchangeError`.',
   ],
-  debrief: `The starter is the shape that gets written first: a call with a deadline, then a loop "just in case", then a null when everything fails. Both choices are wrong in the same direction, trading a predictable user experience for a chance at a slightly better bid. The fix makes the timeout part of the product: a house creative fills the slot, the response says it is a fallback and why, and the impression kind keeps house inventory out of campaign billing. A production exchange client also propagates the inbound request's remaining deadline rather than starting a fresh 150 ms, and puts a circuit breaker in front of the stub so a dead upstream is not probed on every serve.`,
+  debrief: `A serve is inside a page load, so the exchange gets a fixed slice of it and the fallback has to be as good as an answer: a house ad fills the slot, and the kind and reason travel with it so billing and the delivery report never credit it to a campaign. Retrying inside the request spends the deadline again on a dependency that has already said it is slow or down. The status code decides the branch: a deadline or an outage says nothing about the request, while INVALID_ARGUMENT says the request itself is wrong, so filling the slot would hide a bug. Production clients also propagate the caller's remaining budget as the deadline, and trip a breaker so a dead exchange is skipped instead of waited on.`,
 };

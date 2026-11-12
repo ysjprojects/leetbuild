@@ -8,201 +8,154 @@ export const judgeGateStep: Step = {
   focus: ['api', 'judge', 'gtx'],
   task: `## Task
 
-**Starting point.** The starter implements \`gate(version)\`, the release gate run before a new
-prompt or model version ships: it samples five conversations, asks one judge to "Rate this
-conversation 0-10" on the last message of each, with no deadline and no schema check, averages the
-scores and returns true above 0.5. It is what Sidekick's team calls vibe testing. It hides five
-flaws.
+**Starting point.** The starter is \`gate(version)\`, run before a new prompt or model version ships.
+It takes \`gtx.sample(version, 5)\` from the provided ground-truth set, calls \`Judge.Score\` once per
+conversation with criterion \`overall\`, the rubric "Rate this conversation 0-10." and the last turn
+as the transcript, with no deadline, and ships when the mean is above 0.5. It serves the demo and hides
+5 flaws.
 
-**Failure mode the checks target.** A 0.79 ships over a 0.91 because both "looked fine". Five
-conversations cannot tell a regression from noise. A judge nobody calibrated may agree with humans
-no better than a coin flip. Judging the last message hides a wrong tool call three turns earlier,
-and a filter such as \`customer_tags CONTAINS 'enabled'\` passes because no schema is checked.
+**Failure mode the checks target.** Five conversations cannot tell a regression from noise. One vague
+judge on the last turn misses a wrong tool call two turns earlier. A judge nobody calibrated may agree
+with humans no better than chance, a filter like \`customer_tags CONTAINS enabled\` reaches the judge
+unchecked, and a 0.79 ships after a 0.95.
 
-- Sample \`SAMPLE_SIZE = 200\` conversations replayed through the candidate
-  (\`gtx.sample(version, SAMPLE_SIZE)\`). Every judge call carries a **15 s** deadline
-  (\`JUDGE_DEADLINE_S\`).
-- One judge per criterion with a written rubric: \`CRITERIA\` are \`correctness\`,
-  \`schema_compliance\` and \`helpfulness\`, each scored over the whole conversation
-  (\`rubric=RUBRICS[criterion]\`).
-- Calibrate before trusting: on the human-labelled subset, compare each judge's labels with
-  \`human_labels\` using \`cohen_kappa\` and refuse to gate below \`MIN_JUDGE_KAPPA = 0.6\`.
-- Procedural validation first: \`validate_schema\` checks every tool call's arguments before any
-  judge runs; an invalid conversation scores 0 on every criterion and spends no judge call.
-- The gate: a version ships only when every criterion's mean is at least \`MIN_SCORE = 0.8\` and no
-  criterion regresses more than \`MAX_REGRESSION = 0.02\` below \`releases.baseline(criterion)\`;
-  \`record\` the means on success.`,
+- Judge \`SAMPLE_SIZE = 200\` conversations.
+- Per valid conversation, one \`Score\` per criterion in \`CRITERIA\` with \`RUBRICS[criterion]\`,
+  \`transcript(conversation)\` and a \`JUDGE_DEADLINE_S = 15\` deadline.
+- \`validate_schema\` every tool call first: an invalid conversation scores 0 on every criterion and
+  costs no judge call.
+- Calibrate: on conversations with \`human_labels\`, \`cohen_kappa\`(judge, human) below
+  \`MIN_JUDGE_KAPPA = 0.6\` refuses the release.
+- Ship only when every mean is at least \`MIN_SCORE = 0.8\` and no more than \`MAX_REGRESSION = 0.02\`
+  below \`gtx.baseline(criterion)\`; then \`gtx.record(version, means)\`.`,
   sequence: {
-    participants: ['Release gate', 'ground-truth set', 'Judge'],
+    participants: ['release gate', 'ground-truth set', 'Judge'],
     messages: [
-      {from: 'Release gate', to: 'ground-truth set', label: 'labelled() · human labels per criterion', kind: 'sync'},
+      {from: 'release gate', to: 'ground-truth set', label: 'sample(version, 200)', kind: 'sync'},
+      {from: 'release gate', to: 'release gate', label: 'validate_schema(tool calls) → 0, no judge call', kind: 'sync'},
+      {from: 'release gate', to: 'Judge', label: 'Score(criterion, rubric, whole transcript) × 3 · 15 s', kind: 'sync'},
+      {from: 'Judge', to: 'release gate', label: 'score', kind: 'reply'},
+      {from: 'release gate', to: 'release gate', label: 'cohen_kappa(judge, human) ≥ 0.6 per criterion', kind: 'sync'},
       {
-        from: 'Release gate',
-        to: 'Judge',
-        label: 'Score(turns, criterion, rubric) · 15 s · per labelled conversation',
-        kind: 'sync',
-      },
-      {from: 'Judge', to: 'Release gate', label: 'score', kind: 'reply'},
-      {from: 'Release gate', to: 'Release gate', label: 'cohen_kappa(human, judge) ≥ 0.6 or refuse', kind: 'sync'},
-      {from: 'Release gate', to: 'ground-truth set', label: 'sample(version, 200)', kind: 'sync'},
-      {
-        from: 'Release gate',
-        to: 'Release gate',
-        label: 'validate_schema(tool calls) → 0 without a judge call',
-        kind: 'sync',
-      },
-      {from: 'Release gate', to: 'Judge', label: 'Score(whole conversation, criterion, rubric) × 3', kind: 'sync'},
-      {
-        from: 'Release gate',
+        from: 'release gate',
         to: 'ground-truth set',
         label: 'baseline(criterion) · record(version, means)',
         kind: 'sync',
       },
     ],
   },
-  hints: [
-    "A release that passed the gate dropped merchant task completion by a tenth, and the judge's scores on the labelled set agree with the product experts about as often as a coin.",
-    '`gtx.sample(version, 5)` and `turns=conversation.turns[-1:]` give the judge too little; one `"Rate this conversation 0-10"` rubric measures nothing named; `>= 0.5` is compared with no baseline.',
-    'Sample `SAMPLE_SIZE`, run `validate_schema` first, score each `CRITERIA` entry with `RUBRICS[criterion]` over full `turns` and `timeout=JUDGE_DEADLINE_S`, require `cohen_kappa >= MIN_JUDGE_KAPPA`, then gate on `MIN_SCORE` and `baseline - MAX_REGRESSION`.',
-  ],
   checks: [
     {
-      id: 'calibrate',
-      title: 'Calibrates each judge against human labels with Cohen’s kappa',
+      id: 'full-sample',
+      title: 'Judges 200 sampled conversations',
       detail:
-        'The judge’s labels on the human-labelled subset are compared with `human_labels` using `cohen_kappa`, and the gate refuses when kappa is below `MIN_JUDGE_KAPPA = 0.6`. The starter trusts the judge without ever checking it against a person.',
+        'A gate run reaches the judge for 200 distinct conversations of the candidate. The starter judges five, which cannot separate a two-point regression from noise.',
       match: {
-        python: {all: [/cohen_kappa\(/, /MIN_JUDGE_KAPPA\s*=\s*0\.6/, /human_labels/]},
-        typescript: {all: [/cohenKappa\(/, /MIN_JUDGE_KAPPA\s*=\s*0\.6/, /humanLabels/]},
-        go: {all: [/cohenKappa\(/, /minJudgeKappa\s*=\s*0\.6/, /HumanLabels/]},
-        scala: {all: [/cohenKappa\(/, /MinJudgeKappa\s*=\s*0\.6/, /humanLabels/]},
-        cpp: {all: [/cohenKappa\(/, /kMinJudgeKappa\s*=\s*0\.6/, /humanLabels/]},
+        python: {all: [/SAMPLE_SIZE\s*=\s*200\b/, /gtx\.sample\(\s*version\s*,\s*SAMPLE_SIZE\s*\)/]},
+        typescript: {all: [/SAMPLE_SIZE\s*=\s*200\b/, /gtx\.sample\(\s*version\s*,\s*SAMPLE_SIZE\s*\)/]},
+        go: {all: [/sampleSize\s*=\s*200\b/, /gtx\.Sample\(\s*version\s*,\s*sampleSize\s*\)/]},
+        scala: {all: [/SampleSize\s*=\s*200\b/, /Gtx\.sample\(\s*version\s*,\s*SampleSize\s*\)/]},
+        cpp: {all: [/kSampleSize\s*=\s*200\b/, /gtx::sample\(\s*version\s*,\s*kSampleSize\s*\)/]},
       },
     },
     {
-      id: 'rubric-per-criterion',
-      title: 'One judge per criterion with a rubric, over the whole conversation',
+      id: 'judge-per-criterion',
+      title: 'One judge per criterion, with its rubric, over the whole conversation',
       detail:
-        'Scores come from `CRITERIA` × `RUBRICS[criterion]` and every `Score` request carries the full `turns`; there is no "Rate this" vibe judge. The starter asks one judge for a 0–10 number on the last message.',
+        "Every Score call names a criterion from CRITERIA, carries that criterion's rubric, the whole transcript and a deadline of at most 15 s, and each valid conversation is judged on all three criteria. The starter asks one vague question about the last turn.",
       match: {
-        python: {all: [/CRITERIA/, /rubric\s*=\s*RUBRICS\[/], none: [/Rate this/, /turns\[-1:\]/]},
-        typescript: {all: [/CRITERIA/, /rubric:\s*RUBRICS\[/], none: [/Rate this/, /\.slice\(-1\)/]},
-        go: {all: [/\bcriteria\b/, /Rubric:\s*rubrics\[/], none: [/Rate this/, /Turns\[len\(/]},
-        scala: {all: [/Criteria/, /rubric\s*=\s*Rubrics\(/], none: [/Rate this/, /\.takeRight\(1\)/]},
-        cpp: {all: [/kCriteria/, /set_rubric\(\s*kRubrics\.at\(/], none: [/Rate this/, /\.back\(\)/]},
-      },
-    },
-    {
-      id: 'sample-deadline',
-      title: 'Samples 200 conversations and bounds every judge call',
-      detail:
-        'The candidate is scored on `SAMPLE_SIZE = 200` conversations from the ground-truth set and each `Score` call carries `JUDGE_DEADLINE_S` (15 s). Five conversations cannot separate a regression from noise, and an unbounded judge call pins the release pipeline.',
-      match: {
-        python: {all: [/SAMPLE_SIZE\s*=\s*200/, /JUDGE_DEADLINE_S\s*=\s*15/, /timeout\s*=\s*JUDGE_DEADLINE_S/]},
+        python: {all: [/RUBRICS\[/, /transcript\(/, /timeout\s*=\s*JUDGE_DEADLINE_S/], none: [/turns\[-1\]/]},
         typescript: {
-          all: [
-            /SAMPLE_SIZE\s*=\s*200/,
-            /JUDGE_DEADLINE_MS\s*=\s*15_?000/,
-            /deadline:\s*Date\.now\(\)\s*\+\s*JUDGE_DEADLINE_MS/,
-          ],
+          all: [/RUBRICS\[/, /transcript\(/, /JUDGE_DEADLINE_MS/],
+          none: [/\.turns\.at\(-1\)|turns\.length\s*-\s*1\]/],
         },
-        go: {all: [/sampleSize\s*=\s*200/, /judgeDeadline\s*=\s*15\s*\*\s*time\.Second/, /context\.WithTimeout/]},
-        scala: {all: [/SampleSize\s*=\s*200/, /JudgeDeadlineMs\s*=\s*15000/, /withDeadlineAfter\(\s*JudgeDeadlineMs/]},
-        cpp: {all: [/kSampleSize\s*=\s*200/, /kJudgeDeadlineMs\s*=\s*15000/, /set_deadline\(/]},
+        go: {all: [/evals\.Rubrics\[/, /evals\.Transcript\(/, /judgeDeadline/], none: [/Turns\[len\(/]},
+        scala: {all: [/Evals\.Rubrics\(/, /Evals\.transcript\(/, /withDeadlineAfter\(/], none: [/turns\.last/]},
+        cpp: {all: [/evals::kRubrics/, /evals::transcript\(/, /set_deadline\(/], none: [/turns\.back\(\)/]},
+      },
+    },
+    {
+      id: 'calibrated-judges',
+      title: 'Refuses to gate with a judge that disagrees with humans',
+      detail:
+        'With a judge that scores every conversation 1.0, the correctness labels disagree with the human labels (kappa 0), so the gate refuses and records nothing; with the calibrated judge the same version ships. The starter never compares the judge with the humans.',
+      match: {
+        python: {all: [/cohen_kappa\(/, /MIN_JUDGE_KAPPA/, /human_labels/]},
+        typescript: {all: [/cohenKappa\(/, /MIN_JUDGE_KAPPA/, /human_labels/]},
+        go: {all: [/evals\.CohenKappa\(/, /minJudgeKappa/, /HumanLabels/]},
+        scala: {all: [/Evals\.cohenKappa\(/, /MinJudgeKappa/, /humanLabels/]},
+        cpp: {all: [/evals::cohen_kappa\(/, /kMinJudgeKappa/, /human_labels/]},
       },
     },
     {
       id: 'schema-first',
-      title: 'Validates tool-call schemas before any judge call',
+      title: 'Validates the schema before any judge runs',
       detail:
-        '`validate_schema` runs on the conversation’s tool calls before the judge is asked; an invalid call scores 0 on every criterion and spends no judge call. The starter has no procedural check at all — the source’s tag-hacking filters would pass.',
+        "In version v-tag, a fifth of the conversations filter on `customer_tags CONTAINS enabled`: none of them reaches the judge, they score 0, and the version does not ship. The starter hands them to the judge, which finds nothing wrong with the conversation's words.",
       match: {
-        python: {all: [/validate_schema\(/], order: [/validate_schema\(/, /judge\.Score\(/]},
-        typescript: {all: [/validateSchema\(/], order: [/validateSchema\(/, /judge\.Score\(/]},
-        go: {all: [/validateSchema\(/], order: [/validateSchema\(/, /judge\.Score\(/]},
-        scala: {all: [/validateSchema\(/], order: [/validateSchema\(/, /\.score\(/]},
-        cpp: {all: [/validateSchema\(/], order: [/validateSchema\(/, /judge->Score\(/]},
+        python: {order: [/validate_schema\(/, /judge\.Score\(/]},
+        typescript: {order: [/validateSchema\(|\(\s*validateSchema\s*\)/, /judge\.Score\(/]},
+        go: {order: [/evals\.ValidateSchema\(/, /judgeClient\.Score\(/]},
+        scala: {order: [/Evals\.validateSchema\b/, /judge\s*\.withDeadlineAfter[\s\S]{0,80}\.score\(|judge\.score\(/]},
+        cpp: {order: [/evals::validate_schema\(/, /judge_stub->Score\(/]},
       },
     },
     {
-      id: 'gate',
-      title: 'Ships only above the floor and within regression of the baseline',
+      id: 'ship-decision',
+      title: 'Ships only above the floor and within the regression limit',
       detail:
-        'Every criterion’s mean must reach `MIN_SCORE = 0.8` and stay within `MAX_REGRESSION = 0.02` of `baseline(criterion)`; the means are recorded only on success. The starter returns true whenever the average looks acceptable.',
+        'Against a baseline of 0.95 correctness and helpfulness: v-early (correctness 0.65) and v-regress (helpfulness 0.90) are refused, v-good ships and its means are recorded. The starter ships anything above 0.5.',
       match: {
-        python: {all: [/MIN_SCORE\s*=\s*0\.8/, /MAX_REGRESSION\s*=\s*0\.02/, /\.baseline\(/, /\.record\(/]},
-        typescript: {all: [/MIN_SCORE\s*=\s*0\.8/, /MAX_REGRESSION\s*=\s*0\.02/, /\.baseline\(/, /\.record\(/]},
-        go: {all: [/minScore\s*=\s*0\.8/, /maxRegression\s*=\s*0\.02/, /\.Baseline\(/, /\.Record\(/]},
-        scala: {all: [/MinScore\s*=\s*0\.8/, /MaxRegression\s*=\s*0\.02/, /\.baseline\(/, /\.record\(/]},
-        cpp: {all: [/kMinScore\s*=\s*0\.8/, /kMaxRegression\s*=\s*0\.02/, /\.baseline\(/, /\.record\(/]},
+        python: {all: [/MIN_SCORE/, /MAX_REGRESSION/, /gtx\.baseline\(/]},
+        typescript: {all: [/MIN_SCORE/, /MAX_REGRESSION/, /gtx\.baseline\(/]},
+        go: {all: [/minScore/, /maxRegression/, /gtx\.Baseline\(/]},
+        scala: {all: [/MinScore/, /MaxRegression/, /Gtx\.baseline\(/]},
+        cpp: {all: [/kMinScore/, /kMaxRegression/, /gtx::baseline\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `from dataclasses import dataclass, field
+      starter: `import grpc
 
-import grpc
+import merchant_agent_pb2
+import merchant_agent_pb2_grpc
+from sidekick import gtx
+from sidekick.config import JUDGE_ADDR
+from sidekick.evals import Decision
 
-import sidekick_pb2
-import sidekick_pb2_grpc
+SAMPLE_SIZE = 5
 
-judge = sidekick_pb2_grpc.JudgeStub(grpc.insecure_channel("judge:9000"))
-
-
-@dataclass
-class Conversation:
-    id: str
-    turns: list[sidekick_pb2.Message]
-    tool_calls: list[tuple[str, str]] = field(default_factory=list)
-    human_labels: dict[str, int] | None = None
+judge = merchant_agent_pb2_grpc.JudgeStub(grpc.insecure_channel(JUDGE_ADDR))
 
 
-class GroundTruthSet:
-    def sample(self, version: str, n: int) -> list[Conversation]:
-        """Real merchant conversations, replayed through the candidate version."""
-        raise NotImplementedError
-
-    def labelled(self) -> list[Conversation]:
-        """The subset at least three product experts labelled per criterion (1 = acceptable)."""
-        raise NotImplementedError
-
-
-class ReleaseStore:
-    def baseline(self, criterion: str) -> float:
-        """Mean score of the version in production."""
-        raise NotImplementedError
-
-    def record(self, version: str, means: dict[str, float]) -> None:
-        raise NotImplementedError
-
-
-gtx = GroundTruthSet()
-releases = ReleaseStore()
-
-
-def gate(version: str) -> bool:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    sample = gtx.sample(version, 5)
-    total = 0.0
-    for conversation in sample:
+def gate(version: str) -> Decision:
+    """Whether a candidate prompt or model version may ship."""
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    scores = []
+    for conversation in gtx.sample(version, SAMPLE_SIZE):
         reply = judge.Score(
-            sidekick_pb2.ScoreRequest(
-                turns=conversation.turns[-1:],
+            merchant_agent_pb2.ScoreRequest(
+                conversation_id=conversation.id,
                 criterion="overall",
                 rubric="Rate this conversation 0-10.",
+                transcript=conversation.turns[-1],
             )
         )
-        total += reply.score / 10
-    return total / len(sample) >= 0.5
+        scores.append(reply.score)
+    mean = sum(scores) / len(scores)
+    if mean > 0.5:
+        gtx.record(version, {"overall": mean})
+        return Decision(True, {"overall": mean}, "looks good")
+    return Decision(False, {"overall": mean}, "below 0.5")
 `,
-      solution: `import json
-from dataclasses import dataclass, field
+      solution: `import grpc
 
-import grpc
-
-import sidekick_pb2
-import sidekick_pb2_grpc
+import merchant_agent_pb2
+import merchant_agent_pb2_grpc
+from sidekick import gtx
+from sidekick.config import JUDGE_ADDR
+from sidekick.evals import CRITERIA, RUBRICS, Decision, cohen_kappa, transcript, validate_schema
 
 SAMPLE_SIZE = 200
 JUDGE_DEADLINE_S = 15.0
@@ -210,328 +163,208 @@ MIN_JUDGE_KAPPA = 0.6
 MIN_SCORE = 0.8
 MAX_REGRESSION = 0.02
 
-CRITERIA = ("correctness", "schema_compliance", "helpfulness")
-RUBRICS = {
-    "correctness": "1 when every fact and figure in the assistant's replies follows from the tool results; 0 otherwise.",
-    "schema_compliance": "1 when every filter uses the documented customer, order and product fields with valid "
-    "enum values (customer_account_status = 'ENABLED', never a tag as a catch-all); 0 otherwise.",
-    "helpfulness": "1 when the merchant's request was completed or a precise reason was given; 0 when the "
-    "assistant opted out of a task it had the tools for.",
-}
-FILTER_FIELDS = {"customer_account_status", "default_address.city", "total_spent", "orders_count", "tags"}
-
-judge = sidekick_pb2_grpc.JudgeStub(grpc.insecure_channel("judge:9000"))
+judge = merchant_agent_pb2_grpc.JudgeStub(grpc.insecure_channel(JUDGE_ADDR))
 
 
-@dataclass
-class Conversation:
-    id: str
-    turns: list[sidekick_pb2.Message]
-    tool_calls: list[tuple[str, str]] = field(default_factory=list)
-    human_labels: dict[str, int] | None = None
-
-
-class GroundTruthSet:
-    def sample(self, version: str, n: int) -> list[Conversation]:
-        """Real merchant conversations, replayed through the candidate version."""
-        raise NotImplementedError
-
-    def labelled(self) -> list[Conversation]:
-        """The subset at least three product experts labelled per criterion (1 = acceptable)."""
-        raise NotImplementedError
-
-
-class ReleaseStore:
-    def baseline(self, criterion: str) -> float:
-        """Mean score of the version in production."""
-        raise NotImplementedError
-
-    def record(self, version: str, means: dict[str, float]) -> None:
-        raise NotImplementedError
-
-
-gtx = GroundTruthSet()
-releases = ReleaseStore()
-
-
-class JudgeNotTrusted(Exception):
-    pass
-
-
-def validate_schema(tool_calls: list[tuple[str, str]]) -> bool:
-    """Procedural stage: every filter names a documented field, and status is the enum, not a tag."""
-    for _, args_json in tool_calls:
-        try:
-            args = json.loads(args_json)
-        except ValueError:
-            return False
-        for clause in args.get("filters", []):
-            if clause.get("field") not in FILTER_FIELDS:
-                return False
-            if clause.get("field") == "tags" and str(clause.get("value", "")).lower() in {"enabled", "disabled"}:
-                return False
-    return True
-
-
-def judge_score(conversation: Conversation, criterion: str) -> float:
-    request = sidekick_pb2.ScoreRequest(
-        turns=conversation.turns,
-        criterion=criterion,
-        rubric=RUBRICS[criterion],
-    )
-    return judge.Score(request, timeout=JUDGE_DEADLINE_S).score
-
-
-def cohen_kappa(human: list[int], judged: list[int]) -> float:
-    n = len(human)
-    observed = sum(1 for h, j in zip(human, judged) if h == j) / n
-    p_human = sum(human) / n
-    p_judge = sum(judged) / n
-    expected = p_human * p_judge + (1 - p_human) * (1 - p_judge)
-    return 1.0 if expected == 1.0 else (observed - expected) / (1 - expected)
-
-
-def calibrate(criterion: str) -> float:
-    labelled = [c for c in gtx.labelled() if c.human_labels is not None and criterion in c.human_labels]
-    human = [c.human_labels[criterion] for c in labelled]
-    judged = [1 if judge_score(c, criterion) >= 0.5 else 0 for c in labelled]
-    return cohen_kappa(human, judged)
-
-
-def evaluate(version: str) -> dict[str, float]:
-    sample = gtx.sample(version, SAMPLE_SIZE)
-    scores: dict[str, list[float]] = {criterion: [] for criterion in CRITERIA}
-    for conversation in sample:
-        if not validate_schema(conversation.tool_calls):
-            for criterion in CRITERIA:
-                scores[criterion].append(0.0)
+def gate(version: str) -> Decision:
+    """Whether a candidate prompt or model version may ship, judged on the ground-truth set."""
+    scores: dict[str, list[float]] = {c: [] for c in CRITERIA}
+    labels: dict[str, list[tuple[int, int]]] = {c: [] for c in CRITERIA}  # (judge, human) on the labelled subset
+    for conversation in gtx.sample(version, SAMPLE_SIZE):
+        if not all(validate_schema(call) for call in conversation.tool_calls):
+            for c in CRITERIA:
+                scores[c].append(0.0)  # procedural validation failed: no judge call
             continue
-        for criterion in CRITERIA:
-            scores[criterion].append(judge_score(conversation, criterion))
-    return {criterion: sum(values) / len(values) for criterion, values in scores.items()}
-
-
-def gate(version: str) -> bool:
-    for criterion in CRITERIA:
-        kappa = calibrate(criterion)
+        text = transcript(conversation)
+        for c in CRITERIA:
+            request = merchant_agent_pb2.ScoreRequest(conversation_id=conversation.id, criterion=c, rubric=RUBRICS[c], transcript=text)
+            score = judge.Score(request, timeout=JUDGE_DEADLINE_S).score
+            scores[c].append(score)
+            if c in conversation.human_labels:
+                labels[c].append((round(score), conversation.human_labels[c]))
+    means = {c: sum(s) / len(s) for c, s in scores.items()}
+    for c in CRITERIA:
+        kappa = cohen_kappa([j for j, _ in labels[c]], [h for _, h in labels[c]])
         if kappa < MIN_JUDGE_KAPPA:
-            raise JudgeNotTrusted(f"{criterion} judge kappa {kappa:.2f} < {MIN_JUDGE_KAPPA}")
-    means = evaluate(version)
-    for criterion, mean in means.items():
-        if mean < MIN_SCORE or mean < releases.baseline(criterion) - MAX_REGRESSION:
-            return False
-    releases.record(version, means)
-    return True
+            return Decision(False, means, f"the {c} judge agrees with the labellers at kappa {kappa:.2f}")
+    for c in CRITERIA:
+        if means[c] < MIN_SCORE:
+            return Decision(False, means, f"{c} {means[c]:.3f} is below {MIN_SCORE}")
+        if means[c] < gtx.baseline(c) - MAX_REGRESSION:
+            return Decision(False, means, f"{c} {means[c]:.3f} regressed from {gtx.baseline(c):.3f}")
+    gtx.record(version, means)
+    return Decision(True, means, "ship")
 `,
     },
     typescript: {
-      starter: `/** Release gate: flawed code that judges five conversations on vibes. */
-import {judge, type Message} from './clients';
-import {gtx, releases} from './stores';
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-export interface Conversation {
-  id: string;
-  turns: Message[];
-  toolCalls: Array<{name: string; argsJson: string}>;
-  humanLabels?: Record<string, number>;
+import {JUDGE_ADDR} from 'sidekick/config';
+import type {Decision} from 'sidekick/evals';
+import * as gtx from 'sidekick/gtx';
+
+export const SAMPLE_SIZE = 5;
+
+interface ScoreRequest {
+  conversation_id: string;
+  criterion: string;
+  rubric: string;
+  transcript: string;
+}
+interface JudgeClient {
+  Score(request: ScoreRequest, options?: {deadline: number}): Promise<{score: number}>;
 }
 
-export async function gate(version: string): Promise<boolean> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const sample = await gtx.sample(version, 5);
-  let total = 0;
-  for (const conversation of sample) {
+const {sidekickrpc} = grpc.loadPackageDefinition(protoLoader.loadSync('merchant_agent.proto')) as unknown as {
+  sidekickrpc: {Judge: new (target: string, credentials: grpc.ChannelCredentials) => JudgeClient};
+};
+const judge = new sidekickrpc.Judge(JUDGE_ADDR, grpc.credentials.createInsecure());
+
+/** Whether a candidate prompt or model version may ship. */
+export async function gate(version: string): Promise<Decision> {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  const scores: number[] = [];
+  for (const conversation of gtx.sample(version, SAMPLE_SIZE)) {
     const reply = await judge.Score({
-      turns: conversation.turns.slice(-1),
+      conversation_id: conversation.id,
       criterion: 'overall',
       rubric: 'Rate this conversation 0-10.',
+      transcript: conversation.turns[conversation.turns.length - 1],
     });
-    total += reply.score / 10;
+    scores.push(reply.score);
   }
-  return total / sample.length >= 0.5;
+  const mean = scores.reduce((sum, s) => sum + s, 0) / scores.length;
+  if (mean > 0.5) {
+    await gtx.record(version, {overall: mean});
+    return {ship: true, means: {overall: mean}, reason: 'looks good'};
+  }
+  return {ship: false, means: {overall: mean}, reason: 'below 0.5'};
 }
 `,
-      solution: `/** Release gate: calibrated per-criterion judges over a ground-truth sample, schema first, baseline-compared. */
-import {judge, type Message} from './clients';
-import {gtx, releases} from './stores';
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 
-const SAMPLE_SIZE = 200;
-const JUDGE_DEADLINE_MS = 15_000;
-const MIN_JUDGE_KAPPA = 0.6;
-const MIN_SCORE = 0.8;
-const MAX_REGRESSION = 0.02;
+import {JUDGE_ADDR} from 'sidekick/config';
+import {CRITERIA, RUBRICS, type Decision, cohenKappa, transcript, validateSchema} from 'sidekick/evals';
+import * as gtx from 'sidekick/gtx';
 
-const CRITERIA = ['correctness', 'schema_compliance', 'helpfulness'] as const;
-type Criterion = (typeof CRITERIA)[number];
+export const SAMPLE_SIZE = 200;
+export const JUDGE_DEADLINE_MS = 15_000;
+export const MIN_JUDGE_KAPPA = 0.6;
+export const MIN_SCORE = 0.8;
+export const MAX_REGRESSION = 0.02;
 
-const RUBRICS: Record<Criterion, string> = {
-  correctness: "1 when every fact and figure in the assistant's replies follows from the tool results; 0 otherwise.",
-  schema_compliance:
-    '1 when every filter uses the documented customer, order and product fields with valid enum values ' +
-    "(customer_account_status = 'ENABLED', never a tag as a catch-all); 0 otherwise.",
-  helpfulness:
-    "1 when the merchant's request was completed or a precise reason was given; 0 when the assistant " +
-    'opted out of a task it had the tools for.',
-};
-const FILTER_FIELDS: Record<string, true> = {
-  customer_account_status: true,
-  'default_address.city': true,
-  total_spent: true,
-  orders_count: true,
-  tags: true,
-};
-
-export interface Conversation {
-  id: string;
-  turns: Message[];
-  toolCalls: Array<{name: string; argsJson: string}>;
-  humanLabels?: Record<string, number>;
+interface ScoreRequest {
+  conversation_id: string;
+  criterion: string;
+  rubric: string;
+  transcript: string;
+}
+interface JudgeClient {
+  Score(request: ScoreRequest, options?: {deadline: number}): Promise<{score: number}>;
 }
 
-export class JudgeNotTrusted extends Error {}
+const {sidekickrpc} = grpc.loadPackageDefinition(protoLoader.loadSync('merchant_agent.proto')) as unknown as {
+  sidekickrpc: {Judge: new (target: string, credentials: grpc.ChannelCredentials) => JudgeClient};
+};
+const judge = new sidekickrpc.Judge(JUDGE_ADDR, grpc.credentials.createInsecure());
 
-/** Procedural stage: every filter names a documented field, and status is the enum, not a tag. */
-function validateSchema(toolCalls: Conversation['toolCalls']): boolean {
-  for (const call of toolCalls) {
-    let args: {filters?: Array<{field?: string; value?: unknown}>};
-    try {
-      args = JSON.parse(call.argsJson) as {filters?: Array<{field?: string; value?: unknown}>};
-    } catch {
-      return false;
+/** Whether a candidate prompt or model version may ship, judged on the ground-truth set. */
+export async function gate(version: string): Promise<Decision> {
+  const scores: Record<string, number[]> = Object.fromEntries(CRITERIA.map(c => [c, []]));
+  const judged: Record<string, number[]> = Object.fromEntries(CRITERIA.map(c => [c, []]));
+  const human: Record<string, number[]> = Object.fromEntries(CRITERIA.map(c => [c, []]));
+  for (const conversation of gtx.sample(version, SAMPLE_SIZE)) {
+    if (!conversation.tool_calls.every(validateSchema)) {
+      for (const c of CRITERIA) scores[c].push(0); // procedural validation failed: no judge call
+      continue;
     }
-    for (const clause of args.filters ?? []) {
-      if (clause.field === undefined || FILTER_FIELDS[clause.field] !== true) return false;
-      const value = String(clause.value ?? '').toLowerCase();
-      if (clause.field === 'tags' && (value === 'enabled' || value === 'disabled')) return false;
+    const text = transcript(conversation);
+    for (const c of CRITERIA) {
+      const request = {conversation_id: conversation.id, criterion: c, rubric: RUBRICS[c], transcript: text};
+      const {score} = await judge.Score(request, {deadline: Date.now() + JUDGE_DEADLINE_MS});
+      scores[c].push(score);
+      if (c in conversation.human_labels) {
+        judged[c].push(Math.round(score));
+        human[c].push(conversation.human_labels[c]);
+      }
     }
   }
-  return true;
-}
-
-async function judgeScore(conversation: Conversation, criterion: Criterion): Promise<number> {
-  const reply = await judge.Score(
-    {turns: conversation.turns, criterion, rubric: RUBRICS[criterion]},
-    {deadline: Date.now() + JUDGE_DEADLINE_MS},
-  );
-  return reply.score;
-}
-
-function cohenKappa(human: number[], judged: number[]): number {
-  const n = human.length;
-  const observed = human.filter((h, i) => h === judged[i]).length / n;
-  const pHuman = human.reduce((a, b) => a + b, 0) / n;
-  const pJudge = judged.reduce((a, b) => a + b, 0) / n;
-  const expected = pHuman * pJudge + (1 - pHuman) * (1 - pJudge);
-  return expected === 1 ? 1 : (observed - expected) / (1 - expected);
-}
-
-async function calibrate(criterion: Criterion): Promise<number> {
-  const labelled = (await gtx.labelled()).filter(c => c.humanLabels !== undefined && criterion in c.humanLabels);
-  const human = labelled.map(c => c.humanLabels![criterion]);
-  const judged: number[] = [];
-  for (const conversation of labelled) judged.push((await judgeScore(conversation, criterion)) >= 0.5 ? 1 : 0);
-  return cohenKappa(human, judged);
-}
-
-async function evaluate(version: string): Promise<Record<Criterion, number>> {
-  const sample = await gtx.sample(version, SAMPLE_SIZE);
-  const sums: Record<Criterion, number> = {correctness: 0, schema_compliance: 0, helpfulness: 0};
-  for (const conversation of sample) {
-    if (!validateSchema(conversation.toolCalls)) continue;
-    for (const criterion of CRITERIA) sums[criterion] += await judgeScore(conversation, criterion);
+  const means = Object.fromEntries(CRITERIA.map(c => [c, scores[c].reduce((sum, s) => sum + s, 0) / scores[c].length]));
+  for (const c of CRITERIA) {
+    const kappa = cohenKappa(judged[c], human[c]);
+    if (kappa < MIN_JUDGE_KAPPA) return {ship: false, means, reason: \`the \${c} judge agrees with the labellers at kappa \${kappa.toFixed(2)}\`};
   }
-  return {
-    correctness: sums.correctness / sample.length,
-    schema_compliance: sums.schema_compliance / sample.length,
-    helpfulness: sums.helpfulness / sample.length,
-  };
-}
-
-export async function gate(version: string): Promise<boolean> {
-  for (const criterion of CRITERIA) {
-    const kappa = await calibrate(criterion);
-    if (kappa < MIN_JUDGE_KAPPA) throw new JudgeNotTrusted(\`\${criterion} judge kappa \${kappa.toFixed(2)} < \${MIN_JUDGE_KAPPA}\`);
+  for (const c of CRITERIA) {
+    if (means[c] < MIN_SCORE) return {ship: false, means, reason: \`\${c} \${means[c].toFixed(3)} is below \${MIN_SCORE}\`};
+    const baseline = await gtx.baseline(c);
+    if (means[c] < baseline - MAX_REGRESSION) return {ship: false, means, reason: \`\${c} \${means[c].toFixed(3)} regressed from \${baseline}\`};
   }
-  const means = await evaluate(version);
-  for (const criterion of CRITERIA) {
-    const baseline = await releases.baseline(criterion);
-    if (means[criterion] < MIN_SCORE || means[criterion] < baseline - MAX_REGRESSION) return false;
-  }
-  await releases.record(version, means);
-  return true;
+  await gtx.record(version, means);
+  return {ship: true, means, reason: 'ship'};
 }
 `,
     },
     go: {
-      starter: `package judge
+      starter: `package main
 
 import (
 	"context"
 
-	pb "sidekick/sidekickpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"sidekick/config" // config.JudgeAddr — provided
+	"sidekick/evals"  // evals.Decision — provided
+	"sidekick/gtx"    // gtx.Sample(version, n), gtx.Record(ctx, version, means) — provided
+	pb "sidekickrpc/gen/merchant_agent"
 )
 
-type ToolCall struct {
-	Name     string
-	ArgsJSON string
-}
+const sampleSize = 5
 
-type Conversation struct {
-	ID          string
-	Turns       []*pb.Message
-	ToolCalls   []ToolCall
-	HumanLabels map[string]int
-}
+var judgeConn, _ = grpc.NewClient(config.JudgeAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var judgeClient = pb.NewJudgeClient(judgeConn)
 
-type GroundTruthSet interface {
-	// Sample is real merchant conversations, replayed through the candidate version.
-	Sample(ctx context.Context, version string, n int) ([]Conversation, error)
-	// Labelled is the subset at least three product experts labelled per criterion (1 = acceptable).
-	Labelled(ctx context.Context) ([]Conversation, error)
-}
-
-type ReleaseStore interface {
-	Baseline(ctx context.Context, criterion string) (float64, error)
-	Record(ctx context.Context, version string, means map[string]float64) error
-}
-
-var (
-	judge    pb.JudgeClient
-	gtx      GroundTruthSet
-	releases ReleaseStore
-)
-
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-func Gate(ctx context.Context, version string) (bool, error) {
-	sample, err := gtx.Sample(ctx, version, 5)
-	if err != nil {
-		return false, err
-	}
-	total := 0.0
-	for _, conversation := range sample {
-		reply, err := judge.Score(ctx, &pb.ScoreRequest{
-			Turns:     conversation.Turns[len(conversation.Turns)-1:],
-			Criterion: "overall",
-			Rubric:    "Rate this conversation 0-10.",
+// gate decides whether a candidate prompt or model version may ship.
+func gate(ctx context.Context, version string) (evals.Decision, error) {
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+	sum, n := 0.0, 0
+	for _, conv := range gtx.Sample(version, sampleSize) {
+		reply, err := judgeClient.Score(ctx, &pb.ScoreRequest{
+			ConversationId: conv.ID,
+			Criterion:      "overall",
+			Rubric:         "Rate this conversation 0-10.",
+			Transcript:     conv.Turns[len(conv.Turns)-1],
 		})
 		if err != nil {
-			return false, err
+			return evals.Decision{}, err
 		}
-		total += reply.Score / 10
+		sum += reply.GetScore()
+		n++
 	}
-	return total/float64(len(sample)) >= 0.5, nil
+	means := map[string]float64{"overall": sum / float64(n)}
+	if means["overall"] > 0.5 {
+		return evals.Decision{Ship: true, Means: means, Reason: "looks good"}, gtx.Record(ctx, version, means)
+	}
+	return evals.Decision{Ship: false, Means: means, Reason: "below 0.5"}, nil
 }
 `,
-      solution: `package judge
+      solution: `package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"strings"
+	"math"
 	"time"
 
-	pb "sidekick/sidekickpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"sidekick/config" // config.JudgeAddr — provided
+	"sidekick/evals"  // evals.Criteria, Rubrics, Transcript, ValidateSchema, CohenKappa, Decision — provided
+	"sidekick/gtx"    // gtx.Sample(version, n), gtx.Baseline(ctx, criterion), gtx.Record(ctx, version, means) — provided
+	pb "sidekickrpc/gen/merchant_agent"
 )
 
 const (
@@ -542,250 +375,117 @@ const (
 	maxRegression  = 0.02
 )
 
-var criteria = []string{"correctness", "schema_compliance", "helpfulness"}
+var judgeConn, _ = grpc.NewClient(config.JudgeAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+var judgeClient = pb.NewJudgeClient(judgeConn)
 
-var rubrics = map[string]string{
-	"correctness":       "1 when every fact and figure in the assistant's replies follows from the tool results; 0 otherwise.",
-	"schema_compliance": "1 when every filter uses the documented customer, order and product fields with valid enum values (customer_account_status = 'ENABLED', never a tag as a catch-all); 0 otherwise.",
-	"helpfulness":       "1 when the merchant's request was completed or a precise reason was given; 0 when the assistant opted out of a task it had the tools for.",
-}
-
-var filterFields = map[string]bool{
-	"customer_account_status": true,
-	"default_address.city":    true,
-	"total_spent":             true,
-	"orders_count":            true,
-	"tags":                    true,
-}
-
-type ToolCall struct {
-	Name     string
-	ArgsJSON string
-}
-
-type Conversation struct {
-	ID          string
-	Turns       []*pb.Message
-	ToolCalls   []ToolCall
-	HumanLabels map[string]int
-}
-
-type GroundTruthSet interface {
-	// Sample is real merchant conversations, replayed through the candidate version.
-	Sample(ctx context.Context, version string, n int) ([]Conversation, error)
-	// Labelled is the subset at least three product experts labelled per criterion (1 = acceptable).
-	Labelled(ctx context.Context) ([]Conversation, error)
-}
-
-type ReleaseStore interface {
-	Baseline(ctx context.Context, criterion string) (float64, error)
-	Record(ctx context.Context, version string, means map[string]float64) error
-}
-
-var (
-	judge    pb.JudgeClient
-	gtx      GroundTruthSet
-	releases ReleaseStore
-)
-
-type ErrJudgeNotTrusted struct {
-	Criterion string
-	Kappa     float64
-}
-
-func (e *ErrJudgeNotTrusted) Error() string {
-	return fmt.Sprintf("%s judge kappa %.2f < %.2f", e.Criterion, e.Kappa, minJudgeKappa)
-}
-
-type filterClause struct {
-	Field string \`json:"field"\`
-	Value any    \`json:"value"\`
-}
-
-// validateSchema is the procedural stage: every filter names a documented field, and status is the enum, not a tag.
-func validateSchema(calls []ToolCall) bool {
-	for _, call := range calls {
-		var args struct {
-			Filters []filterClause \`json:"filters"\`
-		}
-		if err := json.Unmarshal([]byte(call.ArgsJSON), &args); err != nil {
+func valid(conv evals.Conversation) bool {
+	for _, call := range conv.ToolCalls {
+		if !evals.ValidateSchema(call) {
 			return false
-		}
-		for _, clause := range args.Filters {
-			if !filterFields[clause.Field] {
-				return false
-			}
-			value := strings.ToLower(fmt.Sprint(clause.Value))
-			if clause.Field == "tags" && (value == "enabled" || value == "disabled") {
-				return false
-			}
 		}
 	}
 	return true
 }
 
-func judgeScore(ctx context.Context, conversation Conversation, criterion string) (float64, error) {
-	callCtx, cancel := context.WithTimeout(ctx, judgeDeadline)
-	defer cancel()
-	reply, err := judge.Score(callCtx, &pb.ScoreRequest{
-		Turns:     conversation.Turns,
-		Criterion: criterion,
-		Rubric:    rubrics[criterion],
-	})
-	if err != nil {
-		return 0, err
-	}
-	return reply.Score, nil
-}
-
-func cohenKappa(human, judged []int) float64 {
-	n := float64(len(human))
-	agree, sumHuman, sumJudged := 0.0, 0.0, 0.0
-	for i := range human {
-		if human[i] == judged[i] {
-			agree++
-		}
-		sumHuman += float64(human[i])
-		sumJudged += float64(judged[i])
-	}
-	observed := agree / n
-	pHuman, pJudge := sumHuman/n, sumJudged/n
-	expected := pHuman*pJudge + (1-pHuman)*(1-pJudge)
-	if expected == 1 {
-		return 1
-	}
-	return (observed - expected) / (1 - expected)
-}
-
-func calibrate(ctx context.Context, criterion string) (float64, error) {
-	labelled, err := gtx.Labelled(ctx)
-	if err != nil {
-		return 0, err
-	}
-	var human, judged []int
-	for _, conversation := range labelled {
-		label, ok := conversation.HumanLabels[criterion]
-		if !ok {
-			continue
-		}
-		score, err := judgeScore(ctx, conversation, criterion)
-		if err != nil {
-			return 0, err
-		}
-		human = append(human, label)
-		if score >= 0.5 {
-			judged = append(judged, 1)
-		} else {
-			judged = append(judged, 0)
-		}
-	}
-	return cohenKappa(human, judged), nil
-}
-
-func evaluate(ctx context.Context, version string) (map[string]float64, error) {
-	sample, err := gtx.Sample(ctx, version, sampleSize)
-	if err != nil {
-		return nil, err
-	}
-	sums := map[string]float64{}
-	for _, conversation := range sample {
-		if !validateSchema(conversation.ToolCalls) {
-			continue
-		}
-		for _, criterion := range criteria {
-			score, err := judgeScore(ctx, conversation, criterion)
-			if err != nil {
-				return nil, err
+// gate decides whether a candidate prompt or model version may ship, judged on the ground-truth set.
+func gate(ctx context.Context, version string) (evals.Decision, error) {
+	scores := map[string][]float64{}
+	judged := map[string][]int{} // judge labels on the human-labelled subset
+	human := map[string][]int{}
+	for _, conv := range gtx.Sample(version, sampleSize) {
+		if !valid(conv) {
+			for _, c := range evals.Criteria {
+				scores[c] = append(scores[c], 0) // procedural validation failed: no judge call
 			}
-			sums[criterion] += score
+			continue
+		}
+		text := evals.Transcript(conv)
+		for _, c := range evals.Criteria {
+			callCtx, cancel := context.WithTimeout(ctx, judgeDeadline)
+			reply, err := judgeClient.Score(callCtx, &pb.ScoreRequest{ConversationId: conv.ID, Criterion: c, Rubric: evals.Rubrics[c], Transcript: text})
+			cancel()
+			if err != nil {
+				return evals.Decision{}, err
+			}
+			scores[c] = append(scores[c], reply.GetScore())
+			if label, ok := conv.HumanLabels[c]; ok {
+				judged[c] = append(judged[c], int(math.Round(reply.GetScore())))
+				human[c] = append(human[c], label)
+			}
 		}
 	}
 	means := map[string]float64{}
-	for _, criterion := range criteria {
-		means[criterion] = sums[criterion] / float64(len(sample))
+	for _, c := range evals.Criteria {
+		sum := 0.0
+		for _, s := range scores[c] {
+			sum += s
+		}
+		means[c] = sum / float64(len(scores[c]))
 	}
-	return means, nil
-}
-
-func Gate(ctx context.Context, version string) (bool, error) {
-	for _, criterion := range criteria {
-		kappa, err := calibrate(ctx, criterion)
+	for _, c := range evals.Criteria {
+		if kappa := evals.CohenKappa(judged[c], human[c]); kappa < minJudgeKappa {
+			return evals.Decision{Means: means, Reason: fmt.Sprintf("the %s judge agrees with the labellers at kappa %.2f", c, kappa)}, nil
+		}
+	}
+	for _, c := range evals.Criteria {
+		if means[c] < minScore {
+			return evals.Decision{Means: means, Reason: fmt.Sprintf("%s %.3f is below %.1f", c, means[c], minScore)}, nil
+		}
+		baseline, err := gtx.Baseline(ctx, c)
 		if err != nil {
-			return false, err
+			return evals.Decision{}, err
 		}
-		if kappa < minJudgeKappa {
-			return false, &ErrJudgeNotTrusted{Criterion: criterion, Kappa: kappa}
-		}
-	}
-	means, err := evaluate(ctx, version)
-	if err != nil {
-		return false, err
-	}
-	for _, criterion := range criteria {
-		baseline, err := releases.Baseline(ctx, criterion)
-		if err != nil {
-			return false, err
-		}
-		if means[criterion] < minScore || means[criterion] < baseline-maxRegression {
-			return false, nil
+		if means[c] < baseline-maxRegression {
+			return evals.Decision{Means: means, Reason: fmt.Sprintf("%s %.3f regressed from %.3f", c, means[c], baseline)}, nil
 		}
 	}
-	if err := releases.Record(ctx, version, means); err != nil {
-		return false, err
+	if err := gtx.Record(ctx, version, means); err != nil {
+		return evals.Decision{}, err
 	}
-	return true, nil
+	return evals.Decision{Ship: true, Means: means, Reason: "ship"}, nil
 }
 `,
     },
     scala: {
       starter: `import io.grpc.ManagedChannelBuilder
 
-final case class ToolCall(name: String, argsJson: String)
-final case class Conversation(
-    id: String,
-    turns: Seq[Message],
-    toolCalls: Seq[ToolCall],
-    humanLabels: Option[Map[String, Int]]
-)
+import sidekick.{Config, Decision, Gtx}
+import sidekickrpc.merchant_agent.{JudgeGrpc, ScoreRequest}
 
 object JudgeGate {
-  val judge = JudgeGrpc.blockingStub(ManagedChannelBuilder.forAddress("judge", 9000).usePlaintext().build())
-  val gtx = GroundTruthSet.open()
-  val releases = ReleaseStore.open()
+  val SampleSize = 5
 
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def gate(version: String): Boolean = {
-    val sample = gtx.sample(version, 5)
-    val total = sample.map { conversation =>
+  private val judge = JudgeGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.JudgeAddr).usePlaintext().build())
+
+  /** Whether a candidate prompt or model version may ship. */
+  def gate(version: String): Decision = {
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    val scores = Gtx.sample(version, SampleSize).map { conversation =>
       judge
         .score(
           ScoreRequest(
-            turns = conversation.turns.takeRight(1),
+            conversationId = conversation.id,
             criterion = "overall",
-            rubric = "Rate this conversation 0-10."
+            rubric = "Rate this conversation 0-10.",
+            transcript = conversation.turns.last
           )
         )
-        .score / 10
-    }.sum
-    total / sample.size >= 0.5
+        .score
+    }
+    val means = Map("overall" -> scores.sum / scores.size)
+    if (means("overall") > 0.5) {
+      Gtx.record(version, means)
+      Decision(ship = true, means, "looks good")
+    } else Decision(ship = false, means, "below 0.5")
   }
 }
 `,
       solution: `import java.util.concurrent.TimeUnit
 
 import io.grpc.ManagedChannelBuilder
-import spray.json._
 
-final case class ToolCall(name: String, argsJson: String)
-final case class Conversation(
-    id: String,
-    turns: Seq[Message],
-    toolCalls: Seq[ToolCall],
-    humanLabels: Option[Map[String, Int]]
-)
-
-final case class JudgeNotTrusted(criterion: String, kappa: Double)
-    extends RuntimeException(f"$criterion judge kappa $kappa%.2f < \${JudgeGate.MinJudgeKappa}")
+import sidekick.{Config, Decision, Evals, Gtx}
+import sidekickrpc.merchant_agent.{JudgeGrpc, ScoreRequest}
 
 object JudgeGate {
   val SampleSize = 200
@@ -794,80 +494,35 @@ object JudgeGate {
   val MinScore = 0.8
   val MaxRegression = 0.02
 
-  val Criteria = List("correctness", "schema_compliance", "helpfulness")
-  val Rubrics = Map(
-    "correctness" -> "1 when every fact and figure in the assistant's replies follows from the tool results; 0 otherwise.",
-    "schema_compliance" -> ("1 when every filter uses the documented customer, order and product fields with valid " +
-      "enum values (customer_account_status = 'ENABLED', never a tag as a catch-all); 0 otherwise."),
-    "helpfulness" -> ("1 when the merchant's request was completed or a precise reason was given; 0 when the " +
-      "assistant opted out of a task it had the tools for.")
-  )
-  val FilterFields = Set("customer_account_status", "default_address.city", "total_spent", "orders_count", "tags")
+  private val judge = JudgeGrpc.blockingStub(ManagedChannelBuilder.forTarget(Config.JudgeAddr).usePlaintext().build())
 
-  val judge = JudgeGrpc.blockingStub(ManagedChannelBuilder.forAddress("judge", 9000).usePlaintext().build())
-  val gtx = GroundTruthSet.open()
-  val releases = ReleaseStore.open()
-
-  // Procedural stage: every filter names a documented field, and status is the enum, not a tag.
-  def validateSchema(calls: Seq[ToolCall]): Boolean =
-    calls.forall { call =>
-      scala.util.Try(call.argsJson.parseJson.asJsObject).toOption.exists { args =>
-        args.fields.get("filters").collect { case JsArray(clauses) => clauses }.getOrElse(Vector.empty).forall {
-          case JsObject(clause) =>
-            val field = clause.get("field").collect { case JsString(f) => f }
-            val value = clause.get("value").map(_.toString.toLowerCase.replace("\\"", ""))
-            field.exists(FilterFields.contains) &&
-            !(field.contains("tags") && value.exists(v => v == "enabled" || v == "disabled"))
-          case _ => false
+  /** Whether a candidate prompt or model version may ship, judged on the ground-truth set. */
+  def gate(version: String): Decision = {
+    val scores = scala.collection.mutable.Map(Evals.Criteria.map(_ -> Vector.empty[Double]): _*)
+    val labels = scala.collection.mutable.Map(Evals.Criteria.map(_ -> Vector.empty[(Int, Int)]): _*) // (judge, human)
+    for (conversation <- Gtx.sample(version, SampleSize)) {
+      if (!conversation.toolCalls.forall(Evals.validateSchema)) {
+        Evals.Criteria.foreach(c => scores(c) :+= 0.0) // procedural validation failed: no judge call
+      } else {
+        val text = Evals.transcript(conversation)
+        for (c <- Evals.Criteria) {
+          val request = ScoreRequest(conversationId = conversation.id, criterion = c, rubric = Evals.Rubrics(c), transcript = text)
+          val score = judge.withDeadlineAfter(JudgeDeadlineMs, TimeUnit.MILLISECONDS).score(request).score
+          scores(c) :+= score
+          conversation.humanLabels.get(c).foreach(human => labels(c) :+= ((math.round(score).toInt, human)))
         }
       }
     }
-
-  def judgeScore(conversation: Conversation, criterion: String): Double =
-    judge
-      .withDeadlineAfter(JudgeDeadlineMs, TimeUnit.MILLISECONDS)
-      .score(ScoreRequest(turns = conversation.turns, criterion = criterion, rubric = Rubrics(criterion)))
-      .score
-
-  def cohenKappa(human: Seq[Int], judged: Seq[Int]): Double = {
-    val n = human.size.toDouble
-    val observed = human.zip(judged).count { case (h, j) => h == j } / n
-    val pHuman = human.sum / n
-    val pJudge = judged.sum / n
-    val expected = pHuman * pJudge + (1 - pHuman) * (1 - pJudge)
-    if (expected == 1.0) 1.0 else (observed - expected) / (1 - expected)
-  }
-
-  def calibrate(criterion: String): Double = {
-    val labelled = gtx.labelled().filter(_.humanLabels.exists(_.contains(criterion)))
-    val human = labelled.map(_.humanLabels.get(criterion))
-    val judged = labelled.map(c => if (judgeScore(c, criterion) >= 0.5) 1 else 0)
-    cohenKappa(human, judged)
-  }
-
-  def evaluate(version: String): Map[String, Double] = {
-    val sample = gtx.sample(version, SampleSize)
-    val sums = scala.collection.mutable.Map(Criteria.map(_ -> 0.0): _*)
-    sample.foreach { conversation =>
-      if (validateSchema(conversation.toolCalls)) {
-        Criteria.foreach(criterion => sums(criterion) += judgeScore(conversation, criterion))
-      }
+    val means = Evals.Criteria.map(c => c -> scores(c).sum / scores(c).size).toMap
+    val uncalibrated = Evals.Criteria.find(c => Evals.cohenKappa(labels(c).map(_._1), labels(c).map(_._2)) < MinJudgeKappa)
+    val failing = Evals.Criteria.find(c => means(c) < MinScore || means(c) < Gtx.baseline(c) - MaxRegression)
+    (uncalibrated, failing) match {
+      case (Some(c), _) => Decision(ship = false, means, s"the $c judge disagrees with the labellers")
+      case (_, Some(c)) => Decision(ship = false, means, f"$c \${means(c)}%.3f is below the floor or the baseline")
+      case _ =>
+        Gtx.record(version, means)
+        Decision(ship = true, means, "ship")
     }
-    Criteria.map(criterion => criterion -> sums(criterion) / sample.size).toMap
-  }
-
-  def gate(version: String): Boolean = {
-    Criteria.foreach { criterion =>
-      val kappa = calibrate(criterion)
-      if (kappa < MinJudgeKappa) throw JudgeNotTrusted(criterion, kappa)
-    }
-    val means = evaluate(version)
-    val passes = Criteria.forall { criterion =>
-      val mean = means(criterion)
-      mean >= MinScore && mean >= releases.baseline(criterion) - MaxRegression
-    }
-    if (passes) releases.record(version, means)
-    passes
   }
 }
 `,
@@ -875,218 +530,529 @@ object JudgeGate {
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
 
-#include "sidekick.grpc.pb.h"
-
 #include <map>
-#include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
-struct ToolCall {
-  std::string name;
-  std::string argsJson;
-};
+#include "merchant_agent.grpc.pb.h"
+#include "sidekick/config.h"  // config::kJudgeAddr — provided
+#include "sidekick/evals.h"   // evals::Decision — provided
+#include "sidekick/gtx.h"     // gtx::sample(version, n), gtx::record(version, means) — provided
 
-struct Conversation {
-  std::string id;
-  std::vector<sidekick::Message> turns;
-  std::vector<ToolCall> toolCalls;
-  std::optional<std::map<std::string, int>> humanLabels;
-};
+constexpr int kSampleSize = 5;
 
-struct GroundTruthSet {
-  // Real merchant conversations, replayed through the candidate version.
-  std::vector<Conversation> sample(const std::string& version, int n);
-  // The subset at least three product experts labelled per criterion (1 = acceptable).
-  std::vector<Conversation> labelled();
-};
+auto judge_stub = sidekickrpc::Judge::NewStub(grpc::CreateChannel(config::kJudgeAddr, grpc::InsecureChannelCredentials()));
 
-struct ReleaseStore {
-  double baseline(const std::string& criterion);
-  void record(const std::string& version, const std::map<std::string, double>& means);
-};
-
-std::unique_ptr<sidekick::Judge::Stub> judge =
-    sidekick::Judge::NewStub(grpc::CreateChannel("judge:9000", grpc::InsecureChannelCredentials()));
-GroundTruthSet gtx;
-ReleaseStore releases;
-
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-bool gate(const std::string& version) {
-  const auto sample = gtx.sample(version, 5);
-  double total = 0;
-  for (const auto& conversation : sample) {
+// Whether a candidate prompt or model version may ship.
+evals::Decision gate(const std::string& version) {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  double sum = 0;
+  int n = 0;
+  for (const auto& conversation : gtx::sample(version, kSampleSize)) {
     grpc::ClientContext ctx;
-    sidekick::ScoreRequest request;
-    *request.add_turns() = conversation.turns.back();
+    sidekickrpc::ScoreRequest request;
+    request.set_conversation_id(conversation.id);
     request.set_criterion("overall");
     request.set_rubric("Rate this conversation 0-10.");
-    sidekick::ScoreReply reply;
-    const grpc::Status status = judge->Score(&ctx, request, &reply);
-    if (!status.ok()) throw std::runtime_error("judge failed: " + status.error_message());
-    total += reply.score() / 10;
+    request.set_transcript(conversation.turns.back());
+    sidekickrpc::ScoreReply reply;
+    const grpc::Status status = judge_stub->Score(&ctx, request, &reply);
+    if (!status.ok()) throw std::runtime_error("judge: " + status.error_message());
+    sum += reply.score();
+    n++;
   }
-  return total / static_cast<double>(sample.size()) >= 0.5;
+  const std::map<std::string, double> means = {{"overall", sum / n}};
+  if (means.at("overall") > 0.5) {
+    gtx::record(version, means);
+    return {true, means, "looks good"};
+  }
+  return {false, means, "below 0.5"};
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
 
-#include "sidekick.grpc.pb.h"
-
-#include <algorithm>
-#include <cctype>
 #include <chrono>
+#include <cmath>
 #include <map>
-#include <memory>
-#include <optional>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-using json = nlohmann::json;
+#include "merchant_agent.grpc.pb.h"
+#include "sidekick/config.h"  // config::kJudgeAddr — provided
+#include "sidekick/evals.h"   // evals::kCriteria, kRubrics, transcript, validate_schema, cohen_kappa, Decision — provided
+#include "sidekick/gtx.h"     // gtx::sample(version, n), gtx::baseline(criterion), gtx::record(version, means) — provided
 
 constexpr int kSampleSize = 200;
-constexpr int kJudgeDeadlineMs = 15000;
+constexpr std::chrono::seconds kJudgeDeadline{15};
 constexpr double kMinJudgeKappa = 0.6;
 constexpr double kMinScore = 0.8;
 constexpr double kMaxRegression = 0.02;
 
-const std::vector<std::string> kCriteria = {"correctness", "schema_compliance", "helpfulness"};
-const std::map<std::string, std::string> kRubrics = {
-    {"correctness",
-     "1 when every fact and figure in the assistant's replies follows from the tool results; 0 otherwise."},
-    {"schema_compliance",
-     "1 when every filter uses the documented customer, order and product fields with valid enum values "
-     "(customer_account_status = 'ENABLED', never a tag as a catch-all); 0 otherwise."},
-    {"helpfulness",
-     "1 when the merchant's request was completed or a precise reason was given; 0 when the assistant "
-     "opted out of a task it had the tools for."},
-};
-const std::set<std::string> kFilterFields = {
-    "customer_account_status", "default_address.city", "total_spent", "orders_count", "tags"};
+auto judge_stub = sidekickrpc::Judge::NewStub(grpc::CreateChannel(config::kJudgeAddr, grpc::InsecureChannelCredentials()));
 
-struct ToolCall {
-  std::string name;
-  std::string argsJson;
-};
-
-struct Conversation {
-  std::string id;
-  std::vector<sidekick::Message> turns;
-  std::vector<ToolCall> toolCalls;
-  std::optional<std::map<std::string, int>> humanLabels;
-};
-
-struct GroundTruthSet {
-  // Real merchant conversations, replayed through the candidate version.
-  std::vector<Conversation> sample(const std::string& version, int n);
-  // The subset at least three product experts labelled per criterion (1 = acceptable).
-  std::vector<Conversation> labelled();
-};
-
-struct ReleaseStore {
-  double baseline(const std::string& criterion);
-  void record(const std::string& version, const std::map<std::string, double>& means);
-};
-
-struct JudgeNotTrusted : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
-
-std::unique_ptr<sidekick::Judge::Stub> judge =
-    sidekick::Judge::NewStub(grpc::CreateChannel("judge:9000", grpc::InsecureChannelCredentials()));
-GroundTruthSet gtx;
-ReleaseStore releases;
-
-// Procedural stage: every filter names a documented field, and status is the enum, not a tag.
-bool validateSchema(const std::vector<ToolCall>& calls) {
-  for (const auto& call : calls) {
-    const json args = json::parse(call.argsJson, nullptr, false);
-    if (!args.is_object()) return false;
-    for (const auto& clause : args.value("filters", json::array())) {
-      const auto field = clause.value("field", std::string());
-      if (kFilterFields.count(field) == 0) return false;
-      std::string value = clause.contains("value") ? clause["value"].dump() : "";
-      value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
-      std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
-      if (field == "tags" && (value == "enabled" || value == "disabled")) return false;
-    }
+bool valid(const evals::Conversation& conversation) {
+  for (const auto& call : conversation.tool_calls) {
+    if (!evals::validate_schema(call)) return false;
   }
   return true;
 }
 
-double judgeScore(const Conversation& conversation, const std::string& criterion) {
-  grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kJudgeDeadlineMs));
-  sidekick::ScoreRequest request;
-  for (const auto& turn : conversation.turns) *request.add_turns() = turn;
-  request.set_criterion(criterion);
-  request.set_rubric(kRubrics.at(criterion));
-  sidekick::ScoreReply reply;
-  const grpc::Status status = judge->Score(&ctx, request, &reply);
-  if (!status.ok()) throw std::runtime_error("judge failed: " + status.error_message());
-  return reply.score();
-}
-
-double cohenKappa(const std::vector<int>& human, const std::vector<int>& judged) {
-  const double n = static_cast<double>(human.size());
-  double agree = 0, sumHuman = 0, sumJudged = 0;
-  for (std::size_t i = 0; i < human.size(); i++) {
-    if (human[i] == judged[i]) agree += 1;
-    sumHuman += human[i];
-    sumJudged += judged[i];
-  }
-  const double observed = agree / n;
-  const double pHuman = sumHuman / n;
-  const double pJudge = sumJudged / n;
-  const double expected = pHuman * pJudge + (1 - pHuman) * (1 - pJudge);
-  return expected == 1.0 ? 1.0 : (observed - expected) / (1 - expected);
-}
-
-double calibrate(const std::string& criterion) {
-  std::vector<int> human;
-  std::vector<int> judged;
-  for (const auto& conversation : gtx.labelled()) {
-    if (!conversation.humanLabels || conversation.humanLabels->count(criterion) == 0) continue;
-    human.push_back(conversation.humanLabels->at(criterion));
-    judged.push_back(judgeScore(conversation, criterion) >= 0.5 ? 1 : 0);
-  }
-  return cohenKappa(human, judged);
-}
-
-std::map<std::string, double> evaluate(const std::string& version) {
-  const auto sample = gtx.sample(version, kSampleSize);
-  std::map<std::string, double> sums;
-  for (const auto& conversation : sample) {
-    if (!validateSchema(conversation.toolCalls)) continue;
-    for (const auto& criterion : kCriteria) sums[criterion] += judgeScore(conversation, criterion);
+// Whether a candidate prompt or model version may ship, judged on the ground-truth set.
+evals::Decision gate(const std::string& version) {
+  std::map<std::string, std::vector<double>> scores;
+  std::map<std::string, std::vector<int>> judged, human;  // labels on the human-labelled subset
+  for (const auto& conversation : gtx::sample(version, kSampleSize)) {
+    if (!valid(conversation)) {
+      for (const auto& c : evals::kCriteria) scores[c].push_back(0);  // procedural validation failed: no judge call
+      continue;
+    }
+    const std::string text = evals::transcript(conversation);
+    for (const auto& c : evals::kCriteria) {
+      grpc::ClientContext ctx;
+      ctx.set_deadline(std::chrono::system_clock::now() + kJudgeDeadline);
+      sidekickrpc::ScoreRequest request;
+      request.set_conversation_id(conversation.id);
+      request.set_criterion(c);
+      request.set_rubric(evals::kRubrics.at(c));
+      request.set_transcript(text);
+      sidekickrpc::ScoreReply reply;
+      const grpc::Status status = judge_stub->Score(&ctx, request, &reply);
+      if (!status.ok()) throw std::runtime_error("judge: " + status.error_message());
+      scores[c].push_back(reply.score());
+      if (const auto label = conversation.human_labels.find(c); label != conversation.human_labels.end()) {
+        judged[c].push_back(static_cast<int>(std::lround(reply.score())));
+        human[c].push_back(label->second);
+      }
+    }
   }
   std::map<std::string, double> means;
-  for (const auto& criterion : kCriteria) means[criterion] = sums[criterion] / static_cast<double>(sample.size());
-  return means;
-}
-
-bool gate(const std::string& version) {
-  for (const auto& criterion : kCriteria) {
-    const double kappa = calibrate(criterion);
-    if (kappa < kMinJudgeKappa) {
-      throw JudgeNotTrusted(criterion + " judge kappa " + std::to_string(kappa) + " < " + std::to_string(kMinJudgeKappa));
-    }
+  for (const auto& c : evals::kCriteria) {
+    double sum = 0;
+    for (double s : scores[c]) sum += s;
+    means[c] = sum / scores[c].size();
   }
-  const auto means = evaluate(version);
-  for (const auto& criterion : kCriteria) {
-    const double mean = means.at(criterion);
-    if (mean < kMinScore || mean < releases.baseline(criterion) - kMaxRegression) return false;
+  for (const auto& c : evals::kCriteria) {
+    if (evals::cohen_kappa(judged[c], human[c]) < kMinJudgeKappa) return {false, means, "the " + c + " judge disagrees with the labellers"};
   }
-  releases.record(version, means);
-  return true;
+  for (const auto& c : evals::kCriteria) {
+    if (means[c] < kMinScore) return {false, means, c + " is below the floor"};
+    if (means[c] < gtx::baseline(c) - kMaxRegression) return {false, means, c + " regressed from the baseline"};
+  }
+  gtx::record(version, means);
+  return {true, means, "ship"};
 }
 `,
     },
   },
-  debrief: `Evaluation differs from reassurance in where its numbers come from. The sample comes from a ground-truth set that mirrors what merchants ask, in numbers that can detect a regression. Each criterion has its own judge and rubric, scoring whole conversations, because the failure is usually a tool call several turns back. Every judge is calibrated against human labels with an agreement statistic; Shopify's judges went from a kappa of 0.02 to 0.61 against a human ceiling of 0.69, and until a judge clears that bar its score is not evidence. Procedural validation sits in front of the semantic judge because tag-hacking filters are caught by a schema check that costs nothing. The gate compares against the baseline rather than a feeling. Production pipelines add a merchant simulator and the test the source describes: swap a judge for a human at random and see whether anyone can tell.`,
+  harness: {
+    python: `import merchant_agent_pb2
+import merchant_agent_pb2_grpc
+from sidekick import config, evals, judge
+
+BASELINE = {"correctness": "0.95", "schema_compliance": "1.0", "helpfulness": "0.95"}
+
+
+class JudgePeer(merchant_agent_pb2_grpc.JudgeServicer):
+    """The stand-in judges (sidekick.judge); rubber_stamp makes them score everything 1.0."""
+
+    def __init__(self):
+        self.rubber_stamp = False
+
+    def Score(self, request, context):
+        if self.rubber_stamp:
+            return merchant_agent_pb2.ScoreReply(score=1.0)
+        return merchant_agent_pb2.ScoreReply(score=judge.score(request.criterion, request.rubric, request.transcript))
+
+
+def _world(ctx):
+    peer = JudgePeer()
+    ctx.grpc.serve(merchant_agent_pb2_grpc.add_JudgeServicer_to_server, peer, config.JUDGE_ADDR)
+    ctx.redis.hset("gtx:baseline", mapping=BASELINE)
+    return ctx.load("judge_gate"), peer
+
+
+def _scored(ctx):
+    return [call.request for call in ctx.grpc.calls_to("Score")]
+
+
+def check_full_sample(ctx):
+    m, _ = _world(ctx)
+    m.gate("v-good")
+    ids = {r.conversation_id for r in _scored(ctx)}
+    assert len(ids) == 200, f"the gate judged {len(ids)} conversations: five cannot tell a two-point regression from noise; judge SAMPLE_SIZE = 200"
+
+
+def check_judge_per_criterion(ctx):
+    m, _ = _world(ctx)
+    m.gate("v-good")
+    requests = _scored(ctx)
+    assert requests, "the gate never called the judge"
+    for r in requests:
+        assert r.criterion in evals.CRITERIA, f"Score was called with criterion {r.criterion!r}: one judge per criterion in {evals.CRITERIA}"
+        assert r.rubric == evals.RUBRICS[r.criterion], f"the {r.criterion} judge got the rubric {r.rubric!r}, not RUBRICS[{r.criterion!r}]"
+        assert r.transcript.startswith("merchant:") and r.transcript.count("\\n") >= 3, f"the judge saw {r.transcript!r}: it must read the whole conversation, where a wrong tool call two turns back shows"
+    per_conversation = {}
+    for r in requests:
+        per_conversation.setdefault(r.conversation_id, set()).add(r.criterion)
+    partial = [cid for cid, seen in per_conversation.items() if seen != set(evals.CRITERIA)]
+    assert not partial, f"conversations judged on fewer than all three criteria: {partial[:3]}"
+    timeouts = {call.timeout for call in ctx.grpc.calls_to("Score")}
+    assert None not in timeouts and max(timeouts) <= 15.5, f"every Score call carries a deadline of at most 15 s, saw {sorted(timeouts, key=str)[:3]}"
+
+
+def check_calibrated_judges(ctx):
+    m, peer = _world(ctx)
+    peer.rubber_stamp = True
+    decision = m.gate("v-good")
+    assert decision.ship is False, f"a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway: {decision}"
+    assert not ctx.redis.exists("gtx:release:v-good"), "a refused release must record nothing"
+    peer.rubber_stamp = False
+    decision = m.gate("v-good")
+    assert decision.ship is True, f"with judges that agree with the labellers v-good ships: {decision}"
+
+
+def check_schema_first(ctx):
+    m, _ = _world(ctx)
+    decision = m.gate("v-tag")
+    tagged = sorted({r.conversation_id for r in _scored(ctx) if int(r.conversation_id.rsplit("-", 1)[1]) % 20 in (4, 8, 12, 16)})
+    assert not tagged, f"conversations that filter on customer_tags CONTAINS enabled reached the judge ({tagged[:3]}…): validate_schema runs first and they score 0"
+    assert decision.ship is False, f"a fifth of v-tag's segments use a tag as a status and v-tag shipped: {decision}"
+
+
+def check_ship_decision(ctx):
+    m, _ = _world(ctx)
+    early = m.gate("v-early")
+    assert early.ship is False, f"v-early's correctness is 0.65, under MIN_SCORE = 0.8, and it shipped: {early}"
+    regress = m.gate("v-regress")
+    assert regress.ship is False, f"v-regress's helpfulness is 0.90 against a baseline of 0.95 (MAX_REGRESSION = 0.02) and it shipped: {regress}"
+    good = m.gate("v-good")
+    assert good.ship is True, f"v-good matches the baseline and must ship: {good}"
+    recorded = ctx.redis.hgetall("gtx:release:v-good")
+    assert set(recorded) == set(evals.CRITERIA) and abs(float(recorded["correctness"]) - 0.95) < 1e-6, f"a shipped version records its mean per criterion: {recorded}"
+    assert not ctx.redis.exists("gtx:release:v-early") and not ctx.redis.exists("gtx:release:v-regress"), "a refused version must record nothing"
+`,
+    typescript: `const BASELINE = {correctness: '0.95', schema_compliance: '1.0', helpfulness: '0.95'};
+
+/** The stand-in judges (sidekick/judge), the baseline seeded, the learner's module. */
+function world(ctx) {
+  const {sidekickrpc} = ctx.proto('merchant_agent.proto');
+  const config = ctx.load('/support/sidekick/config.ts');
+  const judge = ctx.load('/support/sidekick/judge.ts');
+  const evals = ctx.load('/support/sidekick/evals.ts');
+  const peer = {rubberStamp: false};
+  ctx.grpc.serve(sidekickrpc.Judge.service, {
+    Score(call, callback) {
+      if (peer.rubberStamp) return callback(null, {score: 1});
+      return callback(null, {score: judge.score(call.request.criterion, call.request.rubric, call.request.transcript)});
+    },
+  }, config.JUDGE_ADDR);
+  ctx.redis.hset('gtx:baseline', BASELINE);
+  return {m: ctx.load('judge_gate'), peer, evals};
+}
+
+const scored = ctx => ctx.grpc.callsTo('Score').map(call => call.request);
+
+export async function check_full_sample(ctx) {
+  const {m} = world(ctx);
+  await m.gate('v-good');
+  const ids = new Set(scored(ctx).map(r => r.conversation_id));
+  assert.equal(ids.size, 200, \`the gate judged \${ids.size} conversations: five cannot tell a two-point regression from noise; judge SAMPLE_SIZE = 200\`);
+}
+
+export async function check_judge_per_criterion(ctx) {
+  const {m, evals} = world(ctx);
+  await m.gate('v-good');
+  const requests = scored(ctx);
+  assert(requests.length > 0, 'the gate never called the judge');
+  for (const r of requests) {
+    assert(evals.CRITERIA.includes(r.criterion), \`Score was called with criterion \${JSON.stringify(r.criterion)}: one judge per criterion in \${JSON.stringify(evals.CRITERIA)}\`);
+    assert.equal(r.rubric, evals.RUBRICS[r.criterion], \`the \${r.criterion} judge got the rubric \${JSON.stringify(r.rubric)}, not RUBRICS[\${r.criterion}]\`);
+    assert(r.transcript.startsWith('merchant:') && r.transcript.split('\\n').length >= 4, \`the judge saw \${JSON.stringify(r.transcript)}: it must read the whole conversation, where a wrong tool call two turns back shows\`);
+  }
+  const seen: Record<string, string[]> = {};
+  for (const r of requests) (seen[r.conversation_id] ??= []).push(r.criterion);
+  const partial = Object.entries(seen).filter(([, cs]) => new Set(cs).size !== evals.CRITERIA.length).map(([id]) => id);
+  assert.deepEqual(partial, [], \`conversations judged on fewer than all three criteria: \${JSON.stringify(partial.slice(0, 3))}\`);
+  const timeouts = ctx.grpc.callsTo('Score').map(call => call.timeout);
+  assert(timeouts.every(t => t !== null && t <= 15.5), \`every Score call carries a deadline of at most 15 s, saw \${JSON.stringify(timeouts.slice(0, 3))}\`);
+}
+
+export async function check_calibrated_judges(ctx) {
+  const {m, peer} = world(ctx);
+  peer.rubberStamp = true;
+  let decision = await m.gate('v-good');
+  assert.equal(decision.ship, false, \`a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway: \${JSON.stringify(decision)}\`);
+  assert.equal(ctx.redis.exists('gtx:release:v-good'), 0, 'a refused release must record nothing');
+  peer.rubberStamp = false;
+  decision = await m.gate('v-good');
+  assert.equal(decision.ship, true, \`with judges that agree with the labellers v-good ships: \${JSON.stringify(decision)}\`);
+}
+
+export async function check_schema_first(ctx) {
+  const {m} = world(ctx);
+  const decision = await m.gate('v-tag');
+  const tagged = [...new Set(scored(ctx).map(r => r.conversation_id))].filter(id => [4, 8, 12, 16].includes(Number(id.split('-').pop()) % 20));
+  assert.deepEqual(tagged, [], \`conversations that filter on customer_tags CONTAINS enabled reached the judge (\${JSON.stringify(tagged.slice(0, 3))}…): validateSchema runs first and they score 0\`);
+  assert.equal(decision.ship, false, \`a fifth of v-tag's segments use a tag as a status and v-tag shipped: \${JSON.stringify(decision)}\`);
+}
+
+export async function check_ship_decision(ctx) {
+  const {m, evals} = world(ctx);
+  const early = await m.gate('v-early');
+  assert.equal(early.ship, false, \`v-early's correctness is 0.65, under MIN_SCORE = 0.8, and it shipped: \${JSON.stringify(early)}\`);
+  const regress = await m.gate('v-regress');
+  assert.equal(regress.ship, false, \`v-regress's helpfulness is 0.90 against a baseline of 0.95 (MAX_REGRESSION = 0.02) and it shipped: \${JSON.stringify(regress)}\`);
+  const good = await m.gate('v-good');
+  assert.equal(good.ship, true, \`v-good matches the baseline and must ship: \${JSON.stringify(good)}\`);
+  const recorded = ctx.redis.hgetall('gtx:release:v-good');
+  assert(Object.keys(recorded).sort().join() === [...evals.CRITERIA].sort().join() && Math.abs(Number(recorded.correctness) - 0.95) < 1e-6, \`a shipped version records its mean per criterion: \${JSON.stringify(recorded)}\`);
+  assert(ctx.redis.exists('gtx:release:v-early') === 0 && ctx.redis.exists('gtx:release:v-regress') === 0, 'a refused version must record nothing');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+
+	"sidekick/config"
+	"sidekick/evals"
+	"sidekick/judge"
+	pb "sidekickrpc/gen/merchant_agent"
+
+	"leetbuild/harness"
+)
+
+// gatePeer is the stand-in judges (sidekick/judge); rubberStamp makes them score everything 1.0.
+type gatePeer struct {
+	pb.UnimplementedJudgeServer
+	rubberStamp bool
+}
+
+func (p *gatePeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
+	if p.rubberStamp {
+		return &pb.ScoreReply{Score: 1}, nil
+	}
+	return &pb.ScoreReply{Score: judge.Score(req.GetCriterion(), req.GetRubric(), req.GetTranscript())}, nil
+}
+
+func gateWorld(ctx *harness.Ctx) *gatePeer {
+	peer := &gatePeer{}
+	pb.RegisterJudgeServer(ctx.GRPC.Server(config.JudgeAddr), peer)
+	ctx.Redis.Do("HSET", "gtx:baseline", "correctness", "0.95", "schema_compliance", "1.0", "helpfulness", "0.95")
+	return peer
+}
+
+func gateRun(ctx *harness.Ctx, version string) evals.Decision {
+	d, err := gate(context.Background(), version)
+	ctx.NoError(err, "gate(%q)", version)
+	return d
+}
+
+func gateScored(ctx *harness.Ctx) []*pb.ScoreRequest {
+	out := []*pb.ScoreRequest{}
+	for _, c := range ctx.GRPC.CallsTo("Score", "") {
+		req, _ := c.Request.(*pb.ScoreRequest)
+		out = append(out, req)
+	}
+	return out
+}
+
+func CheckFullSample(ctx *harness.Ctx) {
+	gateWorld(ctx)
+	gateRun(ctx, "v-good")
+	ids := map[string]bool{}
+	for _, r := range gateScored(ctx) {
+		ids[r.GetConversationId()] = true
+	}
+	ctx.Equal(len(ids), 200, "five conversations cannot tell a two-point regression from noise; judge sampleSize = 200; conversations judged")
+}
+
+func CheckJudgePerCriterion(ctx *harness.Ctx) {
+	gateWorld(ctx)
+	gateRun(ctx, "v-good")
+	requests := gateScored(ctx)
+	ctx.Assert(len(requests) > 0, "the gate never called the judge")
+	seen := map[string]map[string]bool{}
+	for _, r := range requests {
+		rubric, known := evals.Rubrics[r.GetCriterion()]
+		ctx.Assert(known, "Score was called with criterion %q: one judge per criterion in %v", r.GetCriterion(), evals.Criteria)
+		ctx.Equal(r.GetRubric(), rubric, "the %s judge's rubric must be evals.Rubrics[%q]", r.GetCriterion(), r.GetCriterion())
+		ctx.Assert(strings.HasPrefix(r.GetTranscript(), "merchant:") && strings.Count(r.GetTranscript(), "\\n") >= 3, "the judge saw %q: it must read the whole conversation, where a wrong tool call two turns back shows", r.GetTranscript())
+		if seen[r.GetConversationId()] == nil {
+			seen[r.GetConversationId()] = map[string]bool{}
+		}
+		seen[r.GetConversationId()][r.GetCriterion()] = true
+	}
+	for id, cs := range seen {
+		ctx.Equal(len(cs), len(evals.Criteria), "conversation %s must be judged on every criterion; criteria", id)
+	}
+	for _, c := range ctx.GRPC.CallsTo("Score", "") {
+		ctx.Assert(c.HasDeadline() && c.Timeout.Seconds() <= 15.5, "every Score call carries a deadline of at most 15 s, one carried %v", c.Timeout)
+	}
+}
+
+func CheckCalibratedJudges(ctx *harness.Ctx) {
+	peer := gateWorld(ctx)
+	peer.rubberStamp = true
+	d := gateRun(ctx, "v-good")
+	ctx.Assert(!d.Ship, "a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway: %+v", d)
+	ctx.Equal(ctx.Redis.Exists("gtx:release:v-good"), int64(0), "a refused release must record nothing; gtx:release:v-good exists")
+	peer.rubberStamp = false
+	d = gateRun(ctx, "v-good")
+	ctx.Assert(d.Ship, "with judges that agree with the labellers v-good ships: %+v", d)
+}
+
+func CheckSchemaFirst(ctx *harness.Ctx) {
+	gateWorld(ctx)
+	d := gateRun(ctx, "v-tag")
+	tagged := []string{}
+	for _, r := range gateScored(ctx) {
+		parts := strings.Split(r.GetConversationId(), "-")
+		i, _ := strconv.Atoi(parts[len(parts)-1])
+		if p := i % 20; p == 4 || p == 8 || p == 12 || p == 16 {
+			tagged = append(tagged, r.GetConversationId())
+		}
+	}
+	sort.Strings(tagged)
+	ctx.Equal(len(tagged), 0, "conversations that filter on customer_tags CONTAINS enabled reached the judge (%v): evals.ValidateSchema runs first and they score 0", tagged)
+	ctx.Assert(!d.Ship, "a fifth of v-tag's segments use a tag as a status and v-tag shipped: %+v", d)
+}
+
+func CheckShipDecision(ctx *harness.Ctx) {
+	gateWorld(ctx)
+	early := gateRun(ctx, "v-early")
+	ctx.Assert(!early.Ship, "v-early's correctness is 0.65, under minScore = 0.8, and it shipped: %+v", early)
+	regress := gateRun(ctx, "v-regress")
+	ctx.Assert(!regress.Ship, "v-regress's helpfulness is 0.90 against a baseline of 0.95 (maxRegression = 0.02) and it shipped: %+v", regress)
+	good := gateRun(ctx, "v-good")
+	ctx.Assert(good.Ship, "v-good matches the baseline and must ship: %+v", good)
+	recorded := ctx.Redis.HGetAll("gtx:release:v-good")
+	correctness, _ := strconv.ParseFloat(recorded["correctness"], 64)
+	ctx.Assert(len(recorded) == len(evals.Criteria) && math.Abs(correctness-0.95) < 1e-6, "a shipped version records its mean per criterion: %v", recorded)
+	ctx.Assert(ctx.Redis.Exists("gtx:release:v-early", "gtx:release:v-regress") == 0, "a refused version must record nothing")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "merchant_agent.grpc.pb.h"
+#include "sidekick/config.h"
+#include "sidekick/evals.h"
+#include "sidekick/judge.h"
+
+namespace {
+
+// The stand-in judges (sidekick/judge.h); rubber_stamp makes them score everything 1.0.
+class GatePeer final : public sidekickrpc::Judge::Service {
+ public:
+  bool rubber_stamp = false;
+  grpc::Status Score(grpc::ServerContext*, const sidekickrpc::ScoreRequest* req, sidekickrpc::ScoreReply* reply) override {
+    reply->set_score(rubber_stamp ? 1.0 : judge::score(req->criterion(), req->rubric(), req->transcript()));
+    return grpc::Status::OK;
+  }
+};
+
+GatePeer& gateWorld(harness::Ctx& ctx) {
+  static GatePeer* peer = nullptr;
+  delete peer;
+  peer = new GatePeer;
+  ctx.GRPC.Server(config::kJudgeAddr)->RegisterService(peer);
+  ctx.Redis.Do("HSET", "gtx:baseline", "correctness", "0.95", "schema_compliance", "1.0", "helpfulness", "0.95");
+  return *peer;
+}
+
+std::vector<sidekickrpc::ScoreRequest> gateScored(harness::Ctx& ctx) {
+  std::vector<sidekickrpc::ScoreRequest> out;
+  for (const auto& c : ctx.GRPC.CallsTo("Score")) out.push_back(c.Request<sidekickrpc::ScoreRequest>());
+  return out;
+}
+
+}  // namespace
+
+void CheckFullSample(harness::Ctx& ctx) {
+  gateWorld(ctx);
+  gate("v-good");
+  std::set<std::string> ids;
+  for (const auto& r : gateScored(ctx)) ids.insert(r.conversation_id());
+  ctx.Equal(ids.size(), 200, "five conversations cannot tell a two-point regression from noise; judge kSampleSize = 200; conversations judged");
+}
+
+void CheckJudgePerCriterion(harness::Ctx& ctx) {
+  gateWorld(ctx);
+  gate("v-good");
+  const auto requests = gateScored(ctx);
+  ctx.Assert(!requests.empty(), "the gate never called the judge");
+  std::map<std::string, std::set<std::string>> seen;
+  for (const auto& r : requests) {
+    const auto rubric = evals::kRubrics.find(r.criterion());
+    ctx.Assert(rubric != evals::kRubrics.end(), "Score was called with criterion %q: one judge per criterion in %v", r.criterion(), evals::kCriteria);
+    ctx.Equal(r.rubric(), rubric->second, "the %s judge's rubric must be evals::kRubrics.at(%q)", r.criterion(), r.criterion());
+    const auto lines = std::count(r.transcript().begin(), r.transcript().end(), '\\n');
+    ctx.Assert(r.transcript().rfind("merchant:", 0) == 0 && lines >= 3, "the judge saw %q: it must read the whole conversation, where a wrong tool call two turns back shows", r.transcript());
+    seen[r.conversation_id()].insert(r.criterion());
+  }
+  for (const auto& [id, criteria] : seen) ctx.Equal(criteria.size(), evals::kCriteria.size(), "conversation %s must be judged on every criterion; criteria", id);
+  for (const auto& c : ctx.GRPC.CallsTo("Score")) {
+    ctx.Assert(c.HasDeadline() && c.TimeoutSeconds() <= 15.5, "every Score call carries a deadline of at most 15 s, one carried %vs", c.TimeoutSeconds());
+  }
+}
+
+void CheckCalibratedJudges(harness::Ctx& ctx) {
+  auto& peer = gateWorld(ctx);
+  peer.rubber_stamp = true;
+  auto d = gate("v-good");
+  ctx.Assert(!d.ship, "a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway (%s)", d.reason);
+  ctx.Equal(ctx.Redis.Exists("gtx:release:v-good"), 0, "a refused release must record nothing; gtx:release:v-good exists");
+  peer.rubber_stamp = false;
+  d = gate("v-good");
+  ctx.Assert(d.ship, "with judges that agree with the labellers v-good ships (%s)", d.reason);
+}
+
+void CheckSchemaFirst(harness::Ctx& ctx) {
+  gateWorld(ctx);
+  const auto d = gate("v-tag");
+  std::vector<std::string> tagged;
+  for (const auto& r : gateScored(ctx)) {
+    const std::string& id = r.conversation_id();
+    const int p = std::atoi(id.substr(id.rfind('-') + 1).c_str()) % 20;
+    if (p == 4 || p == 8 || p == 12 || p == 16) tagged.push_back(id);
+  }
+  ctx.Equal(tagged.size(), 0, "conversations that filter on customer_tags CONTAINS enabled reached the judge (%v): evals::validate_schema runs first and they score 0", tagged);
+  ctx.Assert(!d.ship, "a fifth of v-tag's segments use a tag as a status and v-tag shipped (%s)", d.reason);
+}
+
+void CheckShipDecision(harness::Ctx& ctx) {
+  gateWorld(ctx);
+  const auto early = gate("v-early");
+  ctx.Assert(!early.ship, "v-early's correctness is 0.65, under kMinScore = 0.8, and it shipped (%s)", early.reason);
+  const auto regress = gate("v-regress");
+  ctx.Assert(!regress.ship, "v-regress's helpfulness is 0.90 against a baseline of 0.95 (kMaxRegression = 0.02) and it shipped (%s)", regress.reason);
+  const auto good = gate("v-good");
+  ctx.Assert(good.ship, "v-good matches the baseline and must ship (%s)", good.reason);
+  const auto recorded = ctx.Redis.HGetAll("gtx:release:v-good");
+  const auto correctness = recorded.find("correctness");
+  ctx.Assert(recorded.size() == evals::kCriteria.size() && correctness != recorded.end() && std::fabs(std::strtod(correctness->second.c_str(), nullptr) - 0.95) < 1e-6,
+             "a shipped version records its mean per criterion: %v", recorded);
+  ctx.Equal(ctx.Redis.Exists("gtx:release:v-early", "gtx:release:v-regress"), 0, "a refused version must record nothing; refused releases recorded");
+}
+`,
+  },
+  hints: [
+    'Symptom: a prompt change that broke one tool in five shipped on a green gate, and the gate is just as green when the judge prompt is replaced by "score everything 1".',
+    'Mechanism: five conversations, one judge asked a 0-10 question about the last turn, no comparison with the human labels, no schema check before the judge, and a threshold of 0.5 with no baseline.',
+    'Change: `gtx.sample(version, SAMPLE_SIZE)` with 200; per valid conversation one `Score` per criterion with `RUBRICS[c]`, `transcript(conversation)` and `timeout=JUDGE_DEADLINE_S`; score invalid ones 0; `cohen_kappa` per criterion before trusting means; floor plus baseline regression.',
+  ],
+  debrief: `The gate is only as trustworthy as its weakest measurement, so each fix removes one way to be fooled. Two hundred conversations make a two-point drop visible; a judge per criterion with its own rubric turns "looks fine" into three questions a human labeller also answered; kappa against those labels is the evidence that the judge's 0.95 means what a person's would. Validating the schema first is cheap and catches the failure the judge reads past, a tag used as a status. The regression limit compares with the last release, not with an absolute bar. A production gate also replays conversations through a merchant simulator, stratifies the sample by page and tool, and re-measures kappa whenever the judge prompt or model changes.`,
 };

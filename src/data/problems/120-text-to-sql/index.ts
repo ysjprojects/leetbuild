@@ -1,20 +1,23 @@
 import {UBER} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {queryEndpointStep} from './steps/1-query-endpoint';
 import {decisionCacheStep} from './steps/2-decision-cache';
 import {agentChainStep} from './steps/3-agent-chain';
 import {runGuardStep} from './steps/4-run-guard';
 import {feedbackEvalStep} from './steps/5-feedback-eval';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Uber's QueryGPT: not "ask a model for SQL", but the service around the agents that makes the
  * SQL safe to run. A validated, idempotent query endpoint that resolves a workspace and proposes
  * tables for the user's ACK → a Redis layer that caches decisions by workspace and normalised
- * question, reserves a per-user budget atomically and expires pending ACKs → the agent chain under
- * per-call deadlines with column pruning before generation and defensively parsed output → a run
- * endpoint that never executes generated SQL as-is → a feedback topic carrying the evaluation
- * signals, aggregated per workspace before the commit.
+ * question and reserves a per-user budget in one script → the agent chain under per-call deadlines
+ * with column pruning before generation and defensively parsed output → a run endpoint that guards
+ * generated SQL before the warehouse sees it → a feedback topic carrying the evaluation signals,
+ * aggregated per workspace before the commit. The agents and the warehouse are deterministic
+ * stand-ins the harness serves over gRPC.
  */
 export const textToSqlProblem: Problem = {
   id: 'text-to-sql',
@@ -63,23 +66,22 @@ course's guards come from: per question they record intent accuracy, a table-ove
 \`status = "Finished"\` run cleanly and return nothing — and an LLM-judged similarity to the golden
 SQL, and their own dashboard shows a query failing repeatedly for a missing partition filter. The
 learnings name the rest: LLMs classify well when given one small job, hallucinated tables and
-columns remain unsolved, and five-word questions with typos need a prompt enhancer. Steps 1 and 2
-take the workspaces, the intent agent and the ACK; step 3 the deadlines, the pruning and the
-parsed output; step 4 the partition filter, the ACKed tables and the has-output signal; step 5 the
-evaluation signals themselves.
+columns remain unsolved, and five-word questions with typos need a prompt enhancer.
 
 ## What you build here
 
-One service, **querygen**:
+One service, **querygen**, on the \`querygen\` support package (\`config\`, the \`queries\` store, \`catalog\`
+DDL) and \`text_to_sql.proto\` (\`Agents\`, \`Warehouse\`; stand-ins in the checks):
 
-1. \`POST /v1/queries\`: capped question, allow-listed workspace, \`Idempotency-Key\`, **202** with
-   proposed tables.
-2. **Redis**: decisions cached per workspace and question, a per-user budget reserved by one Lua
-   \`EVAL\`, expiring ACKs.
-3. **gRPC** agents under deadlines, pruning over a token budget, defensive parsing.
-4. \`POST /v1/queries/{id}/run\`: one \`SELECT\` over ACKed tables, \`datestr\` filter, \`LIMIT 1000\`,
-   \`has_output\`.
-5. **Kafka** \`query.feedback\` keyed by user, and an \`eval\` consumer writing \`eval:{workspace}\`.
+1. \`POST /v1/queries\`: capped question, allow-listed workspace, \`Idempotency-Key\`, **202**
+   \`pending_ack\` with \`tables_proposed\`.
+2. **Redis**: \`decision:{workspace}:{sha256}\` for a day; \`budget:{user}\` reserved by one Lua script.
+3. **gRPC** \`generate_sql\`: deadlines, one retry on \`UNAVAILABLE\`, pruning over 24 000 tokens,
+   \`GenerationError\`.
+4. \`POST /v1/queries/{id}/run\`: one \`SELECT\`, ACKed tables, a \`datestr\` filter, \`LIMIT 1000\`, 60 s;
+   \`run_ok\` and \`has_output\` saved.
+5. **Kafka** \`query.feedback\` keyed by user, idempotent; the \`eval\` consumer writes \`eval:{workspace}\`,
+   then commits.
 
 ## The debugging habit
 
@@ -87,12 +89,13 @@ Debug each starter against the failure modes, fix it, and prove the fix with che
 
 ## Left out on purpose
 
-Embeddings, custom workspaces, the prompt enhancer, the validation agent and the LLM judge.`,
+The ACK endpoint, embeddings, custom workspaces, the prompt enhancer, the validation agent and the
+LLM judge.`,
   diagram: {
     nodes: [
       {id: 'analyst', kind: 'client', label: 'Query editor', sub: 'ask · ACK · run · rate', x: 6, y: 50},
       {id: 'api', kind: 'http', label: 'querygen API', sub: 'HTTPS :8443', x: 24, y: 50},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'decision · budget · pending', x: 44, y: 14},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'queries · decision · budget · eval', x: 44, y: 14},
       {id: 'agents', kind: 'grpc', label: 'Agents', sub: 'Intent · PickTables · PruneColumns · Generate', x: 44, y: 42},
       {id: 'workspaces', kind: 'db', label: 'Workspaces', sub: 'tables · samples · schemas', x: 66, y: 30},
       {id: 'warehouse', kind: 'db', label: 'Warehouse', sub: 'partitioned by datestr', x: 44, y: 70},
@@ -104,12 +107,19 @@ Embeddings, custom workspaces, the prompt enhancer, the validation agent and the
       {from: 'api', to: 'redis', kind: 'redis', label: 'EVAL · GET/SET EX'},
       {from: 'api', to: 'agents', kind: 'grpc', label: 'deadline 10 s / 30 s'},
       {from: 'agents', to: 'workspaces', kind: 'plain', label: 'tables · samples'},
-      {from: 'api', to: 'workspaces', kind: 'plain', label: 'schemas_for(tables)'},
-      {from: 'api', to: 'warehouse', kind: 'plain', label: 'guarded SELECT · LIMIT · timeout'},
+      {from: 'api', to: 'workspaces', kind: 'plain', label: 'schema_for(table)'},
+      {from: 'api', to: 'warehouse', kind: 'grpc', label: 'Execute · LIMIT 1000 · 60 s'},
       {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce query.feedback'},
       {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
       {from: 'consumer', to: 'redis', kind: 'redis', label: 'HINCRBY eval:{workspace}'},
     ],
   },
   steps: [queryEndpointStep, decisionCacheStep, agentChainStep, runGuardStep, feedbackEvalStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

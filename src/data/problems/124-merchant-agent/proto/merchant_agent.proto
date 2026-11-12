@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package sidekickrpc;
+
+// The model behind the agent loop (step 2): one unary call per turn of the loop, with a deadline.
+// The checks serve a deterministic stand-in at model:9000 (sidekick/model in the support modules).
+service Model {
+  rpc Complete(CompleteRequest) returns (CompleteReply);
+}
+
+// The admin's tools (step 3 calls them for the loop): reads, and one write that fills the product
+// form. The checks serve a stand-in at tools:9000 (sidekick/tools).
+service Tools {
+  rpc Invoke(InvokeRequest) returns (InvokeReply);
+}
+
+// One LLM judge per criterion (step 4). The checks serve a stand-in at judge:9000 (sidekick/judge).
+service Judge {
+  rpc Score(ScoreRequest) returns (ScoreReply);
+}
+
+// A tool as the model sees it: a name and a one-line description.
+message ToolSpec {
+  string name = 1;
+  string description = 2;
+}
+
+// One message of the conversation: role "user", "assistant" (a tool call, tool_name set) or
+// "tool" (a tool's result, or PERMISSION_DENIED, for tool_name).
+message Message {
+  string role = 1;
+  string content = 2;
+  string tool_name = 3;
+}
+
+message CompleteRequest {
+  string shop = 1;
+  string page = 2;
+  string system_prompt = 3;
+  repeated ToolSpec tools = 4;
+  repeated Message messages = 5;
+  // Just-in-time instructions: the guidance of the tool that ran in the previous turn, else "".
+  string instructions = 6;
+}
+
+// A tool call the model asks for; an empty name means the model answered instead.
+message ToolCall {
+  string name = 1;
+  string args_json = 2;
+}
+
+message CompleteReply {
+  string text = 1;
+  ToolCall tool_call = 2;
+}
+
+message InvokeRequest {
+  string shop = 1;
+  string turn_id = 2;
+  string name = 3;
+  string args_json = 4;
+}
+
+message InvokeReply {
+  string result_json = 1;
+}
+
+message ScoreRequest {
+  string conversation_id = 1;
+  string criterion = 2;
+  string rubric = 3;
+  string transcript = 4;
+}
+
+message ScoreReply {
+  double score = 1;
+}

@@ -8,41 +8,45 @@ export const guardEndpointsStep: Step = {
   focus: ['assistant', 'guard'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/guard/input\` and \`POST /v1/guard/output\`,
-parses \`{"text", "conversation_id"}\`, calls \`guard.evaluate(text, direction)\` and returns
-\`{allowed, tier}\`. The body also carries a \`skip_guard\` flag that short-circuits the call, and
-every request is logged with its text. It serves the demo and hides four flaws.
+**Starting point.** The starter serves \`POST /v1/guard/input\` and \`POST /v1/guard/output\` with a
+body \`{conversation_id, text, skip_guard}\`. It runs \`tiers.evaluate(text, POLICY_VERSION)\` (step
+2's tiers, provided as \`fhguard.tiers\`) and answers \`{direction, allowed, reasons, tier,
+policy_version}\`; \`skip_guard: true\` answers allowed without running a tier. It serves the demo
+and hides four flaws.
 
-**Failure mode the checks target.** The assistant calls the input route before the model sees the
-user's message and the output route before the answer reaches the user. A flag that skips the guard
-turns a legal control into a suggestion; a missing policy version lets two turns of one conversation
-be judged under different rules with no record of which; no size cap lets a 2 MB "message" reach the
-classifier; and user questions about protected classes end up in a log pipeline.
+**Failure mode the checks target.** An anonymous caller uses the guard as a free classifier; a
+caller that sets \`skip_guard\` turns a legal control into a suggestion; every request is judged
+under one hard-coded policy whatever version the conversation pinned; and a 200 KB "message" goes
+straight to the classifier.
 
-- Identify the caller by \`X-Api-Key\` via \`api_keys.caller(...)\`; missing or unknown is **401**.
-- Require \`X-Policy-Version\` matching \`POLICY_VERSION_RE\` (\`fh-YYYY-MM-DD[.n]\`, **400**
-  otherwise), pass it to \`evaluate\` and echo it as \`policy_version\`.
-- \`conversation_id\` must match \`CONVERSATION_ID_RE\` (\`[A-Za-z0-9_-]{1,64}\`, **400**); \`text\`
-  is non-empty (**400**) and at most \`MAX_TEXT_BYTES\` (\`1 << 13\` bytes of UTF-8, **413**).
-- Return \`{allowed, reasons, tier, policy_version}\`; remove \`skip_guard\` entirely.
-- Log direction, conversation, verdict, tier and policy version, not the text.`,
+- Identify the caller with \`store.caller\` on \`X-Api-Key\`: missing or unknown is **401**, before
+  any tier runs.
+- \`X-Policy-Version\` is required and matches \`fh-YYYY-MM-DD[.n]\` (**400** otherwise); evaluate
+  under it and echo it as \`policy_version\`.
+- \`conversation_id\` matches \`[A-Za-z0-9_-]{1,64}\` (**400**); \`text\` is at most
+  \`MAX_TEXT_BYTES\` = 8 KiB of UTF-8 (**413**). Both are checked before any tier.
+- No field of the body can skip the guard.`,
   sequence: {
     participants: ['Assistant', 'fhguard', 'Guard tiers'],
     messages: [
       {from: 'Assistant', to: 'fhguard', label: 'POST /v1/guard/input · X-Api-Key · X-Policy-Version', kind: 'sync'},
-      {from: 'fhguard', to: 'fhguard', label: 'validate key · version · conversation_id · 8 KiB cap', kind: 'sync'},
-      {from: 'fhguard', to: 'Guard tiers', label: 'evaluate(text, "input", policy_version)', kind: 'sync'},
+      {from: 'fhguard', to: 'fhguard', label: 'store.caller(key) → 401 · version → 400 · 8 KiB → 413', kind: 'sync'},
+      {from: 'fhguard', to: 'Guard tiers', label: 'evaluate(text, policy_version)', kind: 'sync'},
       {from: 'Guard tiers', to: 'fhguard', label: 'Decision{allowed, tier, reasons}', kind: 'reply'},
-      {from: 'fhguard', to: 'Assistant', label: '200 {allowed, reasons, tier, policy_version}', kind: 'reply'},
-      {from: 'Assistant', to: 'fhguard', label: 'POST /v1/guard/output · same headers', kind: 'sync'},
-      {from: 'fhguard', to: 'Assistant', label: '200 {allowed: false, reasons, tier, policy_version}', kind: 'reply'},
+      {
+        from: 'fhguard',
+        to: 'Assistant',
+        label: '200 {direction, allowed, reasons, tier, policy_version}',
+        kind: 'reply',
+      },
     ],
   },
   checks: [
     {
       id: 'routes',
-      title: 'Handles both guard routes',
-      detail: 'Register `POST /v1/guard/input` and `POST /v1/guard/output`.',
+      title: 'Serves both guard routes',
+      detail:
+        'Register `POST /v1/guard/input` and `POST /v1/guard/output`; each answers the tiers’ decision as `{direction, allowed, reasons, tier, policy_version}`.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/guard\/input["']/, /@app\.post\(\s*["']\/v1\/guard\/output["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/guard\/input['"]/, /app\.post\(\s*['"]\/v1\/guard\/output['"]/]},
@@ -51,7 +55,6 @@ classifier; and user questions about protected classes end up in a log pipeline.
           all: [
             /path\(\s*"v1"\s*\/\s*"guard"\s*\/\s*"input"\s*\)/,
             /path\(\s*"v1"\s*\/\s*"guard"\s*\/\s*"output"\s*\)/,
-            /\bpost\s*\{/,
           ],
         },
         cpp: {all: [/svr\.Post\(\s*"\/v1\/guard\/input"/, /svr\.Post\(\s*"\/v1\/guard\/output"/]},
@@ -59,281 +62,245 @@ classifier; and user questions about protected classes end up in a log pipeline.
     },
     {
       id: 'api-key',
-      title: 'Requires a known X-Api-Key',
+      title: 'A missing or unknown X-Api-Key is 401 before any tier',
       detail:
-        'The caller is identified by `X-Api-Key` and looked up in the key store; a missing or unknown key is **401**. The starter serves anonymous callers.',
+        'The caller is looked up with `store.caller` on `X-Api-Key` before the tiers run; a missing or unknown key answers **401** and reaches no classifier.',
       match: {
-        python: {all: [/X-Api-Key/, /api_keys\.caller\(/, /status_code\s*=\s*401/]},
-        typescript: {all: [/x-api-key/, /apiKeys\.caller\(/, /code\(\s*401\s*\)/]},
-        go: {all: [/X-Api-Key/, /apiKeys\.Caller\(/, /StatusUnauthorized/]},
-        scala: {all: [/X-Api-Key/, /apiKeys\.caller\(/, /StatusCodes\.Unauthorized/]},
-        cpp: {all: [/X-Api-Key/, /apiKeys\.caller\(/, /\b401\b/]},
-      },
-    },
-    {
-      id: 'caps',
-      title: 'Enforces the 8 KiB text cap and the conversation_id format',
-      detail:
-        'Text over `1 << 13` bytes is **413**; a `conversation_id` outside `[A-Za-z0-9_-]{1,64}` is **400**. The starter forwards anything to the tiers.',
-      match: {
-        python: {all: [/MAX_TEXT_BYTES/, /CONVERSATION_ID_RE/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_TEXT_BYTES/, /CONVERSATION_ID_RE/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxTextBytes/, /conversationIDRe/, /StatusRequestEntityTooLarge/, /StatusBadRequest/]},
-        scala: {
-          all: [/MaxTextBytes/, /ConversationIdRe/, /StatusCodes\.RequestEntityTooLarge/, /StatusCodes\.BadRequest/],
+        python: {all: [/x-api-key/i, /store\.caller\(/, /\b401\b/], order: [/store\.caller\(/, /tiers\.evaluate\(/]},
+        typescript: {all: [/x-api-key/i, /\bcaller\(/, /\b401\b/], order: [/\bcaller\(/, /\bevaluate\(/]},
+        go: {
+          all: [/X-Api-Key/i, /store\.Caller\(/, /StatusUnauthorized|\b401\b/],
+          order: [/store\.Caller\(/, /tiers\.Evaluate\(/],
         },
-        cpp: {all: [/kMaxTextBytes/, /kConversationIdRe/, /\b413\b/, /\b400\b/]},
+        scala: {
+          all: [/X-Api-Key/i, /Store\.caller/, /Unauthorized|\b401\b/],
+          order: [/Store\.caller/, /Tiers\.evaluate\(/],
+        },
+        cpp: {all: [/X-Api-Key/i, /store::caller\(/, /\b401\b/], order: [/store::caller\(/, /tiers::evaluate\(/]},
       },
     },
     {
       id: 'policy-version',
-      title: 'Requires X-Policy-Version and echoes it',
+      title: 'Judges under the pinned X-Policy-Version and echoes it',
       detail:
-        'The pinned `X-Policy-Version` is required and validated, passed to the tiers, and returned as `policy_version`. The starter has no notion of a policy version, so a conversation can be judged under two policies and the audit cannot say which.',
+        '`X-Policy-Version` is required and validated against `fh-YYYY-MM-DD[.n]` (**400** otherwise), passed to `evaluate` and echoed as `policy_version`; the starter evaluates every request under its own constant.',
       match: {
-        python: {all: [/X-Policy-Version/, /POLICY_VERSION_RE/, /policy_version/]},
-        typescript: {all: [/x-policy-version/, /POLICY_VERSION_RE/, /policy_version/]},
-        go: {all: [/X-Policy-Version/, /policyVersionRe/, /policy_version/]},
-        scala: {all: [/X-Policy-Version/, /PolicyVersionRe/, /policy_version/]},
-        cpp: {all: [/X-Policy-Version/, /kPolicyVersionRe/, /policy_version/]},
+        python: {all: [/x-policy-version/i, /POLICY_VERSION_RE/, /\b400\b/], none: [/evaluate\([^)]*POLICY_VERSION\)/]},
+        typescript: {
+          all: [/x-policy-version/i, /POLICY_VERSION_RE/, /\b400\b/],
+          none: [/evaluate\([^)]*POLICY_VERSION\)/],
+        },
+        go: {
+          all: [/X-Policy-Version/i, /policyVersionRe/, /StatusBadRequest|\b400\b/],
+          none: [/Evaluate\([^\n]*,\s*policyVersion\)/],
+        },
+        scala: {
+          all: [/X-Policy-Version/i, /PolicyVersionRe/, /BadRequest|\b400\b/],
+          none: [/evaluate\([^)]*,\s*PolicyVersion\)/],
+        },
+        cpp: {all: [/X-Policy-Version/i, /kPolicyVersionRe/, /\b400\b/], none: [/evaluate\([^\n]*kPolicyVersion\)/]},
+      },
+    },
+    {
+      id: 'caps',
+      title: 'Caps text at 8 KiB of UTF-8 and validates conversation_id',
+      detail:
+        'Text over `MAX_TEXT_BYTES` (8 KiB, counted in UTF-8 bytes) is **413** and a `conversation_id` outside `[A-Za-z0-9_-]{1,64}` is **400**, both before any tier runs.',
+      match: {
+        python: {
+          all: [/MAX_TEXT_BYTES/, /\.encode\(/, /\b413\b/, /CONVERSATION_ID_RE/],
+          order: [/\b413\b/, /tiers\.evaluate\(/],
+        },
+        typescript: {
+          all: [/MAX_TEXT_BYTES/, /TextEncoder|Buffer\.byteLength/, /\b413\b/, /CONVERSATION_ID_RE/],
+          order: [/\b413\b/, /\bevaluate\(/],
+        },
+        go: {
+          all: [/maxTextBytes/, /StatusRequestEntityTooLarge|\b413\b/, /conversationIDRe/],
+          order: [/StatusRequestEntityTooLarge|\b413\b/, /tiers\.Evaluate\(/],
+        },
+        scala: {
+          all: [
+            /MaxTextBytes/,
+            /getBytes\(/,
+            /PayloadTooLarge|RequestEntityTooLarge|ContentTooLarge|\b413\b/,
+            /ConversationIdRe/,
+          ],
+          order: [/PayloadTooLarge|\b413\b/, /Tiers\.evaluate\(/],
+        },
+        cpp: {all: [/kMaxTextBytes/, /\b413\b/, /kConversationIdRe/], order: [/\b413\b/, /tiers::evaluate\(/]},
       },
     },
     {
       id: 'no-bypass',
-      title: 'No caller can skip the guard; the text is never logged',
+      title: 'No caller can skip the guard',
       detail:
-        'There is no `skip_guard` flag: every request is evaluated and the response carries `reasons`. The log line names direction, conversation, verdict and policy — never the text. The starter honours `skip_guard` and logs the text on every request.',
+        'Every request with a valid key, version and body runs the tiers; nothing in the body, such as the starter’s `skip_guard`, decides whether they run.',
       match: {
-        python: {all: [/reasons/, /logger\.info\(/], none: [/skip_guard/, /logger\.\w+\([^)]*text/]},
-        typescript: {all: [/reasons/, /\.log\.info\(/], none: [/skip_guard/, /log\.\w+\([^)]*text/]},
-        go: {all: [/reasons/, /log\.Printf\(/], none: [/SkipGuard|skip_guard/, /log\.\w+\([^)]*[Tt]ext/]},
-        scala: {all: [/reasons/, /log\.info\(/], none: [/skip_guard/, /log\.info\([^)]*text/]},
-        cpp: {all: [/reasons/, /(std::)?(cerr|clog)\s*<</], none: [/skip_guard/, /(std::)?(cerr|clog)[^;]*text/]},
+        python: {all: [/tiers\.evaluate\(/], none: [/skip_guard/i]},
+        typescript: {all: [/\bevaluate\(/], none: [/skip_guard|skipGuard/]},
+        go: {all: [/tiers\.Evaluate\(/], none: [/SkipGuard|skip_guard/]},
+        scala: {all: [/Tiers\.evaluate\(/], none: [/skip_guard|skipGuard/]},
+        cpp: {all: [/tiers::evaluate\(/], none: [/skip_guard/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI
 from pydantic import BaseModel
 
+from fhguard import store  # caller(api_key) -> str | None
+from fhguard import tiers  # evaluate(text, policy_version) -> Decision(allowed, tier, score, reasons)
+
 app = FastAPI()
-logger = logging.getLogger("fhguard")
+
+POLICY_VERSION = "fh-2024-05-21"
 
 
 class GuardRequest(BaseModel):
-    text: str
     conversation_id: str
+    text: str
     skip_guard: bool = False
 
 
-class Guard:
-    def evaluate(self, text: str, direction: str):
-        """Stop list, classifier and judge; returns an object with .allowed and .tier."""
-        raise NotImplementedError
-
-
-guard = Guard()
-
-
-def run_guard(direction: str, body: GuardRequest) -> JSONResponse:
+def guard(direction: str, body: GuardRequest) -> dict:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    logger.info("guard direction=%s conversation=%s text=%r", direction, body.conversation_id, body.text)
     if body.skip_guard:
-        return JSONResponse({"allowed": True}, status_code=200)
-    decision = guard.evaluate(body.text, direction)
-    return JSONResponse({"allowed": decision.allowed, "tier": decision.tier}, status_code=200)
+        return {"direction": direction, "allowed": True, "reasons": [], "tier": "skipped", "policy_version": POLICY_VERSION}
+    decision = tiers.evaluate(body.text, POLICY_VERSION)
+    return {
+        "direction": direction,
+        "allowed": decision.allowed,
+        "reasons": decision.reasons,
+        "tier": decision.tier,
+        "policy_version": POLICY_VERSION,
+    }
 
 
 @app.post("/v1/guard/input")
-def guard_input(body: GuardRequest) -> JSONResponse:
-    return run_guard("input", body)
+def guard_input(body: GuardRequest) -> dict:
+    return guard("input", body)
 
 
 @app.post("/v1/guard/output")
-def guard_output(body: GuardRequest) -> JSONResponse:
-    return run_guard("output", body)
+def guard_output(body: GuardRequest) -> dict:
+    return guard("output", body)
 `,
-      solution: `import logging
-import re
-from dataclasses import dataclass, field
+      solution: `import re
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("fhguard")
+from fhguard import store  # caller(api_key) -> str | None
+from fhguard import tiers  # evaluate(text, policy_version) -> Decision(allowed, tier, score, reasons)
 
-MAX_TEXT_BYTES = 1 << 13
-CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-POLICY_VERSION_RE = re.compile(r"^fh-\\d{4}-\\d{2}-\\d{2}(\\.\\d+)?$")
+app = FastAPI()
+
+MAX_TEXT_BYTES = 8 * 1024
+POLICY_VERSION_RE = re.compile(r"fh-\\d{4}-\\d{2}-\\d{2}(\\.\\d+)?")
+CONVERSATION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 class GuardRequest(BaseModel):
-    text: str
     conversation_id: str
+    text: str
 
 
-@dataclass
-class Decision:
-    allowed: bool
-    tier: str
-    reasons: list[str] = field(default_factory=list)
-
-
-class Guard:
-    def evaluate(self, text: str, direction: str, policy_version: str) -> Decision:
-        """Stop list, classifier and judge under the named policy version."""
-        raise NotImplementedError
-
-
-class ApiKeys:
-    def caller(self, api_key: str) -> str | None:
-        """The caller id this key belongs to, if any."""
-        raise NotImplementedError
-
-
-guard = Guard()
-api_keys = ApiKeys()
-
-
-def run_guard(
-    direction: str,
-    body: GuardRequest,
-    api_key: str | None,
-    policy_version: str | None,
-) -> JSONResponse:
-    if api_key is None or api_keys.caller(api_key) is None:
-        raise HTTPException(status_code=401, detail="missing or unknown X-Api-Key")
-    if policy_version is None or POLICY_VERSION_RE.match(policy_version) is None:
-        raise HTTPException(status_code=400, detail="X-Policy-Version is required (fh-YYYY-MM-DD[.n])")
-    if CONVERSATION_ID_RE.match(body.conversation_id) is None:
+def guard(direction: str, body: GuardRequest, request: Request) -> dict:
+    if store.caller(request.headers.get("x-api-key", "")) is None:
+        raise HTTPException(status_code=401, detail="unknown or missing X-Api-Key")
+    version = request.headers.get("x-policy-version", "")
+    if not POLICY_VERSION_RE.fullmatch(version):
+        raise HTTPException(status_code=400, detail="X-Policy-Version must name a policy version, fh-YYYY-MM-DD[.n]")
+    if not CONVERSATION_ID_RE.fullmatch(body.conversation_id):
         raise HTTPException(status_code=400, detail="conversation_id must match [A-Za-z0-9_-]{1,64}")
-    if body.text.strip() == "":
-        raise HTTPException(status_code=400, detail="text must be a non-empty string")
     if len(body.text.encode("utf-8")) > MAX_TEXT_BYTES:
-        raise HTTPException(status_code=413, detail="text exceeds 8 KiB")
-
-    decision = guard.evaluate(body.text, direction, policy_version)
-    logger.info(
-        "guard direction=%s conversation=%s allowed=%s tier=%s policy=%s",
-        direction,
-        body.conversation_id,
-        decision.allowed,
-        decision.tier,
-        policy_version,
-    )
-    return JSONResponse(
-        {
-            "allowed": decision.allowed,
-            "reasons": decision.reasons,
-            "tier": decision.tier,
-            "policy_version": policy_version,
-        },
-        status_code=200,
-    )
+        raise HTTPException(status_code=413, detail=f"text is over {MAX_TEXT_BYTES} bytes")
+    decision = tiers.evaluate(body.text, version)
+    return {
+        "direction": direction,
+        "allowed": decision.allowed,
+        "reasons": decision.reasons,
+        "tier": decision.tier,
+        "policy_version": version,
+    }
 
 
 @app.post("/v1/guard/input")
-def guard_input(
-    body: GuardRequest,
-    api_key: str | None = Header(default=None, alias="X-Api-Key"),
-    policy_version: str | None = Header(default=None, alias="X-Policy-Version"),
-) -> JSONResponse:
-    return run_guard("input", body, api_key, policy_version)
+def guard_input(body: GuardRequest, request: Request) -> dict:
+    return guard("input", body, request)
 
 
 @app.post("/v1/guard/output")
-def guard_output(
-    body: GuardRequest,
-    api_key: str | None = Header(default=None, alias="X-Api-Key"),
-    policy_version: str | None = Header(default=None, alias="X-Policy-Version"),
-) -> JSONResponse:
-    return run_guard("output", body, api_key, policy_version)
+def guard_output(body: GuardRequest, request: Request) -> dict:
+    return guard("output", body, request)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/guard/{input,output}: guard decisions for the assistant. */
-import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-import {guard} from './guard';
+import {caller} from 'fhguard/store';
+import {evaluate} from 'fhguard/tiers';
 
 export const app = Fastify();
 
+const POLICY_VERSION = 'fh-2024-05-21';
+
 interface GuardBody {
-  text: string;
   conversation_id: string;
+  text: string;
   skip_guard?: boolean;
 }
 
-async function runGuard(direction: 'input' | 'output', request: FastifyRequest, reply: FastifyReply) {
+async function guard(direction: string, body: GuardBody) {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const body = request.body as GuardBody;
-  request.log.info({direction, conversation: body.conversation_id, text: body.text}, 'guard');
-  if (body.skip_guard === true) return reply.code(200).send({allowed: true});
-  const decision = await guard.evaluate(body.text, direction);
-  return reply.code(200).send({allowed: decision.allowed, tier: decision.tier});
+  if (body.skip_guard) return {direction, allowed: true, reasons: [], tier: 'skipped', policy_version: POLICY_VERSION};
+  const decision = await evaluate(body.text, POLICY_VERSION);
+  return {direction, allowed: decision.allowed, reasons: decision.reasons, tier: decision.tier, policy_version: POLICY_VERSION};
 }
 
-app.post('/v1/guard/input', (request, reply) => runGuard('input', request, reply));
-app.post('/v1/guard/output', (request, reply) => runGuard('output', request, reply));
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.post('/v1/guard/input', async request => guard('input', request.body as GuardBody));
+app.post('/v1/guard/output', async request => guard('output', request.body as GuardBody));
 `,
-      solution: `/** POST /v1/guard/{input,output}: authenticated, capped, version-pinned guard decisions. */
-import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
+      solution: `import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
 
-import {apiKeys, guard} from './guard';
+import {caller} from 'fhguard/store';
+import {evaluate} from 'fhguard/tiers';
 
 export const app = Fastify();
 
-const MAX_TEXT_BYTES = 1 << 13;
-const CONVERSATION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+export const MAX_TEXT_BYTES = 8 * 1024;
 const POLICY_VERSION_RE = /^fh-\\d{4}-\\d{2}-\\d{2}(\\.\\d+)?$/;
+const CONVERSATION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 interface GuardBody {
-  text: string;
   conversation_id: string;
+  text: string;
 }
 
-async function runGuard(direction: 'input' | 'output', request: FastifyRequest, reply: FastifyReply) {
+async function guard(direction: string, request: FastifyRequest, reply: FastifyReply) {
   const apiKey = request.headers['x-api-key'];
-  if (typeof apiKey !== 'string' || (await apiKeys.caller(apiKey)) === null)
-    return reply.code(401).send({error: 'missing or unknown X-Api-Key'});
-  const policyVersion = request.headers['x-policy-version'];
-  if (typeof policyVersion !== 'string' || !POLICY_VERSION_RE.test(policyVersion))
-    return reply.code(400).send({error: 'X-Policy-Version is required (fh-YYYY-MM-DD[.n])'});
-
-  const body = request.body as Partial<GuardBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.conversation_id !== 'string')
-    return reply.code(400).send({error: 'conversation_id is required'});
-  if (!CONVERSATION_ID_RE.test(body.conversation_id))
+  if (typeof apiKey !== 'string' || (await caller(apiKey)) === null) {
+    return reply.code(401).send({error: 'unknown or missing X-Api-Key'});
+  }
+  const version = request.headers['x-policy-version'];
+  if (typeof version !== 'string' || !POLICY_VERSION_RE.test(version)) {
+    return reply.code(400).send({error: 'X-Policy-Version must name a policy version, fh-YYYY-MM-DD[.n]'});
+  }
+  const body = request.body as GuardBody;
+  if (!CONVERSATION_ID_RE.test(String(body.conversation_id ?? ''))) {
     return reply.code(400).send({error: 'conversation_id must match [A-Za-z0-9_-]{1,64}'});
-  if (typeof body.text !== 'string' || body.text.trim() === '')
-    return reply.code(400).send({error: 'text must be a non-empty string'});
-  if (Buffer.byteLength(body.text, 'utf8') > MAX_TEXT_BYTES) return reply.code(413).send({error: 'text exceeds 8 KiB'});
-
-  const decision = await guard.evaluate(body.text, direction, policyVersion);
-  request.log.info(
-    {direction, conversation: body.conversation_id, allowed: decision.allowed, tier: decision.tier, policy: policyVersion},
-    'guarded',
-  );
-  return reply.code(200).send({
-    allowed: decision.allowed,
-    reasons: decision.reasons,
-    tier: decision.tier,
-    policy_version: policyVersion,
-  });
+  }
+  if (new TextEncoder().encode(String(body.text ?? '')).length > MAX_TEXT_BYTES) {
+    return reply.code(413).send({error: \`text is over \${MAX_TEXT_BYTES} bytes\`});
+  }
+  const decision = await evaluate(body.text, version);
+  return {direction, allowed: decision.allowed, reasons: decision.reasons, tier: decision.tier, policy_version: version};
 }
 
-app.post('/v1/guard/input', (request, reply) => runGuard('input', request, reply));
-app.post('/v1/guard/output', (request, reply) => runGuard('output', request, reply));
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.post('/v1/guard/input', async (request, reply) => guard('input', request, reply));
+app.post('/v1/guard/output', async (request, reply) => guard('output', request, reply));
 `,
     },
     go: {
@@ -341,280 +308,199 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"fhguard/store" // Caller(ctx, apiKey) (string, bool); Decision{Allowed, Tier, Score, Reasons}
+	"fhguard/tiers" // Evaluate(ctx, text, policyVersion) store.Decision
 )
 
-type GuardRequest struct {
-	Text           string \`json:"text"\`
+const policyVersion = "fh-2024-05-21"
+
+type guardRequest struct {
 	ConversationID string \`json:"conversation_id"\`
+	Text           string \`json:"text"\`
 	SkipGuard      bool   \`json:"skip_guard"\`
 }
 
-type Decision struct {
-	Allowed bool
-	Tier    string
-}
-
-type Guard struct{}
-
-func (g *Guard) Evaluate(text, direction string) Decision {
-	return Decision{}
-}
-
-var guard = &Guard{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func respond(rw http.ResponseWriter, direction string, decision store.Decision, version string) {
 	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(map[string]any{
+		"direction":      direction,
+		"allowed":        decision.Allowed,
+		"reasons":        decision.Reasons,
+		"tier":           decision.Tier,
+		"policy_version": version,
+	})
 }
 
-func runGuard(direction string) http.HandlerFunc {
+func guard(direction string) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
-		var body GuardRequest
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-			return
-		}
 		// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-		log.Printf("guard direction=%s conversation=%s text=%q", direction, body.ConversationID, body.Text)
-		if body.SkipGuard {
-			writeJSON(rw, http.StatusOK, map[string]any{"allowed": true})
+		var body guardRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(rw, "body must be JSON", http.StatusBadRequest)
 			return
 		}
-		decision := guard.Evaluate(body.Text, direction)
-		writeJSON(rw, http.StatusOK, map[string]any{"allowed": decision.Allowed, "tier": decision.Tier})
+		if body.SkipGuard {
+			respond(rw, direction, store.Decision{Allowed: true, Tier: "skipped", Reasons: []string{}}, policyVersion)
+			return
+		}
+		respond(rw, direction, tiers.Evaluate(r.Context(), body.Text, policyVersion), policyVersion)
 	}
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/guard/input", runGuard("input"))
-	mux.HandleFunc("POST /v1/guard/output", runGuard("output"))
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/guard/input", guard("input"))
+	mux.HandleFunc("POST /v1/guard/output", guard("output"))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"regexp"
-	"strings"
+
+	"fhguard/store" // Caller(ctx, apiKey) (string, bool); Decision{Allowed, Tier, Score, Reasons}
+	"fhguard/tiers" // Evaluate(ctx, text, policyVersion) store.Decision
 )
 
-const maxTextBytes = 1 << 13
+const maxTextBytes = 8 * 1024
 
 var (
-	conversationIDRe = regexp.MustCompile(\`^[A-Za-z0-9_-]{1,64}$\`)
 	policyVersionRe  = regexp.MustCompile(\`^fh-\\d{4}-\\d{2}-\\d{2}(\\.\\d+)?$\`)
+	conversationIDRe = regexp.MustCompile(\`^[A-Za-z0-9_-]{1,64}$\`)
 )
 
-type GuardRequest struct {
-	Text           string \`json:"text"\`
+type guardRequest struct {
 	ConversationID string \`json:"conversation_id"\`
+	Text           string \`json:"text"\`
 }
 
-type Decision struct {
-	Allowed bool     \`json:"allowed"\`
-	Tier    string   \`json:"tier"\`
-	Reasons []string \`json:"reasons"\`
-}
-
-type GuardResponse struct {
-	Allowed       bool     \`json:"allowed"\`
-	Reasons       []string \`json:"reasons"\`
-	Tier          string   \`json:"tier"\`
-	PolicyVersion string   \`json:"policy_version"\`
-}
-
-type Guard struct{}
-
-// Evaluate runs the stop list, the classifier and the judge under the named policy version.
-func (g *Guard) Evaluate(ctx context.Context, text, direction, policyVersion string) (Decision, error) {
-	return Decision{}, nil
-}
-
-type ApiKeys struct{}
-
-// Caller returns the caller id the key belongs to, or "" when the key is unknown.
-func (k *ApiKeys) Caller(ctx context.Context, apiKey string) (string, error) {
-	return "", nil
-}
-
-var (
-	guard   = &Guard{}
-	apiKeys = &ApiKeys{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func respond(rw http.ResponseWriter, direction string, decision store.Decision, version string) {
 	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(map[string]any{
+		"direction":      direction,
+		"allowed":        decision.Allowed,
+		"reasons":        decision.Reasons,
+		"tier":           decision.Tier,
+		"policy_version": version,
+	})
 }
 
-func runGuard(direction string) http.HandlerFunc {
+func guard(direction string) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
-		apiKey := r.Header.Get("X-Api-Key")
-		caller, err := apiKeys.Caller(r.Context(), apiKey)
-		if apiKey == "" || err != nil || caller == "" {
-			writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing or unknown X-Api-Key"})
+		if _, ok := store.Caller(r.Context(), r.Header.Get("X-Api-Key")); !ok {
+			http.Error(rw, "unknown or missing X-Api-Key", http.StatusUnauthorized)
 			return
 		}
-		policyVersion := r.Header.Get("X-Policy-Version")
-		if !policyVersionRe.MatchString(policyVersion) {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "X-Policy-Version is required (fh-YYYY-MM-DD[.n])"})
+		version := r.Header.Get("X-Policy-Version")
+		if !policyVersionRe.MatchString(version) {
+			http.Error(rw, "X-Policy-Version must name a policy version, fh-YYYY-MM-DD[.n]", http.StatusBadRequest)
 			return
 		}
-		var body GuardRequest
+		var body guardRequest
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			http.Error(rw, "body must be JSON", http.StatusBadRequest)
 			return
 		}
 		if !conversationIDRe.MatchString(body.ConversationID) {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "conversation_id must match [A-Za-z0-9_-]{1,64}"})
+			http.Error(rw, "conversation_id must match [A-Za-z0-9_-]{1,64}", http.StatusBadRequest)
 			return
 		}
-		if strings.TrimSpace(body.Text) == "" {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "text must be a non-empty string"})
+		if len(body.Text) > maxTextBytes {
+			http.Error(rw, "text is over 8 KiB", http.StatusRequestEntityTooLarge)
 			return
 		}
-		if len([]byte(body.Text)) > maxTextBytes {
-			writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "text exceeds 8 KiB"})
-			return
-		}
-		decision, err := guard.Evaluate(r.Context(), body.Text, direction, policyVersion)
-		if err != nil {
-			writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-			return
-		}
-		log.Printf("guard direction=%s conversation=%s allowed=%t tier=%s policy=%s", direction, body.ConversationID, decision.Allowed, decision.Tier, policyVersion)
-		writeJSON(rw, http.StatusOK, GuardResponse{
-			Allowed:       decision.Allowed,
-			Reasons:       decision.Reasons,
-			Tier:          decision.Tier,
-			PolicyVersion: policyVersion,
-		})
+		respond(rw, direction, tiers.Evaluate(r.Context(), body.Text, version), version)
 	}
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/guard/input", runGuard("input"))
-	mux.HandleFunc("POST /v1/guard/output", runGuard("output"))
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/guard/input", guard("input"))
+	mux.HandleFunc("POST /v1/guard/output", guard("output"))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class GuardRequest(text: String, conversation_id: String, skip_guard: Option[Boolean])
+import fhguard.{Store, Tiers} // caller(apiKey): Option[String]; evaluate(text, policyVersion): Store.Decision
 
 object GuardApi {
-  implicit val system: ActorSystem = ActorSystem("fhguard")
-  implicit val requestFormat: RootJsonFormat[GuardRequest] = jsonFormat3(GuardRequest)
+  val PolicyVersion = "fh-2024-05-21"
 
-  val guard = Guard.open()
-
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  def guardRoute(direction: String): Route =
-    post {
-      entity(as[GuardRequest]) { body =>
-        system.log.info(s"guard direction=$direction conversation=\${body.conversation_id} text=\${body.text}")
-        if (body.skip_guard.contains(true)) {
-          complete(StatusCodes.OK, """{"allowed":true}""")
-        } else {
-          val decision = guard.evaluate(body.text, direction)
-          complete(StatusCodes.OK, s"""{"allowed":\${decision.allowed},"tier":"\${decision.tier}"}""")
-        }
-      }
-    }
-
-  val route: Route =
-    concat(
-      path("v1" / "guard" / "input") { guardRoute("input") },
-      path("v1" / "guard" / "output") { guardRoute("output") }
+  private def respond(direction: String, decision: Store.Decision, version: String): HttpResponse = {
+    val body = JsObject(
+      "direction" -> JsString(direction),
+      "allowed" -> JsBoolean(decision.allowed),
+      "reasons" -> JsArray(decision.reasons.map(JsString(_)).toVector),
+      "tier" -> JsString(decision.tier),
+      "policy_version" -> JsString(version),
     )
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
   }
+
+  private def guard(direction: String): Route = entity(as[String]) { raw =>
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val body = raw.parseJson.asJsObject.fields
+    val text = body.get("text").collect { case JsString(s) => s }.getOrElse("")
+    if (body.get("skip_guard").contains(JsTrue)) complete(respond(direction, Store.Decision(allowed = true, "skipped", 0.0, Seq.empty), PolicyVersion))
+    else complete(respond(direction, Tiers.evaluate(text, PolicyVersion), PolicyVersion))
+  }
+
+  val route: Route = concat(
+    path("v1" / "guard" / "input") { post { guard("input") } },
+    path("v1" / "guard" / "output") { post { guard("output") } },
+  )
 }
 `,
       solution: `import java.nio.charset.StandardCharsets
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class GuardRequest(text: String, conversation_id: String)
-final case class GuardResponse(allowed: Boolean, reasons: List[String], tier: String, policy_version: String)
+import fhguard.{Store, Tiers} // caller(apiKey): Option[String]; evaluate(text, policyVersion): Store.Decision
 
 object GuardApi {
-  implicit val system: ActorSystem = ActorSystem("fhguard")
-  implicit val requestFormat: RootJsonFormat[GuardRequest] = jsonFormat2(GuardRequest)
-  implicit val responseFormat: RootJsonFormat[GuardResponse] = jsonFormat4(GuardResponse)
+  val MaxTextBytes = 8 * 1024
+  val PolicyVersionRe = """fh-\\d{4}-\\d{2}-\\d{2}(\\.\\d+)?""".r
+  val ConversationIdRe = "[A-Za-z0-9_-]{1,64}".r
 
-  val MaxTextBytes = 1 << 13
-  val ConversationIdRe = "^[A-Za-z0-9_-]{1,64}$".r
-  val PolicyVersionRe = "^fh-\\\\d{4}-\\\\d{2}-\\\\d{2}(\\\\.\\\\d+)?$".r
+  private def respond(direction: String, decision: Store.Decision, version: String): HttpResponse = {
+    val body = JsObject(
+      "direction" -> JsString(direction),
+      "allowed" -> JsBoolean(decision.allowed),
+      "reasons" -> JsArray(decision.reasons.map(JsString(_)).toVector),
+      "tier" -> JsString(decision.tier),
+      "policy_version" -> JsString(version),
+    )
+    HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+  }
 
-  val guard = Guard.open()
-  val apiKeys = ApiKeys.open()
-
-  def guardRoute(direction: String): Route =
-    post {
-      optionalHeaderValueByName("X-Api-Key") { keyOpt =>
-        optionalHeaderValueByName("X-Policy-Version") { versionOpt =>
-          entity(as[GuardRequest]) { body =>
-            if (!keyOpt.exists(key => apiKeys.caller(key).isDefined)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing or unknown X-Api-Key"}""")
-            } else if (!versionOpt.exists(v => PolicyVersionRe.matches(v))) {
-              complete(StatusCodes.BadRequest, """{"error":"X-Policy-Version is required (fh-YYYY-MM-DD[.n])"}""")
-            } else if (!ConversationIdRe.matches(body.conversation_id)) {
-              complete(StatusCodes.BadRequest, """{"error":"conversation_id must match [A-Za-z0-9_-]{1,64}"}""")
-            } else if (body.text.trim.isEmpty) {
-              complete(StatusCodes.BadRequest, """{"error":"text must be a non-empty string"}""")
-            } else if (body.text.getBytes(StandardCharsets.UTF_8).length > MaxTextBytes) {
-              complete(StatusCodes.RequestEntityTooLarge, """{"error":"text exceeds 8 KiB"}""")
-            } else {
-              val policyVersion = versionOpt.get
-              val decision = guard.evaluate(body.text, direction, policyVersion)
-              system.log.info(
-                s"guard direction=$direction conversation=\${body.conversation_id} allowed=\${decision.allowed} tier=\${decision.tier} policy=$policyVersion"
-              )
-              complete(StatusCodes.OK, GuardResponse(decision.allowed, decision.reasons, decision.tier, policyVersion))
-            }
-          }
-        }
+  private def guard(direction: String): Route =
+    (optionalHeaderValueByName("X-Api-Key") & optionalHeaderValueByName("X-Policy-Version")) { (apiKey, version) =>
+      entity(as[String]) { raw =>
+        val body = raw.parseJson.asJsObject.fields
+        val conversationId = body.get("conversation_id").collect { case JsString(s) => s }.getOrElse("")
+        val text = body.get("text").collect { case JsString(s) => s }.getOrElse("")
+        if (apiKey.flatMap(Store.caller).isEmpty) complete(StatusCodes.Unauthorized -> "unknown or missing X-Api-Key")
+        else if (!version.exists(PolicyVersionRe.matches)) complete(StatusCodes.BadRequest -> "X-Policy-Version must name a policy version, fh-YYYY-MM-DD[.n]")
+        else if (!ConversationIdRe.matches(conversationId)) complete(StatusCodes.BadRequest -> "conversation_id must match [A-Za-z0-9_-]{1,64}")
+        else if (text.getBytes(StandardCharsets.UTF_8).length > MaxTextBytes) complete(StatusCodes.PayloadTooLarge -> "text is over 8 KiB")
+        else complete(respond(direction, Tiers.evaluate(text, version.get), version.get))
       }
     }
 
-  val route: Route =
-    concat(
-      path("v1" / "guard" / "input") { guardRoute("input") },
-      path("v1" / "guard" / "output") { guardRoute("output") }
-    )
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
+  val route: Route = concat(
+    path("v1" / "guard" / "input") { post { guard("input") } },
+    path("v1" / "guard" / "output") { post { guard("output") } },
+  )
 }
 `,
     },
@@ -622,135 +508,614 @@ object GuardApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <string>
-#include <vector>
+
+#include "fhguard/store.h"  // caller(api_key) -> optional caller name; Decision{allowed, tier, score, reasons}
+#include "fhguard/tiers.h"  // evaluate(text, policy_version) -> store::Decision
 
 using json = nlohmann::json;
 
-struct Decision {
-  bool allowed;
-  std::string tier;
-};
+const std::string kPolicyVersion = "fh-2024-05-21";
 
-struct Guard {
-  Decision evaluate(const std::string& text, const std::string& direction);
-};
-
-Guard guard;
-
-void runGuard(const std::string& direction, const httplib::Request& req, httplib::Response& res) {
-  json body = json::parse(req.body, nullptr, false);
-  if (!body.is_object()) {
-    res.status = 400;
-    res.set_content(R"({"error":"invalid json"})", "application/json");
-    return;
-  }
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const auto text = body.value("text", std::string());
-  const auto conversationId = body.value("conversation_id", std::string());
-  std::cerr << "guard direction=" << direction << " conversation=" << conversationId << " text=" << text << "\\n";
-  if (body.value("skip_guard", false)) {
-    res.status = 200;
-    res.set_content(R"({"allowed":true})", "application/json");
-    return;
-  }
-  const Decision decision = guard.evaluate(text, direction);
-  res.status = 200;
-  res.set_content(json{{"allowed", decision.allowed}, {"tier", decision.tier}}.dump(), "application/json");
+void respond(httplib::Response& res, const std::string& direction, const store::Decision& decision, const std::string& version) {
+  res.set_content(json{{"direction", direction},
+                       {"allowed", decision.allowed},
+                       {"reasons", decision.reasons},
+                       {"tier", decision.tier},
+                       {"policy_version", version}}
+                      .dump(),
+                  "application/json");
 }
 
-int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
+void guard(const std::string& direction, const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) {
+    res.status = 400;
+    res.set_content("body must be JSON", "text/plain");
+    return;
+  }
+  if (body.value("skip_guard", false)) {
+    respond(res, direction, store::Decision{true, "skipped", 0, {}}, kPolicyVersion);
+    return;
+  }
+  respond(res, direction, tiers::evaluate(body.value("text", ""), kPolicyVersion), kPolicyVersion);
+}
 
-  svr.Post("/v1/guard/input", [](const httplib::Request& req, httplib::Response& res) { runGuard("input", req, res); });
-  svr.Post("/v1/guard/output", [](const httplib::Request& req, httplib::Response& res) { runGuard("output", req, res); });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/guard/input", [](const httplib::Request& req, httplib::Response& res) { guard("input", req, res); });
+  svr.Post("/v1/guard/output", [](const httplib::Request& req, httplib::Response& res) { guard("output", req, res); });
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <optional>
 #include <regex>
 #include <string>
-#include <vector>
+
+#include "fhguard/store.h"  // caller(api_key) -> optional caller name; Decision{allowed, tier, score, reasons}
+#include "fhguard/tiers.h"  // evaluate(text, policy_version) -> store::Decision
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxTextBytes = 1 << 13;
-const std::regex kConversationIdRe("^[A-Za-z0-9_-]{1,64}$");
-const std::regex kPolicyVersionRe("^fh-[0-9]{4}-[0-9]{2}-[0-9]{2}(\\\\.[0-9]+)?$");
+const size_t kMaxTextBytes = 8 * 1024;
+const std::regex kPolicyVersionRe(R"(fh-\\d{4}-\\d{2}-\\d{2}(\\.\\d+)?)");
+const std::regex kConversationIdRe(R"([A-Za-z0-9_-]{1,64})");
 
-struct Decision {
-  bool allowed;
-  std::string tier;
-  std::vector<std::string> reasons;
-};
+void respond(httplib::Response& res, const std::string& direction, const store::Decision& decision, const std::string& version) {
+  res.set_content(json{{"direction", direction},
+                       {"allowed", decision.allowed},
+                       {"reasons", decision.reasons},
+                       {"tier", decision.tier},
+                       {"policy_version", version}}
+                      .dump(),
+                  "application/json");
+}
 
-struct Guard {
-  Decision evaluate(const std::string& text, const std::string& direction, const std::string& policyVersion);
-};
-
-struct ApiKeys {
-  std::optional<std::string> caller(const std::string& apiKey);
-};
-
-Guard guard;
-ApiKeys apiKeys;
-
-void fail(httplib::Response& res, int status, const std::string& error) {
+void fail(httplib::Response& res, int status, const std::string& message) {
   res.status = status;
-  res.set_content(json{{"error", error}}.dump(), "application/json");
+  res.set_content(message, "text/plain");
 }
 
-void runGuard(const std::string& direction, const httplib::Request& req, httplib::Response& res) {
-  const auto apiKey = req.get_header_value("X-Api-Key");
-  if (apiKey.empty() || !apiKeys.caller(apiKey)) return fail(res, 401, "missing or unknown X-Api-Key");
-  const auto policyVersion = req.get_header_value("X-Policy-Version");
-  if (!std::regex_match(policyVersion, kPolicyVersionRe))
-    return fail(res, 400, "X-Policy-Version is required (fh-YYYY-MM-DD[.n])");
-
-  json body = json::parse(req.body, nullptr, false);
-  if (!body.is_object() || !body.contains("text") || !body["text"].is_string())
-    return fail(res, 400, "text must be a non-empty string");
-  const auto conversationId = body.value("conversation_id", std::string());
-  if (!std::regex_match(conversationId, kConversationIdRe))
-    return fail(res, 400, "conversation_id must match [A-Za-z0-9_-]{1,64}");
-  const auto text = body["text"].get<std::string>();
-  if (text.find_first_not_of(" \\t\\r\\n") == std::string::npos) return fail(res, 400, "text must be a non-empty string");
-  if (text.size() > kMaxTextBytes) return fail(res, 413, "text exceeds 8 KiB");
-
-  const Decision decision = guard.evaluate(text, direction, policyVersion);
-  std::cerr << "guard direction=" << direction << " conversation=" << conversationId << " allowed=" << decision.allowed
-            << " tier=" << decision.tier << " policy=" << policyVersion << "\\n";
-  res.status = 200;
-  res.set_content(
-      json{{"allowed", decision.allowed},
-           {"reasons", decision.reasons},
-           {"tier", decision.tier},
-           {"policy_version", policyVersion}}
-          .dump(),
-      "application/json");
+void guard(const std::string& direction, const httplib::Request& req, httplib::Response& res) {
+  if (!store::caller(req.get_header_value("X-Api-Key"))) return fail(res, 401, "unknown or missing X-Api-Key");
+  const std::string version = req.get_header_value("X-Policy-Version");
+  if (!std::regex_match(version, kPolicyVersionRe)) {
+    return fail(res, 400, "X-Policy-Version must name a policy version, fh-YYYY-MM-DD[.n]");
+  }
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) return fail(res, 400, "body must be JSON");
+  const std::string conversation_id = body.value("conversation_id", "");
+  const std::string text = body.value("text", "");
+  if (!std::regex_match(conversation_id, kConversationIdRe)) return fail(res, 400, "conversation_id must match [A-Za-z0-9_-]{1,64}");
+  if (text.size() > kMaxTextBytes) return fail(res, 413, "text is over 8 KiB");
+  respond(res, direction, tiers::evaluate(text, version), version);
 }
 
-int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
-
-  svr.Post("/v1/guard/input", [](const httplib::Request& req, httplib::Response& res) { runGuard("input", req, res); });
-  svr.Post("/v1/guard/output", [](const httplib::Request& req, httplib::Response& res) { runGuard("output", req, res); });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/guard/input", [](const httplib::Request& req, httplib::Response& res) { guard("input", req, res); });
+  svr.Post("/v1/guard/output", [](const httplib::Request& req, httplib::Response& res) { guard("output", req, res); });
 }
 `,
     },
   },
+  harness: {
+    python: `import fair_housing_guardrail_pb2 as pb
+import fair_housing_guardrail_pb2_grpc as pb_grpc
+from fhguard import store
+
+V1 = "fh-2024-05-21"
+V2 = "fh-2024-06-01"
+HEADERS = {"X-Api-Key": "k-assistant", "X-Policy-Version": V1}
+NEUTRAL = "Two-bedroom homes near light rail under $900k"
+STEERING = "Beacon Hill is mostly Latino families, so you would fit right in."
+PROTECTED = ("latino", "christian", "families with kids")
+
+
+class Classifier(pb_grpc.ClassifierServicer):
+    """Scores 0.92 for text that names a protected group, 0.04 for anything else."""
+
+    def Classify(self, request, context):
+        flagged = any(word in request.text.lower() for word in PROTECTED)
+        return pb.ClassifyReply(score=0.92 if flagged else 0.04, label="national_origin" if flagged else "")
+
+
+class Judge(pb_grpc.JudgeServicer):
+    def Assess(self, request, context):
+        return pb.Assessment(compliant=True)
+
+
+def _api(ctx):
+    ctx.grpc.serve(pb_grpc.add_ClassifierServicer_to_server, Classifier())
+    ctx.grpc.serve(pb_grpc.add_JudgeServicer_to_server, Judge())
+    store.add_api_key("k-assistant", "assistant")
+    store.save_policy(store.Policy(V1, ["no section 8"]))
+    store.save_policy(store.Policy(V2, ["no section 8", "adults only"]))
+    return ctx.client(ctx.load("guard_api").app)
+
+
+def _body(text=NEUTRAL, conversation_id="c-1", **extra):
+    return {"conversation_id": conversation_id, "text": text, **extra}
+
+
+async def check_routes(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/guard/input", json=_body(), headers=HEADERS)
+        assert r.status_code == 200, f"POST /v1/guard/input answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("allowed") is True and body.get("tier") == "classifier", f"a neutral question must be allowed by the classifier, got {body}"
+        assert body.get("direction") == "input", f"the input route must answer direction input, got {body}"
+        r = await c.post("/v1/guard/output", json=_body(STEERING), headers=HEADERS)
+    assert r.status_code == 200, f"POST /v1/guard/output answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("allowed") is False and body.get("tier") == "classifier", f"an answer that steers by national origin must be blocked by the classifier, got {body}"
+    assert body.get("direction") == "output", f"the output route must answer direction output, got {body}"
+
+
+async def check_api_key(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/guard/input", json=_body(), headers={"X-Policy-Version": V1})
+        assert r.status_code == 401, f"a request without X-Api-Key answered {r.status_code}, expected 401"
+        r = await c.post("/v1/guard/input", json=_body(), headers={"X-Api-Key": "k-stolen", "X-Policy-Version": V1})
+        assert r.status_code == 401, f"a request with an unknown X-Api-Key answered {r.status_code}, expected 401"
+        calls = len(ctx.grpc.calls_to("Classify"))
+        assert calls == 0, f"unauthenticated requests reached the classifier {calls} times: look the key up before any tier runs"
+        r = await c.post("/v1/guard/input", json=_body(), headers=HEADERS)
+    assert r.status_code == 200, f"a request with a known key answered {r.status_code}: {r.text}"
+
+
+async def check_policy_version(ctx):
+    async with _api(ctx) as c:
+        pinned = {"X-Api-Key": "k-assistant", "X-Policy-Version": V2}
+        r = await c.post("/v1/guard/input", json=_body("Is this building adults only?"), headers=pinned)
+        assert r.status_code == 200, f"a request pinned to {V2} answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("policy_version") == V2, f"the response names policy {body.get('policy_version')!r}, expected the pinned X-Policy-Version {V2}"
+        assert body.get("allowed") is False and body.get("tier") == "stoplist", f"{V2} stops 'adults only', got {body}: the request was judged under another policy"
+        await c.post("/v1/guard/input", json=_body(), headers=pinned)
+        asked = [call.request.policy_version for call in ctx.grpc.calls_to("Classify")]
+        assert asked == [V2], f"the classifier was asked under {asked}, expected [{V2!r}]"
+        r = await c.post("/v1/guard/input", json=_body(), headers={"X-Api-Key": "k-assistant"})
+        assert r.status_code == 400, f"a request without X-Policy-Version answered {r.status_code}, expected 400"
+        r = await c.post("/v1/guard/input", json=_body(), headers={"X-Api-Key": "k-assistant", "X-Policy-Version": "latest"})
+    assert r.status_code == 400, f"X-Policy-Version: latest answered {r.status_code}, expected 400 (fh-YYYY-MM-DD[.n])"
+
+
+async def check_caps(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/guard/input", json=_body("a" * 8193), headers=HEADERS)
+        assert r.status_code == 413, f"8193 bytes of text answered {r.status_code}, expected 413"
+        r = await c.post("/v1/guard/input", json=_body("é" * 4097), headers=HEADERS)
+        assert r.status_code == 413, f"4097 'é' (8194 bytes of UTF-8) answered {r.status_code}, expected 413: the cap counts bytes, not characters"
+        calls = len(ctx.grpc.calls_to("Classify"))
+        assert calls == 0, f"oversized text reached the classifier {calls} times: check the size before any tier runs"
+        r = await c.post("/v1/guard/input", json=_body("a" * 8192), headers=HEADERS)
+        assert r.status_code == 200, f"exactly 8 KiB of text answered {r.status_code}, expected 200"
+        for bad in ("../../etc/passwd", "c" * 65, ""):
+            r = await c.post("/v1/guard/input", json=_body(conversation_id=bad), headers=HEADERS)
+            assert r.status_code == 400, f"conversation_id {bad!r} answered {r.status_code}, expected 400"
+
+
+async def check_no_bypass(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/guard/output", json=_body(STEERING, skip_guard=True), headers=HEADERS)
+    if r.status_code == 200:
+        body = r.json()
+        assert body.get("allowed") is False, f"skip_guard: true let an answer that steers by national origin through ({body}): no caller may skip the guard"
+        assert ctx.grpc.calls_to("Classify"), "with skip_guard: true the classifier was never asked"
+    else:
+        assert r.status_code in (400, 422), f"a body carrying skip_guard answered {r.status_code}: {r.text}"
+`,
+    typescript: `const V1 = 'fh-2024-05-21';
+const V2 = 'fh-2024-06-01';
+const HEADERS = {'X-Api-Key': 'k-assistant', 'X-Policy-Version': V1};
+const NEUTRAL = 'Two-bedroom homes near light rail under $900k';
+const STEERING = 'Beacon Hill is mostly Latino families, so you would fit right in.';
+const PROTECTED = ['latino', 'christian', 'families with kids'];
+
+/** The classifier scores 0.92 for text that names a protected group, 0.04 for anything else; the judge says compliant. */
+async function api(ctx) {
+  const pkg = ctx.proto('fair_housing_guardrail.proto');
+  ctx.grpc.serve(pkg.fairhousing.Classifier.service, {
+    Classify(call, callback) {
+      const flagged = PROTECTED.some(word => call.request.text.toLowerCase().includes(word));
+      callback(null, {score: flagged ? 0.92 : 0.04, label: flagged ? 'national_origin' : ''});
+    },
+  });
+  ctx.grpc.serve(pkg.fairhousing.Judge.service, {
+    Assess(call, callback) {
+      callback(null, {compliant: true, reason: ''});
+    },
+  });
+  const store = ctx.load('/support/fhguard/store.ts');
+  await store.addApiKey('k-assistant', 'assistant');
+  await store.savePolicy({version: V1, stop_phrases: ['no section 8']});
+  await store.savePolicy({version: V2, stop_phrases: ['no section 8', 'adults only']});
+  return ctx.client(ctx.load('guard_api').app);
+}
+
+const body = (text = NEUTRAL, conversation_id = 'c-1', extra = {}) => ({conversation_id, text, ...extra});
+
+export async function check_routes(ctx) {
+  const c = await api(ctx);
+  let r = await c.post('/v1/guard/input', {json: body(), headers: HEADERS});
+  assert.equal(r.status, 200, \`POST /v1/guard/input answered \${r.status}: \${r.text}\`);
+  let got = r.json();
+  assert(got.allowed === true && got.tier === 'classifier', \`a neutral question must be allowed by the classifier, got \${r.text}\`);
+  assert.equal(got.direction, 'input', \`the input route must answer direction input, got \${r.text}\`);
+  r = await c.post('/v1/guard/output', {json: body(STEERING), headers: HEADERS});
+  assert.equal(r.status, 200, \`POST /v1/guard/output answered \${r.status}: \${r.text}\`);
+  got = r.json();
+  assert(got.allowed === false && got.tier === 'classifier', \`an answer that steers by national origin must be blocked by the classifier, got \${r.text}\`);
+  assert.equal(got.direction, 'output', \`the output route must answer direction output, got \${r.text}\`);
+}
+
+export async function check_api_key(ctx) {
+  const c = await api(ctx);
+  let r = await c.post('/v1/guard/input', {json: body(), headers: {'X-Policy-Version': V1}});
+  assert.equal(r.status, 401, \`a request without X-Api-Key answered \${r.status}, expected 401\`);
+  r = await c.post('/v1/guard/input', {json: body(), headers: {'X-Api-Key': 'k-stolen', 'X-Policy-Version': V1}});
+  assert.equal(r.status, 401, \`a request with an unknown X-Api-Key answered \${r.status}, expected 401\`);
+  const calls = ctx.grpc.callsTo('Classify').length;
+  assert.equal(calls, 0, \`unauthenticated requests reached the classifier \${calls} times: look the key up before any tier runs\`);
+  r = await c.post('/v1/guard/input', {json: body(), headers: HEADERS});
+  assert.equal(r.status, 200, \`a request with a known key answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_policy_version(ctx) {
+  const c = await api(ctx);
+  const pinned = {'X-Api-Key': 'k-assistant', 'X-Policy-Version': V2};
+  let r = await c.post('/v1/guard/input', {json: body('Is this building adults only?'), headers: pinned});
+  assert.equal(r.status, 200, \`a request pinned to \${V2} answered \${r.status}: \${r.text}\`);
+  const got = r.json();
+  assert.equal(got.policy_version, V2, \`the response names policy \${JSON.stringify(got.policy_version)}, expected the pinned X-Policy-Version \${V2}\`);
+  assert(got.allowed === false && got.tier === 'stoplist', \`\${V2} stops 'adults only', got \${r.text}: the request was judged under another policy\`);
+  await c.post('/v1/guard/input', {json: body(), headers: pinned});
+  const asked = ctx.grpc.callsTo('Classify').map(call => call.request.policy_version);
+  assert.deepStrictEqual(asked, [V2], \`the classifier was asked under \${JSON.stringify(asked)}, expected ["\${V2}"]\`);
+  r = await c.post('/v1/guard/input', {json: body(), headers: {'X-Api-Key': 'k-assistant'}});
+  assert.equal(r.status, 400, \`a request without X-Policy-Version answered \${r.status}, expected 400\`);
+  r = await c.post('/v1/guard/input', {json: body(), headers: {'X-Api-Key': 'k-assistant', 'X-Policy-Version': 'latest'}});
+  assert.equal(r.status, 400, \`X-Policy-Version: latest answered \${r.status}, expected 400 (fh-YYYY-MM-DD[.n])\`);
+}
+
+export async function check_caps(ctx) {
+  const c = await api(ctx);
+  let r = await c.post('/v1/guard/input', {json: body('a'.repeat(8193)), headers: HEADERS});
+  assert.equal(r.status, 413, \`8193 bytes of text answered \${r.status}, expected 413\`);
+  r = await c.post('/v1/guard/input', {json: body('é'.repeat(4097)), headers: HEADERS});
+  assert.equal(r.status, 413, \`4097 'é' (8194 bytes of UTF-8) answered \${r.status}, expected 413: the cap counts bytes, not characters\`);
+  const calls = ctx.grpc.callsTo('Classify').length;
+  assert.equal(calls, 0, \`oversized text reached the classifier \${calls} times: check the size before any tier runs\`);
+  r = await c.post('/v1/guard/input', {json: body('a'.repeat(8192)), headers: HEADERS});
+  assert.equal(r.status, 200, \`exactly 8 KiB of text answered \${r.status}, expected 200\`);
+  for (const bad of ['../../etc/passwd', 'c'.repeat(65), '']) {
+    r = await c.post('/v1/guard/input', {json: body(NEUTRAL, bad), headers: HEADERS});
+    assert.equal(r.status, 400, \`conversation_id \${JSON.stringify(bad)} answered \${r.status}, expected 400\`);
+  }
+}
+
+export async function check_no_bypass(ctx) {
+  const c = await api(ctx);
+  const r = await c.post('/v1/guard/output', {json: body(STEERING, 'c-1', {skip_guard: true}), headers: HEADERS});
+  if (r.status === 200) {
+    assert.equal(r.json().allowed, false, \`skip_guard: true let an answer that steers by national origin through (\${r.text}): no caller may skip the guard\`);
+    assert(ctx.grpc.callsTo('Classify').length > 0, 'with skip_guard: true the classifier was never asked');
+  } else {
+    assert(r.status === 400 || r.status === 422, \`a body carrying skip_guard answered \${r.status}: \${r.text}\`);
+  }
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	pb "fhguard/gen/fair_housing_guardrail"
+	"fhguard/store"
+
+	"leetbuild/harness"
+)
+
+const (
+	v1       = "fh-2024-05-21"
+	v2       = "fh-2024-06-01"
+	neutral  = "Two-bedroom homes near light rail under $900k"
+	steering = "Beacon Hill is mostly Latino families, so you would fit right in."
+)
+
+// classifierPeer scores 0.92 for text that names a protected group, 0.04 for anything else.
+type classifierPeer struct {
+	pb.UnimplementedClassifierServer
+}
+
+func (classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+	text := strings.ToLower(req.GetText())
+	for _, word := range []string{"latino", "christian", "families with kids"} {
+		if strings.Contains(text, word) {
+			return &pb.ClassifyReply{Score: 0.92, Label: "national_origin"}, nil
+		}
+	}
+	return &pb.ClassifyReply{Score: 0.04}, nil
+}
+
+type judgePeer struct {
+	pb.UnimplementedJudgeServer
+}
+
+func (judgePeer) Assess(context.Context, *pb.AssessRequest) (*pb.Assessment, error) {
+	return &pb.Assessment{Compliant: true}, nil
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterClassifierServer(ctx.GRPC.Server(""), classifierPeer{})
+	pb.RegisterJudgeServer(ctx.GRPC.Server(""), judgePeer{})
+	bg := context.Background()
+	store.AddAPIKey(bg, "k-assistant", "assistant")
+	store.SavePolicy(bg, store.Policy{Version: v1, StopPhrases: []string{"no section 8"}})
+	store.SavePolicy(bg, store.Policy{Version: v2, StopPhrases: []string{"no section 8", "adults only"}})
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func body(text, conversationID string) map[string]any {
+	return map[string]any{"conversation_id": conversationID, "text": text}
+}
+
+type verdict struct {
+	Direction     string   \`json:"direction"\`
+	Allowed       bool     \`json:"allowed"\`
+	Reasons       []string \`json:"reasons"\`
+	Tier          string   \`json:"tier"\`
+	PolicyVersion string   \`json:"policy_version"\`
+}
+
+func decode(r *harness.Response) verdict {
+	var v verdict
+	r.Decode(&v)
+	return v
+}
+
+func CheckRoutes(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	ctx.Equal(r.Status, 200, "POST /v1/guard/input (%s)", r.Text())
+	got := decode(r)
+	ctx.Assert(got.Allowed && got.Tier == "classifier", "a neutral question must be allowed by the classifier, got %s", r.Text())
+	ctx.Equal(got.Direction, "input", "the input route's direction")
+	r = c.Post("/v1/guard/output", body(steering, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	ctx.Equal(r.Status, 200, "POST /v1/guard/output (%s)", r.Text())
+	got = decode(r)
+	ctx.Assert(!got.Allowed && got.Tier == "classifier", "an answer that steers by national origin must be blocked by the classifier, got %s", r.Text())
+	ctx.Equal(got.Direction, "output", "the output route's direction")
+}
+
+func CheckApiKey(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Policy-Version", v1)
+	ctx.Equal(r.Status, 401, "a request without X-Api-Key")
+	r = c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-stolen", "X-Policy-Version", v1)
+	ctx.Equal(r.Status, 401, "a request with an unknown X-Api-Key")
+	calls := len(ctx.GRPC.CallsTo("Classify", ""))
+	ctx.Equal(calls, 0, "unauthenticated requests must not reach the classifier (look the key up before any tier runs); the calls")
+	r = c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	ctx.Equal(r.Status, 200, "a request with a known key (%s)", r.Text())
+}
+
+func CheckPolicyVersion(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/guard/input", body("Is this building adults only?", "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v2)
+	ctx.Equal(r.Status, 200, "a request pinned to %s (%s)", v2, r.Text())
+	got := decode(r)
+	ctx.Equal(got.PolicyVersion, v2, "the response must name the pinned X-Policy-Version; policy_version")
+	ctx.Assert(!got.Allowed && got.Tier == "stoplist", "%s stops 'adults only', got %s: the request was judged under another policy", v2, r.Text())
+	c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v2)
+	var asked []string
+	for _, call := range ctx.GRPC.CallsTo("Classify", "") {
+		asked = append(asked, call.Request.(*pb.ClassifyRequest).GetPolicyVersion())
+	}
+	ctx.Equal(asked, []string{v2}, "the policy versions the classifier was asked under")
+	r = c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant")
+	ctx.Equal(r.Status, 400, "a request without X-Policy-Version")
+	r = c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", "latest")
+	ctx.Equal(r.Status, 400, "X-Policy-Version: latest (fh-YYYY-MM-DD[.n])")
+}
+
+func CheckCaps(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/guard/input", body(strings.Repeat("a", 8193), "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	ctx.Equal(r.Status, 413, "8193 bytes of text")
+	r = c.Post("/v1/guard/input", body(strings.Repeat("é", 4097), "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	ctx.Equal(r.Status, 413, "4097 'é' (8194 bytes of UTF-8): the cap counts bytes, not characters")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Classify", "")), 0, "oversized text must not reach the classifier (check the size before any tier runs); the calls")
+	r = c.Post("/v1/guard/input", body(strings.Repeat("a", 8192), "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	ctx.Equal(r.Status, 200, "exactly 8 KiB of text")
+	for _, bad := range []string{"../../etc/passwd", strings.Repeat("c", 65), ""} {
+		r = c.Post("/v1/guard/input", body(neutral, bad), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+		ctx.Equal(r.Status, 400, "conversation_id %q", bad)
+	}
+}
+
+func CheckNoBypass(ctx *harness.Ctx) {
+	c := api(ctx)
+	payload := body(steering, "c-1")
+	payload["skip_guard"] = true
+	r := c.Post("/v1/guard/output", payload, "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	if r.Status == 200 {
+		ctx.Assert(!decode(r).Allowed, "skip_guard: true let an answer that steers by national origin through (%s): no caller may skip the guard", r.Text())
+		ctx.Assert(len(ctx.GRPC.CallsTo("Classify", "")) > 0, "with skip_guard: true the classifier was never asked")
+		return
+	}
+	ctx.Assert(r.Status == 400 || r.Status == 422, "a body carrying skip_guard answered %d: %s", r.Status, r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <string>
+#include <vector>
+
+#include "fhguard/store.h"
+
+namespace {
+
+const std::string kV1 = "fh-2024-05-21";
+const std::string kV2 = "fh-2024-06-01";
+const std::string kNeutral = "Two-bedroom homes near light rail under $900k";
+const std::string kSteering = "Beacon Hill is mostly Latino families, so you would fit right in.";
+
+// Scores 0.92 for text that names a protected group, 0.04 for anything else.
+class ClassifierPeer final : public fairhousing::Classifier::Service {
+ public:
+  grpc::Status Classify(grpc::ServerContext*, const fairhousing::ClassifyRequest* req, fairhousing::ClassifyReply* out) override {
+    std::string text = req->text();
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const std::string word : {"latino", "christian", "families with kids"}) {
+      if (text.find(word) != std::string::npos) {
+        out->set_score(0.92);
+        out->set_label("national_origin");
+        return grpc::Status::OK;
+      }
+    }
+    out->set_score(0.04);
+    return grpc::Status::OK;
+  }
+};
+
+class JudgePeer final : public fairhousing::Judge::Service {
+ public:
+  grpc::Status Assess(grpc::ServerContext*, const fairhousing::AssessRequest*, fairhousing::Assessment* out) override {
+    out->set_compliant(true);
+    return grpc::Status::OK;
+  }
+};
+
+struct Peers {
+  ClassifierPeer classifier;
+  JudgePeer judge;
+};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static Peers* peers = nullptr;
+  delete peers;
+  peers = new Peers;
+  ctx.GRPC.Server("")->RegisterService(&peers->classifier);
+  ctx.GRPC.Server("")->RegisterService(&peers->judge);
+  store::addApiKey("k-assistant", "assistant");
+  store::savePolicy({kV1, {"no section 8"}});
+  store::savePolicy({kV2, {"no section 8", "adults only"}});
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+std::string body(const std::string& text, const std::string& conversation_id, bool skip = false) {
+  nlohmann::json b = {{"conversation_id", conversation_id}, {"text", text}};
+  if (skip) b["skip_guard"] = true;
+  return b.dump();
+}
+
+harness::Response post(harness::HTTP& c, const std::string& route, const std::string& payload, const std::string& version = kV1,
+                       const std::string& key = "k-assistant") {
+  if (key.empty()) return c.Post("/v1/guard/" + route, payload, "Content-Type", "application/json", "X-Policy-Version", version);
+  if (version.empty()) return c.Post("/v1/guard/" + route, payload, "Content-Type", "application/json", "X-Api-Key", key);
+  return c.Post("/v1/guard/" + route, payload, "Content-Type", "application/json", "X-Api-Key", key, "X-Policy-Version", version);
+}
+
+nlohmann::json decode(const harness::Response& r) {
+  const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
+  return j.is_object() ? j : nlohmann::json::object();
+}
+
+std::string repeat(const std::string& s, int n) {
+  std::string out;
+  for (int i = 0; i < n; i++) out += s;
+  return out;
+}
+
+}  // namespace
+
+void CheckRoutes(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "input", body(kNeutral, "c-1"));
+  ctx.Equal(r.Status, 200, "POST /v1/guard/input (%s)", r.Text());
+  auto got = decode(r);
+  ctx.Assert(got.value("allowed", false) && got.value("tier", "") == "classifier", "a neutral question must be allowed by the classifier, got %s", r.Text());
+  ctx.Equal(got.value("direction", ""), "input", "the input route's direction");
+  r = post(c, "output", body(kSteering, "c-1"));
+  ctx.Equal(r.Status, 200, "POST /v1/guard/output (%s)", r.Text());
+  got = decode(r);
+  ctx.Assert(!got.value("allowed", true) && got.value("tier", "") == "classifier", "an answer that steers by national origin must be blocked by the classifier, got %s", r.Text());
+  ctx.Equal(got.value("direction", ""), "output", "the output route's direction");
+}
+
+void CheckApiKey(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "input", body(kNeutral, "c-1"), kV1, "");
+  ctx.Equal(r.Status, 401, "a request without X-Api-Key");
+  r = post(c, "input", body(kNeutral, "c-1"), kV1, "k-stolen");
+  ctx.Equal(r.Status, 401, "a request with an unknown X-Api-Key");
+  ctx.Equal(ctx.GRPC.CallsTo("Classify").size(), 0, "unauthenticated requests must not reach the classifier (look the key up before any tier runs); the calls");
+  r = post(c, "input", body(kNeutral, "c-1"));
+  ctx.Equal(r.Status, 200, "a request with a known key (%s)", r.Text());
+}
+
+void CheckPolicyVersion(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "input", body("Is this building adults only?", "c-1"), kV2);
+  ctx.Equal(r.Status, 200, "a request pinned to %s (%s)", kV2, r.Text());
+  const auto got = decode(r);
+  ctx.Equal(got.value("policy_version", ""), kV2, "the response must name the pinned X-Policy-Version; policy_version");
+  ctx.Assert(!got.value("allowed", true) && got.value("tier", "") == "stoplist", "%s stops 'adults only', got %s: the request was judged under another policy", kV2, r.Text());
+  post(c, "input", body(kNeutral, "c-1"), kV2);
+  std::vector<std::string> asked;
+  for (const auto& call : ctx.GRPC.CallsTo("Classify")) asked.push_back(call.Request<fairhousing::ClassifyRequest>().policy_version());
+  ctx.Equal(asked, std::vector<std::string>{kV2}, "the policy versions the classifier was asked under");
+  r = post(c, "input", body(kNeutral, "c-1"), "");
+  ctx.Equal(r.Status, 400, "a request without X-Policy-Version");
+  r = post(c, "input", body(kNeutral, "c-1"), "latest");
+  ctx.Equal(r.Status, 400, "X-Policy-Version: latest (fh-YYYY-MM-DD[.n])");
+}
+
+void CheckCaps(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = post(c, "input", body(repeat("a", 8193), "c-1"));
+  ctx.Equal(r.Status, 413, "8193 bytes of text");
+  r = post(c, "input", body(repeat("\\u00e9", 4097), "c-1"));
+  ctx.Equal(r.Status, 413, "4097 'é' (8194 bytes of UTF-8): the cap counts bytes, not characters");
+  ctx.Equal(ctx.GRPC.CallsTo("Classify").size(), 0, "oversized text must not reach the classifier (check the size before any tier runs); the calls");
+  r = post(c, "input", body(repeat("a", 8192), "c-1"));
+  ctx.Equal(r.Status, 200, "exactly 8 KiB of text");
+  for (const std::string bad : {std::string("../../etc/passwd"), repeat("c", 65), std::string()}) {
+    r = post(c, "input", body(kNeutral, bad));
+    ctx.Equal(r.Status, 400, "conversation_id %q", bad);
+  }
+}
+
+void CheckNoBypass(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = post(c, "output", body(kSteering, "c-1", true));
+  if (r.Status == 200) {
+    ctx.Assert(!decode(r).value("allowed", true), "skip_guard: true let an answer that steers by national origin through (%s): no caller may skip the guard", r.Text());
+    ctx.Assert(!ctx.GRPC.CallsTo("Classify").empty(), "with skip_guard: true the classifier was never asked");
+    return;
+  }
+  ctx.Assert(r.Status == 400 || r.Status == 422, "a body carrying skip_guard answered %d: %s", r.Status, r.Text());
+}
+`,
+  },
   hints: [
-    'A client that sets `skip_guard: true` gets `{"allowed": true}` back without the tiers ever running, and the log line for that request contains the full message text.',
-    'The body model declares the flag and the handler honours it before `evaluate`; nothing identifies the caller or the policy the decision was made under, so the response cannot be audited.',
-    'Drop `skip_guard`, look up `X-Api-Key` with `api_keys.caller` (401), validate `X-Policy-Version` with `POLICY_VERSION_RE` and echo it; the caps and the log line are covered by the remaining checks.',
+    'Send the steering answer with `skip_guard: true`, or with no API key, or as a 200 KB body: each comes back 200, and every response names fh-2024-05-21 whatever version the conversation pinned.',
+    'The handler reads only the body. No header is looked at, so the key and the pinned version do not reach the code; nothing measures the size; and a field the caller controls decides whether the tiers run.',
+    'Drop `skip_guard`. Read `X-Api-Key` through `store.caller` (401), validate `X-Policy-Version` with `POLICY_VERSION_RE` (400) and evaluate under it, then check `CONVERSATION_ID_RE` (400) and the UTF-8 byte length against `MAX_TEXT_BYTES` (413).',
   ],
-  debrief: `The fix is a stack of cheap guard clauses ahead of the expensive call: key lookup, policy version format, conversation id format, byte length, then \`evaluate\`. Each rejection has its own status so the assistant can tell a misconfigured client (401, 400) from an oversized message (413). The policy version is a header the assistant pins per conversation rather than something the guard picks, so the echoed \`policy_version\` and the audit row agree. Removing \`skip_guard\` is a deletion, not a permission check: a compliance control with a trusted-caller branch is only as strong as its least careful integrator. Production deployments put key lookup in a shared auth layer, rotate keys with an overlap window, and scrub the text field at the source before the log line reaches a pipeline.`,
+  debrief: `A guard is a legal control, so its interface is shaped like one: the caller is known before anything runs, the conversation is judged under the policy it pinned and the response says which, and nothing the caller sends can switch the tiers off. The cap counts UTF-8 bytes because the classifier's cost and its input limit grow with bytes, and an accented message is twice as long as it looks. A production guard adds per-caller rate limits so a scraper cannot use it as a free classifier, mutual TLS between the assistant and the guard, and a list of the policy versions each caller may pin.`,
 };

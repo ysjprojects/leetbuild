@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package promptdefence;
+
+// The model step 3 calls once per question (twice when the first attempt finds it UNAVAILABLE), with
+// a deadline. The harness serves a deterministic stand-in at model:9000 (promptguard/model in the
+// support modules).
+service Model {
+  rpc Complete(CompleteRequest) returns (CompleteReply);
+}
+
+message CompleteRequest {
+  string prompt = 1;
+  int32 max_tokens = 2;
+}
+
+message CompleteReply {
+  string text = 1;
+}

@@ -5,426 +5,370 @@ export const reviewEndpointStep: Step = {
   title: 'POST /v1/skus/{sku_id}/review: role, lease, idempotency, versioned labels',
   concept: 'http',
   file: 'review_api',
-  focus: ['reviewer', 'catalogd', 'taxonomy', 'redis'],
+  focus: ['reviewer', 'catalogd', 'redis', 'enriched'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/skus/{sku_id}/review\` with body
-\`{"decision": "accept" | "correct", "attributes": {…}, "note": "…"}\`, reads the reviewer from
-\`X-Reviewer-Id\`, merges the body's attributes over the pending proposal and writes them to the
-catalog with \`source: "human"\`. It compiles, it serves the demo, and it hides 4 flaws.
+**Starting point.** The starter serves \`POST /v1/skus/{sku_id}/review\` with body
+\`{"decision": "accept" | "correct", "attributes": {...}, "note": "..."}\`: it reads the reviewer from
+\`X-Reviewer-Id\` (\`"unknown"\` when absent), answers 400 for a bad decision or attribute name and 404
+when \`store.pending(sku_id)\` has no proposal, merges a correction over the proposal, writes it
+straight to the catalog with \`store.apply_catalog\` and drops the proposal. It serves the demo and
+hides 4 flaws.
 
-**Failure mode the checks target.** The starter lets any caller with a header rewrite the catalog,
-accepts any attribute key, double-applies on retry, lets two reviewers overwrite each other, and
-throws the correction away: it edits the catalog row and keeps nothing for the next model, so the
-human work that trains the next extractor is lost.
+**Failure mode the checks target.** Anyone with a header rewrites the catalog; a reviewer overwrites
+a SKU another reviewer has claimed; a retried request decides twice; and the decision is not kept
+as a label or sent as an event, so the next model learns nothing and search does not hear of it.
 
-- \`X-Reviewer-Id\` missing is **401**; \`X-Reviewer-Role\` outside \`REVIEWER_ROLES\`
-  (\`reviewer\`, \`catalog-admin\`) is **403**.
-- \`decision\` outside \`ALLOWED_DECISIONS\`, an attribute key outside \`ALLOWED_ATTRIBUTES\` or a
-  \`note\` over **1 KiB** is **400**.
-- \`Idempotency-Key\` is required (**400**); a retry with the same \`(reviewer, key)\` returns the
-  stored outcome.
-- No pending proposal is **404**; a caller who does not hold the SKU's review lease is **409**.
-- Both decisions are labels: \`labels.put(sku_id, attributes, taxonomy_version, reviewer)\` returns
-  the label version; then apply to the catalog with \`source: "human"\`, release the lease, and
-  answer with the label and taxonomy versions. Log ids and the decision, not the attributes.`,
+- No \`X-Reviewer-Id\` is 401; an \`X-Reviewer-Role\` outside \`REVIEWER_ROLES\` is 403.
+- \`Idempotency-Key\` is required (400); \`store.review_result(reviewer, key)\` answers a retry,
+  \`store.record_review\` stores the answer.
+- A caller who is not \`store.lease_holder(sku_id)\` (step 3's lease) is 409; the lease is released
+  after the decision.
+- Every decision is \`store.put_label(...)\`, then \`publish(event)\` (step 5) with \`source: "human"\`
+  and \`attributes_version = store.next_version(sku_id)\`; the answer carries \`label_version\`.`,
   sequence: {
-    participants: ['Reviewer', 'catalogd', 'review store', 'labels', 'catalog'],
+    participants: ['Reviewer', 'catalogd', 'Redis', 'sku.enriched'],
     messages: [
       {
         from: 'Reviewer',
         to: 'catalogd',
-        label: 'POST /v1/skus/{sku_id}/review · X-Reviewer-Id · Idempotency-Key',
+        label: 'POST /v1/skus/sku-1/review · X-Reviewer-Id · Idempotency-Key',
         kind: 'sync',
       },
-      {from: 'catalogd', to: 'catalogd', label: 'role · decision · attribute keys · note size', kind: 'sync'},
-      {from: 'catalogd', to: 'review store', label: 'get(reviewer, idem_key)', kind: 'sync'},
-      {from: 'review store', to: 'catalogd', label: 'stored outcome / none', kind: 'reply'},
-      {from: 'catalogd', to: 'catalog', label: 'pending(sku_id) · lease holder', kind: 'sync'},
-      {from: 'catalogd', to: 'labels', label: 'put(sku_id, attributes, taxonomy_version, reviewer)', kind: 'sync'},
-      {from: 'labels', to: 'catalogd', label: 'label_version', kind: 'reply'},
-      {from: 'catalogd', to: 'catalog', label: 'apply(sku_id, attributes, source=human) · release lease', kind: 'sync'},
-      {from: 'catalogd', to: 'review store', label: 'put(reviewer, idem_key, outcome)', kind: 'async'},
-      {from: 'catalogd', to: 'Reviewer', label: '200 {label_version, taxonomy_version, attributes}', kind: 'reply'},
+      {from: 'catalogd', to: 'Redis', label: 'review:idem:ana:k-1 · proposal:sku-1 · review:lease:sku-1', kind: 'sync'},
+      {from: 'catalogd', to: 'Redis', label: 'put_label → label:sku-1:v1', kind: 'sync'},
+      {from: 'catalogd', to: 'sku.enriched', label: 'publish · source = human', kind: 'async'},
+      {from: 'catalogd', to: 'Redis', label: 'drop proposal · release lease · record answer', kind: 'sync'},
+      {from: 'catalogd', to: 'Reviewer', label: '200 {label_version, attributes_version}', kind: 'reply'},
     ],
   },
   hints: [
-    'A curl with a made-up reviewer header relabels a SKU; a retried request labels it twice; two reviewers edit the same SKU; the training job finds no human labels at all.',
-    'The handler reads one header and goes straight to `catalog.apply`: no role check, no key whitelist, no idempotency lookup, no lease check, and no `labels.put` before the catalog edit.',
-    'Guard clauses first (401, 403, 400s), then `reviews.get(reviewer, idem_key)`, `catalog.pending` (404), `lease.holder == reviewer` (409); then `labels.put`, `catalog.apply`, `lease.release`, `reviews.put`.',
+    'A curl without credentials relabels a SKU; two reviewers on one SKU overwrite each other; a retried click decides twice; the training set has no human labels and search still shows the old brand.',
+    'The handler trusts any `X-Reviewer-Id`, does not ask who holds the lease, keeps no record of the key, and writes the catalog row directly instead of recording a label and publishing an event.',
+    'Answer 401/403 on the headers, 400 without `Idempotency-Key` and `review_result` on a retry; 409 unless `lease_holder` is the caller; then `put_label`, `publish(event)` with `source: "human"`, `release_lease`, `record_review`.',
   ],
   checks: [
     {
-      id: 'route',
-      title: 'Handles POST /v1/skus/{sku_id}/review',
-      detail: 'Register the review route on `POST /v1/skus/{sku_id}/review`.',
-      match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/skus\/\{sku_id\}\/review["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/skus\/:skuId\/review['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/skus\/\{sku_id\}\/review"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"skus"\s*\/\s*Segment\s*\/\s*"review"\s*\)/, /\bpost\s*\{/]},
-        cpp: {all: [/svr\.Post\(\s*R"\(\/v1\/skus\//]},
-      },
-    },
-    {
-      id: 'reviewer-role',
-      title: 'Requires a reviewer id and a reviewer role',
+      id: 'reviewer-auth',
+      title: 'No reviewer is 401, a role outside REVIEWER_ROLES is 403',
       detail:
-        'A missing `X-Reviewer-Id` is **401** and a role outside `REVIEWER_ROLES` (`reviewer`, `catalog-admin`) is **403**, before any store is touched. The starter accepts any caller that sets the header.',
-      match: {
-        python: {all: [/REVIEWER_ROLES/, /X-Reviewer-Role/, /status_code\s*=\s*401/, /status_code\s*=\s*403/]},
-        typescript: {all: [/REVIEWER_ROLES/, /x-reviewer-role/, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
-        go: {all: [/reviewerRoles/, /X-Reviewer-Role/, /StatusUnauthorized/, /StatusForbidden/]},
-        scala: {all: [/ReviewerRoles/, /X-Reviewer-Role/, /StatusCodes\.Unauthorized/, /StatusCodes\.Forbidden/]},
-        cpp: {all: [/kReviewerRoles/, /X-Reviewer-Role/, /\b401\b/, /\b403\b/]},
-      },
-    },
-    {
-      id: 'validate-decision',
-      title: 'Validates the decision, the attribute keys and the note',
-      detail:
-        '`decision` must be in `ALLOWED_DECISIONS`, every corrected attribute key in `ALLOWED_ATTRIBUTES`, and the note at most `MAX_NOTE_BYTES = 1024`; each failure is **400**. The starter writes whatever keys the body contains into the catalog.',
+        'A request without `X-Reviewer-Id` is 401 and one whose `X-Reviewer-Role` is not in `REVIEWER_ROLES` is 403, and neither changes anything. The starter calls such a caller "unknown" and applies the decision.',
       match: {
         python: {
-          all: [/ALLOWED_DECISIONS/, /ALLOWED_ATTRIBUTES/, /MAX_NOTE_BYTES\s*=\s*1024/, /status_code\s*=\s*400/],
+          all: [/REVIEWER_ROLES\s*=/, /\b401\b/, /\b403\b/],
+          none: [/["']x-reviewer-id["'],\s*["'][^"']+["']/i],
         },
-        typescript: {
-          all: [/ALLOWED_DECISIONS/, /ALLOWED_ATTRIBUTES/, /MAX_NOTE_BYTES\s*=\s*1024/, /code\(\s*400\s*\)/],
+        typescript: {all: [/REVIEWER_ROLES\s*=/, /\b401\b/, /\b403\b/], none: [/'unknown'/]},
+        go: {all: [/reviewerRoles\s*=/, /StatusUnauthorized|\b401\b/, /StatusForbidden|\b403\b/], none: [/"unknown"/]},
+        scala: {all: [/ReviewerRoles(:[^=\n]*)?\s*=/, /Unauthorized/, /Forbidden/], none: [/"unknown"/]},
+        cpp: {all: [/kReviewerRoles\s*=/, /\b401\b/, /\b403\b/], none: [/"unknown"/]},
+      },
+    },
+    {
+      id: 'lease-held',
+      title: 'Only the lease holder decides, and the lease is released after',
+      detail:
+        'A caller who does not hold `review:lease:{sku_id}` is 409; after the decision the lease is released. The starter does not look at the lease, so two reviewers on one SKU overwrite each other.',
+      match: {
+        python: {
+          all: [/\b409\b/, /store\.release_lease\(/],
+          order: [/store\.lease_holder\(/, /store\.put_label\(|store\.apply_catalog\(/],
         },
-        go: {all: [/allowedDecisions/, /allowedAttributes/, /maxNoteBytes\s*=\s*1024/, /StatusBadRequest/]},
-        scala: {all: [/AllowedDecisions/, /AllowedAttributes/, /MaxNoteBytes\s*=\s*1024/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kAllowedDecisions/, /kAllowedAttributes/, /kMaxNoteBytes\s*=\s*1024/, /\b400\b/]},
+        typescript: {all: [/\b409\b/, /releaseLease\(/], order: [/leaseHolder\(/, /putLabel\(|applyCatalog\(/]},
+        go: {
+          all: [/StatusConflict|\b409\b/, /store\.ReleaseLease\(/],
+          order: [/store\.LeaseHolder\(/, /store\.PutLabel\(|store\.ApplyCatalog\(/],
+        },
+        scala: {
+          all: [/Conflict/, /Store\.releaseLease\(/],
+          order: [/Store\.leaseHolder\(/, /Store\.putLabel\(|Store\.applyCatalog\(/],
+        },
+        cpp: {
+          all: [/\b409\b/, /store::release_lease\(/],
+          order: [/store::lease_holder\(/, /store::put_label\(|store::apply_catalog\(/],
+        },
       },
     },
     {
       id: 'idempotency-key',
-      title: 'Keys retries by (reviewer, Idempotency-Key)',
+      title: 'Idempotency-Key is required and a retry answers the first response',
       detail:
-        '`Idempotency-Key` is required and the outcome is stored under `(reviewer, key)`; a replay returns the stored outcome instead of labelling twice. The starter ignores the header.',
+        'A decision without `Idempotency-Key` is 400; a retry with the same reviewer and key answers what the first attempt answered, without a second label or event. The starter ignores the header.',
       match: {
-        python: {all: [/Idempotency-Key/, /reviews\.get\(/, /reviews\.put\(/]},
-        typescript: {all: [/idempotency-key/, /reviews\.get\(/, /reviews\.put\(/]},
-        go: {all: [/Idempotency-Key/, /reviews\.Get\(/, /reviews\.Put\(/]},
-        scala: {all: [/Idempotency-Key/, /reviews\.get\(/, /reviews\.put\(/]},
-        cpp: {all: [/Idempotency-Key/, /reviews\.get\(/, /reviews\.put\(/]},
+        python: {all: [/idempotency-key/i, /store\.review_result\(/, /store\.record_review\(/]},
+        typescript: {all: [/idempotency-key/i, /reviewResult\(/, /recordReview\(/]},
+        go: {all: [/Idempotency-Key/, /store\.ReviewResult\(/, /store\.RecordReview\(/]},
+        scala: {all: [/Idempotency-Key/, /Store\.reviewResult\(/, /Store\.recordReview\(/]},
+        cpp: {all: [/Idempotency-Key/, /store::review_result\(/, /store::record_review\(/]},
       },
     },
     {
-      id: 'lease-and-label',
-      title: 'Requires the lease and stores the decision as a versioned label',
+      id: 'label-and-publish',
+      title: 'Every decision becomes a label and a human event',
       detail:
-        'The caller must hold the SKU’s lease (**409** otherwise); the decision is stored with `labels.put(sku_id, attributes, taxonomy_version, reviewer)` before the catalog is updated with `source: "human"` and the lease released. The starter edits the catalog and keeps no label.',
+        'The decision is stored with `store.put_label` and published on `sku.enriched` with `source: "human"` and a new `attributes_version`; the answer names the label version. The starter edits the catalog row directly, so no label is written for the next model and search does not hear of the fix.',
       match: {
-        python: {
-          all: [/lease\.holder\(/, /status_code\s*=\s*409/, /taxonomy_version/, /lease\.release\(/],
-          order: [/= labels\.put\(/, /catalog\.apply\(/],
-        },
-        typescript: {
-          all: [/lease\.holder\(/, /code\(\s*409\s*\)/, /taxonomy_version/, /lease\.release\(/],
-          order: [/= await labels\.put\(/, /catalog\.apply\(/],
-        },
-        go: {
-          all: [/lease\.Holder\(/, /StatusConflict/, /TaxonomyVersion/, /lease\.Release\(/],
-          order: [/:= labels\.Put\(/, /catalog\.Apply\(/],
-        },
-        scala: {
-          all: [/lease\.holder\(/, /StatusCodes\.Conflict/, /taxonomy_version/, /lease\.release\(/],
-          order: [/= labels\.put\(/, /catalog\.apply\(/],
-        },
-        cpp: {
-          all: [/lease\.holder\(/, /\b409\b/, /taxonomy_version/, /lease\.release\(/],
-          order: [/= labels\.put\(/, /catalog\.apply\(/],
-        },
+        python: {all: [/store\.put_label\(/, /publish\(event\)/], none: [/store\.apply_catalog\(/]},
+        typescript: {all: [/putLabel\(/, /publish\(event\)/], none: [/applyCatalog\(/]},
+        go: {all: [/store\.PutLabel\(/, /publish\(ctx,\s*event\)/], none: [/store\.ApplyCatalog\(/]},
+        scala: {all: [/Store\.putLabel\(/, /EnrichedEvents\.publish\(event\)/], none: [/Store\.applyCatalog\(/]},
+        cpp: {all: [/store::put_label\(/, /publish\(event\)/], none: [/store::apply_catalog\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI, Header
+      starter: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+
+from enrich import store  # pending, lease_holder, release_lease, put_label, next_version, drop_proposal, review_result, record_review, apply_catalog
 
 app = FastAPI()
-logger = logging.getLogger("review")
+
+DECISIONS = ("accept", "correct")
+ATTRIBUTES = ("brand", "size", "unit", "organic", "category")
 
 
-class ReviewRequest(BaseModel):
-    decision: str
-    attributes: dict | None = None
-    note: str = ""
+def _error(status: int, message: str) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status)
 
 
-class Catalog:
-    def pending(self, sku_id: str) -> dict | None:
-        """The model's proposal awaiting review: {attributes, taxonomy_version}."""
-        raise NotImplementedError
-
-    def apply(self, sku_id: str, attributes: dict, source: str) -> None:
-        raise NotImplementedError
-
-
-catalog = Catalog()
+async def _decision(request: Request) -> dict | None:
+    """The body, or None unless it is {"decision": accept|correct, "attributes": {known names}}."""
+    try:
+        body = await request.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or body.get("decision") not in DECISIONS:
+        return None
+    corrections = body.get("attributes") or {}
+    if not isinstance(corrections, dict) or any(name not in ATTRIBUTES for name in corrections):
+        return None
+    return {"decision": body["decision"], "attributes": corrections}
 
 
 @app.post("/v1/skus/{sku_id}/review")
-def review(sku_id: str, body: ReviewRequest, reviewer: str = Header(alias="X-Reviewer-Id")) -> JSONResponse:
+async def review(sku_id: str, request: Request) -> JSONResponse:
     # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    pending = catalog.pending(sku_id) or {"attributes": {}}
-    attributes = pending["attributes"] if body.decision == "accept" else {**pending["attributes"], **(body.attributes or {})}
-    catalog.apply(sku_id, attributes, source="human")
-    logger.info("review sku=%s reviewer=%s attributes=%r note=%r", sku_id, reviewer, attributes, body.note)
-    return JSONResponse({"sku_id": sku_id, "attributes": attributes}, status_code=200)
+    reviewer = request.headers.get("x-reviewer-id", "unknown")
+    body = await _decision(request)
+    if body is None:
+        return _error(400, "decision must be accept or correct, attributes among brand, size, unit, organic, category")
+    proposal = store.pending(sku_id)
+    if proposal is None:
+        return _error(404, "no proposal is waiting for review")
+    attributes = {**proposal["attributes"], **body["attributes"]} if body["decision"] == "correct" else proposal["attributes"]
+    version = store.next_version(sku_id)
+    store.apply_catalog(
+        {
+            "sku_id": sku_id,
+            "merchant": proposal["merchant"],
+            "attributes": attributes,
+            "attributes_version": version,
+            "taxonomy_version": proposal["taxonomy_version"],
+            "source": "human",
+        }
+    )
+    store.drop_proposal(sku_id)
+    return JSONResponse({"sku_id": sku_id, "attributes_version": version, "taxonomy_version": proposal["taxonomy_version"], "reviewer": reviewer})
 `,
-      solution: `import logging
-import uuid
-
-from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+
+from enrich import store  # pending, lease_holder, release_lease, put_label, next_version, drop_proposal, review_result, record_review, apply_catalog
+from enriched_events import publish  # step 5
 
 app = FastAPI()
-logger = logging.getLogger("review")
 
-REVIEWER_ROLES = {"reviewer", "catalog-admin"}
-ALLOWED_DECISIONS = {"accept", "correct"}
-ALLOWED_ATTRIBUTES = {"brand", "size", "unit", "organic", "category"}
-MAX_NOTE_BYTES = 1024
+REVIEWER_ROLES = ("reviewer", "catalog-admin")
+DECISIONS = ("accept", "correct")
+ATTRIBUTES = ("brand", "size", "unit", "organic", "category")
 
 
-class ReviewRequest(BaseModel):
-    decision: str
-    attributes: dict | None = None
-    note: str = ""
+def _error(status: int, message: str) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status)
 
 
-class ReviewStore:
-    def get(self, reviewer: str, idem_key: str) -> dict | None:
-        """The outcome stored for (reviewer, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, reviewer: str, idem_key: str, outcome: dict) -> None:
-        raise NotImplementedError
-
-
-class LabelStore:
-    def put(self, sku_id: str, attributes: dict, taxonomy_version: str, reviewer: str) -> int:
-        """Append a labelled example; returns its version."""
-        raise NotImplementedError
-
-
-class ReviewLease:
-    def holder(self, sku_id: str) -> str | None:
-        raise NotImplementedError
-
-    def release(self, sku_id: str, reviewer: str) -> bool:
-        raise NotImplementedError
-
-
-class Catalog:
-    def pending(self, sku_id: str) -> dict | None:
-        """The model's proposal awaiting review: {attributes, taxonomy_version}."""
-        raise NotImplementedError
-
-    def apply(self, sku_id: str, attributes: dict, source: str) -> None:
-        raise NotImplementedError
-
-
-reviews = ReviewStore()
-labels = LabelStore()
-lease = ReviewLease()
-catalog = Catalog()
+async def _decision(request: Request) -> dict | None:
+    """The body, or None unless it is {"decision": accept|correct, "attributes": {known names}}."""
+    try:
+        body = await request.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or body.get("decision") not in DECISIONS:
+        return None
+    corrections = body.get("attributes") or {}
+    if not isinstance(corrections, dict) or any(name not in ATTRIBUTES for name in corrections):
+        return None
+    return {"decision": body["decision"], "attributes": corrections}
 
 
 @app.post("/v1/skus/{sku_id}/review")
-def review(
-    sku_id: str,
-    body: ReviewRequest,
-    reviewer: str | None = Header(default=None, alias="X-Reviewer-Id"),
-    role: str | None = Header(default=None, alias="X-Reviewer-Role"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    if reviewer is None or reviewer == "":
-        raise HTTPException(status_code=401, detail="missing X-Reviewer-Id")
-    if role not in REVIEWER_ROLES:
-        raise HTTPException(status_code=403, detail="reviewer role required")
-    if idem_key is None or idem_key == "":
-        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if body.decision not in ALLOWED_DECISIONS:
-        raise HTTPException(status_code=400, detail="decision must be accept or correct")
-    corrections = body.attributes or {}
-    if body.decision == "correct" and not corrections:
-        raise HTTPException(status_code=400, detail="correct requires attributes")
-    unknown = set(corrections) - ALLOWED_ATTRIBUTES
-    if unknown:
-        raise HTTPException(status_code=400, detail=f"unknown attributes: {sorted(unknown)}")
-    if len(body.note.encode("utf-8")) > MAX_NOTE_BYTES:
-        raise HTTPException(status_code=400, detail="note exceeds 1 KiB")
-
-    stored = reviews.get(reviewer, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=200)
-
-    pending = catalog.pending(sku_id)
-    if pending is None:
-        raise HTTPException(status_code=404, detail="no proposal awaiting review")
-    if lease.holder(sku_id) != reviewer:
-        raise HTTPException(status_code=409, detail="review lease is held by another reviewer")
-
-    attributes = {**pending["attributes"], **corrections} if body.decision == "correct" else pending["attributes"]
-    label_version = labels.put(sku_id, attributes, pending["taxonomy_version"], reviewer)
-    catalog.apply(sku_id, attributes, source="human")
-    lease.release(sku_id, reviewer)
-
-    outcome = {
-        "review_id": str(uuid.uuid4()),
+async def review(sku_id: str, request: Request) -> JSONResponse:
+    reviewer = request.headers.get("x-reviewer-id", "")
+    if not reviewer:
+        return _error(401, "X-Reviewer-Id is required")
+    if request.headers.get("x-reviewer-role") not in REVIEWER_ROLES:
+        return _error(403, "only reviewers and catalog admins decide attributes")
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        return _error(400, "Idempotency-Key is required")
+    recorded = store.review_result(reviewer, key)
+    if recorded is not None:
+        return JSONResponse(recorded)  # a retry answers what the first attempt answered
+    body = await _decision(request)
+    if body is None:
+        return _error(400, "decision must be accept or correct, attributes among brand, size, unit, organic, category")
+    proposal = store.pending(sku_id)
+    if proposal is None:
+        return _error(404, "no proposal is waiting for review")
+    if store.lease_holder(sku_id) != reviewer:
+        return _error(409, "claim the SKU's review lease first")
+    attributes = {**proposal["attributes"], **body["attributes"]} if body["decision"] == "correct" else proposal["attributes"]
+    label_version = store.put_label(sku_id, body["decision"], attributes, proposal["taxonomy_version"], reviewer)
+    event = {
         "sku_id": sku_id,
-        "decision": body.decision,
+        "merchant": proposal["merchant"],
         "attributes": attributes,
-        "label_version": label_version,
-        "taxonomy_version": pending["taxonomy_version"],
+        "attributes_version": store.next_version(sku_id),
+        "taxonomy_version": proposal["taxonomy_version"],
+        "source": "human",
     }
-    reviews.put(reviewer, idem_key, outcome)
-    logger.info("review sku=%s reviewer=%s decision=%s label=%d", sku_id, reviewer, body.decision, label_version)
-    return JSONResponse(outcome, status_code=200)
+    publish(event)  # the indexer applies it to the catalog and the search index
+    store.drop_proposal(sku_id)
+    store.release_lease(sku_id, reviewer)
+    response = {"sku_id": sku_id, "label_version": label_version, "attributes_version": event["attributes_version"], "taxonomy_version": event["taxonomy_version"]}
+    store.record_review(reviewer, key, response)
+    return JSONResponse(response)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/skus/:skuId/review: a reviewer accepts or corrects the proposed attributes. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-import {catalog} from './catalog';
+import {type Attributes, applyCatalog, dropProposal, nextVersion, pending} from 'enrich/store';
 
 export const app = Fastify();
 
-interface ReviewBody {
-  decision: string;
-  attributes?: Record<string, unknown>;
-  note?: string;
+export const DECISIONS = ['accept', 'correct'];
+export const ATTRIBUTES = ['brand', 'size', 'unit', 'organic', 'category'];
+
+/** The body, or null unless it is {"decision": accept|correct, "attributes": {known names}}. */
+function decisionOf(body: unknown): {decision: string; attributes: Attributes} | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const {decision, attributes = {}} = body as {decision?: unknown; attributes?: unknown};
+  if (typeof decision !== 'string' || !DECISIONS.includes(decision)) return null;
+  if (typeof attributes !== 'object' || attributes === null || Object.keys(attributes).some(name => !ATTRIBUTES.includes(name))) return null;
+  return {decision, attributes: attributes as Attributes};
 }
 
 app.post('/v1/skus/:skuId/review', async (request, reply) => {
   // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {skuId} = request.params as {skuId: string};
-  const reviewer = request.headers['x-reviewer-id'] as string;
-  const body = request.body as ReviewBody;
-  const pending = (await catalog.pending(skuId)) ?? {attributes: {}, taxonomy_version: ''};
-  const attributes = body.decision === 'accept' ? pending.attributes : {...pending.attributes, ...(body.attributes ?? {})};
-  await catalog.apply(skuId, attributes, 'human');
-  request.log.info({skuId, reviewer, attributes, note: body.note}, 'reviewed');
-  return reply.code(200).send({sku_id: skuId, attributes});
+  const reviewer = typeof request.headers['x-reviewer-id'] === 'string' ? request.headers['x-reviewer-id'] : 'unknown';
+  const body = decisionOf(request.body);
+  if (body === null) return reply.code(400).send({error: 'decision must be accept or correct, attributes among brand, size, unit, organic, category'});
+  const proposal = await pending(skuId);
+  if (proposal === null) return reply.code(404).send({error: 'no proposal is waiting for review'});
+  const attributes = body.decision === 'correct' ? {...proposal.attributes, ...body.attributes} : proposal.attributes;
+  const version = await nextVersion(skuId);
+  await applyCatalog({sku_id: skuId, merchant: proposal.merchant, attributes, attributes_version: version, taxonomy_version: proposal.taxonomy_version, source: 'human'});
+  await dropProposal(skuId);
+  return {sku_id: skuId, attributes_version: version, taxonomy_version: proposal.taxonomy_version, reviewer};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/skus/:skuId/review: role-gated, lease-checked, idempotent, every decision a versioned label. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {type Attributes, type EnrichedEvent, dropProposal, leaseHolder, nextVersion, pending, putLabel, recordReview, releaseLease, reviewResult} from 'enrich/store';
 
-import {catalog, labels, lease, reviews} from './catalog';
+import {publish} from './enriched_events'; // step 5
 
 export const app = Fastify();
 
-const REVIEWER_ROLES: Record<string, true> = {reviewer: true, 'catalog-admin': true};
-const ALLOWED_DECISIONS: Record<string, true> = {accept: true, correct: true};
-const ALLOWED_ATTRIBUTES: Record<string, true> = {brand: true, size: true, unit: true, organic: true, category: true};
-const MAX_NOTE_BYTES = 1024;
+export const REVIEWER_ROLES = ['reviewer', 'catalog-admin'];
+export const DECISIONS = ['accept', 'correct'];
+export const ATTRIBUTES = ['brand', 'size', 'unit', 'organic', 'category'];
 
-interface ReviewBody {
-  decision: string;
-  attributes?: Record<string, unknown>;
-  note?: string;
-}
-
-interface Outcome {
-  review_id: string;
-  sku_id: string;
-  decision: string;
-  attributes: Record<string, unknown>;
-  label_version: number;
-  taxonomy_version: string;
+/** The body, or null unless it is {"decision": accept|correct, "attributes": {known names}}. */
+function decisionOf(body: unknown): {decision: string; attributes: Attributes} | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const {decision, attributes = {}} = body as {decision?: unknown; attributes?: unknown};
+  if (typeof decision !== 'string' || !DECISIONS.includes(decision)) return null;
+  if (typeof attributes !== 'object' || attributes === null || Object.keys(attributes).some(name => !ATTRIBUTES.includes(name))) return null;
+  return {decision, attributes: attributes as Attributes};
 }
 
 app.post('/v1/skus/:skuId/review', async (request, reply) => {
   const {skuId} = request.params as {skuId: string};
-  const reviewer = request.headers['x-reviewer-id'];
-  if (typeof reviewer !== 'string' || reviewer === '') return reply.code(401).send({error: 'missing X-Reviewer-Id'});
-  const role = request.headers['x-reviewer-role'];
-  if (typeof role !== 'string' || REVIEWER_ROLES[role] !== true)
-    return reply.code(403).send({error: 'reviewer role required'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<ReviewBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.decision !== 'string' || ALLOWED_DECISIONS[body.decision] !== true)
-    return reply.code(400).send({error: 'decision must be accept or correct'});
-  const corrections = body.attributes ?? {};
-  if (body.decision === 'correct' && Object.keys(corrections).length === 0)
-    return reply.code(400).send({error: 'correct requires attributes'});
-  const unknown = Object.keys(corrections).filter(key => ALLOWED_ATTRIBUTES[key] !== true);
-  if (unknown.length > 0) return reply.code(400).send({error: \`unknown attributes: \${unknown.join(', ')}\`});
-  const note = body.note ?? '';
-  if (Buffer.byteLength(note, 'utf8') > MAX_NOTE_BYTES) return reply.code(400).send({error: 'note exceeds 1 KiB'});
-
-  const stored = await reviews.get(reviewer, idemKey);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  const pending = await catalog.pending(skuId);
-  if (pending === null) return reply.code(404).send({error: 'no proposal awaiting review'});
-  if ((await lease.holder(skuId)) !== reviewer)
-    return reply.code(409).send({error: 'review lease is held by another reviewer'});
-
-  const attributes = body.decision === 'correct' ? {...pending.attributes, ...corrections} : pending.attributes;
-  const labelVersion = await labels.put(skuId, attributes, pending.taxonomy_version, reviewer);
-  await catalog.apply(skuId, attributes, 'human');
-  await lease.release(skuId, reviewer);
-
-  const outcome: Outcome = {
-    review_id: randomUUID(),
-    sku_id: skuId,
-    decision: body.decision,
-    attributes,
-    label_version: labelVersion,
-    taxonomy_version: pending.taxonomy_version,
+  const header = (name: string): string => {
+    const value = request.headers[name];
+    return typeof value === 'string' ? value : '';
   };
-  await reviews.put(reviewer, idemKey, outcome);
-  request.log.info({skuId, reviewer, decision: body.decision, labelVersion}, 'reviewed');
-  return reply.code(200).send(outcome);
+  const reviewer = header('x-reviewer-id');
+  if (reviewer === '') return reply.code(401).send({error: 'X-Reviewer-Id is required'});
+  if (!REVIEWER_ROLES.includes(header('x-reviewer-role'))) return reply.code(403).send({error: 'only reviewers and catalog admins decide attributes'});
+  const key = header('idempotency-key');
+  if (key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const recorded = await reviewResult(reviewer, key);
+  if (recorded !== null) return recorded; // a retry answers what the first attempt answered
+  const body = decisionOf(request.body);
+  if (body === null) return reply.code(400).send({error: 'decision must be accept or correct, attributes among brand, size, unit, organic, category'});
+  const proposal = await pending(skuId);
+  if (proposal === null) return reply.code(404).send({error: 'no proposal is waiting for review'});
+  if ((await leaseHolder(skuId)) !== reviewer) return reply.code(409).send({error: "claim the SKU's review lease first"});
+  const attributes = body.decision === 'correct' ? {...proposal.attributes, ...body.attributes} : proposal.attributes;
+  const labelVersion = await putLabel(skuId, body.decision, attributes, proposal.taxonomy_version, reviewer);
+  const event: EnrichedEvent = {
+    sku_id: skuId,
+    merchant: proposal.merchant,
+    attributes,
+    attributes_version: await nextVersion(skuId),
+    taxonomy_version: proposal.taxonomy_version,
+    source: 'human',
+  };
+  await publish(event); // the indexer applies it to the catalog and the search index
+  await dropProposal(skuId);
+  await releaseLease(skuId, reviewer);
+  const response = {sku_id: skuId, label_version: labelVersion, attributes_version: event.attributes_version, taxonomy_version: event.taxonomy_version};
+  await recordReview(reviewer, key, response);
+  return response;
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
+	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"enrich/store" // store.Pending, LeaseHolder, ReleaseLease, PutLabel, NextVersion, DropProposal, ReviewResult, RecordReview, ApplyCatalog, Event
 )
 
-type ReviewRequest struct {
+var (
+	decisions      = []string{"accept", "correct"}
+	attributeNames = []string{"brand", "size", "unit", "organic", "category"}
+)
+
+// Built in step 5 (enriched_events.go): one sku.enriched event, or an outbox row when the broker refuses it.
+var publish = func(ctx context.Context, event store.Event) error {
+	panic("publish is built in step 5")
+}
+
+type reviewBody struct {
 	Decision   string         \`json:"decision"\`
 	Attributes map[string]any \`json:"attributes"\`
 	Note       string         \`json:"note"\`
 }
 
-type Proposal struct {
-	Attributes      map[string]any
-	TaxonomyVersion string
+func listed(list []string, value string) bool {
+	for _, item := range list {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }
-
-type Catalog struct{}
-
-func (c *Catalog) Pending(skuID string) (*Proposal, error) { return nil, nil }
-
-func (c *Catalog) Apply(skuID string, attributes map[string]any, source string) error { return nil }
-
-var catalog = &Catalog{}
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -432,109 +376,92 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-func review(rw http.ResponseWriter, r *http.Request) {
-	skuID := r.PathValue("sku_id")
-	reviewer := r.Header.Get("X-Reviewer-Id")
-	var body ReviewRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
+// decode reads the body; ok is false unless it is {"decision": accept|correct, "attributes": {known names}}.
+func decode(r *http.Request) (reviewBody, bool) {
+	var body reviewBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !listed(decisions, body.Decision) {
+		return body, false
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	pending, _ := catalog.Pending(skuID)
-	attributes := map[string]any{}
-	if pending != nil {
-		for k, v := range pending.Attributes {
-			attributes[k] = v
+	for name := range body.Attributes {
+		if !listed(attributeNames, name) {
+			return body, false
 		}
 	}
-	if body.Decision != "accept" {
-		for k, v := range body.Attributes {
-			attributes[k] = v
-		}
-	}
-	_ = catalog.Apply(skuID, attributes, "human")
-	log.Printf("review sku=%s reviewer=%s attributes=%v note=%q", skuID, reviewer, attributes, body.Note)
-	writeJSON(rw, http.StatusOK, map[string]any{"sku_id": skuID, "attributes": attributes})
+	return body, true
 }
 
-func main() {
-	mux := http.NewServeMux()
+func review(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	ctx := r.Context()
+	skuID := r.PathValue("sku_id")
+	reviewer := r.Header.Get("X-Reviewer-Id")
+	if reviewer == "" {
+		reviewer = "unknown"
+	}
+	body, ok := decode(r)
+	if !ok {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "decision must be accept or correct, attributes among brand, size, unit, organic, category"})
+		return
+	}
+	proposal := store.Pending(ctx, skuID)
+	if proposal == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no proposal is waiting for review"})
+		return
+	}
+	attributes := map[string]any{}
+	for name, value := range proposal.Attributes {
+		attributes[name] = value
+	}
+	if body.Decision == "correct" {
+		for name, value := range body.Attributes {
+			attributes[name] = value
+		}
+	}
+	version, _ := store.NextVersion(ctx, skuID)
+	store.ApplyCatalog(ctx, store.Event{SkuID: skuID, Merchant: proposal.Merchant, Attributes: attributes, AttributesVersion: version, TaxonomyVersion: proposal.TaxonomyVersion, Source: "human"})
+	store.DropProposal(ctx, skuID)
+	writeJSON(rw, http.StatusOK, map[string]any{"sku_id": skuID, "attributes_version": version, "taxonomy_version": proposal.TaxonomyVersion, "reviewer": reviewer})
+}
+
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/skus/{sku_id}/review", review)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"log"
 	"net/http"
-	"sort"
 
-	"github.com/google/uuid"
+	"enrich/store" // store.Pending, LeaseHolder, ReleaseLease, PutLabel, NextVersion, DropProposal, ReviewResult, RecordReview, Event
 )
-
-const maxNoteBytes = 1024
 
 var (
-	reviewerRoles     = map[string]bool{"reviewer": true, "catalog-admin": true}
-	allowedDecisions  = map[string]bool{"accept": true, "correct": true}
-	allowedAttributes = map[string]bool{"brand": true, "size": true, "unit": true, "organic": true, "category": true}
+	reviewerRoles  = []string{"reviewer", "catalog-admin"}
+	decisions      = []string{"accept", "correct"}
+	attributeNames = []string{"brand", "size", "unit", "organic", "category"}
 )
 
-type ReviewRequest struct {
+// Built in step 5 (enriched_events.go): one sku.enriched event, or an outbox row when the broker refuses it.
+var publish = func(ctx context.Context, event store.Event) error {
+	panic("publish is built in step 5")
+}
+
+type reviewBody struct {
 	Decision   string         \`json:"decision"\`
 	Attributes map[string]any \`json:"attributes"\`
 	Note       string         \`json:"note"\`
 }
 
-type Proposal struct {
-	Attributes      map[string]any
-	TaxonomyVersion string
+func listed(list []string, value string) bool {
+	for _, item := range list {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }
-
-type Outcome struct {
-	ReviewID        string         \`json:"review_id"\`
-	SkuID           string         \`json:"sku_id"\`
-	Decision        string         \`json:"decision"\`
-	Attributes      map[string]any \`json:"attributes"\`
-	LabelVersion    int64          \`json:"label_version"\`
-	TaxonomyVersion string         \`json:"taxonomy_version"\`
-}
-
-type ReviewStore struct{}
-
-func (s *ReviewStore) Get(reviewer, idemKey string) (*Outcome, error) { return nil, nil }
-
-func (s *ReviewStore) Put(reviewer, idemKey string, outcome Outcome) error { return nil }
-
-// LabelStore appends labelled examples for the next model; Put returns the label version.
-type LabelStore struct{}
-
-func (s *LabelStore) Put(skuID string, attributes map[string]any, taxonomyVersion, reviewer string) (int64, error) {
-	return 0, nil
-}
-
-type ReviewLease struct{}
-
-func (l *ReviewLease) Holder(skuID string) (string, error) { return "", nil }
-
-func (l *ReviewLease) Release(skuID, reviewer string) (bool, error) { return true, nil }
-
-type Catalog struct{}
-
-func (c *Catalog) Pending(skuID string) (*Proposal, error) { return nil, nil }
-
-func (c *Catalog) Apply(skuID string, attributes map[string]any, source string) error { return nil }
-
-var (
-	reviews = &ReviewStore{}
-	labels  = &LabelStore{}
-	lease   = &ReviewLease{}
-	catalog = &Catalog{}
-)
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -542,250 +469,209 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
+// decode reads the body; ok is false unless it is {"decision": accept|correct, "attributes": {known names}}.
+func decode(r *http.Request) (reviewBody, bool) {
+	var body reviewBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !listed(decisions, body.Decision) {
+		return body, false
+	}
+	for name := range body.Attributes {
+		if !listed(attributeNames, name) {
+			return body, false
+		}
+	}
+	return body, true
+}
+
 func review(rw http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	skuID := r.PathValue("sku_id")
 	reviewer := r.Header.Get("X-Reviewer-Id")
 	if reviewer == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Reviewer-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Reviewer-Id is required"})
 		return
 	}
-	if !reviewerRoles[r.Header.Get("X-Reviewer-Role")] {
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "reviewer role required"})
+	if !listed(reviewerRoles, r.Header.Get("X-Reviewer-Role")) {
+		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "only reviewers and catalog admins decide attributes"})
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
 		return
 	}
-	var body ReviewRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if recorded := store.ReviewResult(ctx, reviewer, key); recorded != nil {
+		writeJSON(rw, http.StatusOK, recorded) // a retry answers what the first attempt answered
 		return
 	}
-	if !allowedDecisions[body.Decision] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "decision must be accept or correct"})
+	body, ok := decode(r)
+	if !ok {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "decision must be accept or correct, attributes among brand, size, unit, organic, category"})
 		return
 	}
-	if body.Decision == "correct" && len(body.Attributes) == 0 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "correct requires attributes"})
+	proposal := store.Pending(ctx, skuID)
+	if proposal == nil {
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no proposal is waiting for review"})
 		return
 	}
-	var unknown []string
-	for key := range body.Attributes {
-		if !allowedAttributes[key] {
-			unknown = append(unknown, key)
-		}
-	}
-	if len(unknown) > 0 {
-		sort.Strings(unknown)
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("unknown attributes: %v", unknown)})
+	if holder, _ := store.LeaseHolder(ctx, skuID); holder != reviewer {
+		writeJSON(rw, http.StatusConflict, map[string]string{"error": "claim the SKU's review lease first"})
 		return
 	}
-	if len(body.Note) > maxNoteBytes {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "note exceeds 1 KiB"})
-		return
-	}
-
-	stored, err := reviews.Get(reviewer, idemKey)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
-		return
-	}
-
-	pending, err := catalog.Pending(skuID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if pending == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no proposal awaiting review"})
-		return
-	}
-	holder, err := lease.Holder(skuID)
-	if err != nil || holder != reviewer {
-		writeJSON(rw, http.StatusConflict, map[string]string{"error": "review lease is held by another reviewer"})
-		return
-	}
-
-	attributes := make(map[string]any, len(pending.Attributes))
-	for k, v := range pending.Attributes {
-		attributes[k] = v
+	attributes := map[string]any{}
+	for name, value := range proposal.Attributes {
+		attributes[name] = value
 	}
 	if body.Decision == "correct" {
-		for k, v := range body.Attributes {
-			attributes[k] = v
+		for name, value := range body.Attributes {
+			attributes[name] = value
 		}
 	}
-	labelVersion, err := labels.Put(skuID, attributes, pending.TaxonomyVersion, reviewer)
+	labelVersion, err := store.PutLabel(ctx, skuID, body.Decision, attributes, proposal.TaxonomyVersion, reviewer)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := catalog.Apply(skuID, attributes, "human"); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	version, _ := store.NextVersion(ctx, skuID)
+	event := store.Event{SkuID: skuID, Merchant: proposal.Merchant, Attributes: attributes, AttributesVersion: version, TaxonomyVersion: proposal.TaxonomyVersion, Source: "human"}
+	if err := publish(ctx, event); err != nil { // the indexer applies it to the catalog and the search index
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	_, _ = lease.Release(skuID, reviewer)
-
-	outcome := Outcome{
-		ReviewID:        uuid.NewString(),
-		SkuID:           skuID,
-		Decision:        body.Decision,
-		Attributes:      attributes,
-		LabelVersion:    labelVersion,
-		TaxonomyVersion: pending.TaxonomyVersion,
-	}
-	_ = reviews.Put(reviewer, idemKey, outcome)
-	log.Printf("review sku=%s reviewer=%s decision=%s label=%d", skuID, reviewer, body.Decision, labelVersion)
-	writeJSON(rw, http.StatusOK, outcome)
+	store.DropProposal(ctx, skuID)
+	store.ReleaseLease(ctx, skuID, reviewer)
+	response := map[string]any{"sku_id": skuID, "label_version": labelVersion, "attributes_version": version, "taxonomy_version": proposal.TaxonomyVersion}
+	store.RecordReview(ctx, reviewer, key, response)
+	writeJSON(rw, http.StatusOK, response)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/skus/{sku_id}/review", review)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
 
-final case class ReviewRequest(decision: String, attributes: Option[Map[String, JsValue]], note: Option[String])
+import scala.collection.mutable
+import scala.util.Try
+
+import enrich.Store // Store.pending, leaseHolder, releaseLease, putLabel, nextVersion, dropProposal, reviewResult, recordReview, applyCatalog
 
 object ReviewApi {
-  import DefaultJsonProtocol._
-  implicit val system: ActorSystem = ActorSystem("catalogd")
-  implicit val reviewFormat: RootJsonFormat[ReviewRequest] = jsonFormat3(ReviewRequest)
+  val Decisions: Set[String] = Set("accept", "correct")
+  val AttributeNames: Set[String] = Set("brand", "size", "unit", "organic", "category")
 
-  val catalog = Catalog.open()
+  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
 
-  val route: Route =
-    path("v1" / "skus" / Segment / "review") { skuId =>
-      post {
-        headerValueByName("X-Reviewer-Id") { reviewer =>
-          entity(as[ReviewRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val pending = catalog.pending(skuId).map(_.attributes).getOrElse(Map.empty[String, JsValue])
-            val attributes = if (body.decision == "accept") pending else pending ++ body.attributes.getOrElse(Map.empty)
-            catalog.apply(skuId, attributes, "human")
-            system.log.info(s"review sku=$skuId reviewer=$reviewer attributes=$attributes note=\${body.note}")
-            complete(StatusCodes.OK, JsObject("sku_id" -> JsString(skuId), "attributes" -> JsObject(attributes)))
-          }
-        }
-      }
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, ujson.Obj("error" -> message))
+
+  /** The body, or None unless it is {"decision": accept|correct, "attributes": {known names}}. */
+  def decisionOf(raw: String): Option[(String, ujson.Obj)] =
+    Try(ujson.read(raw)).toOption.flatMap(_.objOpt).flatMap { body =>
+      val decision = body.get("decision").flatMap(_.strOpt).filter(Decisions.contains)
+      val corrections = body.get("attributes").map(_.objOpt).getOrElse(Some(mutable.LinkedHashMap.empty[String, ujson.Value]))
+      for (d <- decision; c <- corrections if c.keys.forall(AttributeNames.contains)) yield (d, ujson.Obj.from(c))
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  def decide(skuId: String, reviewer: Option[String], raw: String): HttpResponse = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    val who = reviewer.getOrElse("unknown")
+    (decisionOf(raw), Store.pending(skuId)) match {
+      case (None, _) => error(StatusCodes.BadRequest, "decision must be accept or correct, attributes among brand, size, unit, organic, category")
+      case (_, None) => error(StatusCodes.NotFound, "no proposal is waiting for review")
+      case (Some((decision, corrections)), Some(proposal)) =>
+        val attributes = ujson.Obj.from(proposal("attributes").obj)
+        if (decision == "correct") corrections.value.foreach { case (name, value) => attributes(name) = value }
+        val version = Store.nextVersion(skuId).toDouble
+        Store.applyCatalog(ujson.Obj("sku_id" -> skuId, "merchant" -> proposal("merchant").str, "attributes" -> attributes, "attributes_version" -> version,
+          "taxonomy_version" -> proposal("taxonomy_version").str, "source" -> "human"))
+        Store.dropProposal(skuId)
+        json(StatusCodes.OK, ujson.Obj("sku_id" -> skuId, "attributes_version" -> version, "taxonomy_version" -> proposal("taxonomy_version").str, "reviewer" -> who))
+    }
+  }
+
+  val route: Route = path("v1" / "skus" / Segment / "review") { skuId =>
+    post {
+      optionalHeaderValueByName("X-Reviewer-Id") { reviewer =>
+        entity(as[String]) { raw => complete(decide(skuId, reviewer, raw)) }
+      }
+    }
   }
 }
 `,
-      solution: `import java.nio.charset.StandardCharsets
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json._
 
-final case class ReviewRequest(decision: String, attributes: Option[Map[String, JsValue]], note: Option[String])
+import scala.collection.mutable
+import scala.util.Try
+
+import enrich.Store // Store.pending, leaseHolder, releaseLease, putLabel, nextVersion, dropProposal, reviewResult, recordReview, applyCatalog
 
 object ReviewApi {
-  import DefaultJsonProtocol._
-  implicit val system: ActorSystem = ActorSystem("catalogd")
-  implicit val reviewFormat: RootJsonFormat[ReviewRequest] = jsonFormat3(ReviewRequest)
+  val ReviewerRoles: Set[String] = Set("reviewer", "catalog-admin")
+  val Decisions: Set[String] = Set("accept", "correct")
+  val AttributeNames: Set[String] = Set("brand", "size", "unit", "organic", "category")
 
-  val ReviewerRoles = Set("reviewer", "catalog-admin")
-  val AllowedDecisions = Set("accept", "correct")
-  val AllowedAttributes = Set("brand", "size", "unit", "organic", "category")
-  val MaxNoteBytes = 1024
+  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
 
-  val reviews = ReviewStore.open()
-  val labels = LabelStore.open()
-  val lease = ReviewLease.open()
-  val catalog = Catalog.open()
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, ujson.Obj("error" -> message))
 
-  def error(status: StatusCode, message: String): Route =
-    complete(status, JsObject("error" -> JsString(message)))
-
-  val route: Route =
-    path("v1" / "skus" / Segment / "review") { skuId =>
-      post {
-        optionalHeaderValueByName("X-Reviewer-Id") { reviewerOpt =>
-          optionalHeaderValueByName("X-Reviewer-Role") { roleOpt =>
-            optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-              entity(as[ReviewRequest]) { body =>
-                val corrections = body.attributes.getOrElse(Map.empty[String, JsValue])
-                val unknown = corrections.keySet.diff(AllowedAttributes)
-                val note = body.note.getOrElse("")
-                if (!reviewerOpt.exists(_.nonEmpty)) error(StatusCodes.Unauthorized, "missing X-Reviewer-Id")
-                else if (!roleOpt.exists(ReviewerRoles.contains)) error(StatusCodes.Forbidden, "reviewer role required")
-                else if (!idemOpt.exists(_.nonEmpty)) error(StatusCodes.BadRequest, "Idempotency-Key is required")
-                else if (!AllowedDecisions.contains(body.decision))
-                  error(StatusCodes.BadRequest, "decision must be accept or correct")
-                else if (body.decision == "correct" && corrections.isEmpty)
-                  error(StatusCodes.BadRequest, "correct requires attributes")
-                else if (unknown.nonEmpty)
-                  error(StatusCodes.BadRequest, s"unknown attributes: \${unknown.toList.sorted.mkString(", ")}")
-                else if (note.getBytes(StandardCharsets.UTF_8).length > MaxNoteBytes)
-                  error(StatusCodes.BadRequest, "note exceeds 1 KiB")
-                else {
-                  val reviewer = reviewerOpt.get
-                  val idemKey = idemOpt.get
-                  reviews.get(reviewer, idemKey) match {
-                    case Some(stored) => complete(StatusCodes.OK, stored)
-                    case None =>
-                      catalog.pending(skuId) match {
-                        case None => error(StatusCodes.NotFound, "no proposal awaiting review")
-                        case Some(pending) =>
-                          if (!lease.holder(skuId).contains(reviewer))
-                            error(StatusCodes.Conflict, "review lease is held by another reviewer")
-                          else {
-                            val attributes =
-                              if (body.decision == "correct") pending.attributes ++ corrections else pending.attributes
-                            val labelVersion = labels.put(skuId, attributes, pending.taxonomyVersion, reviewer)
-                            catalog.apply(skuId, attributes, "human")
-                            lease.release(skuId, reviewer)
-                            val outcome = JsObject(
-                              "review_id" -> JsString(UUID.randomUUID().toString),
-                              "sku_id" -> JsString(skuId),
-                              "decision" -> JsString(body.decision),
-                              "attributes" -> JsObject(attributes),
-                              "label_version" -> JsNumber(labelVersion),
-                              "taxonomy_version" -> JsString(pending.taxonomyVersion)
-                            )
-                            reviews.put(reviewer, idemKey, outcome)
-                            system.log.info(
-                              s"review sku=$skuId reviewer=$reviewer decision=\${body.decision} label=$labelVersion"
-                            )
-                            complete(StatusCodes.OK, outcome)
-                          }
-                      }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
+  /** The body, or None unless it is {"decision": accept|correct, "attributes": {known names}}. */
+  def decisionOf(raw: String): Option[(String, ujson.Obj)] =
+    Try(ujson.read(raw)).toOption.flatMap(_.objOpt).flatMap { body =>
+      val decision = body.get("decision").flatMap(_.strOpt).filter(Decisions.contains)
+      val corrections = body.get("attributes").map(_.objOpt).getOrElse(Some(mutable.LinkedHashMap.empty[String, ujson.Value]))
+      for (d <- decision; c <- corrections if c.keys.forall(AttributeNames.contains)) yield (d, ujson.Obj.from(c))
     }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  def decide(skuId: String, reviewer: Option[String], role: Option[String], idempotencyKey: Option[String], raw: String): HttpResponse = {
+    val who = reviewer.getOrElse("")
+    val key = idempotencyKey.getOrElse("")
+    if (who.isEmpty) error(StatusCodes.Unauthorized, "X-Reviewer-Id is required")
+    else if (!role.exists(ReviewerRoles.contains)) error(StatusCodes.Forbidden, "only reviewers and catalog admins decide attributes")
+    else if (key.isEmpty) error(StatusCodes.BadRequest, "Idempotency-Key is required")
+    else
+      Store.reviewResult(who, key) match {
+        case Some(recorded) => json(StatusCodes.OK, recorded) // a retry answers what the first attempt answered
+        case None =>
+          (decisionOf(raw), Store.pending(skuId)) match {
+            case (None, _) => error(StatusCodes.BadRequest, "decision must be accept or correct, attributes among brand, size, unit, organic, category")
+            case (_, None) => error(StatusCodes.NotFound, "no proposal is waiting for review")
+            case (Some((decision, corrections)), Some(proposal)) =>
+              if (!Store.leaseHolder(skuId).contains(who)) error(StatusCodes.Conflict, "claim the SKU's review lease first")
+              else record(skuId, who, key, decision, corrections, proposal)
+          }
+      }
+  }
+
+  /** One decision by the lease holder: a label, then a human event. */
+  def record(skuId: String, who: String, key: String, decision: String, corrections: ujson.Obj, proposal: ujson.Obj): HttpResponse = {
+    val attributes = ujson.Obj.from(proposal("attributes").obj)
+    if (decision == "correct") corrections.value.foreach { case (name, value) => attributes(name) = value }
+    val taxonomyVersion = proposal("taxonomy_version").str
+    val labelVersion = Store.putLabel(skuId, decision, attributes, taxonomyVersion, who)
+    val event = ujson.Obj("sku_id" -> skuId, "merchant" -> proposal("merchant").str, "attributes" -> attributes,
+      "attributes_version" -> Store.nextVersion(skuId).toDouble, "taxonomy_version" -> taxonomyVersion, "source" -> "human")
+    EnrichedEvents.publish(event) // step 5: the indexer applies it to the catalog and the search index
+    Store.dropProposal(skuId)
+    Store.releaseLease(skuId, who)
+    val response = ujson.Obj("sku_id" -> skuId, "label_version" -> labelVersion.toDouble, "attributes_version" -> event("attributes_version"), "taxonomy_version" -> taxonomyVersion)
+    Store.recordReview(who, key, response)
+    json(StatusCodes.OK, response)
+  }
+
+  val route: Route = path("v1" / "skus" / Segment / "review") { skuId =>
+    post {
+      (optionalHeaderValueByName("X-Reviewer-Id") & optionalHeaderValueByName("X-Reviewer-Role") & optionalHeaderValueByName("Idempotency-Key")) {
+        (reviewer, role, key) => entity(as[String]) { raw => complete(decide(skuId, reviewer, role, key, raw)) }
+      }
+    }
   }
 }
 `,
@@ -794,165 +680,504 @@ object ReviewApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <optional>
+#include <algorithm>
 #include <string>
+#include <vector>
+
+#include "enrich/store.h"  // store::pending, lease_holder, release_lease, put_label, next_version, drop_proposal, review_result, record_review, apply_catalog
 
 using json = nlohmann::json;
 
-struct Proposal {
-  json attributes;
-  std::string taxonomy_version;
-};
+const std::vector<std::string> kDecisions = {"accept", "correct"};
+const std::vector<std::string> kAttributes = {"brand", "size", "unit", "organic", "category"};
 
-struct Catalog {
-  std::optional<Proposal> pending(const std::string& skuId);
-  void apply(const std::string& skuId, const json& attributes, const std::string& source);
-};
+bool listed(const std::vector<std::string>& list, const std::string& value) {
+  return std::find(list.begin(), list.end(), value) != list.end();
+}
 
-Catalog catalog;
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
+// The body, or null unless it is {"decision": accept|correct, "attributes": {known names}}.
+json decisionOf(const std::string& raw) {
+  const json body = json::parse(raw, nullptr, false);
+  if (!body.is_object() || !body.contains("decision") || !body["decision"].is_string() || !listed(kDecisions, body["decision"])) return nullptr;
+  const json corrections = body.contains("attributes") ? body["attributes"] : json::object();
+  if (!corrections.is_object()) return nullptr;
+  for (const auto& item : corrections.items())
+    if (!listed(kAttributes, item.key())) return nullptr;
+  return {{"decision", body["decision"]}, {"attributes", corrections}};
+}
 
-  svr.Post(R"(/v1/skus/([^/]+)/review)", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string skuId = req.matches[1];
-    const auto reviewer = req.get_header_value("X-Reviewer-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto pending = catalog.pending(skuId);
-    json attributes = pending ? pending->attributes : json::object();
-    if (body.value("decision", std::string()) != "accept" && body.contains("attributes"))
-      attributes.update(body["attributes"]);
-    catalog.apply(skuId, attributes, "human");
-    std::cerr << "review sku=" << skuId << " reviewer=" << reviewer << " attributes=" << attributes.dump()
-              << " note=" << body.value("note", std::string()) << "\\n";
-    res.status = 200;
-    res.set_content(json{{"sku_id", skuId}, {"attributes", attributes}}.dump(), "application/json");
-  });
+void review(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string sku_id = req.matches[1];
+  std::string reviewer = req.get_header_value("X-Reviewer-Id");
+  if (reviewer.empty()) reviewer = "unknown";
+  const json body = decisionOf(req.body);
+  if (body.is_null()) return reply(res, 400, {{"error", "decision must be accept or correct, attributes among brand, size, unit, organic, category"}});
+  const auto proposal = store::pending(sku_id);
+  if (!proposal) return reply(res, 404, {{"error", "no proposal is waiting for review"}});
+  json attributes = (*proposal)["attributes"];
+  if (body["decision"] == "correct") attributes.update(body["attributes"]);
+  const long long version = store::next_version(sku_id);
+  store::apply_catalog({{"sku_id", sku_id}, {"merchant", (*proposal)["merchant"]}, {"attributes", attributes}, {"attributes_version", version},
+                        {"taxonomy_version", (*proposal)["taxonomy_version"]}, {"source", "human"}});
+  store::drop_proposal(sku_id);
+  reply(res, 200, {{"sku_id", sku_id}, {"attributes_version", version}, {"taxonomy_version", (*proposal)["taxonomy_version"]}, {"reviewer", reviewer}});
+}
 
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post(R"(/v1/skus/([\\w-]+)/review)", review);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
-#include <optional>
-#include <set>
+#include <algorithm>
 #include <string>
 #include <vector>
 
+#include "enrich/store.h"  // store::pending, lease_holder, release_lease, put_label, next_version, drop_proposal, review_result, record_review, apply_catalog
+
 using json = nlohmann::json;
 
-const std::set<std::string> kReviewerRoles = {"reviewer", "catalog-admin"};
-const std::set<std::string> kAllowedDecisions = {"accept", "correct"};
-const std::set<std::string> kAllowedAttributes = {"brand", "size", "unit", "organic", "category"};
-constexpr std::size_t kMaxNoteBytes = 1024;
+const std::vector<std::string> kReviewerRoles = {"reviewer", "catalog-admin"};
+const std::vector<std::string> kDecisions = {"accept", "correct"};
+const std::vector<std::string> kAttributes = {"brand", "size", "unit", "organic", "category"};
 
-struct Proposal {
-  json attributes;
-  std::string taxonomy_version;
-};
+// Built in step 5 (enriched_events.cpp): one sku.enriched event, or an outbox row when the broker refuses it.
+void publish(const json& event);
 
-struct ReviewStore {
-  std::optional<json> get(const std::string& reviewer, const std::string& idemKey);
-  void put(const std::string& reviewer, const std::string& idemKey, const json& outcome);
-};
-
-// Appends labelled examples for the next model; put returns the label version.
-struct LabelStore {
-  long long put(const std::string& skuId, const json& attributes, const std::string& taxonomyVersion,
-                const std::string& reviewer);
-};
-
-struct ReviewLease {
-  std::optional<std::string> holder(const std::string& skuId);
-  bool release(const std::string& skuId, const std::string& reviewer);
-};
-
-struct Catalog {
-  std::optional<Proposal> pending(const std::string& skuId);
-  void apply(const std::string& skuId, const json& attributes, const std::string& source);
-};
-
-ReviewStore reviews;
-LabelStore labels;
-ReviewLease lease;
-Catalog catalog;
-std::string uuidString();
-
-void fail(httplib::Response& res, int status, const std::string& message) {
-  res.status = status;
-  res.set_content(json{{"error", message}}.dump(), "application/json");
+bool listed(const std::vector<std::string>& list, const std::string& value) {
+  return std::find(list.begin(), list.end(), value) != list.end();
 }
 
-int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-  svr.Post(R"(/v1/skus/([^/]+)/review)", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string skuId = req.matches[1];
-    const auto reviewer = req.get_header_value("X-Reviewer-Id");
-    if (reviewer.empty()) return fail(res, 401, "missing X-Reviewer-Id");
-    if (kReviewerRoles.count(req.get_header_value("X-Reviewer-Role")) == 0)
-      return fail(res, 403, "reviewer role required");
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) return fail(res, 400, "Idempotency-Key is required");
+// The body, or null unless it is {"decision": accept|correct, "attributes": {known names}}.
+json decisionOf(const std::string& raw) {
+  const json body = json::parse(raw, nullptr, false);
+  if (!body.is_object() || !body.contains("decision") || !body["decision"].is_string() || !listed(kDecisions, body["decision"])) return nullptr;
+  const json corrections = body.contains("attributes") ? body["attributes"] : json::object();
+  if (!corrections.is_object()) return nullptr;
+  for (const auto& item : corrections.items())
+    if (!listed(kAttributes, item.key())) return nullptr;
+  return {{"decision", body["decision"]}, {"attributes", corrections}};
+}
 
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("decision") || !body["decision"].is_string())
-      return fail(res, 400, "decision must be accept or correct");
-    const auto decision = body["decision"].get<std::string>();
-    if (kAllowedDecisions.count(decision) == 0) return fail(res, 400, "decision must be accept or correct");
-    const json corrections = body.contains("attributes") && body["attributes"].is_object() ? body["attributes"] : json::object();
-    if (decision == "correct" && corrections.empty()) return fail(res, 400, "correct requires attributes");
-    std::vector<std::string> unknown;
-    for (const auto& [key, value] : corrections.items())
-      if (kAllowedAttributes.count(key) == 0) unknown.push_back(key);
-    if (!unknown.empty()) return fail(res, 400, "unknown attributes: " + json(unknown).dump());
-    if (body.value("note", std::string()).size() > kMaxNoteBytes) return fail(res, 400, "note exceeds 1 KiB");
+void review(const httplib::Request& req, httplib::Response& res) {
+  const std::string sku_id = req.matches[1];
+  const std::string reviewer = req.get_header_value("X-Reviewer-Id");
+  if (reviewer.empty()) return reply(res, 401, {{"error", "X-Reviewer-Id is required"}});
+  if (!listed(kReviewerRoles, req.get_header_value("X-Reviewer-Role"))) return reply(res, 403, {{"error", "only reviewers and catalog admins decide attributes"}});
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return reply(res, 400, {{"error", "Idempotency-Key is required"}});
+  if (const auto recorded = store::review_result(reviewer, key)) return reply(res, 200, *recorded);  // a retry answers what the first attempt answered
+  const json body = decisionOf(req.body);
+  if (body.is_null()) return reply(res, 400, {{"error", "decision must be accept or correct, attributes among brand, size, unit, organic, category"}});
+  const auto proposal = store::pending(sku_id);
+  if (!proposal) return reply(res, 404, {{"error", "no proposal is waiting for review"}});
+  if (store::lease_holder(sku_id).value_or("") != reviewer) return reply(res, 409, {{"error", "claim the SKU's review lease first"}});
+  json attributes = (*proposal)["attributes"];
+  if (body["decision"] == "correct") attributes.update(body["attributes"]);
+  const std::string taxonomy_version = (*proposal)["taxonomy_version"];
+  const long long label_version = store::put_label(sku_id, body["decision"], attributes, taxonomy_version, reviewer);
+  const json event = {{"sku_id", sku_id}, {"merchant", (*proposal)["merchant"]}, {"attributes", attributes},
+                      {"attributes_version", store::next_version(sku_id)}, {"taxonomy_version", taxonomy_version}, {"source", "human"}};
+  publish(event);  // the indexer applies it to the catalog and the search index
+  store::drop_proposal(sku_id);
+  store::release_lease(sku_id, reviewer);
+  const json response = {{"sku_id", sku_id}, {"label_version", label_version}, {"attributes_version", event["attributes_version"]}, {"taxonomy_version", taxonomy_version}};
+  store::record_review(reviewer, key, response);
+  reply(res, 200, response);
+}
 
-    if (const auto stored = reviews.get(reviewer, idemKey)) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-
-    const auto pending = catalog.pending(skuId);
-    if (!pending) return fail(res, 404, "no proposal awaiting review");
-    const auto holder = lease.holder(skuId);
-    if (!holder || *holder != reviewer) return fail(res, 409, "review lease is held by another reviewer");
-
-    json attributes = pending->attributes;
-    if (decision == "correct") attributes.update(corrections);
-    const long long labelVersion = labels.put(skuId, attributes, pending->taxonomy_version, reviewer);
-    catalog.apply(skuId, attributes, "human");
-    lease.release(skuId, reviewer);
-
-    const json outcome = {
-        {"review_id", uuidString()},
-        {"sku_id", skuId},
-        {"decision", decision},
-        {"attributes", attributes},
-        {"label_version", labelVersion},
-        {"taxonomy_version", pending->taxonomy_version},
-    };
-    reviews.put(reviewer, idemKey, outcome);
-    std::cerr << "review sku=" << skuId << " reviewer=" << reviewer << " decision=" << decision
-              << " label=" << labelVersion << "\\n";
-    res.status = 200;
-    res.set_content(outcome.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post(R"(/v1/skus/([\\w-]+)/review)", review);
 }
 `,
     },
   },
-  debrief: `The fix sits at the boundary where humans write into a model's world. Most of it is ordinary trust-boundary work: a role check (reaching the service does not make a caller a reviewer), input whitelists (an unknown key is a schema change nobody approved), and idempotency keyed by reviewer so a retry does not label twice. The lease check is the concurrency part: without it the lease from step 3 is decorative and two reviewers silently overwrite each other. The label store is what matters to the business: reviewers' decisions are the golden annotations that train the next extractor, and an endpoint that only edits the catalog row throws them away. This step does not sample decisions for a second reviewer, track per-reviewer accuracy, or gate the next model on an eval set built from the labels.`,
+  harness: {
+    python: `import json
+
+from enrich import store, taxonomy
+
+PROPOSAL = {"sku_id": "sku-1", "merchant": "m-1", "attributes": {"brand": None, "size": 1.0, "unit": "l", "organic": False, "category": "plant-milk"}, "confidence": 0.62, "taxonomy_version": taxonomy.VERSION}
+CORRECT = {"decision": "correct", "attributes": {"brand": "Oatly"}, "note": "brand printed on the carton"}
+
+
+def _api(ctx, holder="ana"):
+    store.enqueue_review(PROPOSAL, "brand 'Glowra' is not a taxonomy candidate")
+    if holder:
+        ctx.redis.set("review:lease:sku-1", holder)
+    return ctx.client(ctx.load("review_api").app)
+
+
+def _headers(key, reviewer="ana", role="reviewer"):
+    headers = {}
+    for name, value in (("Idempotency-Key", key), ("X-Reviewer-Id", reviewer), ("X-Reviewer-Role", role)):
+        if value:
+            headers[name] = value
+    return headers
+
+
+async def _post(c, key, sku_id="sku-1", **who):
+    return await c.post(f"/v1/skus/{sku_id}/review", json=CORRECT, headers=_headers(key, **who))
+
+
+def _events(ctx):
+    return [json.loads(r.value) for r in ctx.kafka.records("sku.enriched")]
+
+
+def _untouched(ctx, why):
+    assert store.read_label("sku-1", 1) is None and not _events(ctx) and store.catalog_current("sku-1") is None, f"{why}, yet a label, an event or a catalog row was written"
+    assert store.pending("sku-1") is not None, f"{why}, yet the proposal left the review queue"
+
+
+async def check_reviewer_auth(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, "k-1", reviewer=None)
+        assert r.status_code == 401, f"a decision without X-Reviewer-Id answered {r.status_code}, expected 401"
+        r = await _post(c, "k-2", role="shopper")
+        assert r.status_code == 403, f"a decision from role 'shopper' answered {r.status_code}, expected 403"
+        _untouched(ctx, "after two refused requests")
+        r = await _post(c, "k-3")
+    assert r.status_code == 200, f"a reviewer holding the lease answered {r.status_code}: {r.text}"
+
+
+async def check_lease_held(ctx):
+    async with _api(ctx, holder="ben") as c:
+        r = await _post(c, "k-1")
+        assert r.status_code == 409, f"ana decided on a SKU whose review lease ben holds: answered {r.status_code}, expected 409"
+        _untouched(ctx, "after a decision without the lease")
+        ctx.redis.set("review:lease:sku-1", "ana")
+        r = await _post(c, "k-2")
+        assert r.status_code == 200, f"the lease holder's decision answered {r.status_code}: {r.text}"
+        assert ctx.redis.get("review:lease:sku-1") is None, "the decision is made: release the lease so the SKU does not stay claimed for 15 minutes"
+        r = await _post(c, "k-3", sku_id="sku-404")
+    assert r.status_code == 404, f"a decision on a SKU with no proposal answered {r.status_code}, expected 404"
+
+
+async def check_idempotency_key(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, None)
+        assert r.status_code == 400, f"a decision without Idempotency-Key answered {r.status_code}, expected 400"
+        _untouched(ctx, "after a decision without Idempotency-Key")
+        first = await _post(c, "k-1")
+        assert first.status_code == 200, f"the first decision answered {first.status_code}: {first.text}"
+        retry = await _post(c, "k-1")
+    assert retry.status_code == 200 and retry.json() == first.json(), f"a retry with the same Idempotency-Key must answer the first response: first {first.text}, retry {retry.status_code} {retry.text}"
+    assert store.read_label("sku-1", 2) is None and len(_events(ctx)) == 1, f"the retry recorded a second decision: {len(_events(ctx))} events on sku.enriched"
+
+
+async def check_label_and_publish(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, "k-1")
+    assert r.status_code == 200, f"the decision answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("label_version") == 1, f"the answer must carry the label version, got {body}"
+    label = store.read_label("sku-1", 1)
+    assert label is not None, "no label:sku-1:v1 was written: the correction is the training example for the next model"
+    assert label["decision"] == "correct" and label["attributes"]["brand"] == "Oatly" and label["reviewer"] == "ana" and label["taxonomy_version"] == taxonomy.VERSION, f"the label must hold the decision, the corrected attributes, the reviewer and the taxonomy version, got {label}"
+    events = _events(ctx)
+    assert len(events) == 1, f"the decision must reach sku.enriched once, the topic holds {len(events)} events"
+    assert events[0]["source"] == "human" and events[0]["attributes"]["brand"] == "Oatly", f"the event must carry the corrected attributes with source human, got {events[0]}"
+    assert events[0]["attributes_version"] == body.get("attributes_version"), f"the event's attributes_version {events[0]['attributes_version']} differs from the answer's {body.get('attributes_version')}"
+    assert store.pending("sku-1") is None, "the decided proposal is still in the review queue"
+`,
+    typescript: `const PROPOSAL = {
+  sku_id: 'sku-1',
+  merchant: 'm-1',
+  attributes: {brand: null, size: 1, unit: 'l', organic: false, category: 'plant-milk'},
+  confidence: 0.62,
+  taxonomy_version: 'tx-2026.11',
+  source: 'model',
+  status: 'review',
+};
+const CORRECT = {decision: 'correct', attributes: {brand: 'Oatly'}, note: 'brand printed on the carton'};
+
+async function api(ctx, holder: string | null = 'ana') {
+  const store = ctx.load('/support/enrich/store.ts');
+  await store.enqueueReview(PROPOSAL, "brand 'Glowra' is not a taxonomy candidate");
+  if (holder !== null) ctx.redis.set('review:lease:sku-1', holder);
+  return {c: ctx.client(ctx.load('review_api').app), store};
+}
+
+function headers(key: string | null, reviewer: string | null = 'ana', role: string | null = 'reviewer'): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (key !== null) out['Idempotency-Key'] = key;
+  if (reviewer !== null) out['X-Reviewer-Id'] = reviewer;
+  if (role !== null) out['X-Reviewer-Role'] = role;
+  return out;
+}
+
+const post = (c, key: string | null, skuId = 'sku-1', reviewer: string | null = 'ana', role: string | null = 'reviewer') =>
+  c.post(\`/v1/skus/\${skuId}/review\`, {json: CORRECT, headers: headers(key, reviewer, role)});
+
+const events = (ctx) => ctx.kafka.records('sku.enriched').map(r => JSON.parse(Buffer.from(r.value).toString('utf8')));
+
+async function untouched(ctx, store, why: string): Promise<void> {
+  assert((await store.readLabel('sku-1', 1)) === null && events(ctx).length === 0 && (await store.catalogCurrent('sku-1')) === null, \`\${why}, yet a label, an event or a catalog row was written\`);
+  assert((await store.pending('sku-1')) !== null, \`\${why}, yet the proposal left the review queue\`);
+}
+
+export async function check_reviewer_auth(ctx) {
+  const {c, store} = await api(ctx);
+  let r = await post(c, 'k-1', 'sku-1', null);
+  assert.equal(r.status, 401, \`a decision without X-Reviewer-Id answered \${r.status}, expected 401\`);
+  r = await post(c, 'k-2', 'sku-1', 'ana', 'shopper');
+  assert.equal(r.status, 403, \`a decision from role 'shopper' answered \${r.status}, expected 403\`);
+  await untouched(ctx, store, 'after two refused requests');
+  r = await post(c, 'k-3');
+  assert.equal(r.status, 200, \`a reviewer holding the lease answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_lease_held(ctx) {
+  const {c, store} = await api(ctx, 'ben');
+  let r = await post(c, 'k-1');
+  assert.equal(r.status, 409, \`ana decided on a SKU whose review lease ben holds: answered \${r.status}, expected 409\`);
+  await untouched(ctx, store, 'after a decision without the lease');
+  ctx.redis.set('review:lease:sku-1', 'ana');
+  r = await post(c, 'k-2');
+  assert.equal(r.status, 200, \`the lease holder's decision answered \${r.status}: \${r.text}\`);
+  assert.equal(ctx.redis.get('review:lease:sku-1'), null, 'the decision is made: release the lease so the SKU does not stay claimed for 15 minutes');
+  r = await post(c, 'k-3', 'sku-404');
+  assert.equal(r.status, 404, \`a decision on a SKU with no proposal answered \${r.status}, expected 404\`);
+}
+
+export async function check_idempotency_key(ctx) {
+  const {c, store} = await api(ctx);
+  const r = await post(c, null);
+  assert.equal(r.status, 400, \`a decision without Idempotency-Key answered \${r.status}, expected 400\`);
+  await untouched(ctx, store, 'after a decision without Idempotency-Key');
+  const first = await post(c, 'k-1');
+  assert.equal(first.status, 200, \`the first decision answered \${first.status}: \${first.text}\`);
+  const retry = await post(c, 'k-1');
+  assert(retry.status === 200 && JSON.stringify(retry.json()) === JSON.stringify(first.json()), \`a retry with the same Idempotency-Key must answer the first response: first \${first.text}, retry \${retry.status} \${retry.text}\`);
+  assert((await store.readLabel('sku-1', 2)) === null && events(ctx).length === 1, \`the retry recorded a second decision: \${events(ctx).length} events on sku.enriched\`);
+}
+
+export async function check_label_and_publish(ctx) {
+  const {c, store} = await api(ctx);
+  const r = await post(c, 'k-1');
+  assert.equal(r.status, 200, \`the decision answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert.equal(body.label_version, 1, \`the answer must carry the label version, got \${r.text}\`);
+  const label = await store.readLabel('sku-1', 1);
+  assert(label !== null, 'no label:sku-1:v1 was written: the correction is the training example for the next model');
+  assert(label.decision === 'correct' && label.attributes.brand === 'Oatly' && label.reviewer === 'ana' && label.taxonomy_version === 'tx-2026.11', \`the label must hold the decision, the corrected attributes, the reviewer and the taxonomy version, got \${JSON.stringify(label)}\`);
+  const all = events(ctx);
+  assert.equal(all.length, 1, 'the decision must reach sku.enriched once');
+  assert(all[0].source === 'human' && all[0].attributes.brand === 'Oatly', \`the event must carry the corrected attributes with source human, got \${JSON.stringify(all[0])}\`);
+  assert.equal(all[0].attributes_version, body.attributes_version, "the event's attributes_version must be the one the answer names");
+  assert.equal(await store.pending('sku-1'), null, 'the decided proposal is still in the review queue');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"enrich/store"
+	"enrich/taxonomy"
+
+	"leetbuild/harness"
+)
+
+var reviewBg = context.Background()
+
+var correction = map[string]any{"decision": "correct", "attributes": map[string]any{"brand": "Oatly"}, "note": "brand printed on the carton"}
+
+// reviewAPI parks one proposal for sku-1, gives the lease to holder, and stands in for step 5's publish.
+func reviewAPI(ctx *harness.Ctx, holder string) (*harness.HTTP, *[]store.Event) {
+	published := []store.Event{}
+	publish = func(_ context.Context, event store.Event) error {
+		published = append(published, event)
+		return nil
+	}
+	proposal := store.Result{SkuID: "sku-1", Merchant: "m-1", Attributes: map[string]any{"brand": nil, "size": 1.0, "unit": "l", "organic": false, "category": "plant-milk"},
+		Confidence: 0.62, TaxonomyVersion: taxonomy.Version, Source: "model", Status: "review"}
+	ctx.NoError(store.EnqueueReview(reviewBg, proposal, "brand 'Glowra' is not a taxonomy candidate"), "parking the proposal")
+	if holder != "" {
+		ctx.Redis.Set("review:lease:sku-1", holder)
+	}
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux), &published
+}
+
+func decide(c *harness.HTTP, skuID string, headers ...string) *harness.Response {
+	return c.Post("/v1/skus/"+skuID+"/review", correction, headers...)
+}
+
+func untouched(ctx *harness.Ctx, published *[]store.Event, why string) {
+	ctx.Assert(store.ReadLabel(reviewBg, "sku-1", 1) == nil && len(*published) == 0 && store.CatalogCurrent(reviewBg, "sku-1") == nil, "%s, yet a label, an event or a catalog row was written", why)
+	ctx.Assert(store.Pending(reviewBg, "sku-1") != nil, "%s, yet the proposal left the review queue", why)
+}
+
+func CheckReviewerAuth(ctx *harness.Ctx) {
+	c, published := reviewAPI(ctx, "ana")
+	r := decide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Role", "reviewer")
+	ctx.Equal(r.Status, 401, "a decision without X-Reviewer-Id; the status")
+	r = decide(c, "sku-1", "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "shopper")
+	ctx.Equal(r.Status, 403, "a decision from role 'shopper'; the status")
+	untouched(ctx, published, "after two refused requests")
+	r = decide(c, "sku-1", "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer")
+	ctx.Equal(r.Status, 200, "a reviewer holding the lease (%s); the status", r.Text())
+}
+
+func CheckLeaseHeld(ctx *harness.Ctx) {
+	c, published := reviewAPI(ctx, "ben")
+	ana := []string{"X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer"}
+	r := decide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
+	ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease ben holds; the status")
+	untouched(ctx, published, "after a decision without the lease")
+	ctx.Redis.Set("review:lease:sku-1", "ana")
+	r = decide(c, "sku-1", append([]string{"Idempotency-Key", "k-2"}, ana...)...)
+	ctx.Equal(r.Status, 200, "the lease holder's decision (%s); the status", r.Text())
+	_, held := ctx.Redis.Get("review:lease:sku-1")
+	ctx.Assert(!held, "the decision is made: release the lease so the SKU does not stay claimed for 15 minutes")
+	r = decide(c, "sku-404", append([]string{"Idempotency-Key", "k-3"}, ana...)...)
+	ctx.Equal(r.Status, 404, "a decision on a SKU with no proposal; the status")
+}
+
+func CheckIdempotencyKey(ctx *harness.Ctx) {
+	c, published := reviewAPI(ctx, "ana")
+	ana := []string{"X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer"}
+	r := decide(c, "sku-1", ana...)
+	ctx.Equal(r.Status, 400, "a decision without Idempotency-Key; the status")
+	untouched(ctx, published, "after a decision without Idempotency-Key")
+	first := decide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
+	ctx.Equal(first.Status, 200, "the first decision (%s); the status", first.Text())
+	retry := decide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
+	ctx.Assert(retry.Status == 200 && retry.Text() == first.Text(), "a retry with the same Idempotency-Key must answer the first response: first %s, retry %d %s", first.Text(), retry.Status, retry.Text())
+	ctx.Assert(store.ReadLabel(reviewBg, "sku-1", 2) == nil && len(*published) == 1, "the retry recorded a second decision: %d events published", len(*published))
+}
+
+func CheckLabelAndPublish(ctx *harness.Ctx) {
+	c, published := reviewAPI(ctx, "ana")
+	r := decide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer")
+	ctx.Equal(r.Status, 200, "the decision (%s); the status", r.Text())
+	var body struct {
+		LabelVersion      int64 \`json:"label_version"\`
+		AttributesVersion int64 \`json:"attributes_version"\`
+	}
+	r.Decode(&body)
+	ctx.Equal(body.LabelVersion, int64(1), "the answer must carry the label version (%s); label_version", r.Text())
+	label := store.ReadLabel(reviewBg, "sku-1", 1)
+	ctx.Assert(label != nil, "no label:sku-1:v1 was written: the correction is the training example for the next model")
+	attributes, _ := label["attributes"].(map[string]any)
+	ctx.Assert(label["decision"] == "correct" && attributes["brand"] == "Oatly" && label["reviewer"] == "ana" && label["taxonomy_version"] == taxonomy.Version,
+		"the label must hold the decision, the corrected attributes, the reviewer and the taxonomy version, got %v", label)
+	ctx.Equal(len(*published), 1, "the decision must be published once; the events")
+	event := (*published)[0]
+	ctx.Assert(event.Source == "human" && event.Attributes["brand"] == "Oatly", "the event must carry the corrected attributes with source human, got %+v", event)
+	ctx.Equal(event.AttributesVersion, body.AttributesVersion, "the event's attributes_version must be the one the answer names")
+	ctx.Assert(store.Pending(reviewBg, "sku-1") == nil, "the decided proposal is still in the review queue")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "enrich/store.h"
+#include "enrich/taxonomy.h"
+
+std::vector<nlohmann::json> review_published;
+
+// Stands in for step 5: records the events the endpoint publishes.
+void publish(const nlohmann::json& event) { review_published.push_back(event); }
+
+namespace {
+
+const std::string kCorrection = R"({"decision": "correct", "attributes": {"brand": "Oatly"}, "note": "brand printed on the carton"})";
+
+// Parks one proposal for sku-1 and gives the lease to holder.
+harness::HTTP reviewAPI(harness::Ctx& ctx, const std::string& holder) {
+  review_published.clear();
+  const nlohmann::json proposal = {{"sku_id", "sku-1"}, {"merchant", "m-1"},
+                                   {"attributes", {{"brand", nullptr}, {"size", 1.0}, {"unit", "l"}, {"organic", false}, {"category", "plant-milk"}}},
+                                   {"confidence", 0.62}, {"taxonomy_version", taxonomy::kVersion}};
+  store::enqueue_review(proposal, "brand 'Glowra' is not a taxonomy candidate");
+  if (!holder.empty()) ctx.Redis.Set("review:lease:sku-1", holder);
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+void untouched(harness::Ctx& ctx, const std::string& why) {
+  ctx.Assert(!store::read_label("sku-1", 1) && review_published.empty() && !store::catalog_current("sku-1"), "%s, yet a label, an event or a catalog row was written", why);
+  ctx.Assert(store::pending("sku-1").has_value(), "%s, yet the proposal left the review queue", why);
+}
+
+}  // namespace
+
+void CheckReviewerAuth(harness::Ctx& ctx) {
+  auto c = reviewAPI(ctx, "ana");
+  auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Role", "reviewer");
+  ctx.Equal(r.Status, 401, "a decision without X-Reviewer-Id; the status");
+  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "shopper");
+  ctx.Equal(r.Status, 403, "a decision from role 'shopper'; the status");
+  untouched(ctx, "after two refused requests");
+  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  ctx.Equal(r.Status, 200, "a reviewer holding the lease (%s); the status", r.Text());
+}
+
+void CheckLeaseHeld(harness::Ctx& ctx) {
+  auto c = reviewAPI(ctx, "ben");
+  auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease ben holds; the status");
+  untouched(ctx, "after a decision without the lease");
+  ctx.Redis.Set("review:lease:sku-1", "ana");
+  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  ctx.Equal(r.Status, 200, "the lease holder's decision (%s); the status", r.Text());
+  ctx.Assert(!ctx.Redis.Get("review:lease:sku-1"), "the decision is made: release the lease so the SKU does not stay claimed for 15 minutes");
+  r = c.Post("/v1/skus/sku-404/review", kCorrection, "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  ctx.Equal(r.Status, 404, "a decision on a SKU with no proposal; the status");
+}
+
+void CheckIdempotencyKey(harness::Ctx& ctx) {
+  auto c = reviewAPI(ctx, "ana");
+  const auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  ctx.Equal(r.Status, 400, "a decision without Idempotency-Key; the status");
+  untouched(ctx, "after a decision without Idempotency-Key");
+  const auto first = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  ctx.Equal(first.Status, 200, "the first decision (%s); the status", first.Text());
+  const auto retry = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  ctx.Assert(retry.Status == 200 && retry.Text() == first.Text(), "a retry with the same Idempotency-Key must answer the first response: first %s, retry %d %s", first.Text(), retry.Status, retry.Text());
+  ctx.Assert(!store::read_label("sku-1", 2) && review_published.size() == 1, "the retry recorded a second decision: %d events published", review_published.size());
+}
+
+void CheckLabelAndPublish(harness::Ctx& ctx) {
+  auto c = reviewAPI(ctx, "ana");
+  const auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  ctx.Equal(r.Status, 200, "the decision (%s); the status", r.Text());
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(body.is_object() && body.value("label_version", 0LL) == 1, "the answer must carry the label version, got %s", r.Text());
+  const auto label = store::read_label("sku-1", 1);
+  ctx.Assert(label.has_value(), "no label:sku-1:v1 was written: the correction is the training example for the next model");
+  ctx.Assert((*label)["decision"] == "correct" && (*label)["attributes"]["brand"] == "Oatly" && (*label)["reviewer"] == "ana" && (*label)["taxonomy_version"] == taxonomy::kVersion,
+             "the label must hold the decision, the corrected attributes, the reviewer and the taxonomy version, got %s", label->dump());
+  ctx.Equal(review_published.size(), 1, "the decision must be published once; the events");
+  const auto& event = review_published[0];
+  ctx.Assert(event["source"] == "human" && event["attributes"]["brand"] == "Oatly", "the event must carry the corrected attributes with source human, got %s", event.dump());
+  ctx.Assert(event["attributes_version"] == body["attributes_version"], "the event's attributes_version %s differs from the answer's %s", event["attributes_version"].dump(), body.value("attributes_version", nlohmann::json()).dump());
+  ctx.Assert(!store::pending("sku-1"), "the decided proposal is still in the review queue");
+}
+`,
+  },
+  debrief: `The order of the guards is the order of who may know what: authentication and role first, so an anonymous caller learns nothing; the idempotency record next, so a retry is answered before anything is read or written; then the lease, which turns "two reviewers on one SKU" into a 409 instead of a lost correction. The label is written before the event because the label is the durable product of the review, the training example the next model is fine-tuned on, while the event only tells the catalog and the search index. Publishing instead of writing the catalog row keeps one path into the catalog, so step 5's version and human-wins rules apply to reviewers too. A larger tool would add reviewer agreement checks, an audit trail per label, and sampling of accepted SKUs for review.`,
 };

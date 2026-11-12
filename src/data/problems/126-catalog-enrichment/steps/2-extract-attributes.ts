@@ -8,173 +8,169 @@ export const extractAttributesStep: Step = {
   focus: ['catalogd', 'taxonomy', 'llm'],
   task: `## Task
 
-**Starting point.** The starter implements \`extract_attributes(sku)\` for a job from
-\`sku.extract\`: it calls \`Extractor.Extract\` with the title and description alone (empty
-\`candidate_brands\`, empty \`schema\`, no deadline, one attempt), parses "key: value" lines out of
-\`reply.output\`, copies every value and returns the result as \`accepted\`. On clean titles the
-demo looks great. It hides 5 flaws.
+**Starting point.** The starter is \`extract_attributes(job)\` for a job from \`sku.extract\`: it calls
+\`Extractor.Extract\` once with the SKU's title and description (no \`candidate_brands\`, no \`schema\`,
+no deadline), reads \`key: value\` lines out of \`reply.output\` and returns
+\`{sku_id, merchant, attributes, confidence, taxonomy_version, source: "model", status: "accepted"}\`.
+It hides 5 flaws.
 
-**Failure mode the checks target.** A model asked for free text with no candidates produces a brand
-for every title, including brands that do not exist, and the starter writes them into the catalog.
-No deadline pins a worker on a slow model; no retry turns a broker blip into a failed job; the line
-parser drops every attribute once the model rephrases. The confidence gate is the subtle one:
-without it, human reviewers do not see the SKUs that need them.
+**Failure mode the checks target.** A model asked for free text with no candidates names brands
+that do not exist and the starter accepts them; the line parser finds nothing in a reply the model
+phrased differently; a slow model holds the worker with no deadline and a single \`UNAVAILABLE\`
+fails the job; and no result ever reaches a reviewer.
 
-- **Retrieve before the model.** Pass the **20** nearest brand names (\`BRAND_CANDIDATES = 20\`,
-  \`taxonomy.nearest_brands\`) as \`candidate_brands\`.
-- **Structured output.** Send \`ATTRIBUTE_SCHEMA\` and parse \`reply.output\` as JSON.
-- **Deadline and retry.** A **5-second** deadline per attempt; at most **2** attempts, only on
-  \`UNAVAILABLE\`.
-- **Validate.** A brand outside the candidates, a unit outside \`ALLOWED_UNITS\` or an unknown
-  category is nulled and recorded as a problem.
-- **Gate.** Any problem or \`reply.confidence\` below **0.85** (\`MIN_CONFIDENCE\`) goes to
-  \`review.enqueue\` with \`status: "review"\`; otherwise \`"accepted"\`. Every result carries its
-  \`taxonomy_version\` and \`source: "model"\`.`,
+- \`candidate_brands\` is \`taxonomy.nearest_brands(title + " " + description, BRAND_CANDIDATES)\`
+  (20), retrieved before the call.
+- The request carries \`taxonomy.ATTRIBUTE_SCHEMA\`; \`reply.output\` is parsed as one JSON object.
+- Every attempt has a 5-second deadline; at most \`MAX_ATTEMPTS\` (2), the second only after
+  \`UNAVAILABLE\`. Any other error is raised.
+- A brand outside the candidates, a unit outside \`ALLOWED_UNITS\` or a category \`has_category\`
+  rejects becomes null and is recorded as a problem.
+- Any problem, or a confidence below \`MIN_CONFIDENCE\` (0.85), makes the result \`"review"\` and
+  parks it with \`store.enqueue_review(result, reason)\`.`,
   sequence: {
-    participants: ['catalogd', 'taxonomy', 'Extractor', 'review queue'],
+    participants: ['catalogd', 'taxonomy', 'Extractor', 'Redis'],
     messages: [
       {from: 'catalogd', to: 'taxonomy', label: 'nearest_brands(title + description, 20)', kind: 'sync'},
-      {from: 'taxonomy', to: 'catalogd', label: '["Dove", "Dove Men+Care", …]', kind: 'reply'},
       {from: 'catalogd', to: 'Extractor', label: 'Extract(title, description, candidates, schema) · 5 s', kind: 'sync'},
-      {from: 'Extractor', to: 'catalogd', label: 'UNAVAILABLE → one retry', kind: 'reply'},
-      {from: 'Extractor', to: 'catalogd', label: '{output: json, confidence: 0.91}', kind: 'reply'},
-      {from: 'catalogd', to: 'taxonomy', label: 'has_category(category)', kind: 'sync'},
-      {
-        from: 'catalogd',
-        to: 'review queue',
-        label: 'enqueue(sku_id, result, reason) when unresolved or < 0.85',
-        kind: 'async',
-      },
+      {from: 'Extractor', to: 'catalogd', label: 'UNAVAILABLE → one more attempt', kind: 'reply'},
+      {from: 'Extractor', to: 'catalogd', label: '{output: JSON, confidence: 0.95}', kind: 'reply'},
+      {from: 'catalogd', to: 'taxonomy', label: 'brand ∈ candidates · unit · has_category', kind: 'sync'},
+      {from: 'catalogd', to: 'Redis', label: 'problem or < 0.85 → enqueue_review', kind: 'async'},
     ],
   },
   hints: [
-    'The catalog shows brands no taxonomy lists, a slow extractor pins a worker for minutes, a rephrased reply yields an empty attribute set, and the review queue stays empty all day.',
-    'The request carries no candidates and no schema, so the model answers freely and the line parser cannot read it; there is no deadline, one attempt, and no check on what comes back.',
-    'Retrieve `taxonomy.nearest_brands` into `candidate_brands`, send `ATTRIBUTE_SCHEMA`, loop `MAX_ATTEMPTS` with `timeout=DEADLINE_S` retrying only `UNAVAILABLE`, validate against the taxonomy, then gate on `MIN_CONFIDENCE` with `review.enqueue`.',
+    'The catalog shows brands no taxonomy lists, a reworded reply leaves every attribute empty, one UNAVAILABLE fails the job, a slow model holds a worker indefinitely, and the review queue stays empty.',
+    'The request has no candidates and no schema, so the model answers freely in prose; the parser expects `key: value` lines; there is one attempt with no deadline; nothing checks the answer or its confidence.',
+    'Send `nearest_brands(...)` as `candidate_brands` and `ATTRIBUTE_SCHEMA`; loop `MAX_ATTEMPTS` with `timeout=DEADLINE_S`, retrying only `UNAVAILABLE`; `json.loads(reply.output)`; null what the taxonomy rejects; route problems and low confidence to `store.enqueue_review`.',
   ],
   checks: [
     {
       id: 'retrieve-first',
-      title: 'Retrieves 20 candidate brands from the taxonomy before the model call',
+      title: 'Retrieves 20 candidate brands before the model call',
       detail:
-        '`BRAND_CANDIDATES = 20` nearest brand names come from `taxonomy.nearest_brands` and are passed to the model as `candidate_brands`; the retrieval precedes the call. The starter sends the title alone and lets the model name any brand.',
+        'The request carries `taxonomy.nearest_brands(title + " " + description, BRAND_CANDIDATES)` as `candidate_brands`, so the model chooses among brands the taxonomy knows. The starter sends none and the model names any brand.',
       match: {
         python: {
-          all: [/BRAND_CANDIDATES\s*=\s*20/, /candidate_brands=candidates/],
-          order: [/taxonomy\.nearest_brands\(/, /= call_model\(/],
+          all: [/BRAND_CANDIDATES\s*=\s*20\b/, /candidate_brands\s*=\s*candidates/],
+          order: [/taxonomy\.nearest_brands\(/, /call_model\(request\)/],
         },
         typescript: {
-          all: [/BRAND_CANDIDATES\s*=\s*20/, /candidate_brands:\s*candidates/],
-          order: [/taxonomy\.nearestBrands\(/, /= await callModel\(/],
+          all: [/BRAND_CANDIDATES\s*=\s*20\b/, /candidate_brands:\s*candidates/],
+          order: [/nearestBrands\(/, /callModel\(request\)/],
         },
         go: {
-          all: [/brandCandidates\s*=\s*20/, /CandidateBrands:\s*candidates/],
-          order: [/taxonomy\.NearestBrands\(/, /:= callModel\(/],
+          all: [/brandCandidates\s*=\s*20\b/, /CandidateBrands:\s*candidates/],
+          order: [/taxonomy\.NearestBrands\(/, /callModel\(ctx,\s*request\)/],
         },
         scala: {
-          all: [/BrandCandidates\s*=\s*20/, /candidateBrands\s*=\s*candidates/],
-          order: [/taxonomy\.nearestBrands\(/, /= callModel\(/],
+          all: [/BrandCandidates\s*=\s*20\b/, /candidateBrands\s*=\s*candidates/],
+          order: [/Taxonomy\.nearestBrands\(/, /callModel\(request\)/],
         },
         cpp: {
-          all: [/kBrandCandidates\s*=\s*20/, /add_candidate_brands\(/],
-          order: [/taxonomy\.nearestBrands\(/, /= callModel\(/],
+          all: [/kBrandCandidates\s*=\s*20\b/, /add_candidate_brands\(/],
+          order: [/taxonomy::nearest_brands\(/, /callModel\(request\)/],
+        },
+      },
+    },
+    {
+      id: 'structured-output',
+      title: 'Asks for the schema and parses the reply as JSON',
+      detail:
+        'The request carries `taxonomy.ATTRIBUTE_SCHEMA` and `reply.output` is parsed as one JSON object. The starter asks for free text and scans it for `key: value` lines, which a reworded answer does not contain.',
+      match: {
+        python: {
+          all: [/schema\s*=\s*taxonomy\.ATTRIBUTE_SCHEMA/, /json\.loads\(\s*reply\.output/],
+          none: [/splitlines\(/],
+        },
+        typescript: {all: [/schema:\s*ATTRIBUTE_SCHEMA/, /JSON\.parse\(\s*reply\.output/], none: [/\.split\(/]},
+        go: {
+          all: [/Schema:\s*taxonomy\.AttributeSchema/, /json\.Unmarshal\(\s*\[\]byte\(reply\.(GetOutput\(\)|Output)\)/],
+          none: [/strings\.Split\(/],
+        },
+        scala: {
+          all: [/schema\s*=\s*Taxonomy\.AttributeSchema/, /ujson\.read\(\s*reply\.output/],
+          none: [/\.split\(|linesIterator/],
+        },
+        cpp: {
+          all: [/set_schema\(\s*taxonomy::kAttributeSchema/, /json::parse\(\s*reply\.output\(\)/],
+          none: [/std::getline/],
         },
       },
     },
     {
       id: 'deadline-retry',
-      title: 'Every attempt has a 5 s deadline; at most two, only on UNAVAILABLE',
+      title: 'A 5-second deadline per attempt; one retry, only on UNAVAILABLE',
       detail:
-        'The call carries a 5-second deadline, attempts are bounded by `MAX_ATTEMPTS = 2`, and only `UNAVAILABLE` is retried. The starter calls once with no deadline and no retry, so a stuck model pins the worker and a broker blip fails the job.',
+        'Every attempt carries a 5-second deadline; a second attempt follows only an `UNAVAILABLE`, and any other error (a deadline, `INVALID_ARGUMENT`) is raised after one call. The starter makes one call with no deadline.',
       match: {
         python: {
           all: [
-            /DEADLINE_S\s*=\s*5\.0/,
-            /timeout=DEADLINE_S/,
-            /MAX_ATTEMPTS\s*=\s*2/,
-            /range\(MAX_ATTEMPTS\)/,
+            /DEADLINE_S\s*=\s*5\b/,
+            /timeout\s*=\s*DEADLINE_S/,
+            /MAX_ATTEMPTS\s*=\s*2\b/,
             /StatusCode\.UNAVAILABLE/,
           ],
           none: [/while\s+True/],
         },
         typescript: {
           all: [
-            /DEADLINE_MS\s*=\s*5_?000/,
+            /DEADLINE_MS\s*=\s*5_?000\b/,
             /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/,
-            /MAX_ATTEMPTS\s*=\s*2/,
-            /attempt\s*<\s*MAX_ATTEMPTS/,
-            /UNAVAILABLE/,
+            /MAX_ATTEMPTS\s*=\s*2\b/,
+            /status\.UNAVAILABLE/,
           ],
-          none: [/while\s*\(\s*true\s*\)/, /for\s*\(\s*;\s*;\s*\)/],
         },
         go: {
           all: [
             /deadline\s*=\s*5\s*\*\s*time\.Second/,
-            /context\.WithTimeout\(/,
-            /maxAttempts\s*=\s*2/,
-            /attempt\s*<\s*maxAttempts/,
+            /context\.WithTimeout\([^\n]*deadline\)/,
+            /maxAttempts\s*=\s*2\b/,
             /codes\.Unavailable/,
           ],
         },
         scala: {
           all: [
-            /DeadlineMs\s*=\s*5000/,
-            /withDeadlineAfter\(\s*DeadlineMs/,
-            /MaxAttempts\s*=\s*2/,
-            /attempt\s*<\s*MaxAttempts/,
-            /Status\.Code\.UNAVAILABLE/,
+            /DeadlineSeconds\s*=\s*5L?\b/,
+            /withDeadlineAfter\(\s*DeadlineSeconds/,
+            /MaxAttempts\s*=\s*2\b/,
+            /UNAVAILABLE/,
           ],
-          none: [/while\s*\(\s*true\s*\)/],
         },
         cpp: {
           all: [
-            /kDeadlineMs\s*=\s*5000/,
-            /set_deadline\(/,
-            /kMaxAttempts\s*=\s*2/,
-            /attempt\s*<\s*kMaxAttempts/,
+            /kDeadline\{5\}/,
+            /set_deadline\([^\n]*kDeadline\)/,
+            /kMaxAttempts\s*=\s*2\b/,
             /StatusCode::UNAVAILABLE/,
           ],
-          none: [/while\s*\(\s*true\s*\)/],
         },
-      },
-    },
-    {
-      id: 'structured-output',
-      title: 'Asks for a schema and parses the reply as JSON',
-      detail:
-        'The request carries `ATTRIBUTE_SCHEMA` and `reply.output` is parsed as JSON. The starter asks for free text and splits lines on `:` — it silently loses every attribute the moment the model rephrases.',
-      match: {
-        python: {all: [/ATTRIBUTE_SCHEMA/, /schema=ATTRIBUTE_SCHEMA/, /json\.loads\(\s*reply\.output/]},
-        typescript: {all: [/ATTRIBUTE_SCHEMA/, /schema:\s*ATTRIBUTE_SCHEMA/, /JSON\.parse\(\s*reply\.output/]},
-        go: {all: [/attributeSchema/, /Schema:\s*attributeSchema/, /json\.Unmarshal\(\s*\[\]byte\(reply\.Output\)/]},
-        scala: {all: [/AttributeSchema/, /schema\s*=\s*AttributeSchema/, /reply\.output\.parseJson/]},
-        cpp: {all: [/kAttributeSchema/, /set_schema\(\s*kAttributeSchema/, /json::parse\(\s*reply\.output\(\)/]},
       },
     },
     {
       id: 'taxonomy-validate',
-      title: 'Validates brand, unit and category against the taxonomy',
+      title: 'Nulls a brand, unit or category the taxonomy does not know',
       detail:
-        'The brand must be one of the retrieved candidates, the unit one of `ALLOWED_UNITS`, and the category known to the taxonomy (`has_category`); anything else is nulled and recorded as a problem. The starter copies whatever the model said.',
+        'A brand outside the retrieved candidates, a unit outside `ALLOWED_UNITS` and a category `has_category` rejects become null, and the problem sends the result to review. The starter copies whatever the model said.',
       match: {
-        python: {all: [/ALLOWED_UNITS/, /not in candidate_names/, /taxonomy\.has_category\(/]},
-        typescript: {all: [/ALLOWED_UNITS/, /candidateNames\[/, /taxonomy\.hasCategory\(/]},
-        go: {all: [/allowedUnits/, /candidateNames\[/, /taxonomy\.HasCategory\(/]},
-        scala: {all: [/AllowedUnits/, /candidateNames\.contains\(/, /taxonomy\.hasCategory\(/]},
-        cpp: {all: [/kAllowedUnits/, /candidateNames\.count\(/, /taxonomy\.hasCategory\(/]},
+        python: {all: [/taxonomy\.ALLOWED_UNITS/, /not in candidates/, /taxonomy\.has_category\(/]},
+        typescript: {all: [/ALLOWED_UNITS\.includes\(/, /candidates\.includes\(/, /hasCategory\(/]},
+        go: {all: [/taxonomy\.AllowedUnits/, /listed\(candidates,/, /taxonomy\.HasCategory\(/]},
+        scala: {all: [/Taxonomy\.AllowedUnits/, /candidates\.contains\(/, /Taxonomy\.hasCategory\(/]},
+        cpp: {all: [/taxonomy::kAllowedUnits/, /listed\(candidates,/, /taxonomy::has_category\(/]},
       },
     },
     {
-      id: 'confidence-review',
-      title: 'Routes unresolved or low-confidence results to human review',
+      id: 'confidence-gate',
+      title: 'Routes problems and low confidence to human review',
       detail:
-        'Any validation problem or a confidence below `MIN_CONFIDENCE = 0.85` sends the SKU to `review.enqueue` with the reason and marks the result `review`. The starter accepts everything the model returns.',
+        'A result with a problem, or with a confidence below `MIN_CONFIDENCE` (0.85), is marked `review` and parked with `store.enqueue_review(result, reason)`; a clean, confident one is `accepted`. The starter accepts everything.',
       match: {
-        python: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /review\.enqueue\(/, /["']review["']/, /taxonomy_version/]},
-        typescript: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /review\.enqueue\(/, /['"]review['"]/, /taxonomy_version/]},
-        go: {all: [/minConfidence\s*=\s*0\.85/, /review\.Enqueue\(/, /"review"/, /TaxonomyVersion/]},
-        scala: {all: [/MinConfidence\s*=\s*0\.85/, /review\.enqueue\(/, /"review"/, /taxonomy_version/]},
-        cpp: {all: [/kMinConfidence\s*=\s*0\.85/, /review\.enqueue\(/, /"review"/, /taxonomy_version/]},
+        python: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /store\.enqueue_review\(/, /["']review["']/]},
+        typescript: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /enqueueReview\(/, /'review'/]},
+        go: {all: [/minConfidence\s*=\s*0\.85/, /store\.EnqueueReview\(/, /"review"/]},
+        scala: {all: [/MinConfidence\s*=\s*0\.85/, /Store\.enqueueReview\(/, /"review"/]},
+        cpp: {all: [/kMinConfidence\s*=\s*0\.85/, /store::enqueue_review\(/, /"review"/]},
       },
     },
   ],
@@ -182,178 +178,127 @@ without it, human reviewers do not see the SKUs that need them.
     python: {
       starter: `import grpc
 
-import extractor_pb2
-import extractor_pb2_grpc
-
-channel = grpc.insecure_channel("extractor:50051")
-extractor = extractor_pb2_grpc.ExtractorStub(channel)
+import catalog_enrichment_pb2 as pb
+import catalog_enrichment_pb2_grpc as pb_grpc
+from enrich import store, taxonomy  # store.enqueue_review; taxonomy.VERSION, nearest_brands, ALLOWED_UNITS, has_category, ATTRIBUTE_SCHEMA
 
 FIELDS = ("brand", "size", "unit", "organic", "category")
 
+extractor = pb_grpc.ExtractorStub(grpc.insecure_channel("extractor:50051"))
 
-def extract_attributes(sku: dict) -> dict:
+
+def extract_attributes(job: dict) -> dict:
+    """The attributes of one SKU version: {sku_id, merchant, attributes, confidence, taxonomy_version, source, status}."""
     # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    request = extractor_pb2.ExtractRequest(
-        title=sku["title"],
-        description=sku.get("description", ""),
-        candidate_brands=[],
-        schema="",
-    )
+    request = pb.ExtractRequest(sku_id=job["sku_id"], title=job["title"], description=job["description"])
     reply = extractor.Extract(request)
     attributes: dict = {field: None for field in FIELDS}
     for line in reply.output.splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = key.strip().lower()
-        if key in FIELDS:
-            attributes[key] = value.strip()
-    attributes["organic"] = str(attributes["organic"]).lower() == "true"
+        if ":" in line:
+            key, value = line.split(":", 1)
+            if key.strip().lower() in FIELDS:
+                attributes[key.strip().lower()] = value.strip()
+    attributes["organic"] = attributes["organic"] == "true"
     return {
-        "sku_id": sku["sku_id"],
+        "sku_id": job["sku_id"],
+        "merchant": job["merchant"],
         "attributes": attributes,
         "confidence": reply.confidence,
-        "status": "accepted",
+        "taxonomy_version": taxonomy.VERSION,
         "source": "model",
+        "status": "accepted",
     }
 `,
       solution: `import json
 
 import grpc
 
-import extractor_pb2
-import extractor_pb2_grpc
+import catalog_enrichment_pb2 as pb
+import catalog_enrichment_pb2_grpc as pb_grpc
+from enrich import store, taxonomy  # store.enqueue_review; taxonomy.VERSION, nearest_brands, ALLOWED_UNITS, has_category, ATTRIBUTE_SCHEMA
 
-DEADLINE_S = 5.0
+DEADLINE_S = 5
 MAX_ATTEMPTS = 2
 BRAND_CANDIDATES = 20
 MIN_CONFIDENCE = 0.85
-ALLOWED_UNITS = {"ml", "l", "g", "kg", "oz", "fl oz", "lb", "ct"}
-ATTRIBUTE_SCHEMA = json.dumps(
-    {
-        "type": "object",
-        "properties": {
-            "brand": {"type": ["string", "null"]},
-            "size": {"type": ["number", "null"]},
-            "unit": {"type": ["string", "null"]},
-            "organic": {"type": "boolean"},
-            "category": {"type": ["string", "null"]},
-        },
-        "required": ["brand", "size", "unit", "organic", "category"],
-        "additionalProperties": False,
-    }
-)
 
-channel = grpc.insecure_channel("extractor:50051")
-extractor = extractor_pb2_grpc.ExtractorStub(channel)
+extractor = pb_grpc.ExtractorStub(grpc.insecure_channel("extractor:50051"))
 
 
-class Taxonomy:
-    def version(self) -> str:
-        """Version of the brand and category taxonomy the result is valid under."""
-        raise NotImplementedError
-
-    def nearest_brands(self, text: str, k: int) -> list[str]:
-        """The k brand names whose embeddings are nearest to the text."""
-        raise NotImplementedError
-
-    def has_category(self, category: str) -> bool:
-        raise NotImplementedError
-
-
-class ReviewQueue:
-    def enqueue(self, sku_id: str, result: dict, reason: str) -> None:
-        raise NotImplementedError
-
-
-taxonomy = Taxonomy()
-review = ReviewQueue()
-
-
-def call_model(request: extractor_pb2.ExtractRequest) -> extractor_pb2.ExtractReply:
-    last_error: grpc.RpcError | None = None
-    for _ in range(MAX_ATTEMPTS):
+def call_model(request: pb.ExtractRequest) -> pb.ExtractReply:
+    """One call per attempt, each under DEADLINE_S; only UNAVAILABLE earns another attempt."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             return extractor.Extract(request, timeout=DEADLINE_S)
         except grpc.RpcError as exc:
-            last_error = exc
-            if exc.code() != grpc.StatusCode.UNAVAILABLE:
+            if exc.code() != grpc.StatusCode.UNAVAILABLE or attempt == MAX_ATTEMPTS:
                 raise
-    raise last_error or RuntimeError("extractor unavailable")
 
 
-def validate(raw: dict, candidate_names: set[str]) -> tuple[dict, list[str]]:
-    """Attributes the taxonomy accepts, and why anything was dropped."""
+def validate(raw: dict, candidates: list[str]) -> tuple[dict, list[str]]:
+    """The attributes the taxonomy accepts, and why anything was dropped."""
     problems: list[str] = []
-    brand = raw.get("brand")
-    if brand is not None and brand not in candidate_names:
+    brand, unit, category, size = raw.get("brand"), raw.get("unit"), raw.get("category"), raw.get("size")
+    if brand is not None and brand not in candidates:
         problems.append(f"brand {brand!r} is not a taxonomy candidate")
         brand = None
-    size = raw.get("size")
-    if size is not None and (isinstance(size, bool) or not isinstance(size, (int, float)) or size <= 0):
-        problems.append("size must be a positive number")
-        size = None
-    unit = raw.get("unit")
-    if unit is not None and unit not in ALLOWED_UNITS:
+    if unit is not None and unit not in taxonomy.ALLOWED_UNITS:
         problems.append(f"unit {unit!r} is not allowed")
         unit = None
-    category = raw.get("category")
     if category is not None and not taxonomy.has_category(category):
         problems.append(f"category {category!r} is not in the taxonomy")
         category = None
-    attributes = {
-        "brand": brand,
-        "size": size,
-        "unit": unit,
-        "organic": raw.get("organic") is True,
-        "category": category,
-    }
-    return attributes, problems
+    if size is not None and (isinstance(size, bool) or not isinstance(size, (int, float)) or size <= 0):
+        problems.append("size is not a positive number")
+        size = None
+    return {"brand": brand, "size": size, "unit": unit, "organic": raw.get("organic") is True, "category": category}, problems
 
 
-def extract_attributes(sku: dict) -> dict:
-    text = f"{sku['title']} {sku.get('description', '')}".strip()
-    candidates = taxonomy.nearest_brands(text, BRAND_CANDIDATES)
-    candidate_names = set(candidates)
-    request = extractor_pb2.ExtractRequest(
-        title=sku["title"],
-        description=sku.get("description", ""),
+def extract_attributes(job: dict) -> dict:
+    """The attributes of one SKU version: {sku_id, merchant, attributes, confidence, taxonomy_version, source, status}."""
+    candidates = taxonomy.nearest_brands(f"{job['title']} {job['description']}", BRAND_CANDIDATES)
+    request = pb.ExtractRequest(
+        sku_id=job["sku_id"],
+        title=job["title"],
+        description=job["description"],
         candidate_brands=candidates,
-        schema=ATTRIBUTE_SCHEMA,
+        schema=taxonomy.ATTRIBUTE_SCHEMA,
     )
     reply = call_model(request)
     try:
         raw = json.loads(reply.output)
     except ValueError:
         raw = None
-    if not isinstance(raw, dict):
-        raw = {}
-        problems = ["model output is not a JSON object"]
-        attributes = {"brand": None, "size": None, "unit": None, "organic": False, "category": None}
+    if isinstance(raw, dict):
+        attributes, problems = validate(raw, candidates)
     else:
-        attributes, problems = validate(raw, candidate_names)
+        attributes = {"brand": None, "size": None, "unit": None, "organic": False, "category": None}
+        problems = ["the reply is not a JSON object"]
+    if reply.confidence < MIN_CONFIDENCE:
+        problems.append(f"confidence {reply.confidence:.2f} is below {MIN_CONFIDENCE}")
     result = {
-        "sku_id": sku["sku_id"],
+        "sku_id": job["sku_id"],
+        "merchant": job["merchant"],
         "attributes": attributes,
         "confidence": reply.confidence,
-        "taxonomy_version": taxonomy.version(),
+        "taxonomy_version": taxonomy.VERSION,
         "source": "model",
+        "status": "review" if problems else "accepted",
     }
-    if problems or reply.confidence < MIN_CONFIDENCE:
-        reason = "; ".join(problems) if problems else f"confidence {reply.confidence:.2f} below threshold"
-        review.enqueue(sku["sku_id"], result, reason)
-        result["status"] = "review"
-    else:
-        result["status"] = "accepted"
+    if problems:
+        store.enqueue_review(result, "; ".join(problems))  # a reviewer decides; the label trains the next model
     return result
 `,
     },
     typescript: {
-      starter: `/** Extract: one call to the extractor service. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
+import type {Attributes, Job, Result} from 'enrich/store';
+import {VERSION} from 'enrich/taxonomy';
+
 interface ExtractRequest {
+  sku_id: string;
   title: string;
   description: string;
   candidate_brands: string[];
@@ -364,72 +309,44 @@ interface ExtractReply {
   output: string;
   confidence: number;
 }
-
-interface ExtractorClient {
-  Extract(request: ExtractRequest, callback: (error: grpc.ServiceError | null, reply: ExtractReply) => void): void;
-}
-
-const {extractor} = grpc.loadPackageDefinition(protoLoader.loadSync('extractor.proto')) as unknown as {
-  extractor: {Extractor: new (target: string, credentials: grpc.ChannelCredentials) => ExtractorClient};
-};
-const client = new extractor.Extractor('extractor:50051', grpc.credentials.createInsecure());
 
 const FIELDS = ['brand', 'size', 'unit', 'organic', 'category'];
 
-export interface SkuJob {
-  sku_id: string;
-  merchant: string;
-  content_hash: string;
-  title: string;
-  description?: string;
-  images?: string[];
-}
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('catalog_enrichment.proto')) as unknown as {
+  catalogenrich: {Extractor: grpc.ServiceClientConstructor};
+};
+const extractor = new pkg.catalogenrich.Extractor('extractor:50051', grpc.credentials.createInsecure()) as grpc.Client & {
+  Extract(request: ExtractRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<ExtractReply>;
+};
 
-export async function extractAttributes(sku: SkuJob): Promise<Record<string, unknown>> {
+/** The attributes of one SKU version. */
+export async function extractAttributes(job: Job): Promise<Result> {
   // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const reply = await new Promise<ExtractReply>((resolve, reject) => {
-    client.Extract(
-      {title: sku.title, description: sku.description ?? '', candidate_brands: [], schema: ''},
-      (error, result) => (error ? reject(error) : resolve(result)),
-    );
-  });
-  const attributes: Record<string, unknown> = {};
-  for (const field of FIELDS) attributes[field] = null;
+  const request = {sku_id: job.sku_id, title: job.title, description: job.description, candidate_brands: [], schema: ''};
+  const reply = await extractor.Extract(request, new grpc.Metadata(), {});
+  const attributes: Attributes = Object.fromEntries(FIELDS.map(field => [field, null]));
   for (const line of reply.output.split('\\n')) {
-    const colon = line.indexOf(':');
-    if (colon < 0) continue;
-    const key = line.slice(0, colon).trim().toLowerCase();
-    if (FIELDS.includes(key)) attributes[key] = line.slice(colon + 1).trim();
+    const at = line.indexOf(':');
+    const key = line.slice(0, at).trim().toLowerCase();
+    if (at >= 0 && FIELDS.includes(key)) attributes[key] = line.slice(at + 1).trim();
   }
-  attributes.organic = String(attributes.organic).toLowerCase() === 'true';
-  return {sku_id: sku.sku_id, attributes, confidence: reply.confidence, status: 'accepted', source: 'model'};
+  attributes.organic = attributes.organic === 'true';
+  return {sku_id: job.sku_id, merchant: job.merchant, attributes, confidence: reply.confidence, taxonomy_version: VERSION, source: 'model', status: 'accepted'};
 }
 `,
-      solution: `/** Extract: candidate brands retrieved first, a schema, taxonomy validation, a confidence gate. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-import {review, taxonomy} from './taxonomy';
+import {type Attributes, type Job, type Result, enqueueReview} from 'enrich/store';
+import {ALLOWED_UNITS, ATTRIBUTE_SCHEMA, VERSION, hasCategory, nearestBrands} from 'enrich/taxonomy';
 
-const DEADLINE_MS = 5_000;
-const MAX_ATTEMPTS = 2;
-const BRAND_CANDIDATES = 20;
-const MIN_CONFIDENCE = 0.85;
-const ALLOWED_UNITS: Record<string, true> = {ml: true, l: true, g: true, kg: true, oz: true, 'fl oz': true, lb: true, ct: true};
-const ATTRIBUTE_SCHEMA = JSON.stringify({
-  type: 'object',
-  properties: {
-    brand: {type: ['string', 'null']},
-    size: {type: ['number', 'null']},
-    unit: {type: ['string', 'null']},
-    organic: {type: 'boolean'},
-    category: {type: ['string', 'null']},
-  },
-  required: ['brand', 'size', 'unit', 'organic', 'category'],
-  additionalProperties: false,
-});
+export const DEADLINE_MS = 5000;
+export const MAX_ATTEMPTS = 2;
+export const BRAND_CANDIDATES = 20;
+export const MIN_CONFIDENCE = 0.85;
 
 interface ExtractRequest {
+  sku_id: string;
   title: string;
   description: string;
   candidate_brands: string[];
@@ -441,131 +358,72 @@ interface ExtractReply {
   confidence: number;
 }
 
-interface ExtractorClient {
-  Extract(
-    request: ExtractRequest,
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-    callback: (error: grpc.ServiceError | null, reply: ExtractReply) => void,
-  ): void;
-}
-
-const {extractor} = grpc.loadPackageDefinition(protoLoader.loadSync('extractor.proto')) as unknown as {
-  extractor: {Extractor: new (target: string, credentials: grpc.ChannelCredentials) => ExtractorClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('catalog_enrichment.proto')) as unknown as {
+  catalogenrich: {Extractor: grpc.ServiceClientConstructor};
 };
-const client = new extractor.Extractor('extractor:50051', grpc.credentials.createInsecure());
+const extractor = new pkg.catalogenrich.Extractor('extractor:50051', grpc.credentials.createInsecure()) as grpc.Client & {
+  Extract(request: ExtractRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<ExtractReply>;
+};
 
-export interface SkuJob {
-  sku_id: string;
-  merchant: string;
-  content_hash: string;
-  title: string;
-  description?: string;
-  images?: string[];
-}
-
-export interface Attributes {
-  brand: string | null;
-  size: number | null;
-  unit: string | null;
-  organic: boolean;
-  category: string | null;
-}
-
-export interface ExtractionResult {
-  sku_id: string;
-  attributes: Attributes;
-  confidence: number;
-  taxonomy_version: string;
-  source: 'model';
-  status: 'accepted' | 'review';
-}
-
+/** One call per attempt, each under DEADLINE_MS; only UNAVAILABLE earns another attempt. */
 async function callModel(request: ExtractRequest): Promise<ExtractReply> {
-  let lastError: grpc.ServiceError | null = null;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; ; attempt += 1) {
     try {
-      return await new Promise<ExtractReply>((resolve, reject) => {
-        client.Extract(request, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS}, (error, reply) =>
-          error ? reject(error) : resolve(reply),
-        );
-      });
-    } catch (error) {
-      const serviceError = error as grpc.ServiceError;
-      lastError = serviceError;
-      if (serviceError.code !== grpc.status.UNAVAILABLE) throw serviceError;
+      return await extractor.Extract(request, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+    } catch (e) {
+      if ((e as grpc.ServiceError).code !== grpc.status.UNAVAILABLE || attempt >= MAX_ATTEMPTS) throw e;
     }
   }
-  throw lastError ?? new Error('extractor unavailable');
 }
 
-/** Attributes the taxonomy accepts, and why anything was dropped. */
-async function validate(
-  raw: Record<string, unknown>,
-  candidateNames: Record<string, true>,
-): Promise<{attributes: Attributes; problems: string[]}> {
+/** The attributes the taxonomy accepts, and why anything was dropped. */
+function validate(raw: Record<string, unknown>, candidates: string[]): {attributes: Attributes; problems: string[]} {
   const problems: string[] = [];
-  let brand = typeof raw.brand === 'string' ? raw.brand : null;
-  if (brand !== null && candidateNames[brand] !== true) {
-    problems.push(\`brand "\${brand}" is not a taxonomy candidate\`);
-    brand = null;
+  const attributes: Attributes = {brand: null, size: null, unit: null, organic: raw.organic === true, category: null};
+  const {brand, unit, category, size} = raw;
+  if (typeof brand === 'string') {
+    if (candidates.includes(brand)) attributes.brand = brand;
+    else problems.push(\`brand "\${brand}" is not a taxonomy candidate\`);
   }
-  let size = typeof raw.size === 'number' ? raw.size : null;
-  if (size !== null && !(size > 0)) {
-    problems.push('size must be a positive number');
-    size = null;
+  if (typeof unit === 'string') {
+    if (ALLOWED_UNITS.includes(unit)) attributes.unit = unit;
+    else problems.push(\`unit "\${unit}" is not allowed\`);
   }
-  let unit = typeof raw.unit === 'string' ? raw.unit : null;
-  if (unit !== null && ALLOWED_UNITS[unit] !== true) {
-    problems.push(\`unit "\${unit}" is not allowed\`);
-    unit = null;
+  if (typeof category === 'string') {
+    if (hasCategory(category)) attributes.category = category;
+    else problems.push(\`category "\${category}" is not in the taxonomy\`);
   }
-  let category = typeof raw.category === 'string' ? raw.category : null;
-  if (category !== null && !(await taxonomy.hasCategory(category))) {
-    problems.push(\`category "\${category}" is not in the taxonomy\`);
-    category = null;
-  }
-  return {attributes: {brand, size, unit, organic: raw.organic === true, category}, problems};
+  if (typeof size === 'number' && size > 0) attributes.size = size;
+  else if (size !== null && size !== undefined) problems.push('size is not a positive number');
+  return {attributes, problems};
 }
 
-export async function extractAttributes(sku: SkuJob): Promise<ExtractionResult> {
-  const text = \`\${sku.title} \${sku.description ?? ''}\`.trim();
-  const candidates = await taxonomy.nearestBrands(text, BRAND_CANDIDATES);
-  const candidateNames: Record<string, true> = {};
-  for (const name of candidates) candidateNames[name] = true;
-  const reply = await callModel({
-    title: sku.title,
-    description: sku.description ?? '',
-    candidate_brands: candidates,
-    schema: ATTRIBUTE_SCHEMA,
-  });
+/** The attributes of one SKU version. */
+export async function extractAttributes(job: Job): Promise<Result> {
+  const candidates = nearestBrands(\`\${job.title} \${job.description}\`, BRAND_CANDIDATES);
+  const request = {sku_id: job.sku_id, title: job.title, description: job.description, candidate_brands: candidates, schema: ATTRIBUTE_SCHEMA};
+  const reply = await callModel(request);
   let raw: unknown = null;
   try {
     raw = JSON.parse(reply.output);
   } catch {
-    raw = null;
+    // not JSON: a problem below
   }
-  let attributes: Attributes;
-  let problems: string[];
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    attributes = {brand: null, size: null, unit: null, organic: false, category: null};
-    problems = ['model output is not a JSON object'];
-  } else {
-    ({attributes, problems} = await validate(raw as Record<string, unknown>, candidateNames));
-  }
-  const result: ExtractionResult = {
-    sku_id: sku.sku_id,
+  const {attributes, problems} =
+    typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+      ? validate(raw as Record<string, unknown>, candidates)
+      : {attributes: {brand: null, size: null, unit: null, organic: false, category: null}, problems: ['the reply is not a JSON object']};
+  if (reply.confidence < MIN_CONFIDENCE) problems.push(\`confidence \${reply.confidence.toFixed(2)} is below \${MIN_CONFIDENCE}\`);
+  const result: Result = {
+    sku_id: job.sku_id,
+    merchant: job.merchant,
     attributes,
     confidence: reply.confidence,
-    taxonomy_version: await taxonomy.version(),
+    taxonomy_version: VERSION,
     source: 'model',
-    status: 'accepted',
+    status: problems.length > 0 ? 'review' : 'accepted',
   };
-  if (problems.length > 0 || reply.confidence < MIN_CONFIDENCE) {
-    const reason = problems.length > 0 ? problems.join('; ') : \`confidence \${reply.confidence.toFixed(2)} below threshold\`;
-    await review.enqueue(sku.sku_id, result, reason);
-    result.status = 'review';
-  }
+  if (problems.length > 0) await enqueueReview(result, problems.join('; ')); // a reviewer decides; the label trains the next model
   return result;
 }
 `,
@@ -577,62 +435,44 @@ import (
 	"context"
 	"strings"
 
-	pb "catalogd/extractorpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "enrich/gen/catalog_enrichment"
+	"enrich/store"    // store.Job, Result
+	"enrich/taxonomy" // taxonomy.Version
 )
-
-var extractor pb.ExtractorClient
-
-type SkuJob struct {
-	SkuID       string   \`json:"sku_id"\`
-	Merchant    string   \`json:"merchant"\`
-	ContentHash string   \`json:"content_hash"\`
-	Title       string   \`json:"title"\`
-	Description string   \`json:"description"\`
-	Images      []string \`json:"images"\`
-}
-
-type Result struct {
-	SkuID      string         \`json:"sku_id"\`
-	Attributes map[string]any \`json:"attributes"\`
-	Confidence float32        \`json:"confidence"\`
-	Status     string         \`json:"status"\`
-	Source     string         \`json:"source"\`
-}
 
 var fields = []string{"brand", "size", "unit", "organic", "category"}
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-func extractAttributes(ctx context.Context, sku SkuJob) (Result, error) {
-	reply, err := extractor.Extract(ctx, &pb.ExtractRequest{
-		Title:       sku.Title,
-		Description: sku.Description,
-	})
+var (
+	conn, _   = grpc.NewClient("extractor:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	extractor = pb.NewExtractorClient(conn)
+)
+
+// extractAttributes is the attributes of one SKU version.
+func extractAttributes(ctx context.Context, job store.Job) (store.Result, error) {
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+	request := &pb.ExtractRequest{SkuId: job.SkuID, Title: job.Title, Description: job.Description}
+	reply, err := extractor.Extract(ctx, request)
 	if err != nil {
-		return Result{}, err
+		return store.Result{}, err
 	}
 	attributes := map[string]any{}
 	for _, field := range fields {
 		attributes[field] = nil
 	}
-	for _, line := range strings.Split(reply.Output, "\\n") {
+	for _, line := range strings.Split(reply.GetOutput(), "\\n") {
 		key, value, found := strings.Cut(line, ":")
-		if !found {
-			continue
-		}
 		key = strings.ToLower(strings.TrimSpace(key))
-		for _, field := range fields {
-			if key == field {
-				attributes[field] = strings.TrimSpace(value)
-			}
+		if _, known := attributes[key]; found && known {
+			attributes[key] = strings.TrimSpace(value)
 		}
 	}
-	attributes["organic"] = strings.EqualFold(strings.TrimSpace(strings.ToLower(attributesString(attributes["organic"]))), "true")
-	return Result{SkuID: sku.SkuID, Attributes: attributes, Confidence: reply.Confidence, Status: "accepted", Source: "model"}, nil
-}
-
-func attributesString(v any) string {
-	s, _ := v.(string)
-	return s
+	organic, _ := attributes["organic"].(string)
+	attributes["organic"] = organic == "true"
+	return store.Result{SkuID: job.SkuID, Merchant: job.Merchant, Attributes: attributes, Confidence: reply.GetConfidence(),
+		TaxonomyVersion: taxonomy.Version, Source: "model", Status: "accepted"}, nil
 }
 `,
       solution: `package main
@@ -640,15 +480,18 @@ func attributesString(v any) string {
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	pb "catalogd/extractorpb"
+	pb "enrich/gen/catalog_enrichment"
+	"enrich/store"    // store.Job, Result, EnqueueReview
+	"enrich/taxonomy" // taxonomy.Version, NearestBrands, AllowedUnits, HasCategory, AttributeSchema
 )
 
 const (
@@ -658,166 +501,99 @@ const (
 	minConfidence   = 0.85
 )
 
-var allowedUnits = map[string]bool{"ml": true, "l": true, "g": true, "kg": true, "oz": true, "fl oz": true, "lb": true, "ct": true}
-
-const attributeSchema = \`{
-  "type": "object",
-  "properties": {
-    "brand": {"type": ["string", "null"]},
-    "size": {"type": ["number", "null"]},
-    "unit": {"type": ["string", "null"]},
-    "organic": {"type": "boolean"},
-    "category": {"type": ["string", "null"]}
-  },
-  "required": ["brand", "size", "unit", "organic", "category"],
-  "additionalProperties": false
-}\`
-
-// Taxonomy is the brand and category knowledge graph the model is constrained by.
-type Taxonomy interface {
-	Version(ctx context.Context) (string, error)
-	NearestBrands(ctx context.Context, text string, k int) ([]string, error)
-	HasCategory(ctx context.Context, category string) (bool, error)
-}
-
-type ReviewQueue interface {
-	Enqueue(ctx context.Context, skuID string, result Result, reason string) error
-}
-
 var (
-	extractor pb.ExtractorClient
-	taxonomy  Taxonomy
-	review    ReviewQueue
+	conn, _   = grpc.NewClient("extractor:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	extractor = pb.NewExtractorClient(conn)
 )
 
-type SkuJob struct {
-	SkuID       string   \`json:"sku_id"\`
-	Merchant    string   \`json:"merchant"\`
-	ContentHash string   \`json:"content_hash"\`
-	Title       string   \`json:"title"\`
-	Description string   \`json:"description"\`
-	Images      []string \`json:"images"\`
-}
-
-type Attributes struct {
-	Brand    *string  \`json:"brand"\`
-	Size     *float64 \`json:"size"\`
-	Unit     *string  \`json:"unit"\`
-	Organic  bool     \`json:"organic"\`
-	Category *string  \`json:"category"\`
-}
-
-type Result struct {
-	SkuID           string     \`json:"sku_id"\`
-	Attributes      Attributes \`json:"attributes"\`
-	Confidence      float32    \`json:"confidence"\`
-	TaxonomyVersion string     \`json:"taxonomy_version"\`
-	Source          string     \`json:"source"\`
-	Status          string     \`json:"status"\`
-}
-
+// callModel makes one call per attempt, each under the deadline; only Unavailable earns another attempt.
 func callModel(ctx context.Context, request *pb.ExtractRequest) (*pb.ExtractReply, error) {
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, deadline)
-		reply, err := extractor.Extract(attemptCtx, request)
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, deadline)
+		reply, callErr := extractor.Extract(callCtx, request)
 		cancel()
-		if err == nil {
+		if callErr == nil {
 			return reply, nil
 		}
-		lastErr = err
-		if status.Code(err) != codes.Unavailable {
-			return nil, err
+		err = callErr
+		if status.Code(callErr) != codes.Unavailable {
+			break
 		}
 	}
-	return nil, lastErr
+	return nil, err
 }
 
-type rawAttributes struct {
-	Brand    *string  \`json:"brand"\`
-	Size     *float64 \`json:"size"\`
-	Unit     *string  \`json:"unit"\`
-	Organic  bool     \`json:"organic"\`
-	Category *string  \`json:"category"\`
+func listed(list []string, value string) bool {
+	for _, item := range list {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }
 
-// validate returns the attributes the taxonomy accepts and why anything was dropped.
-func validate(ctx context.Context, raw rawAttributes, candidateNames map[string]bool) (Attributes, []string, error) {
+// validate keeps the attributes the taxonomy accepts and says why anything was dropped.
+func validate(raw map[string]any, candidates []string) (map[string]any, []string) {
 	var problems []string
-	out := Attributes{Brand: raw.Brand, Size: raw.Size, Unit: raw.Unit, Organic: raw.Organic, Category: raw.Category}
-	if out.Brand != nil && !candidateNames[*out.Brand] {
-		problems = append(problems, fmt.Sprintf("brand %q is not a taxonomy candidate", *out.Brand))
-		out.Brand = nil
-	}
-	if out.Size != nil && *out.Size <= 0 {
-		problems = append(problems, "size must be a positive number")
-		out.Size = nil
-	}
-	if out.Unit != nil && !allowedUnits[*out.Unit] {
-		problems = append(problems, fmt.Sprintf("unit %q is not allowed", *out.Unit))
-		out.Unit = nil
-	}
-	if out.Category != nil {
-		known, err := taxonomy.HasCategory(ctx, *out.Category)
-		if err != nil {
-			return Attributes{}, nil, err
-		}
-		if !known {
-			problems = append(problems, fmt.Sprintf("category %q is not in the taxonomy", *out.Category))
-			out.Category = nil
+	attributes := map[string]any{"brand": nil, "size": nil, "unit": nil, "organic": raw["organic"] == true, "category": nil}
+	if brand, ok := raw["brand"].(string); ok {
+		if listed(candidates, brand) {
+			attributes["brand"] = brand
+		} else {
+			problems = append(problems, fmt.Sprintf("brand %q is not a taxonomy candidate", brand))
 		}
 	}
-	return out, problems, nil
+	if unit, ok := raw["unit"].(string); ok {
+		if listed(taxonomy.AllowedUnits, unit) {
+			attributes["unit"] = unit
+		} else {
+			problems = append(problems, fmt.Sprintf("unit %q is not allowed", unit))
+		}
+	}
+	if category, ok := raw["category"].(string); ok {
+		if taxonomy.HasCategory(category) {
+			attributes["category"] = category
+		} else {
+			problems = append(problems, fmt.Sprintf("category %q is not in the taxonomy", category))
+		}
+	}
+	if size, ok := raw["size"].(float64); ok && size > 0 {
+		attributes["size"] = size
+	} else if raw["size"] != nil {
+		problems = append(problems, "size is not a positive number")
+	}
+	return attributes, problems
 }
 
-func extractAttributes(ctx context.Context, sku SkuJob) (Result, error) {
-	text := strings.TrimSpace(sku.Title + " " + sku.Description)
-	candidates, err := taxonomy.NearestBrands(ctx, text, brandCandidates)
+// extractAttributes is the attributes of one SKU version.
+func extractAttributes(ctx context.Context, job store.Job) (store.Result, error) {
+	candidates := taxonomy.NearestBrands(job.Title+" "+job.Description, brandCandidates)
+	request := &pb.ExtractRequest{SkuId: job.SkuID, Title: job.Title, Description: job.Description, CandidateBrands: candidates, Schema: taxonomy.AttributeSchema}
+	reply, err := callModel(ctx, request)
 	if err != nil {
-		return Result{}, err
+		return store.Result{}, err
 	}
-	candidateNames := make(map[string]bool, len(candidates))
-	for _, name := range candidates {
-		candidateNames[name] = true
-	}
-	reply, err := callModel(ctx, &pb.ExtractRequest{
-		Title:           sku.Title,
-		Description:     sku.Description,
-		CandidateBrands: candidates,
-		Schema:          attributeSchema,
-	})
-	if err != nil {
-		return Result{}, err
-	}
-	var raw rawAttributes
-	var attributes Attributes
+	var raw map[string]any
+	var attributes map[string]any
 	var problems []string
-	if err := json.Unmarshal([]byte(reply.Output), &raw); err != nil {
-		problems = []string{"model output is not a JSON object"}
-	} else if attributes, problems, err = validate(ctx, raw, candidateNames); err != nil {
-		return Result{}, err
+	if json.Unmarshal([]byte(reply.GetOutput()), &raw) == nil && raw != nil {
+		attributes, problems = validate(raw, candidates)
+	} else {
+		attributes = map[string]any{"brand": nil, "size": nil, "unit": nil, "organic": false, "category": nil}
+		problems = []string{"the reply is not a JSON object"}
 	}
-	version, err := taxonomy.Version(ctx)
-	if err != nil {
-		return Result{}, err
+	if reply.GetConfidence() < minConfidence {
+		problems = append(problems, fmt.Sprintf("confidence %.2f is below %v", reply.GetConfidence(), minConfidence))
 	}
-	result := Result{
-		SkuID:           sku.SkuID,
-		Attributes:      attributes,
-		Confidence:      reply.Confidence,
-		TaxonomyVersion: version,
-		Source:          "model",
-		Status:          "accepted",
-	}
-	if len(problems) > 0 || float64(reply.Confidence) < minConfidence {
-		reason := strings.Join(problems, "; ")
-		if reason == "" {
-			reason = fmt.Sprintf("confidence %.2f below threshold", reply.Confidence)
-		}
-		if err := review.Enqueue(ctx, sku.SkuID, result, reason); err != nil {
-			return Result{}, errors.Join(errors.New("review enqueue failed"), err)
-		}
+	result := store.Result{SkuID: job.SkuID, Merchant: job.Merchant, Attributes: attributes, Confidence: reply.GetConfidence(),
+		TaxonomyVersion: taxonomy.Version, Source: "model", Status: "accepted"}
+	if len(problems) > 0 {
 		result.Status = "review"
+		// A reviewer decides; the label trains the next model.
+		if err := store.EnqueueReview(ctx, result, strings.Join(problems, "; ")); err != nil {
+			return store.Result{}, err
+		}
 	}
 	return result, nil
 }
@@ -825,45 +601,34 @@ func extractAttributes(ctx context.Context, sku SkuJob) (Result, error) {
     },
     scala: {
       starter: `import io.grpc.ManagedChannelBuilder
-import spray.json._
 
-final case class SkuJob(
-    sku_id: String,
-    merchant: String,
-    content_hash: String,
-    title: String,
-    description: Option[String],
-    images: Option[List[String]])
+import catalogenrich.catalog_enrichment.{ExtractRequest, ExtractorGrpc}
+import enrich.{Store, Taxonomy} // Store.enqueueReview; Taxonomy.Version, nearestBrands, AllowedUnits, hasCategory, AttributeSchema
 
 object ExtractAttributes {
-  val stub = ExtractorGrpc.blockingStub(ManagedChannelBuilder.forAddress("extractor", 50051).usePlaintext().build())
+  val Fields: Seq[String] = Seq("brand", "size", "unit", "organic", "category")
 
-  val Fields = List("brand", "size", "unit", "organic", "category")
+  private val extractor = ExtractorGrpc.blockingStub(ManagedChannelBuilder.forAddress("extractor", 50051).usePlaintext().build())
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def extractAttributes(sku: SkuJob): JsObject = {
-    val reply = stub.extract(
-      ExtractRequest(title = sku.title, description = sku.description.getOrElse(""), candidateBrands = Nil, schema = "")
-    )
-    val parsed = reply.output.linesIterator.flatMap { line =>
-      line.split(":", 2) match {
-        case Array(key, value) if Fields.contains(key.trim.toLowerCase) => Some(key.trim.toLowerCase -> value.trim)
-        case _ => None
-      }
-    }.toMap
-    val attributes = JsObject(
-      "brand" -> parsed.get("brand").map(JsString(_)).getOrElse(JsNull),
-      "size" -> parsed.get("size").map(JsString(_)).getOrElse(JsNull),
-      "unit" -> parsed.get("unit").map(JsString(_)).getOrElse(JsNull),
-      "organic" -> JsBoolean(parsed.get("organic").exists(_.equalsIgnoreCase("true"))),
-      "category" -> parsed.get("category").map(JsString(_)).getOrElse(JsNull)
-    )
-    JsObject(
-      "sku_id" -> JsString(sku.sku_id),
+  /** The attributes of one SKU version: {sku_id, merchant, attributes, confidence, taxonomy_version, source, status}. */
+  def extractAttributes(job: ujson.Value): ujson.Obj = {
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+    val request = ExtractRequest(skuId = job("sku_id").str, title = job("title").str, description = job("description").str)
+    val reply = extractor.extract(request)
+    val attributes = ujson.Obj.from(Fields.map(_ -> ujson.Null))
+    reply.output.split("\\n").foreach { line =>
+      val at = line.indexOf(':')
+      if (at >= 0 && Fields.contains(line.take(at).trim.toLowerCase)) attributes(line.take(at).trim.toLowerCase) = line.drop(at + 1).trim
+    }
+    attributes("organic") = attributes("organic") == ujson.Str("true")
+    ujson.Obj(
+      "sku_id" -> job("sku_id").str,
+      "merchant" -> job("merchant").str,
       "attributes" -> attributes,
-      "confidence" -> JsNumber(reply.confidence.toDouble),
-      "status" -> JsString("accepted"),
-      "source" -> JsString("model")
+      "confidence" -> reply.confidence,
+      "taxonomy_version" -> Taxonomy.Version,
+      "source" -> "model",
+      "status" -> "accepted",
     )
   }
 }
@@ -871,126 +636,75 @@ object ExtractAttributes {
       solution: `import java.util.concurrent.TimeUnit
 
 import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import spray.json._
 
-final case class SkuJob(
-    sku_id: String,
-    merchant: String,
-    content_hash: String,
-    title: String,
-    description: Option[String],
-    images: Option[List[String]])
+import scala.collection.mutable
+import scala.util.Try
+
+import catalogenrich.catalog_enrichment.{ExtractReply, ExtractRequest, ExtractorGrpc}
+import enrich.{Store, Taxonomy} // Store.enqueueReview; Taxonomy.Version, nearestBrands, AllowedUnits, hasCategory, AttributeSchema
 
 object ExtractAttributes {
-  val DeadlineMs = 5000L
+  val DeadlineSeconds = 5L
   val MaxAttempts = 2
   val BrandCandidates = 20
   val MinConfidence = 0.85
-  val AllowedUnits = Set("ml", "l", "g", "kg", "oz", "fl oz", "lb", "ct")
-  val AttributeSchema: String =
-    """{
-      |  "type": "object",
-      |  "properties": {
-      |    "brand": {"type": ["string", "null"]},
-      |    "size": {"type": ["number", "null"]},
-      |    "unit": {"type": ["string", "null"]},
-      |    "organic": {"type": "boolean"},
-      |    "category": {"type": ["string", "null"]}
-      |  },
-      |  "required": ["brand", "size", "unit", "organic", "category"],
-      |  "additionalProperties": false
-      |}""".stripMargin
 
-  val stub = ExtractorGrpc.blockingStub(ManagedChannelBuilder.forAddress("extractor", 50051).usePlaintext().build())
-  val taxonomy = Taxonomy.open()
-  val review = ReviewQueue.open()
+  private val extractor = ExtractorGrpc.blockingStub(ManagedChannelBuilder.forAddress("extractor", 50051).usePlaintext().build())
 
-  def callModel(request: ExtractRequest): ExtractReply = {
-    var lastError: Option[StatusRuntimeException] = None
-    var attempt = 0
-    while (attempt < MaxAttempts) {
-      try {
-        return stub.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).extract(request)
-      } catch {
-        case exc: StatusRuntimeException =>
-          lastError = Some(exc)
-          if (exc.getStatus.getCode != Status.Code.UNAVAILABLE) throw exc
-      }
-      attempt += 1
+  /** One call per attempt, each under the deadline; only UNAVAILABLE earns another attempt. */
+  def callModel(request: ExtractRequest, attempt: Int = 1): ExtractReply =
+    try extractor.withDeadlineAfter(DeadlineSeconds, TimeUnit.SECONDS).extract(request)
+    catch {
+      case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.UNAVAILABLE && attempt < MaxAttempts =>
+        callModel(request, attempt + 1)
     }
-    throw lastError.getOrElse(new RuntimeException("extractor unavailable"))
+
+  /** The attributes the taxonomy accepts, and why anything was dropped. */
+  def validate(raw: ujson.Obj, candidates: Seq[String]): (ujson.Obj, Seq[String]) = {
+    val problems = mutable.Buffer.empty[String]
+    val attributes = ujson.Obj("brand" -> ujson.Null, "size" -> ujson.Null, "unit" -> ujson.Null, "organic" -> (raw.value.get("organic") == Some(ujson.True)), "category" -> ujson.Null)
+    raw.value.get("brand").flatMap(_.strOpt).foreach { brand =>
+      if (candidates.contains(brand)) attributes("brand") = brand else problems += s"brand '$brand' is not a taxonomy candidate"
+    }
+    raw.value.get("unit").flatMap(_.strOpt).foreach { unit =>
+      if (Taxonomy.AllowedUnits.contains(unit)) attributes("unit") = unit else problems += s"unit '$unit' is not allowed"
+    }
+    raw.value.get("category").flatMap(_.strOpt).foreach { category =>
+      if (Taxonomy.hasCategory(category)) attributes("category") = category else problems += s"category '$category' is not in the taxonomy"
+    }
+    raw.value.get("size").filterNot(_ == ujson.Null).foreach { size =>
+      if (size.numOpt.exists(_ > 0)) attributes("size") = size else problems += "size is not a positive number"
+    }
+    (attributes, problems.toSeq)
   }
 
-  /** Attributes the taxonomy accepts, and why anything was dropped. */
-  def validate(raw: Map[String, JsValue], candidateNames: Set[String]): (JsObject, List[String]) = {
-    val problems = scala.collection.mutable.ListBuffer.empty[String]
-    val brand = raw.get("brand").collect { case JsString(b) => b }.filter { b =>
-      val ok = candidateNames.contains(b)
-      if (!ok) problems += s"brand '$b' is not a taxonomy candidate"
-      ok
-    }
-    val size = raw.get("size").collect { case JsNumber(n) => n }.filter { n =>
-      val ok = n > 0
-      if (!ok) problems += "size must be a positive number"
-      ok
-    }
-    val unit = raw.get("unit").collect { case JsString(u) => u }.filter { u =>
-      val ok = AllowedUnits.contains(u)
-      if (!ok) problems += s"unit '$u' is not allowed"
-      ok
-    }
-    val category = raw.get("category").collect { case JsString(c) => c }.filter { c =>
-      val ok = taxonomy.hasCategory(c)
-      if (!ok) problems += s"category '$c' is not in the taxonomy"
-      ok
-    }
-    val attributes = JsObject(
-      "brand" -> brand.map(JsString(_)).getOrElse(JsNull),
-      "size" -> size.map(JsNumber(_)).getOrElse(JsNull),
-      "unit" -> unit.map(JsString(_)).getOrElse(JsNull),
-      "organic" -> JsBoolean(raw.get("organic").contains(JsTrue)),
-      "category" -> category.map(JsString(_)).getOrElse(JsNull)
+  /** The attributes of one SKU version: {sku_id, merchant, attributes, confidence, taxonomy_version, source, status}. */
+  def extractAttributes(job: ujson.Value): ujson.Obj = {
+    val candidates = Taxonomy.nearestBrands(s"\${job("title").str} \${job("description").str}", BrandCandidates)
+    val request = ExtractRequest(
+      skuId = job("sku_id").str,
+      title = job("title").str,
+      description = job("description").str,
+      candidateBrands = candidates,
+      schema = Taxonomy.AttributeSchema,
     )
-    (attributes, problems.toList)
-  }
-
-  def extractAttributes(sku: SkuJob): JsObject = {
-    val text = s"\${sku.title} \${sku.description.getOrElse("")}".trim
-    val candidates = taxonomy.nearestBrands(text, BrandCandidates)
-    val candidateNames = candidates.toSet
-    val reply = callModel(
-      ExtractRequest(
-        title = sku.title,
-        description = sku.description.getOrElse(""),
-        candidateBrands = candidates,
-        schema = AttributeSchema
-      )
-    )
-    val parsed =
-      try Some(reply.output.parseJson.asJsObject.fields)
-      catch { case _: Exception => None }
-    val (attributes, problems) = parsed match {
-      case Some(raw) => validate(raw, candidateNames)
+    val reply = callModel(request)
+    val (attributes, problems) = Try(ujson.read(reply.output)).toOption.flatMap(_.objOpt) match {
+      case Some(raw) => validate(ujson.Obj.from(raw), candidates)
       case None =>
-        (
-          JsObject("brand" -> JsNull, "size" -> JsNull, "unit" -> JsNull, "organic" -> JsFalse, "category" -> JsNull),
-          List("model output is not a JSON object")
-        )
+        (ujson.Obj("brand" -> ujson.Null, "size" -> ujson.Null, "unit" -> ujson.Null, "organic" -> false, "category" -> ujson.Null), Seq("the reply is not a JSON object"))
     }
-    val needsReview = problems.nonEmpty || reply.confidence < MinConfidence
-    val result = JsObject(
-      "sku_id" -> JsString(sku.sku_id),
+    val all = if (reply.confidence < MinConfidence) problems :+ f"confidence \${reply.confidence}%.2f is below $MinConfidence" else problems
+    val result = ujson.Obj(
+      "sku_id" -> job("sku_id").str,
+      "merchant" -> job("merchant").str,
       "attributes" -> attributes,
-      "confidence" -> JsNumber(reply.confidence.toDouble),
-      "taxonomy_version" -> JsString(taxonomy.version()),
-      "source" -> JsString("model"),
-      "status" -> JsString(if (needsReview) "review" else "accepted")
+      "confidence" -> reply.confidence,
+      "taxonomy_version" -> Taxonomy.Version,
+      "source" -> "model",
+      "status" -> (if (all.nonEmpty) "review" else "accepted"),
     )
-    if (needsReview) {
-      val reason =
-        if (problems.nonEmpty) problems.mkString("; ") else f"confidence \${reply.confidence}%.2f below threshold"
-      review.enqueue(sku.sku_id, result, reason)
-    }
+    if (all.nonEmpty) Store.enqueueReview(result, all.mkString("; ")) // a reviewer decides; the label trains the next model
     result
   }
 }
@@ -998,196 +712,707 @@ object ExtractAttributes {
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
-
-#include "extractor.grpc.pb.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
-#include <memory>
-#include <nlohmann/json.hpp>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-using json = nlohmann::json;
+#include "catalog_enrichment.grpc.pb.h"
+#include "enrich/store.h"     // store::enqueue_review
+#include "enrich/taxonomy.h"  // taxonomy::kVersion, nearest_brands, kAllowedUnits, has_category, kAttributeSchema
 
-std::unique_ptr<Extractor::Stub> stub;
+using json = nlohmann::json;
 
 const std::vector<std::string> kFields = {"brand", "size", "unit", "organic", "category"};
 
-std::string lower(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
-  return s;
-}
+auto extractor = catalogenrich::Extractor::NewStub(grpc::CreateChannel("extractor:50051", grpc::InsecureChannelCredentials()));
 
-std::string trim(const std::string& s) {
-  const auto begin = s.find_first_not_of(" \\t\\r\\n");
-  if (begin == std::string::npos) return "";
-  const auto end = s.find_last_not_of(" \\t\\r\\n");
-  return s.substr(begin, end - begin + 1);
-}
+// The extractor did not answer.
+struct ExtractorFailed : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-json extractAttributes(const json& sku) {
+// The attributes of one SKU version: {sku_id, merchant, attributes, confidence, taxonomy_version, source, status}.
+json extractAttributes(const json& job) {
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+  catalogenrich::ExtractRequest request;
+  request.set_sku_id(job["sku_id"].get<std::string>());
+  request.set_title(job["title"].get<std::string>());
+  request.set_description(job["description"].get<std::string>());
   grpc::ClientContext ctx;
-  ExtractRequest request;
-  request.set_title(sku["title"].get<std::string>());
-  request.set_description(sku.value("description", std::string()));
-  ExtractReply reply;
-  const grpc::Status status = stub->Extract(&ctx, request, &reply);
-  if (!status.ok()) throw std::runtime_error("extract failed: " + status.error_message());
-
-  json attributes;
-  for (const auto& field : kFields) attributes[field] = nullptr;
+  catalogenrich::ExtractReply reply;
+  const grpc::Status status = extractor->Extract(&ctx, request, &reply);
+  if (!status.ok()) throw ExtractorFailed("extractor: " + status.error_message());
+  json attributes = {{"brand", nullptr}, {"size", nullptr}, {"unit", nullptr}, {"organic", nullptr}, {"category", nullptr}};
   std::istringstream lines(reply.output());
   std::string line;
   while (std::getline(lines, line)) {
-    const auto colon = line.find(':');
-    if (colon == std::string::npos) continue;
-    const auto key = lower(trim(line.substr(0, colon)));
-    if (std::find(kFields.begin(), kFields.end(), key) != kFields.end()) attributes[key] = trim(line.substr(colon + 1));
+    const size_t at = line.find(':');
+    if (at == std::string::npos) continue;
+    std::string key = line.substr(0, at);
+    key.erase(std::remove(key.begin(), key.end(), ' '), key.end());
+    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+    if (std::find(kFields.begin(), kFields.end(), key) != kFields.end()) attributes[key] = line.substr(at + 1);
   }
-  attributes["organic"] = attributes["organic"].is_string() && lower(attributes["organic"].get<std::string>()) == "true";
-  return json{{"sku_id", sku["sku_id"]},
-              {"attributes", attributes},
-              {"confidence", reply.confidence()},
-              {"status", "accepted"},
-              {"source", "model"}};
+  attributes["organic"] = attributes["organic"] == json("true");
+  return {{"sku_id", job["sku_id"]},   {"merchant", job["merchant"]}, {"attributes", attributes}, {"confidence", reply.confidence()},
+          {"taxonomy_version", taxonomy::kVersion}, {"source", "model"}, {"status", "accepted"}};
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-
-#include "extractor.grpc.pb.h"
-
-#include <chrono>
-#include <memory>
 #include <nlohmann/json.hpp>
-#include <set>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "catalog_enrichment.grpc.pb.h"
+#include "enrich/store.h"     // store::enqueue_review
+#include "enrich/taxonomy.h"  // taxonomy::kVersion, nearest_brands, kAllowedUnits, has_category, kAttributeSchema
+
 using json = nlohmann::json;
 
-constexpr int kDeadlineMs = 5000;
+constexpr std::chrono::seconds kDeadline{5};
 constexpr int kMaxAttempts = 2;
-constexpr int kBrandCandidates = 20;
+constexpr size_t kBrandCandidates = 20;
 constexpr double kMinConfidence = 0.85;
-const std::set<std::string> kAllowedUnits = {"ml", "l", "g", "kg", "oz", "fl oz", "lb", "ct"};
-const char* kAttributeSchema = R"SCHEMA({
-  "type": "object",
-  "properties": {
-    "brand": {"type": ["string", "null"]},
-    "size": {"type": ["number", "null"]},
-    "unit": {"type": ["string", "null"]},
-    "organic": {"type": "boolean"},
-    "category": {"type": ["string", "null"]}
-  },
-  "required": ["brand", "size", "unit", "organic", "category"],
-  "additionalProperties": false
-})SCHEMA";
 
-// The brand and category knowledge graph the model is constrained by.
-struct Taxonomy {
-  std::string version();
-  std::vector<std::string> nearestBrands(const std::string& text, int k);
-  bool hasCategory(const std::string& category);
+auto extractor = catalogenrich::Extractor::NewStub(grpc::CreateChannel("extractor:50051", grpc::InsecureChannelCredentials()));
+
+// The extractor did not answer.
+struct ExtractorFailed : std::runtime_error {
+  using std::runtime_error::runtime_error;
 };
 
-struct ReviewQueue {
-  void enqueue(const std::string& skuId, const json& result, const std::string& reason);
-};
-
-std::unique_ptr<Extractor::Stub> stub;
-Taxonomy taxonomy;
-ReviewQueue review;
-
-ExtractReply callModel(const ExtractRequest& request) {
-  grpc::Status last;
-  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
+// One call per attempt, each under kDeadline; only UNAVAILABLE earns another attempt.
+catalogenrich::ExtractReply callModel(const catalogenrich::ExtractRequest& request) {
+  grpc::Status status;
+  for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
     grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kDeadlineMs));
-    ExtractReply reply;
-    last = stub->Extract(&ctx, request, &reply);
-    if (last.ok()) return reply;
-    if (last.error_code() != grpc::StatusCode::UNAVAILABLE)
-      throw std::runtime_error("extract failed: " + last.error_message());
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    catalogenrich::ExtractReply reply;
+    status = extractor->Extract(&ctx, request, &reply);
+    if (status.ok()) return reply;
+    if (status.error_code() != grpc::StatusCode::UNAVAILABLE) break;
   }
-  throw std::runtime_error("extractor unavailable: " + last.error_message());
+  throw ExtractorFailed("extractor: " + status.error_message());
 }
 
-struct Validated {
-  json attributes;
-  std::vector<std::string> problems;
-};
+bool listed(const std::vector<std::string>& list, const std::string& value) {
+  return std::find(list.begin(), list.end(), value) != list.end();
+}
 
-// Attributes the taxonomy accepts, and why anything was dropped.
-Validated validate(const json& raw, const std::set<std::string>& candidateNames) {
-  Validated out;
-  out.attributes = {{"brand", nullptr}, {"size", nullptr}, {"unit", nullptr}, {"organic", false}, {"category", nullptr}};
+// The attributes the taxonomy accepts; why anything was dropped goes to problems.
+json validate(const json& raw, const std::vector<std::string>& candidates, std::vector<std::string>& problems) {
+  const bool organic = raw.contains("organic") && raw["organic"].is_boolean() && raw["organic"].get<bool>();
+  json attributes = {{"brand", nullptr}, {"size", nullptr}, {"unit", nullptr}, {"organic", organic}, {"category", nullptr}};
   if (raw.contains("brand") && raw["brand"].is_string()) {
-    const auto brand = raw["brand"].get<std::string>();
-    if (candidateNames.count(brand) > 0) out.attributes["brand"] = brand;
-    else out.problems.push_back("brand '" + brand + "' is not a taxonomy candidate");
-  }
-  if (raw.contains("size") && raw["size"].is_number()) {
-    const auto size = raw["size"].get<double>();
-    if (size > 0) out.attributes["size"] = size;
-    else out.problems.push_back("size must be a positive number");
+    const std::string brand = raw["brand"];
+    if (listed(candidates, brand)) attributes["brand"] = brand;
+    else problems.push_back("brand '" + brand + "' is not a taxonomy candidate");
   }
   if (raw.contains("unit") && raw["unit"].is_string()) {
-    const auto unit = raw["unit"].get<std::string>();
-    if (kAllowedUnits.count(unit) > 0) out.attributes["unit"] = unit;
-    else out.problems.push_back("unit '" + unit + "' is not allowed");
+    const std::string unit = raw["unit"];
+    if (listed(taxonomy::kAllowedUnits, unit)) attributes["unit"] = unit;
+    else problems.push_back("unit '" + unit + "' is not allowed");
   }
   if (raw.contains("category") && raw["category"].is_string()) {
-    const auto category = raw["category"].get<std::string>();
-    if (taxonomy.hasCategory(category)) out.attributes["category"] = category;
-    else out.problems.push_back("category '" + category + "' is not in the taxonomy");
+    const std::string category = raw["category"];
+    if (taxonomy::has_category(category)) attributes["category"] = category;
+    else problems.push_back("category '" + category + "' is not in the taxonomy");
   }
-  out.attributes["organic"] = raw.contains("organic") && raw["organic"].is_boolean() && raw["organic"].get<bool>();
-  return out;
+  if (raw.contains("size") && !raw["size"].is_null()) {
+    if (raw["size"].is_number() && raw["size"].get<double>() > 0) attributes["size"] = raw["size"];
+    else problems.push_back("size is not a positive number");
+  }
+  return attributes;
 }
 
-json extractAttributes(const json& sku) {
-  const auto title = sku["title"].get<std::string>();
-  const auto description = sku.value("description", std::string());
-  const auto candidates = taxonomy.nearestBrands(title + " " + description, kBrandCandidates);
-  const std::set<std::string> candidateNames(candidates.begin(), candidates.end());
-
-  ExtractRequest request;
+// The attributes of one SKU version: {sku_id, merchant, attributes, confidence, taxonomy_version, source, status}.
+json extractAttributes(const json& job) {
+  const std::string title = job["title"], description = job["description"];
+  const std::vector<std::string> candidates = taxonomy::nearest_brands(title + " " + description, kBrandCandidates);
+  catalogenrich::ExtractRequest request;
+  request.set_sku_id(job["sku_id"].get<std::string>());
   request.set_title(title);
   request.set_description(description);
-  for (const auto& brand : candidates) request.add_candidate_brands(brand);
-  request.set_schema(kAttributeSchema);
-  const ExtractReply reply = callModel(request);
-
+  for (const std::string& brand : candidates) request.add_candidate_brands(brand);
+  request.set_schema(taxonomy::kAttributeSchema);
+  const catalogenrich::ExtractReply reply = callModel(request);
+  std::vector<std::string> problems;
   const json raw = json::parse(reply.output(), nullptr, false);
-  Validated validated;
-  if (raw.is_object()) {
-    validated = validate(raw, candidateNames);
-  } else {
-    validated.attributes = {{"brand", nullptr}, {"size", nullptr}, {"unit", nullptr}, {"organic", false}, {"category", nullptr}};
-    validated.problems.push_back("model output is not a JSON object");
+  json attributes = {{"brand", nullptr}, {"size", nullptr}, {"unit", nullptr}, {"organic", false}, {"category", nullptr}};
+  if (raw.is_object()) attributes = validate(raw, candidates, problems);
+  else problems.push_back("the reply is not a JSON object");
+  if (reply.confidence() < kMinConfidence) {
+    char line[64];
+    std::snprintf(line, sizeof line, "confidence %.2f is below 0.85", reply.confidence());
+    problems.push_back(line);
   }
-  const bool needsReview = !validated.problems.empty() || reply.confidence() < kMinConfidence;
-  json result = {{"sku_id", sku["sku_id"]},
-                 {"attributes", validated.attributes},
-                 {"confidence", reply.confidence()},
-                 {"taxonomy_version", taxonomy.version()},
-                 {"source", "model"},
-                 {"status", needsReview ? "review" : "accepted"}};
-  if (needsReview) {
+  json result = {{"sku_id", job["sku_id"]},   {"merchant", job["merchant"]}, {"attributes", attributes}, {"confidence", reply.confidence()},
+                 {"taxonomy_version", taxonomy::kVersion}, {"source", "model"}, {"status", "accepted"}};
+  if (!problems.empty()) {
+    result["status"] = "review";
     std::string reason;
-    for (const auto& problem : validated.problems) reason += (reason.empty() ? "" : "; ") + problem;
-    if (reason.empty()) reason = "confidence " + std::to_string(reply.confidence()) + " below threshold";
-    review.enqueue(sku["sku_id"].get<std::string>(), result, reason);
+    for (const std::string& p : problems) reason += (reason.empty() ? "" : "; ") + p;
+    store::enqueue_review(result, reason);  // a reviewer decides; the label trains the next model
   }
   return result;
 }
 `,
     },
   },
-  debrief: `The fix constrains the model from three sides so a system that cannot read its output can still trust it: retrieval before the call (the model picks a brand from candidates that exist in the taxonomy, as DoorDash's brand pipeline retrieves similar brands from the knowledge graph before deciding), structure in the call (a schema, parsed as JSON) and validation after it (nothing outside the controlled vocabulary survives). The deadline and the single retry on UNAVAILABLE are ordinary gRPC hygiene. The confidence gate is what makes human reviewers useful: SKUs the model cannot tag confidently go to a person instead of into the catalog. This step does not vary the attribute set per category, put a cheap classifier in front of the model, or read images when the title is an abbreviation.`,
+  harness: {
+    python: `import json
+
+import grpc
+
+import catalog_enrichment_pb2 as pb
+import catalog_enrichment_pb2_grpc as pb_grpc
+from enrich import store, taxonomy
+
+GOOD = {"sku_id": "sku-1", "merchant": "m-1", "title": "DOVE SILK GLOW BODY WASH 500ML", "description": "Nourishing body wash"}
+INVENTED = {"sku_id": "sku-2", "merchant": "m-1", "title": "GLOWRA OAT DRINK 1L", "description": "Oat drink"}
+BAD_UNIT = {"sku_id": "sku-3", "merchant": "m-1", "title": "BARILLA SPAGHETTI 12PACK", "description": "Durum wheat pasta"}
+NO_DESCRIPTION = {"sku_id": "sku-4", "merchant": "m-1", "title": "OATLY OAT MILK 1L", "description": ""}
+GOOD_ATTRIBUTES = {"brand": "Dove", "size": 500, "unit": "ml", "organic": False, "category": "body-wash"}
+
+
+def _size(title):
+    for token in title.split():
+        digits = token.rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+        if digits and digits != token and digits.replace(".", "").isdigit():
+            return float(digits), token[len(digits):].lower()
+    return None, None
+
+
+class Extractor(pb_grpc.ExtractorServicer):
+    """The model: picks the first candidate brand in the title, or names the title's first word; prose without a schema."""
+
+    def Extract(self, request, context):
+        title = request.title.upper()
+        brand = next((c for c in request.candidate_brands if c.lower() in request.title.lower()), None) or request.title.split()[0].capitalize()
+        size, unit = _size(title)
+        category = "body-wash" if "BODY WASH" in title else "plant-milk" if "OAT" in title else "pasta" if "SPAGHETTI" in title else "grocery"
+        confidence = 0.95 if request.description else 0.6
+        if not request.schema:
+            return pb.ExtractReply(output=f"Looks like {brand} {category}, {size} {unit}.", confidence=confidence)
+        attributes = {"brand": brand, "size": size, "unit": unit, "organic": "ORGANIC" in title, "category": category}
+        return pb.ExtractReply(output=json.dumps(attributes), confidence=confidence)
+
+
+def _module(ctx):
+    ctx.grpc.serve(pb_grpc.add_ExtractorServicer_to_server, Extractor())
+    return ctx.load("extract_attributes")
+
+
+def _extract(m, job, why):
+    try:
+        return m.extract_attributes(job)
+    except Exception as exc:  # noqa: BLE001 - what it raised is the verdict
+        detail = f"{exc.code().name} {exc.details()}" if isinstance(exc, grpc.RpcError) else f"{type(exc).__name__}: {exc}"
+        raise AssertionError(f"{why}: extract_attributes raised {detail}") from None
+
+
+def _raises(m, job, why):
+    try:
+        result = m.extract_attributes(job)
+    except Exception:  # noqa: BLE001 - the error reaches the caller, as it must
+        return
+    raise AssertionError(f"{why}: extract_attributes returned {result} instead of raising")
+
+
+def check_retrieve_first(ctx):
+    m = _module(ctx)
+    _extract(m, GOOD, "with a healthy extractor")
+    calls = ctx.grpc.calls_to("Extract")
+    assert calls, "no Extract call was made"
+    candidates = list(calls[0].request.candidate_brands)
+    assert 0 < len(candidates) <= 20, f"the request carried {len(candidates)} candidate brands: retrieve the 20 nearest from the taxonomy before the call"
+    assert "Dove" in candidates and all(c in taxonomy.BRANDS for c in candidates), f"the candidates must be taxonomy.nearest_brands of the title and description, got {candidates}"
+
+
+def check_structured_output(ctx):
+    m = _module(ctx)
+    result = _extract(m, GOOD, "with a healthy extractor")
+    request = ctx.grpc.calls_to("Extract")[0].request
+    assert request.schema == taxonomy.ATTRIBUTE_SCHEMA, f"the request carried schema {request.schema[:40]!r}: send taxonomy.ATTRIBUTE_SCHEMA so the model answers one JSON object"
+    assert result.get("attributes") == GOOD_ATTRIBUTES, f"the attributes of {GOOD['title']!r} came out as {result.get('attributes')}, expected {GOOD_ATTRIBUTES}"
+
+
+def check_deadline_retry(ctx):
+    m = _module(ctx)
+    ctx.grpc.fail("Extract", grpc.StatusCode.UNAVAILABLE, "extractor restarting", 1)
+    _extract(m, GOOD, "after one UNAVAILABLE")
+    calls = ctx.grpc.calls_to("Extract")
+    assert len(calls) == 2, f"one UNAVAILABLE then a healthy extractor took {len(calls)} calls, expected 2"
+    for call in calls:
+        assert call.timeout is not None and 4.5 <= call.timeout <= 5.5, f"an Extract call carried a {call.timeout} s deadline, expected 5"
+    ctx.grpc.set_latency("Extract", 10.0)
+    _raises(m, GOOD, "with an extractor slower than the deadline")
+    assert len(ctx.grpc.calls_to("Extract")) == 3, f"a deadline must not be retried: {len(ctx.grpc.calls_to('Extract')) - 2} calls after the slow one started"
+    ctx.grpc.set_latency("Extract", 0.0)
+    ctx.grpc.fail("Extract", grpc.StatusCode.INVALID_ARGUMENT, "title too long", 2)
+    _raises(m, GOOD, "with INVALID_ARGUMENT")
+    assert len(ctx.grpc.calls_to("Extract")) == 4, "INVALID_ARGUMENT must not be retried"
+
+
+def check_taxonomy_validate(ctx):
+    m = _module(ctx)
+    result = _extract(m, INVENTED, "with a brand the taxonomy does not know")
+    brand = result.get("attributes", {}).get("brand")
+    assert brand is None, f"the model named brand {brand!r}, which is not a taxonomy candidate, and it was kept"
+    assert result.get("status") == "review", f"an invented brand must send the SKU to review, status is {result.get('status')!r}"
+    assert store.pending("sku-2") is not None, "the SKU with an invented brand was not parked with store.enqueue_review"
+    result = _extract(m, BAD_UNIT, "with a unit outside ALLOWED_UNITS")
+    unit = result.get("attributes", {}).get("unit")
+    assert unit is None and result.get("status") == "review", f"unit {unit!r} is not in ALLOWED_UNITS: it must be nulled and the SKU reviewed, got {result}"
+    assert store.pending("sku-3") is not None, "the SKU with an unknown unit was not parked with store.enqueue_review"
+
+
+def check_confidence_gate(ctx):
+    m = _module(ctx)
+    result = _extract(m, NO_DESCRIPTION, "with a confidence of 0.6")
+    assert result.get("status") == "review", f"a 0.6 confidence must go to review, status is {result.get('status')!r}"
+    proposal = store.pending("sku-4")
+    assert proposal is not None and proposal["reason"], f"the low-confidence SKU must be parked with a reason, store.pending gives {proposal}"
+    assert result.get("taxonomy_version") == taxonomy.VERSION and result.get("source") == "model", f"the result must carry taxonomy_version and source, got {result}"
+    result = _extract(m, GOOD, "with a confident, valid answer")
+    assert result.get("status") == "accepted", f"a clean answer at 0.95 must be accepted, status is {result.get('status')!r}"
+    assert store.pending("sku-1") is None, "a clean, confident answer must not be sent to review"
+`,
+    typescript: `const GOOD = {sku_id: 'sku-1', merchant: 'm-1', content_hash: 'h1', title: 'DOVE SILK GLOW BODY WASH 500ML', description: 'Nourishing body wash', images: []};
+const INVENTED = {...GOOD, sku_id: 'sku-2', title: 'GLOWRA OAT DRINK 1L', description: 'Oat drink'};
+const BAD_UNIT = {...GOOD, sku_id: 'sku-3', title: 'BARILLA SPAGHETTI 12PACK', description: 'Durum wheat pasta'};
+const NO_DESCRIPTION = {...GOOD, sku_id: 'sku-4', title: 'OATLY OAT MILK 1L', description: ''};
+const GOOD_ATTRIBUTES = {brand: 'Dove', size: 500, unit: 'ml', organic: false, category: 'body-wash'};
+
+function sizeOf(title: string): [number | null, string | null] {
+  for (const token of title.split(' ')) {
+    const digits = token.replace(/[A-Z]+$/, '');
+    if (digits !== '' && digits !== token && /^[0-9.]+$/.test(digits)) return [Number(digits), token.slice(digits.length).toLowerCase()];
+  }
+  return [null, null];
+}
+
+/** The model: picks the first candidate brand in the title, or names the title's first word; prose without a schema. */
+function module(ctx) {
+  const pkg = ctx.proto('catalog_enrichment.proto');
+  ctx.grpc.serve(pkg.catalogenrich.Extractor.service, {
+    Extract(call, callback) {
+      const {title, description, candidate_brands, schema} = call.request;
+      const upper = title.toUpperCase();
+      const first = title.split(' ')[0];
+      const brand = (candidate_brands ?? []).find(c => title.toLowerCase().includes(c.toLowerCase())) ?? first[0].toUpperCase() + first.slice(1).toLowerCase();
+      const [size, unit] = sizeOf(upper);
+      const category = upper.includes('BODY WASH') ? 'body-wash' : upper.includes('OAT') ? 'plant-milk' : upper.includes('SPAGHETTI') ? 'pasta' : 'grocery';
+      const confidence = description ? 0.95 : 0.6;
+      if (!schema) return callback(null, {output: \`Looks like \${brand} \${category}, \${size} \${unit}.\`, confidence});
+      callback(null, {output: JSON.stringify({brand, size, unit, organic: upper.includes('ORGANIC'), category}), confidence});
+    },
+  });
+  return {m: ctx.load('extract_attributes'), store: ctx.load('/support/enrich/store.ts'), taxonomy: ctx.load('/support/enrich/taxonomy.ts')};
+}
+
+async function extract(m, job, why: string) {
+  try {
+    return await m.extractAttributes(job);
+  } catch (e) {
+    assert.fail(\`\${why}: extractAttributes threw \${e}\`);
+  }
+}
+
+async function throws(m, job, why: string): Promise<void> {
+  let result;
+  try {
+    result = await m.extractAttributes(job);
+  } catch {
+    return;
+  }
+  assert.fail(\`\${why}: extractAttributes returned \${JSON.stringify(result)} instead of throwing\`);
+}
+
+export async function check_retrieve_first(ctx) {
+  const {m, taxonomy} = module(ctx);
+  await extract(m, GOOD, 'with a healthy extractor');
+  const calls = ctx.grpc.callsTo('Extract');
+  assert(calls.length > 0, 'no Extract call was made');
+  const candidates: string[] = calls[0].request.candidate_brands ?? [];
+  assert(candidates.length > 0 && candidates.length <= 20, \`the request carried \${candidates.length} candidate brands: retrieve the 20 nearest from the taxonomy before the call\`);
+  assert(candidates.includes('Dove') && candidates.every(c => taxonomy.BRANDS.includes(c)), \`the candidates must be nearestBrands of the title and description, got \${JSON.stringify(candidates)}\`);
+}
+
+export async function check_structured_output(ctx) {
+  const {m, taxonomy} = module(ctx);
+  const result = await extract(m, GOOD, 'with a healthy extractor');
+  const request = ctx.grpc.callsTo('Extract')[0].request;
+  assert.equal(request.schema, taxonomy.ATTRIBUTE_SCHEMA, 'send ATTRIBUTE_SCHEMA so the model answers one JSON object');
+  assert.deepStrictEqual(result.attributes, GOOD_ATTRIBUTES, \`the attributes of \${GOOD.title} came out as \${JSON.stringify(result.attributes)}\`);
+}
+
+export async function check_deadline_retry(ctx) {
+  const {m} = module(ctx);
+  ctx.grpc.fail('Extract', ctx.grpc.status.UNAVAILABLE, 'extractor restarting', 1);
+  await extract(m, GOOD, 'after one UNAVAILABLE');
+  const calls = ctx.grpc.callsTo('Extract');
+  assert.equal(calls.length, 2, \`one UNAVAILABLE then a healthy extractor took \${calls.length} calls, expected 2\`);
+  for (const call of calls) assert(call.timeout !== null && call.timeout >= 4.5 && call.timeout <= 5.5, \`an Extract call carried a \${call.timeout} s deadline, expected 5\`);
+  ctx.grpc.setLatency('Extract', 10);
+  await throws(m, GOOD, 'with an extractor slower than the deadline');
+  assert.equal(ctx.grpc.callsTo('Extract').length, 3, 'a deadline must not be retried');
+  ctx.grpc.setLatency('Extract', 0);
+  ctx.grpc.fail('Extract', ctx.grpc.status.INVALID_ARGUMENT, 'title too long', 2);
+  await throws(m, GOOD, 'with INVALID_ARGUMENT');
+  assert.equal(ctx.grpc.callsTo('Extract').length, 4, 'INVALID_ARGUMENT must not be retried');
+}
+
+export async function check_taxonomy_validate(ctx) {
+  const {m, store} = module(ctx);
+  let result = await extract(m, INVENTED, 'with a brand the taxonomy does not know');
+  assert.equal(result.attributes.brand, null, \`the model named brand \${JSON.stringify(result.attributes.brand)}, which is not a taxonomy candidate, and it was kept\`);
+  assert.equal(result.status, 'review', 'an invented brand must send the SKU to review');
+  assert.notEqual(await store.pending('sku-2'), null, 'the SKU with an invented brand was not parked with enqueueReview');
+  result = await extract(m, BAD_UNIT, 'with a unit outside ALLOWED_UNITS');
+  assert(result.attributes.unit === null && result.status === 'review', \`a unit outside ALLOWED_UNITS must be nulled and the SKU reviewed, got \${JSON.stringify(result)}\`);
+  assert.notEqual(await store.pending('sku-3'), null, 'the SKU with an unknown unit was not parked with enqueueReview');
+}
+
+export async function check_confidence_gate(ctx) {
+  const {m, store, taxonomy} = module(ctx);
+  let result = await extract(m, NO_DESCRIPTION, 'with a confidence of 0.6');
+  assert.equal(result.status, 'review', 'a 0.6 confidence must go to review');
+  const proposal = await store.pending('sku-4');
+  assert(proposal !== null && proposal.reason !== '', \`the low-confidence SKU must be parked with a reason, pending gives \${JSON.stringify(proposal)}\`);
+  assert(result.taxonomy_version === taxonomy.VERSION && result.source === 'model', \`the result must carry taxonomy_version and source, got \${JSON.stringify(result)}\`);
+  result = await extract(m, GOOD, 'with a confident, valid answer');
+  assert.equal(result.status, 'accepted', 'a clean answer at 0.95 must be accepted');
+  assert.equal(await store.pending('sku-1'), null, 'a clean, confident answer must not be sent to review');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	pb "enrich/gen/catalog_enrichment"
+	"enrich/store"
+	"enrich/taxonomy"
+
+	"leetbuild/harness"
+)
+
+var (
+	extractBg     = context.Background()
+	goodJob       = store.Job{SkuID: "sku-1", Merchant: "m-1", Title: "DOVE SILK GLOW BODY WASH 500ML", Description: "Nourishing body wash"}
+	inventedJob   = store.Job{SkuID: "sku-2", Merchant: "m-1", Title: "GLOWRA OAT DRINK 1L", Description: "Oat drink"}
+	badUnitJob    = store.Job{SkuID: "sku-3", Merchant: "m-1", Title: "BARILLA SPAGHETTI 12PACK", Description: "Durum wheat pasta"}
+	noDescription = store.Job{SkuID: "sku-4", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: ""}
+)
+
+// extractorPeer is the model: it picks the first candidate brand in the title, or names the title's first word; prose without a schema.
+type extractorPeer struct {
+	pb.UnimplementedExtractorServer
+}
+
+func sizeOf(title string) (any, any) {
+	for _, token := range strings.Fields(title) {
+		digits := strings.TrimRight(token, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+		if n, err := strconv.ParseFloat(digits, 64); err == nil && digits != token {
+			return n, strings.ToLower(token[len(digits):])
+		}
+	}
+	return nil, nil
+}
+
+func (extractorPeer) Extract(_ context.Context, req *pb.ExtractRequest) (*pb.ExtractReply, error) {
+	upper := strings.ToUpper(req.GetTitle())
+	first := strings.Fields(req.GetTitle())[0]
+	brand := strings.ToUpper(first[:1]) + strings.ToLower(first[1:])
+	for _, c := range req.GetCandidateBrands() {
+		if strings.Contains(strings.ToLower(req.GetTitle()), strings.ToLower(c)) {
+			brand = c
+			break
+		}
+	}
+	size, unit := sizeOf(upper)
+	category := "grocery"
+	switch {
+	case strings.Contains(upper, "BODY WASH"):
+		category = "body-wash"
+	case strings.Contains(upper, "OAT"):
+		category = "plant-milk"
+	case strings.Contains(upper, "SPAGHETTI"):
+		category = "pasta"
+	}
+	confidence := 0.95
+	if req.GetDescription() == "" {
+		confidence = 0.6
+	}
+	if req.GetSchema() == "" {
+		return &pb.ExtractReply{Output: fmt.Sprintf("Looks like %s %s, %v %v.", brand, category, size, unit), Confidence: confidence}, nil
+	}
+	output, _ := json.Marshal(map[string]any{"brand": brand, "size": size, "unit": unit, "organic": strings.Contains(upper, "ORGANIC"), "category": category})
+	return &pb.ExtractReply{Output: string(output), Confidence: confidence}, nil
+}
+
+func extractPeer(ctx *harness.Ctx) {
+	pb.RegisterExtractorServer(ctx.GRPC.Server(""), extractorPeer{})
+}
+
+func mustExtract(ctx *harness.Ctx, job store.Job, why string) store.Result {
+	result, err := extractAttributes(extractBg, job)
+	ctx.NoError(err, "%s: extractAttributes failed", why)
+	return result
+}
+
+func mustFail(ctx *harness.Ctx, job store.Job, why string) {
+	result, err := extractAttributes(extractBg, job)
+	ctx.Assert(err != nil, "%s: extractAttributes returned %+v instead of an error", why, result)
+}
+
+func CheckRetrieveFirst(ctx *harness.Ctx) {
+	extractPeer(ctx)
+	mustExtract(ctx, goodJob, "with a healthy extractor")
+	calls := ctx.GRPC.CallsTo("Extract", "")
+	ctx.Assert(len(calls) > 0, "no Extract call was made")
+	candidates := calls[0].Request.(*pb.ExtractRequest).GetCandidateBrands()
+	ctx.Assert(len(candidates) > 0 && len(candidates) <= 20, "the request carried %d candidate brands: retrieve the 20 nearest from the taxonomy before the call", len(candidates))
+	known := map[string]bool{}
+	for _, b := range taxonomy.Brands {
+		known[b] = true
+	}
+	hasDove := false
+	for _, c := range candidates {
+		ctx.Assert(known[c], "candidate %q is not a taxonomy brand", c)
+		hasDove = hasDove || c == "Dove"
+	}
+	ctx.Assert(hasDove, "the candidates must be taxonomy.NearestBrands of the title and description, got %v", candidates)
+}
+
+func CheckStructuredOutput(ctx *harness.Ctx) {
+	extractPeer(ctx)
+	result := mustExtract(ctx, goodJob, "with a healthy extractor")
+	request := ctx.GRPC.CallsTo("Extract", "")[0].Request.(*pb.ExtractRequest)
+	ctx.Equal(request.GetSchema(), taxonomy.AttributeSchema, "send taxonomy.AttributeSchema so the model answers one JSON object; the schema")
+	ctx.Equal(result.Attributes, map[string]any{"brand": "Dove", "size": 500.0, "unit": "ml", "organic": false, "category": "body-wash"}, "the attributes of %s", goodJob.Title)
+}
+
+func CheckDeadlineRetry(ctx *harness.Ctx) {
+	extractPeer(ctx)
+	ctx.GRPC.Fail("Extract", codes.Unavailable, "extractor restarting", 1, "")
+	mustExtract(ctx, goodJob, "after one UNAVAILABLE")
+	calls := ctx.GRPC.CallsTo("Extract", "")
+	ctx.Equal(len(calls), 2, "one UNAVAILABLE then a healthy extractor; the calls")
+	for _, call := range calls {
+		ctx.Assert(call.HasDeadline() && call.Timeout >= 4500*time.Millisecond && call.Timeout <= 5500*time.Millisecond, "an Extract call carried a %v deadline, expected 5 s", call.Timeout)
+	}
+	ctx.GRPC.SetLatency("Extract", 10.0, "")
+	mustFail(ctx, goodJob, "with an extractor slower than the deadline")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Extract", "")), 3, "a deadline must not be retried; the calls")
+	ctx.GRPC.SetLatency("Extract", 0, "")
+	ctx.GRPC.Fail("Extract", codes.InvalidArgument, "title too long", 2, "")
+	mustFail(ctx, goodJob, "with INVALID_ARGUMENT")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Extract", "")), 4, "INVALID_ARGUMENT must not be retried; the calls")
+}
+
+func CheckTaxonomyValidate(ctx *harness.Ctx) {
+	extractPeer(ctx)
+	result := mustExtract(ctx, inventedJob, "with a brand the taxonomy does not know")
+	ctx.Assert(result.Attributes["brand"] == nil, "the model named brand %v, which is not a taxonomy candidate, and it was kept", result.Attributes["brand"])
+	ctx.Equal(result.Status, "review", "an invented brand must send the SKU to review; the status")
+	ctx.Assert(store.Pending(extractBg, "sku-2") != nil, "the SKU with an invented brand was not parked with store.EnqueueReview")
+	result = mustExtract(ctx, badUnitJob, "with a unit outside AllowedUnits")
+	ctx.Assert(result.Attributes["unit"] == nil && result.Status == "review", "a unit outside AllowedUnits must be nulled and the SKU reviewed, got %+v", result)
+	ctx.Assert(store.Pending(extractBg, "sku-3") != nil, "the SKU with an unknown unit was not parked with store.EnqueueReview")
+}
+
+func CheckConfidenceGate(ctx *harness.Ctx) {
+	extractPeer(ctx)
+	result := mustExtract(ctx, noDescription, "with a confidence of 0.6")
+	ctx.Equal(result.Status, "review", "a 0.6 confidence must go to review; the status")
+	proposal := store.Pending(extractBg, "sku-4")
+	ctx.Assert(proposal != nil && proposal.Reason != "", "the low-confidence SKU must be parked with a reason, store.Pending gives %+v", proposal)
+	ctx.Assert(result.TaxonomyVersion == taxonomy.Version && result.Source == "model", "the result must carry the taxonomy version and source, got %+v", result)
+	result = mustExtract(ctx, goodJob, "with a confident, valid answer")
+	ctx.Equal(result.Status, "accepted", "a clean answer at 0.95 must be accepted; the status")
+	ctx.Assert(store.Pending(extractBg, "sku-1") == nil, "a clean, confident answer must not be sent to review")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "catalog_enrichment.grpc.pb.h"
+#include "enrich/store.h"
+#include "enrich/taxonomy.h"
+
+namespace {
+
+nlohmann::json extractJob(const std::string& sku_id, const std::string& title, const std::string& description) {
+  return {{"sku_id", sku_id}, {"merchant", "m-1"}, {"content_hash", "h"}, {"title", title}, {"description", description}, {"images", nlohmann::json::array()}};
+}
+
+const nlohmann::json kGood = extractJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "Nourishing body wash");
+const nlohmann::json kInvented = extractJob("sku-2", "GLOWRA OAT DRINK 1L", "Oat drink");
+const nlohmann::json kBadUnit = extractJob("sku-3", "BARILLA SPAGHETTI 12PACK", "Durum wheat pasta");
+const nlohmann::json kNoDescription = extractJob("sku-4", "OATLY OAT MILK 1L", "");
+
+std::string lower(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+// The model: picks the first candidate brand in the title, or names the title's first word; prose without a schema.
+class ExtractorPeer final : public catalogenrich::Extractor::Service {
+ public:
+  grpc::Status Extract(grpc::ServerContext*, const catalogenrich::ExtractRequest* req, catalogenrich::ExtractReply* out) override {
+    const std::string title = req->title();
+    std::istringstream words(title);
+    std::string first, token;
+    words >> first;
+    std::string brand = std::string(1, first[0]) + lower(first.substr(1));
+    for (const std::string& c : req->candidate_brands()) {
+      if (lower(title).find(lower(c)) != std::string::npos) {
+        brand = c;
+        break;
+      }
+    }
+    nlohmann::json size = nullptr, unit = nullptr;
+    std::istringstream tokens(title);
+    while (tokens >> token) {
+      size_t digits = 0;
+      while (digits < token.size() && (std::isdigit(static_cast<unsigned char>(token[digits])) || token[digits] == '.')) digits++;
+      if (digits > 0 && digits < token.size()) {
+        size = std::stod(token.substr(0, digits));
+        unit = lower(token.substr(digits));
+        break;
+      }
+    }
+    const auto has = [&title](const char* word) { return title.find(word) != std::string::npos; };
+    const std::string category = has("BODY WASH") ? "body-wash" : has("OAT") ? "plant-milk" : has("SPAGHETTI") ? "pasta" : "grocery";
+    out->set_confidence(req->description().empty() ? 0.6 : 0.95);
+    if (req->schema().empty()) {
+      out->set_output("Looks like " + brand + " " + category + ", " + size.dump() + " " + unit.dump() + ".");
+    } else {
+      out->set_output(nlohmann::json{{"brand", brand}, {"size", size}, {"unit", unit}, {"organic", has("ORGANIC")}, {"category", category}}.dump());
+    }
+    return grpc::Status::OK;
+  }
+};
+
+void extractPeer(harness::Ctx& ctx) {
+  static ExtractorPeer* peer = nullptr;
+  delete peer;
+  peer = new ExtractorPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+}
+
+nlohmann::json mustExtract(harness::Ctx& ctx, const nlohmann::json& job, const std::string& why) {
+  try {
+    return extractAttributes(job);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("%s: extractAttributes threw %s: %s", why, harness::CurrentExceptionType(), e.what());
+  }
+}
+
+void mustThrow(harness::Ctx& ctx, const nlohmann::json& job, const std::string& why) {
+  nlohmann::json result;
+  try {
+    result = extractAttributes(job);
+  } catch (const std::exception&) {
+    return;
+  }
+  ctx.Fatalf("%s: extractAttributes returned %s instead of throwing", why, result.dump());
+}
+
+}  // namespace
+
+void CheckRetrieveFirst(harness::Ctx& ctx) {
+  extractPeer(ctx);
+  mustExtract(ctx, kGood, "with a healthy extractor");
+  const auto calls = ctx.GRPC.CallsTo("Extract");
+  ctx.Assert(!calls.empty(), "no Extract call was made");
+  const auto request = calls[0].Request<catalogenrich::ExtractRequest>();
+  const int n = request.candidate_brands_size();
+  ctx.Assert(n > 0 && n <= 20, "the request carried %d candidate brands: retrieve the 20 nearest from the taxonomy before the call", n);
+  bool dove = false;
+  for (const std::string& c : request.candidate_brands()) {
+    ctx.Assert(std::find(taxonomy::kBrands.begin(), taxonomy::kBrands.end(), c) != taxonomy::kBrands.end(), "candidate %q is not a taxonomy brand", c);
+    dove = dove || c == "Dove";
+  }
+  ctx.Assert(dove, "the candidates must be taxonomy::nearest_brands of the title and description, and Dove is missing");
+}
+
+void CheckStructuredOutput(harness::Ctx& ctx) {
+  extractPeer(ctx);
+  const auto result = mustExtract(ctx, kGood, "with a healthy extractor");
+  const auto request = ctx.GRPC.CallsTo("Extract")[0].Request<catalogenrich::ExtractRequest>();
+  ctx.Equal(request.schema(), taxonomy::kAttributeSchema, "send taxonomy::kAttributeSchema so the model answers one JSON object; the schema");
+  const nlohmann::json expected = {{"brand", "Dove"}, {"size", 500.0}, {"unit", "ml"}, {"organic", false}, {"category", "body-wash"}};
+  ctx.Assert(result.contains("attributes") && result["attributes"] == expected, "the attributes of the Dove body wash came out as %s, expected %s", result.value("attributes", nlohmann::json()).dump(), expected.dump());
+}
+
+void CheckDeadlineRetry(harness::Ctx& ctx) {
+  extractPeer(ctx);
+  ctx.GRPC.Fail("Extract", grpc::StatusCode::UNAVAILABLE, "extractor restarting", 1);
+  mustExtract(ctx, kGood, "after one UNAVAILABLE");
+  const auto calls = ctx.GRPC.CallsTo("Extract");
+  ctx.Equal(calls.size(), 2, "one UNAVAILABLE then a healthy extractor; the calls");
+  for (const auto& call : calls) {
+    ctx.Assert(call.HasDeadline() && call.TimeoutSeconds() >= 4.5 && call.TimeoutSeconds() <= 5.5, "an Extract call carried a %v s deadline, expected 5", call.TimeoutSeconds());
+  }
+  ctx.GRPC.SetLatency("Extract", 10.0);
+  mustThrow(ctx, kGood, "with an extractor slower than the deadline");
+  ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 3, "a deadline must not be retried; the calls");
+  ctx.GRPC.SetLatency("Extract", 0);
+  ctx.GRPC.Fail("Extract", grpc::StatusCode::INVALID_ARGUMENT, "title too long", 2);
+  mustThrow(ctx, kGood, "with INVALID_ARGUMENT");
+  ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 4, "INVALID_ARGUMENT must not be retried; the calls");
+}
+
+void CheckTaxonomyValidate(harness::Ctx& ctx) {
+  extractPeer(ctx);
+  auto result = mustExtract(ctx, kInvented, "with a brand the taxonomy does not know");
+  ctx.Assert(result["attributes"]["brand"].is_null(), "the model named brand %s, which is not a taxonomy candidate, and it was kept", result["attributes"]["brand"].dump());
+  ctx.Equal(result.value("status", ""), "review", "an invented brand must send the SKU to review; the status");
+  ctx.Assert(store::pending("sku-2").has_value(), "the SKU with an invented brand was not parked with store::enqueue_review");
+  result = mustExtract(ctx, kBadUnit, "with a unit outside kAllowedUnits");
+  ctx.Assert(result["attributes"]["unit"].is_null() && result.value("status", "") == "review", "a unit outside kAllowedUnits must be nulled and the SKU reviewed, got %s", result.dump());
+  ctx.Assert(store::pending("sku-3").has_value(), "the SKU with an unknown unit was not parked with store::enqueue_review");
+}
+
+void CheckConfidenceGate(harness::Ctx& ctx) {
+  extractPeer(ctx);
+  auto result = mustExtract(ctx, kNoDescription, "with a confidence of 0.6");
+  ctx.Equal(result.value("status", ""), "review", "a 0.6 confidence must go to review; the status");
+  const auto proposal = store::pending("sku-4");
+  ctx.Assert(proposal && !(*proposal)["reason"].get<std::string>().empty(), "the low-confidence SKU must be parked with a reason");
+  ctx.Assert(result.value("taxonomy_version", "") == taxonomy::kVersion && result.value("source", "") == "model", "the result must carry taxonomy_version and source, got %s", result.dump());
+  result = mustExtract(ctx, kGood, "with a confident, valid answer");
+  ctx.Equal(result.value("status", ""), "accepted", "a clean answer at 0.95 must be accepted; the status");
+  ctx.Assert(!store::pending("sku-1").has_value(), "a clean, confident answer must not be sent to review");
+}
+`,
+  },
+  debrief: `Each fix narrows what the model is allowed to say. The candidate list turns brand extraction into a choice among brands the knowledge graph already holds, and checking the answer against that list catches the model when it ignores it. The schema makes the reply parseable whatever wording the model prefers. The deadline and the single retry on \`UNAVAILABLE\` bound what one SKU can cost a worker, while a timeout or a rejected request goes back to the caller, because retrying those only spends more. The confidence gate decides who reads the result: a reviewer sees exactly the SKUs the model was unsure about, and each decision becomes a label. A larger system would also retrieve golden annotations as in-context examples, propose genuinely new brands to a taxonomy owner, and track review rates per merchant.`,
 };

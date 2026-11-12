@@ -2,244 +2,192 @@ import type {Step} from '@/lib/types';
 
 export const verifyEndpointStep: Step = {
   id: 'verify-endpoint',
-  title: 'POST /v1/entities/{id}/verify: owner-only, tier derived server-side, audited',
+  title: 'POST /v1/entities/{id}/verify: owner only, tier derived on the server, audited',
   concept: 'http',
   file: 'verify_api',
-  focus: ['owner', 'metasense', 'db'],
+  focus: ['owner', 'metasense', 'redis'],
   task: `## Task
 
 **Starting point.** The starter serves \`POST /v1/entities/{entity_id}/verify\` with body
-\`{"action": "ack" | "edit", "tags": {...}, "tier": 4}\`: it reads \`X-User-Id\`, takes the body's
-tags on \`edit\` or the pending tags otherwise, stores them with \`body.tier\` through
-\`store.record_verification\` and echoes the tier back. It serves the demo and hides four flaws.
+\`{"action": "ack" | "edit", "tags": {"passport_no": "Personal.ID"}, "tier": 4}\`. It answers 401
+without \`X-User-Id\` and 404 when \`store.pending(entity_id)\` (\`metasense.store\`) has nothing; on
+\`edit\` the body's tags replace the pending ones. It stores the tags with the body's \`tier\` through
+\`store.record_verification\` and answers \`{entity, tier, tags, version}\`. It serves the demo and
+hides 4 flaws.
 
 **Failure mode the checks target.** Any caller with a user id can verify any table; a tier copied
-from the body lets a producer mark a passport table Tier 4 and open it; a tag outside the taxonomy
-is a tier nobody defined; a verification with no audit row cannot be defended later.
+from the body lets a producer mark a passport table Tier 4 and open it to the company; a tag outside
+the library is a tier nobody defined; and a verification with no audit entry cannot be defended.
 
-- The caller comes from \`X-User-Id\`; a missing caller is **401**.
-- Only the **owner** may verify: \`store.owner_of(entity_id)\` (**404** when unknown), **403** for
-  anyone else.
-- \`action\` is \`ack\` (pending tags confirmed as they are) or \`edit\` (the body's \`tags\` replace
-  them); anything else is **400**. On \`edit\`, every tag must be in the taxonomy (\`Personal.ID\`,
-  \`Personal.Name\`, \`Personal.Contact_Info\`, \`Geo.Geohash\`, \`None\`), else **400**.
-- The **tier is derived on the server**: any \`Personal.ID\` → **Tier 1**; else \`Personal.Name\` or
-  \`Personal.Contact_Info\` → **Tier 2**; else \`Geo.Geohash\` → **Tier 3**; else **Tier 4**. A
-  \`tier\` in the body is ignored: the tier is what access control reads, not an input.
-- Record with \`store.record_verification(entity_id, tags, tier, user, action)\` and
-  \`store.audit(entity_id, user, action)\`; respond with \`entity\`, \`tier\`, \`tags\`,
-  \`verified_by\` and the new \`version\`.`,
+- Only the owner of the pending verification may verify: anyone else is **403**.
+- The tier is derived from the tags over \`PRIVACY_RULES\`: any \`Personal.ID\` is Tier 1, else
+  \`Personal.Name\` or \`Personal.Contact_Info\` Tier 2, else \`Geo.Geohash\` Tier 3, else Tier 4.
+  A \`tier\` in the body is ignored.
+- An \`action\` other than \`ack\`/\`edit\`, or an edited tag that \`taxonomy.known\` rejects, is **400**.
+- Call \`store.audit(entity_id, user, action)\` and answer \`verified_by\` too.`,
   sequence: {
-    participants: ['Data owner', 'metasense', 'store'],
+    participants: ['Data owner', 'metasense', 'Redis'],
     messages: [
       {from: 'Data owner', to: 'metasense', label: 'POST /v1/entities/deliveries/verify · X-User-Id', kind: 'sync'},
-      {from: 'metasense', to: 'store', label: 'owner_of(deliveries)', kind: 'sync'},
-      {from: 'store', to: 'metasense', label: 'team-logistics / none → 404 · mismatch → 403', kind: 'reply'},
+      {from: 'metasense', to: 'Redis', label: 'pending(deliveries) → owner, tags', kind: 'sync'},
       {
         from: 'metasense',
         to: 'metasense',
-        label: 'validate action · tags ∈ TAXONOMY · derive_tier(tags)',
+        label: 'owner? 403 · action, tags known? 400 · derive_tier(tags)',
         kind: 'sync',
       },
-      {from: 'metasense', to: 'store', label: 'record_verification(...) · audit(entity, user, action)', kind: 'sync'},
-      {from: 'store', to: 'metasense', label: 'version', kind: 'reply'},
+      {from: 'metasense', to: 'Redis', label: 'record_verification · audit(entity, user, action)', kind: 'sync'},
       {from: 'metasense', to: 'Data owner', label: '200 {entity, tier, tags, verified_by, version}', kind: 'reply'},
     ],
   },
-  hints: [
-    'A producer on another team posts `{"action": "edit", "tags": {"passport_no": "Public"}, "tier": 4}` against a table they do not own, gets 200, and the table opens to the company.',
-    'The handler trusts what it should compute or check: nobody is compared to the owner, the tier is read from the body, any string passes as a tag, and no record says who did it.',
-    'Guard clauses in order: no header 401, `store.owner_of` 404 then 403, action whitelist 400, tags in `TAXONOMY` 400. Then `derive_tier(tags)` over `PRIVACY_RULES`, `record_verification(..., tier, user, action)`, `audit(...)`, respond with `verified_by`.',
-  ],
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/entities/{entity_id}/verify',
-      detail: 'Register the verification route on `POST /v1/entities/{entity_id}/verify`.',
+      title: 'Serves POST /v1/entities/{entity_id}/verify',
+      detail:
+        'The owner acknowledging the pending tags gets 200 with the entity, its tags and version 1, and the classification is stored.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/entities\/\{entity_id\}\/verify["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/entities\/:entityId\/verify['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/entities\/\{entity_id\}\/verify"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"entities"\s*\/\s*Segment\s*\/\s*"verify"\s*\)/, /\bpost\s*\{/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"entities"\s*\/\s*Segment\s*\/\s*"verify"\s*\)/]},
         cpp: {all: [/svr\.Post\(\s*R"\(\/v1\/entities\/\(\[\^\/\]\+\)\/verify\)"/]},
       },
     },
     {
       id: 'owner-only',
-      title: 'Authenticates the caller and allows only the owner',
+      title: 'Lets only the owner verify',
       detail:
-        'A missing `X-User-Id` is **401**; the owner comes from `store.owner_of(entity_id)` and any other caller gets **403**. The starter lets any caller verify any entity.',
+        'A caller who is not the owner in the pending verification gets 403 and nothing is stored. The starter lets any caller with a user id verify any table.',
       match: {
-        python: {all: [/status_code\s*=\s*401/, /status_code\s*=\s*403/, /store\.owner_of\(/]},
-        typescript: {all: [/code\(\s*401\s*\)/, /code\(\s*403\s*\)/, /store\.ownerOf\(/]},
-        go: {all: [/StatusUnauthorized/, /StatusForbidden/, /store\.OwnerOf\(/]},
-        scala: {all: [/StatusCodes\.Unauthorized/, /StatusCodes\.Forbidden/, /store\.ownerOf\(/]},
-        cpp: {all: [/\b401\b/, /\b403\b/, /store\.ownerOf\(/]},
+        python: {all: [/\b403\b/, /\[["']owner["']\]/]},
+        typescript: {all: [/\b403\b/, /\.owner\b/]},
+        go: {all: [/StatusForbidden/, /\.Owner\b/]},
+        scala: {all: [/StatusCodes\.Forbidden/, /\.owner\b/]},
+        cpp: {all: [/\b403\b/, /->owner\b/]},
       },
     },
     {
       id: 'tier-server-side',
-      title: 'Derives the tier from tags and privacy rules, never from the body',
+      title: 'Derives the tier from the tags, never from the body',
       detail:
-        'A `derive_tier(tags)` function over `PRIVACY_RULES` computes the tier; the handler never reads a `tier` from the request. The starter stores whatever tier the caller sent.',
+        'An edit that tags `passport_no` as `Personal.ID` while sending `"tier": 4` is stored and answered as Tier 1; acknowledged contact data is Tier 2 whatever the body says. The starter stores the tier the caller sent.',
       match: {
-        python: {all: [/PRIVACY_RULES/, /derive_tier\(/], none: [/body\.tier/]},
-        typescript: {all: [/PRIVACY_RULES/, /deriveTier\(/], none: [/body\.tier/]},
-        go: {all: [/privacyRules/, /deriveTier\(/], none: [/body\.Tier/]},
-        scala: {all: [/PrivacyRules/, /deriveTier\(/], none: [/body\.tier/]},
-        cpp: {all: [/kPrivacyRules/, /deriveTier\(/], none: [/value\(\s*"tier"/, /body\["tier"\]/]},
+        python: {all: [/PRIVACY_RULES/, /derive_tier\(/], none: [/body\.get\(\s*["']tier["']/, /body\[["']tier["']\]/]},
+        typescript: {all: [/PRIVACY_RULES/, /deriveTier\(/], none: [/body\.tier\b/, /\[['"]tier['"]\]/]},
+        go: {all: [/privacyRules/, /deriveTier\(/], none: [/body\.Tier\b/]},
+        scala: {all: [/PrivacyRules/, /deriveTier\(/], none: [/body\.get\("tier"\)/, /body\("tier"\)/]},
+        cpp: {all: [/kPrivacyRules/, /deriveTier\(/], none: [/value\("tier"/, /body\["tier"\]/]},
       },
     },
     {
       id: 'tag-whitelist',
-      title: 'Rejects tags outside the taxonomy with 400',
+      title: 'Rejects unknown actions and tags outside the library with 400',
       detail:
-        'On `edit`, every tag is checked against `TAXONOMY` and an unknown tag (or an unknown `action`) is **400**. The starter stores any string as a tag.',
+        'An edit that tags a column `Public` and an action `approve` both answer 400 and store nothing. The starter stores any string as a tag and treats any action as an acknowledgement.',
       match: {
-        python: {all: [/TAXONOMY/, /status_code\s*=\s*400/]},
-        typescript: {all: [/TAXONOMY/, /code\(\s*400\s*\)/]},
-        go: {all: [/taxonomy\[/, /StatusBadRequest/]},
-        scala: {all: [/Taxonomy\.contains\(/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kTaxonomy\.count\(/, /\b400\b/]},
+        python: {all: [/taxonomy\.known\(/, /\b400\b/]},
+        typescript: {all: [/\bknown\(/, /\b400\b/]},
+        go: {all: [/taxonomy\.Known\(/, /StatusBadRequest/]},
+        scala: {all: [/Taxonomy\.known\b/, /StatusCodes\.BadRequest/]},
+        cpp: {all: [/taxonomy::known\(/, /\b400\b/]},
       },
     },
     {
       id: 'audit',
-      title: 'Audits who verified and returns verified_by',
+      title: 'Audits who verified, and answers verified_by',
       detail:
-        'The handler calls `store.audit(entity_id, user, action)` and the response carries `verified_by`. The starter stores the tags and forgets who confirmed them.',
+        'Each verification appends `{user, action}` to `audit:{entity}` and the response names `verified_by`. The starter keeps no record of who confirmed the tags.',
       match: {
-        python: {all: [/store\.audit\(/, /verified_by/]},
-        typescript: {all: [/store\.audit\(/, /verified_by/]},
-        go: {all: [/store\.Audit\(/, /verified_by/]},
-        scala: {all: [/store\.audit\(/, /verified_by/]},
-        cpp: {all: [/store\.audit\(/, /verified_by/]},
+        python: {all: [/store\.audit\(/, /["']verified_by["']/]},
+        typescript: {all: [/\baudit\(/, /verified_by/]},
+        go: {all: [/store\.Audit\(/, /"verified_by"/]},
+        scala: {all: [/Store\.audit\(/, /"verified_by"/]},
+        cpp: {all: [/store::audit\(/, /"verified_by"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+      starter: `from fastapi import FastAPI, HTTPException, Request
+
+from metasense import store, taxonomy  # store.pending, record_verification, audit; taxonomy.known
 
 app = FastAPI()
-
-
-class VerifyRequest(BaseModel):
-    action: str = "ack"
-    tags: dict[str, str] = {}
-    tier: int = 4
-
-
-class VerificationStore:
-    def pending_tags(self, entity_id: str) -> dict[str, str]:
-        """The model's tags awaiting verification, column → tag."""
-        raise NotImplementedError
-
-    def record_verification(self, entity_id: str, tags: dict[str, str], tier: int) -> int:
-        """Store the verified tags and tier; returns the new version."""
-        raise NotImplementedError
-
-
-store = VerificationStore()
 
 
 @app.post("/v1/entities/{entity_id}/verify")
-def verify(entity_id: str, body: VerifyRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse:
+async def verify(entity_id: str, request: Request) -> dict:
     # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    tags = body.tags if body.action == "edit" else store.pending_tags(entity_id)
-    version = store.record_verification(entity_id, tags, body.tier)
-    return JSONResponse({"entity": entity_id, "tier": body.tier, "tags": tags, "version": version}, status_code=200)
+    user = request.headers.get("x-user-id", "")
+    if not user:
+        raise HTTPException(status_code=401, detail="X-User-Id is required")
+    pending = store.pending(entity_id)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="nothing waits for verification")
+    body = await request.json()
+    tags = dict(pending["tags"])
+    if body.get("action") == "edit":
+        tags.update(body.get("tags", {}))
+    tier = int(body.get("tier", 4))
+    version = store.record_verification(entity_id, tags, tier, user)
+    return {"entity": entity_id, "tier": tier, "tags": tags, "version": version}
 `,
-      solution: `from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+      solution: `from fastapi import FastAPI, HTTPException, Request
+
+from metasense import store, taxonomy  # store.pending, record_verification, audit; taxonomy.known
 
 app = FastAPI()
 
-TAXONOMY = {"Personal.ID", "Personal.Name", "Personal.Contact_Info", "Geo.Geohash", "None"}
-ALLOWED_ACTIONS = {"ack", "edit"}
-PRIVACY_RULES: list[tuple[str, int]] = [
-    ("Personal.ID", 1),
-    ("Personal.Name", 2),
-    ("Personal.Contact_Info", 2),
-    ("Geo.Geohash", 3),
-]
-DEFAULT_TIER = 4
-
-
-class VerifyRequest(BaseModel):
-    action: str = "ack"
-    tags: dict[str, str] = {}
-
-
-class VerificationStore:
-    def owner_of(self, entity_id: str) -> str | None:
-        """The owner registered for the entity, if it exists."""
-        raise NotImplementedError
-
-    def pending_tags(self, entity_id: str) -> dict[str, str]:
-        """The model's tags awaiting verification, column → tag."""
-        raise NotImplementedError
-
-    def record_verification(self, entity_id: str, tags: dict[str, str], tier: int, user: str, action: str) -> int:
-        """Store the verified tags and tier; returns the new version."""
-        raise NotImplementedError
-
-    def audit(self, entity_id: str, user: str, action: str) -> None:
-        """Append one audit row: who verified which entity, and how."""
-        raise NotImplementedError
-
-
-store = VerificationStore()
+# The privacy office's rules, most sensitive first: the first tier whose tags appear wins.
+PRIVACY_RULES = (
+    (1, {"Personal.ID"}),
+    (2, {"Personal.Name", "Personal.Contact_Info"}),
+    (3, {"Geo.Geohash"}),
+)
+LEAST_SENSITIVE_TIER = 4
+ACTIONS = ("ack", "edit")
 
 
 def derive_tier(tags: dict[str, str]) -> int:
     present = set(tags.values())
-    tiers = [tier for tag, tier in PRIVACY_RULES if tag in present]
-    return min(tiers) if tiers else DEFAULT_TIER
+    for tier, sensitive in PRIVACY_RULES:
+        if present & sensitive:
+            return tier
+    return LEAST_SENSITIVE_TIER
 
 
 @app.post("/v1/entities/{entity_id}/verify")
-def verify(
-    entity_id: str,
-    body: VerifyRequest,
-    user: str | None = Header(default=None, alias="X-User-Id"),
-) -> JSONResponse:
-    if user is None or user == "":
-        raise HTTPException(status_code=401, detail="missing X-User-Id")
-    owner = store.owner_of(entity_id)
-    if owner is None:
-        raise HTTPException(status_code=404, detail="unknown entity")
-    if owner != user:
-        raise HTTPException(status_code=403, detail="only the owner may verify")
-    if body.action not in ALLOWED_ACTIONS:
-        raise HTTPException(status_code=400, detail="action must be ack or edit")
-    if body.action == "edit":
-        if not body.tags:
-            raise HTTPException(status_code=400, detail="edit requires tags")
-        for column, tag in body.tags.items():
-            if column == "" or tag not in TAXONOMY:
-                raise HTTPException(status_code=400, detail=f"unknown tag for {column}")
-        tags = body.tags
-    else:
-        tags = store.pending_tags(entity_id)
-
-    tier = derive_tier(tags)
-    version = store.record_verification(entity_id, tags, tier, user, body.action)
-    store.audit(entity_id, user, body.action)
-    return JSONResponse(
-        {"entity": entity_id, "tier": tier, "tags": tags, "verified_by": user, "version": version},
-        status_code=200,
-    )
+async def verify(entity_id: str, request: Request) -> dict:
+    user = request.headers.get("x-user-id", "")
+    if not user:
+        raise HTTPException(status_code=401, detail="X-User-Id is required")
+    pending = store.pending(entity_id)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="nothing waits for verification")
+    if pending["owner"] != user:
+        raise HTTPException(status_code=403, detail="only the owner verifies an entity")
+    body = await request.json()
+    action = body.get("action")
+    if action not in ACTIONS:
+        raise HTTPException(status_code=400, detail="action is ack or edit")
+    tags = dict(pending["tags"])
+    if action == "edit":
+        edits = body.get("tags", {})
+        if not isinstance(edits, dict) or not all(taxonomy.known(tag) for tag in edits.values()):
+            raise HTTPException(status_code=400, detail="every tag must be in the tag library")
+        tags.update(edits)
+    tier = derive_tier(tags)  # access control reads the tier: it is computed, never taken from the caller
+    version = store.record_verification(entity_id, tags, tier, user)
+    store.audit(entity_id, user, action)
+    return {"entity": entity_id, "tier": tier, "tags": tags, "verified_by": user, "version": version}
 `,
     },
     typescript: {
-      starter: `/** POST /v1/entities/:entityId/verify. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-import {store} from './store';
+import {audit, pending, recordVerification} from 'metasense/store';
+import {known} from 'metasense/taxonomy';
 
 export const app = Fastify();
 
@@ -252,80 +200,64 @@ interface VerifyBody {
 app.post('/v1/entities/:entityId/verify', async (request, reply) => {
   // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {entityId} = request.params as {entityId: string};
-  const body = request.body as VerifyBody;
-  const tags = body.action === 'edit' ? (body.tags ?? {}) : await store.pendingTags(entityId);
+  const user = request.headers['x-user-id'];
+  if (typeof user !== 'string' || user === '') return reply.code(401).send({error: 'X-User-Id is required'});
+  const open = await pending(entityId);
+  if (open === null) return reply.code(404).send({error: 'nothing waits for verification'});
+  const body = (request.body ?? {}) as VerifyBody;
+  const tags = body.action === 'edit' ? {...open.tags, ...body.tags} : {...open.tags};
   const tier = body.tier ?? 4;
-  const version = await store.recordVerification(entityId, tags, tier);
-  return reply.code(200).send({entity: entityId, tier, tags, version});
+  const version = await recordVerification(entityId, tags, tier, user);
+  return {entity: entityId, tier, tags, version};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/entities/:entityId/verify: owner-only, tier derived from tags and rules, audited. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 
-import {store} from './store';
+import {audit, pending, recordVerification} from 'metasense/store';
+import {known} from 'metasense/taxonomy';
 
 export const app = Fastify();
 
-const TAXONOMY: Record<string, true> = {
-  'Personal.ID': true,
-  'Personal.Name': true,
-  'Personal.Contact_Info': true,
-  'Geo.Geohash': true,
-  None: true,
-};
-const ALLOWED_ACTIONS: Record<string, true> = {ack: true, edit: true};
-const PRIVACY_RULES: [string, number][] = [
-  ['Personal.ID', 1],
-  ['Personal.Name', 2],
-  ['Personal.Contact_Info', 2],
-  ['Geo.Geohash', 3],
+// The privacy office's rules, most sensitive first: the first tier whose tags appear wins.
+export const PRIVACY_RULES: readonly [number, readonly string[]][] = [
+  [1, ['Personal.ID']],
+  [2, ['Personal.Name', 'Personal.Contact_Info']],
+  [3, ['Geo.Geohash']],
 ];
-const DEFAULT_TIER = 4;
+export const LEAST_SENSITIVE_TIER = 4;
+const ACTIONS = ['ack', 'edit'];
 
 interface VerifyBody {
   action?: string;
-  tags?: Record<string, string>;
+  tags?: Record<string, unknown>;
 }
 
-function deriveTier(tags: Record<string, string>): number {
+export function deriveTier(tags: Record<string, string>): number {
   const present = new Set(Object.values(tags));
-  let tier = DEFAULT_TIER;
-  for (const [tag, ruleTier] of PRIVACY_RULES) if (present.has(tag) && ruleTier < tier) tier = ruleTier;
-  return tier;
+  return PRIVACY_RULES.find(([, sensitive]) => sensitive.some(tag => present.has(tag)))?.[0] ?? LEAST_SENSITIVE_TIER;
 }
 
 app.post('/v1/entities/:entityId/verify', async (request, reply) => {
-  const user = request.headers['x-user-id'];
-  if (typeof user !== 'string' || user === '') return reply.code(401).send({error: 'missing X-User-Id'});
   const {entityId} = request.params as {entityId: string};
-  const owner = await store.ownerOf(entityId);
-  if (owner === null) return reply.code(404).send({error: 'unknown entity'});
-  if (owner !== user) return reply.code(403).send({error: 'only the owner may verify'});
-
+  const user = request.headers['x-user-id'];
+  if (typeof user !== 'string' || user === '') return reply.code(401).send({error: 'X-User-Id is required'});
+  const open = await pending(entityId);
+  if (open === null) return reply.code(404).send({error: 'nothing waits for verification'});
+  if (open.owner !== user) return reply.code(403).send({error: 'only the owner verifies an entity'});
   const body = (request.body ?? {}) as VerifyBody;
-  const action = body.action ?? 'ack';
-  if (ALLOWED_ACTIONS[action] !== true) return reply.code(400).send({error: 'action must be ack or edit'});
-  let tags: Record<string, string>;
+  const action = body.action ?? '';
+  if (!ACTIONS.includes(action)) return reply.code(400).send({error: 'action is ack or edit'});
+  const tags: Record<string, string> = {...open.tags};
   if (action === 'edit') {
-    if (body.tags === undefined || Object.keys(body.tags).length === 0)
-      return reply.code(400).send({error: 'edit requires tags'});
-    for (const [column, tag] of Object.entries(body.tags))
-      if (column === '' || typeof tag !== 'string' || TAXONOMY[tag] !== true)
-        return reply.code(400).send({error: \`unknown tag for \${column}\`});
-    tags = body.tags;
-  } else {
-    tags = await store.pendingTags(entityId);
+    const edits = body.tags ?? {};
+    if (!Object.values(edits).every(tag => known(tag))) return reply.code(400).send({error: 'every tag must be in the tag library'});
+    Object.assign(tags, edits);
   }
-
-  const tier = deriveTier(tags);
-  const version = await store.recordVerification(entityId, tags, tier, user, action);
-  await store.audit(entityId, user, action);
-  return reply.code(200).send({entity: entityId, tier, tags, verified_by: user, version});
+  const tier = deriveTier(tags); // access control reads the tier: it is computed, never taken from the caller
+  const version = await recordVerification(entityId, tags, tier, user);
+  await audit(entityId, user, action);
+  return {entity: entityId, tier, tags, verified_by: user, version};
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -333,318 +265,263 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"metasense/store" // store.Pending, RecordVerification, Audit
 )
 
-type VerifyRequest struct {
-	Action string            \`json:"action"\`
-	Tags   map[string]string \`json:"tags"\`
-	Tier   int               \`json:"tier"\`
-}
-
-type VerificationStore struct{}
-
-// PendingTags returns the model's tags awaiting verification, column → tag.
-func (s *VerificationStore) PendingTags(entityID string) (map[string]string, error) { return nil, nil }
-
-// RecordVerification stores the verified tags and tier and returns the new version.
-func (s *VerificationStore) RecordVerification(entityID string, tags map[string]string, tier int) (int, error) {
-	return 0, nil
-}
-
-var store = &VerificationStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func verify(rw http.ResponseWriter, r *http.Request) {
+func verifyEntity(rw http.ResponseWriter, r *http.Request) {
 	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	entityID := r.PathValue("entity_id")
-	var body VerifyRequest
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	tags := body.Tags
-	if body.Action != "edit" {
-		tags, _ = store.PendingTags(entityID)
+	user := r.Header.Get("X-User-Id")
+	if user == "" {
+		http.Error(rw, "X-User-Id is required", http.StatusUnauthorized)
+		return
+	}
+	open, err := store.Pending(r.Context(), entityID)
+	if err != nil || open == nil {
+		http.Error(rw, "nothing waits for verification", http.StatusNotFound)
+		return
+	}
+	var body struct {
+		Action string            \`json:"action"\`
+		Tags   map[string]string \`json:"tags"\`
+		Tier   int               \`json:"tier"\`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	tags := map[string]string{}
+	for column, tag := range open.Tags {
+		tags[column] = tag
+	}
+	if body.Action == "edit" {
+		for column, tag := range body.Tags {
+			tags[column] = tag
+		}
 	}
 	tier := body.Tier
 	if tier == 0 {
 		tier = 4
 	}
-	version, _ := store.RecordVerification(entityID, tags, tier)
+	version, err := store.RecordVerification(r.Context(), entityID, tags, tier, user)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(rw, http.StatusOK, map[string]any{"entity": entityID, "tier": tier, "tags": tags, "version": version})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/entities/{entity_id}/verify", verify)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/entities/{entity_id}/verify", verifyEntity)
 }
 `,
       solution: `package main
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"metasense/store" // store.Pending, RecordVerification, Audit
+	"metasense/taxonomy"
 )
 
-const defaultTier = 4
-
-var taxonomy = map[string]bool{
-	"Personal.ID":           true,
-	"Personal.Name":         true,
-	"Personal.Contact_Info": true,
-	"Geo.Geohash":           true,
-	"None":                  true,
-}
-
-var allowedActions = map[string]bool{"ack": true, "edit": true}
-
-type privacyRule struct {
-	tag  string
+// privacyRules are the privacy office's rules, most sensitive first: the first tier whose tags appear wins.
+var privacyRules = []struct {
 	tier int
+	tags []string
+}{
+	{1, []string{"Personal.ID"}},
+	{2, []string{"Personal.Name", "Personal.Contact_Info"}},
+	{3, []string{"Geo.Geohash"}},
 }
 
-var privacyRules = []privacyRule{
-	{"Personal.ID", 1},
-	{"Personal.Name", 2},
-	{"Personal.Contact_Info", 2},
-	{"Geo.Geohash", 3},
-}
-
-type VerifyRequest struct {
-	Action string            \`json:"action"\`
-	Tags   map[string]string \`json:"tags"\`
-}
-
-type VerificationStore struct{}
-
-// OwnerOf returns the owner registered for the entity, or "" when it does not exist.
-func (s *VerificationStore) OwnerOf(entityID string) (string, error) { return "", nil }
-
-// PendingTags returns the model's tags awaiting verification, column → tag.
-func (s *VerificationStore) PendingTags(entityID string) (map[string]string, error) { return nil, nil }
-
-// RecordVerification stores the verified tags and tier and returns the new version.
-func (s *VerificationStore) RecordVerification(entityID string, tags map[string]string, tier int, user, action string) (int, error) {
-	return 0, nil
-}
-
-// Audit appends one row: who verified which entity, and how.
-func (s *VerificationStore) Audit(entityID, user, action string) error { return nil }
-
-var store = &VerificationStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
+const leastSensitiveTier = 4
 
 func deriveTier(tags map[string]string) int {
-	present := make(map[string]bool, len(tags))
+	present := map[string]bool{}
 	for _, tag := range tags {
 		present[tag] = true
 	}
-	tier := defaultTier
 	for _, rule := range privacyRules {
-		if present[rule.tag] && rule.tier < tier {
-			tier = rule.tier
-		}
-	}
-	return tier
-}
-
-func verify(rw http.ResponseWriter, r *http.Request) {
-	user := r.Header.Get("X-User-Id")
-	if user == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-User-Id"})
-		return
-	}
-	entityID := r.PathValue("entity_id")
-	owner, err := store.OwnerOf(entityID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if owner == "" {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown entity"})
-		return
-	}
-	if owner != user {
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "only the owner may verify"})
-		return
-	}
-	var body VerifyRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	action := body.Action
-	if action == "" {
-		action = "ack"
-	}
-	if !allowedActions[action] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "action must be ack or edit"})
-		return
-	}
-	var tags map[string]string
-	if action == "edit" {
-		if len(body.Tags) == 0 {
-			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "edit requires tags"})
-			return
-		}
-		for column, tag := range body.Tags {
-			if column == "" || !taxonomy[tag] {
-				writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown tag for " + column})
-				return
+		for _, tag := range rule.tags {
+			if present[tag] {
+				return rule.tier
 			}
 		}
-		tags = body.Tags
-	} else {
-		tags, err = store.PendingTags(entityID)
-		if err != nil {
-			writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-			return
-		}
 	}
-	tier := deriveTier(tags)
-	version, err := store.RecordVerification(entityID, tags, tier, user, action)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if err := store.Audit(entityID, user, action); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"entity":      entityID,
-		"tier":        tier,
-		"tags":        tags,
-		"verified_by": user,
-		"version":     version,
-	})
+	return leastSensitiveTier
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/entities/{entity_id}/verify", verify)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func verifyEntity(rw http.ResponseWriter, r *http.Request) {
+	entityID := r.PathValue("entity_id")
+	user := r.Header.Get("X-User-Id")
+	if user == "" {
+		http.Error(rw, "X-User-Id is required", http.StatusUnauthorized)
+		return
+	}
+	open, err := store.Pending(r.Context(), entityID)
+	if err != nil || open == nil {
+		http.Error(rw, "nothing waits for verification", http.StatusNotFound)
+		return
+	}
+	if open.Owner != user {
+		http.Error(rw, "only the owner verifies an entity", http.StatusForbidden)
+		return
+	}
+	var body struct {
+		Action string            \`json:"action"\`
+		Tags   map[string]string \`json:"tags"\`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || (body.Action != "ack" && body.Action != "edit") {
+		http.Error(rw, "action is ack or edit", http.StatusBadRequest)
+		return
+	}
+	tags := map[string]string{}
+	for column, tag := range open.Tags {
+		tags[column] = tag
+	}
+	if body.Action == "edit" {
+		for column, tag := range body.Tags {
+			if !taxonomy.Known(tag) {
+				http.Error(rw, "every tag must be in the tag library", http.StatusBadRequest)
+				return
+			}
+			tags[column] = tag
+		}
+	}
+	tier := deriveTier(tags) // access control reads the tier: it is computed, never taken from the caller
+	version, err := store.RecordVerification(r.Context(), entityID, tags, tier, user)
+	if err == nil {
+		err = store.Audit(r.Context(), entityID, user, body.Action)
+	}
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, http.StatusOK, map[string]any{"entity": entityID, "tier": tier, "tags": tags, "verified_by": user, "version": version})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/entities/{entity_id}/verify", verifyEntity)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class VerifyRequest(action: Option[String], tags: Option[Map[String, String]], tier: Option[Int])
+import metasense.{Store, Taxonomy} // Store.pending, recordVerification, audit; Taxonomy.known
 
 object VerifyApi {
-  implicit val system: ActorSystem = ActorSystem("metasense")
-  implicit val requestFormat: RootJsonFormat[VerifyRequest] = jsonFormat3(VerifyRequest)
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val store = VerificationStore.open()
+  private def tagsOf(value: Option[JsValue]): Map[String, String] = value match {
+    case Some(JsObject(fields)) => fields.collect { case (c, JsString(t)) => c -> t }
+    case _                      => Map.empty
+  }
 
-  val route: Route =
-    path("v1" / "entities" / Segment / "verify") { entityId =>
-      post {
-        headerValueByName("X-User-Id") { user =>
-          entity(as[VerifyRequest]) { body =>
+  val route: Route = path("v1" / "entities" / Segment / "verify") { entityId =>
+    post {
+      optionalHeaderValueByName("X-User-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-User-Id is required")
+        case Some(user) =>
+          entity(as[String]) { raw =>
             // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val tags = if (body.action.contains("edit")) body.tags.getOrElse(Map.empty) else store.pendingTags(entityId)
-            val tier = body.tier.getOrElse(4)
-            val version = store.recordVerification(entityId, tags, tier)
-            val tagsJson = tags.map { case (k, v) => s""""$k":"$v"""" }.mkString("{", ",", "}")
-            complete(StatusCodes.OK, s"""{"entity":"$entityId","tier":$tier,"tags":$tagsJson,"version":$version}""")
+            Store.pending(entityId) match {
+              case None => complete(StatusCodes.NotFound -> "nothing waits for verification")
+              case Some(open) =>
+                val body = raw.parseJson.asJsObject.fields
+                val tags = if (body.get("action").contains(JsString("edit"))) open.tags ++ tagsOf(body.get("tags")) else open.tags
+                val tier = body.get("tier").collect { case JsNumber(n) => n.toInt }.getOrElse(4)
+                val version = Store.recordVerification(entityId, tags, tier, user)
+                val answer = JsObject(
+                  "entity" -> JsString(entityId),
+                  "tier" -> JsNumber(tier),
+                  "tags" -> JsObject(tags.map { case (c, t) => c -> JsString(t) }),
+                  "version" -> JsNumber(version)
+                )
+                complete(json(StatusCodes.OK, answer))
+            }
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class VerifyRequest(action: Option[String], tags: Option[Map[String, String]])
-final case class Verified(entity: String, tier: Int, tags: Map[String, String], verified_by: String, version: Int)
+import metasense.{Store, Taxonomy} // Store.pending, recordVerification, audit; Taxonomy.known
 
 object VerifyApi {
-  implicit val system: ActorSystem = ActorSystem("metasense")
-  implicit val requestFormat: RootJsonFormat[VerifyRequest] = jsonFormat2(VerifyRequest)
-  implicit val verifiedFormat: RootJsonFormat[Verified] = jsonFormat5(Verified)
+  /** The privacy office's rules, most sensitive first: the first tier whose tags appear wins. */
+  val PrivacyRules: Seq[(Int, Set[String])] = Seq(
+    1 -> Set("Personal.ID"),
+    2 -> Set("Personal.Name", "Personal.Contact_Info"),
+    3 -> Set("Geo.Geohash")
+  )
+  val LeastSensitiveTier = 4
+  val Actions = Set("ack", "edit")
 
-  val Taxonomy = Set("Personal.ID", "Personal.Name", "Personal.Contact_Info", "Geo.Geohash", "None")
-  val AllowedActions = Set("ack", "edit")
-  val PrivacyRules: List[(String, Int)] =
-    List("Personal.ID" -> 1, "Personal.Name" -> 2, "Personal.Contact_Info" -> 2, "Geo.Geohash" -> 3)
-  val DefaultTier = 4
+  def deriveTier(tags: Map[String, String]): Int =
+    PrivacyRules.collectFirst { case (tier, sensitive) if tags.values.exists(sensitive.contains) => tier }.getOrElse(LeastSensitiveTier)
 
-  val store = VerificationStore.open()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def deriveTier(tags: Map[String, String]): Int = {
-    val present = tags.values.toSet
-    val tiers = PrivacyRules.collect { case (tag, tier) if present.contains(tag) => tier }
-    if (tiers.isEmpty) DefaultTier else tiers.min
-  }
-
-  val route: Route =
-    path("v1" / "entities" / Segment / "verify") { entityId =>
-      post {
-        optionalHeaderValueByName("X-User-Id") { userOpt =>
-          entity(as[VerifyRequest]) { body =>
-            val action = body.action.getOrElse("ack")
-            val editTags = body.tags.getOrElse(Map.empty)
-            userOpt.filter(_.nonEmpty) match {
-              case None =>
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-User-Id"}""")
-              case Some(user) =>
-                store.ownerOf(entityId) match {
-                  case None =>
-                    complete(StatusCodes.NotFound, """{"error":"unknown entity"}""")
-                  case Some(owner) if owner != user =>
-                    complete(StatusCodes.Forbidden, """{"error":"only the owner may verify"}""")
-                  case Some(_) if !AllowedActions.contains(action) =>
-                    complete(StatusCodes.BadRequest, """{"error":"action must be ack or edit"}""")
-                  case Some(_) if action == "edit" && editTags.isEmpty =>
-                    complete(StatusCodes.BadRequest, """{"error":"edit requires tags"}""")
-                  case Some(_) if action == "edit" && editTags.exists { case (c, t) => c.isEmpty || !Taxonomy.contains(t) } =>
-                    complete(StatusCodes.BadRequest, """{"error":"unknown tag"}""")
-                  case Some(_) =>
-                    val tags = if (action == "edit") editTags else store.pendingTags(entityId)
-                    val tier = deriveTier(tags)
-                    val version = store.recordVerification(entityId, tags, tier, user, action)
-                    store.audit(entityId, user, action)
-                    complete(StatusCodes.OK, Verified(entityId, tier, tags, user, version))
+  val route: Route = path("v1" / "entities" / Segment / "verify") { entityId =>
+    post {
+      optionalHeaderValueByName("X-User-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-User-Id is required")
+        case Some(user) =>
+          entity(as[String]) { raw =>
+            Store.pending(entityId) match {
+              case None                             => complete(StatusCodes.NotFound -> "nothing waits for verification")
+              case Some(open) if open.owner != user => complete(StatusCodes.Forbidden -> "only the owner verifies an entity")
+              case Some(open) =>
+                val body = raw.parseJson.asJsObject.fields
+                val action = body.get("action").collect { case JsString(a) => a }.getOrElse("")
+                val edits = body.get("tags") match {
+                  case Some(JsObject(fields)) if action == "edit" => fields.toSeq.map { case (c, t) => c -> t }
+                  case _                                          => Seq.empty
+                }
+                val known = edits.collect { case (c, JsString(t)) if Taxonomy.known(t) => c -> t }
+                if (!Actions.contains(action)) complete(StatusCodes.BadRequest -> "action is ack or edit")
+                else if (known.size != edits.size) complete(StatusCodes.BadRequest -> "every tag must be in the tag library")
+                else {
+                  val tags = open.tags ++ known
+                  val tier = deriveTier(tags) // access control reads the tier: it is computed, never taken from the caller
+                  val version = Store.recordVerification(entityId, tags, tier, user)
+                  Store.audit(entityId, user, action)
+                  val answer = JsObject(
+                    "entity" -> JsString(entityId),
+                    "tier" -> JsNumber(tier),
+                    "tags" -> JsObject(tags.map { case (c, t) => c -> JsString(t) }),
+                    "verified_by" -> JsString(user),
+                    "version" -> JsNumber(version)
+                  )
+                  complete(json(StatusCodes.OK, answer))
                 }
             }
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -653,128 +530,431 @@ object VerifyApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <map>
 #include <string>
+
+#include "metasense/store.h"     // store::pending, recordVerification, audit
+#include "metasense/taxonomy.h"  // taxonomy::known
 
 using json = nlohmann::json;
 
-struct VerificationStore {
-  std::map<std::string, std::string> pendingTags(const std::string& entityId);
-  int recordVerification(const std::string& entityId, const std::map<std::string, std::string>& tags, int tier);
-};
-
-VerificationStore store;
-
-int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
-
-  svr.Post(R"(/v1/entities/([^/]+)/verify)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const std::string entityId = req.matches[1];
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    std::map<std::string, std::string> tags;
-    if (body.value("action", std::string("ack")) == "edit" && body.contains("tags")) {
-      tags = body["tags"].get<std::map<std::string, std::string>>();
-    } else {
-      tags = store.pendingTags(entityId);
-    }
-    const int tier = body.value("tier", 4);
-    const int version = store.recordVerification(entityId, tags, tier);
-    res.status = 200;
-    res.set_content(json{{"entity", entityId}, {"tier", tier}, {"tags", tags}, {"version", version}}.dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void verify_entity(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string entity_id = req.matches[1];
+  const std::string user = req.get_header_value("X-User-Id");
+  if (user.empty()) {
+    res.status = 401;
+    res.set_content("X-User-Id is required", "text/plain");
+    return;
+  }
+  const auto open = store::pending(entity_id);
+  if (!open) {
+    res.status = 404;
+    res.set_content("nothing waits for verification", "text/plain");
+    return;
+  }
+  const json body = json::parse(req.body);
+  auto tags = open->tags;
+  if (body.value("action", "") == "edit" && body.contains("tags")) {
+    for (const auto& [column, tag] : body["tags"].items()) tags[column] = tag.get<std::string>();
+  }
+  const int tier = body.value("tier", 4);
+  const long long version = store::recordVerification(entity_id, tags, tier, user);
+  res.set_content(json{{"entity", entity_id}, {"tier", tier}, {"tags", tags}, {"version", version}}.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Post(R"(/v1/entities/([^/]+)/verify)", verify_entity); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <map>
-#include <optional>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "metasense/store.h"     // store::pending, recordVerification, audit
+#include "metasense/taxonomy.h"  // taxonomy::known
+
 using json = nlohmann::json;
 
-const std::set<std::string> kTaxonomy = {"Personal.ID", "Personal.Name", "Personal.Contact_Info", "Geo.Geohash",
-                                         "None"};
-const std::set<std::string> kAllowedActions = {"ack", "edit"};
-const std::vector<std::pair<std::string, int>> kPrivacyRules = {
-    {"Personal.ID", 1}, {"Personal.Name", 2}, {"Personal.Contact_Info", 2}, {"Geo.Geohash", 3}};
-constexpr int kDefaultTier = 4;
-
-struct VerificationStore {
-  std::optional<std::string> ownerOf(const std::string& entityId);
-  std::map<std::string, std::string> pendingTags(const std::string& entityId);
-  int recordVerification(const std::string& entityId, const std::map<std::string, std::string>& tags, int tier,
-                         const std::string& user, const std::string& action);
-  void audit(const std::string& entityId, const std::string& user, const std::string& action);
+// The privacy office's rules, most sensitive first: the first tier whose tags appear wins.
+const std::vector<std::pair<int, std::set<std::string>>> kPrivacyRules = {
+    {1, {"Personal.ID"}},
+    {2, {"Personal.Name", "Personal.Contact_Info"}},
+    {3, {"Geo.Geohash"}},
 };
-
-VerificationStore store;
+constexpr int kLeastSensitiveTier = 4;
 
 int deriveTier(const std::map<std::string, std::string>& tags) {
-  std::set<std::string> present;
-  for (const auto& [column, tag] : tags) present.insert(tag);
-  int tier = kDefaultTier;
-  for (const auto& [tag, ruleTier] : kPrivacyRules) {
-    if (present.count(tag) > 0 && ruleTier < tier) tier = ruleTier;
-  }
-  return tier;
-}
-
-void fail(httplib::Response& res, int status, const std::string& message) {
-  res.status = status;
-  res.set_content(json{{"error", message}}.dump(), "application/json");
-}
-
-int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
-
-  svr.Post(R"(/v1/entities/([^/]+)/verify)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto user = req.get_header_value("X-User-Id");
-    if (user.empty()) return fail(res, 401, "missing X-User-Id");
-    const std::string entityId = req.matches[1];
-    const auto owner = store.ownerOf(entityId);
-    if (!owner) return fail(res, 404, "unknown entity");
-    if (*owner != user) return fail(res, 403, "only the owner may verify");
-
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) body = json::object();
-    const auto action = body.value("action", std::string("ack"));
-    if (kAllowedActions.count(action) == 0) return fail(res, 400, "action must be ack or edit");
-    std::map<std::string, std::string> tags;
-    if (action == "edit") {
-      if (!body.contains("tags") || !body["tags"].is_object() || body["tags"].empty())
-        return fail(res, 400, "edit requires tags");
-      for (const auto& [column, tag] : body["tags"].items()) {
-        if (column.empty() || !tag.is_string() || kTaxonomy.count(tag.get<std::string>()) == 0)
-          return fail(res, 400, "unknown tag for " + column);
-        tags[column] = tag.get<std::string>();
-      }
-    } else {
-      tags = store.pendingTags(entityId);
+  for (const auto& [tier, sensitive] : kPrivacyRules) {
+    for (const auto& [column, tag] : tags) {
+      if (sensitive.count(tag)) return tier;
     }
-
-    const int tier = deriveTier(tags);
-    const int version = store.recordVerification(entityId, tags, tier, user, action);
-    store.audit(entityId, user, action);
-    res.status = 200;
-    res.set_content(
-        json{{"entity", entityId}, {"tier", tier}, {"tags", tags}, {"verified_by", user}, {"version", version}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+  }
+  return kLeastSensitiveTier;
 }
+
+void reject(httplib::Response& res, int status, const std::string& why) {
+  res.status = status;
+  res.set_content(why, "text/plain");
+}
+
+void verify_entity(const httplib::Request& req, httplib::Response& res) {
+  const std::string entity_id = req.matches[1];
+  const std::string user = req.get_header_value("X-User-Id");
+  if (user.empty()) return reject(res, 401, "X-User-Id is required");
+  const auto open = store::pending(entity_id);
+  if (!open) return reject(res, 404, "nothing waits for verification");
+  if (open->owner != user) return reject(res, 403, "only the owner verifies an entity");
+  const json body = json::parse(req.body, nullptr, false);
+  const std::string action = body.is_object() && body.contains("action") && body["action"].is_string() ? body["action"].get<std::string>() : "";
+  if (action != "ack" && action != "edit") return reject(res, 400, "action is ack or edit");
+  auto tags = open->tags;
+  if (action == "edit" && body.contains("tags") && body["tags"].is_object()) {
+    for (const auto& [column, tag] : body["tags"].items()) {
+      if (!tag.is_string() || !taxonomy::known(tag.get<std::string>())) return reject(res, 400, "every tag must be in the tag library");
+      tags[column] = tag.get<std::string>();
+    }
+  }
+  const int tier = deriveTier(tags);  // access control reads the tier: it is computed, never taken from the caller
+  const long long version = store::recordVerification(entity_id, tags, tier, user);
+  store::audit(entity_id, user, action);
+  res.set_content(json{{"entity", entity_id}, {"tier", tier}, {"tags", tags}, {"verified_by", user}, {"version", version}}.dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post(R"(/v1/entities/([^/]+)/verify)", verify_entity); }
 `,
     },
   },
-  debrief: `Some request fields are inputs and some are conclusions. The tier is a conclusion: access control and masking read it, and the source is explicit that it is derived from the tags and the privacy office's rules. A handler that copies it from the body turns governance into a self-service form, so the fix computes it from \`PRIVACY_RULES\` and ignores whatever the client sent. The owner check sits first because the source's verification step exists for the one person who knows the data; the taxonomy whitelist exists because an unknown tag has no rule and no tier; the audit row with \`verified_by\` lets the verification be defended later. Production services also require a second approver for an edit that lowers the tier, and feed the owner's diff back into prompt evaluation as Metasense V2 describes.`,
+  harness: {
+    python: `import json
+
+OWNER = "team-logistics"
+HASH = "4f2a"
+PENDING = {"merchant_id": "None", "passport_no": "None", "customer_email": "Personal.Contact_Info"}
+
+
+def _api(ctx):
+    ctx.redis.hset("verify:deliveries", mapping={"owner": OWNER, "schema_hash": HASH, "state": "pending"})
+    ctx.redis.set(f"classify:deliveries:{HASH}", json.dumps(PENDING))
+    return ctx.client(ctx.load("verify_api").app)
+
+
+async def _verify(c, body, user=OWNER):
+    headers = {"X-User-Id": user} if user else {}
+    return await c.post("/v1/entities/deliveries/verify", json=body, headers=headers)
+
+
+def _stored(ctx):
+    return ctx.redis.hgetall("entity:deliveries")
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _verify(c, {"action": "ack"})
+    assert r.status_code == 200, f"the owner's ack answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("entity") == "deliveries" and body.get("tags") == PENDING and body.get("version") == 1, f"the ack answered {body}, expected the entity, the pending tags and version 1"
+    assert _stored(ctx).get("version") == "1", f"entity:deliveries holds {_stored(ctx)} after the ack"
+
+
+async def check_owner_only(ctx):
+    async with _api(ctx) as c:
+        r = await _verify(c, {"action": "edit", "tags": {"passport_no": "None"}}, user="team-growth")
+        assert r.status_code == 403, f"team-growth verified team-logistics' table and got {r.status_code}, expected 403: only the owner verifies"
+        assert _stored(ctx) == {}, f"a refused verification stored {_stored(ctx)}"
+        r = await _verify(c, {"action": "ack"}, user="")
+        assert r.status_code == 401, f"a verification without X-User-Id answered {r.status_code}, expected 401"
+        r = await _verify(c, {"action": "ack"})
+    assert r.status_code == 200, f"the owner's own ack answered {r.status_code}: {r.text}"
+
+
+async def check_tier_server_side(ctx):
+    async with _api(ctx) as c:
+        r = await _verify(c, {"action": "ack", "tier": 4})
+        assert r.status_code == 200, f"the owner's ack answered {r.status_code}: {r.text}"
+        assert r.json().get("tier") == 2, f"acknowledged tags with Personal.Contact_Info answered tier {r.json().get('tier')}, expected 2: the tier comes from the tags, not the body"
+        r = await _verify(c, {"action": "edit", "tags": {"passport_no": "Personal.ID"}, "tier": 4})
+    assert r.status_code == 200, f"the owner's edit answered {r.status_code}: {r.text}"
+    assert r.json().get("tier") == 1, f"passport_no tagged Personal.ID with \\"tier\\": 4 in the body answered tier {r.json().get('tier')}, expected 1"
+    assert _stored(ctx).get("tier") == "1", f"entity:deliveries stores tier {_stored(ctx).get('tier')!r}, expected 1: access control reads this"
+
+
+async def check_tag_whitelist(ctx):
+    async with _api(ctx) as c:
+        r = await _verify(c, {"action": "edit", "tags": {"passport_no": "Public"}})
+        assert r.status_code == 400, f"an edit with the tag Public answered {r.status_code}, expected 400: Public is not in the tag library"
+        r = await _verify(c, {"action": "approve"})
+        assert r.status_code == 400, f"the action approve answered {r.status_code}, expected 400: actions are ack and edit"
+    assert _stored(ctx) == {}, f"refused verifications stored {_stored(ctx)}"
+
+
+async def check_audit(ctx):
+    async with _api(ctx) as c:
+        r = await _verify(c, {"action": "edit", "tags": {"passport_no": "Personal.ID"}})
+    assert r.status_code == 200, f"the owner's edit answered {r.status_code}: {r.text}"
+    assert r.json().get("verified_by") == OWNER, f"the response names verified_by {r.json().get('verified_by')!r}, expected {OWNER}"
+    entries = [json.loads(e) for e in ctx.redis.lrange("audit:deliveries", 0, -1)]
+    assert [(e.get("user"), e.get("action")) for e in entries] == [(OWNER, "edit")], f"audit:deliveries holds {entries}, expected one entry for {OWNER}'s edit"
+`,
+    typescript: `const OWNER = 'team-logistics';
+const HASH = '4f2a';
+const PENDING = {merchant_id: 'None', passport_no: 'None', customer_email: 'Personal.Contact_Info'};
+
+function api(ctx) {
+  ctx.redis.hset('verify:deliveries', {owner: OWNER, schema_hash: HASH, state: 'pending'});
+  ctx.redis.set(\`classify:deliveries:\${HASH}\`, JSON.stringify(PENDING));
+  return ctx.client(ctx.load('verify_api').app);
+}
+
+const verify = (c, body, user = OWNER) => c.post('/v1/entities/deliveries/verify', {json: body, headers: user ? {'X-User-Id': user} : {}});
+const stored = ctx => ({...ctx.redis.hgetall('entity:deliveries')});
+
+export async function check_route(ctx) {
+  const c = api(ctx);
+  const r = await verify(c, {action: 'ack'});
+  assert.equal(r.status, 200, \`the owner's ack answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.entity === 'deliveries' && body.version === 1, \`the ack answered \${r.text}, expected the entity and version 1\`);
+  assert.deepEqual(body.tags, PENDING, \`the ack answered tags \${JSON.stringify(body.tags)}, expected the pending tags\`);
+  assert.equal(stored(ctx).version, '1', \`entity:deliveries holds \${JSON.stringify(stored(ctx))} after the ack\`);
+}
+
+export async function check_owner_only(ctx) {
+  const c = api(ctx);
+  let r = await verify(c, {action: 'edit', tags: {passport_no: 'None'}}, 'team-growth');
+  assert.equal(r.status, 403, \`team-growth verified team-logistics' table and got \${r.status}, expected 403: only the owner verifies\`);
+  assert.deepEqual(stored(ctx), {}, \`a refused verification stored \${JSON.stringify(stored(ctx))}\`);
+  r = await verify(c, {action: 'ack'}, '');
+  assert.equal(r.status, 401, \`a verification without X-User-Id answered \${r.status}, expected 401\`);
+  r = await verify(c, {action: 'ack'});
+  assert.equal(r.status, 200, \`the owner's own ack answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_tier_server_side(ctx) {
+  const c = api(ctx);
+  let r = await verify(c, {action: 'ack', tier: 4});
+  assert.equal(r.status, 200, \`the owner's ack answered \${r.status}: \${r.text}\`);
+  assert.equal(r.json().tier, 2, \`acknowledged tags with Personal.Contact_Info answered tier \${r.json().tier}, expected 2: the tier comes from the tags, not the body\`);
+  r = await verify(c, {action: 'edit', tags: {passport_no: 'Personal.ID'}, tier: 4});
+  assert.equal(r.status, 200, \`the owner's edit answered \${r.status}: \${r.text}\`);
+  assert.equal(r.json().tier, 1, \`passport_no tagged Personal.ID with "tier": 4 in the body answered tier \${r.json().tier}, expected 1\`);
+  assert.equal(stored(ctx).tier, '1', \`entity:deliveries stores tier \${stored(ctx).tier}, expected 1: access control reads this\`);
+}
+
+export async function check_tag_whitelist(ctx) {
+  const c = api(ctx);
+  let r = await verify(c, {action: 'edit', tags: {passport_no: 'Public'}});
+  assert.equal(r.status, 400, \`an edit with the tag Public answered \${r.status}, expected 400: Public is not in the tag library\`);
+  r = await verify(c, {action: 'approve'});
+  assert.equal(r.status, 400, \`the action approve answered \${r.status}, expected 400: actions are ack and edit\`);
+  assert.deepEqual(stored(ctx), {}, \`refused verifications stored \${JSON.stringify(stored(ctx))}\`);
+}
+
+export async function check_audit(ctx) {
+  const c = api(ctx);
+  const r = await verify(c, {action: 'edit', tags: {passport_no: 'Personal.ID'}});
+  assert.equal(r.status, 200, \`the owner's edit answered \${r.status}: \${r.text}\`);
+  assert.equal(r.json().verified_by, OWNER, \`the response names verified_by \${r.json().verified_by}, expected \${OWNER}\`);
+  const entries = (ctx.redis.lrange('audit:deliveries', 0, -1) as string[]).map(e => JSON.parse(e));
+  assert.deepEqual(entries.map(e => [e.user, e.action]), [[OWNER, 'edit']], \`audit:deliveries holds \${JSON.stringify(entries)}, expected one entry for \${OWNER}'s edit\`);
+}
+`,
+    go: `package main
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"leetbuild/harness"
+)
+
+const (
+	verifyOwner = "team-logistics"
+	verifyHash  = "4f2a"
+)
+
+var verifyPending = map[string]string{"merchant_id": "None", "passport_no": "None", "customer_email": "Personal.Contact_Info"}
+
+func verifyAPI(ctx *harness.Ctx) *harness.HTTP {
+	ctx.Redis.Do("HSET", "verify:deliveries", "owner", verifyOwner, "schema_hash", verifyHash, "state", "pending")
+	raw, _ := json.Marshal(verifyPending)
+	ctx.Redis.Set("classify:deliveries:"+verifyHash, string(raw))
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func verifyAs(c *harness.HTTP, body any, user string) *harness.Response {
+	if user == "" {
+		return c.Post("/v1/entities/deliveries/verify", body)
+	}
+	return c.Post("/v1/entities/deliveries/verify", body, "X-User-Id", user)
+}
+
+type verifyAnswer struct {
+	Entity     string            \`json:"entity"\`
+	Tier       int               \`json:"tier"\`
+	Tags       map[string]string \`json:"tags"\`
+	VerifiedBy string            \`json:"verified_by"\`
+	Version    int               \`json:"version"\`
+}
+
+func verifyDecode(r *harness.Response) verifyAnswer {
+	var answer verifyAnswer
+	r.Decode(&answer)
+	return answer
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := verifyAPI(ctx)
+	r := verifyAs(c, map[string]any{"action": "ack"}, verifyOwner)
+	ctx.Equal(r.Status, 200, "the owner's ack (%s)", r.Text())
+	answer := verifyDecode(r)
+	ctx.Assert(answer.Entity == "deliveries" && answer.Version == 1, "the ack answered %s, expected the entity and version 1", r.Text())
+	ctx.Equal(answer.Tags, verifyPending, "the ack must answer the pending tags")
+	ctx.Equal(ctx.Redis.HGetAll("entity:deliveries")["version"], "1", "entity:deliveries version after the ack")
+}
+
+func CheckOwnerOnly(ctx *harness.Ctx) {
+	c := verifyAPI(ctx)
+	r := verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "None"}}, "team-growth")
+	ctx.Equal(r.Status, 403, "team-growth verifying team-logistics' table (only the owner verifies)")
+	ctx.Equal(len(ctx.Redis.HGetAll("entity:deliveries")), 0, "a refused verification must store nothing; fields stored")
+	r = verifyAs(c, map[string]any{"action": "ack"}, "")
+	ctx.Equal(r.Status, 401, "a verification without X-User-Id")
+	r = verifyAs(c, map[string]any{"action": "ack"}, verifyOwner)
+	ctx.Equal(r.Status, 200, "the owner's own ack (%s)", r.Text())
+}
+
+func CheckTierServerSide(ctx *harness.Ctx) {
+	c := verifyAPI(ctx)
+	r := verifyAs(c, map[string]any{"action": "ack", "tier": 4}, verifyOwner)
+	ctx.Equal(r.Status, 200, "the owner's ack (%s)", r.Text())
+	ctx.Equal(verifyDecode(r).Tier, 2, "acknowledged tags with Personal.Contact_Info: the tier comes from the tags, not the body; tier")
+	r = verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Personal.ID"}, "tier": 4}, verifyOwner)
+	ctx.Equal(r.Status, 200, "the owner's edit (%s)", r.Text())
+	ctx.Equal(verifyDecode(r).Tier, 1, "passport_no tagged Personal.ID with \\"tier\\": 4 in the body; tier")
+	ctx.Equal(ctx.Redis.HGetAll("entity:deliveries")["tier"], "1", "the stored tier access control reads")
+}
+
+func CheckTagWhitelist(ctx *harness.Ctx) {
+	c := verifyAPI(ctx)
+	r := verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Public"}}, verifyOwner)
+	ctx.Equal(r.Status, 400, "an edit with the tag Public (not in the tag library)")
+	r = verifyAs(c, map[string]any{"action": "approve"}, verifyOwner)
+	ctx.Equal(r.Status, 400, "the action approve (actions are ack and edit)")
+	ctx.Equal(len(ctx.Redis.HGetAll("entity:deliveries")), 0, "refused verifications must store nothing; fields stored")
+}
+
+func CheckAudit(ctx *harness.Ctx) {
+	c := verifyAPI(ctx)
+	r := verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Personal.ID"}}, verifyOwner)
+	ctx.Equal(r.Status, 200, "the owner's edit (%s)", r.Text())
+	ctx.Equal(verifyDecode(r).VerifiedBy, verifyOwner, "the response's verified_by")
+	var entries [][2]string
+	for _, raw := range ctx.Redis.LRange("audit:deliveries", 0, -1) {
+		var entry struct{ User, Action string }
+		json.Unmarshal([]byte(raw), &entry)
+		entries = append(entries, [2]string{entry.User, entry.Action})
+	}
+	ctx.Equal(entries, [][2]string{{verifyOwner, "edit"}}, "audit:deliveries must hold one entry for the owner's edit")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+const std::string kOwner = "team-logistics";
+const std::map<std::string, std::string> kPending = {{"merchant_id", "None"}, {"passport_no", "None"}, {"customer_email", "Personal.Contact_Info"}};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  ctx.Redis.Do("HSET", "verify:deliveries", "owner", kOwner, "schema_hash", "4f2a", "state", "pending");
+  ctx.Redis.Set("classify:deliveries:4f2a", nlohmann::json(kPending).dump());
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response verify(harness::HTTP& c, const nlohmann::json& body, const std::string& user = kOwner) {
+  if (user.empty()) return c.Post("/v1/entities/deliveries/verify", body.dump(), "Content-Type", "application/json");
+  return c.Post("/v1/entities/deliveries/verify", body.dump(), "Content-Type", "application/json", "X-User-Id", user);
+}
+
+nlohmann::json answer(const harness::Response& r) {
+  const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
+  return j.is_object() ? j : nlohmann::json::object();
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = verify(c, {{"action", "ack"}});
+  ctx.Equal(r.Status, 200, "the owner's ack (%s)", r.Text());
+  const auto body = answer(r);
+  ctx.Assert(body.value("entity", "") == "deliveries" && body.value("version", 0) == 1, "the ack answered %s, expected the entity and version 1", r.Text());
+  ctx.Equal(body.contains("tags") ? body["tags"] : nlohmann::json(), nlohmann::json(kPending), "the ack must answer the pending tags");
+  ctx.Equal(ctx.Redis.HGet("entity:deliveries", "version").value_or(""), "1", "entity:deliveries version after the ack");
+}
+
+void CheckOwnerOnly(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = verify(c, {{"action", "edit"}, {"tags", {{"passport_no", "None"}}}}, "team-growth");
+  ctx.Equal(r.Status, 403, "team-growth verifying team-logistics' table (only the owner verifies)");
+  ctx.Equal(ctx.Redis.HGetAll("entity:deliveries").size(), 0, "a refused verification must store nothing; fields stored");
+  r = verify(c, {{"action", "ack"}}, "");
+  ctx.Equal(r.Status, 401, "a verification without X-User-Id");
+  r = verify(c, {{"action", "ack"}});
+  ctx.Equal(r.Status, 200, "the owner's own ack (%s)", r.Text());
+}
+
+void CheckTierServerSide(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = verify(c, {{"action", "ack"}, {"tier", 4}});
+  ctx.Equal(r.Status, 200, "the owner's ack (%s)", r.Text());
+  ctx.Equal(answer(r).value("tier", 0), 2, "acknowledged tags with Personal.Contact_Info: the tier comes from the tags, not the body; tier");
+  r = verify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Personal.ID"}}}, {"tier", 4}});
+  ctx.Equal(r.Status, 200, "the owner's edit (%s)", r.Text());
+  ctx.Equal(answer(r).value("tier", 0), 1, "passport_no tagged Personal.ID with \\"tier\\": 4 in the body; tier");
+  ctx.Equal(ctx.Redis.HGet("entity:deliveries", "tier").value_or(""), "1", "the stored tier access control reads");
+}
+
+void CheckTagWhitelist(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = verify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Public"}}}});
+  ctx.Equal(r.Status, 400, "an edit with the tag Public (not in the tag library)");
+  r = verify(c, {{"action", "approve"}});
+  ctx.Equal(r.Status, 400, "the action approve (actions are ack and edit)");
+  ctx.Equal(ctx.Redis.HGetAll("entity:deliveries").size(), 0, "refused verifications must store nothing; fields stored");
+}
+
+void CheckAudit(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = verify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Personal.ID"}}}});
+  ctx.Equal(r.Status, 200, "the owner's edit (%s)", r.Text());
+  ctx.Equal(answer(r).value("verified_by", ""), kOwner, "the response's verified_by");
+  std::vector<std::pair<std::string, std::string>> entries;
+  for (const auto& raw : ctx.Redis.LRange("audit:deliveries", 0, -1)) {
+    const auto e = nlohmann::json::parse(raw, nullptr, false);
+    entries.emplace_back(e.value("user", ""), e.value("action", ""));
+  }
+  ctx.Equal(entries, std::vector<std::pair<std::string, std::string>>{{kOwner, "edit"}}, "audit:deliveries must hold one entry for the owner's edit");
+}
+`,
+  },
+  hints: [
+    'A producer on another team posts `{"action": "edit", "tags": {"passport_no": "Public"}, "tier": 4}` against a table they do not own, gets 200, and the table opens to the company with nobody named.',
+    'The handler checks who is calling but not whether they own the entity, takes the tier as an input when access control treats it as a result, accepts any string as a tag or action, and writes no audit entry.',
+    '403 when `pending["owner"] != user`; 400 unless `action in ("ack", "edit")` and every edited tag passes `taxonomy.known`; `tier = derive_tier(tags)` over `PRIVACY_RULES`; then `store.audit(entity_id, user, action)` and `verified_by` in the answer.',
+  ],
+  debrief: `The tier is what access control and masking read, so it is computed from the tags and the privacy office's rules, never taken from whoever calls; once that holds, the tags are the only input that matters, and the tag check and the owner check guard exactly that input. The audit entry is the record an incident review starts from: who confirmed which tags, and when. Grab feeds owner edits back into the evaluation set for the next prompt version, which this endpoint would do by keeping the model's tags beside the verified ones. A production version would also need a second approver for an edit that lowers the tier, and an owner that is a team with a directory lookup rather than one user id.`,
 };

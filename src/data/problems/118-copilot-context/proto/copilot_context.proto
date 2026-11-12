@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package copilotctx;
+
+// The code model completiond asks for ghost text (step 3 builds the call; steps 1 and 2 use the
+// provided copilot.model). The harness serves it at model:9000. A fill-in-the-middle request
+// carries the code before the cursor and the code after it as separate fields.
+service Model {
+  rpc Complete(CompleteRequest) returns (CompleteReply);
+}
+
+message CompleteRequest {
+  string prefix = 1;
+  string suffix = 2;
+  repeated string snippets = 3;
+  string language = 4;
+  int32 n = 5;
+}
+
+// One generated suggestion; truncated means the model stopped at its token limit mid-suggestion.
+message Candidate {
+  string text = 1;
+  bool truncated = 2;
+}
+
+message CompleteReply {
+  repeated Candidate candidates = 1;
+}

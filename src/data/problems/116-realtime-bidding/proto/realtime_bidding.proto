@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package rtbfeatures;
+
+// The feature service a bid asks before it is priced: the user's identity tier (by the exchange's
+// user hash) and the auction's contextual tier (by auction id). Both answer in a few milliseconds
+// when healthy; the bid gives each its own slice of the auction budget.
+service Features {
+  rpc Identity(IdentityRequest) returns (IdentityFeatures);
+  rpc Contextual(ContextRequest) returns (ContextFeatures);
+}
+
+// The model scorer: what an impression is worth to this bidder, in cents, given both feature tiers.
+service Scorer {
+  rpc Score(ScoreRequest) returns (ScoreReply);
+}
+
+message IdentityRequest {
+  string user_hash = 1;
+}
+
+message IdentityFeatures {
+  string segment = 1;
+  int32 frequency = 2;
+}
+
+message ContextRequest {
+  string auction_id = 1;
+}
+
+message ContextFeatures {
+  string category = 1;
+  int32 viewability_pct = 2;
+}
+
+message ScoreRequest {
+  string user_hash = 1;
+  string auction_id = 2;
+  string segment = 3;
+  string category = 4;
+}
+
+message ScoreReply {
+  int64 value_cents = 1;
+}

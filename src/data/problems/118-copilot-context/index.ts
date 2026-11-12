@@ -1,10 +1,12 @@
 import {GITHUB} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {completionEndpointStep} from './steps/1-completion-endpoint';
 import {neighboringTabsStep} from './steps/2-neighboring-tabs';
 import {fimCallStep} from './steps/3-fim-call';
 import {completionTelemetryStep} from './steps/4-completion-telemetry';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * GitHub Copilot's completion context, rebuilt as the service behind an editor's ghost text and
@@ -30,7 +32,7 @@ export const copilotContextProblem: Problem = {
       by: 'Johan Rosenkilde',
       date: '2023-05-17',
       takes:
-        'The mechanisms and numbers: a prompt library that selects, prioritises, filters and assembles snippets into a window of about 6,000 characters; neighboring tabs, where snippets from the other open files are matched against the code around the cursor with a deliberately very low inclusion bar (+5 % acceptance); fill-in-the-middle, which tells the model which part is prefix and which is suffix (+10 %); caching so that neither adds latency; and the life of a completion — n generated, at most n shown.',
+        'The mechanisms and numbers: a prompt library that selects, prioritises, filters and assembles snippets into a window of about 6,000 characters; neighboring tabs, where snippets from the other open files are matched against the code around the cursor with a deliberately very low inclusion bar (+5 % acceptance); fill-in-the-middle, which tells the model which part is prefix and which is suffix (+10 %); caching so that neither adds latency; and the life of a completion: n generated, at most n shown.',
     },
     {
       title: 'Inside GitHub: Working with the LLMs behind GitHub Copilot',
@@ -38,7 +40,7 @@ export const copilotContextProblem: Problem = {
       by: 'Sara Verdi',
       date: '2023-05-17',
       takes:
-        'The origin of the two prompt tricks this course builds — the file path and language at the top of the prompt, and the component that scans the other open tabs for text similar to what is around the cursor, credited with a large lift in acceptance and characters retained.',
+        "Where neighboring tabs came from: the component that scans the other open tabs for text similar to what is around the cursor, credited with a large lift in acceptance and characters retained; and the file path and language at the top of the prompt, which this course passes as the request's `language`.",
     },
     {
       title: 'How to build an enterprise LLM application: Lessons from GitHub Copilot',
@@ -67,28 +69,31 @@ the code before and after the cursor as a prefix and a suffix.
 *How GitHub Copilot is getting better at understanding your code* gives the window (about 6,000
 characters) and the prompt library's four verbs. It reports that a **very low bar** for including a
 neighboring-tab match gave a 5 % relative lift in acceptance, with the best match beating nothing
-even when weak; fill-in-the-middle was worth 10 %, and caching keeps both free of added latency. Its
-diagram of the life of a completion (*n* generated, ≤ *n* shown) is this course's diagram. *Inside
-GitHub* adds the file path and language at the top of the prompt. *How to build an enterprise LLM
-application* contributes acceptance and retention rate as the metrics and the lesson that generating
-ten suggestions when most developers take the first is wasted compute.
+even when weak; fill-in-the-middle was worth 10 %. Its diagram of the life of a completion (*n*
+generated, ≤ *n* shown) is this course's diagram. *How to build an enterprise LLM application* adds
+acceptance rate as the metric and the lesson that generating ten suggestions when most developers
+take the first wastes compute.
 
 ## What you build here
 
-One service, **completiond**, with four pieces:
+One service, **completiond**, with four pieces. Step 1 calls the other three through provided
+modules (\`copilot.tabs\`: \`remember_tabs\`, \`pick_snippets\`; \`copilot.model\`: \`complete\`)
+that do what steps 2 and 3 build.
 
-1. \`POST /v1/completions\`: a required \`X-Session-Id\` (**401**), **413** over **1 MiB**, the
-   prefix trimmed to its last **3,500** characters and the suffix to its first **1,000**, a fresh
-   \`request_id\` and the editor's \`token\` echoed, and a log line without code.
+1. \`POST /v1/completions\` with \`{prefix, suffix, language, path, token, open_tabs}\`: a required
+   \`X-Session-Id\` (**401**), **413** over **1 MiB**, the prefix trimmed to its last **3,500**
+   characters and the suffix to its first **1,000**, a fresh \`request_id\` beside the echoed
+   \`token\`, and a log line without code.
 2. The **neighboring-tabs cache** in Redis: \`tabs:{session}:{path}\` with a **600 s** TTL, Jaccard
    scoring against the last **60** lines before the cursor, a **0.05** bar with the best match kept
    below it, the top **4** chosen, one \`MGET\` per session.
-3. The **gRPC** model call: \`Complete\` with separate \`prefix\` and \`suffix\`, a **300 ms**
-   deadline, at most **2** attempts only on \`UNAVAILABLE\`, **3** candidates with empty, truncated
-   and duplicate ones dropped.
-4. The **Kafka** telemetry path: \`completion.shown\` and \`completion.accepted\` keyed by session
-   with \`request_id\`, \`language\`, \`candidate_len\` and \`latency_ms\`, an idempotent producer with
-   \`acks=all\`, and \`HINCRBY acceptance:{language}\` before the commit.
+3. The **gRPC** call \`copilotctx.Model/Complete\` at \`model:9000\`: separate \`prefix\`,
+   \`suffix\` and \`snippets\`, a **300 ms** deadline, at most **2** attempts only on
+   \`UNAVAILABLE\`, **3** candidates with empty, truncated and duplicate ones dropped.
+4. \`POST /v1/telemetry\` and the **Kafka** topics \`completion.shown\` and \`completion.accepted\`:
+   events keyed by session with \`request_id\`, \`session\`, \`language\`, \`candidate_len\` and
+   \`latency_ms\`, an idempotent producer with \`acks=all\`, and a consumer in group \`acceptance\`
+   that runs \`HINCRBY acceptance:{language} {event} 1\` before its commit.
 
 ## The debugging habit
 
@@ -102,7 +107,7 @@ editor-side debouncing, and the A/B platform.`,
   diagram: {
     nodes: [
       {id: 'editor', kind: 'client', label: 'Editor', sub: 'ghost text · open tabs', x: 8, y: 50},
-      {id: 'api', kind: 'http', label: 'completiond', sub: 'HTTPS :8443', x: 28, y: 50},
+      {id: 'api', kind: 'http', label: 'completiond', sub: 'completions · telemetry', x: 28, y: 50},
       {id: 'redis', kind: 'redis', label: 'Redis', sub: 'tabs:{session}:{path} · acceptance', x: 50, y: 20},
       {id: 'model', kind: 'grpc', label: 'Model service', sub: 'Complete · prefix + suffix', x: 50, y: 50},
       {id: 'kafka', kind: 'kafka', label: 'completion.shown · accepted', sub: 'key = session', x: 50, y: 80},
@@ -118,4 +123,11 @@ editor-side debouncing, and the A/B platform.`,
     ],
   },
   steps: [completionEndpointStep, neighboringTabsStep, fimCallStep, completionTelemetryStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

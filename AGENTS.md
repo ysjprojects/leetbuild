@@ -92,14 +92,16 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   dated by its creation) and the posts or docs that explain it, each with its `kind`, `venue` and
   what the problem takes from it. Every link is checked against the live page, never written from
   memory; `yarn verify` enforces the shape.
-- Debugging courses are being rebuilt to the classic courses' bar: one contract across the steps,
-  support modules in all five languages, Python, TypeScript, Go and C++ harnesses that execute in the
-  browser runtime, and Scala compiled by `yarn check:scala`; a course not yet rebuilt is judged by
-  its static checks only. The runtimes: Go's is `goruntime/`, rebuilt into the committed
-  `public/go/runtime.wasm.gz` by `yarn build:go` after any change there; C++'s is `cppruntime/`,
-  rebuilt into the committed `public/cpp/runtime.pack.gz` by `yarn build:cpp`, and `yarn verify`
-  needs Node 24 to run it. Harness checks stay outcome-based; update the README when what a course
-  runs changes.
+- Every debugging course is built to the classic courses' bar: one contract across its steps, support
+  modules in all five languages, Python, TypeScript, Go and C++ harnesses that execute in the browser
+  runtime (the starter fails every check but at most the example, the solution passes them all), and
+  Scala compiled by `yarn check:scala`. A new or changed debugging course keeps that bar. Every
+  `.proto` file name and top-level `package.Message`/`Service` is unique across the catalogue (one
+  Python runtime serves every course on a page). The runtimes: Go's is `goruntime/`, rebuilt into the
+  committed `public/go/runtime.wasm.gz` by `yarn build:go` after any change there; C++'s is
+  `cppruntime/`, rebuilt into the committed `public/cpp/runtime.pack.gz` by `yarn build:cpp`, and
+  `yarn verify` needs Node 24 to run it. Harness checks stay outcome-based; update the README when what
+  a course runs changes.
 
 ## Pull requests
 

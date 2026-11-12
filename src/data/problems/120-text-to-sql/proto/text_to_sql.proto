@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package sqlagents;
+
+// The agents querygen calls. The checks serve a deterministic stand-in at agents:9000 (querygen/agents
+// in the support modules): step 1 calls Intent and PickTables, step 3 PruneColumns and Generate.
+service Agents {
+  // The intent agent: which workspace a question belongs to.
+  rpc Intent(IntentRequest) returns (IntentReply);
+  // The table agent: the tables it proposes for the user to ACK.
+  rpc PickTables(PickTablesRequest) returns (PickTablesReply);
+  // The column prune agent: the same schemas without the columns the question does not need.
+  rpc PruneColumns(PruneColumnsRequest) returns (PruneColumnsReply);
+  // The SQL generator: text holds JSON {"sql": "...", "explanation": "..."} when the model behaves.
+  rpc Generate(GenerateRequest) returns (GenerateReply);
+}
+
+message IntentRequest {
+  string question = 1;
+}
+
+message IntentReply {
+  string workspace = 1;
+}
+
+message PickTablesRequest {
+  string question = 1;
+  string workspace = 2;
+}
+
+message PickTablesReply {
+  repeated string tables = 1;
+}
+
+message PruneColumnsRequest {
+  string question = 1;
+  repeated string schemas = 2;
+}
+
+message PruneColumnsReply {
+  repeated string schemas = 1;
+}
+
+message GenerateRequest {
+  string question = 1;
+  string workspace = 2;
+  repeated string schemas = 3;
+}
+
+message GenerateReply {
+  string text = 1;
+}
+
+// The warehouse step 4 runs guarded SQL on. The checks serve a stand-in at warehouse:9000
+// (querygen/warehouse); the call's deadline is the statement timeout.
+service Warehouse {
+  rpc Execute(ExecuteRequest) returns (ExecuteReply);
+}
+
+message ExecuteRequest {
+  string sql = 1;
+}
+
+message Row {
+  repeated string values = 1;
+}
+
+message ExecuteReply {
+  repeated string columns = 1;
+  repeated Row rows = 2;
+}

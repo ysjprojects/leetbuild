@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package fairhousing;
+
+// The fast tier (step 2): a fine-tuned binary classifier, the same for the user's question and the
+// model's answer. score is the probability that the text is non-compliant under the Fair Housing
+// Act; label names the protected class it leans on. The harness serves a deterministic stand-in at
+// classifier:9000.
+service Classifier {
+  rpc Classify(ClassifyRequest) returns (ClassifyReply);
+}
+
+// The slow tier (step 2): an LLM judge asked only about the uncertain band. The harness serves a
+// deterministic stand-in at judge:9000.
+service Judge {
+  rpc Assess(AssessRequest) returns (Assessment);
+}
+
+// The assistant's model (step 4): answers a question, optionally under extra instructions. The
+// harness serves a deterministic stand-in at model:9000.
+service Assistant {
+  rpc Complete(CompleteRequest) returns (CompleteReply);
+}
+
+message ClassifyRequest {
+  string text = 1;
+  string policy_version = 2;
+}
+
+message ClassifyReply {
+  double score = 1;
+  string label = 2;
+}
+
+message AssessRequest {
+  string text = 1;
+  string policy_version = 2;
+}
+
+message Assessment {
+  bool compliant = 1;
+  string reason = 2;
+}
+
+message CompleteRequest {
+  string question = 1;
+  string instructions = 2;
+}
+
+message CompleteReply {
+  string answer = 1;
+}

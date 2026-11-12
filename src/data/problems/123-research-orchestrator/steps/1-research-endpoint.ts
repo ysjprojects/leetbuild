@@ -2,195 +2,211 @@ import type {Step} from '@/lib/types';
 
 export const researchEndpointStep: Step = {
   id: 'research-endpoint',
-  title: 'POST /v1/research: effort budgets, 202 and a job id',
+  title: 'POST /v1/research: the server sets the budget, a retry finds its job',
   concept: 'http',
-  file: 'research_api',
-  focus: ['client', 'api', 'lead'],
+  file: 'api',
+  focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`POST /v1/research\` with body
-\`{"query": "…", "effort": "compare"}\`: it reads the tenant header, builds a budget from the body,
-calls the lead agent inline and answers 200 with the report. There is no status route. It
-compiles, serves the demo, and hides five flaws.
+**Starting point.** The starter serves \`POST /v1/research\` with body \`{"query": "…", "effort":
+"compare"}\` and \`GET /v1/research/{job_id}\` on the job store (\`research.jobs\`, provided). The
+start route reads \`X-Tenant-Id\`, builds the budget from the body's \`max_subagents\`,
+\`max_tool_calls\` and \`token_budget\` (the fact budget when they are absent), stores the job with
+\`create_job\`, enqueues it and answers **202** with the job; the status route answers the job the id
+names. It serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** Research inside the request ties a worker to a multi-minute
-job and loses it on every timeout or deploy; a caller-supplied budget and an uncapped query make
-one request an unbounded bill; an un-keyed start endpoint spawns a second job per retry.
+**Failure mode the checks target.** A request asks for a hundred thousand tool calls and gets them; a
+client that times out and retries starts a second job and a second bill; a request with no tenant, a
+50 KB query or an effort nobody defined is accepted; any tenant reads any job by its id.
 
-- Tenant from the \`X-Tenant-Id\` header; missing is **401** on both routes.
-- \`query\` is non-empty and at most **8 KiB** (\`1 << 13\` bytes); larger is **413**.
-- \`effort\` is \`fact\`, \`compare\` or \`deep\` (**400** otherwise), default \`fact\`. The budget
-  comes from a server-side table: \`fact\` → 1 subagent, 10 tool calls, 50 000 tokens;
-  \`compare\` → 4, 60, 250 000; \`deep\` → 10, 150, 1 000 000.
-- \`Idempotency-Key\` is required (**400** when missing); a replay of \`(tenant, key)\` returns the
-  stored job.
-- The handler stores the job, **enqueues** it for the lead agent and answers **202** with
-  \`{job_id, status: "queued", budget}\`; the research does not run inline.
-- \`GET /v1/research/{job_id}\` returns the owning tenant's job status, **404** otherwise.`,
+- \`X-Tenant-Id\` is required on both routes (**401**); \`query\` is non-empty and at most
+  \`MAX_QUERY_BYTES\` = 8192 bytes of UTF-8 (**413**); \`effort\` is \`fact\`, \`compare\` or \`deep\`
+  (**400**), default \`fact\`.
+- The budget comes from \`EFFORT_BUDGETS\` only: \`fact\` 1 subagent, 10 tool calls, 50 000 tokens;
+  \`compare\` 4, 60, 250 000; \`deep\` 10, 150, 1 000 000.
+- \`Idempotency-Key\` is required (**400**): answer \`job_for_key(tenant, key)\` when it is set;
+  otherwise create the job, \`remember_key\` it (it returns the job the key belongs to, so a
+  concurrent retry that won is answered instead) and enqueue only your own.
+- The status route answers **404** for another tenant's job.`,
   sequence: {
-    participants: ['Client', 'researchd API', 'job store', 'Lead agent'],
+    participants: ['Client', 'researchd API', 'job store'],
     messages: [
       {from: 'Client', to: 'researchd API', label: 'POST /v1/research · X-Tenant-Id · Idempotency-Key', kind: 'sync'},
       {
         from: 'researchd API',
         to: 'researchd API',
-        label: 'validate tenant · query ≤ 8 KiB · effort → budget',
+        label: 'tenant · query ≤ 8192 B · effort → EFFORT_BUDGETS',
         kind: 'sync',
       },
-      {from: 'researchd API', to: 'job store', label: 'get(tenant, idem_key)', kind: 'sync'},
-      {from: 'job store', to: 'researchd API', label: 'stored job / none', kind: 'reply'},
-      {from: 'researchd API', to: 'job store', label: 'put(tenant, idem_key, job)', kind: 'sync'},
-      {from: 'researchd API', to: 'Lead agent', label: 'enqueue(job)', kind: 'async'},
+      {from: 'researchd API', to: 'job store', label: 'job_for_key(tenant, key) → job / none', kind: 'sync'},
+      {from: 'researchd API', to: 'job store', label: 'create_job · remember_key · enqueue', kind: 'sync'},
       {from: 'researchd API', to: 'Client', label: '202 {job_id, status: queued, budget}', kind: 'reply'},
-      {from: 'Client', to: 'researchd API', label: 'GET /v1/research/{job_id}', kind: 'sync'},
-      {from: 'researchd API', to: 'Client', label: '200 {job_id, status, …}', kind: 'reply'},
+      {from: 'Client', to: 'researchd API', label: 'GET /v1/research/{job_id} · X-Tenant-Id', kind: 'sync'},
+      {from: 'researchd API', to: 'Client', label: '200 the job · 404 another tenant’s', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'routes',
-      title: 'Handles POST /v1/research and GET /v1/research/{job_id}',
+      title: 'Starts a job with 202 and answers its status',
       detail:
-        'Register the start route on `POST /v1/research` and the status route on `GET /v1/research/{job_id}`. The starter has no status route because it answers the report inline.',
+        '`POST /v1/research` stores the job, enqueues its id on `research:queue` and answers **202** with the job; `GET /v1/research/{job_id}` answers it.',
       match: {
-        python: {all: [/@app\.post\(\s*["']\/v1\/research["']/, /@app\.get\(\s*["']\/v1\/research\/\{job_id\}["']/]},
-        typescript: {all: [/app\.post\(\s*['"]\/v1\/research['"]/, /app\.get\(\s*['"]\/v1\/research\/:\w+['"]/]},
-        go: {all: [/HandleFunc\(\s*"POST \/v1\/research"/, /HandleFunc\(\s*"GET \/v1\/research\/\{\w+\}"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"research"\s*\)/, /path\(\s*"v1"\s*\/\s*"research"\s*\/\s*Segment\s*\)/]},
-        cpp: {all: [/svr\.Post\(\s*"\/v1\/research"/, /svr\.Get\(\s*R"\(\/v1\/research\//]},
+        python: {
+          all: [
+            /@app\.post\(\s*["']\/v1\/research["']/,
+            /@app\.get\(\s*["']\/v1\/research\/\{job_id\}["']/,
+            /jobs\.enqueue\(/,
+          ],
+        },
+        typescript: {
+          all: [/app\.post\(\s*['"]\/v1\/research['"]/, /app\.get\(\s*['"]\/v1\/research\/:\w+['"]/, /\benqueue\(/],
+        },
+        go: {
+          all: [
+            /HandleFunc\(\s*"POST \/v1\/research"/,
+            /HandleFunc\(\s*"GET \/v1\/research\/\{\w+\}"/,
+            /jobs\.Enqueue\(/,
+          ],
+        },
+        scala: {
+          all: [
+            /path\(\s*"v1"\s*\/\s*"research"\s*\)/,
+            /path\(\s*"v1"\s*\/\s*"research"\s*\/\s*Segment\s*\)/,
+            /Jobs\.enqueue\(/,
+          ],
+        },
+        cpp: {all: [/svr\.Post\(\s*"\/v1\/research"/, /svr\.Get\(\s*R"\(\/v1\/research\//, /jobs::enqueue\(/]},
       },
     },
     {
       id: 'validate',
-      title: 'Authenticates the tenant, caps the query, checks the effort',
+      title: 'Refuses a request without a tenant, an oversized query or an unknown effort',
       detail:
-        'A missing `X-Tenant-Id` is **401**; a query over `1 << 13` bytes is **413**; an `effort` outside `fact`/`compare`/`deep` is **400**. The starter accepts any query size and any effort string from anyone.',
+        'A missing `X-Tenant-Id` is **401**, a query over `MAX_QUERY_BYTES` (8192 bytes of UTF-8) is **413**, an effort outside the budget table is **400**, and none of them creates a job.',
       match: {
-        python: {all: [/MAX_QUERY_BYTES/, /ALLOWED_EFFORTS/, /status_code\s*=\s*413/, /status_code\s*=\s*401/]},
-        typescript: {all: [/MAX_QUERY_BYTES/, /ALLOWED_EFFORTS/, /code\(\s*413\s*\)/, /code\(\s*401\s*\)/]},
-        go: {all: [/maxQueryBytes/, /allowedEfforts/, /StatusRequestEntityTooLarge/, /StatusUnauthorized/]},
+        python: {all: [/MAX_QUERY_BYTES\s*=/, /\b401\b/, /\b413\b/, /\.encode\(/]},
+        typescript: {all: [/MAX_QUERY_BYTES\s*=/, /code\(\s*401\s*\)/, /code\(\s*413\s*\)/, /TextEncoder|byteLength/]},
+        go: {all: [/maxQueryBytes\s*=/, /StatusUnauthorized|\b401\b/, /StatusRequestEntityTooLarge|\b413\b/]},
         scala: {
-          all: [/MaxQueryBytes/, /AllowedEfforts/, /StatusCodes\.RequestEntityTooLarge/, /StatusCodes\.Unauthorized/],
+          all: [
+            /MaxQueryBytes\s*=/,
+            /Unauthorized|\b401\b/,
+            /PayloadTooLarge|RequestEntityTooLarge|\b413\b/,
+            /getBytes\(/,
+          ],
         },
-        cpp: {all: [/kMaxQueryBytes/, /kAllowedEfforts/, /\b413\b/, /\b401\b/]},
+        cpp: {all: [/kMaxQueryBytes\s*=/, /\b401\b/, /\b413\b/]},
       },
     },
     {
       id: 'budget-table',
-      title: 'Maps effort to a server-side budget',
+      title: 'The budget comes from the server-side effort table',
       detail:
-        'The budget — `max_subagents`, `max_tool_calls`, `token_budget` — comes from an `EFFORT_BUDGETS` table keyed by effort. The starter copies `max_subagents` and friends from the request body, so the caller sets their own spend.',
+        '`max_subagents`, `max_tool_calls` and `token_budget` are looked up in `EFFORT_BUDGETS` by effort; a budget field in the body is ignored.',
       match: {
         python: {
-          all: [/EFFORT_BUDGETS/, /max_subagents/, /max_tool_calls/, /token_budget/],
-          none: [/body\.max_subagents/, /body\.max_tool_calls/],
+          all: [/EFFORT_BUDGETS\s*=/, /EFFORT_BUDGETS\[/],
+          none: [/body(\.get\(|\[)\s*["'](max_subagents|max_tool_calls|token_budget)/],
         },
         typescript: {
-          all: [/EFFORT_BUDGETS/, /max_subagents/, /max_tool_calls/, /token_budget/],
-          none: [/body\.max_subagents/, /body\.max_tool_calls/],
+          all: [/EFFORT_BUDGETS\s*[:=]/, /EFFORT_BUDGETS\.get\(|EFFORT_BUDGETS\[/],
+          none: [/body\.(max_subagents|max_tool_calls|token_budget)/],
         },
-        go: {
-          all: [/effortBudgets/, /MaxSubagents/, /MaxToolCalls/, /TokenBudget/],
-          none: [/body\.MaxSubagents/, /body\.MaxToolCalls/],
-        },
+        go: {all: [/effortBudgets\s*=/, /effortBudgets\[/], none: [/body\.(MaxSubagents|MaxToolCalls|TokenBudget)/]},
         scala: {
-          all: [/EffortBudgets/, /max_subagents/, /max_tool_calls/, /token_budget/],
-          none: [/body\.max_subagents/, /body\.max_tool_calls/],
+          all: [/EffortBudgets\s*[:=]/, /EffortBudgets\.get\(/],
+          none: [/number\(\s*body\s*,\s*"(max_subagents|max_tool_calls|token_budget)"/],
         },
         cpp: {
-          all: [/kEffortBudgets/, /max_subagents/, /max_tool_calls/, /token_budget/],
-          none: [/body\.value\(\s*"max_subagents"/, /body\.value\(\s*"max_tool_calls"/],
+          all: [/kEffortBudgets\s*=/, /kEffortBudgets\.find\(|kEffortBudgets\.at\(/],
+          none: [/body\.value\(\s*"(max_subagents|max_tool_calls|token_budget)"/],
         },
       },
     },
     {
       id: 'idempotency-key',
-      title: 'Keys retries by (tenant, Idempotency-Key)',
+      title: 'A retry with the same Idempotency-Key answers the first job',
       detail:
-        '`Idempotency-Key` is required and the job is stored under `(tenant, key)`; a replay returns the stored job instead of starting a second one. The starter ignores the header, so every client retry spawns another job with its own budget.',
+        '`Idempotency-Key` is required (**400**); `job_for_key`/`jobForKey` is asked before a job is created, a new job is recorded with `remember_key`/`rememberKey`, and only the job the key belongs to is enqueued.',
       match: {
-        python: {all: [/Idempotency-Key/, /jobs\.get\(/, /jobs\.put\(/]},
-        typescript: {all: [/idempotency-key/, /jobs\.get\(/, /jobs\.put\(/]},
-        go: {all: [/Idempotency-Key/, /jobs\.Get\(/, /jobs\.Put\(/]},
-        scala: {all: [/Idempotency-Key/, /jobs\.get\(/, /jobs\.put\(/]},
-        cpp: {all: [/Idempotency-Key/, /jobs\.get\(/, /jobs\.put\(/]},
+        python: {
+          all: [/idempotency-key/i, /jobs\.job_for_key\(/, /jobs\.remember_key\(/, /\b400\b/],
+          order: [/jobs\.job_for_key\(/, /jobs\.create_job\(/],
+        },
+        typescript: {
+          all: [/idempotency-key/i, /jobForKey\(/, /rememberKey\(/, /\b400\b/],
+          order: [/jobForKey\(/, /createJob\(/],
+        },
+        go: {
+          all: [/Idempotency-Key/i, /jobs\.JobForKey\(/, /jobs\.RememberKey\(/, /StatusBadRequest|\b400\b/],
+          order: [/jobs\.JobForKey\(/, /jobs\.CreateJob\(/],
+        },
+        scala: {
+          all: [/Idempotency-Key/i, /Jobs\.jobForKey\(/, /Jobs\.rememberKey\(/, /BadRequest|\b400\b/],
+          order: [/Jobs\.jobForKey\(/, /Jobs\.createJob\(/],
+        },
+        cpp: {
+          all: [/Idempotency-Key/i, /jobs::jobForKey\(/, /jobs::rememberKey\(/, /\b400\b/],
+          order: [/jobs::jobForKey\(/, /jobs::createJob\(/],
+        },
       },
     },
     {
-      id: 'async-202',
-      title: 'Enqueues the job and answers 202',
+      id: 'tenant-scope',
+      title: 'A tenant reads only its own jobs',
       detail:
-        'The handler enqueues the job for the lead agent and answers **202** with the job id; the research never runs inside the request. The starter calls the lead agent synchronously and holds the connection for the whole job.',
+        'The status route requires `X-Tenant-Id` and compares it with the job’s tenant: another tenant’s job is **404**, as if it did not exist.',
       match: {
-        python: {all: [/status_code\s*=\s*202/, /queue\.enqueue\(/], none: [/run_research\(/]},
-        typescript: {all: [/code\(\s*202\s*\)/, /queue\.enqueue\(/], none: [/runResearch\(/]},
-        go: {all: [/StatusAccepted/, /queue\.Enqueue\(/], none: [/runResearch\(/]},
-        scala: {all: [/StatusCodes\.Accepted/, /queue\.enqueue\(/], none: [/runResearch\(/]},
-        cpp: {all: [/status\s*=\s*202/, /queue\.enqueue\(/], none: [/runResearch\(/]},
+        python: {all: [/job\[["']tenant["']\]\s*(!=|==)\s*tenant/]},
+        typescript: {all: [/job\.tenant\s*(!==|===|!=|==)\s*tenant/]},
+        go: {all: [/job\.Tenant\s*(!=|==)\s*tenant/]},
+        scala: {all: [/job\.tenant\s*(!=|==)\s*tenant/]},
+        cpp: {all: [/job(->|\.)tenant\s*(!=|==)\s*tenant/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-import uuid
-
-from fastapi import FastAPI, Header
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-from lead_agent import run_research
+from research import jobs  # create_job, get_job, job_for_key, remember_key, enqueue
 
 app = FastAPI()
-logger = logging.getLogger("researchd")
-
-
-class ResearchRequest(BaseModel):
-    query: str
-    effort: str = "fact"
-    max_subagents: int = 10
-    max_tool_calls: int = 150
-    token_budget: int = 1_000_000
-
-
-class JobStore:
-    def get(self, tenant: str, idem_key: str):
-        """The job stored for (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, job: dict) -> None:
-        """Store the job under (tenant, idem_key)."""
-        raise NotImplementedError
-
-
-jobs = JobStore()
 
 
 @app.post("/v1/research")
-def research(body: ResearchRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    job_id = str(uuid.uuid4())
+async def start_research(request: Request) -> JSONResponse:
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    body = await request.json()
     budget = {
-        "max_subagents": body.max_subagents,
-        "max_tool_calls": body.max_tool_calls,
-        "token_budget": body.token_budget,
+        "max_subagents": int(body.get("max_subagents", 1)),
+        "max_tool_calls": int(body.get("max_tool_calls", 10)),
+        "token_budget": int(body.get("token_budget", 50_000)),
     }
-    logger.info("research tenant=%s job=%s effort=%s", tenant, job_id, body.effort)
-    report = run_research(job_id, body.query, budget)
-    return JSONResponse({"job_id": job_id, "status": "done", "report": report}, status_code=200)
-`,
-      solution: `import logging
-import uuid
+    job = jobs.create_job(tenant, body.get("query", ""), body.get("effort", "fact"), budget)
+    jobs.enqueue(job["job_id"])
+    return JSONResponse(job, status_code=202)
 
-from fastapi import FastAPI, Header, HTTPException
+
+@app.get("/v1/research/{job_id}")
+def research_status(job_id: str, request: Request) -> JSONResponse:
+    job = jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="no such job")
+    return JSONResponse(job)
+`,
+      solution: `from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+
+from research import jobs  # create_job, get_job, job_for_key, remember_key, enqueue
 
 app = FastAPI()
-logger = logging.getLogger("researchd")
 
-MAX_QUERY_BYTES = 1 << 13
-ALLOWED_EFFORTS = {"fact", "compare", "deep"}
+MAX_QUERY_BYTES = 8192
+# The spend is the server's decision: a budget field in the body is ignored.
 EFFORT_BUDGETS = {
     "fact": {"max_subagents": 1, "max_tool_calls": 10, "token_budget": 50_000},
     "compare": {"max_subagents": 4, "max_tool_calls": 60, "token_budget": 250_000},
@@ -198,96 +214,57 @@ EFFORT_BUDGETS = {
 }
 
 
-class ResearchRequest(BaseModel):
-    query: str
-    effort: str = "fact"
-
-
-class JobStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The job stored for (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, job: dict) -> None:
-        """Store the job under (tenant, idem_key) and under its job id."""
-        raise NotImplementedError
-
-    def status(self, tenant: str, job_id: str) -> dict | None:
-        """The job with this id, if the tenant owns it."""
-        raise NotImplementedError
-
-
-class JobQueue:
-    def enqueue(self, job: dict) -> None:
-        """Hand the job to a lead agent worker; the request does not wait for it."""
-        raise NotImplementedError
-
-
-jobs = JobStore()
-queue = JobQueue()
-
-
-def require_tenant(tenant: str | None) -> str:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
+def require_tenant(request: Request) -> str:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
     return tenant
 
 
 @app.post("/v1/research")
-def research(
-    body: ResearchRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    tenant = require_tenant(tenant)
-    if idem_key is None or idem_key == "":
+async def start_research(request: Request) -> JSONResponse:
+    tenant = require_tenant(request)
+    key = request.headers.get("idempotency-key", "")
+    if not key:
         raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if body.query == "":
+    body = await request.json()
+    query = body.get("query", "")
+    effort = body.get("effort", "fact")
+    if not isinstance(query, str) or query == "":
         raise HTTPException(status_code=400, detail="query must be a non-empty string")
-    if len(body.query.encode("utf-8")) > MAX_QUERY_BYTES:
-        raise HTTPException(status_code=413, detail="query exceeds 8 KiB")
-    if body.effort not in ALLOWED_EFFORTS:
+    if len(query.encode("utf-8")) > MAX_QUERY_BYTES:
+        raise HTTPException(status_code=413, detail=f"query exceeds {MAX_QUERY_BYTES} bytes")
+    if effort not in EFFORT_BUDGETS:
         raise HTTPException(status_code=400, detail="effort must be fact, compare or deep")
-
-    stored = jobs.get(tenant, idem_key)
+    stored = jobs.job_for_key(tenant, key)
     if stored is not None:
-        return JSONResponse(stored, status_code=202)
-
-    budget = EFFORT_BUDGETS[body.effort]
-    job = {
-        "job_id": str(uuid.uuid4()),
-        "tenant": tenant,
-        "effort": body.effort,
-        "status": "queued",
-        "budget": budget,
-    }
-    jobs.put(tenant, idem_key, job)
-    queue.enqueue({**job, "query": body.query})
-    logger.info("research tenant=%s job=%s effort=%s", tenant, job["job_id"], body.effort)
+        return JSONResponse(jobs.get_job(stored), status_code=202)  # a retry answers the first job
+    job = jobs.create_job(tenant, query, effort, EFFORT_BUDGETS[effort])
+    owner = jobs.remember_key(tenant, key, job["job_id"])
+    if owner != job["job_id"]:
+        return JSONResponse(jobs.get_job(owner), status_code=202)  # a concurrent retry won the key
+    jobs.enqueue(job["job_id"])
     return JSONResponse(job, status_code=202)
 
 
 @app.get("/v1/research/{job_id}")
-def research_status(job_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    tenant = require_tenant(tenant)
-    job = jobs.status(tenant, job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="no such job")
-    return JSONResponse(job, status_code=200)
+def research_status(job_id: str, request: Request) -> JSONResponse:
+    tenant = require_tenant(request)
+    job = jobs.get_job(job_id)
+    if job is None or job["tenant"] != tenant:
+        raise HTTPException(status_code=404, detail="no such job")  # another tenant's job does not exist here
+    return JSONResponse(job)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/research. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
-
-import {runResearch} from './lead_agent';
+import {createJob, enqueue, getJob, jobForKey, rememberKey} from 'research/jobs';
 
 export const app = Fastify();
 
-interface ResearchBody {
-  query: string;
+interface StartBody {
+  query?: string;
   effort?: string;
   max_subagents?: number;
   max_tool_calls?: number;
@@ -295,101 +272,69 @@ interface ResearchBody {
 }
 
 app.post('/v1/research', async (request, reply) => {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const body = request.body as ResearchBody;
-  const jobId = randomUUID();
-  const budget = {
-    max_subagents: body.max_subagents ?? 10,
-    max_tool_calls: body.max_tool_calls ?? 150,
-    token_budget: body.token_budget ?? 1_000_000,
-  };
-  request.log.info({tenant, jobId, effort: body.effort ?? 'fact'}, 'research');
-  const report = await runResearch(jobId, body.query, budget);
-  return reply.code(200).send({job_id: jobId, status: 'done', report});
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const tenant = String(request.headers['x-tenant-id'] ?? '');
+  const body = (request.body ?? {}) as StartBody;
+  const budget = {max_subagents: body.max_subagents ?? 1, max_tool_calls: body.max_tool_calls ?? 10, token_budget: body.token_budget ?? 50_000};
+  const job = await createJob(tenant, body.query ?? '', body.effort ?? 'fact', budget);
+  await enqueue(job.job_id);
+  return reply.code(202).send(job);
 });
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.get('/v1/research/:jobId', async (request, reply) => {
+  const {jobId} = request.params as {jobId: string};
+  const job = await getJob(jobId);
+  if (job === null) return reply.code(404).send({error: 'no such job'});
+  return job;
+});
 `,
-      solution: `/** POST /v1/research: authenticated, capped, budgeted by effort, idempotent, queued. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
-
-import {jobs, queue} from './jobs';
+import {type Budget, createJob, enqueue, getJob, jobForKey, rememberKey} from 'research/jobs';
 
 export const app = Fastify();
 
-const MAX_QUERY_BYTES = 1 << 13;
-const ALLOWED_EFFORTS: Record<string, true> = {fact: true, compare: true, deep: true};
-
-interface Budget {
-  max_subagents: number;
-  max_tool_calls: number;
-  token_budget: number;
-}
-
-const EFFORT_BUDGETS: Record<string, Budget> = {
+export const MAX_QUERY_BYTES = 8192;
+// The spend is the server's decision: a budget field in the body is ignored.
+export const EFFORT_BUDGETS: Record<string, Budget> = {
   fact: {max_subagents: 1, max_tool_calls: 10, token_budget: 50_000},
   compare: {max_subagents: 4, max_tool_calls: 60, token_budget: 250_000},
   deep: {max_subagents: 10, max_tool_calls: 150, token_budget: 1_000_000},
 };
 
-interface ResearchBody {
-  query: string;
+interface StartBody {
+  query?: unknown;
   effort?: string;
 }
 
-export interface Job {
-  job_id: string;
-  tenant: string;
-  effort: string;
-  status: string;
-  budget: Budget;
-}
-
-function tenantOf(headers: Record<string, unknown>): string | null {
-  const tenant = headers['x-tenant-id'];
-  return typeof tenant === 'string' && tenant !== '' ? tenant : null;
-}
-
 app.post('/v1/research', async (request, reply) => {
-  const tenant = tenantOf(request.headers);
-  if (tenant === null) return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<ResearchBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.query !== 'string' || body.query === '')
-    return reply.code(400).send({error: 'query must be a non-empty string'});
-  if (Buffer.byteLength(body.query, 'utf8') > MAX_QUERY_BYTES)
-    return reply.code(413).send({error: 'query exceeds 8 KiB'});
-  const effort = body.effort ?? 'fact';
-  if (ALLOWED_EFFORTS[effort] !== true)
-    return reply.code(400).send({error: 'effort must be fact, compare or deep'});
-
-  const stored: Job | null = await jobs.get(tenant, idemKey);
-  if (stored !== null) return reply.code(202).send(stored);
-
-  const budget = EFFORT_BUDGETS[effort];
-  const job: Job = {job_id: randomUUID(), tenant, effort, status: 'queued', budget};
-  await jobs.put(tenant, idemKey, job);
-  await queue.enqueue({...job, query: body.query});
-  request.log.info({tenant, jobId: job.job_id, effort}, 'research');
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const {query, effort = 'fact'} = (request.body ?? {}) as StartBody;
+  if (typeof query !== 'string' || query === '') return reply.code(400).send({error: 'query must be a non-empty string'});
+  if (new TextEncoder().encode(query).length > MAX_QUERY_BYTES) return reply.code(413).send({error: \`query exceeds \${MAX_QUERY_BYTES} bytes\`});
+  const budget = Object.hasOwn(EFFORT_BUDGETS, effort) ? EFFORT_BUDGETS[effort] : undefined;
+  if (budget === undefined) return reply.code(400).send({error: 'effort must be fact, compare or deep'});
+  const stored = await jobForKey(tenant, key);
+  if (stored !== null) return reply.code(202).send(await getJob(stored)); // a retry answers the first job
+  const job = await createJob(tenant, query, effort, budget);
+  const owner = await rememberKey(tenant, key, job.job_id);
+  if (owner !== job.job_id) return reply.code(202).send(await getJob(owner)); // a concurrent retry won the key
+  await enqueue(job.job_id);
   return reply.code(202).send(job);
 });
 
 app.get('/v1/research/:jobId', async (request, reply) => {
-  const tenant = tenantOf(request.headers);
-  if (tenant === null) return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {jobId} = request.params as {jobId: string};
-  const job: Job | null = await jobs.status(tenant, jobId);
-  if (job === null) return reply.code(404).send({error: 'no such job'});
-  return reply.code(200).send(job);
+  const job = await getJob(jobId);
+  // Another tenant's job does not exist here.
+  if (job === null || job.tenant !== tenant) return reply.code(404).send({error: 'no such job'});
+  return job;
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -397,13 +342,12 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 
-	"github.com/google/uuid"
+	"research/jobs" // jobs.CreateJob, GetJob, JobForKey, RememberKey, Enqueue
 )
 
-type ResearchRequest struct {
+type startBody struct {
 	Query        string \`json:"query"\`
 	Effort       string \`json:"effort"\`
 	MaxSubagents int    \`json:"max_subagents"\`
@@ -411,345 +355,250 @@ type ResearchRequest struct {
 	TokenBudget  int    \`json:"token_budget"\`
 }
 
-type Budget struct {
-	MaxSubagents int \`json:"max_subagents"\`
-	MaxToolCalls int \`json:"max_tool_calls"\`
-	TokenBudget  int \`json:"token_budget"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func research(rw http.ResponseWriter, r *http.Request) {
+func startResearch(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
-	var body ResearchRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	jobID := uuid.NewString()
-	budget := Budget{MaxSubagents: body.MaxSubagents, MaxToolCalls: body.MaxToolCalls, TokenBudget: body.TokenBudget}
-	log.Printf("research tenant=%s job=%s effort=%s", tenant, jobID, body.Effort)
-	report, err := runResearch(r.Context(), jobID, body.Query, budget)
-	if err != nil {
-		writeJSON(rw, http.StatusBadGateway, map[string]string{"error": "research failed"})
-		return
-	}
-	writeJSON(rw, http.StatusOK, map[string]any{"job_id": jobID, "status": "done", "report": report})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/research", research)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-      solution: `package main
-
-import (
-	"context"
-	"encoding/json"
-	"log"
-	"net/http"
-
-	"github.com/google/uuid"
-)
-
-const maxQueryBytes = 1 << 13
-
-var allowedEfforts = map[string]bool{"fact": true, "compare": true, "deep": true}
-
-type Budget struct {
-	MaxSubagents int \`json:"max_subagents"\`
-	MaxToolCalls int \`json:"max_tool_calls"\`
-	TokenBudget  int \`json:"token_budget"\`
-}
-
-var effortBudgets = map[string]Budget{
-	"fact":    {MaxSubagents: 1, MaxToolCalls: 10, TokenBudget: 50000},
-	"compare": {MaxSubagents: 4, MaxToolCalls: 60, TokenBudget: 250000},
-	"deep":    {MaxSubagents: 10, MaxToolCalls: 150, TokenBudget: 1000000},
-}
-
-type ResearchRequest struct {
-	Query  string \`json:"query"\`
-	Effort string \`json:"effort"\`
-}
-
-type Job struct {
-	JobID  string \`json:"job_id"\`
-	Tenant string \`json:"tenant"\`
-	Effort string \`json:"effort"\`
-	Status string \`json:"status"\`
-	Budget Budget \`json:"budget"\`
-	Query  string \`json:"-"\`
-}
-
-type JobStore struct{}
-
-func (s *JobStore) Get(ctx context.Context, tenant, idemKey string) (*Job, error) {
-	return nil, nil
-}
-
-func (s *JobStore) Put(ctx context.Context, tenant, idemKey string, job *Job) error {
-	return nil
-}
-
-func (s *JobStore) Status(ctx context.Context, tenant, jobID string) (*Job, error) {
-	return nil, nil
-}
-
-type JobQueue struct{}
-
-func (q *JobQueue) Enqueue(ctx context.Context, job *Job) error {
-	return nil
-}
-
-var (
-	jobs  = &JobStore{}
-	queue = &JobQueue{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func requireTenant(rw http.ResponseWriter, r *http.Request) (string, bool) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
-		return "", false
-	}
-	return tenant, true
-}
-
-func research(rw http.ResponseWriter, r *http.Request) {
-	tenant, ok := requireTenant(rw, r)
-	if !ok {
-		return
-	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
-		return
-	}
-	var body ResearchRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	if body.Query == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "query must be a non-empty string"})
-		return
-	}
-	if len([]byte(body.Query)) > maxQueryBytes {
-		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "query exceeds 8 KiB"})
-		return
-	}
-	effort := body.Effort
-	if effort == "" {
-		effort = "fact"
-	}
-	if !allowedEfforts[effort] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "effort must be fact, compare or deep"})
-		return
-	}
-	stored, err := jobs.Get(r.Context(), tenant, idemKey)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if stored != nil {
-		writeJSON(rw, http.StatusAccepted, stored)
-		return
-	}
-	job := &Job{
-		JobID:  uuid.NewString(),
-		Tenant: tenant,
-		Effort: effort,
-		Status: "queued",
-		Budget: effortBudgets[effort],
-		Query:  body.Query,
-	}
-	if err := jobs.Put(r.Context(), tenant, idemKey, job); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if err := queue.Enqueue(r.Context(), job); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("research tenant=%s job=%s effort=%s", tenant, job.JobID, effort)
+	body := startBody{Effort: "fact", MaxSubagents: 1, MaxToolCalls: 10, TokenBudget: 50000}
+	json.NewDecoder(r.Body).Decode(&body)
+	budget := jobs.Budget{MaxSubagents: body.MaxSubagents, MaxToolCalls: body.MaxToolCalls, TokenBudget: body.TokenBudget}
+	job := jobs.CreateJob(r.Context(), tenant, body.Query, body.Effort, budget)
+	jobs.Enqueue(r.Context(), job.JobID)
 	writeJSON(rw, http.StatusAccepted, job)
 }
 
 func researchStatus(rw http.ResponseWriter, r *http.Request) {
-	tenant, ok := requireTenant(rw, r)
-	if !ok {
-		return
-	}
-	job, err := jobs.Status(r.Context(), tenant, r.PathValue("jobID"))
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
+	job := jobs.GetJob(r.Context(), r.PathValue("id"))
 	if job == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "no such job"})
+		http.Error(rw, "no such job", http.StatusNotFound)
 		return
 	}
 	writeJSON(rw, http.StatusOK, job)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/research", research)
-	mux.HandleFunc("GET /v1/research/{jobID}", researchStatus)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/research", startResearch)
+	mux.HandleFunc("GET /v1/research/{id}", researchStatus)
+}
+`,
+      solution: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"research/jobs" // jobs.CreateJob, GetJob, JobForKey, RememberKey, Enqueue
+)
+
+const maxQueryBytes = 8192
+
+// The spend is the server's decision: a budget field in the body is ignored.
+var effortBudgets = map[string]jobs.Budget{
+	"fact":    {MaxSubagents: 1, MaxToolCalls: 10, TokenBudget: 50000},
+	"compare": {MaxSubagents: 4, MaxToolCalls: 60, TokenBudget: 250000},
+	"deep":    {MaxSubagents: 10, MaxToolCalls: 150, TokenBudget: 1000000},
+}
+
+type startBody struct {
+	Query  string \`json:"query"\`
+	Effort string \`json:"effort"\`
+}
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func startResearch(rw http.ResponseWriter, r *http.Request) {
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
+		return
+	}
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		http.Error(rw, "Idempotency-Key is required", http.StatusBadRequest)
+		return
+	}
+	body := startBody{Effort: "fact"}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Query == "" {
+		http.Error(rw, "query must be a non-empty string", http.StatusBadRequest)
+		return
+	}
+	if len(body.Query) > maxQueryBytes {
+		http.Error(rw, fmt.Sprintf("query exceeds %d bytes", maxQueryBytes), http.StatusRequestEntityTooLarge)
+		return
+	}
+	budget, known := effortBudgets[body.Effort]
+	if !known {
+		http.Error(rw, "effort must be fact, compare or deep", http.StatusBadRequest)
+		return
+	}
+	if stored := jobs.JobForKey(r.Context(), tenant, key); stored != "" {
+		writeJSON(rw, http.StatusAccepted, jobs.GetJob(r.Context(), stored)) // a retry answers the first job
+		return
+	}
+	job := jobs.CreateJob(r.Context(), tenant, body.Query, body.Effort, budget)
+	if owner := jobs.RememberKey(r.Context(), tenant, key, job.JobID); owner != job.JobID {
+		writeJSON(rw, http.StatusAccepted, jobs.GetJob(r.Context(), owner)) // a concurrent retry won the key
+		return
+	}
+	jobs.Enqueue(r.Context(), job.JobID)
+	writeJSON(rw, http.StatusAccepted, job)
+}
+
+func researchStatus(rw http.ResponseWriter, r *http.Request) {
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
+		return
+	}
+	job := jobs.GetJob(r.Context(), r.PathValue("id"))
+	if job == nil || job.Tenant != tenant {
+		http.Error(rw, "no such job", http.StatusNotFound) // another tenant's job does not exist here
+		return
+	}
+	writeJSON(rw, http.StatusOK, job)
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/research", startResearch)
+	mux.HandleFunc("GET /v1/research/{id}", researchStatus)
 }
 `,
     },
     scala: {
-      starter: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class ResearchRequest(
-    query: String,
-    effort: String,
-    max_subagents: Int,
-    max_tool_calls: Int,
-    token_budget: Int
-)
-final case class Budget(max_subagents: Int, max_tool_calls: Int, token_budget: Int)
+import research.Jobs // Jobs.createJob, getJob, jobForKey, rememberKey, enqueue
 
-object ResearchApi {
-  implicit val system: ActorSystem = ActorSystem("researchd")
-  implicit val requestFormat: RootJsonFormat[ResearchRequest] = jsonFormat5(ResearchRequest)
-  implicit val budgetFormat: RootJsonFormat[Budget] = jsonFormat3(Budget)
+object Api {
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
+  private def jobJson(job: Jobs.Job): JsObject = JsObject(
+    "job_id" -> JsString(job.jobId), "tenant" -> JsString(job.tenant), "effort" -> JsString(job.effort), "status" -> JsString(job.status),
+    "budget" -> JsObject("max_subagents" -> JsNumber(job.budget.maxSubagents), "max_tool_calls" -> JsNumber(job.budget.maxToolCalls),
+      "token_budget" -> JsNumber(job.budget.tokenBudget)),
+    "version" -> JsString(job.version))
+
+  private def text(body: Map[String, JsValue], name: String, default: String): String =
+    body.get(name).collect { case JsString(s) => s }.getOrElse(default)
+
+  private def number(body: Map[String, JsValue], name: String, default: Long): Long =
+    body.get(name).collect { case JsNumber(n) => n.toLong }.getOrElse(default)
+
+  val route: Route = concat(
     path("v1" / "research") {
       post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          entity(as[ResearchRequest]) { body =>
-            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-            val jobId = UUID.randomUUID().toString
-            val budget = Budget(body.max_subagents, body.max_tool_calls, body.token_budget)
-            system.log.info(s"research tenant=$tenant job=$jobId effort=\${body.effort}")
-            val report = LeadAgent.runResearch(jobId, body.query, budget)
-            complete(StatusCodes.OK, s"""{"job_id":"$jobId","status":"done","report":"$report"}""")
+        optionalHeaderValueByName("X-Tenant-Id") { tenant =>
+          entity(as[String]) { raw =>
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+            val body = raw.parseJson.asJsObject.fields
+            val budget = Jobs.Budget(number(body, "max_subagents", 1).toInt, number(body, "max_tool_calls", 10).toInt, number(body, "token_budget", 50000))
+            val job = Jobs.createJob(tenant.getOrElse(""), text(body, "query", ""), text(body, "effort", "fact"), budget)
+            Jobs.enqueue(job.jobId)
+            complete(json(StatusCodes.Accepted, jobJson(job)))
           }
         }
       }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
+    },
+    path("v1" / "research" / Segment) { jobId =>
+      get {
+        Jobs.getJob(jobId) match {
+          case None => complete(StatusCodes.NotFound -> "no such job")
+          case Some(job) => complete(json(StatusCodes.OK, jobJson(job)))
+        }
+      }
+    },
+  )
 }
 `,
       solution: `import java.nio.charset.StandardCharsets
-import java.util.UUID
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class ResearchRequest(query: String, effort: Option[String])
-final case class Budget(max_subagents: Int, max_tool_calls: Int, token_budget: Int)
-final case class Job(job_id: String, tenant: String, effort: String, status: String, budget: Budget)
+import research.Jobs // Jobs.createJob, getJob, jobForKey, rememberKey, enqueue
 
-object ResearchApi {
-  implicit val system: ActorSystem = ActorSystem("researchd")
-  implicit val requestFormat: RootJsonFormat[ResearchRequest] = jsonFormat2(ResearchRequest)
-  implicit val budgetFormat: RootJsonFormat[Budget] = jsonFormat3(Budget)
-  implicit val jobFormat: RootJsonFormat[Job] = jsonFormat5(Job)
+object Api {
+  val MaxQueryBytes = 8192
+  // The spend is the server's decision: a budget field in the body is ignored.
+  val EffortBudgets: Map[String, Jobs.Budget] = Map(
+    "fact" -> Jobs.Budget(1, 10, 50000L), "compare" -> Jobs.Budget(4, 60, 250000L), "deep" -> Jobs.Budget(10, 150, 1000000L))
 
-  val MaxQueryBytes = 1 << 13
-  val AllowedEfforts = Set("fact", "compare", "deep")
-  val EffortBudgets = Map(
-    "fact" -> Budget(1, 10, 50000),
-    "compare" -> Budget(4, 60, 250000),
-    "deep" -> Budget(10, 150, 1000000)
-  )
+  private def json(status: StatusCode, body: JsValue): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val jobs = JobStore.open()
-  val queue = JobQueue.open()
+  private def jobJson(job: Jobs.Job): JsObject = JsObject(
+    "job_id" -> JsString(job.jobId), "tenant" -> JsString(job.tenant), "effort" -> JsString(job.effort), "status" -> JsString(job.status),
+    "budget" -> JsObject("max_subagents" -> JsNumber(job.budget.maxSubagents), "max_tool_calls" -> JsNumber(job.budget.maxToolCalls),
+      "token_budget" -> JsNumber(job.budget.tokenBudget)),
+    "version" -> JsString(job.version))
 
-  val route: Route =
-    concat(
-      path("v1" / "research") {
-        post {
-          optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-            optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-              entity(as[ResearchRequest]) { body =>
-                val effort = body.effort.getOrElse("fact")
-                if (!tenantOpt.exists(_.nonEmpty)) {
-                  complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-                } else if (!idemOpt.exists(_.nonEmpty)) {
-                  complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-                } else if (body.query.isEmpty) {
-                  complete(StatusCodes.BadRequest, """{"error":"query must be a non-empty string"}""")
-                } else if (body.query.getBytes(StandardCharsets.UTF_8).length > MaxQueryBytes) {
-                  complete(StatusCodes.RequestEntityTooLarge, """{"error":"query exceeds 8 KiB"}""")
-                } else if (!AllowedEfforts.contains(effort)) {
-                  complete(StatusCodes.BadRequest, """{"error":"effort must be fact, compare or deep"}""")
-                } else {
-                  val tenant = tenantOpt.get
-                  val idemKey = idemOpt.get
-                  jobs.get(tenant, idemKey) match {
-                    case Some(stored) =>
-                      complete(StatusCodes.Accepted, stored)
-                    case None =>
-                      val job = Job(UUID.randomUUID().toString, tenant, effort, "queued", EffortBudgets(effort))
-                      jobs.put(tenant, idemKey, job)
-                      queue.enqueue(job, body.query)
-                      system.log.info(s"research tenant=$tenant job=\${job.job_id} effort=$effort")
-                      complete(StatusCodes.Accepted, job)
-                  }
-                }
-              }
+  private def text(body: Map[String, JsValue], name: String, default: String): String =
+    body.get(name).collect { case JsString(s) => s }.getOrElse(default)
+
+  private def start(tenant: String, key: String, query: String, effort: String): Route =
+    if (query.isEmpty) complete(StatusCodes.BadRequest -> "query must be a non-empty string")
+    else if (query.getBytes(StandardCharsets.UTF_8).length > MaxQueryBytes) complete(StatusCodes.PayloadTooLarge -> s"query exceeds $MaxQueryBytes bytes")
+    else EffortBudgets.get(effort) match {
+      case None => complete(StatusCodes.BadRequest -> "effort must be fact, compare or deep")
+      case Some(budget) =>
+        Jobs.jobForKey(tenant, key).flatMap(Jobs.getJob) match {
+          case Some(stored) => complete(json(StatusCodes.Accepted, jobJson(stored))) // a retry answers the first job
+          case None =>
+            val job = Jobs.createJob(tenant, query, effort, budget)
+            val owner = Jobs.rememberKey(tenant, key, job.jobId)
+            if (owner != job.jobId) complete(json(StatusCodes.Accepted, jobJson(Jobs.getJob(owner).getOrElse(job)))) // a concurrent retry won the key
+            else {
+              Jobs.enqueue(job.jobId)
+              complete(json(StatusCodes.Accepted, jobJson(job)))
             }
-          }
         }
-      },
-      path("v1" / "research" / Segment) { jobId =>
-        get {
-          optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else {
-              jobs.status(tenantOpt.get, jobId) match {
-                case Some(job) => complete(StatusCodes.OK, job)
-                case None => complete(StatusCodes.NotFound, """{"error":"no such job"}""")
-              }
+    }
+
+  val route: Route = concat(
+    path("v1" / "research") {
+      post {
+        (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("Idempotency-Key")) { (tenant, key) =>
+          entity(as[String]) { raw =>
+            val body = raw.parseJson.asJsObject.fields
+            (tenant.filter(_.nonEmpty), key.filter(_.nonEmpty)) match {
+              case (None, _) => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+              case (_, None) => complete(StatusCodes.BadRequest -> "Idempotency-Key is required")
+              case (Some(t), Some(k)) => start(t, k, text(body, "query", ""), text(body, "effort", "fact"))
             }
           }
         }
       }
-    )
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
+    },
+    path("v1" / "research" / Segment) { jobId =>
+      get {
+        optionalHeaderValueByName("X-Tenant-Id") {
+          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+          case Some(tenant) =>
+            Jobs.getJob(jobId) match {
+              // Another tenant's job does not exist here.
+              case Some(job) if job.tenant == tenant => complete(json(StatusCodes.OK, jobJson(job)))
+              case _ => complete(StatusCodes.NotFound -> "no such job")
+            }
+        }
+      }
+    },
+  )
 }
 `,
     },
@@ -757,165 +606,510 @@ object ResearchApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <string>
 
-#include "lead_agent.h"
+#include "research/jobs.h"  // jobs::createJob, getJob, jobForKey, rememberKey, enqueue
 
 using json = nlohmann::json;
 
-std::string uuidString();
+void start_research(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const json body = json::parse(req.body);
+  const jobs::Budget budget{body.value("max_subagents", 1L), body.value("max_tool_calls", 10L), body.value("token_budget", 50000L)};
+  const jobs::Job job = jobs::createJob(tenant, body.value("query", ""), body.value("effort", "fact"), budget);
+  jobs::enqueue(job.job_id);
+  res.status = 202;
+  res.set_content(json(job).dump(), "application/json");
+}
 
-int main() {
-  httplib::Server svr;
+void research_status(const httplib::Request& req, httplib::Response& res) {
+  const auto job = jobs::getJob(req.matches[1]);
+  if (!job) {
+    res.status = 404;
+    res.set_content("no such job", "text/plain");
+    return;
+  }
+  res.set_content(json(*job).dump(), "application/json");
+}
 
-  svr.Post("/v1/research", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    const auto jobId = uuidString();
-    const auto effort = body.value("effort", std::string("fact"));
-    const json budget = {
-        {"max_subagents", body.value("max_subagents", 10)},
-        {"max_tool_calls", body.value("max_tool_calls", 150)},
-        {"token_budget", body.value("token_budget", 1000000)},
-    };
-    std::cerr << "research tenant=" << tenant << " job=" << jobId << " effort=" << effort << "\\n";
-    const auto report = runResearch(jobId, body.value("query", std::string()), budget);
-    res.status = 200;
-    res.set_content(json{{"job_id", jobId}, {"status", "done"}, {"report", report}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/research", start_research);
+  svr.Get(R"(/v1/research/([\\w-]+))", research_status);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <map>
-#include <optional>
-#include <set>
 #include <string>
+
+#include "research/jobs.h"  // jobs::createJob, getJob, jobForKey, rememberKey, enqueue
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxQueryBytes = 1 << 13;
-const std::set<std::string> kAllowedEfforts = {"fact", "compare", "deep"};
-const std::map<std::string, json> kEffortBudgets = {
-    {"fact", {{"max_subagents", 1}, {"max_tool_calls", 10}, {"token_budget", 50000}}},
-    {"compare", {{"max_subagents", 4}, {"max_tool_calls", 60}, {"token_budget", 250000}}},
-    {"deep", {{"max_subagents", 10}, {"max_tool_calls", 150}, {"token_budget", 1000000}}},
-};
+constexpr size_t kMaxQueryBytes = 8192;
+// The spend is the server's decision: a budget field in the body is ignored.
+const std::map<std::string, jobs::Budget> kEffortBudgets = {
+    {"fact", {1, 10, 50000}}, {"compare", {4, 60, 250000}}, {"deep", {10, 150, 1000000}}};
 
-struct JobStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& job);
-  std::optional<json> status(const std::string& tenant, const std::string& jobId);
-};
-
-struct JobQueue {
-  void enqueue(const json& job);
-};
-
-JobStore jobs;
-JobQueue queue;
-std::string uuidString();
-
-bool requireTenant(const httplib::Request& req, httplib::Response& res, std::string& tenant) {
-  tenant = req.get_header_value("X-Tenant-Id");
-  if (tenant.empty()) {
-    res.status = 401;
-    res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-    return false;
-  }
-  return true;
+void refuse(httplib::Response& res, int status, const std::string& reason) {
+  res.status = status;
+  res.set_content(reason, "text/plain");
 }
 
-int main() {
-  httplib::Server svr;
+void answer(httplib::Response& res, int status, const jobs::Job& job) {
+  res.status = status;
+  res.set_content(json(job).dump(), "application/json");
+}
 
-  svr.Post("/v1/research", [](const httplib::Request& req, httplib::Response& res) {
-    std::string tenant;
-    if (!requireTenant(req, res, tenant)) return;
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("query") || !body["query"].is_string()) {
-      res.status = 400;
-      res.set_content(R"({"error":"query must be a non-empty string"})", "application/json");
-      return;
-    }
-    const auto query = body["query"].get<std::string>();
-    if (query.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"query must be a non-empty string"})", "application/json");
-      return;
-    }
-    if (query.size() > kMaxQueryBytes) {
-      res.status = 413;
-      res.set_content(R"({"error":"query exceeds 8 KiB"})", "application/json");
-      return;
-    }
-    const auto effort = body.value("effort", std::string("fact"));
-    if (kAllowedEfforts.count(effort) == 0) {
-      res.status = 400;
-      res.set_content(R"({"error":"effort must be fact, compare or deep"})", "application/json");
-      return;
-    }
-    const auto stored = jobs.get(tenant, idemKey);
-    if (stored) {
-      res.status = 202;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    const json job = {
-        {"job_id", uuidString()},
-        {"tenant", tenant},
-        {"effort", effort},
-        {"status", "queued"},
-        {"budget", kEffortBudgets.at(effort)},
-    };
-    jobs.put(tenant, idemKey, job);
-    json queued = job;
-    queued["query"] = query;
-    queue.enqueue(queued);
-    std::cerr << "research tenant=" << tenant << " job=" << job["job_id"] << " effort=" << effort << "\\n";
-    res.status = 202;
-    res.set_content(job.dump(), "application/json");
-  });
+void start_research(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return refuse(res, 401, "X-Tenant-Id is required");
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return refuse(res, 400, "Idempotency-Key is required");
+  const json body = json::parse(req.body, nullptr, false);
+  const std::string query = body.is_object() && body.contains("query") && body["query"].is_string() ? body["query"].get<std::string>() : "";
+  const std::string effort = body.is_object() ? body.value("effort", "fact") : "fact";
+  if (query.empty()) return refuse(res, 400, "query must be a non-empty string");
+  if (query.size() > kMaxQueryBytes) return refuse(res, 413, "query exceeds 8192 bytes");
+  const auto budget = kEffortBudgets.find(effort);
+  if (budget == kEffortBudgets.end()) return refuse(res, 400, "effort must be fact, compare or deep");
+  if (const auto stored = jobs::jobForKey(tenant, key)) return answer(res, 202, *jobs::getJob(*stored));  // a retry answers the first job
+  const jobs::Job job = jobs::createJob(tenant, query, effort, budget->second);
+  const std::string owner = jobs::rememberKey(tenant, key, job.job_id);
+  if (owner != job.job_id) return answer(res, 202, *jobs::getJob(owner));  // a concurrent retry won the key
+  jobs::enqueue(job.job_id);
+  answer(res, 202, job);
+}
 
-  svr.Get(R"(/v1/research/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    std::string tenant;
-    if (!requireTenant(req, res, tenant)) return;
-    const auto job = jobs.status(tenant, req.matches[1]);
-    if (!job) {
-      res.status = 404;
-      res.set_content(R"({"error":"no such job"})", "application/json");
-      return;
-    }
-    res.status = 200;
-    res.set_content(job->dump(), "application/json");
-  });
+void research_status(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return refuse(res, 401, "X-Tenant-Id is required");
+  const auto job = jobs::getJob(req.matches[1]);
+  if (!job || job->tenant != tenant) return refuse(res, 404, "no such job");  // another tenant's job does not exist here
+  answer(res, 200, *job);
+}
 
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/research", start_research);
+  svr.Get(R"(/v1/research/([\\w-]+))", research_status);
 }
 `,
     },
   },
+  harness: {
+    python: `from research import jobs
+
+FACT = {"max_subagents": 1, "max_tool_calls": 10, "token_budget": 50000}
+COMPARE = {"max_subagents": 4, "max_tool_calls": 60, "token_budget": 250000}
+DEEP = {"max_subagents": 10, "max_tool_calls": 150, "token_budget": 1000000}
+QUERY = "Compare the board composition of the five largest European banks"
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+async def _start(c, tenant="acme", key="k-1", **body):
+    headers = {}
+    if tenant is not None:
+        headers["X-Tenant-Id"] = tenant
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return await c.post("/v1/research", json={"query": QUERY, "effort": "compare", **body}, headers=headers)
+
+
+def _queue(ctx):
+    return ctx.redis.lrange("research:queue", 0, -1)
+
+
+async def check_routes(ctx):
+    async with _api(ctx) as c:
+        r = await _start(c)
+        assert r.status_code == 202, f"POST /v1/research answered {r.status_code}: {r.text}"
+        job = r.json()
+        assert job.get("status") == "queued" and job.get("job_id"), f"the 202 must carry the queued job, got {job}"
+        assert _queue(ctx) == [job["job_id"]], f"research:queue holds {_queue(ctx)}: the job must be enqueued for the lead agent workers"
+        s = await c.get(f"/v1/research/{job['job_id']}", headers={"X-Tenant-Id": "acme"})
+    assert s.status_code == 200, f"GET /v1/research/{job['job_id']} answered {s.status_code}: {s.text}"
+    assert s.json().get("job_id") == job["job_id"], f"the status route answered {s.json()}"
+
+
+async def check_validate(ctx):
+    async with _api(ctx) as c:
+        r = await _start(c, tenant=None)
+        assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}, expected 401"
+        r = await _start(c, key="k-2", effort="exhaustive")
+        assert r.status_code == 400, f"an effort outside fact, compare and deep answered {r.status_code}, expected 400"
+        r = await _start(c, key="k-3", query="é" * 4097)
+        assert r.status_code == 413, f"a query of 8194 bytes (4097 characters of UTF-8) answered {r.status_code}, expected 413: the cap counts bytes"
+        r = await _start(c, key="k-4", query="")
+        assert r.status_code == 400, f"an empty query answered {r.status_code}, expected 400"
+        assert _queue(ctx) == [], f"refused requests enqueued {_queue(ctx)}"
+        r = await _start(c, key="k-5", query="q" * 8192)
+    assert r.status_code == 202, f"a query of exactly 8192 bytes answered {r.status_code}: {r.text}"
+    assert len(_queue(ctx)) == 1, f"research:queue holds {_queue(ctx)}, expected the one valid job"
+
+
+async def check_budget_table(ctx):
+    async with _api(ctx) as c:
+        r = await _start(c, key="k-1", effort="fact", max_subagents=50, max_tool_calls=100000, token_budget=10**9)
+        assert r.status_code == 202, f"POST /v1/research answered {r.status_code}: {r.text}"
+        job = r.json()
+        assert job.get("budget") == FACT, f"a fact job asking for 100000 tool calls got the budget {job.get('budget')}: the budget comes from EFFORT_BUDGETS, not the body"
+        stored = jobs.get_job(job["job_id"])
+        assert stored["budget"] == FACT, f"the stored job's budget is {stored['budget']}, expected {FACT}"
+        deep = (await _start(c, key="k-2", effort="deep")).json()
+        assert deep.get("budget") == DEEP, f"a deep job got {deep.get('budget')}, expected {DEEP}"
+        compare = (await _start(c, key="k-3")).json()
+        assert compare.get("budget") == COMPARE, f"a compare job got {compare.get('budget')}, expected {COMPARE}"
+        r = await c.post("/v1/research", json={"query": QUERY}, headers={"X-Tenant-Id": "acme", "Idempotency-Key": "k-4"})
+    assert r.status_code == 202 and r.json().get("budget") == FACT, f"a request without an effort must get the fact budget, got {r.status_code} {r.text}"
+
+
+async def check_idempotency_key(ctx):
+    async with _api(ctx) as c:
+        first = await _start(c, key="k-1")
+        assert first.status_code == 202, f"the first start answered {first.status_code}: {first.text}"
+        replay = await _start(c, key="k-1")
+        assert replay.status_code == 202 and replay.json().get("job_id") == first.json()["job_id"], f"a retry with the same Idempotency-Key started {replay.json().get('job_id')}, expected the first job {first.json()['job_id']}"
+        assert _queue(ctx) == [first.json()["job_id"]], f"research:queue holds {_queue(ctx)}: a retry must not enqueue a second job"
+        other = await _start(c, tenant="beta", key="k-1")
+        assert other.status_code == 202 and other.json().get("job_id") != first.json()["job_id"], "the same key from another tenant is another request: it must start its own job"
+        none = await _start(c, key=None)
+    assert none.status_code == 400, f"a start without Idempotency-Key answered {none.status_code}, expected 400"
+    assert len(_queue(ctx)) == 2, f"research:queue holds {_queue(ctx)}, expected acme's job and beta's"
+
+
+async def check_tenant_scope(ctx):
+    async with _api(ctx) as c:
+        job = (await _start(c)).json()
+        path = f"/v1/research/{job['job_id']}"
+        other = await c.get(path, headers={"X-Tenant-Id": "beta"})
+        assert other.status_code == 404, f"tenant beta read acme's job: {other.status_code} {other.text}. Another tenant's job is 404"
+        anonymous = await c.get(path)
+        assert anonymous.status_code == 401, f"a status request without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+        own = await c.get(path, headers={"X-Tenant-Id": "acme"})
+        assert own.status_code == 200 and own.json().get("job_id") == job["job_id"], f"acme must read its own job, got {own.status_code} {own.text}"
+        missing = await c.get("/v1/research/job-999", headers={"X-Tenant-Id": "acme"})
+    assert missing.status_code == 404, f"an unknown job answered {missing.status_code}, expected 404"
+`,
+    typescript: `const FACT = {max_subagents: 1, max_tool_calls: 10, token_budget: 50000};
+const COMPARE = {max_subagents: 4, max_tool_calls: 60, token_budget: 250000};
+const DEEP = {max_subagents: 10, max_tool_calls: 150, token_budget: 1000000};
+const QUERY = 'Compare the board composition of the five largest European banks';
+
+function api(ctx) {
+  return {c: ctx.client(ctx.load('api').app), jobs: ctx.load('/support/research/jobs.ts')};
+}
+
+function start(c, {tenant = 'acme' as string | null, key = 'k-1' as string | null, ...body} = {}) {
+  const headers: Record<string, string> = {};
+  if (tenant !== null) headers['X-Tenant-Id'] = tenant;
+  if (key !== null) headers['Idempotency-Key'] = key;
+  return c.post('/v1/research', {json: {query: QUERY, effort: 'compare', ...body}, headers});
+}
+
+const queue = (ctx): string[] => ctx.redis.lrange('research:queue', 0, -1);
+
+export async function check_routes(ctx) {
+  const {c} = api(ctx);
+  const r = await start(c);
+  assert.equal(r.status, 202, \`POST /v1/research answered \${r.status}: \${r.text}\`);
+  const job = r.json();
+  assert(job.status === 'queued' && job.job_id, \`the 202 must carry the queued job, got \${r.text}\`);
+  assert.deepStrictEqual(queue(ctx), [job.job_id], \`research:queue holds \${JSON.stringify(queue(ctx))}: the job must be enqueued for the lead agent workers\`);
+  const s = await c.get(\`/v1/research/\${job.job_id}\`, {headers: {'X-Tenant-Id': 'acme'}});
+  assert.equal(s.status, 200, \`GET /v1/research/\${job.job_id} answered \${s.status}: \${s.text}\`);
+  assert.equal(s.json().job_id, job.job_id, \`the status route answered \${s.text}\`);
+}
+
+export async function check_validate(ctx) {
+  const {c} = api(ctx);
+  let r = await start(c, {tenant: null});
+  assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}, expected 401\`);
+  r = await start(c, {key: 'k-2', effort: 'exhaustive'});
+  assert.equal(r.status, 400, \`an effort outside fact, compare and deep answered \${r.status}, expected 400\`);
+  r = await start(c, {key: 'k-3', query: 'é'.repeat(4097)});
+  assert.equal(r.status, 413, \`a query of 8194 bytes (4097 characters of UTF-8) answered \${r.status}, expected 413: the cap counts bytes\`);
+  r = await start(c, {key: 'k-4', query: ''});
+  assert.equal(r.status, 400, \`an empty query answered \${r.status}, expected 400\`);
+  assert.deepStrictEqual(queue(ctx), [], \`refused requests enqueued \${JSON.stringify(queue(ctx))}\`);
+  r = await start(c, {key: 'k-5', query: 'q'.repeat(8192)});
+  assert.equal(r.status, 202, \`a query of exactly 8192 bytes answered \${r.status}: \${r.text}\`);
+  assert.equal(queue(ctx).length, 1, \`research:queue holds \${JSON.stringify(queue(ctx))}, expected the one valid job\`);
+}
+
+export async function check_budget_table(ctx) {
+  const {c, jobs} = api(ctx);
+  let r = await start(c, {key: 'k-1', effort: 'fact', max_subagents: 50, max_tool_calls: 100000, token_budget: 1e9});
+  assert.equal(r.status, 202, \`POST /v1/research answered \${r.status}: \${r.text}\`);
+  const job = r.json();
+  assert.deepStrictEqual(job.budget, FACT, \`a fact job asking for 100000 tool calls got the budget \${JSON.stringify(job.budget)}: the budget comes from EFFORT_BUDGETS, not the body\`);
+  assert.deepStrictEqual((await jobs.getJob(job.job_id)).budget, FACT, 'the stored job must carry the fact budget');
+  assert.deepStrictEqual((await start(c, {key: 'k-2', effort: 'deep'})).json().budget, DEEP, 'a deep job must get the deep budget');
+  assert.deepStrictEqual((await start(c, {key: 'k-3'})).json().budget, COMPARE, 'a compare job must get the compare budget');
+  r = await c.post('/v1/research', {json: {query: QUERY}, headers: {'X-Tenant-Id': 'acme', 'Idempotency-Key': 'k-4'}});
+  assert(r.status === 202 && JSON.stringify(r.json().budget) === JSON.stringify(FACT), \`a request without an effort must get the fact budget, got \${r.status} \${r.text}\`);
+}
+
+export async function check_idempotency_key(ctx) {
+  const {c} = api(ctx);
+  const first = await start(c, {key: 'k-1'});
+  assert.equal(first.status, 202, \`the first start answered \${first.status}: \${first.text}\`);
+  const replay = await start(c, {key: 'k-1'});
+  assert(replay.status === 202 && replay.json().job_id === first.json().job_id, \`a retry with the same Idempotency-Key started \${replay.json().job_id}, expected the first job \${first.json().job_id}\`);
+  assert.deepStrictEqual(queue(ctx), [first.json().job_id], \`research:queue holds \${JSON.stringify(queue(ctx))}: a retry must not enqueue a second job\`);
+  const other = await start(c, {tenant: 'beta', key: 'k-1'});
+  assert(other.status === 202 && other.json().job_id !== first.json().job_id, 'the same key from another tenant is another request: it must start its own job');
+  const none = await start(c, {key: null});
+  assert.equal(none.status, 400, \`a start without Idempotency-Key answered \${none.status}, expected 400\`);
+  assert.equal(queue(ctx).length, 2, \`research:queue holds \${JSON.stringify(queue(ctx))}, expected acme's job and beta's\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {c} = api(ctx);
+  const job = (await start(c)).json();
+  const path = \`/v1/research/\${job.job_id}\`;
+  const other = await c.get(path, {headers: {'X-Tenant-Id': 'beta'}});
+  assert.equal(other.status, 404, \`tenant beta read acme's job: \${other.status} \${other.text}. Another tenant's job is 404\`);
+  const anonymous = await c.get(path);
+  assert.equal(anonymous.status, 401, \`a status request without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  const own = await c.get(path, {headers: {'X-Tenant-Id': 'acme'}});
+  assert(own.status === 200 && own.json().job_id === job.job_id, \`acme must read its own job, got \${own.status} \${own.text}\`);
+  const missing = await c.get('/v1/research/job-999', {headers: {'X-Tenant-Id': 'acme'}});
+  assert.equal(missing.status, 404, \`an unknown job answered \${missing.status}, expected 404\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"research/jobs"
+
+	"leetbuild/harness"
+)
+
+const apiQuery = "Compare the board composition of the five largest European banks"
+
+var (
+	factBudget    = jobs.Budget{MaxSubagents: 1, MaxToolCalls: 10, TokenBudget: 50000}
+	compareBudget = jobs.Budget{MaxSubagents: 4, MaxToolCalls: 60, TokenBudget: 250000}
+	deepBudget    = jobs.Budget{MaxSubagents: 10, MaxToolCalls: 150, TokenBudget: 1000000}
+)
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+// start posts a research request; tenant or key "" leaves that header out.
+func start(c *harness.HTTP, tenant, key string, body map[string]any) *harness.Response {
+	payload := map[string]any{"query": apiQuery, "effort": "compare"}
+	for k, v := range body {
+		payload[k] = v
+	}
+	var headers []string
+	if tenant != "" {
+		headers = append(headers, "X-Tenant-Id", tenant)
+	}
+	if key != "" {
+		headers = append(headers, "Idempotency-Key", key)
+	}
+	return c.Post("/v1/research", payload, headers...)
+}
+
+func jobOf(r *harness.Response) jobs.Job {
+	var job jobs.Job
+	r.Decode(&job)
+	return job
+}
+
+func queue(ctx *harness.Ctx) []string { return ctx.Redis.LRange("research:queue", 0, -1) }
+
+func CheckRoutes(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := start(c, "acme", "k-1", nil)
+	ctx.Equal(r.Status, 202, "POST /v1/research (%s)", r.Text())
+	job := jobOf(r)
+	ctx.Assert(job.Status == "queued" && job.JobID != "", "the 202 must carry the queued job, got %s", r.Text())
+	ctx.Equal(queue(ctx), []string{job.JobID}, "the job must be enqueued for the lead agent workers; research:queue")
+	s := c.Get("/v1/research/"+job.JobID, "X-Tenant-Id", "acme")
+	ctx.Equal(s.Status, 200, "GET /v1/research/%s (%s)", job.JobID, s.Text())
+	ctx.Equal(jobOf(s).JobID, job.JobID, "the status route's job_id")
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	c := api(ctx)
+	ctx.Equal(start(c, "", "k-1", nil).Status, 401, "a request without X-Tenant-Id")
+	ctx.Equal(start(c, "acme", "k-2", map[string]any{"effort": "exhaustive"}).Status, 400, "an effort outside fact, compare and deep")
+	ctx.Equal(start(c, "acme", "k-3", map[string]any{"query": strings.Repeat("é", 4097)}).Status, 413, "a query of 8194 bytes (4097 characters of UTF-8; the cap counts bytes)")
+	ctx.Equal(start(c, "acme", "k-4", map[string]any{"query": ""}).Status, 400, "an empty query")
+	ctx.Equal(len(queue(ctx)), 0, "refused requests must not enqueue a job; research:queue length")
+	r := start(c, "acme", "k-5", map[string]any{"query": strings.Repeat("q", 8192)})
+	ctx.Equal(r.Status, 202, "a query of exactly 8192 bytes (%s)", r.Text())
+	ctx.Equal(len(queue(ctx)), 1, "the one valid job; research:queue length")
+}
+
+func CheckBudgetTable(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := start(c, "acme", "k-1", map[string]any{"effort": "fact", "max_subagents": 50, "max_tool_calls": 100000, "token_budget": 1000000000})
+	ctx.Equal(r.Status, 202, "POST /v1/research (%s)", r.Text())
+	job := jobOf(r)
+	ctx.Equal(job.Budget, factBudget, "a fact job asking for 100000 tool calls must get the fact budget: the budget comes from effortBudgets, not the body")
+	ctx.Equal(jobs.GetJob(context.Background(), job.JobID).Budget, factBudget, "the stored job's budget")
+	ctx.Equal(jobOf(start(c, "acme", "k-2", map[string]any{"effort": "deep"})).Budget, deepBudget, "a deep job's budget")
+	ctx.Equal(jobOf(start(c, "acme", "k-3", nil)).Budget, compareBudget, "a compare job's budget")
+	r = c.Post("/v1/research", map[string]any{"query": apiQuery}, "X-Tenant-Id", "acme", "Idempotency-Key", "k-4")
+	ctx.Equal(r.Status, 202, "a request without an effort (%s)", r.Text())
+	ctx.Equal(jobOf(r).Budget, factBudget, "a request without an effort must get the fact budget")
+}
+
+func CheckIdempotencyKey(ctx *harness.Ctx) {
+	c := api(ctx)
+	first := start(c, "acme", "k-1", nil)
+	ctx.Equal(first.Status, 202, "the first start (%s)", first.Text())
+	replay := start(c, "acme", "k-1", nil)
+	ctx.Equal(jobOf(replay).JobID, jobOf(first).JobID, "a retry with the same Idempotency-Key must answer the first job; the job_id")
+	ctx.Equal(queue(ctx), []string{jobOf(first).JobID}, "a retry must not enqueue a second job; research:queue")
+	other := start(c, "beta", "k-1", nil)
+	ctx.Assert(other.Status == 202 && jobOf(other).JobID != jobOf(first).JobID, "the same key from another tenant is another request: it must start its own job, got %s", other.Text())
+	ctx.Equal(start(c, "acme", "", nil).Status, 400, "a start without Idempotency-Key")
+	ctx.Equal(len(queue(ctx)), 2, "acme's job and beta's; research:queue length")
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	c := api(ctx)
+	job := jobOf(start(c, "acme", "k-1", nil))
+	path := "/v1/research/" + job.JobID
+	other := c.Get(path, "X-Tenant-Id", "beta")
+	ctx.Equal(other.Status, 404, "tenant beta read acme's job (%s); another tenant's job is 404", other.Text())
+	ctx.Equal(c.Get(path).Status, 401, "a status request without X-Tenant-Id")
+	own := c.Get(path, "X-Tenant-Id", "acme")
+	ctx.Assert(own.Status == 200 && jobOf(own).JobID == job.JobID, "acme must read its own job, got %d %s", own.Status, own.Text())
+	ctx.Equal(c.Get("/v1/research/job-999", "X-Tenant-Id", "acme").Status, 404, "an unknown job")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "research/jobs.h"
+
+namespace {
+
+const std::string kQuery = "Compare the board composition of the five largest European banks";
+const nlohmann::json kFact = {{"max_subagents", 1}, {"max_tool_calls", 10}, {"token_budget", 50000}};
+const nlohmann::json kCompare = {{"max_subagents", 4}, {"max_tool_calls", 60}, {"token_budget", 250000}};
+const nlohmann::json kDeep = {{"max_subagents", 10}, {"max_tool_calls", 150}, {"token_budget", 1000000}};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+// A research request; an empty tenant or key leaves that header out.
+harness::Response start(harness::HTTP& c, const std::string& tenant, const std::string& key, nlohmann::json body = nlohmann::json::object()) {
+  nlohmann::json payload = {{"query", kQuery}, {"effort", "compare"}};
+  payload.update(body);
+  std::vector<std::string> headers = {"Content-Type", "application/json"};
+  if (!tenant.empty()) headers.insert(headers.end(), {"X-Tenant-Id", tenant});
+  if (!key.empty()) headers.insert(headers.end(), {"Idempotency-Key", key});
+  return c.Send("POST", "/v1/research", payload.dump(), headers);
+}
+
+nlohmann::json jobOf(const harness::Response& r) {
+  const auto job = nlohmann::json::parse(r.Text(), nullptr, false);
+  return job.is_object() ? job : nlohmann::json::object();
+}
+
+std::vector<std::string> queue(harness::Ctx& ctx) { return ctx.Redis.LRange("research:queue", 0, -1); }
+
+}  // namespace
+
+void CheckRoutes(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = start(c, "acme", "k-1");
+  ctx.Equal(r.Status, 202, "POST /v1/research (%s)", r.Text());
+  const auto job = jobOf(r);
+  const std::string job_id = job.value("job_id", "");
+  ctx.Assert(job.value("status", "") == "queued" && !job_id.empty(), "the 202 must carry the queued job, got %s", r.Text());
+  ctx.Equal(queue(ctx), {job_id}, "the job must be enqueued for the lead agent workers; research:queue");
+  const auto s = c.Get("/v1/research/" + job_id, "X-Tenant-Id", "acme");
+  ctx.Equal(s.Status, 200, "GET /v1/research/%s (%s)", job_id, s.Text());
+  ctx.Equal(jobOf(s).value("job_id", ""), job_id, "the status route's job_id");
+}
+
+void CheckValidate(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  ctx.Equal(start(c, "", "k-1").Status, 401, "a request without X-Tenant-Id");
+  ctx.Equal(start(c, "acme", "k-2", {{"effort", "exhaustive"}}).Status, 400, "an effort outside fact, compare and deep");
+  std::string wide;
+  for (int i = 0; i < 4097; i++) wide += "é";
+  ctx.Equal(start(c, "acme", "k-3", {{"query", wide}}).Status, 413, "a query of 8194 bytes (4097 characters of UTF-8; the cap counts bytes)");
+  ctx.Equal(start(c, "acme", "k-4", {{"query", ""}}).Status, 400, "an empty query");
+  ctx.Equal(queue(ctx).size(), 0, "refused requests must not enqueue a job; research:queue length");
+  const auto r = start(c, "acme", "k-5", {{"query", std::string(8192, 'q')}});
+  ctx.Equal(r.Status, 202, "a query of exactly 8192 bytes (%s)", r.Text());
+  ctx.Equal(queue(ctx).size(), 1, "the one valid job; research:queue length");
+}
+
+void CheckBudgetTable(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = start(c, "acme", "k-1", {{"effort", "fact"}, {"max_subagents", 50}, {"max_tool_calls", 100000}, {"token_budget", 1000000000}});
+  ctx.Equal(r.Status, 202, "POST /v1/research (%s)", r.Text());
+  const auto job = jobOf(r);
+  ctx.Equal(job.value("budget", nlohmann::json()), kFact, "a fact job asking for 100000 tool calls must get the fact budget: the budget comes from kEffortBudgets, not the body");
+  ctx.Equal(jobs::getJob(job.value("job_id", ""))->budget.max_tool_calls, 10, "the stored job's max_tool_calls");
+  ctx.Equal(jobOf(start(c, "acme", "k-2", {{"effort", "deep"}})).value("budget", nlohmann::json()), kDeep, "a deep job's budget");
+  ctx.Equal(jobOf(start(c, "acme", "k-3")).value("budget", nlohmann::json()), kCompare, "a compare job's budget");
+  r = c.Post("/v1/research", nlohmann::json{{"query", kQuery}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "Idempotency-Key", "k-4");
+  ctx.Equal(r.Status, 202, "a request without an effort (%s)", r.Text());
+  ctx.Equal(jobOf(r).value("budget", nlohmann::json()), kFact, "a request without an effort must get the fact budget");
+}
+
+void CheckIdempotencyKey(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto first = start(c, "acme", "k-1");
+  ctx.Equal(first.Status, 202, "the first start (%s)", first.Text());
+  const std::string first_id = jobOf(first).value("job_id", "");
+  const auto replay = start(c, "acme", "k-1");
+  ctx.Equal(jobOf(replay).value("job_id", ""), first_id, "a retry with the same Idempotency-Key must answer the first job; the job_id");
+  ctx.Equal(queue(ctx), {first_id}, "a retry must not enqueue a second job; research:queue");
+  const auto other = start(c, "beta", "k-1");
+  ctx.Assert(other.Status == 202 && jobOf(other).value("job_id", "") != first_id, "the same key from another tenant is another request: it must start its own job, got %s", other.Text());
+  ctx.Equal(start(c, "acme", "").Status, 400, "a start without Idempotency-Key");
+  ctx.Equal(queue(ctx).size(), 2, "acme's job and beta's; research:queue length");
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::string job_id = jobOf(start(c, "acme", "k-1")).value("job_id", "");
+  const std::string path = "/v1/research/" + job_id;
+  const auto other = c.Get(path, "X-Tenant-Id", "beta");
+  ctx.Equal(other.Status, 404, "tenant beta read acme's job (%s); another tenant's job is 404", other.Text());
+  ctx.Equal(c.Get(path).Status, 401, "a status request without X-Tenant-Id");
+  const auto own = c.Get(path, "X-Tenant-Id", "acme");
+  ctx.Assert(own.Status == 200 && jobOf(own).value("job_id", "") == job_id, "acme must read its own job, got %d %s", own.Status, own.Text());
+  ctx.Equal(c.Get("/v1/research/job-999", "X-Tenant-Id", "acme").Status, 404, "an unknown job");
+}
+`,
+  },
   hints: [
-    'A client that times out at 30 s and retries gets a second bill for the same question, and a request body with `"max_tool_calls": 100000` is honoured. Nothing lets the caller poll a running job.',
-    'The handler awaits `run_research` inside the request, copies `max_subagents` and friends from the body, checks neither query size nor effort, and reads no `Idempotency-Key`, so every retry is a brand-new job.',
-    'Guard tenant, `Idempotency-Key`, query bytes (`MAX_QUERY_BYTES`) and `ALLOWED_EFFORTS`; look the budget up in `EFFORT_BUDGETS[effort]`; `jobs.get` then `jobs.put` and `queue.enqueue(job)`; answer 202 and add `GET /v1/research/{job_id}`.',
+    'A client that timed out and retried has two jobs in `research:queue`, a body with `"max_tool_calls": 100000` gets exactly that budget, and tenant beta reads acme’s job by guessing its id.',
+    'The handler copies the budget out of the body and never reads `Idempotency-Key`; it checks neither the tenant, the query’s size nor the effort, and the status route loads a job by id without comparing its tenant with the caller.',
+    'Guard `X-Tenant-Id` (401), the key (400), the UTF-8 bytes against `MAX_QUERY_BYTES` (413) and the effort (400); budget = `EFFORT_BUDGETS[effort]`; `job_for_key` first, then `create_job`, `remember_key`, `enqueue`; 404 when `job["tenant"]` is not the caller.',
   ],
-  debrief: `The fix moves the job out of the request because an HTTP connection is the wrong place to hold minutes of work and fifteen chats of spend: the queue plus a job record makes the work durable and pollable, the effort table makes the spend a server decision, the byte cap closes the same leak at the input, and the \`(tenant, key)\` lookup makes a retry cost nothing. The status route is the half that gets forgotten: a 202 without a way to poll is fire-and-forget. Production systems go further with a per-tenant limit on open jobs, a daily token budget layered over the per-job one, a cancel route that stops the subagents, and job records that outlive the process so a replay still finds its key after a restart.`,
+  debrief: `The budget is a server decision because the bill is the server's: a budget field in a request body is a request to spend, and the effort table turns three words into numbers the service can afford. The byte cap is the same rule at the input, counted in bytes because that is what a context window and a log line pay for. The idempotency record is keyed by tenant and key and claimed with \`SET NX\`, so a retry and a concurrent duplicate both land on one job. Answering 404 for another tenant's job keeps job ids from confirming that a job exists. Production services add a per-tenant limit on open jobs, a daily token budget over the per-job one, and a cancel route that stops the subagents.`,
 };

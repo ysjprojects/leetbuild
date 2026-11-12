@@ -1,20 +1,21 @@
 import {ANTHROPIC} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {researchEndpointStep} from './steps/1-research-endpoint';
 import {subagentFanoutStep} from './steps/2-subagent-fanout';
 import {checkpointsStep} from './steps/3-checkpoints';
 import {toolCallsStep} from './steps/4-tool-calls';
 import {traceEventsStep} from './steps/5-trace-events';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Anthropic's multi-agent Research system, rebuilt as the orchestration layer around the models:
  * a research job endpoint whose effort level fixes the budget → a lead agent that fans out to
- * subagents in parallel under deadlines and condenses what comes back → checkpoints and atomic
- * tool-call counters in Redis so a crashed lead resumes instead of restarting → tool calls with
- * deadlines, bounded backoff, untrusted results and literal citations → a trace topic without
- * content, an end-state evaluation consumer with a rubric, and jobs pinned to the version that
- * started them.
+ * subagents in parallel under deadlines and keeps their condensed findings → checkpoints and an
+ * atomic tool-call reservation in Redis so a crashed lead resumes instead of restarting → tool calls
+ * with a deadline, bounded backoff, untrusted results and literal citations → a trace topic without
+ * content and an end-state evaluation consumer that writes before it commits.
  */
 export const researchOrchestratorProblem: Problem = {
   id: 'research-orchestrator',
@@ -55,12 +56,10 @@ bounded, survives a crash halfway through, and can prove every citation points a
 
 Anthropic's **Research** feature is an orchestrator-worker system: a lead agent plans, spawns
 subagents that search in parallel with their own context windows, synthesises what they condense
-and hands the result to a citation agent. What made it a product is the budget that scales with the
-query, checkpoints that let a stateful agent resume instead of restart, tracing that explains a bad
-answer without the conversation, and a rainbow deployment that ships a new version mid-task. The
-resume problem is general: LangGraph's checkpointers save graph state after every step
-under a \`thread_id\`, and its docs warn that \`InMemorySaver\` loses every checkpoint on restart, so
-production uses \`PostgresSaver\`. Step 3 builds the same thing on Redis hashes.
+and hands the result to a citation agent. Its production chapter is about budgets, resuming instead
+of restarting, and tracing without the conversation. LangGraph's checkpointers solve the same resume
+problem, saving graph state after every step under a \`thread_id\`; its docs keep \`InMemorySaver\`
+for experiments and point production at a database-backed saver such as \`PostgresSaver\`.
 
 ## From the source
 
@@ -72,48 +71,63 @@ the bounded loop and the tool contract in step 4.
 
 ## What you build here
 
-One service, **researchd**: \`POST /v1/research\` with a server-side budget and a **202**; a lead
-agent running \`Subagent.Run\` in parallel batches of **5** under a **120 s** deadline; checkpoints
-under \`research:{job_id}\` with a **24-hour** TTL and a Lua script that reserves tool calls; tool
-calls with a **30 s** deadline, **3** attempts, sanitised results and literal citations; and a
-\`research.trace\` topic feeding an end-state evaluation consumer, with every job pinned to its
-starting version.
+One service, **researchd**, on one job store (\`research.jobs\`, provided: the hash
+\`research:{job_id}\` with the job's budget and version, \`research:idem:{tenant}:{key}\`,
+\`research:queue\`, and the shared \`Task\` and \`Budget\` shapes) and one proto (\`Subagent.Run\`,
+\`Tools.Call\`):
+
+1. \`POST /v1/research\` and \`GET /v1/research/{job_id}\`: a budget from a server-side effort table,
+   one job per tenant and \`Idempotency-Key\`, a **202** and an enqueued job id.
+2. \`run_subagents(job_id, plan, budget)\`: \`Subagent.Run\` in parallel batches of at most **5**, cut
+   to the budget, under a **120 s** deadline, keeping condensed findings.
+3. Checkpoints: the plan in \`research:{job_id}\`, results in \`research:{job_id}:results\`, a Lua
+   script reserving tool calls on \`research:{job_id}:tools\`, every key expiring **24 h** after its
+   last write.
+4. \`call_tool\` and \`verify_citations\`: a **30 s** deadline, **3** attempts with backoff, sanitised
+   results, citations checked against the fetched text.
+5. \`research.trace\` keyed by job with ids and numbers only, and the \`end-state-eval\` consumer that
+   writes \`research:{job_id}:eval\` before it commits.
 
 ## The debugging habit
 
-Every starter compiles and serves the happy path. In every step you debug it against the failure
-modes the source names, fix it, and prove the fix with checks that fail on the starter and pass on
-yours.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-The prompts, the model calls behind planning and synthesis, source-quality heuristics, human
-evaluation and the rainbow traffic shift itself.`,
+The prompts, the model calls behind planning and synthesis, the judge model that scores a report
+against a rubric, source-quality heuristics, human evaluation and the rainbow traffic shift itself.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'research · status', x: 6, y: 50},
-      {id: 'api', kind: 'http', label: 'researchd API', sub: 'HTTPS :8443', x: 22, y: 50},
-      {id: 'lead', kind: 'service', label: 'Lead agent', sub: 'plan · fan out · synthesise', x: 40, y: 40},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'research:{job} · budgets', x: 40, y: 78},
-      {id: 'subagent', kind: 'grpc', label: 'Subagents', sub: 'Subagent.Run', x: 58, y: 20},
-      {id: 'tools', kind: 'grpc', label: 'Tools', sub: 'Tools.Call · search / fetch', x: 76, y: 20},
+      {id: 'api', kind: 'http', label: 'researchd API', sub: 'POST /v1/research', x: 22, y: 50},
+      {id: 'lead', kind: 'service', label: 'Lead agent', sub: 'fan out · resume', x: 40, y: 40},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'research:{job} · results · tools', x: 40, y: 78},
+      {id: 'subagent', kind: 'grpc', label: 'Subagents', sub: 'Subagent.Run · 120 s', x: 58, y: 20},
+      {id: 'tools', kind: 'grpc', label: 'Tools', sub: 'Tools.Call · 30 s', x: 76, y: 20},
       {id: 'citation', kind: 'service', label: 'Citation pass', sub: 'literal spans only', x: 58, y: 50},
       {id: 'kafka', kind: 'kafka', label: 'research.trace', sub: 'key = job', x: 58, y: 80},
-      {id: 'evaluator', kind: 'service', label: 'End-state eval', sub: 'group end-state-eval', x: 76, y: 80},
-      {id: 'judge', kind: 'external', label: 'LLM judge', sub: 'rubric 0.0–1.0 · pass/fail', x: 92, y: 80},
+      {id: 'evaluator', kind: 'service', label: 'End-state eval', sub: 'group end-state-eval', x: 80, y: 80},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
-      {from: 'api', to: 'lead', kind: 'plain', label: 'enqueue job'},
-      {from: 'lead', to: 'subagent', kind: 'grpc', label: 'Run · deadline 120 s'},
-      {from: 'subagent', to: 'tools', kind: 'grpc', label: 'Call · deadline 30 s'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'job · idem key · research:queue'},
+      {from: 'lead', to: 'subagent', kind: 'grpc', label: 'Run · batches of 5'},
+      {from: 'subagent', to: 'tools', kind: 'grpc', label: 'Call · 3 attempts'},
       {from: 'lead', to: 'redis', kind: 'redis', label: 'checkpoints · reserve'},
       {from: 'lead', to: 'citation', kind: 'plain', label: 'report + sources'},
       {from: 'lead', to: 'kafka', kind: 'kafka', label: 'produce research.trace'},
       {from: 'kafka', to: 'evaluator', kind: 'kafka', label: 'consume'},
-      {from: 'evaluator', to: 'judge', kind: 'plain', label: 'score(job, rubric)'},
       {from: 'evaluator', to: 'redis', kind: 'redis', label: 'HSET research:{job}:eval'},
     ],
   },
   steps: [researchEndpointStep, subagentFanoutStep, checkpointsStep, toolCallsStep, traceEventsStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

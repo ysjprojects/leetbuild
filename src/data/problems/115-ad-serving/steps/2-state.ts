@@ -2,234 +2,187 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis frequency caps and pacing counters, atomic',
+  title: 'One atomic Redis decision per serve',
   concept: 'redis',
   file: 'state',
-  focus: ['server', 'redis', 'db'],
+  focus: ['server', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is the counter layer behind \`reserve(campaign, user_hash,
-price_micros)\`: it builds \`freq:{campaign_id}:{user_hash}\` and \`pace:{campaign_id}\`, runs
-\`INCR\` and \`INCRBY\` as two separate commands and compares the results afterwards. It compiles
-and hides four flaws that only appear under load or under a crash.
+**Starting point.** The starter is \`reserve(campaign, user_hash, price_micros)\`, the decision a
+serve makes once its campaign has won: it runs \`INCR freq:{campaign_id}:{user_hash}\`, reads
+\`pace:{campaign_id}\`, refuses when the count is over \`freq_cap\` or the price does not fit
+\`paced_budget_micros\`, and otherwise \`INCRBY\`s the pacing counter. It answers
+\`{"allowed", "seen", "spent_micros"}\` and hides three flaws.
 
-**Failure mode the checks target.** The starter \`INCR\`s the user counter before it knows whether
-the serve will happen, then updates the pacing counter in a second command and compares afterwards.
-A crashed request still burns an impression, and a burst all reads the same \`spent\` value, so every
-request in the burst passes the remaining budget. Without \`EXPIRE\` the counter never resets, and a
-user who was capped last month is still capped today.
+**Failure mode the checks target.** A refused serve still burns one of the user's impressions, two
+serves that race for the last of a budget both pass, and a user who reached the cap stays capped
+forever.
 
-One call per serve returns \`{"allowed": bool, "seen": int, "spent_micros": int}\`:
-
-- **One atomic decision.** The frequency allowance and the pacing budget are checked and written by
-  a single Lua script, loaded once with \`SCRIPT LOAD\` and run with \`EVALSHA\`, so a burst of
-  concurrent serves cannot all read the same remaining budget.
-- The script reads the user counter **before** it increments it, and increments it **only when the
-  serve is allowed**.
-- The pacing counter moves in the same script: allowed only when \`spent + price <= paced_budget\`,
-  then incremented by \`price\` with \`INCRBY\`.
-- The user counter gets its TTL **at first write** (\`EXPIRE\` when the increment returns \`1\`) with
-  the campaign's \`freq_window_s\`, so caps roll off at the end of the window.`,
+- The decision is **one Lua script** (\`register_script\`/\`EVAL\`): it reads both counters, refuses
+  when \`seen >= freq_cap\` or \`spent + price > paced_budget_micros\`, and only then increments
+  both, so nothing moves on a refusal and no other serve can land in between.
+- The user's counter gets its TTL, \`freq_window_s\`, **at its first write** (\`EXPIRE\` when
+  \`INCR\` returns 1), so the window starts at the first impression and then rolls off.
+- \`seen\` and \`spent_micros\` are the counters after the decision.`,
   sequence: {
-    participants: ['Ad Server', 'Redis', 'pacing script'],
+    participants: ['Ad Server', 'Redis'],
     messages: [
-      {from: 'Ad Server', to: 'Redis', label: 'EVALSHA reserve · KEYS[cap, pace]', kind: 'sync'},
-      {from: 'Redis', to: 'pacing script', label: 'run once, in Redis', kind: 'sync'},
-      {from: 'pacing script', to: 'pacing script', label: 'seen < cap ?', kind: 'sync'},
-      {from: 'pacing script', to: 'pacing script', label: 'spent + price <= paced_budget ?', kind: 'sync'},
-      {from: 'pacing script', to: 'Redis', label: 'INCR cap_key · EXPIRE window_s at first write', kind: 'sync'},
-      {from: 'pacing script', to: 'Redis', label: 'INCRBY pace_key price', kind: 'sync'},
-      {from: 'Redis', to: 'Ad Server', label: '{allowed, seen, spent_micros}', kind: 'reply'},
+      {
+        from: 'Ad Server',
+        to: 'Redis',
+        label: 'EVALSHA reserve · freq:{id}:{user} pace:{id} · cap window price budget',
+        kind: 'sync',
+      },
+      {from: 'Redis', to: 'Redis', label: 'GET both · refuse, or INCR (+EXPIRE at 1) and INCRBY', kind: 'sync'},
+      {from: 'Redis', to: 'Ad Server', label: '{allowed, seen, spent}', kind: 'reply'},
     ],
   },
   checks: [
     {
-      id: 'keys',
-      title: 'Scopes one counter per user and one per campaign',
+      id: 'no-burn',
+      title: 'A refused serve moves no counter',
       detail:
-        'The per-user frequency counter is `freq:{campaign_id}:{user_hash}` and the pacing counter is `pace:{campaign_id}`; the starter already builds both keys this way, so only the atomicity, ordering and TTL around them are wrong.',
-      match: {
-        python: {all: [/FREQ_KEY_PREFIX/, /PACE_KEY_PREFIX/]},
-        typescript: {all: [/FREQ_KEY_PREFIX/, /PACE_KEY_PREFIX/]},
-        go: {all: [/freqKeyPrefix/, /paceKeyPrefix/]},
-        scala: {all: [/FreqKeyPrefix/, /PaceKeyPrefix/]},
-        cpp: {all: [/kFreqKeyPrefix/, /kPaceKeyPrefix/]},
-      },
-    },
-    {
-      id: 'atomic',
-      title: 'One Lua script decides and writes both counters',
-      detail:
-        'The cap check, the pacing check, the user increment and the pacing increment all live in one script that is loaded once and invoked with `EVALSHA` per serve. The starter uses separate `INCR`/`INCRBY`/`GET` commands, so two serves can both read the same remaining budget.',
-      match: {
-        python: {all: [/RESERVE_SCRIPT/, /script_load/, /evalsha/]},
-        typescript: {all: [/RESERVE_SCRIPT/, /script\(\s*['"]load['"]/, /evalsha/]},
-        go: {all: [/reserveScript/, /redis\.NewScript/, /\.Run\(/]},
-        scala: {all: [/ReserveScript/, /scriptLoad/, /evalsha/]},
-        cpp: {all: [/kReserveScript/, /script_load/, /EVALSHA/]},
-      },
-    },
-    {
-      id: 'cap-before-increment',
-      title: 'Reads the cap before it increments the allowance',
-      detail:
-        'Inside the script the user counter is read and compared with the cap **before** `INCR`, and the increment happens only on the allowed path. The starter increments first and decides afterwards, so a request that never returns an ad still burns an impression.',
-      match: {
-        python: {order: [/redis\.call\(\s*'get'\s*,\s*cap_key\)/, /redis\.call\(\s*'incr'\s*,\s*cap_key\)/]},
-        typescript: {order: [/redis\.call\(\s*'get'\s*,\s*cap_key\)/, /redis\.call\(\s*'incr'\s*,\s*cap_key\)/]},
-        go: {order: [/redis\.call\(\s*'get'\s*,\s*cap_key\)/, /redis\.call\(\s*'incr'\s*,\s*cap_key\)/]},
-        scala: {order: [/redis\.call\(\s*'get'\s*,\s*cap_key\)/, /redis\.call\(\s*'incr'\s*,\s*cap_key\)/]},
-        cpp: {order: [/redis\.call\(\s*'get'\s*,\s*cap_key\)/, /redis\.call\(\s*'incr'\s*,\s*cap_key\)/]},
-      },
-    },
-    {
-      id: 'ttl',
-      title: 'Expires the cap key at the frequency window',
-      detail:
-        'The user counter is given a TTL when it is first written: the script runs `EXPIRE cap_key window_s` on the increment that returns `1`. The starter writes the key with no expiry, so the cap never rolls off.',
+        'Inside the script the user counter is read and compared with `freq_cap` before any `INCR`, and both counters move only on the allowed path. The starter increments the user first, so a capped or unfunded request burns an impression it never showed.',
       match: {
         python: {
-          all: [/\bwindow_s\b/],
-          order: [/seen\s*==\s*1/, /redis\.call\(\s*'expire'\s*,\s*cap_key\s*,\s*window_s\)/],
+          all: [/register_script\(|\.eval\(/],
+          order: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]\s*\)/, /redis\.call\(\s*['"]INCR['"],\s*KEYS\[1\]\s*\)/],
+          none: [/\br\.incr\(/],
         },
         typescript: {
-          all: [/\bwindow_s\b/],
-          order: [/seen\s*==\s*1/, /redis\.call\(\s*'expire'\s*,\s*cap_key\s*,\s*window_s\)/],
+          all: [/defineCommand\(|\.eval\(/],
+          order: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]\s*\)/, /redis\.call\(\s*['"]INCR['"],\s*KEYS\[1\]\s*\)/],
+          none: [/redis\.incr\(/],
         },
         go: {
-          all: [/\bwindow_s\b/],
-          order: [/seen\s*==\s*1/, /redis\.call\(\s*'expire'\s*,\s*cap_key\s*,\s*window_s\)/],
+          all: [/redis\.NewScript\(|\.Eval\(/],
+          order: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]\s*\)/, /redis\.call\(\s*['"]INCR['"],\s*KEYS\[1\]\s*\)/],
+          none: [/rdb\.Incr\(/],
         },
         scala: {
-          all: [/\bwindow_s\b/],
-          order: [/seen\s*==\s*1/, /redis\.call\(\s*'expire'\s*,\s*cap_key\s*,\s*window_s\)/],
+          all: [/jedis\.eval(sha)?\(/],
+          order: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]\s*\)/, /redis\.call\(\s*['"]INCR['"],\s*KEYS\[1\]\s*\)/],
+          none: [/jedis\.incr\(/],
         },
         cpp: {
-          all: [/\bwindow_s\b/],
-          order: [/seen\s*==\s*1/, /redis\.call\(\s*'expire'\s*,\s*cap_key\s*,\s*window_s\)/],
+          all: [/redis\.eval(sha)?[<(]/],
+          order: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[1\]\s*\)/, /redis\.call\(\s*['"]INCR['"],\s*KEYS\[1\]\s*\)/],
+          none: [/redis\.incr\(/],
         },
       },
     },
     {
-      id: 'no-overspend',
-      title: 'Refuses the serve when the remaining budget is short',
+      id: 'one-decision',
+      title: 'Two racing serves cannot both spend the last of a budget',
       detail:
-        'The script compares `spent + price > paced_budget` and returns `allowed = false` before any `INCRBY`, so a burst cannot spend past the budget; the increment only happens on the allowed path. The starter increments the pacing counter and compares afterwards.',
+        'The pacing counter is read and incremented by `INCRBY` inside the same script (`KEYS[2]`), so a second serve landing between the read and the write sees the new total. The starter reads `pace:{id}` and increments it in two round trips.',
       match: {
         python: {
-          all: [/spent\s*\+\s*price\s*>\s*paced_budget/, /redis\.call\(\s*'incrby'\s*,\s*pace_key\s*,\s*price\)/],
+          all: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[2\]\s*\)/, /redis\.call\(\s*['"]INCRBY['"],\s*KEYS\[2\]/],
+          none: [/\br\.incrby\(/, /\br\.get\(\s*pace_key\(/],
         },
         typescript: {
-          all: [/spent\s*\+\s*price\s*>\s*paced_budget/, /redis\.call\(\s*'incrby'\s*,\s*pace_key\s*,\s*price\)/],
+          all: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[2\]\s*\)/, /redis\.call\(\s*['"]INCRBY['"],\s*KEYS\[2\]/],
+          none: [/redis\.incrby\(/, /redis\.get\(\s*paceKey\(/],
         },
-        go: {all: [/spent\s*\+\s*price\s*>\s*paced_budget/, /redis\.call\(\s*'incrby'\s*,\s*pace_key\s*,\s*price\)/]},
+        go: {
+          all: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[2\]\s*\)/, /redis\.call\(\s*['"]INCRBY['"],\s*KEYS\[2\]/],
+          none: [/rdb\.IncrBy\(/, /rdb\.Get\([^\n]*paceKey\(/],
+        },
         scala: {
-          all: [/spent\s*\+\s*price\s*>\s*paced_budget/, /redis\.call\(\s*'incrby'\s*,\s*pace_key\s*,\s*price\)/],
+          all: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[2\]\s*\)/, /redis\.call\(\s*['"]INCRBY['"],\s*KEYS\[2\]/],
+          none: [/jedis\.incrBy\(/, /jedis\.get\(\s*paceKey\(/],
         },
-        cpp: {all: [/spent\s*\+\s*price\s*>\s*paced_budget/, /redis\.call\(\s*'incrby'\s*,\s*pace_key\s*,\s*price\)/]},
+        cpp: {
+          all: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[2\]\s*\)/, /redis\.call\(\s*['"]INCRBY['"],\s*KEYS\[2\]/],
+          none: [/redis\.incrby\(/, /redis\.get\(\s*paceKey\(/],
+        },
+      },
+    },
+    {
+      id: 'window-ttl',
+      title: 'The cap key expires at the frequency window',
+      detail:
+        'The script runs `EXPIRE KEYS[1] freq_window_s` when `INCR` returns 1, so the window starts at the first impression, is not pushed back by later ones, and the user can be served again once it ends. The starter never sets a TTL.',
+      match: {
+        python: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
+        typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
+        go: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
+        scala: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
+        cpp: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import redis  # redis-py
+      starter: `import redis
 
-FREQ_KEY_PREFIX = "freq:"
-PACE_KEY_PREFIX = "pace:"
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def freq_key(campaign_id: str, user_hash: str) -> str:
-    return f"{FREQ_KEY_PREFIX}{campaign_id}:{user_hash}"
+    return f"freq:{campaign_id}:{user_hash}"
 
 
 def pace_key(campaign_id: str) -> str:
-    return f"{PACE_KEY_PREFIX}{campaign_id}"
+    return f"pace:{campaign_id}"
 
 
-class PacingStore:
-    def __init__(self, client: redis.Redis) -> None:
-        self._client = client
-
-    def reserve(self, campaign: dict, user_hash: str, price_micros: int) -> dict:
-        # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        cap_key = freq_key(campaign["campaign_id"], user_hash)
-        charge_key = pace_key(campaign["campaign_id"])
-        seen = int(self._client.incr(cap_key))
-        spent = int(self._client.incrby(charge_key, price_micros))
-        allowed = seen <= campaign["freq_cap_impressions"] and spent <= campaign["paced_budget_micros"]
-        return {"allowed": allowed, "seen": seen, "spent_micros": spent}
+def reserve(campaign: dict, user_hash: str, price_micros: int) -> dict:
+    """Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed."""
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    seen = r.incr(freq_key(campaign["campaign_id"], user_hash))
+    spent = int(r.get(pace_key(campaign["campaign_id"])) or 0)
+    if seen > campaign["freq_cap"] or spent + price_micros > campaign["paced_budget_micros"]:
+        return {"allowed": False, "seen": seen, "spent_micros": spent}
+    spent = r.incrby(pace_key(campaign["campaign_id"]), price_micros)
+    return {"allowed": True, "seen": seen, "spent_micros": spent}
 `,
-      solution: `import redis  # redis-py
+      solution: `import redis
 
-FREQ_KEY_PREFIX = "freq:"
-PACE_KEY_PREFIX = "pace:"
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# One script decides and writes: the allowance and the pacing spend commit together, so a serve
-# that is never returned does not burn an impression and a burst cannot pass the same budget.
-RESERVE_SCRIPT = """
-local cap_key = KEYS[1]
-local pace_key = KEYS[2]
-local cap = tonumber(ARGV[1])
-local window_s = tonumber(ARGV[2])
-local price = tonumber(ARGV[3])
-local paced_budget = tonumber(ARGV[4])
-local seen = tonumber(redis.call('get', cap_key) or '0')
-if seen >= cap then
-  return {0, seen, 0}
-end
-local spent = tonumber(redis.call('get', pace_key) or '0')
-if spent + price > paced_budget then
+# KEYS: the user's counter, the campaign's pacing counter. ARGV: freq_cap, freq_window_s, price, paced budget.
+# Redis runs the script to completion: no other serve can land between the reads and the writes.
+RESERVE_LUA = """
+local seen = tonumber(redis.call('GET', KEYS[1]) or '0')
+local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
+if seen >= tonumber(ARGV[1]) or spent + tonumber(ARGV[3]) > tonumber(ARGV[4]) then
   return {0, seen, spent}
 end
-seen = redis.call('incr', cap_key)
+seen = redis.call('INCR', KEYS[1])
 if seen == 1 then
-  redis.call('expire', cap_key, window_s)
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
 end
-local new_spent = redis.call('incrby', pace_key, price)
-return {1, seen, new_spent}
+spent = redis.call('INCRBY', KEYS[2], ARGV[3])
+return {1, seen, spent}
 """
+reserve_script = r.register_script(RESERVE_LUA)
 
 
 def freq_key(campaign_id: str, user_hash: str) -> str:
-    return f"{FREQ_KEY_PREFIX}{campaign_id}:{user_hash}"
+    return f"freq:{campaign_id}:{user_hash}"
 
 
 def pace_key(campaign_id: str) -> str:
-    return f"{PACE_KEY_PREFIX}{campaign_id}"
+    return f"pace:{campaign_id}"
 
 
-class PacingStore:
-    def __init__(self, client: redis.Redis) -> None:
-        self._client = client
-        self._sha = client.script_load(RESERVE_SCRIPT)
-
-    def reserve(self, campaign: dict, user_hash: str, price_micros: int) -> dict:
-        """Allow, charge and count in one round trip, or allow nothing at all."""
-        allowed, seen, spent = self._client.evalsha(
-            self._sha,
-            2,
-            freq_key(campaign["campaign_id"], user_hash),
-            pace_key(campaign["campaign_id"]),
-            campaign["freq_cap_impressions"],
-            campaign["freq_window_s"],
-            price_micros,
-            campaign["paced_budget_micros"],
-        )
-        return {"allowed": bool(allowed), "seen": int(seen), "spent_micros": int(spent)}
+def reserve(campaign: dict, user_hash: str, price_micros: int) -> dict:
+    """Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed."""
+    allowed, seen, spent = reserve_script(
+        keys=[freq_key(campaign["campaign_id"], user_hash), pace_key(campaign["campaign_id"])],
+        args=[campaign["freq_cap"], campaign["freq_window_s"], price_micros, campaign["paced_budget_micros"]],
+    )
+    return {"allowed": allowed == 1, "seen": seen, "spent_micros": spent}
 `,
     },
     typescript: {
-      starter: `/** Frequency and pacing counters. */
-import Redis from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const FREQ_KEY_PREFIX = 'freq:';
-export const PACE_KEY_PREFIX = 'pace:';
+import type {Campaign} from 'ads/store';
 
-export interface Campaign {
-  campaign_id: string;
-  freq_cap_impressions: number;
-  paced_budget_micros: number;
-}
+const redis = new Redis({host: 'redis', port: 6379});
 
 export interface Reservation {
   allowed: boolean;
@@ -237,59 +190,44 @@ export interface Reservation {
   spent_micros: number;
 }
 
-export const freqKey = (campaignId: string, userHash: string): string =>
-  \`\${FREQ_KEY_PREFIX}\${campaignId}:\${userHash}\`;
+export const freqKey = (campaignId: string, userHash: string): string => \`freq:\${campaignId}:\${userHash}\`;
+export const paceKey = (campaignId: string): string => \`pace:\${campaignId}\`;
 
-export const paceKey = (campaignId: string): string => \`\${PACE_KEY_PREFIX}\${campaignId}\`;
-
-export class PacingStore {
-  constructor(private readonly redis: Redis) {}
-
-  async reserve(campaign: Campaign, userHash: string, priceMicros: number): Promise<Reservation> {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const seen = await this.redis.incr(freqKey(campaign.campaign_id, userHash));
-    const spent = await this.redis.incrby(paceKey(campaign.campaign_id), priceMicros);
-    const allowed = seen <= campaign.freq_cap_impressions && spent <= campaign.paced_budget_micros;
-    return {allowed, seen, spent_micros: spent};
-  }
+/** Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed. */
+export async function reserve(campaign: Campaign, userHash: string, priceMicros: number): Promise<Reservation> {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const seen = await redis.incr(freqKey(campaign.campaign_id, userHash));
+  const spent = Number((await redis.get(paceKey(campaign.campaign_id))) ?? 0);
+  if (seen > campaign.freq_cap || spent + priceMicros > campaign.paced_budget_micros) return {allowed: false, seen, spent_micros: spent};
+  return {allowed: true, seen, spent_micros: await redis.incrby(paceKey(campaign.campaign_id), priceMicros)};
 }
 `,
-      solution: `/** Frequency and pacing counters: one atomic decision per serve. */
-import Redis from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const FREQ_KEY_PREFIX = 'freq:';
-export const PACE_KEY_PREFIX = 'pace:';
+import type {Campaign} from 'ads/store';
 
-/** Loaded once, run once per serve: cap, pacing and both counters commit together. */
-export const RESERVE_SCRIPT = \`
-local cap_key = KEYS[1]
-local pace_key = KEYS[2]
-local cap = tonumber(ARGV[1])
-local window_s = tonumber(ARGV[2])
-local price = tonumber(ARGV[3])
-local paced_budget = tonumber(ARGV[4])
-local seen = tonumber(redis.call('get', cap_key) or '0')
-if seen >= cap then
-  return {0, seen, 0}
-end
-local spent = tonumber(redis.call('get', pace_key) or '0')
-if spent + price > paced_budget then
+// KEYS: the user's counter, the campaign's pacing counter. ARGV: freq_cap, freq_window_s, price, paced budget.
+// Redis runs the script to completion: no other serve can land between the reads and the writes.
+export const RESERVE_LUA = \`
+local seen = tonumber(redis.call('GET', KEYS[1]) or '0')
+local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
+if seen >= tonumber(ARGV[1]) or spent + tonumber(ARGV[3]) > tonumber(ARGV[4]) then
   return {0, seen, spent}
 end
-seen = redis.call('incr', cap_key)
+seen = redis.call('INCR', KEYS[1])
 if seen == 1 then
-  redis.call('expire', cap_key, window_s)
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
 end
-local new_spent = redis.call('incrby', pace_key, price)
-return {1, seen, new_spent}
+spent = redis.call('INCRBY', KEYS[2], ARGV[3])
+return {1, seen, spent}
 \`;
 
-export interface Campaign {
-  campaign_id: string;
-  freq_cap_impressions: number;
-  freq_window_s: number;
-  paced_budget_micros: number;
+interface ReserveRedis extends Redis {
+  reserveServe(freqKey: string, paceKey: string, cap: number, windowS: number, price: number, budget: number): Promise<[number, number, number]>;
 }
+
+const redis = new Redis({host: 'redis', port: 6379}) as ReserveRedis;
+redis.defineCommand('reserveServe', {numberOfKeys: 2, lua: RESERVE_LUA});
 
 export interface Reservation {
   allowed: boolean;
@@ -297,30 +235,20 @@ export interface Reservation {
   spent_micros: number;
 }
 
-export const freqKey = (campaignId: string, userHash: string): string =>
-  \`\${FREQ_KEY_PREFIX}\${campaignId}:\${userHash}\`;
+export const freqKey = (campaignId: string, userHash: string): string => \`freq:\${campaignId}:\${userHash}\`;
+export const paceKey = (campaignId: string): string => \`pace:\${campaignId}\`;
 
-export const paceKey = (campaignId: string): string => \`\${PACE_KEY_PREFIX}\${campaignId}\`;
-
-export class PacingStore {
-  private sha: string | null = null;
-
-  constructor(private readonly redis: Redis) {}
-
-  async reserve(campaign: Campaign, userHash: string, priceMicros: number): Promise<Reservation> {
-    this.sha ??= (await this.redis.script('load', RESERVE_SCRIPT)) as string;
-    const reply = (await this.redis.evalsha(
-      this.sha,
-      2,
-      freqKey(campaign.campaign_id, userHash),
-      paceKey(campaign.campaign_id),
-      campaign.freq_cap_impressions,
-      campaign.freq_window_s,
-      priceMicros,
-      campaign.paced_budget_micros,
-    )) as [number, number, number];
-    return {allowed: reply[0] === 1, seen: reply[1], spent_micros: reply[2]};
-  }
+/** Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed. */
+export async function reserve(campaign: Campaign, userHash: string, priceMicros: number): Promise<Reservation> {
+  const [allowed, seen, spent] = await redis.reserveServe(
+    freqKey(campaign.campaign_id, userHash),
+    paceKey(campaign.campaign_id),
+    campaign.freq_cap,
+    campaign.freq_window_s,
+    priceMicros,
+    campaign.paced_budget_micros,
+  );
+  return {allowed: allowed === 1, seen, spent_micros: spent};
 }
 `,
     },
@@ -329,244 +257,157 @@ export class PacingStore {
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/redis/go-redis/v9"
+
+	"ads/store" // store.Campaign
 )
 
-const (
-	freqKeyPrefix = "freq:"
-	paceKeyPrefix = "pace:"
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type Campaign struct {
-	CampaignID         string
-	FreqCapImpressions int
-	PacedBudgetMicros  int64
-}
-
+// Reservation is the decision for one serve and the counters after it.
 type Reservation struct {
-	Allowed     bool
-	Seen        int
-	SpentMicros int64
+	Allowed     bool  \`json:"allowed"\`
+	Seen        int64 \`json:"seen"\`
+	SpentMicros int64 \`json:"spent_micros"\`
 }
 
-func freqKey(campaignID, userHash string) string {
-	return fmt.Sprintf("%s%s:%s", freqKeyPrefix, campaignID, userHash)
-}
+func freqKey(campaignID, userHash string) string { return "freq:" + campaignID + ":" + userHash }
 
-func paceKey(campaignID string) string {
-	return paceKeyPrefix + campaignID
-}
+func paceKey(campaignID string) string { return "pace:" + campaignID }
 
-type PacingStore struct {
-	client *redis.Client
-}
-
-func NewPacingStore(client *redis.Client) *PacingStore {
-	return &PacingStore{client: client}
-}
-
-func (s *PacingStore) Reserve(ctx context.Context, campaign Campaign, userHash string, priceMicros int64) (Reservation, error) {
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	capKey := freqKey(campaign.CampaignID, userHash)
-	spendKey := paceKey(campaign.CampaignID)
-	seen, err := s.client.Incr(ctx, capKey).Result()
+// reserve decides one serve against the user's frequency cap and the campaign's paced budget, and counts it when allowed.
+func reserve(ctx context.Context, c store.Campaign, userHash string, priceMicros int64) (Reservation, error) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	seen, err := rdb.Incr(ctx, freqKey(c.CampaignID, userHash)).Result()
 	if err != nil {
 		return Reservation{}, err
 	}
-	spent, err := s.client.IncrBy(ctx, spendKey, priceMicros).Result()
-	if err != nil {
+	spent, err := rdb.Get(ctx, paceKey(c.CampaignID)).Int64()
+	if err != nil && err != redis.Nil {
 		return Reservation{}, err
 	}
-	allowed := seen <= int64(campaign.FreqCapImpressions) && spent <= campaign.PacedBudgetMicros
-	return Reservation{Allowed: allowed, Seen: int(seen), SpentMicros: spent}, nil
+	if seen > c.FreqCap || spent+priceMicros > c.PacedBudgetMicros {
+		return Reservation{Allowed: false, Seen: seen, SpentMicros: spent}, nil
+	}
+	spent, err = rdb.IncrBy(ctx, paceKey(c.CampaignID), priceMicros).Result()
+	return Reservation{Allowed: true, Seen: seen, SpentMicros: spent}, err
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/redis/go-redis/v9"
+
+	"ads/store" // store.Campaign
 )
 
-const (
-	freqKeyPrefix = "freq:"
-	paceKeyPrefix = "pace:"
-)
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-// reserveScript decides and writes in one round trip: the allowance and the pacing spend commit
-// together, so a serve that is never returned does not burn an impression and a burst cannot
-// pass the same remaining budget.
-const reserveScript = \`
-local cap_key = KEYS[1]
-local pace_key = KEYS[2]
-local cap = tonumber(ARGV[1])
-local window_s = tonumber(ARGV[2])
-local price = tonumber(ARGV[3])
-local paced_budget = tonumber(ARGV[4])
-local seen = tonumber(redis.call('get', cap_key) or '0')
-if seen >= cap then
-  return {0, seen, 0}
-end
-local spent = tonumber(redis.call('get', pace_key) or '0')
-if spent + price > paced_budget then
+// reserveScript: KEYS the user's counter and the campaign's pacing counter; ARGV freq_cap,
+// freq_window_s, price, paced budget. Redis runs it to completion: no other serve can land between
+// the reads and the writes.
+var reserveScript = redis.NewScript(\`
+local seen = tonumber(redis.call('GET', KEYS[1]) or '0')
+local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
+if seen >= tonumber(ARGV[1]) or spent + tonumber(ARGV[3]) > tonumber(ARGV[4]) then
   return {0, seen, spent}
 end
-seen = redis.call('incr', cap_key)
+seen = redis.call('INCR', KEYS[1])
 if seen == 1 then
-  redis.call('expire', cap_key, window_s)
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
 end
-local new_spent = redis.call('incrby', pace_key, price)
-return {1, seen, new_spent}
-\`
+spent = redis.call('INCRBY', KEYS[2], ARGV[3])
+return {1, seen, spent}
+\`)
 
-type Campaign struct {
-	CampaignID         string
-	FreqCapImpressions int
-	FreqWindowS        int
-	PacedBudgetMicros  int64
-}
-
+// Reservation is the decision for one serve and the counters after it.
 type Reservation struct {
-	Allowed     bool
-	Seen        int
-	SpentMicros int64
+	Allowed     bool  \`json:"allowed"\`
+	Seen        int64 \`json:"seen"\`
+	SpentMicros int64 \`json:"spent_micros"\`
 }
 
-func freqKey(campaignID, userHash string) string {
-	return fmt.Sprintf("%s%s:%s", freqKeyPrefix, campaignID, userHash)
-}
+func freqKey(campaignID, userHash string) string { return "freq:" + campaignID + ":" + userHash }
 
-func paceKey(campaignID string) string {
-	return paceKeyPrefix + campaignID
-}
+func paceKey(campaignID string) string { return "pace:" + campaignID }
 
-type PacingStore struct {
-	client *redis.Client
-	script *redis.Script
-}
-
-func NewPacingStore(client *redis.Client) *PacingStore {
-	return &PacingStore{client: client, script: redis.NewScript(reserveScript)}
-}
-
-func (s *PacingStore) Reserve(ctx context.Context, campaign Campaign, userHash string, priceMicros int64) (Reservation, error) {
-	keys := []string{freqKey(campaign.CampaignID, userHash), paceKey(campaign.CampaignID)}
-	raw, err := s.script.Run(
-		ctx,
-		s.client,
-		keys,
-		campaign.FreqCapImpressions,
-		campaign.FreqWindowS,
-		priceMicros,
-		campaign.PacedBudgetMicros,
-	).Slice()
+// reserve decides one serve against the user's frequency cap and the campaign's paced budget, and counts it when allowed.
+func reserve(ctx context.Context, c store.Campaign, userHash string, priceMicros int64) (Reservation, error) {
+	keys := []string{freqKey(c.CampaignID, userHash), paceKey(c.CampaignID)}
+	out, err := reserveScript.Run(ctx, rdb, keys, c.FreqCap, c.FreqWindowS, priceMicros, c.PacedBudgetMicros).Int64Slice()
 	if err != nil {
 		return Reservation{}, err
 	}
-	allowed, _ := raw[0].(int64)
-	seen, _ := raw[1].(int64)
-	spent, _ := raw[2].(int64)
-	return Reservation{Allowed: allowed == 1, Seen: int(seen), SpentMicros: spent}, nil
+	return Reservation{Allowed: out[0] == 1, Seen: out[1], SpentMicros: out[2]}, nil
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
 
-object PacingStore {
-  val FreqKeyPrefix = "freq:"
-  val PaceKeyPrefix = "pace:"
-}
+import ads.Store // Store.Campaign
 
-final case class Campaign(campaign_id: String, freq_cap_impressions: Int, paced_budget_micros: Long)
+/** The decision for one serve and the counters after it. */
+final case class Reservation(allowed: Boolean, seen: Long, spentMicros: Long)
 
-final case class Reservation(allowed: Boolean, seen: Long, spent_micros: Long)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-class PacingStore(client: Jedis) {
-  import PacingStore._
+  def freqKey(campaignId: String, userHash: String): String = s"freq:$campaignId:$userHash"
+  def paceKey(campaignId: String): String = s"pace:$campaignId"
 
-  def freqKey(campaignId: String, userHash: String): String = s"$FreqKeyPrefix$campaignId:$userHash"
-
-  def paceKey(campaignId: String): String = s"$PaceKeyPrefix$campaignId"
-
-  def reserve(campaign: Campaign, userHash: String, priceMicros: Long): Reservation = {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    val seen = client.incr(freqKey(campaign.campaign_id, userHash))
-    val spent = client.incrBy(paceKey(campaign.campaign_id), priceMicros)
-    val allowed = seen <= campaign.freq_cap_impressions && spent <= campaign.paced_budget_micros
-    Reservation(allowed, seen, spent)
+  /** Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed. */
+  def reserve(c: Store.Campaign, userHash: String, priceMicros: Long): Reservation = {
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    val seen = jedis.incr(freqKey(c.campaignId, userHash))
+    val spent = Option(jedis.get(paceKey(c.campaignId))).map(_.toLong).getOrElse(0L)
+    if (seen > c.freqCap || spent + priceMicros > c.pacedBudgetMicros) Reservation(allowed = false, seen, spent)
+    else Reservation(allowed = true, seen, jedis.incrBy(paceKey(c.campaignId), priceMicros))
   }
 }
 `,
-      solution: `import redis.clients.jedis.Jedis
+      solution: `import redis.clients.jedis.JedisPooled
 
 import scala.jdk.CollectionConverters._
 
-object PacingStore {
-  val FreqKeyPrefix = "freq:"
-  val PaceKeyPrefix = "pace:"
-}
+import ads.Store // Store.Campaign
 
-object Scripts {
-  /** Loaded once, run once per serve: cap, pacing and both counters commit together. */
-  val ReserveScript: String =
-    """
-local cap_key = KEYS[1]
-local pace_key = KEYS[2]
-local cap = tonumber(ARGV[1])
-local window_s = tonumber(ARGV[2])
-local price = tonumber(ARGV[3])
-local paced_budget = tonumber(ARGV[4])
-local seen = tonumber(redis.call('get', cap_key) or '0')
-if seen >= cap then
-  return {0, seen, 0}
-end
-local spent = tonumber(redis.call('get', pace_key) or '0')
-if spent + price > paced_budget then
-  return {0, seen, spent}
-end
-seen = redis.call('incr', cap_key)
-if seen == 1 then
-  redis.call('expire', cap_key, window_s)
-end
-local new_spent = redis.call('incrby', pace_key, price)
-return {1, seen, new_spent}
-"""
-}
+/** The decision for one serve and the counters after it. */
+final case class Reservation(allowed: Boolean, seen: Long, spentMicros: Long)
 
-final case class Campaign(
-    campaign_id: String,
-    freq_cap_impressions: Int,
-    freq_window_s: Int,
-    paced_budget_micros: Long)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-final case class Reservation(allowed: Boolean, seen: Long, spent_micros: Long)
+  /**
+   * KEYS the user's counter and the campaign's pacing counter; ARGV freq_cap, freq_window_s, price,
+   * paced budget. Redis runs it to completion: no other serve can land between the reads and the writes.
+   */
+  val ReserveLua: String =
+    """local seen = tonumber(redis.call('GET', KEYS[1]) or '0')
+      |local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
+      |if seen >= tonumber(ARGV[1]) or spent + tonumber(ARGV[3]) > tonumber(ARGV[4]) then
+      |  return {0, seen, spent}
+      |end
+      |seen = redis.call('INCR', KEYS[1])
+      |if seen == 1 then
+      |  redis.call('EXPIRE', KEYS[1], ARGV[2])
+      |end
+      |spent = redis.call('INCRBY', KEYS[2], ARGV[3])
+      |return {1, seen, spent}
+      |""".stripMargin
 
-class PacingStore(client: Jedis) {
-  import PacingStore._
+  def freqKey(campaignId: String, userHash: String): String = s"freq:$campaignId:$userHash"
+  def paceKey(campaignId: String): String = s"pace:$campaignId"
 
-  private val scriptSha: String = client.scriptLoad(Scripts.ReserveScript)
-
-  def freqKey(campaignId: String, userHash: String): String = s"$FreqKeyPrefix$campaignId:$userHash"
-
-  def paceKey(campaignId: String): String = s"$PaceKeyPrefix$campaignId"
-
-  def reserve(campaign: Campaign, userHash: String, priceMicros: Long): Reservation = {
-    val reply = client.evalsha(
-      scriptSha,
-      2,
-      freqKey(campaign.campaign_id, userHash),
-      paceKey(campaign.campaign_id),
-      campaign.freq_cap_impressions.toString,
-      campaign.freq_window_s.toString,
-      priceMicros.toString,
-      campaign.paced_budget_micros.toString)
-    val values = reply.asScala.map(_.toLong).toList
-    Reservation(values.head == 1L, values(1), values(2))
+  /** Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed. */
+  def reserve(c: Store.Campaign, userHash: String, priceMicros: Long): Reservation = {
+    val keys = List(freqKey(c.campaignId, userHash), paceKey(c.campaignId)).asJava
+    val args = List(c.freqCap, c.freqWindowS, priceMicros, c.pacedBudgetMicros).map(_.toString).asJava
+    val out = jedis.eval(ReserveLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]].asScala.map(_.longValue)
+    Reservation(allowed = out(0) == 1L, out(1), out(2))
   }
 }
 `,
@@ -575,130 +416,401 @@ class PacingStore(client: Jedis) {
       starter: `#include <sw/redis++/redis++.h>
 
 #include <string>
-#include <vector>
 
-const std::string kFreqKeyPrefix = "freq:";
-const std::string kPaceKeyPrefix = "pace:";
+#include "ads/store.h"  // store::Campaign
 
-struct Campaign {
-  std::string campaign_id;
-  int freq_cap_impressions;
-  long paced_budget_micros;
-};
+sw::redis::Redis redis("tcp://redis:6379");
 
+// The decision for one serve and the counters after it.
 struct Reservation {
-  bool allowed;
-  long seen;
-  long spent_micros;
+  bool allowed = false;
+  long long seen = 0;
+  long long spent_micros = 0;
 };
 
-std::string freqKey(const std::string& campaignId, const std::string& userHash) {
-  return kFreqKeyPrefix + campaignId + ":" + userHash;
+std::string freqKey(const std::string& campaign_id, const std::string& user_hash) { return "freq:" + campaign_id + ":" + user_hash; }
+
+std::string paceKey(const std::string& campaign_id) { return "pace:" + campaign_id; }
+
+// Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed.
+Reservation reserve(const store::Campaign& c, const std::string& user_hash, long long price_micros) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const long long seen = redis.incr(freqKey(c.campaign_id, user_hash));
+  const auto raw = redis.get(paceKey(c.campaign_id));
+  const long long spent = raw ? std::stoll(*raw) : 0;
+  if (seen > c.freq_cap || spent + price_micros > c.paced_budget_micros) return Reservation{false, seen, spent};
+  return Reservation{true, seen, redis.incrby(paceKey(c.campaign_id), price_micros)};
 }
-
-std::string paceKey(const std::string& campaignId) { return kPaceKeyPrefix + campaignId; }
-
-class PacingStore {
- public:
-  explicit PacingStore(sw::redis::Redis& client) : client_(client) {}
-
-  Reservation reserve(const Campaign& campaign, const std::string& userHash, long priceMicros) {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const long seen = client_.incr(freqKey(campaign.campaign_id, userHash));
-    const long spent = client_.incrby(paceKey(campaign.campaign_id), priceMicros);
-    const bool allowed = seen <= campaign.freq_cap_impressions && spent <= campaign.paced_budget_micros;
-    return Reservation{allowed, seen, spent};
-  }
-
- private:
-  sw::redis::Redis& client_;
-};
 `,
       solution: `#include <sw/redis++/redis++.h>
 
+#include <iterator>
 #include <string>
 #include <vector>
 
-const std::string kFreqKeyPrefix = "freq:";
-const std::string kPaceKeyPrefix = "pace:";
+#include "ads/store.h"  // store::Campaign
 
-// Loaded once with SCRIPT LOAD, run once per serve with EVALSHA: the allowance and the pacing
-// spend commit together, so a serve that is never returned does not burn an impression.
-const std::string kReserveScript = R"lua(
-local cap_key = KEYS[1]
-local pace_key = KEYS[2]
-local cap = tonumber(ARGV[1])
-local window_s = tonumber(ARGV[2])
-local price = tonumber(ARGV[3])
-local paced_budget = tonumber(ARGV[4])
-local seen = tonumber(redis.call('get', cap_key) or '0')
-if seen >= cap then
-  return {0, seen, 0}
-end
-local spent = tonumber(redis.call('get', pace_key) or '0')
-if spent + price > paced_budget then
+sw::redis::Redis redis("tcp://redis:6379");
+
+// KEYS the user's counter and the campaign's pacing counter; ARGV freq_cap, freq_window_s, price,
+// paced budget. Redis runs it to completion: no other serve can land between the reads and the writes.
+const std::string kReserveLua = R"lua(
+local seen = tonumber(redis.call('GET', KEYS[1]) or '0')
+local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
+if seen >= tonumber(ARGV[1]) or spent + tonumber(ARGV[3]) > tonumber(ARGV[4]) then
   return {0, seen, spent}
 end
-seen = redis.call('incr', cap_key)
+seen = redis.call('INCR', KEYS[1])
 if seen == 1 then
-  redis.call('expire', cap_key, window_s)
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
 end
-local new_spent = redis.call('incrby', pace_key, price)
-return {1, seen, new_spent}
+spent = redis.call('INCRBY', KEYS[2], ARGV[3])
+return {1, seen, spent}
 )lua";
 
-struct Campaign {
-  std::string campaign_id;
-  int freq_cap_impressions;
-  int freq_window_s;
-  long paced_budget_micros;
-};
-
+// The decision for one serve and the counters after it.
 struct Reservation {
-  bool allowed;
-  long seen;
-  long spent_micros;
+  bool allowed = false;
+  long long seen = 0;
+  long long spent_micros = 0;
 };
 
-std::string freqKey(const std::string& campaignId, const std::string& userHash) {
-  return kFreqKeyPrefix + campaignId + ":" + userHash;
+std::string freqKey(const std::string& campaign_id, const std::string& user_hash) { return "freq:" + campaign_id + ":" + user_hash; }
+
+std::string paceKey(const std::string& campaign_id) { return "pace:" + campaign_id; }
+
+// Decide one serve against the user's frequency cap and the campaign's paced budget, and count it when allowed.
+Reservation reserve(const store::Campaign& c, const std::string& user_hash, long long price_micros) {
+  std::vector<long long> out;
+  redis.eval(kReserveLua, {freqKey(c.campaign_id, user_hash), paceKey(c.campaign_id)},
+             {std::to_string(c.freq_cap), std::to_string(c.freq_window_s), std::to_string(price_micros), std::to_string(c.paced_budget_micros)},
+             std::back_inserter(out));
+  return Reservation{out.at(0) == 1, out.at(1), out.at(2)};
 }
-
-std::string paceKey(const std::string& campaignId) { return kPaceKeyPrefix + campaignId; }
-
-/** redis-plus-plus returns one value per EVALSHA, so the array reply is fetched as a command. */
-std::vector<long long> evalReserve(sw::redis::Redis& client, const std::string& sha,
-                                   const std::vector<std::string>& keys,
-                                   const std::vector<std::string>& args) {
-  return client.command<std::vector<long long>>("EVALSHA", sha, std::to_string(keys.size()), keys[0], keys[1],
-                                                args[0], args[1], args[2], args[3]);
-}
-
-class PacingStore {
- public:
-  explicit PacingStore(sw::redis::Redis& client) : client_(client), sha_(client.script_load(kReserveScript)) {}
-
-  Reservation reserve(const Campaign& campaign, const std::string& userHash, long priceMicros) {
-    const std::vector<std::string> keys{freqKey(campaign.campaign_id, userHash), paceKey(campaign.campaign_id)};
-    const std::vector<std::string> args{std::to_string(campaign.freq_cap_impressions),
-                                       std::to_string(campaign.freq_window_s),
-                                       std::to_string(priceMicros),
-                                       std::to_string(campaign.paced_budget_micros)};
-    const auto reply = evalReserve(client_, sha_, keys, args);
-    return Reservation{reply[0] == 1, reply[1], reply[2]};
-  }
-
- private:
-  sw::redis::Redis& client_;
-  std::string sha_;
-};
 `,
     },
   },
+  harness: {
+    python: `def _campaign(**fields):
+    campaign = {
+        "campaign_id": "c-1", "advertiser_id": "adv-1", "version": 1, "state": "active", "placement": "home-top",
+        "creative_id": "cr-c-1", "bid_micros": 1000, "freq_cap": 2, "freq_window_s": 3600,
+        "paced_budget_micros": 3000, "goal_impressions": 1000, "start_ts": 0, "end_ts": 86400,
+    }
+    campaign.update(fields)
+    return campaign
+
+
+def check_no_burn(ctx):
+    m = ctx.load("state")
+    c = _campaign()
+    for n in (1, 2):
+        got = m.reserve(c, "u-1", 1000)
+        assert got["allowed"] is True and got["seen"] == n, f"reserve #{n} for u-1 (freq_cap 2) answered {got}, expected allowed with seen {n}"
+    refused = m.reserve(c, "u-1", 1000)
+    assert refused["allowed"] is False, f"a third serve for u-1 with freq_cap 2 answered {refused}, expected a refusal"
+    assert ctx.redis.get("freq:c-1:u-1") == "2", f"the refused serve moved freq:c-1:u-1 to {ctx.redis.get('freq:c-1:u-1')}: a serve that was never shown burned one of the user's impressions. Compare before INCR"
+    assert ctx.redis.get("pace:c-1") == "2000", f"pace:c-1 is {ctx.redis.get('pace:c-1')} after a refused serve, expected the 2000 the two allowed serves reserved"
+    ctx.redis.set("pace:c-1", 3000)
+    broke = m.reserve(c, "u-2", 1000)
+    assert broke["allowed"] is False, f"a serve with the budget spent answered {broke}, expected a refusal"
+    assert ctx.redis.get("freq:c-1:u-2") in (None, "0"), f"a serve refused for budget moved freq:c-1:u-2 to {ctx.redis.get('freq:c-1:u-2')}: u-2 never saw the ad"
+    assert ctx.redis.get("pace:c-1") == "3000", f"a serve refused for budget moved pace:c-1 to {ctx.redis.get('pace:c-1')}"
+
+
+def check_one_decision(ctx):
+    m = ctx.load("state")
+    c = _campaign(freq_cap=10, paced_budget_micros=2000)
+    ctx.redis.set("pace:c-1", 1000)
+    # Another app server's serve lands right after this one first touches the pacing counter.
+    rival = ctx.redis_after("pace:c-1", lambda: m.reserve(c, "u-2", 1000))
+    mine = m.reserve(c, "u-1", 1000)
+    assert rival.fired, "reserve never touched pace:c-1"
+    if rival.error is not None:
+        raise rival.error
+    allowed = [got for got in (mine, rival.result) if got["allowed"]]
+    assert len(allowed) == 1, f"two serves raced for the last 1000 micros of a 2000-micro budget and {len(allowed)} were allowed (pace:c-1 is now {ctx.redis.get('pace:c-1')}): the read and the increment must be one atomic decision"
+    assert ctx.redis.get("pace:c-1") == "2000", f"pace:c-1 is {ctx.redis.get('pace:c-1')} after the race, expected the 2000-micro budget, not more"
+
+
+def check_window_ttl(ctx):
+    m = ctx.load("state")
+    c = _campaign(freq_cap=5, paced_budget_micros=1_000_000)
+    m.reserve(c, "u-1", 1000)
+    ttl = ctx.redis.ttl("freq:c-1:u-1")
+    assert 3590 <= ttl <= 3600, f"freq:c-1:u-1 has TTL {ttl} after the first impression, expected the campaign's 3600 s frequency window: without it the cap never rolls off"
+    ctx.clock.advance(600)
+    m.reserve(c, "u-1", 1000)
+    ttl = ctx.redis.ttl("freq:c-1:u-1")
+    assert 2990 <= ttl <= 3000, f"freq:c-1:u-1 has TTL {ttl} after a second impression 600 s later, expected about 3000: the window starts at the first impression (EXPIRE when INCR returns 1)"
+    ctx.clock.advance(3001)
+    assert ctx.redis.exists("freq:c-1:u-1") == 0, "freq:c-1:u-1 is still there after the frequency window"
+    got = m.reserve(c, "u-1", 1000)
+    assert got["allowed"] is True and got["seen"] == 1, f"after the window ended u-1's next serve answered {got}, expected allowed with seen 1"
+`,
+    typescript: `const campaign = (fields = {}) => ({
+  campaign_id: 'c-1',
+  advertiser_id: 'adv-1',
+  version: 1,
+  state: 'active',
+  placement: 'home-top',
+  creative_id: 'cr-c-1',
+  bid_micros: 1000,
+  freq_cap: 2,
+  freq_window_s: 3600,
+  paced_budget_micros: 3000,
+  goal_impressions: 1000,
+  start_ts: 0,
+  end_ts: 86400,
+  ...fields,
+});
+
+export async function check_no_burn(ctx) {
+  const m = ctx.load('state');
+  const c = campaign();
+  for (const n of [1, 2]) {
+    const got = await m.reserve(c, 'u-1', 1000);
+    assert(got.allowed === true && got.seen === n, \`reserve #\${n} for u-1 (freq_cap 2) answered \${JSON.stringify(got)}, expected allowed with seen \${n}\`);
+  }
+  const refused = await m.reserve(c, 'u-1', 1000);
+  assert.equal(refused.allowed, false, \`a third serve for u-1 with freq_cap 2 answered \${JSON.stringify(refused)}, expected a refusal\`);
+  assert.equal(ctx.redis.get('freq:c-1:u-1'), '2', \`the refused serve moved freq:c-1:u-1 to \${ctx.redis.get('freq:c-1:u-1')}: a serve that was never shown burned one of the user's impressions. Compare before INCR\`);
+  assert.equal(ctx.redis.get('pace:c-1'), '2000', \`pace:c-1 is \${ctx.redis.get('pace:c-1')} after a refused serve, expected the 2000 the two allowed serves reserved\`);
+  ctx.redis.set('pace:c-1', '3000');
+  const broke = await m.reserve(c, 'u-2', 1000);
+  assert.equal(broke.allowed, false, \`a serve with the budget spent answered \${JSON.stringify(broke)}, expected a refusal\`);
+  const u2 = ctx.redis.get('freq:c-1:u-2');
+  assert(u2 === null || u2 === '0', \`a serve refused for budget moved freq:c-1:u-2 to \${u2}: u-2 never saw the ad\`);
+  assert.equal(ctx.redis.get('pace:c-1'), '3000', \`a serve refused for budget moved pace:c-1 to \${ctx.redis.get('pace:c-1')}\`);
+}
+
+export async function check_one_decision(ctx) {
+  const m = ctx.load('state');
+  const c = campaign({freq_cap: 10, paced_budget_micros: 2000});
+  ctx.redis.set('pace:c-1', '1000');
+  // Another app server's serve lands right after this one first touches the pacing counter.
+  const rival = ctx.redisAfter('pace:c-1', () => m.reserve(c, 'u-2', 1000));
+  const mine = await m.reserve(c, 'u-1', 1000);
+  assert(rival.fired, 'reserve never touched pace:c-1');
+  if (rival.error !== undefined) throw rival.error;
+  const theirs = await rival.result;
+  const allowed = [mine, theirs].filter(got => got.allowed).length;
+  assert.equal(allowed, 1, \`two serves raced for the last 1000 micros of a 2000-micro budget and \${allowed} were allowed (pace:c-1 is now \${ctx.redis.get('pace:c-1')}): the read and the increment must be one atomic decision\`);
+  assert.equal(ctx.redis.get('pace:c-1'), '2000', \`pace:c-1 is \${ctx.redis.get('pace:c-1')} after the race, expected the 2000-micro budget, not more\`);
+}
+
+export async function check_window_ttl(ctx) {
+  const m = ctx.load('state');
+  const c = campaign({freq_cap: 5, paced_budget_micros: 1000000});
+  await m.reserve(c, 'u-1', 1000);
+  let ttl = ctx.redis.ttl('freq:c-1:u-1');
+  assert(3590 <= ttl && ttl <= 3600, \`freq:c-1:u-1 has TTL \${ttl} after the first impression, expected the campaign's 3600 s frequency window: without it the cap never rolls off\`);
+  ctx.clock.advance(600);
+  await m.reserve(c, 'u-1', 1000);
+  ttl = ctx.redis.ttl('freq:c-1:u-1');
+  assert(2990 <= ttl && ttl <= 3000, \`freq:c-1:u-1 has TTL \${ttl} after a second impression 600 s later, expected about 3000: the window starts at the first impression (EXPIRE when INCR returns 1)\`);
+  ctx.clock.advance(3001);
+  assert.equal(ctx.redis.exists('freq:c-1:u-1'), 0, 'freq:c-1:u-1 is still there after the frequency window');
+  const got = await m.reserve(c, 'u-1', 1000);
+  assert(got.allowed === true && got.seen === 1, \`after the window ended u-1's next serve answered \${JSON.stringify(got)}, expected allowed with seen 1\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+
+	"ads/store"
+
+	"leetbuild/harness"
+)
+
+var stateBg = context.Background()
+
+func stateCampaign() store.Campaign {
+	return store.Campaign{
+		CampaignID: "c-1", AdvertiserID: "adv-1", Version: 1, State: "active", Placement: "home-top", CreativeID: "cr-c-1",
+		BidMicros: 1000, FreqCap: 2, FreqWindowS: 3600, PacedBudgetMicros: 3000, GoalImpressions: 1000, StartTs: 0, EndTs: 86400,
+	}
+}
+
+func stateReserve(ctx *harness.Ctx, c store.Campaign, user string) Reservation {
+	got, err := reserve(stateBg, c, user, 1000)
+	ctx.NoError(err, "reserve(c-1, %s, 1000)", user)
+	return got
+}
+
+func stateGet(ctx *harness.Ctx, key string) string {
+	v, _ := ctx.Redis.Get(key)
+	return v
+}
+
+func CheckNoBurn(ctx *harness.Ctx) {
+	c := stateCampaign()
+	for n := int64(1); n <= 2; n++ {
+		got := stateReserve(ctx, c, "u-1")
+		ctx.Assert(got.Allowed && got.Seen == n, "reserve #%d for u-1 (freq_cap 2) answered %+v, expected allowed with seen %d", n, got, n)
+	}
+	refused := stateReserve(ctx, c, "u-1")
+	ctx.Equal(refused.Allowed, false, "a third serve for u-1 with freq_cap 2 must be refused; allowed")
+	ctx.Equal(stateGet(ctx, "freq:c-1:u-1"), "2", "a serve that was never shown must not burn one of the user's impressions (compare before INCR); freq:c-1:u-1 after the refusal")
+	ctx.Equal(stateGet(ctx, "pace:c-1"), "2000", "pace:c-1 after a refused serve")
+	ctx.Redis.Set("pace:c-1", "3000")
+	broke := stateReserve(ctx, c, "u-2")
+	ctx.Equal(broke.Allowed, false, "a serve with the budget spent must be refused; allowed")
+	u2 := stateGet(ctx, "freq:c-1:u-2")
+	ctx.Assert(u2 == "" || u2 == "0", "a serve refused for budget moved freq:c-1:u-2 to %s: u-2 never saw the ad", u2)
+	ctx.Equal(stateGet(ctx, "pace:c-1"), "3000", "pace:c-1 after a serve refused for budget")
+}
+
+func CheckOneDecision(ctx *harness.Ctx) {
+	c := stateCampaign()
+	c.FreqCap = 10
+	c.PacedBudgetMicros = 2000
+	ctx.Redis.Set("pace:c-1", "1000")
+	// Another app server's serve lands right after this one first touches the pacing counter.
+	rival := ctx.Redis.After("pace:c-1", func() any {
+		got, err := reserve(stateBg, c, "u-2", 1000)
+		ctx.NoError(err, "the rival reserve failed")
+		return got
+	})
+	mine := stateReserve(ctx, c, "u-1")
+	ctx.Assert(rival.Fired, "reserve never touched pace:c-1")
+	ctx.Assert(rival.Err == nil, "the rival reserve failed: %v", rival.Err)
+	theirs, _ := rival.Result.(Reservation)
+	allowed := 0
+	for _, got := range []Reservation{mine, theirs} {
+		if got.Allowed {
+			allowed++
+		}
+	}
+	ctx.Equal(allowed, 1, "two serves raced for the last 1000 micros of a 2000-micro budget (pace:c-1 is now %s): the read and the increment must be one atomic decision; serves allowed", stateGet(ctx, "pace:c-1"))
+	ctx.Equal(stateGet(ctx, "pace:c-1"), "2000", "pace:c-1 after the race must not pass the 2000-micro budget")
+}
+
+func CheckWindowTtl(ctx *harness.Ctx) {
+	c := stateCampaign()
+	c.FreqCap = 5
+	c.PacedBudgetMicros = 1000000
+	stateReserve(ctx, c, "u-1")
+	ttl := ctx.Redis.TTL("freq:c-1:u-1")
+	ctx.Assert(3590 <= ttl && ttl <= 3600, "freq:c-1:u-1 has TTL %d after the first impression, expected the campaign's 3600 s frequency window: without it the cap never rolls off", ttl)
+	ctx.Clock.Advance(600)
+	stateReserve(ctx, c, "u-1")
+	ttl = ctx.Redis.TTL("freq:c-1:u-1")
+	ctx.Assert(2990 <= ttl && ttl <= 3000, "freq:c-1:u-1 has TTL %d after a second impression 600 s later, expected about 3000: the window starts at the first impression (EXPIRE when INCR returns 1)", ttl)
+	ctx.Clock.Advance(3001)
+	ctx.Equal(ctx.Redis.Exists("freq:c-1:u-1"), 0, "freq:c-1:u-1 after the frequency window")
+	got := stateReserve(ctx, c, "u-1")
+	ctx.Assert(got.Allowed && got.Seen == 1, "after the window ended u-1's next serve answered %+v, expected allowed with seen 1", got)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <optional>
+#include <string>
+
+#include "ads/store.h"
+
+namespace {
+
+store::Campaign stateCampaign() {
+  store::Campaign c;
+  c.campaign_id = "c-1";
+  c.advertiser_id = "adv-1";
+  c.version = 1;
+  c.state = "active";
+  c.placement = "home-top";
+  c.creative_id = "cr-c-1";
+  c.bid_micros = 1000;
+  c.freq_cap = 2;
+  c.freq_window_s = 3600;
+  c.paced_budget_micros = 3000;
+  c.goal_impressions = 1000;
+  c.start_ts = 0;
+  c.end_ts = 86400;
+  return c;
+}
+
+std::string stateGet(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key).value_or(""); }
+
+std::string stateShow(const Reservation& r) {
+  return std::string("{allowed ") + (r.allowed ? "true" : "false") + ", seen " + std::to_string(r.seen) + ", spent_micros " + std::to_string(r.spent_micros) + "}";
+}
+
+// A probe's outcome: whether it fired, what the rival reserve returned, what it threw.
+struct StateRival {
+  bool fired = false;
+  Reservation got;
+  std::optional<std::string> err;
+};
+
+}  // namespace
+
+void CheckNoBurn(harness::Ctx& ctx) {
+  const store::Campaign c = stateCampaign();
+  for (long long n = 1; n <= 2; n++) {
+    const Reservation got = reserve(c, "u-1", 1000);
+    ctx.Assert(got.allowed && got.seen == n, "reserve #%d for u-1 (freq_cap 2) answered %s, expected allowed with seen %d", n, stateShow(got), n);
+  }
+  const Reservation refused = reserve(c, "u-1", 1000);
+  ctx.Equal(refused.allowed, false, "a third serve for u-1 with freq_cap 2 must be refused; allowed");
+  ctx.Equal(stateGet(ctx, "freq:c-1:u-1"), std::string("2"), "a serve that was never shown must not burn one of the user's impressions (compare before INCR); freq:c-1:u-1 after the refusal");
+  ctx.Equal(stateGet(ctx, "pace:c-1"), std::string("2000"), "pace:c-1 after a refused serve");
+  ctx.Redis.Set("pace:c-1", "3000");
+  const Reservation broke = reserve(c, "u-2", 1000);
+  ctx.Equal(broke.allowed, false, "a serve with the budget spent must be refused; allowed");
+  const std::string u2 = stateGet(ctx, "freq:c-1:u-2");
+  ctx.Assert(u2.empty() || u2 == "0", "a serve refused for budget moved freq:c-1:u-2 to %s: u-2 never saw the ad", u2);
+  ctx.Equal(stateGet(ctx, "pace:c-1"), std::string("3000"), "pace:c-1 after a serve refused for budget");
+}
+
+void CheckOneDecision(harness::Ctx& ctx) {
+  store::Campaign c = stateCampaign();
+  c.freq_cap = 10;
+  c.paced_budget_micros = 2000;
+  ctx.Redis.Set("pace:c-1", "1000");
+  // Another app server's serve lands right after this one first touches the pacing counter.
+  auto rival = std::make_shared<StateRival>();
+  ctx.Redis.After("pace:c-1", [rival, c] {
+    rival->fired = true;
+    try {
+      rival->got = reserve(c, "u-2", 1000);
+    } catch (const std::exception& e) {
+      rival->err = e.what();
+    }
+  });
+  const Reservation mine = reserve(c, "u-1", 1000);
+  ctx.Assert(rival->fired, "reserve never touched pace:c-1");
+  ctx.Assert(!rival->err, "the rival reserve failed: %s", rival->err.value_or(""));
+  const int allowed = (mine.allowed ? 1 : 0) + (rival->got.allowed ? 1 : 0);
+  ctx.Equal(allowed, 1, "two serves raced for the last 1000 micros of a 2000-micro budget (pace:c-1 is now %s): the read and the increment must be one atomic decision; serves allowed", stateGet(ctx, "pace:c-1"));
+  ctx.Equal(stateGet(ctx, "pace:c-1"), std::string("2000"), "pace:c-1 after the race must not pass the 2000-micro budget");
+}
+
+void CheckWindowTtl(harness::Ctx& ctx) {
+  store::Campaign c = stateCampaign();
+  c.freq_cap = 5;
+  c.paced_budget_micros = 1000000;
+  reserve(c, "u-1", 1000);
+  long long ttl = ctx.Redis.TTL("freq:c-1:u-1");
+  ctx.Assert(3590 <= ttl && ttl <= 3600, "freq:c-1:u-1 has TTL %d after the first impression, expected the campaign's 3600 s frequency window: without it the cap never rolls off", ttl);
+  ctx.Clock.Advance(600);
+  reserve(c, "u-1", 1000);
+  ttl = ctx.Redis.TTL("freq:c-1:u-1");
+  ctx.Assert(2990 <= ttl && ttl <= 3000, "freq:c-1:u-1 has TTL %d after a second impression 600 s later, expected about 3000: the window starts at the first impression (EXPIRE when INCR returns 1)", ttl);
+  ctx.Clock.Advance(3001);
+  ctx.Equal(ctx.Redis.Exists("freq:c-1:u-1"), 0, "freq:c-1:u-1 after the frequency window");
+  const Reservation got = reserve(c, "u-1", 1000);
+  ctx.Assert(got.allowed && got.seen == 1, "after the window ended u-1's next serve answered %s, expected allowed with seen 1", stateShow(got));
+}
+`,
+  },
   hints: [
-    'A campaign with a 10 USD pacing budget spends 14 USD in one traffic spike; a user capped in March is still capped in April; a request that timed out still counted as an impression.',
-    'Each `reserve` does `INCR cap_key`, then `INCRBY pace_key price`, then compares. Both writes land before any decision, and between the two commands other serves read the same remaining budget. No `EXPIRE` is ever issued.',
-    'Move the whole decision into `RESERVE_SCRIPT`, loaded once with `script_load` and run with `evalsha`: `get cap_key` and compare, check `spent + price > paced_budget`, then `incr`, `expire` when `seen == 1`, and `incrby`.',
+    'Cap a user at two impressions and ask a third time: the answer is a refusal, yet the counter reads 3. Two serves fired together at the last of a budget both come back allowed.',
+    'The user is counted with `INCR` before anything is decided, and the pacing counter is read in one round trip and written in another; between them another serve reads the same total. Nothing ever sets a TTL.',
+    'Move the decision into one Lua script: GET both keys, return `{0, seen, spent}` when `seen >= cap` or `spent + price > budget`, else INCR (EXPIRE the key when it returns 1) and INCRBY.',
   ],
-  debrief: `Every flaw in the starter is an ordering flaw, so the fix is a reordering with a fence around it. Incrementing before the decision means the counter reflects requests rather than impressions; pacing in a second command means the read-modify-write race is visible to the whole burst; missing the TTL means the window never rolls. One Lua script fixes all of it because Redis runs it to completion without interleaving: the checks and both writes are a single atomic step, and the TTL is set exactly once, at the first write. A production pacing layer separates reservation from confirmation, so a serve whose render is cancelled gives its budget back, and aligns the pacing key's TTL with the flight end so counters cannot outlive the campaign.`,
+  debrief: `Redis runs a script to completion, so putting the reads and the writes in one script turns a read-modify-write that a burst can interleave into one decision. The order inside it matters as much as the fence: comparing before incrementing is what makes the counters count impressions that were allowed rather than requests that arrived. Setting the TTL only when the counter is created gives a fixed window from the first impression; refreshing it on every write would let a frequent visitor stay capped forever. Production pacing usually spreads a daily budget across the hours with a target curve, and keeps one counter per pacing interval so a slow morning does not leave the whole day's money for the evening.`,
 };

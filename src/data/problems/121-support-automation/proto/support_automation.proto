@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package apv2rpc;
+
+// The four dependencies apv2 calls. The harness serves deterministic stand-ins at the addresses in
+// apv2/config (apv2/standins in the support modules says how each one answers).
+
+// The dynamic context retriever step 2 calls for help articles relevant to the question.
+service ContextRetriever {
+  rpc Retrieve(RetrieveRequest) returns (RetrieveReply);
+}
+
+message RetrieveRequest {
+  string tenant = 1;
+  string retriever = 2;
+  string question = 3;
+}
+
+message RetrieveReply {
+  repeated string items = 1;
+}
+
+// One entry of the conversation the model sees: kind is user, assistant or tool.
+message ContextItem {
+  string kind = 1;
+  string text = 2;
+}
+
+// The LLM Adapter step 3 asks for the next move: a tool to run, or the result.
+service LlmAdapter {
+  rpc Reason(ReasonRequest) returns (ReasonReply);
+}
+
+message ReasonRequest {
+  string turn_id = 1;
+  int32 iteration = 2;
+  repeated ContextItem messages = 3;
+}
+
+message ReasonReply {
+  // "tool" (run tool with args, a JSON object) or "result" (text is the answer).
+  string kind = 1;
+  string tool = 2;
+  string args = 3;
+  string text = 4;
+  int32 input_tokens = 5;
+  int32 output_tokens = 6;
+}
+
+// The Tool Manager step 3 asks to run a registered tool.
+service ToolManager {
+  rpc Invoke(InvokeRequest) returns (InvokeReply);
+}
+
+message InvokeRequest {
+  string turn_id = 1;
+  string tool = 2;
+  string args = 3;
+  // Set for WRITE tools: the Tool Manager runs a key once and answers a repeat from its ledger.
+  string idempotency_key = 4;
+}
+
+message InvokeReply {
+  string result = 1;
+}
+
+// The Guardrails Framework step 4 asks for one guardrail's verdict on an answer.
+service GuardrailFramework {
+  rpc Check(CheckRequest) returns (CheckReply);
+}
+
+message CheckRequest {
+  string guardrail = 1;
+  string turn_id = 2;
+  string question = 3;
+  string answer = 4;
+  repeated string articles = 5;
+}
+
+message CheckReply {
+  // PASS or FAIL.
+  string verdict = 1;
+  string reason = 2;
+}

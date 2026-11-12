@@ -8,42 +8,43 @@ export const turnEndpointStep: Step = {
   focus: ['client', 'api', 'db', 'workflow'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/conversations/{conversation}/messages\` with
-body \`{"text": "…"}\`, parses the body, runs the Chain of Thought workflow inside the request and
-answers 200 with the model's text. It serves the demo and hides 4 flaws.
+**Starting point.** The starter serves \`POST /v1/conversations/{conversation}/messages\` with body
+\`{"text": "…"}\`: \`auth.verify\` turns the bearer token into a principal (401 without one), it
+builds a turn \`{turn_id, tenant, conversation, actor, role, text}\`, looks it up with \`turns.get\`
+under the \`Idempotency-Key\` (or the fresh turn id), stores it with \`turns.put\`, hands it to
+\`workflow.enqueue\` and answers 202 \`{"turn_id", "status": "queued"}\`. It serves the demo and hides
+4 flaws.
 
-**Failure mode the checks target.** A role read from the body lets any customer run agent-only
-tools; an uncapped \`text\` is re-sent to the model on every iteration; an endpoint without an
-idempotency key turns one client retry into two turns and two executions of whatever write tool
-the model chose; a loop run inline lets the HTTP timeout, not the platform, end the turn.
+**Failure mode the checks target.** The role decides which tools the reasoning loop may run, and the
+starter lets the body name it. Every byte of the text is re-sent to the model on every iteration,
+uncapped. A retry without a key, or two replicas handling one retry at once, becomes two turns and two
+runs of whatever write tool the model picks.
 
-- The actor comes from the verified bearer token: \`auth.verify(authorization)\` returns the
-  principal (tenant, actor id, role) or nothing. No principal is **401**. The **role** is the
-  principal's role, not a field of the body.
-- \`text\` is a non-empty string of at most **8 KiB** (\`8 << 10\` bytes) of UTF-8; empty is
-  **400**, larger is **413**.
-- \`Idempotency-Key\` is required (**400** when missing). A retry with the same
-  \`(conversation, key)\` returns the stored turn instead of starting a second one.
-- The turn is **enqueued** for the workflow (\`workflow.enqueue\`) and the response is **202**
-  with \`{"turn_id": "…"}\`.
-- Log conversation, turn id and role, not the text.`,
+- \`role\` is the principal's role; a \`role\` in the body changes nothing.
+- \`text\` is a non-empty string (**400** otherwise) of at most **8 KiB** of UTF-8
+  (\`MAX_TEXT_BYTES = 8 << 10\`, counted in bytes); larger is **413**.
+- \`Idempotency-Key\` is required (**400**). A replay of \`(conversation, key)\` answers 202 with the
+  stored turn's id and enqueues nothing.
+- Check and store in one command: \`turns.claim(conversation, key, turn)\` (one \`SET NX\`) returns the
+  turn already stored, if any; only a turn this request stored is enqueued.
+- Every rejection happens before anything is stored or enqueued.`,
   sequence: {
     participants: ['Client', 'apv2 API', 'turn store', 'CoT workflow'],
     messages: [
       {from: 'Client', to: 'apv2 API', label: 'POST …/messages · Authorization · Idempotency-Key', kind: 'sync'},
-      {from: 'apv2 API', to: 'apv2 API', label: 'auth.verify → principal · caps', kind: 'sync'},
-      {from: 'apv2 API', to: 'turn store', label: 'get(conversation, idem_key)', kind: 'sync'},
+      {from: 'apv2 API', to: 'apv2 API', label: 'auth.verify → principal · 8 KiB cap', kind: 'sync'},
+      {from: 'apv2 API', to: 'turn store', label: 'claim(conversation, key, turn) · SET NX', kind: 'sync'},
       {from: 'turn store', to: 'apv2 API', label: 'stored turn / none', kind: 'reply'},
-      {from: 'apv2 API', to: 'turn store', label: 'put(conversation, idem_key, turn)', kind: 'sync'},
       {from: 'apv2 API', to: 'CoT workflow', label: 'enqueue(turn)', kind: 'async'},
-      {from: 'apv2 API', to: 'Client', label: '202 {turn_id}', kind: 'reply'},
+      {from: 'apv2 API', to: 'Client', label: '202 {turn_id, status: queued}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
       title: 'Handles POST /v1/conversations/{conversation}/messages',
-      detail: 'Register the message route on `POST /v1/conversations/{conversation}/messages`.',
+      detail:
+        'A message with a valid bearer token answers 202 `{turn_id, status: "queued"}` and enqueues one turn carrying the tenant, conversation, actor and text; no token or an unknown one answers 401 and enqueues nothing.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/conversations\/\{conversation\}\/messages["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/conversations\/:conversation\/messages['"]/]},
@@ -54,54 +55,54 @@ the model chose; a loop run inline lets the HTTP timeout, not the platform, end 
     },
     {
       id: 'principal',
-      title: 'Takes the role from the verified principal, 401 without one',
+      title: 'Takes the role from the verified principal',
       detail:
-        'The bearer token is verified with `auth.verify`; no principal is **401**, and the turn carries the principal’s role. The starter takes `role` from the request body, so a customer can claim to be an agent.',
+        'A guest token with `"role": "agent"` in the body enqueues a turn with role customer; an agent token enqueues role agent. The starter lets the body name the role.',
       match: {
-        python: {all: [/auth\.verify\(/, /status_code\s*=\s*401/], none: [/body\.role/]},
-        typescript: {all: [/auth\.verify\(/, /code\(\s*401\s*\)/], none: [/body\.role/]},
-        go: {all: [/auth\.Verify\(/, /StatusUnauthorized/], none: [/body\.Role/]},
-        scala: {all: [/Auth\.verify\(/, /StatusCodes\.Unauthorized/], none: [/body\.role/]},
-        cpp: {all: [/auth\.verify\(/, /\b401\b/], none: [/body\.value\(\s*"role"/, /body\["role"\]/]},
+        python: {all: [/principal\.role/], none: [/body\.get\(\s*["']role["']|body\[\s*["']role["']\s*\]/]},
+        typescript: {all: [/principal\.role/], none: [/body\.role/]},
+        go: {all: [/principal\.Role/], none: [/body\.Role/]},
+        scala: {all: [/principal\.role/], none: [/\(\s*"role"\s*\)/]},
+        cpp: {all: [/principal->role/], none: [/body\.value\(\s*"role"|body\[\s*"role"\s*\]/]},
       },
     },
     {
-      id: 'caps',
-      title: 'Rejects empty text with 400 and text over 8 KiB with 413',
+      id: 'text-cap',
+      title: 'Rejects empty text with 400 and text over 8 KiB of UTF-8 with 413',
       detail:
-        'A `MAX_TEXT_BYTES` cap of `8 << 10` bytes answers **413**, an empty `text` answers **400**. The starter forwards whatever arrives to the workflow, where every reasoning iteration re-sends it to the model.',
+        'An empty or missing text answers 400; 8193 bytes, or 3000 characters that are 9000 bytes, answer 413; exactly 8192 bytes is accepted; nothing rejected is enqueued. The starter forwards any text to the workflow.',
       match: {
-        python: {all: [/MAX_TEXT_BYTES/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MAX_TEXT_BYTES/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
-        go: {all: [/maxTextBytes/, /StatusRequestEntityTooLarge/, /StatusBadRequest/]},
-        scala: {all: [/MaxTextBytes/, /StatusCodes\.RequestEntityTooLarge/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kMaxTextBytes/, /\b413\b/, /\b400\b/]},
+        python: {all: [/MAX_TEXT_BYTES/, /status_code\s*=\s*413/, /\.encode\(/]},
+        typescript: {all: [/MAX_TEXT_BYTES/, /code\(\s*413\s*\)/, /TextEncoder|byteLength/]},
+        go: {all: [/maxTextBytes/, /StatusRequestEntityTooLarge/]},
+        scala: {all: [/MaxTextBytes/, /StatusCodes\.(RequestEntityTooLarge|PayloadTooLarge)/, /getBytes/]},
+        cpp: {all: [/kMaxTextBytes/, /\b413\b/]},
       },
     },
     {
-      id: 'idempotency',
-      title: 'Keys retries by (conversation, Idempotency-Key)',
+      id: 'idempotency-key',
+      title: 'Requires Idempotency-Key and answers a replay with the stored turn',
       detail:
-        '`Idempotency-Key` is required and the turn is stored under `(conversation, key)`; a replay returns the stored turn instead of enqueuing a second one. The starter ignores the header and starts a new turn per request.',
+        'A message without `Idempotency-Key` answers 400 and enqueues nothing; a replay of the same `(conversation, key)` answers 202 with the first turn id and enqueues nothing; the same key on another conversation is a new turn. The starter falls back to the fresh turn id, so a retry without a key is a second turn.',
       match: {
-        python: {all: [/Idempotency-Key/, /turns\.get\(/, /turns\.put\(/]},
-        typescript: {all: [/idempotency-key/, /turns\.get\(/, /turns\.put\(/]},
-        go: {all: [/Idempotency-Key/, /turns\.Get\(/, /turns\.Put\(/]},
-        scala: {all: [/Idempotency-Key/, /turns\.get\(/, /turns\.put\(/]},
-        cpp: {all: [/Idempotency-Key/, /turns\.get\(/, /turns\.put\(/]},
+        python: {all: [/idempotency-key/i, /status_code\s*=\s*400/], none: [/["']idempotency-key["']\s*\)\s*or\b/i]},
+        typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)/], none: [/\|\|\s*turn\.turn_id/]},
+        go: {all: [/Idempotency-Key/, /StatusBadRequest/], none: [/idemKey\s*=\s*turn\.TurnID/]},
+        scala: {all: [/Idempotency-Key/, /StatusCodes\.BadRequest/], none: [/getOrElse\(\s*turn\.turn_id\s*\)/]},
+        cpp: {all: [/Idempotency-Key/, /\b400\b/], none: [/idem_key\s*=\s*turn\["turn_id"\]/]},
       },
     },
     {
-      id: 'accepted',
-      title: 'Enqueues the turn and answers 202',
+      id: 'claim-race',
+      title: 'Claims the key in one command, so a concurrent retry enqueues once',
       detail:
-        'The turn is handed to the workflow with `enqueue` and the handler answers **202** with the turn id. The starter runs the whole reasoning loop inside the request and answers 200 with the text.',
+        'Another replica stores and enqueues its turn for the same `(conversation, key)` right after this request first touches the key: exactly one turn is enqueued and the answer names the stored turn. The starter reads with `turns.get`, then writes with `turns.put`, and both replicas enqueue.',
       match: {
-        python: {all: [/workflow\.enqueue\(/, /status_code\s*=\s*202/], none: [/workflow\.run\(/]},
-        typescript: {all: [/workflow\.enqueue\(/, /code\(\s*202\s*\)/], none: [/workflow\.run\(/]},
-        go: {all: [/workflow\.Enqueue\(/, /StatusAccepted/], none: [/workflow\.Run\(/]},
-        scala: {all: [/workflow\.enqueue\(/, /StatusCodes\.Accepted/], none: [/workflow\.run\(/]},
-        cpp: {all: [/workflow\.enqueue\(/, /\b202\b/], none: [/workflow\.run\(/]},
+        python: {all: [/turns\.claim\(/], none: [/turns\.put\(/]},
+        typescript: {all: [/turns\.claim\(/], none: [/turns\.put\(/]},
+        go: {all: [/turns\.Claim\(/], none: [/turns\.Put\(/]},
+        scala: {all: [/Turns\.claim\(/], none: [/Turns\.put\(/]},
+        cpp: {all: [/turns::claim\(/], none: [/turns::put\(/]},
       },
     },
   ],
@@ -110,82 +111,46 @@ the model chose; a loop run inline lets the HTTP timeout, not the platform, end 
       starter: `import logging
 import uuid
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+
+from apv2 import auth, turns, workflow  # auth.verify, turns.get/put/claim, workflow.enqueue: provided
 
 app = FastAPI()
 logger = logging.getLogger("apv2")
 
 
-class MessageRequest(BaseModel):
-    text: str
-    role: str = "customer"
-
-
-class Principal:
-    tenant: str
-    actor_id: str
-    role: str
-
-
-class Auth:
-    def verify(self, authorization: str | None) -> Principal | None:
-        """The principal behind a bearer token, or None when missing or invalid."""
-        raise NotImplementedError
-
-
-class TurnStore:
-    def get(self, conversation: str, idem_key: str) -> dict | None:
-        """The turn stored for (conversation, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, conversation: str, idem_key: str, turn: dict) -> None:
-        """Store the turn under (conversation, idem_key)."""
-        raise NotImplementedError
-
-
-class Workflow:
-    def run(self, turn: dict) -> dict:
-        """Run the Chain of Thought loop to completion and return the answer."""
-        raise NotImplementedError
-
-    def enqueue(self, turn: dict) -> None:
-        """Hand the turn to the workflow engine; it runs outside the request."""
-        raise NotImplementedError
-
-
-auth = Auth()
-turns = TurnStore()
-workflow = Workflow()
-
-
 @app.post("/v1/conversations/{conversation}/messages")
-def post_message(
-    conversation: str,
-    body: MessageRequest,
-    authorization: str | None = Header(default=None),
-) -> JSONResponse:
+async def post_message(conversation: str, request: Request) -> JSONResponse:
     # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    principal = auth.verify(authorization)
-    actor = principal.actor_id if principal is not None else "anonymous"
+    principal = auth.verify(request.headers.get("authorization"))
+    if principal is None:
+        return JSONResponse({"error": "missing or invalid bearer token"}, status_code=401)
+    body = await request.json()
     turn = {
         "turn_id": str(uuid.uuid4()),
+        "tenant": principal.tenant,
         "conversation": conversation,
-        "actor": actor,
-        "role": body.role,
-        "text": body.text,
+        "actor": principal.actor_id,
+        "role": body.get("role", principal.role),
+        "text": body.get("text", ""),
     }
-    logger.info("turn conversation=%s actor=%s text=%r", conversation, actor, body.text)
-    answer = workflow.run(turn)
-    return JSONResponse({"turn_id": turn["turn_id"], "answer": answer["text"]}, status_code=200)
+    idem_key = request.headers.get("idempotency-key") or turn["turn_id"]
+    stored = turns.get(conversation, idem_key)
+    if stored is not None:
+        return JSONResponse({"turn_id": stored["turn_id"], "status": "queued"}, status_code=202)
+    turns.put(conversation, idem_key, turn)
+    workflow.enqueue(turn)
+    logger.info("turn conversation=%s turn=%s role=%s", conversation, turn["turn_id"], turn["role"])
+    return JSONResponse({"turn_id": turn["turn_id"], "status": "queued"}, status_code=202)
 `,
       solution: `import logging
 import uuid
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+
+from apv2 import auth, turns, workflow  # auth.verify, turns.get/put/claim, workflow.enqueue: provided
 
 app = FastAPI()
 logger = logging.getLogger("apv2")
@@ -193,170 +158,109 @@ logger = logging.getLogger("apv2")
 MAX_TEXT_BYTES = 8 << 10
 
 
-class MessageRequest(BaseModel):
-    text: str
-
-
-class Principal:
-    tenant: str
-    actor_id: str
-    role: str
-
-
-class Auth:
-    def verify(self, authorization: str | None) -> Principal | None:
-        """The principal behind a bearer token, or None when missing or invalid."""
-        raise NotImplementedError
-
-
-class TurnStore:
-    def get(self, conversation: str, idem_key: str) -> dict | None:
-        """The turn stored for (conversation, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, conversation: str, idem_key: str, turn: dict) -> None:
-        """Store the turn under (conversation, idem_key)."""
-        raise NotImplementedError
-
-
-class Workflow:
-    def run(self, turn: dict) -> dict:
-        """Run the Chain of Thought loop to completion and return the answer."""
-        raise NotImplementedError
-
-    def enqueue(self, turn: dict) -> None:
-        """Hand the turn to the workflow engine; it runs outside the request."""
-        raise NotImplementedError
-
-
-auth = Auth()
-turns = TurnStore()
-workflow = Workflow()
-
-
 @app.post("/v1/conversations/{conversation}/messages")
-def post_message(
-    conversation: str,
-    body: MessageRequest,
-    authorization: str | None = Header(default=None),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    principal = auth.verify(authorization)
+async def post_message(conversation: str, request: Request) -> JSONResponse:
+    principal = auth.verify(request.headers.get("authorization"))
     if principal is None:
-        raise HTTPException(status_code=401, detail="missing or invalid bearer token")
-    if idem_key is None or idem_key == "":
-        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if body.text == "":
-        raise HTTPException(status_code=400, detail="text must be a non-empty string")
-    if len(body.text.encode("utf-8")) > MAX_TEXT_BYTES:
-        raise HTTPException(status_code=413, detail="text exceeds 8 KiB")
-
-    stored = turns.get(conversation, idem_key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=202)
+        return JSONResponse({"error": "missing or invalid bearer token"}, status_code=401)
+    idem_key = request.headers.get("idempotency-key", "")
+    if idem_key == "":
+        return JSONResponse({"error": "Idempotency-Key is required"}, status_code=400)
+    body = await request.json()
+    text = body.get("text") if isinstance(body, dict) else None
+    if not isinstance(text, str) or text == "":
+        return JSONResponse({"error": "text must be a non-empty string"}, status_code=400)
+    if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+        return JSONResponse({"error": "text exceeds 8 KiB"}, status_code=413)
 
     turn = {
         "turn_id": str(uuid.uuid4()),
-        "conversation": conversation,
         "tenant": principal.tenant,
+        "conversation": conversation,
         "actor": principal.actor_id,
-        "role": principal.role,
-        "text": body.text,
+        "role": principal.role,  # the verified role decides which tools the loop may run
+        "text": text,
     }
-    accepted = {"turn_id": turn["turn_id"]}
-    turns.put(conversation, idem_key, accepted)
+    stored = turns.claim(conversation, idem_key, turn)  # one SET NX: a concurrent retry finds this turn
+    if stored is not None:
+        return JSONResponse({"turn_id": stored["turn_id"], "status": "queued"}, status_code=202)
     workflow.enqueue(turn)
-    logger.info("turn conversation=%s turn=%s role=%s", conversation, turn["turn_id"], principal.role)
-    return JSONResponse(accepted, status_code=202)
+    logger.info("turn conversation=%s turn=%s role=%s", conversation, turn["turn_id"], turn["role"])
+    return JSONResponse({"turn_id": turn["turn_id"], "status": "queued"}, status_code=202)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/conversations/:conversation/messages: accepts one support turn and answers it. */
-import {randomUUID} from 'node:crypto';
+      starter: `import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
 
-import {auth, turns, workflow} from './platform';
+import * as auth from 'apv2/auth';
+import type {Turn} from 'apv2/model';
+import * as turns from 'apv2/turns';
+import * as workflow from 'apv2/workflow';
 
 export const app = Fastify();
-
-interface MessageBody {
-  text: string;
-  role?: string;
-}
 
 app.post('/v1/conversations/:conversation/messages', async (request, reply) => {
   // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const {conversation} = request.params as {conversation: string};
-  const body = request.body as MessageBody;
   const principal = auth.verify(request.headers.authorization);
-  const actor = principal?.actorId ?? 'anonymous';
-  const turn = {
+  if (principal === null) return reply.code(401).send({error: 'missing or invalid bearer token'});
+  const {conversation} = request.params as {conversation: string};
+  const body = (request.body ?? {}) as {text?: string; role?: string};
+  const turn: Turn = {
     turn_id: randomUUID(),
+    tenant: principal.tenant,
     conversation,
-    actor,
-    role: body.role ?? 'customer',
-    text: body.text,
+    actor: principal.actor_id,
+    role: body.role ?? principal.role,
+    text: body.text ?? '',
   };
-  request.log.info({conversation, actor, text: body.text}, 'turn');
-  const answer = await workflow.run(turn);
-  return reply.code(200).send({turn_id: turn.turn_id, answer: answer.text});
+  const idemKey = (request.headers['idempotency-key'] as string | undefined) || turn.turn_id;
+  const stored = await turns.get(conversation, idemKey);
+  if (stored !== null) return reply.code(202).send({turn_id: stored.turn_id, status: 'queued'});
+  await turns.put(conversation, idemKey, turn);
+  await workflow.enqueue(turn);
+  request.log.info({conversation, turn_id: turn.turn_id, role: turn.role}, 'turn queued');
+  return reply.code(202).send({turn_id: turn.turn_id, status: 'queued'});
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/conversations/:conversation/messages: verified principal, capped text, idempotent, 202. */
-import {randomUUID} from 'node:crypto';
+      solution: `import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
 
-import {auth, turns, workflow} from './platform';
+import * as auth from 'apv2/auth';
+import type {Turn} from 'apv2/model';
+import * as turns from 'apv2/turns';
+import * as workflow from 'apv2/workflow';
 
 export const app = Fastify();
 
-const MAX_TEXT_BYTES = 8 << 10;
-
-interface MessageBody {
-  text: string;
-}
-
-interface Accepted {
-  turn_id: string;
-}
+export const MAX_TEXT_BYTES = 8 << 10;
 
 app.post('/v1/conversations/:conversation/messages', async (request, reply) => {
-  const {conversation} = request.params as {conversation: string};
   const principal = auth.verify(request.headers.authorization);
   if (principal === null) return reply.code(401).send({error: 'missing or invalid bearer token'});
   const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
+  if (typeof idemKey !== 'string' || idemKey === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const {conversation} = request.params as {conversation: string};
+  const {text} = (request.body ?? {}) as {text?: unknown};
+  if (typeof text !== 'string' || text === '') return reply.code(400).send({error: 'text must be a non-empty string'});
+  if (new TextEncoder().encode(text).length > MAX_TEXT_BYTES) return reply.code(413).send({error: 'text exceeds 8 KiB'});
 
-  const body = request.body as Partial<MessageBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.text !== 'string' || body.text === '')
-    return reply.code(400).send({error: 'text must be a non-empty string'});
-  if (Buffer.byteLength(body.text, 'utf8') > MAX_TEXT_BYTES)
-    return reply.code(413).send({error: 'text exceeds 8 KiB'});
-
-  const stored: Accepted | null = await turns.get(conversation, idemKey);
-  if (stored !== null) return reply.code(202).send(stored);
-
-  const turn = {
+  const turn: Turn = {
     turn_id: randomUUID(),
-    conversation,
     tenant: principal.tenant,
-    actor: principal.actorId,
-    role: principal.role,
-    text: body.text,
+    conversation,
+    actor: principal.actor_id,
+    role: principal.role, // the verified role decides which tools the loop may run
+    text,
   };
-  const accepted: Accepted = {turn_id: turn.turn_id};
-  await turns.put(conversation, idemKey, accepted);
+  const stored = await turns.claim(conversation, idemKey, turn); // one SET NX: a concurrent retry finds this turn
+  if (stored !== null) return reply.code(202).send({turn_id: stored.turn_id, status: 'queued'});
   await workflow.enqueue(turn);
-  request.log.info({conversation, turn_id: turn.turn_id, role: principal.role}, 'turn accepted');
-  return reply.code(202).send(accepted);
+  request.log.info({conversation, turn_id: turn.turn_id, role: turn.role}, 'turn queued');
+  return reply.code(202).send({turn_id: turn.turn_id, status: 'queued'});
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -368,42 +272,17 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
+
+	"apv2/auth"     // auth.Verify(header) → principal, ok — provided
+	"apv2/model"    // model.Turn
+	"apv2/turns"    // turns.Get, turns.Put, turns.Claim — provided
+	"apv2/workflow" // workflow.Enqueue — provided
 )
 
-type MessageRequest struct {
+type messageRequest struct {
 	Text string \`json:"text"\`
 	Role string \`json:"role"\`
 }
-
-type Principal struct {
-	Tenant  string
-	ActorID string
-	Role    string
-}
-
-type Auth struct{}
-
-// Verify returns the principal behind a bearer token, or nil when missing or invalid.
-func (a *Auth) Verify(authorization string) *Principal {
-	return nil
-}
-
-type Workflow struct{}
-
-// Run executes the Chain of Thought loop to completion and returns the answer.
-func (w *Workflow) Run(turn map[string]any) (map[string]any, error) {
-	return nil, nil
-}
-
-// Enqueue hands the turn to the workflow engine; it runs outside the request.
-func (w *Workflow) Enqueue(turn map[string]any) error {
-	return nil
-}
-
-var (
-	auth     = &Auth{}
-	workflow = &Workflow{}
-)
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -412,103 +291,75 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func postMessage(rw http.ResponseWriter, r *http.Request) {
-	conversation := r.PathValue("conversation")
-	var body MessageRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	principal, ok := auth.Verify(r.Header.Get("Authorization"))
+	if !ok {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
 		return
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	principal := auth.Verify(r.Header.Get("Authorization"))
-	actor := "anonymous"
-	if principal != nil {
-		actor = principal.ActorID
-	}
+	var body messageRequest
+	json.NewDecoder(r.Body).Decode(&body)
 	role := body.Role
 	if role == "" {
-		role = "customer"
+		role = principal.Role
 	}
-	turn := map[string]any{
-		"turn_id":      uuid.NewString(),
-		"conversation": conversation,
-		"actor":        actor,
-		"role":         role,
-		"text":         body.Text,
+	conversation := r.PathValue("conversation")
+	turn := model.Turn{TurnID: uuid.NewString(), Tenant: principal.Tenant, Conversation: conversation, Actor: principal.ActorID, Role: role, Text: body.Text}
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey == "" {
+		idemKey = turn.TurnID
 	}
-	log.Printf("turn conversation=%s actor=%s text=%q", conversation, actor, body.Text)
-	answer, err := workflow.Run(turn)
+	stored, err := turns.Get(r.Context(), conversation, idemKey)
 	if err != nil {
-		writeJSON(rw, http.StatusBadGateway, map[string]string{"error": "workflow failed"})
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
 		return
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{"turn_id": turn["turn_id"], "answer": answer["text"]})
+	if stored != nil {
+		writeJSON(rw, http.StatusAccepted, map[string]string{"turn_id": stored.TurnID, "status": "queued"})
+		return
+	}
+	if err := turns.Put(r.Context(), conversation, idemKey, turn); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		return
+	}
+	if err := workflow.Enqueue(r.Context(), turn); err != nil {
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		return
+	}
+	log.Printf("turn conversation=%s turn=%s role=%s", conversation, turn.TurnID, turn.Role)
+	writeJSON(rw, http.StatusAccepted, map[string]string{"turn_id": turn.TurnID, "status": "queued"})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/conversations/{conversation}/messages", postMessage)
 }
 
 func main() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/conversations/{conversation}/messages", postMessage)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	register(mux)
+	log.Fatal(http.ListenAndServe(":8443", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 
 	"github.com/google/uuid"
+
+	"apv2/auth"     // auth.Verify(header) → principal, ok — provided
+	"apv2/model"    // model.Turn
+	"apv2/turns"    // turns.Get, turns.Put, turns.Claim — provided
+	"apv2/workflow" // workflow.Enqueue — provided
 )
 
 const maxTextBytes = 8 << 10
 
-type MessageRequest struct {
+type messageRequest struct {
 	Text string \`json:"text"\`
 }
-
-type Principal struct {
-	Tenant  string
-	ActorID string
-	Role    string
-}
-
-type Auth struct{}
-
-// Verify returns the principal behind a bearer token, or nil when missing or invalid.
-func (a *Auth) Verify(authorization string) *Principal {
-	return nil
-}
-
-type TurnStore struct{}
-
-// Get returns the turn stored for (conversation, idemKey), if any.
-func (s *TurnStore) Get(ctx context.Context, conversation, idemKey string) (map[string]any, error) {
-	return nil, nil
-}
-
-// Put stores the turn under (conversation, idemKey).
-func (s *TurnStore) Put(ctx context.Context, conversation, idemKey string, turn map[string]any) error {
-	return nil
-}
-
-type Workflow struct{}
-
-// Run executes the Chain of Thought loop to completion and returns the answer.
-func (w *Workflow) Run(turn map[string]any) (map[string]any, error) {
-	return nil, nil
-}
-
-// Enqueue hands the turn to the workflow engine; it runs outside the request.
-func (w *Workflow) Enqueue(turn map[string]any) error {
-	return nil
-}
-
-var (
-	auth     = &Auth{}
-	turns    = &TurnStore{}
-	workflow = &Workflow{}
-)
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -517,9 +368,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func postMessage(rw http.ResponseWriter, r *http.Request) {
-	conversation := r.PathValue("conversation")
-	principal := auth.Verify(r.Header.Get("Authorization"))
-	if principal == nil {
+	principal, ok := auth.Verify(r.Header.Get("Authorization"))
+	if !ok {
 		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
 		return
 	}
@@ -528,197 +378,90 @@ func postMessage(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
 		return
 	}
-	var body MessageRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	if body.Text == "" {
+	var body messageRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Text == "" {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "text must be a non-empty string"})
 		return
 	}
-	if len([]byte(body.Text)) > maxTextBytes {
+	if len(body.Text) > maxTextBytes { // len counts UTF-8 bytes
 		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "text exceeds 8 KiB"})
 		return
 	}
-	stored, err := turns.Get(r.Context(), conversation, idemKey)
+
+	conversation := r.PathValue("conversation")
+	// The verified role decides which tools the loop may run.
+	turn := model.Turn{TurnID: uuid.NewString(), Tenant: principal.Tenant, Conversation: conversation, Actor: principal.ActorID, Role: principal.Role, Text: body.Text}
+	stored, err := turns.Claim(r.Context(), conversation, idemKey, turn) // one SET NX: a concurrent retry finds this turn
 	if err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
 		return
 	}
 	if stored != nil {
-		writeJSON(rw, http.StatusAccepted, stored)
+		writeJSON(rw, http.StatusAccepted, map[string]string{"turn_id": stored.TurnID, "status": "queued"})
 		return
 	}
-	turnID := uuid.NewString()
-	turn := map[string]any{
-		"turn_id":      turnID,
-		"conversation": conversation,
-		"tenant":       principal.Tenant,
-		"actor":        principal.ActorID,
-		"role":         principal.Role,
-		"text":         body.Text,
-	}
-	accepted := map[string]any{"turn_id": turnID}
-	if err := turns.Put(r.Context(), conversation, idemKey, accepted); err != nil {
+	if err := workflow.Enqueue(r.Context(), turn); err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
 		return
 	}
-	if err := workflow.Enqueue(turn); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("turn conversation=%s turn=%s role=%s", conversation, turnID, principal.Role)
-	writeJSON(rw, http.StatusAccepted, accepted)
+	log.Printf("turn conversation=%s turn=%s role=%s", conversation, turn.TurnID, turn.Role)
+	writeJSON(rw, http.StatusAccepted, map[string]string{"turn_id": turn.TurnID, "status": "queued"})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/conversations/{conversation}/messages", postMessage)
 }
 
 func main() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/conversations/{conversation}/messages", postMessage)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	register(mux)
+	log.Fatal(http.ListenAndServe(":8443", mux))
 }
 `,
     },
     scala: {
       starter: `import java.util.UUID
 
+import scala.util.Try
+
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class MessageRequest(text: String, role: Option[String])
-final case class Principal(tenant: String, actorId: String, role: String)
-final case class Turn(turnId: String, conversation: String, actor: String, role: String, text: String)
-
-object Auth {
-  /** The principal behind a bearer token, or None when missing or invalid. */
-  def verify(authorization: Option[String]): Option[Principal] = ???
-}
-
-object Workflow {
-  /** Runs the Chain of Thought loop to completion and returns the answer text. */
-  def run(turn: Turn): String = ???
-
-  /** Hands the turn to the workflow engine; it runs outside the request. */
-  def enqueue(turn: Turn): Unit = ???
-}
+import apv2.{Auth, Turn, Turns, Workflow}
 
 object TurnApi {
   implicit val system: ActorSystem = ActorSystem("apv2")
-  implicit val messageFormat: RootJsonFormat[MessageRequest] = jsonFormat2(MessageRequest)
 
-  val workflow = Workflow
+  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
+
+  private def accepted(turnId: String): HttpResponse = json(StatusCodes.Accepted, ujson.Obj("turn_id" -> turnId, "status" -> "queued"))
 
   val route: Route =
     path("v1" / "conversations" / Segment / "messages") { conversation =>
       post {
         optionalHeaderValueByName("Authorization") { authorization =>
-          entity(as[MessageRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val actor = Auth.verify(authorization).map(_.actorId).getOrElse("anonymous")
-            val turn = Turn(UUID.randomUUID().toString, conversation, actor, body.role.getOrElse("customer"), body.text)
-            system.log.info(s"turn conversation=$conversation actor=$actor text=\${body.text}")
-            val answer = workflow.run(turn)
-            complete(StatusCodes.OK, s"""{"turn_id":"\${turn.turnId}","answer":"$answer"}""")
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.nio.charset.StandardCharsets
-import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class MessageRequest(text: String)
-final case class Principal(tenant: String, actorId: String, role: String)
-final case class Turn(turnId: String, conversation: String, tenant: String, actor: String, role: String, text: String)
-final case class Accepted(turn_id: String)
-
-object Auth {
-  /** The principal behind a bearer token, or None when missing or invalid. */
-  def verify(authorization: Option[String]): Option[Principal] = ???
-}
-
-object TurnStore {
-  /** The turn stored for (conversation, idemKey), if any. */
-  def get(conversation: String, idemKey: String): Option[Accepted] = ???
-
-  /** Stores the turn under (conversation, idemKey). */
-  def put(conversation: String, idemKey: String, accepted: Accepted): Unit = ???
-}
-
-object Workflow {
-  /** Runs the Chain of Thought loop to completion and returns the answer text. */
-  def run(turn: Turn): String = ???
-
-  /** Hands the turn to the workflow engine; it runs outside the request. */
-  def enqueue(turn: Turn): Unit = ???
-}
-
-object TurnApi {
-  implicit val system: ActorSystem = ActorSystem("apv2")
-  implicit val messageFormat: RootJsonFormat[MessageRequest] = jsonFormat1(MessageRequest)
-  implicit val acceptedFormat: RootJsonFormat[Accepted] = jsonFormat1(Accepted)
-
-  val MaxTextBytes = 8 << 10
-
-  val turns = TurnStore
-  val workflow = Workflow
-
-  val route: Route =
-    path("v1" / "conversations" / Segment / "messages") { conversation =>
-      post {
-        optionalHeaderValueByName("Authorization") { authorization =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[MessageRequest]) { body =>
+          optionalHeaderValueByName("Idempotency-Key") { idemKey =>
+            entity(as[String]) { raw =>
+              // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
               Auth.verify(authorization) match {
-                case None =>
-                  complete(StatusCodes.Unauthorized, """{"error":"missing or invalid bearer token"}""")
+                case None => complete(json(StatusCodes.Unauthorized, ujson.Obj("error" -> "missing or invalid bearer token")))
                 case Some(principal) =>
-                  if (!idemOpt.exists(_.nonEmpty)) {
-                    complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-                  } else if (body.text.isEmpty) {
-                    complete(StatusCodes.BadRequest, """{"error":"text must be a non-empty string"}""")
-                  } else if (body.text.getBytes(StandardCharsets.UTF_8).length > MaxTextBytes) {
-                    complete(StatusCodes.RequestEntityTooLarge, """{"error":"text exceeds 8 KiB"}""")
-                  } else {
-                    val idemKey = idemOpt.get
-                    turns.get(conversation, idemKey) match {
-                      case Some(stored) =>
-                        complete(StatusCodes.Accepted, stored)
-                      case None =>
-                        val turn = Turn(
-                          UUID.randomUUID().toString,
-                          conversation,
-                          principal.tenant,
-                          principal.actorId,
-                          principal.role,
-                          body.text
-                        )
-                        val accepted = Accepted(turn.turnId)
-                        turns.put(conversation, idemKey, accepted)
-                        workflow.enqueue(turn)
-                        system.log.info(s"turn conversation=$conversation turn=\${turn.turnId} role=\${principal.role}")
-                        complete(StatusCodes.Accepted, accepted)
-                    }
+                  val body = Try(ujson.read(raw)).getOrElse(ujson.Obj())
+                  val role = Try(body("role").str).getOrElse(principal.role)
+                  val text = Try(body("text").str).getOrElse("")
+                  val turn = Turn(UUID.randomUUID().toString, principal.tenant, conversation, principal.actorId, role, text)
+                  val key = idemKey.filter(_.nonEmpty).getOrElse(turn.turn_id)
+                  Turns.get(conversation, key) match {
+                    case Some(stored) => complete(accepted(stored.turn_id))
+                    case None =>
+                      Turns.put(conversation, key, turn)
+                      Workflow.enqueue(turn)
+                      system.log.info(s"turn conversation=$conversation turn=\${turn.turn_id} role=\${turn.role}")
+                      complete(accepted(turn.turn_id))
                   }
               }
             }
@@ -729,6 +472,68 @@ object TurnApi {
 
   def main(args: Array[String]): Unit = {
     Http().newServerAt("0.0.0.0", 8443).bind(route)
+    ()
+  }
+}
+`,
+      solution: `import java.nio.charset.StandardCharsets.UTF_8
+import java.util.UUID
+
+import scala.util.Try
+
+import org.apache.pekko.actor.ActorSystem
+import org.apache.pekko.http.scaladsl.Http
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
+import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+
+import apv2.{Auth, Turn, Turns, Workflow}
+
+object TurnApi {
+  implicit val system: ActorSystem = ActorSystem("apv2")
+
+  val MaxTextBytes: Int = 8 << 10
+
+  private def json(status: StatusCode, body: ujson.Value): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, ujson.write(body)))
+
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, ujson.Obj("error" -> message))
+
+  private def accepted(turnId: String): HttpResponse = json(StatusCodes.Accepted, ujson.Obj("turn_id" -> turnId, "status" -> "queued"))
+
+  val route: Route =
+    path("v1" / "conversations" / Segment / "messages") { conversation =>
+      post {
+        optionalHeaderValueByName("Authorization") { authorization =>
+          optionalHeaderValueByName("Idempotency-Key") { idemKey =>
+            entity(as[String]) { raw =>
+              val text = Try(ujson.read(raw)("text").str).getOrElse("")
+              Auth.verify(authorization) match {
+                case None => complete(error(StatusCodes.Unauthorized, "missing or invalid bearer token"))
+                case Some(_) if !idemKey.exists(_.nonEmpty) => complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
+                case Some(_) if text.isEmpty => complete(error(StatusCodes.BadRequest, "text must be a non-empty string"))
+                case Some(_) if text.getBytes(UTF_8).length > MaxTextBytes =>
+                  complete(error(StatusCodes.PayloadTooLarge, "text exceeds 8 KiB"))
+                case Some(principal) =>
+                  // The verified role decides which tools the loop may run.
+                  val turn = Turn(UUID.randomUUID().toString, principal.tenant, conversation, principal.actorId, principal.role, text)
+                  Turns.claim(conversation, idemKey.get, turn) match { // one SET NX: a concurrent retry finds this turn
+                    case Some(stored) => complete(accepted(stored.turn_id))
+                    case None =>
+                      Workflow.enqueue(turn)
+                      system.log.info(s"turn conversation=$conversation turn=\${turn.turn_id} role=\${turn.role}")
+                      complete(accepted(turn.turn_id))
+                  }
+              }
+            }
+          }
+        }
+      }
+    }
+
+  def main(args: Array[String]): Unit = {
+    Http().newServerAt("0.0.0.0", 8443).bind(route)
+    ()
   }
 }
 `,
@@ -738,61 +543,49 @@ object TurnApi {
 #include <nlohmann/json.hpp>
 
 #include <iostream>
-#include <optional>
 #include <string>
+
+#include "apv2/auth.h"      // auth::verify(authorization) — provided
+#include "apv2/turns.h"     // turns::get, turns::put, turns::claim — provided
+#include "apv2/workflow.h"  // workflow::enqueue — provided
+#include "ids.h"            // new_uuid() — provided
 
 using json = nlohmann::json;
 
-struct Principal {
-  std::string tenant;
-  std::string actorId;
-  std::string role;
-};
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-struct Auth {
-  // The principal behind a bearer token, or nullopt when missing or invalid.
-  std::optional<Principal> verify(const std::string& authorization);
-};
+void post_message(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const auto principal = auth::verify(req.get_header_value("Authorization"));
+  if (!principal) return reply(res, 401, {{"error", "missing or invalid bearer token"}});
+  json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) body = json::object();
+  const std::string conversation = req.matches[1];
+  const json turn = {
+      {"turn_id", new_uuid()},
+      {"tenant", principal->tenant},
+      {"conversation", conversation},
+      {"actor", principal->actor_id},
+      {"role", body.value("role", principal->role)},
+      {"text", body.value("text", std::string())},
+  };
+  std::string idem_key = req.get_header_value("Idempotency-Key");
+  if (idem_key.empty()) idem_key = turn["turn_id"];
+  if (const auto stored = turns::get(conversation, idem_key)) return reply(res, 202, {{"turn_id", (*stored)["turn_id"]}, {"status", "queued"}});
+  turns::put(conversation, idem_key, turn);
+  workflow::enqueue(turn);
+  std::cerr << "turn conversation=" << conversation << " turn=" << turn["turn_id"].get<std::string>() << " role=" << turn["role"].get<std::string>() << "\\n";
+  reply(res, 202, {{"turn_id", turn["turn_id"]}, {"status", "queued"}});
+}
 
-struct Workflow {
-  // Runs the Chain of Thought loop to completion and returns the answer.
-  json run(const json& turn);
-  // Hands the turn to the workflow engine; it runs outside the request.
-  void enqueue(const json& turn);
-};
-
-Auth auth;
-Workflow workflow;
-std::string uuidString();
+void register_routes(httplib::Server& svr) { svr.Post(R"(/v1/conversations/([\\w-]+)/messages)", post_message); }
 
 int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
-
-  svr.Post(R"(/v1/conversations/([A-Za-z0-9-]+)/messages)", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string conversation = req.matches[1].str();
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto principal = auth.verify(req.get_header_value("Authorization"));
-    const std::string actor = principal ? principal->actorId : "anonymous";
-    const auto text = body.value("text", std::string());
-    const json turn = {
-        {"turn_id", uuidString()},
-        {"conversation", conversation},
-        {"actor", actor},
-        {"role", body.value("role", std::string("customer"))},
-        {"text", text},
-    };
-    std::cerr << "turn conversation=" << conversation << " actor=" << actor << " text=" << text << "\\n";
-    const json answer = workflow.run(turn);
-    res.status = 200;
-    res.set_content(json{{"turn_id", turn["turn_id"]}, {"answer", answer["text"]}}.dump(), "application/json");
-  });
-
+  httplib::Server svr;
+  register_routes(svr);
   svr.listen("0.0.0.0", 8443);
 }
 `,
@@ -800,107 +593,503 @@ int main() {
 #include <nlohmann/json.hpp>
 
 #include <iostream>
-#include <optional>
 #include <string>
+
+#include "apv2/auth.h"      // auth::verify(authorization) — provided
+#include "apv2/turns.h"     // turns::get, turns::put, turns::claim — provided
+#include "apv2/workflow.h"  // workflow::enqueue — provided
+#include "ids.h"            // new_uuid() — provided
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxTextBytes = 8 << 10;
+constexpr size_t kMaxTextBytes = 8 << 10;
 
-struct Principal {
-  std::string tenant;
-  std::string actorId;
-  std::string role;
-};
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-struct Auth {
-  // The principal behind a bearer token, or nullopt when missing or invalid.
-  std::optional<Principal> verify(const std::string& authorization);
-};
+void post_message(const httplib::Request& req, httplib::Response& res) {
+  const auto principal = auth::verify(req.get_header_value("Authorization"));
+  if (!principal) return reply(res, 401, {{"error", "missing or invalid bearer token"}});
+  const std::string idem_key = req.get_header_value("Idempotency-Key");
+  if (idem_key.empty()) return reply(res, 400, {{"error", "Idempotency-Key is required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object() || !body.contains("text") || !body["text"].is_string() || body["text"].get<std::string>().empty()) {
+    return reply(res, 400, {{"error", "text must be a non-empty string"}});
+  }
+  const std::string text = body["text"];
+  if (text.size() > kMaxTextBytes) return reply(res, 413, {{"error", "text exceeds 8 KiB"}});  // size() counts UTF-8 bytes
 
-struct TurnStore {
-  std::optional<json> get(const std::string& conversation, const std::string& idemKey);
-  void put(const std::string& conversation, const std::string& idemKey, const json& accepted);
-};
+  const std::string conversation = req.matches[1];
+  const json turn = {
+      {"turn_id", new_uuid()},
+      {"tenant", principal->tenant},
+      {"conversation", conversation},
+      {"actor", principal->actor_id},
+      {"role", principal->role},  // the verified role decides which tools the loop may run
+      {"text", text},
+  };
+  // One SET NX: a concurrent retry finds this turn.
+  if (const auto stored = turns::claim(conversation, idem_key, turn)) return reply(res, 202, {{"turn_id", (*stored)["turn_id"]}, {"status", "queued"}});
+  workflow::enqueue(turn);
+  std::cerr << "turn conversation=" << conversation << " turn=" << turn["turn_id"].get<std::string>() << " role=" << principal->role << "\\n";
+  reply(res, 202, {{"turn_id", turn["turn_id"]}, {"status", "queued"}});
+}
 
-struct Workflow {
-  // Runs the Chain of Thought loop to completion and returns the answer.
-  json run(const json& turn);
-  // Hands the turn to the workflow engine; it runs outside the request.
-  void enqueue(const json& turn);
-};
-
-Auth auth;
-TurnStore turns;
-Workflow workflow;
-std::string uuidString();
+void register_routes(httplib::Server& svr) { svr.Post(R"(/v1/conversations/([\\w-]+)/messages)", post_message); }
 
 int main() {
-  httplib::SSLServer svr("cert.pem", "key.pem");
-
-  svr.Post(R"(/v1/conversations/([A-Za-z0-9-]+)/messages)", [](const httplib::Request& req, httplib::Response& res) {
-    const std::string conversation = req.matches[1].str();
-    const auto principal = auth.verify(req.get_header_value("Authorization"));
-    if (!principal) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing or invalid bearer token"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("text") || !body["text"].is_string()) {
-      res.status = 400;
-      res.set_content(R"({"error":"text must be a non-empty string"})", "application/json");
-      return;
-    }
-    const auto text = body["text"].get<std::string>();
-    if (text.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"text must be a non-empty string"})", "application/json");
-      return;
-    }
-    if (text.size() > kMaxTextBytes) {
-      res.status = 413;
-      res.set_content(R"({"error":"text exceeds 8 KiB"})", "application/json");
-      return;
-    }
-    const auto stored = turns.get(conversation, idemKey);
-    if (stored) {
-      res.status = 202;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    const std::string turnId = uuidString();
-    const json turn = {
-        {"turn_id", turnId},
-        {"conversation", conversation},
-        {"tenant", principal->tenant},
-        {"actor", principal->actorId},
-        {"role", principal->role},
-        {"text", text},
-    };
-    const json accepted = {{"turn_id", turnId}};
-    turns.put(conversation, idemKey, accepted);
-    workflow.enqueue(turn);
-    std::cerr << "turn conversation=" << conversation << " turn=" << turnId << " role=" << principal->role << "\\n";
-    res.status = 202;
-    res.set_content(accepted.dump(), "application/json");
-  });
-
+  httplib::Server svr;
+  register_routes(svr);
   svr.listen("0.0.0.0", 8443);
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+QUESTION = "Where is my next reservation?"
+QUEUE = "apv2:turns"
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("turn_api").app)
+
+
+async def _post(c, text=QUESTION, conversation="c-1", key="k-1", token="tok-guest-1", body=None):
+    headers = {}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    payload = body if body is not None else {"text": text}
+    return await c.post(f"/v1/conversations/{conversation}/messages", json=payload, headers=headers)
+
+
+def _queued(ctx):
+    return [json.loads(raw) for raw in ctx.redis.lrange(QUEUE, 0, -1)]
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c)
+        assert r.status_code == 202, f"a valid message answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("turn_id") and body.get("status") == "queued", f"the 202 body must be {{turn_id, status: queued}}, got {body}"
+        queued = _queued(ctx)
+        assert len(queued) == 1, f"one message must enqueue one turn on apv2:turns, found {len(queued)}"
+        turn = queued[0]
+        assert turn.get("turn_id") == body["turn_id"], f"the enqueued turn {turn.get('turn_id')!r} is not the one answered ({body['turn_id']!r})"
+        for field, value in {"tenant": "t1", "conversation": "c-1", "actor": "guest-1", "text": QUESTION}.items():
+            assert turn.get(field) == value, f"the enqueued turn's {field} is {turn.get(field)!r}, expected {value!r}: {turn}"
+        r = await _post(c, token=None, key="k-2")
+        assert r.status_code == 401, f"a message without a bearer token answered {r.status_code}, expected 401"
+        r = await _post(c, token="tok-unknown", key="k-3")
+        assert r.status_code == 401, f"a message with an unknown token answered {r.status_code}, expected 401"
+        assert len(_queued(ctx)) == 1, "a rejected message must enqueue nothing"
+
+
+async def check_principal(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, body={"text": "Refund my last stay", "role": "agent"})
+        assert r.status_code == 202, f"a guest message answered {r.status_code}: {r.text}"
+        turn = _queued(ctx)[-1]
+        assert turn.get("role") == "customer", f"a guest token with \\"role\\": \\"agent\\" in the body enqueued a turn with role {turn.get('role')!r}: the role must come from the verified principal, or any guest runs agent-only tools"
+        r = await _post(c, token="tok-agent-7", conversation="c-2", key="k-2")
+        assert r.status_code == 202, f"an agent message answered {r.status_code}: {r.text}"
+        turn = _queued(ctx)[-1]
+        assert turn.get("role") == "agent" and turn.get("actor") == "agent-7", f"an agent token must enqueue role agent, actor agent-7: {turn}"
+
+
+async def check_text_cap(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, text="", key="k-empty")
+        assert r.status_code == 400, f"an empty text answered {r.status_code}, expected 400"
+        r = await _post(c, body={}, key="k-none")
+        assert r.status_code == 400, f"a body without text answered {r.status_code}, expected 400"
+        r = await _post(c, text="a" * 8193, key="k-big")
+        assert r.status_code == 413, f"8193 bytes of text answered {r.status_code}, expected 413: every byte is re-sent to the model on every iteration"
+        r = await _post(c, text="\\u20ac" * 3000, key="k-euro")
+        assert r.status_code == 413, f"3000 euro signs (9000 bytes of UTF-8) answered {r.status_code}, expected 413: the cap counts bytes, not characters"
+        assert _queued(ctx) == [], f"rejected messages enqueued {len(_queued(ctx))} turns"
+        r = await _post(c, text="a" * 8192, key="k-edge")
+        assert r.status_code == 202, f"exactly 8192 bytes is within the cap, got {r.status_code}: {r.text}"
+
+
+async def check_idempotency_key(ctx):
+    async with _api(ctx) as c:
+        r = await _post(c, key=None)
+        assert r.status_code == 400, f"a message without Idempotency-Key answered {r.status_code}, expected 400: a retry of it could not be told from a new question"
+        assert _queued(ctx) == [], "a message without Idempotency-Key must enqueue nothing"
+        first = await _post(c, key="k-7")
+        assert first.status_code == 202, f"the first message answered {first.status_code}: {first.text}"
+        replay = await _post(c, key="k-7")
+        assert replay.status_code == 202, f"a replay answered {replay.status_code}, expected 202 with the stored turn"
+        assert replay.json().get("turn_id") == first.json().get("turn_id"), f"a replay of (c-1, k-7) answered turn {replay.json().get('turn_id')!r}, the first made {first.json().get('turn_id')!r}"
+        assert len(_queued(ctx)) == 1, f"a message and its replay enqueued {len(_queued(ctx))} turns, expected 1"
+        other = await _post(c, key="k-7", conversation="c-2")
+        assert other.status_code == 202 and other.json().get("turn_id") != first.json().get("turn_id"), "the same key on another conversation is a new turn"
+
+
+async def check_claim_race(ctx):
+    rival = {"turn_id": "rival-turn", "tenant": "t1", "conversation": "c-1", "actor": "guest-1", "role": "customer", "text": QUESTION}
+
+    def rival_replica():
+        # Another replica handling the same retry stores its turn and enqueues it.
+        if ctx.redis.set("turn:c-1:k-race", json.dumps(rival), ex=86400, nx=True):
+            ctx.redis.rpush(QUEUE, json.dumps(rival))
+
+    probe = ctx.redis_after("turn:c-1:k-race", rival_replica)
+    async with _api(ctx) as c:
+        r = await _post(c, key="k-race")
+    assert probe.fired, "the handler never touched turn:c-1:k-race: store the turn under (conversation, Idempotency-Key)"
+    assert r.status_code == 202, f"the message answered {r.status_code}: {r.text}"
+    queued = _queued(ctx)
+    assert len(queued) == 1, f"two replicas handled one retry and {len(queued)} turns were enqueued for one key: a read then a write leaves a gap another replica lands in. Claim the key in one command (turns.claim)"
+    stored = json.loads(ctx.redis.get("turn:c-1:k-race"))
+    assert r.json().get("turn_id") == stored["turn_id"], f"the answer names turn {r.json().get('turn_id')!r} but the key holds {stored['turn_id']!r}"
+`,
+    typescript: `const QUESTION = 'Where is my next reservation?';
+const QUEUE = 'apv2:turns';
+
+function api(ctx) {
+  return ctx.client(ctx.load('turn_api').app);
+}
+
+async function post(c, {text = QUESTION, conversation = 'c-1', key = 'k-1' as string | null, token = 'tok-guest-1' as string | null, body = undefined as unknown} = {}) {
+  const headers: Record<string, string> = {};
+  if (token !== null) headers.Authorization = \`Bearer \${token}\`;
+  if (key !== null) headers['Idempotency-Key'] = key;
+  return c.post(\`/v1/conversations/\${conversation}/messages\`, {json: body ?? {text}, headers});
+}
+
+const queued = (ctx): Record<string, any>[] => ctx.redis.lrange(QUEUE, 0, -1).map((raw: string) => JSON.parse(raw));
+
+export async function check_route(ctx) {
+  const c = api(ctx);
+  let r = await post(c);
+  assert.equal(r.status, 202, \`a valid message answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.turn_id && body.status === 'queued', \`the 202 body must be {turn_id, status: queued}, got \${r.text}\`);
+  const turns = queued(ctx);
+  assert.equal(turns.length, 1, \`one message must enqueue one turn on apv2:turns, found \${turns.length}\`);
+  assert.equal(turns[0].turn_id, body.turn_id, \`the enqueued turn \${turns[0].turn_id} is not the one answered (\${body.turn_id})\`);
+  for (const [field, value] of Object.entries({tenant: 't1', conversation: 'c-1', actor: 'guest-1', text: QUESTION})) {
+    assert.equal(turns[0][field], value, \`the enqueued turn's \${field} is \${JSON.stringify(turns[0][field])}, expected \${value}: \${JSON.stringify(turns[0])}\`);
+  }
+  r = await post(c, {token: null, key: 'k-2'});
+  assert.equal(r.status, 401, \`a message without a bearer token answered \${r.status}, expected 401\`);
+  r = await post(c, {token: 'tok-unknown', key: 'k-3'});
+  assert.equal(r.status, 401, \`a message with an unknown token answered \${r.status}, expected 401\`);
+  assert.equal(queued(ctx).length, 1, 'a rejected message must enqueue nothing');
+}
+
+export async function check_principal(ctx) {
+  const c = api(ctx);
+  let r = await post(c, {body: {text: 'Refund my last stay', role: 'agent'}});
+  assert.equal(r.status, 202, \`a guest message answered \${r.status}: \${r.text}\`);
+  let turn = queued(ctx).at(-1);
+  assert.equal(turn.role, 'customer', \`a guest token with "role": "agent" in the body enqueued a turn with role \${turn.role}: the role must come from the verified principal, or any guest runs agent-only tools\`);
+  r = await post(c, {token: 'tok-agent-7', conversation: 'c-2', key: 'k-2'});
+  assert.equal(r.status, 202, \`an agent message answered \${r.status}: \${r.text}\`);
+  turn = queued(ctx).at(-1);
+  assert(turn.role === 'agent' && turn.actor === 'agent-7', \`an agent token must enqueue role agent, actor agent-7: \${JSON.stringify(turn)}\`);
+}
+
+export async function check_text_cap(ctx) {
+  const c = api(ctx);
+  let r = await post(c, {text: '', key: 'k-empty'});
+  assert.equal(r.status, 400, \`an empty text answered \${r.status}, expected 400\`);
+  r = await post(c, {body: {}, key: 'k-none'});
+  assert.equal(r.status, 400, \`a body without text answered \${r.status}, expected 400\`);
+  r = await post(c, {text: 'a'.repeat(8193), key: 'k-big'});
+  assert.equal(r.status, 413, \`8193 bytes of text answered \${r.status}, expected 413: every byte is re-sent to the model on every iteration\`);
+  r = await post(c, {text: '\\u20ac'.repeat(3000), key: 'k-euro'});
+  assert.equal(r.status, 413, \`3000 euro signs (9000 bytes of UTF-8) answered \${r.status}, expected 413: the cap counts bytes, not characters\`);
+  assert.equal(queued(ctx).length, 0, \`rejected messages enqueued \${queued(ctx).length} turns\`);
+  r = await post(c, {text: 'a'.repeat(8192), key: 'k-edge'});
+  assert.equal(r.status, 202, \`exactly 8192 bytes is within the cap, got \${r.status}: \${r.text}\`);
+}
+
+export async function check_idempotency_key(ctx) {
+  const c = api(ctx);
+  const noKey = await post(c, {key: null});
+  assert.equal(noKey.status, 400, \`a message without Idempotency-Key answered \${noKey.status}, expected 400: a retry of it could not be told from a new question\`);
+  assert.equal(queued(ctx).length, 0, 'a message without Idempotency-Key must enqueue nothing');
+  const first = await post(c, {key: 'k-7'});
+  assert.equal(first.status, 202, \`the first message answered \${first.status}: \${first.text}\`);
+  const replay = await post(c, {key: 'k-7'});
+  assert.equal(replay.status, 202, \`a replay answered \${replay.status}, expected 202 with the stored turn\`);
+  assert.equal(replay.json().turn_id, first.json().turn_id, \`a replay of (c-1, k-7) answered turn \${replay.json().turn_id}, the first made \${first.json().turn_id}\`);
+  assert.equal(queued(ctx).length, 1, \`a message and its replay enqueued \${queued(ctx).length} turns, expected 1\`);
+  const other = await post(c, {key: 'k-7', conversation: 'c-2'});
+  assert(other.status === 202 && other.json().turn_id !== first.json().turn_id, 'the same key on another conversation is a new turn');
+}
+
+export async function check_claim_race(ctx) {
+  const rival = {turn_id: 'rival-turn', tenant: 't1', conversation: 'c-1', actor: 'guest-1', role: 'customer', text: QUESTION};
+  const probe = ctx.redisAfter('turn:c-1:k-race', () => {
+    // Another replica handling the same retry stores its turn and enqueues it.
+    if (ctx.redis.set('turn:c-1:k-race', JSON.stringify(rival), 'EX', 86400, 'NX') === 'OK') ctx.redis.rpush(QUEUE, JSON.stringify(rival));
+  });
+  const r = await post(api(ctx), {key: 'k-race'});
+  assert(probe.fired, 'the handler never touched turn:c-1:k-race: store the turn under (conversation, Idempotency-Key)');
+  assert.equal(r.status, 202, \`the message answered \${r.status}: \${r.text}\`);
+  const turns = queued(ctx);
+  assert.equal(turns.length, 1, \`two replicas handled one retry and \${turns.length} turns were enqueued for one key: a read then a write leaves a gap another replica lands in. Claim the key in one command (turns.claim)\`);
+  const stored = JSON.parse(ctx.redis.get('turn:c-1:k-race'));
+  assert.equal(r.json().turn_id, stored.turn_id, \`the answer names turn \${r.json().turn_id} but the key holds \${stored.turn_id}\`);
+}
+`,
+    go: `package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const apiQuestion = "Where is my next reservation?"
+
+func apiClient(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func apiPost(c *harness.HTTP, conversation, key, token string, body any) *harness.Response {
+	var headers []string
+	if token != "" {
+		headers = append(headers, "Authorization", "Bearer "+token)
+	}
+	if key != "" {
+		headers = append(headers, "Idempotency-Key", key)
+	}
+	return c.Post("/v1/conversations/"+conversation+"/messages", body, headers...)
+}
+
+func apiText(text string) map[string]any { return map[string]any{"text": text} }
+
+func apiQueued(ctx *harness.Ctx) []map[string]any {
+	var out []map[string]any
+	for _, raw := range ctx.Redis.LRange("apv2:turns", 0, -1) {
+		var turn map[string]any
+		ctx.NoError(json.Unmarshal([]byte(raw), &turn), "an enqueued turn must be JSON: %s", raw)
+		out = append(out, turn)
+	}
+	return out
+}
+
+func apiTurnID(ctx *harness.Ctx, r *harness.Response) string {
+	body, ok := r.JSON().(map[string]any)
+	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
+	id, _ := body["turn_id"].(string)
+	return id
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	r := apiPost(c, "c-1", "k-1", "tok-guest-1", apiText(apiQuestion))
+	ctx.Equal(r.Status, 202, "a valid message (%s)", r.Text())
+	body, _ := r.JSON().(map[string]any)
+	ctx.Assert(body["turn_id"] != nil && body["turn_id"] != "" && body["status"] == "queued", "the 202 body must be {turn_id, status: queued}, got %s", r.Text())
+	queued := apiQueued(ctx)
+	ctx.Equal(len(queued), 1, "one message must enqueue one turn on apv2:turns; turns enqueued")
+	ctx.Equal(queued[0]["turn_id"], body["turn_id"], "the enqueued turn must be the one answered")
+	for field, value := range map[string]string{"tenant": "t1", "conversation": "c-1", "actor": "guest-1", "text": apiQuestion} {
+		ctx.Equal(queued[0][field], value, "the enqueued turn's %s (%v)", field, queued[0])
+	}
+	ctx.Equal(apiPost(c, "c-1", "k-2", "", apiText(apiQuestion)).Status, 401, "a message without a bearer token")
+	ctx.Equal(apiPost(c, "c-1", "k-3", "tok-unknown", apiText(apiQuestion)).Status, 401, "a message with an unknown token")
+	ctx.Equal(len(apiQueued(ctx)), 1, "a rejected message must enqueue nothing; turns enqueued")
+}
+
+func CheckPrincipal(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	r := apiPost(c, "c-1", "k-1", "tok-guest-1", map[string]any{"text": "Refund my last stay", "role": "agent"})
+	ctx.Equal(r.Status, 202, "a guest message (%s)", r.Text())
+	queued := apiQueued(ctx)
+	ctx.Equal(queued[len(queued)-1]["role"], "customer", "a guest token with \\"role\\": \\"agent\\" in the body: the enqueued turn's role must come from the verified principal, or any guest runs agent-only tools; the role")
+	r = apiPost(c, "c-2", "k-2", "tok-agent-7", apiText(apiQuestion))
+	ctx.Equal(r.Status, 202, "an agent message (%s)", r.Text())
+	queued = apiQueued(ctx)
+	turn := queued[len(queued)-1]
+	ctx.Assert(turn["role"] == "agent" && turn["actor"] == "agent-7", "an agent token must enqueue role agent, actor agent-7: %v", turn)
+}
+
+func CheckTextCap(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	ctx.Equal(apiPost(c, "c-1", "k-empty", "tok-guest-1", apiText("")).Status, 400, "an empty text")
+	ctx.Equal(apiPost(c, "c-1", "k-none", "tok-guest-1", map[string]any{}).Status, 400, "a body without text")
+	ctx.Equal(apiPost(c, "c-1", "k-big", "tok-guest-1", apiText(strings.Repeat("a", 8193))).Status, 413, "8193 bytes of text (every byte is re-sent to the model on every iteration)")
+	ctx.Equal(apiPost(c, "c-1", "k-euro", "tok-guest-1", apiText(strings.Repeat("\\u20ac", 3000))).Status, 413, "3000 euro signs, 9000 bytes of UTF-8 (the cap counts bytes, not characters)")
+	ctx.Equal(len(apiQueued(ctx)), 0, "rejected messages must enqueue nothing; turns enqueued")
+	r := apiPost(c, "c-1", "k-edge", "tok-guest-1", apiText(strings.Repeat("a", 8192)))
+	ctx.Equal(r.Status, 202, "exactly 8192 bytes is within the cap (%s)", r.Text())
+}
+
+func CheckIdempotencyKey(ctx *harness.Ctx) {
+	c := apiClient(ctx)
+	ctx.Equal(apiPost(c, "c-1", "", "tok-guest-1", apiText(apiQuestion)).Status, 400, "a message without Idempotency-Key (a retry of it could not be told from a new question)")
+	ctx.Equal(len(apiQueued(ctx)), 0, "a message without Idempotency-Key must enqueue nothing; turns enqueued")
+	first := apiPost(c, "c-1", "k-7", "tok-guest-1", apiText(apiQuestion))
+	ctx.Equal(first.Status, 202, "the first message (%s)", first.Text())
+	replay := apiPost(c, "c-1", "k-7", "tok-guest-1", apiText(apiQuestion))
+	ctx.Equal(replay.Status, 202, "a replay must answer 202 with the stored turn")
+	ctx.Equal(apiTurnID(ctx, replay), apiTurnID(ctx, first), "a replay of (c-1, k-7) must answer the first turn id")
+	ctx.Equal(len(apiQueued(ctx)), 1, "a message and its replay; turns enqueued")
+	other := apiPost(c, "c-2", "k-7", "tok-guest-1", apiText(apiQuestion))
+	ctx.Assert(other.Status == 202 && apiTurnID(ctx, other) != apiTurnID(ctx, first), "the same key on another conversation is a new turn")
+}
+
+func CheckClaimRace(ctx *harness.Ctx) {
+	rival, _ := json.Marshal(map[string]string{"turn_id": "rival-turn", "tenant": "t1", "conversation": "c-1", "actor": "guest-1", "role": "customer", "text": apiQuestion})
+	probe := ctx.Redis.After("turn:c-1:k-race", func() any {
+		// Another replica handling the same retry stores its turn and enqueues it.
+		if ctx.Redis.Set("turn:c-1:k-race", string(rival), "EX", 86400, "NX") {
+			ctx.Redis.Do("RPUSH", "apv2:turns", string(rival))
+		}
+		return nil
+	})
+	r := apiPost(apiClient(ctx), "c-1", "k-race", "tok-guest-1", apiText(apiQuestion))
+	ctx.Assert(probe.Fired, "the handler never touched turn:c-1:k-race: store the turn under (conversation, Idempotency-Key)")
+	ctx.Equal(r.Status, 202, "the message (%s)", r.Text())
+	ctx.Equal(len(apiQueued(ctx)), 1, "two replicas handled one retry: a read then a write leaves a gap another replica lands in, so claim the key in one command (turns.Claim); turns enqueued for one key")
+	raw, _ := ctx.Redis.Get("turn:c-1:k-race")
+	var stored map[string]any
+	json.Unmarshal([]byte(raw), &stored)
+	ctx.Equal(apiTurnID(ctx, r), stored["turn_id"], "the answer must name the turn the key holds")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+using json = nlohmann::json;
+
+const std::string kQuestion = "Where is my next reservation?";
+
+struct Api {
+  httplib::Server svr;
+  harness::HTTP http;
+  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+
+  harness::Response post(const json& body, const std::string& conversation = "c-1", const std::string& key = "k-1",
+                         const std::string& token = "tok-guest-1") {
+    const std::string path = "/v1/conversations/" + conversation + "/messages";
+    if (token.empty()) return http.Post(path, body.dump(), "Idempotency-Key", key);
+    if (key.empty()) return http.Post(path, body.dump(), "Authorization", "Bearer " + token);
+    return http.Post(path, body.dump(), "Authorization", "Bearer " + token, "Idempotency-Key", key);
+  }
+};
+
+json text(const std::string& t) { return {{"text", t}}; }
+
+std::vector<json> queued(harness::Ctx& ctx) {
+  std::vector<json> out;
+  for (const auto& raw : ctx.Redis.LRange("apv2:turns", 0, -1)) out.push_back(json::parse(raw, nullptr, false));
+  return out;
+}
+
+std::string turnId(const harness::Response& r) {
+  const json body = json::parse(r.Text(), nullptr, false);
+  return body.is_object() && body.contains("turn_id") && body["turn_id"].is_string() ? body["turn_id"].get<std::string>() : "";
+}
+
+std::string repeat(const std::string& s, int n) {
+  std::string out;
+  for (int i = 0; i < n; i++) out += s;
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  Api api(ctx);
+  const auto r = api.post(text(kQuestion));
+  ctx.Equal(r.Status, 202, "a valid message (%s)", r.Text());
+  const json body = json::parse(r.Text(), nullptr, false);
+  ctx.Assert(body.is_object() && !turnId(r).empty() && body.value("status", "") == "queued", "the 202 body must be {turn_id, status: queued}, got %s", r.Text());
+  const auto turns = queued(ctx);
+  ctx.Equal(turns.size(), 1, "one message must enqueue one turn on apv2:turns; turns enqueued");
+  ctx.Equal(turns[0].value("turn_id", ""), turnId(r), "the enqueued turn must be the one answered");
+  for (const auto& [field, value] : std::vector<std::pair<std::string, std::string>>{{"tenant", "t1"}, {"conversation", "c-1"}, {"actor", "guest-1"}, {"text", kQuestion}}) {
+    ctx.Equal(turns[0].value(field, ""), value, "the enqueued turn's %s (%s)", field, turns[0].dump());
+  }
+  ctx.Equal(api.post(text(kQuestion), "c-1", "k-2", "").Status, 401, "a message without a bearer token");
+  ctx.Equal(api.post(text(kQuestion), "c-1", "k-3", "tok-unknown").Status, 401, "a message with an unknown token");
+  ctx.Equal(queued(ctx).size(), 1, "a rejected message must enqueue nothing; turns enqueued");
+}
+
+void CheckPrincipal(harness::Ctx& ctx) {
+  Api api(ctx);
+  auto r = api.post({{"text", "Refund my last stay"}, {"role", "agent"}});
+  ctx.Equal(r.Status, 202, "a guest message (%s)", r.Text());
+  ctx.Equal(queued(ctx).back().value("role", ""), "customer",
+            "a guest token with \\"role\\": \\"agent\\" in the body: the enqueued turn's role must come from the verified principal, or any guest runs agent-only tools; the role");
+  r = api.post(text(kQuestion), "c-2", "k-2", "tok-agent-7");
+  ctx.Equal(r.Status, 202, "an agent message (%s)", r.Text());
+  const json turn = queued(ctx).back();
+  ctx.Assert(turn.value("role", "") == "agent" && turn.value("actor", "") == "agent-7", "an agent token must enqueue role agent, actor agent-7: %s", turn.dump());
+}
+
+void CheckTextCap(harness::Ctx& ctx) {
+  Api api(ctx);
+  ctx.Equal(api.post(text(""), "c-1", "k-empty").Status, 400, "an empty text");
+  ctx.Equal(api.post(json::object(), "c-1", "k-none").Status, 400, "a body without text");
+  ctx.Equal(api.post(text(std::string(8193, 'a')), "c-1", "k-big").Status, 413, "8193 bytes of text (every byte is re-sent to the model on every iteration)");
+  ctx.Equal(api.post(text(repeat("\\u20ac", 3000)), "c-1", "k-euro").Status, 413, "3000 euro signs, 9000 bytes of UTF-8 (the cap counts bytes, not characters)");
+  ctx.Equal(queued(ctx).size(), 0, "rejected messages must enqueue nothing; turns enqueued");
+  const auto r = api.post(text(std::string(8192, 'a')), "c-1", "k-edge");
+  ctx.Equal(r.Status, 202, "exactly 8192 bytes is within the cap (%s)", r.Text());
+}
+
+void CheckIdempotencyKey(harness::Ctx& ctx) {
+  Api api(ctx);
+  ctx.Equal(api.post(text(kQuestion), "c-1", "").Status, 400, "a message without Idempotency-Key (a retry of it could not be told from a new question)");
+  ctx.Equal(queued(ctx).size(), 0, "a message without Idempotency-Key must enqueue nothing; turns enqueued");
+  const auto first = api.post(text(kQuestion), "c-1", "k-7");
+  ctx.Equal(first.Status, 202, "the first message (%s)", first.Text());
+  const auto replay = api.post(text(kQuestion), "c-1", "k-7");
+  ctx.Equal(replay.Status, 202, "a replay must answer 202 with the stored turn");
+  ctx.Equal(turnId(replay), turnId(first), "a replay of (c-1, k-7) must answer the first turn id");
+  ctx.Equal(queued(ctx).size(), 1, "a message and its replay; turns enqueued");
+  const auto other = api.post(text(kQuestion), "c-2", "k-7");
+  ctx.Assert(other.Status == 202 && turnId(other) != turnId(first), "the same key on another conversation is a new turn");
+}
+
+void CheckClaimRace(harness::Ctx& ctx) {
+  const json rival = {{"turn_id", "rival-turn"}, {"tenant", "t1"}, {"conversation", "c-1"}, {"actor", "guest-1"}, {"role", "customer"}, {"text", kQuestion}};
+  bool fired = false;
+  ctx.Redis.After("turn:c-1:k-race", [&] {
+    fired = true;
+    // Another replica handling the same retry stores its turn and enqueues it.
+    if (ctx.Redis.Set("turn:c-1:k-race", rival.dump(), "EX", 86400, "NX")) ctx.Redis.Do("RPUSH", "apv2:turns", rival.dump());
+  });
+  Api api(ctx);
+  const auto r = api.post(text(kQuestion), "c-1", "k-race");
+  ctx.Assert(fired, "the handler never touched turn:c-1:k-race: store the turn under (conversation, Idempotency-Key)");
+  ctx.Equal(r.Status, 202, "the message (%s)", r.Text());
+  ctx.Equal(queued(ctx).size(), 1,
+            "two replicas handled one retry: a read then a write leaves a gap another replica lands in, so claim the key in one command (turns::claim); turns enqueued for one key");
+  const json stored = json::parse(ctx.Redis.Get("turn:c-1:k-race").value_or("{}"), nullptr, false);
+  ctx.Equal(turnId(r), stored.value("turn_id", ""), "the answer must name the turn the key holds");
+}
+`,
+  },
   hints: [
-    'A customer who sends `"role": "agent"` gets agent tools; a client that retries a timed-out POST gets two answers and, if the model chose `issue_refund`, two refunds; a long paste hangs for seconds.',
-    'The handler copies `body.role` into the turn, ignores `Idempotency-Key`, caps nothing, and calls `workflow.run` inline, so every retry re-runs the whole reasoning loop with the full text.',
-    'Return 401 without a principal, 400 without the key or with empty text, 413 over `MAX_TEXT_BYTES`; look up `turns.get((conversation, key))`, else `turns.put`, `workflow.enqueue(turn)`, answer 202 with `{turn_id}`.',
+    "Symptom: a guest's message reaches the workflow as an agent turn, a pasted 50 KB log is accepted, and a client that retried once, or whose retry two replicas handled together, gets two answers.",
+    'Mechanism: the handler copies `role` from the body, never measures the text, falls back to the fresh turn id when `Idempotency-Key` is missing, and reads (`turns.get`) then writes (`turns.put`), leaving a gap a second replica lands in.',
+    'Change: role from the principal; 400 without `Idempotency-Key` or text, 413 above `MAX_TEXT_BYTES` counted in UTF-8 bytes; replace get and put with `turns.claim(conversation, key, turn)` and enqueue only when it returns nothing.',
   ],
-  debrief: `The fix is a handler that trusts only what it verified and does only what it can finish inside one request. The role rides on the principal because it decides which tools the reasoning loop may call; a body field is a self-granted privilege. The byte cap matters more here than on an ordinary API, since every byte of the text is re-sent to the model on every iteration. The idempotency key is scoped to the conversation so a retry finds the stored turn before anything is enqueued, and the 202 moves the multi-second loop into the workflow engine, where the client polls for the answer. Production platforms also check conversation ownership, apply per-actor rate limits, and mint a request-scoped trace id that step 5 carries into every event.`,
+  debrief: `The handler trusts only what it verified and stores before it acts. The role rides on the principal because it decides which tools the reasoning loop may run; a body field is a self-granted privilege. The byte cap matters more here than on an ordinary API, since every byte is re-sent to the model on every iteration. The key is scoped to the conversation and claimed with one \`SET NX\`, so a retry handled by two replicas at once still yields one turn: a read followed by a write is a check whose answer is stale by the time it is used. Production platforms also check that the actor owns the conversation, rate-limit per actor, and mint a trace id here that every span of the turn carries.`,
 };
